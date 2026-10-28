@@ -29,18 +29,43 @@ fn print_usage() {
         "Usage: w34 <subcommand> [options]\n\
          Subcommands:\n\
            generate     --model <id|path> [--tp 1|2] [--prompt <str>] [--max-tokens <n>] [--kv-format fp16|tq4|k8v4|firstlast2]\n\
-           bench        --model <id|path> [--tp 1|2] [--prompt-len <n>] [--gen-len <n>] [--kv-format fp16|tq4|k8v4|firstlast2] [--out <json>]\n\
-           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>]\n\
+           bench        --model <id|path> [--tp 1|2] [--stage decode|radix|scheduler|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format fp16|tq4|k8v4|firstlast2] [--out <json>]\n\
+           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>] [--verify-lossless] [--verify-radix-warm]\n\
            dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--compare-tp2] [--golden <safetensors>]\n\
-           profile-diff --oracle <sqlite|json> [--preset <key>] [--w34 <sqlite|json>] [--rounds <n>]\n\
+           profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
            serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format fp16|tq4|k8v4|firstlast2]\n\
            chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--max-tokens <n>] [--no-thinking]\n\
-         Speculative options (generate/bench/greedy-diff/serve/chat):\n\
+         Speculative options (generate/bench/greedy-diff/dump-diff/profile-diff/serve/chat):\n\
            --speculative mtp|dflash2 [--draft-model <id|path>] [--mtp-k 1..3] [--kv-pages <n>]\n\
            Native MTP shares target weights; DFlash2 requires a draft model.\n\
            Speculative CLI mode is eager/greedy; the server also honors sampling parameters.\n\
            Native mode defaults to 256 target KV pages (4096 tokens, including verification reserve)."
     );
+}
+
+#[cfg(feature = "cuda")]
+fn tensor_diff_metrics(a: &[f32], b: &[f32]) -> (f32, f64, f64) {
+    let mut max_abs = 0.0f32;
+    let mut err_sq = 0.0f64;
+    let mut a_sq = 0.0f64;
+    let mut b_sq = 0.0f64;
+    let mut dot = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let d = (x - y).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+        let xf = f64::from(x);
+        let yf = f64::from(y);
+        err_sq += (xf - yf) * (xf - yf);
+        a_sq += xf * xf;
+        b_sq += yf * yf;
+        dot += xf * yf;
+    }
+    let rel_l2 = (err_sq / b_sq.max(1e-30)).sqrt();
+    let denom = (a_sq * b_sq).sqrt();
+    let cosine = if denom > 1e-30 { dot / denom } else { 1.0 };
+    (max_abs, rel_l2, cosine)
 }
 
 #[cfg(feature = "cuda")]
@@ -74,6 +99,11 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     let mut draft_model = None;
     let mut mtp_k = 3usize;
     let mut kv_pages = None;
+    let mut bench_stage = "decode".to_string();
+    let mut batch_size = 8usize;
+    let mut verify_lossless = false;
+    let mut verify_radix_warm = false;
+    let mut live_profile = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -208,6 +238,36 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             "--no-thinking" => {
                 enable_thinking = false;
             }
+            "--stage" => {
+                i += 1;
+                bench_stage = args.get(i).cloned().ok_or("missing --stage value")?;
+                if !matches!(
+                    bench_stage.as_str(),
+                    "decode" | "radix" | "scheduler" | "all"
+                ) {
+                    return Err("--stage expects decode, radix, scheduler, or all".into());
+                }
+            }
+            "--batch-size" => {
+                i += 1;
+                batch_size = args
+                    .get(i)
+                    .ok_or("missing --batch-size")?
+                    .parse()
+                    .map_err(|_| "invalid --batch-size")?;
+                if !(1..=1024).contains(&batch_size) {
+                    return Err("--batch-size must be 1..1024".into());
+                }
+            }
+            "--verify-lossless" => {
+                verify_lossless = true;
+            }
+            "--verify-radix-warm" => {
+                verify_radix_warm = true;
+            }
+            "--live" => {
+                live_profile = true;
+            }
             "--help" | "-h" => {
                 print_usage();
                 return Ok(ExitCode::SUCCESS);
@@ -236,16 +296,22 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     {
         return Err("--speculative dflash2 requires --draft-model".into());
     }
+    if verify_lossless && speculative_kind.is_none() {
+        return Err("--verify-lossless requires --speculative".into());
+    }
     if speculative_kind.is_some()
-        && !matches!(sub, "generate" | "bench" | "greedy-diff" | "serve" | "chat")
+        && !matches!(
+            sub,
+            "generate" | "bench" | "greedy-diff" | "dump-diff" | "profile-diff" | "serve" | "chat"
+        )
     {
         return Err(
-            "speculation is supported by generate, bench, greedy-diff, serve and chat".into(),
+            "speculation is supported by generate, bench, greedy-diff, dump-diff, profile-diff, serve and chat".into(),
         );
     }
     let spec_config = speculative_kind.map(|kind| w34_host::proposer::SpeculativeConfig {
         kind,
-        draft_model,
+        draft_model: draft_model.clone(),
         mtp_k,
     });
     // Leave VRAM for the resident drafter instead of filling it with target KV.
@@ -291,37 +357,194 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             let base_ids = engine
                 .encode("The quick brown fox jumps over the lazy dog. ")
                 .map_err(|e| e.to_string())?;
-            let mut synth_prompt = Vec::with_capacity(prompt_len);
-            while synth_prompt.len() < prompt_len {
-                for &id in &base_ids {
-                    if synth_prompt.len() < prompt_len {
-                        synth_prompt.push(id);
+            let make_prompt = |len: usize| -> Vec<i32> {
+                let mut out = Vec::with_capacity(len);
+                while out.len() < len {
+                    for &id in &base_ids {
+                        if out.len() < len {
+                            out.push(id);
+                        }
                     }
                 }
-            }
+                out
+            };
+            let synth_prompt = make_prompt(prompt_len);
             // Warmup pass (captures CUDA Graph on decode step 1 and ramps GPU boost clock out of P8)
             let _ = engine
                 .generate_tokens(&synth_prompt[..16.min(prompt_len)], 32, false)
                 .map_err(|e| e.to_string())?;
 
-            let metrics = engine
-                .generate_tokens(&synth_prompt, gen_len, false)
-                .map_err(|e| e.to_string())?;
-            let summary = serde_json::json!({
-                "model": model,
-                "tp": tp,
-                "kv_format": kv_format,
-                "cuda_graph": engine.use_cuda_graph,
-                "speculative": speculative_kind.map(|k|match k {w34_host::proposer::SpeculativeKind::Mtp=>"mtp",w34_host::proposer::SpeculativeKind::DFlash2=>"dflash2"}),
-                "accepted_drafts_per_round": engine.speculative.as_ref().map(|p|&p.last_accepted),
-                "prompt_len": metrics.prompt_len,
-                "gen_len": metrics.gen_len,
-                "ttft_ms": metrics.ttft_ms,
-                "prefill_tok_per_s": metrics.prefill_tok_per_s,
-                "decode_ms": metrics.decode_ms,
-                "decode_tok_per_s": metrics.decode_tok_per_s,
-                "itl_ms": metrics.itl_ms,
+            let spec_label = speculative_kind.map(|k| match k {
+                w34_host::proposer::SpeculativeKind::Mtp => "mtp",
+                w34_host::proposer::SpeculativeKind::DFlash2 => "dflash2",
             });
+
+            let mut decode_summary = serde_json::Value::Null;
+            if matches!(bench_stage.as_str(), "decode" | "all") {
+                engine.reset_all_states().map_err(|e| e.to_string())?;
+                let metrics = engine
+                    .generate_tokens(&synth_prompt, gen_len, false)
+                    .map_err(|e| e.to_string())?;
+                let accepted = engine.speculative.as_ref().map(|p| p.last_accepted.clone());
+                let verify_rounds = accepted.as_ref().map(Vec::len);
+                let total_accepted: usize = accepted
+                    .as_ref()
+                    .map(|v| v.iter().copied().sum())
+                    .unwrap_or(0);
+                let mean_accepted_drafts = verify_rounds.and_then(|r| {
+                    if r > 0 {
+                        Some(total_accepted as f64 / r as f64)
+                    } else {
+                        None
+                    }
+                });
+                let mean_tokens_per_round = mean_accepted_drafts.map(|a| 1.0 + a);
+                let ms_per_verify_round = verify_rounds.and_then(|r| {
+                    if r > 0 {
+                        Some(metrics.decode_ms / r as f64)
+                    } else {
+                        None
+                    }
+                });
+                decode_summary = serde_json::json!({
+                    "model": model,
+                    "tp": tp,
+                    "kv_format": kv_format,
+                    "cuda_graph": engine.use_cuda_graph,
+                    "speculative": spec_label,
+                    "accepted_drafts_per_round": accepted,
+                    "verify_rounds": verify_rounds,
+                    "mean_accepted_drafts": mean_accepted_drafts,
+                    "mean_tokens_per_round": mean_tokens_per_round,
+                    "ms_per_verify_round": ms_per_verify_round,
+                    "prompt_len": metrics.prompt_len,
+                    "gen_len": metrics.gen_len,
+                    "ttft_ms": metrics.ttft_ms,
+                    "prefill_tok_per_s": metrics.prefill_tok_per_s,
+                    "decode_ms": metrics.decode_ms,
+                    "decode_tok_per_s": metrics.decode_tok_per_s,
+                    "itl_ms": metrics.itl_ms,
+                });
+            }
+
+            let mut radix_summary = serde_json::Value::Null;
+            if matches!(bench_stage.as_str(), "radix" | "all") {
+                engine.reset_all_states().map_err(|e| e.to_string())?;
+                let r_prompt_len = (prompt_len.max(128) / 64) * 64 + 8;
+                let r_prompt = make_prompt(r_prompt_len);
+                let r_gen = gen_len.clamp(4, 32);
+                let cold = engine
+                    .generate_with_radix_cache(&r_prompt, r_gen, 64, false)
+                    .map_err(|e| e.to_string())?;
+                let warm = engine
+                    .generate_with_radix_cache(&r_prompt, r_gen, 64, false)
+                    .map_err(|e| e.to_string())?;
+                let lossless_parity = cold.generated_token_ids == warm.generated_token_ids;
+                if !lossless_parity {
+                    return Err(
+                        "radix benchmark: warm prefix-hit output diverged from cold reference"
+                            .into(),
+                    );
+                }
+                if warm.cached_prefix_tokens < 64 {
+                    return Err(format!(
+                        "radix benchmark: expected >= 64 cached prefix tokens on warm hit, got {}",
+                        warm.cached_prefix_tokens
+                    ));
+                }
+                let restored_proposer = engine.speculative.as_ref().map(|p| p.last_restored_tokens);
+                let ttft_reduction_pct = if cold.ttft_ms > 0.0 {
+                    100.0 * (1.0 - warm.ttft_ms / cold.ttft_ms)
+                } else {
+                    0.0
+                };
+                let ttft_speedup_x = if warm.ttft_ms > 0.0 {
+                    cold.ttft_ms / warm.ttft_ms
+                } else {
+                    0.0
+                };
+                radix_summary = serde_json::json!({
+                    "prompt_len": r_prompt.len(),
+                    "gen_len": r_gen,
+                    "cold_ttft_ms": cold.ttft_ms,
+                    "warm_ttft_ms": warm.ttft_ms,
+                    "ttft_speedup_x": ttft_speedup_x,
+                    "ttft_reduction_pct": ttft_reduction_pct,
+                    "cached_prefix_tokens": warm.cached_prefix_tokens,
+                    "donated_seq_len": cold.donated_seq_len,
+                    "proposer_restored_tokens": restored_proposer,
+                    "warm_decode_tok_per_s": warm.decode_tok_per_s,
+                    "lossless_parity": lossless_parity,
+                });
+            }
+
+            let mut scheduler_summary = serde_json::Value::Null;
+            if matches!(bench_stage.as_str(), "scheduler" | "all") {
+                engine.reset_all_states().map_err(|e| e.to_string())?;
+                let shared_prefix = make_prompt(64);
+                let s_gen = gen_len.clamp(4, 32);
+                let mut batch_prompts = Vec::with_capacity(batch_size);
+                for b in 0..batch_size {
+                    let mut p = shared_prefix.clone();
+                    for t in 0..16 {
+                        p.push(base_ids[(b * 7 + t) % base_ids.len()]);
+                    }
+                    batch_prompts.push(p);
+                }
+                // Seed shared 64-token prefix into MambaRadixCache so batch exercises prefix sharing
+                let _ = engine
+                    .generate_with_radix_cache(&batch_prompts[0], 2, 64, false)
+                    .map_err(|e| e.to_string())?;
+                let sched_cfg = w34_host::scheduler::SchedulerConfig {
+                    max_num_seqs: batch_size.min(8),
+                    ..Default::default()
+                };
+                let t0 = std::time::Instant::now();
+                let batch_res = engine
+                    .generate_batch_scheduled(&batch_prompts, s_gen, sched_cfg)
+                    .map_err(|e| e.to_string())?;
+                let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let total_prompt_tokens: usize = batch_prompts.iter().map(Vec::len).sum();
+                let total_cached_tokens: usize = batch_res.iter().map(|(_, c)| *c).sum();
+                let total_gen_tokens: usize = batch_res.iter().map(|(g, _)| g.len()).sum();
+                let aggregate_decode_tok_per_s = if wall_ms > 0.0 {
+                    total_gen_tokens as f64 * 1000.0 / wall_ms
+                } else {
+                    0.0
+                };
+                let total_tok_per_s = if wall_ms > 0.0 {
+                    (total_prompt_tokens + total_gen_tokens) as f64 * 1000.0 / wall_ms
+                } else {
+                    0.0
+                };
+                scheduler_summary = serde_json::json!({
+                    "batch_size": batch_size,
+                    "max_active_seqs": sched_cfg.max_num_seqs,
+                    "total_prompt_tokens": total_prompt_tokens,
+                    "total_cached_prefix_tokens": total_cached_tokens,
+                    "radix_hit_rate": engine.radix.hit_rate(),
+                    "total_gen_tokens": total_gen_tokens,
+                    "wall_ms": wall_ms,
+                    "aggregate_decode_tok_per_s": aggregate_decode_tok_per_s,
+                    "total_tok_per_s": total_tok_per_s,
+                });
+            }
+
+            let summary = match bench_stage.as_str() {
+                "decode" => decode_summary,
+                "radix" => radix_summary,
+                "scheduler" => scheduler_summary,
+                "all" => serde_json::json!({
+                    "model": model,
+                    "tp": tp,
+                    "kv_format": kv_format,
+                    "speculative": spec_label,
+                    "decode": decode_summary,
+                    "radix": radix_summary,
+                    "scheduler": scheduler_summary,
+                }),
+                _ => unreachable!(),
+            };
             println!("{}", serde_json::to_string_pretty(&summary).unwrap());
             if let Some(out_p) = out_json {
                 fs::write(out_p, serde_json::to_string_pretty(&summary).unwrap())
@@ -433,13 +656,89 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             let mut total_matches = 0usize;
             let mut first_step_matches = 0usize;
             let mut adjudicated_passes = 0usize;
+            let mut total_spec_rounds = 0usize;
+            let mut total_spec_accepted = 0usize;
+            let mut lossless_passes = 0usize;
+            let mut radix_warm_passes = 0usize;
             let num_cases = cases.len().min(max_prompts);
 
             for (id, prompt_ids, ref_gen_ids, top5_opt) in cases.iter().take(num_cases) {
                 let cmp_len = ref_gen_ids.len().min(max_tokens);
-                let metrics = engine
-                    .generate_tokens(prompt_ids, cmp_len, false)
-                    .map_err(|e| e.to_string())?;
+                let plain_ref_ids = if verify_lossless && engine.speculative.is_some() {
+                    let saved_spec = engine.speculative.take();
+                    engine.reset_all_states().map_err(|e| e.to_string())?;
+                    let plain_m = engine
+                        .generate_tokens(prompt_ids, cmp_len, false)
+                        .map_err(|e| e.to_string())?;
+                    engine.speculative = saved_spec;
+                    Some(plain_m.generated_token_ids)
+                } else {
+                    None
+                };
+
+                engine.reset_all_states().map_err(|e| e.to_string())?;
+                let metrics = if verify_radix_warm {
+                    engine
+                        .generate_with_radix_cache(prompt_ids, cmp_len, 64, false)
+                        .map(|m| w34_host::model::BenchMetrics {
+                            prompt_len: m.prompt_len,
+                            gen_len: m.gen_len,
+                            ttft_ms: m.ttft_ms,
+                            prefill_tok_per_s: m.prefill_tok_per_s,
+                            decode_ms: m.decode_ms,
+                            decode_tok_per_s: m.decode_tok_per_s,
+                            itl_ms: m.itl_ms,
+                            generated_token_ids: m.generated_token_ids,
+                        })
+                        .map_err(|e| e.to_string())?
+                } else {
+                    engine
+                        .generate_tokens(prompt_ids, cmp_len, false)
+                        .map_err(|e| e.to_string())?
+                };
+
+                let mut spec_info = String::new();
+                if let Some(proposer) = &engine.speculative {
+                    let r = proposer.last_accepted.len();
+                    let a: usize = proposer.last_accepted.iter().copied().sum();
+                    total_spec_rounds += r;
+                    total_spec_accepted += a;
+                    let tau = if r > 0 {
+                        1.0 + (a as f64 / r as f64)
+                    } else {
+                        1.0
+                    };
+                    spec_info = format!(" [spec: r={r} acc={a} tau={tau:.2}x]");
+                }
+
+                if let Some(ref plain_ids) = plain_ref_ids {
+                    if &metrics.generated_token_ids == plain_ids {
+                        lossless_passes += 1;
+                    } else {
+                        return Err(format!(
+                            "greedy-diff --verify-lossless failed on case {id}: speculative output diverged from plain target greedy"
+                        ));
+                    }
+                } else if verify_lossless {
+                    lossless_passes += 1;
+                }
+
+                if verify_radix_warm {
+                    let warm = engine
+                        .generate_with_radix_cache(prompt_ids, cmp_len, 64, false)
+                        .map_err(|e| e.to_string())?;
+                    if warm.generated_token_ids == metrics.generated_token_ids {
+                        radix_warm_passes += 1;
+                        spec_info.push_str(&format!(
+                            " [radix: cached={} ttft={:.1}->{:.1}ms]",
+                            warm.cached_prefix_tokens, metrics.ttft_ms, warm.ttft_ms
+                        ));
+                    } else {
+                        return Err(format!(
+                            "greedy-diff --verify-radix-warm failed on case {id}: warm prefix-hit output diverged from cold output"
+                        ));
+                    }
+                }
 
                 let mut prefix_match = 0usize;
                 let mut exact_matches = 0usize;
@@ -491,31 +790,58 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                 total_tokens_compared += cmp_len;
                 total_matches += exact_matches;
                 println!(
-                    "[greedy-diff] case={id:<10} first_tok={} prefix={prefix_match:>3}/{cmp_len} exact={exact_matches:>3}/{cmp_len} decode={:>5.1}tok/s [{flip_info}]",
+                    "[greedy-diff] case={id:<10} first_tok={} prefix={prefix_match:>3}/{cmp_len} exact={exact_matches:>3}/{cmp_len} decode={:>5.1}tok/s [{flip_info}]{spec_info}",
                     metrics.generated_token_ids.first() == ref_gen_ids.first(),
                     metrics.decode_tok_per_s
                 );
             }
+            let spec_summary = if total_spec_rounds > 0 {
+                let tau = 1.0 + (total_spec_accepted as f64 / total_spec_rounds as f64);
+                format!(
+                    " spec_rounds={total_spec_rounds} spec_accepted={total_spec_accepted} mean_tau={tau:.2}x"
+                )
+            } else {
+                String::new()
+            };
+            let lossless_summary = if verify_lossless {
+                format!(" lossless={lossless_passes}/{num_cases}")
+            } else {
+                String::new()
+            };
+            let radix_summary = if verify_radix_warm {
+                format!(" radix_warm={radix_warm_passes}/{num_cases}")
+            } else {
+                String::new()
+            };
             println!(
-                "[greedy-diff summary] model={model} tp={tp} first_step={first_step_matches}/{num_cases} adjudicated={adjudicated_passes}/{num_cases} total_token_match={total_matches}/{total_tokens_compared} ({:.1}%)",
+                "[greedy-diff summary] model={model} tp={tp} first_step={first_step_matches}/{num_cases} adjudicated={adjudicated_passes}/{num_cases} total_token_match={total_matches}/{total_tokens_compared} ({:.1}%){spec_summary}{lossless_summary}{radix_summary}",
                 if total_tokens_compared > 0 {
                     100.0 * (total_matches as f64) / (total_tokens_compared as f64)
                 } else {
                     100.0
                 }
             );
+            if adjudicated_passes < num_cases {
+                return Err(format!(
+                    "greedy-diff failed: only {adjudicated_passes}/{num_cases} prompts passed adjudication"
+                ));
+            }
             Ok(ExitCode::SUCCESS)
         }
         "dump-diff" => {
-            let mut engine =
-                Qwen3_5Engine::load(&model, tp, policy, None, false).map_err(|e| e.to_string())?;
+            let mut engine = load_engine().map_err(|e| e.to_string())?;
             let prompt_ids = engine.encode(&prompt).map_err(|e| e.to_string())?;
             let dump = engine.dump_prompt(&prompt_ids).map_err(|e| e.to_string())?;
             let decoded_top1 = engine
                 .decode(&[dump.greedy_token_id])
                 .unwrap_or_else(|_| "<err>".to_string());
+            let draft_str = if !dump.draft_proposal_ids.is_empty() {
+                format!(" draft_proposals={:?}", dump.draft_proposal_ids)
+            } else {
+                String::new()
+            };
             println!(
-                "[dump-diff] model={model} tp={tp} prompt_len={} tensors_captured={} greedy_id={} ({:?}) top5_ids={:?} top5_logprobs={:?}",
+                "[dump-diff] model={model} tp={tp} prompt_len={} tensors_captured={} greedy_id={} ({:?}) top5_ids={:?} top5_logprobs={:?}{draft_str}",
                 prompt_ids.len(),
                 dump.tensors_f32.len(),
                 dump.greedy_token_id,
@@ -525,12 +851,23 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             );
             if compare_tp2 {
                 drop(engine);
-                let mut engine_tp2 = Qwen3_5Engine::load(&model, 2, policy, None, false)
+                let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
+                let mut engine_tp2 = Qwen3_5Engine::load(&model, 2, policy, pages, false)
                     .map_err(|e| e.to_string())?;
+                if let Some(config) = &spec_config {
+                    engine_tp2
+                        .enable_speculative(config)
+                        .map_err(|e| e.to_string())?;
+                }
                 let dump_tp2 = engine_tp2
                     .dump_prompt(&prompt_ids)
                     .map_err(|e| e.to_string())?;
                 let mut max_layer_diff = 0.0f32;
+                let mut target_max_rel_l2 = 0.0f64;
+                let mut min_cosine = 1.0f64;
+                let mut drafter_rel_l2 = 0.0f64;
+                let mut drafter_cosine = 1.0f64;
+                let mut compared_drafter_hidden = false;
                 for (name, (shape1, vals1)) in &dump.tensors_f32 {
                     if name == "logits" {
                         continue; // logits_buf on rank 0 is vocab-sharded under TP=2
@@ -538,49 +875,105 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                     if let Some((shape2, vals2)) = dump_tp2.tensors_f32.get(name)
                         && shape1 == shape2
                     {
-                        let mut mdiff = 0.0f32;
-                        for (&a, &b) in vals1.iter().zip(vals2.iter()) {
-                            mdiff = mdiff.max((a - b).abs());
+                        let (mdiff, rel, cos) = tensor_diff_metrics(vals1, vals2);
+                        if name == "drafter_hidden" {
+                            drafter_rel_l2 = rel;
+                            drafter_cosine = cos;
+                            compared_drafter_hidden = true;
+                        } else {
+                            max_layer_diff = max_layer_diff.max(mdiff);
+                            target_max_rel_l2 = target_max_rel_l2.max(rel);
+                            min_cosine = min_cosine.min(cos);
                         }
-                        max_layer_diff = max_layer_diff.max(mdiff);
                     }
                 }
+                let top1_match = dump.greedy_token_id == dump_tp2.greedy_token_id;
+                let draft_prefix_match = dump
+                    .draft_proposal_ids
+                    .iter()
+                    .zip(dump_tp2.draft_proposal_ids.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let draft_exact_match = dump
+                    .draft_proposal_ids
+                    .iter()
+                    .zip(dump_tp2.draft_proposal_ids.iter())
+                    .filter(|(a, b)| a == b)
+                    .count();
+                let draft_len = dump.draft_proposal_ids.len();
+                let draft_ok = if spec_config.is_some() {
+                    compared_drafter_hidden
+                        && draft_len > 0
+                        && dump_tp2.draft_proposal_ids.len() == draft_len
+                        && draft_prefix_match >= 1
+                        && drafter_cosine >= 0.95
+                } else {
+                    true
+                };
+                let spec_cmp = if spec_config.is_some() {
+                    format!(
+                        " drafter_rel_l2={drafter_rel_l2:.6} drafter_cosine={drafter_cosine:.6} draft_prefix={draft_prefix_match}/{draft_len} draft_exact={draft_exact_match}/{draft_len} tp1_drafts={:?} tp2_drafts={:?}",
+                        dump.draft_proposal_ids, dump_tp2.draft_proposal_ids
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "[dump-diff tp1-vs-tp2] model={model} max_hidden_diff={max_layer_diff:.6} tp1_top1={} tp2_top1={} match={}",
-                    dump.greedy_token_id,
-                    dump_tp2.greedy_token_id,
-                    dump.greedy_token_id == dump_tp2.greedy_token_id
+                    "[dump-diff tp1-vs-tp2] model={model} max_hidden_diff={max_layer_diff:.6} target_max_rel_l2={target_max_rel_l2:.6} min_cosine={min_cosine:.6} tp1_top1={} tp2_top1={} match={top1_match}{spec_cmp}",
+                    dump.greedy_token_id, dump_tp2.greedy_token_id,
                 );
+                if !top1_match || !draft_ok || target_max_rel_l2 > 0.05 {
+                    return Err(format!(
+                        "dump-diff tp1-vs-tp2 parity check failed: top1_match={top1_match} draft_ok={draft_ok} target_max_rel_l2={target_max_rel_l2:.6}"
+                    ));
+                }
             }
             if let Some(gpath) = golden_path {
                 let archive = w34_host::loader::SafetensorsArchive::open(Path::new(&gpath))
                     .map_err(|e| e.to_string())?;
                 let mut compared = 0usize;
                 let mut max_diff = 0.0f32;
+                let mut max_rel_l2 = 0.0f64;
+                let mut min_cosine = 1.0f64;
                 for (name, (_shape, vals)) in &dump.tensors_f32 {
                     if let Some(resolved) = archive.resolve_name(name) {
                         let ref_vals = archive.read_f32(&resolved).map_err(|e| e.to_string())?;
                         if ref_vals.len() == vals.len() {
-                            let mut d = 0.0f32;
-                            for (&a, &b) in vals.iter().zip(ref_vals.iter()) {
-                                d = d.max((a - b).abs());
-                            }
+                            let (d, rel, cos) = tensor_diff_metrics(vals, &ref_vals);
                             max_diff = max_diff.max(d);
+                            max_rel_l2 = max_rel_l2.max(rel);
+                            min_cosine = min_cosine.min(cos);
                             compared += 1;
                         }
                     }
                 }
                 println!(
-                    "[dump-diff golden] golden={gpath} compared_tensors={compared} max_abs_diff={max_diff:.6}"
+                    "[dump-diff golden] golden={gpath} compared_tensors={compared} max_abs_diff={max_diff:.6} max_rel_l2={max_rel_l2:.6} min_cosine={min_cosine:.6}"
                 );
+                if compared == 0 || max_rel_l2 > 0.05 {
+                    return Err(format!(
+                        "dump-diff golden check failed: compared_tensors={compared} max_rel_l2={max_rel_l2:.6}"
+                    ));
+                }
             }
             Ok(ExitCode::SUCCESS)
         }
         "profile-diff" => {
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let resolve_repo_file = |rel: &str| -> String {
+                let p = Path::new(rel);
+                if p.exists() {
+                    rel.to_string()
+                } else {
+                    repo_root.join(rel).display().to_string()
+                }
+            };
             let oracle = oracle_path
-                .unwrap_or_else(|| "tools/oracle/goldens/oracle_baselines.json".to_string());
+                .unwrap_or_else(|| resolve_repo_file("tools/oracle/goldens/oracle_baselines.json"));
+            let script = resolve_repo_file("tools/oracle/profile_diff.py");
             let mut cmd = std::process::Command::new("python3");
-            cmd.arg("tools/oracle/profile_diff.py")
+            cmd.arg("-B")
+                .arg(&script)
                 .arg("--oracle")
                 .arg(&oracle)
                 .arg("--rounds")
@@ -590,6 +983,45 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             }
             if let Some(w) = &w34_prof_path {
                 cmd.arg("--w34").arg(w);
+            } else if live_profile {
+                let exe = env::current_exe().map_err(|e| e.to_string())?;
+                let mut bench_args = vec![
+                    exe.display().to_string(),
+                    "bench".to_string(),
+                    "--model".to_string(),
+                    model.clone(),
+                    "--tp".to_string(),
+                    tp.to_string(),
+                    "--prompt-len".to_string(),
+                    prompt_len.to_string(),
+                    "--gen-len".to_string(),
+                    gen_len.to_string(),
+                    "--kv-format".to_string(),
+                    kv_format.clone(),
+                ];
+                if let Some(kind) = speculative_kind {
+                    bench_args.push("--speculative".to_string());
+                    match kind {
+                        w34_host::proposer::SpeculativeKind::Mtp => {
+                            bench_args.push("mtp".to_string());
+                            bench_args.push("--mtp-k".to_string());
+                            bench_args.push(mtp_k.to_string());
+                        }
+                        w34_host::proposer::SpeculativeKind::DFlash2 => {
+                            bench_args.push("dflash2".to_string());
+                        }
+                    }
+                }
+                if let Some(dm) = &draft_model {
+                    bench_args.push("--draft-model".to_string());
+                    bench_args.push(dm.clone());
+                }
+                if let Some(kp) = kv_pages {
+                    bench_args.push("--kv-pages".to_string());
+                    bench_args.push(kp.to_string());
+                }
+                cmd.arg("--live-cmd")
+                    .arg(serde_json::to_string(&bench_args).unwrap());
             }
             if let Some(o) = &out_json {
                 cmd.arg("--json-out").arg(o);

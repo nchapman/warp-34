@@ -13,7 +13,10 @@ into the 7 canonical warp-34 categories (`docs/ROADMAP.md` §3.3):
 """
 import argparse
 import json
+import shlex
 import sqlite3
+import subprocess
+import tempfile
 from pathlib import Path
 
 CATEGORIES = [
@@ -26,21 +29,95 @@ CATEGORIES = [
 ]
 
 
-def classify_kernel(name: str) -> str:
+def classify_kernel(name: str, in_spec_span: bool = False) -> str:
     s = name.lower()
     if any(k in s for k in ("all_reduce", "allreduce", "all_gather", "nccl", "exchange", "tp2_", "cross_device")):
         return "tp_comm"
-    if any(k in s for k in ("dflash", "mtp", "rejection", "accept_walk", "draft")):
+    if in_spec_span or any(
+        k in s
+        for k in (
+            "dflash",
+            "mtp",
+            "rejection",
+            "accept_walk",
+            "draft",
+            "tap_add",
+            "16bf",
+            "bfloat16",
+            "bf16",
+        )
+    ):
         return "spec_decode"
     if any(k in s for k in ("gdn", "delta_rule", "conv1d", "ssm", "mamba", "recurrent")):
         return "gdn_ssm"
-    if any(k in s for k in ("rms_norm", "rmsnorm", "layernorm", "rope", "silu", "act_and_mul", "output_gate", "split_cols", "sampler", "elementwise", "embed")):
+    if any(
+        k in s
+        for k in (
+            "rms_norm",
+            "rmsnorm",
+            "layernorm",
+            "rope",
+            "silu",
+            "act_and_mul",
+            "output_gate",
+            "split_cols",
+            "sampler",
+            "topk_rows",
+            "elementwise",
+            "embed",
+        )
+    ):
         return "norms_rope_act"
     if any(k in s for k in ("flash_attn", "fattn", "paged_attn", "paged_attention", "kv_cache_write", "fmha", "attn")):
         return "full_attn"
     if any(k in s for k in ("marlin", "gemm", "gemv", "cutlass", "ampere_fp16", "cublas", "matmul")):
         return "marlin_gemm"
     return "norms_rope_act"
+
+
+def _find_target_passes(rows: list[tuple[str, int, int]]) -> list[tuple[int, int]]:
+    """Returns `(start_idx, target_end_idx)` for each target forward pass in `rows`.
+
+    Target passes start at `embed_lookup` and contain GDN (`conv1d`/`gdn`) layers before
+    their final `topk_rows` / `sampler` (whereas MTP draft passes have 0 GDN layers and
+    DFlash2 uses `embed_lookup_bf16`).
+    """
+    embed_f16 = [
+        i
+        for i, (kname, _, _) in enumerate(rows)
+        if "embed_lookup" in kname.lower() and "bf16" not in kname.lower()
+    ]
+    if not embed_f16:
+        return []
+
+    has_any_gdn = any("conv1d" in k.lower() or "gdn" in k.lower() for k, _, _ in rows)
+    target_starts: list[int] = []
+    for pos, idx in enumerate(embed_f16):
+        nxt = embed_f16[pos + 1] if pos + 1 < len(embed_f16) else len(rows)
+        if not has_any_gdn:
+            target_starts.append(idx)
+            continue
+        gdn_count = sum(
+            1
+            for k, _, _ in rows[idx:nxt]
+            if "conv1d" in k.lower() or "gdn" in k.lower()
+        )
+        if gdn_count >= 4:
+            target_starts.append(idx)
+
+    passes: list[tuple[int, int]] = []
+    for pos, s_idx in enumerate(target_starts):
+        nxt_s = target_starts[pos + 1] if pos + 1 < len(target_starts) else len(rows)
+        end_idx = nxt_s - 1
+        for j in range(s_idx, nxt_s):
+            kl = rows[j][0].lower()
+            if "topk_rows" in kl or "sampler_greedy" in kl:
+                end_idx = j
+                if j + 1 < nxt_s and "all_gather_top1" in rows[j + 1][0].lower():
+                    end_idx = j + 1
+                break
+        passes.append((s_idx, end_idx))
+    return passes
 
 
 def parse_nsys_sqlite(sqlite_path: Path, rounds: int = 128, device_id: int = 0) -> dict:
@@ -61,29 +138,42 @@ def parse_nsys_sqlite(sqlite_path: Path, rounds: int = 128, device_id: int = 0) 
     cat_ns = {c: 0 for c in CATEGORIES}
     cat_launches = {c: 0 for c in CATEGORIES}
     if not rows:
-        return {"rounds": rounds, "categories": {c: {"ms_per_round": 0.0, "launches_per_round": 0.0} for c in CATEGORIES + ["host_gap"]}, "total_ms_per_round": 0.0}
+        return {
+            "rounds": rounds,
+            "categories": {
+                c: {"ms_per_round": 0.0, "launches_per_round": 0.0}
+                for c in CATEGORIES + ["host_gap"]
+            },
+            "total_ms_per_round": 0.0,
+        }
 
-    # If trace contains w34 embed_lookup_f16_kernel launches, slice exactly the last
-    # `rounds` decode steps (skipping model load repack, warmup, and prefill).
-    embed_indices = [i for i, (kname, _, _) in enumerate(rows) if "embed_lookup" in kname.lower()]
-    if len(embed_indices) >= 4:
-        take_rounds = min(rounds, len(embed_indices) - 2) if len(embed_indices) > 2 else len(embed_indices)
-        start_idx = embed_indices[-take_rounds]
-        window = rows[start_idx:]
+    target_passes = _find_target_passes(rows)
+    spec_indices: set[int] = set()
+    for pos, (s_idx, e_idx) in enumerate(target_passes):
+        nxt_s = target_passes[pos + 1][0] if pos + 1 < len(target_passes) else len(rows)
+        for j in range(e_idx + 1, nxt_s):
+            spec_indices.add(j)
+
+    if len(target_passes) >= 4:
+        take_rounds = min(rounds, len(target_passes) - 2)
+        start_idx = target_passes[-take_rounds][0]
         effective_rounds = float(take_rounds)
+        window_indices = range(start_idx, len(rows))
     else:
         start_idx = len(rows) // 10 if len(rows) > 200 else 0
-        window = rows[start_idx:]
-        effective_rounds = max(1.0, rounds * (len(window) / max(1, len(rows))))
+        window_indices = range(start_idx, len(rows))
+        effective_rounds = max(1.0, rounds * (len(window_indices) / max(1, len(rows))))
 
-    prev_end = window[0][1]
+    first_i = window_indices[0]
+    prev_end = rows[first_i][1]
     gap_ns = 0
-    for kname, start, end in window:
+    for idx in window_indices:
+        kname, start, end = rows[idx]
         dur = max(0, end - start)
         if start > prev_end:
             gap_ns += start - prev_end
         prev_end = max(prev_end, end)
-        cat = classify_kernel(kname)
+        cat = classify_kernel(kname, in_spec_span=(idx in spec_indices))
         cat_ns[cat] += dur
         cat_launches[cat] += 1
 
@@ -104,6 +194,84 @@ def parse_nsys_sqlite(sqlite_path: Path, rounds: int = 128, device_id: int = 0) 
         "total_ms_per_round": round(total_ms, 4),
         "tok_per_s_m1": round(1000.0 / total_ms, 2) if total_ms > 0 else 0.0,
     }
+
+
+def run_live_nsys(live_cmd: str, rounds: int, device_id: int) -> dict:
+    with tempfile.TemporaryDirectory(prefix="w34_nsys_") as tmpdir:
+        rep_prefix = Path(tmpdir) / "trace"
+        rep_file = Path(tmpdir) / "trace.nsys-rep"
+        sqlite_file = Path(tmpdir) / "trace.sqlite"
+        cmd_str = live_cmd.strip()
+        if cmd_str.startswith("["):
+            cmd_parts = [str(x) for x in json.loads(cmd_str)]
+        else:
+            cmd_parts = shlex.split(live_cmd)
+        nsys_cmd = [
+            "nsys",
+            "profile",
+            "--trace=cuda",
+            "--cuda-graph-trace=node",
+            "--sample=none",
+            "--cpuctxsw=none",
+            "--force-overwrite=true",
+            "-o",
+            str(rep_prefix),
+            *cmd_parts,
+        ]
+        proc = subprocess.run(nsys_cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"nsys profile failed (rc={proc.returncode}):\n{proc.stderr}\n{proc.stdout}"
+            )
+        export_proc = subprocess.run(
+            [
+                "nsys",
+                "export",
+                "--type=sqlite",
+                "--force-overwrite=true",
+                "-o",
+                str(sqlite_file),
+                str(rep_file),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if export_proc.returncode != 0:
+            raise RuntimeError(
+                f"nsys export failed (rc={export_proc.returncode}):\n{export_proc.stderr}\n{export_proc.stdout}"
+            )
+        bench_json = None
+        stdout = proc.stdout
+        brace_start = stdout.find("{")
+        brace_end = stdout.rfind("}")
+        if brace_start != -1 and brace_end > brace_start:
+            try:
+                bench_json = json.loads(stdout[brace_start : brace_end + 1])
+            except json.JSONDecodeError:
+                bench_json = None
+
+        actual_rounds = rounds
+        if isinstance(bench_json, dict):
+            if bench_json.get("verify_rounds") is not None:
+                actual_rounds = int(bench_json["verify_rounds"])
+            elif bench_json.get("gen_len") is not None:
+                actual_rounds = max(1, int(bench_json["gen_len"]) - 1)
+
+        prof = parse_nsys_sqlite(sqlite_file, rounds=actual_rounds, device_id=device_id)
+        prof["source"] = f"live nsys ({live_cmd})"
+        if isinstance(bench_json, dict):
+            if "decode_tok_per_s" in bench_json:
+                prof["measured_decode_tok_per_s"] = round(
+                    float(bench_json["decode_tok_per_s"]), 2
+                )
+            if bench_json.get("mean_tokens_per_round") is not None:
+                tau = float(bench_json["mean_tokens_per_round"])
+                prof["mean_tokens_per_round"] = round(tau, 3)
+                if prof["total_ms_per_round"] > 0:
+                    prof["tok_per_s_m1"] = round(
+                        1000.0 * tau / prof["total_ms_per_round"], 2
+                    )
+        return prof
 
 
 def load_profile(path: Path, rounds: int, device_id: int, preset: str | None = None) -> dict:
@@ -135,6 +303,14 @@ def render_scoreboard(oracle_label: str, oracle: dict, w34_label: str, w34: dict
     w_tot = w34.get("total_ms_per_round", 0.0)
     tot_sp = f"{o_tot / w_tot:.2f}x" if w_tot > 1e-6 and o_tot > 1e-6 else "n/a"
     lines.append(f"{'TOTAL':<18} | {o_tot:>16.4f} | {w_tot:>16.4f} | {w_tot - o_tot:>+13.4f} | {tot_sp:>9}")
+    o_tps = oracle.get("tok_per_s_m1", 0.0)
+    w_tps = w34.get("measured_decode_tok_per_s", w34.get("tok_per_s_m1", 0.0))
+    tps_sp = f"{w_tps / o_tps:.2f}x" if o_tps > 1e-6 and w_tps > 1e-6 else "n/a"
+    lines.append(f"{'TOK/S (effective)':<18} | {o_tps:>16.2f} | {w_tps:>16.2f} | {w_tps - o_tps:>+13.2f} | {tps_sp:>9}")
+    if "mean_tokens_per_round" in w34:
+        lines.append(
+            f"rounds={w34.get('rounds')}  mean_tokens_per_round(tau)={w34['mean_tokens_per_round']:.2f}x"
+        )
     return "\n".join(lines)
 
 
@@ -142,8 +318,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--oracle", required=True, help="Oracle nsys .sqlite or .json profile")
     ap.add_argument("--preset", default=None, help="Preset key inside oracle_baselines.json")
-    ap.add_argument("--oracle-label", default="vLLM 0.31.0", help="Oracle column header")
+    ap.add_argument("--oracle-label", default=None, help="Oracle column header")
     ap.add_argument("--w34", default=None, help="warp-34 nsys .sqlite or .json profile")
+    ap.add_argument("--live-cmd", default=None, help="Run command under nsys profile and parse SQLite")
     ap.add_argument("--w34-label", default="warp-34", help="warp-34 column header")
     ap.add_argument("--rounds", type=int, default=128, help="Nominal rounds in trace")
     ap.add_argument("--device", type=int, default=0, help="CUDA deviceId in nsys trace")
@@ -153,10 +330,16 @@ def main() -> None:
     oracle_prof = load_profile(Path(args.oracle), args.rounds, args.device, args.preset)
     if args.w34:
         w34_prof = load_profile(Path(args.w34), args.rounds, args.device, args.preset)
+    elif args.live_cmd:
+        w34_prof = run_live_nsys(args.live_cmd, args.rounds, args.device)
     else:
         w34_prof = oracle_prof
 
-    table = render_scoreboard(args.oracle_label, oracle_prof, args.w34_label, w34_prof)
+    oracle_label = args.oracle_label
+    if not oracle_label:
+        oracle_label = "SGLang v0.5.19" if (args.preset and "sglang" in args.preset) else "vLLM 0.31.0"
+
+    table = render_scoreboard(oracle_label, oracle_prof, args.w34_label, w34_prof)
     print(table)
     if args.json_out:
         Path(args.json_out).write_text(json.dumps({"oracle": oracle_prof, "w34": w34_prof}, indent=2))

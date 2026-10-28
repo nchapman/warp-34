@@ -40,6 +40,7 @@ pub struct ForwardDump {
     pub greedy_token_id: i32,
     pub top5_ids: [i32; 5],
     pub top5_logprobs: [f32; 5],
+    pub draft_proposal_ids: Vec<i32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1664,6 +1665,44 @@ impl Qwen3_5ModelRank {
                 "final_norm",
                 dump,
             )?;
+            if num_tokens <= self.max_tap_rows {
+                if let Some(tap_buf) = &self.tap_aux_bf16
+                    && !self.tap_layer_ids.is_empty()
+                {
+                    let tap_cols = self.tap_layer_ids.len() * h_dim;
+                    let count = num_tokens * tap_cols;
+                    let mut host_u16 = vec![0u16; count];
+                    check_rc(
+                        unsafe {
+                            ffi::w34_memcpy_d2h_async(
+                                host_u16.as_mut_ptr() as *mut c_void,
+                                tap_buf.addr() as *const c_void,
+                                count * 2,
+                                self.stream.handle,
+                            )
+                        },
+                        "record_dump_bf16 d2h",
+                    )?;
+                    self.stream.synchronize()?;
+                    let vals_f32: Vec<f32> = host_u16
+                        .into_iter()
+                        .map(|b| f32::from_bits((b as u32) << 16))
+                        .collect();
+                    dump.tensors_f32.insert(
+                        "tap_aux_bf16".to_string(),
+                        (vec![num_tokens, tap_cols], vals_f32),
+                    );
+                }
+                if let Some(final_h_buf) = &self.last_final_hidden_f16 {
+                    Self::record_dump_f16(
+                        &self.stream,
+                        final_h_buf.addr(),
+                        vec![num_tokens, h_dim],
+                        "last_final_hidden_f16",
+                        dump,
+                    )?;
+                }
+            }
         }
 
         // 4. LM Head on last token row `[1, h_dim]`
@@ -1769,10 +1808,11 @@ impl Qwen3_5ModelRank {
         selected_rows: &[usize],
     ) -> Result<Vec<i32>> {
         self.validate_tap_rows(num_tokens)?;
-        if self
-            .speculative_logits
-            .as_ref()
-            .is_some_and(|b| selected_rows.len() > b.len_bytes / (self.local_vocab_size * 2))
+        if attn_batch.num_reqs <= 1
+            && self
+                .speculative_logits
+                .as_ref()
+                .is_some_and(|b| selected_rows.len() > b.len_bytes / (self.local_vocab_size * 2))
         {
             return Err(loader_err(
                 "selected rows exceed speculative logits capacity",
@@ -2279,8 +2319,12 @@ impl Qwen3_5ModelRank {
             return Ok(Vec::new());
         }
         let num_selected = selected_rows.len();
-        let all_logits_buf = if let Some(buf) = &self.speculative_logits {
-            buf.addr()
+        let use_spec_buf = self
+            .speculative_logits
+            .as_ref()
+            .is_some_and(|b| num_selected <= b.len_bytes / (self.local_vocab_size * 2));
+        let all_logits_buf = if use_spec_buf {
+            self.speculative_logits.as_ref().unwrap().addr()
         } else {
             self.scratch_arena
                 .alloc_aligned(num_selected * self.local_vocab_size * 2)?
@@ -2377,7 +2421,7 @@ impl Qwen3_5ModelRank {
             "copy selected greedy ids",
         )?;
         self.stream.synchronize()?;
-        self.speculative_logits_rows = num_selected;
+        self.speculative_logits_rows = if use_spec_buf { num_selected } else { 0 };
         Ok(out_ids)
     }
 
@@ -3576,7 +3620,8 @@ impl Qwen3_5Engine {
         })
     }
 
-    /// Runs a single diagnostic prefill pass and returns [`ForwardDump`] for `dump-diff`.
+    /// Runs a single diagnostic prefill pass (plus optional speculative drafter pass)
+    /// and returns [`ForwardDump`] for `dump-diff`.
     pub fn dump_prompt(&mut self, prompt_token_ids: &[i32]) -> Result<ForwardDump> {
         self.reset_all_states()?;
         let needed_pages = (prompt_token_ids.len() + 4).div_ceil(16);
@@ -3594,10 +3639,22 @@ impl Qwen3_5Engine {
             false,
             Some(&mut dump),
         )?;
+        if let Some(mut proposer) = self.speculative.take() {
+            let res = proposer.dump_step(self, prompt_token_ids, dump.greedy_token_id, &mut dump);
+            self.speculative = Some(proposer);
+            res?;
+        }
         Ok(dump)
     }
 
     pub fn alloc_kv_page(&mut self) -> Option<i32> {
+        let mut radix = std::mem::replace(&mut self.radix, MambaRadixCache::new(16, 64));
+        let out = self.alloc_kv_page_from(&mut radix);
+        self.radix = radix;
+        out
+    }
+
+    pub fn alloc_kv_page_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
         if let Some(p0) = self.ranks[0].kv_pool.alloc_page() {
             if self.tp_size == 2 {
                 let p1 = self.ranks[1].kv_pool.alloc_page();
@@ -3605,7 +3662,7 @@ impl Qwen3_5Engine {
             }
             return Some(p0);
         }
-        let ev = self.radix.evict_full_pages(1);
+        let ev = radix.evict_full_pages(1);
         if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
             self.free_kv_pages(&ev.freed_kv_pages);
             self.free_state_slots(&ev.freed_mamba_slots);
@@ -3631,6 +3688,13 @@ impl Qwen3_5Engine {
     }
 
     pub fn alloc_state_slot(&mut self) -> Option<i32> {
+        let mut radix = std::mem::replace(&mut self.radix, MambaRadixCache::new(16, 64));
+        let out = self.alloc_state_slot_from(&mut radix);
+        self.radix = radix;
+        out
+    }
+
+    pub fn alloc_state_slot_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
         if let Some(s0) = self.ranks[0].state_pool.alloc_slot() {
             if self.tp_size == 2 {
                 let s1 = self.ranks[1].state_pool.alloc_slot();
@@ -3638,7 +3702,7 @@ impl Qwen3_5Engine {
             }
             return Some(s0);
         }
-        let ev = self.radix.evict_mamba(1);
+        let ev = radix.evict_mamba(1);
         if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
             self.free_kv_pages(&ev.freed_kv_pages);
             self.free_state_slots(&ev.freed_mamba_slots);
@@ -3935,12 +3999,22 @@ impl Qwen3_5Engine {
     }
 
     pub(crate) fn alloc_three_state_slots(&mut self) -> Option<(i32, [i32; 2])> {
-        let s0 = self.alloc_state_slot()?;
-        let Some(s1) = self.alloc_state_slot() else {
+        let mut radix = std::mem::replace(&mut self.radix, MambaRadixCache::new(16, 64));
+        let out = self.alloc_three_state_slots_from(&mut radix);
+        self.radix = radix;
+        out
+    }
+
+    pub(crate) fn alloc_three_state_slots_from(
+        &mut self,
+        radix: &mut MambaRadixCache,
+    ) -> Option<(i32, [i32; 2])> {
+        let s0 = self.alloc_state_slot_from(radix)?;
+        let Some(s1) = self.alloc_state_slot_from(radix) else {
             self.free_state_slots(&[s0]);
             return None;
         };
-        let Some(s2) = self.alloc_state_slot() else {
+        let Some(s2) = self.alloc_state_slot_from(radix) else {
             self.free_state_slots(&[s0, s1]);
             return None;
         };
@@ -4359,7 +4433,7 @@ impl Qwen3_5Engine {
         let mut results_by_id: HashMap<u64, (Vec<i32>, usize)> = HashMap::new();
         let loop_res: Result<()> = (|| {
             loop {
-                sched.admit_waiting(|_radix| self.alloc_three_state_slots());
+                sched.admit_waiting(|radix| self.alloc_three_state_slots_from(radix));
 
                 if sched.active.is_empty() && sched.waiting.is_empty() {
                     break;
@@ -4375,7 +4449,7 @@ impl Qwen3_5Engine {
                     let needed = total_len.div_ceil(16);
                     while seq.radix_state.kv_pages.len() < needed {
                         let p = self
-                            .alloc_kv_page()
+                            .alloc_kv_page_from(&mut sched.radix)
                             .ok_or_else(|| loader_err("KvPool out of pages in scheduler"))?;
                         seq.radix_state.kv_pages.push(p);
                     }
@@ -4425,9 +4499,17 @@ impl Qwen3_5Engine {
                     } else {
                         None
                     };
-                    if let Some(don) = sched.commit_slice(sl, emitted, || self.alloc_state_slot()) {
+                    let mut rep_slot = if sl.is_prefill_chunk {
+                        self.alloc_state_slot_from(&mut sched.radix)
+                    } else {
+                        None
+                    };
+                    if let Some(don) = sched.commit_slice(sl, emitted, || rep_slot.take()) {
                         self.free_kv_pages(&don.freed_kv_pages);
                         self.free_state_slots(&don.freed_mamba_slots);
+                    }
+                    if let Some(unused_slot) = rep_slot {
+                        self.free_state_slots(&[unused_slot]);
                     }
                 }
 

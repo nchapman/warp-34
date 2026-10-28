@@ -4,4 +4,6 @@
 /models/
 *.nsys-rep
 *.sqlite
+__pycache__/
+*.pyc
 /.pi/

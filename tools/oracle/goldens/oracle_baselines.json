@@ -14,6 +14,36 @@
     "total_ms_per_round": 7.42,
     "tok_per_s_m1": 134.77
   },
+  "vllm_4b_tp1_mtp_k3": {
+    "source": "vLLM 0.31.0 (8352b2427) Qwen3.5-4B-W4A16-GPTQ + MTP k=3 TP=1 M=4 verify (242.0 tok/s)",
+    "rounds": 50,
+    "categories": {
+      "marlin_gemm": { "ms_per_round": 5.10, "launches_per_round": 161.0 },
+      "full_attn": { "ms_per_round": 0.32, "launches_per_round": 8.0 },
+      "gdn_ssm": { "ms_per_round": 0.95, "launches_per_round": 48.0 },
+      "norms_rope_act": { "ms_per_round": 0.68, "launches_per_round": 105.0 },
+      "tp_comm": { "ms_per_round": 0.0, "launches_per_round": 0.0 },
+      "spec_decode": { "ms_per_round": 2.15, "launches_per_round": 42.0 },
+      "host_gap": { "ms_per_round": 1.38, "launches_per_round": 0.0 }
+    },
+    "total_ms_per_round": 10.58,
+    "tok_per_s_m1": 242.00
+  },
+  "sglang_4b_tp1_dflash2_m16": {
+    "source": "SGLang v0.5.19 (0bcd822377) Qwen3.5-4B-W4A16-GPTQ + DFlash2 TP=1 M=16 verify (612.0 tok/s)",
+    "rounds": 23,
+    "categories": {
+      "marlin_gemm": { "ms_per_round": 4.95, "launches_per_round": 161.0 },
+      "full_attn": { "ms_per_round": 0.38, "launches_per_round": 8.0 },
+      "gdn_ssm": { "ms_per_round": 1.12, "launches_per_round": 48.0 },
+      "norms_rope_act": { "ms_per_round": 0.72, "launches_per_round": 105.0 },
+      "tp_comm": { "ms_per_round": 0.0, "launches_per_round": 0.0 },
+      "spec_decode": { "ms_per_round": 1.45, "launches_per_round": 62.0 },
+      "host_gap": { "ms_per_round": 0.85, "launches_per_round": 0.0 }
+    },
+    "total_ms_per_round": 9.47,
+    "tok_per_s_m1": 612.00
+  },
   "vllm_9b_tp1_decode": {
     "source": "vLLM 0.31.0 (8352b2427) Qwen3.5-9B-W4A16-GPTQ TP=1 M=1 decode (91.2 tok/s)",
     "rounds": 128,

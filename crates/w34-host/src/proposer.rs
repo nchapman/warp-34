@@ -4,7 +4,7 @@
 //! draft KV without rerunning target layers; it is not a second target cache.
 use crate::{
     cache::StateTx,
-    cuda::{DeviceBuffer, Result, check_rc},
+    cuda::{DeviceBuffer, Result, check_rc, f16_to_f32},
     dflash::{DFlash2Rank, DraftCandidates},
     loader::resolve_hf_model_dir,
     model::{EngineBatchSlice, Qwen3_5Engine, RadixBenchMetrics, loader_err},
@@ -462,6 +462,46 @@ impl NativeProposer {
         }
         Ok(full)
     }
+    /// Runs one diagnostic drafter ingest + proposal step on `prompt` and `anchor`,
+    /// recording `"drafter_hidden"` and `draft_proposal_ids` into `dump`.
+    pub fn dump_step(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        prompt: &[i32],
+        anchor: i32,
+        dump: &mut crate::model::ForwardDump,
+    ) -> Result<()> {
+        self.restore(engine, &[])?;
+        let features = self.captured(engine)?;
+        self.ingest(engine, prompt, &features)?;
+        let drafts = self.propose(engine, anchor, self.k)?;
+        dump.draft_proposal_ids = drafts;
+        let t0 = &engine.ranks[0];
+        let h = engine.cfg.hidden_size;
+        t0.device.make_current()?;
+        match &self.ranks {
+            Ranks::Mtp(rs) => {
+                let mut bits = vec![0u16; h];
+                rs[0].hidden.copy_to_host(&mut bits, &t0.stream)?;
+                let vals: Vec<f32> = bits.into_iter().map(f16_to_f32).collect();
+                dump.tensors_f32
+                    .insert("drafter_hidden".to_string(), (vec![1, h], vals));
+            }
+            Ranks::DFlash(rs) => {
+                let rows = rs[0].cfg.block_size;
+                let mut bits = vec![0u16; rows * h];
+                rs[0].hidden.copy_to_host(&mut bits, &t0.stream)?;
+                let vals: Vec<f32> = bits
+                    .into_iter()
+                    .map(|b| f32::from_bits((b as u32) << 16))
+                    .collect();
+                dump.tensors_f32
+                    .insert("drafter_hidden".to_string(), (vec![rows, h], vals));
+            }
+        }
+        Ok(())
+    }
+
     pub fn generate(
         &mut self,
         engine: &mut Qwen3_5Engine,

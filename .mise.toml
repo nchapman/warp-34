@@ -40,3 +40,38 @@ run = "cargo test --release --features cuda"
 [tasks.check]
 description = "Format check, clippy (both states), and full release test suite"
 depends = ["fmt-check", "clippy", "clippy-cpu", "test"]
+
+[tasks."oracle-dump"]
+description = "Run w34 dump-diff TP=1 vs TP=2 parity across plain, MTP, and DFlash2"
+depends = ["build"]
+run = """
+./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --compare-tp2
+./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --speculative mtp --mtp-k 3 --compare-tp2
+./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --compare-tp2
+"""
+
+[tasks."oracle-greedy"]
+description = "Run w34 greedy-diff with lossless speculative and warm radix verification"
+depends = ["build"]
+run = """
+./target/release/w34 greedy-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --speculative mtp --mtp-k 3 --verify-lossless --verify-radix-warm
+./target/release/w34 greedy-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --verify-lossless --verify-radix-warm
+"""
+
+[tasks."bench-all"]
+description = "Run multi-stage w34 bench (decode + radix + scheduler) across plain, MTP, and DFlash2"
+depends = ["build"]
+run = """
+./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --prompt-len 128 --gen-len 128 --batch-size 8
+./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --prompt-len 128 --gen-len 128 --batch-size 8 --speculative mtp --mtp-k 3
+./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --prompt-len 128 --gen-len 128 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
+"""
+
+[tasks."profile-live"]
+description = "Capture live nsys SQLite profiles and render category scoreboards vs vLLM/SGLang"
+depends = ["build"]
+run = """
+./target/release/w34 profile-diff --live --preset vllm_4b_tp1_decode --model nchapman/Qwen3.5-4B-W4A16-GPTQ --tp 1
+./target/release/w34 profile-diff --live --preset vllm_4b_tp1_mtp_k3 --model nchapman/Qwen3.5-4B-W4A16-GPTQ --tp 1 --speculative mtp --mtp-k 3
+./target/release/w34 profile-diff --live --preset sglang_4b_tp1_dflash2_m16 --model nchapman/Qwen3.5-4B-W4A16-GPTQ --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
+"""
