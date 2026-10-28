@@ -1,10 +1,10 @@
 # warp-34 — Session Orientation & Current State
 
-## Status: Phase 0, Phase 1, & Phase 2 Complete (`main`)
+## Status: Phase 0, Phase 1, Phase 2, & Phase 3 Complete (`main`)
 
-`warp-34` has completed **Phase 0** (Foundational Seam Contracts, Oracle & `nsys` Diff Harness, CUDA Runtime & `CapacityPlanner`, Unified Safetensors Loader), **Phase 1** (Donor-Aligned Kernel Suite + Decisive Gate Tests #1, #2, #4), and **Phase 2** (Qwen 3.5 / 3.8 Hybrid Backbone on `TP=1` and `TP=2`, `KvPool`, `StateBundlePool`, `CUDAGraphRunner` Gate #3, and `w34` CLI).
+`warp-34` has completed **Phase 0** (Foundational Seam Contracts, Oracle & `nsys` Diff Harness, CUDA Runtime & `CapacityPlanner`, Unified Safetensors Loader), **Phase 1** (Donor-Aligned Kernel Suite + Decisive Gate Tests #1, #2, #4), **Phase 2** (Qwen 3.5 / 3.8 Hybrid Backbone on `TP=1` and `TP=2`, `KvPool`, `StateBundlePool`, `CUDAGraphRunner` Gate #3, and `w34` CLI), and **Phase 3** (`SchedulerV1` token-budget continuous batching, `SGLang`-donor `MambaRadixCache` + `HybridReqToTokenPool` `extra_buffer` ping-pong GDN checkpoint donation passing **Decisive Gate Test #5**, `SamplerV1` + structured-output bitmask + `Qwen3Parser`, and OpenAI HTTP/1.1 + SSE server `w34 serve` / `w34 chat`).
 
-All 4 dense target model configurations (`4B TP=1`, `9B TP=1`, `9B TP=2`, `27B TP=2`) pass `w34 greedy-diff`, `w34 dump-diff`, and `w34 profile-diff`, **beating `vLLM 0.31.0` by +31% to +83% in single-stream decode throughput** on 1–2× RTX 3090 Ti (`sm_86`) before speculative decoding or `TQ4` compression.
+All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host/tests/phase0_1_2_gates.rs` and `crates/w34-host/tests/phase3_gates.rs`. All 4 dense target model configurations (`4B TP=1`, `9B TP=1`, `9B TP=2`, `27B TP=2`) pass `w34 greedy-diff`, `w34 dump-diff`, and `w34 profile-diff`, **beating `vLLM 0.31.0` by +31% to +83% in single-stream decode throughput** on 1–2× RTX 3090 Ti (`sm_86`) before speculative decoding or `TQ4` compression, and achieving a **95.2% warm prefix TTFT drop** (`145.68 ms` → `7.05 ms`) via `MambaRadixCache`.
 
 ---
 
@@ -49,11 +49,18 @@ All 4 dense target model configurations (`4B TP=1`, `9B TP=1`, `9B TP=2`, `27B T
    - `op_sampler.cu`: 1024-thread GPU `sampler_greedy_top5_f16_kernel` (`vocab_size = 248320`, sharded `[124160, 124160]` under `TP=2`).
 5. **Phase 2 — Qwen 3.5 / 3.8 Hybrid Backbone & CLI (`crates/w34-host/src/{cache,model,main}.rs`):**
    - `KvPool`, `StateBundlePool`, `StateTx`, `Qwen3_5Engine` (`TP=1` and `TP=2`), `CUDAGraphRunner` (**Gate #3** bit-exact graph replay under metadata mutation verified), and `w34` CLI (`generate`, `bench`, `dump-diff`, `greedy-diff`, `profile-diff`).
+6. **Phase 3 — Continuous Batching Scheduler, `MambaRadixCache` (`SGLang` Donor), `Qwen3Parser`, & OpenAI HTTP/SSE Server (`crates/w34-host/src/{radix,scheduler,parser,server}.rs`):**
+   - `MambaRadixCache` + `ReqRadixState` (`crates/w34-host/src/radix.rs`): Dual-lock (`full_lock_ref >= mamba_lock_ref`) and dual-LRU (`full_lru` + `mamba_lru`) radix tree over `P = 16` logical KV pages and `C = 64` GDN `StateBundle` checkpoints with tombstone cleanup, child-split invariants, and `extra_buffer` (`ping_pong_slots: [i32; 2]`) checkpoint donation.
+   - **Decisive Gate Test #5 (`test_gate5_warm_prefix_hit_speculation_and_cross_boundary_rejection`)**: Verified 0-ULP `conv_state` (`max_abs_diff = 0.0`) and `ssm_state` (`max_abs_diff = 0.0`) parity and 100% token parity against a cold non-speculative reference across warm `C = 64` prefix restore, `1 + k` speculative verification, cross-boundary (`t = 128`) rejection + retry, and checkpoint donation.
+   - **Warm Prefix TTFT Drop**: Verified **95.2% warm TTFT reduction** (`145.68 ms` cold → `7.05 ms` warm, `192` cached prefix tokens) with 100% generated token parity.
+   - `SchedulerV1` (`crates/w34-host/src/scheduler.rs`): Token-budget continuous batching (`max_num_batched_tokens`, `max_num_seqs`, `prefill_chunk_size = 64`) with decode-priority scheduling, chunked suffix prefill, and multi-request `step_batch_slices` execution.
+   - `SamplerV1` + `TokenBitmaskConstraint` + `Qwen3Parser` (`crates/w34-host/src/parser.rs`): 9-step sampling chain with speculative rollback parity, plus streaming/complete `<think>...</think>` reasoning and `<tool_call>` (Qwen3-XML `<function=...><parameter=...>` and Hermes JSON) extraction.
+   - OpenAI HTTP/1.1 + SSE Server (`crates/w34-host/src/server.rs`, `w34 serve` & `w34 chat`): `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize`, `/detokenize`, `/health`, and `/metrics` (Prometheus exposition format including `w34_radix_cache_hit_rate`).
 
 ---
 
-## Next Phase Entry Point: Phase 3 (`docs/ROADMAP.md` §4)
+## Next Phase Entry Point: Phase 4 (`docs/ROADMAP.md` §4 Phase 4)
 
-Start **Phase 3** (Paged `TQ4` / `FirstLast2` Long-Context Validation & Continuous Batching Scheduler + `MambaRadixCache`):
-- Validate `FirstLast2` (`--kv-format first-last2`) and `TQ4` (`--kv-format tq4`) long-context (`8k–128k`) decode throughput and perplexity / greedy parity against `FP16` KV.
-- Implement `Scheduler` + `MambaRadixCache` (`SGLang` `extra_buffer` ping-pong GDN prefix checkpointing) and `W4A8` dense MLP evaluation (`docs/ROADMAP.md` §4 Phase 3.3).
+Start **Phase 4** (Speculative Decoding: `DFlash2` Parallel Block Diffusion (`M = 16` on 4B, `M = 8` on 27B) & Native `Qwen3_5MTP`):
+- Phase 4.1: Native `Qwen3_5MTP` 1-layer speculative drafter (`fc: 2H -> H`, shared embedding + `lm_head`, `K = 1..3`).
+- Phase 4.2: `DFlash2` parallel block-diffusion drafter (`z LabQwen3_5-4B-DFlash` in native `BF16` for 4B `M = 16`, `z-lab/Qwen3.5-27B-DFlash` for 27B `M = 8`) with `extract_context_feature` across target layers (`[1, 9, 17, 25, 33]` on 4B; `[2, 17, 32, 47, 62]` on 27B), cross-attention KV concat (`[ctx_k || draft_k]`), and `1 + M` target verify with `StateTx` rollback and `CUDAGraphRunner` capture for batch sizes `M in {1, 2, 4, 8, 9, 16, 17}`.

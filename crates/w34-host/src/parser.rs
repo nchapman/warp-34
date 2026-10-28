@@ -1,0 +1,713 @@
+//! Phase 3.3: `SamplerV1` (penalties, temperature, `top_k`, `top_p`, `min_p`, seeded RNG,
+//! and structured-output `TokenBitmaskConstraint` with speculative rollback) and
+//! `Qwen3Parser` (`vllm/parser/qwen3.py` parity for `<think>...</think>` reasoning and
+//! Qwen3-XML / Hermes JSON `<tool_call>` extraction).
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub repetition_penalty: f32,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
+    pub seed: u64,
+    pub max_tokens: usize,
+    pub stop_token_ids: Vec<i32>,
+    pub stop_strings: Vec<String>,
+    pub enable_thinking: bool,
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: -1,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            seed: 42,
+            max_tokens: 256,
+            stop_token_ids: vec![151643, 151645, 248044, 248046],
+            stop_strings: Vec::new(),
+            enable_thinking: true,
+        }
+    }
+}
+
+/// Transactional structured-output constraint (`response_format` / `json_schema` / prefix set)
+/// with `max_rollback_tokens` state stack for speculative rejection.
+#[derive(Clone, Debug)]
+pub struct TokenBitmaskConstraint {
+    vocab_size: usize,
+    /// Optional explicit whitelist of allowed token sequences or JSON brace-depth state.
+    allowed_token_ids: Option<Vec<i32>>,
+    /// History of committed token IDs and brace depth for transactional rollback.
+    history: Vec<(i32, i32)>,
+    brace_depth: i32,
+    require_json_object: bool,
+    json_open_brace_tokens: Vec<i32>,
+    json_close_brace_tokens: Vec<i32>,
+}
+
+impl TokenBitmaskConstraint {
+    pub fn unconstrained(vocab_size: usize) -> Self {
+        Self {
+            vocab_size,
+            allowed_token_ids: None,
+            history: Vec::new(),
+            brace_depth: 0,
+            require_json_object: false,
+            json_open_brace_tokens: Vec::new(),
+            json_close_brace_tokens: Vec::new(),
+        }
+    }
+
+    pub fn from_allowed_tokens(vocab_size: usize, allowed: Vec<i32>) -> Self {
+        Self {
+            vocab_size,
+            allowed_token_ids: Some(allowed),
+            history: Vec::new(),
+            brace_depth: 0,
+            require_json_object: false,
+            json_open_brace_tokens: Vec::new(),
+            json_close_brace_tokens: Vec::new(),
+        }
+    }
+
+    pub fn json_object(
+        vocab_size: usize,
+        open_brace_tokens: Vec<i32>,
+        close_brace_tokens: Vec<i32>,
+    ) -> Self {
+        Self {
+            vocab_size,
+            allowed_token_ids: None,
+            history: Vec::new(),
+            brace_depth: 0,
+            require_json_object: true,
+            json_open_brace_tokens: open_brace_tokens,
+            json_close_brace_tokens: close_brace_tokens,
+        }
+    }
+
+    #[inline]
+    pub fn committed_len(&self) -> usize {
+        self.history.len()
+    }
+
+    #[inline]
+    pub fn brace_depth(&self) -> i32 {
+        self.brace_depth
+    }
+
+    /// Packs a `[ceil(vocab_size / 32)]` `u32` bitmask for the current state (`1` = allowed, `0` = masked).
+    pub fn current_bitmask(&self) -> Vec<u32> {
+        let num_words = self.vocab_size.div_ceil(32);
+        if let Some(ref allowed) = self.allowed_token_ids {
+            let mut mask = vec![0u32; num_words];
+            for &tid in allowed {
+                if tid >= 0 && (tid as usize) < self.vocab_size {
+                    let u = tid as usize;
+                    mask[u >> 5] |= 1u32 << (u & 31);
+                }
+            }
+            return mask;
+        }
+        if self.require_json_object
+            && self.history.is_empty()
+            && !self.json_open_brace_tokens.is_empty()
+        {
+            // First token of a JSON object must open `{`
+            let mut mask = vec![0u32; num_words];
+            for &tid in &self.json_open_brace_tokens {
+                if tid >= 0 && (tid as usize) < self.vocab_size {
+                    let u = tid as usize;
+                    mask[u >> 5] |= 1u32 << (u & 31);
+                }
+            }
+            return mask;
+        }
+        vec![0xFFFF_FFFFu32; num_words]
+    }
+
+    #[inline]
+    pub fn is_token_allowed(&self, token_id: i32) -> bool {
+        if token_id < 0 || (token_id as usize) >= self.vocab_size {
+            return false;
+        }
+        if let Some(ref allowed) = self.allowed_token_ids {
+            return allowed.contains(&token_id);
+        }
+        if self.require_json_object
+            && self.history.is_empty()
+            && !self.json_open_brace_tokens.is_empty()
+        {
+            return self.json_open_brace_tokens.contains(&token_id);
+        }
+        true
+    }
+
+    pub fn advance(&mut self, token_id: i32) {
+        self.history.push((token_id, self.brace_depth));
+        if self.json_open_brace_tokens.contains(&token_id) {
+            self.brace_depth += 1;
+        }
+        if self.json_close_brace_tokens.contains(&token_id) {
+            self.brace_depth = (self.brace_depth - 1).max(0);
+        }
+    }
+
+    /// Rolls back the last `num_rejected` speculative tokens, restoring exact pre-speculation state.
+    pub fn rollback(&mut self, num_rejected: usize) {
+        for _ in 0..num_rejected {
+            if let Some((_, prev_depth)) = self.history.pop() {
+                self.brace_depth = prev_depth;
+            }
+        }
+    }
+}
+
+/// Transactional `SamplerV1` implementing `vLLM`'s 9-step sampling pipeline with
+/// deterministic per-(seed, position) RNG and speculative rollback.
+#[derive(Clone, Debug)]
+pub struct SamplerV1 {
+    pub params: SamplingParams,
+    pub prompt_counts: BTreeMap<i32, u32>,
+    pub output_counts: BTreeMap<i32, u32>,
+    pub output_history: Vec<i32>,
+    pub constraint: Option<TokenBitmaskConstraint>,
+}
+
+impl SamplerV1 {
+    pub fn new(
+        params: SamplingParams,
+        prompt_tokens: &[i32],
+        constraint: Option<TokenBitmaskConstraint>,
+    ) -> Self {
+        let mut prompt_counts = BTreeMap::new();
+        for &t in prompt_tokens {
+            *prompt_counts.entry(t).or_insert(0) += 1;
+        }
+        Self {
+            params,
+            prompt_counts,
+            output_counts: BTreeMap::new(),
+            output_history: Vec::new(),
+            constraint,
+        }
+    }
+
+    /// Deterministic SplitMix64 uniform float in `[0.0, 1.0)` keyed by `(seed, step_pos)`.
+    fn uniform_f32(seed: u64, step_pos: usize) -> f32 {
+        let mut z = seed
+            .wrapping_add((step_pos as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        ((z >> 40) as u32 as f32) * (1.0 / ((1u32 << 24) as f32))
+    }
+
+    /// Samples a token from `logits` (or candidate `(token_id, logit)` pairs) and advances
+    /// transactional state (`output_history`, `output_counts`, and `constraint`).
+    pub fn sample_from_logits(&mut self, logits: &[f32]) -> i32 {
+        let mut candidates: Vec<(i32, f32)> = logits
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &val)| {
+                let tid = idx as i32;
+                if let Some(ref c) = self.constraint
+                    && !c.is_token_allowed(tid)
+                {
+                    return None;
+                }
+                let mut l = val;
+                let in_prompt = self.prompt_counts.get(&tid).copied().unwrap_or(0) > 0;
+                let out_cnt = self.output_counts.get(&tid).copied().unwrap_or(0);
+                if (in_prompt || out_cnt > 0) && (self.params.repetition_penalty - 1.0).abs() > 1e-6
+                {
+                    if l > 0.0 {
+                        l /= self.params.repetition_penalty;
+                    } else {
+                        l *= self.params.repetition_penalty;
+                    }
+                }
+                if out_cnt > 0 {
+                    l -= self.params.frequency_penalty * (out_cnt as f32);
+                    l -= self.params.presence_penalty;
+                }
+                Some((tid, l))
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Greedy fast-path when temperature <= 0 or top_k == 1
+        if self.params.temperature <= 1e-6 || self.params.top_k == 1 {
+            candidates.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let chosen = candidates[0].0;
+            self.commit_token(chosen);
+            return chosen;
+        }
+
+        let inv_temp = 1.0 / self.params.temperature;
+        for c in &mut candidates {
+            c.1 *= inv_temp;
+        }
+        candidates.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        if self.params.top_k > 0 && (self.params.top_k as usize) < candidates.len() {
+            candidates.truncate(self.params.top_k as usize);
+        }
+
+        let max_logit = candidates[0].1;
+        let mut probs: Vec<(i32, f32)> = candidates
+            .iter()
+            .map(|&(tid, l)| (tid, (l - max_logit).exp()))
+            .collect();
+        let sum_p: f32 = probs.iter().map(|x| x.1).sum();
+        if sum_p > 0.0 {
+            for p in &mut probs {
+                p.1 /= sum_p;
+            }
+        }
+
+        // Apply `min_p` relative to top-1 probability
+        if self.params.min_p > 0.0 && !probs.is_empty() {
+            let threshold = probs[0].1 * self.params.min_p;
+            let keep = probs.iter().take_while(|p| p.1 >= threshold).count().max(1);
+            probs.truncate(keep);
+            let renorm: f32 = probs.iter().map(|x| x.1).sum();
+            if renorm > 0.0 {
+                for p in &mut probs {
+                    p.1 /= renorm;
+                }
+            }
+        }
+
+        // Apply `top_p` nucleus cutoff
+        if self.params.top_p < 1.0 && probs.len() > 1 {
+            let mut cum = 0.0f32;
+            let mut keep = 0usize;
+            for p in &probs {
+                cum += p.1;
+                keep += 1;
+                if cum >= self.params.top_p {
+                    break;
+                }
+            }
+            probs.truncate(keep.max(1));
+        }
+
+        let norm_sum: f32 = probs.iter().map(|x| x.1).sum();
+        let u = Self::uniform_f32(self.params.seed, self.output_history.len()) * norm_sum;
+        let mut acc = 0.0f32;
+        let mut chosen = probs.last().unwrap().0;
+        for &(tid, p) in &probs {
+            acc += p;
+            if u <= acc {
+                chosen = tid;
+                break;
+            }
+        }
+        self.commit_token(chosen);
+        chosen
+    }
+
+    pub fn commit_token(&mut self, token_id: i32) {
+        self.output_history.push(token_id);
+        *self.output_counts.entry(token_id).or_insert(0) += 1;
+        if let Some(ref mut c) = self.constraint {
+            c.advance(token_id);
+        }
+    }
+
+    /// Rolls back `num_rejected` speculative tokens from `output_history`, `output_counts`,
+    /// and `constraint` (`docs/ROADMAP.md` §4 Phase 3.3).
+    pub fn rollback_tokens(&mut self, num_rejected: usize) {
+        for _ in 0..num_rejected {
+            if let Some(tid) = self.output_history.pop()
+                && let Some(cnt) = self.output_counts.get_mut(&tid)
+            {
+                if *cnt <= 1 {
+                    self.output_counts.remove(&tid);
+                } else {
+                    *cnt -= 1;
+                }
+            }
+        }
+        if let Some(ref mut c) = self.constraint {
+            c.rollback(num_rejected);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedFunctionCall {
+    pub name: String,
+    /// JSON-serialized arguments object string (OpenAI `function.arguments` contract).
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ParsedFunctionCall,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParsedAssistantTurn {
+    pub reasoning_content: Option<String>,
+    pub content: Option<String>,
+    pub tool_calls: Vec<ParsedToolCall>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamParseDelta {
+    pub reasoning_delta: Option<String>,
+    pub content_delta: Option<String>,
+    pub completed_tool_calls: Vec<ParsedToolCall>,
+}
+
+/// Unified Qwen 3.5 / 3.6 / 3.8 reasoning and tool parser (`vllm/parser/qwen3.py` parity).
+///
+/// Supports:
+/// - `enable_thinking: bool` (`<think>...</think>` extraction into `reasoning_content`)
+/// - Implicit `</think>` transition when `<tool_call>` appears directly inside reasoning
+/// - Duplicate `</think>` absorption in content state
+/// - Both **Qwen3-XML** (`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`)
+///   and **Hermes JSON** (`<tool_call>{"name": "...", "arguments": {...}}</tool_call>`) tool calls
+#[derive(Clone, Debug)]
+pub struct Qwen3Parser {
+    pub enable_thinking: bool,
+    in_reasoning: bool,
+    in_tool_call: bool,
+    buffer: String,
+    reasoning_accum: String,
+    content_accum: String,
+    tool_calls: Vec<ParsedToolCall>,
+    next_tool_idx: usize,
+}
+
+impl Qwen3Parser {
+    pub const THINK_START: &'static str = "<think>";
+    pub const THINK_END: &'static str = "</think>";
+    pub const TOOL_START: &'static str = "<tool_call>";
+    pub const TOOL_END: &'static str = "</tool_call>";
+
+    pub fn new(enable_thinking: bool) -> Self {
+        Self {
+            enable_thinking,
+            in_reasoning: enable_thinking,
+            in_tool_call: false,
+            buffer: String::new(),
+            reasoning_accum: String::new(),
+            content_accum: String::new(),
+            tool_calls: Vec::new(),
+            next_tool_idx: 0,
+        }
+    }
+
+    fn trim_wrapping_newlines(s: &str) -> &str {
+        let s = s.strip_prefix('\n').unwrap_or(s);
+        s.strip_suffix('\n').unwrap_or(s)
+    }
+
+    /// Parses either Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
+    /// or Hermes JSON (`{"name": "...", "arguments": ...}`) inside a `<tool_call>...</tool_call>` body.
+    pub fn parse_tool_body(raw_body: &str, call_idx: usize) -> Option<ParsedToolCall> {
+        let body = raw_body.trim();
+        if body.is_empty() {
+            return None;
+        }
+
+        // 1. Check Qwen3-XML format: `<function=func_name>...`
+        if let Some(fn_pos) = body.find("<function=") {
+            let after_prefix = &body[fn_pos + "<function=".len()..];
+            let close_angle = after_prefix.find('>')?;
+            let fn_name = after_prefix[..close_angle].trim().to_string();
+            let rest = &after_prefix[close_angle + 1..];
+            let fn_body = match rest.find("</function>") {
+                Some(end_idx) => &rest[..end_idx],
+                None => rest,
+            };
+
+            let mut params = serde_json::Map::new();
+            let mut search = fn_body;
+            while let Some(p_start) = search.find("<parameter=") {
+                let after_p = &search[p_start + "<parameter=".len()..];
+                let Some(p_angle) = after_p.find('>') else {
+                    break;
+                };
+                let param_name = after_p[..p_angle].trim().to_string();
+                let val_start = &after_p[p_angle + 1..];
+                let (raw_val, next_slice) = if let Some(p_end) = val_start.find("</parameter>") {
+                    (
+                        &val_start[..p_end],
+                        &val_start[p_end + "</parameter>".len()..],
+                    )
+                } else if let Some(next_p) = val_start.find("<parameter=") {
+                    (&val_start[..next_p], &val_start[next_p..])
+                } else {
+                    (val_start, "")
+                };
+                let trimmed = Self::trim_wrapping_newlines(raw_val);
+                // Preserve structured JSON numbers/booleans/arrays/objects when valid JSON,
+                // or store string value (`_qwen3_arg_converter`).
+                let json_val = serde_json::from_str::<serde_json::Value>(trimmed)
+                    .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()));
+                params.insert(param_name, json_val);
+                search = next_slice;
+            }
+
+            let args_json =
+                serde_json::to_string(&serde_json::Value::Object(params)).unwrap_or_default();
+            return Some(ParsedToolCall {
+                id: format!("call_w34_{call_idx}"),
+                call_type: "function".to_string(),
+                function: ParsedFunctionCall {
+                    name: fn_name,
+                    arguments: args_json,
+                },
+            });
+        }
+
+        // 2. Check Hermes JSON format: `{"name": "func_name", "arguments": {...}}`
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(body)
+            && let Some(name) = val.get("name").and_then(|v| v.as_str())
+        {
+            let args_str = match val.get("arguments") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+                None => "{}".to_string(),
+            };
+            return Some(ParsedToolCall {
+                id: format!("call_w34_{call_idx}"),
+                call_type: "function".to_string(),
+                function: ParsedFunctionCall {
+                    name: name.to_string(),
+                    arguments: args_str,
+                },
+            });
+        }
+
+        None
+    }
+
+    fn longest_tag_prefix_suffix(s: &str, tags: &[&str]) -> usize {
+        let mut max_keep = 0usize;
+        for &tag in tags {
+            let max_check = (tag.len() - 1).min(s.len());
+            for k in (1..=max_check).rev() {
+                if s.ends_with(&tag[..k]) {
+                    max_keep = max_keep.max(k);
+                    break;
+                }
+            }
+        }
+        max_keep
+    }
+
+    /// Feeds a streaming text chunk and returns incremental `reasoning_delta`, `content_delta`,
+    /// and any newly completed `tool_calls`.
+    pub fn push_str(&mut self, chunk: &str) -> StreamParseDelta {
+        self.buffer.push_str(chunk);
+        let mut delta = StreamParseDelta::default();
+        let mut r_out = String::new();
+        let mut c_out = String::new();
+
+        loop {
+            if self.in_tool_call {
+                if let Some(end_pos) = self.buffer.find(Self::TOOL_END) {
+                    let body = self.buffer[..end_pos].to_string();
+                    self.buffer.drain(..end_pos + Self::TOOL_END.len());
+                    self.in_tool_call = false;
+                    if let Some(tc) = Self::parse_tool_body(&body, self.next_tool_idx) {
+                        self.next_tool_idx += 1;
+                        self.tool_calls.push(tc.clone());
+                        delta.completed_tool_calls.push(tc);
+                    }
+                    continue;
+                }
+                break;
+            } else if self.in_reasoning {
+                // Absorb leading `<think>` if emitted explicitly
+                if let Some(rest) = self.buffer.strip_prefix(Self::THINK_START) {
+                    self.buffer = rest.to_string();
+                    continue;
+                }
+                let think_end = self.buffer.find(Self::THINK_END);
+                let tool_start = self.buffer.find(Self::TOOL_START);
+                match (think_end, tool_start) {
+                    (Some(te), Some(ts)) if ts < te => {
+                        // Implicit `</think>` on `<tool_call>` directly from reasoning
+                        let text = &self.buffer[..ts];
+                        r_out.push_str(text);
+                        self.reasoning_accum.push_str(text);
+                        self.buffer.drain(..ts + Self::TOOL_START.len());
+                        self.in_reasoning = false;
+                        self.in_tool_call = true;
+                        continue;
+                    }
+                    (Some(te), _) => {
+                        let text = &self.buffer[..te];
+                        r_out.push_str(text);
+                        self.reasoning_accum.push_str(text);
+                        self.buffer.drain(..te + Self::THINK_END.len());
+                        self.in_reasoning = false;
+                        continue;
+                    }
+                    (None, Some(ts)) => {
+                        let text = &self.buffer[..ts];
+                        r_out.push_str(text);
+                        self.reasoning_accum.push_str(text);
+                        self.buffer.drain(..ts + Self::TOOL_START.len());
+                        self.in_reasoning = false;
+                        self.in_tool_call = true;
+                        continue;
+                    }
+                    (None, None) => {
+                        let keep = Self::longest_tag_prefix_suffix(
+                            &self.buffer,
+                            &[Self::THINK_START, Self::THINK_END, Self::TOOL_START],
+                        );
+                        let emit_len = self.buffer.len() - keep;
+                        if emit_len > 0 {
+                            let text = &self.buffer[..emit_len];
+                            r_out.push_str(text);
+                            self.reasoning_accum.push_str(text);
+                            self.buffer.drain(..emit_len);
+                        }
+                        break;
+                    }
+                }
+            } else {
+                // In CONTENT state: check for `<think>` (if thinking wasn't initially active),
+                // absorb duplicate `</think>`, or transition to `<tool_call>`.
+                let think_start = self.buffer.find(Self::THINK_START);
+                let dup_think_end = self.buffer.find(Self::THINK_END);
+                let tool_start = self.buffer.find(Self::TOOL_START);
+
+                let earliest = [
+                    think_start.map(|p| (p, 0u8)),
+                    dup_think_end.map(|p| (p, 1u8)),
+                    tool_start.map(|p| (p, 2u8)),
+                ]
+                .into_iter()
+                .flatten()
+                .min_by_key(|&(pos, _)| pos);
+
+                if let Some((pos, kind)) = earliest {
+                    let text = &self.buffer[..pos];
+                    c_out.push_str(text);
+                    self.content_accum.push_str(text);
+                    match kind {
+                        0 => {
+                            self.buffer.drain(..pos + Self::THINK_START.len());
+                            self.in_reasoning = true;
+                        }
+                        1 => {
+                            // Absorb duplicate `</think>` silently (`vllm/parser/qwen3.py:130-134`)
+                            self.buffer.drain(..pos + Self::THINK_END.len());
+                        }
+                        _ => {
+                            self.buffer.drain(..pos + Self::TOOL_START.len());
+                            self.in_tool_call = true;
+                        }
+                    }
+                    continue;
+                }
+
+                let keep = Self::longest_tag_prefix_suffix(
+                    &self.buffer,
+                    &[Self::THINK_START, Self::THINK_END, Self::TOOL_START],
+                );
+                let emit_len = self.buffer.len() - keep;
+                if emit_len > 0 {
+                    let text = &self.buffer[..emit_len];
+                    c_out.push_str(text);
+                    self.content_accum.push_str(text);
+                    self.buffer.drain(..emit_len);
+                }
+                break;
+            }
+        }
+
+        if !r_out.is_empty() {
+            delta.reasoning_delta = Some(r_out);
+        }
+        if !c_out.is_empty() {
+            delta.content_delta = Some(c_out);
+        }
+        delta
+    }
+
+    /// Flushes any trailing buffered text at end-of-sequence and returns the final turn.
+    pub fn finish(&mut self) -> (StreamParseDelta, ParsedAssistantTurn) {
+        let mut delta = StreamParseDelta::default();
+        if !self.buffer.is_empty() {
+            let rem = std::mem::take(&mut self.buffer);
+            if self.in_tool_call {
+                if let Some(tc) = Self::parse_tool_body(&rem, self.next_tool_idx) {
+                    self.next_tool_idx += 1;
+                    self.tool_calls.push(tc.clone());
+                    delta.completed_tool_calls.push(tc);
+                } else {
+                    let fallback = format!("{}{rem}", Self::TOOL_START);
+                    self.content_accum.push_str(&fallback);
+                    delta.content_delta = Some(fallback);
+                }
+                self.in_tool_call = false;
+            } else if self.in_reasoning {
+                self.reasoning_accum.push_str(&rem);
+                delta.reasoning_delta = Some(rem);
+            } else {
+                self.content_accum.push_str(&rem);
+                delta.content_delta = Some(rem);
+            }
+        }
+
+        let trimmed_content = self.content_accum.trim_matches('\n');
+        let turn = ParsedAssistantTurn {
+            reasoning_content: if self.reasoning_accum.is_empty() {
+                None
+            } else {
+                Some(self.reasoning_accum.clone())
+            },
+            content: if trimmed_content.is_empty() {
+                None
+            } else {
+                Some(trimmed_content.to_string())
+            },
+            tool_calls: self.tool_calls.clone(),
+        };
+        (delta, turn)
+    }
+
+    /// One-shot helper for non-streaming completions.
+    pub fn parse_complete(text: &str, enable_thinking: bool) -> ParsedAssistantTurn {
+        let mut p = Self::new(enable_thinking);
+        let _ = p.push_str(text);
+        p.finish().1
+    }
+}

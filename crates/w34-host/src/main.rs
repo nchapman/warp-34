@@ -32,7 +32,9 @@ fn print_usage() {
            bench        --model <id|path> [--tp 1|2] [--prompt-len <n>] [--gen-len <n>] [--kv-format fp16|tq4|k8v4|firstlast2] [--out <json>]\n\
            greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>]\n\
            dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--compare-tp2] [--golden <safetensors>]\n\
-           profile-diff --oracle <sqlite|json> [--preset <key>] [--w34 <sqlite|json>] [--rounds <n>]"
+           profile-diff --oracle <sqlite|json> [--preset <key>] [--w34 <sqlite|json>] [--rounds <n>]\n\
+           serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format fp16|tq4|k8v4|firstlast2]\n\
+           chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--max-tokens <n>] [--no-thinking]"
     );
 }
 
@@ -60,6 +62,9 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     let mut preset_key: Option<String> = None;
     let mut w34_prof_path: Option<String> = None;
     let mut prof_rounds = 128usize;
+    let mut host = "127.0.0.1".to_string();
+    let mut port = 8000u16;
+    let mut enable_thinking = true;
 
     let mut i = 1;
     while i < args.len() {
@@ -149,6 +154,21 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                     .ok_or("missing --rounds")?
                     .parse()
                     .map_err(|_| "invalid --rounds")?;
+            }
+            "--host" => {
+                i += 1;
+                host = args.get(i).cloned().ok_or("missing --host")?;
+            }
+            "--port" => {
+                i += 1;
+                port = args
+                    .get(i)
+                    .ok_or("missing --port")?
+                    .parse()
+                    .map_err(|_| "invalid --port")?;
+            }
+            "--no-thinking" => {
+                enable_thinking = false;
             }
             "--help" | "-h" => {
                 print_usage();
@@ -499,6 +519,55 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             } else {
                 Err("profile_diff.py exited with non-zero status".to_string())
             }
+        }
+        "serve" => {
+            let engine = Qwen3_5Engine::load(&model, tp, policy, None, use_cuda_graph)
+                .map_err(|e| e.to_string())?;
+            let bind_addr = format!("{host}:{port}");
+            println!("[w34 serve] model={model} tp={tp} listening on http://{bind_addr}");
+            let state = w34_host::server::OpenAiServerState::new(model, engine);
+            w34_host::server::run_blocking_server(&bind_addr, state)
+                .map_err(|e| format!("server error: {e}"))?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "chat" => {
+            let mut engine = Qwen3_5Engine::load(&model, tp, policy, None, use_cuda_graph)
+                .map_err(|e| e.to_string())?;
+            let msgs = vec![w34_host::server::ChatMessage {
+                role: "user".to_string(),
+                content: Some(prompt.clone()),
+                reasoning_content: None,
+            }];
+            let formatted = w34_host::server::format_chatml_prompt(&msgs, None, enable_thinking);
+            let prompt_ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
+            let metrics = engine
+                .generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
+                .map_err(|e| e.to_string())?;
+            let raw_text = engine
+                .decode(&metrics.generated_token_ids)
+                .map_err(|e| e.to_string())?;
+            let parsed = w34_host::parser::Qwen3Parser::parse_complete(&raw_text, enable_thinking);
+            println!(
+                "[w34 chat] model={model} tp={tp} prompt_tokens={} cached_tokens={} gen_tokens={} ttft={:.2}ms decode={:.2}tok/s",
+                metrics.prompt_len,
+                metrics.cached_prefix_tokens,
+                metrics.gen_len,
+                metrics.ttft_ms,
+                metrics.decode_tok_per_s
+            );
+            if let Some(ref r) = parsed.reasoning_content {
+                println!("--- reasoning ---\n{r}");
+            }
+            if let Some(ref c) = parsed.content {
+                println!("--- content ---\n{c}");
+            }
+            if !parsed.tool_calls.is_empty() {
+                println!(
+                    "--- tool_calls ---\n{}",
+                    serde_json::to_string_pretty(&parsed.tool_calls).unwrap_or_default()
+                );
+            }
+            Ok(ExitCode::SUCCESS)
         }
         other => Err(format!("unknown subcommand: {other}")),
     }
