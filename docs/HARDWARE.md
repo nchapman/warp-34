@@ -1,0 +1,387 @@
+# RTX 3090 Ti (GA102, sm_86) — Hardware Reference
+
+Every number an optimization decision might depend on, each with its source.
+Sources are tagged inline:
+
+- **[BOX]** queried on this machine (2× RTX 3090 Ti, driver 615.71.09, CUDA 13.4)
+- **[VENDOR]** pinned llama.cpp source (`vendor/llama.cpp`, cb7934c5) — block
+  structs / kernel dispatch, the spec for format internals
+- **[WP]** NVIDIA Ampere GA102 GPU Architecture Whitepaper (v1/v2)
+- **[ADA]** NVIDIA Ada Whitepaper Appendix A (official RTX 3090 Ti performance table)
+- **[CC]** CUDA C++ Programming Guide, Compute Capabilities appendix (CUDA 13.x)
+- **[BPG]** CUDA C++ Best Practices Guide §12.1 throughput table (CUDA 13.4)
+- **[PTX]** PTX ISA 9.4 documentation
+- **[ATG]** CUDA Ampere Tuning Guide
+- **[TPU]** TechPowerUp GPU database
+- **[PTXAS]** verified by assembling PTX with this box's `ptxas` (CUDA 13.4)
+
+> **The box is not what the project name says.** `nvidia-smi` reports **2×
+> GeForce RTX 3090 Ti** (GA102-350, fully-enabled die), not RTX 3090. All
+> numbers below are for the 3090 Ti. Differences that matter: 84 SMs (not 82),
+> 336 tensor cores, 21 Gbps GDDR6X (1008 GB/s, not 936), boost 1860 MHz
+> (not 1695), 450W stock TDP — and **no NVLink** (removed on 3090 Ti).
+> PLAN.md still says "RTX 3090"; every target/decision below assumes sm_86,
+> which both cards share.
+
+---
+
+## 1. Card identity
+
+| Property | Value | Source |
+|---|---|---|
+| GPU / die | GA102-350, Samsung 8N, 28.3B transistors, 628 mm² | [TPU] |
+| Compute capability | 8.6 (`sm_86`) | [BOX] |
+| SMs | **84** | [BOX] |
+| CUDA (FP32) cores | 10,752 (128/SM) | [WP][TPU] |
+| Tensor cores | 336 (4/SM, 3rd gen) | [WP] |
+| RT cores | 84 (2nd gen; irrelevant to us) | [TPU] |
+| Base / boost clock | 1560 MHz reference (1670 MHz FE) / **1860 MHz** | [TPU][NV] |
+| Max SM clock (driver cap) | 2100 MHz | [BOX] |
+| Memory | 24 GB GDDR6X, 384-bit, 21 Gbps (mem clock 10501 MHz [BOX]) | [TPU][BOX] |
+| Theoretical DRAM BW | **1008 GB/s** | [NV][TPU] |
+| L2 cache | 6,291,456 B = **6 MB** | [BOX] |
+| L1/shared per SM | 128 KB unified | [WP][CC] |
+| Register file per SM | 64K × 32-bit (256 KB) | [WP][ATG] |
+| TDP | 450W stock — ran power-capped at 275W during early perf research; **both cards at stock 450 W since 2026-10-03** (ops, commit `ac9b9cd`; §8 measured: the cap does not bind); pre-lift IMMA/power ceilings in perf notes are conservative | [TPU][BOX] |
+| PCIe | Gen4 x16 card; **this box wires each card at x8** (2-GPU bifurcation) | [TPU][BOX] |
+| GPU0↔GPU1 | `nvidia-smi topo -m` = **PHB** (same host bridge) — **P2P is dead on this box**: `cudaDeviceCanAccessPeer` = 0 both directions, `cudaDeviceEnablePeerAccess` → "peer access is not supported" (AMD Ryzen root complex; measured, `docs/contracts/mtp-tp.md` LV2). Cross-GPU traffic is pinned-sysmem two-hop — the TP substrate (`src/cuda/tpm.rs` dispatches P2P one-shot when available, sysmem otherwise); strategy in `docs/contracts/multi-gpu.md` | measured 2026-10-04; P2P probe 2026-10-14 |
+| NVLink | **None.** 3090 Ti removed it (RTX 3090 had 2-way NVLink) | NVIDIA dev forums; note some vendor spec sheets still list "2-way NVLink" — template noise, the PCB has no NVLink fingers |
+| ECC | No | [BOX][TPU] |
+| Copy engines (`asyncEngineCount`) | 2 → H2D and D2H can overlap | [BOX] |
+
+---
+
+## 2. SM microarchitecture
+
+GA10x SM [WP]:
+
+- **4 processing blocks (partitions)**, each with one warp scheduler + one
+  dispatch port: **each SM issues at most 4 warp instructions per clock** (1
+  per scheduler) [CC].
+- Each partition has **two 16-lane datapaths**: one FP32-only, one
+  FP32+INT32 shared. Per SM per clock: **128 FP32 ops, or 64 FP32 + 64 INT32**
+  — INT32 work (address math, predicates, masks) displaces FP32 issue, and
+  pure-INT32 code runs at half the FP32 rate [WP].
+- Per partition: 1 tensor core, 4 SFU, 4 LD/ST units.
+- Arithmetic result latency ≈ 4 clocks; with the 4-scheduler model you need
+  roughly **16 resident warps/SM issuing independently** to hide ALU
+  latencies, more for memory [CC].
+- Warp size 32; max 48 resident warps (1536 threads)/SM [CC][ATG].
+
+---
+
+## 3. Execution-unit throughput (per SM per clock, and card totals @ 1860 MHz)
+
+Rates from [BPG] table ("8.6/8.9" column), [WP], and [CC]; card totals = rate
+× 84 SMs × 1.86 GHz.
+
+| Operation | ops/clk/SM | Card total | Notes |
+|---|---|---|---|
+| FP32 add/mul/mad | 128 | 40.0 TFLOPS | 2× sm_80 (A100 has 64) [ATG] |
+| FP16 `f16x2` add/mul/mad | 64 | 40.0 TFLOPS (½-pairs) | **Half A100's rate**; FLOPs equal FP32 → CUDA-core FP16 buys bandwidth, not math [BPG] |
+| FP16/BF16 non-tensor TFLOPS | — | 40.0 | equals FP32 [ADA] |
+| INT32 add/mul/shift/logical | 64 | 20.0 TOPS | shared datapath w/ FP32 [WP][BPG] |
+| 64-bit integer add | 32 | — | [BPG] |
+| FP64 | 2 | 0.625 TFLOPS | FP32:FP64 = **64:1** on 8.6 [CC][BPG] |
+| SFU: rcp/rsqrt/lg2/ex2/sin/cos | 16 | — | `tanh.approx.f32`-class ops; use `__expf`-style intrinsics [BPG] |
+| `clz`, `popc` | 16 | — | [BPG] |
+| cvt 8/16-bit int ↔ 32-bit | 64 | — | [BPG] |
+| cvt f32 ↔ f16 | 64 | — | [BPG] |
+| cvt involving int ↔ f32 | 64 | — | [BPG] |
+| cvt involving f64 | 2 | — | [BPG] |
+| `shfl.sync` | 32 | — | [BPG] |
+| DP4A/DP2A | 64 | ≈80 TOPS int8-equiv | CUDA 12.x guide table (row dropped from CUDA 13 table) |
+| Shared-memory access | 128 B/clk | ~20 TB/s | 32 banks × 4 B; bank conflicts serialize; broadcast free [CC] |
+| `__syncthreads()` | 16 ops/clk | — | [BPG] |
+
+---
+
+## 4. Tensor cores (3rd gen, 4 per SM)
+
+Official 3090 Ti numbers at 1860 MHz boost — dense / with 2:4 sparsity [ADA]:
+
+| Mode | TFLOPS/TOPS | FMA per SM per clock |
+|---|---|---|
+| FP16 in, **FP16 acc** | **160 / 320** | 512 |
+| FP16 in, **FP32 acc** | **80 / 160** | 256 |
+| BF16 in, FP32 acc | 80 / 160 | 256 |
+| TF32 | 40 / 80 | 128 |
+| INT8 (s8/u8) | 320 / 640 | 1024 |
+| INT4 (s4/u4) | 640 / 1280 | 2048 |
+| FP64 tensor | **not supported** (GA10x has no FP64 tensor input; A100 only) | — |
+| FP8 | not supported (sm_89+) | — |
+
+Decisions these numbers force:
+
+1. **GeForce nerf: FP32 accumulate is HALF rate.** On GA10x, FP16×FP16 with
+   FP32 accumulation runs at 80 TF while FP16 accumulation runs at the full
+   160 TF [ADA][WP]. A100 runs both at full rate. llama.cpp's MMA kernels
+   (and ours, ported) accumulate in FP32 → our dense-F16 GEMM ceiling is
+   **80 TF**, not 160. FP16 accumulation is a potential 2× prefill win if
+   accuracy testing ever justifies it.
+2. **TF32 is ¼ rate** (40 TF = same as CUDA-core FP32, but no bandwidth
+   savings) — never worth using on this chip [ADA; NVIDIA dev forums confirm
+   3090 TF32 = 35.6 dense = ¼ of its 142.7 FP16-acc rate].
+3. **INT8 IMMA is 4× the FP32-acc FP16 rate** (320 vs 80): for Q4_K weights,
+   dequant→s8 + `mma.m16n8k32.s8` is the fast lane (llama.cpp MMQ's approach).
+4. Marketing "Tensor performance" numbers NVIDIA publishes for 30-series
+   (e.g. "285 TFLOPS" for 3090, "320" for 3090 Ti) are **sparse FP16-acc**
+   — divide by 2, and by 2 again for FP32-acc, when rooflining.
+
+---
+
+## 5. Memory hierarchy
+
+| Level | Size / rate | Notes |
+|---|---|---|
+| DRAM | 24 GB @ **1008 GB/s** theoretical | **Measured: 959.5 GB/s read stream (95.2%)** — see §11 |
+| L2 | 6 MB (6,291,456 B) [BOX] | Residency control available on 8.0+ [CC]: `cudaStreamSetAttribute` access-policy window; max window 128 MB [BOX]; **max persisting set-aside 4,325,376 B ≈ 4.125 MB** [BOX] |
+| L1 / shared | 128 KB unified per SM | carveout options 0/8/16/32/64/100 KB shared [CC] |
+| Shared per block | 48 KB static; **99 KB (101,376 B) with dynamic-smem opt-in** (`cudaFuncAttributeMaxDynamicSharedMemorySize`) | driver reserves 1 KB/block → ≤1 block/SM at full 99 KB [CC][ATG][BOX] |
+| Shared banks | 32 banks × 4 B, 128 B/clk/SM | broadcast/multicast conflict-free; 64-bit accesses split | [CC] |
+| Constant | 64 KB total, 8 KB/SM cache | uniform (same-address) reads broadcast, divergent reads serialize [CC] |
+| Local (spill) | 512 KB/thread | spills go to L1/L2/DRAM at 128 B granularity — keep register pressure ≤ 255/thread instead |
+| L2 fetch granularity | `cudaLimitMaxL2FetchGranularity` 32/64/128 B | useful for KV/streaming reads |
+| PTX cache hints | `ld.global.nc` (read-only/`__ldg` path), `evict_first/last/unchanged` (sm_70+), `.L2::128B/.L2::256B` prefetch (sm_80+), `createpolicy`+`.L2::cache_hint` (sm_80+) | [PTX] |
+
+---
+
+## 6. Occupancy & limits (all [BOX] + [CC])
+
+| Limit | Value |
+|---|---|
+| Threads per SM | 1,536 |
+| Warps per SM | 48 |
+| Blocks per SM | 16 |
+| Threads per block | 1,024 |
+| Registers per SM / per thread | 65,536 / 255 |
+| Shared per SM / per block (opt-in) | 102,400 B / 101,376 B |
+| Grid x / y,z | 2³¹−1 / 65,535 |
+| Concurrent resident grids | 128 [CC] |
+| Streams | stream priorities supported [BOX] |
+
+Worked occupancy anchors:
+
+- Full 1,536-thread occupancy with 128-thread blocks → 12 blocks × ≤40 regs
+  (65536/1536 = 42.7); with 256-thread blocks → 6 blocks, same register cap.
+- MMA tile kernels using ~99 KB dynamic smem → **1 block/SM**; pair with
+  ≥512 threads/block for ≥16 warps to cover cp.async + HMMA issue.
+- 255-reg kernels → 8 warps/SM (1×256-thread block) ≈ 17% occupancy; only
+  viable with heavy ILP.
+
+---
+
+## 7. Instruction / feature availability on sm_86
+
+Verified against PTX ISA 9.4 [PTX] and, where marked, by assembling with
+this box's `ptxas` [PTXAS].
+
+| Feature | sm_86 | Notes |
+|---|---|---|
+| `mma.sync` dense: f16 m16n8k16, bf16 m16n8k8/k16, tf32 m16n8k4/k8, s8 m16n8k16/k32, s4 m16n8k32/k64 | ✅ (all sm_80+) | [PTX][PTXAS] |
+| `ldmatrix` (incl. `.trans`, b16) | ✅ sm_75+ | [PTX][PTXAS] |
+| `cp.async` (global→shared, 4/8/16 B) + commit/wait groups | ✅ sm_80+ | [PTX]; LDGSTS |
+| `mbarrier` init/arrive/wait/`test_wait` | ✅ sm_80+ | [PTX][PTXAS] |
+| `mbarrier.try_wait` | ❌ sm_90+ | poll `test_wait.parity` instead [PTX] |
+| `mbarrier.expect_tx` | ❌ sm_90+ (TMA companion) | [PTX] |
+| `redux.sync` (u32/s32 add/min/max/and/or/xor) | ✅ sm_80+ | f32/f16 variants are sm_100a+ [PTX][PTXAS] |
+| `mma.sp` (2:4 sparse) | ⛔ requires arch-specific target `sm_86a` | **CUDA 13.4 `ptxas` rejects `sm_86a` entirely** (`Value 'sm_86a' is not defined`) → sparsity is unreachable with our toolchain [PTXAS]. Irrelevant for dense LLM weights. |
+| `stmatrix` | ❌ sm_90+ | "Feature 'stmatrix' requires .target sm_90" [PTXAS] |
+| `wgmma`, `cp.async.bulk(.tensor)` (TMA), thread-block clusters, DSMEM, async mbarrier tx | ❌ sm_90+ | [PTX][CCCL docs] |
+| FP8 (`e4m3`/`e5m2`) mma | ❌ sm_89+ | [PTX] |
+| `tanh.approx.f16/f16x2` | ✅ sm_75+ | bf16 variant is sm_90+ [PTX] — GELU/tanh activations |
+| L2 cache hints (`.L2::256B`, `cache_hint`, eviction priority) | ✅ sm_80+ | [PTX] |
+| `nanosleep`, async barriers (`barrier.cluster` aside) | ✅ | — |
+| **Compile target** | `-arch=sm_86` | use `sm_86`, not `sm_80` binaries: 8.0 code runs but leaves the doubled FP32 path on the table [ATG] |
+
+Practical takeaway (matches llama.cpp's design): sm_86's ceiling for GEMM is
+**manually pipelined `cp.async` + `ldmatrix` + `mma.sync` with double-buffered
+smem and `test_wait`-style barriers** — Hopper niceties don't exist here.
+
+---
+
+## 8. Clocks & power reality on this box
+
+[BOX] Both cards:
+
+- Power limit **450 W (stock) since 2026-10-03** (ops change on `main`;
+  was 275 W before — all numbers derived under the 275 W cap were stale
+  until re-measured, see §11 and `research/log.md`).
+- **Measured (2026-10-03, GPU 1, synthetic loads): the cap does not bind.**
+  DRAM streaming held 1950 MHz at ~305 W; pure-mma tensor loads held
+  1950–1965 MHz at only 205–238 W. So §4 peak tables scale by 1950/1860
+  (+4.8%) at these operating points, not down.
+- Real kernels mix pipes + DRAM and may draw more than any synthetic —
+  sustained clocks under actual GEMM/decode get confirmed per-kernel by
+  the census/micro layers in `research/`, not assumed from these numbers.
+- GDDR6X junction temps run hot; `nvidia-smi` doesn't expose memory
+  temperature on this driver — watch for memory-clock throttling during long
+  decode runs.
+
+---
+
+## 9. Roofline mapping to our workloads
+
+Models on disk (dev/parity) [BOX]: `Qwen3.5-0.8B-Q4_K_M.gguf` = 508 MB,
+`Qwen3.5-9B-Q4_K_M.gguf` = 5.3 GB. **Production lane (since the lane
+consolidation): GPTQ W4A16 g128** (`docs/contracts/gptq-g128.md`,
+Qwen3.8-27B staged) — the Q4_K_M rows below are the retired GGUF lane's
+reference math, kept for the llama-bench comparisons. Bandwidth model
+uses the **measured 959.5 GB/s** read ceiling (§11; 95.2% of 1008 theory).
+
+- **Decode (batch 1) is DRAM-bound**: per-token traffic ≈ all weights + KV
+  row reads.
+  - 9B Q4_K_M: 5.3 GB/token → ceiling ≈ 959.5/5.3 ≈ **181 tok/s**
+    (weights only). Tensor cores idle.
+  - 27B Q4_K_M (production target): 16.3 GB file, but decode reads
+    14.02 GB/token (GGUF enumeration, research/results/PROXY.md: minus
+    the 0.72 GB duplicate-vocab tensor, norms, non-weight state) →
+    ceiling ≈ **68.4 tok/s** at measured BW. The 58.8 figure (16.3 GB
+    total) remains the conservative bound; the 52 tok/s M1 target = 76%
+    of the decode-read ceiling.
+  - 0.8B Q4_K_M: 508 MB/token → ceiling ≈ **1890 tok/s** theory-bound —
+    but at ~30 kernels/layer the measured 1.36 µs pipelined launch
+    overhead (§11) dominates long before that: **CUDA graphs / kernel
+    fusion is the lever for the 0.8B** (graphs amortize to 0.58 µs/node).
+- **Prefill is tensor-bound**. Ceilings: **83.8 TF measured sustained**
+  (F16 mma, FP32-acc, 1950 MHz) / **337 TOPS measured** (s8 IMMA) / ~80
+  TOPS (dp4a path). Arithmetic-intensity crossover vs measured DRAM:
+  F16-TC 83.8e12/959.5e9 ≈ **87 FLOP/B**; IMMA ≈ **351 OP/B**. K-quants:
+  dequant cost rides the INT32/FP32 pipes concurrently with mma.
+- **L2 (6 MB) cannot hold a layer** (9B: ~190 MB/layer average) — decode
+  bandwidth math must assume DRAM for weights. The 4.125 MB persisting
+  set-aside fits things like the embedding table slice or a hot KV page.
+- **KV cache per token** (full-attention layers):
+  `2 × n_attn_layers × n_kv_heads × head_dim × bytes` — pull exact dims from
+  the GGUF headers when sizing; budget is tens of GB-free so even fp16 KV
+  for 32k ctx is fine on 24 GB with 5.3 GB weights.
+- **Two GPUs, no NVLink, no P2P** (§1): weights-parallel sharding over both
+cards works (each holds half the layers); cross-card traffic goes over
+PCIe Gen4 x8 via pinned sysmem. TP=2 is VIABLE on this substrate and
+landed — 9B tg128 231 t/s vs vLLM TP=2 169.7 (`docs/contracts/tp2.md`);
+the seam is a two-hop sysmem exchange (~37–55 µs at 8–24 KB payloads on
+the PHB wire, the per-seam floor without P2P).
+- Model load over PCIe Gen4 x8 ≈ 16 GB/s → 5.3 GB in ~0.35 s; `asyncEngineCount=2`
+  lets H2D and D2H overlap [BOX].
+
+---
+
+## 10. Choosing quantization formats — hardware decision variables
+
+A quant format prices three hardware resources: **(a)** bits per weight →
+DRAM bytes per token (decode speed) and model size (capacity), **(b)** which
+compute path the format feeds (prefill speed), **(c)** dequant ALU cost —
+whether the decode kernel can actually saturate DRAM. Quality-vs-bpw is
+model-dependent and priced elsewhere (perplexity runs / llama.cpp's tables);
+this section only prices the speed/size side.
+
+### (a) Bits per weight → decode speed and capacity
+
+Exact bpw computed from the vendored block structs (`ggml-common.h`,
+QK_K = 256, QK8_0 = 32, K_SCALE_SIZE = 12) [VENDOR]; `_M`/`_S` variants mix
+in Q6_K/Q5_K rows, so use measured file sizes when exact [BOX: Q4_K_M 9B =
+5.3 GB]. Weights-only decode ceiling at 850 GB/s (batch 1), for the 9B
+parity model and the 27B production target:
+
+| Format | bpw | 9B bytes | 9B tok/s | 27B bytes | 27B tok/s |
+|---|---|---|---|---|---|
+| F16/BF16 | 16 | 18.0 GB | ~47 | 54.0 GB | fits nowhere |
+| Q8_0 | 8.5 | 9.6 GB | ~88 | 28.7 GB | ~30 (2 cards) |
+| Q6_K | 6.5625 | 7.4 GB | ~114 | 22.1 GB | ~38 |
+| Q5_K_M | ≈5.69 | 6.3 GB | ~130 | 19.2 GB | ~44 |
+| Q4_K_M | ≈4.83 | 5.3 GB [BOX] | ~155 | 16.3 GB | **~52** |
+| IQ4_XS | ≈4.25 | 4.8 GB | ~172 | 14.3 GB | ~59 |
+| IQ3_S | 3.44 | 3.9 GB | ~208 | 11.6 GB | ~72 |
+| IQ3_XXS | 3.06 | 3.4 GB | ~234 | 10.3 GB | ~81 |
+| Q2_K | 2.63 | 2.9 GB | ~272 | 8.9 GB | ~94 |
+| IQ2_S | 2.56 | 2.9 GB | ~279 | 8.6 GB | ~96 |
+| IQ2_XS | 2.31 | 2.6 GB | ~309 | 7.8 GB | ~107 |
+| IQ2_XXS | 2.06 | 2.3 GB | ~346 | 6.9 GB | ~120 |
+
+All rows are loadable formats (the retired GGUF lane's Tier 1 + Tier 2
+coverage — historical reference; the engine reads GPTQ g128 today). unsloth UD mixes land between rows by element share
+(UD-IQ4_XS 27B: 14.25 GB ≈ 4.22 effective bpw). §10c's ALU caveat applies
+below 3 bpw: grid-decode formats stream below the DRAM ceiling until
+ncu says otherwise.
+
+`tok/s ≈ achieved_BW × 8 / (params × bpw + KV bytes/token)`. F16 9B fits
+24 GB but leaves thin KV headroom; quant buys it back linearly. **For 27B
+the ladder hits a wall at the top**: Q4_K_M leaves ~6 GB for KV+context on
+one card; Q6_K leaves ~1 GB (unusable); Q8_0 needs both cards; F16 27B fits
+not even 2×24 GB. Q4_K_M is the best quality that keeps a usable KV budget
+on one 24 GB card.
+
+### (b) Format class → prefill compute path
+
+- **Integer formats ≤ 8 bit** (every `Q*_0/Q*_1/Q*_K/IQ_*` in the vendored
+  tree, plus MXFP4/NVFP4) have MMQ paths: dequant → s8 + IMMA → ceiling
+  **320 TOPS** [VENDOR: `ggml-cuda/mmq.cu` type dispatch].
+- **F16/BF16** → HMMA with FP32 accumulate → **80 TF**.
+- Anything forced onto scalar pipes (dp4a / FFMA) → ~80 TOPS / 40 TF.
+
+Prefill spread between formats is up to 4× and decided by path availability,
+not bpw: pick formats with MMQ coverage for long-prompt work.
+
+### (c) Dequant ALU budget at streaming rate — the hidden constraint
+
+During batch-1 decode the tensor cores are idle and the scalar pipes are all
+available for dequant: 128 FP32 + 64 INT32 lane-ops/clk/SM ≈ 27 Tops/s at
+1860 MHz. Per byte streamed at 850 GB/s that is ≈ **32 lane-ops/byte**, i.e.
+≈ 4 ops per weight at b bpw: Q8_0 ≈ 34, Q6_K ≈ 26, Q4_K ≈ 18, IQ2-class ≈ 11
+ops/weight. K-quant dequant costs ~3–6 ops/weight (mask/shift + scale MAD,
+scales amortized over 256-weight super-blocks) → ≥3× margin down to 4-bit.
+**Sub-3-bit codebook formats (IQ2_*, Q2_K: grid lookups, extra shared loads
++ address math) approach the budget — verify with ncu before assuming a
+2-bit model streams at DRAM speed.** Shared-memory staging is never the
+limit (84 SM × 128 B/clk ≈ 18 TB/s ≫ DRAM).
+
+### (d) Capacity ledger
+
+24 GB = weights + KV (`2 × n_attn_layers × n_kv_heads × head_dim × bytes ×
+ctx`) + activations + CUDA context (~0.5–1 GB). Two cards give 48 GB via
+layer-split only (no NVLink, §1) — and layer-split streams each card's half
+**sequentially**, so it buys capacity, not speed: two-card Q8_0 27B ≈
+30 tok/s is slower than one-card Q4_K_M ≈ 52 tok/s.
+
+## 11. Measured on this box (calibration 2026-10-03, GPU 1; `research/log.md` + `research/results/calib/*.json`)
+
+1. **DRAM bandwidth — MEASURED**: read stream **959.5 GB/s** (95.2% of
+   theory; p10–p90 spread 0.04%), memcpy D2D 909 GB/s effective.
+2. **Sustained clocks / TC peaks at 450 W — MEASURED**: cap does not bind
+   for pure loads (DRAM stream 305 W, pure mma ≤ 238 W, both at 1950+ MHz).
+   Sustained **83.8 TF** F16-TC FP32-acc and **337 TOPS** INT8 IMMA — 100%
+   of §4 tables scaled to 1950 MHz.
+3. **Kernel launch overhead — MEASURED**: 1.36 µs pipelined back-to-back,
+   4.02 µs launch+sync round trip, **0.58 µs/node in CUDA graphs**, 2.05 µs
+   1-node graph replay. Implication: at ~150 launches/token the 0.8B pays
+   ~37% of its weight-bound budget in dispatch — graphs/fusion are
+   first-class for 0.8B; host-side syncs are ruinous.
+4. **P2P between the two cards — RESOLVED (dead)**: `cudaDeviceCanAccessPeer`
+   = 0 both directions; enable → "peer access is not supported between
+   these two devices" (2026-10-14, `docs/contracts/mtp-tp.md` LV2). The TP
+   seam runs pinned-sysmem two-hop by necessity.
+5. Optional: L2 line/sector behavior and shared-memory latency numbers for
+   the tuning docs (microbench; not verified in this pass).
+
+Re-verification one-liners:
+
+```sh
+nvidia-smi --query-gpu=index,name,power.limit,power.default_limit,clocks.sm,clocks.mem,pcie.link.gen.current,pcie.link.width.current --format=csv
+nvcc -o /tmp/devprops tools/hw/devprops.cu && /tmp/devprops   # cudaDeviceProp dump
+for t in sm_86 sm_90; do sed "s/^.target .*/.target $t/" tools/hw/feat.ptx > /tmp/feat_$t.ptx; ptxas -arch=$t /tmp/feat_$t.ptx -o /dev/null; done  # feature-gate probes
+```
+
+---
+
+## Source index
+
+- GA102 whitepaper (v1/v2): nvidia.com/content/dam/en-zz/Solutions/geforce/ampere/pdf/NVIDIA-ampere-GA102-whitepaper-v1.pdf (SM datapaths, per-SM composition, GDDR6X, NVLink3)
+- Ada whitepaper Appendix A: nvidia.com/content/PDF/nvidia-ada-gpu-architecture-whitepaper-v2.pdf (official RTX 3090 Ti tensor/FLOPS table)
+- CUDA C++ Programming Guide — Compute Capabilities appendix: docs.nvidia.com/cuda/cuda-programming-guide (limits, ratios, data types, carveouts)
+- CUDA C++ Best Practices Guide §12.1: docs.nvidia.com/cuda/cuda-c-best-practices-guide (instruction throughput table, CUDA 13.4)
+- CUDA Ampere Tuning Guide: docs.nvidia.com/cuda/archive/12.6.1/pdf/Ampere_Tuning_Guide.pdf (8.0-vs-8.6 deltas)
+- PTX ISA 9.4: docs.nvidia.com/cuda/parallel-thread-execution (target gates for mma/mma.sp/ldmatrix/cp.async/mbarrier/redux/L2 hints)
+- NVIDIA product pages + TechPowerUp GA102-350 entry (card-level clocks/BDW/TDP; FP64 1:64 pattern)
+- NVIDIA developer forums: "TF32 TFLOPs of GeForce RTX 3090 vs A40" (GA10x TF32 rate), "NVLink port support for RTX 3090 Ti" (NVLink removal)
+- Pinned llama.cpp (`vendor/llama.cpp` @ cb7934c5): `ggml-common.h` block
+  structs (bpw math), `ggml-cuda/mmq.cu` type dispatch (MMQ/IMMA coverage)
