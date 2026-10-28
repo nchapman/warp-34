@@ -12,7 +12,6 @@ fn draft_attention_matches_pinned_sglang_flashinfer_operator() {
         .expect("run tools/oracle/sglang_dflash_attention_dump.py in pinned SGLang image");
     let _device = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();
-    let ex = stream.exec(0, 0);
     for (name, rows, seq_len, window) in [
         ("short", 8, 24, 16),
         ("full", 16, 24, 0),
@@ -20,50 +19,6 @@ fn draft_attention_matches_pinned_sglang_flashinfer_operator() {
         ("narrow", 16, 24, 4),
     ] {
         replay_paged_bf16(&archive, &stream, name, rows, seq_len, window);
-        let q = archive.read_f32(&format!("{name}.q")).unwrap();
-        let k = archive.read_bf16_bits(&format!("{name}.k")).unwrap();
-        let v = archive.read_bf16_bits(&format!("{name}.v")).unwrap();
-        let expected = archive.read_f32(&format!("{name}.out")).unwrap();
-        let dq = DeviceBuffer::alloc(0, q.len() * 4).unwrap();
-        let dk = DeviceBuffer::alloc(0, k.len() * 2).unwrap();
-        let dv = DeviceBuffer::alloc(0, v.len() * 2).unwrap();
-        let out = DeviceBuffer::alloc(0, expected.len() * 4).unwrap();
-        dq.copy_from_host(&q, &stream).unwrap();
-        dk.copy_from_host(&k, &stream).unwrap();
-        dv.copy_from_host(&v, &stream).unwrap();
-        // SAFETY: fixture arrays have Q=8/16,Hq=8,Hkv=2,D=128 and S cache rows.
-        unsafe {
-            check_rc(
-                ffi::w34_dflash_attention_f32(
-                    &ex,
-                    dq.addr() as *const f32,
-                    dk.addr() as *const c_void,
-                    dv.addr() as *const c_void,
-                    out.addr() as *mut f32,
-                    rows,
-                    seq_len - rows,
-                    seq_len,
-                    8,
-                    2,
-                    128,
-                    window,
-                    1.0 / 128.0f32.sqrt(),
-                ),
-                "donor attention replay",
-            )
-            .unwrap();
-        }
-        let mut actual = vec![0.0f32; expected.len()];
-        out.copy_to_host(&mut actual, &stream).unwrap();
-        let max_abs = actual
-            .iter()
-            .zip(&expected)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            actual.iter().all(|x| x.is_finite()) && max_abs < 0.02,
-            "{name}: max abs {max_abs} vs actual SGLang/FlashInfer BF16 output"
-        );
     }
 }
 
@@ -221,59 +176,91 @@ fn replay_paged_bf16(
 
 #[test]
 fn draft_kv_preserves_bf16_range_through_attention() {
+    use w34_host::{
+        cache::{KvFormatPolicy, KvPool},
+        cuda::f32_to_bf16,
+    };
     let _device = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();
     let ex = stream.exec(0, 0);
-    let k = DeviceBuffer::alloc(0, 128 * 4).unwrap();
-    let v = DeviceBuffer::alloc(0, 128 * 4).unwrap();
-    let q = DeviceBuffer::alloc(0, 128 * 4).unwrap();
-    let kc = DeviceBuffer::alloc(0, 128 * 2).unwrap();
-    let vc = DeviceBuffer::alloc(0, 128 * 2).unwrap();
-    let out = DeviceBuffer::alloc(0, 128 * 4).unwrap();
-    k.copy_from_host(&vec![0.0f32; 128], &stream).unwrap();
-    q.copy_from_host(&vec![1.0f32; 128], &stream).unwrap();
-    v.copy_from_host(&vec![131072.0f32; 128], &stream).unwrap();
+    let pool = KvPool::new(
+        0,
+        ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
+        &[0],
+        1,
+        128,
+        16,
+        1,
+        KvFormatPolicy::Bf16,
+    )
+    .unwrap();
+    let layout = &pool.layers[0].layout;
+    // Pack [K, V] in a single row [1, 256] BF16 with V = 131072.0 (exceeds FP16 max 65504.0).
+    let mut kv_host = vec![0u16; 256];
+    for x in &mut kv_host[128..] {
+        *x = f32_to_bf16(131072.0);
+    }
+    let q_host = vec![f32_to_bf16(1.0); 128];
+    let kv_dev = DeviceBuffer::alloc(0, 256 * 2).unwrap();
+    let q_dev = DeviceBuffer::alloc(0, 128 * 2).unwrap();
+    let out_dev = DeviceBuffer::alloc(0, 128 * 2).unwrap();
+    kv_dev.copy_from_host(&kv_host, &stream).unwrap();
+    q_dev.copy_from_host(&q_host, &stream).unwrap();
+    let meta = DeviceBuffer::alloc(0, 6 * 4).unwrap();
+    meta.copy_from_host(&[0i32, 1, 0, 1, 0, 0], &stream)
+        .unwrap();
+    let batch = ffi::W34AttentionBatch {
+        query_start_loc: meta.addr() as *const i32,
+        context_lens_before: (meta.addr() + 8) as *const i32,
+        seq_lens_after: (meta.addr() + 12) as *const i32,
+        block_tables: (meta.addr() + 16) as *const i32,
+        write_slot_mapping: (meta.addr() + 20) as *const i32,
+        valid_token_mask: core::ptr::null(),
+        valid_req_mask: core::ptr::null(),
+        num_reqs: 1,
+        total_tokens: 1,
+        max_blocks_per_req: 1,
+        max_q_len: 1,
+        max_seq_len: 1,
+        sliding_window: 0,
+        mask_mode: ffi::W34_ATTN_MASK_NONCAUSAL_WINDOW,
+        sm_scale: 1.0,
+        reserved: 0,
+    };
     // SAFETY: all device arrays cover a single 128-element head on this stream.
     unsafe {
         check_rc(
-            ffi::w34_dflash_kv_write_f32_to_bf16(
+            ffi::w34_kv_cache_write_strided_bf16(
                 &ex,
-                k.addr() as *const f32,
-                v.addr() as *const f32,
-                kc.addr() as *mut c_void,
-                vc.addr() as *mut c_void,
-                0,
-                1,
-                128,
+                layout,
+                &batch,
+                kv_dev.addr() as *const c_void,
+                (kv_dev.addr() + 128 * 2) as *const c_void,
+                256,
             ),
-            "draft kv write",
+            "strided draft kv write",
         )
         .unwrap();
         check_rc(
-            ffi::w34_dflash_attention_f32(
+            ffi::w34_paged_attention_bf16(
                 &ex,
-                q.addr() as *const f32,
-                kc.addr() as *const c_void,
-                vc.addr() as *const c_void,
-                out.addr() as *mut f32,
+                layout,
+                &batch,
+                q_dev.addr() as *const c_void,
+                out_dev.addr() as *mut c_void,
                 1,
-                0,
-                1,
-                1,
-                1,
-                128,
-                0,
-                1.0,
             ),
-            "draft attention",
+            "paged draft attention",
         )
         .unwrap();
     }
-    let mut result = vec![0.0f32; 128];
-    out.copy_to_host(&mut result, &stream).unwrap();
+    let mut result = vec![0u16; 128];
+    out_dev.copy_to_host(&mut result, &stream).unwrap();
     assert!(
-        result.iter().all(|&x| x == 131072.0),
+        result
+            .iter()
+            .all(|&x| f32::from_bits((x as u32) << 16) == 131072.0),
         "BF16 range lost: {}",
-        result[0]
+        f32::from_bits((result[0] as u32) << 16)
     );
 }

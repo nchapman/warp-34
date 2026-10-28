@@ -63,6 +63,7 @@ pub struct Qwen3_5MtpRank {
     scratch: DeviceArena,
     kv: KvPool,
     pages: Vec<i32>,
+    pages_dev: u64,
     len: usize,
     committed: usize,
     fc: LinearProj,
@@ -92,6 +93,7 @@ impl Qwen3_5MtpRank {
         let i = c.intermediate_size;
         let bytes = 2
             * (2 * h * h + (2 * q + 2 * kv) * h + h * q + 3 * h * i + 5 * h + 2 * c.head_dim)
+            + capacity.div_ceil(16) * 4
             + 65536;
         let mut weights = DeviceArena::new(target.device.device_id, bytes)?;
         let staging = DeviceBuffer::alloc(target.device.device_id, 256)?;
@@ -160,9 +162,10 @@ impl Qwen3_5MtpRank {
             capacity.div_ceil(16),
             KvFormatPolicy::Fp16,
         )?;
-        let pages = (0..kv.num_pages)
+        let pages: Vec<i32> = (0..kv.num_pages)
             .map(|_| kv.alloc_page().unwrap())
             .collect();
+        let pages_dev = weights.upload_slice(&pages, &target.stream)?;
         // Bound eager batch memory independently of the KV capacity.
         let max_batch_rows = capacity.min(256);
         // All FP16 intermediates (including split QKV and full vocabulary logits),
@@ -186,6 +189,7 @@ impl Qwen3_5MtpRank {
             scratch: DeviceArena::new(target.device.device_id, scratch_bytes)?,
             kv,
             pages,
+            pages_dev,
             len: 0,
             committed: 0,
             fc,
@@ -247,7 +251,7 @@ impl Qwen3_5MtpRank {
             return Err(loader_err("invalid MTP ingest rows"));
         }
         if !next_tokens.is_empty() {
-            self.forward(target, next_tokens, target_hidden, tp2)?;
+            self.forward_inner(target, next_tokens, target_hidden, tp2, false)?;
             self.committed = self.len;
         }
         Ok(())
@@ -317,6 +321,17 @@ impl Qwen3_5MtpRank {
         input_hidden: u64,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<i32> {
+        self.forward_inner(target, tokens, input_hidden, tp2, true)?
+            .ok_or_else(|| loader_err("MTP forward did not sample token"))
+    }
+    fn forward_inner(
+        &mut self,
+        target: &Qwen3_5ModelRank,
+        tokens: &[i32],
+        input_hidden: u64,
+        tp2: Option<&Tp2Collectives>,
+        sample_last: bool,
+    ) -> Result<Option<i32>> {
         let t = target;
         if t.embed_tokens_ptr != self.target_embedding {
             return Err(loader_err("MTP target rank mismatch"));
@@ -350,9 +365,9 @@ impl Qwen3_5MtpRank {
         let local_interm = t.cfg.intermediate_size / t.tp_size;
         let q_gate_dim = local_q_heads * head_dim * 2;
         let kv_dim = local_kv_heads * head_dim;
-        let residual_buf = self.scratch.alloc_aligned(num_tokens * (h_dim) * 2)?;
-        let normed_buf = self.scratch.alloc_aligned(num_tokens * (h_dim) * 2)?;
-        let embed = self.scratch.alloc_aligned(num_tokens * (h_dim) * 2)?;
+        let residual_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
+        let normed_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
+        let embed = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
         let concat = self.scratch.alloc_aligned(num_tokens * (2 * h_dim) * 2)?;
         let qkv_proj_buf = self
             .scratch
@@ -360,7 +375,7 @@ impl Qwen3_5MtpRank {
         let q_buf = self
             .scratch
             .alloc_aligned(num_tokens * (local_q_heads * head_dim) * 2)?;
-        let k_buf = self.scratch.alloc_aligned(num_tokens * (kv_dim) * 2)?;
+        let k_buf = self.scratch.alloc_aligned(num_tokens * kv_dim * 2)?;
         let gate_buf = self
             .scratch
             .alloc_aligned(num_tokens * (local_q_heads * head_dim) * 2)?;
@@ -370,42 +385,30 @@ impl Qwen3_5MtpRank {
         let gated_attn_buf = self
             .scratch
             .alloc_aligned(num_tokens * (local_q_heads * head_dim) * 2)?;
-        let block_out_buf = self.scratch.alloc_aligned(num_tokens * (h_dim) * 2)?;
+        let block_out_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
         let gate_up_buf = self
             .scratch
             .alloc_aligned(num_tokens * (2 * local_interm) * 2)?;
-        let act_buf = self
-            .scratch
-            .alloc_aligned(num_tokens * (local_interm) * 2)?;
-        let mlp_out_buf = self.scratch.alloc_aligned(num_tokens * (h_dim) * 2)?;
-        let logits_buf = self
-            .scratch
-            .alloc_aligned(num_tokens * (t.local_vocab_size) * 2)?;
-        let token_ids_ptr = self.scratch.upload_slice(tokens, &t.stream)?;
-        let positions_ptr = self.scratch.upload_slice(
-            &(self.len..self.len + num_tokens)
-                .map(|p| p as i32)
-                .collect::<Vec<_>>(),
-            &t.stream,
-        )?;
-        let qs = self
-            .scratch
-            .upload_slice(&[0i32, num_tokens as i32], &t.stream)?;
-        let after = self
-            .scratch
-            .upload_slice(&[(self.len + num_tokens) as i32], &t.stream)?;
-        let tables = self.scratch.upload_slice(&self.pages, &t.stream)?;
-        let slot = self.scratch.upload_slice(
-            &(self.len..self.len + num_tokens)
-                .map(|p| self.pages[p / 16] * 16 + (p % 16) as i32)
-                .collect::<Vec<_>>(),
-            &t.stream,
-        )?;
+        let act_buf = self.scratch.alloc_aligned(num_tokens * local_interm * 2)?;
+        let mlp_out_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
+        let mut meta = Vec::with_capacity(3 * num_tokens + 3);
+        meta.extend_from_slice(tokens);
+        meta.extend((self.len..self.len + num_tokens).map(|p| p as i32));
+        meta.extend(
+            (self.len..self.len + num_tokens).map(|p| self.pages[p / 16] * 16 + (p % 16) as i32),
+        );
+        meta.extend_from_slice(&[0i32, num_tokens as i32, (self.len + num_tokens) as i32]);
+        let meta_base = self.scratch.upload_slice(&meta, &t.stream)?;
+        let token_ids_ptr = meta_base;
+        let positions_ptr = token_ids_ptr + (num_tokens * 4) as u64;
+        let slot = positions_ptr + (num_tokens * 4) as u64;
+        let qs = slot + (num_tokens * 4) as u64;
+        let after = qs + 8;
         let attn_batch = &W34AttentionBatch {
             query_start_loc: qs as *const i32,
             context_lens_before: positions_ptr as *const i32,
             seq_lens_after: after as *const i32,
-            block_tables: tables as *const i32,
+            block_tables: self.pages_dev as *const i32,
             write_slot_mapping: slot as *const i32,
             valid_token_mask: core::ptr::null(),
             valid_req_mask: core::ptr::null(),
@@ -434,41 +437,64 @@ impl Qwen3_5MtpRank {
             },
             "MTP embed",
         )?;
-        let hidden_norm = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
-        for (input, weight, output) in [
-            (embed, self.norms[0], normed_buf),
-            (input_hidden, self.norms[1], hidden_norm),
-        ] {
+        if num_tokens == 1 {
+            for (input, weight, output) in [
+                (embed, self.norms[0], concat),
+                (input_hidden, self.norms[1], concat + (h_dim * 2) as u64),
+            ] {
+                check_rc(
+                    unsafe {
+                        ffi::w34_gemma_rms_norm_f16(
+                            &ex,
+                            input as *const c_void,
+                            weight as *const c_void,
+                            output as *mut c_void,
+                            core::ptr::null(),
+                            1,
+                            h_dim as i32,
+                            t.cfg.rms_norm_eps,
+                        )
+                    },
+                    "MTP pre FC norm",
+                )?;
+            }
+        } else {
+            let hidden_norm = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
+            for (input, weight, output) in [
+                (embed, self.norms[0], normed_buf),
+                (input_hidden, self.norms[1], hidden_norm),
+            ] {
+                check_rc(
+                    unsafe {
+                        ffi::w34_gemma_rms_norm_f16(
+                            &ex,
+                            input as *const c_void,
+                            weight as *const c_void,
+                            output as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            h_dim as i32,
+                            t.cfg.rms_norm_eps,
+                        )
+                    },
+                    "MTP pre FC norm",
+                )?;
+            }
             check_rc(
                 unsafe {
-                    ffi::w34_gemma_rms_norm_f16(
+                    ffi::w34_concat_cols_2_f16(
                         &ex,
-                        input as *const c_void,
-                        weight as *const c_void,
-                        output as *mut c_void,
-                        core::ptr::null(),
+                        normed_buf as *const c_void,
+                        hidden_norm as *const c_void,
+                        concat as *mut c_void,
                         num_tokens as i32,
                         h_dim as i32,
-                        t.cfg.rms_norm_eps,
+                        h_dim as i32,
                     )
                 },
-                "MTP pre FC norm",
+                "MTP concat",
             )?;
         }
-        check_rc(
-            unsafe {
-                ffi::w34_concat_cols_2_f16(
-                    &ex,
-                    normed_buf as *const c_void,
-                    hidden_norm as *const c_void,
-                    concat as *mut c_void,
-                    num_tokens as i32,
-                    h_dim as i32,
-                    h_dim as i32,
-                )
-            },
-            "MTP concat",
-        )?;
         Self::project(&self.fc, t, concat, residual_buf, num_tokens)?;
         check_rc(
             unsafe {
@@ -487,25 +513,34 @@ impl Qwen3_5MtpRank {
         )?;
         let fa = &self.fa;
         Self::project(&fa.qkv_proj, t, normed_buf, qkv_proj_buf, num_tokens)?;
-        let q_gate_ptr = self.scratch.alloc_aligned(num_tokens * q_gate_dim * 2)?;
-        let k_raw_ptr = self.scratch.alloc_aligned(num_tokens * kv_dim * 2)?;
-        let v_ptr = self.scratch.alloc_aligned(num_tokens * kv_dim * 2)?;
-        check_rc(
-            unsafe {
-                ffi::w34_split_cols_3_f16(
-                    &ex,
-                    qkv_proj_buf as *const c_void,
-                    q_gate_ptr as *mut c_void,
-                    k_raw_ptr as *mut c_void,
-                    v_ptr as *mut c_void,
-                    num_tokens as i32,
-                    q_gate_dim as i32,
-                    kv_dim as i32,
-                    kv_dim as i32,
-                )
-            },
-            "MTP split QKV",
-        )?;
+        let (q_gate_ptr, k_raw_ptr, v_ptr) = if num_tokens == 1 {
+            (
+                qkv_proj_buf,
+                qkv_proj_buf + (q_gate_dim * 2) as u64,
+                qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64,
+            )
+        } else {
+            let q_gate_ptr = self.scratch.alloc_aligned(num_tokens * q_gate_dim * 2)?;
+            let k_raw_ptr = self.scratch.alloc_aligned(num_tokens * kv_dim * 2)?;
+            let v_ptr = self.scratch.alloc_aligned(num_tokens * kv_dim * 2)?;
+            check_rc(
+                unsafe {
+                    ffi::w34_split_cols_3_f16(
+                        &ex,
+                        qkv_proj_buf as *const c_void,
+                        q_gate_ptr as *mut c_void,
+                        k_raw_ptr as *mut c_void,
+                        v_ptr as *mut c_void,
+                        num_tokens as i32,
+                        q_gate_dim as i32,
+                        kv_dim as i32,
+                        kv_dim as i32,
+                    )
+                },
+                "MTP split QKV",
+            )?;
+            (q_gate_ptr, k_raw_ptr, v_ptr)
+        };
         check_rc(
             unsafe {
                 ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
@@ -643,66 +678,75 @@ impl Qwen3_5MtpRank {
             },
             "MTP final norm",
         )?;
-        Self::project(
-            &t.lm_head,
-            t,
-            self.batch_hidden.addr(),
-            logits_buf,
-            num_tokens,
-        )?;
-        let id = DeviceBuffer::alloc(t.device.device_id, 4)?;
-        let local_id = self.scratch.alloc_aligned(4)?;
-        let local_val = self.scratch.alloc_aligned(4)?;
-        let global_val = self.scratch.alloc_aligned(4)?;
-        check_rc(
-            unsafe {
-                ffi::w34_sampler_greedy_top5_f16(
-                    &ex,
-                    (logits_buf + ((num_tokens - 1) * t.local_vocab_size * 2) as u64)
-                        as *const c_void,
-                    if tp2.is_some() { local_id } else { id.addr() } as *mut i32,
-                    core::ptr::null_mut(),
-                    if tp2.is_some() {
-                        local_val as *mut f32
-                    } else {
-                        core::ptr::null_mut()
-                    },
-                    1,
-                    t.local_vocab_size as i32,
-                    t.vocab_offset as i32,
-                )
-            },
-            "MTP greedy",
-        )?;
-        if let Some(comm) = tp2 {
-            comm.all_gather_top1_f32_i32(
-                &ex,
-                local_val,
-                local_id,
-                global_val,
-                id.addr(),
-                t.rank as i32,
-                1,
-            )?;
-        }
-        let mut out = [0i32];
-        id.copy_to_host(&mut out, &t.stream)?;
-        t.stream.synchronize()?;
+        let last_hidden_ptr = self.batch_hidden.addr() + ((num_tokens - 1) * h_dim * 2) as u64;
         check_rc(
             unsafe {
                 ffi::w34_memcpy_d2d_async(
                     self.hidden.addr() as *mut c_void,
-                    (self.batch_hidden.addr() + ((num_tokens - 1) * h_dim * 2) as u64)
-                        as *const c_void,
+                    last_hidden_ptr as *const c_void,
                     h_dim * 2,
                     t.stream.handle,
                 )
             },
             "MTP last hidden",
         )?;
-        t.stream.synchronize()?;
+        let sampled_id = if sample_last {
+            let logits_buf = self.scratch.alloc_aligned(t.local_vocab_size * 2)?;
+            Self::project(&t.lm_head, t, last_hidden_ptr, logits_buf, 1)?;
+            let out_id = self.scratch.alloc_aligned(4)?;
+            let local_id = self.scratch.alloc_aligned(4)?;
+            let local_val = self.scratch.alloc_aligned(4)?;
+            let global_val = self.scratch.alloc_aligned(4)?;
+            check_rc(
+                unsafe {
+                    ffi::w34_sampler_greedy_top5_f16(
+                        &ex,
+                        logits_buf as *const c_void,
+                        if tp2.is_some() { local_id } else { out_id } as *mut i32,
+                        core::ptr::null_mut(),
+                        if tp2.is_some() {
+                            local_val as *mut f32
+                        } else {
+                            core::ptr::null_mut()
+                        },
+                        1,
+                        t.local_vocab_size as i32,
+                        t.vocab_offset as i32,
+                    )
+                },
+                "MTP greedy",
+            )?;
+            if let Some(comm) = tp2 {
+                comm.all_gather_top1_f32_i32(
+                    &ex,
+                    local_val,
+                    local_id,
+                    global_val,
+                    out_id,
+                    t.rank as i32,
+                    1,
+                )?;
+            }
+            let mut out = [0i32];
+            check_rc(
+                unsafe {
+                    ffi::w34_memcpy_d2h_async(
+                        out.as_mut_ptr().cast(),
+                        out_id as *const c_void,
+                        4,
+                        t.stream.handle,
+                    )
+                },
+                "MTP greedy copy",
+            )?;
+            t.stream.synchronize()?;
+            Some(out[0])
+        } else {
+            t.stream.synchronize()?;
+            None
+        };
         self.batch_hidden_rows = num_tokens;
         self.len += num_tokens;
-        Ok(out[0])
+        Ok(sampled_id)
     }
 }

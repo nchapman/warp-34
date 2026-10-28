@@ -128,7 +128,10 @@ impl LinearProj {
                 size_n,
                 size_k,
             } => {
-                if m > 1 && m <= 8 {
+                // Only small-N projections (GDN in_proj_ba, size_n <= 128) need per-row
+                // GEMVs to preserve 0-ULP ssm_state parity across prefill vs decode.
+                // Large-N projections (lm_head, size_n >= 124160) must run batched.
+                if m > 1 && m <= 8 && size_n <= 256 {
                     for r in 0..m {
                         cublas.gemm_f16(
                             x_ptr + (r * size_k * 2) as u64,
@@ -583,6 +586,7 @@ pub struct Qwen3_5ModelRank {
     pub cfg: ModelConfig,
     pub weight_arena: DeviceArena,
     pub scratch_arena: DeviceArena,
+    pub batch_meta_arena: DeviceArena,
     pub marlin_ws: DeviceBuffer,
     pub embed_tokens_ptr: u64,
     pub final_norm_ptr: u64,
@@ -596,7 +600,7 @@ pub struct Qwen3_5ModelRank {
     pub decode_graph: Option<CudaGraph>,
     pub capacity_plan: CapacityPlan,
     pub tap_layer_ids: Vec<usize>,
-    pub tap_aux_f32: Option<DeviceBuffer>,
+    pub tap_aux_bf16: Option<DeviceBuffer>,
     /// Selected-row local-vocabulary logits for native processed verification.
     pub speculative_logits: Option<DeviceBuffer>,
     pub speculative_logits_rows: usize,
@@ -630,6 +634,7 @@ impl Qwen3_5ModelRank {
         };
         let mut weight_arena = DeviceArena::new(device_id, est_weight_bytes)?;
         let scratch_arena = DeviceArena::new(device_id, 512 * 1024 * 1024)?;
+        let batch_meta_arena = DeviceArena::new(device_id, 16 * 1024 * 1024)?;
         let marlin_ws = DeviceBuffer::alloc(device_id, 84 * 64 * 4)?;
         let repack_staging = DeviceBuffer::alloc(device_id, 128 * 1024 * 1024)?;
 
@@ -996,6 +1001,7 @@ impl Qwen3_5ModelRank {
             cfg: cfg.clone(),
             weight_arena,
             scratch_arena,
+            batch_meta_arena,
             marlin_ws,
             embed_tokens_ptr,
             final_norm_ptr,
@@ -1009,7 +1015,7 @@ impl Qwen3_5ModelRank {
             decode_graph: None,
             capacity_plan,
             tap_layer_ids: Vec::new(),
-            tap_aux_f32: None,
+            tap_aux_bf16: None,
             speculative_logits: None,
             speculative_logits_rows: 0,
             last_final_hidden_f16: None,
@@ -1052,10 +1058,10 @@ impl Qwen3_5ModelRank {
         let row_elems = max_tap_rows
             .checked_mul(self.cfg.hidden_size)
             .ok_or_else(|| loader_err("tap capacity overflow"))?;
-        let tap_aux_f32 = if !tap_layer_ids.is_empty() {
+        let tap_aux_bf16 = if !tap_layer_ids.is_empty() {
             let bytes = row_elems
                 .checked_mul(tap_layer_ids.len())
-                .and_then(|n| n.checked_mul(4))
+                .and_then(|n| n.checked_mul(2))
                 .ok_or_else(|| loader_err("tap capacity overflow"))?;
             Some(DeviceBuffer::alloc(self.device.device_id, bytes)?)
         } else {
@@ -1071,7 +1077,7 @@ impl Qwen3_5ModelRank {
         };
         self.tap_layer_ids = tap_layer_ids.to_vec();
         self.max_tap_rows = max_tap_rows;
-        self.tap_aux_f32 = tap_aux_f32;
+        self.tap_aux_bf16 = tap_aux_bf16;
         self.last_final_hidden_f16 = last_final_hidden_f16;
         Ok(())
     }
@@ -1595,28 +1601,35 @@ impl Qwen3_5ModelRank {
 
             if num_tokens <= self.max_tap_rows
                 && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
-                && let Some(tap_buf) = &self.tap_aux_f32
+                && let Some(tap_buf) = &self.tap_aux_bf16
             {
                 let num_taps = self.tap_layer_ids.len();
                 check_rc(
                     unsafe {
-                        ffi::w34_tap_add_f16_to_f32(
+                        ffi::w34_tap_add_f16_to_bf16(
                             &ex,
                             residual_buf as *const c_void,
                             mlp_out_buf as *const c_void,
-                            tap_buf.addr() as *mut f32,
+                            tap_buf.addr() as *mut c_void,
                             num_tokens as i32,
                             h_dim as i32,
                             (num_taps * h_dim) as i32,
                             (tap_slot * h_dim) as i32,
                         )
                     },
-                    "w34_tap_add_f16_to_f32",
+                    "w34_tap_add_f16_to_bf16",
                 )?;
             }
         }
 
-        // 3. Final RMSNorm
+        // 3. Final RMSNorm (write directly into last_final_hidden_f16 when export is active)
+        let final_norm_out_buf = if num_tokens <= self.max_tap_rows
+            && let Some(final_h_buf) = &self.last_final_hidden_f16
+        {
+            final_h_buf.addr()
+        } else {
+            normed_buf
+        };
         check_rc(
             unsafe {
                 ffi::w34_fused_add_gemma_rms_norm_f16(
@@ -1624,7 +1637,7 @@ impl Qwen3_5ModelRank {
                     mlp_out_buf as *const c_void,
                     residual_buf as *mut c_void,
                     self.final_norm_ptr as *const c_void,
-                    normed_buf as *mut c_void,
+                    final_norm_out_buf as *mut c_void,
                     core::ptr::null(),
                     num_tokens as i32,
                     h_dim as i32,
@@ -1633,22 +1646,6 @@ impl Qwen3_5ModelRank {
             },
             "w34_fused_add_gemma_rms_norm_f16 (final)",
         )?;
-
-        if num_tokens <= self.max_tap_rows
-            && let Some(final_h_buf) = &self.last_final_hidden_f16
-        {
-            check_rc(
-                unsafe {
-                    ffi::w34_memcpy_d2d_async(
-                        final_h_buf.addr() as *mut c_void,
-                        normed_buf as *const c_void,
-                        num_tokens * h_dim * 2,
-                        self.stream.handle,
-                    )
-                },
-                "export_final_hidden d2d",
-            )?;
-        }
 
         if let Some(dump) = dump_out.as_deref_mut()
             && self.rank == 0
@@ -1662,7 +1659,7 @@ impl Qwen3_5ModelRank {
             )?;
             Self::record_dump_f16(
                 &self.stream,
-                normed_buf,
+                final_norm_out_buf,
                 vec![num_tokens, h_dim],
                 "final_norm",
                 dump,
@@ -1670,7 +1667,7 @@ impl Qwen3_5ModelRank {
         }
 
         // 4. LM Head on last token row `[1, h_dim]`
-        let last_hidden_ptr = normed_buf + ((num_tokens - 1) * h_dim * 2) as u64;
+        let last_hidden_ptr = final_norm_out_buf + ((num_tokens - 1) * h_dim * 2) as u64;
         self.lm_head.forward(
             &ex,
             &self.cublas,
@@ -1862,9 +1859,6 @@ impl Qwen3_5ModelRank {
         let act_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * local_interm * 2)?;
-        let logits_buf = self
-            .scratch_arena
-            .alloc_aligned(self.local_vocab_size * 2)?;
 
         check_rc(
             unsafe {
@@ -2235,27 +2229,34 @@ impl Qwen3_5ModelRank {
 
             if num_tokens <= self.max_tap_rows
                 && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
-                && let Some(tap_buf) = &self.tap_aux_f32
+                && let Some(tap_buf) = &self.tap_aux_bf16
             {
                 let num_taps = self.tap_layer_ids.len();
                 check_rc(
                     unsafe {
-                        ffi::w34_tap_add_f16_to_f32(
+                        ffi::w34_tap_add_f16_to_bf16(
                             &ex,
                             residual_buf as *const c_void,
                             mlp_out_buf as *const c_void,
-                            tap_buf.addr() as *mut f32,
+                            tap_buf.addr() as *mut c_void,
                             num_tokens as i32,
                             h_dim as i32,
                             (num_taps * h_dim) as i32,
                             (tap_slot * h_dim) as i32,
                         )
                     },
-                    "w34_tap_add_f16_to_f32 (selected)",
+                    "w34_tap_add_f16_to_bf16 (selected)",
                 )?;
             }
         }
 
+        let final_norm_out_buf = if num_tokens <= self.max_tap_rows
+            && let Some(final_h_buf) = &self.last_final_hidden_f16
+        {
+            final_h_buf.addr()
+        } else {
+            normed_buf
+        };
         check_rc(
             unsafe {
                 ffi::w34_fused_add_gemma_rms_norm_f16(
@@ -2263,7 +2264,7 @@ impl Qwen3_5ModelRank {
                     mlp_out_buf as *const c_void,
                     residual_buf as *mut c_void,
                     self.final_norm_ptr as *const c_void,
-                    normed_buf as *mut c_void,
+                    final_norm_out_buf as *mut c_void,
                     core::ptr::null(),
                     num_tokens as i32,
                     h_dim as i32,
@@ -2273,100 +2274,221 @@ impl Qwen3_5ModelRank {
             "w34_fused_add_gemma_rms_norm_f16 (final)",
         )?;
 
-        if num_tokens <= self.max_tap_rows
-            && let Some(final_h_buf) = &self.last_final_hidden_f16
-        {
-            check_rc(
-                unsafe {
-                    ffi::w34_memcpy_d2d_async(
-                        final_h_buf.addr() as *mut c_void,
-                        normed_buf as *const c_void,
-                        num_tokens * h_dim * 2,
-                        self.stream.handle,
-                    )
-                },
-                "export_final_hidden d2d (selected)",
-            )?;
+        if selected_rows.is_empty() {
+            self.speculative_logits_rows = 0;
+            return Ok(Vec::new());
         }
-
-        let mut out_ids = Vec::with_capacity(selected_rows.len());
-        for (selected_idx, &row_idx) in selected_rows.iter().enumerate() {
-            let row_hidden_ptr = normed_buf + (row_idx * h_dim * 2) as u64;
-            self.lm_head.forward(
-                &ex,
-                &self.cublas,
-                marlin_ws_ptr,
-                marlin_ws_ints,
-                row_hidden_ptr,
-                logits_buf,
-                1,
-            )?;
-            if let Some(buf) = &self.speculative_logits {
-                // SAFETY: capacity was validated before dispatch and logits_buf
-                // owns one local-vocabulary row on this rank's stream.
+        let num_selected = selected_rows.len();
+        let all_logits_buf = if let Some(buf) = &self.speculative_logits {
+            buf.addr()
+        } else {
+            self.scratch_arena
+                .alloc_aligned(num_selected * self.local_vocab_size * 2)?
+        };
+        let is_contiguous = selected_rows
+            .iter()
+            .enumerate()
+            .all(|(i, &r)| r == selected_rows[0] + i);
+        let selected_hidden_ptr = if is_contiguous {
+            final_norm_out_buf + (selected_rows[0] * h_dim * 2) as u64
+        } else {
+            let gathered_hidden = self.scratch_arena.alloc_aligned(num_selected * h_dim * 2)?;
+            for (selected_idx, &row_idx) in selected_rows.iter().enumerate() {
                 check_rc(
                     unsafe {
                         ffi::w34_memcpy_d2d_async(
-                            (buf.addr() + (selected_idx * self.local_vocab_size * 2) as u64)
-                                as *mut c_void,
-                            logits_buf as *const c_void,
-                            self.local_vocab_size * 2,
+                            (gathered_hidden + (selected_idx * h_dim * 2) as u64) as *mut c_void,
+                            (final_norm_out_buf + (row_idx * h_dim * 2) as u64) as *const c_void,
+                            h_dim * 2,
                             self.stream.handle,
                         )
                     },
-                    "capture selected logits",
+                    "gather selected hidden rows",
                 )?;
             }
-            if let Some(comm) = tp2 {
-                check_rc(
-                    unsafe {
-                        ffi::w34_sampler_greedy_top5_f16(
-                            &ex,
-                            logits_buf as *const c_void,
-                            self.decode_io.local_max_id.addr() as *mut i32,
-                            core::ptr::null_mut(),
-                            self.decode_io.local_max_val.addr() as *mut f32,
-                            1,
-                            self.local_vocab_size as i32,
-                            self.vocab_offset as i32,
-                        )
-                    },
-                    "w34_sampler_greedy_top5_f16 (tp2 local)",
-                )?;
-                comm.all_gather_top1_f32_i32(
-                    &ex,
-                    self.decode_io.local_max_val.addr(),
-                    self.decode_io.local_max_id.addr(),
-                    self.decode_io.global_max_val.addr(),
-                    self.decode_io.out_greedy_id.addr(),
-                    self.rank as i32,
-                    1,
-                )?;
-            } else {
-                check_rc(
-                    unsafe {
-                        ffi::w34_sampler_greedy_top5_f16(
-                            &ex,
-                            logits_buf as *const c_void,
-                            self.decode_io.out_greedy_id.addr() as *mut i32,
-                            core::ptr::null_mut(),
-                            core::ptr::null_mut(),
-                            1,
-                            self.local_vocab_size as i32,
-                            self.vocab_offset as i32,
-                        )
-                    },
-                    "w34_sampler_greedy_top5_f16",
-                )?;
-            }
-            let mut gid = [0i32; 1];
-            self.decode_io
-                .out_greedy_id
-                .copy_to_host(&mut gid, &self.stream)?;
-            out_ids.push(gid[0]);
+            gathered_hidden
+        };
+        self.lm_head.forward(
+            &ex,
+            &self.cublas,
+            marlin_ws_ptr,
+            marlin_ws_ints,
+            selected_hidden_ptr,
+            all_logits_buf,
+            num_selected,
+        )?;
+
+        let out_greedy_ids_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
+        if let Some(comm) = tp2 {
+            let local_max_ids_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
+            let local_max_vals_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
+            let global_max_vals_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
+            check_rc(
+                unsafe {
+                    ffi::w34_sampler_greedy_top5_f16(
+                        &ex,
+                        all_logits_buf as *const c_void,
+                        local_max_ids_dev as *mut i32,
+                        core::ptr::null_mut(),
+                        local_max_vals_dev as *mut f32,
+                        num_selected as i32,
+                        self.local_vocab_size as i32,
+                        self.vocab_offset as i32,
+                    )
+                },
+                "w34_sampler_greedy_top5_f16 (tp2 local)",
+            )?;
+            comm.all_gather_top1_f32_i32(
+                &ex,
+                local_max_vals_dev,
+                local_max_ids_dev,
+                global_max_vals_dev,
+                out_greedy_ids_dev,
+                self.rank as i32,
+                num_selected as i32,
+            )?;
+        } else {
+            check_rc(
+                unsafe {
+                    ffi::w34_sampler_greedy_top5_f16(
+                        &ex,
+                        all_logits_buf as *const c_void,
+                        out_greedy_ids_dev as *mut i32,
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                        num_selected as i32,
+                        self.local_vocab_size as i32,
+                        self.vocab_offset as i32,
+                    )
+                },
+                "w34_sampler_greedy_top5_f16",
+            )?;
         }
-        self.speculative_logits_rows = selected_rows.len();
+        let mut out_ids = vec![0i32; num_selected];
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    out_ids.as_mut_ptr().cast(),
+                    out_greedy_ids_dev as *const c_void,
+                    num_selected * 4,
+                    self.stream.handle,
+                )
+            },
+            "copy selected greedy ids",
+        )?;
+        self.stream.synchronize()?;
+        self.speculative_logits_rows = num_selected;
         Ok(out_ids)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_batch_meta(
+        &mut self,
+        flat_tokens: &[i32],
+        flat_positions: &[i32],
+        q_start_loc: &[i32],
+        ctx_lens_before: &[i32],
+        seq_lens_after: &[i32],
+        block_tables: &[i32],
+        flat_write_slots: &[i32],
+        state_in_indices: &[i32],
+        state_out_indices: &[i32],
+        has_initial_state: &[u8],
+        spec_state_indices: &[i32],
+        checkpoint_dst_indices: &[i32],
+        checkpoint_token_offsets: &[i32],
+        num_reqs: usize,
+        total_tokens: usize,
+        max_blocks_per_req: usize,
+        max_q_len: usize,
+        max_seq_len: usize,
+        max_verify_tokens: usize,
+        max_checkpoints_per_req: usize,
+    ) -> Result<(u64, u64, W34AttentionBatch, W34GdnBatch)> {
+        self.device.make_current()?;
+        self.batch_meta_arena.reset();
+        let total_i32 = flat_tokens.len()
+            + flat_positions.len()
+            + q_start_loc.len()
+            + ctx_lens_before.len()
+            + seq_lens_after.len()
+            + block_tables.len()
+            + flat_write_slots.len()
+            + state_in_indices.len()
+            + state_out_indices.len()
+            + spec_state_indices.len()
+            + checkpoint_dst_indices.len()
+            + checkpoint_token_offsets.len();
+        let mut packed = Vec::with_capacity(total_i32);
+        let push_slice = |v: &mut Vec<i32>, s: &[i32]| -> usize {
+            let off = v.len();
+            v.extend_from_slice(s);
+            off
+        };
+        let off_tok = push_slice(&mut packed, flat_tokens);
+        let off_pos = push_slice(&mut packed, flat_positions);
+        let off_qs = push_slice(&mut packed, q_start_loc);
+        let off_cb = push_slice(&mut packed, ctx_lens_before);
+        let off_sa = push_slice(&mut packed, seq_lens_after);
+        let off_bt = push_slice(&mut packed, block_tables);
+        let off_ws = push_slice(&mut packed, flat_write_slots);
+        let off_si = push_slice(&mut packed, state_in_indices);
+        let off_so = push_slice(&mut packed, state_out_indices);
+        let off_sp = push_slice(&mut packed, spec_state_indices);
+        let off_cd = push_slice(&mut packed, checkpoint_dst_indices);
+        let off_co = push_slice(&mut packed, checkpoint_token_offsets);
+
+        let base = self.batch_meta_arena.upload_slice(&packed, &self.stream)?;
+        let ptr_at = |off: usize| -> u64 { base + (off * 4) as u64 };
+        let has_init_ptr = self
+            .batch_meta_arena
+            .upload_slice(has_initial_state, &self.stream)?;
+
+        let attn_batch = W34AttentionBatch {
+            query_start_loc: ptr_at(off_qs) as *const i32,
+            context_lens_before: ptr_at(off_cb) as *const i32,
+            seq_lens_after: ptr_at(off_sa) as *const i32,
+            block_tables: ptr_at(off_bt) as *const i32,
+            write_slot_mapping: ptr_at(off_ws) as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: num_reqs as i32,
+            total_tokens: total_tokens as i32,
+            max_blocks_per_req: max_blocks_per_req as i32,
+            max_q_len: max_q_len as i32,
+            max_seq_len: max_seq_len as i32,
+            mask_mode: W34_ATTN_MASK_CAUSAL,
+            sliding_window: 0,
+            sm_scale: (self.cfg.head_dim as f32).powf(-0.5),
+            reserved: 0,
+        };
+        let gdn_batch = W34GdnBatch {
+            query_start_loc: ptr_at(off_qs) as *const i32,
+            state_in_indices: ptr_at(off_si) as *const i32,
+            state_out_indices: ptr_at(off_so) as *const i32,
+            spec_state_indices: if spec_state_indices.is_empty() {
+                core::ptr::null()
+            } else {
+                ptr_at(off_sp) as *const i32
+            },
+            checkpoint_dst_indices: if checkpoint_dst_indices.is_empty() {
+                core::ptr::null()
+            } else {
+                ptr_at(off_cd) as *const i32
+            },
+            checkpoint_token_offsets: if checkpoint_token_offsets.is_empty() {
+                core::ptr::null()
+            } else {
+                ptr_at(off_co) as *const i32
+            },
+            has_initial_state: has_init_ptr as *const u8,
+            valid_req_mask: core::ptr::null(),
+            num_reqs: num_reqs as i32,
+            total_tokens: total_tokens as i32,
+            max_verify_tokens: max_verify_tokens as i32,
+            max_checkpoints_per_req: max_checkpoints_per_req as i32,
+        };
+        Ok((ptr_at(off_tok), ptr_at(off_pos), attn_batch, gdn_batch))
     }
 
     fn record_dump_f16(
@@ -3655,92 +3777,31 @@ impl Qwen3_5Engine {
         let total_tokens = flat_tokens.len();
         let flat_ids = if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
-            r0.device.make_current()?;
-            let tok_dev = DeviceBuffer::alloc(r0.device.device_id, total_tokens * 4)?;
-            let pos_dev = DeviceBuffer::alloc(r0.device.device_id, total_tokens * 4)?;
-            let q_start_dev = DeviceBuffer::alloc(r0.device.device_id, q_start_loc.len() * 4)?;
-            let ctx_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs * 4)?;
-            let seq_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs * 4)?;
-            let blk_dev = DeviceBuffer::alloc(r0.device.device_id, block_tables.len() * 4)?;
-            let slot_dev = DeviceBuffer::alloc(r0.device.device_id, total_tokens * 4)?;
-            let st_in_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs * 4)?;
-            let st_out_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs * 4)?;
-            let has_init_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs.max(4))?;
-            let spec_dev = if !spec_state_indices.is_empty() {
-                let b = DeviceBuffer::alloc(r0.device.device_id, spec_state_indices.len() * 4)?;
-                b.copy_from_host(&spec_state_indices, &r0.stream)?;
-                Some(b)
-            } else {
-                None
-            };
-            let ckpt_dst_dev = if !checkpoint_dst_indices.is_empty() {
-                let b = DeviceBuffer::alloc(r0.device.device_id, checkpoint_dst_indices.len() * 4)?;
-                b.copy_from_host(&checkpoint_dst_indices, &r0.stream)?;
-                Some(b)
-            } else {
-                None
-            };
-            let ckpt_off_dev = if !checkpoint_token_offsets.is_empty() {
-                let b =
-                    DeviceBuffer::alloc(r0.device.device_id, checkpoint_token_offsets.len() * 4)?;
-                b.copy_from_host(&checkpoint_token_offsets, &r0.stream)?;
-                Some(b)
-            } else {
-                None
-            };
-
-            tok_dev.copy_from_host(&flat_tokens, &r0.stream)?;
-            pos_dev.copy_from_host(&flat_positions, &r0.stream)?;
-            q_start_dev.copy_from_host(&q_start_loc, &r0.stream)?;
-            ctx_dev.copy_from_host(&ctx_lens_before, &r0.stream)?;
-            seq_dev.copy_from_host(&seq_lens_after, &r0.stream)?;
-            blk_dev.copy_from_host(&block_tables, &r0.stream)?;
-            slot_dev.copy_from_host(&flat_write_slots, &r0.stream)?;
-            st_in_dev.copy_from_host(&state_in_indices, &r0.stream)?;
-            st_out_dev.copy_from_host(&state_out_indices, &r0.stream)?;
-            has_init_dev.copy_from_host(&has_initial_state, &r0.stream)?;
-
-            let attn_batch = W34AttentionBatch {
-                query_start_loc: q_start_dev.addr() as *const i32,
-                context_lens_before: ctx_dev.addr() as *const i32,
-                seq_lens_after: seq_dev.addr() as *const i32,
-                block_tables: blk_dev.addr() as *const i32,
-                write_slot_mapping: slot_dev.addr() as *const i32,
-                valid_token_mask: core::ptr::null(),
-                valid_req_mask: core::ptr::null(),
-                num_reqs: num_reqs as i32,
-                total_tokens: total_tokens as i32,
-                max_blocks_per_req: max_blocks_per_req as i32,
-                max_q_len: max_q_len as i32,
-                max_seq_len: max_seq_len as i32,
-                mask_mode: W34_ATTN_MASK_CAUSAL,
-                sliding_window: 0,
-                sm_scale: (r0.cfg.head_dim as f32).powf(-0.5),
-                reserved: 0,
-            };
-            let gdn_batch = W34GdnBatch {
-                query_start_loc: q_start_dev.addr() as *const i32,
-                state_in_indices: st_in_dev.addr() as *const i32,
-                state_out_indices: st_out_dev.addr() as *const i32,
-                spec_state_indices: spec_dev
-                    .as_ref()
-                    .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                checkpoint_dst_indices: ckpt_dst_dev
-                    .as_ref()
-                    .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                checkpoint_token_offsets: ckpt_off_dev
-                    .as_ref()
-                    .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                has_initial_state: has_init_dev.addr() as *const u8,
-                valid_req_mask: core::ptr::null(),
-                num_reqs: num_reqs as i32,
-                total_tokens: total_tokens as i32,
-                max_verify_tokens: max_verify_tokens as i32,
-                max_checkpoints_per_req: max_checkpoints_per_req as i32,
-            };
+            let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
+                &flat_tokens,
+                &flat_positions,
+                &q_start_loc,
+                &ctx_lens_before,
+                &seq_lens_after,
+                &block_tables,
+                &flat_write_slots,
+                &state_in_indices,
+                &state_out_indices,
+                &has_initial_state,
+                &spec_state_indices,
+                &checkpoint_dst_indices,
+                &checkpoint_token_offsets,
+                num_reqs,
+                total_tokens,
+                max_blocks_per_req,
+                max_q_len,
+                max_seq_len,
+                max_verify_tokens,
+                max_checkpoints_per_req,
+            )?;
             r0.forward_selected_rows(
-                tok_dev.addr(),
-                pos_dev.addr(),
+                tok_ptr,
+                pos_ptr,
                 total_tokens,
                 &attn_batch,
                 &gdn_batch,
@@ -3780,91 +3841,31 @@ impl Qwen3_5Engine {
             let (res0, res1) = std::thread::scope(|sc| {
                 let c0 = comm.clone();
                 let h0 = sc.spawn(move || -> Result<Vec<i32>> {
-                    r0.device.make_current()?;
-                    let tok_dev = DeviceBuffer::alloc(r0.device.device_id, total_tokens * 4)?;
-                    let pos_dev = DeviceBuffer::alloc(r0.device.device_id, total_tokens * 4)?;
-                    let q_start_dev = DeviceBuffer::alloc(r0.device.device_id, qs_ref.len() * 4)?;
-                    let ctx_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs * 4)?;
-                    let seq_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs * 4)?;
-                    let blk_dev = DeviceBuffer::alloc(r0.device.device_id, bt_ref.len() * 4)?;
-                    let slot_dev = DeviceBuffer::alloc(r0.device.device_id, total_tokens * 4)?;
-                    let st_in_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs * 4)?;
-                    let st_out_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs * 4)?;
-                    let has_init_dev = DeviceBuffer::alloc(r0.device.device_id, num_reqs.max(4))?;
-                    let spec_dev = if !sp_ref.is_empty() {
-                        let b = DeviceBuffer::alloc(r0.device.device_id, sp_ref.len() * 4)?;
-                        b.copy_from_host(sp_ref, &r0.stream)?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    let ckpt_dst_dev = if !cd_ref.is_empty() {
-                        let b = DeviceBuffer::alloc(r0.device.device_id, cd_ref.len() * 4)?;
-                        b.copy_from_host(cd_ref, &r0.stream)?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    let ckpt_off_dev = if !co_ref.is_empty() {
-                        let b = DeviceBuffer::alloc(r0.device.device_id, co_ref.len() * 4)?;
-                        b.copy_from_host(co_ref, &r0.stream)?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-
-                    tok_dev.copy_from_host(ft_ref, &r0.stream)?;
-                    pos_dev.copy_from_host(fp_ref, &r0.stream)?;
-                    q_start_dev.copy_from_host(qs_ref, &r0.stream)?;
-                    ctx_dev.copy_from_host(cb_ref, &r0.stream)?;
-                    seq_dev.copy_from_host(sa_ref, &r0.stream)?;
-                    blk_dev.copy_from_host(bt_ref, &r0.stream)?;
-                    slot_dev.copy_from_host(ws_ref, &r0.stream)?;
-                    st_in_dev.copy_from_host(si_ref, &r0.stream)?;
-                    st_out_dev.copy_from_host(so_ref, &r0.stream)?;
-                    has_init_dev.copy_from_host(hi_ref, &r0.stream)?;
-
-                    let attn_batch = W34AttentionBatch {
-                        query_start_loc: q_start_dev.addr() as *const i32,
-                        context_lens_before: ctx_dev.addr() as *const i32,
-                        seq_lens_after: seq_dev.addr() as *const i32,
-                        block_tables: blk_dev.addr() as *const i32,
-                        write_slot_mapping: slot_dev.addr() as *const i32,
-                        valid_token_mask: core::ptr::null(),
-                        valid_req_mask: core::ptr::null(),
-                        num_reqs: num_reqs as i32,
-                        total_tokens: total_tokens as i32,
-                        max_blocks_per_req: max_blocks_per_req as i32,
-                        max_q_len: max_q_len as i32,
-                        max_seq_len: max_seq_len as i32,
-                        mask_mode: W34_ATTN_MASK_CAUSAL,
-                        sliding_window: 0,
-                        sm_scale: (r0.cfg.head_dim as f32).powf(-0.5),
-                        reserved: 0,
-                    };
-                    let gdn_batch = W34GdnBatch {
-                        query_start_loc: q_start_dev.addr() as *const i32,
-                        state_in_indices: st_in_dev.addr() as *const i32,
-                        state_out_indices: st_out_dev.addr() as *const i32,
-                        spec_state_indices: spec_dev
-                            .as_ref()
-                            .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                        checkpoint_dst_indices: ckpt_dst_dev
-                            .as_ref()
-                            .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                        checkpoint_token_offsets: ckpt_off_dev
-                            .as_ref()
-                            .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                        has_initial_state: has_init_dev.addr() as *const u8,
-                        valid_req_mask: core::ptr::null(),
-                        num_reqs: num_reqs as i32,
-                        total_tokens: total_tokens as i32,
-                        max_verify_tokens: max_verify_tokens as i32,
-                        max_checkpoints_per_req: max_checkpoints_per_req as i32,
-                    };
+                    let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
+                        ft_ref,
+                        fp_ref,
+                        qs_ref,
+                        cb_ref,
+                        sa_ref,
+                        bt_ref,
+                        ws_ref,
+                        si_ref,
+                        so_ref,
+                        hi_ref,
+                        sp_ref,
+                        cd_ref,
+                        co_ref,
+                        num_reqs,
+                        total_tokens,
+                        max_blocks_per_req,
+                        max_q_len,
+                        max_seq_len,
+                        max_verify_tokens,
+                        max_checkpoints_per_req,
+                    )?;
                     r0.forward_selected_rows(
-                        tok_dev.addr(),
-                        pos_dev.addr(),
+                        tok_ptr,
+                        pos_ptr,
                         total_tokens,
                         &attn_batch,
                         &gdn_batch,
@@ -3875,91 +3876,31 @@ impl Qwen3_5Engine {
 
                 let c1 = comm.clone();
                 let h1 = sc.spawn(move || -> Result<()> {
-                    r1.device.make_current()?;
-                    let tok_dev = DeviceBuffer::alloc(r1.device.device_id, total_tokens * 4)?;
-                    let pos_dev = DeviceBuffer::alloc(r1.device.device_id, total_tokens * 4)?;
-                    let q_start_dev = DeviceBuffer::alloc(r1.device.device_id, qs_ref.len() * 4)?;
-                    let ctx_dev = DeviceBuffer::alloc(r1.device.device_id, num_reqs * 4)?;
-                    let seq_dev = DeviceBuffer::alloc(r1.device.device_id, num_reqs * 4)?;
-                    let blk_dev = DeviceBuffer::alloc(r1.device.device_id, bt_ref.len() * 4)?;
-                    let slot_dev = DeviceBuffer::alloc(r1.device.device_id, total_tokens * 4)?;
-                    let st_in_dev = DeviceBuffer::alloc(r1.device.device_id, num_reqs * 4)?;
-                    let st_out_dev = DeviceBuffer::alloc(r1.device.device_id, num_reqs * 4)?;
-                    let has_init_dev = DeviceBuffer::alloc(r1.device.device_id, num_reqs.max(4))?;
-                    let spec_dev = if !sp_ref.is_empty() {
-                        let b = DeviceBuffer::alloc(r1.device.device_id, sp_ref.len() * 4)?;
-                        b.copy_from_host(sp_ref, &r1.stream)?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    let ckpt_dst_dev = if !cd_ref.is_empty() {
-                        let b = DeviceBuffer::alloc(r1.device.device_id, cd_ref.len() * 4)?;
-                        b.copy_from_host(cd_ref, &r1.stream)?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    let ckpt_off_dev = if !co_ref.is_empty() {
-                        let b = DeviceBuffer::alloc(r1.device.device_id, co_ref.len() * 4)?;
-                        b.copy_from_host(co_ref, &r1.stream)?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-
-                    tok_dev.copy_from_host(ft_ref, &r1.stream)?;
-                    pos_dev.copy_from_host(fp_ref, &r1.stream)?;
-                    q_start_dev.copy_from_host(qs_ref, &r1.stream)?;
-                    ctx_dev.copy_from_host(cb_ref, &r1.stream)?;
-                    seq_dev.copy_from_host(sa_ref, &r1.stream)?;
-                    blk_dev.copy_from_host(bt_ref, &r1.stream)?;
-                    slot_dev.copy_from_host(ws_ref, &r1.stream)?;
-                    st_in_dev.copy_from_host(si_ref, &r1.stream)?;
-                    st_out_dev.copy_from_host(so_ref, &r1.stream)?;
-                    has_init_dev.copy_from_host(hi_ref, &r1.stream)?;
-
-                    let attn_batch = W34AttentionBatch {
-                        query_start_loc: q_start_dev.addr() as *const i32,
-                        context_lens_before: ctx_dev.addr() as *const i32,
-                        seq_lens_after: seq_dev.addr() as *const i32,
-                        block_tables: blk_dev.addr() as *const i32,
-                        write_slot_mapping: slot_dev.addr() as *const i32,
-                        valid_token_mask: core::ptr::null(),
-                        valid_req_mask: core::ptr::null(),
-                        num_reqs: num_reqs as i32,
-                        total_tokens: total_tokens as i32,
-                        max_blocks_per_req: max_blocks_per_req as i32,
-                        max_q_len: max_q_len as i32,
-                        max_seq_len: max_seq_len as i32,
-                        mask_mode: W34_ATTN_MASK_CAUSAL,
-                        sliding_window: 0,
-                        sm_scale: (r1.cfg.head_dim as f32).powf(-0.5),
-                        reserved: 0,
-                    };
-                    let gdn_batch = W34GdnBatch {
-                        query_start_loc: q_start_dev.addr() as *const i32,
-                        state_in_indices: st_in_dev.addr() as *const i32,
-                        state_out_indices: st_out_dev.addr() as *const i32,
-                        spec_state_indices: spec_dev
-                            .as_ref()
-                            .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                        checkpoint_dst_indices: ckpt_dst_dev
-                            .as_ref()
-                            .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                        checkpoint_token_offsets: ckpt_off_dev
-                            .as_ref()
-                            .map_or(core::ptr::null(), |b| b.addr() as *const i32),
-                        has_initial_state: has_init_dev.addr() as *const u8,
-                        valid_req_mask: core::ptr::null(),
-                        num_reqs: num_reqs as i32,
-                        total_tokens: total_tokens as i32,
-                        max_verify_tokens: max_verify_tokens as i32,
-                        max_checkpoints_per_req: max_checkpoints_per_req as i32,
-                    };
+                    let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r1.upload_batch_meta(
+                        ft_ref,
+                        fp_ref,
+                        qs_ref,
+                        cb_ref,
+                        sa_ref,
+                        bt_ref,
+                        ws_ref,
+                        si_ref,
+                        so_ref,
+                        hi_ref,
+                        sp_ref,
+                        cd_ref,
+                        co_ref,
+                        num_reqs,
+                        total_tokens,
+                        max_blocks_per_req,
+                        max_q_len,
+                        max_seq_len,
+                        max_verify_tokens,
+                        max_checkpoints_per_req,
+                    )?;
                     let _ = r1.forward_selected_rows(
-                        tok_dev.addr(),
-                        pos_dev.addr(),
+                        tok_ptr,
+                        pos_ptr,
                         total_tokens,
                         &attn_batch,
                         &gdn_batch,

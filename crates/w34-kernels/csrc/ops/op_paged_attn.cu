@@ -332,7 +332,21 @@ __global__ void paged_attention_kernel(
             float num_frag[8][2] = {{0.f}};
             float maximum = -FLT_MAX, denominator = 0.f;
             const float scale = batch.sm_scale * 1.4426950408889634f;
-            for (int base = 0; base <= max_kv_pos; base += tile) {
+            const uint32_t* qp32 = (const uint32_t*)q_row;
+            uint32_t qa0[16], qa2[16];
+            const int k_steps = head_dim >> 4;
+#pragma unroll
+            for (int ks = 0; ks < 16; ++ks) {
+                if (ks < k_steps && lane < 4) {
+                    qa0[ks] = qp32[ks * 8 + lane];
+                    qa2[ks] = qp32[ks * 8 + 4 + lane];
+                } else {
+                    qa0[ks] = 0u;
+                    qa2[ks] = 0u;
+                }
+            }
+            const int start_base = (min_kv_pos > 0) ? ((min_kv_pos / tile) * tile) : 0;
+            for (int base = start_base; base <= max_kv_pos; base += tile) {
                 for (int t = wid; t < tile; t += 4) {
                     int kv = base + t;
                     float dot = -FLT_MAX;
@@ -347,13 +361,12 @@ __global__ void paged_attention_kernel(
                             + (size_t)kv_head * layout.v_head_stride_bytes
                             + (size_t)(kv % layout.block_size) * layout.v_token_stride_bytes;
                         dot = 0.f;
-                        const uint32_t* qp32 = (const uint32_t*)q_row;
                         const uint32_t* kp32 = (const uint32_t*)kp;
-                        for (int k0 = 0; k0 < head_dim; k0 += 16) {
-                            uint32_t a0 = (lane < 4) ? qp32[(k0 >> 1) + lane] : 0u;
-                            uint32_t a2 = (lane < 4) ? qp32[(k0 >> 1) + 4 + lane] : 0u;
-                            uint32_t b0 = (lane < 4) ? kp32[(k0 >> 1) + lane] : 0u;
-                            uint32_t b1 = (lane < 4) ? kp32[(k0 >> 1) + 4 + lane] : 0u;
+                        for (int ks = 0; ks < k_steps; ++ks) {
+                            uint32_t a0 = qa0[ks];
+                            uint32_t a2 = qa2[ks];
+                            uint32_t b0 = (lane < 4) ? kp32[ks * 8 + lane] : 0u;
+                            uint32_t b1 = (lane < 4) ? kp32[ks * 8 + 4 + lane] : 0u;
                             uint32_t z = 0u;
                             float d1 = 0.f, d2 = 0.f, d3 = 0.f;
                             asm volatile(
@@ -371,7 +384,7 @@ __global__ void paged_attention_kernel(
                 __syncthreads();
                 float next = maximum;
                 for (int t = 0; t < tile; ++t) next = fmaxf(next, scores[t]);
-                float alpha = ptx_exp2(maximum * scale - next * scale);
+                float alpha = (next == -FLT_MAX) ? 0.f : ptx_exp2(maximum * scale - next * scale);
                 denominator *= alpha;
 #pragma unroll
                 for (int step = 0; step < 8; ++step) {
@@ -534,9 +547,11 @@ __global__ void paged_attention_kernel(
 }
 
 // Native BF16 write: no FP16 intermediary (4B drafter values may exceed 65504).
+// Supports arbitrary row_stride_elems >= local_kv_heads * head_dim so packed [K, V]
+// and [Q, K, V] activations can be written directly without intermediate column copies.
 __global__ void kv_cache_write_bf16_kernel(
     w34_kv_layer_layout layout, w34_attention_batch batch,
-    const __nv_bfloat16* k, const __nv_bfloat16* v) {
+    const __nv_bfloat16* k, const __nv_bfloat16* v, int row_stride_elems) {
     const int tok = blockIdx.x;
     if (batch.valid_token_mask && !batch.valid_token_mask[tok]) return;
     int req = -1;
@@ -554,8 +569,9 @@ __global__ void kv_cache_write_bf16_kernel(
     auto* vd = (__nv_bfloat16*)((uint8_t*)(uintptr_t)layout.v_base +
         (size_t)page * layout.v_page_stride_bytes + (size_t)head * layout.v_head_stride_bytes +
         (size_t)off * layout.v_token_stride_bytes);
+    const size_t base = (size_t)tok * row_stride_elems + (size_t)head * layout.head_dim;
     for (int c = threadIdx.x; c < layout.head_dim; c += blockDim.x) {
-        const size_t src = ((size_t)tok * layout.local_kv_heads + head) * layout.head_dim + c;
+        const size_t src = base + c;
         kd[c] = k[src];
         vd[c] = v[src];
     }
@@ -583,16 +599,24 @@ static bool valid_bf16_layout(const w34_kv_layer_layout* l) {
         l->k_transform == W34_KV_TRANSFORM_IDENTITY && l->v_transform == W34_KV_TRANSFORM_IDENTITY;
 }
 
-extern "C" int w34_kv_cache_write_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
-    const w34_attention_batch* batch, const void* k, const void* v) {
+extern "C" int w34_kv_cache_write_strided_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
+    const w34_attention_batch* batch, const void* k, const void* v, int row_stride_elems) {
     if (!ex || !valid_bf16_layout(layout) || !batch || !k || !v ||
+        row_stride_elems < layout->local_kv_heads * layout->head_dim ||
         batch->total_tokens < 0 || batch->num_reqs <= 0 || !batch->query_start_loc ||
         !batch->write_slot_mapping) return (int)cudaErrorInvalidValue;
     if (!batch->total_tokens) return 0;
     dim3 grid((unsigned)batch->total_tokens, (unsigned)layout->local_kv_heads);
     w34_attn::kv_cache_write_bf16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-        *layout, *batch, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v);
+        *layout, *batch, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, row_stride_elems);
     return (int)cudaGetLastError();
+}
+
+extern "C" int w34_kv_cache_write_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
+    const w34_attention_batch* batch, const void* k, const void* v) {
+    if (!valid_bf16_layout(layout)) return (int)cudaErrorInvalidValue;
+    return w34_kv_cache_write_strided_bf16(
+        ex, layout, batch, k, v, layout->local_kv_heads * layout->head_dim);
 }
 
 extern "C" int w34_paged_attention_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,

@@ -190,7 +190,7 @@
     "/sgl-workspace/sglang/python/sglang/srt/models/dflash.py": "bfdef4b6ebe54f0ed88e04295310102c88b4b85798604f736cdb46320f3929ef",
     "/sgl-workspace/sglang/python/sglang/srt/speculative/dflash_utils.py": "31739297e7cbf21bf0bace04cecce212ea2176774fe1c8593ba9f7ccee5a163e"
   },
-  "script_sha256": "e2759ab1491d830495604df0f5ed324e3e5ed9f7bfe5815d7156cbce06a3f0cf",
+  "script_sha256": "c75c2b441d278c75ab61ed3cc6f054c3fb76b35fc0317d941263762551441d76",
   "context_positions": [
     0,
     1,

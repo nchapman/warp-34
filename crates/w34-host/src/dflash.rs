@@ -203,6 +203,7 @@ pub struct DFlash2Rank {
     scratch: DeviceArena,
     kv: KvPool,
     pages: Vec<i32>,
+    pages_dev: u64,
     capacity: usize,
     max_rows: usize,
     committed: usize,
@@ -218,11 +219,6 @@ pub struct DFlash2Rank {
     succ: u64,
     pub hidden: DeviceBuffer,
     projected: DeviceBuffer,
-    /// Explicit diagnostic destination; disabled by default, with no device copies.
-    pub trace_dir: Option<std::path::PathBuf>,
-    /// Counterfactual diagnostic only: substitute captured donor attention outputs.
-    /// None in normal execution; never a parity result for the native model.
-    pub diagnostic_attention_oracle: Option<std::path::PathBuf>,
 }
 impl DFlash2Rank {
     pub fn load(
@@ -452,9 +448,10 @@ impl DFlash2Rank {
             rope_rows.div_ceil(16),
             KvFormatPolicy::Bf16,
         )?;
-        let pages = (0..kv.num_pages)
+        let pages: Vec<i32> = (0..kv.num_pages)
             .map(|_| kv.alloc_page().unwrap())
             .collect();
+        let pages_dev = weights.upload_slice(&pages, &t.stream)?;
         let hidden = DeviceBuffer::alloc(t.device.device_id, cfg.block_size * h * 2)?;
         let projected = DeviceBuffer::alloc(
             t.device.device_id,
@@ -470,6 +467,7 @@ impl DFlash2Rank {
             scratch: DeviceArena::new(t.device.device_id, 64 * 1024 * 1024)?,
             kv,
             pages,
+            pages_dev,
             capacity,
             max_rows,
             committed: 0,
@@ -485,30 +483,7 @@ impl DFlash2Rank {
             succ,
             hidden,
             projected,
-            trace_dir: None,
-            diagnostic_attention_oracle: None,
         })
-    }
-    fn trace(&self, t: &Qwen3_5ModelRank, name: &str, ptr: u64, n: usize) -> Result<()> {
-        let Some(dir) = &self.trace_dir else {
-            return Ok(());
-        };
-        let mut bytes = vec![0u8; n * 2];
-        check_rc(
-            unsafe {
-                ffi::w34_memcpy_d2h_async(
-                    bytes.as_mut_ptr().cast(),
-                    ptr as *const c_void,
-                    bytes.len(),
-                    t.stream.handle,
-                )
-            },
-            "DFlash trace",
-        )?;
-        t.stream.synchronize()?;
-        std::fs::create_dir_all(dir).map_err(|_| loader_err("DFlash trace directory"))?;
-        std::fs::write(dir.join(format!("{name}.bf16")), bytes)
-            .map_err(|_| loader_err("DFlash trace write"))
     }
     pub fn committed_len(&self) -> usize {
         self.committed
@@ -536,19 +511,22 @@ impl DFlash2Rank {
     fn metadata(&mut self, t: &Qwen3_5ModelRank, rows: usize) -> Result<(W34AttentionBatch, u64)> {
         let before = self.committed;
         let after = before + rows;
-        let positions: Vec<i32> = (before..after).map(|v| v as i32).collect();
-        let slots: Vec<i32> = (before..after)
-            .map(|p| self.pages[p / 16] * 16 + (p % 16) as i32)
-            .collect();
-        let pos = self.scratch.upload_slice(&positions, &t.stream)?;
+        let mut meta = Vec::with_capacity(2 * rows + 4);
+        meta.extend((before..after).map(|v| v as i32));
+        meta.extend((before..after).map(|p| self.pages[p / 16] * 16 + (p % 16) as i32));
+        meta.extend_from_slice(&[0i32, rows as i32, before as i32, after as i32]);
+        let base = self.scratch.upload_slice(&meta, &t.stream)?;
+        let pos = base;
+        let slots = base + (rows * 4) as u64;
+        let q_start = slots + (rows * 4) as u64;
+        let ctx_before = q_start + 8;
+        let seq_after = ctx_before + 4;
         let batch = W34AttentionBatch {
-            query_start_loc: self.scratch.upload_slice(&[0i32, rows as i32], &t.stream)?
-                as *const i32,
-            context_lens_before: self.scratch.upload_slice(&[before as i32], &t.stream)?
-                as *const i32,
-            seq_lens_after: self.scratch.upload_slice(&[after as i32], &t.stream)? as *const i32,
-            block_tables: self.scratch.upload_slice(&self.pages, &t.stream)? as *const i32,
-            write_slot_mapping: self.scratch.upload_slice(&slots, &t.stream)? as *const i32,
+            query_start_loc: q_start as *const i32,
+            context_lens_before: ctx_before as *const i32,
+            seq_lens_after: seq_after as *const i32,
+            block_tables: self.pages_dev as *const i32,
+            write_slot_mapping: slots as *const i32,
             valid_token_mask: core::ptr::null(),
             valid_req_mask: core::ptr::null(),
             num_reqs: 1,
@@ -592,6 +570,7 @@ impl DFlash2Rank {
         &self,
         t: &Qwen3_5ModelRank,
         qkv: u64,
+        q_out: u64,
         pos: u64,
         qheads: usize,
         layer: &Layer,
@@ -599,9 +578,10 @@ impl DFlash2Rank {
     ) -> Result<()> {
         check_rc(
             unsafe {
-                ffi::w34_dflash_qk_norm_rope_bf16_f32_table(
+                ffi::w34_dflash_qk_norm_rope_bf16_f32_table_qout(
                     &t.stream.exec(0, 0),
                     qkv as *mut c_void,
+                    q_out as *mut c_void,
                     pos as *const i32,
                     layer.q_norm as *const c_void,
                     layer.k_norm as *const c_void,
@@ -617,46 +597,20 @@ impl DFlash2Rank {
             "DFlash QK norm/RoPE",
         )
     }
-    fn copy(
-        t: &Qwen3_5ModelRank,
-        src: u64,
-        dst: u64,
-        rows: usize,
-        stride: usize,
-        start: usize,
-        cols: usize,
-    ) -> Result<()> {
-        check_rc(
-            unsafe {
-                ffi::w34_copy_cols_bf16(
-                    &t.stream.exec(0, 0),
-                    src as *const c_void,
-                    dst as *mut c_void,
-                    rows as i32,
-                    stride as i32,
-                    cols as i32,
-                    start as i32,
-                    0,
-                    cols as i32,
-                )
-            },
-            "DFlash column copy",
-        )
-    }
-    /// `tap_f32` is a live device span [rows,5*H] of committed target taps only.
+    /// `tap_bf16` is a live device span [rows, 5*H] of committed target taps in BF16.
     /// No unverified rows may be passed here. This advances committed context.
-    pub fn ingest(&mut self, t: &Qwen3_5ModelRank, tap_f32: u64, rows: usize) -> Result<()> {
+    pub fn ingest(&mut self, t: &Qwen3_5ModelRank, tap_bf16: u64, rows: usize) -> Result<()> {
         self.validate_target(t)?;
         if rows == 0 {
             return Ok(());
         }
         if rows > self.max_rows
             || rows > self.capacity - self.committed
-            || tap_f32 == 0
-            || !tap_f32.is_multiple_of(4)
-            || tap_f32
+            || tap_bf16 == 0
+            || !tap_bf16.is_multiple_of(2)
+            || tap_bf16
                 .checked_add(
-                    (rows * self.cfg.target_layers.len() * self.cfg.model.hidden_size * 4) as u64,
+                    (rows * self.cfg.target_layers.len() * self.cfg.model.hidden_size * 2) as u64,
                 )
                 .is_none()
         {
@@ -667,31 +621,13 @@ impl DFlash2Rank {
         let h = self.cfg.model.hidden_size;
         let q = self.cfg.model.num_attention_heads * self.cfg.model.head_dim / self.tp;
         let kv = self.cfg.model.num_key_value_heads * self.cfg.model.head_dim / self.tp;
-        let taps = self
-            .scratch
-            .alloc_aligned(rows * self.cfg.target_layers.len() * h * 2)?;
         let projected = self.scratch.alloc_aligned(rows * h * 2)?;
         let ctx = self.scratch.alloc_aligned(rows * h * 2)?;
         let packed = self.scratch.alloc_aligned(rows * 2 * kv * 2)?;
-        let k = self.scratch.alloc_aligned(rows * kv * 2)?;
-        let v = self.scratch.alloc_aligned(rows * kv * 2)?;
         let (batch, pos) = self.metadata(t, rows)?;
         let ex = t.stream.exec(0, 0);
-        check_rc(
-            unsafe {
-                ffi::w34_cast_f32_bf16(
-                    &ex,
-                    tap_f32 as *const f32,
-                    taps as *mut c_void,
-                    (rows * self.cfg.target_layers.len() * h) as i64,
-                )
-            },
-            "DFlash tap cast",
-        )?;
-        self.fc.run(t, taps, projected, rows)?;
+        self.fc.run(t, tap_bf16, projected, rows)?;
         self.norm(t, projected, 0, self.hidden_norm, ctx, rows)?;
-        self.trace(t, "context.fc", projected, rows * h)?;
-        self.trace(t, "context.hidden", ctx, rows * h)?;
         for (l, layer) in self.layers.iter().enumerate() {
             // Slice K/V from the single resident fused QKV weight, no duplicate.
             let kv_proj = Linear {
@@ -700,19 +636,16 @@ impl DFlash2Rank {
                 k: h,
             };
             kv_proj.run(t, ctx, packed, rows)?;
-            self.rope(t, packed, pos, 0, layer, rows)?;
-            Self::copy(t, packed, k, rows, 2 * kv, 0, kv)?;
-            Self::copy(t, packed, v, rows, 2 * kv, kv, kv)?;
-            self.trace(t, &format!("layers.{l}.context_k"), k, rows * kv)?;
-            self.trace(t, &format!("layers.{l}.context_v"), v, rows * kv)?;
+            self.rope(t, packed, 0, pos, 0, layer, rows)?;
             check_rc(
                 unsafe {
-                    ffi::w34_kv_cache_write_bf16(
+                    ffi::w34_kv_cache_write_strided_bf16(
                         &ex,
                         &self.kv.layers[l].layout,
                         &batch,
-                        k as *const c_void,
-                        v as *const c_void,
+                        packed as *const c_void,
+                        (packed + (kv * 2) as u64) as *const c_void,
+                        (2 * kv) as i32,
                     )
                 },
                 "DFlash context KV",
@@ -784,8 +717,6 @@ impl DFlash2Rank {
             .alloc_aligned(m * 2 * self.cfg.taps * (h / self.cfg.group) * 2)?;
         let packed = self.scratch.alloc_aligned(m * (q + 2 * kv) * 2)?;
         let qb = self.scratch.alloc_aligned(m * q * 2)?;
-        let kb = self.scratch.alloc_aligned(m * kv * 2)?;
-        let vb = self.scratch.alloc_aligned(m * kv * 2)?;
         let attn = self.scratch.alloc_aligned(m * q * 2)?;
         let tmp = self.scratch.alloc_aligned(m * h * 2)?;
         let gu = self.scratch.alloc_aligned(m * 2 * i * 2)?;
@@ -818,38 +749,18 @@ impl DFlash2Rank {
                 normed,
                 m,
             )?;
-            self.trace(
-                t,
-                &format!("ops.layers.{l}.input_layernorm.output0"),
-                normed,
-                m * h,
-            )?;
             self.conv(t, &layer.attn_conv, normed, coeff, filtered, 0)?;
-            self.trace(
-                t,
-                &format!("ops.layers.{l}.self_attn.qkv_proj.input0"),
-                filtered,
-                m * h,
-            )?;
             layer.qkv.run(t, filtered, packed, m)?;
-            self.trace(
-                t,
-                &format!("ops.layers.{l}.self_attn.qkv_proj.output0"),
-                packed,
-                m * (q + 2 * kv),
-            )?;
-            self.rope(t, packed, pos, q / d, layer, m)?;
-            Self::copy(t, packed, qb, m, q + 2 * kv, 0, q)?;
-            Self::copy(t, packed, kb, m, q + 2 * kv, q, kv)?;
-            Self::copy(t, packed, vb, m, q + 2 * kv, q + kv, kv)?;
+            self.rope(t, packed, qb, pos, q / d, layer, m)?;
             check_rc(
                 unsafe {
-                    ffi::w34_kv_cache_write_bf16(
+                    ffi::w34_kv_cache_write_strided_bf16(
                         &ex,
                         &self.kv.layers[l].layout,
                         &batch,
-                        kb as *const c_void,
-                        vb as *const c_void,
+                        (packed + (q * 2) as u64) as *const c_void,
+                        (packed + ((q + kv) * 2) as u64) as *const c_void,
+                        (q + 2 * kv) as i32,
                     )
                 },
                 "DFlash query KV",
@@ -867,68 +778,14 @@ impl DFlash2Rank {
                 },
                 "DFlash paged attention",
             )?;
-            self.trace(t, &format!("layers.{l}.q"), qb, m * q)?;
-            self.trace(t, &format!("layers.{l}.attention"), attn, m * q)?;
-            if let Some(path) = &self.diagnostic_attention_oracle {
-                let archive = SafetensorsArchive::open(path)
-                    .map_err(|_| loader_err("attention diagnostic archive"))?;
-                let bytes = archive
-                    .read_bytes(&format!("layers.{l}.attention"))
-                    .map_err(|_| loader_err("attention diagnostic tensor"))?;
-                if bytes.len() != m * q * 2 {
-                    return Err(loader_err("attention diagnostic shape"));
-                }
-                check_rc(
-                    unsafe {
-                        ffi::w34_memcpy_h2d_async(
-                            attn as *mut c_void,
-                            bytes.as_ptr().cast(),
-                            bytes.len(),
-                            t.stream.handle,
-                        )
-                    },
-                    "attention diagnostic injection",
-                )?;
-                t.stream.synchronize()?;
-            }
             layer.out.run(t, attn, tmp, m)?;
             if let Some(comm) = comm {
                 comm.all_reduce_bf16(&ex, tmp, tmp, self.rank as i32, (m * h) as i32)?;
             }
-            self.trace(
-                t,
-                &format!("gemms.layers.{l}.self_attn.o_proj.output"),
-                tmp,
-                m * h,
-            )?;
             self.conv(t, &layer.attn_conv, tmp, coeff, x, 1)?;
-            self.trace(
-                t,
-                &format!("norms.layers.{l}.post_attention_layernorm.call0.input0"),
-                x,
-                m * h,
-            )?;
             self.norm(t, x, residual, layer.post_norm, normed, m)?;
-            self.trace(
-                t,
-                &format!("ops.layers.{l}.post_attention_layernorm.output0"),
-                normed,
-                m * h,
-            )?;
             self.conv(t, &layer.mlp_conv, normed, coeff, filtered, 0)?;
-            self.trace(
-                t,
-                &format!("ops.layers.{l}.mlp.gate_up_proj.input0"),
-                filtered,
-                m * h,
-            )?;
             layer.gate_up.run(t, filtered, gu, m)?;
-            self.trace(
-                t,
-                &format!("ops.layers.{l}.mlp.gate_up_proj.output0"),
-                gu,
-                m * 2 * i,
-            )?;
             check_rc(
                 unsafe {
                     ffi::w34_silu_and_mul_bf16(
@@ -941,25 +798,11 @@ impl DFlash2Rank {
                 },
                 "DFlash SiLU",
             )?;
-            self.trace(
-                t,
-                &format!("ops.layers.{l}.mlp.down_proj.input0"),
-                act,
-                m * i,
-            )?;
             layer.down.run(t, act, tmp, m)?;
-            self.trace(
-                t,
-                &format!("ops.layers.{l}.mlp.down_proj.output0"),
-                tmp,
-                m * h,
-            )?;
             if let Some(comm) = comm {
                 comm.all_reduce_bf16(&ex, tmp, tmp, self.rank as i32, (m * h) as i32)?;
             }
             self.conv(t, &layer.mlp_conv, tmp, coeff, x, 1)?;
-            self.trace(t, &format!("layers.{l}.hidden"), x, m * h)?;
-            self.trace(t, &format!("layers.{l}.residual"), residual, m * h)?;
         }
         self.norm(t, x, residual, self.final_norm, self.hidden.addr(), m)?;
         let draft_hidden = self.hidden.addr() + (h * 2) as u64;
@@ -989,15 +832,16 @@ impl DFlash2Rank {
             logits,
             m - 1,
         )?;
-        let ids = DeviceBuffer::alloc(t.device.device_id, (m - 1) * self.cfg.top_k * 4)?;
-        let scores = DeviceBuffer::alloc(t.device.device_id, (m - 1) * self.cfg.top_k * 4)?;
+        let topk_elems = (m - 1) * self.cfg.top_k;
+        let ids_dev = self.scratch.alloc_aligned(topk_elems * 4)?;
+        let scores_dev = self.scratch.alloc_aligned(topk_elems * 4)?;
         check_rc(
             unsafe {
                 ffi::w34_topk_rows_f16(
                     &ex,
                     logits as *const c_void,
-                    ids.addr() as *mut i32,
-                    scores.addr() as *mut f32,
+                    ids_dev as *mut i32,
+                    scores_dev as *mut f32,
                     (m - 1) as i32,
                     t.local_vocab_size as i32,
                     t.vocab_offset as i32,
@@ -1007,13 +851,34 @@ impl DFlash2Rank {
             "DFlash top-k",
         )?;
         let mut out = DraftCandidates {
-            ids: vec![0; (m - 1) * self.cfg.top_k],
-            scores: vec![0.0; (m - 1) * self.cfg.top_k],
+            ids: vec![0; topk_elems],
+            scores: vec![0.0; topk_elems],
             rows: m - 1,
             top_k: self.cfg.top_k,
         };
-        ids.copy_to_host(&mut out.ids, &t.stream)?;
-        scores.copy_to_host(&mut out.scores, &t.stream)?;
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    out.ids.as_mut_ptr().cast(),
+                    ids_dev as *const c_void,
+                    topk_elems * 4,
+                    t.stream.handle,
+                )
+            },
+            "DFlash top-k ids copy",
+        )?;
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    out.scores.as_mut_ptr().cast(),
+                    scores_dev as *const c_void,
+                    topk_elems * 4,
+                    t.stream.handle,
+                )
+            },
+            "DFlash top-k scores copy",
+        )?;
+        t.stream.synchronize()?;
         if out.scores.iter().any(|x| !x.is_finite()) {
             return Err(loader_err("nonfinite DFlash logits"));
         }
@@ -1046,7 +911,7 @@ impl DFlash2Rank {
         self.scratch.reset();
         let ids = self.scratch.upload_slice(&candidates.ids, &t.stream)?;
         let vals = self.scratch.upload_slice(&candidates.scores, &t.stream)?;
-        let edges = DeviceBuffer::alloc(t.device.device_id, k * n * n * 4)?;
+        let edges = self.scratch.alloc_aligned(k * n * n * 4)?;
         check_rc(
             unsafe {
                 ffi::w34_dflash_edges_bf16(
@@ -1056,7 +921,7 @@ impl DFlash2Rank {
                     self.projected.addr() as *const c_void,
                     self.pred as *const c_void,
                     self.succ as *const c_void,
-                    edges.addr() as *mut f32,
+                    edges as *mut f32,
                     anchor,
                     k as i32,
                     n as i32,
@@ -1067,7 +932,18 @@ impl DFlash2Rank {
             "DFlash selector",
         )?;
         let mut scores = vec![0f32; k * n * n];
-        edges.copy_to_host(&mut scores, &t.stream)?;
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    scores.as_mut_ptr().cast(),
+                    edges as *const c_void,
+                    k * n * n * 4,
+                    t.stream.handle,
+                )
+            },
+            "DFlash edges copy",
+        )?;
+        t.stream.synchronize()?;
         if scores.iter().any(|x| !x.is_finite()) {
             return Err(loader_err("nonfinite DFlash edges"));
         }

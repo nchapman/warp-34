@@ -2,40 +2,36 @@
 
 ## Oracle integrity and scope
 
-`sglang_dflash_model_4b.safetensors` is the original actual SGLang v0.5.19
-`DFlash2DraftModel` capture with an explicit FlashInfer FA2 attention adapter.
-It is **not** an end-to-end DFlashWorkerV2 serving oracle. Its tensors and
-provenance were not changed to resolve numerical differences.
-
-The independent `sglang_dflash_model_4b_operators.safetensors` capture contains
-real checkpoint operands and outputs; all 52 shared tensors match the original
-capture bitwise. Norm operands were captured before in-place mutation in the
-separate `sglang_dflash_model_4b_norms.safetensors` capture.
+`sglang_dflash_model_4b.safetensors` is the actual SGLang v0.5.19
+`DFlash2DraftModel` capture with an explicit FlashInfer FA2 attention adapter,
+including pre-mutation RMSNorm operands (`norms.*`) and real-shape operator
+operands (`ops.*`). It is **not** an end-to-end DFlashWorkerV2 serving oracle.
+Its tensors and provenance were not changed to resolve numerical differences.
 
 ## Verified full-model and operator results
 
 - `phase4_dflash actual_sglang_full_model_hidden_parity` checks original input
-  tokens, anchor, and bitwise target taps, then compares final hidden states.
-  It now runs by default and measured **relL2=0, maxabs=0** for this 4B capture.
-  This is not a claim of bitwise parity for every intermediate or every prompt.
+  tokens, anchor, and bitwise target BF16 taps (`w34_tap_add_f16_to_bf16`), then
+  compares final hidden states against the `< 0.005` relative-L2 gate (`relL2=0,
+  maxabs=0` measured on this 4B capture).
 - `phase4_bf16_attention` measured bit-exact outputs for each of five layers
   when replaying the donor's attention operands at head dimension 256.
-- All 20 real-shape grouped-convolution replays and the captured norm outputs
-  measured zero error. QK/RoPE replays pass the unchanged 1e-4 relative-L2 bound;
-  they are not all bit-exact. The four layer-0 GEMMs and five SiLU replays match
-  their captured outputs bitwise.
+- All 20 real-shape grouped-convolution replays, captured norm outputs,
+  QK/RoPE replays, layer-0 GEMMs, and five SiLU replays pass their `< 1e-4`
+  relative-L2 bounds (with V columns in QK/RoPE verified bitwise).
 
-Mechanisms corrected:
+Mechanisms verified:
 
 1. Production RoPE uses an FP32 cos/sin cache even with BF16 activations.
-   `w34_dflash_qk_norm_rope_bf16_f32_table` is declared in the shared CUDA header
-   and Rust FFI and registered in execution-plan warmup. The BF16-table variant
-   remains available for its separate component contract.
+   `w34_dflash_qk_norm_rope_bf16_f32_table` and
+   `w34_dflash_qk_norm_rope_bf16_f32_table_qout` are declared in the shared CUDA
+   header and Rust FFI and registered in execution-plan warmup. The BF16-table
+   variant remains available for its separate component contract.
 2. FA2 head-dimension-256 attention uses 16-key tiles, BF16-rounded softmax
    probabilities, Tensor Core QK/PV/rowsum contractions, and approximate PTX
    exponentials and reciprocals.
-3. Grouped convolution requires separately rounded multiply and add; norm
-   reductions match the donor's thread geometry and ascending butterfly order.
+3. Grouped convolution requires separately rounded multiply and add; norm and
+   QK-norm reductions use single-warp FP32 butterfly reductions.
 
 ## Head-dimension-128 and split-KV adjudication
 

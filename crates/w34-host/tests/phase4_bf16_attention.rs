@@ -8,7 +8,7 @@ use w34_host::cuda::{CudaDevice, CudaStream, DeviceBuffer, check_rc};
 use w34_kernels::ffi;
 fn replay(layers: std::ops::Range<usize>) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/oracle/goldens/sglang_dflash_model_4b_operators.safetensors");
+        .join("../../tools/oracle/goldens/sglang_dflash_model_4b.safetensors");
     let archive = w34_host::loader::SafetensorsArchive::open(&path).unwrap();
     let _device = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();

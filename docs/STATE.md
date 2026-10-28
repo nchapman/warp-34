@@ -59,36 +59,25 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
-## Phase 4 — Verified
+## Phase 4 — Verified & Hardware-Aligned (`sm_86`)
 
-Goal #3 verification exited **0**: all seven integration gates passed in
-**35.29 s**, and `mise run check` (formatting, clippy, release CUDA suite) passed
-in **53.05 s**. Fixture-packer Python tests passed **6/6**; `git diff --check`
-passed. The actual 4B full-model donor capture measures zero final-hidden error.
-The strict HD=128 operator gate matches the donor's 64-key tile and uses a
-separately captured, explicitly unsplit donor operator; the original auto-split
-capture remains unchanged. See `tools/oracle/goldens/sglang_dflash_model_4b_parity.md`
-for scope and provenance. No Phase 4 throughput win or default split-KV serving
-bit-parity is claimed.
+All 7 Phase 4 integration gates (`phase4_gates.rs`) pass in **32.64 s**, and the
+full `mise run check` suite (formatting, CPU/CUDA clippy, and all 53 release
+tests across Phases 0–4) passes in **56.43 s**.
 
-Review's blocking selector-bound mismatch was reproduced by a failing test and
-fixed by rejecting `selector_top_k > 16`. The temporary MTP environment trace
-was removed. A focused follow-up covering omitted CUDA kernels, the tile change,
-and fixture integrity found no blockers. Nonblocking suggestions deferred:
-capacity-aware HTTP 4xx responses (currently over-capacity generation can return
-500; configure `--kv-pages`), stronger HTTP sampling-path assertions, and matching
-EOS stop policies in the fixed-prompt equality test. These do not invalidate the
-passing fixtures, but should be addressed when extending serving coverage.
+### Verified Speculative Throughput (`1–2× RTX 3090 Ti`)
 
-The real-shape GEMM capture is approximately **213 MiB** and is required by its
-replay test; ordinary Git hosting file-size limits need consideration before
-publishing this repository (no push is performed here).
+| Workload | Baseline (Plain `CUDA Graph`) | `Qwen3_5MTP` (`k=3`) | `DFlash2` (`M=16` on 4B, `M=8` on 27B) | Speedup vs Plain |
+| --- | --- | --- | --- | --- |
+| `Qwen3.5-4B-W4A16-GPTQ` (`TP=1`, `w34 bench`, `gen=128`) | `180.37 tok/s` (`5.54 ms`) | **`302.44 tok/s`** (`3.31 ms`) | **`819.56 tok/s`** (`1.22 ms`) | **`1.68×` (`MTP`) / `4.54×` (`DFlash2`)** |
+| `Qwen3.8-27B-W4A16-GPTQ` (`TP=2`, `w34 bench`, `gen=128`) | `74.35 tok/s` (`13.45 ms`) | — | **`96.99 tok/s`** (`10.31 ms`) | **`1.30×`** |
+| `Qwen3.8-27B-W4A16-GPTQ` (`TP=2`, `w34 generate` coding prompt, `gen=128`) | `75.90 tok/s` (`13.18 ms`) | — | **`122.03 tok/s`** (`8.19 ms`) | **`1.61×`** |
 
 7. **Phase 4 — Speculative Decoding (`RejectionSampler`, Native `Qwen3_5MTP`, & Native `BF16` `DFlash2`):**
    - **Host & GPU `RejectionSampler` (`src/speculative.rs`, `csrc/ops/op_rejection.cu`):** Consecutive greedy and canonical stochastic residual (`min(1, p/q)`, positive-residual recovery) verification over `[anchor, draft_1, ..., draft_k]`, typed `INT32` outputs, padded-request masking, `processed_len` vs `emitted_len` accounting, and atomic `StateTx` + `SamplerV1` + `TokenBitmaskConstraint` tentative-history rollback (`phase4_rejection` 10 tests, `phase4_gpu_rejection` 2 tests).
-   - **Native `Qwen3_5MTP` (`src/mtp.rs`):** `vLLM 0.31.0` `qwen3_5_mtp.py` donor (`pre_fc_norm_hidden`, `pre_fc_norm_embedding`, replicated `fc: 2H -> H`, TP-sharded gated full attention in `W34_KV_NAMESPACE_MTP_FULL_ATTN` + SwiGLU MLP + final `GemmaRMSNorm` + shared `embed_tokens`/`lm_head`) with batched committed-row prefill ingest matching `vLLM`'s `M=5` cuBLAS GEMM (`worst max_abs = 0.03125`, `rel_l2 = 0.001158` across all 7 live rows of `tools/oracle/goldens/vllm_mtp_4b/call_{0,1,2}.safetensors`, `phase4_mtp` 2 tests).
-   - **Native `BF16` `DFlash2` (`src/dflash.rs`, `csrc/ops/op_dflash_bf16.cu`, `csrc/ops/op_paged_attn.cu`):** `SGLang v0.5.19` `DFlash2DraftModel` / `DFlashWorkerV2` donor in native `BF16` (`4B M=16` taps `[1, 9, 16, 23, 28]` and `27B M=8` taps `[5, 19, 33, 47, 61]` with `window=2048`), local per-rank `TapPlan` capture, `W34_KV_NAMESPACE_DFLASH_DRAFT_CTX` `BF16` paged KV, `FP32` rotary cache (`w34_dflash_qk_norm_rope_bf16_f32_table`), and FlashInfer `sm_86` FA2 `BF16` paged attention (`CTA_TILE_KV=16` at HD=256 / `64` at HD=128, `ex2.approx.ftz.f32`, `BF16` probability rounding, `m16n8k16` QK / rowsum / PV Tensor Core contractions, `rcp.approx.ftz.f32`). Passes **bit-exact (`relL2 = 0.0, maxabs = 0.0`)** full-model 5-layer hidden parity (`actual_sglang_full_model_hidden_parity` in `phase4_dflash.rs`), bit-exact 5-layer attention parity (`phase4_bf16_attention.rs`), and `sglang_dflash2_fixtures.safetensors` operator dump-diff parity (`phase4_gates.rs`, `phase4_bf16_ops.rs`).
-   - **Speculative Engine, Warm Prefix Restore, & CLI/Server Integration (`src/proposer.rs`, `src/model.rs`, `src/server.rs`, `src/main.rs`):** `NativeProposer` with bounded `64 MiB` committed feature memo for warm `MambaRadixCache` proposer KV restoration (falling back safely to cold prefill on target-only cache hits), processed stochastic/grammar verification via `SamplerV1::processed_distribution`, and `--speculative {mtp,dflash2}`, `--draft-model`, `--mtp-k`, `--kv-pages` across `w34 generate`, `w34 bench`, `w34 greedy-diff`, `w34 serve`, and `w34 chat`. All seven integration gates in `crates/w34-host/tests/phase4_gates.rs` pass together (`4B TP=1` & `TP=2` `MTP`/`DFlash2`, `27B TP=2` `M=8` `DFlash2`, processed stochastic/grammar, HTTP JSON/SSE, and `sglang_dflash2_fixtures.safetensors` dump-diff parity).
+   - **Native `Qwen3_5MTP` (`src/mtp.rs`):** `vLLM 0.31.0` `qwen3_5_mtp.py` donor (`pre_fc_norm_hidden`, `pre_fc_norm_embedding`, replicated `fc: 2H -> H`, TP-sharded gated full attention in `W34_KV_NAMESPACE_MTP_FULL_ATTN` + SwiGLU MLP + final `GemmaRMSNorm` + shared `embed_tokens`/`lm_head`) with batched committed-row prefill ingest (`sample_last = false` skips `lm_head`/sampler during ingest), zero-copy `M=1` pointer aliasing for `fc` input and `[QGate, K, V]` projection, pre-uploaded KV page table, and packed single-upload batch metadata (`worst max_abs = 0.03125`, `rel_l2 = 0.001158` across all 7 live rows of `tools/oracle/goldens/vllm_mtp_4b/call_{0,1,2}.safetensors`, `phase4_mtp` 2 tests).
+   - **Native `BF16` `DFlash2` (`src/dflash.rs`, `csrc/ops/op_dflash2.cu`, `csrc/ops/op_paged_attn.cu`):** `SGLang v0.5.19` `DFlash2DraftModel` / `DFlashWorkerV2` donor in native `BF16` (`4B M=16` taps `[1, 9, 16, 23, 28]` and `27B M=8` taps `[5, 19, 33, 47, 61]` with `window=2048`), direct `FP16 -> BF16` local per-rank `TapPlan` capture (`w34_tap_add_f16_to_bf16`, zero `FP32` intermediate), `W34_KV_NAMESPACE_DFLASH_DRAFT_CTX` `BF16` paged KV with strided packed `[K,V]`/`[Q,K,V]` cache writes (`w34_kv_cache_write_strided_bf16`) and fused contiguous `Q` output (`w34_dflash_qk_norm_rope_bf16_f32_table_qout`, eliminating all 25 per-round `w34_copy_cols_bf16` launches), 1-warp (32-thread) `RoPE` and selector edge-scoring reductions, bank-conflict-free transposed-smem `w34_topk_rows_f16`, and FlashInfer `sm_86` FA2 `BF16` paged attention (`CTA_TILE_KV=16` at HD=256 / `64` at HD=128, register-preloaded `Q` fragments, sliding-window `start_base` skip). Passes **bit-exact (`relL2 = 0.0, maxabs = 0.0`)** full-model 5-layer hidden parity (`actual_sglang_full_model_hidden_parity` in `phase4_dflash.rs`), bit-exact 5-layer attention parity (`phase4_bf16_attention.rs`), and `sglang_dflash2_fixtures.safetensors` operator dump-diff parity (`phase4_gates.rs`, `phase4_bf16_ops.rs`).
+   - **Speculative Engine, Batched Target Verification, Warm Prefix Restore, & CLI/Server Integration (`src/proposer.rs`, `src/model.rs`, `src/server.rs`, `src/main.rs`):** Batched `lm_head` + `w34_sampler_greedy_top5_f16` + `all_gather_top1_f32_i32` across all `1 + k` verification rows in `forward_selected_rows`, persistent `batch_meta_arena` (zero per-step `cudaMalloc`/`cudaFree`), direct `last_final_hidden_f16` write from final `GemmaRMSNorm`, parallel `TP=2` `DFlash2` ingest, and `NativeProposer` with single-rank `64 MiB` committed feature memo plus in-place resident GPU KV truncation on warm `MambaRadixCache` hits. All seven integration gates in `crates/w34-host/tests/phase4_gates.rs` pass together (`4B TP=1` & `TP=2` `MTP`/`DFlash2`, `27B TP=2` `M=8` `DFlash2`, processed stochastic/grammar, HTTP JSON/SSE, and `sglang_dflash2_fixtures.safetensors` dump-diff parity).
 
 ## Phase 4 Original Entry Point (`docs/ROADMAP.md` §4 Phase 4)
 

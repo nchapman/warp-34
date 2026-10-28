@@ -236,6 +236,8 @@ int w34_kv_cache_write(const w34_exec* ex, const w34_kv_layer_layout* layout,
 // Native BF16 I/O and BF16 descriptor storage; identity transforms required.
 int w34_kv_cache_write_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
     const w34_attention_batch* batch, const void* k_in, const void* v_in);
+int w34_kv_cache_write_strided_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
+    const w34_attention_batch* batch, const void* k_in, const void* v_in, int row_stride_elems);
 int w34_paged_attention_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
     const w34_attention_batch* batch, const void* q_in, void* attn_out, int num_q_heads);
 
@@ -313,9 +315,15 @@ int w34_rejection_stochastic(const w34_exec* ex, const int32_t* drafts,
     const double* recovery, const uint8_t* valid, int32_t* emitted,
     int32_t* accepted, int32_t* status, int num_reqs, int k, int vocab);
 
+// --- Phase 4: MTP & DFlash2 Speculative Decoding Kernels (op_dflash2.cu) ---
 // BF16 activation path. RMSNorm may update a distinct residual in place;
 // x==y is supported, but residual must not alias either. Other outputs must not
-// overlap inputs. RoPE table [table_rows,dim] contains BF16 [cos || sin].
+// overlap inputs. RoPE table [table_rows,dim] contains [cos || sin].
+int w34_concat_cols_2_f16(const w34_exec* ex, const void* src0, const void* src1,
+                          void* dst, int num_tokens, int dim0, int dim1);
+int w34_tap_add_f16_to_bf16(const w34_exec* ex, const void* res_f16, const void* mlp_f16,
+                            void* dst_bf16, int num_tokens, int hidden_size,
+                            int dst_row_stride, int dst_col_offset);
 int w34_embed_lookup_f16_to_bf16(const w34_exec*, const int32_t* ids,
     const void* weight, void* out, int rows, int hidden, int vocab);
 int w34_cast_bf16_to_f16(const w34_exec*, const void* x, void* y, int64_t n);
@@ -330,62 +338,20 @@ int w34_dflash_conv_bf16(const w34_exec*, const void* x, const void* delta,
 // q_heads==0 selects K-only norm/RoPE over packed [K,V] context projection.
 // *_f32_table reads FP32 [table_rows, dim] cos/sin tables (production DFlash2Rank);
 // w34_dflash_qk_norm_rope_bf16 reads BF16 [table_rows, dim] tables.
+// *_qout writes rotated Q heads directly to contiguous q_out [rows, q_heads * dim]
+// when q_out != nullptr (or in-place into qkv when q_out == nullptr).
 int w34_dflash_qk_norm_rope_bf16_f32_table(const w34_exec*, void* qkv, const int32_t* positions,
     const void* qw, const void* kw, const void* table, int rows, int q_heads, int kv_heads,
     int dim, int table_rows, float eps);
+int w34_dflash_qk_norm_rope_bf16_f32_table_qout(const w34_exec*, void* qkv, void* q_out,
+    const int32_t* positions, const void* qw, const void* kw, const void* table,
+    int rows, int q_heads, int kv_heads, int dim, int table_rows, float eps);
 int w34_dflash_qk_norm_rope_bf16(const w34_exec*, void* qkv, const int32_t* positions,
     const void* qw, const void* kw, const void* table, int rows, int q_heads, int kv_heads,
     int dim, int table_rows, float eps);
 int w34_copy_cols_bf16(const w34_exec*, const void* src, void* dst,
     int rows, int src_stride, int dst_stride, int src_col, int dst_col, int cols);
-
-// --- Phase 4: MTP & DFlash2 Speculative Decoding Kernels (op_dflash2.cu) ---
-int w34_concat_cols_2_f16(const w34_exec* ex, const void* src0, const void* src1,
-                          void* dst, int num_tokens, int dim0, int dim1);
-int w34_tap_add_f16_to_f32(const w34_exec* ex, const void* res_f16, const void* mlp_f16,
-                           float* dst_f32, int num_tokens, int hidden_size,
-                           int dst_row_stride, int dst_col_offset);
-int w34_cast_f32_bf16(const w34_exec* ex, const float* src, void* dst_bf16, int64_t n);
-int w34_cast_f32_f16(const w34_exec* ex, const float* src, void* dst_f16, int64_t n);
-int w34_embed_lookup_f16_to_f32(const w34_exec* ex, const int32_t* token_ids,
-                                const void* embed_weight_f16, float* out_f32,
-                                int num_tokens, int hidden_size, int vocab_size);
-int w34_embed_lookup_bf16_to_f32(const w34_exec* ex, const int32_t* token_ids,
-                                 const void* embed_weight_bf16, float* out_f32,
-                                 int num_tokens, int hidden_size, int vocab_size);
-int w34_gemm_bf16_rows(const w34_exec* ex, float* y_f32, const void* x_bf16,
-                       const void* w_bf16, int64_t rows, int64_t n, int64_t k);
-int w34_rms_norm_f32(const w34_exec* ex, const float* x, const float* weight,
-                     float* out, int num_rows, int dim, float eps);
-int w34_add_f32(const w34_exec* ex, const float* a, const float* b, float* out, int64_t n);
-int w34_silu_and_mul_f32(const w34_exec* ex, const float* gate, const float* up,
-                         float* out, int64_t n);
-int w34_split_cols_2_f32(const w34_exec* ex, const float* src, float* dst0, float* dst1,
-                         int num_rows, int dim0, int dim1);
-int w34_split_cols_3_f32(const w34_exec* ex, const float* src, float* dst0, float* dst1,
-                         float* dst2, int num_rows, int dim0, int dim1, int dim2);
-int w34_dflash_conv_f32(const w34_exec* ex, float* y, const float* x, const float* kp,
-                        const float* base, int64_t rows, int64_t hidden, int64_t block,
-                        int64_t group, int64_t taps, int64_t conv);
-int w34_dflash_rope_f32(const w34_exec* ex, float* x, const float* pos,
-                        int64_t rows, int64_t heads, int64_t d, float base);
-int w34_dflash_kv_write_f32_to_bf16(const w34_exec* ex, const float* k_in, const float* v_in,
-                                   void* k_cache_bf16, void* v_cache_bf16,
-                                   int pos_base, int num_rows, int row_elems);
-int w34_dflash_attention_f32(const w34_exec* ex, const float* q_in,
-                             const void* k_cache_bf16, const void* v_cache_bf16,
-                             float* attn_out, int block_rows, int q_pos_base,
-                             int total_kv_len, int num_q_heads, int num_kv_heads,
-                             int head_dim, int sliding_window, float sm_scale);
-int w34_dflash_edges_f32(const w34_exec* ex, float* edges,
-                         const void* pred_cb_bf16, const void* succ_cb_bf16,
-                         const float* hp, const int32_t* cand_ids,
-                         const float* cand_vals, int32_t bonus_id,
-                         int64_t k, int64_t top_k, int64_t rank);
 int w34_topk_rows_f16(const w34_exec* ex, const void* logits_f16,
-                      int32_t* out_ids, float* out_vals,
-                      int num_rows, int local_vocab_size, int vocab_offset, int top_k);
-int w34_topk_rows_f32(const w34_exec* ex, const float* logits_f32,
                       int32_t* out_ids, float* out_vals,
                       int num_rows, int local_vocab_size, int vocab_offset, int top_k);
 

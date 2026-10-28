@@ -1301,213 +1301,27 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
     check_rc(
         unsafe {
-            ffi::w34_tap_add_f16_to_f32(
+            ffi::w34_tap_add_f16_to_bf16(
                 &ex,
                 buf_a as *const c_void,
                 buf_b as *const c_void,
-                buf_c as *mut f32,
+                buf_c as *mut c_void,
                 1,
                 128,
                 640,
                 0,
             )
         },
-        "warmup w34_tap_add_f16_to_f32",
-    )?;
-    check_rc(
-        unsafe { ffi::w34_cast_f32_bf16(&ex, buf_a as *const f32, buf_b as *mut c_void, 128) },
-        "warmup w34_cast_f32_bf16",
-    )?;
-    check_rc(
-        unsafe { ffi::w34_cast_f32_f16(&ex, buf_a as *const f32, buf_b as *mut c_void, 128) },
-        "warmup w34_cast_f32_f16",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_embed_lookup_f16_to_f32(
-                &ex,
-                buf_a as *const i32,
-                buf_b as *const c_void,
-                buf_c as *mut f32,
-                1,
-                128,
-                256,
-            )
-        },
-        "warmup w34_embed_lookup_f16_to_f32",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_embed_lookup_bf16_to_f32(
-                &ex,
-                buf_a as *const i32,
-                buf_b as *const c_void,
-                buf_c as *mut f32,
-                1,
-                128,
-                256,
-            )
-        },
-        "warmup w34_embed_lookup_bf16_to_f32",
-    )?;
-    for r_warm in [1i64, 7, 8, 15, 16] {
-        check_rc(
-            unsafe {
-                ffi::w34_gemm_bf16_rows(
-                    &ex,
-                    buf_c as *mut f32,
-                    buf_a as *const c_void,
-                    buf_b as *const c_void,
-                    r_warm,
-                    64,
-                    128,
-                )
-            },
-            "warmup w34_gemm_bf16_rows",
-        )?;
-    }
-    check_rc(
-        unsafe {
-            ffi::w34_rms_norm_f32(
-                &ex,
-                buf_a as *const f32,
-                buf_b as *const f32,
-                buf_c as *mut f32,
-                1,
-                128,
-                1e-6,
-            )
-        },
-        "warmup w34_rms_norm_f32",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_add_f32(
-                &ex,
-                buf_a as *const f32,
-                buf_b as *const f32,
-                buf_c as *mut f32,
-                128,
-            )
-        },
-        "warmup w34_add_f32",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_silu_and_mul_f32(
-                &ex,
-                buf_a as *const f32,
-                buf_b as *const f32,
-                buf_c as *mut f32,
-                128,
-            )
-        },
-        "warmup w34_silu_and_mul_f32",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_split_cols_2_f32(
-                &ex,
-                buf_a as *const f32,
-                buf_b as *mut f32,
-                buf_c as *mut f32,
-                1,
-                64,
-                64,
-            )
-        },
-        "warmup w34_split_cols_2_f32",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_split_cols_3_f32(
-                &ex,
-                buf_a as *const f32,
-                buf_b as *mut f32,
-                buf_c as *mut f32,
-                buf_d as *mut f32,
-                1,
-                64,
-                32,
-                32,
-            )
-        },
-        "warmup w34_split_cols_3_f32",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_dflash_conv_f32(
-                &ex,
-                buf_c as *mut f32,
-                buf_a as *const f32,
-                buf_b as *const f32,
-                buf_d as *const f32,
-                8,
-                128,
-                8,
-                16,
-                2,
-                0,
-            )
-        },
-        "warmup w34_dflash_conv_f32",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_dflash_rope_f32(
-                &ex,
-                buf_a as *mut f32,
-                buf_b as *const f32,
-                8,
-                4,
-                128,
-                1_000_000.0,
-            )
-        },
-        "warmup w34_dflash_rope_f32",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_dflash_kv_write_f32_to_bf16(
-                &ex,
-                buf_a as *const f32,
-                buf_b as *const f32,
-                buf_c as *mut c_void,
-                buf_d as *mut c_void,
-                0,
-                1,
-                128,
-            )
-        },
-        "warmup w34_dflash_kv_write_f32_to_bf16",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_dflash_attention_f32(
-                &ex,
-                buf_a as *const f32,
-                buf_b as *const c_void,
-                buf_c as *const c_void,
-                buf_d as *mut f32,
-                1,
-                0,
-                1,
-                2,
-                1,
-                128,
-                0,
-                0.08838835,
-            )
-        },
-        "warmup w34_dflash_attention_f32",
+        "warmup w34_tap_add_f16_to_bf16",
     )?;
     // Selector IDs are indices, not the FP32 GDN state previously in buf_ws.
     let candidate_ids = arena.upload_slice(&[0i32; 16], &stream)?;
     check_rc(
         unsafe {
-            ffi::w34_dflash_qk_norm_rope_bf16_f32_table(
+            ffi::w34_dflash_qk_norm_rope_bf16_f32_table_qout(
                 &ex,
                 buf_a as *mut c_void,
+                buf_d as *mut c_void,
                 candidate_ids as *const i32,
                 buf_b as *const c_void,
                 buf_b as *const c_void,
@@ -1563,24 +1377,6 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
     check_rc(
         unsafe {
-            ffi::w34_dflash_edges_f32(
-                &ex,
-                buf_d as *mut f32,
-                buf_a as *const c_void,
-                buf_b as *const c_void,
-                buf_c as *const f32,
-                candidate_ids as *const i32,
-                buf_c as *const f32,
-                0,
-                1,
-                16,
-                256,
-            )
-        },
-        "warmup w34_dflash_edges_f32",
-    )?;
-    check_rc(
-        unsafe {
             ffi::w34_topk_rows_f16(
                 &ex,
                 buf_a as *const c_void,
@@ -1593,21 +1389,6 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )
         },
         "warmup w34_topk_rows_f16",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_topk_rows_f32(
-                &ex,
-                buf_a as *const f32,
-                buf_b as *mut i32,
-                buf_c as *mut f32,
-                1,
-                256,
-                0,
-                16,
-            )
-        },
-        "warmup w34_topk_rows_f32",
     )?;
 
     check_rc(

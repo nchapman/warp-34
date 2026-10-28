@@ -58,25 +58,15 @@ fn rejects_selector_top_k_beyond_native_topk_limit() {
 }
 #[test]
 fn cached_4b_native_bf16_dflash_block() {
-    run_4b(false, false, false);
-}
-#[test]
-#[ignore = "explicit generation of inputs for the independent SGLang model oracle"]
-fn export_dflash_oracle_inputs() {
-    run_4b(true, false, false);
+    run_4b(false);
 }
 #[test]
 fn actual_sglang_full_model_hidden_parity() {
-    run_4b(false, true, false);
-}
-#[test]
-#[ignore = "counterfactual donor attention injection; NOT native parity"]
-fn diagnostic_donor_attention_full_model() {
-    run_4b(false, true, true);
+    run_4b(true);
 }
 static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn run_4b(export: bool, strict_parity: bool, inject_attention: bool) {
+fn run_4b(strict_parity: bool) {
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = resolve_hf_model_dir("nchapman/Qwen3.5-4B-DFlash2").unwrap();
     let cfg = DFlash2Config::load(&dir).unwrap();
@@ -99,77 +89,13 @@ fn run_4b(export: bool, strict_parity: bool, inject_attention: bool) {
         .unwrap();
     let target = &engine.ranks[0];
     let mut draft = DFlash2Rank::load(target, &dir, 64, 64).unwrap();
-    if inject_attention {
-        draft.trace_dir = Some(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.pi/dflash-model-inputs/trace-donor-attention"),
-        );
-        draft.diagnostic_attention_oracle = Some(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tools/oracle/goldens/sglang_dflash_model_4b.safetensors"),
-        );
-    }
-    if export {
-        draft.trace_dir = Some(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../.pi/dflash-model-inputs/trace"),
-        );
-    }
     for l in draft.kv_layouts() {
         assert_eq!(l.namespace_id, W34_KV_NAMESPACE_DFLASH_DRAFT_CTX);
         assert_eq!(l.k_format, W34_KV_FORMAT_BF16);
     }
-    let taps = target.tap_aux_f32.as_ref().unwrap().addr();
+    let taps = target.tap_aux_bf16.as_ref().unwrap().addr();
     draft.ingest(target, taps, tokens.len()).unwrap();
     assert_eq!(draft.committed_len(), tokens.len());
-    if export {
-        use w34_host::cuda::{f16_to_f32, f32_to_bf16};
-        let h = engine.cfg.hidden_size;
-        let out =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.pi/dflash-model-inputs");
-        std::fs::create_dir_all(&out).unwrap();
-        let mut values = vec![0f32; tokens.len() * 5 * h];
-        target
-            .tap_aux_f32
-            .as_ref()
-            .unwrap()
-            .copy_to_host(&mut values, &target.stream)
-            .unwrap();
-        std::fs::write(
-            out.join("taps.f32"),
-            values
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let mut embeddings = Vec::with_capacity(16 * h);
-        for id in std::iter::once(anchor).chain(std::iter::repeat_n(cfg.mask_token, 15)) {
-            let mut row = vec![0u16; h];
-            // SAFETY: id indexes a resident target embedding row; host row is H elements and is synchronized below.
-            // SAFETY: buffers are sized from the captured operator geometry and remain alive through readback.
-            let rc = unsafe {
-                w34_kernels::ffi::w34_memcpy_d2h_async(
-                    row.as_mut_ptr().cast(),
-                    (target.embed_tokens_ptr + (id as usize * h * 2) as u64) as *const _,
-                    h * 2,
-                    target.stream.handle,
-                )
-            };
-            assert_eq!(rc, 0);
-            target.stream.synchronize().unwrap();
-            embeddings.extend(row.into_iter().map(|v| f32_to_bf16(f16_to_f32(v))));
-        }
-        std::fs::write(
-            out.join("embeddings.bf16"),
-            embeddings
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        std::fs::write(out.join("input.json"),serde_json::json!({"rows":tokens.len(),"block_size":16,"hidden_size":h,"anchor":anchor,"tokens":tokens}).to_string()).unwrap();
-    }
     let candidates = draft.forward(target, anchor, None).unwrap();
     if strict_parity {
         let root =
@@ -184,18 +110,14 @@ fn run_4b(export: bool, strict_parity: bool, inject_attention: bool) {
             &root.join("sglang_dflash_model_4b.safetensors"),
         )
         .unwrap();
-        let mut taps_f32 = vec![0f32; tokens.len() * 5 * engine.cfg.hidden_size];
+        let expected_taps = golden.read_bytes("input.taps_bf16").unwrap();
+        let mut actual_taps = vec![0u8; tokens.len() * 5 * engine.cfg.hidden_size * 2];
         target
-            .tap_aux_f32
+            .tap_aux_bf16
             .as_ref()
             .unwrap()
-            .copy_to_host(&mut taps_f32, &target.stream)
+            .copy_to_host(&mut actual_taps, &target.stream)
             .unwrap();
-        let expected_taps = golden.read_bytes("input.taps_bf16").unwrap();
-        let actual_taps: Vec<u8> = taps_f32
-            .iter()
-            .flat_map(|&x| w34_host::cuda::f32_to_bf16(x).to_le_bytes())
-            .collect();
         assert_eq!(actual_taps, expected_taps, "oracle input taps changed");
         let expected = golden.read_f32("final_hidden").unwrap();
         let mut actual = vec![0u16; expected.len()];
@@ -221,23 +143,6 @@ fn run_4b(export: bool, strict_parity: bool, inject_attention: bool) {
         );
     }
 
-    if export {
-        let mut values = vec![0u16; 16 * engine.cfg.hidden_size];
-        draft
-            .hidden
-            .copy_to_host(&mut values, &target.stream)
-            .unwrap();
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.pi/dflash-model-inputs/native_hidden.bf16");
-        std::fs::write(
-            out,
-            values
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-    }
     let merged = DraftCandidates::merge(&[candidates]).unwrap();
     let proposal = draft.select_greedy(target, anchor, &merged).unwrap();
     eprintln!("DFlash anchor={anchor}, proposal={proposal:?}");
@@ -275,7 +180,7 @@ fn real_shape_qk_rope_matches_actual_sglang() {
     let stream = CudaStream::new(0).unwrap();
     let a = SafetensorsArchive::open(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/oracle/goldens/sglang_dflash_model_4b_operators.safetensors"),
+            .join("../../tools/oracle/goldens/sglang_dflash_model_4b.safetensors"),
     )
     .unwrap();
     for layer in 0..5 {
@@ -351,7 +256,7 @@ fn real_shape_grouped_convs_match_actual_sglang() {
     let stream = CudaStream::new(0).unwrap();
     let a = SafetensorsArchive::open(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/oracle/goldens/sglang_dflash_model_4b_operators.safetensors"),
+            .join("../../tools/oracle/goldens/sglang_dflash_model_4b.safetensors"),
     )
     .unwrap();
     let upload = |bytes: &[u8]| {
@@ -416,7 +321,7 @@ fn real_shape_silu_matches_actual_sglang() {
     let stream = CudaStream::new(0).unwrap();
     let a = SafetensorsArchive::open(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/oracle/goldens/sglang_dflash_model_4b_operators.safetensors"),
+            .join("../../tools/oracle/goldens/sglang_dflash_model_4b.safetensors"),
     )
     .unwrap();
     for layer in 0..5 {
@@ -464,7 +369,7 @@ fn real_shape_norms_match_actual_sglang() {
     let stream = CudaStream::new(0).unwrap();
     let a = SafetensorsArchive::open(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/oracle/goldens/sglang_dflash_model_4b_norms.safetensors"),
+            .join("../../tools/oracle/goldens/sglang_dflash_model_4b.safetensors"),
     )
     .unwrap();
     let mut failures = Vec::new();
@@ -542,29 +447,55 @@ fn real_shape_layer0_gemms_match_actual_sglang() {
     let _device = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();
     let blas = CublasHandle::new(&stream).unwrap();
-    let a = SafetensorsArchive::open(
+    let ops = SafetensorsArchive::open(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/oracle/goldens/sglang_dflash_model_4b_gemms.safetensors"),
+            .join("../../tools/oracle/goldens/sglang_dflash_model_4b.safetensors"),
     )
     .unwrap();
+    let weights_dir = resolve_hf_model_dir("nchapman/Qwen3.5-4B-DFlash2").unwrap();
+    let weights = SafetensorsArchive::open(&weights_dir).unwrap();
+    let upload = |bytes: &[u8]| {
+        let b = DeviceBuffer::alloc(0, bytes.len()).unwrap();
+        b.copy_from_host(bytes, &stream).unwrap();
+        b
+    };
     let mut failures = Vec::new();
     let mut count = 0;
-    for name in a
-        .tensor_names()
-        .filter(|n| n.starts_with("gemms.") && n.ends_with(".weight"))
-    {
-        let prefix = name.strip_suffix(".weight").unwrap();
-        let upload = |suffix: &str| {
-            let bytes = a.read_bytes(&format!("{prefix}.{suffix}")).unwrap();
-            let b = DeviceBuffer::alloc(0, bytes.len()).unwrap();
-            b.copy_from_host(&bytes, &stream).unwrap();
-            b
-        };
-        let x = upload("input");
-        let w = upload("weight");
-        let shape = &a.tensor_info(name).unwrap().shape;
-        let (n, k) = (shape[0], shape[1]);
-        let expected = a.read_f32(&format!("{prefix}.output")).unwrap();
+    for (proj, w_names, n, k) in [
+        (
+            "self_attn.qkv_proj",
+            &[
+                "layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight",
+            ][..],
+            6144usize,
+            2560usize,
+        ),
+        (
+            "mlp.gate_up_proj",
+            &[
+                "layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.up_proj.weight",
+            ][..],
+            18432,
+            2560,
+        ),
+        (
+            "mlp.down_proj",
+            &["layers.0.mlp.down_proj.weight"][..],
+            2560,
+            9216,
+        ),
+    ] {
+        let op_prefix = format!("ops.layers.0.{proj}");
+        let x = upload(&ops.read_bytes(&format!("{op_prefix}.input0")).unwrap());
+        let mut w_bytes = Vec::with_capacity(n * k * 2);
+        for name in w_names {
+            w_bytes.extend_from_slice(&weights.read_bytes(name).unwrap());
+        }
+        let w = upload(&w_bytes);
+        let expected = ops.read_f32(&format!("{op_prefix}.output0")).unwrap();
         let y = DeviceBuffer::alloc(0, expected.len() * 2).unwrap();
         blas.gemm_bf16(
             x.addr(),
@@ -587,12 +518,12 @@ fn real_shape_layer0_gemms_match_actual_sglang() {
             unequal += usize::from(x != y);
         }
         let rel = (err / energy).sqrt();
-        eprintln!("{prefix} relL2={rel} maxabs={maxabs} unequal={unequal}");
+        eprintln!("{op_prefix} relL2={rel} maxabs={maxabs} unequal={unequal}");
         if rel >= 1e-4 {
-            failures.push(format!("{prefix}: {rel}"));
+            failures.push(format!("{op_prefix}: {rel}"));
         }
         count += 1;
     }
-    assert_eq!(count, 4);
+    assert_eq!(count, 3);
     assert!(failures.is_empty(), "real GEMM failures: {failures:?}");
 }
