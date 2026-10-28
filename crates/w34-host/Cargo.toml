@@ -1,0 +1,20 @@
+[package]
+name = "w34-host"
+description = "Host runtime, loader, scheduler, and server for warp-34"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "w34"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["w34-kernels/cuda"]
+
+[dependencies]
+w34-kernels = { path = "../w34-kernels" }

@@ -1,0 +1,10 @@
+# Pinned upstream references (vLLM-first clean-room port)
+# Primary kernel & engine oracle: vLLM (Apache-2.0)
+VLLM_COMMIT=8352b2427bf0a5b0ba37a570cd9fbdf2edcf7cf5
+VLLM_PIP_VERSION=0.31.0
+
+# C++ mechanism reference: vllm.cpp
+VLLM_CPP_COMMIT=50d425bec0c6645d05a4dc70ef3fd5c4b8cbab72
+
+# Speculative M=8 verify & radix state reference: SGLang (Apache-2.0)
+SGLANG_COMMIT=0bcd822377da7b5718e674eaf9c870d349424dd1

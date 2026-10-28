@@ -1,0 +1,42 @@
+[tools]
+"cargo:cargo-llvm-cov" = "0.8.3"
+rust = "1.99.0"
+
+[env]
+_.file = { path = ".env", ignored_if_missing = true }
+
+[tasks.build]
+description = "Build release binary with CUDA kernels"
+run = "cargo build --release --features cuda"
+
+[tasks.fmt]
+description = "Format all Rust code"
+run = "cargo fmt"
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+run = "cargo fmt --check"
+
+[tasks.clippy]
+description = "Clippy with CUDA feature enabled"
+run = "cargo clippy --features cuda --all-targets -- -D warnings"
+
+[tasks."clippy-cpu"]
+description = "Clippy without CUDA feature"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks."check-quick"]
+description = "Format check + clippy (both feature states)"
+depends = ["fmt-check", "clippy", "clippy-cpu"]
+
+[tasks."test-quick"]
+description = "Unit tests only (lib target with CUDA)"
+run = "cargo test --release --features cuda --lib"
+
+[tasks.test]
+description = "Full release test suite with CUDA"
+run = "cargo test --release --features cuda"
+
+[tasks.check]
+description = "Format check, clippy (both states), and full release test suite"
+depends = ["fmt-check", "clippy", "clippy-cpu", "test"]

@@ -1,0 +1,16 @@
+[package]
+name = "w34-kernels"
+description = "vLLM-aligned CUDA kernels (sm_86) and FFI seam for warp-34"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+cuda = []

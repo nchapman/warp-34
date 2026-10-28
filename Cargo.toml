@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/w34-kernels", "crates/w34-host"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn" }
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

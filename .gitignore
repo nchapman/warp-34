@@ -1,0 +1,7 @@
+/target/
+/target-cov/
+/vendor/
+/models/
+*.nsys-rep
+*.sqlite
+/.pi/
