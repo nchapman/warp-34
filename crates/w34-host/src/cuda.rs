@@ -968,37 +968,39 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_embed_lookup_f16",
     )?;
-    check_rc(
-        unsafe {
-            ffi::w34_gemma_rms_norm_f16(
-                &ex,
-                buf_a as *const c_void,
-                buf_b as *const c_void,
-                buf_c as *mut c_void,
-                core::ptr::null(),
-                1,
-                128,
-                1e-6,
-            )
-        },
-        "warmup w34_gemma_rms_norm_f16",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_fused_add_gemma_rms_norm_f16(
-                &ex,
-                buf_a as *const c_void,
-                buf_b as *mut c_void,
-                buf_c as *const c_void,
-                buf_d as *mut c_void,
-                core::ptr::null(),
-                1,
-                128,
-                1e-6,
-            )
-        },
-        "warmup w34_fused_add_gemma_rms_norm_f16",
-    )?;
+    for hs in [128i32, 3072, 5120, 6144] {
+        check_rc(
+            unsafe {
+                ffi::w34_gemma_rms_norm_f16(
+                    &ex,
+                    buf_a as *const c_void,
+                    buf_b as *const c_void,
+                    buf_c as *mut c_void,
+                    core::ptr::null(),
+                    1,
+                    hs,
+                    1e-6,
+                )
+            },
+            "warmup w34_gemma_rms_norm_f16",
+        )?;
+        check_rc(
+            unsafe {
+                ffi::w34_fused_add_gemma_rms_norm_f16(
+                    &ex,
+                    buf_a as *const c_void,
+                    buf_b as *mut c_void,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    core::ptr::null(),
+                    1,
+                    hs,
+                    1e-6,
+                )
+            },
+            "warmup w34_fused_add_gemma_rms_norm_f16",
+        )?;
+    }
     check_rc(
         unsafe {
             ffi::w34_rms_norm_gated_silu_f16(

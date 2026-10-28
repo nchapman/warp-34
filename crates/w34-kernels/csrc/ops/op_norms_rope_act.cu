@@ -79,6 +79,7 @@ __global__ void copy_masked_rows_f16_kernel(
     }
 }
 
+template <int MAX_ITERS>
 __global__ void gemma_rms_norm_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ weight,
@@ -92,10 +93,10 @@ __global__ void gemma_rms_norm_f16_kernel(
     __half* out_row = out + (size_t)row * hidden_size;
 
     __shared__ float s_warp[32];
-    float reg_v[24];
+    float reg_v[MAX_ITERS];
     float sum_sq = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 24; k++) {
+    for (int k = 0; k < MAX_ITERS; k++) {
         const int i = threadIdx.x + k * blockDim.x;
         if (i < hidden_size) {
             float v = __half2float(x_row[i]);
@@ -107,7 +108,7 @@ __global__ void gemma_rms_norm_f16_kernel(
     const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
 
 #pragma unroll
-    for (int k = 0; k < 24; k++) {
+    for (int k = 0; k < MAX_ITERS; k++) {
         const int i = threadIdx.x + k * blockDim.x;
         if (i < hidden_size) {
             float v = reg_v[k] * inv_rms;
@@ -117,6 +118,7 @@ __global__ void gemma_rms_norm_f16_kernel(
     }
 }
 
+template <int MAX_ITERS>
 __global__ void fused_add_gemma_rms_norm_f16_kernel(
     const __half* __restrict__ x,
     __half* __restrict__ residual,
@@ -132,10 +134,10 @@ __global__ void fused_add_gemma_rms_norm_f16_kernel(
     __half* out_row = out + (size_t)row * hidden_size;
 
     __shared__ float s_warp[32];
-    float reg_v[24];
+    float reg_v[MAX_ITERS];
     float sum_sq = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 24; k++) {
+    for (int k = 0; k < MAX_ITERS; k++) {
         const int i = threadIdx.x + k * blockDim.x;
         if (i < hidden_size) {
             __half sum_h = __hadd(x_row[i], res_row[i]);
@@ -149,7 +151,7 @@ __global__ void fused_add_gemma_rms_norm_f16_kernel(
     const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
 
 #pragma unroll
-    for (int k = 0; k < 24; k++) {
+    for (int k = 0; k < MAX_ITERS; k++) {
         const int i = threadIdx.x + k * blockDim.x;
         if (i < hidden_size) {
             float v = reg_v[k] * inv_rms;
@@ -376,9 +378,23 @@ extern "C" int w34_gemma_rms_norm_f16(const w34_exec* ex, const void* x, const v
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens <= 0 || hidden_size <= 0) return 0;
-    w34::gemma_rms_norm_f16_kernel<<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)x, (const __half*)weight, (__half*)out,
-        valid_token_mask, hidden_size, eps);
+    if (hidden_size <= 2560) {
+        w34::gemma_rms_norm_f16_kernel<10><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    } else if (hidden_size <= 4096) {
+        w34::gemma_rms_norm_f16_kernel<16><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    } else if (hidden_size <= 5120) {
+        w34::gemma_rms_norm_f16_kernel<20><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    } else {
+        w34::gemma_rms_norm_f16_kernel<24><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    }
     return (int)cudaGetLastError();
 }
 
@@ -390,9 +406,23 @@ extern "C" int w34_fused_add_gemma_rms_norm_f16(const w34_exec* ex, const void* 
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens <= 0 || hidden_size <= 0) return 0;
-    w34::fused_add_gemma_rms_norm_f16_kernel<<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out,
-        valid_token_mask, hidden_size, eps);
+    if (hidden_size <= 2560) {
+        w34::fused_add_gemma_rms_norm_f16_kernel<10><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    } else if (hidden_size <= 4096) {
+        w34::fused_add_gemma_rms_norm_f16_kernel<16><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    } else if (hidden_size <= 5120) {
+        w34::fused_add_gemma_rms_norm_f16_kernel<20><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    } else {
+        w34::fused_add_gemma_rms_norm_f16_kernel<24><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    }
     return (int)cudaGetLastError();
 }
 

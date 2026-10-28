@@ -217,9 +217,9 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                     }
                 }
             }
-            // Warmup pass (captures CUDA Graph on decode step 1)
+            // Warmup pass (captures CUDA Graph on decode step 1 and ramps GPU boost clock out of P8)
             let _ = engine
-                .generate_tokens(&synth_prompt[..16.min(prompt_len)], 4, false)
+                .generate_tokens(&synth_prompt[..16.min(prompt_len)], 32, false)
                 .map_err(|e| e.to_string())?;
 
             let metrics = engine
