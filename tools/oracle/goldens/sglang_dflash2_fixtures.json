@@ -1,0 +1,180 @@
+{
+  "scope": "actual component and attention captures; not end-to-end serving",
+  "sglang": "0.5.19",
+  "sources": {
+    "sglang_dflash_attention.safetensors": {
+      "provenance": {
+        "backend": "FlashInfer fa2 paged prefill",
+        "cases": [
+          {
+            "causal": false,
+            "name": "short",
+            "q_len": 8,
+            "q_pos_base": 16,
+            "reference_max_abs_errors": {
+              "block_end": 1.173828125,
+              "query_left": 0.0078125,
+              "symmetric": 0.0078125
+            },
+            "seq_len": 24,
+            "window": 16,
+            "window_left": 15
+          },
+          {
+            "causal": false,
+            "name": "full",
+            "q_len": 16,
+            "q_pos_base": 8,
+            "reference_max_abs_errors": {
+              "block_end": 0.00390625,
+              "query_left": 0.00390625,
+              "symmetric": 0.00390625
+            },
+            "seq_len": 24,
+            "window": 0,
+            "window_left": -1
+          },
+          {
+            "causal": false,
+            "name": "long",
+            "q_len": 8,
+            "q_pos_base": 2056,
+            "reference_max_abs_errors": {
+              "block_end": 0.0126953125,
+              "query_left": 0.00054931640625,
+              "symmetric": 0.00054931640625
+            },
+            "seq_len": 2064,
+            "window": 2048,
+            "window_left": 2047
+          },
+          {
+            "causal": false,
+            "name": "narrow",
+            "q_len": 16,
+            "q_pos_base": 8,
+            "reference_max_abs_errors": {
+              "block_end": 2.6875,
+              "query_left": 0.0078125,
+              "symmetric": 1.94140625
+            },
+            "seq_len": 24,
+            "window": 4,
+            "window_left": 3
+          }
+        ],
+        "dtype": "bfloat16",
+        "flashinfer": "0.6.18",
+        "gpu": "NVIDIA GeForce RTX 3090 Ti",
+        "scope": "operator only; not a DFlashWorkerV2 end-to-end capture",
+        "sglang": "0.5.19",
+        "source": "/sgl-workspace/sglang/python/sglang/srt/layers/attention/flashinfer_backend.py",
+        "source_sha256": "ac46fc8c976285e20c7217beeaa882cc5a673072a7ddadf6a8508fdba5b6f6f0",
+        "torch": "2.13.0+cu130"
+      },
+      "sha256": "721d8ea9681393aff7e924c9d079c10863ca0918a600c764c2cd3a52b966e597",
+      "tensor_count": 16
+    },
+    "sglang_dflash_attention_unsplit.safetensors": {
+      "provenance": {
+        "disable_split_kv": true,
+        "flashinfer": "0.6.18",
+        "gpu": "NVIDIA GeForce RTX 3090 Ti",
+        "image": "lmsysorg/sglang:v0.5.19",
+        "input_provenance": {
+          "backend": "FlashInfer fa2 paged prefill",
+          "cases": [
+            {
+              "causal": false,
+              "name": "short",
+              "q_len": 8,
+              "q_pos_base": 16,
+              "reference_max_abs_errors": {
+                "block_end": 1.173828125,
+                "query_left": 0.0078125,
+                "symmetric": 0.0078125
+              },
+              "seq_len": 24,
+              "window": 16,
+              "window_left": 15
+            },
+            {
+              "causal": false,
+              "name": "full",
+              "q_len": 16,
+              "q_pos_base": 8,
+              "reference_max_abs_errors": {
+                "block_end": 0.00390625,
+                "query_left": 0.00390625,
+                "symmetric": 0.00390625
+              },
+              "seq_len": 24,
+              "window": 0,
+              "window_left": -1
+            },
+            {
+              "causal": false,
+              "name": "long",
+              "q_len": 8,
+              "q_pos_base": 2056,
+              "reference_max_abs_errors": {
+                "block_end": 0.0126953125,
+                "query_left": 0.00054931640625,
+                "symmetric": 0.00054931640625
+              },
+              "seq_len": 2064,
+              "window": 2048,
+              "window_left": 2047
+            },
+            {
+              "causal": false,
+              "name": "narrow",
+              "q_len": 16,
+              "q_pos_base": 8,
+              "reference_max_abs_errors": {
+                "block_end": 2.6875,
+                "query_left": 0.0078125,
+                "symmetric": 1.94140625
+              },
+              "seq_len": 24,
+              "window": 4,
+              "window_left": 3
+            }
+          ],
+          "dtype": "bfloat16",
+          "flashinfer": "0.6.18",
+          "gpu": "NVIDIA GeForce RTX 3090 Ti",
+          "scope": "operator only; not a DFlashWorkerV2 end-to-end capture",
+          "sglang": "0.5.19",
+          "source": "/sgl-workspace/sglang/python/sglang/srt/layers/attention/flashinfer_backend.py",
+          "source_sha256": "ac46fc8c976285e20c7217beeaa882cc5a673072a7ddadf6a8508fdba5b6f6f0",
+          "torch": "2.13.0+cu130"
+        },
+        "input_sha256": "721d8ea9681393aff7e924c9d079c10863ca0918a600c764c2cd3a52b966e597",
+        "scope": "actual unsplit FA2 operator; not default split-KV or serving parity",
+        "script_sha256": "db0e8a38fa6ce4decd0fd290b4fe00db897cbe3db23f94207799a311f2405a36",
+        "sglang": "0.5.19",
+        "torch": "2.13.0+cu130"
+      },
+      "sha256": "32eaf18f5db3fd47b377344a4d6c6d8f9420a7856496c93e2dcbd8d74c0de1ca",
+      "tensor_count": 4
+    },
+    "sglang_dflash_bf16.safetensors": {
+      "provenance": {
+        "dtype": "bfloat16",
+        "gpu": "NVIDIA GeForce RTX 3090 Ti",
+        "scope": "actual component outputs, not full-model parity",
+        "sglang": "0.5.19",
+        "sources": {
+          "/sgl-workspace/sglang/python/sglang/srt/layers/activation.py": "7cb92806f75eaa95529e841c6b506e77da5030b99e7e98110e64a7f3232e489a",
+          "/sgl-workspace/sglang/python/sglang/srt/layers/layernorm.py": "392508942d4a9233af38d7c2984f5db49bde0ebc3d9449f11a3507238f981b15",
+          "/sgl-workspace/sglang/python/sglang/srt/models/dflash.py": "bfdef4b6ebe54f0ed88e04295310102c88b4b85798604f736cdb46320f3929ef",
+          "/sgl-workspace/sglang/python/sglang/srt/speculative/dflash_utils.py": "31739297e7cbf21bf0bace04cecce212ea2176774fe1c8593ba9f7ccee5a163e"
+        },
+        "torch": "2.13.0+cu130"
+      },
+      "sha256": "d8f14d047add6b4f31d5afa8ee9f5c0031c1a5c6b608291c48284c8d1a13ef65",
+      "tensor_count": 42
+    }
+  }
+}

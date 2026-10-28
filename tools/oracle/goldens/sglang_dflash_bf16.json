@@ -1,0 +1,13 @@
+{
+  "sglang": "0.5.19",
+  "torch": "2.13.0+cu130",
+  "gpu": "NVIDIA GeForce RTX 3090 Ti",
+  "sources": {
+    "/sgl-workspace/sglang/python/sglang/srt/layers/layernorm.py": "392508942d4a9233af38d7c2984f5db49bde0ebc3d9449f11a3507238f981b15",
+    "/sgl-workspace/sglang/python/sglang/srt/layers/activation.py": "7cb92806f75eaa95529e841c6b506e77da5030b99e7e98110e64a7f3232e489a",
+    "/sgl-workspace/sglang/python/sglang/srt/models/dflash.py": "bfdef4b6ebe54f0ed88e04295310102c88b4b85798604f736cdb46320f3929ef",
+    "/sgl-workspace/sglang/python/sglang/srt/speculative/dflash_utils.py": "31739297e7cbf21bf0bace04cecce212ea2176774fe1c8593ba9f7ccee5a163e"
+  },
+  "dtype": "bfloat16",
+  "scope": "actual component outputs, not full-model parity"
+}

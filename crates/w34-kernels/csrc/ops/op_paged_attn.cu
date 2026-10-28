@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <float.h>
 #include <math.h>
+#include <type_traits>
 
 namespace w34_attn {
 
@@ -227,11 +228,12 @@ __global__ void kv_cache_write_kernel(
 // Grid: (total_tokens, num_q_heads), Block: 128 threads.
 // Uses online FP32 softmax across the paged sequence, deterministic per-step reduction
 // so output is bit-identical regardless of physical page permutation in block_tables!
-__global__ void paged_attention_f16_kernel(
+template <typename Scalar>
+__global__ void paged_attention_kernel(
     w34_kv_layer_layout layout,
     w34_attention_batch batch,
-    const __half* __restrict__ q_in,
-    __half* __restrict__ attn_out,
+    const Scalar* __restrict__ q_in,
+    Scalar* __restrict__ attn_out,
     int num_q_heads) {
     const int tok = blockIdx.x;
     if (tok >= batch.total_tokens) return;
@@ -265,7 +267,8 @@ __global__ void paged_attention_f16_kernel(
                                : (batch.seq_lens_after[req] - (q_end - q_start));
     const int seq_after = batch.seq_lens_after[req];
 
-    // Causal vs symmetric non-causal sliding window (DFlash2)
+    // Non-causal DFlash permits all materialized future keys. SGLang's
+    // FlashInfer window_left applies relative to each query, NOT the block end.
     int max_kv_pos = (batch.mask_mode == W34_ATTN_MASK_SYMMETRIC_WINDOW)
                          ? (seq_after - 1)
                          : (ctx_before + q_offset_in_req);
@@ -273,15 +276,13 @@ __global__ void paged_attention_f16_kernel(
 
     int min_kv_pos = 0;
     if (batch.sliding_window > 0) {
-        int ref_pos = (batch.mask_mode == W34_ATTN_MASK_SYMMETRIC_WINDOW)
-                          ? (seq_after - 1)
-                          : max_kv_pos;
+        int ref_pos = ctx_before + q_offset_in_req;
         int win_start = ref_pos - batch.sliding_window + 1;
         if (win_start > min_kv_pos) min_kv_pos = win_start;
     }
 
-    const __half* q_row = q_in + ((size_t)tok * num_q_heads + q_head) * head_dim;
-    __half* out_row = attn_out + ((size_t)tok * num_q_heads + q_head) * head_dim;
+    const Scalar* q_row = q_in + ((size_t)tok * num_q_heads + q_head) * head_dim;
+    Scalar* out_row = attn_out + ((size_t)tok * num_q_heads + q_head) * head_dim;
 
     // 4 warps (128 threads): each warp `wid` (0..3) processes kv_pos = min_kv_pos + wid + 4*step
     // using register-only warp shuffles (0 __syncthreads() inside the KV loop), then merges
@@ -294,7 +295,7 @@ __global__ void paged_attention_f16_kernel(
 #pragma unroll
     for (int j = 0; j < 8; j++) {
         const int col = lane + 32 * j;
-        q_reg[j] = (col < head_dim) ? __half2float(q_row[col]) : 0.0f;
+        q_reg[j] = (col < head_dim) ? (float)q_row[col] : 0.0f;
         acc[j] = 0.0f;
     }
 
@@ -302,6 +303,146 @@ __global__ void paged_attention_f16_kernel(
     float l_i = 0.0f;
 
     const int32_t* req_blocks = batch.block_tables + (size_t)req * batch.max_blocks_per_req;
+
+    // FlashInfer FA2 compute_sfm_v casts exp2 scores to DTypeQ before
+    // BOTH PV MMA and m16k16_rowsum_f16f16f32. Keep the FP16 and quantized
+    // policies below untouched. Tile maxima must precede probability rounding:
+    // rounding each scalar online update is not equivalent.
+    if constexpr (std::is_same<Scalar, __nv_bfloat16>::value) {
+        if (layout.k_format == W34_KV_FORMAT_BF16 &&
+            layout.v_format == W34_KV_FORMAT_BF16) {
+            // Pinned sm86 FA2 uses NUM_MMA_KV=4 at HD=128, but =1 at
+            // HD=256 (WKV=1 for both). Probability rounding follows the maximum
+            // of the entire 64/16-key tile, before 16-key MMA contractions.
+            // Split-KV donor dispatches can additionally round partial outputs.
+            const int tile = head_dim <= 128 ? 64 : 16;
+            __shared__ float scores[64];
+            __shared__ __align__(4) uint16_t p_bits[64];
+            __shared__ const uint8_t* v_ptrs[64];
+            auto ptx_exp2 = [](float x) {
+                float y;
+                asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+                return y;
+            };
+            auto ptx_rcp = [](float x) {
+                float y;
+                asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+                return y;
+            };
+            float num_frag[8][2] = {{0.f}};
+            float maximum = -FLT_MAX, denominator = 0.f;
+            const float scale = batch.sm_scale * 1.4426950408889634f;
+            for (int base = 0; base <= max_kv_pos; base += tile) {
+                for (int t = wid; t < tile; t += 4) {
+                    int kv = base + t;
+                    float dot = -FLT_MAX;
+                    const uint8_t* vp = nullptr;
+                    if (kv >= min_kv_pos && kv <= max_kv_pos) {
+                        const uint8_t* kp = (const uint8_t*)(uintptr_t)layout.k_base
+                            + (size_t)req_blocks[kv / layout.block_size] * layout.k_page_stride_bytes
+                            + (size_t)kv_head * layout.k_head_stride_bytes
+                            + (size_t)(kv % layout.block_size) * layout.k_token_stride_bytes;
+                        vp = (const uint8_t*)(uintptr_t)layout.v_base
+                            + (size_t)req_blocks[kv / layout.block_size] * layout.v_page_stride_bytes
+                            + (size_t)kv_head * layout.v_head_stride_bytes
+                            + (size_t)(kv % layout.block_size) * layout.v_token_stride_bytes;
+                        dot = 0.f;
+                        const uint32_t* qp32 = (const uint32_t*)q_row;
+                        const uint32_t* kp32 = (const uint32_t*)kp;
+                        for (int k0 = 0; k0 < head_dim; k0 += 16) {
+                            uint32_t a0 = (lane < 4) ? qp32[(k0 >> 1) + lane] : 0u;
+                            uint32_t a2 = (lane < 4) ? qp32[(k0 >> 1) + 4 + lane] : 0u;
+                            uint32_t b0 = (lane < 4) ? kp32[(k0 >> 1) + lane] : 0u;
+                            uint32_t b1 = (lane < 4) ? kp32[(k0 >> 1) + 4 + lane] : 0u;
+                            uint32_t z = 0u;
+                            float d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                            asm volatile(
+                                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                                : "+f"(dot), "+f"(d1), "+f"(d2), "+f"(d3)
+                                : "r"(a0), "r"(z), "r"(a2), "r"(z), "r"(b0), "r"(b1));
+                        }
+                    }
+                    if (lane == 0) {
+                        scores[t] = dot;
+                        v_ptrs[t] = vp;
+                    }
+                }
+                __syncthreads();
+                float next = maximum;
+                for (int t = 0; t < tile; ++t) next = fmaxf(next, scores[t]);
+                float alpha = ptx_exp2(maximum * scale - next * scale);
+                denominator *= alpha;
+#pragma unroll
+                for (int step = 0; step < 8; ++step) {
+                    num_frag[step][0] *= alpha;
+                    num_frag[step][1] *= alpha;
+                }
+                maximum = next;
+                if (threadIdx.x < tile) {
+                    int kv = base + threadIdx.x;
+                    p_bits[threadIdx.x] = (kv >= min_kv_pos && kv <= max_kv_pos)
+                        ? __bfloat16_as_ushort(__float2bfloat16_rn(ptx_exp2(scores[threadIdx.x] * scale - maximum * scale)))
+                        : 0u;
+                }
+                __syncthreads();
+                for (int chunk = 0; chunk < tile; chunk += 16) {
+                const uint32_t* p32 = (const uint32_t*)(p_bits + chunk);
+                uint32_t pa0 = (lane < 4) ? p32[lane] : 0u;
+                uint32_t pa2 = (lane < 4) ? p32[4 + lane] : 0u;
+                uint32_t z = 0u;
+                {
+                    float d0 = denominator, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                    uint32_t ones = (lane < 4) ? 0x3f803f80u : 0u;
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                        : "r"(pa0), "r"(z), "r"(pa2), "r"(z), "r"(ones), "r"(ones));
+                    denominator = __shfl_sync(0xffffffffu, d0, 0);
+                }
+                const int col_group = lane >> 2;
+                const int k_pair = lane & 3;
+#pragma unroll
+                for (int step = 0; step < 8; ++step) {
+                    int col = wid * 64 + step * 8 + col_group;
+                    uint32_t vb0 = 0u, vb1 = 0u;
+                    if (col < head_dim) {
+                        const uint16_t* vp0 = (const uint16_t*)v_ptrs[chunk + 2 * k_pair];
+                        const uint16_t* vp1 = (const uint16_t*)v_ptrs[chunk + 2 * k_pair + 1];
+                        const uint16_t* vp2 = (const uint16_t*)v_ptrs[chunk + 8 + 2 * k_pair];
+                        const uint16_t* vp3 = (const uint16_t*)v_ptrs[chunk + 8 + 2 * k_pair + 1];
+                        uint32_t v0 = vp0 ? vp0[col] : 0u;
+                        uint32_t v1 = vp1 ? vp1[col] : 0u;
+                        uint32_t v2 = vp2 ? vp2[col] : 0u;
+                        uint32_t v3 = vp3 ? vp3[col] : 0u;
+                        vb0 = v0 | (v1 << 16);
+                        vb1 = v2 | (v3 << 16);
+                    }
+                    float c0 = num_frag[step][0], c1 = num_frag[step][1], c2 = 0.f, c3 = 0.f;
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                        : "r"(pa0), "r"(z), "r"(pa2), "r"(z), "r"(vb0), "r"(vb1));
+                    num_frag[step][0] = c0;
+                    num_frag[step][1] = c1;
+                }
+                }
+                __syncthreads();
+            }
+            const float d_rcp = (maximum > -FLT_MAX && denominator > 0.f) ? ptx_rcp(denominator) : 0.f;
+            if (lane < 4) {
+#pragma unroll
+                for (int step = 0; step < 8; ++step) {
+                    int col0 = wid * 64 + step * 8 + 2 * lane;
+                    if (col0 < head_dim) out_row[col0] = __float2bfloat16_rn(num_frag[step][0] * d_rcp);
+                    if (col0 + 1 < head_dim) out_row[col0 + 1] = __float2bfloat16_rn(num_frag[step][1] * d_rcp);
+                }
+            }
+            return;
+        }
+    }
 
     for (int kv_pos = min_kv_pos + wid; kv_pos <= max_kv_pos; kv_pos += 4) {
         const int logical_block = kv_pos / layout.block_size;
@@ -388,7 +529,35 @@ __global__ void paged_attention_f16_kernel(
                     + s_acc[1][col] * w_scale[1]
                     + s_acc[2][col] * w_scale[2]
                     + s_acc[3][col] * w_scale[3];
-        out_row[col] = __float2half(sum_v * inv_l);
+        out_row[col] = Scalar(sum_v * inv_l);
+    }
+}
+
+// Native BF16 write: no FP16 intermediary (4B drafter values may exceed 65504).
+__global__ void kv_cache_write_bf16_kernel(
+    w34_kv_layer_layout layout, w34_attention_batch batch,
+    const __nv_bfloat16* k, const __nv_bfloat16* v) {
+    const int tok = blockIdx.x;
+    if (batch.valid_token_mask && !batch.valid_token_mask[tok]) return;
+    int req = -1;
+    for (int r = 0; r < batch.num_reqs; ++r) {
+        if (tok >= batch.query_start_loc[r] && tok < batch.query_start_loc[r + 1]) { req = r; break; }
+    }
+    if (req < 0 || (batch.valid_req_mask && !batch.valid_req_mask[req])) return;
+    const int slot = batch.write_slot_mapping[tok];
+    if (slot < 0) return;
+    const int head = blockIdx.y;
+    const int page = slot / layout.block_size, off = slot % layout.block_size;
+    auto* kd = (__nv_bfloat16*)((uint8_t*)(uintptr_t)layout.k_base +
+        (size_t)page * layout.k_page_stride_bytes + (size_t)head * layout.k_head_stride_bytes +
+        (size_t)off * layout.k_token_stride_bytes);
+    auto* vd = (__nv_bfloat16*)((uint8_t*)(uintptr_t)layout.v_base +
+        (size_t)page * layout.v_page_stride_bytes + (size_t)head * layout.v_head_stride_bytes +
+        (size_t)off * layout.v_token_stride_bytes);
+    for (int c = threadIdx.x; c < layout.head_dim; c += blockDim.x) {
+        const size_t src = ((size_t)tok * layout.local_kv_heads + head) * layout.head_dim + c;
+        kd[c] = k[src];
+        vd[c] = v[src];
     }
 }
 
@@ -407,6 +576,40 @@ extern "C" int w34_kv_cache_write(const w34_exec* ex, const w34_kv_layer_layout*
     return (int)cudaGetLastError();
 }
 
+static bool valid_bf16_layout(const w34_kv_layer_layout* l) {
+    return l && l->local_kv_heads > 0 && l->block_size > 0 &&
+        l->head_dim > 0 && l->head_dim <= 256 && l->k_base && l->v_base &&
+        l->k_format == W34_KV_FORMAT_BF16 && l->v_format == W34_KV_FORMAT_BF16 &&
+        l->k_transform == W34_KV_TRANSFORM_IDENTITY && l->v_transform == W34_KV_TRANSFORM_IDENTITY;
+}
+
+extern "C" int w34_kv_cache_write_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
+    const w34_attention_batch* batch, const void* k, const void* v) {
+    if (!ex || !valid_bf16_layout(layout) || !batch || !k || !v ||
+        batch->total_tokens < 0 || batch->num_reqs <= 0 || !batch->query_start_loc ||
+        !batch->write_slot_mapping) return (int)cudaErrorInvalidValue;
+    if (!batch->total_tokens) return 0;
+    dim3 grid((unsigned)batch->total_tokens, (unsigned)layout->local_kv_heads);
+    w34_attn::kv_cache_write_bf16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+        *layout, *batch, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_paged_attention_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
+    const w34_attention_batch* batch, const void* q, void* out, int num_q_heads) {
+    if (!ex || !valid_bf16_layout(layout) || !batch || !q || !out || num_q_heads <= 0 ||
+        num_q_heads % layout->local_kv_heads != 0 || batch->total_tokens < 0 ||
+        batch->num_reqs <= 0 || !batch->query_start_loc || !batch->seq_lens_after ||
+        !batch->block_tables || batch->max_blocks_per_req <= 0 || batch->sliding_window < 0 ||
+        (batch->mask_mode != W34_ATTN_MASK_CAUSAL && batch->mask_mode != W34_ATTN_MASK_SYMMETRIC_WINDOW))
+        return (int)cudaErrorInvalidValue;
+    if (!batch->total_tokens) return 0;
+    dim3 grid((unsigned)batch->total_tokens, (unsigned)num_q_heads);
+    w34_attn::paged_attention_kernel<__nv_bfloat16><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+        *layout, *batch, (const __nv_bfloat16*)q, (__nv_bfloat16*)out, num_q_heads);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_layout* layout,
                                        const w34_attention_batch* batch,
                                        const void* q_in, void* attn_out,
@@ -416,7 +619,7 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
     }
     if (batch->total_tokens <= 0 || num_q_heads <= 0) return 0;
     dim3 grid((unsigned)batch->total_tokens, (unsigned)num_q_heads);
-    w34_attn::paged_attention_f16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+    w34_attn::paged_attention_kernel<__half><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
         *layout, *batch, (const __half*)q_in, (__half*)attn_out, num_q_heads);
     return (int)cudaGetLastError();
 }

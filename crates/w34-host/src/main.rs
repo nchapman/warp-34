@@ -34,7 +34,12 @@ fn print_usage() {
            dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--compare-tp2] [--golden <safetensors>]\n\
            profile-diff --oracle <sqlite|json> [--preset <key>] [--w34 <sqlite|json>] [--rounds <n>]\n\
            serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format fp16|tq4|k8v4|firstlast2]\n\
-           chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--max-tokens <n>] [--no-thinking]"
+           chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--max-tokens <n>] [--no-thinking]\n\
+         Speculative options (generate/bench/greedy-diff/serve/chat):\n\
+           --speculative mtp|dflash2 [--draft-model <id|path>] [--mtp-k 1..3] [--kv-pages <n>]\n\
+           Native MTP shares target weights; DFlash2 requires a draft model.\n\
+           Speculative CLI mode is eager/greedy; the server also honors sampling parameters.\n\
+           Native mode defaults to 256 target KV pages (4096 tokens, including verification reserve)."
     );
 }
 
@@ -65,10 +70,43 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     let mut host = "127.0.0.1".to_string();
     let mut port = 8000u16;
     let mut enable_thinking = true;
+    let mut speculative_kind = None;
+    let mut draft_model = None;
+    let mut mtp_k = 3usize;
+    let mut kv_pages = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--speculative" => {
+                i += 1;
+                speculative_kind = Some(match args.get(i).map(String::as_str) {
+                    Some("mtp") => w34_host::proposer::SpeculativeKind::Mtp,
+                    Some("dflash2") => w34_host::proposer::SpeculativeKind::DFlash2,
+                    _ => return Err("--speculative expects mtp or dflash2".into()),
+                });
+            }
+            "--draft-model" => {
+                i += 1;
+                draft_model = Some(args.get(i).cloned().ok_or("missing --draft-model")?);
+            }
+            "--mtp-k" => {
+                i += 1;
+                mtp_k = args
+                    .get(i)
+                    .ok_or("missing --mtp-k")?
+                    .parse()
+                    .map_err(|_| "invalid --mtp-k")?;
+            }
+            "--kv-pages" => {
+                i += 1;
+                kv_pages = Some(
+                    args.get(i)
+                        .ok_or("missing --kv-pages")?
+                        .parse::<usize>()
+                        .map_err(|_| "invalid --kv-pages")?,
+                );
+            }
             "--model" | "-m" => {
                 i += 1;
                 model = args.get(i).cloned().ok_or("missing --model value")?;
@@ -180,11 +218,56 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     }
 
     let policy = parse_kv_policy(&kv_format)?;
+    if kv_pages == Some(0) {
+        return Err("--kv-pages must be positive".into());
+    }
+    if !matches!(mtp_k, 1..=3) {
+        return Err("--mtp-k must be 1..3".into());
+    }
+    if draft_model.is_some()
+        && speculative_kind != Some(w34_host::proposer::SpeculativeKind::DFlash2)
+    {
+        return Err(
+            "--draft-model requires --speculative dflash2; native MTP uses target weights".into(),
+        );
+    }
+    if speculative_kind == Some(w34_host::proposer::SpeculativeKind::DFlash2)
+        && draft_model.is_none()
+    {
+        return Err("--speculative dflash2 requires --draft-model".into());
+    }
+    if speculative_kind.is_some()
+        && !matches!(sub, "generate" | "bench" | "greedy-diff" | "serve" | "chat")
+    {
+        return Err(
+            "speculation is supported by generate, bench, greedy-diff, serve and chat".into(),
+        );
+    }
+    let spec_config = speculative_kind.map(|kind| w34_host::proposer::SpeculativeConfig {
+        kind,
+        draft_model,
+        mtp_k,
+    });
+    // Leave VRAM for the resident drafter instead of filling it with target KV.
+    // The initial native execution path is eager; it never captures tentative addresses.
+    let load_engine = || -> w34_host::cuda::Result<Qwen3_5Engine> {
+        let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
+        let mut engine = Qwen3_5Engine::load(
+            &model,
+            tp,
+            policy,
+            pages,
+            use_cuda_graph && spec_config.is_none(),
+        )?;
+        if let Some(config) = &spec_config {
+            engine.enable_speculative(config)?;
+        }
+        Ok(engine)
+    };
 
     match sub {
         "generate" => {
-            let mut engine = Qwen3_5Engine::load(&model, tp, policy, None, use_cuda_graph)
-                .map_err(|e| e.to_string())?;
+            let mut engine = load_engine().map_err(|e| e.to_string())?;
             let prompt_ids = engine.encode(&prompt).map_err(|e| e.to_string())?;
             let metrics = engine
                 .generate_tokens(&prompt_ids, max_tokens, true)
@@ -204,8 +287,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "bench" => {
-            let mut engine = Qwen3_5Engine::load(&model, tp, policy, None, use_cuda_graph)
-                .map_err(|e| e.to_string())?;
+            let mut engine = load_engine().map_err(|e| e.to_string())?;
             let base_ids = engine
                 .encode("The quick brown fox jumps over the lazy dog. ")
                 .map_err(|e| e.to_string())?;
@@ -229,7 +311,9 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                 "model": model,
                 "tp": tp,
                 "kv_format": kv_format,
-                "cuda_graph": use_cuda_graph,
+                "cuda_graph": engine.use_cuda_graph,
+                "speculative": speculative_kind.map(|k|match k {w34_host::proposer::SpeculativeKind::Mtp=>"mtp",w34_host::proposer::SpeculativeKind::DFlash2=>"dflash2"}),
+                "accepted_drafts_per_round": engine.speculative.as_ref().map(|p|&p.last_accepted),
                 "prompt_len": metrics.prompt_len,
                 "gen_len": metrics.gen_len,
                 "ttft_ms": metrics.ttft_ms,
@@ -248,8 +332,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
         "greedy-diff" => {
             let golden_arg = golden_path.ok_or("--golden <dir-or-json> is required")?;
             let golden_p = Path::new(&golden_arg);
-            let mut engine = Qwen3_5Engine::load(&model, tp, policy, None, use_cuda_graph)
-                .map_err(|e| e.to_string())?;
+            let mut engine = load_engine().map_err(|e| e.to_string())?;
 
             #[allow(clippy::type_complexity)]
             let mut cases: Vec<(
@@ -521,8 +604,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             }
         }
         "serve" => {
-            let engine = Qwen3_5Engine::load(&model, tp, policy, None, use_cuda_graph)
-                .map_err(|e| e.to_string())?;
+            let engine = load_engine().map_err(|e| e.to_string())?;
             let bind_addr = format!("{host}:{port}");
             println!("[w34 serve] model={model} tp={tp} listening on http://{bind_addr}");
             let state = w34_host::server::OpenAiServerState::new(model, engine);
@@ -531,8 +613,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "chat" => {
-            let mut engine = Qwen3_5Engine::load(&model, tp, policy, None, use_cuda_graph)
-                .map_err(|e| e.to_string())?;
+            let mut engine = load_engine().map_err(|e| e.to_string())?;
             let msgs = vec![w34_host::server::ChatMessage {
                 role: "user".to_string(),
                 content: Some(prompt.clone()),

@@ -33,7 +33,9 @@ pub const W34_KV_TRANSFORM_IDENTITY: i32 = 0;
 pub const W34_KV_TRANSFORM_RADEMACHER_WHT256: i32 = 1;
 
 pub const W34_ATTN_MASK_CAUSAL: i32 = 0;
+/// Legacy name: query-relative left window, non-causal (no right bound).
 pub const W34_ATTN_MASK_SYMMETRIC_WINDOW: i32 = 1;
+pub const W34_ATTN_MASK_NONCAUSAL_WINDOW: i32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -352,6 +354,22 @@ unsafe extern "C" {
         v_in: *const c_void,
     ) -> i32;
 
+    pub fn w34_kv_cache_write_bf16(
+        ex: *const W34Exec,
+        layout: *const W34KvLayerLayout,
+        batch: *const W34AttentionBatch,
+        k_in: *const c_void,
+        v_in: *const c_void,
+    ) -> i32;
+    pub fn w34_paged_attention_bf16(
+        ex: *const W34Exec,
+        layout: *const W34KvLayerLayout,
+        batch: *const W34AttentionBatch,
+        q_in: *const c_void,
+        attn_out: *mut c_void,
+        num_q_heads: i32,
+    ) -> i32;
+
     pub fn w34_paged_attention_f16(
         ex: *const W34Exec,
         layout: *const W34KvLayerLayout,
@@ -463,6 +481,334 @@ unsafe extern "C" {
         num_rows: i32,
         local_vocab_size: i32,
         vocab_offset: i32,
+    ) -> i32;
+
+    pub fn w34_embed_lookup_f16_to_bf16(
+        ex: *const W34Exec,
+        ids: *const i32,
+        weight: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        hidden: i32,
+        vocab: i32,
+    ) -> i32;
+    pub fn w34_cast_bf16_to_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        y: *mut c_void,
+        n: i64,
+    ) -> i32;
+    pub fn w34_dflash_edges_bf16(
+        ex: *const W34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out: *mut f32,
+        anchor: i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
+    ) -> i32;
+
+    pub fn w34_rms_norm_bf16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        y: *mut c_void,
+        rows: i32,
+        hidden: i32,
+        eps: f32,
+    ) -> i32;
+    pub fn w34_silu_and_mul_bf16(
+        ex: *const W34Exec,
+        gate_up: *const c_void,
+        y: *mut c_void,
+        rows: i32,
+        hidden: i32,
+    ) -> i32;
+    pub fn w34_dflash_conv_bf16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        delta: *const c_void,
+        base: *const c_void,
+        y: *mut c_void,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        group: i32,
+        taps: i32,
+        side: i32,
+    ) -> i32;
+    pub fn w34_dflash_qk_norm_rope_bf16_f32_table(
+        ex: *const W34Exec,
+        qkv: *mut c_void,
+        positions: *const i32,
+        qw: *const c_void,
+        kw: *const c_void,
+        table: *const c_void,
+        rows: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        dim: i32,
+        table_rows: i32,
+        eps: f32,
+    ) -> i32;
+    pub fn w34_dflash_qk_norm_rope_bf16(
+        ex: *const W34Exec,
+        qkv: *mut c_void,
+        positions: *const i32,
+        qw: *const c_void,
+        kw: *const c_void,
+        table: *const c_void,
+        rows: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        dim: i32,
+        table_rows: i32,
+        eps: f32,
+    ) -> i32;
+    pub fn w34_copy_cols_bf16(
+        ex: *const W34Exec,
+        src: *const c_void,
+        dst: *mut c_void,
+        rows: i32,
+        src_stride: i32,
+        dst_stride: i32,
+        src_col: i32,
+        dst_col: i32,
+        cols: i32,
+    ) -> i32;
+
+    pub fn w34_rejection_greedy(
+        ex: *const W34Exec,
+        drafts: *const i32,
+        targets: *const i32,
+        valid: *const u8,
+        emitted: *mut i32,
+        accepted: *mut i32,
+        status: *mut i32,
+        num_reqs: i32,
+        k: i32,
+    ) -> i32;
+
+    pub fn w34_rejection_stochastic(
+        ex: *const W34Exec,
+        drafts: *const i32,
+        target: *const f32,
+        proposal: *const f32,
+        uniforms: *const f64,
+        recovery: *const f64,
+        valid: *const u8,
+        emitted: *mut i32,
+        accepted: *mut i32,
+        status: *mut i32,
+        num_reqs: i32,
+        k: i32,
+        vocab: i32,
+    ) -> i32;
+
+    pub fn w34_concat_cols_2_f16(
+        ex: *const W34Exec,
+        src0: *const c_void,
+        src1: *const c_void,
+        dst: *mut c_void,
+        num_tokens: i32,
+        dim0: i32,
+        dim1: i32,
+    ) -> i32;
+
+    pub fn w34_tap_add_f16_to_f32(
+        ex: *const W34Exec,
+        res_f16: *const c_void,
+        mlp_f16: *const c_void,
+        dst_f32: *mut f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        dst_row_stride: i32,
+        dst_col_offset: i32,
+    ) -> i32;
+
+    pub fn w34_cast_f32_bf16(
+        ex: *const W34Exec,
+        src: *const f32,
+        dst_bf16: *mut c_void,
+        n: i64,
+    ) -> i32;
+
+    pub fn w34_cast_f32_f16(
+        ex: *const W34Exec,
+        src: *const f32,
+        dst_f16: *mut c_void,
+        n: i64,
+    ) -> i32;
+
+    pub fn w34_embed_lookup_f16_to_f32(
+        ex: *const W34Exec,
+        token_ids: *const i32,
+        embed_weight_f16: *const c_void,
+        out_f32: *mut f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        vocab_size: i32,
+    ) -> i32;
+
+    pub fn w34_embed_lookup_bf16_to_f32(
+        ex: *const W34Exec,
+        token_ids: *const i32,
+        embed_weight_bf16: *const c_void,
+        out_f32: *mut f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        vocab_size: i32,
+    ) -> i32;
+
+    pub fn w34_gemm_bf16_rows(
+        ex: *const W34Exec,
+        y_f32: *mut f32,
+        x_bf16: *const c_void,
+        w_bf16: *const c_void,
+        rows: i64,
+        n: i64,
+        k: i64,
+    ) -> i32;
+
+    pub fn w34_rms_norm_f32(
+        ex: *const W34Exec,
+        x: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        num_rows: i32,
+        dim: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_add_f32(
+        ex: *const W34Exec,
+        a: *const f32,
+        b: *const f32,
+        out: *mut f32,
+        n: i64,
+    ) -> i32;
+
+    pub fn w34_silu_and_mul_f32(
+        ex: *const W34Exec,
+        gate: *const f32,
+        up: *const f32,
+        out: *mut f32,
+        n: i64,
+    ) -> i32;
+
+    pub fn w34_split_cols_2_f32(
+        ex: *const W34Exec,
+        src: *const f32,
+        dst0: *mut f32,
+        dst1: *mut f32,
+        num_rows: i32,
+        dim0: i32,
+        dim1: i32,
+    ) -> i32;
+
+    pub fn w34_split_cols_3_f32(
+        ex: *const W34Exec,
+        src: *const f32,
+        dst0: *mut f32,
+        dst1: *mut f32,
+        dst2: *mut f32,
+        num_rows: i32,
+        dim0: i32,
+        dim1: i32,
+        dim2: i32,
+    ) -> i32;
+
+    pub fn w34_dflash_conv_f32(
+        ex: *const W34Exec,
+        y: *mut f32,
+        x: *const f32,
+        kp: *const f32,
+        base: *const f32,
+        rows: i64,
+        hidden: i64,
+        block: i64,
+        group: i64,
+        taps: i64,
+        conv: i64,
+    ) -> i32;
+
+    pub fn w34_dflash_rope_f32(
+        ex: *const W34Exec,
+        x: *mut f32,
+        pos: *const f32,
+        rows: i64,
+        heads: i64,
+        d: i64,
+        base: f32,
+    ) -> i32;
+
+    pub fn w34_dflash_kv_write_f32_to_bf16(
+        ex: *const W34Exec,
+        k_in: *const f32,
+        v_in: *const f32,
+        k_cache_bf16: *mut c_void,
+        v_cache_bf16: *mut c_void,
+        pos_base: i32,
+        num_rows: i32,
+        row_elems: i32,
+    ) -> i32;
+
+    pub fn w34_dflash_attention_f32(
+        ex: *const W34Exec,
+        q_in: *const f32,
+        k_cache_bf16: *const c_void,
+        v_cache_bf16: *const c_void,
+        attn_out: *mut f32,
+        block_rows: i32,
+        q_pos_base: i32,
+        total_kv_len: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        sliding_window: i32,
+        sm_scale: f32,
+    ) -> i32;
+
+    pub fn w34_dflash_edges_f32(
+        ex: *const W34Exec,
+        edges: *mut f32,
+        pred_cb_bf16: *const c_void,
+        succ_cb_bf16: *const c_void,
+        hp: *const f32,
+        cand_ids: *const i32,
+        cand_vals: *const f32,
+        bonus_id: i32,
+        k: i64,
+        top_k: i64,
+        rank: i64,
+    ) -> i32;
+
+    pub fn w34_topk_rows_f16(
+        ex: *const W34Exec,
+        logits_f16: *const c_void,
+        out_ids: *mut i32,
+        out_vals: *mut f32,
+        num_rows: i32,
+        local_vocab_size: i32,
+        vocab_offset: i32,
+        top_k: i32,
+    ) -> i32;
+
+    pub fn w34_topk_rows_f32(
+        ex: *const W34Exec,
+        logits_f32: *const f32,
+        out_ids: *mut i32,
+        out_vals: *mut f32,
+        num_rows: i32,
+        local_vocab_size: i32,
+        vocab_offset: i32,
+        top_k: i32,
     ) -> i32;
 }
 

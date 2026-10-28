@@ -23,7 +23,7 @@ use tokenizers::Tokenizer;
 use w34_kernels::ffi::{self, W34_ATTN_MASK_CAUSAL, W34AttentionBatch, W34Exec, W34GdnBatch};
 
 #[inline]
-fn loader_err(context: &'static str) -> CudaError {
+pub(crate) fn loader_err(context: &'static str) -> CudaError {
     CudaError { code: -10, context }
 }
 
@@ -156,7 +156,7 @@ impl LinearProj {
 }
 
 /// Raw host representation of a linear weight before sharding/uploading.
-enum RawLinearHost {
+pub(crate) enum RawLinearHost {
     U4B8NMajor {
         packed: Vec<u32>,
         scales: Vec<u16>,
@@ -172,7 +172,7 @@ enum RawLinearHost {
 }
 
 impl RawLinearHost {
-    fn load(
+    pub(crate) fn load(
         archive: &SafetensorsArchive,
         base_prefix: &str,
         default_group_size: usize,
@@ -258,7 +258,7 @@ impl RawLinearHost {
         Ok(Self::DenseF16 { weight, n, k })
     }
 
-    fn slice_rows(&self, row_start: usize, row_end: usize) -> Self {
+    pub(crate) fn slice_rows(&self, row_start: usize, row_end: usize) -> Self {
         let out_n = row_end - row_start;
         match self {
             Self::U4B8NMajor {
@@ -286,7 +286,7 @@ impl RawLinearHost {
         }
     }
 
-    fn slice_cols(&self, col_start: usize, col_end: usize) -> Self {
+    pub(crate) fn slice_cols(&self, col_start: usize, col_end: usize) -> Self {
         let out_k = col_end - col_start;
         match self {
             Self::U4B8NMajor {
@@ -335,7 +335,7 @@ impl RawLinearHost {
         }
     }
 
-    fn concat_rows(parts: &[Self]) -> Self {
+    pub(crate) fn concat_rows(parts: &[Self]) -> Self {
         assert!(!parts.is_empty());
         let k = match &parts[0] {
             Self::U4B8NMajor { k, .. } | Self::DenseF16 { k, .. } => *k,
@@ -400,7 +400,7 @@ impl RawLinearHost {
     }
 
     #[cfg(feature = "cuda")]
-    fn upload(
+    pub(crate) fn upload(
         &self,
         arena: &mut DeviceArena,
         stream: &CudaStream,
@@ -595,6 +595,13 @@ pub struct Qwen3_5ModelRank {
     pub decode_io: DecodeGraphIo,
     pub decode_graph: Option<CudaGraph>,
     pub capacity_plan: CapacityPlan,
+    pub tap_layer_ids: Vec<usize>,
+    pub tap_aux_f32: Option<DeviceBuffer>,
+    /// Selected-row local-vocabulary logits for native processed verification.
+    pub speculative_logits: Option<DeviceBuffer>,
+    pub speculative_logits_rows: usize,
+    pub last_final_hidden_f16: Option<DeviceBuffer>,
+    pub max_tap_rows: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -1001,7 +1008,81 @@ impl Qwen3_5ModelRank {
             decode_io,
             decode_graph: None,
             capacity_plan,
+            tap_layer_ids: Vec::new(),
+            tap_aux_f32: None,
+            speculative_logits: None,
+            speculative_logits_rows: 0,
+            last_final_hidden_f16: None,
+            max_tap_rows: 0,
         })
+    }
+
+    /// Configures replicated `TapPlan` auxiliary hidden-state capture for TP
+    /// DFlash2 and/or post-final-norm hidden export for native MTP. Each target
+    /// rank already owns the all-reduced activation; local capture avoids a
+    /// second PCIe transfer before the replicated drafter context projection.
+    /// Call on every TP rank with identical arguments before any forward or
+    /// graph capture, enforcing the same row capacity. Engine callers must also
+    /// propagate configuration failures before dispatching any rank forward.
+    pub fn configure_speculative_taps(
+        &mut self,
+        tap_layer_ids: &[usize],
+        export_final_hidden: bool,
+        max_tap_rows: usize,
+    ) -> Result<()> {
+        // Captured graphs own these destination addresses and the tap geometry.
+        // Require configuration before capture rather than freeing live targets.
+        if self.decode_graph.is_some() {
+            return Err(loader_err(
+                "configure speculative taps before decode graph capture",
+            ));
+        }
+        if (export_final_hidden || !tap_layer_ids.is_empty()) && max_tap_rows == 0 {
+            return Err(loader_err("speculative tap capacity must be positive"));
+        }
+        if tap_layer_ids
+            .iter()
+            .enumerate()
+            .any(|(i, &id)| id >= self.layers.len() || tap_layer_ids[..i].contains(&id))
+        {
+            return Err(loader_err("tap layer ids must be unique and in range"));
+        }
+        self.device.make_current()?;
+        self.stream.synchronize()?;
+        let row_elems = max_tap_rows
+            .checked_mul(self.cfg.hidden_size)
+            .ok_or_else(|| loader_err("tap capacity overflow"))?;
+        let tap_aux_f32 = if !tap_layer_ids.is_empty() {
+            let bytes = row_elems
+                .checked_mul(tap_layer_ids.len())
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| loader_err("tap capacity overflow"))?;
+            Some(DeviceBuffer::alloc(self.device.device_id, bytes)?)
+        } else {
+            None
+        };
+        let last_final_hidden_f16 = if export_final_hidden {
+            let bytes = row_elems
+                .checked_mul(2)
+                .ok_or_else(|| loader_err("final hidden capacity overflow"))?;
+            Some(DeviceBuffer::alloc(self.device.device_id, bytes)?)
+        } else {
+            None
+        };
+        self.tap_layer_ids = tap_layer_ids.to_vec();
+        self.max_tap_rows = max_tap_rows;
+        self.tap_aux_f32 = tap_aux_f32;
+        self.last_final_hidden_f16 = last_final_hidden_f16;
+        Ok(())
+    }
+
+    fn validate_tap_rows(&self, num_tokens: usize) -> Result<()> {
+        if (!self.tap_layer_ids.is_empty() || self.last_final_hidden_f16.is_some())
+            && num_tokens > self.max_tap_rows
+        {
+            return Err(loader_err("forward rows exceed speculative tap capacity"));
+        }
+        Ok(())
     }
 
     /// Executes the full model spine for `num_tokens` tokens on this rank.
@@ -1019,6 +1100,7 @@ impl Qwen3_5ModelRank {
         out_top5_logprobs_ptr: u64,
         mut dump_out: Option<&mut ForwardDump>,
     ) -> Result<i32> {
+        self.validate_tap_rows(num_tokens)?;
         self.device.make_current()?;
         self.scratch_arena.reset();
         let ex = self.stream.exec(
@@ -1510,6 +1592,28 @@ impl Qwen3_5ModelRank {
                     (num_tokens * h_dim) as i32,
                 )?;
             }
+
+            if num_tokens <= self.max_tap_rows
+                && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
+                && let Some(tap_buf) = &self.tap_aux_f32
+            {
+                let num_taps = self.tap_layer_ids.len();
+                check_rc(
+                    unsafe {
+                        ffi::w34_tap_add_f16_to_f32(
+                            &ex,
+                            residual_buf as *const c_void,
+                            mlp_out_buf as *const c_void,
+                            tap_buf.addr() as *mut f32,
+                            num_tokens as i32,
+                            h_dim as i32,
+                            (num_taps * h_dim) as i32,
+                            (tap_slot * h_dim) as i32,
+                        )
+                    },
+                    "w34_tap_add_f16_to_f32",
+                )?;
+            }
         }
 
         // 3. Final RMSNorm
@@ -1529,6 +1633,22 @@ impl Qwen3_5ModelRank {
             },
             "w34_fused_add_gemma_rms_norm_f16 (final)",
         )?;
+
+        if num_tokens <= self.max_tap_rows
+            && let Some(final_h_buf) = &self.last_final_hidden_f16
+        {
+            check_rc(
+                unsafe {
+                    ffi::w34_memcpy_d2d_async(
+                        final_h_buf.addr() as *mut c_void,
+                        normed_buf as *const c_void,
+                        num_tokens * h_dim * 2,
+                        self.stream.handle,
+                    )
+                },
+                "export_final_hidden d2d",
+            )?;
+        }
 
         if let Some(dump) = dump_out.as_deref_mut()
             && self.rank == 0
@@ -1651,6 +1771,17 @@ impl Qwen3_5ModelRank {
         tp2: Option<&Tp2Collectives>,
         selected_rows: &[usize],
     ) -> Result<Vec<i32>> {
+        self.validate_tap_rows(num_tokens)?;
+        if self
+            .speculative_logits
+            .as_ref()
+            .is_some_and(|b| selected_rows.len() > b.len_bytes / (self.local_vocab_size * 2))
+        {
+            return Err(loader_err(
+                "selected rows exceed speculative logits capacity",
+            ));
+        }
+        self.speculative_logits_rows = 0;
         self.device.make_current()?;
         let ex = self.stream.exec(0, 0);
         let h_dim = self.cfg.hidden_size;
@@ -2101,6 +2232,28 @@ impl Qwen3_5ModelRank {
                     (num_tokens * h_dim) as i32,
                 )?;
             }
+
+            if num_tokens <= self.max_tap_rows
+                && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
+                && let Some(tap_buf) = &self.tap_aux_f32
+            {
+                let num_taps = self.tap_layer_ids.len();
+                check_rc(
+                    unsafe {
+                        ffi::w34_tap_add_f16_to_f32(
+                            &ex,
+                            residual_buf as *const c_void,
+                            mlp_out_buf as *const c_void,
+                            tap_buf.addr() as *mut f32,
+                            num_tokens as i32,
+                            h_dim as i32,
+                            (num_taps * h_dim) as i32,
+                            (tap_slot * h_dim) as i32,
+                        )
+                    },
+                    "w34_tap_add_f16_to_f32 (selected)",
+                )?;
+            }
         }
 
         check_rc(
@@ -2120,8 +2273,24 @@ impl Qwen3_5ModelRank {
             "w34_fused_add_gemma_rms_norm_f16 (final)",
         )?;
 
+        if num_tokens <= self.max_tap_rows
+            && let Some(final_h_buf) = &self.last_final_hidden_f16
+        {
+            check_rc(
+                unsafe {
+                    ffi::w34_memcpy_d2d_async(
+                        final_h_buf.addr() as *mut c_void,
+                        normed_buf as *const c_void,
+                        num_tokens * h_dim * 2,
+                        self.stream.handle,
+                    )
+                },
+                "export_final_hidden d2d (selected)",
+            )?;
+        }
+
         let mut out_ids = Vec::with_capacity(selected_rows.len());
-        for &row_idx in selected_rows {
+        for (selected_idx, &row_idx) in selected_rows.iter().enumerate() {
             let row_hidden_ptr = normed_buf + (row_idx * h_dim * 2) as u64;
             self.lm_head.forward(
                 &ex,
@@ -2132,6 +2301,22 @@ impl Qwen3_5ModelRank {
                 logits_buf,
                 1,
             )?;
+            if let Some(buf) = &self.speculative_logits {
+                // SAFETY: capacity was validated before dispatch and logits_buf
+                // owns one local-vocabulary row on this rank's stream.
+                check_rc(
+                    unsafe {
+                        ffi::w34_memcpy_d2d_async(
+                            (buf.addr() + (selected_idx * self.local_vocab_size * 2) as u64)
+                                as *mut c_void,
+                            logits_buf as *const c_void,
+                            self.local_vocab_size * 2,
+                            self.stream.handle,
+                        )
+                    },
+                    "capture selected logits",
+                )?;
+            }
             if let Some(comm) = tp2 {
                 check_rc(
                     unsafe {
@@ -2180,6 +2365,7 @@ impl Qwen3_5ModelRank {
                 .copy_to_host(&mut gid, &self.stream)?;
             out_ids.push(gid[0]);
         }
+        self.speculative_logits_rows = selected_rows.len();
         Ok(out_ids)
     }
 
@@ -2312,6 +2498,7 @@ unsafe impl Send for Qwen3_5ModelRank {}
 /// Top-level `TP=1` / `TP=2` Qwen 3.5 / 3.8 inference engine.
 #[cfg(feature = "cuda")]
 pub struct Qwen3_5Engine {
+    pub model_dir: std::path::PathBuf,
     pub cfg: ModelConfig,
     pub tp_size: usize,
     pub ranks: Vec<Qwen3_5ModelRank>,
@@ -2319,6 +2506,7 @@ pub struct Qwen3_5Engine {
     pub tokenizer: Option<Tokenizer>,
     pub use_cuda_graph: bool,
     pub radix: MambaRadixCache,
+    pub speculative: Option<crate::proposer::NativeProposer>,
 }
 
 #[derive(Clone, Debug)]
@@ -2414,6 +2602,7 @@ impl Qwen3_5Engine {
         };
 
         Ok(Self {
+            model_dir: dir.to_path_buf(),
             cfg,
             tp_size,
             ranks,
@@ -2421,9 +2610,55 @@ impl Qwen3_5Engine {
             tokenizer,
             use_cuda_graph,
             radix: MambaRadixCache::new(16, 64),
+            speculative: None,
         })
     }
 
+    /// Enable one native proposer before target graph capture. The proposer
+    /// remains resident across requests, including its bounded prefix memo.
+    pub fn enable_speculative(
+        &mut self,
+        config: &crate::proposer::SpeculativeConfig,
+    ) -> Result<()> {
+        if self.speculative.is_some() {
+            return Err(loader_err("speculation is already configured"));
+        }
+        self.speculative = Some(crate::proposer::NativeProposer::load(self, config)?);
+        self.use_cuda_graph = false;
+        Ok(())
+    }
+    fn generate_native_speculative(
+        &mut self,
+        prompt: &[i32],
+        max_new: usize,
+        chunk: usize,
+        stop_eos: bool,
+    ) -> Result<RadixBenchMetrics> {
+        let mut proposer = self
+            .speculative
+            .take()
+            .ok_or_else(|| loader_err("missing native proposer"))?;
+        let result = proposer.generate(self, prompt, max_new, chunk, stop_eos);
+        self.speculative = Some(proposer);
+        result
+    }
+    /// Processed stochastic/grammar decoding using the configured native proposer.
+    /// Greedy proposals retain point-mass q; rejection still samples the exact target law.
+    pub fn generate_sampled_with_radix_cache(
+        &mut self,
+        prompt: &[i32],
+        params: crate::parser::SamplingParams,
+        constraint: Option<crate::parser::TokenBitmaskConstraint>,
+        chunk: usize,
+    ) -> Result<RadixBenchMetrics> {
+        let mut proposer = self
+            .speculative
+            .take()
+            .ok_or_else(|| loader_err("sampled decoding requires a native proposer"))?;
+        let result = proposer.generate_sampled(self, prompt, params, constraint, chunk);
+        self.speculative = Some(proposer);
+        result
+    }
     pub fn encode(&self, text: &str) -> Result<Vec<i32>> {
         let tok = self
             .tokenizer
@@ -3123,6 +3358,24 @@ impl Qwen3_5Engine {
         max_new_tokens: usize,
         stop_on_eos: bool,
     ) -> Result<BenchMetrics> {
+        if self.speculative.is_some() {
+            let m = self.generate_native_speculative(
+                prompt_token_ids,
+                max_new_tokens,
+                64,
+                stop_on_eos,
+            )?;
+            return Ok(BenchMetrics {
+                prompt_len: m.prompt_len,
+                gen_len: m.gen_len,
+                ttft_ms: m.ttft_ms,
+                prefill_tok_per_s: m.prefill_tok_per_s,
+                decode_ms: m.decode_ms,
+                decode_tok_per_s: m.decode_tok_per_s,
+                itl_ms: m.itl_ms,
+                generated_token_ids: m.generated_token_ids,
+            });
+        }
         self.reset_all_states()?;
         let total_needed_tokens = prompt_token_ids.len() + max_new_tokens + 4;
         let needed_pages = total_needed_tokens.div_ceil(16);
@@ -3740,7 +3993,7 @@ impl Qwen3_5Engine {
         self.cfg.eos_token_ids.contains(&token_id)
     }
 
-    fn alloc_three_state_slots(&mut self) -> Option<(i32, [i32; 2])> {
+    pub(crate) fn alloc_three_state_slots(&mut self) -> Option<(i32, [i32; 2])> {
         let s0 = self.alloc_state_slot()?;
         let Some(s1) = self.alloc_state_slot() else {
             self.free_state_slots(&[s0]);
@@ -3753,7 +4006,7 @@ impl Qwen3_5Engine {
         Some((s0, [s1, s2]))
     }
 
-    fn ensure_kv_pages_for_len(
+    pub(crate) fn ensure_kv_pages_for_len(
         &mut self,
         req_state: &mut ReqRadixState,
         target_len: usize,
@@ -3777,6 +4030,14 @@ impl Qwen3_5Engine {
         prefill_chunk_size: usize,
         stop_on_eos: bool,
     ) -> Result<RadixBenchMetrics> {
+        if self.speculative.is_some() {
+            return self.generate_native_speculative(
+                prompt_token_ids,
+                max_new_tokens,
+                prefill_chunk_size,
+                stop_on_eos,
+            );
+        }
         if prompt_token_ids.is_empty() {
             return Err(loader_err("empty prompt in generate_with_radix_cache"));
         }

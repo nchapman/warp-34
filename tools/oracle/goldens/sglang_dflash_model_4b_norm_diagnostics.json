@@ -1,0 +1,788 @@
+{
+  "capture_vs_original": {
+    "final_hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.context_prepared": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.v_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.v_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "context.fc": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.k_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.q": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.residual": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.q": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.attention": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "context.hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "input.taps_bf16": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.v_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.context_prepared": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.k_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.residual": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.v_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "input.taps.f32": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.v_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.k_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.k_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "input.embeddings.bf16": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.q": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "selector.projected_hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.residual": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.residual": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.attention": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.attention": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.attention": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.residual": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.q": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.context_prepared": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.q": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.context_prepared": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.attention": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.k_all": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.context_prepared": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    }
+  },
+  "norm_counterfactual": {
+    "norms.layers.0.post_attention_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 7.489735160253714e-06,
+        "maxabs": 0.0009765625,
+        "unequal": 19
+      },
+      "max_operand_abs": 39583744.0
+    },
+    "norms.layers.1.input_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.0013504676621685038,
+        "maxabs": 0.0625,
+        "unequal": 5861
+      },
+      "max_operand_abs": 28185722880.0
+    },
+    "norms.layers.1.post_attention_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.0023134658852766547,
+        "maxabs": 0.125,
+        "unequal": 9351
+      },
+      "max_operand_abs": 28185722880.0
+    },
+    "norms.layers.2.input_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.002514029933672832,
+        "maxabs": 0.0625,
+        "unequal": 9030
+      },
+      "max_operand_abs": 272730423296.0
+    },
+    "norms.layers.2.post_attention_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 3.8606281258016046e-05,
+        "maxabs": 0.0078125,
+        "unequal": 1
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.0018282133412734387,
+        "maxabs": 0.0625,
+        "unequal": 8793
+      },
+      "max_operand_abs": 277025390592.0
+    },
+    "norms.layers.3.input_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.002833171644258671,
+        "maxabs": 0.125,
+        "unequal": 8991
+      },
+      "max_operand_abs": 1030792151040.0
+    },
+    "norms.layers.3.post_attention_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.0008443485782861625,
+        "maxabs": 0.03125,
+        "unequal": 4529
+      },
+      "max_operand_abs": 1099511627776.0
+    },
+    "norms.layers.4.input_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.0027321697348060953,
+        "maxabs": 0.0625,
+        "unequal": 9436
+      },
+      "max_operand_abs": 1821066133504.0
+    },
+    "norms.layers.4.post_attention_layernorm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.0003801537767717717,
+        "maxabs": 0.015625,
+        "unequal": 3161
+      },
+      "max_operand_abs": 1632087572480.0
+    },
+    "norms.norm.call0": {
+      "fp32_sum": {
+        "relL2": 0.0,
+        "maxabs": 0.0,
+        "unequal": 0
+      },
+      "rounded_bf16_sum": {
+        "relL2": 0.0028537696434253325,
+        "maxabs": 0.0625,
+        "unequal": 9473
+      },
+      "max_operand_abs": 4879082848256.0
+    }
+  },
+  "native_trace": {
+    "context.fc": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "context.hidden": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "gemms.layers.0.self_attn.o_proj.output": {
+      "relL2": 0.00017731160275159905,
+      "maxabs": 128.0,
+      "unequal": 429
+    },
+    "layers.0.attention": {
+      "relL2": 5.151256944018615e-05,
+      "maxabs": 2.0,
+      "unequal": 24
+    },
+    "layers.0.context_k": {
+      "relL2": 1.66590182795208e-09,
+      "maxabs": 1.1920928955078125e-07,
+      "unequal": 1
+    },
+    "layers.0.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.0.hidden": {
+      "relL2": 0.0041776027285298995,
+      "maxabs": 134217728.0,
+      "unequal": 17648
+    },
+    "layers.0.q": {
+      "relL2": 9.53687817641045e-07,
+      "maxabs": 0.000244140625,
+      "unequal": 3
+    },
+    "layers.0.residual": {
+      "relL2": 0.00011298128879340811,
+      "maxabs": 4096.0,
+      "unequal": 486
+    },
+    "layers.1.attention": {
+      "relL2": 0.008583786091253846,
+      "maxabs": 80.0,
+      "unequal": 49389
+    },
+    "layers.1.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.1.hidden": {
+      "relL2": 0.012730517628444866,
+      "maxabs": 2684354560.0,
+      "unequal": 35792
+    },
+    "layers.1.q": {
+      "relL2": 0.0082665819959108,
+      "maxabs": 0.0498046875,
+      "unequal": 39840
+    },
+    "layers.1.residual": {
+      "relL2": 0.004185584961401635,
+      "maxabs": 134217728.0,
+      "unequal": 22576
+    },
+    "layers.2.attention": {
+      "relL2": 0.009666684215775807,
+      "maxabs": 768.0,
+      "unequal": 55090
+    },
+    "layers.2.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.2.hidden": {
+      "relL2": 0.011410605231603916,
+      "maxabs": 12884901888.0,
+      "unequal": 38259
+    },
+    "layers.2.q": {
+      "relL2": 0.012667457045388995,
+      "maxabs": 0.078125,
+      "unequal": 55518
+    },
+    "layers.2.residual": {
+      "relL2": 0.012735507900286434,
+      "maxabs": 2684354560.0,
+      "unequal": 35289
+    },
+    "layers.3.attention": {
+      "relL2": 0.013914594980044069,
+      "maxabs": 304.0,
+      "unequal": 57224
+    },
+    "layers.3.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.3.hidden": {
+      "relL2": 0.018166641041721634,
+      "maxabs": 38654705664.0,
+      "unequal": 37730
+    },
+    "layers.3.q": {
+      "relL2": 0.01855833984347879,
+      "maxabs": 0.140625,
+      "unequal": 57825
+    },
+    "layers.3.residual": {
+      "relL2": 0.011694111300508195,
+      "maxabs": 17179869184.0,
+      "unequal": 36639
+    },
+    "layers.4.attention": {
+      "relL2": 0.02450403732471191,
+      "maxabs": 176.0,
+      "unequal": 60644
+    },
+    "layers.4.context_k": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.context_v": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "layers.4.hidden": {
+      "relL2": 0.015336967121114658,
+      "maxabs": 68719476736.0,
+      "unequal": 37131
+    },
+    "layers.4.q": {
+      "relL2": 0.02442470404219815,
+      "maxabs": 0.1893310546875,
+      "unequal": 59917
+    },
+    "layers.4.residual": {
+      "relL2": 0.018279475040321375,
+      "maxabs": 42949672960.0,
+      "unequal": 37261
+    },
+    "norms.layers.0.post_attention_layernorm.call0.input0": {
+      "relL2": 0.00011298128879340811,
+      "maxabs": 4096.0,
+      "unequal": 486
+    },
+    "norms.layers.1.post_attention_layernorm.call0.input0": {
+      "relL2": 0.00988090578046729,
+      "maxabs": 851968.0,
+      "unequal": 34014
+    },
+    "norms.layers.2.post_attention_layernorm.call0.input0": {
+      "relL2": 0.01361338571080043,
+      "maxabs": 201326592.0,
+      "unequal": 36581
+    },
+    "norms.layers.3.post_attention_layernorm.call0.input0": {
+      "relL2": 0.0155605119719384,
+      "maxabs": 8388608.0,
+      "unequal": 37420
+    },
+    "norms.layers.4.post_attention_layernorm.call0.input0": {
+      "relL2": 0.02393285504278414,
+      "maxabs": 1310720.0,
+      "unequal": 38243
+    },
+    "ops.layers.0.input_layernorm.output0": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "ops.layers.0.mlp.down_proj.input0": {
+      "relL2": 0.0021170414471766755,
+      "maxabs": 32768.0,
+      "unequal": 27212
+    },
+    "ops.layers.0.mlp.down_proj.output0": {
+      "relL2": 0.0028711838016219162,
+      "maxabs": 1048576.0,
+      "unequal": 15881
+    },
+    "ops.layers.0.mlp.gate_up_proj.input0": {
+      "relL2": 0.0012472589817454707,
+      "maxabs": 1.0,
+      "unequal": 3804
+    },
+    "ops.layers.0.mlp.gate_up_proj.output0": {
+      "relL2": 0.001503056449387698,
+      "maxabs": 32.0,
+      "unequal": 57181
+    },
+    "ops.layers.0.post_attention_layernorm.output0": {
+      "relL2": 0.00043969630938719306,
+      "maxabs": 0.0625,
+      "unequal": 485
+    },
+    "ops.layers.0.self_attn.qkv_proj.input0": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "ops.layers.0.self_attn.qkv_proj.output0": {
+      "relL2": 0.0,
+      "maxabs": 0.0,
+      "unequal": 0
+    },
+    "ops.layers.1.input_layernorm.output0": {
+      "relL2": 0.005211294088308831,
+      "maxabs": 0.15625,
+      "unequal": 17586
+    },
+    "ops.layers.1.mlp.down_proj.input0": {
+      "relL2": 0.014527261268036476,
+      "maxabs": 1310720.0,
+      "unequal": 52713
+    },
+    "ops.layers.1.mlp.down_proj.output0": {
+      "relL2": 0.013010808895718703,
+      "maxabs": 33554432.0,
+      "unequal": 34373
+    },
+    "ops.layers.1.mlp.gate_up_proj.input0": {
+      "relL2": 0.00857563818212355,
+      "maxabs": 16.0,
+      "unequal": 30009
+    },
+    "ops.layers.1.mlp.gate_up_proj.output0": {
+      "relL2": 0.008157678323352494,
+      "maxabs": 224.0,
+      "unequal": 219237
+    },
+    "ops.layers.1.post_attention_layernorm.output0": {
+      "relL2": 0.005696655923027243,
+      "maxabs": 0.125,
+      "unequal": 22822
+    },
+    "ops.layers.1.self_attn.qkv_proj.input0": {
+      "relL2": 0.008184527663178493,
+      "maxabs": 12.0,
+      "unequal": 24155
+    },
+    "ops.layers.1.self_attn.qkv_proj.output0": {
+      "relL2": 0.008307778654964014,
+      "maxabs": 128.0,
+      "unequal": 59926
+    },
+    "ops.layers.2.input_layernorm.output0": {
+      "relL2": 0.012930872466861802,
+      "maxabs": 0.1875,
+      "unequal": 35599
+    },
+    "ops.layers.2.mlp.down_proj.input0": {
+      "relL2": 0.023220104734545784,
+      "maxabs": 1835008.0,
+      "unequal": 87227
+    },
+    "ops.layers.2.mlp.down_proj.output0": {
+      "relL2": 0.019414650983543776,
+      "maxabs": 100663296.0,
+      "unequal": 37389
+    },
+    "ops.layers.2.mlp.gate_up_proj.input0": {
+      "relL2": 0.015801530247169324,
+      "maxabs": 16.0,
+      "unequal": 37714
+    },
+    "ops.layers.2.mlp.gate_up_proj.output0": {
+      "relL2": 0.01656173483060857,
+      "maxabs": 224.0,
+      "unequal": 260215
+    },
+    "ops.layers.2.post_attention_layernorm.output0": {
+      "relL2": 0.012973017581704377,
+      "maxabs": 0.1875,
+      "unequal": 35629
+    },
+    "ops.layers.2.self_attn.qkv_proj.input0": {
+      "relL2": 0.013438080223667956,
+      "maxabs": 88.0,
+      "unequal": 37223
+    },
+    "ops.layers.2.self_attn.qkv_proj.output0": {
+      "relL2": 0.012615758562413005,
+      "maxabs": 1280.0,
+      "unequal": 84047
+    },
+    "ops.layers.3.input_layernorm.output0": {
+      "relL2": 0.0135851004408017,
+      "maxabs": 0.28125,
+      "unequal": 36858
+    },
+    "ops.layers.3.mlp.down_proj.input0": {
+      "relL2": 0.021895837456565703,
+      "maxabs": 29360128.0,
+      "unequal": 80512
+    },
+    "ops.layers.3.mlp.down_proj.output0": {
+      "relL2": 0.02091504086702695,
+      "maxabs": 369098752.0,
+      "unequal": 36951
+    },
+    "ops.layers.3.mlp.gate_up_proj.input0": {
+      "relL2": 0.014172421975574882,
+      "maxabs": 64.0,
+      "unequal": 38498
+    },
+    "ops.layers.3.mlp.gate_up_proj.output0": {
+      "relL2": 0.014612212009467256,
+      "maxabs": 512.0,
+      "unequal": 254982
+    },
+    "ops.layers.3.post_attention_layernorm.output0": {
+      "relL2": 0.013739568727965924,
+      "maxabs": 0.28125,
+      "unequal": 36833
+    },
+    "ops.layers.3.self_attn.qkv_proj.input0": {
+      "relL2": 0.018124216484994606,
+      "maxabs": 28.0,
+      "unequal": 38210
+    },
+    "ops.layers.3.self_attn.qkv_proj.output0": {
+      "relL2": 0.017119728726752007,
+      "maxabs": 336.0,
+      "unequal": 88104
+    },
+    "ops.layers.4.input_layernorm.output0": {
+      "relL2": 0.01517002216020315,
+      "maxabs": 0.28125,
+      "unequal": 37216
+    },
+    "ops.layers.4.mlp.down_proj.input0": {
+      "relL2": 0.019421295112752344,
+      "maxabs": 20971520.0,
+      "unequal": 82318
+    },
+    "ops.layers.4.mlp.down_proj.output0": {
+      "relL2": 0.016164262733370332,
+      "maxabs": 335544320.0,
+      "unequal": 36948
+    },
+    "ops.layers.4.mlp.gate_up_proj.input0": {
+      "relL2": 0.018371834461713074,
+      "maxabs": 42.0,
+      "unequal": 37887
+    },
+    "ops.layers.4.mlp.gate_up_proj.output0": {
+      "relL2": 0.017764597287308927,
+      "maxabs": 768.0,
+      "unequal": 265147
+    },
+    "ops.layers.4.post_attention_layernorm.output0": {
+      "relL2": 0.015414846212139725,
+      "maxabs": 0.28125,
+      "unequal": 37278
+    },
+    "ops.layers.4.self_attn.qkv_proj.input0": {
+      "relL2": 0.022520885729455955,
+      "maxabs": 17.25,
+      "unequal": 38347
+    },
+    "ops.layers.4.self_attn.qkv_proj.output0": {
+      "relL2": 0.021866855013655744,
+      "maxabs": 312.0,
+      "unequal": 89938
+    }
+  }
+}

@@ -14,7 +14,7 @@ No scheduler, radix tree, or block-table manager may multiply a `page_id` or `sl
 A single `KvPool` manages isolated logical page tables across three cache namespaces:
 1. `TargetFullAttn` (`0`): Target model full-attention layers (e.g., 16 full-attn layers on 27B, 8 on 9B, 8 on 4B; `head_dim = 256`).
 2. `MtpFullAttn` (`1`): Native `Qwen3_5MTP` 1-layer full-attention KV cache (`head_dim = 256`).
-3. `DFlashDraftContext` (`2`): `DFlash2` proposer cross-attention draft-context KV cache (`head_dim = 128` on 27B with symmetric non-causal sliding window `2048`; `BF16` full attention on 4B).
+3. `DFlashDraftContext` (`2`): `DFlash2` proposer cross-attention draft-context KV cache (`head_dim = 128` on 27B with non-causal query-relative left window `2048`; `BF16` full attention on 4B).
 
 ## 3. Per-Layer Physical Descriptor (`KvLayerLayout`)
 

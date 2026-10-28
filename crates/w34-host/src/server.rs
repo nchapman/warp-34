@@ -28,6 +28,56 @@ use crate::model::Qwen3_5Engine;
 #[cfg(feature = "cuda")]
 use crate::parser::Qwen3Parser;
 
+/// Parse the sampling subset supported by native speculative requests. Validate
+/// before GPU dispatch; do not silently accept malformed numeric parameters.
+pub fn native_sampling_params(
+    req: &serde_json::Value,
+    max_tokens: usize,
+) -> Result<crate::parser::SamplingParams, String> {
+    use crate::parser::{SamplerV1, SamplingParams};
+    let number = |name: &str, default: f32| -> Result<f32, String> {
+        match req.get(name) {
+            None => Ok(default),
+            Some(v) => v
+                .as_f64()
+                .map(|x| x as f32)
+                .ok_or_else(|| format!("invalid {name}")),
+        }
+    };
+    let defaults = SamplingParams::default();
+    let top_k = match req.get("top_k") {
+        None => defaults.top_k,
+        Some(v) => v
+            .as_i64()
+            .and_then(|x| i32::try_from(x).ok())
+            .ok_or("invalid top_k")?,
+    };
+    let seed = match req.get("seed") {
+        None => defaults.seed,
+        Some(v) => v.as_u64().ok_or("invalid seed")?,
+    };
+    if req
+        .get("stop")
+        .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()))
+    {
+        return Err("native speculative sampling does not yet support stop strings".into());
+    }
+    let params = SamplingParams {
+        temperature: number("temperature", defaults.temperature)?,
+        top_k,
+        top_p: number("top_p", defaults.top_p)?,
+        min_p: number("min_p", defaults.min_p)?,
+        repetition_penalty: number("repetition_penalty", defaults.repetition_penalty)?,
+        frequency_penalty: number("frequency_penalty", defaults.frequency_penalty)?,
+        presence_penalty: number("presence_penalty", defaults.presence_penalty)?,
+        seed,
+        max_tokens,
+        ..defaults
+    };
+    SamplerV1::new(params.clone(), &[], None).processed_distribution(&[0.0])?;
+    Ok(params)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -439,7 +489,24 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                         return;
                     }
                 };
-                let m = match eng.generate_with_radix_cache(&prompt_ids, max_tokens, 64, true) {
+                let generation = if eng.speculative.is_some() {
+                    let params = match native_sampling_params(&req_json, max_tokens) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = write_json_response(
+                                &mut stream,
+                                400,
+                                "Bad Request",
+                                &json!({"error":e}),
+                            );
+                            return;
+                        }
+                    };
+                    eng.generate_sampled_with_radix_cache(&prompt_ids, params, None, 64)
+                } else {
+                    eng.generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
+                };
+                let m = match generation {
                     Ok(m) => m,
                     Err(e) => {
                         let _ = write_json_response(
@@ -594,7 +661,24 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                         return;
                     }
                 };
-                let m = match eng.generate_with_radix_cache(&prompt_ids, max_tokens, 64, true) {
+                let generation = if eng.speculative.is_some() {
+                    let params = match native_sampling_params(&req_json, max_tokens) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = write_json_response(
+                                &mut stream,
+                                400,
+                                "Bad Request",
+                                &json!({"error":e}),
+                            );
+                            return;
+                        }
+                    };
+                    eng.generate_sampled_with_radix_cache(&prompt_ids, params, None, 64)
+                } else {
+                    eng.generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
+                };
+                let m = match generation {
                     Ok(m) => m,
                     Err(e) => {
                         let _ = write_json_response(

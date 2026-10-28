@@ -1176,6 +1176,38 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup w34_paged_attention_f16",
     )?;
 
+    let bf16_layout = W34KvLayerLayout {
+        namespace_id: ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
+        k_format: ffi::W34_KV_FORMAT_BF16,
+        v_format: ffi::W34_KV_FORMAT_BF16,
+        ..layout
+    };
+    check_rc(
+        unsafe {
+            ffi::w34_kv_cache_write_bf16(
+                &ex,
+                &bf16_layout,
+                &attn_batch,
+                buf_c as *const c_void,
+                buf_c as *const c_void,
+            )
+        },
+        "warmup w34_kv_cache_write_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_paged_attention_bf16(
+                &ex,
+                &bf16_layout,
+                &attn_batch,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                2,
+            )
+        },
+        "warmup w34_paged_attention_bf16",
+    )?;
+
     // 4. GDN conv1d & recurrent
     let state_in = arena.upload_slice(&[0i32], &stream)?;
     let state_out = arena.upload_slice(&[0i32], &stream)?;
@@ -1237,7 +1269,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup w34_gdn_recurrent_f16",
     )?;
 
-    // 5. Sampler
+    // 5. Sampler & Phase 4 MTP / DFlash2 kernels
     check_rc(
         unsafe {
             ffi::w34_sampler_greedy_top5_f16(
@@ -1252,6 +1284,446 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )
         },
         "warmup w34_sampler_greedy_top5_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_concat_cols_2_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                128,
+                128,
+            )
+        },
+        "warmup w34_concat_cols_2_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_tap_add_f16_to_f32(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut f32,
+                1,
+                128,
+                640,
+                0,
+            )
+        },
+        "warmup w34_tap_add_f16_to_f32",
+    )?;
+    check_rc(
+        unsafe { ffi::w34_cast_f32_bf16(&ex, buf_a as *const f32, buf_b as *mut c_void, 128) },
+        "warmup w34_cast_f32_bf16",
+    )?;
+    check_rc(
+        unsafe { ffi::w34_cast_f32_f16(&ex, buf_a as *const f32, buf_b as *mut c_void, 128) },
+        "warmup w34_cast_f32_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_embed_lookup_f16_to_f32(
+                &ex,
+                buf_a as *const i32,
+                buf_b as *const c_void,
+                buf_c as *mut f32,
+                1,
+                128,
+                256,
+            )
+        },
+        "warmup w34_embed_lookup_f16_to_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_embed_lookup_bf16_to_f32(
+                &ex,
+                buf_a as *const i32,
+                buf_b as *const c_void,
+                buf_c as *mut f32,
+                1,
+                128,
+                256,
+            )
+        },
+        "warmup w34_embed_lookup_bf16_to_f32",
+    )?;
+    for r_warm in [1i64, 7, 8, 15, 16] {
+        check_rc(
+            unsafe {
+                ffi::w34_gemm_bf16_rows(
+                    &ex,
+                    buf_c as *mut f32,
+                    buf_a as *const c_void,
+                    buf_b as *const c_void,
+                    r_warm,
+                    64,
+                    128,
+                )
+            },
+            "warmup w34_gemm_bf16_rows",
+        )?;
+    }
+    check_rc(
+        unsafe {
+            ffi::w34_rms_norm_f32(
+                &ex,
+                buf_a as *const f32,
+                buf_b as *const f32,
+                buf_c as *mut f32,
+                1,
+                128,
+                1e-6,
+            )
+        },
+        "warmup w34_rms_norm_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_add_f32(
+                &ex,
+                buf_a as *const f32,
+                buf_b as *const f32,
+                buf_c as *mut f32,
+                128,
+            )
+        },
+        "warmup w34_add_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_silu_and_mul_f32(
+                &ex,
+                buf_a as *const f32,
+                buf_b as *const f32,
+                buf_c as *mut f32,
+                128,
+            )
+        },
+        "warmup w34_silu_and_mul_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_split_cols_2_f32(
+                &ex,
+                buf_a as *const f32,
+                buf_b as *mut f32,
+                buf_c as *mut f32,
+                1,
+                64,
+                64,
+            )
+        },
+        "warmup w34_split_cols_2_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_split_cols_3_f32(
+                &ex,
+                buf_a as *const f32,
+                buf_b as *mut f32,
+                buf_c as *mut f32,
+                buf_d as *mut f32,
+                1,
+                64,
+                32,
+                32,
+            )
+        },
+        "warmup w34_split_cols_3_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_conv_f32(
+                &ex,
+                buf_c as *mut f32,
+                buf_a as *const f32,
+                buf_b as *const f32,
+                buf_d as *const f32,
+                8,
+                128,
+                8,
+                16,
+                2,
+                0,
+            )
+        },
+        "warmup w34_dflash_conv_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_rope_f32(
+                &ex,
+                buf_a as *mut f32,
+                buf_b as *const f32,
+                8,
+                4,
+                128,
+                1_000_000.0,
+            )
+        },
+        "warmup w34_dflash_rope_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_kv_write_f32_to_bf16(
+                &ex,
+                buf_a as *const f32,
+                buf_b as *const f32,
+                buf_c as *mut c_void,
+                buf_d as *mut c_void,
+                0,
+                1,
+                128,
+            )
+        },
+        "warmup w34_dflash_kv_write_f32_to_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_attention_f32(
+                &ex,
+                buf_a as *const f32,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                buf_d as *mut f32,
+                1,
+                0,
+                1,
+                2,
+                1,
+                128,
+                0,
+                0.08838835,
+            )
+        },
+        "warmup w34_dflash_attention_f32",
+    )?;
+    // Selector IDs are indices, not the FP32 GDN state previously in buf_ws.
+    let candidate_ids = arena.upload_slice(&[0i32; 16], &stream)?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_qk_norm_rope_bf16_f32_table(
+                &ex,
+                buf_a as *mut c_void,
+                candidate_ids as *const i32,
+                buf_b as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                1,
+                1,
+                1,
+                128,
+                1,
+                1e-6,
+            )
+        },
+        "warmup BF16 QK/RoPE with FP32 table",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_embed_lookup_f16_to_bf16(
+                &ex,
+                candidate_ids as *const i32,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                1,
+                128,
+                1,
+            )
+        },
+        "warmup embed_f16_to_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_cast_bf16_to_f16(&ex, buf_a as *const c_void, buf_b as *mut c_void, 128)
+        },
+        "warmup cast_bf16_to_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_edges_bf16(
+                &ex,
+                candidate_ids as *const i32,
+                buf_c as *const f32,
+                buf_a as *const c_void,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_d as *mut f32,
+                0,
+                1,
+                16,
+                256,
+                1,
+            )
+        },
+        "warmup dflash_edges_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_edges_f32(
+                &ex,
+                buf_d as *mut f32,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const f32,
+                candidate_ids as *const i32,
+                buf_c as *const f32,
+                0,
+                1,
+                16,
+                256,
+            )
+        },
+        "warmup w34_dflash_edges_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_topk_rows_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut i32,
+                buf_c as *mut f32,
+                1,
+                256,
+                0,
+                16,
+            )
+        },
+        "warmup w34_topk_rows_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_topk_rows_f32(
+                &ex,
+                buf_a as *const f32,
+                buf_b as *mut i32,
+                buf_c as *mut f32,
+                1,
+                256,
+                0,
+                16,
+            )
+        },
+        "warmup w34_topk_rows_f32",
+    )?;
+
+    check_rc(
+        unsafe {
+            ffi::w34_rms_norm_bf16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                1,
+                128,
+                1e-6,
+            )
+        },
+        "warmup rms_norm_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_silu_and_mul_bf16(&ex, buf_a as *const c_void, buf_b as *mut c_void, 1, 128)
+        },
+        "warmup silu_and_mul_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_conv_bf16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                1,
+                128,
+                8,
+                64,
+                3,
+                0,
+            )
+        },
+        "warmup dflash_conv_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_qk_norm_rope_bf16(
+                &ex,
+                buf_a as *mut c_void,
+                slot_map as *const i32,
+                buf_b as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                1,
+                2,
+                1,
+                128,
+                1,
+                1e-6,
+            )
+        },
+        "warmup dflash_qk_norm_rope_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_copy_cols_bf16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                1,
+                256,
+                128,
+                128,
+                0,
+                128,
+            )
+        },
+        "warmup copy_cols_bf16",
+    )?;
+
+    // Rejection kernels consume explicit probabilities/draws, not raw scratch.
+    let reject_ids = arena.upload_slice(&[0i32; 2], &stream)?;
+    let reject_probs = arena.upload_slice(&[1.0f32; 2], &stream)?;
+    let reject_draws = arena.upload_slice(&[0.5f64], &stream)?;
+    check_rc(
+        unsafe {
+            ffi::w34_rejection_greedy(
+                &ex,
+                reject_ids as *const i32,
+                reject_ids as *const i32,
+                core::ptr::null(),
+                buf_a as *mut i32,
+                buf_b as *mut i32,
+                buf_c as *mut i32,
+                1,
+                1,
+            )
+        },
+        "warmup w34_rejection_greedy",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_rejection_stochastic(
+                &ex,
+                reject_ids as *const i32,
+                reject_probs as *const f32,
+                reject_probs as *const f32,
+                reject_draws as *const f64,
+                reject_draws as *const f64,
+                core::ptr::null(),
+                buf_a as *mut i32,
+                buf_b as *mut i32,
+                buf_c as *mut i32,
+                1,
+                1,
+                1,
+            )
+        },
+        "warmup w34_rejection_stochastic",
     )?;
 
     dev.synchronize()

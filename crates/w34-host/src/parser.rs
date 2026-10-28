@@ -206,7 +206,9 @@ impl SamplerV1 {
     }
 
     /// Deterministic SplitMix64 uniform float in `[0.0, 1.0)` keyed by `(seed, step_pos)`.
-    fn uniform_f32(seed: u64, step_pos: usize) -> f32 {
+    /// Stateless: callers may domain-separate RNG lanes using distinct derived seeds.
+    /// `step_pos` is the absolute output position, independent of proposer consumption.
+    pub fn uniform_f32(seed: u64, step_pos: usize) -> f32 {
         let mut z = seed
             .wrapping_add((step_pos as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
             .wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -216,9 +218,50 @@ impl SamplerV1 {
         ((z >> 40) as u32 as f32) * (1.0 / ((1u32 << 24) as f32))
     }
 
-    /// Samples a token from `logits` (or candidate `(token_id, logit)` pairs) and advances
-    /// transactional state (`output_history`, `output_counts`, and `constraint`).
-    pub fn sample_from_logits(&mut self, logits: &[f32]) -> i32 {
+    /// Returns normalized dense vocabulary probabilities without advancing RNG, history,
+    /// or grammar state. Greedy policy yields a point mass (ties use lowest token ID).
+    /// Masked logits may be nonfinite; allowed logits and processed scores must be finite.
+    pub fn processed_distribution(&self, logits: &[f32]) -> Result<Vec<f32>, String> {
+        let probs = self.processed_candidates(logits)?;
+        let sum: f32 = probs.iter().map(|p| p.1).sum();
+        let mut dense = vec![0.0; logits.len()];
+        for (tid, p) in probs {
+            dense[tid as usize] = p / sum;
+        }
+        Ok(dense)
+    }
+
+    // Keep sorted weights (including the pre-CDF nucleus sum) for legacy RNG ordering.
+    fn processed_candidates(&self, logits: &[f32]) -> Result<Vec<(i32, f32)>, String> {
+        let p = &self.params;
+        if !p.temperature.is_finite()
+            || p.temperature < 0.0
+            || p.top_k < -1
+            || !p.top_p.is_finite()
+            || p.top_p <= 0.0
+            || p.top_p > 1.0
+            || !p.min_p.is_finite()
+            || !(0.0..=1.0).contains(&p.min_p)
+            || !p.repetition_penalty.is_finite()
+            || p.repetition_penalty <= 0.0
+            || !p.frequency_penalty.is_finite()
+            || !p.presence_penalty.is_finite()
+        {
+            return Err("invalid sampling parameters".into());
+        }
+        if logits.is_empty() || logits.len() > i32::MAX as usize {
+            return Err("empty or oversized vocabulary".into());
+        }
+        for (tid, &logit) in logits.iter().enumerate() {
+            if self
+                .constraint
+                .as_ref()
+                .is_none_or(|c| c.is_token_allowed(tid as i32))
+                && !logit.is_finite()
+            {
+                return Err(format!("nonfinite allowed logit at token {tid}"));
+            }
+        }
         let mut candidates: Vec<(i32, f32)> = logits
             .iter()
             .enumerate()
@@ -249,7 +292,10 @@ impl SamplerV1 {
             .collect();
 
         if candidates.is_empty() {
-            return 0;
+            return Err("grammar has no support in the vocabulary".into());
+        }
+        if candidates.iter().any(|c| !c.1.is_finite()) {
+            return Err("nonfinite penalized logit".into());
         }
 
         // Greedy fast-path when temperature <= 0 or top_k == 1
@@ -259,14 +305,15 @@ impl SamplerV1 {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.0.cmp(&b.0))
             });
-            let chosen = candidates[0].0;
-            self.commit_token(chosen);
-            return chosen;
+            return Ok(vec![(candidates[0].0, 1.0)]);
         }
 
         let inv_temp = 1.0 / self.params.temperature;
         for c in &mut candidates {
             c.1 *= inv_temp;
+            if !c.1.is_finite() {
+                return Err("nonfinite temperature-scaled logit".into());
+            }
         }
         candidates.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
@@ -317,6 +364,20 @@ impl SamplerV1 {
             probs.truncate(keep.max(1));
         }
 
+        Ok(probs)
+    }
+
+    /// Samples and commits a token using the same policy as `processed_distribution`.
+    /// Empty input retains the legacy non-committing return value of zero.
+    /// Panics on other invalid inputs before changing transactional state; use
+    /// `processed_distribution` for fallible validation.
+    pub fn sample_from_logits(&mut self, logits: &[f32]) -> i32 {
+        if logits.is_empty() {
+            return 0;
+        }
+        let probs = self
+            .processed_candidates(logits)
+            .unwrap_or_else(|err| panic!("invalid sampling input: {err}"));
         let norm_sum: f32 = probs.iter().map(|x| x.1).sum();
         let u = Self::uniform_f32(self.params.seed, self.output_history.len()) * norm_sum;
         let mut acc = 0.0f32;

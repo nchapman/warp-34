@@ -1,6 +1,6 @@
 # warp-34 — Session Orientation & Current State
 
-## Status: Phase 0, Phase 1, Phase 2, & Phase 3 Complete (`main`)
+## Status: Phases 0–4 complete; Phase 4 correctness gates verified
 
 `warp-34` has completed **Phase 0** (Foundational Seam Contracts, Oracle & `nsys` Diff Harness, CUDA Runtime & `CapacityPlanner`, Unified Safetensors Loader), **Phase 1** (Donor-Aligned Kernel Suite + Decisive Gate Tests #1, #2, #4), **Phase 2** (Qwen 3.5 / 3.8 Hybrid Backbone on `TP=1` and `TP=2`, `KvPool`, `StateBundlePool`, `CUDAGraphRunner` Gate #3, and `w34` CLI), and **Phase 3** (`SchedulerV1` token-budget continuous batching, `SGLang`-donor `MambaRadixCache` + `HybridReqToTokenPool` `extra_buffer` ping-pong GDN checkpoint donation passing **Decisive Gate Test #5**, `SamplerV1` + structured-output bitmask + `Qwen3Parser`, and OpenAI HTTP/1.1 + SSE server `w34 serve` / `w34 chat`).
 
@@ -43,7 +43,7 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 4. **Phase 1 — Donor-Aligned CUDA Kernel Suite (`crates/w34-kernels/csrc/ops/`):**
    - `op_marlin.cu`: `vLLM` Marlin `W4A16` (`U4B8`) + `W8A16` (`U8B128`) repack (0-ULP bit-exact) and GEMM kernels, plus fused `qkv_proj` / `in_proj_qkvz` / `in_proj_ba` column-Concatenation with zero-copy `M=1` pointer aliasing and `w34_split_cols_{2,3}_f16` for `M>1`.
    - `op_norms_rope_act.cu`: Register-cached `GemmaRMSNorm` (`w + 1.0f` in `FP32`), `fused_add_gemma_rms_norm`, `RMSNormGated`, `silu_and_mul`, `apply_attn_output_gate`, and `fused_qk_rmsnorm_rope_gate` (partial 25% 3D mRoPE `[11, 11, 10]`).
-   - `op_paged_attn.cu`: Descriptor-driven `kv_cache_write` and 4-warp stride-4 warp-shuffle `paged_attention_f16` supporting `FP16`, `BF16`, `TQ4` (`132 B` rows, Rademacher+WHT-256 + Beta(256) codebook), and `Q8_0` (`K8V4`), plus symmetric sliding-window mask for `DFlash2` (**Gate #1** 0-ULP page-table permutation invariance verified).
+   - `op_paged_attn.cu`: Descriptor-driven `kv_cache_write` and 4-warp stride-4 warp-shuffle `paged_attention_f16` supporting `FP16`, `BF16`, `TQ4` (`132 B` rows, Rademacher+WHT-256 + Beta(256) codebook), and `Q8_0` (`K8V4`), plus noncausal query-relative left-window mask for `DFlash2` (**Gate #1** 0-ULP page-table permutation invariance verified).
    - `op_gdn.cu`: `vllm.cpp`-derived `gdn_causal_conv1d_f16` and `gdn_recurrent_f16` with `extra_buffer` ping-pong `spec_state_indices` and `checkpoint_dst_indices` (**Gate #2** 0-ULP continuation and speculative rejection state parity verified).
    - `op_collectives.cu`: Pinned-sysmem two-hop `TP=2` collectives (`all_reduce_f16`, `all_reduce_bf16`, `all_reduce_f32`, `broadcast_i32`, `all_gather_top1_f32_i32`) with `.sys` release/acquire fences (**Gate #4** verified, including `INT32` token IDs `> 65504`).
    - `op_sampler.cu`: 1024-thread GPU `sampler_greedy_top5_f16_kernel` (`vocab_size = 248320`, sharded `[124160, 124160]` under `TP=2`).
@@ -59,8 +59,43 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
-## Next Phase Entry Point: Phase 4 (`docs/ROADMAP.md` §4 Phase 4)
+## Phase 4 — Verified
+
+Goal #3 verification exited **0**: all seven integration gates passed in
+**35.29 s**, and `mise run check` (formatting, clippy, release CUDA suite) passed
+in **53.05 s**. Fixture-packer Python tests passed **6/6**; `git diff --check`
+passed. The actual 4B full-model donor capture measures zero final-hidden error.
+The strict HD=128 operator gate matches the donor's 64-key tile and uses a
+separately captured, explicitly unsplit donor operator; the original auto-split
+capture remains unchanged. See `tools/oracle/goldens/sglang_dflash_model_4b_parity.md`
+for scope and provenance. No Phase 4 throughput win or default split-KV serving
+bit-parity is claimed.
+
+Review's blocking selector-bound mismatch was reproduced by a failing test and
+fixed by rejecting `selector_top_k > 16`. The temporary MTP environment trace
+was removed. A focused follow-up covering omitted CUDA kernels, the tile change,
+and fixture integrity found no blockers. Nonblocking suggestions deferred:
+capacity-aware HTTP 4xx responses (currently over-capacity generation can return
+500; configure `--kv-pages`), stronger HTTP sampling-path assertions, and matching
+EOS stop policies in the fixed-prompt equality test. These do not invalidate the
+passing fixtures, but should be addressed when extending serving coverage.
+
+The real-shape GEMM capture is approximately **213 MiB** and is required by its
+replay test; ordinary Git hosting file-size limits need consideration before
+publishing this repository (no push is performed here).
+
+7. **Phase 4 — Speculative Decoding (`RejectionSampler`, Native `Qwen3_5MTP`, & Native `BF16` `DFlash2`):**
+   - **Host & GPU `RejectionSampler` (`src/speculative.rs`, `csrc/ops/op_rejection.cu`):** Consecutive greedy and canonical stochastic residual (`min(1, p/q)`, positive-residual recovery) verification over `[anchor, draft_1, ..., draft_k]`, typed `INT32` outputs, padded-request masking, `processed_len` vs `emitted_len` accounting, and atomic `StateTx` + `SamplerV1` + `TokenBitmaskConstraint` tentative-history rollback (`phase4_rejection` 10 tests, `phase4_gpu_rejection` 2 tests).
+   - **Native `Qwen3_5MTP` (`src/mtp.rs`):** `vLLM 0.31.0` `qwen3_5_mtp.py` donor (`pre_fc_norm_hidden`, `pre_fc_norm_embedding`, replicated `fc: 2H -> H`, TP-sharded gated full attention in `W34_KV_NAMESPACE_MTP_FULL_ATTN` + SwiGLU MLP + final `GemmaRMSNorm` + shared `embed_tokens`/`lm_head`) with batched committed-row prefill ingest matching `vLLM`'s `M=5` cuBLAS GEMM (`worst max_abs = 0.03125`, `rel_l2 = 0.001158` across all 7 live rows of `tools/oracle/goldens/vllm_mtp_4b/call_{0,1,2}.safetensors`, `phase4_mtp` 2 tests).
+   - **Native `BF16` `DFlash2` (`src/dflash.rs`, `csrc/ops/op_dflash_bf16.cu`, `csrc/ops/op_paged_attn.cu`):** `SGLang v0.5.19` `DFlash2DraftModel` / `DFlashWorkerV2` donor in native `BF16` (`4B M=16` taps `[1, 9, 16, 23, 28]` and `27B M=8` taps `[5, 19, 33, 47, 61]` with `window=2048`), local per-rank `TapPlan` capture, `W34_KV_NAMESPACE_DFLASH_DRAFT_CTX` `BF16` paged KV, `FP32` rotary cache (`w34_dflash_qk_norm_rope_bf16_f32_table`), and FlashInfer `sm_86` FA2 `BF16` paged attention (`CTA_TILE_KV=16` at HD=256 / `64` at HD=128, `ex2.approx.ftz.f32`, `BF16` probability rounding, `m16n8k16` QK / rowsum / PV Tensor Core contractions, `rcp.approx.ftz.f32`). Passes **bit-exact (`relL2 = 0.0, maxabs = 0.0`)** full-model 5-layer hidden parity (`actual_sglang_full_model_hidden_parity` in `phase4_dflash.rs`), bit-exact 5-layer attention parity (`phase4_bf16_attention.rs`), and `sglang_dflash2_fixtures.safetensors` operator dump-diff parity (`phase4_gates.rs`, `phase4_bf16_ops.rs`).
+   - **Speculative Engine, Warm Prefix Restore, & CLI/Server Integration (`src/proposer.rs`, `src/model.rs`, `src/server.rs`, `src/main.rs`):** `NativeProposer` with bounded `64 MiB` committed feature memo for warm `MambaRadixCache` proposer KV restoration (falling back safely to cold prefill on target-only cache hits), processed stochastic/grammar verification via `SamplerV1::processed_distribution`, and `--speculative {mtp,dflash2}`, `--draft-model`, `--mtp-k`, `--kv-pages` across `w34 generate`, `w34 bench`, `w34 greedy-diff`, `w34 serve`, and `w34 chat`. All seven integration gates in `crates/w34-host/tests/phase4_gates.rs` pass together (`4B TP=1` & `TP=2` `MTP`/`DFlash2`, `27B TP=2` `M=8` `DFlash2`, processed stochastic/grammar, HTTP JSON/SSE, and `sglang_dflash2_fixtures.safetensors` dump-diff parity).
+
+## Phase 4 Original Entry Point (`docs/ROADMAP.md` §4 Phase 4)
 
 Start **Phase 4** (Speculative Decoding: `DFlash2` Parallel Block Diffusion (`M = 16` on 4B, `M = 8` on 27B) & Native `Qwen3_5MTP`):
 - Phase 4.1: Native `Qwen3_5MTP` 1-layer speculative drafter (`fc: 2H -> H`, shared embedding + `lm_head`, `K = 1..3`).
-- Phase 4.2: `DFlash2` parallel block-diffusion drafter (`z LabQwen3_5-4B-DFlash` in native `BF16` for 4B `M = 16`, `z-lab/Qwen3.5-27B-DFlash` for 27B `M = 8`) with `extract_context_feature` across target layers (`[1, 9, 17, 25, 33]` on 4B; `[2, 17, 32, 47, 62]` on 27B), cross-attention KV concat (`[ctx_k || draft_k]`), and `1 + M` target verify with `StateTx` rollback and `CUDAGraphRunner` capture for batch sizes `M in {1, 2, 4, 8, 9, 16, 17}`.
+- Phase 4.2: cached checkpoints are `nchapman/Qwen3.5-4B-DFlash2` in native BF16
+  for 4B `M=16` (taps `[1,9,16,23,28]`) and `incoai/Qwen3.8-27B-DFlash2` for 27B
+  `M=8` (taps `[5,19,33,47,61]`). These supersede the stale z-lab names/tap lists
+  in the original entry notes. Verify **M rows total**, including one anchor and
+  `M-1` proposals, with rollback and warm proposer-context restoration.

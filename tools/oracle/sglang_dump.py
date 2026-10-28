@@ -1,69 +1,67 @@
 #!/usr/bin/env python3
-"""SGLang v0.5.19 DFlash2 & MambaRadixCache reference tensor dumper for `w34-oracle`.
+"""Bundle actual pinned SGLang DFlash2 operator captures for Phase 4 gates.
 
-Dumps:
-1. Target hidden state taps (`target_layer_ids = [5, 19, 33, 47, 61]` on 27B)
-2. DFlashWorkerV2 M=8 verify batch (`1 anchor + 7 proposals`) and partial-rejection
-   GDN state rollback (`_update_target_mamba_state_after_verify`)
-3. Symmetric non-causal sliding-window (`window=2048`, `head_dim=128`) draft-context
-   attention outputs.
+This does not execute SGLang or synthesize reference outputs. Generate the
+source captures with sglang_dflash_bf16_dump.py,
+sglang_dflash_attention_dump.py, and sglang_dflash_unsplit_dump.py in
+lmsysorg/sglang:v0.5.19 first. Missing captures,
+missing provenance, mismatched donors, and duplicate tensor names fail closed.
+The obsolete Phase 0 block-end-mask reference is deliberately not included.
 """
 import argparse
+import hashlib
+import json
 from pathlib import Path
 
-import torch
-import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 
-def symmetric_window_attn_ref(
-    q: torch.Tensor,          # [Q, H_q, D] fp16/bf16
-    k_cache: torch.Tensor,    # [S, H_kv, D] fp16/bf16 (S = context_before + Q)
-    v_cache: torch.Tensor,    # [S, H_kv, D] fp16/bf16
-    window: int = 2048,
-) -> torch.Tensor:
-    # DFlash2 non-causal block attention with sliding window:
-    # Within the current verify/draft block of length Q, all Q positions attend
-    # symmetrically to all S = context_before + Q positions within `window` of the block end.
-    orig_dtype = q.dtype
-    q_len, h_q, d = q.shape
-    s_len, h_kv, _ = k_cache.shape
-    gqa = h_q // h_kv
-    scale = d ** -0.5
+SOURCES = ("sglang_dflash_bf16.safetensors", "sglang_dflash_attention.safetensors",
+           "sglang_dflash_attention_unsplit.safetensors")
 
-    qf = q.float().transpose(0, 1)  # [H_q, Q, D]
-    kf = k_cache.float().repeat_interleave(gqa, dim=1).transpose(0, 1)  # [H_q, S, D]
-    vf = v_cache.float().repeat_interleave(gqa, dim=1).transpose(0, 1)  # [H_q, S, D]
 
-    scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale  # [H_q, Q, S]
-    if window > 0 and s_len > window:
-        min_pos = s_len - window
-        mask = torch.arange(s_len, device=q.device) < min_pos
-        scores = scores.masked_fill(mask.view(1, 1, s_len), float("-inf"))
-    probs = torch.softmax(scores, dim=-1)
-    out = torch.matmul(probs, vf).transpose(0, 1).contiguous()  # [Q, H_q, D]
-    return out.to(orig_dtype)
+def bundle(source_dir: Path, out_path: Path) -> None:
+    tensors, sources = {}, {}
+    for name in SOURCES:
+        path = source_dir / name
+        if path.resolve() == out_path.resolve():
+            raise ValueError("Output must not overwrite a source capture")
+        with safe_open(str(path), framework="pt", device="cpu") as capture:
+            provenance = json.loads((capture.metadata() or {})["provenance"])
+            if provenance["sglang"] != "0.5.19":
+                raise ValueError(f"Unexpected SGLang donor in {path}")
+            keys = capture.keys()
+            if not keys:
+                raise ValueError(f"Empty capture: {path}")
+            for key in keys:
+                if key in tensors:
+                    raise ValueError(f"Duplicate captured tensor: {key}")
+                tensors[key] = capture.get_tensor(key)
+        sources[name] = {
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "provenance": provenance,
+            "tensor_count": len(keys),
+        }
+    metadata = {
+        "scope": "actual component and attention captures; not end-to-end serving",
+        "sglang": "0.5.19",
+        "sources": sources,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(out_path), metadata={"provenance": json.dumps(metadata, sort_keys=True)})
+    out_path.chmod(0o644)
+    out_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    print(f"Bundled {len(tensors)} actual donor tensors into {out_path}")
 
 
 def main() -> None:
+    goldens = Path(__file__).resolve().parent / "goldens"
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument(
-        "--out",
-        default=str(Path(__file__).resolve().parent / "goldens" / "sglang_dflash2_fixtures.safetensors"),
-        help="Output safetensors fixture path",
-    )
+    ap.add_argument("--source-dir", type=Path, default=goldens)
+    ap.add_argument("--out", type=Path, default=goldens / "sglang_dflash2_fixtures.safetensors")
     args = ap.parse_args()
-
-    torch.manual_seed(3402)
-    q = torch.randn(8, 8, 128, dtype=torch.float16)
-    k = torch.randn(24, 2, 128, dtype=torch.float16)
-    v = torch.randn(24, 2, 128, dtype=torch.float16)
-    out = symmetric_window_attn_ref(q, k, v, window=16)
-
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    save_file({"dflash_attn.q": q, "dflash_attn.k": k, "dflash_attn.v": v, "dflash_attn.out": out}, str(out_path))
-    print(f"Wrote SGLang DFlash2 fixture to {out_path}")
+    bundle(args.source_dir, args.out)
 
 
 if __name__ == "__main__":

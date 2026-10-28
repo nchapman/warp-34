@@ -2,13 +2,20 @@
 
 pub mod cache;
 pub mod cuda;
+#[cfg(feature = "cuda")]
+pub mod dflash;
 pub mod loader;
 #[cfg(feature = "cuda")]
 pub mod model;
+#[cfg(feature = "cuda")]
+pub mod mtp;
 pub mod parser;
+#[cfg(feature = "cuda")]
+pub mod proposer;
 pub mod radix;
 pub mod scheduler;
 pub mod server;
+pub mod speculative;
 
 /// Returns whether the crate was compiled with the `cuda` feature enabled.
 pub const fn cuda_enabled() -> bool {
