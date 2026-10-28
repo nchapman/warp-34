@@ -1,0 +1,18 @@
+{
+ "chat": [
+  "The capital of France is",
+  "Write a short paragraph about the ocean.",
+  "Summarize the advantages and tradeoffs of flash attention versus standard attention for long-context inference.",
+  "You are helping plan a GPU build for local LLM inference with a 450 W power budget. Recommend a GPU and explain the memory-bandwidth reasoning."
+ ],
+ "agentic": [
+  "Write a Python function `topological_sort(edges)` using Kahn's algorithm. Include type hints and a docstring.",
+  "This function has a bug: `def avg(xs): return sum(xs)/len(xs) - 1`. Identify it and give a corrected version.",
+  "Write a SQL query finding the 5 customers with the highest total order value in 2024, including ties.",
+  "Explain what this regex does: `^(?:\\d{3}-){2}\\d{4}$`.",
+  "Implement a thread-safe LRU cache in Python with `get`/`put` and O(1) ops.",
+  "Refactor this into a list comprehension: `out = []\\nfor x in xs:\\n  if x % 3 == 0:\\n    out.append(x * x)`.",
+  "Write a Rust function that reverses a linked list iteratively.",
+  "What's the difference between `git merge --squash` and `git rebase`? When would you use each?"
+ ]
+}

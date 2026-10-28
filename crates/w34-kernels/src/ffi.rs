@@ -1,5 +1,8 @@
 //! FFI bindings to `csrc/w34_cuda.h`.
 
+#[cfg(feature = "cuda")]
+use core::ffi::c_void;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct W34Exec {
@@ -17,9 +20,450 @@ pub const W34_DTYPE_I32: i32 = 3;
 pub const W34_DTYPE_U8: i32 = 4;
 pub const W34_DTYPE_U32: i32 = 5;
 
+pub const W34_KV_NAMESPACE_TARGET_FULL_ATTN: i32 = 0;
+pub const W34_KV_NAMESPACE_MTP_FULL_ATTN: i32 = 1;
+pub const W34_KV_NAMESPACE_DFLASH_DRAFT_CTX: i32 = 2;
+
+pub const W34_KV_FORMAT_FP16: i32 = 0;
+pub const W34_KV_FORMAT_BF16: i32 = 1;
+pub const W34_KV_FORMAT_TQ4: i32 = 2;
+pub const W34_KV_FORMAT_Q8_0: i32 = 3;
+
+pub const W34_KV_TRANSFORM_IDENTITY: i32 = 0;
+pub const W34_KV_TRANSFORM_RADEMACHER_WHT256: i32 = 1;
+
+pub const W34_ATTN_MASK_CAUSAL: i32 = 0;
+pub const W34_ATTN_MASK_SYMMETRIC_WINDOW: i32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct W34KvLayerLayout {
+    pub k_base: u64,
+    pub v_base: u64,
+    pub k_page_stride_bytes: u64,
+    pub k_head_stride_bytes: u64,
+    pub k_token_stride_bytes: u64,
+    pub v_page_stride_bytes: u64,
+    pub v_head_stride_bytes: u64,
+    pub v_token_stride_bytes: u64,
+    pub namespace_id: i32,
+    pub layer_id: i32,
+    pub local_kv_heads: i32,
+    pub head_dim: i32,
+    pub block_size: i32,
+    pub k_format: i32,
+    pub v_format: i32,
+    pub k_transform: i32,
+    pub v_transform: i32,
+    pub reserved: i32,
+}
+
+const _: [(); 104] = [(); core::mem::size_of::<W34KvLayerLayout>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct W34AttentionBatch {
+    pub query_start_loc: *const i32,
+    pub context_lens_before: *const i32,
+    pub seq_lens_after: *const i32,
+    pub block_tables: *const i32,
+    pub write_slot_mapping: *const i32,
+    pub valid_token_mask: *const u8,
+    pub valid_req_mask: *const u8,
+    pub num_reqs: i32,
+    pub total_tokens: i32,
+    pub max_blocks_per_req: i32,
+    pub max_q_len: i32,
+    pub max_seq_len: i32,
+    pub mask_mode: i32,
+    pub sliding_window: i32,
+    pub sm_scale: f32,
+    pub reserved: i32,
+}
+
+const _: [(); 96] = [(); core::mem::size_of::<W34AttentionBatch>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct W34GdnBatch {
+    pub query_start_loc: *const i32,
+    pub state_in_indices: *const i32,
+    pub state_out_indices: *const i32,
+    pub spec_state_indices: *const i32,
+    pub checkpoint_dst_indices: *const i32,
+    pub checkpoint_token_offsets: *const i32,
+    pub has_initial_state: *const u8,
+    pub valid_req_mask: *const u8,
+    pub num_reqs: i32,
+    pub total_tokens: i32,
+    pub max_verify_tokens: i32,
+    pub max_checkpoints_per_req: i32,
+}
+
+const _: [(); 80] = [(); core::mem::size_of::<W34GdnBatch>()];
+
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
-    fn w34_cublas_runtime_version(out_version: *mut i32) -> i32;
+    pub fn w34_cublas_runtime_version(out_version: *mut i32) -> i32;
+    pub fn w34_get_device_count(out_count: *mut i32) -> i32;
+    pub fn w34_set_device(device_id: i32) -> i32;
+    pub fn w34_device_synchronize() -> i32;
+    pub fn w34_get_mem_info(out_free: *mut usize, out_total: *mut usize) -> i32;
+    pub fn w34_malloc(out_ptr: *mut *mut c_void, bytes: usize) -> i32;
+    pub fn w34_free(ptr: *mut c_void) -> i32;
+    pub fn w34_host_alloc_mapped(
+        out_host_ptr: *mut *mut c_void,
+        out_dev_ptr: *mut *mut c_void,
+        bytes: usize,
+    ) -> i32;
+    pub fn w34_host_free(host_ptr: *mut c_void) -> i32;
+    pub fn w34_memcpy_h2d_async(
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+        stream: usize,
+    ) -> i32;
+    pub fn w34_memcpy_d2h_async(
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+        stream: usize,
+    ) -> i32;
+    pub fn w34_memcpy_d2d_async(
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+        stream: usize,
+    ) -> i32;
+    pub fn w34_memset_async(dst: *mut c_void, value: i32, bytes: usize, stream: usize) -> i32;
+
+    pub fn w34_stream_create(out_stream: *mut usize) -> i32;
+    pub fn w34_stream_destroy(stream: usize) -> i32;
+    pub fn w34_stream_synchronize(stream: usize) -> i32;
+
+    pub fn w34_event_create(out_event: *mut usize, enable_timing: i32) -> i32;
+    pub fn w34_event_destroy(event: usize) -> i32;
+    pub fn w34_event_record(event: usize, stream: usize) -> i32;
+    pub fn w34_stream_wait_event(stream: usize, event: usize) -> i32;
+    pub fn w34_event_synchronize(event: usize) -> i32;
+    pub fn w34_event_elapsed_ms(out_ms: *mut f32, start_event: usize, end_event: usize) -> i32;
+
+    pub fn w34_graph_begin_capture(stream: usize) -> i32;
+    pub fn w34_graph_end_capture(
+        stream: usize,
+        out_graph: *mut usize,
+        out_graph_exec: *mut usize,
+    ) -> i32;
+    pub fn w34_graph_launch(graph_exec: usize, stream: usize) -> i32;
+    pub fn w34_graph_destroy(graph: usize, graph_exec: usize) -> i32;
+
+    pub fn w34_cublas_create(out_handle: *mut usize, stream: usize) -> i32;
+    pub fn w34_cublas_destroy(handle: usize) -> i32;
+    pub fn w34_cublas_gemm_f16(
+        handle: usize,
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> i32;
+    pub fn w34_cublas_gemm_bf16(
+        handle: usize,
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> i32;
+
+    pub fn w34_embed_lookup_f16(
+        ex: *const W34Exec,
+        token_ids: *const i32,
+        embed_weight: *const c_void,
+        out_hidden: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        vocab_size: i32,
+    ) -> i32;
+
+    pub fn w34_copy_masked_rows_f16(
+        ex: *const W34Exec,
+        src: *const c_void,
+        dst: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        row_elems: i32,
+    ) -> i32;
+
+    pub fn w34_gemma_rms_norm_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_fused_add_gemma_rms_norm_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_rms_norm_gated_silu_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        z: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        num_v_heads: i32,
+        head_dim: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_fused_qk_rmsnorm_rope_gate_f16(
+        ex: *const W34Exec,
+        q_gate_in: *const c_void,
+        k_in: *const c_void,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        positions: *const i32,
+        valid_token_mask: *const u8,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        gate_out: *mut c_void,
+        num_tokens: i32,
+        pos_plane_stride: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        mrope_s0: i32,
+        mrope_s1: i32,
+        mrope_s2: i32,
+        rope_theta: f32,
+        rms_eps: f32,
+    ) -> i32;
+
+    pub fn w34_silu_and_mul_f16(
+        ex: *const W34Exec,
+        gate_up: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        intermediate_size: i32,
+    ) -> i32;
+
+    pub fn w34_silu_and_mul_split_f16(
+        ex: *const W34Exec,
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        intermediate_size: i32,
+    ) -> i32;
+
+    pub fn w34_apply_attn_output_gate_f16(
+        ex: *const W34Exec,
+        attn_out: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        total_dim: i32,
+    ) -> i32;
+
+    pub fn w34_split_cols_2_f16(
+        ex: *const W34Exec,
+        src: *const c_void,
+        dst0: *mut c_void,
+        dst1: *mut c_void,
+        num_tokens: i32,
+        dim0: i32,
+        dim1: i32,
+    ) -> i32;
+
+    pub fn w34_split_cols_3_f16(
+        ex: *const W34Exec,
+        src: *const c_void,
+        dst0: *mut c_void,
+        dst1: *mut c_void,
+        dst2: *mut c_void,
+        num_tokens: i32,
+        dim0: i32,
+        dim1: i32,
+        dim2: i32,
+    ) -> i32;
+
+    pub fn w34_zero_i32(ex: *const W34Exec, ptr: *mut c_void, count: i64) -> i32;
+    pub fn w34_marlin_repack_int4(
+        ex: *const W34Exec,
+        src_n_major: *const u32,
+        dst_marlin: *mut u32,
+        k: i64,
+        n: i64,
+    ) -> i32;
+    pub fn w34_marlin_gemm_f16u4(
+        ex: *const W34Exec,
+        a: *const c_void,
+        b: *const c_void,
+        scales: *const c_void,
+        c: *mut c_void,
+        workspace: *mut i32,
+        m: i64,
+        n: i64,
+        k: i64,
+        workspace_ints: i64,
+        group_blocks: i32,
+    ) -> i32;
+    pub fn w34_marlin_gemm_f16u8(
+        ex: *const W34Exec,
+        a: *const c_void,
+        b: *const c_void,
+        scales: *const c_void,
+        c: *mut c_void,
+        workspace: *mut i32,
+        m: i64,
+        n: i64,
+        k: i64,
+        workspace_ints: i64,
+        group_blocks: i32,
+    ) -> i32;
+
+    pub fn w34_kv_cache_write(
+        ex: *const W34Exec,
+        layout: *const W34KvLayerLayout,
+        batch: *const W34AttentionBatch,
+        k_in: *const c_void,
+        v_in: *const c_void,
+    ) -> i32;
+
+    pub fn w34_paged_attention_f16(
+        ex: *const W34Exec,
+        layout: *const W34KvLayerLayout,
+        batch: *const W34AttentionBatch,
+        q_in: *const c_void,
+        attn_out: *mut c_void,
+        num_q_heads: i32,
+    ) -> i32;
+
+    pub fn w34_gdn_causal_conv1d_f16(
+        ex: *const W34Exec,
+        batch: *const W34GdnBatch,
+        x_in: *const c_void,
+        conv_weight: *const c_void,
+        conv_bias: *const c_void,
+        conv_state_pool: *mut c_void,
+        x_out: *mut c_void,
+        conv_dim: i32,
+        kernel_size: i32,
+        total_state_slots: i32,
+        silu_activation: i32,
+    ) -> i32;
+
+    pub fn w34_gdn_recurrent_f16(
+        ex: *const W34Exec,
+        batch: *const W34GdnBatch,
+        qkv_conv_out: *const c_void,
+        q_in: *const c_void,
+        k_in: *const c_void,
+        v_in: *const c_void,
+        b_in: *const c_void,
+        a_in: *const c_void,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        ssm_state_pool: *mut f32,
+        out_f16: *mut c_void,
+        num_k_heads: i32,
+        head_k_dim: i32,
+        num_v_heads: i32,
+        head_v_dim: i32,
+        total_state_slots: i32,
+    ) -> i32;
+
+    pub fn w34_tp2_signal_bytes() -> usize;
+    pub fn w34_tp2_all_reduce_f16(
+        ex: *const W34Exec,
+        local_in: *const c_void,
+        out: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_elems: i32,
+    ) -> i32;
+    pub fn w34_tp2_all_reduce_bf16(
+        ex: *const W34Exec,
+        local_in: *const c_void,
+        out: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_elems: i32,
+    ) -> i32;
+    pub fn w34_tp2_all_reduce_f32(
+        ex: *const W34Exec,
+        local_in: *const f32,
+        out: *mut f32,
+        stage0: *mut f32,
+        stage1: *mut f32,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_elems: i32,
+    ) -> i32;
+    pub fn w34_tp2_broadcast_i32(
+        ex: *const W34Exec,
+        src_rank0: *const i32,
+        out: *mut i32,
+        stage0: *mut i32,
+        stage1: *mut i32,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_elems: i32,
+    ) -> i32;
+    pub fn w34_tp2_all_gather_top1_f32_i32(
+        ex: *const W34Exec,
+        local_max_val: *const f32,
+        local_max_id: *const i32,
+        global_max_val: *mut f32,
+        global_max_id: *mut i32,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_rows: i32,
+    ) -> i32;
+
+    pub fn w34_sampler_greedy_top5_f16(
+        ex: *const W34Exec,
+        logits_f16: *const c_void,
+        out_greedy_ids: *mut i32,
+        out_top5_ids: *mut i32,
+        out_top5_logprobs: *mut f32,
+        num_rows: i32,
+        local_vocab_size: i32,
+        vocab_offset: i32,
+    ) -> i32;
 }
 
 /// Returns the linked cuBLAS runtime version (`major * 10000 + minor * 100 + patch`).

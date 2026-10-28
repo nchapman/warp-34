@@ -1,0 +1,17 @@
+{
+  "9B/agentic00": {
+    "engine_args": ["--kv-tiers", "tq4"],
+    "seat": 17,
+    "pick": 25,
+    "f16_seat": 18,
+    "date": "2026-10-20",
+    "verdict": "family-flip (benign)",
+    "evidence": [
+      "our pick = golden rank-1 runner-up; f16-side gap 0.516 nats (recorded family scale: vLLM own flips 0.414/0.453, ours 0.485)",
+      "our f16 lane flips the ADJACENT seat 18 with a rank-1 pick (gap 0.016) — engine-level marginal-seat behavior, tier-independent",
+      "HF transformers matches vLLM-f16 bit-exact on this row (reference pair stable; deviation is engine-vs-reference, not tier-caused)",
+      "KL(f16||tq4) same-context window steps 0-17: median 0.0030, max 0.0265, top-token agreement 0.944 — contract threshold 0.05, gate PASS; no outlier seat"
+    ],
+    "ledger": "docs/perf/roadmap.md 3.B.4 (2026-10-20); probe: tools/quality/flip_probe.py"
+  }
+}

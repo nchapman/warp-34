@@ -1,0 +1,18 @@
+27B greedy goldens (`27B/agentic*.ids` + `agentic*.top5.json`):
+regenerated against snapshot 0df81ea on 2026-10-23 (re-baseline commit
+`7382fc6`); 23/24 rows shifted vs the c11a884-era goldens. Near-tie
+adjudications live in `adjudications.json`. Quality gate: 12/12 green
+via `tools/quality/greedy_diff.py` (see `docs/contracts/serve-defaults.md`
+§11, `docs/STATE.md`).
+
+9B goldens (`9B/`): re-baselined onto snapshot
+`a161b410df67c1674e76f4f40592a691a5ffafbd` on 2026-10-24. Upstream
+change vs `42e3022`: GDN `linear_attn.in_proj_a/b` now ship as BF16
+dense (were int4-packed; the loader already preferred `.weight` over
+`.weight_packed`, so no code change); `generation_config.json` eos is
+now `[248046 (<|im_end|>), 248044 (<|endoftext|>)]` (gate runs
+`--ignore-eos` on both sides — no harness impact); `model_mtp` weights
+byte-identical. Row-shift count vs the 42e3022-era goldens: 11/12
+chat/agentic rows shifted (all 8 agentic + chat01/02/03; chat00's f16
+reference ids are unchanged — the engine's seat-11 flip there is a
+cross-engine near-tie cleared by the seat+tok vLLM-int8 clause).
