@@ -422,6 +422,9 @@ int w34_dflash_qk_norm_rope_kv_write_bf16_f32_table(const w34_exec* ex, void* qk
 int w34_dflash_select_greedy_bf16(const w34_exec* ex, const int32_t* ids, const float* unary,
     const void* hidden, const void* pred, const void* succ, int32_t* out_path,
     int anchor, int k, int topk, int rank, int vocab);
+int w34_dflash_select_greedy_dev_anchor_bf16(const w34_exec* ex, const int32_t* ids,
+    const float* unary, const void* hidden, const void* pred, const void* succ,
+    int32_t* out_path, const int32_t* anchor_dev, int k, int topk, int rank, int vocab);
 int w34_dflash_qk_norm_rope_bf16(const w34_exec*, void* qkv, const int32_t* positions,
     const void* qw, const void* kw, const void* table, int rows, int q_heads, int kv_heads,
     int dim, int table_rows, float eps);
@@ -430,6 +433,11 @@ int w34_copy_cols_bf16(const w34_exec*, const void* src, void* dst,
 int w34_topk_rows_f16(const w34_exec* ex, const void* logits_f16,
                       int32_t* out_ids, float* out_vals,
                       int num_rows, int local_vocab_size, int vocab_offset, int top_k);
+int w34_topk_rows_split_f16(const w34_exec* ex, const void* logits_f16,
+                            int32_t* split_ids_ws, float* split_vals_ws,
+                            int32_t* out_ids, float* out_vals,
+                            int num_rows, int local_vocab_size, int vocab_offset,
+                            int top_k, int num_splits);
 
 // --- Phase 5.2: Qwen3_VisionTransformer & Multimodal Kernels (op_vision.cu) ---
 int w34_vision_bias_add_f16(const w34_exec* ex, const void* x, const void* bias,
@@ -463,6 +471,15 @@ int w34_moe_w4a16_down_accum_f16(const w34_exec* ex, const void* interm_in,
                                  const void* shared_expert_gate_logits,
                                  void* out, int num_tokens, int top_k, int num_experts,
                                  int k_hidden, int n_interm, int group_size);
+int w34_moe_w4a16_mlp_f16(const w34_exec* ex, const void* x,
+                          const uint32_t* gate_up_packed, const void* gate_up_scales,
+                          const uint32_t* down_packed, const void* down_scales,
+                          const int32_t* topk_ids, const float* topk_weights,
+                          const void* shared_expert_out,
+                          const void* shared_expert_gate_logits,
+                          void* interm_buf, void* out,
+                          int num_tokens, int top_k, int num_experts,
+                          int n_interm, int k_hidden, int group_size);
 int w34_moe_f16_gate_up_silu(const w34_exec* ex, const void* x, const void* gate_up_w,
                              const int32_t* topk_ids, void* interm_out,
                              int num_tokens, int top_k, int num_experts,

@@ -1282,6 +1282,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             let (expanded_prompt, mm_images) =
                 prepare_multimodal_prompt_and_images(&engine.cfg, &prompt, &image_urls)?;
             let msgs = vec![w34_host::server::ChatMessage {
+                tool_calls: Vec::new(),
                 role: "user".to_string(),
                 content: Some(expanded_prompt),
                 reasoning_content: None,

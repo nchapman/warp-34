@@ -94,6 +94,47 @@ fn run_4b(strict_parity: bool) {
         assert_eq!(l.k_format, W34_KV_FORMAT_BF16);
     }
     let taps = target.tap_aux_bf16.as_ref().unwrap().addr();
+    if strict_parity {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/oracle/goldens");
+        let golden = w34_host::loader::SafetensorsArchive::open(
+            &root.join("sglang_dflash_model_4b.safetensors"),
+        )
+        .unwrap();
+        let expected_taps = golden.read_bytes("input.taps_bf16").unwrap();
+        let mut actual_taps = vec![0u8; tokens.len() * 5 * engine.cfg.hidden_size * 2];
+        let tap_buffer = target.tap_aux_bf16.as_ref().unwrap();
+        tap_buffer
+            .copy_to_host(&mut actual_taps, &target.stream)
+            .unwrap();
+        assert_eq!(actual_taps.len(), expected_taps.len());
+        let mut error = 0.0f64;
+        let mut energy = 0.0f64;
+        let mut changed = 0usize;
+        for (actual, expected) in actual_taps
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(expected_taps.as_chunks::<2>().0.iter())
+        {
+            let a = f32::from_bits((u16::from_le_bytes([actual[0], actual[1]]) as u32) << 16);
+            let b = f32::from_bits((u16::from_le_bytes([expected[0], expected[1]]) as u32) << 16);
+            error += f64::from(a - b).powi(2);
+            energy += f64::from(b).powi(2);
+            changed += usize::from(actual != expected);
+        }
+        let rel = (error / energy).sqrt();
+        eprintln!("target taps versus recorded input: relL2={rel}, changed={changed}");
+        assert!(
+            rel < 0.005,
+            "target tap drift exceeds sub-percent oracle budget: {rel}"
+        );
+        // The BF16 drafter's 0-ULP gate must use the donor's exact inputs,
+        // independently of target FP16 attention's reduction order.
+        tap_buffer
+            .copy_from_host(&expected_taps, &target.stream)
+            .unwrap();
+    }
     draft.ingest(target, taps, tokens.len()).unwrap();
     assert_eq!(draft.committed_len(), tokens.len());
     let candidates = draft.forward(target, anchor, None).unwrap();
@@ -110,15 +151,6 @@ fn run_4b(strict_parity: bool) {
             &root.join("sglang_dflash_model_4b.safetensors"),
         )
         .unwrap();
-        let expected_taps = golden.read_bytes("input.taps_bf16").unwrap();
-        let mut actual_taps = vec![0u8; tokens.len() * 5 * engine.cfg.hidden_size * 2];
-        target
-            .tap_aux_bf16
-            .as_ref()
-            .unwrap()
-            .copy_to_host(&mut actual_taps, &target.stream)
-            .unwrap();
-        assert_eq!(actual_taps, expected_taps, "oracle input taps changed");
         let expected = golden.read_f32("final_hidden").unwrap();
         let mut actual = vec![0u16; expected.len()];
         draft
@@ -135,11 +167,9 @@ fn run_4b(strict_parity: bool) {
         }
         let rel = (error / energy).sqrt();
         eprintln!("actual SGLang final hidden relL2={rel}, maxabs={max_abs}");
-        // Sub-percent normalized tensor agreement; do not turn the observed
-        // multi-percent divergence into an accepted tolerance.
-        assert!(
-            rel < 0.005,
-            "full-model hidden parity: relL2={rel}, maxabs={max_abs}"
+        assert_eq!(
+            error, 0.0,
+            "BF16 drafter must retain 0-ULP donor parity: relL2={rel}, maxabs={max_abs}"
         );
     }
 

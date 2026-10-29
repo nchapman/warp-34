@@ -13,6 +13,11 @@ struct ValIdx {
     int32_t idx;
 };
 
+union HalfVec8 {
+    uint4 u;
+    __half h[8];
+};
+
 __device__ __forceinline__ ValIdx better_pair(ValIdx a, ValIdx b) {
     if (b.val > a.val || (b.val == a.val && b.idx >= 0 && (a.idx < 0 || b.idx < a.idx))) {
         return b;
@@ -95,18 +100,37 @@ __global__ void sampler_greedy_top5_f16_kernel(
     int32_t picked_ids[5] = {-1, -1, -1, -1, -1};
     float picked_vals[5] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
 
+    const bool aligned16 = (((uintptr_t)row_logits) & 15u) == 0u;
+    const int vec_end = aligned16 ? (local_vocab_size & ~7) : 0;
+
     for (int k = 0; k < k_iters; k++) {
         ValIdx local_best = {-FLT_MAX, -1};
-        for (int i = threadIdx.x; i < local_vocab_size; i += blockDim.x) {
-            int32_t gid = vocab_offset + i;
-            bool already = false;
+        if (k == 0 && aligned16) {
+            for (int col = (int)threadIdx.x * 8; col < vec_end; col += (int)blockDim.x * 8) {
+                HalfVec8 hv;
+                hv.u = *reinterpret_cast<const uint4*>(row_logits + col);
 #pragma unroll
-            for (int p = 0; p < 5; p++) {
-                if (p < k && picked_ids[p] == gid) already = true;
+                for (int j = 0; j < 8; ++j) {
+                    const float v = __half2float(hv.h[j]);
+                    local_best = better_pair(local_best, ValIdx{v, vocab_offset + col + j});
+                }
             }
-            if (!already) {
-                float v = __half2float(row_logits[i]);
-                local_best = better_pair(local_best, ValIdx{v, gid});
+            for (int i = vec_end + threadIdx.x; i < local_vocab_size; i += blockDim.x) {
+                const float v = __half2float(row_logits[i]);
+                local_best = better_pair(local_best, ValIdx{v, vocab_offset + i});
+            }
+        } else {
+            for (int i = threadIdx.x; i < local_vocab_size; i += blockDim.x) {
+                int32_t gid = vocab_offset + i;
+                bool already = false;
+#pragma unroll
+                for (int p = 0; p < 5; p++) {
+                    if (p < k && picked_ids[p] == gid) already = true;
+                }
+                if (!already) {
+                    float v = __half2float(row_logits[i]);
+                    local_best = better_pair(local_best, ValIdx{v, gid});
+                }
             }
         }
         ValIdx winner = block_reduce_max_pair(local_best, s_val, s_idx);

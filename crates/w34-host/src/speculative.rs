@@ -88,7 +88,9 @@ impl Verification {
             .ok_or(RejectionError("processed length overflow"))?;
 
         let mut committed_sampler = sampler.clone();
-        committed_sampler.rollback_tokens(provisional_drafts);
+        committed_sampler
+            .try_rollback_tokens(provisional_drafts)
+            .map_err(|_| RejectionError("grammar rollback failed"))?;
         for &token in &self.emitted {
             if committed_sampler
                 .constraint
@@ -99,7 +101,9 @@ impl Verification {
                     "verified token violates committed grammar state",
                 ));
             }
-            committed_sampler.commit_token(token);
+            committed_sampler
+                .try_commit_token(token)
+                .map_err(|_| RejectionError("grammar commit failed"))?;
         }
         let freed = tx.resolve_spec_verify(self.processed_rows());
         *sampler = committed_sampler;

@@ -662,6 +662,19 @@ impl DeviceArena {
         self.offset = 0;
     }
 
+    #[inline]
+    pub fn remaining_workspace(&self) -> (u64, usize) {
+        let aligned_off = (self.offset + 255) & !255usize;
+        if aligned_off >= self.buf.len_bytes {
+            (0, 0)
+        } else {
+            (
+                self.buf.addr() + aligned_off as u64,
+                self.buf.len_bytes - aligned_off,
+            )
+        }
+    }
+
     pub fn alloc_aligned(&mut self, bytes: usize) -> Result<u64> {
         let aligned_off = (self.offset + 255) & !255usize;
         let next = aligned_off.checked_add(bytes).ok_or(CudaError {
@@ -1267,6 +1280,76 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_paged_attention_f16",
     )?;
+    // Warm GQA mma.sync + Split-KV reduction specialization (head_dim = 256)
+    let layout_256 = W34KvLayerLayout {
+        head_dim: 256,
+        k_token_stride_bytes: 512,
+        v_token_stride_bytes: 512,
+        k_head_stride_bytes: 16 * 512,
+        v_head_stride_bytes: 16 * 512,
+        k_page_stride_bytes: 16 * 512,
+        v_page_stride_bytes: 16 * 512,
+        ..layout
+    };
+    let blk_tbl_128 = arena.upload_slice(&[0i32; 128], &stream)?;
+    let seq_lens_2048 = arena.upload_slice(&[2048i32], &stream)?;
+    let q_start_2 = arena.upload_slice(&[0i32, 2], &stream)?;
+    let slot_map_2 = arena.upload_slice(&[0i32, 1], &stream)?;
+    let mut attn_batch_m2 = attn_batch;
+    attn_batch_m2.query_start_loc = q_start_2 as *const i32;
+    attn_batch_m2.write_slot_mapping = slot_map_2 as *const i32;
+    attn_batch_m2.total_tokens = 2;
+    attn_batch_m2.max_q_len = 2;
+    attn_batch_m2.seq_lens_after = seq_lens_2048 as *const i32;
+    attn_batch_m2.block_tables = blk_tbl_128 as *const i32;
+    attn_batch_m2.max_blocks_per_req = 128;
+    attn_batch_m2.max_seq_len = 2048;
+    let mut attn_batch_split = attn_batch;
+    attn_batch_split.block_tables = blk_tbl_128 as *const i32;
+    attn_batch_split.seq_lens_after = seq_lens_2048 as *const i32;
+    attn_batch_split.max_blocks_per_req = 128;
+    attn_batch_split.max_seq_len = 2048;
+    let split_ws = arena.alloc_aligned(512 * 1024)?;
+    let ex_split = stream.exec(split_ws, 512 * 1024);
+    check_rc(
+        unsafe {
+            ffi::w34_paged_attention_f16(
+                &ex,
+                &layout_256,
+                &attn_batch,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                4,
+            )
+        },
+        "warmup w34_paged_attention_f16 gqa_vec_m1",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_paged_attention_f16(
+                &ex_split,
+                &layout_256,
+                &attn_batch_m2,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                4,
+            )
+        },
+        "warmup w34_paged_attention_f16 gqa_mma_split_kv",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_paged_attention_f16(
+                &ex_split,
+                &layout_256,
+                &attn_batch_split,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                4,
+            )
+        },
+        "warmup w34_paged_attention_f16 split_kv",
+    )?;
 
     let bf16_layout = W34KvLayerLayout {
         namespace_id: ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
@@ -1503,6 +1586,63 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_topk_rows_f16",
     )?;
+    check_rc(
+        unsafe {
+            ffi::w34_topk_rows_split_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_ws as *mut i32,
+                (buf_ws + 4096) as *mut f32,
+                buf_b as *mut i32,
+                buf_c as *mut f32,
+                1,
+                2048,
+                0,
+                16,
+                8,
+            )
+        },
+        "warmup w34_topk_rows_split_f16",
+    )?;
+    let zero_i32 = arena.upload_slice(&[0i32; 16], &stream)?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_select_greedy_bf16(
+                &ex,
+                zero_i32 as *const i32,
+                buf_c as *const f32,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_b as *const c_void,
+                buf_d as *mut i32,
+                0,
+                1,
+                16,
+                256,
+                1,
+            )
+        },
+        "warmup w34_dflash_select_greedy_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_select_greedy_dev_anchor_bf16(
+                &ex,
+                zero_i32 as *const i32,
+                buf_c as *const f32,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_b as *const c_void,
+                buf_d as *mut i32,
+                zero_i32 as *const i32,
+                1,
+                16,
+                256,
+                1,
+            )
+        },
+        "warmup w34_dflash_select_greedy_dev_anchor_bf16",
+    )?;
 
     check_rc(
         unsafe {
@@ -1518,6 +1658,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )
         },
         "warmup rms_norm_bf16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_rms_norm_bf16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                1,
+                256,
+                1e-6,
+            )
+        },
+        "warmup rms_norm_bf16 vec8",
     )?;
     check_rc(
         unsafe {
@@ -1754,6 +1909,37 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_moe_w4a16_down_accum_f16",
     )?;
+    let moe_ids_m4 = arena.upload_slice(&[0i32, 1, 0, 1], &stream)?;
+    let moe_w_m4 = arena.upload_slice(&[1.0f32; 4], &stream)?;
+    let moe_ws = arena.alloc_aligned(64 * 1024)?;
+    let ex_moe = stream.exec(moe_ws, 64 * 1024);
+    for (m_tok, n_exp) in [(1i32, 2i32), (4, 8), (4, 2)] {
+        check_rc(
+            unsafe {
+                ffi::w34_moe_w4a16_mlp_f16(
+                    &ex_moe,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    moe_ids_m4 as *const i32,
+                    moe_w_m4 as *const f32,
+                    buf_a as *const c_void,
+                    buf_a as *const c_void,
+                    buf_c as *mut c_void,
+                    buf_d as *mut c_void,
+                    m_tok,
+                    1,
+                    n_exp,
+                    64,
+                    64,
+                    64,
+                )
+            },
+            "warmup w34_moe_w4a16_mlp_f16",
+        )?;
+    }
     check_rc(
         unsafe {
             ffi::w34_moe_f16_gate_up_silu(

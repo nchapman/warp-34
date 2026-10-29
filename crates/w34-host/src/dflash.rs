@@ -4,7 +4,7 @@
 //! committed context. Attention/MLP are TP-sharded; context FC and convs replicated.
 #![allow(clippy::too_many_arguments, clippy::undocumented_unsafe_blocks)]
 use crate::cache::{KvFormatPolicy, KvPool};
-use crate::cuda::{DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
+use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
 use crate::loader::{ModelConfig, SafetensorsArchive};
 use crate::model::{Qwen3_5ModelRank, loader_err};
 use core::ffi::c_void;
@@ -194,11 +194,23 @@ impl DraftCandidates {
     }
 }
 
+struct DFlashGraphIo {
+    forward_graph: Option<CudaGraph>,
+    select_greedy_graph: Option<CudaGraph>,
+    forward_arena: DeviceArena,
+    meta_dev: DeviceBuffer,
+    topk_ids_dev: DeviceBuffer,
+    topk_scores_dev: DeviceBuffer,
+    out_path_dev: DeviceBuffer,
+}
+
 pub struct DFlash2Rank {
     pub cfg: DFlash2Config,
+    pub use_cuda_graph: bool,
     rank: usize,
     tp: usize,
     target_embedding: u64,
+    graph_io: DFlashGraphIo,
     _weights: DeviceArena,
     scratch: DeviceArena,
     kv: KvPool,
@@ -457,14 +469,27 @@ impl DFlash2Rank {
             t.device.device_id,
             (cfg.block_size - 1) * cfg.selector_rank * 2,
         )?;
+        let k_draft = cfg.block_size - 1;
+        let topk_elems = k_draft * cfg.top_k;
+        let graph_io = DFlashGraphIo {
+            forward_graph: None,
+            select_greedy_graph: None,
+            forward_arena: DeviceArena::new(t.device.device_id, 32 * 1024 * 1024)?,
+            meta_dev: DeviceBuffer::alloc(t.device.device_id, (3 * cfg.block_size + 4) * 4)?,
+            topk_ids_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
+            topk_scores_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
+            out_path_dev: DeviceBuffer::alloc(t.device.device_id, k_draft * 4)?,
+        };
         t.stream.synchronize()?;
         Ok(Self {
             cfg,
+            use_cuda_graph: true,
             rank: r,
             tp,
             target_embedding: t.embed_tokens_ptr,
+            graph_io,
             _weights: weights,
-            scratch: DeviceArena::new(t.device.device_id, 64 * 1024 * 1024)?,
+            scratch: DeviceArena::new(t.device.device_id, 32 * 1024 * 1024)?,
             kv,
             pages,
             pages_dev,
@@ -704,23 +729,61 @@ impl DFlash2Rank {
             "DFlash grouped conv",
         )
     }
-    fn forward_device_topk(
+    fn fixed_forward_batch_ptrs(&self) -> (W34AttentionBatch, u64, u64) {
+        let m = self.cfg.block_size;
+        let base = self.graph_io.meta_dev.addr();
+        let ids_ptr = base;
+        let pos_ptr = ids_ptr + (m * 4) as u64;
+        let slots_ptr = pos_ptr + (m * 4) as u64;
+        let q_start_ptr = slots_ptr + (m * 4) as u64;
+        let ctx_before_ptr = q_start_ptr + 8;
+        let seq_after_ptr = ctx_before_ptr + 4;
+        let batch = W34AttentionBatch {
+            query_start_loc: q_start_ptr as *const i32,
+            context_lens_before: ctx_before_ptr as *const i32,
+            seq_lens_after: seq_after_ptr as *const i32,
+            block_tables: self.pages_dev as *const i32,
+            write_slot_mapping: slots_ptr as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: m as i32,
+            max_blocks_per_req: self.pages.len() as i32,
+            max_q_len: m as i32,
+            max_seq_len: self.capacity as i32,
+            sliding_window: self.cfg.window as i32,
+            mask_mode: ffi::W34_ATTN_MASK_NONCAUSAL_WINDOW,
+            sm_scale: 1.0 / (self.cfg.model.head_dim as f32).sqrt(),
+            reserved: 0,
+        };
+        (batch, ids_ptr, pos_ptr)
+    }
+
+    fn upload_forward_meta(&self, t: &Qwen3_5ModelRank, anchor: i32) -> Result<()> {
+        let m = self.cfg.block_size;
+        let before = self.committed;
+        let after = before + m;
+        if after > self.capacity {
+            return Err(loader_err("DFlash KV capacity exceeded"));
+        }
+        let mut meta = Vec::with_capacity(3 * m + 4);
+        meta.push(anchor);
+        meta.resize(m, self.cfg.mask_token);
+        meta.extend((before..after).map(|v| v as i32));
+        meta.extend((before..after).map(|p| self.pages[p / 16] * 16 + (p % 16) as i32));
+        meta.extend_from_slice(&[0i32, m as i32, before as i32, after as i32]);
+        self.graph_io.meta_dev.copy_from_host(&meta, &t.stream)
+    }
+
+    fn enqueue_forward_device_topk(
         &mut self,
         t: &Qwen3_5ModelRank,
-        anchor: i32,
+        batch: &W34AttentionBatch,
+        ids_ptr: u64,
+        pos_ptr: u64,
         comm: Option<&Tp2Collectives>,
-    ) -> Result<(u64, u64)> {
-        self.validate_target(t)?;
-        if anchor < 0
-            || anchor as usize >= self.cfg.model.vocab_size
-            || (self.tp == 2) != comm.is_some()
-        {
-            return Err(loader_err("invalid DFlash forward"));
-        }
-        self.proposal_anchor = None;
-        if self.scratch.used() > 32 * 1024 * 1024 {
-            self.scratch.reset();
-        }
+    ) -> Result<()> {
+        self.graph_io.forward_arena.reset();
         let c = &self.cfg.model;
         let (h, m, d) = (c.hidden_size, self.cfg.block_size, c.head_dim);
         let (q, kv, i) = (
@@ -728,29 +791,29 @@ impl DFlash2Rank {
             c.num_key_value_heads * d / self.tp,
             c.intermediate_size / self.tp,
         );
-        let residual = self.scratch.alloc_aligned(m * h * 2)?;
-        let x = self.scratch.alloc_aligned(m * h * 2)?;
-        let normed = self.scratch.alloc_aligned(m * h * 2)?;
-        let filtered = self.scratch.alloc_aligned(m * h * 2)?;
+        let residual = self.graph_io.forward_arena.alloc_aligned(m * h * 2)?;
+        let x = self.graph_io.forward_arena.alloc_aligned(m * h * 2)?;
+        let normed = self.graph_io.forward_arena.alloc_aligned(m * h * 2)?;
+        let filtered = self.graph_io.forward_arena.alloc_aligned(m * h * 2)?;
         let coeff = self
-            .scratch
+            .graph_io
+            .forward_arena
             .alloc_aligned(m * 2 * self.cfg.taps * (h / self.cfg.group) * 2)?;
-        let packed = self.scratch.alloc_aligned(m * (q + 2 * kv) * 2)?;
-        let qb = self.scratch.alloc_aligned(m * q * 2)?;
-        let attn = self.scratch.alloc_aligned(m * q * 2)?;
-        let tmp = self.scratch.alloc_aligned(m * h * 2)?;
-        let gu = self.scratch.alloc_aligned(m * 2 * i * 2)?;
-        let act = self.scratch.alloc_aligned(m * i * 2)?;
-        let mut ids = vec![self.cfg.mask_token; m];
-        ids[0] = anchor;
-        let ids = self.scratch.upload_slice(&ids, &t.stream)?;
-        let (batch, pos) = self.metadata(t, m)?;
+        let packed = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(m * (q + 2 * kv) * 2)?;
+        let qb = self.graph_io.forward_arena.alloc_aligned(m * q * 2)?;
+        let attn = self.graph_io.forward_arena.alloc_aligned(m * q * 2)?;
+        let tmp = self.graph_io.forward_arena.alloc_aligned(m * h * 2)?;
+        let gu = self.graph_io.forward_arena.alloc_aligned(m * 2 * i * 2)?;
+        let act = self.graph_io.forward_arena.alloc_aligned(m * i * 2)?;
         let ex = t.stream.exec(0, 0);
         check_rc(
             unsafe {
                 ffi::w34_embed_lookup_f16_to_bf16(
                     &ex,
-                    ids as *const i32,
+                    ids_ptr as *const i32,
                     t.embed_tokens_ptr as *const c_void,
                     residual as *mut c_void,
                     m as i32,
@@ -775,7 +838,7 @@ impl DFlash2Rank {
                 t,
                 packed,
                 qb,
-                pos,
+                pos_ptr,
                 q / d,
                 layer,
                 &self.kv.layers[l].layout,
@@ -787,7 +850,7 @@ impl DFlash2Rank {
                     ffi::w34_paged_attention_bf16(
                         &ex,
                         &self.kv.layers[l].layout,
-                        &batch,
+                        batch,
                         qb as *const c_void,
                         attn as *mut c_void,
                         (q / d) as i32,
@@ -824,9 +887,10 @@ impl DFlash2Rank {
         self.norm(t, x, residual, self.final_norm, self.hidden.addr(), m)?;
         let draft_hidden = self.hidden.addr() + (h * 2) as u64;
         self.hp.run(t, draft_hidden, self.projected.addr(), m - 1)?;
-        let head_input = self.scratch.alloc_aligned((m - 1) * h * 2)?;
+        let head_input = self.graph_io.forward_arena.alloc_aligned((m - 1) * h * 2)?;
         let logits = self
-            .scratch
+            .graph_io
+            .forward_arena
             .alloc_aligned((m - 1) * t.local_vocab_size * 2)?;
         // Explicit dtype boundary into the target's single resident FP16 head.
         check_rc(
@@ -850,33 +914,122 @@ impl DFlash2Rank {
             m - 1,
         )?;
         let topk_elems = (m - 1) * self.cfg.top_k;
-        let ids_dev = self.scratch.alloc_aligned(topk_elems * 4)?;
-        let scores_dev = self.scratch.alloc_aligned(topk_elems * 4)?;
+        let num_splits = (128 / self.cfg.top_k).clamp(1, 8);
+        let split_ids_ws = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(topk_elems * num_splits * 4)?;
+        let split_vals_ws = self
+            .graph_io
+            .forward_arena
+            .alloc_aligned(topk_elems * num_splits * 4)?;
         check_rc(
             unsafe {
-                ffi::w34_topk_rows_f16(
+                ffi::w34_topk_rows_split_f16(
                     &ex,
                     logits as *const c_void,
-                    ids_dev as *mut i32,
-                    scores_dev as *mut f32,
+                    split_ids_ws as *mut i32,
+                    split_vals_ws as *mut f32,
+                    self.graph_io.topk_ids_dev.addr() as *mut i32,
+                    self.graph_io.topk_scores_dev.addr() as *mut f32,
                     (m - 1) as i32,
                     t.local_vocab_size as i32,
                     t.vocab_offset as i32,
                     self.cfg.top_k as i32,
+                    num_splits as i32,
                 )
             },
             "DFlash top-k",
-        )?;
-        Ok((ids_dev, scores_dev))
+        )
     }
 
-    pub fn forward(
+    pub fn has_forward_graph(&self) -> bool {
+        self.graph_io.forward_graph.is_some()
+    }
+
+    fn ensure_forward_graph(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        if self.graph_io.forward_graph.is_some() {
+            return Ok(());
+        }
+        let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
+        t.stream.synchronize()?;
+        let graph = CudaGraph::capture(&t.stream, || {
+            self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)
+        })?;
+        self.graph_io.forward_graph = Some(graph);
+        Ok(())
+    }
+
+    fn can_capture_select_greedy(&self) -> bool {
+        let (k, n) = (self.cfg.block_size - 1, self.cfg.top_k);
+        self.tp == 1 && self.cfg.selector_rank <= 256 && n <= 32 && k <= 16
+    }
+
+    fn ensure_select_greedy_graph(&mut self, t: &Qwen3_5ModelRank) -> Result<()> {
+        if self.graph_io.select_greedy_graph.is_some() {
+            return Ok(());
+        }
+        let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
+        let (k, n) = (self.cfg.block_size - 1, self.cfg.top_k);
+        let topk_ids = self.graph_io.topk_ids_dev.addr();
+        let topk_scores = self.graph_io.topk_scores_dev.addr();
+        let out_path = self.graph_io.out_path_dev.addr();
+        let projected = self.projected.addr();
+        let pred = self.pred;
+        let succ = self.succ;
+        let selector_rank = self.cfg.selector_rank as i32;
+        let vocab_size = self.cfg.model.vocab_size as i32;
+        t.stream.synchronize()?;
+        let graph = CudaGraph::capture(&t.stream, || {
+            self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, None)?;
+            check_rc(
+                unsafe {
+                    ffi::w34_dflash_select_greedy_dev_anchor_bf16(
+                        &t.stream.exec(0, 0),
+                        topk_ids as *const i32,
+                        topk_scores as *const f32,
+                        projected as *const c_void,
+                        pred as *const c_void,
+                        succ as *const c_void,
+                        out_path as *mut i32,
+                        ids_ptr as *const i32,
+                        k as i32,
+                        n as i32,
+                        selector_rank,
+                        vocab_size,
+                    )
+                },
+                "DFlash greedy selector",
+            )
+        })?;
+        self.graph_io.select_greedy_graph = Some(graph);
+        Ok(())
+    }
+
+    pub fn launch_forward_graph_async(&mut self, t: &Qwen3_5ModelRank, anchor: i32) -> Result<()> {
+        self.validate_target(t)?;
+        if anchor < 0 || anchor as usize >= self.cfg.model.vocab_size {
+            return Err(loader_err("invalid DFlash forward"));
+        }
+        self.proposal_anchor = None;
+        self.upload_forward_meta(t, anchor)?;
+        let graph = self
+            .graph_io
+            .forward_graph
+            .as_ref()
+            .ok_or_else(|| loader_err("DFlash forward graph not captured"))?;
+        graph.launch(&t.stream)
+    }
+
+    pub fn collect_forward_topk_host(
         &mut self,
         t: &Qwen3_5ModelRank,
         anchor: i32,
-        comm: Option<&Tp2Collectives>,
     ) -> Result<DraftCandidates> {
-        let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, comm)?;
         let m = self.cfg.block_size;
         let topk_elems = (m - 1) * self.cfg.top_k;
         let mut out = DraftCandidates {
@@ -889,7 +1042,7 @@ impl DFlash2Rank {
             unsafe {
                 ffi::w34_memcpy_d2h_async(
                     out.ids.as_mut_ptr().cast(),
-                    ids_dev as *const c_void,
+                    self.graph_io.topk_ids_dev.addr() as *const c_void,
                     topk_elems * 4,
                     t.stream.handle,
                 )
@@ -900,7 +1053,7 @@ impl DFlash2Rank {
             unsafe {
                 ffi::w34_memcpy_d2h_async(
                     out.scores.as_mut_ptr().cast(),
-                    scores_dev as *const c_void,
+                    self.graph_io.topk_scores_dev.addr() as *const c_void,
                     topk_elems * 4,
                     t.stream.handle,
                 )
@@ -915,11 +1068,77 @@ impl DFlash2Rank {
         Ok(out)
     }
 
+    fn forward_device_topk(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        anchor: i32,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<(u64, u64)> {
+        self.validate_target(t)?;
+        if anchor < 0
+            || anchor as usize >= self.cfg.model.vocab_size
+            || (self.tp == 2) != comm.is_some()
+        {
+            return Err(loader_err("invalid DFlash forward"));
+        }
+        self.proposal_anchor = None;
+        self.upload_forward_meta(t, anchor)?;
+        if self.use_cuda_graph {
+            self.ensure_forward_graph(t, comm)?;
+            self.graph_io
+                .forward_graph
+                .as_ref()
+                .unwrap()
+                .launch(&t.stream)?;
+        } else {
+            let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
+            self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)?;
+        }
+        Ok((
+            self.graph_io.topk_ids_dev.addr(),
+            self.graph_io.topk_scores_dev.addr(),
+        ))
+    }
+
+    pub fn forward(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        anchor: i32,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<DraftCandidates> {
+        let _ = self.forward_device_topk(t, anchor, comm)?;
+        self.collect_forward_topk_host(t, anchor)
+    }
+
     /// Single-rank (`TP=1`) fused forward + greedy selection on device without
     /// intermediate `DraftCandidates` D2H/H2D round-trips.
     pub fn forward_select_greedy(&mut self, t: &Qwen3_5ModelRank, anchor: i32) -> Result<Vec<i32>> {
         if self.tp != 1 {
             return Err(loader_err("forward_select_greedy requires TP=1"));
+        }
+        if self.use_cuda_graph && self.can_capture_select_greedy() {
+            self.validate_target(t)?;
+            if anchor < 0 || anchor as usize >= self.cfg.model.vocab_size {
+                return Err(loader_err("invalid DFlash forward"));
+            }
+            self.proposal_anchor = None;
+            self.upload_forward_meta(t, anchor)?;
+            self.ensure_select_greedy_graph(t)?;
+            self.graph_io
+                .select_greedy_graph
+                .as_ref()
+                .unwrap()
+                .launch(&t.stream)?;
+            let k = self.cfg.block_size - 1;
+            let mut path = vec![0i32; k];
+            self.graph_io
+                .out_path_dev
+                .copy_to_host(&mut path, &t.stream)?;
+            if path.first().is_some_and(|&id| id < 0) {
+                return Err(loader_err("nonfinite DFlash edges"));
+            }
+            self.proposal_anchor = Some(anchor);
+            return Ok(path);
         }
         let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, None)?;
         self.proposal_anchor = Some(anchor);

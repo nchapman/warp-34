@@ -741,6 +741,20 @@ unsafe extern "C" {
         rank: i32,
         vocab: i32,
     ) -> i32;
+    pub fn w34_dflash_select_greedy_dev_anchor_bf16(
+        ex: *const W34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out_path: *mut i32,
+        anchor_dev: *const i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
+    ) -> i32;
     pub fn w34_dflash_qk_norm_rope_bf16(
         ex: *const W34Exec,
         qkv: *mut c_void,
@@ -825,6 +839,20 @@ unsafe extern "C" {
         local_vocab_size: i32,
         vocab_offset: i32,
         top_k: i32,
+    ) -> i32;
+
+    pub fn w34_topk_rows_split_f16(
+        ex: *const W34Exec,
+        logits_f16: *const c_void,
+        split_ids_ws: *mut i32,
+        split_vals_ws: *mut f32,
+        out_ids: *mut i32,
+        out_vals: *mut f32,
+        num_rows: i32,
+        local_vocab_size: i32,
+        vocab_offset: i32,
+        top_k: i32,
+        num_splits: i32,
     ) -> i32;
 
     pub fn w34_vision_bias_add_f16(
@@ -923,6 +951,27 @@ unsafe extern "C" {
         num_experts: i32,
         k_hidden: i32,
         n_interm: i32,
+        group_size: i32,
+    ) -> i32;
+
+    pub fn w34_moe_w4a16_mlp_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        shared_expert_out: *const c_void,
+        shared_expert_gate_logits: *const c_void,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
         group_size: i32,
     ) -> i32;
 

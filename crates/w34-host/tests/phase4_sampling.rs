@@ -69,7 +69,7 @@ fn dense_normalized_and_sorted_seed_cdf_without_mutation() {
 
 #[test]
 fn greedy_constraint_ties_and_grammar_rollback() {
-    let c = TokenBitmaskConstraint::json_object(3, vec![1], vec![2]);
+    let c = TokenBitmaskConstraint::from_allowed_tokens(3, vec![1]);
     let mut s = SamplerV1::new(SamplingParams::default(), &[], Some(c));
     let before = format!("{s:?}");
     close(
@@ -80,7 +80,7 @@ fn greedy_constraint_ties_and_grammar_rollback() {
     s.commit_token(1);
     close(
         &s.processed_distribution(&[9.0, 1.0, 9.0]).unwrap(),
-        &[1.0, 0.0, 0.0],
+        &[0.0, 1.0, 0.0],
     );
     s.rollback_tokens(1);
     assert_eq!(before, format!("{s:?}"));

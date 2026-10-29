@@ -504,7 +504,10 @@ fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
         .unwrap()
         .generated_token_ids;
     assert_eq!(
-        graphed.ranks[0].spec_verify_graph.as_ref().map(|(m, _)| *m),
+        graphed.ranks[0]
+            .spec_verify_graph
+            .as_ref()
+            .map(|((m, _), _)| *m),
         Some(4)
     );
     assert_eq!(graphed_greedy, eager_greedy);
@@ -514,4 +517,89 @@ fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
         .unwrap()
         .generated_token_ids;
     assert_eq!(graphed_sampled, eager_sampled);
+}
+
+#[test]
+fn dflash_and_tp2_proposer_cuda_graphs_match_eager() {
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dflash_spec = SpeculativeConfig {
+        kind: SpeculativeKind::DFlash2,
+        draft_model: Some("nchapman/Qwen3.5-4B-DFlash2".to_string()),
+        mtp_k: 3,
+    };
+    let mut eager_df = Qwen3_5Engine::load(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        1,
+        KvFormatPolicy::Tq4,
+        Some(16),
+        false,
+    )
+    .unwrap();
+    eager_df.enable_speculative(&dflash_spec).unwrap();
+    let prompt = eager_df
+        .encode("Write a compact Rust function computing Fibonacci numbers iteratively.")
+        .unwrap();
+    let expected_df = eager_df
+        .generate_with_radix_cache(&prompt, 32, 64, false)
+        .unwrap()
+        .generated_token_ids;
+    drop(eager_df);
+
+    for tp in [1usize, 2usize] {
+        let mut graphed_df = Qwen3_5Engine::load(
+            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+            tp,
+            KvFormatPolicy::Tq4,
+            Some(16),
+            true,
+        )
+        .unwrap();
+        graphed_df.enable_speculative(&dflash_spec).unwrap();
+        let got_df = graphed_df
+            .generate_with_radix_cache(&prompt, 32, 64, false)
+            .unwrap()
+            .generated_token_ids;
+        assert_eq!(
+            got_df, expected_df,
+            "DFlash2 CUDA Graph parity failed at TP={tp}"
+        );
+    }
+
+    let mtp_spec = SpeculativeConfig {
+        kind: SpeculativeKind::Mtp,
+        draft_model: None,
+        mtp_k: 3,
+    };
+    let mut eager_mtp2 = Qwen3_5Engine::load(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        2,
+        KvFormatPolicy::Tq4,
+        Some(16),
+        false,
+    )
+    .unwrap();
+    eager_mtp2.enable_speculative(&mtp_spec).unwrap();
+    let expected_mtp2 = eager_mtp2
+        .generate_with_radix_cache(&prompt, 20, 64, false)
+        .unwrap()
+        .generated_token_ids;
+    drop(eager_mtp2);
+
+    let mut graphed_mtp2 = Qwen3_5Engine::load(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        2,
+        KvFormatPolicy::Tq4,
+        Some(16),
+        true,
+    )
+    .unwrap();
+    graphed_mtp2.enable_speculative(&mtp_spec).unwrap();
+    let got_mtp2 = graphed_mtp2
+        .generate_with_radix_cache(&prompt, 20, 64, false)
+        .unwrap()
+        .generated_token_ids;
+    assert_eq!(
+        got_mtp2, expected_mtp2,
+        "TP=2 MTP composite CUDA Graph parity failed"
+    );
 }

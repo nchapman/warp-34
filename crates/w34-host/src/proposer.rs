@@ -73,12 +73,17 @@ impl NativeProposer {
             return Err(loader_err("insufficient speculative context capacity"));
         }
         let h = engine.cfg.hidden_size;
+        let use_graph = engine.use_cuda_graph;
         let (ranks, taps, k, row_bytes) = match config.kind {
             SpeculativeKind::Mtp => {
                 let ranks = engine
                     .ranks
                     .iter()
-                    .map(|t| Qwen3_5MtpRank::load(t, &engine.model_dir, capacity))
+                    .map(|t| {
+                        let mut r = Qwen3_5MtpRank::load(t, &engine.model_dir, capacity)?;
+                        r.use_cuda_graph = use_graph;
+                        Ok(r)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 (Ranks::Mtp(ranks), vec![], config.mtp_k, h * 2)
             }
@@ -92,7 +97,11 @@ impl NativeProposer {
                 let ranks = engine
                     .ranks
                     .iter()
-                    .map(|t| DFlash2Rank::load(t, &dir, capacity, max_rows))
+                    .map(|t| {
+                        let mut r = DFlash2Rank::load(t, &dir, capacity, max_rows)?;
+                        r.use_cuda_graph = use_graph;
+                        Ok(r)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let taps = ranks[0].cfg.target_layers.clone();
                 let k = ranks[0].cfg.block_size - 1;
@@ -438,6 +447,10 @@ impl NativeProposer {
                     memo.tokens.extend_from_slice(tokens);
                 }
                 let n = tokens.len();
+                let use_graph = engine.use_cuda_graph;
+                for r in rs.iter_mut() {
+                    r.use_cuda_graph = use_graph;
+                }
                 if rs.len() == 1 {
                     let res = rs[0]
                         .ingest_no_sync(&engine.ranks[0], features[0], n)
@@ -456,30 +469,50 @@ impl NativeProposer {
                     return Ok(ids);
                 }
                 let comm = engine.tp2_comm.as_deref();
-                let candidates = std::thread::scope(|scope| {
-                    let jobs: Vec<_> = rs
-                        .iter_mut()
-                        .zip(&mut engine.ranks)
-                        .zip(features)
-                        .map(|((r, t), &ptr)| {
-                            scope.spawn(move || -> Result<DraftCandidates> {
-                                r.ingest_no_sync(t, ptr, n)?;
-                                r.forward(t, anchor, comm)
+                let candidates = if use_graph && rs.iter().all(|r| r.has_forward_graph()) {
+                    let enqueue_res: Result<()> = (|| {
+                        for ((r, t), &ptr) in rs.iter_mut().zip(&engine.ranks).zip(features) {
+                            r.ingest_no_sync(t, ptr, n)?;
+                            r.launch_forward_graph_async(t, anchor)?;
+                        }
+                        Ok(())
+                    })();
+                    match enqueue_res {
+                        Ok(()) => rs
+                            .iter_mut()
+                            .zip(&engine.ranks)
+                            .map(|(r, t)| r.collect_forward_topk_host(t, anchor))
+                            .collect::<Result<Vec<_>>>(),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    std::thread::scope(|scope| {
+                        let jobs: Vec<_> = rs
+                            .iter_mut()
+                            .zip(&mut engine.ranks)
+                            .zip(features)
+                            .map(|((r, t), &ptr)| {
+                                scope.spawn(move || -> Result<DraftCandidates> {
+                                    r.ingest_no_sync(t, ptr, n)?;
+                                    r.forward(t, anchor, comm)
+                                })
                             })
-                        })
-                        .collect();
-                    jobs.into_iter()
-                        .map(|j| {
-                            j.join()
-                                .map_err(|_| loader_err("DFlash ingest+proposal rank panic"))?
-                        })
-                        .collect::<Result<Vec<_>>>()
-                });
+                            .collect();
+                        jobs.into_iter()
+                            .map(|j| {
+                                j.join()
+                                    .map_err(|_| loader_err("DFlash ingest+proposal rank panic"))?
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                };
                 let candidates = match candidates {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = engine.ranks[0].device.make_current();
-                        let _ = engine.ranks[0].stream.synchronize();
+                        for t in &engine.ranks {
+                            let _ = t.device.make_current();
+                            let _ = t.stream.synchronize();
+                        }
                         return Err(e);
                     }
                 };
@@ -490,7 +523,95 @@ impl NativeProposer {
                 ids.truncate(k);
                 Ok(ids)
             }
-            Ranks::Mtp(_) => {
+            Ranks::Mtp(rs) => {
+                if self.current.is_none() && engine.use_cuda_graph {
+                    let h = engine.cfg.hidden_size;
+                    let before = self.processed;
+                    let comm = engine.tp2_comm.as_deref();
+                    let run_res: Result<Vec<Vec<i32>>> = (|| {
+                        for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                            r.ensure_propose_graph(t, k, comm)?;
+                        }
+                        for ((((r, t), tail), shifted), &ptr) in rs
+                            .iter_mut()
+                            .zip(&engine.ranks)
+                            .zip(&self.tail)
+                            .zip(&self.shifted)
+                            .zip(features)
+                        {
+                            t.device.make_current()?;
+                            r.truncate(before.saturating_sub(1))?;
+                            let (ids, input) = if before == 0 {
+                                (&tokens[1..], ptr)
+                            } else {
+                                check_rc(
+                                    // SAFETY: both resident buffers hold at least H FP16 elements.
+                                    unsafe {
+                                        ffi::w34_memcpy_d2d_async(
+                                            shifted.addr() as *mut _,
+                                            tail.addr() as *const _,
+                                            h * 2,
+                                            t.stream.handle,
+                                        )
+                                    },
+                                    "MTP preceding hidden",
+                                )?;
+                                if tokens.len() > 1 {
+                                    check_rc(
+                                        // SAFETY: rows<=max_rows and the final shifted row fits;
+                                        // source is the owned live capture for this whole batch.
+                                        unsafe {
+                                            ffi::w34_memcpy_d2d_async(
+                                                (shifted.addr() + (h * 2) as u64) as *mut _,
+                                                ptr as *const _,
+                                                (tokens.len() - 1) * h * 2,
+                                                t.stream.handle,
+                                            )
+                                        },
+                                        "MTP shifted hidden",
+                                    )?;
+                                }
+                                (tokens, shifted.addr())
+                            };
+                            r.ingest_no_sync(t, ids, input, comm)?;
+                            check_rc(
+                                // SAFETY: tokens is nonempty and ptr spans every captured row;
+                                // tail owns exactly one H-element row on this device.
+                                unsafe {
+                                    ffi::w34_memcpy_d2d_async(
+                                        tail.addr() as *mut _,
+                                        (ptr + ((tokens.len() - 1) * h * 2) as u64) as *const _,
+                                        h * 2,
+                                        t.stream.handle,
+                                    )
+                                },
+                                "MTP tail hidden",
+                            )?;
+                            r.launch_propose_graph_async(t, anchor, tail.addr(), k)?;
+                        }
+                        rs.iter_mut()
+                            .zip(&engine.ranks)
+                            .map(|(r, t)| r.collect_propose_host(t, k))
+                            .collect::<Result<Vec<_>>>()
+                    })();
+                    let outputs = match run_res {
+                        Ok(o) => o,
+                        Err(e) => {
+                            for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                                let _ = t.device.make_current();
+                                let _ = t.stream.synchronize();
+                                let _ = r.truncate(before.saturating_sub(1));
+                            }
+                            return Err(e);
+                        }
+                    };
+                    if outputs.windows(2).any(|p| p[0] != p[1]) {
+                        return Err(loader_err("MTP TP token disagreement"));
+                    }
+                    self.resident_tokens.extend_from_slice(tokens);
+                    self.processed += tokens.len();
+                    return Ok(outputs.into_iter().next().unwrap());
+                }
                 self.ingest(engine, tokens, features)?;
                 self.propose(engine, anchor, k)
             }
@@ -501,49 +622,79 @@ impl NativeProposer {
         if k == 0 {
             return Ok(vec![]);
         }
+        let use_graph = engine.use_cuda_graph;
         let comm = engine.tp2_comm.as_deref();
         match &mut self.ranks {
             Ranks::Mtp(rs) => {
-                let outputs = std::thread::scope(|scope| {
-                    let jobs: Vec<_> = rs
-                        .iter_mut()
-                        .zip(&mut engine.ranks)
-                        .zip(&self.tail)
-                        .map(|((r, t), tail)| {
-                            scope.spawn(move || r.propose(t, anchor, tail.addr(), k, comm))
-                        })
-                        .collect();
-                    jobs.into_iter()
-                        .map(|j| {
-                            j.join()
-                                .map_err(|_| loader_err("MTP proposal rank panic"))?
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })?;
+                for r in rs.iter_mut() {
+                    r.use_cuda_graph = use_graph;
+                }
+                let outputs = if use_graph {
+                    for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                        r.ensure_propose_graph(t, k, comm)?;
+                    }
+                    for ((r, t), tail) in rs.iter_mut().zip(&engine.ranks).zip(&self.tail) {
+                        r.launch_propose_graph_async(t, anchor, tail.addr(), k)?;
+                    }
+                    rs.iter_mut()
+                        .zip(&engine.ranks)
+                        .map(|(r, t)| r.collect_propose_host(t, k))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    std::thread::scope(|scope| {
+                        let jobs: Vec<_> = rs
+                            .iter_mut()
+                            .zip(&mut engine.ranks)
+                            .zip(&self.tail)
+                            .map(|((r, t), tail)| {
+                                scope.spawn(move || r.propose(t, anchor, tail.addr(), k, comm))
+                            })
+                            .collect();
+                        jobs.into_iter()
+                            .map(|j| {
+                                j.join()
+                                    .map_err(|_| loader_err("MTP proposal rank panic"))?
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })?
+                };
                 if outputs.windows(2).any(|p| p[0] != p[1]) {
                     return Err(loader_err("MTP TP token disagreement"));
                 }
                 Ok(outputs[0].clone())
             }
             Ranks::DFlash(rs) => {
+                for r in rs.iter_mut() {
+                    r.use_cuda_graph = use_graph;
+                }
                 if rs.len() == 1 {
                     let mut ids = rs[0].forward_select_greedy(&engine.ranks[0], anchor)?;
                     ids.truncate(k);
                     return Ok(ids);
                 }
-                let candidates = std::thread::scope(|scope| {
-                    let jobs: Vec<_> = rs
-                        .iter_mut()
-                        .zip(&mut engine.ranks)
-                        .map(|(r, t)| scope.spawn(move || r.forward(t, anchor, comm)))
-                        .collect();
-                    jobs.into_iter()
-                        .map(|j| {
-                            j.join()
-                                .map_err(|_| loader_err("DFlash proposal rank panic"))?
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })?;
+                let candidates = if use_graph && rs.iter().all(|r| r.has_forward_graph()) {
+                    for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                        r.launch_forward_graph_async(t, anchor)?;
+                    }
+                    rs.iter_mut()
+                        .zip(&engine.ranks)
+                        .map(|(r, t)| r.collect_forward_topk_host(t, anchor))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    std::thread::scope(|scope| {
+                        let jobs: Vec<_> = rs
+                            .iter_mut()
+                            .zip(&mut engine.ranks)
+                            .map(|(r, t)| scope.spawn(move || r.forward(t, anchor, comm)))
+                            .collect();
+                        jobs.into_iter()
+                            .map(|j| {
+                                j.join()
+                                    .map_err(|_| loader_err("DFlash proposal rank panic"))?
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })?
+                };
                 let merged = DraftCandidates::merge(&candidates)?;
                 let mut ids = rs[0].select_greedy(&engine.ranks[0], anchor, &merged)?;
                 ids.truncate(k);
@@ -735,7 +886,9 @@ impl NativeProposer {
                     sampler
                         .processed_distribution(&logits[0])
                         .map_err(|_| loader_err("invalid initial target distribution"))?;
-                    anchor = sampler.sample_from_logits(&logits[0]);
+                    anchor = sampler
+                        .try_sample_from_logits(&logits[0])
+                        .map_err(|_| loader_err("initial sampler/grammar commit failed"))?;
                 } else {
                     sampler.commit_token(anchor);
                 }
@@ -776,7 +929,9 @@ impl NativeProposer {
                         {
                             break;
                         }
-                        hypothetical.commit_token(id);
+                        hypothetical
+                            .try_commit_token(id)
+                            .map_err(|_| loader_err("draft grammar commit failed"))?;
                         valid += 1;
                     }
                     drafts.truncate(valid);
@@ -831,7 +986,9 @@ impl NativeProposer {
                                 let mut q = vec![0f32; engine.cfg.vocab_size];
                                 q[drafts[row] as usize] = 1.0;
                                 proposal.push(q);
-                                hypothetical.commit_token(drafts[row]);
+                                hypothetical.try_commit_token(drafts[row]).map_err(|_| {
+                                    loader_err("verification grammar commit failed")
+                                })?;
                             }
                         }
                         let pos = sampler.output_history.len();
@@ -861,7 +1018,9 @@ impl NativeProposer {
                     engine.free_state_slots(&freed);
                 } else {
                     tx.kv_seq_len_before += 1;
-                    sampler.commit_token(decision.emitted_tokens()[0]);
+                    sampler
+                        .try_commit_token(decision.emitted_tokens()[0])
+                        .map_err(|_| loader_err("sampler/grammar commit failed"))?;
                 }
                 req.active_state_slot = tx.committed_slot;
                 req.commit_tokens(&verify[..processed], &planned);

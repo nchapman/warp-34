@@ -1,0 +1,1213 @@
+{
+  "template_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+  "cases": [
+    {
+      "name": "plain_thinking=False_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "  hello  "
+        }
+      ],
+      "tools": null,
+      "enable_thinking": false,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "plain_thinking=False_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "  hello  "
+        }
+      ],
+      "tools": null,
+      "enable_thinking": false,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "plain_thinking=True_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "  hello  "
+        }
+      ],
+      "tools": null,
+      "enable_thinking": true,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "plain_thinking=True_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "  hello  "
+        }
+      ],
+      "tools": null,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "system_thinking=False_preserve=False",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  Be precise. "
+        },
+        {
+          "role": "user",
+          "content": "weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe precise.<|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "system_thinking=False_preserve=True",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  Be precise. "
+        },
+        {
+          "role": "user",
+          "content": "weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe precise.<|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "system_thinking=True_preserve=False",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  Be precise. "
+        },
+        {
+          "role": "user",
+          "content": "weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe precise.<|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "system_thinking=True_preserve=True",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  Be precise. "
+        },
+        {
+          "role": "user",
+          "content": "weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe precise.<|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "tools_without_system_thinking=False_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "tools_without_system_thinking=False_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "tools_without_system_thinking=True_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "tools_without_system_thinking=True_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "multi_tool_thinking=False_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Compare weather."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "reasoning_content": "  Need both cities.  ",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            },
+            {
+              "id": "call_b",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": {
+                  "city": "Rome"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": " sunny ",
+          "tool_call_id": "call_a"
+        },
+        {
+          "role": "tool",
+          "content": "rain",
+          "tool_call_id": "call_b"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nCompare weather.<|im_end|>\n<|im_start|>assistant\n<think>\nNeed both cities.\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<tool_response>\nrain\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "multi_tool_thinking=False_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Compare weather."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "reasoning_content": "  Need both cities.  ",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            },
+            {
+              "id": "call_b",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": {
+                  "city": "Rome"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": " sunny ",
+          "tool_call_id": "call_a"
+        },
+        {
+          "role": "tool",
+          "content": "rain",
+          "tool_call_id": "call_b"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nCompare weather.<|im_end|>\n<|im_start|>assistant\n<think>\nNeed both cities.\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<tool_response>\nrain\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "multi_tool_thinking=True_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Compare weather."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "reasoning_content": "  Need both cities.  ",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            },
+            {
+              "id": "call_b",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": {
+                  "city": "Rome"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": " sunny ",
+          "tool_call_id": "call_a"
+        },
+        {
+          "role": "tool",
+          "content": "rain",
+          "tool_call_id": "call_b"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nCompare weather.<|im_end|>\n<|im_start|>assistant\n<think>\nNeed both cities.\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<tool_response>\nrain\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "multi_tool_thinking=True_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Compare weather."
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "reasoning_content": "  Need both cities.  ",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            },
+            {
+              "id": "call_b",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": {
+                  "city": "Rome"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": " sunny ",
+          "tool_call_id": "call_a"
+        },
+        {
+          "role": "tool",
+          "content": "rain",
+          "tool_call_id": "call_b"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nCompare weather.<|im_end|>\n<|im_start|>assistant\n<think>\nNeed both cities.\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<tool_response>\nrain\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "old_reasoning_thinking=False_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "first"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nold\n</think>\n\nanswer"
+        },
+        {
+          "role": "user",
+          "content": "next"
+        },
+        {
+          "role": "assistant",
+          "content": "more",
+          "reasoning_content": "new"
+        }
+      ],
+      "tools": null,
+      "enable_thinking": false,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\nnew\n</think>\n\nmore<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "old_reasoning_thinking=False_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "first"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nold\n</think>\n\nanswer"
+        },
+        {
+          "role": "user",
+          "content": "next"
+        },
+        {
+          "role": "assistant",
+          "content": "more",
+          "reasoning_content": "new"
+        }
+      ],
+      "tools": null,
+      "enable_thinking": false,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\n<think>\nold\n</think>\n\nanswer<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\nnew\n</think>\n\nmore<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "old_reasoning_thinking=True_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "first"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nold\n</think>\n\nanswer"
+        },
+        {
+          "role": "user",
+          "content": "next"
+        },
+        {
+          "role": "assistant",
+          "content": "more",
+          "reasoning_content": "new"
+        }
+      ],
+      "tools": null,
+      "enable_thinking": true,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\nnew\n</think>\n\nmore<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "old_reasoning_thinking=True_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "first"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nold\n</think>\n\nanswer"
+        },
+        {
+          "role": "user",
+          "content": "next"
+        },
+        {
+          "role": "assistant",
+          "content": "more",
+          "reasoning_content": "new"
+        }
+      ],
+      "tools": null,
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\n<think>\nold\n</think>\n\nanswer<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n<|im_start|>assistant\n<think>\nnew\n</think>\n\nmore<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "text_before_call_thinking=False_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "Checking.",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "sunny"
+        },
+        {
+          "role": "assistant",
+          "content": "Sunny."
+        },
+        {
+          "role": "user",
+          "content": "thanks"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\nChecking.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>assistant\nSunny.<|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "text_before_call_thinking=False_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "Checking.",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "sunny"
+        },
+        {
+          "role": "assistant",
+          "content": "Sunny."
+        },
+        {
+          "role": "user",
+          "content": "thanks"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nChecking.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nSunny.<|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "text_before_call_thinking=True_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "Checking.",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "sunny"
+        },
+        {
+          "role": "assistant",
+          "content": "Sunny."
+        },
+        {
+          "role": "user",
+          "content": "thanks"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\nChecking.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>assistant\nSunny.<|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "text_before_call_thinking=True_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "Checking.",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "sunny"
+        },
+        {
+          "role": "assistant",
+          "content": "Sunny."
+        },
+        {
+          "role": "user",
+          "content": "thanks"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nChecking.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nSunny.<|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "wrapped_response_thinking=False_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "<tool_response>sunny</tool_response>"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>sunny</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "wrapped_response_thinking=False_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "<tool_response>sunny</tool_response>"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": false,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>sunny</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "wrapped_response_thinking=True_preserve=False",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "<tool_response>sunny</tool_response>"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": false,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>sunny</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "wrapped_response_thinking=True_preserve=True",
+      "messages": [
+        {
+          "role": "user",
+          "content": "weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_a",
+              "type": "function",
+              "function": {
+                "name": "weather",
+                "arguments": "{\"city\":\"Paris\",\"options\":{\"units\":\"°C\",\"days\":[1,2],\"rain\":true}}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "user",
+          "content": "<tool_response>sunny</tool_response>"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "weather",
+            "description": "Weather in <city> & région",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "preserve_thinking": true,
+      "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"weather\", \"description\": \"Weather in <city> & région\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"options\": {\"type\": \"object\"}}, \"required\": [\"city\"], \"additionalProperties\": false}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=options>\n{\"units\": \"°C\", \"days\": [1, 2], \"rain\": true}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>sunny</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    }
+  ]
+}

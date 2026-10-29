@@ -73,6 +73,90 @@ __global__ void tap_add_f16_to_bf16_kernel(
     dst_bf16[dst_idx] = __float2bfloat16(sum);
 }
 
+union Bf16Vec8 {
+    uint4 u;
+    __nv_bfloat16 b[8];
+};
+
+union HalfVec8 {
+    uint4 u;
+    __half h[8];
+};
+
+// 4-warp (4 rows/CTA), register-cached, 128-bit vectorized BF16 RMSNorm preserving
+// the exact 32-lane x vec=8 FP32 reduction tree of FlashInfer's <=3072-width norm.
+__global__ void norm_bf16_vec8_4warp(
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ y,
+    int rows,
+    int hidden,
+    float eps) {
+    constexpr int MAX_ROUNDS = 12; // 12 * 256 = 3072
+    const int wid = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = (int)blockIdx.x * 4 + wid;
+    if (row >= rows) return;
+
+    const int64_t base = (int64_t)row * hidden;
+    const int rounds = hidden >> 8;
+    float vals[MAX_ROUNDS][8];
+    float sq = 0.0f;
+
+    for (int i = 0; i < rounds; ++i) {
+        const int col0 = ((i << 5) + lane) << 3;
+        Bf16Vec8 xv;
+        xv.u = *reinterpret_cast<const uint4*>(x + base + col0);
+        if (residual) {
+            Bf16Vec8 rv;
+            rv.u = *reinterpret_cast<const uint4*>(residual + base + col0);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = (float)xv.b[j] + (float)rv.b[j];
+                vals[i][j] = v;
+                sq += v * v;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = (float)xv.b[j];
+                vals[i][j] = v;
+                sq += v * v;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        sq += __shfl_xor_sync(0xffffffffu, sq, offset);
+    }
+
+    float inv;
+    const float var_eps = sq / (float)hidden + eps;
+    asm volatile("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(var_eps));
+
+    for (int i = 0; i < rounds; ++i) {
+        const int col0 = ((i << 5) + lane) << 3;
+        Bf16Vec8 wv;
+        wv.u = *reinterpret_cast<const uint4*>(weight + col0);
+        if (residual) {
+            Bf16Vec8 rv_out;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                rv_out.b[j] = __float2bfloat16(vals[i][j]);
+            }
+            *reinterpret_cast<uint4*>(residual + base + col0) = rv_out.u;
+        }
+        Bf16Vec8 yv;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            yv.b[j] = __float2bfloat16(vals[i][j] * inv * (float)wv.b[j]);
+        }
+        *reinterpret_cast<uint4*>(y + base + col0) = yv.u;
+    }
+}
+
 __global__ void norm_bf16(
     const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ residual,
@@ -362,6 +446,7 @@ __global__ void dflash_select_greedy_bf16_kernel(
     const __nv_bfloat16* __restrict__ pred,
     const __nv_bfloat16* __restrict__ succ,
     int32_t* __restrict__ out_path,
+    const int32_t* __restrict__ anchor_dev,
     int anchor,
     int k,
     int topk,
@@ -375,8 +460,9 @@ __global__ void dflash_select_greedy_bf16_kernel(
     const int c = threadIdx.x >> 5;
 
     if (threadIdx.x == 0) {
-        s_pred_id = anchor;
-        s_invalid = (anchor < 0 || anchor >= vocab) ? 1 : 0;
+        const int anc = anchor_dev ? anchor_dev[0] : anchor;
+        s_pred_id = anc;
+        s_invalid = (anc < 0 || anc >= vocab) ? 1 : 0;
     }
     __syncthreads();
     if (s_invalid) {
@@ -501,23 +587,48 @@ __device__ __forceinline__ TopkPair warp_reduce_topk_pair(TopkPair v) {
     return v;
 }
 
-// Bank-conflict-free, spill-free top-k extraction (top_k <= 16).
-// Uses transposed shared memory sv[16][256] and si[16][256] so thread tid always
-// accesses shared-memory bank (tid & 31), followed by top_k rounds of warp-shuffle
-// cursor reduction across the 256 per-thread sorted lists.
-__global__ void topk_rows_f16_kernel(
+__device__ __forceinline__ void topk_insert_smem(
+    float v,
+    int32_t id,
+    int tid,
+    int last,
+    float (&sv)[16][256],
+    int32_t (&si)[16][256],
+    float& min_top) {
+    if (v > min_top) {
+        int pos = last;
+        while (pos > 0 && (v > sv[pos - 1][tid] || (v == sv[pos - 1][tid] && id < si[pos - 1][tid]))) {
+            sv[pos][tid] = sv[pos - 1][tid];
+            si[pos][tid] = si[pos - 1][tid];
+            --pos;
+        }
+        sv[pos][tid] = v;
+        si[pos][tid] = id;
+        min_top = sv[last][tid];
+    }
+}
+
+// Bank-conflict-free, spill-free top-k extraction (top_k <= 16) over [col_start, col_end).
+// Uses 128-bit uint4 (8x FP16) vectorized global loads when 16-byte aligned.
+__global__ void topk_rows_range_f16_kernel(
     const __half* __restrict__ logits,
     int32_t* __restrict__ out_ids,
     float* __restrict__ out_vals,
     int num_rows,
     int local_vocab_size,
     int vocab_offset,
-    int top_k) {
+    int top_k,
+    int num_splits) {
     constexpr int MAX_K = 16;
-    const int row = blockIdx.x;
-    if (row >= num_rows) return;
+    const int split_idx = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= num_rows || split_idx >= num_splits) return;
     const __half* row_logits = logits + (int64_t)row * local_vocab_size;
     const int tid = threadIdx.x;
+
+    const int chunk_elems = ((local_vocab_size + num_splits - 1) / num_splits + 7) & ~7;
+    const int col_start = split_idx * chunk_elems;
+    const int col_end = min(local_vocab_size, col_start + chunk_elems);
 
     __shared__ float sv[MAX_K][256];
     __shared__ int32_t si[MAX_K][256];
@@ -532,18 +643,26 @@ __global__ void topk_rows_f16_kernel(
 
     float min_top = -FLT_MAX;
     const int last = top_k - 1;
-    for (int col = tid; col < local_vocab_size; col += 256) {
-        const float v = __half2float(row_logits[col]);
-        if (v > min_top) {
-            int pos = last;
-            while (pos > 0 && v > sv[pos - 1][tid]) {
-                sv[pos][tid] = sv[pos - 1][tid];
-                si[pos][tid] = si[pos - 1][tid];
-                --pos;
+    const bool aligned16 = (((uintptr_t)(row_logits + col_start)) & 15u) == 0u;
+    if (aligned16 && col_start < col_end) {
+        const int vec_end = col_start + ((col_end - col_start) & ~7);
+        for (int col = col_start + (tid << 3); col < vec_end; col += 256 * 8) {
+            HalfVec8 hv;
+            hv.u = *reinterpret_cast<const uint4*>(row_logits + col);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = __half2float(hv.h[j]);
+                topk_insert_smem(v, vocab_offset + col + j, tid, last, sv, si, min_top);
             }
-            sv[pos][tid] = v;
-            si[pos][tid] = vocab_offset + col;
-            min_top = sv[last][tid];
+        }
+        for (int col = vec_end + tid; col < col_end; col += 256) {
+            const float v = __half2float(row_logits[col]);
+            topk_insert_smem(v, vocab_offset + col, tid, last, sv, si, min_top);
+        }
+    } else {
+        for (int col = col_start + tid; col < col_end; col += 256) {
+            const float v = __half2float(row_logits[col]);
+            topk_insert_smem(v, vocab_offset + col, tid, last, sv, si, min_top);
         }
     }
     __syncthreads();
@@ -551,6 +670,7 @@ __global__ void topk_rows_f16_kernel(
     int cur = 0;
     const int lane = tid & 31;
     const int wid = tid >> 5;
+    const int64_t out_base = ((int64_t)row * num_splits + split_idx) * top_k;
     for (int m = 0; m < top_k; ++m) {
         TopkPair cand = (cur < top_k)
             ? TopkPair{sv[cur][tid], si[cur][tid]}
@@ -570,14 +690,60 @@ __global__ void topk_rows_f16_kernel(
             if (lane == 0) {
                 warp_v[0] = w.val;
                 warp_i[0] = w.id;
-                out_vals[(int64_t)row * top_k + m] = w.val;
-                out_ids[(int64_t)row * top_k + m] = w.id;
+                out_vals[out_base + m] = w.val;
+                out_ids[out_base + m] = w.id;
             }
         }
         __syncthreads();
 
         if (cur < top_k && si[cur][tid] == warp_i[0] && warp_i[0] >= 0) {
             ++cur;
+        }
+    }
+}
+
+// Merges `num_splits * top_k <= 128` candidates per row in registers (128 threads/block).
+__global__ void topk_rows_merge_kernel(
+    const int32_t* __restrict__ split_ids,
+    const float* __restrict__ split_vals,
+    int32_t* __restrict__ out_ids,
+    float* __restrict__ out_vals,
+    int num_rows,
+    int top_k,
+    int total_cands) {
+    const int row = blockIdx.x;
+    if (row >= num_rows) return;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+
+    __shared__ float warp_v[4];
+    __shared__ int32_t warp_i[4];
+
+    TopkPair my_cand = (tid < total_cands)
+        ? TopkPair{split_vals[(int64_t)row * total_cands + tid], split_ids[(int64_t)row * total_cands + tid]}
+        : TopkPair{-FLT_MAX, -1};
+
+    for (int m = 0; m < top_k; ++m) {
+        TopkPair w = warp_reduce_topk_pair(my_cand);
+        if (lane == 0) {
+            warp_v[wid] = w.val;
+            warp_i[wid] = w.id;
+        }
+        __syncthreads();
+        if (wid == 0) {
+            TopkPair g = (lane < 4) ? TopkPair{warp_v[lane], warp_i[lane]} : TopkPair{-FLT_MAX, -1};
+            g = warp_reduce_topk_pair(g);
+            if (lane == 0) {
+                warp_v[0] = g.val;
+                warp_i[0] = g.id;
+                out_vals[(int64_t)row * top_k + m] = g.val;
+                out_ids[(int64_t)row * top_k + m] = g.id;
+            }
+        }
+        __syncthreads();
+        if (my_cand.id == warp_i[0] && warp_i[0] >= 0) {
+            my_cand = TopkPair{-FLT_MAX, -1};
         }
     }
 }
@@ -714,6 +880,16 @@ int w34_rms_norm_bf16(
         return (int)cudaErrorInvalidValue;
     }
     if (rows == 0) return 0;
+    const bool aligned16 =
+        (((uintptr_t)x | (uintptr_t)weight | (uintptr_t)y | (uintptr_t)residual) & 15u) == 0u;
+    if (aligned16 && hidden >= 256 && hidden <= 3072 && (hidden & 255) == 0) {
+        const unsigned blocks = (unsigned)((rows + 3) / 4);
+        norm_bf16_vec8_4warp<<<blocks, 128, 0, (cudaStream_t)ex->stream>>>(
+            (const __nv_bfloat16*)x, (__nv_bfloat16*)residual,
+            (const __nv_bfloat16*)weight, (__nv_bfloat16*)y,
+            rows, hidden, eps);
+        return (int)cudaGetLastError();
+    }
     const int threads = (hidden <= 3072) ? 32 : ((hidden <= 6144) ? 64 : 128);
     norm_bf16<<<(unsigned)rows, threads, 0, (cudaStream_t)ex->stream>>>(
         (const __nv_bfloat16*)x, (__nv_bfloat16*)residual,
@@ -880,7 +1056,31 @@ int w34_dflash_select_greedy_bf16(
     dflash_select_greedy_bf16_kernel<<<1, (unsigned)(32 * topk), 0, (cudaStream_t)ex->stream>>>(
         ids, unary, (const __nv_bfloat16*)hidden,
         (const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,
-        out_path, anchor, k, topk, rank, vocab);
+        out_path, nullptr, anchor, k, topk, rank, vocab);
+    return (int)cudaGetLastError();
+}
+
+int w34_dflash_select_greedy_dev_anchor_bf16(
+    const w34_exec* ex,
+    const int32_t* ids,
+    const float* unary,
+    const void* hidden,
+    const void* pred,
+    const void* succ,
+    int32_t* out_path,
+    const int32_t* anchor_dev,
+    int k,
+    int topk,
+    int rank,
+    int vocab) {
+    if (!ex || !ids || !unary || !hidden || !pred || !succ || !out_path || !anchor_dev ||
+        k <= 0 || k > 16 || topk <= 0 || topk > 32 || rank <= 0 || rank > 256 || vocab <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    dflash_select_greedy_bf16_kernel<<<1, (unsigned)(32 * topk), 0, (cudaStream_t)ex->stream>>>(
+        ids, unary, (const __nv_bfloat16*)hidden,
+        (const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,
+        out_path, anchor_dev, 0, k, topk, rank, vocab);
     return (int)cudaGetLastError();
 }
 
@@ -940,14 +1140,58 @@ int w34_topk_rows_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (num_rows == 0) return 0;
-    topk_rows_f16_kernel<<<(unsigned)num_rows, 256, 0, (cudaStream_t)ex->stream>>>(
+    topk_rows_range_f16_kernel<<<dim3(1u, (unsigned)num_rows), 256, 0, (cudaStream_t)ex->stream>>>(
         static_cast<const __half*>(logits_f16),
         out_ids,
         out_vals,
         num_rows,
         local_vocab_size,
         vocab_offset,
-        top_k);
+        top_k,
+        1);
+    return (int)cudaGetLastError();
+}
+
+int w34_topk_rows_split_f16(
+    const w34_exec* ex,
+    const void* logits_f16,
+    int32_t* split_ids_ws,
+    float* split_vals_ws,
+    int32_t* out_ids,
+    float* out_vals,
+    int num_rows,
+    int local_vocab_size,
+    int vocab_offset,
+    int top_k,
+    int num_splits) {
+    if (!ex || !logits_f16 || !out_ids || !out_vals || num_rows < 0 ||
+        local_vocab_size <= 0 || top_k <= 0 || top_k > 16 ||
+        num_splits <= 0 || num_splits > 8 || num_splits * top_k > 128 ||
+        (num_splits > 1 && (!split_ids_ws || !split_vals_ws))) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_rows == 0) return 0;
+    if (num_splits == 1) {
+        return w34_topk_rows_f16(
+            ex, logits_f16, out_ids, out_vals, num_rows, local_vocab_size, vocab_offset, top_k);
+    }
+    topk_rows_range_f16_kernel<<<dim3((unsigned)num_splits, (unsigned)num_rows), 256, 0, (cudaStream_t)ex->stream>>>(
+        static_cast<const __half*>(logits_f16),
+        split_ids_ws,
+        split_vals_ws,
+        num_rows,
+        local_vocab_size,
+        vocab_offset,
+        top_k,
+        num_splits);
+    topk_rows_merge_kernel<<<(unsigned)num_rows, 128, 0, (cudaStream_t)ex->stream>>>(
+        split_ids_ws,
+        split_vals_ws,
+        out_ids,
+        out_vals,
+        num_rows,
+        top_k,
+        num_splits * top_k);
     return (int)cudaGetLastError();
 }
 

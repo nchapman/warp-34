@@ -927,3 +927,532 @@ fn phase5_3_moe_checkpoint_config_and_dense_f16_tp_parity() {
         "MoE FP16 fused output mismatch: got {got}, expected ~1.8907"
     );
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn phase6_2_gqa_mma_and_split_kv_long_context_parity() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let d_ws = DeviceBuffer::alloc(0, 16 * 1024 * 1024).unwrap();
+    let ex_no_split = stream.exec(0, 0);
+    let ex_split = stream.exec(d_ws.addr(), d_ws.len_bytes);
+
+    let seq_len = 4096usize; // 256 pages (> 1,024 Split-KV threshold -> 4 active splits)
+    let num_pages = seq_len / 16;
+    let local_kv_heads = 2usize;
+    let num_q_heads = 8usize; // gqa_ratio = 4
+    let head_dim = 256usize;
+    let layer_ids = [0usize, 1, 2, 3, 4];
+
+    let mut k_host = vec![0u16; seq_len * local_kv_heads * head_dim];
+    let mut v_host = vec![0u16; seq_len * local_kv_heads * head_dim];
+    for t in 0..seq_len {
+        for h in 0..local_kv_heads {
+            for c in 0..head_dim {
+                let kv = (((t * 17 + h * 11 + c * 5) % 97) as f32 - 48.0) * 0.02;
+                let vv = (((t * 23 + h * 13 + c * 7) % 89) as f32 - 44.0) * 0.02;
+                let idx = (t * local_kv_heads + h) * head_dim + c;
+                k_host[idx] = f32_to_f16(kv);
+                v_host[idx] = f32_to_f16(vv);
+            }
+        }
+    }
+    let d_k = DeviceBuffer::alloc(0, k_host.len() * 2).unwrap();
+    let d_v = DeviceBuffer::alloc(0, v_host.len() * 2).unwrap();
+    d_k.copy_from_host(&k_host, &stream).unwrap();
+    d_v.copy_from_host(&v_host, &stream).unwrap();
+
+    for (policy, layer_ord) in [
+        (KvFormatPolicy::Fp16, 0usize),
+        (KvFormatPolicy::Q8_0, 0usize),
+        (KvFormatPolicy::Tq4, 0usize), // rotated Q8_0 boundary
+        (KvFormatPolicy::Tq4, 2usize), // rotated TQ4 interior
+    ] {
+        let pool_contig = KvPool::new(
+            0,
+            0,
+            &layer_ids,
+            local_kv_heads,
+            head_dim,
+            16,
+            num_pages,
+            policy,
+        )
+        .unwrap();
+        let pool_perm = KvPool::new(
+            0,
+            0,
+            &layer_ids,
+            local_kv_heads,
+            head_dim,
+            16,
+            num_pages,
+            policy,
+        )
+        .unwrap();
+        let layout_c = pool_contig.layers[layer_ord].layout;
+        let layout_p = pool_perm.layers[layer_ord].layout;
+
+        let bt_contig: Vec<i32> = (0..num_pages as i32).collect();
+        let bt_perm: Vec<i32> = (0..num_pages)
+            .map(|p| ((p * 73 + 19) % num_pages) as i32)
+            .collect();
+        let slots_c: Vec<i32> = (0..seq_len as i32).collect();
+        let slots_p: Vec<i32> = (0..seq_len)
+            .map(|pos| bt_perm[pos / 16] * 16 + (pos % 16) as i32)
+            .collect();
+
+        let d_q_start_w = DeviceBuffer::alloc(0, 8).unwrap();
+        let d_ctx_w = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_seq_w = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_bt_c = DeviceBuffer::alloc(0, num_pages * 4).unwrap();
+        let d_bt_p = DeviceBuffer::alloc(0, num_pages * 4).unwrap();
+        let d_slots_c = DeviceBuffer::alloc(0, seq_len * 4).unwrap();
+        let d_slots_p = DeviceBuffer::alloc(0, seq_len * 4).unwrap();
+        d_q_start_w
+            .copy_from_host(&[0i32, seq_len as i32], &stream)
+            .unwrap();
+        d_ctx_w.copy_from_host(&[0i32], &stream).unwrap();
+        d_seq_w.copy_from_host(&[seq_len as i32], &stream).unwrap();
+        d_bt_c.copy_from_host(&bt_contig, &stream).unwrap();
+        d_bt_p.copy_from_host(&bt_perm, &stream).unwrap();
+        d_slots_c.copy_from_host(&slots_c, &stream).unwrap();
+        d_slots_p.copy_from_host(&slots_p, &stream).unwrap();
+
+        let mut wb = W34AttentionBatch {
+            query_start_loc: d_q_start_w.addr() as *const i32,
+            context_lens_before: d_ctx_w.addr() as *const i32,
+            seq_lens_after: d_seq_w.addr() as *const i32,
+            block_tables: d_bt_c.addr() as *const i32,
+            write_slot_mapping: d_slots_c.addr() as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: seq_len as i32,
+            max_blocks_per_req: num_pages as i32,
+            max_q_len: seq_len as i32,
+            max_seq_len: seq_len as i32,
+            mask_mode: W34_ATTN_MASK_CAUSAL,
+            sliding_window: 0,
+            sm_scale: 0.0625,
+            reserved: 0,
+        };
+        assert_eq!(
+            unsafe {
+                ffi::w34_kv_cache_write(
+                    &ex_no_split,
+                    &layout_c,
+                    &wb,
+                    d_k.addr() as *const c_void,
+                    d_v.addr() as *const c_void,
+                )
+            },
+            0
+        );
+        wb.block_tables = d_bt_p.addr() as *const i32;
+        wb.write_slot_mapping = d_slots_p.addr() as *const i32;
+        assert_eq!(
+            unsafe {
+                ffi::w34_kv_cache_write(
+                    &ex_no_split,
+                    &layout_p,
+                    &wb,
+                    d_k.addr() as *const c_void,
+                    d_v.addr() as *const c_void,
+                )
+            },
+            0
+        );
+
+        for q_len in [1usize, 16usize] {
+            let q_elems = q_len * num_q_heads * head_dim;
+            let q_host: Vec<u16> = (0..q_elems)
+                .map(|i| f32_to_f16((((i * 29 + 7) % 101) as f32 - 50.0) * 0.02))
+                .collect();
+            let d_q = DeviceBuffer::alloc(0, q_elems * 2).unwrap();
+            let d_out_single = DeviceBuffer::alloc(0, q_elems * 2).unwrap();
+            let d_out_split_c = DeviceBuffer::alloc(0, q_elems * 2).unwrap();
+            let d_out_split_p = DeviceBuffer::alloc(0, q_elems * 2).unwrap();
+            d_q.copy_from_host(&q_host, &stream).unwrap();
+
+            let d_qs = DeviceBuffer::alloc(0, 8).unwrap();
+            let d_ctx = DeviceBuffer::alloc(0, 4).unwrap();
+            d_qs.copy_from_host(&[0i32, q_len as i32], &stream).unwrap();
+            d_ctx
+                .copy_from_host(&[(seq_len - q_len) as i32], &stream)
+                .unwrap();
+
+            let mut ab = W34AttentionBatch {
+                query_start_loc: d_qs.addr() as *const i32,
+                context_lens_before: d_ctx.addr() as *const i32,
+                seq_lens_after: d_seq_w.addr() as *const i32,
+                block_tables: d_bt_c.addr() as *const i32,
+                write_slot_mapping: core::ptr::null(),
+                valid_token_mask: core::ptr::null(),
+                valid_req_mask: core::ptr::null(),
+                num_reqs: 1,
+                total_tokens: q_len as i32,
+                max_blocks_per_req: num_pages as i32,
+                max_q_len: q_len as i32,
+                max_seq_len: seq_len as i32,
+                mask_mode: W34_ATTN_MASK_CAUSAL,
+                sliding_window: 0,
+                sm_scale: 0.0625,
+                reserved: 0,
+            };
+
+            assert_eq!(
+                unsafe {
+                    ffi::w34_paged_attention_f16(
+                        &ex_no_split,
+                        &layout_c,
+                        &ab,
+                        d_q.addr() as *const c_void,
+                        d_out_single.addr() as *mut c_void,
+                        num_q_heads as i32,
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    ffi::w34_paged_attention_f16(
+                        &ex_split,
+                        &layout_c,
+                        &ab,
+                        d_q.addr() as *const c_void,
+                        d_out_split_c.addr() as *mut c_void,
+                        num_q_heads as i32,
+                    )
+                },
+                0
+            );
+            ab.block_tables = d_bt_p.addr() as *const i32;
+            assert_eq!(
+                unsafe {
+                    ffi::w34_paged_attention_f16(
+                        &ex_split,
+                        &layout_p,
+                        &ab,
+                        d_q.addr() as *const c_void,
+                        d_out_split_p.addr() as *mut c_void,
+                        num_q_heads as i32,
+                    )
+                },
+                0
+            );
+
+            let mut h_single = vec![0u16; q_elems];
+            let mut h_split_c = vec![0u16; q_elems];
+            let mut h_split_p = vec![0u16; q_elems];
+            d_out_single.copy_to_host(&mut h_single, &stream).unwrap();
+            d_out_split_c.copy_to_host(&mut h_split_c, &stream).unwrap();
+            d_out_split_p.copy_to_host(&mut h_split_p, &stream).unwrap();
+
+            assert_eq!(
+                h_split_c, h_split_p,
+                "0-ULP Split-KV page-permutation invariance violated for policy={policy:?} ord={layer_ord} q_len={q_len}"
+            );
+            let max_diff = h_single
+                .iter()
+                .zip(h_split_c.iter())
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 2e-3,
+                "Split-KV vs single-pass drift {max_diff} >= 2e-3 for policy={policy:?} ord={layer_ord} q_len={q_len}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn phase6_3_moe_grouped_mma_exact_parity_and_tp2() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+
+    // 48 tokens * top_k=8 = 384 pairs across 16 experts -> average 24 pairs/expert (multi-tile
+    // BLOCK_M=16 + partial tail tiles + intentionally skipped inactive experts 7 & 13).
+    let num_tokens = 48usize;
+    let top_k = 8usize;
+    let num_experts = 16usize;
+    let hidden = 128usize;
+    let interm = 128usize;
+    let group_size = 64usize;
+
+    let gu_words = num_experts * (2 * interm) * (hidden / 8);
+    let gu_scales_len = num_experts * (2 * interm) * (hidden / group_size);
+    let dn_words = num_experts * hidden * (interm / 8);
+    let dn_scales_len = num_experts * hidden * (interm / group_size);
+
+    let mut gu_packed = vec![0u32; gu_words];
+    for (i, w) in gu_packed.iter_mut().enumerate() {
+        let mut word = 0u32;
+        for b in 0..8 {
+            let nib = (((i * 11 + b * 7 + 3) % 15) as u32) & 0x0F;
+            word |= nib << (4 * b);
+        }
+        *w = word;
+    }
+    let gu_scales: Vec<u16> = (0..gu_scales_len)
+        .map(|i| f32_to_f16(0.015 + 0.005 * ((i % 7) as f32)))
+        .collect();
+
+    let mut dn_packed = vec![0u32; dn_words];
+    for (i, w) in dn_packed.iter_mut().enumerate() {
+        let mut word = 0u32;
+        for b in 0..8 {
+            let nib = (((i * 13 + b * 5 + 1) % 15) as u32) & 0x0F;
+            word |= nib << (4 * b);
+        }
+        *w = word;
+    }
+    let dn_scales: Vec<u16> = (0..dn_scales_len)
+        .map(|i| f32_to_f16(0.012 + 0.004 * ((i % 5) as f32)))
+        .collect();
+
+    let x_host: Vec<u16> = (0..(num_tokens * hidden))
+        .map(|i| f32_to_f16((((i * 17 + 5) % 29) as f32 - 14.0) * 0.05))
+        .collect();
+    let sh_out_host: Vec<u16> = (0..(num_tokens * hidden))
+        .map(|i| f32_to_f16((((i * 9 + 2) % 19) as f32 - 9.0) * 0.03))
+        .collect();
+    let sh_gate_host: Vec<u16> = (0..num_tokens)
+        .map(|t| f32_to_f16((t as f32 - 20.0) * 0.1))
+        .collect();
+
+    let mut topk_ids = vec![0i32; num_tokens * top_k];
+    let mut topk_weights = vec![0.0f32; num_tokens * top_k];
+    for t in 0..num_tokens {
+        let mut w_sum = 0.0f32;
+        for s in 0..top_k {
+            let mut e = ((t * 5 + s * 3) % num_experts) as i32;
+            if e == 7 || e == 13 {
+                e = (e + 1) % (num_experts as i32);
+            }
+            topk_ids[t * top_k + s] = e;
+            let w = 1.0f32 / ((s + 1) as f32);
+            topk_weights[t * top_k + s] = w;
+            w_sum += w;
+        }
+        for s in 0..top_k {
+            topk_weights[t * top_k + s] /= w_sum;
+        }
+    }
+
+    let d_x = DeviceBuffer::alloc(0, x_host.len() * 2).unwrap();
+    let d_gu_w = DeviceBuffer::alloc(0, gu_packed.len() * 4).unwrap();
+    let d_gu_s = DeviceBuffer::alloc(0, gu_scales.len() * 2).unwrap();
+    let d_dn_w = DeviceBuffer::alloc(0, dn_packed.len() * 4).unwrap();
+    let d_dn_s = DeviceBuffer::alloc(0, dn_scales.len() * 2).unwrap();
+    let d_ids = DeviceBuffer::alloc(0, topk_ids.len() * 4).unwrap();
+    let d_tw = DeviceBuffer::alloc(0, topk_weights.len() * 4).unwrap();
+    let d_sh_out = DeviceBuffer::alloc(0, sh_out_host.len() * 2).unwrap();
+    let d_sh_gate = DeviceBuffer::alloc(0, sh_gate_host.len() * 2).unwrap();
+    let d_interm_ref = DeviceBuffer::alloc(0, num_tokens * top_k * interm * 2).unwrap();
+    let d_interm_mma = DeviceBuffer::alloc(0, num_tokens * top_k * interm * 2).unwrap();
+    let d_out_ref = DeviceBuffer::alloc(0, num_tokens * hidden * 2).unwrap();
+    let d_out_mma = DeviceBuffer::alloc(0, num_tokens * hidden * 2).unwrap();
+    let ws_cap = 4 * 1024 * 1024;
+    let d_ws = DeviceBuffer::alloc(0, ws_cap).unwrap();
+
+    d_x.copy_from_host(&x_host, &stream).unwrap();
+    d_gu_w.copy_from_host(&gu_packed, &stream).unwrap();
+    d_gu_s.copy_from_host(&gu_scales, &stream).unwrap();
+    d_dn_w.copy_from_host(&dn_packed, &stream).unwrap();
+    d_dn_s.copy_from_host(&dn_scales, &stream).unwrap();
+    d_ids.copy_from_host(&topk_ids, &stream).unwrap();
+    d_tw.copy_from_host(&topk_weights, &stream).unwrap();
+    d_sh_out.copy_from_host(&sh_out_host, &stream).unwrap();
+    d_sh_gate.copy_from_host(&sh_gate_host, &stream).unwrap();
+
+    // Reference (`scratch_ptr = 0` -> warp-per-row FP32 kernel) vs Grouped `mma.sync` (`d_ws`)
+    let ex_ref = stream.exec(0, 0);
+    let ex_mma = stream.exec(d_ws.addr(), ws_cap);
+    for (ex, d_interm, d_out) in [
+        (&ex_ref, &d_interm_ref, &d_out_ref),
+        (&ex_mma, &d_interm_mma, &d_out_mma),
+    ] {
+        assert_eq!(
+            unsafe {
+                ffi::w34_moe_w4a16_mlp_f16(
+                    ex,
+                    d_x.addr() as *const c_void,
+                    d_gu_w.addr() as *const u32,
+                    d_gu_s.addr() as *const c_void,
+                    d_dn_w.addr() as *const u32,
+                    d_dn_s.addr() as *const c_void,
+                    d_ids.addr() as *const i32,
+                    d_tw.addr() as *const f32,
+                    d_sh_out.addr() as *const c_void,
+                    d_sh_gate.addr() as *const c_void,
+                    d_interm.addr() as *mut c_void,
+                    d_out.addr() as *mut c_void,
+                    num_tokens as i32,
+                    top_k as i32,
+                    num_experts as i32,
+                    interm as i32,
+                    hidden as i32,
+                    group_size as i32,
+                )
+            },
+            0
+        );
+    }
+
+    let mut h_ref = vec![0u16; num_tokens * hidden];
+    let mut h_mma = vec![0u16; num_tokens * hidden];
+    d_out_ref.copy_to_host(&mut h_ref, &stream).unwrap();
+    d_out_mma.copy_to_host(&mut h_mma, &stream).unwrap();
+
+    let mut max_diff = 0.0f32;
+    let mut diff_sq = 0.0f64;
+    let mut ref_sq = 0.0f64;
+    for (&r, &m) in h_ref.iter().zip(h_mma.iter()) {
+        let rf = f16_to_f32(r);
+        let mf = f16_to_f32(m);
+        let d = (rf - mf).abs();
+        max_diff = max_diff.max(d);
+        diff_sq += (d as f64) * (d as f64);
+        ref_sq += (rf as f64) * (rf as f64);
+    }
+    let rel_l2 = (diff_sq.sqrt()) / (ref_sq.sqrt().max(1e-12));
+    assert!(
+        max_diff < 2e-3 && rel_l2 < 1e-3,
+        "Grouped mma.sync MoE vs FP32 reference drift too high: max_diff={max_diff} rel_l2={rel_l2}"
+    );
+
+    // Also verify TP=2 sharded intermediate split (`interm = 2 * 64`) summed across 2 shards
+    // matches TP=1 (`interm = 128`) without shared_expert double-counting!
+    let half_interm = interm / 2;
+    let mut gu_w_r = [vec![0u32; gu_words / 2], vec![0u32; gu_words / 2]];
+    let mut gu_s_r = [vec![0u16; gu_scales_len / 2], vec![0u16; gu_scales_len / 2]];
+    let mut dn_w_r = [vec![0u32; dn_words / 2], vec![0u32; dn_words / 2]];
+    let mut dn_s_r = [vec![0u16; dn_scales_len / 2], vec![0u16; dn_scales_len / 2]];
+    let w_row = hidden / 8;
+    let g_row = hidden / group_size;
+    let dw_half = half_interm / 8;
+    let dg_half = half_interm / group_size;
+    for e in 0..num_experts {
+        for r in 0..2 {
+            // Gate rows [r*64 .. (r+1)*64] and Up rows [128 + r*64 .. 128 + (r+1)*64]
+            for c in 0..half_interm {
+                let dst_gate = (e * (2 * half_interm) + c) * w_row;
+                let src_gate = (e * (2 * interm) + r * half_interm + c) * w_row;
+                gu_w_r[r][dst_gate..dst_gate + w_row]
+                    .copy_from_slice(&gu_packed[src_gate..src_gate + w_row]);
+                let dst_gs = (e * (2 * half_interm) + c) * g_row;
+                let src_gs = (e * (2 * interm) + r * half_interm + c) * g_row;
+                gu_s_r[r][dst_gs..dst_gs + g_row]
+                    .copy_from_slice(&gu_scales[src_gs..src_gs + g_row]);
+
+                let dst_up = (e * (2 * half_interm) + half_interm + c) * w_row;
+                let src_up = (e * (2 * interm) + interm + r * half_interm + c) * w_row;
+                gu_w_r[r][dst_up..dst_up + w_row]
+                    .copy_from_slice(&gu_packed[src_up..src_up + w_row]);
+                let dst_us = (e * (2 * half_interm) + half_interm + c) * g_row;
+                let src_us = (e * (2 * interm) + interm + r * half_interm + c) * g_row;
+                gu_s_r[r][dst_us..dst_us + g_row]
+                    .copy_from_slice(&gu_scales[src_us..src_us + g_row]);
+            }
+            for h in 0..hidden {
+                let dst_dw = (e * hidden + h) * dw_half;
+                let src_dw = (e * hidden + h) * (interm / 8) + r * dw_half;
+                dn_w_r[r][dst_dw..dst_dw + dw_half]
+                    .copy_from_slice(&dn_packed[src_dw..src_dw + dw_half]);
+                let dst_ds = (e * hidden + h) * dg_half;
+                let src_ds = (e * hidden + h) * (interm / group_size) + r * dg_half;
+                dn_s_r[r][dst_ds..dst_ds + dg_half]
+                    .copy_from_slice(&dn_scales[src_ds..src_ds + dg_half]);
+            }
+        }
+    }
+
+    assert_eq!(
+        unsafe {
+            ffi::w34_moe_w4a16_mlp_f16(
+                &ex_mma,
+                d_x.addr() as *const c_void,
+                d_gu_w.addr() as *const u32,
+                d_gu_s.addr() as *const c_void,
+                d_dn_w.addr() as *const u32,
+                d_dn_s.addr() as *const c_void,
+                d_ids.addr() as *const i32,
+                d_tw.addr() as *const f32,
+                core::ptr::null(),
+                core::ptr::null(),
+                d_interm_mma.addr() as *mut c_void,
+                d_out_ref.addr() as *mut c_void,
+                num_tokens as i32,
+                top_k as i32,
+                num_experts as i32,
+                interm as i32,
+                hidden as i32,
+                group_size as i32,
+            )
+        },
+        0
+    );
+    let mut h_tp1 = vec![0u16; num_tokens * hidden];
+    d_out_ref.copy_to_host(&mut h_tp1, &stream).unwrap();
+
+    let mut tp2_sum = vec![0.0f32; num_tokens * hidden];
+    for r in 0..2 {
+        let d_gu_wr = DeviceBuffer::alloc(0, gu_w_r[r].len() * 4).unwrap();
+        let d_gu_sr = DeviceBuffer::alloc(0, gu_s_r[r].len() * 2).unwrap();
+        let d_dn_wr = DeviceBuffer::alloc(0, dn_w_r[r].len() * 4).unwrap();
+        let d_dn_sr = DeviceBuffer::alloc(0, dn_s_r[r].len() * 2).unwrap();
+        d_gu_wr.copy_from_host(&gu_w_r[r], &stream).unwrap();
+        d_gu_sr.copy_from_host(&gu_s_r[r], &stream).unwrap();
+        d_dn_wr.copy_from_host(&dn_w_r[r], &stream).unwrap();
+        d_dn_sr.copy_from_host(&dn_s_r[r], &stream).unwrap();
+        assert_eq!(
+            unsafe {
+                ffi::w34_moe_w4a16_mlp_f16(
+                    &ex_mma,
+                    d_x.addr() as *const c_void,
+                    d_gu_wr.addr() as *const u32,
+                    d_gu_sr.addr() as *const c_void,
+                    d_dn_wr.addr() as *const u32,
+                    d_dn_sr.addr() as *const c_void,
+                    d_ids.addr() as *const i32,
+                    d_tw.addr() as *const f32,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    d_interm_mma.addr() as *mut c_void,
+                    d_out_mma.addr() as *mut c_void,
+                    num_tokens as i32,
+                    top_k as i32,
+                    num_experts as i32,
+                    half_interm as i32,
+                    hidden as i32,
+                    group_size as i32,
+                )
+            },
+            0
+        );
+        let mut h_shard = vec![0u16; num_tokens * hidden];
+        d_out_mma.copy_to_host(&mut h_shard, &stream).unwrap();
+        for (acc, &v) in tp2_sum.iter_mut().zip(h_shard.iter()) {
+            *acc += f16_to_f32(v);
+        }
+    }
+
+    let mut tp_diff_sq = 0.0f64;
+    let mut tp_ref_sq = 0.0f64;
+    for (&t1, &t2) in h_tp1.iter().zip(tp2_sum.iter()) {
+        let f1 = f16_to_f32(t1);
+        let f2 = f16_to_f32(f32_to_f16(t2));
+        let d = (f1 - f2) as f64;
+        tp_diff_sq += d * d;
+        tp_ref_sq += (f1 as f64) * (f1 as f64);
+    }
+    let tp_rel_l2 = tp_diff_sq.sqrt() / tp_ref_sq.sqrt().max(1e-12);
+    assert!(
+        tp_rel_l2 < 1e-3,
+        "Grouped mma.sync MoE TP=1 vs TP=2 rel_l2 {tp_rel_l2} >= 1e-3"
+    );
+}

@@ -155,7 +155,7 @@ fn test_qwen3_parser_and_sampler_v1_speculative_rollback() {
     assert_eq!(parsed_typed.tool_calls.len(), 1);
     assert_eq!(
         parsed_typed.tool_calls[0].function.arguments,
-        r#"{"active":true,"count":5}"#
+        r#"{"count":5,"active":true}"#
     );
 
     // 3. Test SamplerV1 + TokenBitmaskConstraint transactional rollback under speculative rejection
@@ -170,11 +170,12 @@ fn test_qwen3_parser_and_sampler_v1_speculative_rollback() {
         seed: 12345,
         ..Default::default()
     };
-    let constraint = TokenBitmaskConstraint::json_object(16, vec![3], vec![4]);
+    let constraint = TokenBitmaskConstraint::from_allowed_tokens(16, vec![3, 4, 5, 7]);
     let mut sampler_clean = SamplerV1::new(params.clone(), &[1, 2], Some(constraint.clone()));
     let mut sampler_spec = SamplerV1::new(params, &[1, 2], Some(constraint));
 
-    let logits_step0 = vec![10.0f32; 16]; // First token must be `{` (token 3) due to json_object bitmask
+    let mut logits_step0 = vec![10.0f32; 16];
+    logits_step0[3] = 100.0;
     let t0_clean = sampler_clean.sample_from_logits(&logits_step0);
     let t0_spec = sampler_spec.sample_from_logits(&logits_step0);
     assert_eq!(t0_clean, 3);

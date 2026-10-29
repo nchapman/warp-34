@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
-use serde::{Deserialize, Serialize};
+pub use crate::chatml::{ChatMessage, format_chatml_prompt, format_chatml_prompt_with_options};
 #[cfg(feature = "cuda")]
 use serde_json::json;
 
@@ -78,15 +78,6 @@ pub fn native_sampling_params(
     Ok(params)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    #[serde(default)]
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
-}
-
 /// Parses OpenAI `messages` array supporting both string `content` and multimodal
 /// array `content` parts (`{"type": "text", "text": "..."}` and
 /// `{"type": "image_url", "image_url": {"url": "..."}}`).
@@ -103,12 +94,22 @@ pub fn parse_openai_messages_multimodal(
     }
     let mut out_msgs = Vec::with_capacity(arr.len());
     let mut out_images = Vec::new();
-    for item in arr {
+    for (index, item) in arr.iter().enumerate() {
         let role = item
             .get("role")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "message missing string 'role'".to_string())?
             .to_string();
+        if !matches!(role.as_str(), "system" | "user" | "assistant" | "tool") {
+            return Err(format!("unsupported message role '{role}'"));
+        }
+        if role == "system" && index != 0 {
+            return Err("system message must be at the beginning".into());
+        }
+        let tool_calls = crate::chatml::parse_history_tools(item.get("tool_calls"))?;
+        if role != "assistant" && !tool_calls.is_empty() {
+            return Err("tool_calls are only valid on assistant messages".into());
+        }
         let reasoning_content = item
             .get("reasoning_content")
             .and_then(|v| v.as_str())
@@ -127,6 +128,9 @@ pub fn parse_openai_messages_multimodal(
                             }
                         }
                         "image_url" => {
+                            if role == "system" {
+                                return Err("system message cannot contain images".into());
+                            }
                             let url = part
                                 .get("image_url")
                                 .and_then(|iu| {
@@ -169,65 +173,17 @@ pub fn parse_openai_messages_multimodal(
             role,
             content: content_opt,
             reasoning_content,
+            tool_calls,
         });
     }
+    if !out_msgs.iter().any(|m| {
+        let content = m.content.as_deref().unwrap_or("").trim();
+        m.role == "user"
+            && !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>"))
+    }) {
+        return Err("no user query found in messages".into());
+    }
     Ok((out_msgs, out_images))
-}
-
-/// Formats OpenAI chat `messages` (and optional `tools` schema array) into a Qwen 3.5 / 3.8
-/// ChatML prompt string. Preserves prefix stability across turns for `MambaRadixCache` hits.
-pub fn format_chatml_prompt(
-    messages: &[ChatMessage],
-    tools: Option<&serde_json::Value>,
-    enable_thinking: bool,
-) -> String {
-    let mut out = String::new();
-    let has_system = messages.first().is_some_and(|m| m.role == "system");
-    if !has_system
-        && let Some(tools_arr) = tools.and_then(|v| v.as_array())
-        && !tools_arr.is_empty()
-    {
-        out.push_str("<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n<tools>\n");
-        for t in tools_arr {
-            if let Ok(s) = serde_json::to_string(t) {
-                out.push_str(&s);
-                out.push('\n');
-            }
-        }
-        out.push_str("</tools>\n\nFor each function call, return a <tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call> block.<|im_end|>\n");
-    }
-
-    for (idx, msg) in messages.iter().enumerate() {
-        out.push_str("<|im_start|>");
-        out.push_str(&msg.role);
-        out.push('\n');
-        if let Some(ref c) = msg.content {
-            out.push_str(c);
-        }
-        if idx == 0
-            && msg.role == "system"
-            && let Some(tools_arr) = tools.and_then(|v| v.as_array())
-            && !tools_arr.is_empty()
-        {
-            out.push_str("\n\n# Tools\n<tools>\n");
-            for t in tools_arr {
-                if let Ok(s) = serde_json::to_string(t) {
-                    out.push_str(&s);
-                    out.push('\n');
-                }
-            }
-            out.push_str("</tools>");
-        }
-        out.push_str("<|im_end|>\n");
-    }
-
-    out.push_str("<|im_start|>assistant\n");
-    if enable_thinking {
-        out.push_str("<think>\n");
-    } else {
-        out.push_str("<think>\n\n</think>\n\n");
-    }
-    out
 }
 
 pub struct ServerMetrics {
@@ -722,7 +678,17 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            let prompt = format_chatml_prompt(&messages, req_json.get("tools"), enable_thinking);
+            let preserve_thinking = req_json
+                .get("chat_template_kwargs")
+                .and_then(|v| v.get("preserve_thinking"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let prompt = format_chatml_prompt_with_options(
+                &messages,
+                req_json.get("tools"),
+                enable_thinking,
+                preserve_thinking,
+            );
             let (metrics, raw_text, hit_eos) = {
                 let mut eng = state.engine.lock().unwrap();
                 let prompt_ids = match eng.encode(&prompt) {

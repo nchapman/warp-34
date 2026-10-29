@@ -42,138 +42,7 @@ impl Default for SamplingParams {
     }
 }
 
-/// Transactional structured-output constraint (`response_format` / `json_schema` / prefix set)
-/// with `max_rollback_tokens` state stack for speculative rejection.
-#[derive(Clone, Debug)]
-pub struct TokenBitmaskConstraint {
-    vocab_size: usize,
-    /// Optional explicit whitelist of allowed token sequences or JSON brace-depth state.
-    allowed_token_ids: Option<Vec<i32>>,
-    /// History of committed token IDs and brace depth for transactional rollback.
-    history: Vec<(i32, i32)>,
-    brace_depth: i32,
-    require_json_object: bool,
-    json_open_brace_tokens: Vec<i32>,
-    json_close_brace_tokens: Vec<i32>,
-}
-
-impl TokenBitmaskConstraint {
-    pub fn unconstrained(vocab_size: usize) -> Self {
-        Self {
-            vocab_size,
-            allowed_token_ids: None,
-            history: Vec::new(),
-            brace_depth: 0,
-            require_json_object: false,
-            json_open_brace_tokens: Vec::new(),
-            json_close_brace_tokens: Vec::new(),
-        }
-    }
-
-    pub fn from_allowed_tokens(vocab_size: usize, allowed: Vec<i32>) -> Self {
-        Self {
-            vocab_size,
-            allowed_token_ids: Some(allowed),
-            history: Vec::new(),
-            brace_depth: 0,
-            require_json_object: false,
-            json_open_brace_tokens: Vec::new(),
-            json_close_brace_tokens: Vec::new(),
-        }
-    }
-
-    pub fn json_object(
-        vocab_size: usize,
-        open_brace_tokens: Vec<i32>,
-        close_brace_tokens: Vec<i32>,
-    ) -> Self {
-        Self {
-            vocab_size,
-            allowed_token_ids: None,
-            history: Vec::new(),
-            brace_depth: 0,
-            require_json_object: true,
-            json_open_brace_tokens: open_brace_tokens,
-            json_close_brace_tokens: close_brace_tokens,
-        }
-    }
-
-    #[inline]
-    pub fn committed_len(&self) -> usize {
-        self.history.len()
-    }
-
-    #[inline]
-    pub fn brace_depth(&self) -> i32 {
-        self.brace_depth
-    }
-
-    /// Packs a `[ceil(vocab_size / 32)]` `u32` bitmask for the current state (`1` = allowed, `0` = masked).
-    pub fn current_bitmask(&self) -> Vec<u32> {
-        let num_words = self.vocab_size.div_ceil(32);
-        if let Some(ref allowed) = self.allowed_token_ids {
-            let mut mask = vec![0u32; num_words];
-            for &tid in allowed {
-                if tid >= 0 && (tid as usize) < self.vocab_size {
-                    let u = tid as usize;
-                    mask[u >> 5] |= 1u32 << (u & 31);
-                }
-            }
-            return mask;
-        }
-        if self.require_json_object
-            && self.history.is_empty()
-            && !self.json_open_brace_tokens.is_empty()
-        {
-            // First token of a JSON object must open `{`
-            let mut mask = vec![0u32; num_words];
-            for &tid in &self.json_open_brace_tokens {
-                if tid >= 0 && (tid as usize) < self.vocab_size {
-                    let u = tid as usize;
-                    mask[u >> 5] |= 1u32 << (u & 31);
-                }
-            }
-            return mask;
-        }
-        vec![0xFFFF_FFFFu32; num_words]
-    }
-
-    #[inline]
-    pub fn is_token_allowed(&self, token_id: i32) -> bool {
-        if token_id < 0 || (token_id as usize) >= self.vocab_size {
-            return false;
-        }
-        if let Some(ref allowed) = self.allowed_token_ids {
-            return allowed.contains(&token_id);
-        }
-        if self.require_json_object
-            && self.history.is_empty()
-            && !self.json_open_brace_tokens.is_empty()
-        {
-            return self.json_open_brace_tokens.contains(&token_id);
-        }
-        true
-    }
-
-    pub fn advance(&mut self, token_id: i32) {
-        self.history.push((token_id, self.brace_depth));
-        if self.json_open_brace_tokens.contains(&token_id) {
-            self.brace_depth += 1;
-        }
-        if self.json_close_brace_tokens.contains(&token_id) {
-            self.brace_depth = (self.brace_depth - 1).max(0);
-        }
-    }
-
-    /// Rolls back the last `num_rejected` speculative tokens, restoring exact pre-speculation state.
-    pub fn rollback(&mut self, num_rejected: usize) {
-        for _ in 0..num_rejected {
-            if let Some((_, prev_depth)) = self.history.pop() {
-                self.brace_depth = prev_depth;
-            }
-        }
-    }
-}
+pub use crate::constraints::TokenBitmaskConstraint;
 
 /// Transactional `SamplerV1` implementing `vLLM`'s 9-step sampling pipeline with
 /// deterministic per-(seed, position) RNG and speculative rollback.
@@ -375,9 +244,12 @@ impl SamplerV1 {
         if logits.is_empty() {
             return 0;
         }
-        let probs = self
-            .processed_candidates(logits)
-            .unwrap_or_else(|err| panic!("invalid sampling input: {err}"));
+        self.try_sample_from_logits(logits)
+            .unwrap_or_else(|err| panic!("invalid sampling input: {err}"))
+    }
+
+    pub fn try_sample_from_logits(&mut self, logits: &[f32]) -> Result<i32, String> {
+        let probs = self.processed_candidates(logits)?;
         let norm_sum: f32 = probs.iter().map(|x| x.1).sum();
         let u = Self::uniform_f32(self.params.seed, self.output_history.len()) * norm_sum;
         let mut acc = 0.0f32;
@@ -389,21 +261,38 @@ impl SamplerV1 {
                 break;
             }
         }
-        self.commit_token(chosen);
-        chosen
+        self.try_commit_token(chosen)?;
+        Ok(chosen)
     }
 
     pub fn commit_token(&mut self, token_id: i32) {
+        self.try_commit_token(token_id)
+            .expect("invalid sampler token commit");
+    }
+
+    pub fn try_commit_token(&mut self, token_id: i32) -> Result<(), String> {
+        if let Some(ref mut c) = self.constraint {
+            c.advance(token_id)?;
+        }
         self.output_history.push(token_id);
         *self.output_counts.entry(token_id).or_insert(0) += 1;
-        if let Some(ref mut c) = self.constraint {
-            c.advance(token_id);
-        }
+        Ok(())
     }
 
     /// Rolls back `num_rejected` speculative tokens from `output_history`, `output_counts`,
     /// and `constraint` (`docs/ROADMAP.md` §4 Phase 3.3).
     pub fn rollback_tokens(&mut self, num_rejected: usize) {
+        self.try_rollback_tokens(num_rejected)
+            .expect("invalid sampler rollback");
+    }
+
+    pub fn try_rollback_tokens(&mut self, num_rejected: usize) -> Result<(), String> {
+        if num_rejected > self.output_history.len() {
+            return Err("sampler rollback exceeds committed tokens".into());
+        }
+        if let Some(ref mut c) = self.constraint {
+            c.rollback(num_rejected)?;
+        }
         for _ in 0..num_rejected {
             if let Some(tid) = self.output_history.pop()
                 && let Some(cnt) = self.output_counts.get_mut(&tid)
@@ -415,9 +304,7 @@ impl SamplerV1 {
                 }
             }
         }
-        if let Some(ref mut c) = self.constraint {
-            c.rollback(num_rejected);
-        }
+        Ok(())
     }
 }
 
@@ -494,6 +381,41 @@ impl Qwen3Parser {
         s.strip_suffix('\n').unwrap_or(s)
     }
 
+    /// Locate a structural delimiter without treating JSON string contents as
+    /// markup. Incomplete JSON is held until another streaming chunk arrives.
+    fn find_tool_delimiter(text: &str, delimiter: &str) -> Option<usize> {
+        fn skip_json(text: &str, start: usize) -> Result<usize, ()> {
+            let rest = &text[start..];
+            let trimmed = rest.trim_start();
+            let offset = start + rest.len() - trimmed.len();
+            if !trimmed.starts_with(['"', '{', '[']) {
+                return Ok(start);
+            }
+            let mut values =
+                serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+            match values.next() {
+                Some(Ok(_)) => Ok(offset + values.byte_offset()),
+                Some(Err(error)) if error.is_eof() => Err(()),
+                _ => Ok(start), // Native XML also allows unquoted text values.
+            }
+        }
+        let mut cursor = skip_json(text, 0).ok()?;
+        while cursor < text.len() {
+            let next = cursor + text[cursor..].find('<')?;
+            let rest = &text[next..];
+            if rest.starts_with(delimiter) {
+                return Some(next);
+            }
+            if rest.starts_with("<parameter=") {
+                let value_start = next + rest.find('>')? + 1;
+                cursor = skip_json(text, value_start).ok()?;
+            } else {
+                cursor = next + 1;
+            }
+        }
+        None
+    }
+
     /// Parses either Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
     /// or Hermes JSON (`{"name": "...", "arguments": ...}`) inside a `<tool_call>...</tool_call>` body.
     pub fn parse_tool_body(raw_body: &str, call_idx: usize) -> Option<ParsedToolCall> {
@@ -503,31 +425,32 @@ impl Qwen3Parser {
         }
 
         // 1. Check Qwen3-XML format: `<function=func_name>...`
-        if let Some(fn_pos) = body.find("<function=") {
-            let after_prefix = &body[fn_pos + "<function=".len()..];
+        if let Some(after_prefix) = body.strip_prefix("<function=") {
             let close_angle = after_prefix.find('>')?;
             let fn_name = after_prefix[..close_angle].trim().to_string();
             let rest = &after_prefix[close_angle + 1..];
-            let fn_body = match rest.find("</function>") {
+            let fn_body = match Self::find_tool_delimiter(rest, "</function>") {
                 Some(end_idx) => &rest[..end_idx],
                 None => rest,
             };
 
             let mut params = serde_json::Map::new();
             let mut search = fn_body;
-            while let Some(p_start) = search.find("<parameter=") {
+            while let Some(p_start) = Self::find_tool_delimiter(search, "<parameter=") {
                 let after_p = &search[p_start + "<parameter=".len()..];
                 let Some(p_angle) = after_p.find('>') else {
                     break;
                 };
                 let param_name = after_p[..p_angle].trim().to_string();
                 let val_start = &after_p[p_angle + 1..];
-                let (raw_val, next_slice) = if let Some(p_end) = val_start.find("</parameter>") {
+                let (raw_val, next_slice) = if let Some(p_end) =
+                    Self::find_tool_delimiter(val_start, "</parameter>")
+                {
                     (
                         &val_start[..p_end],
                         &val_start[p_end + "</parameter>".len()..],
                     )
-                } else if let Some(next_p) = val_start.find("<parameter=") {
+                } else if let Some(next_p) = Self::find_tool_delimiter(val_start, "<parameter=") {
                     (&val_start[..next_p], &val_start[next_p..])
                 } else {
                     (val_start, "")
@@ -599,7 +522,7 @@ impl Qwen3Parser {
 
         loop {
             if self.in_tool_call {
-                if let Some(end_pos) = self.buffer.find(Self::TOOL_END) {
+                if let Some(end_pos) = Self::find_tool_delimiter(&self.buffer, Self::TOOL_END) {
                     let body = self.buffer[..end_pos].to_string();
                     self.buffer.drain(..end_pos + Self::TOOL_END.len());
                     self.in_tool_call = false;
@@ -729,15 +652,11 @@ impl Qwen3Parser {
         if !self.buffer.is_empty() {
             let rem = std::mem::take(&mut self.buffer);
             if self.in_tool_call {
-                if let Some(tc) = Self::parse_tool_body(&rem, self.next_tool_idx) {
-                    self.next_tool_idx += 1;
-                    self.tool_calls.push(tc.clone());
-                    delta.completed_tool_calls.push(tc);
-                } else {
-                    let fallback = format!("{}{rem}", Self::TOOL_START);
-                    self.content_accum.push_str(&fallback);
-                    delta.content_delta = Some(fallback);
-                }
+                // A truncated call is never executable. In particular, a
+                // delimiter inside an unfinished JSON string is not a close tag.
+                let fallback = format!("{}{rem}", Self::TOOL_START);
+                self.content_accum.push_str(&fallback);
+                delta.content_delta = Some(fallback);
                 self.in_tool_call = false;
             } else if self.in_reasoning {
                 self.reasoning_accum.push_str(&rem);

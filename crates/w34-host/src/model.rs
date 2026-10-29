@@ -689,49 +689,31 @@ impl FfnBlockWeights {
                         down_packed_ptr,
                         down_scales_ptr,
                         group_size,
-                    } => {
-                        check_rc(
-                            unsafe {
-                                ffi::w34_moe_w4a16_gate_up_silu_f16(
-                                    ex,
-                                    normed_buf as *const c_void,
-                                    *gate_up_packed_ptr as *const u32,
-                                    *gate_up_scales_ptr as *const c_void,
-                                    moe_topk_ids_buf as *const i32,
-                                    moe_interm_buf as *mut c_void,
-                                    num_tokens as i32,
-                                    moe.top_k as i32,
-                                    moe.num_experts as i32,
-                                    moe.local_moe_interm as i32,
-                                    h_dim as i32,
-                                    *group_size as i32,
-                                )
-                            },
-                            "w34_moe_w4a16_gate_up_silu_f16",
-                        )?;
-                        check_rc(
-                            unsafe {
-                                ffi::w34_moe_w4a16_down_accum_f16(
-                                    ex,
-                                    moe_interm_buf as *const c_void,
-                                    *down_packed_ptr as *const u32,
-                                    *down_scales_ptr as *const c_void,
-                                    moe_topk_ids_buf as *const i32,
-                                    moe_topk_weights_buf as *const f32,
-                                    sh_out_ptr,
-                                    sh_gate_ptr,
-                                    mlp_out_buf as *mut c_void,
-                                    num_tokens as i32,
-                                    moe.top_k as i32,
-                                    moe.num_experts as i32,
-                                    h_dim as i32,
-                                    moe.local_moe_interm as i32,
-                                    *group_size as i32,
-                                )
-                            },
-                            "w34_moe_w4a16_down_accum_f16",
-                        )
-                    }
+                    } => check_rc(
+                        unsafe {
+                            ffi::w34_moe_w4a16_mlp_f16(
+                                ex,
+                                normed_buf as *const c_void,
+                                *gate_up_packed_ptr as *const u32,
+                                *gate_up_scales_ptr as *const c_void,
+                                *down_packed_ptr as *const u32,
+                                *down_scales_ptr as *const c_void,
+                                moe_topk_ids_buf as *const i32,
+                                moe_topk_weights_buf as *const f32,
+                                sh_out_ptr,
+                                sh_gate_ptr,
+                                moe_interm_buf as *mut c_void,
+                                mlp_out_buf as *mut c_void,
+                                num_tokens as i32,
+                                moe.top_k as i32,
+                                moe.num_experts as i32,
+                                moe.local_moe_interm as i32,
+                                h_dim as i32,
+                                *group_size as i32,
+                            )
+                        },
+                        "w34_moe_w4a16_mlp_f16",
+                    ),
                     MoeExpertStorage::DenseF16 {
                         gate_up_ptr,
                         down_ptr,
@@ -1275,9 +1257,9 @@ pub struct Qwen3_5ModelRank {
     pub kv_pool: KvPool,
     pub state_pool: StateBundlePool,
     pub decode_io: DecodeGraphIo,
-    pub decode_graph: Option<CudaGraph>,
+    pub decode_graph: Option<(bool, CudaGraph)>,
     pub spec_verify_io: SpecVerifyGraphIo,
-    pub spec_verify_graph: Option<(usize, CudaGraph)>,
+    pub spec_verify_graph: Option<((usize, bool), CudaGraph)>,
     pub capacity_plan: CapacityPlan,
     pub tap_layer_ids: Vec<usize>,
     pub tap_aux_bf16: Option<DeviceBuffer>,
@@ -1874,10 +1856,6 @@ impl Qwen3_5ModelRank {
         self.validate_tap_rows(num_tokens)?;
         self.device.make_current()?;
         self.scratch_arena.reset();
-        let ex = self.stream.exec(
-            self.scratch_arena.allocation_base(),
-            self.scratch_arena.capacity(),
-        );
 
         let h_dim = self.cfg.hidden_size;
         let local_q_heads = self.cfg.num_attention_heads / self.tp_size;
@@ -1979,6 +1957,8 @@ impl Qwen3_5ModelRank {
         let logits_buf = self
             .scratch_arena
             .alloc_aligned(self.local_vocab_size * 2)?;
+        let (ws_ptr, ws_cap) = self.scratch_arena.remaining_workspace();
+        let ex = self.stream.exec(ws_ptr, ws_cap);
 
         // 1. Embedding lookup into residual_buf (+ optional multimodal visual embedding splice)
         check_rc(
@@ -2631,7 +2611,6 @@ impl Qwen3_5ModelRank {
         }
         self.speculative_logits_rows = 0;
         self.device.make_current()?;
-        let ex = self.stream.exec(0, 0);
         let h_dim = self.cfg.hidden_size;
         let head_dim = self.cfg.head_dim;
         let local_q_heads = self.cfg.num_attention_heads / self.tp_size;
@@ -2729,6 +2708,48 @@ impl Qwen3_5ModelRank {
         } else {
             (0, 0, 0, 0, 0, 0, 0, 0)
         };
+        let num_selected_pre = selected_rows.len();
+        let use_spec_buf_pre = num_selected_pre > 0
+            && self
+                .speculative_logits
+                .as_ref()
+                .is_some_and(|b| num_selected_pre <= b.len_bytes / (self.local_vocab_size * 2));
+        let pre_all_logits_buf = if num_selected_pre == 0 {
+            0
+        } else if use_spec_buf_pre {
+            self.speculative_logits.as_ref().unwrap().addr()
+        } else {
+            self.scratch_arena
+                .alloc_aligned(num_selected_pre * self.local_vocab_size * 2)?
+        };
+        let is_contiguous_pre = num_selected_pre > 0
+            && selected_rows
+                .iter()
+                .enumerate()
+                .all(|(i, &r)| r == selected_rows[0] + i);
+        let pre_gathered_hidden = if num_selected_pre > 0 && !is_contiguous_pre {
+            self.scratch_arena
+                .alloc_aligned(num_selected_pre * h_dim * 2)?
+        } else {
+            0
+        };
+        let pre_out_greedy = if num_selected_pre > 0 && out_greedy_ids_override.is_none() {
+            self.scratch_arena.alloc_aligned(num_selected_pre * 4)?
+        } else {
+            0
+        };
+        let (pre_local_ids, pre_local_vals, pre_global_vals) =
+            if num_selected_pre > 0 && tp2.is_some() {
+                (
+                    self.scratch_arena.alloc_aligned(num_selected_pre * 4)?,
+                    self.scratch_arena.alloc_aligned(num_selected_pre * 4)?,
+                    self.scratch_arena.alloc_aligned(num_selected_pre * 4)?,
+                )
+            } else {
+                (0, 0, 0)
+            };
+        let (ws_ptr, ws_cap) = self.scratch_arena.remaining_workspace();
+        let ex = self.stream.exec(ws_ptr, ws_cap);
 
         check_rc(
             unsafe {
@@ -3108,25 +3129,13 @@ impl Qwen3_5ModelRank {
             self.speculative_logits_rows = 0;
             return Ok((0, false));
         }
-        let num_selected = selected_rows.len();
-        let use_spec_buf = self
-            .speculative_logits
-            .as_ref()
-            .is_some_and(|b| num_selected <= b.len_bytes / (self.local_vocab_size * 2));
-        let all_logits_buf = if use_spec_buf {
-            self.speculative_logits.as_ref().unwrap().addr()
-        } else {
-            self.scratch_arena
-                .alloc_aligned(num_selected * self.local_vocab_size * 2)?
-        };
-        let is_contiguous = selected_rows
-            .iter()
-            .enumerate()
-            .all(|(i, &r)| r == selected_rows[0] + i);
-        let selected_hidden_ptr = if is_contiguous {
+        let num_selected = num_selected_pre;
+        let use_spec_buf = use_spec_buf_pre;
+        let all_logits_buf = pre_all_logits_buf;
+        let selected_hidden_ptr = if is_contiguous_pre {
             final_norm_out_buf + (selected_rows[0] * h_dim * 2) as u64
         } else {
-            let gathered_hidden = self.scratch_arena.alloc_aligned(num_selected * h_dim * 2)?;
+            let gathered_hidden = pre_gathered_hidden;
             for (selected_idx, &row_idx) in selected_rows.iter().enumerate() {
                 check_rc(
                     unsafe {
@@ -3152,14 +3161,11 @@ impl Qwen3_5ModelRank {
             num_selected,
         )?;
 
-        let out_greedy_ids_dev = match out_greedy_ids_override {
-            Some(ptr) => ptr,
-            None => self.scratch_arena.alloc_aligned(num_selected * 4)?,
-        };
+        let out_greedy_ids_dev = out_greedy_ids_override.unwrap_or(pre_out_greedy);
         if let Some(comm) = tp2 {
-            let local_max_ids_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
-            let local_max_vals_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
-            let global_max_vals_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
+            let local_max_ids_dev = pre_local_ids;
+            let local_max_vals_dev = pre_local_vals;
+            let global_max_vals_dev = pre_global_vals;
             check_rc(
                 unsafe {
                     ffi::w34_sampler_greedy_top5_f16(
@@ -3340,11 +3346,24 @@ impl Qwen3_5ModelRank {
         Ok(())
     }
 
-    /// Captures the `M=1` decode forward pass into `self.decode_graph`.
-    pub fn ensure_decode_graph(&mut self, tp2: Option<&Tp2Collectives>) -> Result<()> {
-        if self.decode_graph.is_some() {
+    /// Captures the `M=1` decode forward pass into `self.decode_graph`, keyed by `long_ctx`
+    /// (`seq_after > 1024`: `false` = single-pass GQA mma, `true` = parallel Split-KV).
+    pub fn ensure_decode_graph(
+        &mut self,
+        long_ctx: bool,
+        tp2: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        if let Some((captured_long, _)) = &self.decode_graph
+            && *captured_long == long_ctx
+        {
             return Ok(());
         }
+        self.decode_graph = None;
+        let max_seq_len = if long_ctx {
+            (self.decode_io.max_blocks_per_req * 16).max(2048) as i32
+        } else {
+            1024
+        };
         let attn_batch = W34AttentionBatch {
             query_start_loc: self.decode_io.q_start_loc.addr() as *const i32,
             context_lens_before: self.decode_io.ctx_lens_before.addr() as *const i32,
@@ -3357,7 +3376,7 @@ impl Qwen3_5ModelRank {
             total_tokens: 1,
             max_blocks_per_req: self.decode_io.max_blocks_per_req as i32,
             max_q_len: 1,
-            max_seq_len: (self.decode_io.max_blocks_per_req * 16) as i32,
+            max_seq_len,
             mask_mode: W34_ATTN_MASK_CAUSAL,
             sliding_window: 0,
             sm_scale: (self.cfg.head_dim as f32).powf(-0.5),
@@ -3408,11 +3427,14 @@ impl Qwen3_5ModelRank {
         };
         res?;
         check_rc(end_rc, "w34_graph_end_capture")?;
-        self.decode_graph = Some(CudaGraph {
-            device_id: dev_id,
-            graph,
-            graph_exec,
-        });
+        self.decode_graph = Some((
+            long_ctx,
+            CudaGraph {
+                device_id: dev_id,
+                graph,
+                graph_exec,
+            },
+        ));
         Ok(())
     }
 
@@ -3428,13 +3450,20 @@ impl Qwen3_5ModelRank {
     pub fn ensure_spec_verify_graph(
         &mut self,
         m_verify: usize,
+        long_ctx: bool,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
-        if let Some((captured_m, _)) = &self.spec_verify_graph
-            && *captured_m == m_verify
+        if let Some((captured_key, _)) = &self.spec_verify_graph
+            && *captured_key == (m_verify, long_ctx)
         {
             return Ok(());
         }
+        self.spec_verify_graph = None;
+        let max_seq_len = if long_ctx {
+            (self.spec_verify_io.max_blocks_per_req * 16).max(2048) as i32
+        } else {
+            1024
+        };
         let attn_batch = W34AttentionBatch {
             query_start_loc: self.spec_verify_io.q_start_loc_ptr() as *const i32,
             context_lens_before: self.spec_verify_io.ctx_lens_before_ptr() as *const i32,
@@ -3447,7 +3476,7 @@ impl Qwen3_5ModelRank {
             total_tokens: m_verify as i32,
             max_blocks_per_req: self.spec_verify_io.max_blocks_per_req as i32,
             max_q_len: m_verify as i32,
-            max_seq_len: (self.spec_verify_io.max_blocks_per_req * 16) as i32,
+            max_seq_len,
             mask_mode: W34_ATTN_MASK_CAUSAL,
             sliding_window: 0,
             sm_scale: (self.cfg.head_dim as f32).powf(-0.5),
@@ -3503,7 +3532,7 @@ impl Qwen3_5ModelRank {
         };
         res?;
         check_rc(end_rc, "w34_graph_end_capture (spec_verify)")?;
-        self.spec_verify_graph = Some((m_verify, captured));
+        self.spec_verify_graph = Some(((m_verify, long_ctx), captured));
         Ok(())
     }
 }
@@ -3771,6 +3800,38 @@ impl Qwen3_5Engine {
         let num_tokens = tokens.len();
         if num_tokens == 0 {
             return Err(loader_err("step_tokens requires at least 1 token"));
+        }
+        const MAX_PREFILL_CHUNK: usize = 1024;
+        if num_tokens > MAX_PREFILL_CHUNK
+            && custom_positions.is_none()
+            && dump_out.is_none()
+            && self.ranks[0].tap_layer_ids.is_empty()
+            && self.ranks[0].last_final_hidden_f16.is_none()
+            && self.ranks[0].pending_visual_splice.is_none()
+        {
+            let mut offset = 0usize;
+            let mut last = (0i32, [0i32; 5], [0.0f32; 5]);
+            while offset < num_tokens {
+                let end = (offset + MAX_PREFILL_CHUNK).min(num_tokens);
+                let in_slot = if offset == 0 {
+                    state_in_slot
+                } else {
+                    state_out_slot
+                };
+                let init = if offset == 0 { has_initial_state } else { true };
+                last = self.step_tokens_with_positions(
+                    &tokens[offset..end],
+                    None,
+                    ctx_before + offset,
+                    block_table,
+                    in_slot,
+                    state_out_slot,
+                    init,
+                    None,
+                )?;
+                offset = end;
+            }
+            return Ok(last);
         }
         let seq_after = ctx_before + num_tokens;
         let max_pages = self.ranks[0].kv_pool.num_pages;
@@ -4178,9 +4239,10 @@ impl Qwen3_5Engine {
                 .state_out_indices
                 .copy_from_host(&st_arr, &r0.stream)?;
 
+            let long_ctx = seq_after > 1024;
             if self.use_cuda_graph {
-                r0.ensure_decode_graph(None)?;
-                r0.decode_graph.as_ref().unwrap().launch(&r0.stream)?;
+                r0.ensure_decode_graph(long_ctx, None)?;
+                r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
             } else {
                 let attn_batch = W34AttentionBatch {
                     query_start_loc: r0.decode_io.q_start_loc.addr() as *const i32,
@@ -4242,7 +4304,17 @@ impl Qwen3_5Engine {
             let [r0, r1] = &mut self.ranks[..] else {
                 unreachable!()
             };
-            if use_graph && r0.decode_graph.is_some() && r1.decode_graph.is_some() {
+            let long_ctx = seq_after > 1024;
+            if use_graph
+                && r0
+                    .decode_graph
+                    .as_ref()
+                    .is_some_and(|(lc, _)| *lc == long_ctx)
+                && r1
+                    .decode_graph
+                    .as_ref()
+                    .is_some_and(|(lc, _)| *lc == long_ctx)
+            {
                 for r in [&mut *r0, &mut *r1] {
                     r.device.make_current()?;
                     r.decode_io.token_ids.copy_from_host(&tok_arr, &r.stream)?;
@@ -4265,7 +4337,7 @@ impl Qwen3_5Engine {
                     r.decode_io
                         .state_out_indices
                         .copy_from_host(&st_arr, &r.stream)?;
-                    r.decode_graph.as_ref().unwrap().launch(&r.stream)?;
+                    r.decode_graph.as_ref().unwrap().1.launch(&r.stream)?;
                 }
                 r0.device.make_current()?;
                 let mut gid = [0i32; 1];
@@ -4306,8 +4378,8 @@ impl Qwen3_5Engine {
                         .state_out_indices
                         .copy_from_host(&st_arr, &r0.stream)?;
                     if use_graph {
-                        r0.ensure_decode_graph(Some(&c0))?;
-                        r0.decode_graph.as_ref().unwrap().launch(&r0.stream)?;
+                        r0.ensure_decode_graph(long_ctx, Some(&c0))?;
+                        r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
                     } else {
                         let attn_batch = W34AttentionBatch {
                             query_start_loc: r0.decode_io.q_start_loc.addr() as *const i32,
@@ -4394,8 +4466,8 @@ impl Qwen3_5Engine {
                         .state_out_indices
                         .copy_from_host(&st_arr, &r1.stream)?;
                     if use_graph {
-                        r1.ensure_decode_graph(Some(&c1))?;
-                        r1.decode_graph.as_ref().unwrap().launch(&r1.stream)?;
+                        r1.ensure_decode_graph(long_ctx, Some(&c1))?;
+                        r1.decode_graph.as_ref().unwrap().1.launch(&r1.stream)?;
                     } else {
                         let attn_batch = W34AttentionBatch {
                             query_start_loc: r1.decode_io.q_start_loc.addr() as *const i32,
@@ -4808,6 +4880,8 @@ impl Qwen3_5Engine {
 
     fn step_spec_verify_graph(&mut self, s: &EngineBatchSlice<'_>) -> Result<Vec<Vec<i32>>> {
         let q_len = s.tokens.len();
+        let long_ctx = s.ctx_len_before + q_len > 1024;
+        let graph_key = (q_len, long_ctx);
         let host_meta = SpecVerifyGraphIo::pack_meta(s)?;
         if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
@@ -4818,7 +4892,7 @@ impl Qwen3_5Engine {
             r0.spec_verify_io
                 .block_tables
                 .copy_from_host(s.block_table, &r0.stream)?;
-            r0.ensure_spec_verify_graph(q_len, None)?;
+            r0.ensure_spec_verify_graph(q_len, long_ctx, None)?;
             r0.spec_verify_graph
                 .as_ref()
                 .unwrap()
@@ -4848,7 +4922,15 @@ impl Qwen3_5Engine {
             let [r0, r1] = &mut self.ranks[..] else {
                 unreachable!()
             };
-            if r0.spec_verify_graph.is_some() && r1.spec_verify_graph.is_some() {
+            if r0
+                .spec_verify_graph
+                .as_ref()
+                .is_some_and(|(k, _)| *k == graph_key)
+                && r1
+                    .spec_verify_graph
+                    .as_ref()
+                    .is_some_and(|(k, _)| *k == graph_key)
+            {
                 for r in [&mut *r0, &mut *r1] {
                     r.device.make_current()?;
                     r.spec_verify_io
@@ -4886,7 +4968,7 @@ impl Qwen3_5Engine {
                     r0.spec_verify_io
                         .block_tables
                         .copy_from_host(bt_ref, &r0.stream)?;
-                    r0.ensure_spec_verify_graph(q_len, Some(&c0))?;
+                    r0.ensure_spec_verify_graph(q_len, long_ctx, Some(&c0))?;
                     r0.spec_verify_graph
                         .as_ref()
                         .unwrap()
@@ -4912,7 +4994,7 @@ impl Qwen3_5Engine {
                     r1.spec_verify_io
                         .block_tables
                         .copy_from_host(bt_ref, &r1.stream)?;
-                    r1.ensure_spec_verify_graph(q_len, Some(&c1))?;
+                    r1.ensure_spec_verify_graph(q_len, long_ctx, Some(&c1))?;
                     r1.spec_verify_graph
                         .as_ref()
                         .unwrap()
@@ -4974,10 +5056,15 @@ impl Qwen3_5Engine {
                         && expected_m.is_none_or(|cap| cap == q_len)
                         && r.spec_verify_graph
                             .as_ref()
-                            .is_none_or(|(captured_m, _)| *captured_m == q_len)
+                            .is_none_or(|((captured_m, _), _)| *captured_m == q_len)
                 });
             if can_use_spec_graph {
-                let needs_capture = self.ranks.iter().any(|r| r.spec_verify_graph.is_none());
+                let long_ctx = seq_after > 1024;
+                let needs_capture = self.ranks.iter().any(|r| {
+                    r.spec_verify_graph
+                        .as_ref()
+                        .is_none_or(|(k, _)| *k != (q_len, long_ctx))
+                });
                 match self.step_spec_verify_graph(s) {
                     Ok(out) => return Ok(out),
                     Err(e) if needs_capture => {

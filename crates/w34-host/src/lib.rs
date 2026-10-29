@@ -1,6 +1,8 @@
 //! Host runtime, loader, cache, model, and CLI for `warp-34`.
 
 pub mod cache;
+pub mod chatml;
+pub mod constraints;
 pub mod cuda;
 #[cfg(feature = "cuda")]
 pub mod dflash;
@@ -16,6 +18,7 @@ pub mod radix;
 pub mod scheduler;
 pub mod server;
 pub mod speculative;
+pub mod tool_constraints;
 pub mod vision;
 
 /// Returns whether the crate was compiled with the `cuda` feature enabled.
