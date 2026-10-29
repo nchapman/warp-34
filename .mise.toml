@@ -46,7 +46,7 @@ description = "Run w34 dump-diff TP=1 vs TP=2 parity across plain, Vision, MTP, 
 depends = ["build"]
 run = """
 ./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --compare-tp2
-./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --image https://w34.test/sample.ppm --compare-tp2
+./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --image rgb://https://w34.test/sample.ppm --compare-tp2
 ./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --speculative mtp --mtp-k 3 --compare-tp2
 ./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --compare-tp2
 ./target/release/w34 dump-diff --model llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4 --kv-format tq4 --kv-pages 64 --compare-tp2

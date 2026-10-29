@@ -415,7 +415,7 @@ fn phase5_2_vision_smart_resize_mrope_and_multimodal_radix_key() {
         {
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": "https://example.test/cat.ppm"}},
+                {"type": "image_url", "image_url": {"url": "rgb://https://example.test/cat.ppm"}},
                 {"type": "text", "text": "What is in this image?"}
             ]
         }

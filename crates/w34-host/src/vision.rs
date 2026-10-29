@@ -311,14 +311,26 @@ fn decode_standard_raster(
     raw_bytes: &[u8],
     fmt: image::ImageFormat,
 ) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    use image::ImageDecoder;
+    // Bound peak decoder workspace independently of HTTP ingress concurrency.
+    static DECODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = DECODE_LOCK
+        .lock()
+        .map_err(|_| "image decoder unavailable")?;
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(raw_bytes), fmt);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
-    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
-    let dyn_img = reader
-        .decode()
+    let decoder = reader
+        .into_decoder()
+        .map_err(|e| format!("invalid {fmt:?} image: {e}"))?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > 16 * 1024 * 1024 {
+        return Err("source image exceeds 16 megapixel limit".into());
+    }
+    let dyn_img = image::DynamicImage::from_decoder(decoder)
         .map_err(|e| format!("failed to decode {fmt:?} image: {e}"))?;
     let rgb = dyn_img.into_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
@@ -419,9 +431,31 @@ pub fn decode_image_bytes_to_rgb(
 
 /// Parses an OpenAI `image_url` (`data:image/{png,jpeg,x-portable-pixmap};base64,...`) into
 /// `(rgb_bytes, height, width)`. Rejects local `file://` URIs, bare filesystem paths, and
-/// unrecognized image formats for HTTP security/correctness. Note: `http(s)://` and `rgb://`
-/// URIs generate deterministic offline 64×64 test fixtures without performing outbound network I/O.
+/// unrecognized formats. Remote fetching is disabled; `rgb://` is an explicit offline fixture.
 pub fn parse_image_url_to_rgb(url: &str) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    parse_image_url_with_policy(url, false)
+}
+
+/// Bound aggregate image work before decoding or fetching any parts of a request.
+pub const MAX_IMAGES_PER_REQUEST: usize = 4;
+
+/// Fetch public HTTP(S) images only when explicitly enabled by the server operator.
+pub fn parse_image_url_with_policy(
+    url: &str,
+    allow_remote_images: bool,
+) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    parse_image_url_with_deadline(
+        url,
+        allow_remote_images,
+        std::time::Instant::now() + crate::remote_images::REMOTE_IMAGE_TIMEOUT,
+    )
+}
+
+pub(crate) fn parse_image_url_with_deadline(
+    url: &str,
+    allow_remote_images: bool,
+    deadline: std::time::Instant,
+) -> std::result::Result<(Vec<u8>, usize, usize), String> {
     if url.starts_with("file://") {
         return Err("file:// URLs are not permitted in image_url".to_string());
     }
@@ -431,16 +465,31 @@ pub fn parse_image_url_to_rgb(url: &str) -> std::result::Result<(Vec<u8>, usize,
         }
         let mime_hint = &url[5..idx];
         let b64 = &url[idx + 8..];
+        if b64.len() as u64 > crate::remote_images::MAX_REMOTE_IMAGE_BYTES.div_ceil(3) * 4 {
+            return Err("base64 image exceeds 16 MiB limit".into());
+        }
         let raw_bytes =
             decode_base64(b64).ok_or_else(|| "invalid base64 in image_url".to_string())?;
         if raw_bytes.is_empty() {
             return Err("empty decoded payload in image_url".to_string());
         }
+        if raw_bytes.len() as u64 > crate::remote_images::MAX_REMOTE_IMAGE_BYTES {
+            return Err("decoded image exceeds 16 MiB limit".into());
+        }
         decode_image_bytes_to_rgb(&raw_bytes, Some(mime_hint), true)
-    } else if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("rgb://")
-    {
-        // Deterministic offline procedural RGB fixture (64x64; no outbound network fetch)
-        let digest = fnv1a_hash_bytes(url.as_bytes());
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        if !allow_remote_images {
+            return Err("remote images are disabled; enable --allow-remote-images to fetch public HTTP(S) URLs".into());
+        }
+        let bytes = crate::remote_images::fetch_image_bytes(
+            url,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        )?;
+        decode_image_bytes_to_rgb(&bytes, None, true)
+    } else if let Some(seed) = url.strip_prefix("rgb://") {
+        // The suffix is an opaque fixture seed, never a nested URL to fetch.
+        // This lets migrated oracle fixtures preserve their original pixel bytes.
+        let digest = fnv1a_hash_bytes(seed.as_bytes());
         let (h, w) = (64usize, 64usize);
         let mut rgb = vec![0u8; h * w * 3];
         for (i, px) in rgb.iter_mut().enumerate() {
@@ -454,14 +503,21 @@ pub fn parse_image_url_to_rgb(url: &str) -> std::result::Result<(Vec<u8>, usize,
 
 /// Loads a CLI `--image <path|url>` argument into `(rgb_bytes, height, width)`.
 /// Supports local PNG, JPEG, and PPM (`P6`) files on disk, `data:image/{png,jpeg,x-portable-pixmap};base64,...`
-/// data URIs, and offline deterministic `rgb://` / `http(s)://` test fixtures.
+/// data URIs, and offline deterministic `rgb://` fixtures. Remote fetching is disabled.
 pub fn load_cli_image_to_rgb(spec: &str) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    load_cli_image_with_policy(spec, false)
+}
+
+pub fn load_cli_image_with_policy(
+    spec: &str,
+    allow_remote_images: bool,
+) -> std::result::Result<(Vec<u8>, usize, usize), String> {
     if spec.starts_with("data:")
         || spec.starts_with("http://")
         || spec.starts_with("https://")
         || spec.starts_with("rgb://")
     {
-        return parse_image_url_to_rgb(spec);
+        return parse_image_url_with_policy(spec, allow_remote_images);
     }
     let path_str = spec.strip_prefix("file://").unwrap_or(spec);
     let meta = std::fs::metadata(path_str)

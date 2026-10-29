@@ -86,12 +86,32 @@ pub fn native_sampling_params(
 pub fn parse_openai_messages_multimodal(
     messages_val: &serde_json::Value,
 ) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
+    parse_openai_messages_with_image_policy(messages_val, false)
+}
+
+pub fn parse_openai_messages_with_image_policy(
+    messages_val: &serde_json::Value,
+    allow_remote_images: bool,
+) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
     let arr = messages_val
         .as_array()
         .ok_or_else(|| "'messages' must be an array".to_string())?;
     if arr.is_empty() {
         return Err("'messages' must not be empty".to_string());
     }
+    let image_count = arr
+        .iter()
+        .filter_map(|message| message.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("image_url"))
+        .count();
+    if image_count > crate::vision::MAX_IMAGES_PER_REQUEST {
+        return Err(format!(
+            "at most {} images are allowed per request",
+            crate::vision::MAX_IMAGES_PER_REQUEST
+        ));
+    }
+    let image_deadline = std::time::Instant::now() + crate::remote_images::REMOTE_IMAGE_TIMEOUT;
     let mut out_msgs = Vec::with_capacity(arr.len());
     let mut out_images = Vec::new();
     for (index, item) in arr.iter().enumerate() {
@@ -138,8 +158,12 @@ pub fn parse_openai_messages_multimodal(
                                         .or_else(|| iu.get("url").and_then(|u| u.as_str()))
                                 })
                                 .ok_or_else(|| "image_url part missing 'url'".to_string())?;
-                            let (rgb, h, w) = crate::vision::parse_image_url_to_rgb(url)
-                                .map_err(|e| format!("invalid image_url: {e}"))?;
+                            let (rgb, h, w) = crate::vision::parse_image_url_with_deadline(
+                                url,
+                                allow_remote_images,
+                                image_deadline,
+                            )
+                            .map_err(|e| format!("invalid image_url: {e}"))?;
                             let prep = crate::vision::preprocess_rgb_image(
                                 &rgb,
                                 h,
@@ -214,12 +238,22 @@ pub struct OpenAiServerState {
     pub engine: Mutex<Qwen3_5Engine>,
     pub metrics: ServerMetrics,
     pub shutdown: AtomicBool,
+    pub allow_remote_images: bool,
 }
 
 #[cfg(feature = "cuda")]
 impl OpenAiServerState {
     pub fn new(model_name: String, engine: Qwen3_5Engine) -> Arc<Self> {
+        Self::with_image_policy(model_name, engine, false)
+    }
+
+    pub fn with_image_policy(
+        model_name: String,
+        engine: Qwen3_5Engine,
+        allow_remote_images: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            allow_remote_images,
             model_name,
             engine: Mutex::new(engine),
             metrics: ServerMetrics::default(),
@@ -649,8 +683,9 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
             let (messages, mm_images) = match req_json
                 .get("messages")
                 .ok_or_else(|| "missing 'messages' field".to_string())
-                .and_then(parse_openai_messages_multimodal)
-            {
+                .and_then(|messages| {
+                    parse_openai_messages_with_image_policy(messages, state.allow_remote_images)
+                }) {
                 Ok(v) => v,
                 Err(msg) => {
                     let _ = write_json_response(
@@ -896,13 +931,60 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
 #[cfg(feature = "cuda")]
 pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    for incoming in listener.incoming() {
-        if state.shutdown.load(Ordering::Relaxed) {
-            break;
+    serve_connections(listener, &state.shutdown, |stream| {
+        handle_http_connection(stream, &state)
+    })
+}
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "server_connection_tests.rs"]
+mod connection_tests;
+
+// This bounds network/image work independently of the serialized GPU engine.
+// The Phase 6 scheduler worker will replace GPU serialization, not this ingress pool.
+#[cfg(feature = "cuda")]
+fn serve_connections(
+    listener: TcpListener,
+    shutdown: &AtomicBool,
+    handler: impl Fn(TcpStream) + Sync,
+) -> std::io::Result<()> {
+    serve_incoming(listener.incoming(), shutdown, handler)
+}
+
+#[cfg(feature = "cuda")]
+fn serve_incoming(
+    incoming: impl IntoIterator<Item = std::io::Result<TcpStream>>,
+    shutdown: &AtomicBool,
+    handler: impl Fn(TcpStream) + Sync,
+) -> std::io::Result<()> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<TcpStream>(16);
+    let receiver = Mutex::new(receiver);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let receiver = &receiver;
+            let handler = &handler;
+            scope.spawn(move || {
+                loop {
+                    let next = receiver.lock().unwrap().recv();
+                    let Ok(stream) = next else { break };
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    handler(stream);
+                }
+            });
         }
-        if let Ok(stream) = incoming {
-            handle_http_connection(stream, &state);
+        for incoming in incoming {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            // Aborted/interrupted accepts must not shut down a healthy model server.
+            let Ok(stream) = incoming else { continue };
+            // Saturation closes the connection instead of blocking accept or
+            // spawning unbounded threads. Queued connections consume no image memory.
+            let _ = sender.try_send(stream);
         }
-    }
-    Ok(())
+        drop(sender);
+        Ok(())
+    })
 }

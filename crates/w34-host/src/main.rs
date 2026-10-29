@@ -35,6 +35,7 @@ fn print_usage() {
            profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
            serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
            chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--no-thinking]\n\
+         Image options: --allow-remote-images enables public HTTP(S) fetch (16 MiB, 10 s, no redirects).\n\
          Speculative options (generate/bench/greedy-diff/dump-diff/profile-diff/serve/chat):\n\
            --speculative mtp|dflash2 [--draft-model <id|path>] [--mtp-k 1..3] [--kv-pages <n>]\n\
            Native MTP shares target weights; DFlash2 requires a draft model.\n\
@@ -48,6 +49,7 @@ fn prepare_multimodal_prompt_and_images(
     cfg: &w34_host::loader::ModelConfig,
     raw_prompt: &str,
     image_urls: &[String],
+    allow_remote_images: bool,
 ) -> Result<(String, Vec<w34_host::vision::PreprocessedImage>), String> {
     if image_urls.is_empty() {
         return Ok((raw_prompt.to_string(), Vec::new()));
@@ -60,8 +62,8 @@ fn prepare_multimodal_prompt_and_images(
     let mut images = Vec::with_capacity(image_urls.len());
     let mut prefix = String::new();
     for url in image_urls {
-        let (rgb, h, w) =
-            w34_host::vision::load_cli_image_to_rgb(url).map_err(|e| e.to_string())?;
+        let (rgb, h, w) = w34_host::vision::load_cli_image_with_policy(url, allow_remote_images)
+            .map_err(|e| e.to_string())?;
         let pre = w34_host::vision::preprocess_rgb_image(
             &rgb,
             h,
@@ -152,6 +154,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     let mut verify_radix_warm = false;
     let mut live_profile = false;
     let mut image_urls: Vec<String> = Vec::new();
+    let mut allow_remote_images = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -296,6 +299,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                     return Err("--stage expects decode, radix, scheduler, vision, or all".into());
                 }
             }
+            "--allow-remote-images" => allow_remote_images = true,
             "--image" => {
                 i += 1;
                 image_urls.push(args.get(i).cloned().ok_or("missing --image value")?);
@@ -380,8 +384,12 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     match sub {
         "generate" => {
             let mut engine = load_engine().map_err(|e| e.to_string())?;
-            let (expanded_prompt, mm_images) =
-                prepare_multimodal_prompt_and_images(&engine.cfg, &prompt, &image_urls)?;
+            let (expanded_prompt, mm_images) = prepare_multimodal_prompt_and_images(
+                &engine.cfg,
+                &prompt,
+                &image_urls,
+                allow_remote_images,
+            )?;
             let prompt_ids = engine.encode(&expanded_prompt).map_err(|e| e.to_string())?;
             let (gen_ids, prompt_len, gen_len, ttft_ms, decode_tok_per_s, itl_ms) =
                 if mm_images.is_empty() {
@@ -633,7 +641,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                 if vis_ready {
                     engine.reset_all_states().map_err(|e| e.to_string())?;
                     let urls = if image_urls.is_empty() {
-                        vec!["https://w34.test/bench_img_a.ppm".to_string()]
+                        vec!["rgb://https://w34.test/bench_img_a.ppm".to_string()]
                     } else {
                         image_urls.clone()
                     };
@@ -641,11 +649,13 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                         &engine.cfg,
                         "Describe the colors, geometry, and layout of this image in detail across several sentences.",
                         &urls,
+                        allow_remote_images,
                     )?;
                     let (_, mm_imgs_b) = prepare_multimodal_prompt_and_images(
                         &engine.cfg,
                         "Describe the colors, geometry, and layout of this image in detail across several sentences.",
-                        &["https://w34.test/bench_img_b_distinct.ppm".to_string()],
+                        &["rgb://https://w34.test/bench_img_b_distinct.ppm".to_string()],
+                        allow_remote_images,
                     )?;
                     let mut v_prompt_ids =
                         engine.encode(&v_prompt_str).map_err(|e| e.to_string())?;
@@ -1044,8 +1054,12 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
         }
         "dump-diff" => {
             let mut engine = load_engine().map_err(|e| e.to_string())?;
-            let (expanded_prompt, mm_images) =
-                prepare_multimodal_prompt_and_images(&engine.cfg, &prompt, &image_urls)?;
+            let (expanded_prompt, mm_images) = prepare_multimodal_prompt_and_images(
+                &engine.cfg,
+                &prompt,
+                &image_urls,
+                allow_remote_images,
+            )?;
             let prompt_ids = engine.encode(&expanded_prompt).map_err(|e| e.to_string())?;
             let dump = if mm_images.is_empty() {
                 engine.dump_prompt(&prompt_ids).map_err(|e| e.to_string())?
@@ -1272,15 +1286,23 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             let engine = load_engine().map_err(|e| e.to_string())?;
             let bind_addr = format!("{host}:{port}");
             println!("[w34 serve] model={model} tp={tp} listening on http://{bind_addr}");
-            let state = w34_host::server::OpenAiServerState::new(model, engine);
+            let state = w34_host::server::OpenAiServerState::with_image_policy(
+                model,
+                engine,
+                allow_remote_images,
+            );
             w34_host::server::run_blocking_server(&bind_addr, state)
                 .map_err(|e| format!("server error: {e}"))?;
             Ok(ExitCode::SUCCESS)
         }
         "chat" => {
             let mut engine = load_engine().map_err(|e| e.to_string())?;
-            let (expanded_prompt, mm_images) =
-                prepare_multimodal_prompt_and_images(&engine.cfg, &prompt, &image_urls)?;
+            let (expanded_prompt, mm_images) = prepare_multimodal_prompt_and_images(
+                &engine.cfg,
+                &prompt,
+                &image_urls,
+                allow_remote_images,
+            )?;
             let msgs = vec![w34_host::server::ChatMessage {
                 tool_calls: Vec::new(),
                 role: "user".to_string(),

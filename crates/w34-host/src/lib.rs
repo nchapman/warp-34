@@ -15,6 +15,7 @@ pub mod parser;
 #[cfg(feature = "cuda")]
 pub mod proposer;
 pub mod radix;
+mod remote_images;
 pub mod scheduler;
 pub mod server;
 pub mod speculative;

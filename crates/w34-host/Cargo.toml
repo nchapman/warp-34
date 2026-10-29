@@ -23,4 +23,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokenizers = "0.21"
 llguidance = "=1.9.1"
 toktrie_hf_tokenizers = "=1.9.1"
+# Resolver API is unversioned; pin the audited public-address filtering seam.
+ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
