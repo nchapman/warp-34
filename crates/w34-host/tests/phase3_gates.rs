@@ -3,9 +3,7 @@ use w34_host::parser::{Qwen3Parser, SamplerV1, SamplingParams, TokenBitmaskConst
 use w34_host::radix::{MambaRadixCache, RadixNodeId};
 
 #[cfg(feature = "cuda")]
-use std::io::{Read, Write};
-#[cfg(feature = "cuda")]
-use std::net::{TcpListener, TcpStream};
+mod common;
 #[cfg(feature = "cuda")]
 use w34_host::cache::KvFormatPolicy;
 #[cfg(feature = "cuda")]
@@ -13,7 +11,7 @@ use w34_host::model::Qwen3_5Engine;
 #[cfg(feature = "cuda")]
 use w34_host::scheduler::SchedulerConfig;
 #[cfg(feature = "cuda")]
-use w34_host::server::{OpenAiServerState, handle_http_connection};
+use w34_host::server::OpenAiServerState;
 
 #[test]
 fn test_mamba_radix_cache_dual_lock_dual_lru_tombstone_and_split() {
@@ -437,33 +435,9 @@ fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
     }
 
     // 3. Test OpenAI HTTP/1.1 + SSE Server (`/health`, `/v1/models`, `/tokenize`, `/v1/chat/completions` JSON & SSE, `/metrics`)
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let addr = listener.local_addr().unwrap();
     let state = OpenAiServerState::new("nchapman/Qwen3.5-4B-W4A16-GPTQ".to_string(), engine);
-    let server_state = state.clone();
-    let server_thread = std::thread::spawn(move || {
-        // Serve 5 requests then exit
-        for _ in 0..5 {
-            if let Ok((stream, _)) = listener.accept() {
-                handle_http_connection(stream, &server_state);
-            }
-        }
-    });
-
-    let send_req = |method: &str, path: &str, body: Option<&str>| -> String {
-        let mut s = TcpStream::connect(addr).expect("connect to w34 server");
-        let payload = body.unwrap_or("");
-        write!(
-            s,
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            payload.len(),
-            payload
-        )
-        .unwrap();
-        s.flush().unwrap();
-        let mut resp = String::new();
-        s.read_to_string(&mut resp).unwrap();
-        resp
+    let send_req = |method: &str, path: &str, body: Option<&str>| {
+        common::raw_request(&state, method, path, body)
     };
 
     let health_resp = send_req("GET", "/health", None);
@@ -491,5 +465,5 @@ fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
         "unexpected chat_sse_resp: {chat_sse_resp}"
     );
 
-    server_thread.join().unwrap();
+    common::shutdown(&state);
 }

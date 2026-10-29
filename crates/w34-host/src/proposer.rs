@@ -1057,4 +1057,286 @@ impl NativeProposer {
             token_logprobs,
         })
     }
+
+    #[inline]
+    pub(crate) fn fits_capacity(&self, prompt_len: usize, max_new: usize) -> Option<usize> {
+        let total = prompt_len
+            .checked_add(max_new)
+            .and_then(|n| n.checked_add(self.k + 1))?;
+        (total <= self.capacity).then_some(total)
+    }
+
+    #[inline]
+    pub(crate) fn can_restore_prefix(&self, prefix: &[i32]) -> bool {
+        self.can_restore(prefix)
+    }
+
+    pub(crate) fn restore_prefix(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        prefix: &[i32],
+    ) -> Result<()> {
+        self.restore(engine, prefix)
+    }
+
+    pub(crate) fn abort_scheduled(&mut self) {
+        self.current = None;
+        if matches!(self.ranks, Ranks::DFlash(_)) {
+            self.memo = None;
+        }
+    }
+
+    pub(crate) fn finish_scheduled(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        pending_ingest: &mut Vec<i32>,
+    ) -> Result<()> {
+        if !pending_ingest.is_empty() {
+            let features = self.captured(engine)?;
+            self.ingest(engine, pending_ingest, &features)?;
+            pending_ingest.clear();
+        }
+        self.memo = self.current.take();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn step_scheduled_prefill_chunk(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        radix: &mut crate::radix::MambaRadixCache,
+        seq: &mut crate::scheduler::SeqEntry,
+        sampler: &mut SamplerV1,
+        use_gpu_sampler: bool,
+        chunk: usize,
+    ) -> Result<Option<(i32, Option<crate::parser::StepLogprobs>)>> {
+        let start = seq.prefilled_tokens;
+        let end = (start + chunk.max(1).min(self.max_rows)).min(seq.prompt_tokens.len());
+        let tokens = &seq.prompt_tokens[start..end];
+        let planned = seq.radix_state.plan_checkpoints(tokens.len());
+        let pairs: Vec<_> = planned
+            .iter()
+            .map(|p| (p.trigger_offset_1based, p.dst_slot))
+            .collect();
+        let out = engine.step_batch_slices(&[EngineBatchSlice {
+            tokens,
+            ctx_len_before: start,
+            block_table: &seq.radix_state.kv_pages,
+            state_in_slot: seq.radix_state.current_state_in_slot(),
+            state_out_slot: seq.radix_state.active_state_slot,
+            has_initial_state: seq.radix_state.has_initial_state,
+            spec_slots: &[],
+            checkpoints: &pairs,
+            emit_all_query_tokens: false,
+        }])?;
+        let mut anchor = out[0][0];
+        let features = self.captured(engine)?;
+        self.ingest(engine, tokens, &features)?;
+        seq.radix_state.commit_tokens(tokens, &planned);
+        seq.prefilled_tokens = end;
+
+        if end < seq.prompt_tokens.len() {
+            if seq.radix_state.last_track_seqlen.is_some()
+                && let Some(rep) = engine.alloc_state_slot_from(radix)
+            {
+                let don = seq
+                    .radix_state
+                    .donate_committed_checkpoint(radix, Some(rep), false);
+                engine.free_kv_pages(&don.freed_kv_pages);
+                engine.free_state_slots(&don.freed_mamba_slots);
+            }
+            return Ok(None);
+        }
+
+        if seq.max_new_tokens == 0 {
+            seq.finished = true;
+            return Ok(None);
+        }
+        let lp = if use_gpu_sampler {
+            let (tok, lp) = engine.sample_single_gpu_step(sampler)?;
+            anchor = tok;
+            lp
+        } else {
+            sampler.commit_token(anchor);
+            None
+        };
+        seq.generated_tokens.push(anchor);
+        if seq.generated_tokens.len() >= seq.max_new_tokens || seq.should_stop_on_token(anchor) {
+            seq.finished = true;
+        }
+        Ok(Some((anchor, lp)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn step_scheduled_verify_round(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        radix: &mut crate::radix::MambaRadixCache,
+        seq: &mut crate::scheduler::SeqEntry,
+        pending_ingest: &mut Vec<i32>,
+        sampler: &mut SamplerV1,
+        use_gpu_sampler: bool,
+    ) -> Result<(Vec<i32>, Vec<crate::parser::StepLogprobs>)> {
+        let anchor = *seq
+            .generated_tokens
+            .last()
+            .ok_or_else(|| loader_err("missing anchor in step_scheduled_verify_round"))?;
+        let mut tx = StateTx::new(seq.radix_state.active_state_slot);
+        tx.commit_prefill(seq.radix_state.token_ids.len());
+
+        let k_budget = self.k.min(
+            seq.max_new_tokens
+                .saturating_sub(seq.generated_tokens.len() + 1),
+        );
+        let mut drafts = if pending_ingest.is_empty() {
+            self.propose(engine, anchor, k_budget)?
+        } else {
+            let features = self.captured(engine)?;
+            let out =
+                self.ingest_and_propose(engine, pending_ingest, &features, anchor, k_budget)?;
+            pending_ingest.clear();
+            out
+        };
+        if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
+            let pos_before = seq.generated_tokens.len() + idx;
+            if pos_before < sampler.params.min_tokens {
+                sampler.is_token_soft_banned(*id, &engine.cfg.eos_token_ids)
+            } else {
+                sampler
+                    .params
+                    .is_stop_or_eos(*id, &engine.cfg.eos_token_ids)
+            }
+        }) {
+            drafts.truncate(eos);
+        }
+        if use_gpu_sampler {
+            let mut hypothetical = sampler.clone();
+            let mut valid = 0;
+            for &id in &drafts {
+                if hypothetical
+                    .constraint
+                    .as_ref()
+                    .is_some_and(|c| !c.is_token_allowed(id))
+                {
+                    break;
+                }
+                hypothetical
+                    .try_commit_token(id)
+                    .map_err(|_| loader_err("draft grammar commit failed"))?;
+                valid += 1;
+            }
+            drafts.truncate(valid);
+        }
+        let k = drafts.len();
+        let mut verify = vec![anchor];
+        verify.extend_from_slice(&drafts);
+        let mut extras = Vec::with_capacity(k);
+        for _ in 0..k {
+            match engine.alloc_state_slot_from(radix) {
+                Some(s) => extras.push(s),
+                None => {
+                    engine.free_state_slots(&extras);
+                    return Err(loader_err("no speculative verification state slots"));
+                }
+            }
+        }
+        let schedule = if k > 0 {
+            tx.begin_spec_verify(extras);
+            tx.verify_slot_schedule()
+        } else {
+            vec![tx.committed_slot]
+        };
+        let before = seq.radix_state.token_ids.len();
+        let planned: Vec<PlannedCheckpoint> = seq.radix_state.plan_checkpoints(verify.len());
+        let pairs: Vec<_> = planned
+            .iter()
+            .map(|p| (p.trigger_offset_1based, p.dst_slot))
+            .collect();
+        let step_res = engine.step_batch_slices(&[EngineBatchSlice {
+            tokens: &verify,
+            ctx_len_before: before,
+            block_table: &seq.radix_state.kv_pages,
+            state_in_slot: tx.committed_slot,
+            state_out_slot: *schedule.last().unwrap(),
+            has_initial_state: seq.radix_state.has_initial_state,
+            spec_slots: &schedule,
+            checkpoints: &pairs,
+            emit_all_query_tokens: true,
+        }]);
+        let out = match step_res {
+            Ok(v) => v,
+            Err(e) => {
+                if !tx.spec_slots.is_empty() {
+                    let freed = tx.resolve_spec_verify(1);
+                    engine.free_state_slots(&freed);
+                }
+                seq.radix_state.active_state_slot = tx.committed_slot;
+                return Err(e);
+            }
+        };
+        let (decision, round_lps) = if use_gpu_sampler {
+            match engine.verify_speculative_gpu_step(sampler, &drafts) {
+                Ok(v) => v,
+                Err(e) => {
+                    if !tx.spec_slots.is_empty() {
+                        let freed = tx.resolve_spec_verify(1);
+                        engine.free_state_slots(&freed);
+                    }
+                    seq.radix_state.active_state_slot = tx.committed_slot;
+                    return Err(e);
+                }
+            }
+        } else {
+            (
+                match RejectionSampler::greedy(&drafts, &out[0]) {
+                    Ok(decision) => decision,
+                    Err(_) => {
+                        if !tx.spec_slots.is_empty() {
+                            engine.free_state_slots(&tx.resolve_spec_verify(1));
+                        }
+                        seq.radix_state.active_state_slot = tx.committed_slot;
+                        return Err(loader_err("greedy rejection geometry"));
+                    }
+                },
+                Vec::new(),
+            )
+        };
+        let processed = decision.processed_rows();
+        if k > 0 {
+            let freed = match decision.commit(&mut tx, sampler, 0) {
+                Ok(freed) => freed,
+                Err(_) => {
+                    if !tx.spec_slots.is_empty() {
+                        engine.free_state_slots(&tx.resolve_spec_verify(1));
+                    }
+                    seq.radix_state.active_state_slot = tx.committed_slot;
+                    return Err(loader_err("speculative sampler commit"));
+                }
+            };
+            engine.free_state_slots(&freed);
+        } else {
+            tx.kv_seq_len_before += 1;
+            sampler
+                .try_commit_token(decision.emitted_tokens()[0])
+                .map_err(|_| loader_err("sampler/grammar commit failed"))?;
+        }
+        seq.radix_state.active_state_slot = tx.committed_slot;
+        seq.radix_state
+            .commit_tokens(&verify[..processed], &planned);
+        pending_ingest.extend_from_slice(&verify[..processed]);
+        self.last_accepted.push(decision.accepted_drafts());
+
+        let emitted = decision.emitted_tokens().to_vec();
+        let mut pushed = 0usize;
+        for &tok in &emitted {
+            seq.generated_tokens.push(tok);
+            pushed += 1;
+            if seq.generated_tokens.len() >= seq.max_new_tokens || seq.should_stop_on_token(tok) {
+                seq.finished = true;
+                break;
+            }
+        }
+        let lp_len = round_lps.len().min(pushed);
+        Ok((emitted[..pushed].to_vec(), round_lps[..lp_len].to_vec()))
+    }
 }

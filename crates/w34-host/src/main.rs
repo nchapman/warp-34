@@ -1283,14 +1283,25 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             }
         }
         "serve" => {
-            let engine = load_engine().map_err(|e| e.to_string())?;
             let bind_addr = format!("{host}:{port}");
             println!("[w34 serve] model={model} tp={tp} listening on http://{bind_addr}");
-            let state = w34_host::server::OpenAiServerState::with_image_policy(
+            let worker_model = model.clone();
+            let state = w34_host::server::OpenAiServerState::from_loader(
                 model,
-                engine,
                 allow_remote_images,
-            );
+                move || {
+                    let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
+                    let mut engine =
+                        Qwen3_5Engine::load(&worker_model, tp, policy, pages, use_cuda_graph)
+                            .map_err(|e| e.to_string())?;
+                    if let Some(config) = &spec_config {
+                        engine
+                            .enable_speculative(config)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(engine)
+                },
+            )?;
             w34_host::server::run_blocking_server(&bind_addr, state)
                 .map_err(|e| format!("server error: {e}"))?;
             Ok(ExitCode::SUCCESS)

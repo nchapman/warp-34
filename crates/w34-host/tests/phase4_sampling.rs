@@ -16,6 +16,16 @@ fn native_http_sampling_parameters_are_validated() {
     assert_eq!(params.top_k, 12);
     assert_eq!(params.temperature, 0.8);
     assert_eq!(params.top_p, 0.9);
+    for valid in [
+        json!({"stop":"END"}),
+        json!({"stop":["a","b","c","d"]}),
+        json!({"logit_bias":{"42":2.0}}),
+        json!({"min_tokens":2}),
+        json!({"ignore_eos":true}),
+        json!({"logprobs":true}),
+    ] {
+        assert!(native_sampling_params(&valid, 8).is_ok(), "{valid}");
+    }
     for bad in [
         json!({"temperature":-1}),
         json!({"temperature":"0.8"}),
@@ -23,7 +33,7 @@ fn native_http_sampling_parameters_are_validated() {
         json!({"top_k":1e20}),
         json!({"seed":-1}),
         json!({"repetition_penalty":0}),
-        json!({"stop":"END"}),
+        json!({"stop":["a","b","c","d","e"]}),
     ] {
         assert!(native_sampling_params(&bad, 8).is_err(), "{bad}");
     }

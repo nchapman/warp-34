@@ -98,42 +98,17 @@ fn lossless_cold_and_warm(kind: SpeculativeKind, tp: usize, large: bool) {
     );
     exercise_http(engine);
 }
+mod common;
 fn exercise_http(engine: Qwen3_5Engine) {
-    use std::{
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        time::Duration,
-    };
-    use w34_host::server::{OpenAiServerState, handle_http_connection};
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
+    use std::sync::atomic::Ordering;
+    use w34_host::server::OpenAiServerState;
     let state = OpenAiServerState::new("native-spec-test".into(), engine);
-    let server = state.clone();
-    let thread = std::thread::spawn(move || {
-        for _ in 0..2 {
-            let (stream, _) = listener.accept().unwrap();
-            handle_http_connection(stream, &server);
-        }
-    });
     for stream in [false, true] {
-        state
-            .engine
-            .lock()
-            .unwrap()
-            .speculative
-            .as_mut()
-            .unwrap()
-            .last_accepted
-            .clear();
+        let rounds = state.worker.stats.verify_rounds.load(Ordering::Relaxed);
+        let accepted = state.worker.stats.accepted_drafts.load(Ordering::Relaxed);
         let body=serde_json::json!({"model":"native-spec-test","messages":[{"role":"user","content":"Say hello."}],
             "max_tokens":8,"temperature":if stream {0.8}else{0.0},"seed":72,"top_k":20,"stream":stream,"chat_template_kwargs":{"enable_thinking":false}}).to_string();
-        let mut socket = TcpStream::connect(addr).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        write!(socket,"POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
-        let mut response = String::new();
-        socket.read_to_string(&mut response).unwrap();
+        let response = common::raw_request(&state, "POST", "/v1/chat/completions", Some(&body));
         assert!(response.contains("200 OK"), "{response}");
         if stream {
             assert!(
@@ -144,20 +119,14 @@ fn exercise_http(engine: Qwen3_5Engine) {
             assert!(response.contains("chat.completion"), "{response}");
         }
         assert!(
-            !state
-                .engine
-                .lock()
-                .unwrap()
-                .speculative
-                .as_ref()
-                .unwrap()
-                .last_accepted
-                .is_empty(),
+            state.worker.stats.verify_rounds.load(Ordering::Relaxed) > rounds,
             "server bypassed native proposer"
         );
+        assert!(state.worker.stats.accepted_drafts.load(Ordering::Relaxed) >= accepted);
     }
-    thread.join().unwrap();
+    common::shutdown(&state);
 }
+
 #[test]
 fn native_processed_sampling_and_grammar() {
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());

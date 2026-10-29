@@ -1,16 +1,12 @@
 #![cfg(feature = "cuda")]
 use serde_json::{Value, json};
-use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::sync::{Arc, Mutex, atomic::Ordering};
+mod common;
 use w34_host::{
     cache::KvFormatPolicy,
     model::Qwen3_5Engine,
     proposer::{SpeculativeConfig, SpeculativeKind},
-    server::{OpenAiServerState, handle_http_connection},
+    server::OpenAiServerState,
 };
 
 static GPU_LOCK: Mutex<()> = Mutex::new(());
@@ -20,23 +16,7 @@ fn request_endpoint(
     endpoint: &str,
     body: Value,
 ) -> (String, Value) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let state = state.clone();
-    let worker = std::thread::spawn(move || {
-        handle_http_connection(listener.accept().unwrap().0, &state);
-    });
-    let body = body.to_string();
-    let mut socket = TcpStream::connect(address).unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(90)))
-        .unwrap();
-    write!(socket, "POST {endpoint} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-    let mut response = String::new();
-    socket.read_to_string(&mut response).unwrap();
-    worker.join().unwrap();
-    let (head, body) = response.split_once("\r\n\r\n").unwrap();
-    (head.to_owned(), serde_json::from_str(body).unwrap())
+    common::request(state, "POST", endpoint, body)
 }
 
 fn request(state: &Arc<OpenAiServerState>, body: Value) -> (String, Value) {
@@ -79,22 +59,12 @@ fn exercise(kind: SpeculativeKind) {
         serde_json::from_str::<Value>(content).unwrap(),
         json!({"status":"schema-enforced"})
     );
-    let accepted_trace = state
-        .engine
-        .lock()
-        .unwrap()
-        .speculative
-        .as_ref()
-        .unwrap()
-        .last_accepted
-        .clone();
     assert!(
-        !accepted_trace.is_empty(),
+        state.worker.stats.verify_rounds.load(Ordering::Relaxed) > 0,
         "speculative verifier did not run"
     );
-    println!(
-        "{kind:?}: strict JSON schema enforced under speculative verify (accepted={accepted_trace:?})"
-    );
+    let accepted = state.worker.stats.accepted_drafts.load(Ordering::Relaxed);
+    println!("{kind:?}: strict JSON schema enforced (accepted drafts={accepted})");
 
     let tools = json!([
         {"type":"function","function":{"name":"report","parameters":{"type":"object","properties":{"city":{"const":"Oslo"}},"required":["city"],"additionalProperties":false}}},
@@ -264,7 +234,6 @@ fn exercise(kind: SpeculativeKind) {
         json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"unknown"}}),
         json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_schema","json_schema":{"strict":false,"schema":{"type":"object"}}}}),
         json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_object"}, "structured_outputs":{"regex":"a"}}),
-        json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"rgb://sample"}},{"type":"text","text":"hi"}]}], "response_format":{"type":"json_object"}}),
         json!({"messages":[{"role":"user","content":"hello"}], "structured_outputs":{"regex":"a".repeat(70_000)}}),
     ] {
         let (head, _) = request(&state, bad);
@@ -308,10 +277,11 @@ fn exercise(kind: SpeculativeKind) {
         }),
     );
     assert!(head.contains("400 Bad Request"), "{head}");
+    common::shutdown(&state);
 }
 
 #[test]
-fn non_speculative_and_multimodal_tools_succeed_while_mandatory_constraints_fail_closed() {
+fn non_speculative_and_multimodal_mandatory_constraints_are_enforced() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
@@ -352,13 +322,48 @@ fn non_speculative_and_multimodal_tools_succeed_while_mandatory_constraints_fail
     );
     assert!(head.contains("200 OK"), "{head} {body}");
 
-    for mandatory in [
-        json!({"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}),
-        json!({"messages":[{"role":"user","content":"hi"}],"tools":tools,"tool_choice":"required"}),
+    for messages in [
+        json!([{"role":"user","content":"Say hello."}]),
+        json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":"rgb://sample"}},{"type":"text","text":"Say hello."}]}]),
     ] {
-        let (head, _) = request(&state, mandatory);
-        assert!(head.contains("400 Bad Request"), "{head}");
+        let (head, body) = request(
+            &state,
+            json!({
+                "messages":messages, "max_tokens":64, "chat_template_kwargs":{"enable_thinking":false},
+                "response_format":{"type":"json_schema","json_schema":{"name":"result","strict":true,
+                    "schema":{"type":"object","properties":{"ok":{"const":true}},"required":["ok"],"additionalProperties":false}}}
+            }),
+        );
+        assert!(head.contains("200 OK"), "{head} {body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                body["choices"][0]["message"]["content"].as_str().unwrap()
+            )
+            .unwrap(),
+            json!({"ok":true})
+        );
+        let (head, body) = request(
+            &state,
+            json!({
+                "messages":messages, "tools":tools, "tool_choice":"required", "max_tokens":128,
+                "chat_template_kwargs":{"enable_thinking":false}
+            }),
+        );
+        assert!(head.contains("200 OK"), "{head} {body}");
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert!(!calls.is_empty(), "{body}");
+        for call in calls {
+            assert_eq!(call["function"]["name"], "ping");
+            assert_eq!(
+                serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                    .unwrap(),
+                json!({})
+            );
+        }
     }
+    common::shutdown(&state);
 }
 
 #[test]
@@ -436,4 +441,5 @@ fn qwen3_6_moe_mtp_http_tool_and_schema_adherence() {
             assert_eq!(args.as_object().unwrap().len(), 2, "{args}");
         }
     }
+    common::shutdown(&state);
 }

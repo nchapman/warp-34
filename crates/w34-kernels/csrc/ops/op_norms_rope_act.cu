@@ -88,9 +88,14 @@ __global__ void gemma_rms_norm_f16_kernel(
     int hidden_size,
     float eps) {
     const int row = blockIdx.x;
-    if (valid_token_mask != nullptr && valid_token_mask[row] == 0) return;
-    const __half* x_row = x + (size_t)row * hidden_size;
     __half* out_row = out + (size_t)row * hidden_size;
+    if (valid_token_mask != nullptr && valid_token_mask[row] == 0) {
+        for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+            out_row[i] = __float2half(0.0f);
+        }
+        return;
+    }
+    const __half* x_row = x + (size_t)row * hidden_size;
 
     __shared__ float s_warp[32];
     float reg_v[MAX_ITERS];
@@ -131,10 +136,15 @@ __global__ void fused_add_gemma_rms_norm_f16_kernel(
     int tap_row_stride,
     int tap_col_offset) {
     const int row = blockIdx.x;
-    if (valid_token_mask != nullptr && valid_token_mask[row] == 0) return;
+    __half* out_row = out + (size_t)row * hidden_size;
+    if (valid_token_mask != nullptr && valid_token_mask[row] == 0) {
+        for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+            out_row[i] = __float2half(0.0f);
+        }
+        return;
+    }
     const __half* x_row = x + (size_t)row * hidden_size;
     __half* res_row = residual + (size_t)row * hidden_size;
-    __half* out_row = out + (size_t)row * hidden_size;
     __nv_bfloat16* tap_row = (tap_dst_bf16 != nullptr)
         ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
         : nullptr;

@@ -1235,6 +1235,199 @@ impl SpecVerifyGraphIo {
     }
 }
 
+pub const MAX_BATCHED_DECODE_REQS: usize = 16;
+pub const DECODE_GRAPH_BUCKETS: [usize; 5] = [1, 2, 4, 8, 16];
+const BATCHED_DECODE_META_I32_LEN: usize = 10 * MAX_BATCHED_DECODE_REQS + 1;
+const BATCHED_DECODE_MASKS_U8_LEN: usize = 3 * MAX_BATCHED_DECODE_REQS;
+
+#[inline]
+pub fn decode_graph_bucket(num_reqs: usize) -> Option<usize> {
+    match num_reqs {
+        1 => Some(1),
+        2 => Some(2),
+        3..=4 => Some(4),
+        5..=8 => Some(8),
+        9..=16 => Some(16),
+        _ => None,
+    }
+}
+
+/// Static device buffers used for padded multi-request `B in {1, 2, 4, 8, 16}` decode
+/// CUDA Graph capture and replay (`valid_req_mask` + `valid_token_mask` padding).
+#[cfg(feature = "cuda")]
+pub struct BatchedDecodeGraphIo {
+    pub meta_i32: DeviceBuffer,
+    pub masks_u8: DeviceBuffer,
+    pub block_tables: DeviceBuffer,
+    pub out_greedy_ids: DeviceBuffer,
+    pub max_blocks_per_req: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl BatchedDecodeGraphIo {
+    pub fn new(device_id: i32, max_blocks_per_req: usize, _stream: &CudaStream) -> Result<Self> {
+        let max_blocks = max_blocks_per_req.max(1);
+        let meta_i32 = DeviceBuffer::alloc(device_id, BATCHED_DECODE_META_I32_LEN * 4)?;
+        let masks_u8 = DeviceBuffer::alloc(device_id, BATCHED_DECODE_MASKS_U8_LEN)?;
+        let block_tables =
+            DeviceBuffer::alloc(device_id, MAX_BATCHED_DECODE_REQS * max_blocks * 4)?;
+        let out_greedy_ids = DeviceBuffer::alloc(device_id, MAX_BATCHED_DECODE_REQS * 4)?;
+        Ok(Self {
+            meta_i32,
+            masks_u8,
+            block_tables,
+            out_greedy_ids,
+            max_blocks_per_req: max_blocks,
+        })
+    }
+
+    #[inline]
+    pub fn token_ids_ptr(&self) -> u64 {
+        self.meta_i32.addr()
+    }
+    #[inline]
+    pub fn positions_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn write_slot_mapping_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (2 * MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn q_start_loc_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (3 * MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn ctx_lens_before_ptr(&self) -> u64 {
+        self.meta_i32.addr()
+            + ((3 * MAX_BATCHED_DECODE_REQS + MAX_BATCHED_DECODE_REQS + 1) * 4) as u64
+    }
+    #[inline]
+    pub fn seq_lens_after_ptr(&self) -> u64 {
+        self.ctx_lens_before_ptr() + (MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn state_in_indices_ptr(&self) -> u64 {
+        self.seq_lens_after_ptr() + (MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn state_out_indices_ptr(&self) -> u64 {
+        self.state_in_indices_ptr() + (MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn checkpoint_dst_indices_ptr(&self) -> u64 {
+        self.state_out_indices_ptr() + (MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn checkpoint_token_offsets_ptr(&self) -> u64 {
+        self.checkpoint_dst_indices_ptr() + (MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn has_initial_state_ptr(&self) -> u64 {
+        self.masks_u8.addr()
+    }
+    #[inline]
+    pub fn valid_req_mask_ptr(&self) -> u64 {
+        self.masks_u8.addr() + MAX_BATCHED_DECODE_REQS as u64
+    }
+    #[inline]
+    pub fn valid_token_mask_ptr(&self) -> u64 {
+        self.masks_u8.addr() + (2 * MAX_BATCHED_DECODE_REQS) as u64
+    }
+
+    pub fn pack_meta(
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+    ) -> Result<(
+        [i32; BATCHED_DECODE_META_I32_LEN],
+        [u8; BATCHED_DECODE_MASKS_U8_LEN],
+    )> {
+        let n = slices.len();
+        if n == 0 || n > MAX_BATCHED_DECODE_REQS {
+            return Err(loader_err("invalid slice count for BatchedDecodeGraphIo"));
+        }
+        let mut m = [0i32; BATCHED_DECODE_META_I32_LEN];
+        let mut masks = [0u8; BATCHED_DECODE_MASKS_U8_LEN];
+        let ws_base = 2 * MAX_BATCHED_DECODE_REQS;
+        let qs_base = 3 * MAX_BATCHED_DECODE_REQS;
+        let cb_base = qs_base + MAX_BATCHED_DECODE_REQS + 1;
+        let sa_base = cb_base + MAX_BATCHED_DECODE_REQS;
+        let si_base = sa_base + MAX_BATCHED_DECODE_REQS;
+        let so_base = si_base + MAX_BATCHED_DECODE_REQS;
+        let cd_base = so_base + MAX_BATCHED_DECODE_REQS;
+        let co_base = cd_base + MAX_BATCHED_DECODE_REQS;
+
+        for i in 0..=MAX_BATCHED_DECODE_REQS {
+            m[qs_base + i] = i as i32;
+        }
+        for r in 0..MAX_BATCHED_DECODE_REQS {
+            m[ws_base + r] = -1;
+            m[so_base + r] = -1;
+            m[cd_base + r] = -1;
+            m[co_base + r] = -1;
+        }
+        for (r, s) in slices.iter().enumerate() {
+            if s.tokens.len() != 1
+                || !s.spec_slots.is_empty()
+                || s.checkpoints.len() > 1
+                || s.block_table.len() < (s.ctx_len_before + 1).div_ceil(16)
+            {
+                return Err(loader_err(
+                    "slice incompatible with 1-token BatchedDecodeGraphIo",
+                ));
+            }
+            let pos = s.ctx_len_before;
+            let delta = rope_pos_deltas.and_then(|d| d.get(r).copied()).unwrap_or(0);
+            let page_id = s.block_table[pos / 16];
+            let page_off = (pos % 16) as i32;
+            m[r] = s.tokens[0];
+            m[MAX_BATCHED_DECODE_REQS + r] = (pos as i32) + delta;
+            m[ws_base + r] = page_id * 16 + page_off;
+            m[cb_base + r] = pos as i32;
+            m[sa_base + r] = (pos + 1) as i32;
+            m[si_base + r] = s.state_in_slot;
+            m[so_base + r] = s.state_out_slot;
+            if let Some(&(trig_off, dst_slot)) = s.checkpoints.first() {
+                m[cd_base + r] = dst_slot;
+                m[co_base + r] = trig_off;
+            }
+            masks[r] = u8::from(s.has_initial_state);
+            masks[MAX_BATCHED_DECODE_REQS + r] = 1;
+            masks[2 * MAX_BATCHED_DECODE_REQS + r] = 1;
+        }
+        Ok((m, masks))
+    }
+
+    pub fn upload_inputs(
+        &self,
+        meta: &[i32; BATCHED_DECODE_META_I32_LEN],
+        masks: &[u8; BATCHED_DECODE_MASKS_U8_LEN],
+        slices: &[EngineBatchSlice<'_>],
+        stream: &CudaStream,
+    ) -> Result<()> {
+        self.meta_i32.copy_from_host(meta, stream)?;
+        self.masks_u8.copy_from_host(masks, stream)?;
+        let bt_base = self.block_tables.addr();
+        let row_bytes = self.max_blocks_per_req * 4;
+        for (r, s) in slices.iter().enumerate() {
+            if !s.block_table.is_empty() {
+                check_rc(
+                    unsafe {
+                        ffi::w34_memcpy_h2d_async(
+                            (bt_base + (r * row_bytes) as u64) as *mut c_void,
+                            s.block_table.as_ptr().cast(),
+                            s.block_table.len() * 4,
+                            stream.handle,
+                        )
+                    },
+                    "upload batched decode block_table row",
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One rank of a Qwen 3.5 / 3.8 model resident on a single GPU.
 #[cfg(feature = "cuda")]
 pub struct Qwen3_5ModelRank {
@@ -1260,6 +1453,8 @@ pub struct Qwen3_5ModelRank {
     pub decode_graph: Option<(bool, CudaGraph)>,
     pub spec_verify_io: SpecVerifyGraphIo,
     pub spec_verify_graph: Option<((usize, bool), CudaGraph)>,
+    pub batched_decode_io: BatchedDecodeGraphIo,
+    pub batched_decode_graphs: Vec<((usize, bool), u64, CudaGraph)>,
     pub capacity_plan: CapacityPlan,
     pub tap_layer_ids: Vec<usize>,
     pub tap_aux_bf16: Option<DeviceBuffer>,
@@ -1737,6 +1932,8 @@ impl Qwen3_5ModelRank {
             DecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         let spec_verify_io =
             SpecVerifyGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
+        let batched_decode_io =
+            BatchedDecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         device.synchronize()?;
 
         Ok(Self {
@@ -1762,6 +1959,8 @@ impl Qwen3_5ModelRank {
             decode_graph: None,
             spec_verify_io,
             spec_verify_graph: None,
+            batched_decode_io,
+            batched_decode_graphs: Vec::new(),
             capacity_plan,
             tap_layer_ids: Vec::new(),
             tap_aux_bf16: None,
@@ -1793,7 +1992,10 @@ impl Qwen3_5ModelRank {
     ) -> Result<()> {
         // Captured graphs own these destination addresses and the tap geometry.
         // Require configuration before capture rather than freeing live targets.
-        if self.decode_graph.is_some() || self.spec_verify_graph.is_some() {
+        if self.decode_graph.is_some()
+            || self.spec_verify_graph.is_some()
+            || !self.batched_decode_graphs.is_empty()
+        {
             return Err(loader_err(
                 "configure speculative taps before decode graph capture",
             ));
@@ -2610,7 +2812,9 @@ impl Qwen3_5ModelRank {
         selected_rows: &[usize],
         out_greedy_ids_override: Option<u64>,
     ) -> Result<(u64, bool)> {
-        self.validate_tap_rows(num_tokens)?;
+        if attn_batch.num_reqs <= 1 {
+            self.validate_tap_rows(num_tokens)?;
+        }
         if attn_batch.num_reqs <= 1
             && self
                 .speculative_logits
@@ -3554,6 +3758,107 @@ impl Qwen3_5ModelRank {
         Ok(())
     }
 
+    pub fn find_batched_decode_graph(
+        &self,
+        bucket_b: usize,
+        long_ctx: bool,
+    ) -> Option<(u64, &CudaGraph)> {
+        self.batched_decode_graphs
+            .iter()
+            .find(|(k, _, _)| *k == (bucket_b, long_ctx))
+            .map(|(_, ptr, g)| (*ptr, g))
+    }
+
+    /// Captures a padded `B in {1, 2, 4, 8, 16}` multi-request 1-token decode CUDA Graph.
+    pub fn ensure_batched_decode_graph(
+        &mut self,
+        bucket_b: usize,
+        long_ctx: bool,
+        tp2: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        if self.find_batched_decode_graph(bucket_b, long_ctx).is_some() {
+            return Ok(());
+        }
+        let max_seq_len = if long_ctx {
+            (self.batched_decode_io.max_blocks_per_req * 16).max(2048) as i32
+        } else {
+            1024
+        };
+        let attn_batch = W34AttentionBatch {
+            query_start_loc: self.batched_decode_io.q_start_loc_ptr() as *const i32,
+            context_lens_before: self.batched_decode_io.ctx_lens_before_ptr() as *const i32,
+            seq_lens_after: self.batched_decode_io.seq_lens_after_ptr() as *const i32,
+            block_tables: self.batched_decode_io.block_tables.addr() as *const i32,
+            write_slot_mapping: self.batched_decode_io.write_slot_mapping_ptr() as *const i32,
+            valid_token_mask: self.batched_decode_io.valid_token_mask_ptr() as *const u8,
+            valid_req_mask: self.batched_decode_io.valid_req_mask_ptr() as *const u8,
+            num_reqs: bucket_b as i32,
+            total_tokens: bucket_b as i32,
+            max_blocks_per_req: self.batched_decode_io.max_blocks_per_req as i32,
+            max_q_len: 1,
+            max_seq_len,
+            mask_mode: W34_ATTN_MASK_CAUSAL,
+            sliding_window: 0,
+            sm_scale: (self.cfg.head_dim as f32).powf(-0.5),
+            reserved: 0,
+        };
+        let gdn_batch = W34GdnBatch {
+            query_start_loc: self.batched_decode_io.q_start_loc_ptr() as *const i32,
+            state_in_indices: self.batched_decode_io.state_in_indices_ptr() as *const i32,
+            state_out_indices: self.batched_decode_io.state_out_indices_ptr() as *const i32,
+            spec_state_indices: core::ptr::null(),
+            checkpoint_dst_indices: self.batched_decode_io.checkpoint_dst_indices_ptr()
+                as *const i32,
+            checkpoint_token_offsets: self.batched_decode_io.checkpoint_token_offsets_ptr()
+                as *const i32,
+            has_initial_state: self.batched_decode_io.has_initial_state_ptr() as *const u8,
+            valid_req_mask: self.batched_decode_io.valid_req_mask_ptr() as *const u8,
+            num_reqs: bucket_b as i32,
+            total_tokens: bucket_b as i32,
+            max_verify_tokens: 0,
+            max_checkpoints_per_req: 1,
+        };
+        let tok_ptr = self.batched_decode_io.token_ids_ptr();
+        let pos_ptr = self.batched_decode_io.positions_ptr();
+        let out_ids_ptr = self.batched_decode_io.out_greedy_ids.addr();
+        let selected_rows: Vec<usize> = (0..bucket_b).collect();
+
+        self.stream.synchronize()?;
+        let stream_handle = self.stream.handle;
+        let dev_id = self.device.device_id;
+        check_rc(unsafe { ffi::w34_set_device(dev_id) }, "w34_set_device")?;
+        check_rc(
+            unsafe { ffi::w34_graph_begin_capture(stream_handle) },
+            "w34_graph_begin_capture (batched_decode)",
+        )?;
+        let res = self.forward_selected_rows_device(
+            tok_ptr,
+            pos_ptr,
+            bucket_b,
+            &attn_batch,
+            &gdn_batch,
+            tp2,
+            &selected_rows,
+            Some(out_ids_ptr),
+        );
+        let mut graph = 0usize;
+        let mut graph_exec = 0usize;
+        let end_rc = unsafe {
+            ffi::w34_graph_end_capture(stream_handle, &raw mut graph, &raw mut graph_exec)
+        };
+        let captured = CudaGraph {
+            device_id: dev_id,
+            graph,
+            graph_exec,
+        };
+        res?;
+        check_rc(end_rc, "w34_graph_end_capture (batched_decode)")?;
+        let logits_ptr = self.last_logits_ptr;
+        self.batched_decode_graphs
+            .push(((bucket_b, long_ctx), logits_ptr, captured));
+        Ok(())
+    }
+
     pub fn sampler_workspace_around_last_logits(&self, num_rows: usize) -> Result<(u64, usize)> {
         if self.last_logits_ptr == 0 || self.last_logits_rows < num_rows {
             return Err(loader_err("missing device logits for GPU sampler"));
@@ -3561,7 +3866,8 @@ impl Qwen3_5ModelRank {
         let arena_base = self.scratch_arena.allocation_base();
         let arena_cap = self.scratch_arena.capacity() as u64;
         let arena_end = arena_base + arena_cap;
-        let logits_bytes = (num_rows * self.local_vocab_size * 2) as u64;
+        let reserved_rows = self.last_logits_rows.max(num_rows);
+        let logits_bytes = (reserved_rows * self.local_vocab_size * 2) as u64;
         if self.last_logits_ptr >= arena_base && self.last_logits_ptr < arena_end {
             let before_end = self.last_logits_ptr & !255u64;
             let before_len = before_end.saturating_sub(arena_base);
@@ -5353,14 +5659,147 @@ impl Qwen3_5Engine {
         }
     }
 
+    pub fn captured_decode_graph_keys(&self) -> Vec<(usize, bool)> {
+        let mut keys: Vec<(usize, bool)> = self.ranks[0]
+            .batched_decode_graphs
+            .iter()
+            .map(|(k, _, _)| *k)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn step_batched_decode_graph(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+        bucket_b: usize,
+        long_ctx: bool,
+    ) -> Result<Vec<Vec<i32>>> {
+        let n = slices.len();
+        let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta(slices, rope_pos_deltas)?;
+        use crate::coordinated::{ReplayPhase, replay_ranks};
+        let comm = self.tp2_comm.as_ref().cloned();
+        let stage_bytes = bucket_b
+            .checked_mul(self.cfg.hidden_size)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| loader_err("tp2 staging payload overflow"))?;
+        if comm
+            .as_ref()
+            .is_some_and(|c| stage_bytes > c.max_stage_bytes_per_epoch)
+        {
+            return Err(loader_err(
+                "tp2 batch staging bytes exceed max_stage_bytes_per_epoch",
+            ));
+        }
+        // Capture records nodes; it never executes collectives. Complete all uploads
+        // and captures before launching either rank, including on first-use buckets.
+        let result = replay_ranks(self.ranks.len(), |phase, rank| {
+            let r = &mut self.ranks[rank];
+            r.device.make_current()?;
+            match phase {
+                ReplayPhase::Upload => {
+                    r.batched_decode_io
+                        .upload_inputs(&host_meta, &host_masks, slices, &r.stream)
+                }
+                ReplayPhase::Capture => {
+                    r.ensure_batched_decode_graph(bucket_b, long_ctx, comm.as_deref())
+                }
+                ReplayPhase::Launch => {
+                    let (logits_ptr, graph) =
+                        r.find_batched_decode_graph(bucket_b, long_ctx).unwrap();
+                    graph.launch(&r.stream)?;
+                    r.speculative_logits_rows = if r.has_spec_logits_capacity(bucket_b) {
+                        bucket_b
+                    } else {
+                        0
+                    };
+                    r.last_logits_ptr = logits_ptr;
+                    r.last_logits_rows = bucket_b;
+                    Ok(())
+                }
+            }
+        });
+        if let Err(error) = result {
+            if error.partial_launch {
+                // A peer may be spinning in a system-scope collective. CUDA does not
+                // offer safe cancellation of this graph; unwinding/freeing its buffers
+                // or retrying would hang or corrupt state. Let a supervisor restart.
+                eprintln!(
+                    "[w34] fatal: asymmetric TP graph launch failure: {}",
+                    error.source
+                );
+                std::process::abort();
+            }
+            return Err(error.source);
+        }
+        let mut out_ids = vec![0i32; n];
+        self.ranks[0].device.make_current()?;
+        self.ranks[0]
+            .batched_decode_io
+            .out_greedy_ids
+            .copy_to_host(&mut out_ids, &self.ranks[0].stream)?;
+        for r in &self.ranks[1..] {
+            r.device.make_current()?;
+            r.stream.synchronize()?;
+        }
+        Ok(out_ids.into_iter().map(|t| vec![t]).collect())
+    }
+
     /// Executes a multi-request / speculative / checkpoint-capturing batch step across `TP=1` or `TP=2`.
     /// Returns one `Vec<i32>` of greedy token IDs per slice in `slices` (either `[last_tok]` or all
     /// `q_len` query tokens when `slice.emit_all_query_tokens == true`).
     pub fn step_batch_slices(&mut self, slices: &[EngineBatchSlice<'_>]) -> Result<Vec<Vec<i32>>> {
+        self.step_batch_slices_with_pos_deltas(slices, None)
+    }
+
+    pub fn step_batch_slices_with_pos_deltas(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+    ) -> Result<Vec<Vec<i32>>> {
         if slices.is_empty() {
             return Ok(Vec::new());
         }
-        if slices.len() == 1 {
+        if let Some(deltas) = rope_pos_deltas
+            && deltas.len() != slices.len()
+        {
+            return Err(loader_err("rope_pos_deltas length mismatch"));
+        }
+        let max_pages = self.ranks[0].kv_pool.num_pages;
+        if let Some(bucket_b) = decode_graph_bucket(slices.len())
+            && self.use_cuda_graph
+            && slices.iter().all(|s| {
+                s.tokens.len() == 1
+                    && s.spec_slots.is_empty()
+                    && s.checkpoints.len() <= 1
+                    && s.block_table.len() <= self.ranks[0].batched_decode_io.max_blocks_per_req
+            })
+            && self
+                .ranks
+                .iter()
+                .all(|r| r.current_pos_plane_stride == 0 && r.pending_visual_splice.is_none())
+        {
+            let mut max_seq_after = 0usize;
+            for s in slices {
+                let seq_after = s.ctx_len_before + 1;
+                if seq_after.div_ceil(16) > s.block_table.len()
+                    || s.block_table
+                        .iter()
+                        .any(|&p| p < 0 || (p as usize) >= max_pages)
+                {
+                    return Err(loader_err(
+                        "KV cache page capacity exceeded in step_batch_slices",
+                    ));
+                }
+                max_seq_after = max_seq_after.max(seq_after);
+            }
+            let long_ctx = max_seq_after > 1024;
+            // Failed preparation/capture has not run a forward pass. Surface the error
+            // without disabling unrelated graph families or replaying mutable state.
+            return self.step_batched_decode_graph(slices, rope_pos_deltas, bucket_b, long_ctx);
+        }
+        if slices.len() == 1 && rope_pos_deltas.is_none() {
             let s = &slices[0];
             let q_len = s.tokens.len();
             if q_len == 0 {
@@ -5482,9 +5921,10 @@ impl Qwen3_5Engine {
             }
             let base_tok = flat_tokens.len();
             flat_tokens.extend_from_slice(s.tokens);
+            let delta = rope_pos_deltas.and_then(|d| d.get(r).copied()).unwrap_or(0);
             for step in 0..q_len {
                 let pos = s.ctx_len_before + step;
-                flat_positions.push(pos as i32);
+                flat_positions.push((pos as i32) + delta);
                 let page_id = s.block_table[pos / 16];
                 let page_off = (pos % 16) as i32;
                 flat_write_slots.push(page_id * 16 + page_off);
@@ -5963,7 +6403,7 @@ impl Qwen3_5Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn step_single_slice_with_mrope_and_vision(
+    pub(crate) fn step_single_slice_with_mrope_and_vision(
         &mut self,
         slice: &EngineBatchSlice<'_>,
         custom_positions: &[i32],
