@@ -381,6 +381,46 @@ __global__ void __launch_bounds__(256, 1) tp2_all_gather_top1_f32_i32_kernel(
     }
 }
 
+__global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
+    const __half* __restrict__ local_in,
+    __half* __restrict__ rank0_full_out,
+    __half* __restrict__ s1,
+    Signal* __restrict__ sig0,
+    Signal* __restrict__ sig1,
+    int rank,
+    int num_rows,
+    int local_vocab_size) {
+    const int num_elems = num_rows * local_vocab_size;
+    Signal* self_sg = (rank == 0) ? sig0 : sig1;
+    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
+    bool odd = (epoch_pre & 1u) != 0;
+    __half* s1_buf = odd ? (s1 + num_elems) : s1;
+    const int full_vocab = local_vocab_size * 2;
+
+    if (rank == 1) {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+            s1_buf[i] = local_in[i];
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+            const int row = i / local_vocab_size;
+            const int col = i - row * local_vocab_size;
+            rank0_full_out[(size_t)row * full_vocab + col] = local_in[i];
+        }
+    }
+
+    uint32_t epoch = 0;
+    barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+
+    if (rank == 0) {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+            const int row = i / local_vocab_size;
+            const int col = i - row * local_vocab_size;
+            rank0_full_out[(size_t)row * full_vocab + local_vocab_size + col] = s1_buf[i];
+        }
+    }
+}
+
 }  // namespace w34_comm
 
 extern "C" size_t w34_tp2_signal_bytes(void) {
@@ -551,4 +591,50 @@ extern "C" int w34_tp2_all_gather_top1_f32_i32(
         (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
         rank, num_rows);
     return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp2_gather_vocab_f16(
+    const w34_exec* ex,
+    const void* local_logits_f16,
+    void* rank0_full_logits_f16,
+    void* stage0,
+    void* stage1,
+    void* sig0,
+    void* sig1,
+    int rank,
+    int num_rows,
+    int local_vocab_size) {
+    (void)stage0;
+    if (ex == nullptr || local_logits_f16 == nullptr ||
+        (rank == 0 && rank0_full_logits_f16 == nullptr) ||
+        stage1 == nullptr || sig0 == nullptr || sig1 == nullptr ||
+        (rank != 0 && rank != 1) || num_rows <= 0 || local_vocab_size <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int num_elems = num_rows * local_vocab_size;
+    int blocks = (num_elems + 511) / 512;
+    if (blocks > w34_comm::kMaxBlocks) blocks = w34_comm::kMaxBlocks;
+    if (blocks < 1) blocks = 1;
+    w34_comm::tp2_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)local_logits_f16,
+        (__half*)rank0_full_logits_f16,
+        (__half*)stage1,
+        (w34_comm::Signal*)sig0,
+        (w34_comm::Signal*)sig1,
+        rank,
+        num_rows,
+        local_vocab_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp2_warmup(void) {
+    cudaFuncAttributes attr;
+    cudaError_t err = cudaFuncGetAttributes(&attr, w34_comm::tp2_all_reduce_f16_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp2_all_gather_top1_f32_i32_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp2_gather_vocab_f16_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp2_broadcast_i32_kernel);
+    return (int)err;
 }

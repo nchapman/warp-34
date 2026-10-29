@@ -702,28 +702,6 @@ impl NativeProposer {
             }
         }
     }
-    fn logits(engine: &Qwen3_5Engine, rows: usize) -> Result<Vec<Vec<f32>>> {
-        let mut full = vec![vec![0f32; engine.cfg.vocab_size]; rows];
-        for t in &engine.ranks {
-            if t.speculative_logits_rows != rows {
-                return Err(loader_err("selected logit rows mismatch"));
-            }
-            let mut bits = vec![0u16; rows * t.local_vocab_size];
-            t.speculative_logits
-                .as_ref()
-                .ok_or_else(|| loader_err("missing selected logits"))?
-                .copy_to_host(&mut bits, &t.stream)?;
-            for (row, values) in bits.chunks_exact(t.local_vocab_size).enumerate() {
-                for (col, &value) in values.iter().enumerate() {
-                    let id = t.vocab_offset + col;
-                    if id < engine.cfg.vocab_size {
-                        full[row][id] = crate::cuda::f16_to_f32(value);
-                    }
-                }
-            }
-        }
-        Ok(full)
-    }
     /// Runs one diagnostic drafter ingest + proposal step on `prompt` and `anchor`,
     /// recording `"drafter_hidden"` and `draft_proposal_ids` into `dump`.
     pub fn dump_step(
@@ -796,11 +774,16 @@ impl NativeProposer {
         {
             return Err(loader_err("invalid sampling stop token"));
         }
+        params
+            .validate()
+            .map_err(|_| loader_err("invalid sampling parameters"))?;
+        if let Some(ref c) = constraint
+            && !(0..engine.cfg.vocab_size as i32).any(|tid| c.is_token_allowed(tid))
+        {
+            return Err(loader_err("grammar has no support in the vocabulary"));
+        }
         let count = params.max_tokens;
         let sampler = SamplerV1::new(params, prompt, constraint);
-        sampler
-            .processed_distribution(&vec![0.0; engine.cfg.vocab_size])
-            .map_err(|_| loader_err("invalid sampling parameters or grammar"))?;
         self.generate_impl(engine, prompt, count, chunk, true, Some(sampler))
     }
     #[allow(clippy::too_many_arguments)]
@@ -843,10 +826,19 @@ impl NativeProposer {
         req.restore_prefix_hit(&mut engine.radix, prompt, &hit);
         let mut tx = StateTx::new(active);
         let processed_sampling = configured_sampler.is_some();
-        let mut sampler = configured_sampler
-            .unwrap_or_else(|| SamplerV1::new(SamplingParams::default(), prompt, None));
+        let mut sampler = configured_sampler.unwrap_or_else(|| {
+            SamplerV1::new(
+                SamplingParams {
+                    stop_token_ids: engine.cfg.eos_token_ids.clone(),
+                    eos_token_ids: engine.cfg.eos_token_ids.clone(),
+                    ..SamplingParams::default()
+                },
+                prompt,
+                None,
+            )
+        });
         let started = Instant::now();
-        let result = (|| -> Result<(Vec<i32>, f64, f64)> {
+        let result = (|| -> Result<(Vec<i32>, Vec<crate::parser::StepLogprobs>, f64, f64)> {
             engine.ensure_kv_pages_for_len(&mut req, total)?;
             let mut anchor = 0;
             let mut cursor = cached;
@@ -880,15 +872,14 @@ impl NativeProposer {
             let ttft = started.elapsed().as_secs_f64() * 1000.;
             let decoding = Instant::now();
             let mut generated = Vec::with_capacity(max_new);
+            let mut token_logprobs = Vec::new();
             if max_new > 0 {
                 if processed_sampling {
-                    let logits = Self::logits(engine, 1)?;
-                    sampler
-                        .processed_distribution(&logits[0])
-                        .map_err(|_| loader_err("invalid initial target distribution"))?;
-                    anchor = sampler
-                        .try_sample_from_logits(&logits[0])
-                        .map_err(|_| loader_err("initial sampler/grammar commit failed"))?;
+                    let (tok, lp) = engine.sample_single_gpu_step(&mut sampler)?;
+                    anchor = tok;
+                    if let Some(lp) = lp {
+                        token_logprobs.push(lp);
+                    }
                 } else {
                     sampler.commit_token(anchor);
                 }
@@ -897,8 +888,10 @@ impl NativeProposer {
             let mut pending_ingest: Vec<i32> = Vec::new();
             while generated.len() < max_new
                 && !(stop_eos
-                    && (engine.cfg.eos_token_ids.contains(&anchor)
-                        || sampler.params.stop_token_ids.contains(&anchor)))
+                    && generated.len() >= sampler.params.min_tokens
+                    && sampler
+                        .params
+                        .is_stop_or_eos(anchor, &engine.cfg.eos_token_ids))
             {
                 let k = self.k.min(max_new - generated.len() - 1);
                 let mut drafts = if pending_ingest.is_empty() {
@@ -911,9 +904,15 @@ impl NativeProposer {
                     out
                 };
                 if stop_eos
-                    && let Some(eos) = drafts.iter().position(|id| {
-                        engine.cfg.eos_token_ids.contains(id)
-                            || sampler.params.stop_token_ids.contains(id)
+                    && let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
+                        let pos_before = generated.len() + idx;
+                        if pos_before < sampler.params.min_tokens {
+                            sampler.is_token_soft_banned(*id, &engine.cfg.eos_token_ids)
+                        } else {
+                            sampler
+                                .params
+                                .is_stop_or_eos(*id, &engine.cfg.eos_token_ids)
+                        }
                     })
                 {
                     drafts.truncate(eos);
@@ -972,44 +971,15 @@ impl NativeProposer {
                     checkpoints: &pairs,
                     emit_all_query_tokens: true,
                 }])?;
-                let decision =
-                    if processed_sampling {
-                        let logits = Self::logits(engine, k + 1)?;
-                        let mut hypothetical = sampler.clone();
-                        let mut target = Vec::with_capacity(k + 1);
-                        let mut proposal = Vec::with_capacity(k);
-                        for (row, values) in logits.iter().enumerate() {
-                            target.push(hypothetical.processed_distribution(values).map_err(
-                                |_| loader_err("invalid processed target distribution"),
-                            )?);
-                            if row < k {
-                                let mut q = vec![0f32; engine.cfg.vocab_size];
-                                q[drafts[row] as usize] = 1.0;
-                                proposal.push(q);
-                                hypothetical.try_commit_token(drafts[row]).map_err(|_| {
-                                    loader_err("verification grammar commit failed")
-                                })?;
-                            }
-                        }
-                        let pos = sampler.output_history.len();
-                        let draws: Vec<f64> = (0..k)
-                            .map(|i| {
-                                f64::from(SamplerV1::uniform_f32(
-                                    sampler.params.seed ^ 0xa0761d6478bd642f,
-                                    pos + i,
-                                ))
-                            })
-                            .collect();
-                        let recovery = f64::from(SamplerV1::uniform_f32(
-                            sampler.params.seed ^ 0xe7037ed1a0b428db,
-                            pos,
-                        ));
-                        RejectionSampler::stochastic(&drafts, &target, &proposal, &draws, recovery)
-                            .map_err(|_| loader_err("stochastic rejection failed"))?
-                    } else {
+                let (decision, round_lps) = if processed_sampling {
+                    engine.verify_speculative_gpu_step(&sampler, &drafts)?
+                } else {
+                    (
                         RejectionSampler::greedy(&drafts, &out[0])
-                            .map_err(|_| loader_err("greedy rejection geometry"))?
-                    };
+                            .map_err(|_| loader_err("greedy rejection geometry"))?,
+                        Vec::new(),
+                    )
+                };
                 let processed = decision.processed_rows();
                 if k > 0 {
                     let freed = decision
@@ -1027,6 +997,7 @@ impl NativeProposer {
                 pending_ingest.extend_from_slice(&verify[..processed]);
                 self.last_accepted.push(decision.accepted_drafts());
                 generated.extend_from_slice(decision.emitted_tokens());
+                token_logprobs.extend(round_lps);
                 anchor = *generated.last().unwrap();
             }
             if !pending_ingest.is_empty() {
@@ -1034,9 +1005,14 @@ impl NativeProposer {
                 self.ingest(engine, &pending_ingest, &features)?;
             }
             debug_assert_eq!(sampler.output_history, generated);
-            Ok((generated, ttft, decoding.elapsed().as_secs_f64() * 1000.))
+            Ok((
+                generated,
+                token_logprobs,
+                ttft,
+                decoding.elapsed().as_secs_f64() * 1000.,
+            ))
         })();
-        let (generated, ttft, decode) = match result {
+        let (generated, token_logprobs, ttft, decode) = match result {
             Ok(v) => v,
             Err(e) => {
                 if !tx.spec_slots.is_empty() {
@@ -1078,6 +1054,7 @@ impl NativeProposer {
             },
             itl_ms: if steps > 0 { decode / steps as f64 } else { 0. },
             generated_token_ids: generated,
+            token_logprobs,
         })
     }
 }

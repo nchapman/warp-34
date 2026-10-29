@@ -992,6 +992,38 @@ impl Tp2Collectives {
             "w34_tp2_all_gather_top1_f32_i32",
         )
     }
+
+    pub fn gather_vocab_f16(
+        &self,
+        ex: &W34Exec,
+        local_logits_ptr: u64,
+        rank0_full_logits_ptr: u64,
+        rank: i32,
+        num_rows: i32,
+        local_vocab_size: i32,
+    ) -> Result<()> {
+        assert!(
+            (num_rows as usize) * (local_vocab_size as usize) * 2 <= self.max_stage_bytes_per_epoch,
+            "gather_vocab_f16 exceeds max_stage_bytes_per_epoch"
+        );
+        check_rc(
+            unsafe {
+                ffi::w34_tp2_gather_vocab_f16(
+                    ex,
+                    local_logits_ptr as *const c_void,
+                    rank0_full_logits_ptr as *mut c_void,
+                    self.stage0.dev_ptr,
+                    self.stage1.dev_ptr,
+                    self.sig0.dev_ptr,
+                    self.sig1.dev_ptr,
+                    rank,
+                    num_rows,
+                    local_vocab_size,
+                )
+            },
+            "w34_tp2_gather_vocab_f16",
+        )
+    }
 }
 
 /// Pre-warms every kernel specialization on `device_id` and synchronizes the device.
@@ -1446,6 +1478,10 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
 
     // 5. Sampler & Phase 4 MTP / DFlash2 kernels
     check_rc(
+        unsafe { ffi::w34_tp2_warmup() },
+        "warmup op_collectives module",
+    )?;
+    check_rc(
         unsafe {
             ffi::w34_sampler_greedy_top5_f16(
                 &ex,
@@ -1459,6 +1495,52 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )
         },
         "warmup w34_sampler_greedy_top5_f16",
+    )?;
+    let sampler_cfg = ffi::W34SamplerRowCfg {
+        temperature: 1.0,
+        top_k: 8,
+        top_p: 0.9,
+        min_p: 0.05,
+        repetition_penalty: 1.1,
+        frequency_penalty: 0.1,
+        presence_penalty: 0.1,
+        uniform_sample: 0.5,
+        recovery_uniform: 0.5,
+        draft_token_id: -1,
+        has_bitmask: 0,
+        row_bitmask_word_offset: 0,
+        sparse_offset: 0,
+        sparse_count: 1,
+        top_logprobs_k: 5,
+        use_token_id_cdf: 0,
+    };
+    let sampler_sparse = ffi::W34SamplerSparseEntry {
+        token_id: 0,
+        output_count: 1,
+        logit_bias: 0.0,
+        in_prompt: 1,
+        banned: 0,
+    };
+    let sampler_cfg_dev = arena.upload_slice(&[sampler_cfg], &stream)?;
+    let sampler_sparse_dev = arena.upload_slice(&[sampler_sparse], &stream)?;
+    let sampler_out_dev = arena.alloc_aligned(core::mem::size_of::<ffi::W34SamplerRowOut>())?;
+    let sampler_ws = arena.alloc_aligned(64 * 1024)?;
+    let ex_sampler = stream.exec(sampler_ws, 64 * 1024);
+    check_rc(
+        unsafe {
+            ffi::w34_sampler_step_f16(
+                &ex_sampler,
+                buf_a as *const c_void,
+                sampler_cfg_dev as *const ffi::W34SamplerRowCfg,
+                core::ptr::null(),
+                sampler_sparse_dev as *const ffi::W34SamplerSparseEntry,
+                sampler_out_dev as *mut ffi::W34SamplerRowOut,
+                1,
+                256,
+                1,
+            )
+        },
+        "warmup w34_sampler_step_f16",
     )?;
     check_rc(
         unsafe {

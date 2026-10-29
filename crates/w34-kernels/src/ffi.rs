@@ -104,6 +104,71 @@ pub struct W34GdnBatch {
 
 const _: [(); 80] = [(); core::mem::size_of::<W34GdnBatch>()];
 
+pub const W34_MAX_TOP_LOGPROBS: usize = 20;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct W34SamplerRowCfg {
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub repetition_penalty: f32,
+    pub frequency_penalty: f32,
+    pub presence_penalty: f32,
+    pub uniform_sample: f32,
+    pub recovery_uniform: f32,
+    pub draft_token_id: i32,
+    pub has_bitmask: i32,
+    pub row_bitmask_word_offset: i32,
+    pub sparse_offset: i32,
+    pub sparse_count: i32,
+    pub top_logprobs_k: i32,
+    pub use_token_id_cdf: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct W34SamplerSparseEntry {
+    pub token_id: i32,
+    pub output_count: u32,
+    pub logit_bias: f32,
+    pub in_prompt: u16,
+    pub banned: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct W34SamplerRowOut {
+    pub sampled_id: i32,
+    pub draft_accepted: i32,
+    pub status: i32,
+    pub sampled_logprob: f32,
+    pub draft_prob: f32,
+    pub reserved: i32,
+    pub top_ids: [i32; W34_MAX_TOP_LOGPROBS],
+    pub top_logprobs: [f32; W34_MAX_TOP_LOGPROBS],
+}
+
+impl Default for W34SamplerRowOut {
+    fn default() -> Self {
+        Self {
+            sampled_id: -1,
+            draft_accepted: 0,
+            status: 0,
+            sampled_logprob: 0.0,
+            draft_prob: 0.0,
+            reserved: 0,
+            top_ids: [-1; W34_MAX_TOP_LOGPROBS],
+            top_logprobs: [f32::NEG_INFINITY; W34_MAX_TOP_LOGPROBS],
+        }
+    }
+}
+
+const _: [(); 64] = [(); core::mem::size_of::<W34SamplerRowCfg>()];
+const _: [(); 16] = [(); core::mem::size_of::<W34SamplerSparseEntry>()];
+const _: [(); 184] = [(); core::mem::size_of::<W34SamplerRowOut>()];
+
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
     pub fn w34_cublas_runtime_version(out_version: *mut i32) -> i32;
@@ -609,6 +674,19 @@ unsafe extern "C" {
         rank: i32,
         num_rows: i32,
     ) -> i32;
+    pub fn w34_tp2_gather_vocab_f16(
+        ex: *const W34Exec,
+        local_logits_f16: *const c_void,
+        rank0_full_logits_f16: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_rows: i32,
+        local_vocab_size: i32,
+    ) -> i32;
+    pub fn w34_tp2_warmup() -> i32;
 
     pub fn w34_sampler_greedy_top5_f16(
         ex: *const W34Exec,
@@ -619,6 +697,17 @@ unsafe extern "C" {
         num_rows: i32,
         local_vocab_size: i32,
         vocab_offset: i32,
+    ) -> i32;
+    pub fn w34_sampler_step_f16(
+        ex: *const W34Exec,
+        logits_f16: *const c_void,
+        row_cfgs: *const W34SamplerRowCfg,
+        bitmask_u32: *const u32,
+        sparse_entries: *const W34SamplerSparseEntry,
+        row_outs: *mut W34SamplerRowOut,
+        num_rows: i32,
+        vocab_size: i32,
+        total_sparse_entries: i32,
     ) -> i32;
 
     pub fn w34_embed_lookup_f16_to_bf16(

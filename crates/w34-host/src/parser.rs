@@ -21,6 +21,18 @@ pub struct SamplingParams {
     pub stop_token_ids: Vec<i32>,
     pub stop_strings: Vec<String>,
     pub enable_thinking: bool,
+    #[serde(default)]
+    pub logit_bias: BTreeMap<i32, f32>,
+    #[serde(default)]
+    pub min_tokens: usize,
+    #[serde(default)]
+    pub ignore_eos: bool,
+    #[serde(default)]
+    pub logprobs: bool,
+    #[serde(default)]
+    pub top_logprobs: usize,
+    #[serde(default)]
+    pub eos_token_ids: Vec<i32>,
 }
 
 impl Default for SamplingParams {
@@ -38,8 +50,83 @@ impl Default for SamplingParams {
             stop_token_ids: vec![151643, 151645, 248044, 248046],
             stop_strings: Vec::new(),
             enable_thinking: true,
+            logit_bias: BTreeMap::new(),
+            min_tokens: 0,
+            ignore_eos: false,
+            logprobs: false,
+            top_logprobs: 0,
+            eos_token_ids: vec![151643, 151645, 248044, 248046],
         }
     }
+}
+
+impl SamplingParams {
+    #[inline]
+    pub fn is_plain_greedy(&self, has_constraint: bool) -> bool {
+        !has_constraint
+            && (self.temperature <= 1e-6 || self.top_k == 1)
+            && (self.repetition_penalty - 1.0).abs() <= 1e-6
+            && self.frequency_penalty.abs() <= 1e-6
+            && self.presence_penalty.abs() <= 1e-6
+            && self.logit_bias.is_empty()
+            && self.min_tokens == 0
+            && !self.ignore_eos
+            && !self.logprobs
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.temperature.is_finite()
+            || self.temperature < 0.0
+            || self.top_k < -1
+            || !self.top_p.is_finite()
+            || self.top_p <= 0.0
+            || self.top_p > 1.0
+            || !self.min_p.is_finite()
+            || !(0.0..=1.0).contains(&self.min_p)
+            || !self.repetition_penalty.is_finite()
+            || self.repetition_penalty <= 0.0
+            || !self.frequency_penalty.is_finite()
+            || !self.presence_penalty.is_finite()
+            || self.top_logprobs > w34_kernels::ffi::W34_MAX_TOP_LOGPROBS
+        {
+            return Err("invalid sampling parameters".into());
+        }
+        for (&tid, &bias) in &self.logit_bias {
+            if tid < 0 || !bias.is_finite() || !(-100.0..=100.0).contains(&bias) {
+                return Err(format!("invalid logit_bias for token {tid}"));
+            }
+        }
+        if self.stop_strings.iter().any(String::is_empty) {
+            return Err("stop strings must not be empty".into());
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn is_eos_token(&self, tid: i32, model_eos: &[i32]) -> bool {
+        model_eos.contains(&tid) || self.eos_token_ids.contains(&tid)
+    }
+
+    #[inline]
+    pub fn is_stop_or_eos(&self, tid: i32, model_eos: &[i32]) -> bool {
+        if self.is_eos_token(tid, model_eos) {
+            return !self.ignore_eos;
+        }
+        self.stop_token_ids.contains(&tid)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TokenLogprob {
+    pub token_id: i32,
+    pub logprob: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepLogprobs {
+    pub token_id: i32,
+    pub logprob: f32,
+    pub top_logprobs: Vec<TokenLogprob>,
 }
 
 pub use crate::constraints::TokenBitmaskConstraint;
@@ -102,32 +189,26 @@ impl SamplerV1 {
 
     // Keep sorted weights (including the pre-CDF nucleus sum) for legacy RNG ordering.
     fn processed_candidates(&self, logits: &[f32]) -> Result<Vec<(i32, f32)>, String> {
-        let p = &self.params;
-        if !p.temperature.is_finite()
-            || p.temperature < 0.0
-            || p.top_k < -1
-            || !p.top_p.is_finite()
-            || p.top_p <= 0.0
-            || p.top_p > 1.0
-            || !p.min_p.is_finite()
-            || !(0.0..=1.0).contains(&p.min_p)
-            || !p.repetition_penalty.is_finite()
-            || p.repetition_penalty <= 0.0
-            || !p.frequency_penalty.is_finite()
-            || !p.presence_penalty.is_finite()
-        {
-            return Err("invalid sampling parameters".into());
-        }
+        self.params.validate()?;
         if logits.is_empty() || logits.len() > i32::MAX as usize {
             return Err("empty or oversized vocabulary".into());
         }
+        let honor_bans = (self.params.ignore_eos
+            || self.output_history.len() < self.params.min_tokens)
+            && (0..logits.len() as i32).any(|tid| {
+                self.constraint
+                    .as_ref()
+                    .is_none_or(|c| c.is_token_allowed(tid))
+                    && !self.is_token_soft_banned(tid, &[])
+            });
         for (tid, &logit) in logits.iter().enumerate() {
-            if self
+            let tid_i32 = tid as i32;
+            let allowed = self
                 .constraint
                 .as_ref()
-                .is_none_or(|c| c.is_token_allowed(tid as i32))
-                && !logit.is_finite()
-            {
+                .is_none_or(|c| c.is_token_allowed(tid_i32))
+                && !(honor_bans && self.is_token_soft_banned(tid_i32, &[]));
+            if allowed && !logit.is_finite() {
                 return Err(format!("nonfinite allowed logit at token {tid}"));
             }
         }
@@ -141,7 +222,10 @@ impl SamplerV1 {
                 {
                     return None;
                 }
-                let mut l = val;
+                if honor_bans && self.is_token_soft_banned(tid, &[]) {
+                    return None;
+                }
+                let mut l = val + self.params.logit_bias.get(&tid).copied().unwrap_or(0.0);
                 let in_prompt = self.prompt_counts.get(&tid).copied().unwrap_or(0) > 0;
                 let out_cnt = self.output_counts.get(&tid).copied().unwrap_or(0);
                 if (in_prompt || out_cnt > 0) && (self.params.repetition_penalty - 1.0).abs() > 1e-6
@@ -263,6 +347,160 @@ impl SamplerV1 {
         }
         self.try_commit_token(chosen)?;
         Ok(chosen)
+    }
+
+    #[inline]
+    pub fn is_token_soft_banned(&self, tid: i32, model_eos: &[i32]) -> bool {
+        if self.params.ignore_eos && self.params.is_eos_token(tid, model_eos) {
+            return true;
+        }
+        if self.output_history.len() < self.params.min_tokens
+            && (self.params.is_eos_token(tid, model_eos)
+                || self.params.stop_token_ids.contains(&tid))
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Appends one row's GPU sampler config, optional packed grammar bitmask words, and
+    /// deduplicated sparse penalty/bias/ban entries for `w34_sampler_step_f16`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_gpu_row(
+        &self,
+        vocab_size: usize,
+        model_eos: &[i32],
+        uniform_sample: f32,
+        recovery_uniform: f32,
+        draft_token_id: i32,
+        use_token_id_cdf: bool,
+        bitmask_words_out: &mut Vec<u32>,
+        sparse_out: &mut Vec<w34_kernels::ffi::W34SamplerSparseEntry>,
+    ) -> Result<w34_kernels::ffi::W34SamplerRowCfg, String> {
+        self.params.validate()?;
+        let mask_words_per_row = vocab_size.div_ceil(32);
+        let (has_bitmask, row_bitmask_word_offset) = if let Some(ref c) = self.constraint {
+            let off = i32::try_from(bitmask_words_out.len())
+                .map_err(|_| "bitmask buffer overflow".to_string())?;
+            let start = bitmask_words_out.len();
+            bitmask_words_out.resize(start + mask_words_per_row, 0u32);
+            let words = c.mask_words();
+            let copy_len = words.len().min(mask_words_per_row);
+            bitmask_words_out[start..start + copy_len].copy_from_slice(&words[..copy_len]);
+            (1, off)
+        } else {
+            (0, 0)
+        };
+
+        let sparse_start = sparse_out.len();
+        let has_rep = (self.params.repetition_penalty - 1.0).abs() > 1e-6;
+        let has_freq_pres =
+            self.params.frequency_penalty.abs() > 1e-6 || self.params.presence_penalty.abs() > 1e-6;
+        let under_min = self.output_history.len() < self.params.min_tokens;
+        let has_bans = self.params.ignore_eos || under_min;
+
+        if has_rep || has_freq_pres || !self.params.logit_bias.is_empty() || has_bans {
+            let mut merged: BTreeMap<i32, w34_kernels::ffi::W34SamplerSparseEntry> =
+                BTreeMap::new();
+            if has_rep {
+                for (&tid, &cnt) in &self.prompt_counts {
+                    if cnt > 0 && tid >= 0 && (tid as usize) < vocab_size {
+                        merged
+                            .entry(tid)
+                            .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
+                                token_id: tid,
+                                ..Default::default()
+                            })
+                            .in_prompt = 1;
+                    }
+                }
+            }
+            if has_rep || has_freq_pres {
+                for (&tid, &cnt) in &self.output_counts {
+                    if cnt > 0 && tid >= 0 && (tid as usize) < vocab_size {
+                        merged
+                            .entry(tid)
+                            .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
+                                token_id: tid,
+                                ..Default::default()
+                            })
+                            .output_count = cnt;
+                    }
+                }
+            }
+            for (&tid, &bias) in &self.params.logit_bias {
+                if tid >= 0 && (tid as usize) < vocab_size {
+                    merged
+                        .entry(tid)
+                        .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
+                            token_id: tid,
+                            ..Default::default()
+                        })
+                        .logit_bias = bias;
+                }
+            }
+            if has_bans {
+                let iter_eos = model_eos
+                    .iter()
+                    .chain(self.params.eos_token_ids.iter())
+                    .copied();
+                for tid in iter_eos {
+                    if tid >= 0
+                        && (tid as usize) < vocab_size
+                        && self.is_token_soft_banned(tid, model_eos)
+                    {
+                        merged
+                            .entry(tid)
+                            .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
+                                token_id: tid,
+                                ..Default::default()
+                            })
+                            .banned = 1;
+                    }
+                }
+                if under_min {
+                    for &tid in &self.params.stop_token_ids {
+                        if tid >= 0 && (tid as usize) < vocab_size {
+                            merged
+                                .entry(tid)
+                                .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
+                                    token_id: tid,
+                                    ..Default::default()
+                                })
+                                .banned = 1;
+                        }
+                    }
+                }
+            }
+            sparse_out.extend(merged.into_values());
+        }
+        let sparse_count = sparse_out.len() - sparse_start;
+        let top_logprobs_k = if self.params.logprobs {
+            self.params.top_logprobs as i32
+        } else {
+            -1
+        };
+
+        Ok(w34_kernels::ffi::W34SamplerRowCfg {
+            temperature: self.params.temperature,
+            top_k: self.params.top_k,
+            top_p: self.params.top_p,
+            min_p: self.params.min_p,
+            repetition_penalty: self.params.repetition_penalty,
+            frequency_penalty: self.params.frequency_penalty,
+            presence_penalty: self.params.presence_penalty,
+            uniform_sample,
+            recovery_uniform,
+            draft_token_id,
+            has_bitmask,
+            row_bitmask_word_offset,
+            sparse_offset: i32::try_from(sparse_start)
+                .map_err(|_| "sparse offset overflow".to_string())?,
+            sparse_count: i32::try_from(sparse_count)
+                .map_err(|_| "sparse count overflow".to_string())?,
+            top_logprobs_k,
+            use_token_id_cdf: i32::from(use_token_id_cdf),
+        })
     }
 
     pub fn commit_token(&mut self, token_id: i32) {

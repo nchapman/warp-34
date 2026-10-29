@@ -1266,6 +1266,10 @@ pub struct Qwen3_5ModelRank {
     /// Selected-row local-vocabulary logits for native processed verification.
     pub speculative_logits: Option<DeviceBuffer>,
     pub speculative_logits_rows: usize,
+    pub last_logits_ptr: u64,
+    pub last_logits_rows: usize,
+    pub captured_decode_logits_ptr: u64,
+    pub captured_spec_logits_ptr: u64,
     pub last_final_hidden_f16: Option<DeviceBuffer>,
     pub max_tap_rows: usize,
     pub current_pos_plane_stride: i32,
@@ -1763,6 +1767,10 @@ impl Qwen3_5ModelRank {
             tap_aux_bf16: None,
             speculative_logits: None,
             speculative_logits_rows: 0,
+            last_logits_ptr: 0,
+            last_logits_rows: 0,
+            captured_decode_logits_ptr: 0,
+            captured_spec_logits_ptr: 0,
             last_final_hidden_f16: None,
             max_tap_rows: 0,
             current_pos_plane_stride: 0,
@@ -1957,6 +1965,8 @@ impl Qwen3_5ModelRank {
         let logits_buf = self
             .scratch_arena
             .alloc_aligned(self.local_vocab_size * 2)?;
+        self.last_logits_ptr = logits_buf;
+        self.last_logits_rows = 1;
         let (ws_ptr, ws_cap) = self.scratch_arena.remaining_workspace();
         let ex = self.stream.exec(ws_ptr, ws_cap);
 
@@ -2554,6 +2564,8 @@ impl Qwen3_5ModelRank {
             )?;
             self.stream.synchronize()?;
             self.speculative_logits_rows = 0;
+            self.last_logits_ptr = 0;
+            self.last_logits_rows = 0;
             return Ok(Vec::new());
         }
         let (out_greedy_ids_dev, use_spec_buf) = self.forward_selected_rows_device(
@@ -3127,11 +3139,15 @@ impl Qwen3_5ModelRank {
 
         if selected_rows.is_empty() {
             self.speculative_logits_rows = 0;
+            self.last_logits_ptr = 0;
+            self.last_logits_rows = 0;
             return Ok((0, false));
         }
         let num_selected = num_selected_pre;
         let use_spec_buf = use_spec_buf_pre;
         let all_logits_buf = pre_all_logits_buf;
+        self.last_logits_ptr = all_logits_buf;
+        self.last_logits_rows = num_selected;
         let selected_hidden_ptr = if is_contiguous_pre {
             final_norm_out_buf + (selected_rows[0] * h_dim * 2) as u64
         } else {
@@ -3427,6 +3443,7 @@ impl Qwen3_5ModelRank {
         };
         res?;
         check_rc(end_rc, "w34_graph_end_capture")?;
+        self.captured_decode_logits_ptr = self.last_logits_ptr;
         self.decode_graph = Some((
             long_ctx,
             CudaGraph {
@@ -3532,8 +3549,32 @@ impl Qwen3_5ModelRank {
         };
         res?;
         check_rc(end_rc, "w34_graph_end_capture (spec_verify)")?;
+        self.captured_spec_logits_ptr = self.last_logits_ptr;
         self.spec_verify_graph = Some(((m_verify, long_ctx), captured));
         Ok(())
+    }
+
+    pub fn sampler_workspace_around_last_logits(&self, num_rows: usize) -> Result<(u64, usize)> {
+        if self.last_logits_ptr == 0 || self.last_logits_rows < num_rows {
+            return Err(loader_err("missing device logits for GPU sampler"));
+        }
+        let arena_base = self.scratch_arena.allocation_base();
+        let arena_cap = self.scratch_arena.capacity() as u64;
+        let arena_end = arena_base + arena_cap;
+        let logits_bytes = (num_rows * self.local_vocab_size * 2) as u64;
+        if self.last_logits_ptr >= arena_base && self.last_logits_ptr < arena_end {
+            let before_end = self.last_logits_ptr & !255u64;
+            let before_len = before_end.saturating_sub(arena_base);
+            let after_start = (self.last_logits_ptr + logits_bytes + 255u64) & !255u64;
+            let after_len = arena_end.saturating_sub(after_start);
+            if after_len >= before_len {
+                Ok((after_start, after_len as usize))
+            } else {
+                Ok((arena_base, before_len as usize))
+            }
+        } else {
+            Ok((arena_base, arena_cap as usize))
+        }
     }
 }
 
@@ -3600,6 +3641,7 @@ pub struct RadixBenchMetrics {
     pub decode_tok_per_s: f64,
     pub itl_ms: f64,
     pub generated_token_ids: Vec<i32>,
+    pub token_logprobs: Vec<crate::parser::StepLogprobs>,
 }
 
 #[derive(Clone, Debug)]
@@ -3708,8 +3750,9 @@ impl Qwen3_5Engine {
         self.speculative = Some(proposer);
         result
     }
-    /// Processed stochastic/grammar decoding using the configured native proposer.
-    /// Greedy proposals retain point-mass q; rejection still samples the exact target law.
+    /// Processed stochastic/grammar decoding using GPU-resident `SamplerV1` + device bitmasking
+    /// (with native speculative rejection when a proposer is enabled, or non-speculative
+    /// radix-cached decode when no proposer is configured).
     pub fn generate_sampled_with_radix_cache(
         &mut self,
         prompt: &[i32],
@@ -3717,13 +3760,292 @@ impl Qwen3_5Engine {
         constraint: Option<crate::parser::TokenBitmaskConstraint>,
         chunk: usize,
     ) -> Result<RadixBenchMetrics> {
-        let mut proposer = self
-            .speculative
-            .take()
-            .ok_or_else(|| loader_err("sampled decoding requires a native proposer"))?;
-        let result = proposer.generate_sampled(self, prompt, params, constraint, chunk);
-        self.speculative = Some(proposer);
-        result
+        params
+            .validate()
+            .map_err(|_| loader_err("invalid sampling parameters"))?;
+        if let Some(mut proposer) = self.speculative.take() {
+            let result = proposer.generate_sampled(self, prompt, params, constraint, chunk);
+            self.speculative = Some(proposer);
+            return result;
+        }
+        self.generate_plain_sampled_with_radix_cache(prompt, params, constraint, chunk, true)
+    }
+
+    /// Runs GPU-resident `w34_sampler_step_f16` over the `num_rows` device logits produced by the
+    /// most recent forward step (`TP=1` directly in VRAM; `TP=2` via mapped-sysmem GPU-to-GPU
+    /// `w34_tp2_gather_vocab_f16` onto Rank 0's scratch workspace), copying only compact
+    /// `W34SamplerRowOut` records (`184 B/row`, zero full-vocab logit D2H) back to host.
+    pub fn run_gpu_sampler_rows(
+        &mut self,
+        row_cfgs: &[ffi::W34SamplerRowCfg],
+        bitmask_words: &[u32],
+        sparse_entries: &[ffi::W34SamplerSparseEntry],
+    ) -> Result<Vec<ffi::W34SamplerRowOut>> {
+        let num_rows = row_cfgs.len();
+        if num_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let vocab_size = self.cfg.vocab_size;
+        let (ws_base, ws_cap) = self.ranks[0].sampler_workspace_around_last_logits(num_rows)?;
+
+        let (full_logits_ptr, sampler_ws_ptr, sampler_ws_cap) = if self.tp_size == 1 {
+            (self.ranks[0].last_logits_ptr, ws_base, ws_cap)
+        } else {
+            let comm = self.tp2_comm.as_ref().unwrap().clone();
+            let full_bytes = (num_rows * vocab_size * 2 + 255) & !255;
+            if ws_cap <= full_bytes {
+                return Err(loader_err(
+                    "insufficient scratch workspace for TP=2 GPU sampler",
+                ));
+            }
+            let [r0, r1] = &mut self.ranks[..] else {
+                unreachable!()
+            };
+            if r1.last_logits_ptr == 0 || r1.last_logits_rows < num_rows {
+                return Err(loader_err("missing rank 1 device logits for GPU sampler"));
+            }
+            let shard_bytes = num_rows
+                .checked_mul(r0.local_vocab_size)
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| loader_err("tp2 vocab gather byte overflow"))?;
+            if shard_bytes > comm.max_stage_bytes_per_epoch {
+                return Err(loader_err(
+                    "tp2 vocab gather exceeds max_stage_bytes_per_epoch",
+                ));
+            }
+            let full_ptr = ws_base;
+            let ex0 = r0.stream.exec(0, 0);
+            let ex1 = r1.stream.exec(0, 0);
+            r0.device.make_current()?;
+            comm.gather_vocab_f16(
+                &ex0,
+                r0.last_logits_ptr,
+                full_ptr,
+                0,
+                num_rows as i32,
+                r0.local_vocab_size as i32,
+            )?;
+            r1.device.make_current()?;
+            comm.gather_vocab_f16(
+                &ex1,
+                r1.last_logits_ptr,
+                0,
+                1,
+                num_rows as i32,
+                r1.local_vocab_size as i32,
+            )?;
+            (full_ptr, ws_base + full_bytes as u64, ws_cap - full_bytes)
+        };
+
+        let r0 = &mut self.ranks[0];
+        r0.device.make_current()?;
+        r0.batch_meta_arena.reset();
+        let cfg_dev = r0.batch_meta_arena.upload_slice(row_cfgs, &r0.stream)?;
+        let mask_dev = if bitmask_words.is_empty() {
+            0
+        } else {
+            r0.batch_meta_arena
+                .upload_slice(bitmask_words, &r0.stream)?
+        };
+        let sparse_dev = if sparse_entries.is_empty() {
+            0
+        } else {
+            r0.batch_meta_arena
+                .upload_slice(sparse_entries, &r0.stream)?
+        };
+        let out_bytes = num_rows * core::mem::size_of::<ffi::W34SamplerRowOut>();
+        let out_dev = r0.batch_meta_arena.alloc_aligned(out_bytes)?;
+        let ex_sampler = r0.stream.exec(sampler_ws_ptr, sampler_ws_cap);
+        check_rc(
+            unsafe {
+                ffi::w34_sampler_step_f16(
+                    &ex_sampler,
+                    full_logits_ptr as *const c_void,
+                    cfg_dev as *const ffi::W34SamplerRowCfg,
+                    if mask_dev == 0 {
+                        core::ptr::null()
+                    } else {
+                        mask_dev as *const u32
+                    },
+                    if sparse_dev == 0 {
+                        core::ptr::null()
+                    } else {
+                        sparse_dev as *const ffi::W34SamplerSparseEntry
+                    },
+                    out_dev as *mut ffi::W34SamplerRowOut,
+                    num_rows as i32,
+                    vocab_size as i32,
+                    sparse_entries.len() as i32,
+                )
+            },
+            "w34_sampler_step_f16",
+        )?;
+
+        let mut outs = vec![ffi::W34SamplerRowOut::default(); num_rows];
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    outs.as_mut_ptr().cast(),
+                    out_dev as *const c_void,
+                    out_bytes,
+                    r0.stream.handle,
+                )
+            },
+            "copy GPU sampler outputs",
+        )?;
+        r0.stream.synchronize()?;
+        if self.tp_size == 2 {
+            self.ranks[1].device.make_current()?;
+            self.ranks[1].stream.synchronize()?;
+        }
+        Ok(outs)
+    }
+
+    pub fn extract_step_logprobs(
+        emitted_id: i32,
+        out: &ffi::W34SamplerRowOut,
+        top_k: usize,
+    ) -> crate::parser::StepLogprobs {
+        let k = top_k.min(ffi::W34_MAX_TOP_LOGPROBS);
+        let mut top_logprobs = Vec::with_capacity(k);
+        for j in 0..k {
+            if out.top_ids[j] >= 0 {
+                top_logprobs.push(crate::parser::TokenLogprob {
+                    token_id: out.top_ids[j],
+                    logprob: out.top_logprobs[j],
+                });
+            }
+        }
+        crate::parser::StepLogprobs {
+            token_id: emitted_id,
+            logprob: out.sampled_logprob,
+            top_logprobs,
+        }
+    }
+
+    /// Samples and commits 1 token from the last 1-row forward step on GPU.
+    pub fn sample_single_gpu_step(
+        &mut self,
+        sampler: &mut crate::parser::SamplerV1,
+    ) -> Result<(i32, Option<crate::parser::StepLogprobs>)> {
+        let mut bitmask_words = Vec::new();
+        let mut sparse_entries = Vec::new();
+        let u = crate::parser::SamplerV1::uniform_f32(
+            sampler.params.seed,
+            sampler.output_history.len(),
+        );
+        let cfg = sampler
+            .append_gpu_row(
+                self.cfg.vocab_size,
+                &self.cfg.eos_token_ids,
+                u,
+                0.0,
+                -1,
+                false,
+                &mut bitmask_words,
+                &mut sparse_entries,
+            )
+            .map_err(|_| loader_err("invalid GPU sampler configuration"))?;
+        let outs = self.run_gpu_sampler_rows(&[cfg], &bitmask_words, &sparse_entries)?;
+        let out = &outs[0];
+        if out.status != 0 || out.sampled_id < 0 {
+            return Err(loader_err(
+                "GPU sampler rejected empty or nonfinite distribution",
+            ));
+        }
+        sampler
+            .try_commit_token(out.sampled_id)
+            .map_err(|_| loader_err("GPU sampler grammar commit failed"))?;
+        let lp = sampler
+            .params
+            .logprobs
+            .then(|| Self::extract_step_logprobs(out.sampled_id, out, sampler.params.top_logprobs));
+        Ok((out.sampled_id, lp))
+    }
+
+    /// Runs GPU-resident point-mass speculative rejection verification over `k + 1` verify rows.
+    pub fn verify_speculative_gpu_step(
+        &mut self,
+        sampler: &crate::parser::SamplerV1,
+        drafts: &[i32],
+    ) -> Result<(
+        crate::speculative::Verification,
+        Vec<crate::parser::StepLogprobs>,
+    )> {
+        let k = drafts.len();
+        let mut hypothetical = sampler.clone();
+        let mut row_cfgs = Vec::with_capacity(k + 1);
+        let mut bitmask_words = Vec::new();
+        let mut sparse_entries = Vec::new();
+        let pos = sampler.output_history.len();
+        let recovery_u =
+            crate::parser::SamplerV1::uniform_f32(sampler.params.seed ^ 0xe7037ed1a0b428db, pos);
+
+        for (row, &draft_id) in drafts.iter().enumerate() {
+            let accept_u = crate::parser::SamplerV1::uniform_f32(
+                sampler.params.seed ^ 0xa0761d6478bd642f,
+                pos + row,
+            );
+            let cfg = hypothetical
+                .append_gpu_row(
+                    self.cfg.vocab_size,
+                    &self.cfg.eos_token_ids,
+                    accept_u,
+                    recovery_u,
+                    draft_id,
+                    false,
+                    &mut bitmask_words,
+                    &mut sparse_entries,
+                )
+                .map_err(|_| loader_err("invalid speculative GPU sampler row"))?;
+            row_cfgs.push(cfg);
+            hypothetical
+                .try_commit_token(draft_id)
+                .map_err(|_| loader_err("verification draft grammar commit failed"))?;
+        }
+        let bonus_cfg = hypothetical
+            .append_gpu_row(
+                self.cfg.vocab_size,
+                &self.cfg.eos_token_ids,
+                0.0,
+                recovery_u,
+                -1,
+                true,
+                &mut bitmask_words,
+                &mut sparse_entries,
+            )
+            .map_err(|_| loader_err("invalid speculative bonus GPU sampler row"))?;
+        row_cfgs.push(bonus_cfg);
+
+        let outs = self.run_gpu_sampler_rows(&row_cfgs, &bitmask_words, &sparse_entries)?;
+        if outs.iter().any(|o| o.status != 0) {
+            return Err(loader_err(
+                "speculative GPU verification encountered invalid target distribution",
+            ));
+        }
+        let accepted = outs[..k]
+            .iter()
+            .take_while(|o| o.draft_accepted != 0)
+            .count();
+        let bonus_or_recovered = outs[accepted].sampled_id;
+        let decision = crate::speculative::RejectionSampler::from_gpu_verified(
+            drafts,
+            accepted,
+            bonus_or_recovered,
+        )
+        .map_err(|_| loader_err("GPU speculative verification failed"))?;
+
+        let mut step_lps = Vec::new();
+        if sampler.params.logprobs {
+            for (idx, &emitted_tok) in decision.emitted_tokens().iter().enumerate() {
+                step_lps.push(Self::extract_step_logprobs(
+                    emitted_tok,
+                    &outs[idx],
+                    sampler.params.top_logprobs,
+                ));
+            }
+        }
+        Ok((decision, step_lps))
     }
     pub fn encode(&self, text: &str) -> Result<Vec<i32>> {
         let tok = self
@@ -4243,6 +4565,8 @@ impl Qwen3_5Engine {
             if self.use_cuda_graph {
                 r0.ensure_decode_graph(long_ctx, None)?;
                 r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
+                r0.last_logits_ptr = r0.captured_decode_logits_ptr;
+                r0.last_logits_rows = 1;
             } else {
                 let attn_batch = W34AttentionBatch {
                     query_start_loc: r0.decode_io.q_start_loc.addr() as *const i32,
@@ -4338,6 +4662,8 @@ impl Qwen3_5Engine {
                         .state_out_indices
                         .copy_from_host(&st_arr, &r.stream)?;
                     r.decode_graph.as_ref().unwrap().1.launch(&r.stream)?;
+                    r.last_logits_ptr = r.captured_decode_logits_ptr;
+                    r.last_logits_rows = 1;
                 }
                 r0.device.make_current()?;
                 let mut gid = [0i32; 1];
@@ -4380,6 +4706,8 @@ impl Qwen3_5Engine {
                     if use_graph {
                         r0.ensure_decode_graph(long_ctx, Some(&c0))?;
                         r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
+                        r0.last_logits_ptr = r0.captured_decode_logits_ptr;
+                        r0.last_logits_rows = 1;
                     } else {
                         let attn_batch = W34AttentionBatch {
                             query_start_loc: r0.decode_io.q_start_loc.addr() as *const i32,
@@ -4468,6 +4796,8 @@ impl Qwen3_5Engine {
                     if use_graph {
                         r1.ensure_decode_graph(long_ctx, Some(&c1))?;
                         r1.decode_graph.as_ref().unwrap().1.launch(&r1.stream)?;
+                        r1.last_logits_ptr = r1.captured_decode_logits_ptr;
+                        r1.last_logits_rows = 1;
                     } else {
                         let attn_batch = W34AttentionBatch {
                             query_start_loc: r1.decode_io.q_start_loc.addr() as *const i32,
@@ -4907,6 +5237,8 @@ impl Qwen3_5Engine {
             } else {
                 0
             };
+            r0.last_logits_ptr = r0.captured_spec_logits_ptr;
+            r0.last_logits_rows = q_len;
             Ok(vec![out_ids])
         } else {
             let comm = self.tp2_comm.as_ref().unwrap().clone();
@@ -4945,6 +5277,8 @@ impl Qwen3_5Engine {
                     } else {
                         0
                     };
+                    r.last_logits_ptr = r.captured_spec_logits_ptr;
+                    r.last_logits_rows = q_len;
                 }
                 let mut out_ids = vec![0i32; q_len];
                 r0.device.make_current()?;
@@ -4983,6 +5317,8 @@ impl Qwen3_5Engine {
                     } else {
                         0
                     };
+                    r0.last_logits_ptr = r0.captured_spec_logits_ptr;
+                    r0.last_logits_rows = q_len;
                     Ok(out_ids)
                 });
                 let c1 = comm.clone();
@@ -5006,6 +5342,8 @@ impl Qwen3_5Engine {
                     } else {
                         0
                     };
+                    r1.last_logits_ptr = r1.captured_spec_logits_ptr;
+                    r1.last_logits_rows = q_len;
                     Ok(())
                 });
                 (h0.join().unwrap(), h1.join().unwrap())
@@ -5399,9 +5737,38 @@ impl Qwen3_5Engine {
                 stop_on_eos,
             );
         }
+        let params = crate::parser::SamplingParams {
+            max_tokens: max_new_tokens,
+            stop_token_ids: self.cfg.eos_token_ids.clone(),
+            eos_token_ids: self.cfg.eos_token_ids.clone(),
+            ..Default::default()
+        };
+        self.generate_plain_sampled_with_radix_cache(
+            prompt_token_ids,
+            params,
+            None,
+            prefill_chunk_size,
+            stop_on_eos,
+        )
+    }
+
+    pub fn generate_plain_sampled_with_radix_cache(
+        &mut self,
+        prompt_token_ids: &[i32],
+        params: crate::parser::SamplingParams,
+        constraint: Option<crate::parser::TokenBitmaskConstraint>,
+        prefill_chunk_size: usize,
+        stop_on_eos: bool,
+    ) -> Result<RadixBenchMetrics> {
+        params
+            .validate()
+            .map_err(|_| loader_err("invalid sampling parameters"))?;
         if prompt_token_ids.is_empty() {
             return Err(loader_err("empty prompt in generate_with_radix_cache"));
         }
+        let max_new_tokens = params.max_tokens;
+        let use_gpu_sampler = !params.is_plain_greedy(constraint.is_some());
+        let mut sampler = crate::parser::SamplerV1::new(params, prompt_token_ids, constraint);
         let target_total_len = prompt_token_ids
             .len()
             .checked_add(max_new_tokens)
@@ -5425,7 +5792,7 @@ impl Qwen3_5Engine {
         let mut req_state = ReqRadixState::new(16, 64, active_slot, [pp0, pp1]);
         req_state.restore_prefix_hit(&mut self.radix, prompt_token_ids, &match_res);
 
-        let step_res: Result<(f64, f64, Vec<i32>)> = (|| {
+        let step_res: Result<(f64, f64, Vec<i32>, Vec<crate::parser::StepLogprobs>)> = (|| {
             self.ensure_kv_pages_for_len(&mut req_state, target_total_len)?;
 
             let chunk_sz = prefill_chunk_size.max(1);
@@ -5459,14 +5826,29 @@ impl Qwen3_5Engine {
             let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             let mut gen_ids = Vec::with_capacity(max_new_tokens);
+            let mut token_logprobs = Vec::new();
             if max_new_tokens > 0 {
+                if use_gpu_sampler {
+                    let (tok, lp) = self.sample_single_gpu_step(&mut sampler)?;
+                    first_tok = tok;
+                    if let Some(lp) = lp {
+                        token_logprobs.push(lp);
+                    }
+                } else {
+                    sampler.commit_token(first_tok);
+                }
                 gen_ids.push(first_tok);
             }
 
             let t_dec = std::time::Instant::now();
             let mut cur_tok = first_tok;
             for _ in 1..max_new_tokens {
-                if stop_on_eos && self.cfg.eos_token_ids.contains(&cur_tok) {
+                if stop_on_eos
+                    && sampler.output_history.len() >= sampler.params.min_tokens
+                    && sampler
+                        .params
+                        .is_stop_or_eos(cur_tok, &self.cfg.eos_token_ids)
+                {
                     break;
                 }
                 let ctx_before = req_state.token_ids.len();
@@ -5475,36 +5857,46 @@ impl Qwen3_5Engine {
                     .iter()
                     .map(|c| (c.trigger_offset_1based, c.dst_slot))
                     .collect();
-                let next_tok = if ckpt_pairs.is_empty() && req_state.cow_src_state_slot.is_none() {
-                    self.decode_one_token(
-                        cur_tok,
-                        ctx_before,
-                        &req_state.kv_pages,
-                        req_state.active_state_slot,
-                    )?
+                let mut next_tok =
+                    if ckpt_pairs.is_empty() && req_state.cow_src_state_slot.is_none() {
+                        self.decode_one_token(
+                            cur_tok,
+                            ctx_before,
+                            &req_state.kv_pages,
+                            req_state.active_state_slot,
+                        )?
+                    } else {
+                        let out = self.step_batch_slices(&[EngineBatchSlice {
+                            tokens: &[cur_tok],
+                            ctx_len_before: ctx_before,
+                            block_table: &req_state.kv_pages,
+                            state_in_slot: req_state.current_state_in_slot(),
+                            state_out_slot: req_state.active_state_slot,
+                            has_initial_state: req_state.has_initial_state,
+                            spec_slots: &[],
+                            checkpoints: &ckpt_pairs,
+                            emit_all_query_tokens: false,
+                        }])?;
+                        out[0][0]
+                    };
+                if use_gpu_sampler {
+                    let (tok, lp) = self.sample_single_gpu_step(&mut sampler)?;
+                    next_tok = tok;
+                    if let Some(lp) = lp {
+                        token_logprobs.push(lp);
+                    }
                 } else {
-                    let out = self.step_batch_slices(&[EngineBatchSlice {
-                        tokens: &[cur_tok],
-                        ctx_len_before: ctx_before,
-                        block_table: &req_state.kv_pages,
-                        state_in_slot: req_state.current_state_in_slot(),
-                        state_out_slot: req_state.active_state_slot,
-                        has_initial_state: req_state.has_initial_state,
-                        spec_slots: &[],
-                        checkpoints: &ckpt_pairs,
-                        emit_all_query_tokens: false,
-                    }])?;
-                    out[0][0]
-                };
+                    sampler.commit_token(next_tok);
+                }
                 req_state.commit_tokens(&[cur_tok], &planned);
                 gen_ids.push(next_tok);
                 cur_tok = next_tok;
             }
             let decode_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
-            Ok((ttft_ms, decode_ms, gen_ids))
+            Ok((ttft_ms, decode_ms, gen_ids, token_logprobs))
         })();
 
-        let (ttft_ms, decode_ms, gen_ids) = match step_res {
+        let (ttft_ms, decode_ms, gen_ids, token_logprobs) = match step_res {
             Ok(v) => v,
             Err(e) => {
                 let aborted = req_state.abort_and_release(&mut self.radix);
@@ -5546,6 +5938,7 @@ impl Qwen3_5Engine {
             decode_tok_per_s,
             itl_ms,
             generated_token_ids: gen_ids,
+            token_logprobs,
         })
     }
 
@@ -5769,14 +6162,54 @@ impl Qwen3_5Engine {
         prefill_chunk_size: usize,
         stop_on_eos: bool,
     ) -> Result<RadixBenchMetrics> {
+        let params = crate::parser::SamplingParams {
+            max_tokens: max_new_tokens,
+            stop_token_ids: self.cfg.eos_token_ids.clone(),
+            eos_token_ids: self.cfg.eos_token_ids.clone(),
+            ..Default::default()
+        };
+        self.generate_multimodal_sampled_with_radix_cache(
+            prompt_token_ids,
+            images,
+            params,
+            None,
+            prefill_chunk_size,
+            stop_on_eos,
+        )
+    }
+
+    pub fn generate_multimodal_sampled_with_radix_cache(
+        &mut self,
+        prompt_token_ids: &[i32],
+        images: &[crate::vision::PreprocessedImage],
+        params: crate::parser::SamplingParams,
+        constraint: Option<crate::parser::TokenBitmaskConstraint>,
+        prefill_chunk_size: usize,
+        stop_on_eos: bool,
+    ) -> Result<RadixBenchMetrics> {
+        params
+            .validate()
+            .map_err(|_| loader_err("invalid sampling parameters"))?;
         if images.is_empty() {
-            return self.generate_with_radix_cache(
+            if stop_on_eos {
+                return self.generate_sampled_with_radix_cache(
+                    prompt_token_ids,
+                    params,
+                    constraint,
+                    prefill_chunk_size,
+                );
+            }
+            return self.generate_plain_sampled_with_radix_cache(
                 prompt_token_ids,
-                max_new_tokens,
+                params,
+                constraint,
                 prefill_chunk_size,
-                stop_on_eos,
+                false,
             );
         }
+        let max_new_tokens = params.max_tokens;
+        let use_gpu_sampler = !params.is_plain_greedy(constraint.is_some());
+        let mut sampler = crate::parser::SamplerV1::new(params, prompt_token_ids, constraint);
         if prompt_token_ids.is_empty() {
             return Err(loader_err(
                 "generate_multimodal_with_radix_cache requires at least 1 prompt token",
@@ -5835,7 +6268,7 @@ impl Qwen3_5Engine {
         let mut req_state = ReqRadixState::new(16, 64, active_slot, [pp0, pp1]);
         req_state.restore_prefix_hit(&mut self.radix, &hashed_prompt_ids, &match_res);
 
-        let step_res: Result<(f64, f64, Vec<i32>)> = (|| {
+        let step_res: Result<(f64, f64, Vec<i32>, Vec<crate::parser::StepLogprobs>)> = (|| {
             self.ensure_kv_pages_for_len(&mut req_state, target_total_len)?;
 
             let t0 = std::time::Instant::now();
@@ -5945,14 +6378,29 @@ impl Qwen3_5Engine {
             let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
             let mut gen_ids = Vec::with_capacity(max_new_tokens);
+            let mut token_logprobs = Vec::new();
             if max_new_tokens > 0 {
+                if use_gpu_sampler {
+                    let (tok, lp) = self.sample_single_gpu_step(&mut sampler)?;
+                    first_tok = tok;
+                    if let Some(lp) = lp {
+                        token_logprobs.push(lp);
+                    }
+                } else {
+                    sampler.commit_token(first_tok);
+                }
                 gen_ids.push(first_tok);
             }
 
             let t_dec = std::time::Instant::now();
             let mut cur_tok = first_tok;
             for _dec_step in 1..max_new_tokens {
-                if stop_on_eos && self.cfg.eos_token_ids.contains(&cur_tok) {
+                if stop_on_eos
+                    && sampler.output_history.len() >= sampler.params.min_tokens
+                    && sampler
+                        .params
+                        .is_stop_or_eos(cur_tok, &self.cfg.eos_token_ids)
+                {
                     break;
                 }
                 let ctx_before = req_state.token_ids.len();
@@ -5973,17 +6421,26 @@ impl Qwen3_5Engine {
                     checkpoints: &ckpt_pairs,
                     emit_all_query_tokens: false,
                 };
-                let next_tok =
+                let mut next_tok =
                     self.step_single_slice_with_mrope_and_vision(&eng_slice, &[rope_pos], 0, None)?;
+                if use_gpu_sampler {
+                    let (tok, lp) = self.sample_single_gpu_step(&mut sampler)?;
+                    next_tok = tok;
+                    if let Some(lp) = lp {
+                        token_logprobs.push(lp);
+                    }
+                } else {
+                    sampler.commit_token(next_tok);
+                }
                 req_state.commit_tokens(&[cur_tok], &planned);
                 gen_ids.push(next_tok);
                 cur_tok = next_tok;
             }
             let decode_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
-            Ok((ttft_ms, decode_ms, gen_ids))
+            Ok((ttft_ms, decode_ms, gen_ids, token_logprobs))
         })();
 
-        let (ttft_ms, decode_ms, gen_ids) = match step_res {
+        let (ttft_ms, decode_ms, gen_ids, token_logprobs) = match step_res {
             Ok(v) => v,
             Err(e) => {
                 let aborted = req_state.abort_and_release(&mut self.radix);
@@ -6025,6 +6482,7 @@ impl Qwen3_5Engine {
             decode_tok_per_s,
             itl_ms,
             generated_token_ids: gen_ids,
+            token_logprobs,
         })
     }
 

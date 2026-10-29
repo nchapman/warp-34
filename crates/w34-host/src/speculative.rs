@@ -193,6 +193,18 @@ impl RejectionSampler {
         ))
     }
 
+    /// Constructs a `Verification` directly from GPU-resident rejection sampling outputs.
+    pub fn from_gpu_verified(
+        drafts: &[i32],
+        accepted: usize,
+        next_anchor: i32,
+    ) -> Result<Verification> {
+        if accepted > drafts.len() || next_anchor < 0 || drafts.iter().any(|&id| id < 0) {
+            return Err(RejectionError("invalid GPU rejection verification result"));
+        }
+        Ok(Self::result(drafts, accepted, next_anchor))
+    }
+
     fn result(drafts: &[i32], accepted: usize, next_anchor: i32) -> Verification {
         let mut emitted = drafts[..accepted].to_vec();
         emitted.push(next_anchor);

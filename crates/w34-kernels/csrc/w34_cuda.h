@@ -358,8 +358,55 @@ int w34_tp2_all_gather_top1_f32_i32(const w34_exec* ex,
                                     int32_t* global_max_id,
                                     void* stage0, void* stage1,
                                     void* sig0, void* sig1, int rank, int num_rows);
+int w34_tp2_gather_vocab_f16(const w34_exec* ex,
+                             const void* local_logits_f16,
+                             void* rank0_full_logits_f16,
+                             void* stage0, void* stage1,
+                             void* sig0, void* sig1,
+                             int rank, int num_rows, int local_vocab_size);
+int w34_tp2_warmup(void);
 
 // --- GPU Sampler (op_sampler.cu) ---
+#define W34_MAX_TOP_LOGPROBS 20
+
+typedef struct w34_sampler_row_cfg {
+    float    temperature;
+    int32_t  top_k;
+    float    top_p;
+    float    min_p;
+    float    repetition_penalty;
+    float    frequency_penalty;
+    float    presence_penalty;
+    float    uniform_sample;
+    float    recovery_uniform;
+    int32_t  draft_token_id;
+    int32_t  has_bitmask;
+    int32_t  row_bitmask_word_offset;
+    int32_t  sparse_offset;
+    int32_t  sparse_count;
+    int32_t  top_logprobs_k;
+    int32_t  use_token_id_cdf;
+} w34_sampler_row_cfg;
+
+typedef struct w34_sampler_sparse_entry {
+    int32_t  token_id;
+    uint32_t output_count;
+    float    logit_bias;
+    uint16_t in_prompt;
+    uint16_t banned;
+} w34_sampler_sparse_entry;
+
+typedef struct w34_sampler_row_out {
+    int32_t  sampled_id;
+    int32_t  draft_accepted;
+    int32_t  status;
+    float    sampled_logprob;
+    float    draft_prob;
+    int32_t  reserved;
+    int32_t  top_ids[W34_MAX_TOP_LOGPROBS];
+    float    top_logprobs[W34_MAX_TOP_LOGPROBS];
+} w34_sampler_row_out;
+
 int w34_sampler_greedy_top5_f16(const w34_exec* ex,
                                 const void* logits_f16,     // [num_rows, local_vocab_size]
                                 int32_t* out_greedy_ids,    // [num_rows]
@@ -368,6 +415,16 @@ int w34_sampler_greedy_top5_f16(const w34_exec* ex,
                                 int num_rows,
                                 int local_vocab_size,
                                 int vocab_offset);
+
+int w34_sampler_step_f16(const w34_exec* ex,
+                         const void* logits_f16,
+                         const w34_sampler_row_cfg* row_cfgs,
+                         const uint32_t* bitmask_u32,
+                         const w34_sampler_sparse_entry* sparse_entries,
+                         w34_sampler_row_out* row_outs,
+                         int num_rows,
+                         int vocab_size,
+                         int total_sparse_entries);
 
 // Rejection outputs: emitted [R,k+1], accepted [R], status [R].
 // Only emitted[0..accepted+1] is live; suffix is -1. Masked requests return
