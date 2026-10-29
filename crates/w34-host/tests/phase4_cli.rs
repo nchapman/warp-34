@@ -37,6 +37,10 @@ fn speculative_cli_validation_without_a_visible_gpu() {
             "unknown --kv-format",
         ),
         (
+            vec!["generate", "--kv-format", "firstlast2"],
+            "unknown --kv-format",
+        ),
+        (
             vec!["bench", "--batch-size", "0"],
             "--batch-size must be 1..1024",
         ),

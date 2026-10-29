@@ -781,6 +781,279 @@ impl FfnBlockWeights {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn load_moe_layer_weights(
+    archive: &SafetensorsArchive,
+    cfg: &ModelConfig,
+    pfx: &str,
+    rank: usize,
+    tp_size: usize,
+    default_group_size: usize,
+    weight_arena: &mut DeviceArena,
+    stream: &CudaStream,
+    repack_staging: &DeviceBuffer,
+) -> Result<MoeLayerWeights> {
+    let raw_router = RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), default_group_size)?;
+    let router_gate = raw_router.upload(weight_arena, stream, repack_staging)?;
+
+    let full_interm = cfg.moe_intermediate_size;
+    let local_moe_interm = full_interm / tp_size;
+    let num_exp = cfg.num_experts;
+    let top_k = cfg.num_experts_per_tok.max(1);
+    let scoring_func = i32::from(cfg.scoring_func.eq_ignore_ascii_case("sigmoid"));
+    let h = cfg.hidden_size;
+
+    let fused_gu_key = archive
+        .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj"))
+        .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj.weight")));
+    let fused_dn_key = archive
+        .resolve_name(&format!("{pfx}.mlp.experts.down_proj"))
+        .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.experts.down_proj.weight")));
+
+    let experts = if let (Some(gu_key), Some(dn_key)) = (fused_gu_key, fused_dn_key) {
+        let gu_info = archive
+            .tensor_info(&gu_key)
+            .map_err(|_| loader_err("tensor_info fused experts.gate_up_proj"))?;
+        let dn_info = archive
+            .tensor_info(&dn_key)
+            .map_err(|_| loader_err("tensor_info fused experts.down_proj"))?;
+        if gu_info.shape.as_slice() != [num_exp, 2 * full_interm, h]
+            || dn_info.shape.as_slice() != [num_exp, h, full_interm]
+        {
+            return Err(loader_err("unexpected fused 3D MoE expert shape"));
+        }
+        let gu_all = archive
+            .read_f16_bits(&gu_key)
+            .map_err(|_| loader_err("read fused experts.gate_up_proj"))?;
+        let dn_all = archive
+            .read_f16_bits(&dn_key)
+            .map_err(|_| loader_err("read fused experts.down_proj"))?;
+
+        let expected_gu = num_exp
+            .checked_mul(2)
+            .and_then(|v| v.checked_mul(full_interm))
+            .and_then(|v| v.checked_mul(h))
+            .ok_or_else(|| loader_err("fused experts.gate_up_proj size overflow"))?;
+        let expected_dn = num_exp
+            .checked_mul(h)
+            .and_then(|v| v.checked_mul(full_interm))
+            .ok_or_else(|| loader_err("fused experts.down_proj size overflow"))?;
+        if gu_all.len() != expected_gu || dn_all.len() != expected_dn {
+            return Err(loader_err(
+                "fused MoE expert tensor element count mismatch against shape",
+            ));
+        }
+        let local_gu_cap = num_exp
+            .checked_mul(2)
+            .and_then(|v| v.checked_mul(local_moe_interm))
+            .and_then(|v| v.checked_mul(h))
+            .ok_or_else(|| loader_err("local fused gate_up capacity overflow"))?;
+        let local_dn_cap = num_exp
+            .checked_mul(h)
+            .and_then(|v| v.checked_mul(local_moe_interm))
+            .ok_or_else(|| loader_err("local fused down capacity overflow"))?;
+        let mut all_gu_f16 = Vec::with_capacity(local_gu_cap);
+        let mut all_dn_f16 = Vec::with_capacity(local_dn_cap);
+        let col_start = rank * local_moe_interm;
+        let col_end = (rank + 1) * local_moe_interm;
+
+        for e in 0..num_exp {
+            let exp_gu = &gu_all[e * 2 * full_interm * h..(e + 1) * 2 * full_interm * h];
+            all_gu_f16.extend_from_slice(&exp_gu[col_start * h..col_end * h]);
+            all_gu_f16.extend_from_slice(
+                &exp_gu[(full_interm + col_start) * h..(full_interm + col_end) * h],
+            );
+
+            let exp_dn = &dn_all[e * h * full_interm..(e + 1) * h * full_interm];
+            if tp_size == 1 {
+                all_dn_f16.extend_from_slice(exp_dn);
+            } else {
+                for row in 0..h {
+                    let row_base = row * full_interm;
+                    all_dn_f16.extend_from_slice(&exp_dn[row_base + col_start..row_base + col_end]);
+                }
+            }
+        }
+        drop(gu_all);
+        drop(dn_all);
+        let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
+        let down_ptr = weight_arena.upload_slice(&all_dn_f16, stream)?;
+        MoeExpertStorage::DenseF16 {
+            gate_up_ptr,
+            down_ptr,
+        }
+    } else {
+        // Probe expert 0 to determine W4A16 vs DenseF16 storage
+        let exp0_gate = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.experts.0.gate_proj"),
+            default_group_size,
+        )?;
+        match exp0_gate {
+            RawLinearHost::U4B8NMajor { group_size, .. } => {
+                let gu_words_per_exp = (2 * local_moe_interm) * (h / 8);
+                let gu_scales_per_exp = (2 * local_moe_interm) * h.div_ceil(group_size);
+                let dn_words_per_exp = h * (local_moe_interm / 8);
+                let dn_scales_per_exp = h * local_moe_interm.div_ceil(group_size);
+
+                let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
+                let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
+                let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
+                let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
+
+                for e in 0..num_exp {
+                    let epfx = format!("{pfx}.mlp.experts.{e}");
+                    let rg = RawLinearHost::load(
+                        archive,
+                        &format!("{epfx}.gate_proj"),
+                        default_group_size,
+                    )?
+                    .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let ru = RawLinearHost::load(
+                        archive,
+                        &format!("{epfx}.up_proj"),
+                        default_group_size,
+                    )?
+                    .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let gu = RawLinearHost::concat_rows(&[rg, ru]);
+                    if let RawLinearHost::U4B8NMajor { packed, scales, .. } = gu {
+                        all_gu_packed.extend_from_slice(&packed);
+                        all_gu_scales.extend_from_slice(&scales);
+                    }
+                    let rd = RawLinearHost::load(
+                        archive,
+                        &format!("{epfx}.down_proj"),
+                        default_group_size,
+                    )?
+                    .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    if let RawLinearHost::U4B8NMajor { packed, scales, .. } = rd {
+                        all_dn_packed.extend_from_slice(&packed);
+                        all_dn_scales.extend_from_slice(&scales);
+                    }
+                }
+
+                let gate_up_packed_ptr = weight_arena.upload_slice(&all_gu_packed, stream)?;
+                let gate_up_scales_ptr = weight_arena.upload_slice(&all_gu_scales, stream)?;
+                let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
+                let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
+                MoeExpertStorage::W4A16 {
+                    gate_up_packed_ptr,
+                    gate_up_scales_ptr,
+                    down_packed_ptr,
+                    down_scales_ptr,
+                    group_size,
+                }
+            }
+            RawLinearHost::DenseF16 { .. } => {
+                let mut all_gu_f16 = Vec::with_capacity(num_exp * 2 * local_moe_interm * h);
+                let mut all_dn_f16 = Vec::with_capacity(num_exp * h * local_moe_interm);
+                for e in 0..num_exp {
+                    let epfx = format!("{pfx}.mlp.experts.{e}");
+                    let rg = RawLinearHost::load(
+                        archive,
+                        &format!("{epfx}.gate_proj"),
+                        default_group_size,
+                    )?
+                    .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let ru = RawLinearHost::load(
+                        archive,
+                        &format!("{epfx}.up_proj"),
+                        default_group_size,
+                    )?
+                    .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let gu = RawLinearHost::concat_rows(&[rg, ru]);
+                    if let RawLinearHost::DenseF16 { weight, .. } = gu {
+                        all_gu_f16.extend_from_slice(&weight);
+                    }
+                    let rd = RawLinearHost::load(
+                        archive,
+                        &format!("{epfx}.down_proj"),
+                        default_group_size,
+                    )?
+                    .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    if let RawLinearHost::DenseF16 { weight, .. } = rd {
+                        all_dn_f16.extend_from_slice(&weight);
+                    }
+                }
+                let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
+                let down_ptr = weight_arena.upload_slice(&all_dn_f16, stream)?;
+                MoeExpertStorage::DenseF16 {
+                    gate_up_ptr,
+                    down_ptr,
+                }
+            }
+        }
+    };
+
+    let local_shared_interm = cfg.shared_expert_intermediate_size / tp_size;
+    let (shared_gate_up_proj, shared_down_proj, shared_expert_gate) = if local_shared_interm > 0
+        && archive
+            .resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))
+            .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.qweight")))
+            .or_else(|| {
+                archive.resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.weight_packed"))
+            })
+            .is_some()
+    {
+        let s_gate = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.shared_expert.gate_proj"),
+            default_group_size,
+        )?
+        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+        let s_up = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.shared_expert.up_proj"),
+            default_group_size,
+        )?
+        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+        let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up]).upload(
+            weight_arena,
+            stream,
+            repack_staging,
+        )?;
+        let s_dn = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.shared_expert.down_proj"),
+            default_group_size,
+        )?
+        .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
+        .upload(weight_arena, stream, repack_staging)?;
+        let s_eg = if archive
+            .resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight"))
+            .is_some()
+        {
+            Some(
+                RawLinearHost::load(
+                    archive,
+                    &format!("{pfx}.mlp.shared_expert_gate"),
+                    default_group_size,
+                )?
+                .upload(weight_arena, stream, repack_staging)?,
+            )
+        } else {
+            None
+        };
+        (Some(s_gu), Some(s_dn), s_eg)
+    } else {
+        (None, None, None)
+    };
+
+    Ok(MoeLayerWeights {
+        router_gate,
+        experts,
+        num_experts: num_exp,
+        top_k,
+        norm_topk_prob: cfg.norm_topk_prob,
+        scoring_func,
+        local_moe_interm,
+        shared_gate_up_proj,
+        shared_down_proj,
+        shared_expert_gate,
+        local_shared_interm,
+    })
+}
+
+#[cfg(feature = "cuda")]
 pub struct DecoderLayerWeights {
     pub layer_id: usize,
     pub input_layernorm_ptr: u64,
@@ -857,6 +1130,129 @@ impl DecodeGraphIo {
     }
 }
 
+pub const MAX_SPEC_VERIFY_TOKENS: usize = 16;
+pub const MAX_SPEC_VERIFY_CHECKPOINTS: usize = 4;
+const SPEC_META_I32_LEN: usize = 4 * MAX_SPEC_VERIFY_TOKENS + 2 * MAX_SPEC_VERIFY_CHECKPOINTS + 6;
+
+/// Static device buffers used for fixed-shape `M_verify = K + 1` (`2..=16`) speculative
+/// verification CUDA Graph capture and replay (`MTP` & `DFlash2`, `TP=1` & `TP=2`).
+#[cfg(feature = "cuda")]
+pub struct SpecVerifyGraphIo {
+    pub meta_i32: DeviceBuffer,
+    pub block_tables: DeviceBuffer,
+    pub has_initial_state: DeviceBuffer,
+    pub out_greedy_ids: DeviceBuffer,
+    pub max_blocks_per_req: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl SpecVerifyGraphIo {
+    pub fn new(device_id: i32, max_blocks_per_req: usize, stream: &CudaStream) -> Result<Self> {
+        let meta_i32 = DeviceBuffer::alloc(device_id, SPEC_META_I32_LEN * 4)?;
+        let block_tables = DeviceBuffer::alloc(device_id, max_blocks_per_req.max(1) * 4)?;
+        let has_initial_state = DeviceBuffer::alloc(device_id, 4)?;
+        has_initial_state.copy_from_host(&[1u8, 0, 0, 0], stream)?;
+        let out_greedy_ids = DeviceBuffer::alloc(device_id, MAX_SPEC_VERIFY_TOKENS * 4)?;
+        Ok(Self {
+            meta_i32,
+            block_tables,
+            has_initial_state,
+            out_greedy_ids,
+            max_blocks_per_req: max_blocks_per_req.max(1),
+        })
+    }
+
+    #[inline]
+    pub fn token_ids_ptr(&self) -> u64 {
+        self.meta_i32.addr()
+    }
+    #[inline]
+    pub fn positions_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (MAX_SPEC_VERIFY_TOKENS * 4) as u64
+    }
+    #[inline]
+    pub fn write_slot_mapping_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (2 * MAX_SPEC_VERIFY_TOKENS * 4) as u64
+    }
+    #[inline]
+    pub fn spec_state_indices_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (3 * MAX_SPEC_VERIFY_TOKENS * 4) as u64
+    }
+    #[inline]
+    pub fn checkpoint_dst_indices_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (4 * MAX_SPEC_VERIFY_TOKENS * 4) as u64
+    }
+    #[inline]
+    pub fn checkpoint_token_offsets_ptr(&self) -> u64 {
+        self.meta_i32.addr()
+            + ((4 * MAX_SPEC_VERIFY_TOKENS + MAX_SPEC_VERIFY_CHECKPOINTS) * 4) as u64
+    }
+    #[inline]
+    pub fn q_start_loc_ptr(&self) -> u64 {
+        self.meta_i32.addr()
+            + ((4 * MAX_SPEC_VERIFY_TOKENS + 2 * MAX_SPEC_VERIFY_CHECKPOINTS) * 4) as u64
+    }
+    #[inline]
+    pub fn ctx_lens_before_ptr(&self) -> u64 {
+        self.q_start_loc_ptr() + 8
+    }
+    #[inline]
+    pub fn seq_lens_after_ptr(&self) -> u64 {
+        self.q_start_loc_ptr() + 12
+    }
+    #[inline]
+    pub fn state_in_indices_ptr(&self) -> u64 {
+        self.q_start_loc_ptr() + 16
+    }
+    #[inline]
+    pub fn state_out_indices_ptr(&self) -> u64 {
+        self.q_start_loc_ptr() + 20
+    }
+
+    pub fn pack_meta(slice: &EngineBatchSlice<'_>) -> Result<[i32; SPEC_META_I32_LEN]> {
+        let q_len = slice.tokens.len();
+        let seq_after = slice
+            .ctx_len_before
+            .checked_add(q_len)
+            .ok_or_else(|| loader_err("spec_verify sequence length overflow"))?;
+        if q_len == 0
+            || q_len > MAX_SPEC_VERIFY_TOKENS
+            || slice.spec_slots.len() > MAX_SPEC_VERIFY_TOKENS
+            || slice.checkpoints.len() > MAX_SPEC_VERIFY_CHECKPOINTS
+            || slice.block_table.len() < seq_after.div_ceil(16)
+        {
+            return Err(loader_err(
+                "slice exceeds SpecVerifyGraphIo metadata capacity",
+            ));
+        }
+        let mut m = [-1i32; SPEC_META_I32_LEN];
+        m[..q_len].copy_from_slice(slice.tokens);
+        for step in 0..q_len {
+            let pos = slice.ctx_len_before + step;
+            m[MAX_SPEC_VERIFY_TOKENS + step] = pos as i32;
+            let page_id = slice.block_table[pos / 16];
+            let page_off = (pos % 16) as i32;
+            m[2 * MAX_SPEC_VERIFY_TOKENS + step] = page_id * 16 + page_off;
+        }
+        m[3 * MAX_SPEC_VERIFY_TOKENS..3 * MAX_SPEC_VERIFY_TOKENS + slice.spec_slots.len()]
+            .copy_from_slice(slice.spec_slots);
+        let cp_dst_base = 4 * MAX_SPEC_VERIFY_TOKENS;
+        let cp_off_base = cp_dst_base + MAX_SPEC_VERIFY_CHECKPOINTS;
+        for (e, &(trig_off, dst_slot)) in slice.checkpoints.iter().enumerate() {
+            m[cp_dst_base + e] = dst_slot;
+            m[cp_off_base + e] = trig_off;
+        }
+        let q_base = cp_off_base + MAX_SPEC_VERIFY_CHECKPOINTS;
+        m[q_base] = 0;
+        m[q_base + 1] = q_len as i32;
+        m[q_base + 2] = slice.ctx_len_before as i32;
+        m[q_base + 3] = seq_after as i32;
+        m[q_base + 4] = slice.state_in_slot;
+        m[q_base + 5] = slice.state_out_slot;
+        Ok(m)
+    }
+}
+
 /// One rank of a Qwen 3.5 / 3.8 model resident on a single GPU.
 #[cfg(feature = "cuda")]
 pub struct Qwen3_5ModelRank {
@@ -880,6 +1276,8 @@ pub struct Qwen3_5ModelRank {
     pub state_pool: StateBundlePool,
     pub decode_io: DecodeGraphIo,
     pub decode_graph: Option<CudaGraph>,
+    pub spec_verify_io: SpecVerifyGraphIo,
+    pub spec_verify_graph: Option<(usize, CudaGraph)>,
     pub capacity_plan: CapacityPlan,
     pub tap_layer_ids: Vec<usize>,
     pub tap_aux_bf16: Option<DeviceBuffer>,
@@ -916,18 +1314,26 @@ impl Qwen3_5ModelRank {
             } else if tp_size == 2 {
                 13 * 1024 * 1024 * 1024 // 35B-A3B MoE TP=2 (~10.5 GiB/rank)
             } else {
-                21 * 1024 * 1024 * 1024 // 35B-A3B MoE TP=1 (~19.5 GiB)
+                19_200 * 1024 * 1024 // 35B-A3B MoE TP=1 (~18.3 GiB actual target weights)
             }
         } else {
             match (cfg.num_hidden_layers, tp_size) {
                 (64, 2) => 12 * 1024 * 1024 * 1024, // 27B TP=2 (~9.5 GiB/rank)
-                (64, _) => 19 * 1024 * 1024 * 1024,
-                (_, 2) => 5 * 1024 * 1024 * 1024, // 4B/9B TP=2
-                _ => 8 * 1024 * 1024 * 1024,      // 4B/9B TP=1
+                (64, _) => 16_960 * 1024 * 1024,    // 27B TP=1 (~16.36 GiB actual weights)
+                (_, 2) => 5 * 1024 * 1024 * 1024,   // 4B/9B TP=2
+                _ => 8 * 1024 * 1024 * 1024,        // 4B/9B TP=1
             }
         };
+        let scratch_bytes = if tp_size == 1
+            && cfg.num_hidden_layers >= 64
+            && requested_kv_pages.unwrap_or(0) >= 8192
+        {
+            128 * 1024 * 1024
+        } else {
+            512 * 1024 * 1024
+        };
         let mut weight_arena = DeviceArena::new(device_id, est_weight_bytes)?;
-        let scratch_arena = DeviceArena::new(device_id, 512 * 1024 * 1024)?;
+        let scratch_arena = DeviceArena::new(device_id, scratch_bytes)?;
         let batch_meta_arena = DeviceArena::new(device_id, 16 * 1024 * 1024)?;
         let marlin_ws = DeviceBuffer::alloc(device_id, 84 * 64 * 4)?;
         let repack_staging = DeviceBuffer::alloc(device_id, 128 * 1024 * 1024)?;
@@ -1217,204 +1623,17 @@ impl Qwen3_5ModelRank {
                         .is_some());
 
             let ffn = if is_moe_layer {
-                let raw_router =
-                    RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), default_group_size)?;
-                let router_gate = raw_router.upload(&mut weight_arena, &stream, &repack_staging)?;
-
-                let local_moe_interm = cfg.moe_intermediate_size / tp_size;
-                let num_exp = cfg.num_experts;
-                let top_k = cfg.num_experts_per_tok.max(1);
-                let scoring_func = i32::from(cfg.scoring_func.eq_ignore_ascii_case("sigmoid"));
-
-                // Probe expert 0 to determine W4A16 vs DenseF16 storage
-                let exp0_gate = RawLinearHost::load(
+                FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
                     archive,
-                    &format!("{pfx}.mlp.experts.0.gate_proj"),
+                    cfg,
+                    &pfx,
+                    rank,
+                    tp_size,
                     default_group_size,
-                )?;
-                let experts = match exp0_gate {
-                    RawLinearHost::U4B8NMajor { group_size, .. } => {
-                        let gu_words_per_exp = (2 * local_moe_interm) * (cfg.hidden_size / 8);
-                        let gu_scales_per_exp =
-                            (2 * local_moe_interm) * cfg.hidden_size.div_ceil(group_size);
-                        let dn_words_per_exp = cfg.hidden_size * (local_moe_interm / 8);
-                        let dn_scales_per_exp =
-                            cfg.hidden_size * local_moe_interm.div_ceil(group_size);
-
-                        let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
-                        let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
-                        let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
-                        let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
-
-                        for e in 0..num_exp {
-                            let epfx = format!("{pfx}.mlp.experts.{e}");
-                            let rg = RawLinearHost::load(
-                                archive,
-                                &format!("{epfx}.gate_proj"),
-                                default_group_size,
-                            )?
-                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                            let ru = RawLinearHost::load(
-                                archive,
-                                &format!("{epfx}.up_proj"),
-                                default_group_size,
-                            )?
-                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                            let gu = RawLinearHost::concat_rows(&[rg, ru]);
-                            if let RawLinearHost::U4B8NMajor { packed, scales, .. } = gu {
-                                all_gu_packed.extend_from_slice(&packed);
-                                all_gu_scales.extend_from_slice(&scales);
-                            }
-                            let rd = RawLinearHost::load(
-                                archive,
-                                &format!("{epfx}.down_proj"),
-                                default_group_size,
-                            )?
-                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                            if let RawLinearHost::U4B8NMajor { packed, scales, .. } = rd {
-                                all_dn_packed.extend_from_slice(&packed);
-                                all_dn_scales.extend_from_slice(&scales);
-                            }
-                        }
-
-                        let gate_up_packed_ptr =
-                            weight_arena.upload_slice(&all_gu_packed, &stream)?;
-                        let gate_up_scales_ptr =
-                            weight_arena.upload_slice(&all_gu_scales, &stream)?;
-                        let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, &stream)?;
-                        let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, &stream)?;
-                        MoeExpertStorage::W4A16 {
-                            gate_up_packed_ptr,
-                            gate_up_scales_ptr,
-                            down_packed_ptr,
-                            down_scales_ptr,
-                            group_size,
-                        }
-                    }
-                    RawLinearHost::DenseF16 { .. } => {
-                        let mut all_gu_f16 =
-                            Vec::with_capacity(num_exp * 2 * local_moe_interm * cfg.hidden_size);
-                        let mut all_dn_f16 =
-                            Vec::with_capacity(num_exp * cfg.hidden_size * local_moe_interm);
-                        for e in 0..num_exp {
-                            let epfx = format!("{pfx}.mlp.experts.{e}");
-                            let rg = RawLinearHost::load(
-                                archive,
-                                &format!("{epfx}.gate_proj"),
-                                default_group_size,
-                            )?
-                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                            let ru = RawLinearHost::load(
-                                archive,
-                                &format!("{epfx}.up_proj"),
-                                default_group_size,
-                            )?
-                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                            let gu = RawLinearHost::concat_rows(&[rg, ru]);
-                            if let RawLinearHost::DenseF16 { weight, .. } = gu {
-                                all_gu_f16.extend_from_slice(&weight);
-                            }
-                            let rd = RawLinearHost::load(
-                                archive,
-                                &format!("{epfx}.down_proj"),
-                                default_group_size,
-                            )?
-                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                            if let RawLinearHost::DenseF16 { weight, .. } = rd {
-                                all_dn_f16.extend_from_slice(&weight);
-                            }
-                        }
-                        let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, &stream)?;
-                        let down_ptr = weight_arena.upload_slice(&all_dn_f16, &stream)?;
-                        MoeExpertStorage::DenseF16 {
-                            gate_up_ptr,
-                            down_ptr,
-                        }
-                    }
-                };
-
-                let local_shared_interm = cfg.shared_expert_intermediate_size / tp_size;
-                let (shared_gate_up_proj, shared_down_proj, shared_expert_gate) =
-                    if local_shared_interm > 0
-                        && archive
-                            .resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))
-                            .or_else(|| {
-                                archive.resolve_name(&format!(
-                                    "{pfx}.mlp.shared_expert.gate_proj.qweight"
-                                ))
-                            })
-                            .or_else(|| {
-                                archive.resolve_name(&format!(
-                                    "{pfx}.mlp.shared_expert.gate_proj.weight_packed"
-                                ))
-                            })
-                            .is_some()
-                    {
-                        let s_gate = RawLinearHost::load(
-                            archive,
-                            &format!("{pfx}.mlp.shared_expert.gate_proj"),
-                            default_group_size,
-                        )?
-                        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
-                        let s_up = RawLinearHost::load(
-                            archive,
-                            &format!("{pfx}.mlp.shared_expert.up_proj"),
-                            default_group_size,
-                        )?
-                        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
-                        let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up]).upload(
-                            &mut weight_arena,
-                            &stream,
-                            &repack_staging,
-                        )?;
-                        let s_dn = RawLinearHost::load(
-                            archive,
-                            &format!("{pfx}.mlp.shared_expert.down_proj"),
-                            default_group_size,
-                        )?
-                        .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
-                        .upload(
-                            &mut weight_arena,
-                            &stream,
-                            &repack_staging,
-                        )?;
-                        let s_eg = if archive
-                            .resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight"))
-                            .is_some()
-                        {
-                            Some(
-                                RawLinearHost::load(
-                                    archive,
-                                    &format!("{pfx}.mlp.shared_expert_gate"),
-                                    default_group_size,
-                                )?
-                                .upload(
-                                    &mut weight_arena,
-                                    &stream,
-                                    &repack_staging,
-                                )?,
-                            )
-                        } else {
-                            None
-                        };
-                        (Some(s_gu), Some(s_dn), s_eg)
-                    } else {
-                        (None, None, None)
-                    };
-
-                FfnBlockWeights::Moe(Box::new(MoeLayerWeights {
-                    router_gate,
-                    experts,
-                    num_experts: num_exp,
-                    top_k,
-                    norm_topk_prob: cfg.norm_topk_prob,
-                    scoring_func,
-                    local_moe_interm,
-                    shared_gate_up_proj,
-                    shared_down_proj,
-                    shared_expert_gate,
-                    local_shared_interm,
-                }))
+                    &mut weight_arena,
+                    &stream,
+                    &repack_staging,
+                )?))
             } else {
                 let raw_gate = RawLinearHost::load(
                     archive,
@@ -1463,12 +1682,38 @@ impl Qwen3_5ModelRank {
         stream.synchronize()?;
 
         // 5. StateBundlePool & KvPool via CapacityPlanner
-        let total_state_slots = if est_weight_bytes >= 19 * 1024 * 1024 * 1024 {
+        let block_size = 16usize;
+        let mut bytes_per_kv_page_all_layers = 0usize;
+        for ord in 0..full_attn_layer_ids.len() {
+            let (kf, vf, _, _) = kv_policy.resolve_layer(ord, full_attn_layer_ids.len());
+            let kb = crate::cache::kv_format_row_bytes(kf, cfg.head_dim);
+            let vb = crate::cache::kv_format_row_bytes(vf, cfg.head_dim);
+            bytes_per_kv_page_all_layers += local_kv_heads * block_size * (kb + vb);
+        }
+
+        let conv_dim = 2 * gdn_k_local + gdn_v_local;
+        let bytes_per_state_slot = gdn_layer_ids.len()
+            * (conv_dim * (cfg.linear_conv_kernel_dim - 1) * 2
+                + local_v_heads * cfg.linear_value_head_dim * cfg.linear_key_head_dim * 4);
+        let default_state_slots = if est_weight_bytes >= 17 * 1024 * 1024 * 1024 {
             10usize
         } else {
             24usize
         };
-        let conv_dim = 2 * gdn_k_local + gdn_v_local;
+        let default_pages = requested_kv_pages.or(Some(256));
+        let req_kv_bytes = default_pages.unwrap_or(256) * bytes_per_kv_page_all_layers;
+        let base_fixed = weight_arena
+            .used()
+            .saturating_add(scratch_arena.capacity())
+            .saturating_add(crate::cuda::MIN_HEADROOM_BYTES)
+            .saturating_add(req_kv_bytes);
+        let total_state_slots = if bytes_per_state_slot == 0 {
+            default_state_slots
+        } else if free_vram > base_fixed {
+            ((free_vram - base_fixed) / bytes_per_state_slot).clamp(3, default_state_slots)
+        } else {
+            3usize.min(default_state_slots)
+        };
         let state_pool = StateBundlePool::new(
             device_id,
             &gdn_layer_ids,
@@ -1479,21 +1724,8 @@ impl Qwen3_5ModelRank {
             cfg.linear_key_head_dim,
             cfg.linear_value_head_dim,
         )?;
-        let state_pool_bytes = gdn_layer_ids.len()
-            * total_state_slots
-            * (conv_dim * (cfg.linear_conv_kernel_dim - 1) * 2
-                + local_v_heads * cfg.linear_value_head_dim * cfg.linear_key_head_dim * 4);
+        let state_pool_bytes = total_state_slots * bytes_per_state_slot;
 
-        let block_size = 16usize;
-        let mut bytes_per_kv_page_all_layers = 0usize;
-        for ord in 0..full_attn_layer_ids.len() {
-            let (kf, vf, _, _) = kv_policy.resolve_layer(ord, full_attn_layer_ids.len());
-            let kb = crate::cache::kv_format_row_bytes(kf, cfg.head_dim);
-            let vb = crate::cache::kv_format_row_bytes(vf, cfg.head_dim);
-            bytes_per_kv_page_all_layers += local_kv_heads * block_size * (kb + vb);
-        }
-
-        let default_pages = requested_kv_pages.or(Some(256));
         let capacity_plan = CapacityPlanner::plan(
             total_vram,
             free_vram,
@@ -1517,6 +1749,8 @@ impl Qwen3_5ModelRank {
 
         let decode_io =
             DecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
+        let spec_verify_io =
+            SpecVerifyGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         device.synchronize()?;
 
         Ok(Self {
@@ -1540,6 +1774,8 @@ impl Qwen3_5ModelRank {
             state_pool,
             decode_io,
             decode_graph: None,
+            spec_verify_io,
+            spec_verify_graph: None,
             capacity_plan,
             tap_layer_ids: Vec::new(),
             tap_aux_bf16: None,
@@ -1567,7 +1803,7 @@ impl Qwen3_5ModelRank {
     ) -> Result<()> {
         // Captured graphs own these destination addresses and the tap geometry.
         // Require configuration before capture rather than freeing live targets.
-        if self.decode_graph.is_some() {
+        if self.decode_graph.is_some() || self.spec_verify_graph.is_some() {
             return Err(loader_err(
                 "configure speculative taps before decode graph capture",
             ));
@@ -2325,6 +2561,63 @@ impl Qwen3_5ModelRank {
         tp2: Option<&Tp2Collectives>,
         selected_rows: &[usize],
     ) -> Result<Vec<i32>> {
+        if selected_rows.is_empty() {
+            let _ = self.forward_selected_rows_device(
+                token_ids_ptr,
+                positions_ptr,
+                num_tokens,
+                attn_batch,
+                gdn_batch,
+                tp2,
+                selected_rows,
+                None,
+            )?;
+            self.stream.synchronize()?;
+            self.speculative_logits_rows = 0;
+            return Ok(Vec::new());
+        }
+        let (out_greedy_ids_dev, use_spec_buf) = self.forward_selected_rows_device(
+            token_ids_ptr,
+            positions_ptr,
+            num_tokens,
+            attn_batch,
+            gdn_batch,
+            tp2,
+            selected_rows,
+            None,
+        )?;
+        let num_selected = selected_rows.len();
+        let mut out_ids = vec![0i32; num_selected];
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    out_ids.as_mut_ptr().cast(),
+                    out_greedy_ids_dev as *const c_void,
+                    num_selected * 4,
+                    self.stream.handle,
+                )
+            },
+            "copy selected greedy ids",
+        )?;
+        self.stream.synchronize()?;
+        self.speculative_logits_rows = if use_spec_buf { num_selected } else { 0 };
+        Ok(out_ids)
+    }
+
+    /// Pure device-enqueue core of [`Self::forward_selected_rows`] (no D2H copy or host stream
+    /// synchronize, making fixed-shape `M_verify` speculative verification CUDA-Graph-capturable).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_selected_rows_device(
+        &mut self,
+        token_ids_ptr: u64,
+        positions_ptr: u64,
+        num_tokens: usize,
+        attn_batch: &W34AttentionBatch,
+        gdn_batch: &W34GdnBatch,
+        tp2: Option<&Tp2Collectives>,
+        selected_rows: &[usize],
+        out_greedy_ids_override: Option<u64>,
+    ) -> Result<(u64, bool)> {
         self.validate_tap_rows(num_tokens)?;
         if attn_batch.num_reqs <= 1
             && self
@@ -2813,7 +3106,7 @@ impl Qwen3_5ModelRank {
 
         if selected_rows.is_empty() {
             self.speculative_logits_rows = 0;
-            return Ok(Vec::new());
+            return Ok((0, false));
         }
         let num_selected = selected_rows.len();
         let use_spec_buf = self
@@ -2859,7 +3152,10 @@ impl Qwen3_5ModelRank {
             num_selected,
         )?;
 
-        let out_greedy_ids_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
+        let out_greedy_ids_dev = match out_greedy_ids_override {
+            Some(ptr) => ptr,
+            None => self.scratch_arena.alloc_aligned(num_selected * 4)?,
+        };
         if let Some(comm) = tp2 {
             let local_max_ids_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
             let local_max_vals_dev = self.scratch_arena.alloc_aligned(num_selected * 4)?;
@@ -2905,21 +3201,7 @@ impl Qwen3_5ModelRank {
                 "w34_sampler_greedy_top5_f16",
             )?;
         }
-        let mut out_ids = vec![0i32; num_selected];
-        check_rc(
-            unsafe {
-                ffi::w34_memcpy_d2h_async(
-                    out_ids.as_mut_ptr().cast(),
-                    out_greedy_ids_dev as *const c_void,
-                    num_selected * 4,
-                    self.stream.handle,
-                )
-            },
-            "copy selected greedy ids",
-        )?;
-        self.stream.synchronize()?;
-        self.speculative_logits_rows = if use_spec_buf { num_selected } else { 0 };
-        Ok(out_ids)
+        Ok((out_greedy_ids_dev, use_spec_buf))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3133,6 +3415,97 @@ impl Qwen3_5ModelRank {
         });
         Ok(())
     }
+
+    #[inline]
+    pub fn has_spec_logits_capacity(&self, rows: usize) -> bool {
+        self.speculative_logits
+            .as_ref()
+            .is_some_and(|b| rows <= b.len_bytes / (self.local_vocab_size * 2))
+    }
+
+    /// Captures a fixed-shape `M_verify = m_verify` (`2..=16`) single-request speculative
+    /// verification forward pass into `self.spec_verify_graph`.
+    pub fn ensure_spec_verify_graph(
+        &mut self,
+        m_verify: usize,
+        tp2: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        if let Some((captured_m, _)) = &self.spec_verify_graph
+            && *captured_m == m_verify
+        {
+            return Ok(());
+        }
+        let attn_batch = W34AttentionBatch {
+            query_start_loc: self.spec_verify_io.q_start_loc_ptr() as *const i32,
+            context_lens_before: self.spec_verify_io.ctx_lens_before_ptr() as *const i32,
+            seq_lens_after: self.spec_verify_io.seq_lens_after_ptr() as *const i32,
+            block_tables: self.spec_verify_io.block_tables.addr() as *const i32,
+            write_slot_mapping: self.spec_verify_io.write_slot_mapping_ptr() as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: m_verify as i32,
+            max_blocks_per_req: self.spec_verify_io.max_blocks_per_req as i32,
+            max_q_len: m_verify as i32,
+            max_seq_len: (self.spec_verify_io.max_blocks_per_req * 16) as i32,
+            mask_mode: W34_ATTN_MASK_CAUSAL,
+            sliding_window: 0,
+            sm_scale: (self.cfg.head_dim as f32).powf(-0.5),
+            reserved: 0,
+        };
+        let gdn_batch = W34GdnBatch {
+            query_start_loc: self.spec_verify_io.q_start_loc_ptr() as *const i32,
+            state_in_indices: self.spec_verify_io.state_in_indices_ptr() as *const i32,
+            state_out_indices: self.spec_verify_io.state_out_indices_ptr() as *const i32,
+            spec_state_indices: self.spec_verify_io.spec_state_indices_ptr() as *const i32,
+            checkpoint_dst_indices: self.spec_verify_io.checkpoint_dst_indices_ptr() as *const i32,
+            checkpoint_token_offsets: self.spec_verify_io.checkpoint_token_offsets_ptr()
+                as *const i32,
+            has_initial_state: self.spec_verify_io.has_initial_state.addr() as *const u8,
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: m_verify as i32,
+            max_verify_tokens: m_verify as i32,
+            max_checkpoints_per_req: MAX_SPEC_VERIFY_CHECKPOINTS as i32,
+        };
+        let tok_ptr = self.spec_verify_io.token_ids_ptr();
+        let pos_ptr = self.spec_verify_io.positions_ptr();
+        let out_ids_ptr = self.spec_verify_io.out_greedy_ids.addr();
+        let selected_rows: Vec<usize> = (0..m_verify).collect();
+
+        self.stream.synchronize()?;
+        let stream_handle = self.stream.handle;
+        let dev_id = self.device.device_id;
+        check_rc(unsafe { ffi::w34_set_device(dev_id) }, "w34_set_device")?;
+        check_rc(
+            unsafe { ffi::w34_graph_begin_capture(stream_handle) },
+            "w34_graph_begin_capture (spec_verify)",
+        )?;
+        let res = self.forward_selected_rows_device(
+            tok_ptr,
+            pos_ptr,
+            m_verify,
+            &attn_batch,
+            &gdn_batch,
+            tp2,
+            &selected_rows,
+            Some(out_ids_ptr),
+        );
+        let mut graph = 0usize;
+        let mut graph_exec = 0usize;
+        let end_rc = unsafe {
+            ffi::w34_graph_end_capture(stream_handle, &raw mut graph, &raw mut graph_exec)
+        };
+        let captured = CudaGraph {
+            device_id: dev_id,
+            graph,
+            graph_exec,
+        };
+        res?;
+        check_rc(end_rc, "w34_graph_end_capture (spec_verify)")?;
+        self.spec_verify_graph = Some((m_verify, captured));
+        Ok(())
+    }
 }
 
 impl RawLinearHost {
@@ -3289,7 +3662,6 @@ impl Qwen3_5Engine {
             return Err(loader_err("speculation is already configured"));
         }
         self.speculative = Some(crate::proposer::NativeProposer::load(self, config)?);
-        self.use_cuda_graph = false;
         Ok(())
     }
     fn generate_native_speculative(
@@ -4434,12 +4806,192 @@ impl Qwen3_5Engine {
         }
     }
 
+    fn step_spec_verify_graph(&mut self, s: &EngineBatchSlice<'_>) -> Result<Vec<Vec<i32>>> {
+        let q_len = s.tokens.len();
+        let host_meta = SpecVerifyGraphIo::pack_meta(s)?;
+        if self.tp_size == 1 {
+            let r0 = &mut self.ranks[0];
+            r0.device.make_current()?;
+            r0.spec_verify_io
+                .meta_i32
+                .copy_from_host(&host_meta, &r0.stream)?;
+            r0.spec_verify_io
+                .block_tables
+                .copy_from_host(s.block_table, &r0.stream)?;
+            r0.ensure_spec_verify_graph(q_len, None)?;
+            r0.spec_verify_graph
+                .as_ref()
+                .unwrap()
+                .1
+                .launch(&r0.stream)?;
+            let mut out_ids = vec![0i32; q_len];
+            r0.spec_verify_io
+                .out_greedy_ids
+                .copy_to_host(&mut out_ids, &r0.stream)?;
+            r0.speculative_logits_rows = if r0.has_spec_logits_capacity(q_len) {
+                q_len
+            } else {
+                0
+            };
+            Ok(vec![out_ids])
+        } else {
+            let comm = self.tp2_comm.as_ref().unwrap().clone();
+            let stage_bytes = q_len
+                .checked_mul(self.cfg.hidden_size)
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| loader_err("tp2 staging payload overflow"))?;
+            if stage_bytes > comm.max_stage_bytes_per_epoch {
+                return Err(loader_err(
+                    "tp2 batch staging bytes exceed max_stage_bytes_per_epoch",
+                ));
+            }
+            let [r0, r1] = &mut self.ranks[..] else {
+                unreachable!()
+            };
+            if r0.spec_verify_graph.is_some() && r1.spec_verify_graph.is_some() {
+                for r in [&mut *r0, &mut *r1] {
+                    r.device.make_current()?;
+                    r.spec_verify_io
+                        .meta_i32
+                        .copy_from_host(&host_meta, &r.stream)?;
+                    r.spec_verify_io
+                        .block_tables
+                        .copy_from_host(s.block_table, &r.stream)?;
+                    r.spec_verify_graph.as_ref().unwrap().1.launch(&r.stream)?;
+                    r.speculative_logits_rows = if r.has_spec_logits_capacity(q_len) {
+                        q_len
+                    } else {
+                        0
+                    };
+                }
+                let mut out_ids = vec![0i32; q_len];
+                r0.device.make_current()?;
+                r0.spec_verify_io
+                    .out_greedy_ids
+                    .copy_to_host(&mut out_ids, &r0.stream)?;
+                r1.device.make_current()?;
+                r1.stream.synchronize()?;
+                return Ok(vec![out_ids]);
+            }
+
+            let bt_ref = s.block_table;
+            let meta_ref = &host_meta;
+            let (res0, res1) = std::thread::scope(|sc| {
+                let c0 = comm.clone();
+                let h0 = sc.spawn(move || -> Result<Vec<i32>> {
+                    r0.device.make_current()?;
+                    r0.spec_verify_io
+                        .meta_i32
+                        .copy_from_host(meta_ref, &r0.stream)?;
+                    r0.spec_verify_io
+                        .block_tables
+                        .copy_from_host(bt_ref, &r0.stream)?;
+                    r0.ensure_spec_verify_graph(q_len, Some(&c0))?;
+                    r0.spec_verify_graph
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .launch(&r0.stream)?;
+                    let mut out_ids = vec![0i32; q_len];
+                    r0.spec_verify_io
+                        .out_greedy_ids
+                        .copy_to_host(&mut out_ids, &r0.stream)?;
+                    r0.speculative_logits_rows = if r0.has_spec_logits_capacity(q_len) {
+                        q_len
+                    } else {
+                        0
+                    };
+                    Ok(out_ids)
+                });
+                let c1 = comm.clone();
+                let h1 = sc.spawn(move || -> Result<()> {
+                    r1.device.make_current()?;
+                    r1.spec_verify_io
+                        .meta_i32
+                        .copy_from_host(meta_ref, &r1.stream)?;
+                    r1.spec_verify_io
+                        .block_tables
+                        .copy_from_host(bt_ref, &r1.stream)?;
+                    r1.ensure_spec_verify_graph(q_len, Some(&c1))?;
+                    r1.spec_verify_graph
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .launch(&r1.stream)?;
+                    r1.stream.synchronize()?;
+                    r1.speculative_logits_rows = if r1.has_spec_logits_capacity(q_len) {
+                        q_len
+                    } else {
+                        0
+                    };
+                    Ok(())
+                });
+                (h0.join().unwrap(), h1.join().unwrap())
+            });
+            res1?;
+            Ok(vec![res0?])
+        }
+    }
+
     /// Executes a multi-request / speculative / checkpoint-capturing batch step across `TP=1` or `TP=2`.
     /// Returns one `Vec<i32>` of greedy token IDs per slice in `slices` (either `[last_tok]` or all
     /// `q_len` query tokens when `slice.emit_all_query_tokens == true`).
     pub fn step_batch_slices(&mut self, slices: &[EngineBatchSlice<'_>]) -> Result<Vec<Vec<i32>>> {
         if slices.is_empty() {
             return Ok(Vec::new());
+        }
+        if slices.len() == 1 {
+            let s = &slices[0];
+            let q_len = s.tokens.len();
+            if q_len == 0 {
+                return Err(loader_err("empty slice in step_batch_slices"));
+            }
+            let max_pages = self.ranks[0].kv_pool.num_pages;
+            let seq_after = s.ctx_len_before + q_len;
+            if seq_after.div_ceil(16) > s.block_table.len()
+                || s.block_table
+                    .iter()
+                    .any(|&p| p < 0 || (p as usize) >= max_pages)
+            {
+                return Err(loader_err(
+                    "KV cache page capacity exceeded in step_batch_slices",
+                ));
+            }
+            let can_use_spec_graph = self.use_cuda_graph
+                && (2..=MAX_SPEC_VERIFY_TOKENS).contains(&q_len)
+                && s.has_initial_state
+                && s.emit_all_query_tokens
+                && s.spec_slots.len() == q_len
+                && s.checkpoints.len() <= MAX_SPEC_VERIFY_CHECKPOINTS
+                && s.block_table.len() <= self.ranks[0].spec_verify_io.max_blocks_per_req
+                && self.ranks.iter().all(|r| {
+                    let expected_m = r
+                        .speculative_logits
+                        .as_ref()
+                        .map(|b| b.len_bytes / (r.local_vocab_size * 2));
+                    r.current_pos_plane_stride == 0
+                        && r.pending_visual_splice.is_none()
+                        && expected_m.is_none_or(|cap| cap == q_len)
+                        && r.spec_verify_graph
+                            .as_ref()
+                            .is_none_or(|(captured_m, _)| *captured_m == q_len)
+                });
+            if can_use_spec_graph {
+                let needs_capture = self.ranks.iter().any(|r| r.spec_verify_graph.is_none());
+                match self.step_spec_verify_graph(s) {
+                    Ok(out) => return Ok(out),
+                    Err(e) if needs_capture => {
+                        for r in &mut self.ranks {
+                            r.spec_verify_graph = None;
+                        }
+                        self.use_cuda_graph = false;
+                        eprintln!(
+                            "[w34] warning: spec_verify CUDA Graph capture failed ({e}); degrading to eager verification"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
         let num_reqs = slices.len();
         let mut flat_tokens = Vec::new();

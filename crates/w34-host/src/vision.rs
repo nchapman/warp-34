@@ -307,67 +307,102 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Parses an OpenAI `image_url` (`data:image/...;base64,...`, PPM `P6`, or `http(s)://...`)
-/// into `(rgb_bytes, height, width)`. Rejects local `file://` URIs for security.
-pub fn parse_image_url_to_rgb(url: &str) -> std::result::Result<(Vec<u8>, usize, usize), String> {
-    if url.starts_with("file://") {
-        return Err("file:// URLs are not permitted in image_url".to_string());
+fn decode_standard_raster(
+    raw_bytes: &[u8],
+    fmt: image::ImageFormat,
+) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(raw_bytes), fmt);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let dyn_img = reader
+        .decode()
+        .map_err(|e| format!("failed to decode {fmt:?} image: {e}"))?;
+    let rgb = dyn_img.into_rgb8();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    if w == 0 || h == 0 {
+        return Err("decoded image has zero width or height".to_string());
     }
-    let raw_bytes = if let Some(idx) = url.find(";base64,") {
-        let b64 = &url[idx + 8..];
-        decode_base64(b64).ok_or_else(|| "invalid base64 in image_url".to_string())?
-    } else if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("rgb://")
-    {
-        // Deterministic procedural RGB image from URL digest (64x64) for URL references
-        let digest = fnv1a_hash_bytes(url.as_bytes());
-        let (h, w) = (64usize, 64usize);
-        let mut rgb = vec![0u8; h * w * 3];
-        for (i, px) in rgb.iter_mut().enumerate() {
-            *px = ((digest.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15))) >> 24) as u8;
-        }
-        return Ok((rgb, h, w));
-    } else {
-        return Err(
-            "unsupported image_url scheme (expected data:...;base64, or https://)".to_string(),
-        );
-    };
-    if raw_bytes.is_empty() {
-        return Err("empty decoded payload in image_url".to_string());
-    }
+    Ok((rgb.into_raw(), h, w))
+}
 
-    // Check binary PPM (P6: "P6 <w> <h> 255\n<rgb...>")
-    if raw_bytes.starts_with(b"P6") {
-        let mut pos = 2;
-        let next_token = |data: &[u8], p: &mut usize| -> Option<usize> {
+fn decode_ppm_p6(raw_bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    if !raw_bytes.starts_with(b"P6") {
+        return None;
+    }
+    let mut pos = 2;
+    let skip_ws_and_comments = |data: &[u8], p: &mut usize| {
+        loop {
             while *p < data.len() && data[*p].is_ascii_whitespace() {
                 *p += 1;
             }
-            let start = *p;
-            while *p < data.len() && data[*p].is_ascii_digit() {
-                *p += 1;
-            }
-            std::str::from_utf8(&data[start..*p]).ok()?.parse().ok()
-        };
-        if let (Some(w), Some(h), Some(_maxv)) = (
-            next_token(&raw_bytes, &mut pos),
-            next_token(&raw_bytes, &mut pos),
-            next_token(&raw_bytes, &mut pos),
-        ) && (1..=4096).contains(&w)
-            && (1..=4096).contains(&h)
-        {
-            if pos < raw_bytes.len() && raw_bytes[pos].is_ascii_whitespace() {
-                pos += 1;
-            }
-            if let Some(needed) = w.checked_mul(h).and_then(|px| px.checked_mul(3))
-                && let Some(end) = pos.checked_add(needed)
-                && raw_bytes.len() >= end
-            {
-                return Ok((raw_bytes[pos..end].to_vec(), h, w));
+            if *p < data.len() && data[*p] == b'#' {
+                while *p < data.len() && data[*p] != b'\n' {
+                    *p += 1;
+                }
+            } else {
+                break;
             }
         }
+    };
+    let next_token = |data: &[u8], p: &mut usize| -> Option<usize> {
+        skip_ws_and_comments(data, p);
+        let start = *p;
+        while *p < data.len() && data[*p].is_ascii_digit() {
+            *p += 1;
+        }
+        std::str::from_utf8(&data[start..*p]).ok()?.parse().ok()
+    };
+    let w = next_token(raw_bytes, &mut pos)?;
+    let h = next_token(raw_bytes, &mut pos)?;
+    let maxv = next_token(raw_bytes, &mut pos)?;
+    if !(1..=16_384).contains(&w) || !(1..=16_384).contains(&h) || maxv != 255 {
+        return None;
+    }
+    if pos < raw_bytes.len() && raw_bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    } else {
+        return None;
+    }
+    let needed = w.checked_mul(h)?.checked_mul(3)?;
+    let end = pos.checked_add(needed)?;
+    if raw_bytes.len() < end {
+        return None;
+    }
+    Some((raw_bytes[pos..end].to_vec(), h, w))
+}
+
+/// Decodes PNG, JPEG, or binary PPM (`P6`) bytes into `(rgb_bytes, height, width)`.
+/// When `require_known_format` is `false` and neither `mime_hint` nor magic bytes identify
+/// PNG/JPEG/PPM, falls back to synthetic RGB bytes for raw test payloads.
+pub fn decode_image_bytes_to_rgb(
+    raw_bytes: &[u8],
+    mime_hint: Option<&str>,
+    require_known_format: bool,
+) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    if raw_bytes.is_empty() {
+        return Err("empty image payload".to_string());
+    }
+    let mime = mime_hint.unwrap_or("").to_ascii_lowercase();
+    if raw_bytes.starts_with(b"\x89PNG\r\n\x1a\n") || mime == "image/png" {
+        return decode_standard_raster(raw_bytes, image::ImageFormat::Png);
+    }
+    if raw_bytes.starts_with(&[0xFF, 0xD8, 0xFF]) || mime == "image/jpeg" || mime == "image/jpg" {
+        return decode_standard_raster(raw_bytes, image::ImageFormat::Jpeg);
+    }
+    if raw_bytes.starts_with(b"P6") || mime == "image/x-portable-pixmap" {
+        return decode_ppm_p6(raw_bytes).ok_or_else(|| "invalid binary PPM (P6) image".to_string());
+    }
+    if require_known_format {
+        return Err(
+            "unsupported or corrupt image format (expected PNG, JPEG, or binary PPM P6)"
+                .to_string(),
+        );
     }
 
-    // Fallback: interpret non-empty raw bytes as square or 64x64 RGB image
+    // Fallback for raw non-PNG/JPEG/PPM data-URI test payloads
     let pixels = (raw_bytes.len() / 3).max(1);
     let side = (pixels as f64).sqrt().floor() as usize;
     let (h, w) = if (16..=4096).contains(&side) && side * side * 3 <= raw_bytes.len() {
@@ -380,6 +415,66 @@ pub fn parse_image_url_to_rgb(url: &str) -> std::result::Result<(Vec<u8>, usize,
         *px = raw_bytes[i % raw_bytes.len()];
     }
     Ok((rgb, h, w))
+}
+
+/// Parses an OpenAI `image_url` (`data:image/{png,jpeg,x-portable-pixmap};base64,...`) into
+/// `(rgb_bytes, height, width)`. Rejects local `file://` URIs, bare filesystem paths, and
+/// unrecognized image formats for HTTP security/correctness. Note: `http(s)://` and `rgb://`
+/// URIs generate deterministic offline 64×64 test fixtures without performing outbound network I/O.
+pub fn parse_image_url_to_rgb(url: &str) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    if url.starts_with("file://") {
+        return Err("file:// URLs are not permitted in image_url".to_string());
+    }
+    if let Some(idx) = url.find(";base64,") {
+        if !url.starts_with("data:") {
+            return Err("base64 image_url must start with data:".to_string());
+        }
+        let mime_hint = &url[5..idx];
+        let b64 = &url[idx + 8..];
+        let raw_bytes =
+            decode_base64(b64).ok_or_else(|| "invalid base64 in image_url".to_string())?;
+        if raw_bytes.is_empty() {
+            return Err("empty decoded payload in image_url".to_string());
+        }
+        decode_image_bytes_to_rgb(&raw_bytes, Some(mime_hint), true)
+    } else if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("rgb://")
+    {
+        // Deterministic offline procedural RGB fixture (64x64; no outbound network fetch)
+        let digest = fnv1a_hash_bytes(url.as_bytes());
+        let (h, w) = (64usize, 64usize);
+        let mut rgb = vec![0u8; h * w * 3];
+        for (i, px) in rgb.iter_mut().enumerate() {
+            *px = ((digest.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15))) >> 24) as u8;
+        }
+        Ok((rgb, h, w))
+    } else {
+        Err("unsupported image_url scheme (expected data:...;base64, or https://)".to_string())
+    }
+}
+
+/// Loads a CLI `--image <path|url>` argument into `(rgb_bytes, height, width)`.
+/// Supports local PNG, JPEG, and PPM (`P6`) files on disk, `data:image/{png,jpeg,x-portable-pixmap};base64,...`
+/// data URIs, and offline deterministic `rgb://` / `http(s)://` test fixtures.
+pub fn load_cli_image_to_rgb(spec: &str) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    if spec.starts_with("data:")
+        || spec.starts_with("http://")
+        || spec.starts_with("https://")
+        || spec.starts_with("rgb://")
+    {
+        return parse_image_url_to_rgb(spec);
+    }
+    let path_str = spec.strip_prefix("file://").unwrap_or(spec);
+    let meta = std::fs::metadata(path_str)
+        .map_err(|e| format!("failed to stat image file '{path_str}': {e}"))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err(format!(
+            "image file '{path_str}' exceeds 64 MiB CLI limit ({} bytes)",
+            meta.len()
+        ));
+    }
+    let raw_bytes = std::fs::read(path_str)
+        .map_err(|e| format!("failed to read image file '{path_str}': {e}"))?;
+    decode_image_bytes_to_rgb(&raw_bytes, None, true)
 }
 
 /// Computes the 2D bilinearly interpolated `pos_embed` `[total_patches, hidden_size]`

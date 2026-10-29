@@ -436,10 +436,10 @@ fn test_gate1_fragmented_paged_attention_and_tq4_strides() {
     let stream = CudaStream::new(dev.device_id).expect("stream");
     let ex = stream.exec(0, 0);
 
-    for policy in [KvFormatPolicy::Fp16, KvFormatPolicy::Tq4] {
+    for policy in [KvFormatPolicy::Fp16, KvFormatPolicy::Tq4All] {
         let pool = KvPool::new(0, 0, &[3], 2, 256, 16, 16, policy).expect("KvPool");
         let layout = pool.layers[0].layout;
-        if policy == KvFormatPolicy::Tq4 {
+        if policy == KvFormatPolicy::Tq4All {
             assert_eq!(layout.k_token_stride_bytes, 132);
             assert_eq!(layout.k_format, W34_KV_FORMAT_TQ4);
         } else {

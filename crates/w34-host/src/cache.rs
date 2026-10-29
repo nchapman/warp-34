@@ -17,11 +17,14 @@ pub enum KvFormatPolicy {
     Bf16,
     /// Plain 8-bit (`Q8_0` `272 B`/row for both `K` and `V`, `34,816 B/token`, `1.88x` compression on 27B).
     Q8_0,
+    /// Boundary-anchored TurboQuant 4-bit (default): first 2 (`0, 1`) and last 2 (`N - 2, N - 1`)
+    /// full-attention layers use WHT-256 rotated 8-bit `Q8_0`; interior layers use WHT-256 rotated
+    /// 4-bit `TQ4` with per-128 least-squares scales (`21,376 B/token`, `3.07x` compression on 27B —
+    /// fits full `262k` context on 1x 3090 Ti while matching `FP16` oracle accuracy).
     Tq4,
-    /// Full-attention layer slot `0` and the last 2 full-attention layer slots
-    /// (`num_full_attn_layers - 2`, `num_full_attn_layers - 1`) use `FP16`;
-    /// interior layers use `TQ4` (`26,016 B/token`, `2.52x` compression on 27B).
-    FirstLast2,
+    /// Uniform all-layer TurboQuant 4-bit (`132 B`/row on every full-attention layer,
+    /// `16,896 B/token`, `3.88x` compression on 27B).
+    Tq4All,
 }
 
 impl KvFormatPolicy {
@@ -49,22 +52,16 @@ impl KvFormatPolicy {
                 W34_KV_TRANSFORM_IDENTITY,
                 W34_KV_TRANSFORM_IDENTITY,
             ),
-            Self::Tq4 => (
-                W34_KV_FORMAT_TQ4,
-                W34_KV_FORMAT_TQ4,
-                W34_KV_TRANSFORM_RADEMACHER_WHT256,
-                W34_KV_TRANSFORM_RADEMACHER_WHT256,
-            ),
-            Self::FirstLast2 => {
-                let is_boundary = full_attn_layer_ordinal == 0
+            Self::Tq4 => {
+                let is_boundary = full_attn_layer_ordinal < 2
                     || (num_full_attn_layers >= 2
                         && full_attn_layer_ordinal >= num_full_attn_layers - 2);
                 if is_boundary {
                     (
-                        W34_KV_FORMAT_FP16,
-                        W34_KV_FORMAT_FP16,
-                        W34_KV_TRANSFORM_IDENTITY,
-                        W34_KV_TRANSFORM_IDENTITY,
+                        W34_KV_FORMAT_Q8_0,
+                        W34_KV_FORMAT_Q8_0,
+                        W34_KV_TRANSFORM_RADEMACHER_WHT256,
+                        W34_KV_TRANSFORM_RADEMACHER_WHT256,
                     )
                 } else {
                     (
@@ -75,6 +72,12 @@ impl KvFormatPolicy {
                     )
                 }
             }
+            Self::Tq4All => (
+                W34_KV_FORMAT_TQ4,
+                W34_KV_FORMAT_TQ4,
+                W34_KV_TRANSFORM_RADEMACHER_WHT256,
+                W34_KV_TRANSFORM_RADEMACHER_WHT256,
+            ),
         }
     }
 

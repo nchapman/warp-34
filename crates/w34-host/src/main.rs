@@ -17,9 +17,9 @@ fn parse_kv_policy(s: &str) -> Result<KvFormatPolicy, String> {
         "bf16" => Ok(KvFormatPolicy::Bf16),
         "q8_0" | "q8" => Ok(KvFormatPolicy::Q8_0),
         "tq4" => Ok(KvFormatPolicy::Tq4),
-        "firstlast2" | "first-last2" | "tq4-firstlast2" => Ok(KvFormatPolicy::FirstLast2),
+        "tq4_all" | "tq4-all" => Ok(KvFormatPolicy::Tq4All),
         other => Err(format!(
-            "unknown --kv-format '{other}' (expected fp16, bf16, q8_0, tq4, or firstlast2)"
+            "unknown --kv-format '{other}' (expected tq4, tq4_all, q8_0, fp16, or bf16)"
         )),
     }
 }
@@ -28,18 +28,18 @@ fn print_usage() {
     eprintln!(
         "Usage: w34 <subcommand> [options]\n\
          Subcommands:\n\
-           generate     --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--max-tokens <n>] [--kv-format fp16|q8_0|tq4|firstlast2]\n\
-           bench        --model <id|path> [--tp 1|2] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format fp16|q8_0|tq4|firstlast2] [--out <json>]\n\
-           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>] [--kv-format fp16|q8_0|tq4|firstlast2] [--verify-lossless] [--verify-radix-warm]\n\
-           dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--compare-tp2] [--golden <safetensors>]\n\
+           generate     --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
+           bench        --model <id|path> [--tp 1|2] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format tq4|tq4_all|q8_0|fp16] [--out <json>]\n\
+           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16] [--verify-lossless] [--verify-radix-warm]\n\
+           dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--compare-tp2] [--golden <safetensors>]\n\
            profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
-           serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format fp16|q8_0|tq4|firstlast2]\n\
-           chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--max-tokens <n>] [--no-thinking]\n\
+           serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
+           chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--no-thinking]\n\
          Speculative options (generate/bench/greedy-diff/dump-diff/profile-diff/serve/chat):\n\
            --speculative mtp|dflash2 [--draft-model <id|path>] [--mtp-k 1..3] [--kv-pages <n>]\n\
            Native MTP shares target weights; DFlash2 requires a draft model.\n\
-           Speculative CLI mode is eager/greedy; the server also honors sampling parameters.\n\
-           Native mode defaults to 256 target KV pages (4096 tokens, including verification reserve)."
+           Speculative CLI mode is greedy (CUDA Graph verify by default; pass --no-cuda-graph for eager); serve also honors sampling parameters.\n\
+           Default --kv-format is tq4 (rotated Q8_0 boundary layers + TQ4 interior). Native mode defaults to 256 target KV pages (4096 tokens)."
     );
 }
 
@@ -61,7 +61,7 @@ fn prepare_multimodal_prompt_and_images(
     let mut prefix = String::new();
     for url in image_urls {
         let (rgb, h, w) =
-            w34_host::vision::parse_image_url_to_rgb(url).map_err(|e| e.to_string())?;
+            w34_host::vision::load_cli_image_to_rgb(url).map_err(|e| e.to_string())?;
         let pre = w34_host::vision::preprocess_rgb_image(
             &rgb,
             h,
@@ -129,7 +129,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     let mut max_tokens = 64usize;
     let mut prompt_len = 128usize;
     let mut gen_len = 128usize;
-    let mut kv_format = "fp16".to_string();
+    let mut kv_format = "tq4".to_string();
     let mut golden_path: Option<String> = None;
     let mut out_json: Option<String> = None;
     let mut max_prompts = 12usize;
@@ -367,16 +367,10 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
         mtp_k,
     });
     // Leave VRAM for the resident drafter instead of filling it with target KV.
-    // The initial native execution path is eager; it never captures tentative addresses.
+    // Speculative taps/logits are configured in enable_speculative before lazy graph capture.
     let load_engine = || -> w34_host::cuda::Result<Qwen3_5Engine> {
         let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
-        let mut engine = Qwen3_5Engine::load(
-            &model,
-            tp,
-            policy,
-            pages,
-            use_cuda_graph && spec_config.is_none(),
-        )?;
+        let mut engine = Qwen3_5Engine::load(&model, tp, policy, pages, use_cuda_graph)?;
         if let Some(config) = &spec_config {
             engine.enable_speculative(config)?;
         }

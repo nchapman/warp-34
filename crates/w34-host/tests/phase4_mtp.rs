@@ -318,6 +318,19 @@ fn explicit_tp_geometry() {
     let mut bad = cfg.clone();
     bad.num_experts = 8;
     assert!(validate_geometry(&bad, 0, 1).is_err());
+    let moe_cfg = ModelConfig::from_json(&serde_json::json!({
+        "hidden_size":2048,"intermediate_size":0,"num_attention_heads":16,
+        "num_key_value_heads":2,"head_dim":256,"vocab_size":248320,
+        "mtp_num_hidden_layers":1,"attn_output_gate":true,
+        "num_experts":256,"num_experts_per_tok":8,"moe_intermediate_size":512,
+        "shared_expert_intermediate_size":512
+    }))
+    .unwrap();
+    validate_geometry(&moe_cfg, 0, 1).unwrap();
+    validate_geometry(&moe_cfg, 1, 2).unwrap();
+    let mut bad_moe = moe_cfg.clone();
+    bad_moe.moe_intermediate_size = 513;
+    assert!(validate_geometry(&bad_moe, 0, 2).is_err());
     bad = cfg.clone();
     bad.intermediate_size += 1;
     assert!(validate_geometry(&bad, 0, 2).is_err());

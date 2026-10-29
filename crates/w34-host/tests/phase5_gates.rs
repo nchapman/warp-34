@@ -1,8 +1,9 @@
 //! Phase 5 Verification Gates:
 //! - Phase 5.1: Paged `TQ4` (`132 B`/row) & `Q8_0` (`272 B`/row) KV cache with Seed-42
-//!   Rademacher + WHT-256 rotation on `TQ4`, `FirstLast2` (`26,016 B/token`, `2.52x`)
-//!   boundary layers, 0-ULP page-table permutation invariance, and long-context
-//!   needle-in-a-haystack retrieval.
+//!   Rademacher + WHT-256 rotation, boundary-anchored `Tq4` (`21,376 B/token`, `3.07x`:
+//!   rotated `Q8_0` on first 2 & last 2 full-attention layers + least-squares `TQ4` interior),
+//!   uniform `Tq4All` (`16,896 B/token`, `3.88x`), 0-ULP page-table permutation invariance,
+//!   and long-context needle-in-a-haystack retrieval.
 //! - Phase 5.2: Multimodal Vision (`smart_resize`, bicubic + normalize, 3D `mRoPE`,
 //!   content-hashed `MambaRadixCache` keys, OpenAI `image_url`, `op_vision.cu` kernels,
 //!   and `Qwen3VisionEncoder` + multimodal generation).
@@ -31,7 +32,7 @@ use w34_kernels::ffi::{self, W34_ATTN_MASK_CAUSAL, W34AttentionBatch};
 static GPU_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
-fn test_phase5_1_firstlast2_and_k8v4_byte_budgets() {
+fn test_phase5_1_tq4_and_q8_0_byte_budgets() {
     // Qwen 27B: 16 full-attention layers, 4 KV heads total, head_dim = 256.
     let num_full = 16usize;
     let kv_heads = 4usize;
@@ -44,20 +45,30 @@ fn test_phase5_1_firstlast2_and_k8v4_byte_budgets() {
     let fp16_bpt = KvFormatPolicy::Fp16.bytes_per_token(num_full, kv_heads, head_dim);
     let q8_bpt = KvFormatPolicy::Q8_0.bytes_per_token(num_full, kv_heads, head_dim);
     let tq4_bpt = KvFormatPolicy::Tq4.bytes_per_token(num_full, kv_heads, head_dim);
-    let fl2_bpt = KvFormatPolicy::FirstLast2.bytes_per_token(num_full, kv_heads, head_dim);
+    let tq4_all_bpt = KvFormatPolicy::Tq4All.bytes_per_token(num_full, kv_heads, head_dim);
 
     assert_eq!(fp16_bpt, 65_536);
     assert_eq!(q8_bpt, 34_816); // 1.88x raw compression (plain 8-bit K & V)
-    assert_eq!(tq4_bpt, 16_896); // 3.88x raw compression
-    assert_eq!(fl2_bpt, 26_016); // 2.52x effective compression (3 FP16 + 13 TQ4)
+    assert_eq!(tq4_bpt, 21_376); // 3.07x effective compression (4 rotated Q8_0 + 12 rotated TQ4)
+    assert_eq!(tq4_all_bpt, 16_896); // 3.88x raw compression (16 rotated TQ4)
+
+    assert_eq!(
+        KvFormatPolicy::Q8_0.resolve_layer(0, num_full),
+        (
+            W34_KV_FORMAT_Q8_0,
+            W34_KV_FORMAT_Q8_0,
+            W34_KV_TRANSFORM_IDENTITY,
+            W34_KV_TRANSFORM_IDENTITY
+        )
+    );
 
     for ord in 0..num_full {
-        let (kf, vf, kt, vt) = KvFormatPolicy::FirstLast2.resolve_layer(ord, num_full);
-        if ord == 0 || ord >= num_full - 2 {
-            assert_eq!(kf, W34_KV_FORMAT_FP16);
-            assert_eq!(vf, W34_KV_FORMAT_FP16);
-            assert_eq!(kt, W34_KV_TRANSFORM_IDENTITY);
-            assert_eq!(vt, W34_KV_TRANSFORM_IDENTITY);
+        let (kf, vf, kt, vt) = KvFormatPolicy::Tq4.resolve_layer(ord, num_full);
+        if ord < 2 || ord >= num_full - 2 {
+            assert_eq!(kf, W34_KV_FORMAT_Q8_0);
+            assert_eq!(vf, W34_KV_FORMAT_Q8_0);
+            assert_eq!(kt, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+            assert_eq!(vt, W34_KV_TRANSFORM_RADEMACHER_WHT256);
         } else {
             assert_eq!(kf, W34_KV_FORMAT_TQ4);
             assert_eq!(vf, W34_KV_FORMAT_TQ4);
@@ -75,17 +86,17 @@ fn test_phase5_1_wht256_outlier_protection_and_long_context_needle() {
     let stream = CudaStream::new(dev.device_id).expect("stream");
     let ex = stream.exec(0, 0);
 
-    // 1. Verify WHT-256 rotation protects channel-outlier KV vectors on Tq4/FirstLast2 and
-    //    preserves 0-ULP page-table permutation invariance across Q8_0, Tq4, and FirstLast2.
+    // 1. Verify WHT-256 rotation protects channel-outlier KV vectors on Tq4/Tq4All and
+    //    preserves 0-ULP page-table permutation invariance across Q8_0, Tq4, and Tq4All.
     for policy in [
         KvFormatPolicy::Q8_0,
         KvFormatPolicy::Tq4,
-        KvFormatPolicy::FirstLast2,
+        KvFormatPolicy::Tq4All,
     ] {
         let layer_ids = [3, 7, 11, 15, 19];
         let pool = KvPool::new(0, 0, &layer_ids, 2, 256, 16, 16, policy).expect("KvPool");
-        // Test interior layer (ordinal 1 -> Q8_0 or rotated TQ4)
-        let layout = pool.layers[1].layout;
+        // Test interior layer (ordinal 2 -> Q8_0 or rotated TQ4)
+        let layout = pool.layers[2].layout;
         if policy == KvFormatPolicy::Q8_0 {
             assert_eq!(layout.k_transform, W34_KV_TRANSFORM_IDENTITY);
             assert_eq!(layout.v_transform, W34_KV_TRANSFORM_IDENTITY);
@@ -217,7 +228,11 @@ fn test_phase5_1_wht256_outlier_protection_and_long_context_needle() {
     let num_pages = ctx_len / 16;
     let needle_pos = 2713usize; // deep inside fragmented page table
 
-    for policy in [KvFormatPolicy::Tq4, KvFormatPolicy::Q8_0] {
+    for policy in [
+        KvFormatPolicy::Tq4All,
+        KvFormatPolicy::Tq4,
+        KvFormatPolicy::Q8_0,
+    ] {
         let pool = KvPool::new(0, 0, &[0], 2, 256, 16, num_pages, policy).expect("4K needle pool");
         let layout = pool.layers[0].layout;
 
@@ -412,9 +427,100 @@ fn phase5_2_vision_smart_resize_mrope_and_multimodal_radix_key() {
     assert!(content_str.starts_with("<|vision_start|><|image_pad|>"));
     assert!(content_str.ends_with("<|vision_end|>What is in this image?"));
 
-    // 6. Security: reject local `file://` URLs and empty base64 payloads.
+    // 6. Security: reject local `file://` URLs, bare paths over HTTP, empty base64, and corrupt PNG/JPEG.
     assert!(w34_host::vision::parse_image_url_to_rgb("file:///etc/passwd").is_err());
+    assert!(w34_host::vision::parse_image_url_to_rgb("/etc/passwd").is_err());
     assert!(w34_host::vision::parse_image_url_to_rgb("data:image/png;base64,").is_err());
+    assert!(
+        w34_host::vision::parse_image_url_to_rgb("data:image/png;base64,bm90LWEtcG5n").is_err()
+    );
+    assert!(
+        w34_host::vision::parse_image_url_to_rgb("data:image/jpeg;base64,bm90LWEtanBlZw==")
+            .is_err()
+    );
+    assert!(w34_host::vision::parse_image_url_to_rgb("data:image/webp;base64,UklGRg==").is_err());
+
+    // 7. PNG (RGBA8 -> RGB8) and JPEG decoding via both `data:image/...;base64,...` and local CLI files.
+    let encode_b64 = |data: &[u8]| -> String {
+        const LUT: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+            let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+            let v = (b0 << 16) | (b1 << 8) | b2;
+            out.push(LUT[((v >> 18) & 63) as usize] as char);
+            out.push(LUT[((v >> 12) & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                LUT[((v >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                LUT[(v & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    };
+
+    let (w, h) = (36u32, 24u32);
+    let mut rgba_img = image::RgbaImage::new(w, h);
+    let mut expected_rgb = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = ((x * 7 + y * 3) & 0xFF) as u8;
+            let g = ((x * 5 + y * 11 + 40) & 0xFF) as u8;
+            let b = ((x * 13 + y * 2 + 90) & 0xFF) as u8;
+            rgba_img.put_pixel(x, y, image::Rgba([r, g, b, 128]));
+            expected_rgb.extend_from_slice(&[r, g, b]);
+        }
+    }
+    let mut png_bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba_img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    let png_uri = format!("data:image/png;base64,{}", encode_b64(&png_bytes));
+    let (dec_png_rgb, dec_png_h, dec_png_w) =
+        w34_host::vision::parse_image_url_to_rgb(&png_uri).unwrap();
+    assert_eq!((dec_png_h, dec_png_w), (h as usize, w as usize));
+    assert_eq!(dec_png_rgb, expected_rgb);
+
+    let solid_rgb = image::RgbImage::from_pixel(32, 48, image::Rgb([200, 100, 50]));
+    let mut jpg_bytes = Vec::new();
+    image::DynamicImage::ImageRgb8(solid_rgb)
+        .write_to(
+            &mut std::io::Cursor::new(&mut jpg_bytes),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+    let jpg_uri = format!("data:image/jpeg;base64,{}", encode_b64(&jpg_bytes));
+    let (dec_jpg_rgb, dec_jpg_h, dec_jpg_w) =
+        w34_host::vision::parse_image_url_to_rgb(&jpg_uri).unwrap();
+    assert_eq!((dec_jpg_h, dec_jpg_w), (48, 32));
+    assert!((dec_jpg_rgb[0] as i32 - 200).abs() <= 4);
+    assert!((dec_jpg_rgb[1] as i32 - 100).abs() <= 4);
+    assert!((dec_jpg_rgb[2] as i32 - 50).abs() <= 4);
+
+    let pid = std::process::id();
+    let tmp_png = std::env::temp_dir().join(format!("w34_vision_test_{pid}.png"));
+    let tmp_bad = std::env::temp_dir().join(format!("w34_vision_test_{pid}.txt"));
+    std::fs::write(&tmp_png, &png_bytes).unwrap();
+    std::fs::write(&tmp_bad, b"not an image").unwrap();
+    let cli_png = w34_host::vision::load_cli_image_to_rgb(tmp_png.to_str().unwrap());
+    let http_png = w34_host::vision::parse_image_url_to_rgb(tmp_png.to_str().unwrap());
+    let cli_bad = w34_host::vision::load_cli_image_to_rgb(tmp_bad.to_str().unwrap());
+    let _ = std::fs::remove_file(&tmp_png);
+    let _ = std::fs::remove_file(&tmp_bad);
+    let (cli_rgb, cli_h, cli_w) = cli_png.unwrap();
+    assert_eq!((cli_h, cli_w), (h as usize, w as usize));
+    assert_eq!(cli_rgb, expected_rgb);
+    assert!(http_png.is_err());
+    assert!(cli_bad.is_err());
 }
 
 #[cfg(feature = "cuda")]
@@ -656,9 +762,8 @@ fn phase5_2_live_qwen3_vision_encoder_and_multimodal_radix_cache() {
         return;
     };
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut eng =
-        Qwen3_5Engine::load_from_dir(&dir, 1, KvFormatPolicy::FirstLast2, Some(128), false)
-            .expect("load Qwen3.5-4B-W4A16-GPTQ for vision test");
+    let mut eng = Qwen3_5Engine::load_from_dir(&dir, 1, KvFormatPolicy::Tq4, Some(128), false)
+        .expect("load Qwen3.5-4B-W4A16-GPTQ for vision test");
 
     // Create two distinct 64x64 RGB images (each produces a 1x4x4 patch grid -> 4 merged visual tokens).
     let mut rgb_a = vec![0u8; 64 * 64 * 3];

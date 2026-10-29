@@ -1,4 +1,5 @@
-//! Native single-layer dense Qwen3.5 MTP, using the target stream and shared vocabulary weights.
+//! Native single-layer dense & MoE Qwen3.5 / Qwen3.6 MTP (`Qwen3_5MTP` + `Qwen3_5MoeMTP`),
+//! using the target stream and shared vocabulary weights.
 //!
 //! Donor: vLLM qwen3_5_mtp.py and llm_base_proposer.py. At MTP position p,
 //! the inputs are target FINAL-normalized hidden[p] and token[p+1], NOT
@@ -10,26 +11,38 @@
 //!
 //! This is a single-sequence eager component. All rows use FP16; FC is
 //! replicated (algebraically the donor's column-shard + gather), attention
-//! and dense MLP are TP-sharded. Vocabulary storage is borrowed, never copied.
+//! and dense/MoE FFN are TP-sharded. Vocabulary storage is borrowed, never copied.
 //! TP2 callers must run both ranks concurrently with the same collective order.
 #![allow(clippy::too_many_arguments, clippy::undocumented_unsafe_blocks)]
 use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
-use crate::loader::{ModelConfig, SafetensorsArchive};
+use crate::loader::{ModelConfig, QuantScheme, SafetensorsArchive};
 use crate::model::{
-    FullAttentionLayerWeights, LinearProj, Qwen3_5ModelRank, RawLinearHost, loader_err,
+    FfnBlockWeights, FullAttentionLayerWeights, LinearProj, Qwen3_5ModelRank, RawLinearHost,
+    load_moe_layer_weights, loader_err,
 };
 use core::ffi::c_void;
 use std::path::Path;
 use w34_kernels::ffi::{
-    self, W34_ATTN_MASK_CAUSAL, W34_KV_NAMESPACE_MTP_FULL_ATTN, W34AttentionBatch,
+    self, W34_ATTN_MASK_CAUSAL, W34_KV_NAMESPACE_MTP_FULL_ATTN, W34AttentionBatch, W34Exec,
 };
 
-/// Validate before slicing weights: no replicated-KV or MoE fallback is implicit.
+/// Validate before slicing weights: both dense (`Qwen3_5MTP`) and MoE (`Qwen3_5MoeMTP`) geometries are checked explicitly.
 pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> {
+    let ffn_ok = if c.num_experts == 0 {
+        c.intermediate_size > 0 && c.intermediate_size.is_multiple_of(tp)
+    } else {
+        c.num_experts <= 512
+            && c.num_experts_per_tok > 0
+            && c.num_experts_per_tok <= 16
+            && c.num_experts_per_tok <= c.num_experts
+            && c.moe_intermediate_size > 0
+            && c.moe_intermediate_size.is_multiple_of(tp)
+            && c.shared_expert_intermediate_size.is_multiple_of(tp)
+    };
     if !matches!(tp, 1 | 2)
         || rank >= tp
-        || c.num_experts != 0
+        || !ffn_ok
         || c.mtp_num_hidden_layers != 1
         || !c.attn_output_gate
         || c.hidden_size == 0
@@ -39,15 +52,13 @@ pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> 
         || c.vocab_size == 0
         || c.num_key_value_heads == 0
         || c.num_attention_heads == 0
-        || c.intermediate_size == 0
         || !c.hidden_size.is_multiple_of(tp)
         || !c.num_attention_heads.is_multiple_of(tp)
         || !c.num_key_value_heads.is_multiple_of(tp)
-        || !c.intermediate_size.is_multiple_of(tp)
         || !c.vocab_size.is_multiple_of(tp)
         || !c.num_attention_heads.is_multiple_of(c.num_key_value_heads)
     {
-        return Err(loader_err("unsupported MTP dense TP geometry"));
+        return Err(loader_err("unsupported MTP TP geometry"));
     }
     Ok(())
 }
@@ -68,8 +79,7 @@ pub struct Qwen3_5MtpRank {
     committed: usize,
     fc: LinearProj,
     fa: FullAttentionLayerWeights,
-    gate_up: LinearProj,
-    down: LinearProj,
+    ffn: FfnBlockWeights,
     norms: [u64; 5],
     /// Last MTP final-normalized hidden row, also the recurrent proposal input.
     pub hidden: DeviceBuffer,
@@ -87,25 +97,64 @@ impl Qwen3_5MtpRank {
         }
         target.device.make_current()?;
         let archive = SafetensorsArchive::open(dir).map_err(|_| loader_err("open MTP archive"))?;
+        let r = target.rank;
+        let tp = target.tp_size;
         let h = c.hidden_size;
         let q = c.num_attention_heads * c.head_dim;
         let kv = c.num_key_value_heads * c.head_dim;
         let i = c.intermediate_size;
+        let is_moe_mtp = c.num_experts > 0
+            && (archive
+                .resolve_name("mtp.layers.0.mlp.gate.weight")
+                .is_some()
+                || archive
+                    .resolve_name("mtp.layers.0.mlp.gate.qweight")
+                    .is_some()
+                || archive
+                    .resolve_name("mtp.layers.0.mlp.gate.weight_packed")
+                    .is_some());
+        let ffn_weight_bytes = if is_moe_mtp {
+            let local_moe_i = c.moe_intermediate_size / tp;
+            let local_sh_i = c.shared_expert_intermediate_size / tp;
+            let experts_are_w4 = archive
+                .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.qweight")
+                .is_some()
+                || archive
+                    .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_packed")
+                    .is_some();
+            let expert_elem_bytes = if experts_are_w4 { 1usize } else { 2usize };
+            c.num_experts * 3 * h * local_moe_i * expert_elem_bytes
+                + 2 * (c.num_experts * h + 3 * h * local_sh_i + h)
+                + 16 * 1024 * 1024
+        } else {
+            2 * 3 * h * (i / tp)
+        };
         let bytes = 2
-            * (2 * h * h + (2 * q + 2 * kv) * h + h * q + 3 * h * i + 5 * h + 2 * c.head_dim)
+            * (2 * h * h + (2 * q + 2 * kv) * h / tp + h * q / tp + 5 * h + 2 * c.head_dim)
+            + ffn_weight_bytes
             + capacity.div_ceil(16) * 4
-            + 65536;
+            + 8 * 1024 * 1024;
         let mut weights = DeviceArena::new(target.device.device_id, bytes)?;
-        let staging = DeviceBuffer::alloc(target.device.device_id, 256)?;
+        let staging = DeviceBuffer::alloc(target.device.device_id, 64 * 1024 * 1024)?;
+        let default_group_size = match &c.quant {
+            QuantScheme::CompressedTensors { group_size, .. }
+            | QuantScheme::Gptq { group_size, .. }
+            | QuantScheme::Awq { group_size, .. }
+            | QuantScheme::AutoRound { group_size, .. } => *group_size,
+            QuantScheme::Unquantized => 32,
+        };
         let load = |name: &str, n: usize, k: usize| -> Result<RawLinearHost> {
-            let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), 32)?;
+            let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), default_group_size)?;
             match &raw {
-                RawLinearHost::DenseF16 { n: rn, k: rk, .. } if *rn == n && *rk == k => Ok(raw),
-                _ => Err(loader_err("MTP requires correctly shaped dense weights")),
+                RawLinearHost::DenseF16 { n: rn, k: rk, .. }
+                | RawLinearHost::U4B8NMajor { n: rn, k: rk, .. }
+                    if *rn == n && *rk == k =>
+                {
+                    Ok(raw)
+                }
+                _ => Err(loader_err("MTP requires correctly shaped weights")),
             }
         };
-        let r = target.rank;
-        let tp = target.tp_size;
         let fc = load("fc", h, 2 * h)?.upload(&mut weights, &target.stream, &staging)?;
         let qs = load("layers.0.self_attn.q_proj", 2 * q, h)?
             .slice_rows(r * 2 * q / tp, (r + 1) * 2 * q / tp);
@@ -121,16 +170,41 @@ impl Qwen3_5MtpRank {
         let o_proj = load("layers.0.self_attn.o_proj", h, q)?
             .slice_cols(r * q / tp, (r + 1) * q / tp)
             .upload(&mut weights, &target.stream, &staging)?;
-        let gs = load("layers.0.mlp.gate_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
-        let us = load("layers.0.mlp.up_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
-        let gate_up =
-            RawLinearHost::concat_rows(&[gs, us]).upload(&mut weights, &target.stream, &staging)?;
-        let down = load("layers.0.mlp.down_proj", h, i)?
-            .slice_cols(r * i / tp, (r + 1) * i / tp)
-            .upload(&mut weights, &target.stream, &staging)?;
+        let ffn = if is_moe_mtp {
+            FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
+                &archive,
+                c,
+                "mtp.layers.0",
+                r,
+                tp,
+                default_group_size,
+                &mut weights,
+                &target.stream,
+                &staging,
+            )?))
+        } else {
+            let gs = load("layers.0.mlp.gate_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
+            let us = load("layers.0.mlp.up_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
+            let gate_up_proj = RawLinearHost::concat_rows(&[gs, us]).upload(
+                &mut weights,
+                &target.stream,
+                &staging,
+            )?;
+            let down_proj = load("layers.0.mlp.down_proj", h, i)?
+                .slice_cols(r * i / tp, (r + 1) * i / tp)
+                .upload(&mut weights, &target.stream, &staging)?;
+            FfnBlockWeights::Dense {
+                gate_up_proj,
+                down_proj,
+            }
+        };
+        drop(staging);
         let mut norm = |name: &str, size: usize| -> Result<u64> {
+            let key = archive
+                .resolve_name(&format!("mtp.{name}.weight"))
+                .ok_or_else(|| loader_err("missing MTP norm"))?;
             let v = archive
-                .read_f16_bits(&format!("mtp.{name}.weight"))
+                .read_f16_bits(&key)
                 .map_err(|_| loader_err("read MTP norm"))?;
             if v.len() != size {
                 return Err(loader_err("MTP norm shape"));
@@ -170,15 +244,26 @@ impl Qwen3_5MtpRank {
         let max_batch_rows = capacity.min(256);
         // All FP16 intermediates (including split QKV and full vocabulary logits),
         // plus alignment and per-request/token metadata.
+        let ffn_row_elements = match &ffn {
+            FfnBlockWeights::Dense { .. } => 3 * (i / tp),
+            FfnBlockWeights::Moe(moe) => {
+                moe.num_experts
+                    + 4 * moe.top_k
+                    + moe.top_k * moe.local_moe_interm
+                    + 3 * moe.local_shared_interm
+                    + h
+                    + 64
+            }
+        };
         let row_elements = 9 * h
             + 8 * q / tp
             + 6 * c.num_key_value_heads * c.head_dim / tp
-            + 3 * i / tp
+            + ffn_row_elements
             + target.local_vocab_size;
         let scratch_bytes = max_batch_rows
             .checked_mul(row_elements)
             .and_then(|n| n.checked_mul(2))
-            .and_then(|n| n.checked_add(65536 + capacity.div_ceil(16) * 4))
+            .and_then(|n| n.checked_add(131072 + capacity.div_ceil(16) * 4))
             .ok_or_else(|| loader_err("MTP scratch size overflow"))?;
         target.stream.synchronize()?;
         Ok(Self {
@@ -194,8 +279,7 @@ impl Qwen3_5MtpRank {
             committed: 0,
             fc,
             fa,
-            gate_up,
-            down,
+            ffn,
             norms,
             hidden: DeviceBuffer::alloc(target.device.device_id, h * 2)?,
             batch_hidden: DeviceBuffer::alloc(target.device.device_id, max_batch_rows * h * 2)?,
@@ -287,10 +371,12 @@ impl Qwen3_5MtpRank {
         }
         Ok(out)
     }
-    // Shared LinearProj deliberately row-splits small dense batches. MTP must
-    // preserve the donor's GEMM M dimension, including prefill M=5.
+    // Shared LinearProj dispatches small-N dense projections via w34_small_n_gemm_f16.
+    // MTP keeps cuBLAS GEMM for DenseF16 (matching vLLM donor M=5 prefill) while
+    // dispatching MarlinW4A16 projections for quantized MTP checkpoints.
     fn project(
         proj: &LinearProj,
+        ex: &W34Exec,
         t: &Qwen3_5ModelRank,
         input: u64,
         output: u64,
@@ -309,9 +395,15 @@ impl Qwen3_5MtpRank {
                 size_n as i32,
                 size_k as i32,
             ),
-            _ => Err(loader_err(
-                "MTP requires dense shared head and predictor projections",
-            )),
+            LinearProj::MarlinW4A16 { .. } => proj.forward(
+                ex,
+                &t.cublas,
+                t.marlin_ws.addr(),
+                t.marlin_ws.len_bytes / 4,
+                input,
+                output,
+                rows,
+            ),
         }
     }
     fn forward(
@@ -386,11 +478,71 @@ impl Qwen3_5MtpRank {
             .scratch
             .alloc_aligned(num_tokens * (local_q_heads * head_dim) * 2)?;
         let block_out_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
-        let gate_up_buf = self
-            .scratch
-            .alloc_aligned(num_tokens * (2 * local_interm) * 2)?;
-        let act_buf = self.scratch.alloc_aligned(num_tokens * local_interm * 2)?;
         let mlp_out_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
+        let (
+            gate_up_buf,
+            act_buf,
+            moe_router_logits_buf,
+            moe_topk_weights_buf,
+            moe_topk_ids_buf,
+            moe_interm_buf,
+            moe_sh_gu_buf,
+            moe_sh_act_buf,
+            moe_sh_out_buf,
+            moe_sh_gate_buf,
+        ) = match &self.ffn {
+            FfnBlockWeights::Dense { .. } => (
+                self.scratch
+                    .alloc_aligned(num_tokens * (2 * local_interm) * 2)?,
+                self.scratch.alloc_aligned(num_tokens * local_interm * 2)?,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ),
+            FfnBlockWeights::Moe(moe) => {
+                let sh_gu = if moe.local_shared_interm > 0 {
+                    self.scratch
+                        .alloc_aligned(num_tokens * 2 * moe.local_shared_interm * 2)?
+                } else {
+                    0
+                };
+                let sh_act = if moe.local_shared_interm > 0 {
+                    self.scratch
+                        .alloc_aligned(num_tokens * moe.local_shared_interm * 2)?
+                } else {
+                    0
+                };
+                let sh_out = if moe.local_shared_interm > 0 {
+                    self.scratch.alloc_aligned(num_tokens * h_dim * 2)?
+                } else {
+                    0
+                };
+                let sh_gate = if moe.shared_expert_gate.is_some() {
+                    self.scratch.alloc_aligned(num_tokens * 2)?
+                } else {
+                    0
+                };
+                (
+                    0,
+                    0,
+                    self.scratch
+                        .alloc_aligned(num_tokens * moe.num_experts * 2)?,
+                    self.scratch.alloc_aligned(num_tokens * moe.top_k * 4)?,
+                    self.scratch.alloc_aligned(num_tokens * moe.top_k * 4)?,
+                    self.scratch
+                        .alloc_aligned(num_tokens * moe.top_k * moe.local_moe_interm * 2)?,
+                    sh_gu,
+                    sh_act,
+                    sh_out,
+                    sh_gate,
+                )
+            }
+        };
         let mut meta = Vec::with_capacity(3 * num_tokens + 3);
         meta.extend_from_slice(tokens);
         meta.extend((self.len..self.len + num_tokens).map(|p| p as i32));
@@ -495,7 +647,7 @@ impl Qwen3_5MtpRank {
                 "MTP concat",
             )?;
         }
-        Self::project(&self.fc, t, concat, residual_buf, num_tokens)?;
+        Self::project(&self.fc, &ex, t, concat, residual_buf, num_tokens)?;
         check_rc(
             unsafe {
                 ffi::w34_gemma_rms_norm_f16(
@@ -512,7 +664,7 @@ impl Qwen3_5MtpRank {
             "MTP input norm",
         )?;
         let fa = &self.fa;
-        Self::project(&fa.qkv_proj, t, normed_buf, qkv_proj_buf, num_tokens)?;
+        Self::project(&fa.qkv_proj, &ex, t, normed_buf, qkv_proj_buf, num_tokens)?;
         let qkv_row_stride = (q_gate_dim + 2 * kv_dim) as i32;
         let q_gate_ptr = qkv_proj_buf;
         let k_raw_ptr = qkv_proj_buf + (q_gate_dim * 2) as u64;
@@ -589,7 +741,14 @@ impl Qwen3_5MtpRank {
             },
             "w34_apply_attn_output_gate_f16",
         )?;
-        Self::project(&fa.o_proj, t, gated_attn_buf, block_out_buf, num_tokens)?;
+        Self::project(
+            &fa.o_proj,
+            &ex,
+            t,
+            gated_attn_buf,
+            block_out_buf,
+            num_tokens,
+        )?;
         let post_ln_ptr = self.norms[3];
         if let Some(comm) = tp2 {
             comm.all_reduce_residual_gemma_rms_norm_f16(
@@ -627,21 +786,51 @@ impl Qwen3_5MtpRank {
             )?;
         }
 
-        Self::project(&self.gate_up, t, normed_buf, gate_up_buf, num_tokens)?;
-        check_rc(
-            unsafe {
-                ffi::w34_silu_and_mul_f16(
+        match &self.ffn {
+            FfnBlockWeights::Dense {
+                gate_up_proj,
+                down_proj,
+            } => {
+                Self::project(gate_up_proj, &ex, t, normed_buf, gate_up_buf, num_tokens)?;
+                check_rc(
+                    unsafe {
+                        ffi::w34_silu_and_mul_f16(
+                            &ex,
+                            gate_up_buf as *const c_void,
+                            act_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            local_interm as i32,
+                        )
+                    },
+                    "w34_silu_and_mul_f16",
+                )?;
+                Self::project(down_proj, &ex, t, act_buf, mlp_out_buf, num_tokens)?;
+            }
+            FfnBlockWeights::Moe(_) => {
+                self.ffn.forward(
                     &ex,
-                    gate_up_buf as *const c_void,
-                    act_buf as *mut c_void,
-                    core::ptr::null(),
-                    num_tokens as i32,
-                    local_interm as i32,
-                )
-            },
-            "w34_silu_and_mul_f16",
-        )?;
-        Self::project(&self.down, t, act_buf, mlp_out_buf, num_tokens)?;
+                    &t.cublas,
+                    t.marlin_ws.addr(),
+                    t.marlin_ws.len_bytes / 4,
+                    normed_buf,
+                    mlp_out_buf,
+                    num_tokens,
+                    h_dim,
+                    local_interm,
+                    gate_up_buf,
+                    act_buf,
+                    moe_router_logits_buf,
+                    moe_topk_weights_buf,
+                    moe_topk_ids_buf,
+                    moe_interm_buf,
+                    moe_sh_gu_buf,
+                    moe_sh_act_buf,
+                    moe_sh_out_buf,
+                    moe_sh_gate_buf,
+                )?;
+            }
+        }
         if let Some(comm) = tp2 {
             comm.all_reduce_residual_gemma_rms_norm_f16(
                 &ex,
@@ -690,7 +879,7 @@ impl Qwen3_5MtpRank {
         )?;
         let sampled_id = if sample_last {
             let logits_buf = self.scratch.alloc_aligned(t.local_vocab_size * 2)?;
-            Self::project(&t.lm_head, t, last_hidden_ptr, logits_buf, 1)?;
+            Self::project(&t.lm_head, &ex, t, last_hidden_ptr, logits_buf, 1)?;
             let out_id = self.scratch.alloc_aligned(4)?;
             let local_id = self.scratch.alloc_aligned(4)?;
             let local_val = self.scratch.alloc_aligned(4)?;

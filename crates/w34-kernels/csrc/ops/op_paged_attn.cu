@@ -204,7 +204,8 @@ __device__ void write_kv_row(
             }
             wht256_warp(v, lane);
 
-            float c_sq_sum = 0.0f;
+            float vc_dot0 = 0.0f, c_sq0 = 0.0f;
+            float vc_dot1 = 0.0f, c_sq1 = 0.0f;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const float rv = v[j];
@@ -221,15 +222,21 @@ __device__ void write_kv_row(
                         (uint8_t)(nib | (partner << 4));
                 }
                 const float c = kTq4D256Centroids[q];
-                c_sq_sum += warp_reduce_sum(c * c);
+                const float vc = warp_reduce_sum(rv * c);
+                const float cc = warp_reduce_sum(c * c);
+                if (j < 4) {
+                    vc_dot0 += vc;
+                    c_sq0 += cc;
+                } else {
+                    vc_dot1 += vc;
+                    c_sq1 += cc;
+                }
             }
             if (lane == 0) {
-                const float recon = __fsqrt_rn(c_sq_sum);
-                const float corrected =
-                    (recon > 1e-10f) ? __fdiv_rn(grp_norm, recon) : grp_norm;
-                const __half h = __float2half(corrected);
-                row2[0].d = h;
-                row2[1].d = h;
+                const float d0 = (c_sq0 > 1e-10f) ? (grp_norm * (vc_dot0 / c_sq0)) : 0.0f;
+                const float d1 = (c_sq1 > 1e-10f) ? (grp_norm * (vc_dot1 / c_sq1)) : 0.0f;
+                row2[0].d = __float2half(d0);
+                row2[1].d = __float2half(d1);
             }
         }
         return;

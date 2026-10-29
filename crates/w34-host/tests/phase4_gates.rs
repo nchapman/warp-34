@@ -448,3 +448,70 @@ fn sglang_dflash2_fixtures_operator_dump_diff_parity() {
         check_bf16(&format!("{name}.unsplit_out"), &out);
     }
 }
+
+#[test]
+fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
+    use w34_host::parser::SamplingParams;
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let spec = SpeculativeConfig {
+        kind: SpeculativeKind::Mtp,
+        draft_model: None,
+        mtp_k: 3,
+    };
+    let mut eager = Qwen3_5Engine::load(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        1,
+        KvFormatPolicy::Tq4,
+        Some(16),
+        false,
+    )
+    .unwrap();
+    eager.enable_speculative(&spec).unwrap();
+    let prompt = eager
+        .encode("Explain the difference between a mutex and a semaphore in two sentences.")
+        .unwrap();
+    let eager_greedy = eager
+        .generate_with_radix_cache(&prompt, 16, 64, false)
+        .unwrap()
+        .generated_token_ids;
+    let params = SamplingParams {
+        temperature: 0.8,
+        top_k: 20,
+        top_p: 0.9,
+        seed: 72,
+        max_tokens: 16,
+        ..SamplingParams::default()
+    };
+    let eager_sampled = eager
+        .generate_sampled_with_radix_cache(&prompt, params.clone(), None, 64)
+        .unwrap()
+        .generated_token_ids;
+    drop(eager);
+
+    let mut graphed = Qwen3_5Engine::load(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        1,
+        KvFormatPolicy::Tq4,
+        Some(16),
+        true,
+    )
+    .unwrap();
+    graphed.enable_speculative(&spec).unwrap();
+    assert!(graphed.use_cuda_graph);
+    assert!(graphed.ranks[0].spec_verify_graph.is_none());
+    let graphed_greedy = graphed
+        .generate_with_radix_cache(&prompt, 16, 64, false)
+        .unwrap()
+        .generated_token_ids;
+    assert_eq!(
+        graphed.ranks[0].spec_verify_graph.as_ref().map(|(m, _)| *m),
+        Some(4)
+    );
+    assert_eq!(graphed_greedy, eager_greedy);
+
+    let graphed_sampled = graphed
+        .generate_sampled_with_radix_cache(&prompt, params, None, 64)
+        .unwrap()
+        .generated_token_ids;
+    assert_eq!(graphed_sampled, eager_sampled);
+}
