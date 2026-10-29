@@ -158,8 +158,16 @@ fn run_4b(strict_parity: bool) {
         proposal,
         draft.select_greedy(target, anchor, &replay).unwrap()
     );
+    assert_eq!(
+        proposal,
+        draft.forward_select_greedy(target, anchor).unwrap()
+    );
     draft.truncate(0).unwrap();
     draft.ingest(target, taps, tokens.len()).unwrap();
+    assert_eq!(
+        proposal,
+        draft.forward_select_greedy(target, anchor).unwrap()
+    );
     let replay = draft.forward(target, anchor, None).unwrap();
     assert_eq!(
         proposal,
@@ -242,7 +250,268 @@ fn real_shape_qk_rope_matches_actual_sglang() {
         let rel = (error / energy).sqrt();
         eprintln!("{prefix} relL2={rel}");
         assert!(rel < 0.0001, "{prefix} real-shape RoPE relL2={rel}");
+
+        // Also verify the fused QK-norm/RoPE + contiguous Q-out + BF16 paged KV write kernel
+        // (`w34_dflash_qk_norm_rope_kv_write_bf16_f32_table`) against `w34_kv_cache_write_strided_bf16`,
+        // including reversed page-table mapping and negative (`slot < 0`) skip.
+        let kv_pool = w34_host::cache::KvPool::new(
+            0,
+            w34_kernels::ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
+            &[0],
+            4,
+            256,
+            16,
+            3,
+            w34_host::cache::KvFormatPolicy::Bf16,
+        )
+        .unwrap();
+        let ref_pool = w34_host::cache::KvPool::new(
+            0,
+            w34_kernels::ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
+            &[0],
+            4,
+            256,
+            16,
+            3,
+            w34_host::cache::KvFormatPolicy::Bf16,
+        )
+        .unwrap();
+        let sentinel = vec![0x7E7Eu16; 3 * 4 * 16 * 256];
+        kv_pool.layers[0]
+            .k_buf
+            .copy_from_host(&sentinel, &stream)
+            .unwrap();
+        kv_pool.layers[0]
+            .v_buf
+            .copy_from_host(&sentinel, &stream)
+            .unwrap();
+        ref_pool.layers[0]
+            .k_buf
+            .copy_from_host(&sentinel, &stream)
+            .unwrap();
+        ref_pool.layers[0]
+            .v_buf
+            .copy_from_host(&sentinel, &stream)
+            .unwrap();
+
+        let mut slot_map: Vec<i32> = (0..16).map(|r| 31 - r).collect();
+        slot_map[5] = -1;
+        let slots_dev = DeviceBuffer::alloc(0, slot_map.len() * 4).unwrap();
+        slots_dev.copy_from_host(&slot_map, &stream).unwrap();
+        let q_loc_dev = DeviceBuffer::alloc(0, 2 * 4).unwrap();
+        q_loc_dev.copy_from_host(&[0i32, 16i32], &stream).unwrap();
+
+        let qkv_fused = upload("input");
+        let q_out_fused = DeviceBuffer::alloc(0, 16 * 16 * 256 * 2).unwrap();
+        let q_out_ref = DeviceBuffer::alloc(0, 16 * 16 * 256 * 2).unwrap();
+        let qkv_for_ref = upload("input");
+        // SAFETY: device buffers match the operator geometry and outlive the stream readback.
+        let rc = unsafe {
+            w34_kernels::ffi::w34_dflash_qk_norm_rope_bf16_f32_table_qout(
+                &stream.exec(0, 0),
+                qkv_for_ref.addr() as *mut c_void,
+                q_out_ref.addr() as *mut c_void,
+                pos.addr() as *const i32,
+                qw.addr() as *const c_void,
+                kw.addr() as *const c_void,
+                table.addr() as *const c_void,
+                16,
+                16,
+                4,
+                256,
+                (table_values.len() / 256) as i32,
+                1e-6,
+            )
+        };
+        assert_eq!(rc, 0);
+        let write_batch = w34_kernels::ffi::W34AttentionBatch {
+            query_start_loc: q_loc_dev.addr() as *const i32,
+            context_lens_before: q_loc_dev.addr() as *const i32,
+            seq_lens_after: (q_loc_dev.addr() + 4) as *const i32,
+            block_tables: q_loc_dev.addr() as *const i32,
+            write_slot_mapping: slots_dev.addr() as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: 16,
+            max_blocks_per_req: 1,
+            max_q_len: 16,
+            max_seq_len: 16,
+            sliding_window: 0,
+            mask_mode: w34_kernels::ffi::W34_ATTN_MASK_NONCAUSAL_WINDOW,
+            sm_scale: 1.0,
+            reserved: 0,
+        };
+        // SAFETY: ref_pool and qkv_for_ref are sized for 16 rows and 3 pages of 16 slots.
+        let rc = unsafe {
+            w34_kernels::ffi::w34_kv_cache_write_strided_bf16(
+                &stream.exec(0, 0),
+                &ref_pool.layers[0].layout,
+                &write_batch,
+                (qkv_for_ref.addr() + (16 * 256 * 2) as u64) as *const c_void,
+                (qkv_for_ref.addr() + ((16 + 4) * 256 * 2) as u64) as *const c_void,
+                (16 + 8) * 256,
+            )
+        };
+        assert_eq!(rc, 0);
+        // SAFETY: kv_pool, qkv_fused, and q_out_fused match the 16-row operator geometry.
+        let rc = unsafe {
+            w34_kernels::ffi::w34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
+                &stream.exec(0, 0),
+                qkv_fused.addr() as *mut c_void,
+                q_out_fused.addr() as *mut c_void,
+                pos.addr() as *const i32,
+                qw.addr() as *const c_void,
+                kw.addr() as *const c_void,
+                table.addr() as *const c_void,
+                &kv_pool.layers[0].layout,
+                slots_dev.addr() as *const i32,
+                16,
+                16,
+                4,
+                256,
+                (table_values.len() / 256) as i32,
+                1e-6,
+            )
+        };
+        assert_eq!(rc, 0);
+
+        let mut q_actual = vec![0u16; 16 * 16 * 256];
+        let mut q_expected = vec![0u16; 16 * 16 * 256];
+        q_out_fused.copy_to_host(&mut q_actual, &stream).unwrap();
+        q_out_ref.copy_to_host(&mut q_expected, &stream).unwrap();
+        assert_eq!(q_actual, q_expected, "{prefix} fused q_out mismatch");
+
+        let mut k_actual = vec![0u16; sentinel.len()];
+        let mut k_expected = vec![0u16; sentinel.len()];
+        let mut v_actual = vec![0u16; sentinel.len()];
+        let mut v_expected = vec![0u16; sentinel.len()];
+        kv_pool.layers[0]
+            .k_buf
+            .copy_to_host(&mut k_actual, &stream)
+            .unwrap();
+        ref_pool.layers[0]
+            .k_buf
+            .copy_to_host(&mut k_expected, &stream)
+            .unwrap();
+        kv_pool.layers[0]
+            .v_buf
+            .copy_to_host(&mut v_actual, &stream)
+            .unwrap();
+        ref_pool.layers[0]
+            .v_buf
+            .copy_to_host(&mut v_expected, &stream)
+            .unwrap();
+        assert_eq!(k_actual, k_expected, "{prefix} fused K page write mismatch");
+        assert_eq!(v_actual, v_expected, "{prefix} fused V page write mismatch");
     }
+}
+
+#[test]
+fn dflash_select_greedy_device_matches_ties_and_rejects_bad_anchor() {
+    use core::ffi::c_void;
+    use w34_host::cuda::{CudaDevice, CudaStream, DeviceBuffer};
+    let _device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let rows = 3i32;
+    let hidden = 32i32;
+    let top_k = 4i32;
+    let vocab = 16i32;
+    let f32_to_bf16 = |x: f32| -> u16 { (x.to_bits() >> 16) as u16 };
+
+    // Construct hidden_bf16 [3, 32], weight_bf16 [16, 32] (all ones so dot products equal
+    // the sum of hidden_bf16), and topk_ids [3, 4] with a deliberate score tie on row 1
+    // (candidates 1 and 2 have identical topk_scores so the strict `>` tie-break must pick col 1).
+    let hidden_host = vec![f32_to_bf16(0.25); (rows * hidden) as usize];
+    let weight_host = vec![f32_to_bf16(1.0); (vocab * hidden) as usize];
+    let topk_ids_host: Vec<i32> = vec![
+        3, 5, 7, 9, // row 0
+        2, 4, 6, 8, // row 1 (col 1 and col 2 tie below)
+        1, 10, 11, 12, // row 2
+    ];
+    let topk_scores_host: Vec<f32> = vec![
+        1.0, 2.0, 0.5, 0.1, // row 0
+        0.5, 4.0, 4.0,
+        1.0, // row 1: col 1 (token 4) and col 2 (token 6) tie at 4.0 -> must pick col 1 (token 4)
+        0.2, 0.9, 3.5,
+        3.5, // row 2: col 2 (token 11) and col 3 (token 12) tie at 3.5 -> must pick col 2 (token 11)
+    ];
+
+    let d_hidden = DeviceBuffer::alloc(0, hidden_host.len() * 2).unwrap();
+    let d_weight = DeviceBuffer::alloc(0, weight_host.len() * 2).unwrap();
+    let d_ids = DeviceBuffer::alloc(0, topk_ids_host.len() * 4).unwrap();
+    let d_scores = DeviceBuffer::alloc(0, topk_scores_host.len() * 4).unwrap();
+    let d_path = DeviceBuffer::alloc(0, (rows - 1) as usize * 4).unwrap();
+    d_hidden.copy_from_host(&hidden_host, &stream).unwrap();
+    d_weight.copy_from_host(&weight_host, &stream).unwrap();
+    d_ids.copy_from_host(&topk_ids_host, &stream).unwrap();
+    d_scores.copy_from_host(&topk_scores_host, &stream).unwrap();
+
+    // SAFETY: all device buffers match the 3x4x32 test geometry and remain live until readback.
+    let rc = unsafe {
+        w34_kernels::ffi::w34_dflash_select_greedy_bf16(
+            &stream.exec(0, 0),
+            d_ids.addr() as *const i32,
+            d_scores.addr() as *const f32,
+            d_hidden.addr() as *const c_void,
+            d_weight.addr() as *const c_void,
+            d_weight.addr() as *const c_void,
+            d_path.addr() as *mut i32,
+            2,
+            rows,
+            top_k,
+            hidden,
+            vocab,
+        )
+    };
+    assert_eq!(rc, 0);
+    let mut path = vec![0i32; (rows - 1) as usize];
+    d_path.copy_to_host(&mut path, &stream).unwrap();
+    assert_eq!(path, vec![5, 4]);
+
+    // Out-of-vocab anchor is rejected immediately on the host boundary, and out-of-vocab
+    // candidate IDs in `topk_ids` produce the `-1` sentinel in `out_path[0]`.
+    // SAFETY: all device buffers remain live and out_path has capacity for at least 1 i32.
+    let rc_bad_anchor = unsafe {
+        w34_kernels::ffi::w34_dflash_select_greedy_bf16(
+            &stream.exec(0, 0),
+            d_ids.addr() as *const i32,
+            d_scores.addr() as *const f32,
+            d_hidden.addr() as *const c_void,
+            d_weight.addr() as *const c_void,
+            d_weight.addr() as *const c_void,
+            d_path.addr() as *mut i32,
+            vocab,
+            rows,
+            top_k,
+            hidden,
+            vocab,
+        )
+    };
+    assert_ne!(rc_bad_anchor, 0);
+
+    let bad_ids_host: Vec<i32> = vec![-1; (rows * top_k) as usize];
+    d_ids.copy_from_host(&bad_ids_host, &stream).unwrap();
+    // SAFETY: all device buffers remain live and out_path has capacity for at least 1 i32.
+    let rc_bad_ids = unsafe {
+        w34_kernels::ffi::w34_dflash_select_greedy_bf16(
+            &stream.exec(0, 0),
+            d_ids.addr() as *const i32,
+            d_scores.addr() as *const f32,
+            d_hidden.addr() as *const c_void,
+            d_weight.addr() as *const c_void,
+            d_weight.addr() as *const c_void,
+            d_path.addr() as *mut i32,
+            2,
+            rows,
+            top_k,
+            hidden,
+            vocab,
+        )
+    };
+    assert_eq!(rc_bad_ids, 0);
+    d_path.copy_to_host(&mut path, &stream).unwrap();
+    assert_eq!(path[0], -1);
 }
 
 #[test]

@@ -172,6 +172,8 @@ __global__ void grouped_conv_bf16(
 // 1-warp (32-thread) QK RMSNorm + RoPE for dim <= 256.
 // When q_out != nullptr and head < q_heads, writes rotated Q directly to contiguous
 // q_out [rows, q_heads * dim]; otherwise writes in-place into qkv.
+// When write_slot_mapping != nullptr and head >= q_heads, writes rotated K and
+// copies V directly into the BF16 paged KV cache described by kv_layout.
 template <typename TableT>
 __global__ void qk_norm_rope_bf16_warp(
     __nv_bfloat16* __restrict__ qkv,
@@ -184,7 +186,9 @@ __global__ void qk_norm_rope_bf16_warp(
     int kv_heads,
     int dim,
     int table_rows,
-    float eps) {
+    float eps,
+    w34_kv_layer_layout kv_layout,
+    const int32_t* __restrict__ write_slot_mapping) {
     const int row = blockIdx.x;
     const int head = blockIdx.y;
     const int half = dim >> 1;
@@ -218,6 +222,25 @@ __global__ void qk_norm_rope_bf16_warp(
     __nv_bfloat16* dst = (q_out != nullptr && head < q_heads)
         ? (q_out + ((int64_t)row * q_heads + head) * dim)
         : (qkv + offset);
+    __nv_bfloat16* v_dst = nullptr;
+    const __nv_bfloat16* v_src = nullptr;
+    if (write_slot_mapping != nullptr && head >= q_heads) {
+        const int slot = write_slot_mapping[row];
+        if (slot >= 0) {
+            const int kv_head = head - q_heads;
+            const int page = slot / kv_layout.block_size;
+            const int off = slot % kv_layout.block_size;
+            dst = (__nv_bfloat16*)((uint8_t*)(uintptr_t)kv_layout.k_base +
+                (size_t)page * kv_layout.k_page_stride_bytes +
+                (size_t)kv_head * kv_layout.k_head_stride_bytes +
+                (size_t)off * kv_layout.k_token_stride_bytes);
+            v_dst = (__nv_bfloat16*)((uint8_t*)(uintptr_t)kv_layout.v_base +
+                (size_t)page * kv_layout.v_page_stride_bytes +
+                (size_t)kv_head * kv_layout.v_head_stride_bytes +
+                (size_t)off * kv_layout.v_token_stride_bytes);
+            v_src = qkv + offset + (int64_t)kv_heads * dim;
+        }
+    }
     const TableT* row_table = table + (int64_t)pos * dim;
 
     for (int c = lane; c < half; c += 32) {
@@ -227,6 +250,10 @@ __global__ void qk_norm_rope_bf16_warp(
         const float sine = (float)row_table[half + c];
         dst[c] = __float2bfloat16(a * cosine - b * sine);
         dst[half + c] = __float2bfloat16(b * cosine + a * sine);
+        if (v_dst != nullptr) {
+            v_dst[c] = v_src[c];
+            v_dst[half + c] = v_src[half + c];
+        }
     }
 }
 
@@ -322,6 +349,96 @@ __global__ void edges_bf16_warp(
         prod[4], prod[5], prod[6], prod[7]);
     if (lane == 0) {
         edges[i] = (float)__float2bfloat16(sum) + unary[slot * topk + c];
+    }
+}
+
+// Single-CTA (32 * topk threads) greedy path walk over DFlash2 candidates when rank <= 256.
+// Evaluates only the active predecessor row at each step slot = 0..k-1 with the exact same
+// 0-ULP warp reduction and tie-break order as edges_bf16_warp + host select_greedy.
+__global__ void dflash_select_greedy_bf16_kernel(
+    const int32_t* __restrict__ ids,
+    const float* __restrict__ unary,
+    const __nv_bfloat16* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ pred,
+    const __nv_bfloat16* __restrict__ succ,
+    int32_t* __restrict__ out_path,
+    int anchor,
+    int k,
+    int topk,
+    int rank,
+    int vocab) {
+    __shared__ float s_scores[32];
+    __shared__ int32_t s_pred_id;
+    __shared__ int s_invalid;
+
+    const int lane = threadIdx.x & 31;
+    const int c = threadIdx.x >> 5;
+
+    if (threadIdx.x == 0) {
+        s_pred_id = anchor;
+        s_invalid = (anchor < 0 || anchor >= vocab) ? 1 : 0;
+    }
+    __syncthreads();
+    if (s_invalid) {
+        if (threadIdx.x == 0) out_path[0] = -1;
+        return;
+    }
+
+    for (int slot = 0; slot < k; ++slot) {
+        if (c < topk) {
+            const int32_t pred_id = s_pred_id;
+            const int32_t succ_id = ids[slot * topk + c];
+            const float u_val = unary[slot * topk + c];
+            if (pred_id < 0 || pred_id >= vocab || succ_id < 0 || succ_id >= vocab || !isfinite(u_val)) {
+                if (lane == 0) {
+                    s_scores[c] = -INFINITY;
+                    atomicExch(&s_invalid, 1);
+                }
+            } else {
+                const __nv_bfloat16* pred_row = pred + (int64_t)pred_id * rank;
+                const __nv_bfloat16* hidden_row = hidden + (int64_t)slot * rank;
+                const __nv_bfloat16* succ_row = succ + (int64_t)succ_id * rank;
+
+                float prod[8];
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const int r = lane + m * 32;
+                    if (r < rank) {
+                        const float ph = (float)__float2bfloat16((float)pred_row[r] * (float)hidden_row[r]);
+                        prod[m] = ph * (float)succ_row[r];
+                    } else {
+                        prod[m] = 0.0f;
+                    }
+                }
+                const float sum = reduce_sum256_exact_warp(
+                    prod[0], prod[1], prod[2], prod[3],
+                    prod[4], prod[5], prod[6], prod[7]);
+                if (lane == 0) {
+                    const float edge_score = (float)__float2bfloat16(sum) + u_val;
+                    s_scores[c] = edge_score;
+                    if (!isfinite(edge_score)) {
+                        atomicExch(&s_invalid, 1);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (s_invalid) {
+            if (threadIdx.x == 0) out_path[0] = -1;
+            return;
+        }
+        if (threadIdx.x == 0) {
+            int winner = 0;
+            for (int j = 1; j < topk; ++j) {
+                if (s_scores[j] > s_scores[winner]) {
+                    winner = j;
+                }
+            }
+            const int32_t win_id = ids[slot * topk + winner];
+            out_path[slot] = win_id;
+            s_pred_id = win_id;
+        }
+        __syncthreads();
     }
 }
 
@@ -667,10 +784,12 @@ int w34_dflash_qk_norm_rope_bf16(
         return (int)cudaErrorInvalidValue;
     }
     if (rows == 0) return 0;
+    w34_kv_layer_layout empty_layout = {};
     qk_norm_rope_bf16_warp<<<dim3((unsigned)rows, (unsigned)(q_heads + kv_heads)), 32, 0, (cudaStream_t)ex->stream>>>(
         (__nv_bfloat16*)qkv, nullptr, positions,
         (const __nv_bfloat16*)qw, (const __nv_bfloat16*)kw,
-        (const __nv_bfloat16*)table, q_heads, kv_heads, dim, table_rows, eps);
+        (const __nv_bfloat16*)table, q_heads, kv_heads, dim, table_rows, eps,
+        empty_layout, nullptr);
     return (int)cudaGetLastError();
 }
 
@@ -695,10 +814,73 @@ int w34_dflash_qk_norm_rope_bf16_f32_table_qout(
         return (int)cudaErrorInvalidValue;
     }
     if (rows == 0) return 0;
+    w34_kv_layer_layout empty_layout = {};
     qk_norm_rope_bf16_warp<<<dim3((unsigned)rows, (unsigned)(q_heads + kv_heads)), 32, 0, (cudaStream_t)ex->stream>>>(
         (__nv_bfloat16*)qkv, (__nv_bfloat16*)q_out, positions,
         (const __nv_bfloat16*)qw, (const __nv_bfloat16*)kw,
-        (const float*)table, q_heads, kv_heads, dim, table_rows, eps);
+        (const float*)table, q_heads, kv_heads, dim, table_rows, eps,
+        empty_layout, nullptr);
+    return (int)cudaGetLastError();
+}
+
+int w34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
+    const w34_exec* ex,
+    void* qkv,
+    void* q_out,
+    const int32_t* positions,
+    const void* qw,
+    const void* kw,
+    const void* table,
+    const w34_kv_layer_layout* kv_layout,
+    const int32_t* write_slot_mapping,
+    int rows,
+    int q_heads,
+    int kv_heads,
+    int dim,
+    int table_rows,
+    float eps) {
+    if (!ex || !qkv || !positions || !qw || !kw || !table || !kv_layout || !write_slot_mapping ||
+        rows < 0 || q_heads < 0 || kv_heads <= 0 || q_heads % kv_heads ||
+        dim <= 0 || dim > 256 || dim % 2 || table_rows <= 0 ||
+        !(eps > 0.0f) || !isfinite(eps) || q_out == qkv ||
+        kv_layout->k_base == 0 || kv_layout->v_base == 0 ||
+        kv_layout->block_size <= 0 || kv_layout->local_kv_heads != kv_heads ||
+        kv_layout->head_dim != dim ||
+        kv_layout->k_format != W34_KV_FORMAT_BF16 ||
+        kv_layout->v_format != W34_KV_FORMAT_BF16) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (rows == 0) return 0;
+    qk_norm_rope_bf16_warp<<<dim3((unsigned)rows, (unsigned)(q_heads + kv_heads)), 32, 0, (cudaStream_t)ex->stream>>>(
+        (__nv_bfloat16*)qkv, (__nv_bfloat16*)q_out, positions,
+        (const __nv_bfloat16*)qw, (const __nv_bfloat16*)kw,
+        (const float*)table, q_heads, kv_heads, dim, table_rows, eps,
+        *kv_layout, write_slot_mapping);
+    return (int)cudaGetLastError();
+}
+
+int w34_dflash_select_greedy_bf16(
+    const w34_exec* ex,
+    const int32_t* ids,
+    const float* unary,
+    const void* hidden,
+    const void* pred,
+    const void* succ,
+    int32_t* out_path,
+    int anchor,
+    int k,
+    int topk,
+    int rank,
+    int vocab) {
+    if (!ex || !ids || !unary || !hidden || !pred || !succ || !out_path ||
+        anchor < 0 || anchor >= vocab || k <= 0 || k > 16 ||
+        topk <= 0 || topk > 32 || rank <= 0 || rank > 256 || vocab <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    dflash_select_greedy_bf16_kernel<<<1, (unsigned)(32 * topk), 0, (cudaStream_t)ex->stream>>>(
+        ids, unary, (const __nv_bfloat16*)hidden,
+        (const __nv_bfloat16*)pred, (const __nv_bfloat16*)succ,
+        out_path, anchor, k, topk, rank, vocab);
     return (int)cudaGetLastError();
 }
 

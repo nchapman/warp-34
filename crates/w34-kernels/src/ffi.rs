@@ -223,6 +223,21 @@ unsafe extern "C" {
         eps: f32,
     ) -> i32;
 
+    pub fn w34_fused_add_gemma_rms_norm_tap_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> i32;
+
     pub fn w34_rms_norm_gated_silu_f16(
         ex: *const W34Exec,
         x: *const c_void,
@@ -529,6 +544,25 @@ unsafe extern "C" {
         rank: i32,
         num_elems: i32,
     ) -> i32;
+    pub fn w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
+        ex: *const W34Exec,
+        local_in: *const c_void,
+        ar_out: *mut c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> i32;
     pub fn w34_tp2_all_reduce_bf16(
         ex: *const W34Exec,
         local_in: *const c_void,
@@ -675,6 +709,37 @@ unsafe extern "C" {
         dim: i32,
         table_rows: i32,
         eps: f32,
+    ) -> i32;
+    pub fn w34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
+        ex: *const W34Exec,
+        qkv: *mut c_void,
+        q_out: *mut c_void,
+        positions: *const i32,
+        qw: *const c_void,
+        kw: *const c_void,
+        table: *const c_void,
+        kv_layout: *const W34KvLayerLayout,
+        write_slot_mapping: *const i32,
+        rows: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        dim: i32,
+        table_rows: i32,
+        eps: f32,
+    ) -> i32;
+    pub fn w34_dflash_select_greedy_bf16(
+        ex: *const W34Exec,
+        ids: *const i32,
+        unary: *const f32,
+        hidden: *const c_void,
+        pred: *const c_void,
+        succ: *const c_void,
+        out_path: *mut i32,
+        anchor: i32,
+        k: i32,
+        topk: i32,
+        rank: i32,
+        vocab: i32,
     ) -> i32;
     pub fn w34_dflash_qk_norm_rope_bf16(
         ex: *const W34Exec,

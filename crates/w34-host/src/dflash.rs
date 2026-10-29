@@ -566,7 +566,8 @@ impl DFlash2Rank {
             "DFlash norm",
         )
     }
-    fn rope(
+    #[allow(clippy::too_many_arguments)]
+    fn rope_kv_write(
         &self,
         t: &Qwen3_5ModelRank,
         qkv: u64,
@@ -574,11 +575,13 @@ impl DFlash2Rank {
         pos: u64,
         qheads: usize,
         layer: &Layer,
+        kv_layout: &ffi::W34KvLayerLayout,
+        write_slot_mapping: *const i32,
         rows: usize,
     ) -> Result<()> {
         check_rc(
             unsafe {
-                ffi::w34_dflash_qk_norm_rope_bf16_f32_table_qout(
+                ffi::w34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
                     &t.stream.exec(0, 0),
                     qkv as *mut c_void,
                     q_out as *mut c_void,
@@ -586,6 +589,8 @@ impl DFlash2Rank {
                     layer.q_norm as *const c_void,
                     layer.k_norm as *const c_void,
                     self.rope as *const c_void,
+                    kv_layout,
+                    write_slot_mapping,
                     rows as i32,
                     qheads as i32,
                     (self.cfg.model.num_key_value_heads / self.tp) as i32,
@@ -594,7 +599,7 @@ impl DFlash2Rank {
                     self.cfg.model.rms_norm_eps,
                 )
             },
-            "DFlash QK norm/RoPE",
+            "DFlash QK norm/RoPE + KV write",
         )
     }
     /// `tap_bf16` is a live device span [rows, 5*H] of committed target taps in BF16.
@@ -632,7 +637,6 @@ impl DFlash2Rank {
         let ctx = self.scratch.alloc_aligned(rows * h * 2)?;
         let packed = self.scratch.alloc_aligned(rows * 2 * kv * 2)?;
         let (batch, pos) = self.metadata(t, rows)?;
-        let ex = t.stream.exec(0, 0);
         self.fc.run(t, tap_bf16, projected, rows)?;
         self.norm(t, projected, 0, self.hidden_norm, ctx, rows)?;
         for (l, layer) in self.layers.iter().enumerate() {
@@ -643,19 +647,16 @@ impl DFlash2Rank {
                 k: h,
             };
             kv_proj.run(t, ctx, packed, rows)?;
-            self.rope(t, packed, 0, pos, 0, layer, rows)?;
-            check_rc(
-                unsafe {
-                    ffi::w34_kv_cache_write_strided_bf16(
-                        &ex,
-                        &self.kv.layers[l].layout,
-                        &batch,
-                        packed as *const c_void,
-                        (packed + (kv * 2) as u64) as *const c_void,
-                        (2 * kv) as i32,
-                    )
-                },
-                "DFlash context KV",
+            self.rope_kv_write(
+                t,
+                packed,
+                0,
+                pos,
+                0,
+                layer,
+                &self.kv.layers[l].layout,
+                batch.write_slot_mapping,
+                rows,
             )?;
         }
         self.committed += rows;
@@ -703,12 +704,12 @@ impl DFlash2Rank {
             "DFlash grouped conv",
         )
     }
-    pub fn forward(
+    fn forward_device_topk(
         &mut self,
         t: &Qwen3_5ModelRank,
         anchor: i32,
         comm: Option<&Tp2Collectives>,
-    ) -> Result<DraftCandidates> {
+    ) -> Result<(u64, u64)> {
         self.validate_target(t)?;
         if anchor < 0
             || anchor as usize >= self.cfg.model.vocab_size
@@ -770,19 +771,16 @@ impl DFlash2Rank {
             )?;
             self.conv(t, &layer.attn_conv, normed, coeff, filtered, 0)?;
             layer.qkv.run(t, filtered, packed, m)?;
-            self.rope(t, packed, qb, pos, q / d, layer, m)?;
-            check_rc(
-                unsafe {
-                    ffi::w34_kv_cache_write_strided_bf16(
-                        &ex,
-                        &self.kv.layers[l].layout,
-                        &batch,
-                        (packed + (q * 2) as u64) as *const c_void,
-                        (packed + ((q + kv) * 2) as u64) as *const c_void,
-                        (q + 2 * kv) as i32,
-                    )
-                },
-                "DFlash query KV",
+            self.rope_kv_write(
+                t,
+                packed,
+                qb,
+                pos,
+                q / d,
+                layer,
+                &self.kv.layers[l].layout,
+                batch.write_slot_mapping,
+                m,
             )?;
             check_rc(
                 unsafe {
@@ -869,6 +867,18 @@ impl DFlash2Rank {
             },
             "DFlash top-k",
         )?;
+        Ok((ids_dev, scores_dev))
+    }
+
+    pub fn forward(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        anchor: i32,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<DraftCandidates> {
+        let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, comm)?;
+        let m = self.cfg.block_size;
+        let topk_elems = (m - 1) * self.cfg.top_k;
         let mut out = DraftCandidates {
             ids: vec![0; topk_elems],
             scores: vec![0.0; topk_elems],
@@ -904,32 +914,65 @@ impl DFlash2Rank {
         self.proposal_anchor = Some(anchor);
         Ok(out)
     }
-    /// Greedy conditional selector walk over globally merged candidates. The
-    /// returned draft tokens are predictions, never target-substituted tokens.
-    pub fn select_greedy(
+
+    /// Single-rank (`TP=1`) fused forward + greedy selection on device without
+    /// intermediate `DraftCandidates` D2H/H2D round-trips.
+    pub fn forward_select_greedy(&mut self, t: &Qwen3_5ModelRank, anchor: i32) -> Result<Vec<i32>> {
+        if self.tp != 1 {
+            return Err(loader_err("forward_select_greedy requires TP=1"));
+        }
+        let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, None)?;
+        self.proposal_anchor = Some(anchor);
+        self.select_greedy_from_device(t, anchor, ids_dev, scores_dev)
+    }
+
+    fn select_greedy_from_device(
         &mut self,
         t: &Qwen3_5ModelRank,
         anchor: i32,
-        candidates: &DraftCandidates,
+        ids: u64,
+        vals: u64,
     ) -> Result<Vec<i32>> {
-        self.validate_target(t)?;
         let (k, n) = (self.cfg.block_size - 1, self.cfg.top_k);
-        if self.proposal_anchor != Some(anchor)
-            || candidates.rows != k
-            || candidates.top_k != n
-            || candidates.ids.len() != k * n
-            || candidates.scores.len() != k * n
-            || candidates
-                .ids
-                .iter()
-                .any(|&id| id < 0 || id as usize >= self.cfg.model.vocab_size)
-            || candidates.scores.iter().any(|x| !x.is_finite())
-        {
-            return Err(loader_err("invalid merged DFlash candidates"));
+        if self.cfg.selector_rank <= 256 && n <= 32 && k <= 16 {
+            let path_dev = self.scratch.alloc_aligned(k * 4)?;
+            check_rc(
+                unsafe {
+                    ffi::w34_dflash_select_greedy_bf16(
+                        &t.stream.exec(0, 0),
+                        ids as *const i32,
+                        vals as *const f32,
+                        self.projected.addr() as *const c_void,
+                        self.pred as *const c_void,
+                        self.succ as *const c_void,
+                        path_dev as *mut i32,
+                        anchor,
+                        k as i32,
+                        n as i32,
+                        self.cfg.selector_rank as i32,
+                        self.cfg.model.vocab_size as i32,
+                    )
+                },
+                "DFlash greedy selector",
+            )?;
+            let mut path = vec![0i32; k];
+            check_rc(
+                unsafe {
+                    ffi::w34_memcpy_d2h_async(
+                        path.as_mut_ptr().cast(),
+                        path_dev as *const c_void,
+                        k * 4,
+                        t.stream.handle,
+                    )
+                },
+                "DFlash greedy path copy",
+            )?;
+            t.stream.synchronize()?;
+            if path.first().is_some_and(|&id| id < 0) {
+                return Err(loader_err("nonfinite DFlash edges"));
+            }
+            return Ok(path);
         }
-        self.scratch.reset();
-        let ids = self.scratch.upload_slice(&candidates.ids, &t.stream)?;
-        let vals = self.scratch.upload_slice(&candidates.scores, &t.stream)?;
         let edges = self.scratch.alloc_aligned(k * n * n * 4)?;
         check_rc(
             unsafe {
@@ -966,6 +1009,19 @@ impl DFlash2Rank {
         if scores.iter().any(|x| !x.is_finite()) {
             return Err(loader_err("nonfinite DFlash edges"));
         }
+        let mut candidate_ids = vec![0i32; k * n];
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    candidate_ids.as_mut_ptr().cast(),
+                    ids as *const c_void,
+                    k * n * 4,
+                    t.stream.handle,
+                )
+            },
+            "DFlash candidate ids copy",
+        )?;
+        t.stream.synchronize()?;
         let mut path = Vec::with_capacity(k);
         let mut predecessor = 0;
         for slot in 0..k {
@@ -976,9 +1032,38 @@ impl DFlash2Rank {
                     winner = j;
                 }
             }
-            path.push(candidates.ids[slot * n + winner]);
+            path.push(candidate_ids[slot * n + winner]);
             predecessor = winner;
         }
         Ok(path)
+    }
+
+    /// Greedy conditional selector walk over globally merged candidates. The
+    /// returned draft tokens are predictions, never target-substituted tokens.
+    pub fn select_greedy(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        anchor: i32,
+        candidates: &DraftCandidates,
+    ) -> Result<Vec<i32>> {
+        self.validate_target(t)?;
+        let (k, n) = (self.cfg.block_size - 1, self.cfg.top_k);
+        if self.proposal_anchor != Some(anchor)
+            || candidates.rows != k
+            || candidates.top_k != n
+            || candidates.ids.len() != k * n
+            || candidates.scores.len() != k * n
+            || candidates
+                .ids
+                .iter()
+                .any(|&id| id < 0 || id as usize >= self.cfg.model.vocab_size)
+            || candidates.scores.iter().any(|x| !x.is_finite())
+        {
+            return Err(loader_err("invalid merged DFlash candidates"));
+        }
+        self.scratch.reset();
+        let ids = self.scratch.upload_slice(&candidates.ids, &t.stream)?;
+        let vals = self.scratch.upload_slice(&candidates.scores, &t.stream)?;
+        self.select_greedy_from_device(t, anchor, ids, vals)
     }
 }

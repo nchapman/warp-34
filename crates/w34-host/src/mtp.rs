@@ -590,33 +590,42 @@ impl Qwen3_5MtpRank {
             "w34_apply_attn_output_gate_f16",
         )?;
         Self::project(&fa.o_proj, t, gated_attn_buf, block_out_buf, num_tokens)?;
+        let post_ln_ptr = self.norms[3];
         if let Some(comm) = tp2 {
-            comm.all_reduce_f16(
+            comm.all_reduce_residual_gemma_rms_norm_f16(
                 &ex,
                 block_out_buf,
-                block_out_buf,
+                0,
+                residual_buf,
+                post_ln_ptr,
+                normed_buf,
+                0,
                 t.rank as i32,
-                (num_tokens * h_dim) as i32,
+                num_tokens as i32,
+                h_dim as i32,
+                t.cfg.rms_norm_eps,
+                0,
+                0,
+            )?;
+        } else {
+            // Post-attention RMSNorm + MLP
+            check_rc(
+                unsafe {
+                    ffi::w34_fused_add_gemma_rms_norm_f16(
+                        &ex,
+                        block_out_buf as *const c_void,
+                        residual_buf as *mut c_void,
+                        post_ln_ptr as *const c_void,
+                        normed_buf as *mut c_void,
+                        core::ptr::null(),
+                        num_tokens as i32,
+                        h_dim as i32,
+                        t.cfg.rms_norm_eps,
+                    )
+                },
+                "w34_fused_add_gemma_rms_norm_f16 (post_attn)",
             )?;
         }
-        let post_ln_ptr = self.norms[3];
-        // Post-attention RMSNorm + MLP
-        check_rc(
-            unsafe {
-                ffi::w34_fused_add_gemma_rms_norm_f16(
-                    &ex,
-                    block_out_buf as *const c_void,
-                    residual_buf as *mut c_void,
-                    post_ln_ptr as *const c_void,
-                    normed_buf as *mut c_void,
-                    core::ptr::null(),
-                    num_tokens as i32,
-                    h_dim as i32,
-                    t.cfg.rms_norm_eps,
-                )
-            },
-            "w34_fused_add_gemma_rms_norm_f16 (post_attn)",
-        )?;
 
         Self::project(&self.gate_up, t, normed_buf, gate_up_buf, num_tokens)?;
         check_rc(
@@ -634,30 +643,39 @@ impl Qwen3_5MtpRank {
         )?;
         Self::project(&self.down, t, act_buf, mlp_out_buf, num_tokens)?;
         if let Some(comm) = tp2 {
-            comm.all_reduce_f16(
+            comm.all_reduce_residual_gemma_rms_norm_f16(
                 &ex,
                 mlp_out_buf,
-                mlp_out_buf,
+                0,
+                residual_buf,
+                self.norms[4],
+                self.batch_hidden.addr(),
+                0,
                 t.rank as i32,
-                (num_tokens * h_dim) as i32,
+                num_tokens as i32,
+                h_dim as i32,
+                t.cfg.rms_norm_eps,
+                0,
+                0,
+            )?;
+        } else {
+            check_rc(
+                unsafe {
+                    ffi::w34_fused_add_gemma_rms_norm_f16(
+                        &ex,
+                        mlp_out_buf as *const c_void,
+                        residual_buf as *mut c_void,
+                        self.norms[4] as *const c_void,
+                        self.batch_hidden.addr() as *mut c_void,
+                        core::ptr::null(),
+                        num_tokens as i32,
+                        h_dim as i32,
+                        t.cfg.rms_norm_eps,
+                    )
+                },
+                "MTP final norm",
             )?;
         }
-        check_rc(
-            unsafe {
-                ffi::w34_fused_add_gemma_rms_norm_f16(
-                    &ex,
-                    mlp_out_buf as *const c_void,
-                    residual_buf as *mut c_void,
-                    self.norms[4] as *const c_void,
-                    self.batch_hidden.addr() as *mut c_void,
-                    core::ptr::null(),
-                    num_tokens as i32,
-                    h_dim as i32,
-                    t.cfg.rms_norm_eps,
-                )
-            },
-            "MTP final norm",
-        )?;
         let last_hidden_ptr = self.batch_hidden.addr() + ((num_tokens - 1) * h_dim * 2) as u64;
         check_rc(
             unsafe {

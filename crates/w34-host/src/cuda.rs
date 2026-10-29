@@ -808,6 +808,54 @@ impl Tp2Collectives {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn all_reduce_residual_gemma_rms_norm_f16(
+        &self,
+        ex: &W34Exec,
+        local_in_ptr: u64,
+        ar_out_ptr: u64,
+        residual_ptr: u64,
+        weight_ptr: u64,
+        out_ptr: u64,
+        tap_dst_bf16_ptr: u64,
+        rank: i32,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> Result<()> {
+        let num_elems = (num_tokens as usize) * (hidden_size as usize);
+        assert!(
+            num_elems * 2 <= self.max_stage_bytes_per_epoch,
+            "all_reduce_residual_gemma_rms_norm_f16 exceeds max_stage_bytes_per_epoch"
+        );
+        check_rc(
+            unsafe {
+                ffi::w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
+                    ex,
+                    local_in_ptr as *const c_void,
+                    ar_out_ptr as *mut c_void,
+                    residual_ptr as *mut c_void,
+                    weight_ptr as *const c_void,
+                    out_ptr as *mut c_void,
+                    tap_dst_bf16_ptr as *mut c_void,
+                    self.stage0.dev_ptr,
+                    self.stage1.dev_ptr,
+                    self.sig0.dev_ptr,
+                    self.sig1.dev_ptr,
+                    rank,
+                    num_tokens,
+                    hidden_size,
+                    eps,
+                    tap_row_stride,
+                    tap_col_offset,
+                )
+            },
+            "w34_tp2_all_reduce_residual_gemma_rms_norm_f16",
+        )
+    }
+
     pub fn all_reduce_bf16(
         &self,
         ex: &W34Exec,
@@ -1105,6 +1153,50 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     }
     cublas.gemm_f16(buf_a, buf_b, buf_c, 1, 64, 128)?;
     cublas.gemm_bf16(buf_a, buf_b, buf_c, 1, 64, 128)?;
+    check_rc(
+        unsafe {
+            ffi::w34_small_n_gemm_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                64,
+                128,
+            )
+        },
+        "warmup w34_small_n_gemm_f16",
+    )?;
+    for hs in [128i32, 3072, 5120, 6144] {
+        let sig_u32_len = (unsafe { ffi::w34_tp2_signal_bytes() } as usize).div_ceil(4);
+        let mut fake_sig = vec![0u32; sig_u32_len.max(1216)];
+        fake_sig[1] = 1; // pre-satisfy start[0][1] == epoch(1) for single-GPU warmup
+        let sig_dev = arena.upload_slice(&fake_sig, &stream)?;
+        check_rc(
+            unsafe {
+                ffi::w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
+                    &ex,
+                    buf_a as *const c_void,
+                    core::ptr::null_mut(),
+                    buf_b as *mut c_void,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    core::ptr::null_mut(),
+                    buf_ws as *mut c_void,
+                    buf_ws as *mut c_void,
+                    sig_dev as *mut c_void,
+                    sig_dev as *mut c_void,
+                    0,
+                    1,
+                    hs,
+                    1e-6,
+                    0,
+                    0,
+                )
+            },
+            "warmup w34_tp2_all_reduce_residual_gemma_rms_norm_f16",
+        )?;
+    }
 
     // 3. KV write & Paged Attention
     let q_start = arena.upload_slice(&[0i32, 1], &stream)?;
@@ -1318,7 +1410,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let candidate_ids = arena.upload_slice(&[0i32; 16], &stream)?;
     check_rc(
         unsafe {
-            ffi::w34_dflash_qk_norm_rope_bf16_f32_table_qout(
+            ffi::w34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
                 &ex,
                 buf_a as *mut c_void,
                 buf_d as *mut c_void,
@@ -1326,15 +1418,36 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 buf_b as *const c_void,
                 buf_b as *const c_void,
                 buf_c as *const c_void,
+                &bf16_layout,
+                slot_map as *const i32,
                 1,
                 1,
                 1,
-                128,
+                256,
                 1,
                 1e-6,
             )
         },
-        "warmup BF16 QK/RoPE with FP32 table",
+        "warmup BF16 QK/RoPE + KV write",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_dflash_select_greedy_bf16(
+                &ex,
+                candidate_ids as *const i32,
+                buf_c as *const f32,
+                buf_a as *const c_void,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_d as *mut i32,
+                0,
+                1,
+                16,
+                256,
+                1,
+            )
+        },
+        "warmup dflash_select_greedy_bf16",
     )?;
     check_rc(
         unsafe {

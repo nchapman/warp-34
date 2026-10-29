@@ -169,6 +169,12 @@ int w34_fused_add_gemma_rms_norm_f16(const w34_exec* ex, const void* x, void* re
                                      const uint8_t* valid_token_mask,
                                      int num_tokens, int hidden_size, float eps);
 
+int w34_fused_add_gemma_rms_norm_tap_f16(const w34_exec* ex, const void* x, void* residual,
+                                         const void* weight, void* out, void* tap_dst_bf16,
+                                         const uint8_t* valid_token_mask,
+                                         int num_tokens, int hidden_size, float eps,
+                                         int tap_row_stride, int tap_col_offset);
+
 int w34_rms_norm_gated_silu_f16(const w34_exec* ex, const void* x, const void* z,
                                 const void* weight, void* out,
                                 const uint8_t* valid_token_mask,
@@ -329,6 +335,13 @@ size_t w34_tp2_signal_bytes(void);
 int w34_tp2_all_reduce_f16(const w34_exec* ex, const void* local_in, void* out,
                            void* stage0, void* stage1,
                            void* sig0, void* sig1, int rank, int num_elems);
+int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* tap_dst_bf16,
+    void* stage0, void* stage1,
+    void* sig0, void* sig1, int rank,
+    int num_tokens, int hidden_size, float eps,
+    int tap_row_stride, int tap_col_offset);
 int w34_tp2_all_reduce_bf16(const w34_exec* ex, const void* local_in, void* out,
                             void* stage0, void* stage1,
                             void* sig0, void* sig1, int rank, int num_elems);
@@ -402,6 +415,13 @@ int w34_dflash_qk_norm_rope_bf16_f32_table(const w34_exec*, void* qkv, const int
 int w34_dflash_qk_norm_rope_bf16_f32_table_qout(const w34_exec*, void* qkv, void* q_out,
     const int32_t* positions, const void* qw, const void* kw, const void* table,
     int rows, int q_heads, int kv_heads, int dim, int table_rows, float eps);
+int w34_dflash_qk_norm_rope_kv_write_bf16_f32_table(const w34_exec* ex, void* qkv, void* q_out,
+    const int32_t* positions, const void* qw, const void* kw, const void* table,
+    const w34_kv_layer_layout* kv_layout, const int32_t* write_slot_mapping,
+    int rows, int q_heads, int kv_heads, int dim, int table_rows, float eps);
+int w34_dflash_select_greedy_bf16(const w34_exec* ex, const int32_t* ids, const float* unary,
+    const void* hidden, const void* pred, const void* succ, int32_t* out_path,
+    int anchor, int k, int topk, int rank, int vocab);
 int w34_dflash_qk_norm_rope_bf16(const w34_exec*, void* qkv, const int32_t* positions,
     const void* qw, const void* kw, const void* table, int rows, int q_heads, int kv_heads,
     int dim, int table_rows, float eps);

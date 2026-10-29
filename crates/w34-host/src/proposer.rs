@@ -434,6 +434,23 @@ impl NativeProposer {
                     memo.tokens.extend_from_slice(tokens);
                 }
                 let n = tokens.len();
+                if rs.len() == 1 {
+                    let res = rs[0]
+                        .ingest_no_sync(&engine.ranks[0], features[0], n)
+                        .and_then(|()| rs[0].forward_select_greedy(&engine.ranks[0], anchor));
+                    let mut ids = match res {
+                        Ok(ids) => ids,
+                        Err(e) => {
+                            let _ = engine.ranks[0].device.make_current();
+                            let _ = engine.ranks[0].stream.synchronize();
+                            return Err(e);
+                        }
+                    };
+                    self.resident_tokens.extend_from_slice(tokens);
+                    self.processed += tokens.len();
+                    ids.truncate(k);
+                    return Ok(ids);
+                }
                 let comm = engine.tp2_comm.as_deref();
                 let candidates = std::thread::scope(|scope| {
                     let jobs: Vec<_> = rs
@@ -505,6 +522,11 @@ impl NativeProposer {
                 Ok(outputs[0].clone())
             }
             Ranks::DFlash(rs) => {
+                if rs.len() == 1 {
+                    let mut ids = rs[0].forward_select_greedy(&engine.ranks[0], anchor)?;
+                    ids.truncate(k);
+                    return Ok(ids);
+                }
                 let candidates = std::thread::scope(|scope| {
                     let jobs: Vec<_> = rs
                         .iter_mut()

@@ -1212,6 +1212,14 @@ impl Qwen3_5ModelRank {
             )?;
         }
 
+        let final_norm_out_buf = if num_tokens <= self.max_tap_rows
+            && let Some(final_h_buf) = &self.last_final_hidden_f16
+        {
+            final_h_buf.addr()
+        } else {
+            normed_buf
+        };
+
         // 2. Layers
         for layer_idx in 0..self.layers.len() {
             let in_ln_ptr = self.layers[layer_idx].input_layernorm_ptr;
@@ -1232,34 +1240,6 @@ impl Qwen3_5ModelRank {
                     },
                     "w34_gemma_rms_norm_f16",
                 )?;
-            } else {
-                check_rc(
-                    unsafe {
-                        ffi::w34_fused_add_gemma_rms_norm_f16(
-                            &ex,
-                            mlp_out_buf as *const c_void,
-                            residual_buf as *mut c_void,
-                            in_ln_ptr as *const c_void,
-                            normed_buf as *mut c_void,
-                            core::ptr::null(),
-                            num_tokens as i32,
-                            h_dim as i32,
-                            self.cfg.rms_norm_eps,
-                        )
-                    },
-                    "w34_fused_add_gemma_rms_norm_f16 (input)",
-                )?;
-                if let Some(dump) = dump_out.as_deref_mut()
-                    && self.rank == 0
-                {
-                    Self::record_dump_f16(
-                        &self.stream,
-                        residual_buf,
-                        vec![num_tokens, h_dim],
-                        &format!("layer_{}_hidden_after", layer_idx - 1),
-                        dump,
-                    )?;
-                }
             }
 
             match &self.layers[layer_idx].block {
@@ -1460,44 +1440,63 @@ impl Qwen3_5ModelRank {
             }
 
             if let Some(comm) = tp2 {
-                comm.all_reduce_f16(
+                let ar_out = if dump_out.is_some() { block_out_buf } else { 0 };
+                comm.all_reduce_residual_gemma_rms_norm_f16(
                     &ex,
                     block_out_buf,
-                    block_out_buf,
+                    ar_out,
+                    residual_buf,
+                    post_ln_ptr,
+                    normed_buf,
+                    0,
                     self.rank as i32,
-                    (num_tokens * h_dim) as i32,
+                    num_tokens as i32,
+                    h_dim as i32,
+                    self.cfg.rms_norm_eps,
+                    0,
+                    0,
+                )?;
+                if let Some(dump) = dump_out.as_deref_mut()
+                    && self.rank == 0
+                {
+                    Self::record_dump_f16(
+                        &self.stream,
+                        block_out_buf,
+                        vec![num_tokens, h_dim],
+                        &format!("layer_{layer_idx}_attn_or_gdn_out"),
+                        dump,
+                    )?;
+                }
+            } else {
+                if let Some(dump) = dump_out.as_deref_mut()
+                    && self.rank == 0
+                {
+                    Self::record_dump_f16(
+                        &self.stream,
+                        block_out_buf,
+                        vec![num_tokens, h_dim],
+                        &format!("layer_{layer_idx}_attn_or_gdn_out"),
+                        dump,
+                    )?;
+                }
+                // Post-attention RMSNorm + MLP
+                check_rc(
+                    unsafe {
+                        ffi::w34_fused_add_gemma_rms_norm_f16(
+                            &ex,
+                            block_out_buf as *const c_void,
+                            residual_buf as *mut c_void,
+                            post_ln_ptr as *const c_void,
+                            normed_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            h_dim as i32,
+                            self.cfg.rms_norm_eps,
+                        )
+                    },
+                    "w34_fused_add_gemma_rms_norm_f16 (post_attn)",
                 )?;
             }
-
-            if let Some(dump) = dump_out.as_deref_mut()
-                && self.rank == 0
-            {
-                Self::record_dump_f16(
-                    &self.stream,
-                    block_out_buf,
-                    vec![num_tokens, h_dim],
-                    &format!("layer_{layer_idx}_attn_or_gdn_out"),
-                    dump,
-                )?;
-            }
-
-            // Post-attention RMSNorm + MLP
-            check_rc(
-                unsafe {
-                    ffi::w34_fused_add_gemma_rms_norm_f16(
-                        &ex,
-                        block_out_buf as *const c_void,
-                        residual_buf as *mut c_void,
-                        post_ln_ptr as *const c_void,
-                        normed_buf as *mut c_void,
-                        core::ptr::null(),
-                        num_tokens as i32,
-                        h_dim as i32,
-                        self.cfg.rms_norm_eps,
-                    )
-                },
-                "w34_fused_add_gemma_rms_norm_f16 (post_attn)",
-            )?;
 
             self.layers[layer_idx].gate_up_proj.forward(
                 &ex,
@@ -1530,63 +1529,74 @@ impl Qwen3_5ModelRank {
                 mlp_out_buf,
                 num_tokens,
             )?;
-            if let Some(comm) = tp2 {
-                comm.all_reduce_f16(
-                    &ex,
-                    mlp_out_buf,
-                    mlp_out_buf,
-                    self.rank as i32,
-                    (num_tokens * h_dim) as i32,
-                )?;
-            }
-
-            if num_tokens <= self.max_tap_rows
+            let (next_norm_weight, next_norm_out) = if layer_idx + 1 < self.layers.len() {
+                (self.layers[layer_idx + 1].input_layernorm_ptr, normed_buf)
+            } else {
+                (self.final_norm_ptr, final_norm_out_buf)
+            };
+            let (tap_dst, tap_stride, tap_offset) = if num_tokens <= self.max_tap_rows
                 && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
                 && let Some(tap_buf) = &self.tap_aux_bf16
             {
                 let num_taps = self.tap_layer_ids.len();
-                check_rc(
-                    unsafe {
-                        ffi::w34_tap_add_f16_to_bf16(
-                            &ex,
-                            residual_buf as *const c_void,
-                            mlp_out_buf as *const c_void,
-                            tap_buf.addr() as *mut c_void,
-                            num_tokens as i32,
-                            h_dim as i32,
-                            (num_taps * h_dim) as i32,
-                            (tap_slot * h_dim) as i32,
-                        )
-                    },
-                    "w34_tap_add_f16_to_bf16",
-                )?;
-            }
-        }
-
-        // 3. Final RMSNorm (write directly into last_final_hidden_f16 when export is active)
-        let final_norm_out_buf = if num_tokens <= self.max_tap_rows
-            && let Some(final_h_buf) = &self.last_final_hidden_f16
-        {
-            final_h_buf.addr()
-        } else {
-            normed_buf
-        };
-        check_rc(
-            unsafe {
-                ffi::w34_fused_add_gemma_rms_norm_f16(
+                (
+                    tap_buf.addr(),
+                    (num_taps * h_dim) as i32,
+                    (tap_slot * h_dim) as i32,
+                )
+            } else {
+                (0, 0, 0)
+            };
+            if let Some(comm) = tp2 {
+                comm.all_reduce_residual_gemma_rms_norm_f16(
                     &ex,
-                    mlp_out_buf as *const c_void,
-                    residual_buf as *mut c_void,
-                    self.final_norm_ptr as *const c_void,
-                    final_norm_out_buf as *mut c_void,
-                    core::ptr::null(),
+                    mlp_out_buf,
+                    0,
+                    residual_buf,
+                    next_norm_weight,
+                    next_norm_out,
+                    tap_dst,
+                    self.rank as i32,
                     num_tokens as i32,
                     h_dim as i32,
                     self.cfg.rms_norm_eps,
-                )
-            },
-            "w34_fused_add_gemma_rms_norm_f16 (final)",
-        )?;
+                    tap_stride,
+                    tap_offset,
+                )?;
+            } else {
+                check_rc(
+                    unsafe {
+                        ffi::w34_fused_add_gemma_rms_norm_tap_f16(
+                            &ex,
+                            mlp_out_buf as *const c_void,
+                            residual_buf as *mut c_void,
+                            next_norm_weight as *const c_void,
+                            next_norm_out as *mut c_void,
+                            tap_dst as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            h_dim as i32,
+                            self.cfg.rms_norm_eps,
+                            tap_stride,
+                            tap_offset,
+                        )
+                    },
+                    "w34_fused_add_gemma_rms_norm_tap_f16 (post_mlp)",
+                )?;
+            }
+            if layer_idx + 1 < self.layers.len()
+                && let Some(dump) = dump_out.as_deref_mut()
+                && self.rank == 0
+            {
+                Self::record_dump_f16(
+                    &self.stream,
+                    residual_buf,
+                    vec![num_tokens, h_dim],
+                    &format!("layer_{layer_idx}_hidden_after"),
+                    dump,
+                )?;
+            }
+        }
 
         if let Some(dump) = dump_out.as_deref_mut()
             && self.rank == 0
@@ -1839,6 +1849,14 @@ impl Qwen3_5ModelRank {
             "w34_embed_lookup_f16",
         )?;
 
+        let final_norm_out_buf = if num_tokens <= self.max_tap_rows
+            && let Some(final_h_buf) = &self.last_final_hidden_f16
+        {
+            final_h_buf.addr()
+        } else {
+            normed_buf
+        };
+
         for layer_idx in 0..self.layers.len() {
             let in_ln_ptr = self.layers[layer_idx].input_layernorm_ptr;
             let post_ln_ptr = self.layers[layer_idx].post_attention_layernorm_ptr;
@@ -1857,23 +1875,6 @@ impl Qwen3_5ModelRank {
                         )
                     },
                     "w34_gemma_rms_norm_f16",
-                )?;
-            } else {
-                check_rc(
-                    unsafe {
-                        ffi::w34_fused_add_gemma_rms_norm_f16(
-                            &ex,
-                            mlp_out_buf as *const c_void,
-                            residual_buf as *mut c_void,
-                            in_ln_ptr as *const c_void,
-                            normed_buf as *mut c_void,
-                            core::ptr::null(),
-                            num_tokens as i32,
-                            h_dim as i32,
-                            self.cfg.rms_norm_eps,
-                        )
-                    },
-                    "w34_fused_add_gemma_rms_norm_f16 (input)",
                 )?;
             }
 
@@ -2076,31 +2077,39 @@ impl Qwen3_5ModelRank {
             }
 
             if let Some(comm) = tp2 {
-                comm.all_reduce_f16(
+                comm.all_reduce_residual_gemma_rms_norm_f16(
                     &ex,
                     block_out_buf,
-                    block_out_buf,
+                    0,
+                    residual_buf,
+                    post_ln_ptr,
+                    normed_buf,
+                    0,
                     self.rank as i32,
-                    (num_tokens * h_dim) as i32,
+                    num_tokens as i32,
+                    h_dim as i32,
+                    self.cfg.rms_norm_eps,
+                    0,
+                    0,
+                )?;
+            } else {
+                check_rc(
+                    unsafe {
+                        ffi::w34_fused_add_gemma_rms_norm_f16(
+                            &ex,
+                            block_out_buf as *const c_void,
+                            residual_buf as *mut c_void,
+                            post_ln_ptr as *const c_void,
+                            normed_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            h_dim as i32,
+                            self.cfg.rms_norm_eps,
+                        )
+                    },
+                    "w34_fused_add_gemma_rms_norm_f16 (post)",
                 )?;
             }
-
-            check_rc(
-                unsafe {
-                    ffi::w34_fused_add_gemma_rms_norm_f16(
-                        &ex,
-                        block_out_buf as *const c_void,
-                        residual_buf as *mut c_void,
-                        post_ln_ptr as *const c_void,
-                        normed_buf as *mut c_void,
-                        core::ptr::null(),
-                        num_tokens as i32,
-                        h_dim as i32,
-                        self.cfg.rms_norm_eps,
-                    )
-                },
-                "w34_fused_add_gemma_rms_norm_f16 (post)",
-            )?;
 
             self.layers[layer_idx].gate_up_proj.forward(
                 &ex,
@@ -2134,62 +2143,62 @@ impl Qwen3_5ModelRank {
                 num_tokens,
             )?;
 
-            if let Some(comm) = tp2 {
-                comm.all_reduce_f16(
-                    &ex,
-                    mlp_out_buf,
-                    mlp_out_buf,
-                    self.rank as i32,
-                    (num_tokens * h_dim) as i32,
-                )?;
-            }
-
-            if num_tokens <= self.max_tap_rows
+            let (next_norm_weight, next_norm_out) = if layer_idx + 1 < self.layers.len() {
+                (self.layers[layer_idx + 1].input_layernorm_ptr, normed_buf)
+            } else {
+                (self.final_norm_ptr, final_norm_out_buf)
+            };
+            let (tap_dst, tap_stride, tap_offset) = if num_tokens <= self.max_tap_rows
                 && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
                 && let Some(tap_buf) = &self.tap_aux_bf16
             {
                 let num_taps = self.tap_layer_ids.len();
-                check_rc(
-                    unsafe {
-                        ffi::w34_tap_add_f16_to_bf16(
-                            &ex,
-                            residual_buf as *const c_void,
-                            mlp_out_buf as *const c_void,
-                            tap_buf.addr() as *mut c_void,
-                            num_tokens as i32,
-                            h_dim as i32,
-                            (num_taps * h_dim) as i32,
-                            (tap_slot * h_dim) as i32,
-                        )
-                    },
-                    "w34_tap_add_f16_to_bf16 (selected)",
-                )?;
-            }
-        }
-
-        let final_norm_out_buf = if num_tokens <= self.max_tap_rows
-            && let Some(final_h_buf) = &self.last_final_hidden_f16
-        {
-            final_h_buf.addr()
-        } else {
-            normed_buf
-        };
-        check_rc(
-            unsafe {
-                ffi::w34_fused_add_gemma_rms_norm_f16(
+                (
+                    tap_buf.addr(),
+                    (num_taps * h_dim) as i32,
+                    (tap_slot * h_dim) as i32,
+                )
+            } else {
+                (0, 0, 0)
+            };
+            if let Some(comm) = tp2 {
+                comm.all_reduce_residual_gemma_rms_norm_f16(
                     &ex,
-                    mlp_out_buf as *const c_void,
-                    residual_buf as *mut c_void,
-                    self.final_norm_ptr as *const c_void,
-                    final_norm_out_buf as *mut c_void,
-                    core::ptr::null(),
+                    mlp_out_buf,
+                    0,
+                    residual_buf,
+                    next_norm_weight,
+                    next_norm_out,
+                    tap_dst,
+                    self.rank as i32,
                     num_tokens as i32,
                     h_dim as i32,
                     self.cfg.rms_norm_eps,
-                )
-            },
-            "w34_fused_add_gemma_rms_norm_f16 (final)",
-        )?;
+                    tap_stride,
+                    tap_offset,
+                )?;
+            } else {
+                check_rc(
+                    unsafe {
+                        ffi::w34_fused_add_gemma_rms_norm_tap_f16(
+                            &ex,
+                            mlp_out_buf as *const c_void,
+                            residual_buf as *mut c_void,
+                            next_norm_weight as *const c_void,
+                            next_norm_out as *mut c_void,
+                            tap_dst as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            h_dim as i32,
+                            self.cfg.rms_norm_eps,
+                            tap_stride,
+                            tap_offset,
+                        )
+                    },
+                    "w34_fused_add_gemma_rms_norm_tap_f16 (selected)",
+                )?;
+            }
+        }
 
         if selected_rows.is_empty() {
             self.speculative_logits_rows = 0;
