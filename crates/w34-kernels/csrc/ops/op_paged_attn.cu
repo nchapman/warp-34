@@ -38,6 +38,53 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_reduce_max(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    }
+    return v;
+}
+
+// 256-point Walsh-Hadamard transform on a single warp holding v[0..7] at
+// col = lane + 32 * j (j = 0..7). Stages h = 1..16 use intra-warp shuffles;
+// stages h = 32, 64, 128 operate directly on each thread's register pair
+// v[j] and v[j ^ (h >> 5)] with zero shared memory and zero __syncthreads().
+// Matches warp3090's wht256 rounding order to 0 ULP.
+__device__ __forceinline__ void wht256_warp(float (&v)[8], int lane) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float val = v[j];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            float o = __shfl_xor_sync(0xffffffffu, val, h);
+            val = (lane & h) ? (o - val) : (val + o);
+        }
+        v[j] = val;
+    }
+#pragma unroll
+    for (int j = 0; j < 8; j += 2) {
+        float a = v[j], b = v[j + 1];
+        v[j] = a + b;
+        v[j + 1] = a - b;
+    }
+#pragma unroll
+    for (int g = 0; g < 8; g += 4) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float a = v[g + i], b = v[g + i + 2];
+            v[g + i] = a + b;
+            v[g + i + 2] = a - b;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float a = v[i], b = v[i + 4];
+        v[i] = (a + b) * 0.0625f;
+        v[i + 4] = (a - b) * 0.0625f;
+    }
+}
+
 __device__ __forceinline__ float block_reduce_sum_128(float v, float* s_warp) {
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
@@ -78,9 +125,11 @@ __device__ __forceinline__ float block_reduce_max_128(float v, float* s_warp) {
 __device__ void write_kv_row(
     uint8_t* dst_row,
     int format,
+    int transform,
     const __half* src_row,
     int head_dim,
-    float* s_warp) {
+    float* s_warp,
+    int target_warp) {
     if (format == W34_KV_FORMAT_FP16) {
         __half* dst = (__half*)dst_row;
         for (int c = threadIdx.x; c < head_dim; c += blockDim.x) {
@@ -94,6 +143,91 @@ __device__ void write_kv_row(
             dst[c] = __float2bfloat16(__half2float(src_row[c]));
         }
         return;
+    }
+    if (head_dim == 256 && transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+        if (format == W34_KV_FORMAT_TQ4) {
+            // Exact warp3090 tq4_encode_row (Seed-42 Rademacher + WHT-256 +
+            // full-256 energy-preserving norm + Beta(256) codebook).
+            // Runs on `target_warp` (0 for K, 1 for V) so K and V encode concurrently.
+            if ((int)(threadIdx.x >> 5) == target_warp) {
+                const int lane = threadIdx.x & 31;
+                block_tq4_0* row2 = (block_tq4_0*)dst_row;
+                float v[8];
+                float s_sq = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = 32 * j + lane;
+                    float x = __half2float(src_row[col]);
+                    v[j] = x;
+                    s_sq += warp_reduce_sum(x * x);
+                }
+                const float grp_norm = __fsqrt_rn(s_sq);
+                const float inv_norm = (grp_norm > 1e-10f) ? __fdiv_rn(1.0f, grp_norm) : 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = 32 * j + lane;
+                    v[j] = v[j] * inv_norm * kTq4Signs256[col];
+                }
+                wht256_warp(v, lane);
+
+                float c_sq_sum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float rv = v[j];
+                    int q = 0;
+#pragma unroll
+                    for (int i = 0; i < 15; ++i) {
+                        q += (rv > kTq4D256Boundaries[i]) ? 1 : 0;
+                    }
+                    const uint8_t nib = (uint8_t)q;
+                    const uint8_t partner =
+                        (uint8_t)__shfl_sync(0xffffffffu, (unsigned)nib, lane ^ 1);
+                    if ((lane & 1) == 0) {
+                        row2[j >> 2].qs[((j & 3) * 32 + lane) >> 1] =
+                            (uint8_t)(nib | (partner << 4));
+                    }
+                    const float c = kTq4D256Centroids[q];
+                    c_sq_sum += warp_reduce_sum(c * c);
+                }
+                if (lane == 0) {
+                    const float recon = __fsqrt_rn(c_sq_sum);
+                    const float corrected =
+                        (recon > 1e-10f) ? __fdiv_rn(grp_norm, recon) : grp_norm;
+                    const __half h = __float2half(corrected);
+                    row2[0].d = h;
+                    row2[1].d = h;
+                }
+            }
+            return;
+        }
+        if (format == W34_KV_FORMAT_Q8_0) {
+            // Rotated Q8_0_64 (K8V4 K-cache): R = WHT256 * diag(s), then 4 x 64-elem Q8_0 sub-blocks.
+            if ((int)(threadIdx.x >> 5) == target_warp) {
+                const int lane = threadIdx.x & 31;
+                block_q8_0_64* blks = (block_q8_0_64*)dst_row;
+                float v[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = 32 * j + lane;
+                    v[j] = __half2float(src_row[col]) * kTq4Signs256[col];
+                }
+                wht256_warp(v, lane);
+#pragma unroll
+                for (int sb = 0; sb < 4; ++sb) {
+                    const float x0 = v[2 * sb];
+                    const float x1 = v[2 * sb + 1];
+                    const float amax = warp_reduce_max(fmaxf(fabsf(x0), fabsf(x1)));
+                    const float d = amax / 127.0f;
+                    const float inv_d = (d > 1e-12f) ? (1.0f / d) : 0.0f;
+                    if (lane == 0) blks[sb].d = d;
+                    float q0 = fminf(127.0f, fmaxf(-127.0f, roundf(x0 * inv_d)));
+                    float q1 = fminf(127.0f, fmaxf(-127.0f, roundf(x1 * inv_d)));
+                    blks[sb].qs[lane] = (int8_t)q0;
+                    blks[sb].qs[lane + 32] = (int8_t)q1;
+                }
+            }
+            return;
+        }
     }
     if (format == W34_KV_FORMAT_TQ4) {
         // Quantize each 128-element sub-block into a 66-byte block_tq4_0
@@ -223,8 +357,8 @@ __global__ void kv_cache_write_kernel(
     const __half* v_src = v_in + (size_t)tok * v_row_stride + (size_t)kv_head * layout.head_dim;
 
     __shared__ float s_warp[8];
-    write_kv_row(k_dst, layout.k_format, k_src, layout.head_dim, s_warp);
-    write_kv_row(v_dst, layout.v_format, v_src, layout.head_dim, s_warp);
+    write_kv_row(k_dst, layout.k_format, layout.k_transform, k_src, layout.head_dim, s_warp, 0);
+    write_kv_row(v_dst, layout.v_format, layout.v_transform, v_src, layout.head_dim, s_warp, 1);
 }
 
 // Grid: (total_tokens, num_q_heads), Block: 128 threads.
@@ -299,6 +433,15 @@ __global__ void paged_attention_kernel(
         const int col = lane + 32 * j;
         q_reg[j] = (col < head_dim) ? (float)q_row[col] : 0.0f;
         acc[j] = 0.0f;
+    }
+    if (head_dim == 256 && layout.k_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+        // Pre-rotate Q into the WHT-256 domain once per query row:
+        // Q' = WHT256 * diag(s) * Q so <Q', K_rot> == <Q, K>.
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            q_reg[j] *= kTq4Signs256[lane + 32 * j];
+        }
+        wht256_warp(q_reg, lane);
     }
 
     float m_i = -FLT_MAX;
@@ -474,11 +617,45 @@ __global__ void paged_attention_kernel(
                                + (size_t)page_off * layout.v_token_stride_bytes;
 
         float dot = 0.0f;
+        if (head_dim == 256 && layout.k_format == W34_KV_FORMAT_FP16) {
+            const __half* kh = (const __half*)k_ptr;
 #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const int col = lane + 32 * j;
-            if (col < head_dim) {
-                dot += q_reg[j] * read_kv_elem(k_ptr, layout.k_format, col);
+            for (int j = 0; j < 8; ++j) {
+                dot += q_reg[j] * __half2float(kh[lane + 32 * j]);
+            }
+        } else if (head_dim == 256 && layout.k_format == W34_KV_FORMAT_TQ4) {
+            const block_tq4_0* k_blks = (const block_tq4_0*)k_ptr;
+            const float d0 = __half2float(k_blks[0].d);
+            const float d1 = __half2float(k_blks[1].d);
+            const int odd = lane & 1;
+            float dot0 = 0.0f;
+            float dot1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t p0 = k_blks[0].qs[(lane + 32 * j) >> 1];
+                const uint8_t p1 = k_blks[1].qs[(lane + 32 * j) >> 1];
+                const uint8_t n0 = odd ? (p0 >> 4) : (p0 & 0x0Fu);
+                const uint8_t n1 = odd ? (p1 >> 4) : (p1 & 0x0Fu);
+                dot0 += q_reg[j] * kTq4D256Centroids[n0];
+                dot1 += q_reg[j + 4] * kTq4D256Centroids[n1];
+            }
+            dot = d0 * dot0 + d1 * dot1;
+        } else if (head_dim == 256 && layout.k_format == W34_KV_FORMAT_Q8_0) {
+            const block_q8_0_64* k_blks = (const block_q8_0_64*)k_ptr;
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float d = k_blks[sb].d;
+                const float k0 = (float)k_blks[sb].qs[lane];
+                const float k1 = (float)k_blks[sb].qs[lane + 32];
+                dot += d * (q_reg[2 * sb] * k0 + q_reg[2 * sb + 1] * k1);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int col = lane + 32 * j;
+                if (col < head_dim) {
+                    dot += q_reg[j] * read_kv_elem(k_ptr, layout.k_format, col);
+                }
             }
         }
 #pragma unroll
@@ -493,11 +670,41 @@ __global__ void paged_attention_kernel(
         l_i = l_i * alpha + p;
         m_i = m_new;
 
+        if (head_dim == 256 && layout.v_format == W34_KV_FORMAT_FP16) {
+            const __half* vh = (const __half*)v_ptr;
 #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const int col = lane + 32 * j;
-            if (col < head_dim) {
-                acc[j] = acc[j] * alpha + p * read_kv_elem(v_ptr, layout.v_format, col);
+            for (int j = 0; j < 8; ++j) {
+                acc[j] = acc[j] * alpha + p * __half2float(vh[lane + 32 * j]);
+            }
+        } else if (head_dim == 256 && layout.v_format == W34_KV_FORMAT_TQ4) {
+            const block_tq4_0* v_blks = (const block_tq4_0*)v_ptr;
+            const float pd0 = p * __half2float(v_blks[0].d);
+            const float pd1 = p * __half2float(v_blks[1].d);
+            const int odd = lane & 1;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t p0 = v_blks[0].qs[(lane + 32 * j) >> 1];
+                const uint8_t p1 = v_blks[1].qs[(lane + 32 * j) >> 1];
+                const uint8_t n0 = odd ? (p0 >> 4) : (p0 & 0x0Fu);
+                const uint8_t n1 = odd ? (p1 >> 4) : (p1 & 0x0Fu);
+                acc[j] = acc[j] * alpha + pd0 * kTq4D256Centroids[n0];
+                acc[j + 4] = acc[j + 4] * alpha + pd1 * kTq4D256Centroids[n1];
+            }
+        } else if (head_dim == 256 && layout.v_format == W34_KV_FORMAT_Q8_0) {
+            const block_q8_0_64* v_blks = (const block_q8_0_64*)v_ptr;
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float pd = p * v_blks[sb].d;
+                acc[2 * sb] = acc[2 * sb] * alpha + pd * (float)v_blks[sb].qs[lane];
+                acc[2 * sb + 1] = acc[2 * sb + 1] * alpha + pd * (float)v_blks[sb].qs[lane + 32];
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const int col = lane + 32 * j;
+                if (col < head_dim) {
+                    acc[j] = acc[j] * alpha + p * read_kv_elem(v_ptr, layout.v_format, col);
+                }
             }
         }
     }
@@ -539,6 +746,28 @@ __global__ void paged_attention_kernel(
         }
     }
     const float inv_l = (l_tot > 0.0f) ? (1.0f / l_tot) : 0.0f;
+    if (head_dim == 256 && layout.v_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+        if (wid == 0) {
+            float out_v[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int col = lane + 32 * j;
+                float sum_v = s_acc[0][col] * w_scale[0]
+                            + s_acc[1][col] * w_scale[1]
+                            + s_acc[2][col] * w_scale[2]
+                            + s_acc[3][col] * w_scale[3];
+                out_v[j] = sum_v * inv_l;
+            }
+            // Inverse transform R^{-1} = diag(s) * WHT256: butterfly first, then signs.
+            wht256_warp(out_v, lane);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int col = lane + 32 * j;
+                out_row[col] = Scalar(out_v[j] * kTq4Signs256[col]);
+            }
+        }
+        return;
+    }
     for (int col = threadIdx.x; col < head_dim; col += blockDim.x) {
         float sum_v = s_acc[0][col] * w_scale[0]
                     + s_acc[1][col] * w_scale[1]

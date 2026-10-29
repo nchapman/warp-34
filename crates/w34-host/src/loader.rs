@@ -214,6 +214,20 @@ impl SafetensorsArchive {
             )?;
             files.insert(shard_name.to_string(), f);
         }
+        let extra_name = "model_extra_tensors.safetensors";
+        let extra_path = dir.join(extra_name);
+        if !files.contains_key(extra_name) && extra_path.exists() {
+            let f = File::open(&extra_path)?;
+            let (data_base, file_len, header) = Self::parse_safetensors_header(&f)?;
+            Self::insert_entries_from_header(
+                extra_name,
+                data_base,
+                file_len,
+                &header,
+                &mut entries,
+            )?;
+            files.insert(extra_name.to_string(), f);
+        }
         Ok(Self { files, entries })
     }
 
@@ -491,6 +505,10 @@ pub struct ModelConfig {
     pub num_experts_per_tok: usize,
     pub moe_intermediate_size: usize,
     pub shared_expert_intermediate_size: usize,
+    pub norm_topk_prob: bool,
+    pub scoring_func: String,
+    pub mlp_only_layers: Vec<usize>,
+    pub vision_config: Option<crate::vision::VisionConfig>,
     pub mtp_num_hidden_layers: usize,
     pub dflash_block_size: Option<usize>,
     pub dflash_target_layer_ids: Vec<usize>,
@@ -646,6 +664,38 @@ impl ModelConfig {
             .get("shared_expert_intermediate_size")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
+        let norm_topk_prob = tc
+            .get("norm_topk_prob")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let scoring_func = tc
+            .get("scoring_func")
+            .and_then(|v| v.as_str())
+            .unwrap_or("softmax")
+            .to_string();
+        let mlp_only_layers = tc
+            .get("mlp_only_layers")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|u| u as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let vision_config = root.get("vision_config").and_then(|vc| {
+            let mut vcfg: crate::vision::VisionConfig = serde_json::from_value(vc.clone()).ok()?;
+            if let Some(id) = root.get("image_token_id").and_then(|v| v.as_i64()) {
+                vcfg.image_token_id = id as i32;
+            }
+            if let Some(id) = root.get("vision_start_token_id").and_then(|v| v.as_i64()) {
+                vcfg.vision_start_token_id = id as i32;
+            }
+            if let Some(id) = root.get("vision_end_token_id").and_then(|v| v.as_i64()) {
+                vcfg.vision_end_token_id = id as i32;
+            }
+            Some(vcfg)
+        });
         let mtp_num_hidden_layers = tc
             .get("mtp_num_hidden_layers")
             .and_then(|v| v.as_u64())
@@ -717,6 +767,10 @@ impl ModelConfig {
             num_experts_per_tok,
             moe_intermediate_size,
             shared_expert_intermediate_size,
+            norm_topk_prob,
+            scoring_func,
+            mlp_only_layers,
+            vision_config,
             mtp_num_hidden_layers,
             dflash_block_size,
             dflash_target_layer_ids,

@@ -431,6 +431,49 @@ int w34_topk_rows_f16(const w34_exec* ex, const void* logits_f16,
                       int32_t* out_ids, float* out_vals,
                       int num_rows, int local_vocab_size, int vocab_offset, int top_k);
 
+// --- Phase 5.2: Qwen3_VisionTransformer & Multimodal Kernels (op_vision.cu) ---
+int w34_vision_bias_add_f16(const w34_exec* ex, const void* x, const void* bias,
+                            const void* residual, void* out, int rows, int cols);
+int w34_vision_layernorm_f16(const w34_exec* ex, const void* x, const void* weight,
+                             const void* bias, void* out, int rows, int cols, float eps);
+int w34_vision_bias_gelu_f16(const w34_exec* ex, const void* x, const void* bias,
+                             void* out, int rows, int cols, int use_tanh);
+int w34_vision_qkv_rope_attn_f16(const w34_exec* ex, void* qkv, const void* qkv_bias,
+                                 const int32_t* pos_hw, const int32_t* cu_seqlens,
+                                 void* out, int total_patches, int num_images,
+                                 int num_heads, int head_dim, float rope_theta);
+int w34_embedding_splice_f16(const w34_exec* ex, void* dst_embeds,
+                             const void* src_visual_embeds, const int32_t* token_indices,
+                             int num_visual_tokens, int hidden_size);
+
+// --- Phase 5.3: Qwen3.5 / 3.6 Hybrid MoE Kernels (op_moe.cu) ---
+int w34_moe_topk_router_f16(const w34_exec* ex, const void* router_logits,
+                            float* topk_weights, int32_t* topk_ids,
+                            int num_tokens, int num_experts, int top_k,
+                            int norm_topk_prob, int scoring_func);
+int w34_moe_w4a16_gate_up_silu_f16(const w34_exec* ex, const void* x,
+                                   const uint32_t* gate_up_packed, const void* gate_up_scales,
+                                   const int32_t* topk_ids, void* interm_out,
+                                   int num_tokens, int top_k, int num_experts,
+                                   int n_interm, int k_hidden, int group_size);
+int w34_moe_w4a16_down_accum_f16(const w34_exec* ex, const void* interm_in,
+                                 const uint32_t* down_packed, const void* down_scales,
+                                 const int32_t* topk_ids, const float* topk_weights,
+                                 const void* shared_expert_out,
+                                 const void* shared_expert_gate_logits,
+                                 void* out, int num_tokens, int top_k, int num_experts,
+                                 int k_hidden, int n_interm, int group_size);
+int w34_moe_f16_gate_up_silu(const w34_exec* ex, const void* x, const void* gate_up_w,
+                             const int32_t* topk_ids, void* interm_out,
+                             int num_tokens, int top_k, int num_experts,
+                             int n_interm, int k_hidden);
+int w34_moe_f16_down_accum(const w34_exec* ex, const void* interm_in, const void* down_w,
+                           const int32_t* topk_ids, const float* topk_weights,
+                           const void* shared_expert_out,
+                           const void* shared_expert_gate_logits,
+                           void* out, int num_tokens, int top_k, int num_experts,
+                           int k_hidden, int n_interm);
+
 #ifdef __cplusplus
 }
 #endif

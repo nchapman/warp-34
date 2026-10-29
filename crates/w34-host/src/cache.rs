@@ -17,9 +17,13 @@ pub enum KvFormatPolicy {
     Bf16,
     Tq4,
     K8V4,
-    /// Layers `0, 1` and `num_full_attn_layers - 2, num_full_attn_layers - 1` use `FP16`;
-    /// interior layers use `TQ4`.
+    /// Full-attention layer slot `0` and the last 2 full-attention layer slots
+    /// (`num_full_attn_layers - 2`, `num_full_attn_layers - 1`) use `FP16`;
+    /// interior layers use `TQ4` (`26,016 B/token`, `2.52x` compression on 27B).
     FirstLast2,
+    /// Full-attention layer slot `0` and the last 2 full-attention layer slots
+    /// use `FP16`; interior layers use `K8V4` (`33,296 B/token`, `1.97x` compression on 27B).
+    K8V4FirstLast2,
 }
 
 impl KvFormatPolicy {
@@ -54,7 +58,7 @@ impl KvFormatPolicy {
                 W34_KV_TRANSFORM_RADEMACHER_WHT256,
             ),
             Self::FirstLast2 => {
-                let is_boundary = full_attn_layer_ordinal < 2
+                let is_boundary = full_attn_layer_ordinal == 0
                     || (num_full_attn_layers >= 2
                         && full_attn_layer_ordinal >= num_full_attn_layers - 2);
                 if is_boundary {
@@ -73,7 +77,42 @@ impl KvFormatPolicy {
                     )
                 }
             }
+            Self::K8V4FirstLast2 => {
+                let is_boundary = full_attn_layer_ordinal == 0
+                    || (num_full_attn_layers >= 2
+                        && full_attn_layer_ordinal >= num_full_attn_layers - 2);
+                if is_boundary {
+                    (
+                        W34_KV_FORMAT_FP16,
+                        W34_KV_FORMAT_FP16,
+                        W34_KV_TRANSFORM_IDENTITY,
+                        W34_KV_TRANSFORM_IDENTITY,
+                    )
+                } else {
+                    (
+                        W34_KV_FORMAT_Q8_0,
+                        W34_KV_FORMAT_TQ4,
+                        W34_KV_TRANSFORM_RADEMACHER_WHT256,
+                        W34_KV_TRANSFORM_RADEMACHER_WHT256,
+                    )
+                }
+            }
         }
+    }
+
+    pub fn bytes_per_token(
+        self,
+        num_full_attn_layers: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> usize {
+        (0..num_full_attn_layers)
+            .map(|ord| {
+                let (k_fmt, v_fmt, _, _) = self.resolve_layer(ord, num_full_attn_layers);
+                kv_heads
+                    * (kv_format_row_bytes(k_fmt, head_dim) + kv_format_row_bytes(v_fmt, head_dim))
+            })
+            .sum()
     }
 }
 

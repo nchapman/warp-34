@@ -1620,5 +1620,177 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup w34_rejection_stochastic",
     )?;
 
+    // Warm Phase 5.2 (Vision) & Phase 5.3 (MoE) kernels so CUDA 13 lazy loading
+    // resolves all module symbols before any TP=2 collective or graph capture.
+    let cu_seqlens = arena.upload_slice(&[0i32, 1i32], &stream)?;
+    check_rc(
+        unsafe {
+            ffi::w34_vision_bias_add_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_a as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                64,
+            )
+        },
+        "warmup w34_vision_bias_add_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_vision_layernorm_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                64,
+                1e-6,
+            )
+        },
+        "warmup w34_vision_layernorm_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_vision_bias_gelu_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                64,
+                1,
+            )
+        },
+        "warmup w34_vision_bias_gelu_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_vision_qkv_rope_attn_f16(
+                &ex,
+                buf_a as *mut c_void,
+                buf_b as *const c_void,
+                reject_ids as *const i32,
+                cu_seqlens as *const i32,
+                buf_c as *mut c_void,
+                1,
+                1,
+                2,
+                64,
+                10000.0,
+            )
+        },
+        "warmup w34_vision_qkv_rope_attn_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_embedding_splice_f16(
+                &ex,
+                buf_c as *mut c_void,
+                buf_a as *const c_void,
+                reject_ids as *const i32,
+                1,
+                64,
+            )
+        },
+        "warmup w34_embedding_splice_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_moe_topk_router_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut f32,
+                reject_ids as *mut i32,
+                1,
+                8,
+                2,
+                1,
+                0,
+            )
+        },
+        "warmup w34_moe_topk_router_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_moe_w4a16_gate_up_silu_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const u32,
+                buf_a as *const c_void,
+                reject_ids as *const i32,
+                buf_c as *mut c_void,
+                1,
+                1,
+                2,
+                8,
+                64,
+                64,
+            )
+        },
+        "warmup w34_moe_w4a16_gate_up_silu_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_moe_w4a16_down_accum_f16(
+                &ex,
+                buf_c as *const c_void,
+                buf_b as *const u32,
+                buf_a as *const c_void,
+                reject_ids as *const i32,
+                reject_probs as *const f32,
+                buf_a as *const c_void,
+                buf_a as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                1,
+                2,
+                64,
+                64,
+                64,
+            )
+        },
+        "warmup w34_moe_w4a16_down_accum_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_moe_f16_gate_up_silu(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                reject_ids as *const i32,
+                buf_c as *mut c_void,
+                1,
+                1,
+                2,
+                8,
+                64,
+            )
+        },
+        "warmup w34_moe_f16_gate_up_silu",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_moe_f16_down_accum(
+                &ex,
+                buf_c as *const c_void,
+                buf_b as *const c_void,
+                reject_ids as *const i32,
+                reject_probs as *const f32,
+                buf_a as *const c_void,
+                buf_a as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                1,
+                2,
+                64,
+                8,
+            )
+        },
+        "warmup w34_moe_f16_down_accum",
+    )?;
+
     dev.synchronize()
 }

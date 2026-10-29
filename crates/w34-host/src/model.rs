@@ -502,13 +502,291 @@ pub enum LayerBlockWeights {
 }
 
 #[cfg(feature = "cuda")]
+pub enum MoeExpertStorage {
+    W4A16 {
+        gate_up_packed_ptr: u64,
+        gate_up_scales_ptr: u64,
+        down_packed_ptr: u64,
+        down_scales_ptr: u64,
+        group_size: usize,
+    },
+    DenseF16 {
+        gate_up_ptr: u64,
+        down_ptr: u64,
+    },
+}
+
+#[cfg(feature = "cuda")]
+pub struct MoeLayerWeights {
+    pub router_gate: LinearProj,
+    pub experts: MoeExpertStorage,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub norm_topk_prob: bool,
+    pub scoring_func: i32,
+    pub local_moe_interm: usize,
+    pub shared_gate_up_proj: Option<LinearProj>,
+    pub shared_down_proj: Option<LinearProj>,
+    pub shared_expert_gate: Option<LinearProj>,
+    pub local_shared_interm: usize,
+}
+
+#[cfg(feature = "cuda")]
+pub enum FfnBlockWeights {
+    Dense {
+        gate_up_proj: LinearProj,
+        down_proj: LinearProj,
+    },
+    Moe(Box<MoeLayerWeights>),
+}
+
+#[cfg(feature = "cuda")]
+impl FfnBlockWeights {
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        ex: &W34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        num_tokens: usize,
+        h_dim: usize,
+        local_interm: usize,
+        gate_up_buf: u64,
+        act_buf: u64,
+        moe_router_logits_buf: u64,
+        moe_topk_weights_buf: u64,
+        moe_topk_ids_buf: u64,
+        moe_interm_buf: u64,
+        moe_sh_gu_buf: u64,
+        moe_sh_act_buf: u64,
+        moe_sh_out_buf: u64,
+        moe_sh_gate_buf: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Dense {
+                gate_up_proj,
+                down_proj,
+            } => {
+                gate_up_proj.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    normed_buf,
+                    gate_up_buf,
+                    num_tokens,
+                )?;
+                check_rc(
+                    unsafe {
+                        ffi::w34_silu_and_mul_f16(
+                            ex,
+                            gate_up_buf as *const c_void,
+                            act_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            local_interm as i32,
+                        )
+                    },
+                    "w34_silu_and_mul_f16",
+                )?;
+                down_proj.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    act_buf,
+                    mlp_out_buf,
+                    num_tokens,
+                )
+            }
+            Self::Moe(moe) => {
+                moe.router_gate.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    normed_buf,
+                    moe_router_logits_buf,
+                    num_tokens,
+                )?;
+                check_rc(
+                    unsafe {
+                        ffi::w34_moe_topk_router_f16(
+                            ex,
+                            moe_router_logits_buf as *const c_void,
+                            moe_topk_weights_buf as *mut f32,
+                            moe_topk_ids_buf as *mut i32,
+                            num_tokens as i32,
+                            moe.num_experts as i32,
+                            moe.top_k as i32,
+                            i32::from(moe.norm_topk_prob),
+                            moe.scoring_func,
+                        )
+                    },
+                    "w34_moe_topk_router_f16",
+                )?;
+
+                let (sh_out_ptr, sh_gate_ptr) = if let (Some(sh_gu), Some(sh_dn)) =
+                    (&moe.shared_gate_up_proj, &moe.shared_down_proj)
+                {
+                    sh_gu.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        moe_sh_gu_buf,
+                        num_tokens,
+                    )?;
+                    check_rc(
+                        unsafe {
+                            ffi::w34_silu_and_mul_f16(
+                                ex,
+                                moe_sh_gu_buf as *const c_void,
+                                moe_sh_act_buf as *mut c_void,
+                                core::ptr::null(),
+                                num_tokens as i32,
+                                moe.local_shared_interm as i32,
+                            )
+                        },
+                        "w34_silu_and_mul_f16 (shared_expert)",
+                    )?;
+                    sh_dn.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        moe_sh_act_buf,
+                        moe_sh_out_buf,
+                        num_tokens,
+                    )?;
+                    let sg_ptr = if let Some(sh_gate) = &moe.shared_expert_gate {
+                        sh_gate.forward(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            normed_buf,
+                            moe_sh_gate_buf,
+                            num_tokens,
+                        )?;
+                        moe_sh_gate_buf as *const c_void
+                    } else {
+                        core::ptr::null()
+                    };
+                    (moe_sh_out_buf as *const c_void, sg_ptr)
+                } else {
+                    (core::ptr::null(), core::ptr::null())
+                };
+
+                match &moe.experts {
+                    MoeExpertStorage::W4A16 {
+                        gate_up_packed_ptr,
+                        gate_up_scales_ptr,
+                        down_packed_ptr,
+                        down_scales_ptr,
+                        group_size,
+                    } => {
+                        check_rc(
+                            unsafe {
+                                ffi::w34_moe_w4a16_gate_up_silu_f16(
+                                    ex,
+                                    normed_buf as *const c_void,
+                                    *gate_up_packed_ptr as *const u32,
+                                    *gate_up_scales_ptr as *const c_void,
+                                    moe_topk_ids_buf as *const i32,
+                                    moe_interm_buf as *mut c_void,
+                                    num_tokens as i32,
+                                    moe.top_k as i32,
+                                    moe.num_experts as i32,
+                                    moe.local_moe_interm as i32,
+                                    h_dim as i32,
+                                    *group_size as i32,
+                                )
+                            },
+                            "w34_moe_w4a16_gate_up_silu_f16",
+                        )?;
+                        check_rc(
+                            unsafe {
+                                ffi::w34_moe_w4a16_down_accum_f16(
+                                    ex,
+                                    moe_interm_buf as *const c_void,
+                                    *down_packed_ptr as *const u32,
+                                    *down_scales_ptr as *const c_void,
+                                    moe_topk_ids_buf as *const i32,
+                                    moe_topk_weights_buf as *const f32,
+                                    sh_out_ptr,
+                                    sh_gate_ptr,
+                                    mlp_out_buf as *mut c_void,
+                                    num_tokens as i32,
+                                    moe.top_k as i32,
+                                    moe.num_experts as i32,
+                                    h_dim as i32,
+                                    moe.local_moe_interm as i32,
+                                    *group_size as i32,
+                                )
+                            },
+                            "w34_moe_w4a16_down_accum_f16",
+                        )
+                    }
+                    MoeExpertStorage::DenseF16 {
+                        gate_up_ptr,
+                        down_ptr,
+                    } => {
+                        check_rc(
+                            unsafe {
+                                ffi::w34_moe_f16_gate_up_silu(
+                                    ex,
+                                    normed_buf as *const c_void,
+                                    *gate_up_ptr as *const c_void,
+                                    moe_topk_ids_buf as *const i32,
+                                    moe_interm_buf as *mut c_void,
+                                    num_tokens as i32,
+                                    moe.top_k as i32,
+                                    moe.num_experts as i32,
+                                    moe.local_moe_interm as i32,
+                                    h_dim as i32,
+                                )
+                            },
+                            "w34_moe_f16_gate_up_silu",
+                        )?;
+                        check_rc(
+                            unsafe {
+                                ffi::w34_moe_f16_down_accum(
+                                    ex,
+                                    moe_interm_buf as *const c_void,
+                                    *down_ptr as *const c_void,
+                                    moe_topk_ids_buf as *const i32,
+                                    moe_topk_weights_buf as *const f32,
+                                    sh_out_ptr,
+                                    sh_gate_ptr,
+                                    mlp_out_buf as *mut c_void,
+                                    num_tokens as i32,
+                                    moe.top_k as i32,
+                                    moe.num_experts as i32,
+                                    h_dim as i32,
+                                    moe.local_moe_interm as i32,
+                                )
+                            },
+                            "w34_moe_f16_down_accum",
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub struct DecoderLayerWeights {
     pub layer_id: usize,
     pub input_layernorm_ptr: u64,
     pub post_attention_layernorm_ptr: u64,
     pub block: LayerBlockWeights,
-    pub gate_up_proj: LinearProj,
-    pub down_proj: LinearProj,
+    pub ffn: FfnBlockWeights,
 }
 
 /// Static device buffers used by [`CUDAGraphRunner`] for `M=1` single-request decode.
@@ -610,6 +888,8 @@ pub struct Qwen3_5ModelRank {
     pub speculative_logits_rows: usize,
     pub last_final_hidden_f16: Option<DeviceBuffer>,
     pub max_tap_rows: usize,
+    pub current_pos_plane_stride: i32,
+    pub pending_visual_splice: Option<(u64, u64, usize)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -630,11 +910,21 @@ impl Qwen3_5ModelRank {
         let (free_vram, total_vram) = device.mem_info()?;
 
         // Estimate weight arena size generously based on model size & TP degree
-        let est_weight_bytes = match (cfg.num_hidden_layers, tp_size) {
-            (64, 2) => 12 * 1024 * 1024 * 1024, // 27B TP=2 (~9.5 GiB/rank)
-            (64, _) => 19 * 1024 * 1024 * 1024,
-            (_, 2) => 5 * 1024 * 1024 * 1024, // 4B/9B TP=2
-            _ => 8 * 1024 * 1024 * 1024,      // 4B/9B TP=1
+        let est_weight_bytes = if cfg.num_experts > 0 {
+            if cfg.num_hidden_layers < 10 {
+                256 * 1024 * 1024 // small synthetic MoE test fixture
+            } else if tp_size == 2 {
+                13 * 1024 * 1024 * 1024 // 35B-A3B MoE TP=2 (~10.5 GiB/rank)
+            } else {
+                21 * 1024 * 1024 * 1024 // 35B-A3B MoE TP=1 (~19.5 GiB)
+            }
+        } else {
+            match (cfg.num_hidden_layers, tp_size) {
+                (64, 2) => 12 * 1024 * 1024 * 1024, // 27B TP=2 (~9.5 GiB/rank)
+                (64, _) => 19 * 1024 * 1024 * 1024,
+                (_, 2) => 5 * 1024 * 1024 * 1024, // 4B/9B TP=2
+                _ => 8 * 1024 * 1024 * 1024,      // 4B/9B TP=1
+            }
         };
         let mut weight_arena = DeviceArena::new(device_id, est_weight_bytes)?;
         let scratch_arena = DeviceArena::new(device_id, 512 * 1024 * 1024)?;
@@ -914,29 +1204,258 @@ impl Qwen3_5ModelRank {
                 }
             };
 
-            let raw_gate =
-                RawLinearHost::load(archive, &format!("{pfx}.mlp.gate_proj"), default_group_size)?;
-            let gate_shard = raw_gate.slice_rows(rank * local_interm, (rank + 1) * local_interm);
+            let is_moe_layer = cfg.num_experts > 0
+                && !cfg.mlp_only_layers.contains(&layer_id)
+                && (archive
+                    .resolve_name(&format!("{pfx}.mlp.gate.weight"))
+                    .is_some()
+                    || archive
+                        .resolve_name(&format!("{pfx}.mlp.gate.weight_packed"))
+                        .is_some()
+                    || archive
+                        .resolve_name(&format!("{pfx}.mlp.gate.qweight"))
+                        .is_some());
 
-            let raw_up =
-                RawLinearHost::load(archive, &format!("{pfx}.mlp.up_proj"), default_group_size)?;
-            let up_shard = raw_up.slice_rows(rank * local_interm, (rank + 1) * local_interm);
+            let ffn = if is_moe_layer {
+                let raw_router =
+                    RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), default_group_size)?;
+                let router_gate = raw_router.upload(&mut weight_arena, &stream, &repack_staging)?;
 
-            let gate_up_shard = RawLinearHost::concat_rows(&[gate_shard, up_shard]);
-            let gate_up_proj = gate_up_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
+                let local_moe_interm = cfg.moe_intermediate_size / tp_size;
+                let num_exp = cfg.num_experts;
+                let top_k = cfg.num_experts_per_tok.max(1);
+                let scoring_func = i32::from(cfg.scoring_func.eq_ignore_ascii_case("sigmoid"));
 
-            let raw_down =
-                RawLinearHost::load(archive, &format!("{pfx}.mlp.down_proj"), default_group_size)?;
-            let down_shard = raw_down.slice_cols(rank * local_interm, (rank + 1) * local_interm);
-            let down_proj = down_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
+                // Probe expert 0 to determine W4A16 vs DenseF16 storage
+                let exp0_gate = RawLinearHost::load(
+                    archive,
+                    &format!("{pfx}.mlp.experts.0.gate_proj"),
+                    default_group_size,
+                )?;
+                let experts = match exp0_gate {
+                    RawLinearHost::U4B8NMajor { group_size, .. } => {
+                        let gu_words_per_exp = (2 * local_moe_interm) * (cfg.hidden_size / 8);
+                        let gu_scales_per_exp =
+                            (2 * local_moe_interm) * cfg.hidden_size.div_ceil(group_size);
+                        let dn_words_per_exp = cfg.hidden_size * (local_moe_interm / 8);
+                        let dn_scales_per_exp =
+                            cfg.hidden_size * local_moe_interm.div_ceil(group_size);
+
+                        let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
+                        let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
+                        let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
+                        let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
+
+                        for e in 0..num_exp {
+                            let epfx = format!("{pfx}.mlp.experts.{e}");
+                            let rg = RawLinearHost::load(
+                                archive,
+                                &format!("{epfx}.gate_proj"),
+                                default_group_size,
+                            )?
+                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                            let ru = RawLinearHost::load(
+                                archive,
+                                &format!("{epfx}.up_proj"),
+                                default_group_size,
+                            )?
+                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                            let gu = RawLinearHost::concat_rows(&[rg, ru]);
+                            if let RawLinearHost::U4B8NMajor { packed, scales, .. } = gu {
+                                all_gu_packed.extend_from_slice(&packed);
+                                all_gu_scales.extend_from_slice(&scales);
+                            }
+                            let rd = RawLinearHost::load(
+                                archive,
+                                &format!("{epfx}.down_proj"),
+                                default_group_size,
+                            )?
+                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                            if let RawLinearHost::U4B8NMajor { packed, scales, .. } = rd {
+                                all_dn_packed.extend_from_slice(&packed);
+                                all_dn_scales.extend_from_slice(&scales);
+                            }
+                        }
+
+                        let gate_up_packed_ptr =
+                            weight_arena.upload_slice(&all_gu_packed, &stream)?;
+                        let gate_up_scales_ptr =
+                            weight_arena.upload_slice(&all_gu_scales, &stream)?;
+                        let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, &stream)?;
+                        let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, &stream)?;
+                        MoeExpertStorage::W4A16 {
+                            gate_up_packed_ptr,
+                            gate_up_scales_ptr,
+                            down_packed_ptr,
+                            down_scales_ptr,
+                            group_size,
+                        }
+                    }
+                    RawLinearHost::DenseF16 { .. } => {
+                        let mut all_gu_f16 =
+                            Vec::with_capacity(num_exp * 2 * local_moe_interm * cfg.hidden_size);
+                        let mut all_dn_f16 =
+                            Vec::with_capacity(num_exp * cfg.hidden_size * local_moe_interm);
+                        for e in 0..num_exp {
+                            let epfx = format!("{pfx}.mlp.experts.{e}");
+                            let rg = RawLinearHost::load(
+                                archive,
+                                &format!("{epfx}.gate_proj"),
+                                default_group_size,
+                            )?
+                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                            let ru = RawLinearHost::load(
+                                archive,
+                                &format!("{epfx}.up_proj"),
+                                default_group_size,
+                            )?
+                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                            let gu = RawLinearHost::concat_rows(&[rg, ru]);
+                            if let RawLinearHost::DenseF16 { weight, .. } = gu {
+                                all_gu_f16.extend_from_slice(&weight);
+                            }
+                            let rd = RawLinearHost::load(
+                                archive,
+                                &format!("{epfx}.down_proj"),
+                                default_group_size,
+                            )?
+                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                            if let RawLinearHost::DenseF16 { weight, .. } = rd {
+                                all_dn_f16.extend_from_slice(&weight);
+                            }
+                        }
+                        let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, &stream)?;
+                        let down_ptr = weight_arena.upload_slice(&all_dn_f16, &stream)?;
+                        MoeExpertStorage::DenseF16 {
+                            gate_up_ptr,
+                            down_ptr,
+                        }
+                    }
+                };
+
+                let local_shared_interm = cfg.shared_expert_intermediate_size / tp_size;
+                let (shared_gate_up_proj, shared_down_proj, shared_expert_gate) =
+                    if local_shared_interm > 0
+                        && archive
+                            .resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))
+                            .or_else(|| {
+                                archive.resolve_name(&format!(
+                                    "{pfx}.mlp.shared_expert.gate_proj.qweight"
+                                ))
+                            })
+                            .or_else(|| {
+                                archive.resolve_name(&format!(
+                                    "{pfx}.mlp.shared_expert.gate_proj.weight_packed"
+                                ))
+                            })
+                            .is_some()
+                    {
+                        let s_gate = RawLinearHost::load(
+                            archive,
+                            &format!("{pfx}.mlp.shared_expert.gate_proj"),
+                            default_group_size,
+                        )?
+                        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+                        let s_up = RawLinearHost::load(
+                            archive,
+                            &format!("{pfx}.mlp.shared_expert.up_proj"),
+                            default_group_size,
+                        )?
+                        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+                        let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up]).upload(
+                            &mut weight_arena,
+                            &stream,
+                            &repack_staging,
+                        )?;
+                        let s_dn = RawLinearHost::load(
+                            archive,
+                            &format!("{pfx}.mlp.shared_expert.down_proj"),
+                            default_group_size,
+                        )?
+                        .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
+                        .upload(
+                            &mut weight_arena,
+                            &stream,
+                            &repack_staging,
+                        )?;
+                        let s_eg = if archive
+                            .resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight"))
+                            .is_some()
+                        {
+                            Some(
+                                RawLinearHost::load(
+                                    archive,
+                                    &format!("{pfx}.mlp.shared_expert_gate"),
+                                    default_group_size,
+                                )?
+                                .upload(
+                                    &mut weight_arena,
+                                    &stream,
+                                    &repack_staging,
+                                )?,
+                            )
+                        } else {
+                            None
+                        };
+                        (Some(s_gu), Some(s_dn), s_eg)
+                    } else {
+                        (None, None, None)
+                    };
+
+                FfnBlockWeights::Moe(Box::new(MoeLayerWeights {
+                    router_gate,
+                    experts,
+                    num_experts: num_exp,
+                    top_k,
+                    norm_topk_prob: cfg.norm_topk_prob,
+                    scoring_func,
+                    local_moe_interm,
+                    shared_gate_up_proj,
+                    shared_down_proj,
+                    shared_expert_gate,
+                    local_shared_interm,
+                }))
+            } else {
+                let raw_gate = RawLinearHost::load(
+                    archive,
+                    &format!("{pfx}.mlp.gate_proj"),
+                    default_group_size,
+                )?;
+                let gate_shard =
+                    raw_gate.slice_rows(rank * local_interm, (rank + 1) * local_interm);
+
+                let raw_up = RawLinearHost::load(
+                    archive,
+                    &format!("{pfx}.mlp.up_proj"),
+                    default_group_size,
+                )?;
+                let up_shard = raw_up.slice_rows(rank * local_interm, (rank + 1) * local_interm);
+
+                let gate_up_shard = RawLinearHost::concat_rows(&[gate_shard, up_shard]);
+                let gate_up_proj =
+                    gate_up_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
+
+                let raw_down = RawLinearHost::load(
+                    archive,
+                    &format!("{pfx}.mlp.down_proj"),
+                    default_group_size,
+                )?;
+                let down_shard =
+                    raw_down.slice_cols(rank * local_interm, (rank + 1) * local_interm);
+                let down_proj = down_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
+
+                FfnBlockWeights::Dense {
+                    gate_up_proj,
+                    down_proj,
+                }
+            };
 
             layers.push(DecoderLayerWeights {
                 layer_id,
                 input_layernorm_ptr,
                 post_attention_layernorm_ptr,
                 block,
-                gate_up_proj,
-                down_proj,
+                ffn,
             });
         }
 
@@ -944,7 +1463,11 @@ impl Qwen3_5ModelRank {
         stream.synchronize()?;
 
         // 5. StateBundlePool & KvPool via CapacityPlanner
-        let total_state_slots = 24usize;
+        let total_state_slots = if est_weight_bytes >= 19 * 1024 * 1024 * 1024 {
+            10usize
+        } else {
+            24usize
+        };
         let conv_dim = 2 * gdn_k_local + gdn_v_local;
         let state_pool = StateBundlePool::new(
             device_id,
@@ -1024,6 +1547,8 @@ impl Qwen3_5ModelRank {
             speculative_logits_rows: 0,
             last_final_hidden_f16: None,
             max_tap_rows: 0,
+            current_pos_plane_stride: 0,
+            pending_visual_splice: None,
         })
     }
 
@@ -1173,17 +1698,53 @@ impl Qwen3_5ModelRank {
             .scratch_arena
             .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
 
-        let gate_up_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_interm * 2 * 2)?;
-        let act_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_interm * 2)?;
+        let gate_up_buf = if local_interm > 0 {
+            self.scratch_arena
+                .alloc_aligned(num_tokens * local_interm * 2 * 2)?
+        } else {
+            0
+        };
+        let act_buf = if local_interm > 0 {
+            self.scratch_arena
+                .alloc_aligned(num_tokens * local_interm * 2)?
+        } else {
+            0
+        };
+        let (
+            moe_router_logits_buf,
+            moe_topk_weights_buf,
+            moe_topk_ids_buf,
+            moe_interm_buf,
+            moe_sh_gu_buf,
+            moe_sh_act_buf,
+            moe_sh_out_buf,
+            moe_sh_gate_buf,
+        ) = if self.cfg.num_experts > 0 {
+            let num_exp = self.cfg.num_experts;
+            let top_k = self.cfg.num_experts_per_tok.max(1);
+            let local_moe_interm = (self.cfg.moe_intermediate_size / self.tp_size).max(8);
+            let local_sh_interm = (self.cfg.shared_expert_intermediate_size / self.tp_size).max(8);
+            (
+                self.scratch_arena.alloc_aligned(num_tokens * num_exp * 2)?,
+                self.scratch_arena.alloc_aligned(num_tokens * top_k * 4)?,
+                self.scratch_arena.alloc_aligned(num_tokens * top_k * 4)?,
+                self.scratch_arena
+                    .alloc_aligned(num_tokens * top_k * local_moe_interm * 2)?,
+                self.scratch_arena
+                    .alloc_aligned(num_tokens * local_sh_interm * 2 * 2)?,
+                self.scratch_arena
+                    .alloc_aligned(num_tokens * local_sh_interm * 2)?,
+                self.scratch_arena.alloc_aligned(num_tokens * h_dim * 2)?,
+                self.scratch_arena.alloc_aligned(num_tokens * 2)?,
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        };
         let logits_buf = self
             .scratch_arena
             .alloc_aligned(self.local_vocab_size * 2)?;
 
-        // 1. Embedding lookup into residual_buf
+        // 1. Embedding lookup into residual_buf (+ optional multimodal visual embedding splice)
         check_rc(
             unsafe {
                 ffi::w34_embed_lookup_f16(
@@ -1199,6 +1760,23 @@ impl Qwen3_5ModelRank {
             },
             "w34_embed_lookup_f16",
         )?;
+        if let Some((vis_ptr, idx_ptr, num_vis)) = self.pending_visual_splice
+            && num_vis > 0
+        {
+            check_rc(
+                unsafe {
+                    ffi::w34_embedding_splice_f16(
+                        &ex,
+                        residual_buf as *mut c_void,
+                        vis_ptr as *const c_void,
+                        idx_ptr as *const i32,
+                        num_vis as i32,
+                        h_dim as i32,
+                    )
+                },
+                "w34_embedding_splice_f16",
+            )?;
+        }
 
         if let Some(dump) = dump_out.as_deref_mut()
             && self.rank == 0
@@ -1271,7 +1849,7 @@ impl Qwen3_5ModelRank {
                                 k_buf as *mut c_void,
                                 gate_buf as *mut c_void,
                                 num_tokens as i32,
-                                0, // 1D text positions: all 3 mRoPE planes share plane 0
+                                self.current_pos_plane_stride,
                                 local_q_heads as i32,
                                 local_kv_heads as i32,
                                 head_dim as i32,
@@ -1498,36 +2076,26 @@ impl Qwen3_5ModelRank {
                 )?;
             }
 
-            self.layers[layer_idx].gate_up_proj.forward(
+            self.layers[layer_idx].ffn.forward(
                 &ex,
                 &self.cublas,
                 marlin_ws_ptr,
                 marlin_ws_ints,
                 normed_buf,
-                gate_up_buf,
-                num_tokens,
-            )?;
-            check_rc(
-                unsafe {
-                    ffi::w34_silu_and_mul_f16(
-                        &ex,
-                        gate_up_buf as *const c_void,
-                        act_buf as *mut c_void,
-                        core::ptr::null(),
-                        num_tokens as i32,
-                        local_interm as i32,
-                    )
-                },
-                "w34_silu_and_mul_f16",
-            )?;
-            self.layers[layer_idx].down_proj.forward(
-                &ex,
-                &self.cublas,
-                marlin_ws_ptr,
-                marlin_ws_ints,
-                act_buf,
                 mlp_out_buf,
                 num_tokens,
+                h_dim,
+                local_interm,
+                gate_up_buf,
+                act_buf,
+                moe_router_logits_buf,
+                moe_topk_weights_buf,
+                moe_topk_ids_buf,
+                moe_interm_buf,
+                moe_sh_gu_buf,
+                moe_sh_act_buf,
+                moe_sh_out_buf,
+                moe_sh_gate_buf,
             )?;
             let (next_norm_weight, next_norm_out) = if layer_idx + 1 < self.layers.len() {
                 (self.layers[layer_idx + 1].input_layernorm_ptr, normed_buf)
@@ -1826,12 +2394,48 @@ impl Qwen3_5ModelRank {
             .scratch_arena
             .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
 
-        let gate_up_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_interm * 2 * 2)?;
-        let act_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_interm * 2)?;
+        let gate_up_buf = if local_interm > 0 {
+            self.scratch_arena
+                .alloc_aligned(num_tokens * local_interm * 2 * 2)?
+        } else {
+            0
+        };
+        let act_buf = if local_interm > 0 {
+            self.scratch_arena
+                .alloc_aligned(num_tokens * local_interm * 2)?
+        } else {
+            0
+        };
+        let (
+            moe_router_logits_buf,
+            moe_topk_weights_buf,
+            moe_topk_ids_buf,
+            moe_interm_buf,
+            moe_sh_gu_buf,
+            moe_sh_act_buf,
+            moe_sh_out_buf,
+            moe_sh_gate_buf,
+        ) = if self.cfg.num_experts > 0 {
+            let num_exp = self.cfg.num_experts;
+            let top_k = self.cfg.num_experts_per_tok.max(1);
+            let local_moe_interm = (self.cfg.moe_intermediate_size / self.tp_size).max(8);
+            let local_sh_interm = (self.cfg.shared_expert_intermediate_size / self.tp_size).max(8);
+            (
+                self.scratch_arena.alloc_aligned(num_tokens * num_exp * 2)?,
+                self.scratch_arena.alloc_aligned(num_tokens * top_k * 4)?,
+                self.scratch_arena.alloc_aligned(num_tokens * top_k * 4)?,
+                self.scratch_arena
+                    .alloc_aligned(num_tokens * top_k * local_moe_interm * 2)?,
+                self.scratch_arena
+                    .alloc_aligned(num_tokens * local_sh_interm * 2 * 2)?,
+                self.scratch_arena
+                    .alloc_aligned(num_tokens * local_sh_interm * 2)?,
+                self.scratch_arena.alloc_aligned(num_tokens * h_dim * 2)?,
+                self.scratch_arena.alloc_aligned(num_tokens * 2)?,
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        };
 
         check_rc(
             unsafe {
@@ -1848,6 +2452,23 @@ impl Qwen3_5ModelRank {
             },
             "w34_embed_lookup_f16",
         )?;
+        if let Some((vis_ptr, idx_ptr, num_vis)) = self.pending_visual_splice
+            && num_vis > 0
+        {
+            check_rc(
+                unsafe {
+                    ffi::w34_embedding_splice_f16(
+                        &ex,
+                        residual_buf as *mut c_void,
+                        vis_ptr as *const c_void,
+                        idx_ptr as *const i32,
+                        num_vis as i32,
+                        h_dim as i32,
+                    )
+                },
+                "w34_embedding_splice_f16",
+            )?;
+        }
 
         let final_norm_out_buf = if num_tokens <= self.max_tap_rows
             && let Some(final_h_buf) = &self.last_final_hidden_f16
@@ -1908,7 +2529,7 @@ impl Qwen3_5ModelRank {
                                 k_buf as *mut c_void,
                                 gate_buf as *mut c_void,
                                 num_tokens as i32,
-                                0,
+                                self.current_pos_plane_stride,
                                 local_q_heads as i32,
                                 local_kv_heads as i32,
                                 head_dim as i32,
@@ -2111,36 +2732,26 @@ impl Qwen3_5ModelRank {
                 )?;
             }
 
-            self.layers[layer_idx].gate_up_proj.forward(
+            self.layers[layer_idx].ffn.forward(
                 &ex,
                 &self.cublas,
                 marlin_ws_ptr,
                 marlin_ws_ints,
                 normed_buf,
-                gate_up_buf,
-                num_tokens,
-            )?;
-            check_rc(
-                unsafe {
-                    ffi::w34_silu_and_mul_f16(
-                        &ex,
-                        gate_up_buf as *const c_void,
-                        act_buf as *mut c_void,
-                        core::ptr::null(),
-                        num_tokens as i32,
-                        local_interm as i32,
-                    )
-                },
-                "w34_silu_and_mul_f16",
-            )?;
-            self.layers[layer_idx].down_proj.forward(
-                &ex,
-                &self.cublas,
-                marlin_ws_ptr,
-                marlin_ws_ints,
-                act_buf,
                 mlp_out_buf,
                 num_tokens,
+                h_dim,
+                local_interm,
+                gate_up_buf,
+                act_buf,
+                moe_router_logits_buf,
+                moe_topk_weights_buf,
+                moe_topk_ids_buf,
+                moe_interm_buf,
+                moe_sh_gu_buf,
+                moe_sh_act_buf,
+                moe_sh_out_buf,
+                moe_sh_gate_buf,
             )?;
 
             let (next_norm_weight, next_norm_out) = if layer_idx + 1 < self.layers.len() {
@@ -2559,6 +3170,7 @@ pub struct Qwen3_5Engine {
     pub use_cuda_graph: bool,
     pub radix: MambaRadixCache,
     pub speculative: Option<crate::proposer::NativeProposer>,
+    pub vision_encoder: Option<crate::vision::Qwen3VisionEncoder>,
 }
 
 #[derive(Clone, Debug)]
@@ -2663,6 +3275,7 @@ impl Qwen3_5Engine {
             use_cuda_graph,
             radix: MambaRadixCache::new(16, 64),
             speculative: None,
+            vision_encoder: None,
         })
     }
 
@@ -4036,6 +4649,485 @@ impl Qwen3_5Engine {
                     }])?;
                     out[0][0]
                 };
+                req_state.commit_tokens(&[cur_tok], &planned);
+                gen_ids.push(next_tok);
+                cur_tok = next_tok;
+            }
+            let decode_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
+            Ok((ttft_ms, decode_ms, gen_ids))
+        })();
+
+        let (ttft_ms, decode_ms, gen_ids) = match step_res {
+            Ok(v) => v,
+            Err(e) => {
+                let aborted = req_state.abort_and_release(&mut self.radix);
+                self.free_kv_pages(&aborted.freed_kv_pages);
+                self.free_state_slots(&aborted.freed_mamba_slots);
+                return Err(e);
+            }
+        };
+        let donation = req_state.donate_committed_checkpoint(&mut self.radix, None, true);
+        self.free_kv_pages(&donation.freed_kv_pages);
+        self.free_state_slots(&donation.freed_mamba_slots);
+
+        let decode_steps = gen_ids.len().saturating_sub(1);
+        let decode_tok_per_s = if decode_ms > 0.0 && decode_steps > 0 {
+            (decode_steps as f64) / (decode_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let itl_ms = if decode_steps > 0 {
+            decode_ms / (decode_steps as f64)
+        } else {
+            0.0
+        };
+        let suffix_len = (prompt_token_ids.len() - cached_prefix_tokens).max(1);
+        let prefill_tok_per_s = if ttft_ms > 0.0 {
+            (suffix_len as f64) / (ttft_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        Ok(RadixBenchMetrics {
+            prompt_len: prompt_token_ids.len(),
+            cached_prefix_tokens,
+            donated_seq_len: donation.donated_seq_len,
+            gen_len: gen_ids.len(),
+            ttft_ms,
+            prefill_tok_per_s,
+            decode_ms,
+            decode_tok_per_s,
+            itl_ms,
+            generated_token_ids: gen_ids,
+        })
+    }
+
+    /// Lazily loads [`crate::vision::Qwen3VisionEncoder`] on GPU 0 from `self.model_dir`.
+    pub fn ensure_vision_encoder(&mut self) -> Result<()> {
+        if self.vision_encoder.is_none() {
+            let vcfg = self
+                .cfg
+                .vision_config
+                .as_ref()
+                .ok_or_else(|| loader_err("model does not have a vision_config"))?;
+            let archive = SafetensorsArchive::open(&self.model_dir)
+                .map_err(|_| loader_err("SafetensorsArchive::open for vision_encoder"))?;
+            let r0 = &self.ranks[0];
+            r0.device.make_current()?;
+            let enc =
+                crate::vision::Qwen3VisionEncoder::try_load(&archive, vcfg, 0, &r0.stream)?
+                    .ok_or_else(|| loader_err("vision weights not found in safetensors archive"))?;
+            self.vision_encoder = Some(enc);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_single_slice_with_mrope_and_vision(
+        &mut self,
+        slice: &EngineBatchSlice<'_>,
+        custom_positions: &[i32],
+        pos_plane_stride: i32,
+        vis_splice_per_rank: Option<&[(u64, u64, usize)]>,
+    ) -> Result<i32> {
+        let q_len = slice.tokens.len();
+        if q_len == 0 {
+            return Err(loader_err(
+                "empty slice in step_single_slice_with_mrope_and_vision",
+            ));
+        }
+        let seq_after = slice.ctx_len_before + q_len;
+        let max_pages = self.ranks[0].kv_pool.num_pages;
+        if seq_after.div_ceil(16) > slice.block_table.len()
+            || slice
+                .block_table
+                .iter()
+                .any(|&p| p < 0 || (p as usize) >= max_pages)
+        {
+            return Err(loader_err(
+                "KV cache page capacity exceeded in multimodal step",
+            ));
+        }
+        let mut flat_write_slots = Vec::with_capacity(q_len);
+        for step in 0..q_len {
+            let pos = slice.ctx_len_before + step;
+            let page_id = slice.block_table[pos / 16];
+            let page_off = (pos % 16) as i32;
+            flat_write_slots.push(page_id * 16 + page_off);
+        }
+        let q_start_loc = [0i32, q_len as i32];
+        let ctx_lens_before = [slice.ctx_len_before as i32];
+        let seq_lens_after = [seq_after as i32];
+        let state_in_indices = [slice.state_in_slot];
+        let state_out_indices = [slice.state_out_slot];
+        let has_initial_state = [u8::from(slice.has_initial_state)];
+        let max_checkpoints_per_req = slice.checkpoints.len();
+        let mut checkpoint_token_offsets = Vec::with_capacity(max_checkpoints_per_req);
+        let mut checkpoint_dst_indices = Vec::with_capacity(max_checkpoints_per_req);
+        for &(trig, dst) in slice.checkpoints {
+            checkpoint_token_offsets.push(trig);
+            checkpoint_dst_indices.push(dst);
+        }
+        let selected_rows = [q_len - 1];
+
+        for (r_idx, rank) in self.ranks.iter_mut().enumerate() {
+            rank.current_pos_plane_stride = pos_plane_stride;
+            rank.pending_visual_splice = vis_splice_per_rank.and_then(|s| s.get(r_idx).copied());
+        }
+
+        let run_res: Result<i32> = (|| {
+            if self.tp_size == 1 {
+                let r0 = &mut self.ranks[0];
+                let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
+                    slice.tokens,
+                    custom_positions,
+                    &q_start_loc,
+                    &ctx_lens_before,
+                    &seq_lens_after,
+                    slice.block_table,
+                    &flat_write_slots,
+                    &state_in_indices,
+                    &state_out_indices,
+                    &has_initial_state,
+                    &[],
+                    &checkpoint_dst_indices,
+                    &checkpoint_token_offsets,
+                    1,
+                    q_len,
+                    slice.block_table.len(),
+                    q_len,
+                    seq_after,
+                    0,
+                    max_checkpoints_per_req,
+                )?;
+                let ids = r0.forward_selected_rows(
+                    tok_ptr,
+                    pos_ptr,
+                    q_len,
+                    &attn_batch,
+                    &gdn_batch,
+                    None,
+                    &selected_rows,
+                )?;
+                Ok(ids[0])
+            } else {
+                let comm = self.tp2_comm.as_ref().unwrap().clone();
+                let [r0, r1] = &mut self.ranks[..] else {
+                    unreachable!()
+                };
+                let ft_ref = slice.tokens;
+                let fp_ref = custom_positions;
+                let qs_ref = &q_start_loc;
+                let cb_ref = &ctx_lens_before;
+                let sa_ref = &seq_lens_after;
+                let bt_ref = slice.block_table;
+                let ws_ref = &flat_write_slots;
+                let si_ref = &state_in_indices;
+                let so_ref = &state_out_indices;
+                let hi_ref = &has_initial_state;
+                let cd_ref = &checkpoint_dst_indices;
+                let co_ref = &checkpoint_token_offsets;
+                let sr_ref = &selected_rows;
+                let (res0, res1) = std::thread::scope(|sc| {
+                    let c0 = comm.clone();
+                    let h0 = sc.spawn(move || -> Result<Vec<i32>> {
+                        let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
+                            ft_ref,
+                            fp_ref,
+                            qs_ref,
+                            cb_ref,
+                            sa_ref,
+                            bt_ref,
+                            ws_ref,
+                            si_ref,
+                            so_ref,
+                            hi_ref,
+                            &[],
+                            cd_ref,
+                            co_ref,
+                            1,
+                            q_len,
+                            bt_ref.len(),
+                            q_len,
+                            seq_after,
+                            0,
+                            max_checkpoints_per_req,
+                        )?;
+                        r0.forward_selected_rows(
+                            tok_ptr,
+                            pos_ptr,
+                            q_len,
+                            &attn_batch,
+                            &gdn_batch,
+                            Some(&c0),
+                            sr_ref,
+                        )
+                    });
+                    let c1 = comm.clone();
+                    let h1 = sc.spawn(move || -> Result<()> {
+                        let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r1.upload_batch_meta(
+                            ft_ref,
+                            fp_ref,
+                            qs_ref,
+                            cb_ref,
+                            sa_ref,
+                            bt_ref,
+                            ws_ref,
+                            si_ref,
+                            so_ref,
+                            hi_ref,
+                            &[],
+                            cd_ref,
+                            co_ref,
+                            1,
+                            q_len,
+                            bt_ref.len(),
+                            q_len,
+                            seq_after,
+                            0,
+                            max_checkpoints_per_req,
+                        )?;
+                        let _ = r1.forward_selected_rows(
+                            tok_ptr,
+                            pos_ptr,
+                            q_len,
+                            &attn_batch,
+                            &gdn_batch,
+                            Some(&c1),
+                            sr_ref,
+                        )?;
+                        Ok(())
+                    });
+                    (h0.join().unwrap(), h1.join().unwrap())
+                });
+                res1?;
+                Ok(res0?[0])
+            }
+        })();
+
+        for rank in &mut self.ranks {
+            rank.current_pos_plane_stride = 0;
+            rank.pending_visual_splice = None;
+        }
+        run_res
+    }
+
+    /// Multimodal generation with `Qwen3VisionEncoder`, 3D `mRoPE`, visual embedding splice,
+    /// and content-hashed `MambaRadixCache` prefix reuse.
+    pub fn generate_multimodal_with_radix_cache(
+        &mut self,
+        prompt_token_ids: &[i32],
+        images: &[crate::vision::PreprocessedImage],
+        max_new_tokens: usize,
+        prefill_chunk_size: usize,
+        stop_on_eos: bool,
+    ) -> Result<RadixBenchMetrics> {
+        if images.is_empty() {
+            return self.generate_with_radix_cache(
+                prompt_token_ids,
+                max_new_tokens,
+                prefill_chunk_size,
+                stop_on_eos,
+            );
+        }
+        if prompt_token_ids.is_empty() {
+            return Err(loader_err(
+                "generate_multimodal_with_radix_cache requires at least 1 prompt token",
+            ));
+        }
+        self.ensure_vision_encoder()?;
+        let (merge_size, image_token_id) = self
+            .cfg
+            .vision_config
+            .as_ref()
+            .map(|v| (v.spatial_merge_size, v.image_token_id))
+            .unwrap_or((2, 248056));
+        let grids: Vec<[usize; 3]> = images.iter().map(|img| img.grid_thw).collect();
+        let (mrope_planes, mrope_delta) = crate::vision::compute_mrope_positions(
+            prompt_token_ids,
+            &grids,
+            image_token_id,
+            merge_size,
+        );
+        let hashed_prompt_ids = crate::vision::compute_multimodal_radix_key(
+            prompt_token_ids,
+            images,
+            image_token_id,
+            merge_size,
+        );
+
+        // Map each image_token_id position in prompt_token_ids to its visual token index `0..total_vis`.
+        let mut vis_idx_at_pos = vec![-1i32; prompt_token_ids.len()];
+        let mut total_vis_expected = 0usize;
+        for (pos, &tok) in prompt_token_ids.iter().enumerate() {
+            if tok == image_token_id {
+                vis_idx_at_pos[pos] = total_vis_expected as i32;
+                total_vis_expected += 1;
+            }
+        }
+
+        let target_total_len = prompt_token_ids
+            .len()
+            .checked_add(max_new_tokens)
+            .and_then(|v| v.checked_add(4))
+            .ok_or_else(|| loader_err("token length overflow in multimodal generate"))?;
+        let needed_pages = target_total_len.div_ceil(16);
+        if needed_pages > self.ranks[0].kv_pool.num_pages {
+            return Err(loader_err(
+                "requested sequence pages exceed KV pool capacity",
+            ));
+        }
+        let (active_slot, [pp0, pp1]) = self
+            .alloc_three_state_slots()
+            .ok_or_else(|| loader_err("StateBundlePool out of slots"))?;
+
+        let lookup_len = hashed_prompt_ids.len().saturating_sub(1);
+        let match_res = self.radix.match_prefix(&hashed_prompt_ids[..lookup_len]);
+        let cached_prefix_tokens = match_res.matched_tokens;
+
+        let mut req_state = ReqRadixState::new(16, 64, active_slot, [pp0, pp1]);
+        req_state.restore_prefix_hit(&mut self.radix, &hashed_prompt_ids, &match_res);
+
+        let step_res: Result<(f64, f64, Vec<i32>)> = (|| {
+            self.ensure_kv_pages_for_len(&mut req_state, target_total_len)?;
+
+            let t0 = std::time::Instant::now();
+            // Run ViT only if the uncached suffix contains any visual tokens.
+            let uncached_has_vis = vis_idx_at_pos[cached_prefix_tokens..]
+                .iter()
+                .any(|&idx| idx >= 0);
+            let mut all_vis_embeds_host: Vec<u16> = Vec::new();
+            if uncached_has_vis {
+                let r0 = &self.ranks[0];
+                r0.device.make_current()?;
+                let vis_dev0 = self
+                    .vision_encoder
+                    .as_ref()
+                    .unwrap()
+                    .encode_images(images, &r0.cublas, &r0.stream)?;
+                let num_u16 = vis_dev0.len_bytes / 2;
+                all_vis_embeds_host.resize(num_u16, 0u16);
+                vis_dev0.copy_to_host(&mut all_vis_embeds_host, &r0.stream)?;
+                r0.stream.synchronize()?;
+            }
+
+            let h_dim = self.cfg.hidden_size;
+            let chunk_sz = prefill_chunk_size.max(1);
+            let mut first_tok = 0i32;
+            let mut cursor = cached_prefix_tokens;
+            while cursor < prompt_token_ids.len() {
+                let rem = prompt_token_ids.len() - cursor;
+                let take = rem.min(chunk_sz);
+                let slice_tokens = &prompt_token_ids[cursor..cursor + take];
+                let slice_hashed = &hashed_prompt_ids[cursor..cursor + take];
+                let planned = req_state.plan_checkpoints(take);
+                let ckpt_pairs: Vec<(i32, i32)> = planned
+                    .iter()
+                    .map(|c| (c.trigger_offset_1based, c.dst_slot))
+                    .collect();
+
+                // Pack 3-plane mRoPE positions `[3, take]`.
+                let mut pos_3d = Vec::with_capacity(3 * take);
+                pos_3d.extend_from_slice(&mrope_planes[0][cursor..cursor + take]);
+                pos_3d.extend_from_slice(&mrope_planes[1][cursor..cursor + take]);
+                pos_3d.extend_from_slice(&mrope_planes[2][cursor..cursor + take]);
+
+                // Collect visual tokens that fall inside `cursor..cursor + take`.
+                let mut slice_vis_indices = Vec::new();
+                let mut slice_vis_embeds = Vec::new();
+                for local_idx in 0..take {
+                    let v_idx = vis_idx_at_pos[cursor + local_idx];
+                    if v_idx >= 0 {
+                        let v = v_idx as usize;
+                        if (v + 1) * h_dim <= all_vis_embeds_host.len() {
+                            slice_vis_indices.push(local_idx as i32);
+                            slice_vis_embeds.extend_from_slice(
+                                &all_vis_embeds_host[v * h_dim..(v + 1) * h_dim],
+                            );
+                        }
+                    }
+                }
+
+                let mut rank_vis_bufs: Vec<(DeviceBuffer, DeviceBuffer)> = Vec::new();
+                let mut rank_vis_ptrs: Vec<(u64, u64, usize)> = Vec::new();
+                if !slice_vis_indices.is_empty() {
+                    for rank in &self.ranks {
+                        rank.device.make_current()?;
+                        let emb_dev =
+                            DeviceBuffer::alloc(rank.device.device_id, slice_vis_embeds.len() * 2)?;
+                        let idx_dev = DeviceBuffer::alloc(
+                            rank.device.device_id,
+                            slice_vis_indices.len() * 4,
+                        )?;
+                        emb_dev.copy_from_host(&slice_vis_embeds, &rank.stream)?;
+                        idx_dev.copy_from_host(&slice_vis_indices, &rank.stream)?;
+                        rank_vis_ptrs.push((
+                            emb_dev.addr(),
+                            idx_dev.addr(),
+                            slice_vis_indices.len(),
+                        ));
+                        rank_vis_bufs.push((emb_dev, idx_dev));
+                    }
+                }
+
+                let eng_slice = EngineBatchSlice {
+                    tokens: slice_tokens,
+                    ctx_len_before: cursor,
+                    block_table: &req_state.kv_pages,
+                    state_in_slot: req_state.current_state_in_slot(),
+                    state_out_slot: req_state.active_state_slot,
+                    has_initial_state: req_state.has_initial_state,
+                    spec_slots: &[],
+                    checkpoints: &ckpt_pairs,
+                    emit_all_query_tokens: false,
+                };
+                first_tok = self.step_single_slice_with_mrope_and_vision(
+                    &eng_slice,
+                    &pos_3d,
+                    take as i32,
+                    if rank_vis_ptrs.is_empty() {
+                        None
+                    } else {
+                        Some(&rank_vis_ptrs)
+                    },
+                )?;
+                drop(rank_vis_bufs);
+                req_state.commit_tokens(slice_hashed, &planned);
+                cursor += take;
+            }
+            let ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let mut gen_ids = Vec::with_capacity(max_new_tokens);
+            if max_new_tokens > 0 {
+                gen_ids.push(first_tok);
+            }
+
+            let t_dec = std::time::Instant::now();
+            let mut cur_tok = first_tok;
+            for _dec_step in 1..max_new_tokens {
+                if stop_on_eos && self.cfg.eos_token_ids.contains(&cur_tok) {
+                    break;
+                }
+                let ctx_before = req_state.token_ids.len();
+                let planned = req_state.plan_checkpoints(1);
+                let ckpt_pairs: Vec<(i32, i32)> = planned
+                    .iter()
+                    .map(|c| (c.trigger_offset_1based, c.dst_slot))
+                    .collect();
+                let rope_pos = (ctx_before as i32) + mrope_delta;
+                let eng_slice = EngineBatchSlice {
+                    tokens: &[cur_tok],
+                    ctx_len_before: ctx_before,
+                    block_table: &req_state.kv_pages,
+                    state_in_slot: req_state.current_state_in_slot(),
+                    state_out_slot: req_state.active_state_slot,
+                    has_initial_state: req_state.has_initial_state,
+                    spec_slots: &[],
+                    checkpoints: &ckpt_pairs,
+                    emit_all_query_tokens: false,
+                };
+                let next_tok =
+                    self.step_single_slice_with_mrope_and_vision(&eng_slice, &[rope_pos], 0, None)?;
                 req_state.commit_tokens(&[cur_tok], &planned);
                 gen_ids.push(next_tok);
                 cur_tok = next_tok;

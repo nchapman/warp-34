@@ -16,6 +16,7 @@ pub mod radix;
 pub mod scheduler;
 pub mod server;
 pub mod speculative;
+pub mod vision;
 
 /// Returns whether the crate was compiled with the `cuda` feature enabled.
 pub const fn cuda_enabled() -> bool {

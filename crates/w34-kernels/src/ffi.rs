@@ -826,6 +826,134 @@ unsafe extern "C" {
         vocab_offset: i32,
         top_k: i32,
     ) -> i32;
+
+    pub fn w34_vision_bias_add_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        cols: i32,
+    ) -> i32;
+
+    pub fn w34_vision_layernorm_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_vision_bias_gelu_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        rows: i32,
+        cols: i32,
+        use_tanh: i32,
+    ) -> i32;
+
+    pub fn w34_vision_qkv_rope_attn_f16(
+        ex: *const W34Exec,
+        qkv: *mut c_void,
+        qkv_bias: *const c_void,
+        pos_hw: *const i32,
+        cu_seqlens: *const i32,
+        out: *mut c_void,
+        total_patches: i32,
+        num_images: i32,
+        num_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+    ) -> i32;
+
+    pub fn w34_embedding_splice_f16(
+        ex: *const W34Exec,
+        dst_embeds: *mut c_void,
+        src_visual_embeds: *const c_void,
+        token_indices: *const i32,
+        num_visual_tokens: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn w34_moe_topk_router_f16(
+        ex: *const W34Exec,
+        router_logits: *const c_void,
+        topk_weights: *mut f32,
+        topk_ids: *mut i32,
+        num_tokens: i32,
+        num_experts: i32,
+        top_k: i32,
+        norm_topk_prob: i32,
+        scoring_func: i32,
+    ) -> i32;
+
+    pub fn w34_moe_w4a16_gate_up_silu_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        topk_ids: *const i32,
+        interm_out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+    ) -> i32;
+
+    pub fn w34_moe_w4a16_down_accum_f16(
+        ex: *const W34Exec,
+        interm_in: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        shared_expert_out: *const c_void,
+        shared_expert_gate_logits: *const c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        k_hidden: i32,
+        n_interm: i32,
+        group_size: i32,
+    ) -> i32;
+
+    pub fn w34_moe_f16_gate_up_silu(
+        ex: *const W34Exec,
+        x: *const c_void,
+        gate_up_w: *const c_void,
+        topk_ids: *const i32,
+        interm_out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+    ) -> i32;
+
+    pub fn w34_moe_f16_down_accum(
+        ex: *const W34Exec,
+        interm_in: *const c_void,
+        down_w: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        shared_expert_out: *const c_void,
+        shared_expert_gate_logits: *const c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        k_hidden: i32,
+        n_interm: i32,
+    ) -> i32;
 }
 
 /// Returns the linked cuBLAS runtime version (`major * 10000 + minor * 100 + patch`).

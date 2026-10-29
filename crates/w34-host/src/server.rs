@@ -87,6 +87,93 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
 }
 
+/// Parses OpenAI `messages` array supporting both string `content` and multimodal
+/// array `content` parts (`{"type": "text", "text": "..."}` and
+/// `{"type": "image_url", "image_url": {"url": "..."}}`).
+/// Each `image_url` part is preprocessed into a [`crate::vision::PreprocessedImage`] and
+/// expanded inline into `<|vision_start|><|image_pad|>...<|vision_end|>`.
+pub fn parse_openai_messages_multimodal(
+    messages_val: &serde_json::Value,
+) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
+    let arr = messages_val
+        .as_array()
+        .ok_or_else(|| "'messages' must be an array".to_string())?;
+    if arr.is_empty() {
+        return Err("'messages' must not be empty".to_string());
+    }
+    let mut out_msgs = Vec::with_capacity(arr.len());
+    let mut out_images = Vec::new();
+    for item in arr {
+        let role = item
+            .get("role")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "message missing string 'role'".to_string())?
+            .to_string();
+        let reasoning_content = item
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+        let content_opt = match item.get("content") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Array(parts)) => {
+                let mut combined = String::new();
+                for part in parts {
+                    let ptype = part.get("type").and_then(|v| v.as_str()).unwrap_or("text");
+                    match ptype {
+                        "text" => {
+                            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                combined.push_str(t);
+                            }
+                        }
+                        "image_url" => {
+                            let url = part
+                                .get("image_url")
+                                .and_then(|iu| {
+                                    iu.as_str()
+                                        .or_else(|| iu.get("url").and_then(|u| u.as_str()))
+                                })
+                                .ok_or_else(|| "image_url part missing 'url'".to_string())?;
+                            let (rgb, h, w) = crate::vision::parse_image_url_to_rgb(url)
+                                .map_err(|e| format!("invalid image_url: {e}"))?;
+                            let prep = crate::vision::preprocess_rgb_image(
+                                &rgb,
+                                h,
+                                w,
+                                16,
+                                2,
+                                2,
+                                32 * 32,
+                                1024 * 1024,
+                            );
+                            let num_vis = prep.num_merged_tokens(2);
+                            combined.push_str("<|vision_start|>");
+                            for _ in 0..num_vis {
+                                combined.push_str("<|image_pad|>");
+                            }
+                            combined.push_str("<|vision_end|>");
+                            out_images.push(prep);
+                        }
+                        other => {
+                            return Err(format!("unsupported message content part type '{other}'"));
+                        }
+                    }
+                }
+                Some(combined)
+            }
+            Some(_) => {
+                return Err("message 'content' must be string, array, or null".to_string());
+            }
+        };
+        out_msgs.push(ChatMessage {
+            role,
+            content: content_opt,
+            reasoning_content,
+        });
+    }
+    Ok((out_msgs, out_images))
+}
+
 /// Formats OpenAI chat `messages` (and optional `tools` schema array) into a Qwen 3.5 / 3.8
 /// ChatML prompt string. Preserves prefix stability across turns for `MambaRadixCache` hits.
 pub fn format_chatml_prompt(
@@ -603,23 +690,12 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                 );
                 return;
             };
-            let messages: Vec<ChatMessage> = match req_json
+            let (messages, mm_images) = match req_json
                 .get("messages")
                 .ok_or_else(|| "missing 'messages' field".to_string())
-                .and_then(|v| {
-                    serde_json::from_value::<Vec<ChatMessage>>(v.clone())
-                        .map_err(|e| format!("invalid 'messages': {e}"))
-                }) {
-                Ok(msgs) if !msgs.is_empty() => msgs,
-                Ok(_) => {
-                    let _ = write_json_response(
-                        &mut stream,
-                        400,
-                        "Bad Request",
-                        &json!({"error": "'messages' must not be empty"}),
-                    );
-                    return;
-                }
+                .and_then(parse_openai_messages_multimodal)
+            {
+                Ok(v) => v,
                 Err(msg) => {
                     let _ = write_json_response(
                         &mut stream,
@@ -661,7 +737,15 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                         return;
                     }
                 };
-                let generation = if eng.speculative.is_some() {
+                let generation = if !mm_images.is_empty() {
+                    eng.generate_multimodal_with_radix_cache(
+                        &prompt_ids,
+                        &mm_images,
+                        max_tokens,
+                        64,
+                        true,
+                    )
+                } else if eng.speculative.is_some() {
                     let params = match native_sampling_params(&req_json, max_tokens) {
                         Ok(p) => p,
                         Err(e) => {

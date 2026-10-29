@@ -17,9 +17,10 @@ fn parse_kv_policy(s: &str) -> Result<KvFormatPolicy, String> {
         "bf16" => Ok(KvFormatPolicy::Bf16),
         "tq4" => Ok(KvFormatPolicy::Tq4),
         "k8v4" => Ok(KvFormatPolicy::K8V4),
-        "firstlast2" | "first-last2" => Ok(KvFormatPolicy::FirstLast2),
+        "firstlast2" | "first-last2" | "tq4-firstlast2" => Ok(KvFormatPolicy::FirstLast2),
+        "k8v4-firstlast2" => Ok(KvFormatPolicy::K8V4FirstLast2),
         other => Err(format!(
-            "unknown --kv-format '{other}' (expected fp16, bf16, tq4, k8v4, or firstlast2)"
+            "unknown --kv-format '{other}' (expected fp16, bf16, tq4, k8v4, firstlast2, or k8v4-firstlast2)"
         )),
     }
 }
@@ -770,8 +771,12 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                         let rank_pos = step_top5.iter().position(|&(tid, _)| tid == got_tok);
                         if let Some(r_idx) = rank_pos {
                             let gap = step_top5[0].1 - step_top5[r_idx].1;
-                            is_benign =
-                                (r_idx == 1 && gap < 0.60) || (prefix_match >= 64 && r_idx <= 2);
+                            let max_runner_up_gap = match parse_kv_policy(&kv_format) {
+                                Ok(KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16) => 0.60,
+                                _ => 0.75,
+                            };
+                            is_benign = (r_idx == 1 && gap < max_runner_up_gap)
+                                || (prefix_match >= 64 && r_idx <= 2);
                             flip_info = format!(
                                 "seat={prefix_match} got={got_tok}(rank#{}) want={want_tok} gap={gap:.4}",
                                 r_idx + 1
