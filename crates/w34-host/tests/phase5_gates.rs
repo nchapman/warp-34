@@ -1,8 +1,8 @@
 //! Phase 5 Verification Gates:
-//! - Phase 5.1: Paged `TQ4` (`132 B`/row) & `K8V4` (`272 B` K + `132 B` V) with Seed-42
-//!   Rademacher + WHT-256 rotation, `FirstLast2` (`26,016 B/token`, `2.52x`) and
-//!   `K8V4FirstLast2` (`33,296 B/token`, `1.97x`) boundary layers, 0-ULP page-table
-//!   permutation invariance, and long-context needle-in-a-haystack retrieval.
+//! - Phase 5.1: Paged `TQ4` (`132 B`/row) & `Q8_0` (`272 B`/row) KV cache with Seed-42
+//!   Rademacher + WHT-256 rotation on `TQ4`, `FirstLast2` (`26,016 B/token`, `2.52x`)
+//!   boundary layers, 0-ULP page-table permutation invariance, and long-context
+//!   needle-in-a-haystack retrieval.
 //! - Phase 5.2: Multimodal Vision (`smart_resize`, bicubic + normalize, 3D `mRoPE`,
 //!   content-hashed `MambaRadixCache` keys, OpenAI `image_url`, `op_vision.cu` kernels,
 //!   and `Qwen3VisionEncoder` + multimodal generation).
@@ -42,16 +42,14 @@ fn test_phase5_1_firstlast2_and_k8v4_byte_budgets() {
     assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_Q8_0, head_dim), 272);
 
     let fp16_bpt = KvFormatPolicy::Fp16.bytes_per_token(num_full, kv_heads, head_dim);
+    let q8_bpt = KvFormatPolicy::Q8_0.bytes_per_token(num_full, kv_heads, head_dim);
     let tq4_bpt = KvFormatPolicy::Tq4.bytes_per_token(num_full, kv_heads, head_dim);
-    let k8v4_bpt = KvFormatPolicy::K8V4.bytes_per_token(num_full, kv_heads, head_dim);
     let fl2_bpt = KvFormatPolicy::FirstLast2.bytes_per_token(num_full, kv_heads, head_dim);
-    let k8v4_fl2_bpt = KvFormatPolicy::K8V4FirstLast2.bytes_per_token(num_full, kv_heads, head_dim);
 
     assert_eq!(fp16_bpt, 65_536);
+    assert_eq!(q8_bpt, 34_816); // 1.88x raw compression (plain 8-bit K & V)
     assert_eq!(tq4_bpt, 16_896); // 3.88x raw compression
-    assert_eq!(k8v4_bpt, 25_856); // 2.53x raw compression
     assert_eq!(fl2_bpt, 26_016); // 2.52x effective compression (3 FP16 + 13 TQ4)
-    assert_eq!(k8v4_fl2_bpt, 33_296); // 1.97x effective compression (3 FP16 + 13 K8V4)
 
     for ord in 0..num_full {
         let (kf, vf, kt, vt) = KvFormatPolicy::FirstLast2.resolve_layer(ord, num_full);
@@ -77,20 +75,24 @@ fn test_phase5_1_wht256_outlier_protection_and_long_context_needle() {
     let stream = CudaStream::new(dev.device_id).expect("stream");
     let ex = stream.exec(0, 0);
 
-    // 1. Verify WHT-256 rotation protects channel-outlier KV vectors and preserves
-    //    0-ULP page-table permutation invariance across Tq4, K8V4, FirstLast2, K8V4FirstLast2.
+    // 1. Verify WHT-256 rotation protects channel-outlier KV vectors on Tq4/FirstLast2 and
+    //    preserves 0-ULP page-table permutation invariance across Q8_0, Tq4, and FirstLast2.
     for policy in [
+        KvFormatPolicy::Q8_0,
         KvFormatPolicy::Tq4,
-        KvFormatPolicy::K8V4,
         KvFormatPolicy::FirstLast2,
-        KvFormatPolicy::K8V4FirstLast2,
     ] {
         let layer_ids = [3, 7, 11, 15, 19];
         let pool = KvPool::new(0, 0, &layer_ids, 2, 256, 16, 16, policy).expect("KvPool");
-        // Test interior layer (ordinal 1 -> rotated TQ4 or K8V4)
+        // Test interior layer (ordinal 1 -> Q8_0 or rotated TQ4)
         let layout = pool.layers[1].layout;
-        assert_eq!(layout.k_transform, W34_KV_TRANSFORM_RADEMACHER_WHT256);
-        assert_eq!(layout.v_transform, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+        if policy == KvFormatPolicy::Q8_0 {
+            assert_eq!(layout.k_transform, W34_KV_TRANSFORM_IDENTITY);
+            assert_eq!(layout.v_transform, W34_KV_TRANSFORM_IDENTITY);
+        } else {
+            assert_eq!(layout.k_transform, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+            assert_eq!(layout.v_transform, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+        }
 
         let seq_len = 48usize; // 3 full pages
         let q_len = 8usize; // multi-token verify batch (t <= 16)
@@ -210,12 +212,12 @@ fn test_phase5_1_wht256_outlier_protection_and_long_context_needle() {
     }
 
     // 2. Long-context (4096 tokens = 256 pages, fragmented page table) needle-in-a-haystack gate
-    //    for both TQ4 and K8V4.
+    //    for both TQ4 and Q8_0.
     let ctx_len = 4096usize;
     let num_pages = ctx_len / 16;
     let needle_pos = 2713usize; // deep inside fragmented page table
 
-    for policy in [KvFormatPolicy::Tq4, KvFormatPolicy::K8V4] {
+    for policy in [KvFormatPolicy::Tq4, KvFormatPolicy::Q8_0] {
         let pool = KvPool::new(0, 0, &[0], 2, 256, 16, num_pages, policy).expect("4K needle pool");
         let layout = pool.layers[0].layout;
 

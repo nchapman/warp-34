@@ -15,15 +15,13 @@ use w34_kernels::ffi::{W34_KV_NAMESPACE_TARGET_FULL_ATTN, W34KvLayerLayout};
 pub enum KvFormatPolicy {
     Fp16,
     Bf16,
+    /// Plain 8-bit (`Q8_0` `272 B`/row for both `K` and `V`, `34,816 B/token`, `1.88x` compression on 27B).
+    Q8_0,
     Tq4,
-    K8V4,
     /// Full-attention layer slot `0` and the last 2 full-attention layer slots
     /// (`num_full_attn_layers - 2`, `num_full_attn_layers - 1`) use `FP16`;
     /// interior layers use `TQ4` (`26,016 B/token`, `2.52x` compression on 27B).
     FirstLast2,
-    /// Full-attention layer slot `0` and the last 2 full-attention layer slots
-    /// use `FP16`; interior layers use `K8V4` (`33,296 B/token`, `1.97x` compression on 27B).
-    K8V4FirstLast2,
 }
 
 impl KvFormatPolicy {
@@ -45,14 +43,14 @@ impl KvFormatPolicy {
                 W34_KV_TRANSFORM_IDENTITY,
                 W34_KV_TRANSFORM_IDENTITY,
             ),
+            Self::Q8_0 => (
+                W34_KV_FORMAT_Q8_0,
+                W34_KV_FORMAT_Q8_0,
+                W34_KV_TRANSFORM_IDENTITY,
+                W34_KV_TRANSFORM_IDENTITY,
+            ),
             Self::Tq4 => (
                 W34_KV_FORMAT_TQ4,
-                W34_KV_FORMAT_TQ4,
-                W34_KV_TRANSFORM_RADEMACHER_WHT256,
-                W34_KV_TRANSFORM_RADEMACHER_WHT256,
-            ),
-            Self::K8V4 => (
-                W34_KV_FORMAT_Q8_0,
                 W34_KV_FORMAT_TQ4,
                 W34_KV_TRANSFORM_RADEMACHER_WHT256,
                 W34_KV_TRANSFORM_RADEMACHER_WHT256,
@@ -71,26 +69,6 @@ impl KvFormatPolicy {
                 } else {
                     (
                         W34_KV_FORMAT_TQ4,
-                        W34_KV_FORMAT_TQ4,
-                        W34_KV_TRANSFORM_RADEMACHER_WHT256,
-                        W34_KV_TRANSFORM_RADEMACHER_WHT256,
-                    )
-                }
-            }
-            Self::K8V4FirstLast2 => {
-                let is_boundary = full_attn_layer_ordinal == 0
-                    || (num_full_attn_layers >= 2
-                        && full_attn_layer_ordinal >= num_full_attn_layers - 2);
-                if is_boundary {
-                    (
-                        W34_KV_FORMAT_FP16,
-                        W34_KV_FORMAT_FP16,
-                        W34_KV_TRANSFORM_IDENTITY,
-                        W34_KV_TRANSFORM_IDENTITY,
-                    )
-                } else {
-                    (
-                        W34_KV_FORMAT_Q8_0,
                         W34_KV_FORMAT_TQ4,
                         W34_KV_TRANSFORM_RADEMACHER_WHT256,
                         W34_KV_TRANSFORM_RADEMACHER_WHT256,

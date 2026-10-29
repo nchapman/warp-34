@@ -15,12 +15,11 @@ fn parse_kv_policy(s: &str) -> Result<KvFormatPolicy, String> {
     match s.to_ascii_lowercase().as_str() {
         "fp16" | "f16" => Ok(KvFormatPolicy::Fp16),
         "bf16" => Ok(KvFormatPolicy::Bf16),
+        "q8_0" | "q8" => Ok(KvFormatPolicy::Q8_0),
         "tq4" => Ok(KvFormatPolicy::Tq4),
-        "k8v4" => Ok(KvFormatPolicy::K8V4),
         "firstlast2" | "first-last2" | "tq4-firstlast2" => Ok(KvFormatPolicy::FirstLast2),
-        "k8v4-firstlast2" => Ok(KvFormatPolicy::K8V4FirstLast2),
         other => Err(format!(
-            "unknown --kv-format '{other}' (expected fp16, bf16, tq4, k8v4, firstlast2, or k8v4-firstlast2)"
+            "unknown --kv-format '{other}' (expected fp16, bf16, q8_0, tq4, or firstlast2)"
         )),
     }
 }
@@ -29,12 +28,12 @@ fn print_usage() {
     eprintln!(
         "Usage: w34 <subcommand> [options]\n\
          Subcommands:\n\
-           generate     --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--max-tokens <n>] [--kv-format fp16|tq4|k8v4|firstlast2|k8v4-firstlast2]\n\
-           bench        --model <id|path> [--tp 1|2] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format fp16|tq4|k8v4|firstlast2|k8v4-firstlast2] [--out <json>]\n\
-           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>] [--kv-format fp16|tq4|k8v4|firstlast2|k8v4-firstlast2] [--verify-lossless] [--verify-radix-warm]\n\
+           generate     --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--max-tokens <n>] [--kv-format fp16|q8_0|tq4|firstlast2]\n\
+           bench        --model <id|path> [--tp 1|2] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format fp16|q8_0|tq4|firstlast2] [--out <json>]\n\
+           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>] [--kv-format fp16|q8_0|tq4|firstlast2] [--verify-lossless] [--verify-radix-warm]\n\
            dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--compare-tp2] [--golden <safetensors>]\n\
            profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
-           serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format fp16|tq4|k8v4|firstlast2|k8v4-firstlast2]\n\
+           serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format fp16|q8_0|tq4|firstlast2]\n\
            chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--max-tokens <n>] [--no-thinking]\n\
          Speculative options (generate/bench/greedy-diff/dump-diff/profile-diff/serve/chat):\n\
            --speculative mtp|dflash2 [--draft-model <id|path>] [--mtp-k 1..3] [--kv-pages <n>]\n\
