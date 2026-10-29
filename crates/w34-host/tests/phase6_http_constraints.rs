@@ -1,0 +1,439 @@
+#![cfg(feature = "cuda")]
+use serde_json::{Value, json};
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use w34_host::{
+    cache::KvFormatPolicy,
+    model::Qwen3_5Engine,
+    proposer::{SpeculativeConfig, SpeculativeKind},
+    server::{OpenAiServerState, handle_http_connection},
+};
+
+static GPU_LOCK: Mutex<()> = Mutex::new(());
+
+fn request_endpoint(
+    state: &Arc<OpenAiServerState>,
+    endpoint: &str,
+    body: Value,
+) -> (String, Value) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = state.clone();
+    let worker = std::thread::spawn(move || {
+        handle_http_connection(listener.accept().unwrap().0, &state);
+    });
+    let body = body.to_string();
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(90)))
+        .unwrap();
+    write!(socket, "POST {endpoint} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    worker.join().unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    (head.to_owned(), serde_json::from_str(body).unwrap())
+}
+
+fn request(state: &Arc<OpenAiServerState>, body: Value) -> (String, Value) {
+    request_endpoint(state, "/v1/chat/completions", body)
+}
+
+fn exercise(kind: SpeculativeKind) {
+    let mut engine = Qwen3_5Engine::load(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        1,
+        KvFormatPolicy::Tq4,
+        Some(64),
+        true,
+    )
+    .unwrap();
+    engine
+        .enable_speculative(&SpeculativeConfig {
+            kind,
+            draft_model: if kind == SpeculativeKind::DFlash2 {
+                Some("nchapman/Qwen3.5-4B-DFlash2".into())
+            } else {
+                None
+            },
+            mtp_k: 3,
+        })
+        .unwrap();
+    let state = OpenAiServerState::new("constraint-test".into(), engine);
+    let (head, body) = request(
+        &state,
+        json!({
+            "messages":[{"role":"user","content":"Say hello."}],
+            "chat_template_kwargs":{"enable_thinking":false}, "max_tokens":64,
+            "response_format":{"type":"json_schema","json_schema":{"name":"result","strict":true,
+                "schema":{"type":"object","properties":{"status":{"const":"schema-enforced"}},"required":["status"],"additionalProperties":false}}}
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(content).unwrap(),
+        json!({"status":"schema-enforced"})
+    );
+    let accepted_trace = state
+        .engine
+        .lock()
+        .unwrap()
+        .speculative
+        .as_ref()
+        .unwrap()
+        .last_accepted
+        .clone();
+    assert!(
+        !accepted_trace.is_empty(),
+        "speculative verifier did not run"
+    );
+    println!(
+        "{kind:?}: strict JSON schema enforced under speculative verify (accepted={accepted_trace:?})"
+    );
+
+    let tools = json!([
+        {"type":"function","function":{"name":"report","parameters":{"type":"object","properties":{"city":{"const":"Oslo"}},"required":["city"],"additionalProperties":false}}},
+        {"type":"function","function":{"name":"noop","parameters":{"type":"object","properties":{},"additionalProperties":false}}}
+    ]);
+    for choice in [
+        json!("required"),
+        json!({"type":"function","function":{"name":"report"}}),
+        json!("auto"),
+        json!("none"),
+    ] {
+        let (head, body) = request(
+            &state,
+            json!({"messages":[{"role":"user","content":"Call report for Oslo."}],
+            "tools":tools, "tool_choice":choice, "max_tokens":192, "chat_template_kwargs":{"enable_thinking":false}}),
+        );
+        assert!(head.contains("200 OK"), "{choice}: {head} {body}");
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        if choice == "none" {
+            assert!(calls.is_empty(), "{body}");
+        }
+        if choice == "required" || choice.is_object() {
+            assert!(!calls.is_empty(), "{body}");
+        }
+        for call in calls {
+            let name = call["function"]["name"].as_str().unwrap();
+            let args: Value =
+                serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+            match name {
+                "report" => assert_eq!(args, json!({"city":"Oslo"})),
+                "noop" if !choice.is_object() => assert_eq!(args, json!({})),
+                _ => panic!("unexpected tool {call}"),
+            }
+        }
+        println!(
+            "{kind:?}: tool_choice={choice}, schema-valid calls={}",
+            calls.len()
+        );
+    }
+    let (head, body) = request(
+        &state,
+        json!({
+            "messages":[
+                {"role":"system","content":"Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration."},
+                {"role":"user","content":"What is 1+1?"}
+            ],
+            "max_tokens":512,
+            "chat_template_kwargs":{"enable_thinking":true},
+            "response_format":{"type":"json_schema","json_schema":{"name":"sum","strict":true,
+                "schema":{"type":"object","properties":{"sum":{"const":2}},"required":["sum"],"additionalProperties":false}}}
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let reasoning = body["choices"][0]["message"]["reasoning_content"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !reasoning.trim().is_empty(),
+        "missing reasoning before </think>: {body}"
+    );
+    let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(content).unwrap(),
+        json!({"sum": 2}),
+        "{body}"
+    );
+    println!(
+        "{kind:?}: think-aware json_schema enforced (reasoning_chars={}, content={content})",
+        reasoning.len()
+    );
+
+    // Multi-turn system + tools + assistant.tool_calls + role:tool <tool_response> -> constrained answer
+    let (head, body) = request(
+        &state,
+        json!({
+            "messages":[
+                {"role":"system","content":"Use tool results accurately."},
+                {"role":"user","content":"Report weather for Oslo."},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"report","arguments":"{\"city\":\"Oslo\"}"}}
+                ]},
+                {"role":"tool","tool_call_id":"call_1","content":"{\"temp_c\":7}"}
+            ],
+            "tools":tools,
+            "tool_choice":"none",
+            "max_tokens":64,
+            "chat_template_kwargs":{"enable_thinking":false}
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    assert!(
+        body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{body}"
+    );
+
+    // Structural tag + /v1/completions json_object, grammar, & regex
+    let (head, body) = request(
+        &state,
+        json!({
+            "messages":[{"role":"user","content":"Reply verbatim with <ans>{\"ok\":false}</ans> and nothing else."}],
+            "max_tokens":64,
+            "chat_template_kwargs":{"enable_thinking":false},
+            "response_format":{
+                "type":"structural_tag",
+                "structures":[{"begin":"<ans>","end":"</ans>","schema":{"type":"object","properties":{"ok":{"const":true}},"required":["ok"],"additionalProperties":false}}],
+                "triggers":["<ans>"]
+            }
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let tagged = body["choices"][0]["message"]["content"].as_str().unwrap();
+    let (_, rest) = tagged
+        .split_once("<ans>")
+        .unwrap_or_else(|| panic!("expected triggered <ans> tag in {tagged:?}"));
+    let (payload, _) = rest.split_once("</ans>").expect("closed </ans> tag");
+    assert_eq!(
+        serde_json::from_str::<Value>(payload).unwrap(),
+        json!({"ok":true})
+    );
+
+    let (head, body) = request(
+        &state,
+        json!({
+            "messages":[{"role":"user","content":"Say hello in plain English."}],
+            "max_tokens":64,
+            "chat_template_kwargs":{"enable_thinking":false},
+            "response_format":{"type":"json_object"}
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let obj_str = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(
+        serde_json::from_str::<Value>(obj_str).unwrap().is_object(),
+        "expected JSON object, got {obj_str:?}"
+    );
+
+    let (head, body) = request_endpoint(
+        &state,
+        "/v1/completions",
+        json!({"prompt":"Result: ","max_tokens":16,"structured_outputs":{"grammar":"start: \"PASS\" | \"OK\""}}),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let gtext = body["choices"][0]["text"].as_str().unwrap();
+    assert!(
+        matches!(gtext, "PASS" | "OK"),
+        "unexpected grammar completion: {gtext:?}"
+    );
+
+    let (head, body) = request_endpoint(
+        &state,
+        "/v1/completions",
+        json!({"prompt":"Answer code: ","max_tokens":16,"structured_outputs":{"regex":"OK-[0-9]{2}"}}),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let text = body["choices"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("OK-") && text.len() == 5 && text[3..].chars().all(|c| c.is_ascii_digit()),
+        "unexpected regex completion: {text}"
+    );
+
+    for bad in [
+        json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"unknown"}}),
+        json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_schema","json_schema":{"strict":false,"schema":{"type":"object"}}}}),
+        json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_object"}, "structured_outputs":{"regex":"a"}}),
+        json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"rgb://sample"}},{"type":"text","text":"hi"}]}], "response_format":{"type":"json_object"}}),
+        json!({"messages":[{"role":"user","content":"hello"}], "structured_outputs":{"regex":"a".repeat(70_000)}}),
+    ] {
+        let (head, _) = request(&state, bad);
+        assert!(head.contains("400 Bad Request"), "{head}");
+    }
+
+    let (head, _) = request(
+        &state,
+        json!({
+            "messages":[{"role":"user","content":"Say hi."}],
+            "max_tokens":8,
+            "chat_template_kwargs":{"enable_thinking":false},
+            "tools":null,
+            "tool_choice":null,
+            "response_format":null,
+            "structured_outputs":null
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head}");
+
+    let ref_tools = json!([{"type":"function","function":{"name":"ext","parameters":{"$ref":"https://example.invalid/schema"}}}]);
+    let (head, _) = request(
+        &state,
+        json!({
+            "messages":[{"role":"user","content":"Say hi."}],
+            "max_tokens":8,
+            "chat_template_kwargs":{"enable_thinking":false},
+            "tools":ref_tools,
+            "tool_choice":"auto"
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head}");
+    let (head, _) = request(
+        &state,
+        json!({
+            "messages":[{"role":"user","content":"Say hi."}],
+            "max_tokens":8,
+            "chat_template_kwargs":{"enable_thinking":false},
+            "tools":ref_tools,
+            "tool_choice":"required"
+        }),
+    );
+    assert!(head.contains("400 Bad Request"), "{head}");
+}
+
+#[test]
+fn non_speculative_and_multimodal_tools_succeed_while_mandatory_constraints_fail_closed() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let engine = Qwen3_5Engine::load(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        1,
+        KvFormatPolicy::Tq4,
+        Some(64),
+        true,
+    )
+    .unwrap();
+    let state = OpenAiServerState::new("plain-serve-test".into(), engine);
+    let tools = json!([{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{},"additionalProperties":false}}}]);
+
+    for msgs in [
+        json!([{"role":"user","content":"Say ok."}]),
+        json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":"rgb://sample"}},{"type":"text","text":"Say ok."}]}]),
+    ] {
+        let (head, body) = request(
+            &state,
+            json!({
+                "messages":msgs,
+                "tools":tools,
+                "tool_choice":"none",
+                "max_tokens":8,
+                "chat_template_kwargs":{"enable_thinking":false}
+            }),
+        );
+        assert!(head.contains("200 OK"), "{head} {body}");
+    }
+    let (head, body) = request(
+        &state,
+        json!({
+            "messages":[{"role":"user","content":"Say ok."}],
+            "tools":[],
+            "tool_choice":"auto",
+            "max_tokens":8,
+            "chat_template_kwargs":{"enable_thinking":false}
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+
+    for mandatory in [
+        json!({"messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_object"}}),
+        json!({"messages":[{"role":"user","content":"hi"}],"tools":tools,"tool_choice":"required"}),
+    ] {
+        let (head, _) = request(&state, mandatory);
+        assert!(head.contains("400 Bad Request"), "{head}");
+    }
+}
+
+#[test]
+fn mtp_http_strict_schema_is_enforced() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    exercise(SpeculativeKind::Mtp);
+}
+
+#[test]
+fn dflash_http_strict_schema_is_enforced() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    exercise(SpeculativeKind::DFlash2);
+}
+
+#[test]
+fn qwen3_6_moe_mtp_http_tool_and_schema_adherence() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let model = "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4";
+    if w34_host::cuda::CudaDevice::count().unwrap_or(0) < 2
+        || w34_host::loader::resolve_hf_model_dir(model).is_err()
+    {
+        return;
+    }
+    let mut engine = Qwen3_5Engine::load(model, 2, KvFormatPolicy::Tq4, Some(32), true).unwrap();
+    engine
+        .enable_speculative(&SpeculativeConfig {
+            kind: SpeculativeKind::Mtp,
+            draft_model: None,
+            mtp_k: 3,
+        })
+        .unwrap();
+    let state = OpenAiServerState::new("qwen3.6-moe-test".into(), engine);
+    let tools = json!([{
+        "type":"function",
+        "function":{
+            "name":"lookup_metric",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "host":{"enum":["gpu0","gpu1"]},
+                    "window_s":{"type":"integer","minimum":10,"maximum":60}
+                },
+                "required":["host","window_s"],
+                "additionalProperties":false
+            }
+        }
+    }]);
+    for choice in [
+        json!("required"),
+        json!({"type":"function","function":{"name":"lookup_metric"}}),
+    ] {
+        let (head, body) = request(
+            &state,
+            json!({
+                "messages":[{"role":"user","content":"Check gpu0 metrics over a 30 second window."}],
+                "tools":tools,
+                "tool_choice":choice,
+                "max_tokens":128,
+                "chat_template_kwargs":{"enable_thinking":false}
+            }),
+        );
+        assert!(head.contains("200 OK"), "{choice}: {head} {body}");
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert!(!calls.is_empty(), "{body}");
+        for call in calls {
+            assert_eq!(call["function"]["name"], "lookup_metric");
+            let args: Value =
+                serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+            let host = args["host"].as_str().unwrap();
+            let win = args["window_s"].as_i64().unwrap();
+            assert!(matches!(host, "gpu0" | "gpu1"), "{args}");
+            assert!((10..=60).contains(&win), "{args}");
+            assert_eq!(args.as_object().unwrap().len(), 2, "{args}");
+        }
+    }
+}

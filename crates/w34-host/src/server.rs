@@ -239,10 +239,45 @@ pub struct OpenAiServerState {
     pub metrics: ServerMetrics,
     pub shutdown: AtomicBool,
     pub allow_remote_images: bool,
+    speculative_enabled: bool,
+    constraint_factory: Option<crate::constraints::ConstraintFactory>,
 }
 
 #[cfg(feature = "cuda")]
 impl OpenAiServerState {
+    /// Parses and compiles request constraints outside `self.engine` lock so
+    /// client schemas/grammars never stall GPU inference or other endpoints.
+    fn request_constraint(
+        &self,
+        request: &serde_json::Value,
+        thinking: bool,
+        multimodal: bool,
+    ) -> Result<Option<crate::parser::TokenBitmaskConstraint>, String> {
+        let Some(spec) = crate::request_constraints::RequestConstraint::parse(request)? else {
+            return Ok(None);
+        };
+        if multimodal || !self.speculative_enabled {
+            if !spec.is_mandatory() {
+                return Ok(None);
+            }
+            return Err(
+                "structured outputs currently require text-only native MTP or DFlash2 generation"
+                    .into(),
+            );
+        }
+        let Some(factory) = self.constraint_factory.as_ref() else {
+            if !spec.is_mandatory() {
+                return Ok(None);
+            }
+            return Err("tokenizer unavailable for structured outputs".into());
+        };
+        match spec.compile(factory, thinking) {
+            Ok(constraint) => Ok(Some(constraint)),
+            Err(_) if !spec.is_mandatory() => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn new(model_name: String, engine: Qwen3_5Engine) -> Arc<Self> {
         Self::with_image_policy(model_name, engine, false)
     }
@@ -252,8 +287,25 @@ impl OpenAiServerState {
         engine: Qwen3_5Engine,
         allow_remote_images: bool,
     ) -> Arc<Self> {
+        let speculative_enabled = engine.speculative.is_some();
+        let constraint_factory = engine.tokenizer.as_ref().and_then(|tokenizer| {
+            let eos = engine
+                .cfg
+                .eos_token_ids
+                .iter()
+                .map(|&id| id as u32)
+                .collect::<Vec<_>>();
+            crate::constraints::ConstraintFactory::new(
+                tokenizer.clone(),
+                engine.cfg.vocab_size,
+                &eos,
+            )
+            .ok()
+        });
         Arc::new(Self {
             allow_remote_images,
+            speculative_enabled,
+            constraint_factory,
             model_name,
             engine: Mutex::new(engine),
             metrics: ServerMetrics::default(),
@@ -552,6 +604,18 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let constraint = match state.request_constraint(&req_json, false, false) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = write_json_response(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        &json!({"error": error}),
+                    );
+                    return;
+                }
+            };
             let (metrics, text, hit_eos) = {
                 let mut eng = state.engine.lock().unwrap();
                 let prompt_ids = match eng.encode(prompt) {
@@ -579,7 +643,7 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                             return;
                         }
                     };
-                    eng.generate_sampled_with_radix_cache(&prompt_ids, params, None, 64)
+                    eng.generate_sampled_with_radix_cache(&prompt_ids, params, constraint, 64)
                 } else {
                     eng.generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
                 };
@@ -724,6 +788,19 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                 enable_thinking,
                 preserve_thinking,
             );
+            let constraint =
+                match state.request_constraint(&req_json, enable_thinking, !mm_images.is_empty()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = write_json_response(
+                            &mut stream,
+                            400,
+                            "Bad Request",
+                            &json!({"error": error}),
+                        );
+                        return;
+                    }
+                };
             let (metrics, raw_text, hit_eos) = {
                 let mut eng = state.engine.lock().unwrap();
                 let prompt_ids = match eng.encode(&prompt) {
@@ -759,7 +836,7 @@ pub fn handle_http_connection(mut stream: TcpStream, state: &OpenAiServerState) 
                             return;
                         }
                     };
-                    eng.generate_sampled_with_radix_cache(&prompt_ids, params, None, 64)
+                    eng.generate_sampled_with_radix_cache(&prompt_ids, params, constraint, 64)
                 } else {
                     eng.generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
                 };

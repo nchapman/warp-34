@@ -7,7 +7,7 @@ use llguidance::{
     Matcher, ParserFactory,
     api::{GrammarWithLexer, TopLevelGrammar},
 };
-use toktrie_hf_tokenizers::ByteTokenizer;
+use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct StructuralTag {
@@ -19,6 +19,7 @@ pub struct StructuralTag {
 pub struct ConstraintFactory {
     factory: ParserFactory,
     vocab_size: usize,
+    eos_ids: Vec<i32>,
 }
 
 impl ConstraintFactory {
@@ -38,14 +39,35 @@ impl ConstraintFactory {
             );
         }
         tokenizer.set_eos_tokens(eos_ids);
-        let env = tokenizer
-            .into_tok_env(Some(vocab_size))
-            .map_err(|e| e.to_string())?;
+        // The pinned adapter treats every <...> added token as special, even
+        // when HF marks it ordinary. Restore HF's classification for Qwen's
+        // reasoning/tool delimiters so byte grammars can consume their native IDs.
+        let ordinary_added = tokenizer
+            .hf_tokenizer
+            .get_added_tokens_decoder()
+            .into_iter()
+            .filter(|(_, token)| !token.special)
+            .map(|(id, token)| (id, token.content.into_bytes()))
+            .collect::<Vec<_>>();
+        let mut env =
+            ByteTokenizerEnv::new(tokenizer, Some(vocab_size)).map_err(|e| e.to_string())?;
+        let mut bytes = (0..env.tok_trie.info().vocab_size)
+            .map(|id| env.tok_trie.token(id).to_vec())
+            .collect::<Vec<_>>();
+        for (id, content) in ordinary_added {
+            if !eos_ids.contains(&id) {
+                bytes[id as usize] = content;
+            }
+        }
+        env.tok_trie = llguidance::toktrie::TokTrie::from(env.tok_trie.info(), &bytes)
+            .with_eos_tokens(eos_ids);
+        let env = env.to_env();
         let mut factory = ParserFactory::new_simple(&env).map_err(|e| e.to_string())?;
         factory.quiet();
         Ok(Self {
             factory,
             vocab_size,
+            eos_ids: eos_ids.iter().map(|&id| id as i32).collect(),
         })
     }
 
@@ -190,6 +212,8 @@ impl ConstraintFactory {
         Ok(TokenBitmaskConstraint {
             vocab_size: self.vocab_size,
             matcher: Some(matcher),
+            eos_ids: self.eos_ids.clone(),
+            terminal_eos: false,
             mask,
             committed: 0,
         })
@@ -225,6 +249,8 @@ fn validate_strict_schema_options(value: &serde_json::Value) -> Result<(), Strin
 pub struct TokenBitmaskConstraint {
     vocab_size: usize,
     matcher: Option<Matcher>,
+    eos_ids: Vec<i32>,
+    terminal_eos: bool,
     mask: Vec<u32>,
     committed: usize,
 }
@@ -249,6 +275,8 @@ impl TokenBitmaskConstraint {
         Self {
             vocab_size,
             matcher: None,
+            eos_ids: Vec::new(),
+            terminal_eos: false,
             mask,
             committed: 0,
         }
@@ -264,6 +292,8 @@ impl TokenBitmaskConstraint {
         Self {
             vocab_size,
             matcher: None,
+            eos_ids: Vec::new(),
+            terminal_eos: false,
             mask,
             committed: 0,
         }
@@ -292,6 +322,15 @@ impl TokenBitmaskConstraint {
         if !self.is_token_allowed(id) {
             return Err(format!("token {id} violates grammar"));
         }
+        // EOS is an output event, not a grammar byte/token. llguidance may
+        // already be stopped at NoExtension; consuming its EOS-only mask then
+        // would error. Track EOS separately so rollback still counts emitted tokens.
+        if self.matcher.is_some() && self.eos_ids.contains(&id) {
+            self.terminal_eos = true;
+            self.mask.fill(0);
+            self.committed += 1;
+            return Ok(());
+        }
         if let Some(matcher) = &self.matcher {
             let mut next = matcher.clone();
             next.consume_token(id as u32).map_err(|e| e.to_string())?;
@@ -312,11 +351,15 @@ impl TokenBitmaskConstraint {
         }
         if let Some(matcher) = &self.matcher {
             let mut next = matcher.clone();
-            next.rollback(count).map_err(|e| e.to_string())?;
+            let grammar_count = count - usize::from(self.terminal_eos);
+            if grammar_count > 0 {
+                next.rollback(grammar_count).map_err(|e| e.to_string())?;
+            }
             let mask = next.compute_mask_or_eos().map_err(|e| e.to_string())?;
             self.mask = mask.as_slice().to_vec();
             self.matcher = Some(next);
         }
+        self.terminal_eos = false;
         self.committed -= count;
         Ok(())
     }

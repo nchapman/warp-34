@@ -19,11 +19,21 @@ fn tokenizer() -> Tokenizer {
     vocab.insert("<|im_end|>".into(), json!(EOS));
     // A token crossing the reasoning/JSON boundary exercises byte-level state.
     vocab.insert("</think>{\"ok\":".into(), json!(257));
+    vocab.insert("<think>".into(), json!(258));
+    vocab.insert("</think>".into(), json!(259));
+    vocab.insert("<tool_call>".into(), json!(260));
+    vocab.insert("</tool_call>".into(), json!(261));
+    vocab.insert("<|endoftext|>".into(), json!(262));
     Tokenizer::from_bytes(serde_json::to_vec(&json!({
         "version":"1.0", "truncation":null,"padding":null,
         "added_tokens":[
             {"id":256,"content":"<|im_end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
-            {"id":257,"content":"</think>{\"ok\":","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}
+            {"id":257,"content":"</think>{\"ok\":","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},
+            {"id":258,"content":"<think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},
+            {"id":259,"content":"</think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},
+            {"id":260,"content":"<tool_call>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},
+            {"id":261,"content":"</tool_call>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},
+            {"id":262,"content":"<|endoftext|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
         ],
         "normalizer":null,
         "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
@@ -35,7 +45,7 @@ fn tokenizer() -> Tokenizer {
 
 fn setup() -> (Tokenizer, ConstraintFactory) {
     let tok = tokenizer();
-    let factory = ConstraintFactory::new(tok.clone(), 260, &[EOS as u32]).unwrap();
+    let factory = ConstraintFactory::new(tok.clone(), 266, &[EOS as u32]).unwrap();
     (tok, factory)
 }
 
@@ -44,6 +54,34 @@ fn feed(c: &mut TokenBitmaskConstraint, tok: &Tokenizer, text: &str) -> Result<(
         c.advance(*id as i32)?;
     }
     Ok(())
+}
+
+#[test]
+fn grammar_completion_eos_commits_and_rolls_back_losslessly() {
+    let (tok, factory) = setup();
+    for mut constraint in [
+        factory.regex("ok", false).unwrap(),
+        factory.json_object(false).unwrap(),
+    ] {
+        let text =
+            if constraint.is_token_allowed(tok.encode("o", false).unwrap().get_ids()[0] as i32) {
+                "ok"
+            } else {
+                "{}"
+            };
+        feed(&mut constraint, &tok, text).unwrap();
+        let before = constraint.current_bitmask();
+        let count = constraint.committed_len();
+        constraint.advance(EOS).unwrap();
+        assert_eq!(constraint.committed_len(), count + 1);
+        assert!(constraint.advance(EOS).is_err());
+        constraint.rollback(1).unwrap();
+        assert_eq!(constraint.current_bitmask(), before);
+        constraint.advance(EOS).unwrap();
+        constraint.rollback(count + 1).unwrap();
+        feed(&mut constraint, &tok, text).unwrap();
+        assert_eq!(constraint.current_bitmask(), before);
+    }
 }
 
 #[test]
@@ -58,7 +96,8 @@ fn json_object_enforces_every_byte_not_just_first_brace() {
         assert!(!c.is_token_allowed(EOS));
         feed(&mut c, &tok, text).unwrap();
         assert!(c.is_token_allowed(EOS), "{text}");
-        assert!(!c.is_token_allowed(259)); // padded model-vocab entry
+        assert!(!c.is_token_allowed(262)); // non-EOS special token
+        assert!(!c.is_token_allowed(265)); // padded model-vocab entry
     }
     for text in ["[]", "{x", "{\"x\":truX", "{\"x\":1,}", "{}x"] {
         let mut c = factory.json_object(false).unwrap();
@@ -100,6 +139,9 @@ fn thinking_transition_clone_and_rollback_are_lossless() {
     let count = c.committed_len();
     let mut independent = c.clone();
     assert!(c.is_token_allowed(257));
+    assert!(c.is_token_allowed(259)); // standalone non-special </think> added token
+    assert!(!c.is_token_allowed(260)); // <tool_call> banned inside reasoning
+    assert!(!c.is_token_allowed(262)); // true special token remains disallowed
     c.advance(257).unwrap();
     assert!(!c.is_token_allowed(EOS));
     assert!(feed(&mut c, &tok, "invalid").is_err());
