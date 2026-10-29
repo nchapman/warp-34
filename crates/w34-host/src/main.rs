@@ -29,19 +29,66 @@ fn print_usage() {
     eprintln!(
         "Usage: w34 <subcommand> [options]\n\
          Subcommands:\n\
-           generate     --model <id|path> [--tp 1|2] [--prompt <str>] [--max-tokens <n>] [--kv-format fp16|tq4|k8v4|firstlast2]\n\
-           bench        --model <id|path> [--tp 1|2] [--stage decode|radix|scheduler|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format fp16|tq4|k8v4|firstlast2] [--out <json>]\n\
-           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>] [--verify-lossless] [--verify-radix-warm]\n\
-           dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--compare-tp2] [--golden <safetensors>]\n\
+           generate     --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--max-tokens <n>] [--kv-format fp16|tq4|k8v4|firstlast2|k8v4-firstlast2]\n\
+           bench        --model <id|path> [--tp 1|2] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format fp16|tq4|k8v4|firstlast2|k8v4-firstlast2] [--out <json>]\n\
+           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>] [--kv-format fp16|tq4|k8v4|firstlast2|k8v4-firstlast2] [--verify-lossless] [--verify-radix-warm]\n\
+           dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--compare-tp2] [--golden <safetensors>]\n\
            profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
-           serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format fp16|tq4|k8v4|firstlast2]\n\
-           chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--max-tokens <n>] [--no-thinking]\n\
+           serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format fp16|tq4|k8v4|firstlast2|k8v4-firstlast2]\n\
+           chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--image <url>]... [--max-tokens <n>] [--no-thinking]\n\
          Speculative options (generate/bench/greedy-diff/dump-diff/profile-diff/serve/chat):\n\
            --speculative mtp|dflash2 [--draft-model <id|path>] [--mtp-k 1..3] [--kv-pages <n>]\n\
            Native MTP shares target weights; DFlash2 requires a draft model.\n\
            Speculative CLI mode is eager/greedy; the server also honors sampling parameters.\n\
            Native mode defaults to 256 target KV pages (4096 tokens, including verification reserve)."
     );
+}
+
+#[cfg(feature = "cuda")]
+fn prepare_multimodal_prompt_and_images(
+    cfg: &w34_host::loader::ModelConfig,
+    raw_prompt: &str,
+    image_urls: &[String],
+) -> Result<(String, Vec<w34_host::vision::PreprocessedImage>), String> {
+    if image_urls.is_empty() {
+        return Ok((raw_prompt.to_string(), Vec::new()));
+    }
+    let (patch_size, temporal_patch_size, merge_size) = cfg
+        .vision_config
+        .as_ref()
+        .map(|v| (v.patch_size, v.temporal_patch_size, v.spatial_merge_size))
+        .unwrap_or((16, 2, 2));
+    let mut images = Vec::with_capacity(image_urls.len());
+    let mut prefix = String::new();
+    for url in image_urls {
+        let (rgb, h, w) =
+            w34_host::vision::parse_image_url_to_rgb(url).map_err(|e| e.to_string())?;
+        let pre = w34_host::vision::preprocess_rgb_image(
+            &rgb,
+            h,
+            w,
+            patch_size,
+            temporal_patch_size,
+            merge_size,
+            64 * 32 * 32,
+            2048 * 32 * 32,
+        );
+        if !raw_prompt.contains("<|image_pad|>") {
+            let n_pads = pre.num_merged_tokens(merge_size);
+            prefix.push_str("<|vision_start|>");
+            for _ in 0..n_pads {
+                prefix.push_str("<|image_pad|>");
+            }
+            prefix.push_str("<|vision_end|>");
+        }
+        images.push(pre);
+    }
+    let expanded = if prefix.is_empty() {
+        raw_prompt.to_string()
+    } else {
+        format!("{prefix}{raw_prompt}")
+    };
+    Ok((expanded, images))
 }
 
 #[cfg(feature = "cuda")]
@@ -105,6 +152,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     let mut verify_lossless = false;
     let mut verify_radix_warm = false;
     let mut live_profile = false;
+    let mut image_urls: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -244,10 +292,14 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                 bench_stage = args.get(i).cloned().ok_or("missing --stage value")?;
                 if !matches!(
                     bench_stage.as_str(),
-                    "decode" | "radix" | "scheduler" | "all"
+                    "decode" | "radix" | "scheduler" | "vision" | "all"
                 ) {
-                    return Err("--stage expects decode, radix, scheduler, or all".into());
+                    return Err("--stage expects decode, radix, scheduler, vision, or all".into());
                 }
+            }
+            "--image" => {
+                i += 1;
+                image_urls.push(args.get(i).cloned().ok_or("missing --image value")?);
             }
             "--batch-size" => {
                 i += 1;
@@ -335,21 +387,51 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     match sub {
         "generate" => {
             let mut engine = load_engine().map_err(|e| e.to_string())?;
-            let prompt_ids = engine.encode(&prompt).map_err(|e| e.to_string())?;
-            let metrics = engine
-                .generate_tokens(&prompt_ids, max_tokens, true)
-                .map_err(|e| e.to_string())?;
-            let text = engine
-                .decode(&metrics.generated_token_ids)
-                .map_err(|e| e.to_string())?;
+            let (expanded_prompt, mm_images) =
+                prepare_multimodal_prompt_and_images(&engine.cfg, &prompt, &image_urls)?;
+            let prompt_ids = engine.encode(&expanded_prompt).map_err(|e| e.to_string())?;
+            let (gen_ids, prompt_len, gen_len, ttft_ms, decode_tok_per_s, itl_ms) =
+                if mm_images.is_empty() {
+                    let m = engine
+                        .generate_tokens(&prompt_ids, max_tokens, true)
+                        .map_err(|e| e.to_string())?;
+                    (
+                        m.generated_token_ids,
+                        m.prompt_len,
+                        m.gen_len,
+                        m.ttft_ms,
+                        m.decode_tok_per_s,
+                        m.itl_ms,
+                    )
+                } else {
+                    let m = engine
+                        .generate_multimodal_with_radix_cache(
+                            &prompt_ids,
+                            &mm_images,
+                            max_tokens,
+                            64,
+                            true,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    (
+                        m.generated_token_ids,
+                        m.prompt_len,
+                        m.gen_len,
+                        m.ttft_ms,
+                        m.decode_tok_per_s,
+                        m.itl_ms,
+                    )
+                };
+            let text = engine.decode(&gen_ids).map_err(|e| e.to_string())?;
             println!("{text}");
+            let img_tag = if mm_images.is_empty() {
+                String::new()
+            } else {
+                format!(" images={}", mm_images.len())
+            };
             eprintln!(
-                "[w34 generate] model={model} tp={tp} kv={kv_format} prompt_toks={} gen_toks={} ttft={:.2}ms decode={:.2}tok/s ({:.2}ms/tok)",
-                metrics.prompt_len,
-                metrics.gen_len,
-                metrics.ttft_ms,
-                metrics.decode_tok_per_s,
-                metrics.itl_ms
+                "[w34 generate] model={model} tp={tp} kv={kv_format}{img_tag} prompt_toks={} gen_toks={} ttft={:.2}ms decode={:.2}tok/s ({:.2}ms/tok)",
+                prompt_len, gen_len, ttft_ms, decode_tok_per_s, itl_ms
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -407,10 +489,19 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                         None
                     }
                 });
+                let num_fa_layers = engine.ranks[0].kv_pool.layers.len();
+                let kv_bytes_per_token = policy.bytes_per_token(
+                    num_fa_layers,
+                    engine.cfg.num_key_value_heads,
+                    engine.cfg.head_dim,
+                );
                 decode_summary = serde_json::json!({
                     "model": model,
                     "tp": tp,
                     "kv_format": kv_format,
+                    "kv_bytes_per_token": kv_bytes_per_token,
+                    "num_experts": engine.cfg.num_experts,
+                    "num_experts_per_tok": engine.cfg.num_experts_per_tok,
                     "cuda_graph": engine.use_cuda_graph,
                     "speculative": spec_label,
                     "accepted_drafts_per_round": accepted,
@@ -531,10 +622,134 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                 });
             }
 
+            let mut vision_summary = serde_json::Value::Null;
+            if bench_stage == "vision"
+                || (bench_stage == "all" && engine.cfg.vision_config.is_some())
+            {
+                let vis_ready = match engine.ensure_vision_encoder() {
+                    Ok(()) => true,
+                    Err(e) if bench_stage == "all" => {
+                        vision_summary = serde_json::json!({
+                            "skipped": true,
+                            "reason": e.to_string(),
+                        });
+                        false
+                    }
+                    Err(e) => return Err(e.to_string()),
+                };
+                if vis_ready {
+                    engine.reset_all_states().map_err(|e| e.to_string())?;
+                    let urls = if image_urls.is_empty() {
+                        vec!["https://w34.test/bench_img_a.ppm".to_string()]
+                    } else {
+                        image_urls.clone()
+                    };
+                    let (v_prompt_str, mm_imgs_a) = prepare_multimodal_prompt_and_images(
+                        &engine.cfg,
+                        "Describe the colors, geometry, and layout of this image in detail across several sentences.",
+                        &urls,
+                    )?;
+                    let (_, mm_imgs_b) = prepare_multimodal_prompt_and_images(
+                        &engine.cfg,
+                        "Describe the colors, geometry, and layout of this image in detail across several sentences.",
+                        &["https://w34.test/bench_img_b_distinct.ppm".to_string()],
+                    )?;
+                    let mut v_prompt_ids =
+                        engine.encode(&v_prompt_str).map_err(|e| e.to_string())?;
+                    while v_prompt_ids.len() < 72 {
+                        v_prompt_ids.extend_from_slice(&base_ids);
+                    }
+                    let v_gen = gen_len.clamp(4, 32);
+                    let cold = engine
+                        .generate_multimodal_with_radix_cache(
+                            &v_prompt_ids,
+                            &mm_imgs_a,
+                            v_gen,
+                            64,
+                            false,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let warm = engine
+                        .generate_multimodal_with_radix_cache(
+                            &v_prompt_ids,
+                            &mm_imgs_a,
+                            v_gen,
+                            64,
+                            false,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let distinct = engine
+                        .generate_multimodal_with_radix_cache(
+                            &v_prompt_ids,
+                            &mm_imgs_b,
+                            4,
+                            64,
+                            false,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let lossless_parity = cold.generated_token_ids == warm.generated_token_ids;
+                    if !lossless_parity {
+                        return Err(
+                            "vision benchmark: warm multimodal radix hit diverged from cold reference"
+                                .into(),
+                        );
+                    }
+                    if warm.cached_prefix_tokens < 64 {
+                        return Err(format!(
+                            "vision benchmark: expected >= 64 cached prefix tokens on warm image hit, got {}",
+                            warm.cached_prefix_tokens
+                        ));
+                    }
+                    let content_hash_isolated = distinct.cached_prefix_tokens < 64;
+                    if !content_hash_isolated {
+                        return Err(format!(
+                            "vision benchmark: distinct image falsely matched {} cached prefix tokens",
+                            distinct.cached_prefix_tokens
+                        ));
+                    }
+                    let merge_sz = engine
+                        .cfg
+                        .vision_config
+                        .as_ref()
+                        .map(|v| v.spatial_merge_size)
+                        .unwrap_or(2);
+                    let visual_tokens: usize = mm_imgs_a
+                        .iter()
+                        .map(|img| img.num_merged_tokens(merge_sz))
+                        .sum();
+                    let ttft_reduction_pct = if cold.ttft_ms > 0.0 {
+                        100.0 * (1.0 - warm.ttft_ms / cold.ttft_ms)
+                    } else {
+                        0.0
+                    };
+                    let ttft_speedup_x = if warm.ttft_ms > 0.0 {
+                        cold.ttft_ms / warm.ttft_ms
+                    } else {
+                        0.0
+                    };
+                    vision_summary = serde_json::json!({
+                        "image_grid_thw": mm_imgs_a.first().map(|img| img.grid_thw),
+                        "visual_tokens": visual_tokens,
+                        "prompt_len": v_prompt_ids.len(),
+                        "gen_len": v_gen,
+                        "cold_ttft_ms": cold.ttft_ms,
+                        "warm_ttft_ms": warm.ttft_ms,
+                        "ttft_speedup_x": ttft_speedup_x,
+                        "ttft_reduction_pct": ttft_reduction_pct,
+                        "cached_prefix_tokens": warm.cached_prefix_tokens,
+                        "distinct_image_cached_tokens": distinct.cached_prefix_tokens,
+                        "content_hash_isolated": content_hash_isolated,
+                        "warm_decode_tok_per_s": warm.decode_tok_per_s,
+                        "lossless_parity": lossless_parity,
+                    });
+                }
+            }
+
             let summary = match bench_stage.as_str() {
                 "decode" => decode_summary,
                 "radix" => radix_summary,
                 "scheduler" => scheduler_summary,
+                "vision" => vision_summary,
                 "all" => serde_json::json!({
                     "model": model,
                     "tp": tp,
@@ -543,6 +758,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                     "decode": decode_summary,
                     "radix": radix_summary,
                     "scheduler": scheduler_summary,
+                    "vision": vision_summary,
                 }),
                 _ => unreachable!(),
             };
@@ -819,7 +1035,7 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                 String::new()
             };
             println!(
-                "[greedy-diff summary] model={model} tp={tp} first_step={first_step_matches}/{num_cases} adjudicated={adjudicated_passes}/{num_cases} total_token_match={total_matches}/{total_tokens_compared} ({:.1}%){spec_summary}{lossless_summary}{radix_summary}",
+                "[greedy-diff summary] model={model} tp={tp} kv={kv_format} first_step={first_step_matches}/{num_cases} adjudicated={adjudicated_passes}/{num_cases} total_token_match={total_matches}/{total_tokens_compared} ({:.1}%){spec_summary}{lossless_summary}{radix_summary}",
                 if total_tokens_compared > 0 {
                     100.0 * (total_matches as f64) / (total_tokens_compared as f64)
                 } else {
@@ -835,8 +1051,16 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
         }
         "dump-diff" => {
             let mut engine = load_engine().map_err(|e| e.to_string())?;
-            let prompt_ids = engine.encode(&prompt).map_err(|e| e.to_string())?;
-            let dump = engine.dump_prompt(&prompt_ids).map_err(|e| e.to_string())?;
+            let (expanded_prompt, mm_images) =
+                prepare_multimodal_prompt_and_images(&engine.cfg, &prompt, &image_urls)?;
+            let prompt_ids = engine.encode(&expanded_prompt).map_err(|e| e.to_string())?;
+            let dump = if mm_images.is_empty() {
+                engine.dump_prompt(&prompt_ids).map_err(|e| e.to_string())?
+            } else {
+                engine
+                    .dump_multimodal_prompt(&prompt_ids, &mm_images)
+                    .map_err(|e| e.to_string())?
+            };
             let decoded_top1 = engine
                 .decode(&[dump.greedy_token_id])
                 .unwrap_or_else(|_| "<err>".to_string());
@@ -845,8 +1069,13 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             } else {
                 String::new()
             };
+            let img_str = if mm_images.is_empty() {
+                String::new()
+            } else {
+                format!(" images={}", mm_images.len())
+            };
             println!(
-                "[dump-diff] model={model} tp={tp} prompt_len={} tensors_captured={} greedy_id={} ({:?}) top5_ids={:?} top5_logprobs={:?}{draft_str}",
+                "[dump-diff] model={model} tp={tp} kv={kv_format}{img_str} prompt_len={} tensors_captured={} greedy_id={} ({:?}) top5_ids={:?} top5_logprobs={:?}{draft_str}",
                 prompt_ids.len(),
                 dump.tensors_f32.len(),
                 dump.greedy_token_id,
@@ -864,9 +1093,15 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                         .enable_speculative(config)
                         .map_err(|e| e.to_string())?;
                 }
-                let dump_tp2 = engine_tp2
-                    .dump_prompt(&prompt_ids)
-                    .map_err(|e| e.to_string())?;
+                let dump_tp2 = if mm_images.is_empty() {
+                    engine_tp2
+                        .dump_prompt(&prompt_ids)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    engine_tp2
+                        .dump_multimodal_prompt(&prompt_ids, &mm_images)
+                        .map_err(|e| e.to_string())?
+                };
                 let mut max_layer_diff = 0.0f32;
                 let mut target_max_rel_l2 = 0.0f64;
                 let mut min_cosine = 1.0f64;
@@ -1051,22 +1286,41 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
         }
         "chat" => {
             let mut engine = load_engine().map_err(|e| e.to_string())?;
+            let (expanded_prompt, mm_images) =
+                prepare_multimodal_prompt_and_images(&engine.cfg, &prompt, &image_urls)?;
             let msgs = vec![w34_host::server::ChatMessage {
                 role: "user".to_string(),
-                content: Some(prompt.clone()),
+                content: Some(expanded_prompt),
                 reasoning_content: None,
             }];
             let formatted = w34_host::server::format_chatml_prompt(&msgs, None, enable_thinking);
             let prompt_ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
-            let metrics = engine
-                .generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
-                .map_err(|e| e.to_string())?;
+            let metrics = if mm_images.is_empty() {
+                engine
+                    .generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
+                    .map_err(|e| e.to_string())?
+            } else {
+                engine
+                    .generate_multimodal_with_radix_cache(
+                        &prompt_ids,
+                        &mm_images,
+                        max_tokens,
+                        64,
+                        true,
+                    )
+                    .map_err(|e| e.to_string())?
+            };
             let raw_text = engine
                 .decode(&metrics.generated_token_ids)
                 .map_err(|e| e.to_string())?;
             let parsed = w34_host::parser::Qwen3Parser::parse_complete(&raw_text, enable_thinking);
+            let img_tag = if mm_images.is_empty() {
+                String::new()
+            } else {
+                format!(" images={}", mm_images.len())
+            };
             println!(
-                "[w34 chat] model={model} tp={tp} prompt_tokens={} cached_tokens={} gen_tokens={} ttft={:.2}ms decode={:.2}tok/s",
+                "[w34 chat] model={model} tp={tp} kv={kv_format}{img_tag} prompt_tokens={} cached_tokens={} gen_tokens={} ttft={:.2}ms decode={:.2}tok/s",
                 metrics.prompt_len,
                 metrics.cached_prefix_tokens,
                 metrics.gen_len,

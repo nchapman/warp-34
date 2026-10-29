@@ -29,7 +29,12 @@ fn speculative_cli_validation_without_a_visible_gpu() {
         ),
         (
             vec!["bench", "--stage", "bad"],
-            "--stage expects decode, radix, scheduler, or all",
+            "--stage expects decode, radix, scheduler, vision, or all",
+        ),
+        (vec!["generate", "--image"], "missing --image value"),
+        (
+            vec!["generate", "--kv-format", "bad"],
+            "unknown --kv-format",
         ),
         (
             vec!["bench", "--batch-size", "0"],
@@ -74,6 +79,9 @@ fn profile_diff_presets_and_spec_classification() {
         "sglang_4b_tp1_dflash2_m16",
         "vllm_27b_tp2_decode",
         "sglang_27b_tp2_dflash2_m8",
+        "vllm_27b_tp1_tq4_decode",
+        "vllm_35b_moe_tp1_decode",
+        "vllm_35b_moe_tp2_decode",
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_w34"))
             .env("CUDA_VISIBLE_DEVICES", "")
@@ -97,7 +105,12 @@ fn profile_diff_presets_and_spec_classification() {
                  assert p.classify_kernel('rms_norm_bf16_kernel') == 'spec_decode'; \
                  assert p.classify_kernel('tap_add_f16_to_bf16_kernel') == 'spec_decode'; \
                  assert p.classify_kernel('marlin_gemm_f16', in_spec_span=True) == 'spec_decode'; \
-                 assert p.classify_kernel('marlin_gemm_f16', in_spec_span=False) == 'marlin_gemm'",
+                 assert p.classify_kernel('marlin_gemm_f16', in_spec_span=False) == 'marlin_gemm'; \
+                 assert p.classify_kernel('moe_w4a16_gate_up_silu_kernel') == 'marlin_gemm'; \
+                 assert p.classify_kernel('moe_w4a16_down_accum_kernel') == 'marlin_gemm'; \
+                 assert p.classify_kernel('moe_topk_router_f16_kernel') == 'norms_rope_act'; \
+                 assert p.classify_kernel('vision_qkv_rope_attn_f16_kernel') == 'full_attn'; \
+                 assert p.classify_kernel('embedding_splice_f16_kernel') == 'norms_rope_act'",
                 oracle_dir.display().to_string()
             ),
         ])

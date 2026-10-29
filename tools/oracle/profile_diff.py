@@ -50,6 +50,10 @@ def classify_kernel(name: str, in_spec_span: bool = False) -> str:
         return "spec_decode"
     if any(k in s for k in ("gdn", "delta_rule", "conv1d", "ssm", "mamba", "recurrent")):
         return "gdn_ssm"
+    if "vision_qkv_rope_attn" in s:
+        return "full_attn"
+    if any(k in s for k in ("moe_w4a16", "moe_f16", "moe_wna16", "fused_moe")):
+        return "marlin_gemm"
     if any(
         k in s
         for k in (
@@ -63,6 +67,9 @@ def classify_kernel(name: str, in_spec_span: bool = False) -> str:
             "split_cols",
             "sampler",
             "topk_rows",
+            "moe_topk_router",
+            "vision_bias",
+            "embedding_splice",
             "elementwise",
             "embed",
         )
@@ -168,8 +175,31 @@ def parse_nsys_sqlite(sqlite_path: Path, rounds: int = 128, device_id: int = 0) 
             spec_indices.add(j)
 
     if len(target_passes) >= 4:
-        take_rounds = min(rounds, len(target_passes) - 2)
-        start_idx = target_passes[-take_rounds][0]
+        # Exclude warmup, reset_all_states(), prefill, and CUDA-Graph-capture passes:
+        # find the last pass that contains a prefill kernel, has duration >2.2x the
+        # median pass duration (multi-token prefill), or is preceded by a >15ms
+        # transition gap, and take only the steady-state decode/verify passes after it.
+        pass_durs = sorted(max(1, rows[e][2] - rows[s][1]) for s, e in target_passes)
+        median_dur_ns = pass_durs[len(pass_durs) // 2]
+        last_transition_pos = 1
+        for pos, (s_idx, e_idx) in enumerate(target_passes):
+            has_prefill = any(
+                "prefill" in rows[j][0].lower() or "chunk_gated" in rows[j][0].lower()
+                for j in range(s_idx, e_idx + 1)
+            )
+            dur_ns = rows[e_idx][2] - rows[s_idx][1]
+            prev_e = target_passes[pos - 1][1] if pos > 0 else s_idx
+            gap_before_ns = rows[s_idx][1] - rows[prev_e][2] if pos > 0 else 0
+            if has_prefill or dur_ns > 2.2 * median_dur_ns or gap_before_ns > 15_000_000:
+                last_transition_pos = pos
+        min_steady = min(4, len(target_passes) - 2)
+        steady_passes = (
+            target_passes[last_transition_pos + 1 :]
+            if last_transition_pos + min_steady < len(target_passes)
+            else target_passes[2:]
+        )
+        take_rounds = min(rounds, len(steady_passes))
+        start_idx = steady_passes[-take_rounds][0]
         effective_rounds = float(take_rounds)
         window_indices = range(start_idx, len(rows))
     else:

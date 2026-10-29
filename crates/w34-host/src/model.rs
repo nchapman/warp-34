@@ -3370,6 +3370,30 @@ impl Qwen3_5Engine {
         state_in_slot: i32,
         state_out_slot: i32,
         has_initial_state: bool,
+        dump_out: Option<&mut ForwardDump>,
+    ) -> Result<(i32, [i32; 5], [f32; 5])> {
+        self.step_tokens_with_positions(
+            tokens,
+            None,
+            ctx_before,
+            block_table,
+            state_in_slot,
+            state_out_slot,
+            has_initial_state,
+            dump_out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_tokens_with_positions(
+        &mut self,
+        tokens: &[i32],
+        custom_positions: Option<&[i32]>,
+        ctx_before: usize,
+        block_table: &[i32],
+        state_in_slot: i32,
+        state_out_slot: i32,
+        has_initial_state: bool,
         mut dump_out: Option<&mut ForwardDump>,
     ) -> Result<(i32, [i32; 5], [f32; 5])> {
         let num_tokens = tokens.len();
@@ -3387,6 +3411,15 @@ impl Qwen3_5Engine {
             return Err(loader_err("KV cache page capacity exceeded in step_tokens"));
         }
         let positions: Vec<i32> = (ctx_before..seq_after).map(|p| p as i32).collect();
+        if let Some(cp) = custom_positions
+            && cp.len() != num_tokens
+            && cp.len() != 3 * num_tokens
+        {
+            return Err(loader_err(
+                "custom_positions length must be num_tokens or 3 * num_tokens",
+            ));
+        }
+        let pos_host: &[i32] = custom_positions.unwrap_or(&positions);
         let write_slots: Vec<i32> = (ctx_before..seq_after)
             .map(|pos| {
                 let page_idx = pos / 16;
@@ -3405,7 +3438,7 @@ impl Qwen3_5Engine {
             let r0 = &mut self.ranks[0];
             r0.device.make_current()?;
             let tok_dev = DeviceBuffer::alloc(r0.device.device_id, num_tokens * 4)?;
-            let pos_dev = DeviceBuffer::alloc(r0.device.device_id, num_tokens * 4)?;
+            let pos_dev = DeviceBuffer::alloc(r0.device.device_id, pos_host.len() * 4)?;
             let q_start_dev = DeviceBuffer::alloc(r0.device.device_id, 8)?;
             let ctx_dev = DeviceBuffer::alloc(r0.device.device_id, 4)?;
             let seq_dev = DeviceBuffer::alloc(r0.device.device_id, 4)?;
@@ -3416,7 +3449,7 @@ impl Qwen3_5Engine {
             let has_init_dev = DeviceBuffer::alloc(r0.device.device_id, 4)?;
 
             tok_dev.copy_from_host(tokens, &r0.stream)?;
-            pos_dev.copy_from_host(&positions, &r0.stream)?;
+            pos_dev.copy_from_host(pos_host, &r0.stream)?;
             q_start_dev.copy_from_host(&q_start, &r0.stream)?;
             ctx_dev.copy_from_host(&ctx_arr, &r0.stream)?;
             seq_dev.copy_from_host(&seq_arr, &r0.stream)?;
@@ -3503,7 +3536,7 @@ impl Qwen3_5Engine {
             } else {
                 None
             };
-            let pos_slice = positions.as_slice();
+            let pos_slice = pos_host;
             let slots_slice = write_slots.as_slice();
             let (res0, res1) = std::thread::scope(|sc| {
                 let c0 = comm.clone();
@@ -3511,7 +3544,7 @@ impl Qwen3_5Engine {
                 let h0 = sc.spawn(move || -> Result<(i32, f32, [i32; 5], [f32; 5])> {
                     r0.device.make_current()?;
                     let tok_dev = DeviceBuffer::alloc(r0.device.device_id, num_tokens * 4)?;
-                    let pos_dev = DeviceBuffer::alloc(r0.device.device_id, num_tokens * 4)?;
+                    let pos_dev = DeviceBuffer::alloc(r0.device.device_id, pos_slice.len() * 4)?;
                     let q_start_dev = DeviceBuffer::alloc(r0.device.device_id, 8)?;
                     let ctx_dev = DeviceBuffer::alloc(r0.device.device_id, 4)?;
                     let seq_dev = DeviceBuffer::alloc(r0.device.device_id, 4)?;
@@ -3603,7 +3636,7 @@ impl Qwen3_5Engine {
                 let h1 = sc.spawn(move || -> Result<(f32, [i32; 5], [f32; 5])> {
                     r1.device.make_current()?;
                     let tok_dev = DeviceBuffer::alloc(r1.device.device_id, num_tokens * 4)?;
-                    let pos_dev = DeviceBuffer::alloc(r1.device.device_id, num_tokens * 4)?;
+                    let pos_dev = DeviceBuffer::alloc(r1.device.device_id, pos_slice.len() * 4)?;
                     let q_start_dev = DeviceBuffer::alloc(r1.device.device_id, 8)?;
                     let ctx_dev = DeviceBuffer::alloc(r1.device.device_id, 4)?;
                     let seq_dev = DeviceBuffer::alloc(r1.device.device_id, 4)?;
@@ -3837,6 +3870,41 @@ impl Qwen3_5Engine {
             let [r0, r1] = &mut self.ranks[..] else {
                 unreachable!()
             };
+            if use_graph && r0.decode_graph.is_some() && r1.decode_graph.is_some() {
+                for r in [&mut *r0, &mut *r1] {
+                    r.device.make_current()?;
+                    r.decode_io.token_ids.copy_from_host(&tok_arr, &r.stream)?;
+                    r.decode_io.positions.copy_from_host(&pos_arr, &r.stream)?;
+                    r.decode_io
+                        .ctx_lens_before
+                        .copy_from_host(&ctx_arr, &r.stream)?;
+                    r.decode_io
+                        .seq_lens_after
+                        .copy_from_host(&seq_arr, &r.stream)?;
+                    r.decode_io
+                        .block_tables
+                        .copy_from_host(block_table, &r.stream)?;
+                    r.decode_io
+                        .write_slot_mapping
+                        .copy_from_host(&slot_arr, &r.stream)?;
+                    r.decode_io
+                        .state_in_indices
+                        .copy_from_host(&st_arr, &r.stream)?;
+                    r.decode_io
+                        .state_out_indices
+                        .copy_from_host(&st_arr, &r.stream)?;
+                    r.decode_graph.as_ref().unwrap().launch(&r.stream)?;
+                }
+                r0.device.make_current()?;
+                let mut gid = [0i32; 1];
+                r0.decode_io
+                    .out_greedy_id
+                    .copy_to_host(&mut gid, &r0.stream)?;
+                r0.stream.synchronize()?;
+                r1.device.make_current()?;
+                r1.stream.synchronize()?;
+                return Ok(gid[0]);
+            }
             let (res0, res1) = std::thread::scope(|sc| {
                 let c0 = comm.clone();
                 let h0 = sc.spawn(move || -> Result<i32> {
@@ -4138,6 +4206,146 @@ impl Qwen3_5Engine {
             false,
             Some(&mut dump),
         )?;
+        if let Some(mut proposer) = self.speculative.take() {
+            let res = proposer.dump_step(self, prompt_token_ids, dump.greedy_token_id, &mut dump);
+            self.speculative = Some(proposer);
+            res?;
+        }
+        Ok(dump)
+    }
+
+    /// Runs a multimodal diagnostic prefill pass (including `Qwen3VisionEncoder`, 3D `mRoPE`,
+    /// and visual embedding splice) and returns [`ForwardDump`] for `dump-diff`.
+    pub fn dump_multimodal_prompt(
+        &mut self,
+        prompt_token_ids: &[i32],
+        images: &[crate::vision::PreprocessedImage],
+    ) -> Result<ForwardDump> {
+        if images.is_empty() {
+            return self.dump_prompt(prompt_token_ids);
+        }
+        self.reset_all_states()?;
+        self.ensure_vision_encoder()?;
+        let num_tokens = prompt_token_ids.len();
+        if num_tokens == 0 {
+            return Err(loader_err(
+                "dump_multimodal_prompt requires at least 1 token",
+            ));
+        }
+        let needed_pages = (num_tokens + 4).div_ceil(16);
+        if needed_pages > self.ranks[0].kv_pool.num_pages {
+            return Err(loader_err("prompt exceeds allocated KV page capacity"));
+        }
+        let block_table: Vec<i32> = (0..needed_pages as i32).collect();
+
+        let (merge_size, image_token_id) = self
+            .cfg
+            .vision_config
+            .as_ref()
+            .map(|v| (v.spatial_merge_size, v.image_token_id))
+            .unwrap_or((2, 248056));
+        let grids: Vec<[usize; 3]> = images.iter().map(|img| img.grid_thw).collect();
+        let (mrope_planes, _) = crate::vision::compute_mrope_positions(
+            prompt_token_ids,
+            &grids,
+            image_token_id,
+            merge_size,
+        );
+        let mut pos_3d = Vec::with_capacity(3 * num_tokens);
+        pos_3d.extend_from_slice(&mrope_planes[0]);
+        pos_3d.extend_from_slice(&mrope_planes[1]);
+        pos_3d.extend_from_slice(&mrope_planes[2]);
+
+        let h_dim = self.cfg.hidden_size;
+        let vis_dev0 = {
+            let r0 = &self.ranks[0];
+            r0.device.make_current()?;
+            self.vision_encoder
+                .as_ref()
+                .unwrap()
+                .encode_images(images, &r0.cublas, &r0.stream)?
+        };
+        let num_u16 = vis_dev0.len_bytes / 2;
+        let mut all_vis_embeds_host = vec![0u16; num_u16];
+        {
+            let r0 = &self.ranks[0];
+            r0.device.make_current()?;
+            vis_dev0.copy_to_host(&mut all_vis_embeds_host, &r0.stream)?;
+            r0.stream.synchronize()?;
+        }
+
+        let mut dump = ForwardDump::default();
+        let vis_f32: Vec<f32> = all_vis_embeds_host
+            .iter()
+            .copied()
+            .map(crate::cuda::f16_to_f32)
+            .collect();
+        dump.tensors_f32.insert(
+            "visual_embeddings".to_string(),
+            (vec![num_u16 / h_dim.max(1), h_dim], vis_f32),
+        );
+
+        let total_merged = num_u16 / h_dim.max(1);
+        let mut vis_indices = Vec::new();
+        let mut vis_embeds = Vec::new();
+        let mut v_cursor = 0usize;
+        for (pos, &tok) in prompt_token_ids.iter().enumerate() {
+            if tok == image_token_id {
+                if (v_cursor + 1) * h_dim > all_vis_embeds_host.len() {
+                    return Err(loader_err(
+                        "prompt has more <|image_pad|> tokens than encoded visual embeddings",
+                    ));
+                }
+                vis_indices.push(pos as i32);
+                vis_embeds.extend_from_slice(
+                    &all_vis_embeds_host[v_cursor * h_dim..(v_cursor + 1) * h_dim],
+                );
+                v_cursor += 1;
+            }
+        }
+        if v_cursor != total_merged {
+            return Err(loader_err(
+                "prompt <|image_pad|> count does not match encoded visual token count",
+            ));
+        }
+
+        let mut rank_vis_bufs = Vec::new();
+        let step_res = (|| -> Result<()> {
+            for rank in &mut self.ranks {
+                rank.device.make_current()?;
+                rank.current_pos_plane_stride = num_tokens as i32;
+                if !vis_indices.is_empty() {
+                    let emb_dev = DeviceBuffer::alloc(rank.device.device_id, vis_embeds.len() * 2)?;
+                    let idx_dev =
+                        DeviceBuffer::alloc(rank.device.device_id, vis_indices.len() * 4)?;
+                    emb_dev.copy_from_host(&vis_embeds, &rank.stream)?;
+                    idx_dev.copy_from_host(&vis_indices, &rank.stream)?;
+                    rank.pending_visual_splice =
+                        Some((emb_dev.addr(), idx_dev.addr(), vis_indices.len()));
+                    rank_vis_bufs.push((emb_dev, idx_dev));
+                } else {
+                    rank.pending_visual_splice = None;
+                }
+            }
+            self.step_tokens_with_positions(
+                prompt_token_ids,
+                Some(&pos_3d),
+                0,
+                &block_table,
+                0,
+                0,
+                false,
+                Some(&mut dump),
+            )?;
+            Ok(())
+        })();
+        for rank in &mut self.ranks {
+            rank.current_pos_plane_stride = 0;
+            rank.pending_visual_splice = None;
+        }
+        drop(rank_vis_bufs);
+        step_res?;
+
         if let Some(mut proposer) = self.speculative.take() {
             let res = proposer.dump_step(self, prompt_token_ids, dump.greedy_token_id, &mut dump);
             self.speculative = Some(proposer);
