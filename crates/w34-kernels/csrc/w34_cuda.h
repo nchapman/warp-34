@@ -173,6 +173,11 @@ int w34_rms_norm_gated_silu_f16(const w34_exec* ex, const void* x, const void* z
                                 const void* weight, void* out,
                                 const uint8_t* valid_token_mask,
                                 int num_tokens, int num_v_heads, int head_dim, float eps);
+int w34_rms_norm_gated_silu_strided_f16(const w34_exec* ex, const void* x, const void* z,
+                                        const void* weight, void* out,
+                                        const uint8_t* valid_token_mask,
+                                        int num_tokens, int num_v_heads, int head_dim,
+                                        int z_token_stride, float eps);
 
 int w34_fused_qk_rmsnorm_rope_gate_f16(
     const w34_exec* ex,
@@ -197,6 +202,31 @@ int w34_fused_qk_rmsnorm_rope_gate_f16(
     float rope_theta,
     float rms_eps);
 
+int w34_fused_qk_rmsnorm_rope_gate_strided_f16(
+    const w34_exec* ex,
+    const void* q_gate_in,
+    const void* k_in,
+    const void* q_norm_w,
+    const void* k_norm_w,
+    const int32_t* positions,
+    const uint8_t* valid_token_mask,
+    void* q_out,
+    void* k_out,
+    void* gate_out,
+    int num_tokens,
+    int pos_plane_stride,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    int mrope_s0,
+    int mrope_s1,
+    int mrope_s2,
+    int q_gate_row_stride,
+    int k_row_stride,
+    float rope_theta,
+    float rms_eps);
+
 int w34_silu_and_mul_f16(const w34_exec* ex, const void* gate_up, void* out,
                          const uint8_t* valid_token_mask,
                          int num_tokens, int intermediate_size);
@@ -214,6 +244,8 @@ int w34_split_cols_2_f16(const w34_exec* ex, const void* src, void* dst0, void* 
                          int num_tokens, int dim0, int dim1);
 int w34_split_cols_3_f16(const w34_exec* ex, const void* src, void* dst0, void* dst1, void* dst2,
                          int num_tokens, int dim0, int dim1, int dim2);
+int w34_small_n_gemm_f16(const w34_exec* ex, const void* x, const void* w, void* out,
+                         int m, int size_n, int size_k);
 
 // --- Marlin Repack & GEMMs (op_marlin.cu) ---
 int w34_zero_i32(const w34_exec* ex, void* ptr, int64_t count);
@@ -232,6 +264,10 @@ int w34_marlin_gemm_f16u8(const w34_exec* ex, const void* a, const void* b,
 int w34_kv_cache_write(const w34_exec* ex, const w34_kv_layer_layout* layout,
                        const w34_attention_batch* batch,
                        const void* k_in, const void* v_in);
+int w34_kv_cache_write_strided(const w34_exec* ex, const w34_kv_layer_layout* layout,
+                               const w34_attention_batch* batch,
+                               const void* k_in, const void* v_in,
+                               int k_row_stride, int v_row_stride);
 
 // Native BF16 I/O and BF16 descriptor storage; identity transforms required.
 int w34_kv_cache_write_bf16(const w34_exec* ex, const w34_kv_layer_layout* layout,
@@ -252,6 +288,12 @@ int w34_gdn_causal_conv1d_f16(const w34_exec* ex, const w34_gdn_batch* batch,
                               const void* conv_bias, void* conv_state_pool,
                               void* x_out, int conv_dim, int kernel_size,
                               int total_state_slots, int silu_activation);
+int w34_gdn_causal_conv1d_strided_f16(const w34_exec* ex, const w34_gdn_batch* batch,
+                                      const void* x_in, const void* conv_weight,
+                                      const void* conv_bias, void* conv_state_pool,
+                                      void* x_out, int conv_dim, int x_in_row_stride,
+                                      int kernel_size, int total_state_slots,
+                                      int silu_activation);
 
 int w34_gdn_recurrent_f16(const w34_exec* ex, const w34_gdn_batch* batch,
                           const void* qkv_conv_out, // [total_tokens, 2*k_dim + v_dim] or split q,k,v
@@ -267,6 +309,20 @@ int w34_gdn_recurrent_f16(const w34_exec* ex, const w34_gdn_batch* batch,
                           int num_k_heads, int head_k_dim,
                           int num_v_heads, int head_v_dim,
                           int total_state_slots);
+int w34_gdn_recurrent_strided_f16(const w34_exec* ex, const w34_gdn_batch* batch,
+                                  const void* qkv_conv_out,
+                                  const void* q_in,
+                                  const void* k_in,
+                                  const void* v_in,
+                                  const void* b_in,
+                                  const void* a_in,
+                                  const float* a_log,
+                                  const float* dt_bias,
+                                  float* ssm_state_pool,
+                                  void* out_f16,
+                                  int num_k_heads, int head_k_dim,
+                                  int num_v_heads, int head_v_dim,
+                                  int ba_row_stride, int total_state_slots);
 
 // --- Pinned-Sysmem TP=2 Collectives (op_collectives.cu) ---
 size_t w34_tp2_signal_bytes(void);

@@ -70,7 +70,20 @@ def classify_kernel(name: str, in_spec_span: bool = False) -> str:
         return "norms_rope_act"
     if any(k in s for k in ("flash_attn", "fattn", "paged_attn", "paged_attention", "kv_cache_write", "fmha", "attn")):
         return "full_attn"
-    if any(k in s for k in ("marlin", "gemm", "gemv", "cutlass", "ampere_fp16", "cublas", "matmul")):
+    if any(
+        k in s
+        for k in (
+            "marlin",
+            "gemm",
+            "gemv",
+            "cutlass",
+            "kernel2",
+            "splitkreduce",
+            "ampere_fp16",
+            "cublas",
+            "matmul",
+        )
+    ):
         return "marlin_gemm"
     return "norms_rope_act"
 

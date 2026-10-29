@@ -129,21 +129,24 @@ impl LinearProj {
                 size_n,
                 size_k,
             } => {
-                // Only small-N projections (GDN in_proj_ba, size_n <= 128) need per-row
-                // GEMVs to preserve 0-ULP ssm_state parity across prefill vs decode.
-                // Large-N projections (lm_head, size_n >= 124160) must run batched.
-                if m > 1 && m <= 8 && size_n <= 256 {
-                    for r in 0..m {
-                        cublas.gemm_f16(
-                            x_ptr + (r * size_k * 2) as u64,
-                            weight_ptr,
-                            out_ptr + (r * size_n * 2) as u64,
-                            1,
-                            size_n as i32,
-                            size_k as i32,
-                        )?;
-                    }
-                    Ok(())
+                // Small-N projections (GDN in_proj_ba, size_n <= 256) use a single
+                // batch-size-invariant warp-reduction kernel to avoid per-row cuBLAS
+                // split-K launches and guarantee 0-ULP ssm_state parity across all M.
+                if size_n <= 256 && size_k.is_multiple_of(8) {
+                    check_rc(
+                        unsafe {
+                            ffi::w34_small_n_gemm_f16(
+                                ex,
+                                x_ptr as *const c_void,
+                                weight_ptr as *const c_void,
+                                out_ptr as *mut c_void,
+                                m as i32,
+                                size_n as i32,
+                                size_k as i32,
+                            )
+                        },
+                        "w34_small_n_gemm_f16",
+                    )
                 } else {
                     cublas.gemm_f16(
                         x_ptr,
@@ -1140,11 +1143,6 @@ impl Qwen3_5ModelRank {
         let qkv_proj_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * (q_gate_dim + 2 * kv_dim) * 2)?;
-        let q_gate_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * q_gate_dim * 2)?;
-        let k_raw_buf = self.scratch_arena.alloc_aligned(num_tokens * kv_dim * 2)?;
-        let v_buf = self.scratch_arena.alloc_aligned(num_tokens * kv_dim * 2)?;
         let q_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
@@ -1165,21 +1163,9 @@ impl Qwen3_5ModelRank {
         let ba_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * 2 * local_v_heads * 2)?;
-        let qkv_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * conv_dim * 2)?;
         let qkv_conv_out_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * conv_dim * 2)?;
-        let z_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
-        let b_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_v_heads * 2)?;
-        let a_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_v_heads * 2)?;
         let gdn_raw_out_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
@@ -1287,34 +1273,13 @@ impl Qwen3_5ModelRank {
                         qkv_proj_buf,
                         num_tokens,
                     )?;
-                    let (q_gate_ptr, k_raw_ptr, v_ptr) = if num_tokens == 1 {
-                        (
-                            qkv_proj_buf,
-                            qkv_proj_buf + (q_gate_dim * 2) as u64,
-                            qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64,
-                        )
-                    } else {
-                        check_rc(
-                            unsafe {
-                                ffi::w34_split_cols_3_f16(
-                                    &ex,
-                                    qkv_proj_buf as *const c_void,
-                                    q_gate_buf as *mut c_void,
-                                    k_raw_buf as *mut c_void,
-                                    v_buf as *mut c_void,
-                                    num_tokens as i32,
-                                    q_gate_dim as i32,
-                                    kv_dim as i32,
-                                    kv_dim as i32,
-                                )
-                            },
-                            "w34_split_cols_3_f16",
-                        )?;
-                        (q_gate_buf, k_raw_buf, v_buf)
-                    };
+                    let qkv_row_stride = (q_gate_dim + 2 * kv_dim) as i32;
+                    let q_gate_ptr = qkv_proj_buf;
+                    let k_raw_ptr = qkv_proj_buf + (q_gate_dim * 2) as u64;
+                    let v_ptr = qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64;
                     check_rc(
                         unsafe {
-                            ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
+                            ffi::w34_fused_qk_rmsnorm_rope_gate_strided_f16(
                                 &ex,
                                 q_gate_ptr as *const c_void,
                                 k_raw_ptr as *const c_void,
@@ -1334,24 +1299,28 @@ impl Qwen3_5ModelRank {
                                 self.cfg.mrope_section[0] as i32,
                                 self.cfg.mrope_section[1] as i32,
                                 self.cfg.mrope_section[2] as i32,
+                                qkv_row_stride,
+                                qkv_row_stride,
                                 self.cfg.rope_theta,
                                 self.cfg.rms_norm_eps,
                             )
                         },
-                        "w34_fused_qk_rmsnorm_rope_gate_f16",
+                        "w34_fused_qk_rmsnorm_rope_gate_strided_f16",
                     )?;
                     let kv_layout = &self.kv_pool.layers[fa.kv_layer_ordinal].layout;
                     check_rc(
                         unsafe {
-                            ffi::w34_kv_cache_write(
+                            ffi::w34_kv_cache_write_strided(
                                 &ex,
                                 kv_layout,
                                 attn_batch,
                                 k_buf as *const c_void,
                                 v_ptr as *const c_void,
+                                kv_dim as i32,
+                                qkv_row_stride,
                             )
                         },
-                        "w34_kv_cache_write",
+                        "w34_kv_cache_write_strided",
                     )?;
                     check_rc(
                         unsafe {
@@ -1409,48 +1378,16 @@ impl Qwen3_5ModelRank {
                         ba_buf,
                         num_tokens,
                     )?;
-                    let (qkv_ptr, z_ptr, b_ptr, a_ptr) = if num_tokens == 1 {
-                        (
-                            qkvz_buf,
-                            qkvz_buf + (conv_dim * 2) as u64,
-                            ba_buf,
-                            ba_buf + (local_v_heads * 2) as u64,
-                        )
-                    } else {
-                        check_rc(
-                            unsafe {
-                                ffi::w34_split_cols_2_f16(
-                                    &ex,
-                                    qkvz_buf as *const c_void,
-                                    qkv_buf as *mut c_void,
-                                    z_buf as *mut c_void,
-                                    num_tokens as i32,
-                                    conv_dim as i32,
-                                    gdn_v_dim as i32,
-                                )
-                            },
-                            "w34_split_cols_2_f16 (qkvz)",
-                        )?;
-                        check_rc(
-                            unsafe {
-                                ffi::w34_split_cols_2_f16(
-                                    &ex,
-                                    ba_buf as *const c_void,
-                                    b_buf as *mut c_void,
-                                    a_buf as *mut c_void,
-                                    num_tokens as i32,
-                                    local_v_heads as i32,
-                                    local_v_heads as i32,
-                                )
-                            },
-                            "w34_split_cols_2_f16 (ba)",
-                        )?;
-                        (qkv_buf, z_buf, b_buf, a_buf)
-                    };
+                    let qkvz_row_stride = (conv_dim + gdn_v_dim) as i32;
+                    let ba_row_stride = (2 * local_v_heads) as i32;
+                    let qkv_ptr = qkvz_buf;
+                    let z_ptr = qkvz_buf + (conv_dim * 2) as u64;
+                    let b_ptr = ba_buf;
+                    let a_ptr = ba_buf + (local_v_heads * 2) as u64;
                     let st_bufs = &self.state_pool.layers[gdn.gdn_layer_ordinal];
                     check_rc(
                         unsafe {
-                            ffi::w34_gdn_causal_conv1d_f16(
+                            ffi::w34_gdn_causal_conv1d_strided_f16(
                                 &ex,
                                 gdn_batch,
                                 qkv_ptr as *const c_void,
@@ -1459,16 +1396,17 @@ impl Qwen3_5ModelRank {
                                 st_bufs.conv_state.addr() as *mut c_void,
                                 qkv_conv_out_buf as *mut c_void,
                                 conv_dim as i32,
+                                qkvz_row_stride,
                                 self.cfg.linear_conv_kernel_dim as i32,
                                 self.state_pool.total_slots as i32,
                                 1,
                             )
                         },
-                        "w34_gdn_causal_conv1d_f16",
+                        "w34_gdn_causal_conv1d_strided_f16",
                     )?;
                     check_rc(
                         unsafe {
-                            ffi::w34_gdn_recurrent_f16(
+                            ffi::w34_gdn_recurrent_strided_f16(
                                 &ex,
                                 gdn_batch,
                                 qkv_conv_out_buf as *const c_void,
@@ -1485,14 +1423,15 @@ impl Qwen3_5ModelRank {
                                 head_k_dim as i32,
                                 local_v_heads as i32,
                                 head_v_dim as i32,
+                                ba_row_stride,
                                 self.state_pool.total_slots as i32,
                             )
                         },
-                        "w34_gdn_recurrent_f16",
+                        "w34_gdn_recurrent_strided_f16",
                     )?;
                     check_rc(
                         unsafe {
-                            ffi::w34_rms_norm_gated_silu_f16(
+                            ffi::w34_rms_norm_gated_silu_strided_f16(
                                 &ex,
                                 gdn_raw_out_buf as *const c_void,
                                 z_ptr as *const c_void,
@@ -1502,10 +1441,11 @@ impl Qwen3_5ModelRank {
                                 num_tokens as i32,
                                 local_v_heads as i32,
                                 head_v_dim as i32,
+                                qkvz_row_stride,
                                 self.cfg.rms_norm_eps,
                             )
                         },
-                        "w34_rms_norm_gated_silu_f16",
+                        "w34_rms_norm_gated_silu_strided_f16",
                     )?;
                     gdn.out_proj.forward(
                         &ex,
@@ -1846,11 +1786,6 @@ impl Qwen3_5ModelRank {
         let qkv_proj_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * (q_gate_dim + 2 * kv_dim) * 2)?;
-        let q_gate_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * q_gate_dim * 2)?;
-        let k_raw_buf = self.scratch_arena.alloc_aligned(num_tokens * kv_dim * 2)?;
-        let v_buf = self.scratch_arena.alloc_aligned(num_tokens * kv_dim * 2)?;
         let q_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
@@ -1871,21 +1806,9 @@ impl Qwen3_5ModelRank {
         let ba_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * 2 * local_v_heads * 2)?;
-        let qkv_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * conv_dim * 2)?;
         let qkv_conv_out_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * conv_dim * 2)?;
-        let z_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
-        let b_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_v_heads * 2)?;
-        let a_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_v_heads * 2)?;
         let gdn_raw_out_buf = self
             .scratch_arena
             .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
@@ -1965,35 +1888,14 @@ impl Qwen3_5ModelRank {
                         qkv_proj_buf,
                         num_tokens,
                     )?;
-                    let (q_gate_ptr, k_raw_ptr, v_ptr) = if num_tokens == 1 {
-                        (
-                            qkv_proj_buf,
-                            qkv_proj_buf + (q_gate_dim * 2) as u64,
-                            qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64,
-                        )
-                    } else {
-                        check_rc(
-                            unsafe {
-                                ffi::w34_split_cols_3_f16(
-                                    &ex,
-                                    qkv_proj_buf as *const c_void,
-                                    q_gate_buf as *mut c_void,
-                                    k_raw_buf as *mut c_void,
-                                    v_buf as *mut c_void,
-                                    num_tokens as i32,
-                                    q_gate_dim as i32,
-                                    kv_dim as i32,
-                                    kv_dim as i32,
-                                )
-                            },
-                            "w34_split_cols_3_f16",
-                        )?;
-                        (q_gate_buf, k_raw_buf, v_buf)
-                    };
+                    let qkv_row_stride = (q_gate_dim + 2 * kv_dim) as i32;
+                    let q_gate_ptr = qkv_proj_buf;
+                    let k_raw_ptr = qkv_proj_buf + (q_gate_dim * 2) as u64;
+                    let v_ptr = qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64;
                     let rotary_dim = self.cfg.rotary_dim as i32;
                     check_rc(
                         unsafe {
-                            ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
+                            ffi::w34_fused_qk_rmsnorm_rope_gate_strided_f16(
                                 &ex,
                                 q_gate_ptr as *const c_void,
                                 k_raw_ptr as *const c_void,
@@ -2013,24 +1915,28 @@ impl Qwen3_5ModelRank {
                                 self.cfg.mrope_section[0] as i32,
                                 self.cfg.mrope_section[1] as i32,
                                 self.cfg.mrope_section[2] as i32,
+                                qkv_row_stride,
+                                qkv_row_stride,
                                 self.cfg.rope_theta,
                                 self.cfg.rms_norm_eps,
                             )
                         },
-                        "w34_fused_qk_rmsnorm_rope_gate_f16",
+                        "w34_fused_qk_rmsnorm_rope_gate_strided_f16",
                     )?;
                     let kv_layout = &self.kv_pool.layers[fa.kv_layer_ordinal].layout;
                     check_rc(
                         unsafe {
-                            ffi::w34_kv_cache_write(
+                            ffi::w34_kv_cache_write_strided(
                                 &ex,
                                 kv_layout,
                                 attn_batch,
                                 k_buf as *const c_void,
                                 v_ptr as *const c_void,
+                                kv_dim as i32,
+                                qkv_row_stride,
                             )
                         },
-                        "w34_kv_cache_write",
+                        "w34_kv_cache_write_strided",
                     )?;
                     check_rc(
                         unsafe {
@@ -2088,48 +1994,16 @@ impl Qwen3_5ModelRank {
                         ba_buf,
                         num_tokens,
                     )?;
-                    let (qkv_ptr, z_ptr, b_ptr, a_ptr) = if num_tokens == 1 {
-                        (
-                            qkvz_buf,
-                            qkvz_buf + (conv_dim * 2) as u64,
-                            ba_buf,
-                            ba_buf + (local_v_heads * 2) as u64,
-                        )
-                    } else {
-                        check_rc(
-                            unsafe {
-                                ffi::w34_split_cols_2_f16(
-                                    &ex,
-                                    qkvz_buf as *const c_void,
-                                    qkv_buf as *mut c_void,
-                                    z_buf as *mut c_void,
-                                    num_tokens as i32,
-                                    conv_dim as i32,
-                                    gdn_v_dim as i32,
-                                )
-                            },
-                            "w34_split_cols_2_f16 (qkvz)",
-                        )?;
-                        check_rc(
-                            unsafe {
-                                ffi::w34_split_cols_2_f16(
-                                    &ex,
-                                    ba_buf as *const c_void,
-                                    b_buf as *mut c_void,
-                                    a_buf as *mut c_void,
-                                    num_tokens as i32,
-                                    local_v_heads as i32,
-                                    local_v_heads as i32,
-                                )
-                            },
-                            "w34_split_cols_2_f16 (ba)",
-                        )?;
-                        (qkv_buf, z_buf, b_buf, a_buf)
-                    };
+                    let qkvz_row_stride = (conv_dim + gdn_v_dim) as i32;
+                    let ba_row_stride = (2 * local_v_heads) as i32;
+                    let qkv_ptr = qkvz_buf;
+                    let z_ptr = qkvz_buf + (conv_dim * 2) as u64;
+                    let b_ptr = ba_buf;
+                    let a_ptr = ba_buf + (local_v_heads * 2) as u64;
                     let st_bufs = &self.state_pool.layers[gdn.gdn_layer_ordinal];
                     check_rc(
                         unsafe {
-                            ffi::w34_gdn_causal_conv1d_f16(
+                            ffi::w34_gdn_causal_conv1d_strided_f16(
                                 &ex,
                                 gdn_batch,
                                 qkv_ptr as *const c_void,
@@ -2138,16 +2012,17 @@ impl Qwen3_5ModelRank {
                                 st_bufs.conv_state.addr() as *mut c_void,
                                 qkv_conv_out_buf as *mut c_void,
                                 conv_dim as i32,
+                                qkvz_row_stride,
                                 self.cfg.linear_conv_kernel_dim as i32,
                                 self.state_pool.total_slots as i32,
                                 1,
                             )
                         },
-                        "w34_gdn_causal_conv1d_f16",
+                        "w34_gdn_causal_conv1d_strided_f16",
                     )?;
                     check_rc(
                         unsafe {
-                            ffi::w34_gdn_recurrent_f16(
+                            ffi::w34_gdn_recurrent_strided_f16(
                                 &ex,
                                 gdn_batch,
                                 qkv_conv_out_buf as *const c_void,
@@ -2164,14 +2039,15 @@ impl Qwen3_5ModelRank {
                                 head_k_dim as i32,
                                 local_v_heads as i32,
                                 head_v_dim as i32,
+                                ba_row_stride,
                                 self.state_pool.total_slots as i32,
                             )
                         },
-                        "w34_gdn_recurrent_f16",
+                        "w34_gdn_recurrent_strided_f16",
                     )?;
                     check_rc(
                         unsafe {
-                            ffi::w34_rms_norm_gated_silu_f16(
+                            ffi::w34_rms_norm_gated_silu_strided_f16(
                                 &ex,
                                 gdn_raw_out_buf as *const c_void,
                                 z_ptr as *const c_void,
@@ -2181,10 +2057,11 @@ impl Qwen3_5ModelRank {
                                 num_tokens as i32,
                                 local_v_heads as i32,
                                 head_v_dim as i32,
+                                qkvz_row_stride,
                                 self.cfg.rms_norm_eps,
                             )
                         },
-                        "w34_rms_norm_gated_silu_f16",
+                        "w34_rms_norm_gated_silu_strided_f16",
                     )?;
                     gdn.out_proj.forward(
                         &ex,

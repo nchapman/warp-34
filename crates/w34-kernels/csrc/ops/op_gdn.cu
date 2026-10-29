@@ -38,6 +38,7 @@ __global__ void gdn_causal_conv1d_f16_kernel(
     __half* __restrict__ conv_state_pool,
     __half* __restrict__ x_out,
     int conv_dim,
+    int x_in_row_stride,
     int kernel_size,
     int total_state_slots,
     int silu_activation) {
@@ -72,9 +73,10 @@ __global__ void gdn_causal_conv1d_f16_kernel(
     }
     const float bias_val = (conv_bias != nullptr) ? __half2float(conv_bias[c]) : 0.0f;
 
+    int32_t last_spec_slot = -1;
     for (int step = 0; step < seqlen; step++) {
         const int tok = lo + step;
-        const float x_val = __half2float(x_in[(size_t)tok * conv_dim + c]);
+        const float x_val = __half2float(x_in[(size_t)tok * x_in_row_stride + c]);
 
         float acc = bias_val;
         if (kernel_size == 4) {
@@ -101,6 +103,7 @@ __global__ void gdn_causal_conv1d_f16_kernel(
             if (spec_slot >= 0 && spec_slot < total_state_slots) {
                 __half* s_spec = conv_state_pool + ((size_t)spec_slot * conv_dim + c) * state_len;
                 for (int j = 0; j < state_len; j++) s_spec[j] = __float2half(hist[j]);
+                if (step == seqlen - 1) last_spec_slot = spec_slot;
             }
         }
 
@@ -119,10 +122,10 @@ __global__ void gdn_causal_conv1d_f16_kernel(
         }
     }
 
-    // Write final state to state_out_indices[req]
+    // Write final state to state_out_indices[req] (skip if already written to the same spec_slot)
     if (batch.state_out_indices != nullptr) {
         const int32_t slot_out = batch.state_out_indices[req];
-        if (slot_out >= 0 && slot_out < total_state_slots) {
+        if (slot_out >= 0 && slot_out < total_state_slots && slot_out != last_spec_slot) {
             __half* s_out = conv_state_pool + ((size_t)slot_out * conv_dim + c) * state_len;
             for (int j = 0; j < state_len; j++) s_out[j] = __float2half(hist[j]);
         }
@@ -153,6 +156,7 @@ __global__ void gdn_recurrent_f16_kernel(
     int head_k_dim,
     int num_v_heads,
     int head_v_dim,
+    int ba_row_stride,
     int total_state_slots) {
     const int i_v = blockIdx.x;
     const int i_nh = blockIdx.y;
@@ -188,9 +192,14 @@ __global__ void gdn_recurrent_f16_kernel(
         const float* s_in = ssm_state_pool
                             + ((size_t)slot_in * num_v_heads + hv) * head_state_elems
                             + (size_t)vrow * head_k_dim;
+        const float4* s_in4 = reinterpret_cast<const float4*>(s_in + c0);
 #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            if (c0 + j < head_k_dim) rr[j] = s_in[c0 + j];
+        for (int j = 0; j < 4; j++) {
+            float4 v4 = s_in4[j];
+            rr[j * 4 + 0] = v4.x;
+            rr[j * 4 + 1] = v4.y;
+            rr[j * 4 + 2] = v4.z;
+            rr[j * 4 + 3] = v4.w;
         }
     }
 
@@ -206,9 +215,10 @@ __global__ void gdn_recurrent_f16_kernel(
     const int v_total_dim = num_v_heads * head_v_dim;
     const int qkv_stride = 2 * k_total_dim + v_total_dim;
 
+    int32_t last_spec_slot = -1;
     for (int step = 0; step < seqlen; step++) {
         const int tok = lo + step;
-        __syncthreads();
+        if (step > 0) __syncthreads();
 
         // Load q and k for (tok, hk) and L2-normalize in FP32
         const __half* q_tok_hk = (qkv_conv_out != nullptr)
@@ -237,19 +247,16 @@ __global__ void gdn_recurrent_f16_kernel(
             s_red[4 + (tid >> 5)] = k_sq;
         }
         __syncthreads();
-        if (tid == 0) {
-            s_red[0] = rsqrtf(s_red[0] + s_red[1] + s_red[2] + s_red[3] + 1e-6f) * scale;
-            s_red[4] = rsqrtf(s_red[4] + s_red[5] + s_red[6] + s_red[7] + 1e-6f);
-        }
-        __syncthreads();
         if (tid < head_k_dim) {
-            bq[tid] = q_val * s_red[0];
-            bk[tid] = k_val * s_red[4];
+            const float q_inv = rsqrtf(s_red[0] + s_red[1] + s_red[2] + s_red[3] + 1e-6f) * scale;
+            const float k_inv = rsqrtf(s_red[4] + s_red[5] + s_red[6] + s_red[7] + 1e-6f);
+            bq[tid] = q_val * q_inv;
+            bk[tid] = k_val * k_inv;
         }
         __syncthreads();
 
-        const float a_val = __half2float(a_in[(size_t)tok * num_v_heads + hv]);
-        const float b_val = __half2float(b_in[(size_t)tok * num_v_heads + hv]);
+        const float a_val = __half2float(a_in[(size_t)tok * ba_row_stride + hv]);
+        const float b_val = __half2float(b_in[(size_t)tok * ba_row_stride + hv]);
         const float g = -expf(a_log_hv) * softplus_f32(a_val + dt_bias_hv);
         const float decay = expf(g);
         const float beta = 1.0f / (1.0f + expf(-b_val));
@@ -291,10 +298,13 @@ __global__ void gdn_recurrent_f16_kernel(
                 float* s_spec = ssm_state_pool
                                 + ((size_t)spec_slot * num_v_heads + hv) * head_state_elems
                                 + (size_t)vrow * head_k_dim;
+                float4* s_spec4 = reinterpret_cast<float4*>(s_spec + c0);
 #pragma unroll
-                for (int j = 0; j < 16; j++) {
-                    if (c0 + j < head_k_dim) s_spec[c0 + j] = rr[j];
+                for (int j = 0; j < 4; j++) {
+                    s_spec4[j] = make_float4(
+                        rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
                 }
+                if (step == seqlen - 1) last_spec_slot = spec_slot;
             }
         }
 
@@ -308,9 +318,11 @@ __global__ void gdn_recurrent_f16_kernel(
                         float* s_chk = ssm_state_pool
                                        + ((size_t)chk_slot * num_v_heads + hv) * head_state_elems
                                        + (size_t)vrow * head_k_dim;
+                        float4* s_chk4 = reinterpret_cast<float4*>(s_chk + c0);
 #pragma unroll
-                        for (int j = 0; j < 16; j++) {
-                            if (c0 + j < head_k_dim) s_chk[c0 + j] = rr[j];
+                        for (int j = 0; j < 4; j++) {
+                            s_chk4[j] = make_float4(
+                                rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
                         }
                     }
                 }
@@ -318,22 +330,51 @@ __global__ void gdn_recurrent_f16_kernel(
         }
     }
 
-    // Write final state to state_out_indices[req]
+    // Write final state to state_out_indices[req] (skip if already written to the same spec_slot)
     if (batch.state_out_indices != nullptr && vrow < head_v_dim) {
         const int32_t slot_out = batch.state_out_indices[req];
-        if (slot_out >= 0 && slot_out < total_state_slots) {
+        if (slot_out >= 0 && slot_out < total_state_slots && slot_out != last_spec_slot) {
             float* s_out = ssm_state_pool
                            + ((size_t)slot_out * num_v_heads + hv) * head_state_elems
                            + (size_t)vrow * head_k_dim;
+            float4* s_out4 = reinterpret_cast<float4*>(s_out + c0);
 #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                if (c0 + j < head_k_dim) s_out[c0 + j] = rr[j];
+            for (int j = 0; j < 4; j++) {
+                s_out4[j] = make_float4(
+                    rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
             }
         }
     }
 }
 
 }  // namespace w34_gdn
+
+extern "C" int w34_gdn_causal_conv1d_strided_f16(
+    const w34_exec* ex,
+    const w34_gdn_batch* batch,
+    const void* x_in,
+    const void* conv_weight,
+    const void* conv_bias,
+    void* conv_state_pool,
+    void* x_out,
+    int conv_dim,
+    int x_in_row_stride,
+    int kernel_size,
+    int total_state_slots,
+    int silu_activation) {
+    if (ex == nullptr || batch == nullptr || x_in == nullptr || conv_weight == nullptr ||
+        conv_state_pool == nullptr || x_out == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (batch->num_reqs <= 0 || batch->total_tokens <= 0 || conv_dim <= 0) return 0;
+    if (x_in_row_stride < conv_dim) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)((conv_dim + 255) / 256), (unsigned)batch->num_reqs);
+    w34_gdn::gdn_causal_conv1d_f16_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
+        *batch, (const __half*)x_in, (const __half*)conv_weight,
+        (const __half*)conv_bias, (__half*)conv_state_pool, (__half*)x_out,
+        conv_dim, x_in_row_stride, kernel_size, total_state_slots, silu_activation);
+    return (int)cudaGetLastError();
+}
 
 extern "C" int w34_gdn_causal_conv1d_f16(
     const w34_exec* ex,
@@ -347,20 +388,12 @@ extern "C" int w34_gdn_causal_conv1d_f16(
     int kernel_size,
     int total_state_slots,
     int silu_activation) {
-    if (ex == nullptr || batch == nullptr || x_in == nullptr || conv_weight == nullptr ||
-        conv_state_pool == nullptr || x_out == nullptr) {
-        return (int)cudaErrorInvalidValue;
-    }
-    if (batch->num_reqs <= 0 || batch->total_tokens <= 0 || conv_dim <= 0) return 0;
-    dim3 grid((unsigned)((conv_dim + 255) / 256), (unsigned)batch->num_reqs);
-    w34_gdn::gdn_causal_conv1d_f16_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
-        *batch, (const __half*)x_in, (const __half*)conv_weight,
-        (const __half*)conv_bias, (__half*)conv_state_pool, (__half*)x_out,
-        conv_dim, kernel_size, total_state_slots, silu_activation);
-    return (int)cudaGetLastError();
+    return w34_gdn_causal_conv1d_strided_f16(
+        ex, batch, x_in, conv_weight, conv_bias, conv_state_pool, x_out,
+        conv_dim, conv_dim, kernel_size, total_state_slots, silu_activation);
 }
 
-extern "C" int w34_gdn_recurrent_f16(
+extern "C" int w34_gdn_recurrent_strided_f16(
     const w34_exec* ex,
     const w34_gdn_batch* batch,
     const void* qkv_conv_out,
@@ -377,6 +410,7 @@ extern "C" int w34_gdn_recurrent_f16(
     int head_k_dim,
     int num_v_heads,
     int head_v_dim,
+    int ba_row_stride,
     int total_state_slots) {
     if (ex == nullptr || batch == nullptr || b_in == nullptr || a_in == nullptr ||
         a_log == nullptr || dt_bias == nullptr || ssm_state_pool == nullptr || out_f16 == nullptr) {
@@ -386,7 +420,7 @@ extern "C" int w34_gdn_recurrent_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (batch->num_reqs <= 0 || batch->total_tokens <= 0) return 0;
-    if (head_k_dim != 128) return (int)cudaErrorInvalidValue;
+    if (head_k_dim != 128 || ba_row_stride < num_v_heads) return (int)cudaErrorInvalidValue;
 
     constexpr int BV = 16;
     constexpr int NW = 8;
@@ -408,6 +442,31 @@ extern "C" int w34_gdn_recurrent_f16(
         head_k_dim,
         num_v_heads,
         head_v_dim,
+        ba_row_stride,
         total_state_slots);
     return (int)cudaGetLastError();
+}
+
+extern "C" int w34_gdn_recurrent_f16(
+    const w34_exec* ex,
+    const w34_gdn_batch* batch,
+    const void* qkv_conv_out,
+    const void* q_in,
+    const void* k_in,
+    const void* v_in,
+    const void* b_in,
+    const void* a_in,
+    const float* a_log,
+    const float* dt_bias,
+    float* ssm_state_pool,
+    void* out_f16,
+    int num_k_heads,
+    int head_k_dim,
+    int num_v_heads,
+    int head_v_dim,
+    int total_state_slots) {
+    return w34_gdn_recurrent_strided_f16(
+        ex, batch, qkv_conv_out, q_in, k_in, v_in, b_in, a_in, a_log, dt_bias,
+        ssm_state_pool, out_f16, num_k_heads, head_k_dim, num_v_heads, head_v_dim,
+        num_v_heads, total_state_slots);
 }

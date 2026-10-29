@@ -598,8 +598,15 @@ impl DFlash2Rank {
         )
     }
     /// `tap_bf16` is a live device span [rows, 5*H] of committed target taps in BF16.
-    /// No unverified rows may be passed here. This advances committed context.
-    pub fn ingest(&mut self, t: &Qwen3_5ModelRank, tap_bf16: u64, rows: usize) -> Result<()> {
+    /// No unverified rows may be passed here. Enqueues context KV ingestion on `t.stream`
+    /// without synchronizing the host thread so a subsequent `forward` on the same stream
+    /// can pipeline back-to-back.
+    pub fn ingest_no_sync(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        tap_bf16: u64,
+        rows: usize,
+    ) -> Result<()> {
         self.validate_target(t)?;
         if rows == 0 {
             return Ok(());
@@ -651,9 +658,19 @@ impl DFlash2Rank {
                 "DFlash context KV",
             )?;
         }
-        t.stream.synchronize()?;
         self.committed += rows;
         Ok(())
+    }
+
+    /// `tap_bf16` is a live device span [rows, 5*H] of committed target taps in BF16.
+    /// No unverified rows may be passed here. This advances committed context.
+    pub fn ingest(&mut self, t: &Qwen3_5ModelRank, tap_bf16: u64, rows: usize) -> Result<()> {
+        if rows == 0 {
+            self.validate_target(t)?;
+            return Ok(());
+        }
+        self.ingest_no_sync(t, tap_bf16, rows)?;
+        t.stream.synchronize()
     }
     fn conv(
         &self,
@@ -700,7 +717,9 @@ impl DFlash2Rank {
             return Err(loader_err("invalid DFlash forward"));
         }
         self.proposal_anchor = None;
-        self.scratch.reset();
+        if self.scratch.used() > 32 * 1024 * 1024 {
+            self.scratch.reset();
+        }
         let c = &self.cfg.model;
         let (h, m, d) = (c.hidden_size, self.cfg.block_size, c.head_dim);
         let (q, kv, i) = (

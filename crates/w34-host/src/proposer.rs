@@ -162,11 +162,17 @@ impl NativeProposer {
         Ok(())
     }
     fn can_restore(&self, tokens: &[i32]) -> bool {
-        tokens.is_empty()
-            || self
-                .memo
-                .as_ref()
-                .is_some_and(|m| m.tokens.starts_with(tokens))
+        if tokens.is_empty() {
+            return true;
+        }
+        let has_memo = self
+            .memo
+            .as_ref()
+            .is_some_and(|m| m.tokens.starts_with(tokens));
+        match &self.ranks {
+            Ranks::DFlash(_) => has_memo && self.resident_tokens.starts_with(tokens),
+            Ranks::Mtp(_) => has_memo,
+        }
     }
     fn restore(&mut self, engine: &mut Qwen3_5Engine, tokens: &[i32]) -> Result<()> {
         if tokens.is_empty() {
@@ -203,9 +209,14 @@ impl NativeProposer {
             self.processed = n;
             self.last_accepted.clear();
             self.last_restored_tokens = n;
+            let features = if memo.features.len() >= n * self.row_bytes {
+                memo.features[..n * self.row_bytes].to_vec()
+            } else {
+                vec![]
+            };
             self.current = Some(PrefixMemo {
                 tokens: tokens.to_vec(),
-                features: memo.features[..n * self.row_bytes].to_vec(),
+                features,
             });
             return Ok(());
         }
@@ -265,32 +276,37 @@ impl NativeProposer {
         {
             return Err(loader_err("invalid committed proposer span"));
         }
-        // Host memo holds committed features only (single copy from rank 0 since
-        // target taps and final hidden states are replicated across TP ranks).
+        // Host feature memo is only needed by MTP to restore its 1-row hidden tail or replay
+        // non-resident prefixes; DFlash2 keeps its full draft KV cache resident on GPU and
+        // restores warm radix hits in O(1) via `r.truncate(n)` without host D2H copies.
+        let need_host_features = matches!(self.ranks, Ranks::Mtp(_));
         if let Some(memo) = &self.current
+            && need_host_features
             && (memo.tokens.len() + tokens.len()) * self.row_bytes > MEMO_BUDGET
         {
             self.current = None;
         }
         if let Some(memo) = &mut self.current {
-            let t0 = &engine.ranks[0];
-            t0.device.make_current()?;
-            let len_bytes = tokens.len() * self.row_bytes;
-            let old_len = memo.features.len();
-            memo.features.resize(old_len + len_bytes, 0);
-            check_rc(
-                // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
-                // rank 0's stream is synchronized before ingest returns below.
-                unsafe {
-                    ffi::w34_memcpy_d2h_async(
-                        memo.features[old_len..].as_mut_ptr().cast(),
-                        features[0] as *const _,
-                        len_bytes,
-                        t0.stream.handle,
-                    )
-                },
-                "proposer memo copy",
-            )?;
+            if need_host_features {
+                let t0 = &engine.ranks[0];
+                t0.device.make_current()?;
+                let len_bytes = tokens.len() * self.row_bytes;
+                let old_len = memo.features.len();
+                memo.features.resize(old_len + len_bytes, 0);
+                check_rc(
+                    // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
+                    // rank 0's stream is synchronized before ingest returns below.
+                    unsafe {
+                        ffi::w34_memcpy_d2h_async(
+                            memo.features[old_len..].as_mut_ptr().cast(),
+                            features[0] as *const _,
+                            len_bytes,
+                            t0.stream.handle,
+                        )
+                    },
+                    "proposer memo copy",
+                )?;
+            }
             memo.tokens.extend_from_slice(tokens);
         }
         let ingest_res: Result<()> = match &mut self.ranks {
@@ -391,6 +407,75 @@ impl NativeProposer {
         self.processed += tokens.len();
         Ok(())
     }
+    fn ingest_and_propose(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        tokens: &[i32],
+        features: &[u64],
+        anchor: i32,
+        k: usize,
+    ) -> Result<Vec<i32>> {
+        if tokens.is_empty() {
+            return self.propose(engine, anchor, k);
+        }
+        if k == 0 {
+            self.ingest(engine, tokens, features)?;
+            return Ok(vec![]);
+        }
+        if features.len() != engine.tp_size
+            || tokens.len() > self.max_rows
+            || self.processed + tokens.len() > self.capacity
+        {
+            return Err(loader_err("invalid committed proposer span"));
+        }
+        match &mut self.ranks {
+            Ranks::DFlash(rs) => {
+                if let Some(memo) = &mut self.current {
+                    memo.tokens.extend_from_slice(tokens);
+                }
+                let n = tokens.len();
+                let comm = engine.tp2_comm.as_deref();
+                let candidates = std::thread::scope(|scope| {
+                    let jobs: Vec<_> = rs
+                        .iter_mut()
+                        .zip(&mut engine.ranks)
+                        .zip(features)
+                        .map(|((r, t), &ptr)| {
+                            scope.spawn(move || -> Result<DraftCandidates> {
+                                r.ingest_no_sync(t, ptr, n)?;
+                                r.forward(t, anchor, comm)
+                            })
+                        })
+                        .collect();
+                    jobs.into_iter()
+                        .map(|j| {
+                            j.join()
+                                .map_err(|_| loader_err("DFlash ingest+proposal rank panic"))?
+                        })
+                        .collect::<Result<Vec<_>>>()
+                });
+                let candidates = match candidates {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = engine.ranks[0].device.make_current();
+                        let _ = engine.ranks[0].stream.synchronize();
+                        return Err(e);
+                    }
+                };
+                self.resident_tokens.extend_from_slice(tokens);
+                self.processed += tokens.len();
+                let merged = DraftCandidates::merge(&candidates)?;
+                let mut ids = rs[0].select_greedy(&engine.ranks[0], anchor, &merged)?;
+                ids.truncate(k);
+                Ok(ids)
+            }
+            Ranks::Mtp(_) => {
+                self.ingest(engine, tokens, features)?;
+                self.propose(engine, anchor, k)
+            }
+        }
+    }
+
     fn propose(&mut self, engine: &mut Qwen3_5Engine, anchor: i32, k: usize) -> Result<Vec<i32>> {
         if k == 0 {
             return Ok(vec![]);
@@ -630,13 +715,22 @@ impl NativeProposer {
                 }
                 generated.push(anchor);
             }
+            let mut pending_ingest: Vec<i32> = Vec::new();
             while generated.len() < max_new
                 && !(stop_eos
                     && (engine.cfg.eos_token_ids.contains(&anchor)
                         || sampler.params.stop_token_ids.contains(&anchor)))
             {
                 let k = self.k.min(max_new - generated.len() - 1);
-                let mut drafts = self.propose(engine, anchor, k)?;
+                let mut drafts = if pending_ingest.is_empty() {
+                    self.propose(engine, anchor, k)?
+                } else {
+                    let features = self.captured(engine)?;
+                    let out =
+                        self.ingest_and_propose(engine, &pending_ingest, &features, anchor, k)?;
+                    pending_ingest.clear();
+                    out
+                };
                 if stop_eos
                     && let Some(eos) = drafts.iter().position(|id| {
                         engine.cfg.eos_token_ids.contains(id)
@@ -745,11 +839,14 @@ impl NativeProposer {
                 }
                 req.active_state_slot = tx.committed_slot;
                 req.commit_tokens(&verify[..processed], &planned);
-                let features = self.captured(engine)?;
-                self.ingest(engine, &verify[..processed], &features)?;
+                pending_ingest.extend_from_slice(&verify[..processed]);
                 self.last_accepted.push(decision.accepted_drafts());
                 generated.extend_from_slice(decision.emitted_tokens());
                 anchor = *generated.last().unwrap();
+            }
+            if !pending_ingest.is_empty() {
+                let features = self.captured(engine)?;
+                self.ingest(engine, &pending_ingest, &features)?;
             }
             debug_assert_eq!(sampler.output_history, generated);
             Ok((generated, ttft, decoding.elapsed().as_secs_f64() * 1000.))
@@ -766,6 +863,9 @@ impl NativeProposer {
                 engine.free_kv_pages(&release.freed_kv_pages);
                 engine.free_state_slots(&release.freed_mamba_slots);
                 self.current = None;
+                if matches!(self.ranks, Ranks::DFlash(_)) {
+                    self.memo = None;
+                }
                 return Err(e);
             }
         };

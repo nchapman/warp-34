@@ -513,37 +513,13 @@ impl Qwen3_5MtpRank {
         )?;
         let fa = &self.fa;
         Self::project(&fa.qkv_proj, t, normed_buf, qkv_proj_buf, num_tokens)?;
-        let (q_gate_ptr, k_raw_ptr, v_ptr) = if num_tokens == 1 {
-            (
-                qkv_proj_buf,
-                qkv_proj_buf + (q_gate_dim * 2) as u64,
-                qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64,
-            )
-        } else {
-            let q_gate_ptr = self.scratch.alloc_aligned(num_tokens * q_gate_dim * 2)?;
-            let k_raw_ptr = self.scratch.alloc_aligned(num_tokens * kv_dim * 2)?;
-            let v_ptr = self.scratch.alloc_aligned(num_tokens * kv_dim * 2)?;
-            check_rc(
-                unsafe {
-                    ffi::w34_split_cols_3_f16(
-                        &ex,
-                        qkv_proj_buf as *const c_void,
-                        q_gate_ptr as *mut c_void,
-                        k_raw_ptr as *mut c_void,
-                        v_ptr as *mut c_void,
-                        num_tokens as i32,
-                        q_gate_dim as i32,
-                        kv_dim as i32,
-                        kv_dim as i32,
-                    )
-                },
-                "MTP split QKV",
-            )?;
-            (q_gate_ptr, k_raw_ptr, v_ptr)
-        };
+        let qkv_row_stride = (q_gate_dim + 2 * kv_dim) as i32;
+        let q_gate_ptr = qkv_proj_buf;
+        let k_raw_ptr = qkv_proj_buf + (q_gate_dim * 2) as u64;
+        let v_ptr = qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64;
         check_rc(
             unsafe {
-                ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
+                ffi::w34_fused_qk_rmsnorm_rope_gate_strided_f16(
                     &ex,
                     q_gate_ptr as *const c_void,
                     k_raw_ptr as *const c_void,
@@ -563,24 +539,28 @@ impl Qwen3_5MtpRank {
                     t.cfg.mrope_section[0] as i32,
                     t.cfg.mrope_section[1] as i32,
                     t.cfg.mrope_section[2] as i32,
+                    qkv_row_stride,
+                    qkv_row_stride,
                     t.cfg.rope_theta,
                     t.cfg.rms_norm_eps,
                 )
             },
-            "w34_fused_qk_rmsnorm_rope_gate_f16",
+            "w34_fused_qk_rmsnorm_rope_gate_strided_f16",
         )?;
         let kv_layout = &self.kv.layers[fa.kv_layer_ordinal].layout;
         check_rc(
             unsafe {
-                ffi::w34_kv_cache_write(
+                ffi::w34_kv_cache_write_strided(
                     &ex,
                     kv_layout,
                     attn_batch,
                     k_buf as *const c_void,
                     v_ptr as *const c_void,
+                    kv_dim as i32,
+                    qkv_row_stride,
                 )
             },
-            "w34_kv_cache_write",
+            "w34_kv_cache_write_strided",
         )?;
         check_rc(
             unsafe {

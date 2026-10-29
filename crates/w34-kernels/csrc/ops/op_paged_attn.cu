@@ -196,7 +196,9 @@ __global__ void kv_cache_write_kernel(
     w34_kv_layer_layout layout,
     w34_attention_batch batch,
     const __half* __restrict__ k_in,
-    const __half* __restrict__ v_in) {
+    const __half* __restrict__ v_in,
+    int k_row_stride,
+    int v_row_stride) {
     const int tok = blockIdx.x;
     if (tok >= batch.total_tokens) return;
     if (batch.valid_token_mask != nullptr && batch.valid_token_mask[tok] == 0) return;
@@ -217,8 +219,8 @@ __global__ void kv_cache_write_kernel(
                      + (size_t)kv_head * layout.v_head_stride_bytes
                      + (size_t)page_off * layout.v_token_stride_bytes;
 
-    const __half* k_src = k_in + ((size_t)tok * layout.local_kv_heads + kv_head) * layout.head_dim;
-    const __half* v_src = v_in + ((size_t)tok * layout.local_kv_heads + kv_head) * layout.head_dim;
+    const __half* k_src = k_in + (size_t)tok * k_row_stride + (size_t)kv_head * layout.head_dim;
+    const __half* v_src = v_in + (size_t)tok * v_row_stride + (size_t)kv_head * layout.head_dim;
 
     __shared__ float s_warp[8];
     write_kv_row(k_dst, layout.k_format, k_src, layout.head_dim, s_warp);
@@ -579,17 +581,32 @@ __global__ void kv_cache_write_bf16_kernel(
 
 }  // namespace w34_attn
 
-extern "C" int w34_kv_cache_write(const w34_exec* ex, const w34_kv_layer_layout* layout,
-                                  const w34_attention_batch* batch,
-                                  const void* k_in, const void* v_in) {
+extern "C" int w34_kv_cache_write_strided(
+    const w34_exec* ex,
+    const w34_kv_layer_layout* layout,
+    const w34_attention_batch* batch,
+    const void* k_in,
+    const void* v_in,
+    int k_row_stride,
+    int v_row_stride) {
     if (ex == nullptr || layout == nullptr || batch == nullptr || k_in == nullptr || v_in == nullptr) {
         return (int)cudaErrorInvalidValue;
     }
     if (batch->total_tokens <= 0 || layout->local_kv_heads <= 0) return 0;
+    const int min_stride = layout->local_kv_heads * layout->head_dim;
+    if (k_row_stride < min_stride || v_row_stride < min_stride) return (int)cudaErrorInvalidValue;
     dim3 grid((unsigned)batch->total_tokens, (unsigned)layout->local_kv_heads);
     w34_attn::kv_cache_write_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-        *layout, *batch, (const __half*)k_in, (const __half*)v_in);
+        *layout, *batch, (const __half*)k_in, (const __half*)v_in, k_row_stride, v_row_stride);
     return (int)cudaGetLastError();
+}
+
+extern "C" int w34_kv_cache_write(const w34_exec* ex, const w34_kv_layer_layout* layout,
+                                  const w34_attention_batch* batch,
+                                  const void* k_in, const void* v_in) {
+    if (layout == nullptr) return (int)cudaErrorInvalidValue;
+    const int stride = layout->local_kv_heads * layout->head_dim;
+    return w34_kv_cache_write_strided(ex, layout, batch, k_in, v_in, stride, stride);
 }
 
 static bool valid_bf16_layout(const w34_kv_layer_layout* l) {

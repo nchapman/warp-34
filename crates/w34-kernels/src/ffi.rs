@@ -236,6 +236,20 @@ unsafe extern "C" {
         eps: f32,
     ) -> i32;
 
+    pub fn w34_rms_norm_gated_silu_strided_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        z: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        num_v_heads: i32,
+        head_dim: i32,
+        z_token_stride: i32,
+        eps: f32,
+    ) -> i32;
+
     pub fn w34_fused_qk_rmsnorm_rope_gate_f16(
         ex: *const W34Exec,
         q_gate_in: *const c_void,
@@ -256,6 +270,32 @@ unsafe extern "C" {
         mrope_s0: i32,
         mrope_s1: i32,
         mrope_s2: i32,
+        rope_theta: f32,
+        rms_eps: f32,
+    ) -> i32;
+
+    pub fn w34_fused_qk_rmsnorm_rope_gate_strided_f16(
+        ex: *const W34Exec,
+        q_gate_in: *const c_void,
+        k_in: *const c_void,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        positions: *const i32,
+        valid_token_mask: *const u8,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        gate_out: *mut c_void,
+        num_tokens: i32,
+        pos_plane_stride: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        mrope_s0: i32,
+        mrope_s1: i32,
+        mrope_s2: i32,
+        q_gate_row_stride: i32,
+        k_row_stride: i32,
         rope_theta: f32,
         rms_eps: f32,
     ) -> i32;
@@ -311,6 +351,16 @@ unsafe extern "C" {
         dim2: i32,
     ) -> i32;
 
+    pub fn w34_small_n_gemm_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        w: *const c_void,
+        out: *mut c_void,
+        m: i32,
+        size_n: i32,
+        size_k: i32,
+    ) -> i32;
+
     pub fn w34_zero_i32(ex: *const W34Exec, ptr: *mut c_void, count: i64) -> i32;
     pub fn w34_marlin_repack_int4(
         ex: *const W34Exec,
@@ -352,6 +402,16 @@ unsafe extern "C" {
         batch: *const W34AttentionBatch,
         k_in: *const c_void,
         v_in: *const c_void,
+    ) -> i32;
+
+    pub fn w34_kv_cache_write_strided(
+        ex: *const W34Exec,
+        layout: *const W34KvLayerLayout,
+        batch: *const W34AttentionBatch,
+        k_in: *const c_void,
+        v_in: *const c_void,
+        k_row_stride: i32,
+        v_row_stride: i32,
     ) -> i32;
 
     pub fn w34_kv_cache_write_bf16(
@@ -401,6 +461,21 @@ unsafe extern "C" {
         silu_activation: i32,
     ) -> i32;
 
+    pub fn w34_gdn_causal_conv1d_strided_f16(
+        ex: *const W34Exec,
+        batch: *const W34GdnBatch,
+        x_in: *const c_void,
+        conv_weight: *const c_void,
+        conv_bias: *const c_void,
+        conv_state_pool: *mut c_void,
+        x_out: *mut c_void,
+        conv_dim: i32,
+        x_in_row_stride: i32,
+        kernel_size: i32,
+        total_state_slots: i32,
+        silu_activation: i32,
+    ) -> i32;
+
     pub fn w34_gdn_recurrent_f16(
         ex: *const W34Exec,
         batch: *const W34GdnBatch,
@@ -418,6 +493,27 @@ unsafe extern "C" {
         head_k_dim: i32,
         num_v_heads: i32,
         head_v_dim: i32,
+        total_state_slots: i32,
+    ) -> i32;
+
+    pub fn w34_gdn_recurrent_strided_f16(
+        ex: *const W34Exec,
+        batch: *const W34GdnBatch,
+        qkv_conv_out: *const c_void,
+        q_in: *const c_void,
+        k_in: *const c_void,
+        v_in: *const c_void,
+        b_in: *const c_void,
+        a_in: *const c_void,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        ssm_state_pool: *mut f32,
+        out_f16: *mut c_void,
+        num_k_heads: i32,
+        head_k_dim: i32,
+        num_v_heads: i32,
+        head_v_dim: i32,
+        ba_row_stride: i32,
         total_state_slots: i32,
     ) -> i32;
 

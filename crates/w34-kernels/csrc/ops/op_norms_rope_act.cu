@@ -171,13 +171,15 @@ __global__ void rms_norm_gated_silu_f16_kernel(
     const uint8_t* __restrict__ valid_token_mask,
     int num_v_heads,
     int head_dim,
+    int z_token_stride,
     float eps) {
     const int row = blockIdx.x;
     const int token_idx = row / num_v_heads;
+    const int head_idx = row % num_v_heads;
     if (valid_token_mask != nullptr && valid_token_mask[token_idx] == 0) return;
 
     const __half* x_row = x + (size_t)row * head_dim;
-    const __half* z_row = z + (size_t)row * head_dim;
+    const __half* z_row = z + (size_t)token_idx * z_token_stride + (size_t)head_idx * head_dim;
     __half* out_row = out + (size_t)row * head_dim;
 
     __shared__ float s_warp[32];
@@ -219,6 +221,8 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
     int mrope_s0,
     int mrope_s1,
     int mrope_s2,
+    int q_gate_row_stride,
+    int k_row_stride,
     float rope_theta,
     float rms_eps) {
     const int tok = blockIdx.x;
@@ -237,8 +241,8 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
     __half* dst_head = nullptr;
 
     if (is_q) {
-        // q_gate_in has layout [num_tokens, num_q_heads, 2 * head_dim]
-        const __half* qg_base = q_gate_in + ((size_t)tok * num_q_heads + local_head) * (2 * head_dim);
+        const __half* qg_base =
+            q_gate_in + (size_t)tok * q_gate_row_stride + (size_t)local_head * (2 * head_dim);
         src_head = qg_base;
         const __half* gate_src = qg_base + head_dim;
         __half* gate_dst = gate_out + ((size_t)tok * num_q_heads + local_head) * head_dim;
@@ -248,7 +252,7 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
         norm_w = q_norm_w;
         dst_head = q_out + ((size_t)tok * num_q_heads + local_head) * head_dim;
     } else {
-        src_head = k_in + ((size_t)tok * num_kv_heads + local_head) * head_dim;
+        src_head = k_in + (size_t)tok * k_row_stride + (size_t)local_head * head_dim;
         norm_w = k_norm_w;
         dst_head = k_out + ((size_t)tok * num_kv_heads + local_head) * head_dim;
     }
@@ -426,18 +430,83 @@ extern "C" int w34_fused_add_gemma_rms_norm_f16(const w34_exec* ex, const void* 
     return (int)cudaGetLastError();
 }
 
-extern "C" int w34_rms_norm_gated_silu_f16(const w34_exec* ex, const void* x, const void* z,
-                                           const void* weight, void* out,
-                                           const uint8_t* valid_token_mask,
-                                           int num_tokens, int num_v_heads, int head_dim, float eps) {
+extern "C" int w34_rms_norm_gated_silu_strided_f16(
+    const w34_exec* ex,
+    const void* x,
+    const void* z,
+    const void* weight,
+    void* out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int num_v_heads,
+    int head_dim,
+    int z_token_stride,
+    float eps) {
     if (ex == nullptr || x == nullptr || z == nullptr || weight == nullptr || out == nullptr) {
         return (int)cudaErrorInvalidValue;
     }
     const int total_rows = num_tokens * num_v_heads;
     if (total_rows <= 0 || head_dim <= 0) return 0;
+    if (z_token_stride < num_v_heads * head_dim) return (int)cudaErrorInvalidValue;
     w34::rms_norm_gated_silu_f16_kernel<<<total_rows, 128, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)x, (const __half*)z, (const __half*)weight, (__half*)out,
-        valid_token_mask, num_v_heads, head_dim, eps);
+        valid_token_mask, num_v_heads, head_dim, z_token_stride, eps);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_rms_norm_gated_silu_f16(const w34_exec* ex, const void* x, const void* z,
+                                           const void* weight, void* out,
+                                           const uint8_t* valid_token_mask,
+                                           int num_tokens, int num_v_heads, int head_dim, float eps) {
+    return w34_rms_norm_gated_silu_strided_f16(
+        ex, x, z, weight, out, valid_token_mask, num_tokens, num_v_heads, head_dim,
+        num_v_heads * head_dim, eps);
+}
+
+extern "C" int w34_fused_qk_rmsnorm_rope_gate_strided_f16(
+    const w34_exec* ex,
+    const void* q_gate_in,
+    const void* k_in,
+    const void* q_norm_w,
+    const void* k_norm_w,
+    const int32_t* positions,
+    const uint8_t* valid_token_mask,
+    void* q_out,
+    void* k_out,
+    void* gate_out,
+    int num_tokens,
+    int pos_plane_stride,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim,
+    int mrope_s0,
+    int mrope_s1,
+    int mrope_s2,
+    int q_gate_row_stride,
+    int k_row_stride,
+    float rope_theta,
+    float rms_eps) {
+    if (ex == nullptr || q_gate_in == nullptr || k_in == nullptr || q_norm_w == nullptr ||
+        k_norm_w == nullptr || positions == nullptr || q_out == nullptr ||
+        k_out == nullptr || gate_out == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens <= 0) return 0;
+    if (q_gate_row_stride < num_q_heads * 2 * head_dim || k_row_stride < num_kv_heads * head_dim) {
+        return (int)cudaErrorInvalidValue;
+    }
+    dim3 grid((unsigned)num_tokens, (unsigned)(num_q_heads + num_kv_heads));
+    size_t smem = (32 + (size_t)head_dim) * sizeof(float);
+    w34::fused_qk_rmsnorm_rope_gate_f16_kernel<<<grid, 128, smem, (cudaStream_t)ex->stream>>>(
+        (const __half*)q_gate_in, (const __half*)k_in,
+        (const __half*)q_norm_w, (const __half*)k_norm_w,
+        positions, valid_token_mask,
+        (__half*)q_out, (__half*)k_out, (__half*)gate_out,
+        pos_plane_stride, num_q_heads, num_kv_heads,
+        head_dim, rotary_dim, mrope_s0, mrope_s1, mrope_s2,
+        q_gate_row_stride, k_row_stride,
+        rope_theta, rms_eps);
     return (int)cudaGetLastError();
 }
 
@@ -463,23 +532,12 @@ extern "C" int w34_fused_qk_rmsnorm_rope_gate_f16(
     int mrope_s2,
     float rope_theta,
     float rms_eps) {
-    if (ex == nullptr || q_gate_in == nullptr || k_in == nullptr || q_norm_w == nullptr ||
-        k_norm_w == nullptr || positions == nullptr || q_out == nullptr ||
-        k_out == nullptr || gate_out == nullptr) {
-        return (int)cudaErrorInvalidValue;
-    }
-    if (num_tokens <= 0) return 0;
-    dim3 grid((unsigned)num_tokens, (unsigned)(num_q_heads + num_kv_heads));
-    size_t smem = (32 + (size_t)head_dim) * sizeof(float);
-    w34::fused_qk_rmsnorm_rope_gate_f16_kernel<<<grid, 128, smem, (cudaStream_t)ex->stream>>>(
-        (const __half*)q_gate_in, (const __half*)k_in,
-        (const __half*)q_norm_w, (const __half*)k_norm_w,
-        positions, valid_token_mask,
-        (__half*)q_out, (__half*)k_out, (__half*)gate_out,
-        pos_plane_stride, num_q_heads, num_kv_heads,
+    return w34_fused_qk_rmsnorm_rope_gate_strided_f16(
+        ex, q_gate_in, k_in, q_norm_w, k_norm_w, positions, valid_token_mask,
+        q_out, k_out, gate_out, num_tokens, pos_plane_stride, num_q_heads, num_kv_heads,
         head_dim, rotary_dim, mrope_s0, mrope_s1, mrope_s2,
+        num_q_heads * 2 * head_dim, num_kv_heads * head_dim,
         rope_theta, rms_eps);
-    return (int)cudaGetLastError();
 }
 
 extern "C" int w34_silu_and_mul_f16(const w34_exec* ex, const void* gate_up, void* out,
@@ -584,5 +642,86 @@ extern "C" int w34_split_cols_3_f16(const w34_exec* ex, const void* src, void* d
     if (num_tokens <= 0) return 0;
     w34::split_cols_3_f16_kernel<<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)src, (__half*)dst0, (__half*)dst1, (__half*)dst2, dim0, dim1, dim2);
+    return (int)cudaGetLastError();
+}
+
+namespace w34 {
+
+// Batch-size-invariant FP16 GEMM for small-N projections (e.g. GDN in_proj_ba, size_n <= 256):
+// out[m, size_n] = x[m, size_k] * w[size_n, size_k]^T.
+// Each warp computes one output column `n` across up to 8 rows `m_base .. m_base + 7`,
+// accumulating in FP32 with identical per-row operation order for any `m >= 1`.
+__global__ void small_n_gemm_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w,
+    __half* __restrict__ out,
+    int m,
+    int size_n,
+    int size_k) {
+    const int wid = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * 4 + wid;
+    const int m_base = blockIdx.y * 8;
+    if (n >= size_n || m_base >= m) return;
+
+    const int rows = (m - m_base < 8) ? (m - m_base) : 8;
+    const __half* w_row = w + (size_t)n * size_k;
+
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k = lane * 8; k < size_k; k += 256) {
+        const uint4 wv = *reinterpret_cast<const uint4*>(w_row + k);
+        const __half* wh = reinterpret_cast<const __half*>(&wv);
+        float wf[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            wf[j] = __half2float(wh[j]);
+        }
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            if (r < rows) {
+                const uint4 xv = *reinterpret_cast<const uint4*>(
+                    x + (size_t)(m_base + r) * size_k + k);
+                const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    acc[r] = fmaf(__half2float(xh[j]), wf[j], acc[r]);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 8; r++) {
+        if (r < rows) {
+            float sum = acc[r];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                sum += __shfl_xor_sync(0xffffffffu, sum, off);
+            }
+            if (lane == 0) {
+                out[(size_t)(m_base + r) * size_n + n] = __float2half(sum);
+            }
+        }
+    }
+}
+
+}  // namespace w34
+
+extern "C" int w34_small_n_gemm_f16(
+    const w34_exec* ex,
+    const void* x,
+    const void* w,
+    void* out,
+    int m,
+    int size_n,
+    int size_k) {
+    if (ex == nullptr || x == nullptr || w == nullptr || out == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (m <= 0 || size_n <= 0 || size_k <= 0) return 0;
+    if ((size_k & 7) != 0) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)((size_n + 3) / 4), (unsigned)((m + 7) / 8));
+    w34::small_n_gemm_f16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);
     return (int)cudaGetLastError();
 }
