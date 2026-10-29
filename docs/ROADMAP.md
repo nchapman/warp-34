@@ -207,25 +207,52 @@ Every milestone must pass three automated checks before merging:
 ---
 
 ### Phase 5: Paged `TQ4` 4-Bit KV Cache (`warp3090` Donor), Vision, & `Qwen3.6-35B-A3B` MoE
-**Goal:** Drop optimized `TQ4` / `K8V4` paged kernels behind `KvLayerLayout`, then add multimodal vision and MoE as independent milestone tracks.
-- **5.1 Paged TurboQuant 4-Bit KV (`kv_cache_dtype = "tq4"` or `"k8v4"`):**
+**Goal:** Drop optimized `TQ4` / `Q8_0` paged kernels behind `KvLayerLayout`, then add multimodal vision and MoE as independent milestone tracks.
+- **5.1 Paged TurboQuant 4-Bit & 8-Bit KV (`--kv-format tq4|tq4_all|q8_0|fp16`, `tq4` default):**
   - **Ported from `warp3090` (`op_tq4kv.cu`, `tq4_codebook.cuh`, `fattn-vec-tq.cuh`, `op_fattn_mma.cu`, `kvtier.rs`) into `KvLayerLayout` Paged Slabs:**
-    1. **Block & Page Geometry:** `block_tq4_0 { __half d; uint8_t qs[64]; }` (`66 B` per 128 elements = `4.125 bpw`; `132 B` per `d=256` head row = `3.88×` raw compression; `2,112 B` per 16-row head page). Supports symmetric `tq4` (`K=tq4, V=tq4`) and hybrid `k8v4` (`K=q8_0` `272 B` w/ `dp4a`, `V=tq4` `132 B`, with independent `k_transform` and `v_transform`).
-    2. **Hadamard Rotation (`R = W · diag(s)`):** Seed-42 Rademacher sign diagonal + register/smem WHT-256 (`op_tq4kv.cu:wht256`) fused into KV page write, Q pre-rotation (`q' = W · diag(s) · q`), and O un-rotation (`o = diag(s) · W · o'`).
+    1. **Block & Page Geometry:** `block_tq4_0` (`132 B` per `d=256` head row: two independent 128-wide least-squares `FP16` scales `d0, d1 = grp_norm * <v, c> / ||c||^2` + `128 B` packed 4-bit centroids = `4.125 bpw`, `3.88×` raw compression; `2,112 B` per 16-row head page) alongside `block_q8_0` (`272 B` per `d=256` head row, `1.88×` raw compression). *(Note: hybrid `K8V4` was evaluated and retired in `628e3b1` after plain `Q8_0` scored `95.3%–97.7%` exact token match vs `K8V4`'s `40.6%–55.8%`.)*
+    2. **Hadamard Rotation (`R = W · diag(s)`):** Seed-42 Rademacher sign diagonal + single-warp register WHT-256 (`wht256_warp`) fused into KV page write, Q pre-rotation (`q' = W · diag(s) · q`), and O un-rotation (`o = diag(s) · W · o'`).
     3. **16-Centroid Beta(256) Lloyd-Max Codebook:** Stored in `__constant__` memory (`kTq4D256Centroids[16]`, `kTq4D256Boundaries[15]`).
-    4. **`FirstLast2` `FP16` Boundary Layers (`f16b`):** Full-attention layer slot `0` and the last 2 full-attention layer slots (`N-2`, `N-1`) use `FP16` `KvLayerLayout` (`3 × 512 B + 13 × 132 B` on 27B → **`2.52×` effective KV compression**, `26,016 B/token`; `1.97×` for `k8v4`), eliminating post-WHT V-distribution tail outliers.
+    4. **Four Clean KV Policies (`tq4` default, `tq4_all`, `q8_0`, `fp16`):** Default `tq4` keeps boundary full-attention ordinals `{0, 1, N-2, N-1}` in **WHT-256 rotated `Q8_0`** (`272 B/row`) and interior layers in rotated LSQ `TQ4` (`132 B/row`) — delivering **`3.07×` effective KV compression** on 27B (`21,376 B/tok`, `5,344 MiB` at `262,144` tokens, fitting single-card `27B TP=1` at full `262k` context within 24 GB VRAM while matching `fp16` greedy parity `672/1536` vs `673/1536`); `tq4_all` compresses all layers to `132 B/row` (`3.88×`); `q8_0` uses unrotated `Q8_0` (`1.88×`).
     5. **Full Paged Shape Coverage on `sm_86` (`TP=1` & `TP=2`):**
-       - **Paged Decode (`t == 1`):** `flash_attn_ext_vec_tq` upgraded from contiguous seat strides to `block_tables` lookup, with GQA-8/GQA-4 head packing and parallel KV-split reduction.
-       - **Paged Verify / Small-Chunk (`t <= 8` & `t <= 16`):** `fattn_mma_tq` upgraded to paged `block_tables` lookup (`nstages=0` swizzled `half2` smem tiles, byte-offset loads for `132 B` rows).
-       - **Wide Chunked Prefill / Prefix-Hit Suffix Prefill (`t > 16`):** Bounded-memory tile-streaming dequant-to-smem/staging prefill path so arbitrary scheduler prefill batches never materialize full-context `FP16` KV in VRAM.
+       - Descriptor-driven `kv_cache_write` + 4-warp online-softmax `paged_attention_f16` across `t == 1` decode, `t <= 16` speculative verify, and `t > 16` chunked/prefix-hit prefill without materializing full-context `FP16` KV in VRAM (tensor-core GQA head-sharing & split-KV long-context acceleration tracked in Phase 6.2).
 - **5.2 Multimodal Vision (`Qwen3_VisionTransformer`):**
-  - Image preprocessing (smart resize + bicubic + normalize), 27-layer ViT (`patch=16`, `temporal_patch=2`, `spatial_merge=2`, axial 2D RoPE), deepstack/MLP merger (`1152 → 4096/5120`), visual embedding splice, multimodal radix cache hashing, and 3D `mRoPE` media position IDs.
-- **5.3 `Qwen3.6-35B-A3B` Hybrid MoE (`Qwen3_5MoeForConditionalGeneration`):**
-  - Top-k router softmax/sigmoid + `moe_wna16` fused Marlin MoE kernel + `shared_expert` + `shared_expert_gate` (`qwen3_next.py:143-259`).
+  - PNG, JPEG, and binary PPM (`P6`) decoding (OpenAI `data:image/...;base64,...` + CLI `--image <path|url>`), image preprocessing (smart resize + bicubic + normalize), 24/27-layer ViT (`patch=16`, `temporal_patch=2`, `spatial_merge=2`, axial 2D RoPE), deepstack/MLP merger (`1152 → 4096/5120`), visual embedding splice, multimodal radix cache hashing, and 3D `mRoPE` media position IDs.
+- **5.3 `Qwen3.6-35B-A3B` Hybrid MoE (`Qwen3_5MoeForConditionalGeneration` + Native MoE `MTP`):**
+  - Top-k router softmax/sigmoid + two-stage fused `W4A16` / `FP16` MoE kernels + `shared_expert` + `shared_expert_gate` (`qwen3_next.py:143-259`), plus native 256-expert MoE `Qwen3_5MTP` speculative proposer (`TP=1` & `TP=2`).
 - **Exit Gate:**
-  - Single-card 27B (`TQ4` + `FirstLast2`) and `TP=2` 27B pass 32K/64K/100K needle-in-a-haystack and `greedy-diff` gates within 24 GB VRAM alongside `MambaRadixCache` and speculative decode.
-  - Multimodal vision passes `Qwen3.5-VL` parity against `vLLM`.
-  - `Qwen3.6-35B-A3B` MoE passes `greedy-diff` and `profile-diff` against `vLLM`.
+  - Single-card 27B (`tq4` at full `262,144`-token context) and `TP=2` 27B pass fragmented needle-in-a-haystack and `greedy-diff` gates within 24 GB VRAM alongside `MambaRadixCache` and speculative decode.
+  - Multimodal vision passes `TP=1 == TP=2` `dump-diff` and multimodal `MambaRadixCache` warm-hit & content-hash isolation gates.
+  - `Qwen3.6-35B-A3B` MoE passes `dump-diff` and `profile-diff` against `vLLM` (`1.52×` plain `TP=2` decode; `425.5 tok/s` with native MoE `MTP`).
+
+---
+
+### Phase 6: Roofline Polish, Proposer CUDA Graphs, Concurrent Serving, & Long-Context/VL Hardening
+**Goal:** Polish and push Phases 1–5 to the `sm_86` hardware roofline across proposer latency, long-context `TQ4` attention, batched MoE prefill/verify, true multi-agent continuous-batching HTTP serving, and real-image `Qwen3.5-VL` / `262k` accuracy gates.
+- **6.1 Proposer CUDA Graphs & Drafter Roofline (`MTP` & `DFlash2`, enhancing Phase 4):**
+  - Capture per-rank CUDA Graphs for `Qwen3_5MtpRank` `M=1` draft steps (both dense and `35B-A3B` MoE, launched from a single host thread on `TP=2` without per-draft thread scopes) and `DFlash2Rank::forward` (`M=16` on `4B`, `M=8` on `27B`).
+  - Optimize `DFlash2` `lm_head` / `BF16` GEMM dispatch to cut `spec_decode` time in `nsys` `profile-diff` (`4.90 ms/round` → `< 2.0 ms/round` on `4B + DFlash2`), targeting **`500+ tok/s`** on `35B-A3B MoE TP=2 + MTP` and **`1,100+ tok/s`** on `4B TP=1 + DFlash2`.
+- **6.2 GQA-Grouped, Split-KV, & `mma.sync` Paged `TQ4` / `Q8_0` Attention (enhancing Phase 1.3 & Phase 5.1):**
+  - Share each decoded `TQ4` (`132 B`) / `Q8_0` (`272 B`) / `FP16` KV tile across all GQA query heads per KV head (`4:1` / `8:1` register/smem broadcast, plus `mma.sync` tiles for `M ∈ [2..16]` speculative verify and chunked prefill), eliminating `4×–8×` redundant KV global-memory reads and WHT/dequant work.
+  - Add parallel split-KV reduction across SMs for long contexts (`seq_len >= 4,096` out to `262,144`) so single-sequence decode and `M=4..16` verify saturate `1,008 GB/s` DRAM bandwidth at `32k–262k` context.
+- **6.3 Token-Grouped Marlin `mma.sync` MoE Kernel (`moe_wna16`, enhancing Phase 5.3):**
+  - Add token-grouped `(expert_id, token_slot)` sorting/binning + Marlin `mma.sync` `W4A16` tiles (`vLLM` `moe_wna16` donor) for `M >= 4` (speculative verify, multi-request continuous batching, and chunked prefill), while preserving the low-overhead warp-per-row GEMV path for `M = 1..3`.
+- **6.4 `<think>`-Aware Structured Outputs, 100%-Schema Tool Calling, & Multi-Turn Agent ChatML (enhancing Phase 3.3 & Phase 4.1):**
+  - **Real Grammar / JSON-Schema Engine (`TokenBitmaskConstraint` upgrade):** Replace the 1-token `{` stub in `parser.rs` with full JSON (`response_format: {"type": "json_object"}`), JSON Schema (`{"type": "json_schema", "json_schema": {..., "strict": true}}`), Regex/CFG, and **Structural Tags** (`llguidance` / native Rust token-trie FSM) plugged directly into our existing transactional `RejectionSampler` rollback (`speculative.rs`) so constrained decoding works losslessly alongside `MTP` and `DFlash2`.
+  - **Reasoning-Deferred Constraint Activation:** Keep grammar unconstrained while inside `<think>...</think>` and latch schema enforcement immediately after `</think>` (`enable_in_reasoning = false` by default, matching `vLLM 0.31.0`).
+  - **Qwen 3.5 / 3.6 Native Tool-Call Schema Guarantees & `tool_choice`:** Honor `tool_choice` (`"none"`, `"auto"`, `"required"`, and named `{"type": "function", "function": {"name": "..."}}`) and constrain `<tool_call>` arguments against each declared tool's JSON Schema in Qwen 3.5 / 3.6's native `Qwen3-XML` (`<function=name><parameter=key>...`) or `Hermes-JSON` format (avoiding the generic-JSON format mismatch noted on Qwen 3.6).
+  - **Faithful Multi-Turn `chat_template.jinja` Serialization (`format_chatml_prompt`):** Always emit `<tool_call><function=...>` instructions when `system` + `tools` are both present, serialize historical `assistant.tool_calls` + `reasoning_content`, and wrap `role: "tool"` turns in `<|im_start|>user\n<tool_response>\n...\n</tool_response><|im_end|>`.
+- **6.5 Concurrent Continuous-Batching `w34 serve` & Complete OpenAI Controls (enhancing Phase 3.1 & Phase 3.3):**
+  - Replace per-request `Mutex<Qwen3_5Engine>` serialization and post-hoc SSE buffering in `crates/w34-host/src/server.rs` with a dedicated background engine worker driving `SchedulerV1::step()` over an MPSC request queue and per-request bounded SSE channels (live token-by-token `delta.reasoning_content`, `delta.content`, and `delta.tool_calls` streaming + client-disconnect cancellation freeing `KvPool` & `StateBundlePool` slots).
+  - Unify `SamplingParams` across non-speculative, speculative, and scheduled paths (fixing non-speculative `w34 serve` ignoring `temperature`/`top_p`/`top_k`/penalties/`seed`), and support `stop` strings (with partial-match streaming holdback), `stop_token_ids`, `logit_bias`, `min_tokens`, `ignore_eos`, `logprobs`/`top_logprobs`, `stream_options.include_usage`, and multi-request `GraphKey` decode buckets (`B ∈ {1, 2, 4, 8, 16}`).
+- **6.6 GPU-Resident Stochastic `SamplerV1`, Real-Image `Qwen3.5-VL` Parity, & `32k–262k` Long-Context Gates (enhancing Phase 2.3, Phase 5.1, & Phase 5.2):**
+  - Move non-greedy `SamplerV1` (`penalties → logit_bias → temperature → min_p → top_k/top_p → Gumbel-max`) and grammar bitmask application onto GPU so stochastic/structured requests never copy full-vocab (`248,320`) logits to host.
+  - Verify real PNG/JPEG multimodal prompts on `Qwen3.5-4B` / `27B` / `35B-A3B` against `vLLM 0.31.0` `Qwen3.5-VL` golden dumps (`dump-diff` + `greedy-diff`), add opt-in `--allow-remote-images` HTTP(S) image fetching with strict timeout/byte caps, and run automated `32k / 64k / 128k / 262k` needle-in-a-haystack benchmarks comparing `tq4` vs `tq4_all` on 1× RTX 3090 Ti.
+- **Exit Gate:**
+  - 100% JSON Schema & multi-turn tool-call schema adherence across `<think>` + `MTP`/`DFlash2` speculative verification (`response_format: json_schema` + `tool_choice: auto|required|named`).
+  - `nsys` `profile-diff` shows `spec_decode` and `full_attn` matching or beating `vLLM 0.31.0` / `SGLang v0.5.19` per-category `ms/round` on `4B`, `27B`, and `35B-A3B` MoE.
+  - Concurrent 8-agent and 16-agent `w34 serve` HTTP/SSE load benchmark beats `vLLM` / `SGLang` in TTFT, ITL, and aggregate `tok/s` with live per-token SSE streaming.
+  - `32k / 64k / 128k / 262k` 1-GPU `27B` `tq4` needle retrieval and real-image `Qwen3.5-VL` `vLLM` oracle parity pass 100%.
 
 ---
 
@@ -255,4 +282,5 @@ Before declaring the Phase 1/2/3 spine frozen for production proposers and `TQ4`
 | **P2** | `TP=1` & `TP=2` Model Spine, `TapPlan`, Synthetic Spec Rollback, Composite Graphs | `greedy-diff` 12/12 (`4B`/`9B`/`27B`, `TP=1`/`2`) + **Gate #3** green | `w34 bench` & `profile-diff` ≥ `vLLM` on `TP=1` & `TP=2` |
 | **P3** | V1 Scheduler, `SGLang` `MambaRadixCache`, OpenAI Server, Reasoning/Tools/JSON | OpenAI API + tool/reasoning/schema suite + **Gate #5** green | 8/16-agent `w34 serve` ≥ `vLLM`/`SGLang` TTFT, ITL, & steady tok/s |
 | **P4** | Speculative Decode (`MTP` + `DFlash2` `8/7/8` atop Phase 2/3 Transactions) | Lossless greedy verify + warm prefix-hit proposer restore + `tau` parity | `9B` & `27B` `TP=2` `MTP` / `DFlash2` ≥ `vLLM` / `SGLang` (`175.7` code / `158.5` prose tok/s) |
-| **P5** | Paged `TQ4` (`2.52×` `f16b`), `Qwen3.5-VL` Vision, & `Qwen3.6-35B-A3B` MoE | 64K/100K needle (`TP=1` & `TP=2`) + VL image parity + MoE `greedy-diff` | 1-GPU 27B 64K fits 24 GB; `TP=2` `TQ4` + MoE tok/s ≥ `vLLM` |
+| **P5** | Paged `TQ4` (`tq4` `3.07×` / `tq4_all` `3.88×` / `q8_0` `1.88×`), `Qwen3.5-VL` Vision, & `35B-A3B` MoE + MoE `MTP` | Fragmented needle + PNG/JPEG Vision `TP=1==TP=2` + MoE & MoE `MTP` `dump-diff` | 1-GPU 27B `262k` fits 24 GB (`48.8 tok/s`); `35B-A3B` `TP=2` `221.6 tok/s` (`425.5` w/ `MTP`) |
+| **P6** | Proposer Graphs, GQA/Split-KV `TQ4`, `moe_wna16` `mma.sync`, 100%-Schema JSON/Tool Calls, Concurrent `w34 serve`, & `262k`/VL Gates | 100% JSON/tool schema adherence (`<think>` + spec) + `Qwen3.5-VL` parity + `32k–262k` needle | Proposer & `full_attn` ≤ `vLLM`/`SGLang` `ms/r`; 8/16-agent `w34 serve` ≥ `vLLM`/`SGLang` |
