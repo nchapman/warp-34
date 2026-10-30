@@ -158,7 +158,7 @@ Three specialized subagents cross-checked `warp-34` against its authoritative do
 | **GDN Conv1d State** | Native Triton conv in `vllm.cpp` | `op_gdn.cu:89-102` | **0-ULP Match**: Products materialized in FP16 before FP32 accumulation. |
 | **MoE Routing & FFN** | `qwen3_5.py:168-184` (`Qwen3NextSparseMoeBlock`) | `model.rs:564-742`, `op_moe.cu:299-775` | **Exact Match**: Top-K routing + shared expert + normalized prob. |
 | **Marlin GEMMs** | W4A16, W8A16, W4A8, `moe_wna16` | `op_marlin.cu`, `op_moe.cu` | **Intentional Hardware Boundary**: W4A16 and W8A16 dense + W4A16 MoE supported. W4A8/FP8 omitted because `sm_86` (3090 Ti) lacks FP8 tensor cores. |
-| **Layer Scale** | `qwen3_5.py:191-209` (`attn_layer_scale`, `ffn_layer_scale`) | Not present in `model.rs` | **Minor Config Gap**: Supported Qwen 3.5/3.6/3.8 checkpoints do not set `layer_scale: true`. Fail-closed validation recommended if custom models are loaded. |
+| **Layer Scale** | `qwen3_5.py:191-209` (`attn_layer_scale`, `ffn_layer_scale`) | Fail-closed in `loader.rs:530` | **Exact Fail-Closed Match**: Target checkpoints omit `layer_scale`; loader strictly rejects any truthy `layer_scale` to prevent silent activation drift. |
 | **Sliding Window** | `qwen3_5.py` SWA full attention | Hardcoded causal full attention (`sliding_window: 0`) | **Intentional Simplification**: Target Qwen 3.5 checkpoints use full causal attention without sliding windows. |
 
 ### 3.2 Radix Cache & Speculative Decoding (vs `SGLang v0.5.19`)
