@@ -25,8 +25,9 @@ DFlash2 `drafter_cosine=0.960989, draft_prefix=8/15`;
 `99cfc7749bbe13c8e3058a4f63a3826bf1ab1c4181f4975751ccf54789f129c5`).
 
 Concurrent `N=8` and `N=16` live SSE serving (`tools/oracle/serve_bench.py --concurrency 8 16 --tokens 128 --warmup-repetitions 1`,
-exact `request_sha256` match across all `8/8` and `16/16` requests) now **beats
-`SGLang v0.5.19` across TTFT, ITL, and aggregate `tok/s`** via four strictly
+exact `workload_sha256` match — `N=8` `1fd21082808eccf19280417831b7c57df72623742a79e6d4e7cf07e55fcb564a`,
+`N=16` `b9bc9736bd216d8dae95ea05575c4aab6ea6ba16cd4e5223ebcfba2b78ce8bec` — across all `8/8` and `16/16` requests) now **beats
+both `vLLM 0.31.0` and `SGLang v0.5.19` across TTFT, ITL, and aggregate `tok/s`** via four strictly
 0-ULP serving optimizations — in-graph `DecodeGraphSampleMode::FastGreedy`
 (`w34_sampler_step_fast_greedy_f16` + device-side token chaining), 2-slot
 double-buffered `enqueue_pipelined_decode_step`/`wait_pipelined_decode_step`
@@ -35,17 +36,21 @@ host-CPU/GPU overlap (`nsys` `/tmp/w34-stage-ab/stage_b_nsys.sqlite`: `20.35 µs
 `gdn.in_proj_ba` (`aux_stream` overlapping `in_proj_qkvz + conv1d`), and 8-CTA/SM
 `__launch_bounds__(128, 8)` two-pass `smem_s4[16][17]` occupancy in
 `gdn_recurrent_f16_kernel`:
+- **`vLLM 0.31.0` `FP16`** (`torch.compile` + CUDA Graphs, `--max-model-len 1024 --max-num-seqs 16 --gpu-memory-utilization 0.7 --no-enable-prefix-caching`;
+  `/tmp/w34-phase6-closeout/vllm-serve-warm.json`, SHA-256 `00c9482f6ffddbc95e4be631cf04258900317815f01f05507558d724db0f6e52`):
+  - `N=8`: **`1256.04 tok/s`** (`815.26 ms` wall, mean TTFT **`45.84 ms`**, mean ITL **`6.046 ms`**), `8/8` passed.
+  - `N=16`: **`2038.01 tok/s`** (`1004.90 ms` wall, mean TTFT **`65.38 ms`**, mean ITL **`7.384 ms`**), `16/16` passed.
 - **`SGLang v0.5.19` `FP16`** (`/tmp/w34-phase6-sglang-serve-warm.json`):
   - `N=8`: **`1354.85 tok/s`** (`755.81 ms` wall, mean TTFT **`37.46 ms`**, mean ITL **`5.651 ms`**)
   - `N=16`: **`2194.17 tok/s`** (`933.38 ms` wall, mean TTFT **`57.97 ms`**, mean ITL **`6.882 ms`**)
 - **`warp-34` `FP16`** (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`, SHA-256
   `841ffb9d2af1e148eefadfda6891125e596bbc0b0d4500df91fa4f4082c8637f`):
-  - `N=8`: **`1388.14 tok/s` (`+2.46%`)**, `737.68 ms` wall, mean TTFT **`26.16 ms` (`-30.2%`)**, mean ITL **`5.598 ms` (`-0.94%`)**, `8/8` passed.
-  - `N=16`: **`2213.71 tok/s` (`+0.89%`)**, `925.15 ms` wall, mean TTFT **`51.55 ms` (`-11.1%`)**, mean ITL **`6.870 ms` (`-0.17%`)**, `16/16` passed.
+  - `N=8`: **`1388.14 tok/s`** (**`+10.52%` vs `vLLM` / `+2.46%` vs `SGLang`**), `737.68 ms` wall, mean TTFT **`26.16 ms`** (**`-42.9%` vs `vLLM` / `-30.2%` vs `SGLang`**), mean ITL **`5.598 ms`** (**`-7.4%` vs `vLLM` / `-0.94%` vs `SGLang`**), `8/8` passed.
+  - `N=16`: **`2213.71 tok/s`** (**`+8.62%` vs `vLLM` / `+0.89%` vs `SGLang`**), `925.15 ms` wall, mean TTFT **`51.55 ms`** (**`-21.2%` vs `vLLM` / `-11.1%` vs `SGLang`**), mean ITL **`6.870 ms`** (**`-7.0%` vs `vLLM` / `-0.17%` vs `SGLang`**), `16/16` passed.
 - **`warp-34` `TQ4` (`2.73×` KV compression)** (`/tmp/w34-phase6-closeout/serve-warm-tq4.json`, SHA-256
   `5e6233d68690b0dcce92d8ff90b5ce603fdcf30d6f09d9981c0eee59ac6c725f`):
-  - `N=8`: **`1361.84 tok/s`** (`751.92 ms` wall, mean TTFT **`26.42 ms`**, mean ITL **`5.707 ms`** — beats `SGLang` `FP16` aggregate `tok/s` and TTFT even with 4-bit quantized KV), `8/8` passed.
-  - `N=16`: **`2172.90 tok/s`** (`942.52 ms` wall, mean TTFT **`52.10 ms`**, mean ITL **`7.000 ms`**), `16/16` passed.
+  - `N=8`: **`1361.84 tok/s`** (`751.92 ms` wall, mean TTFT **`26.42 ms`**, mean ITL **`5.707 ms`** — beats both `vLLM` `FP16` `+8.42%` and `SGLang` `FP16` `+0.52%` even with 4-bit quantized KV), `8/8` passed.
+  - `N=16`: **`2172.90 tok/s`** (`942.52 ms` wall, mean TTFT **`52.10 ms`**, mean ITL **`7.000 ms`** — beats `vLLM` `FP16` across `tok/s` `+6.62%`, TTFT `-20.3%`, and ITL `-5.2%`), `16/16` passed.
 
 The post-stabilized 1-GPU 27B 8-case needle matrix was replayed end-to-end on
 this binary (`tools/oracle/needle_matrix.py`, `tq4` on GPU 0 and `tq4_all` on
@@ -120,7 +125,7 @@ all Phase 6 performance or vision exit criteria.
 | 6.4 ChatML | Current full check: 5/5 `phase6_chatml` tests pass, including byte parity against native Jinja, system+tools, assistant tool history and consecutive tool responses. | Regression coverage passes |
 | 6.4 Live tool/schema adherence | Current unrestricted full check passed all live non-speculative, MTP, and DFlash2 structured-output tests. Finite test-matrix evidence. | Tested matrix passes in unrestricted full check |
 | 6.5 Worker/SSE/controls | Axum + dedicated scheduled engine worker (`5bb3742`, `a7da5f7`) plus bounded `<= 16 KiB` unconstrained inline submission, `8 ms` burst cap, and pinned-D2H sync pass all live serving and completion-logprob tests in the unrestricted full check. | Regression coverage passes |
-| 6.5 Eight/sixteen agents | Warm SSE `serve_bench.py --warmup-repetitions 1` with exact `request_sha256` match across all `8/8` and `16/16` requests vs SGLang `FP16` (`/tmp/w34-phase6-sglang-serve-warm.json`: `N=8` **`1354.85 tok/s`**, `755.81 ms`, TTFT **`37.46 ms`**, ITL **`5.651 ms`**; `N=16` **`2194.17 tok/s`**, `933.38 ms`, TTFT **`57.97 ms`**, ITL **`6.882 ms`**): W34 `FP16` (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`, SHA-256 `841ffb9d2af1e148eefadfda6891125e596bbc0b0d4500df91fa4f4082c8637f`) beats SGLang on every metric — `N=8` **`1388.14 tok/s` (`+2.46%`)**, `737.68 ms`, TTFT **`26.16 ms` (`-30.2%`)**, ITL **`5.598 ms` (`-0.94%`)**; `N=16` **`2213.71 tok/s` (`+0.89%`)**, `925.15 ms`, TTFT **`51.55 ms` (`-11.1%`)**, ITL **`6.870 ms` (`-0.17%`)**. W34 `TQ4` (`serve-warm-tq4.json`, SHA-256 `5e6233d68690b0dcce92d8ff90b5ce603fdcf30d6f09d9981c0eee59ac6c725f`) reaches **`1361.84 / 2172.90 tok/s`** (TTFT **`26.42 / 52.10 ms`**, ITL **`5.707 / 7.000 ms`**). | Beats SGLang across TTFT, ITL, and aggregate `tok/s` at both `N=8` and `N=16` |
+| 6.5 Eight/sixteen agents | Warm SSE `serve_bench.py --warmup-repetitions 1` with exact `workload_sha256` match across all `8/8` (`1fd21082...`) and `16/16` (`b9bc9736...`) requests vs `vLLM 0.31.0` `FP16` (`/tmp/w34-phase6-closeout/vllm-serve-warm.json`, SHA-256 `00c9482f6ffddbc95e4be631cf04258900317815f01f05507558d724db0f6e52`: `N=8` **`1256.04 tok/s`**, `815.26 ms`, TTFT **`45.84 ms`**, ITL **`6.046 ms`**; `N=16` **`2038.01 tok/s`**, `1004.90 ms`, TTFT **`65.38 ms`**, ITL **`7.384 ms`**) and `SGLang v0.5.19` `FP16` (`/tmp/w34-phase6-sglang-serve-warm.json`: `N=8` **`1354.85 tok/s`**, `755.81 ms`, TTFT **`37.46 ms`**, ITL **`5.651 ms`**; `N=16` **`2194.17 tok/s`**, `933.38 ms`, TTFT **`57.97 ms`**, ITL **`6.882 ms`**): W34 `FP16` (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`, SHA-256 `841ffb9d2af1e148eefadfda6891125e596bbc0b0d4500df91fa4f4082c8637f`) beats both donors on every metric — `N=8` **`1388.14 tok/s`** (**`+10.52%` vs `vLLM` / `+2.46%` vs `SGLang`**), `737.68 ms`, TTFT **`26.16 ms`** (**`-42.9%` / `-30.2%`**), ITL **`5.598 ms`** (**`-7.4%` / `-0.94%`**); `N=16` **`2213.71 tok/s`** (**`+8.62%` vs `vLLM` / `+0.89%` vs `SGLang`**), `925.15 ms`, TTFT **`51.55 ms`** (**`-21.2%` / `-11.1%`**), ITL **`6.870 ms`** (**`-7.0%` / `-0.17%`**). W34 `TQ4` (`serve-warm-tq4.json`, SHA-256 `5e6233d68690b0dcce92d8ff90b5ce603fdcf30d6f09d9981c0eee59ac6c725f`) reaches **`1361.84 / 2172.90 tok/s`** (TTFT **`26.42 / 52.10 ms`**, ITL **`5.707 / 7.000 ms`**), also beating `vLLM` `FP16` across all metrics at both `N=8` and `N=16`. | Beats both `vLLM 0.31.0` and `SGLang v0.5.19` across TTFT, ITL, and aggregate `tok/s` at `N=8` and `N=16` |
 | 6.5 Graph buckets | `B=1,2,4,8,16` scheduler/graph buckets (`LogitsOnly`, `PlainGreedy`, `FastGreedy`), 2-slot pipelined decode burst replay (`phase6_decode_graphs`), graph metadata mutation regressions, and TP-invariant batched `short_split` (`B=4,8`) pass in `mise run check` and are exercised live by warm `N=8/16` serving. | Verified |
 | 6.6 GPU sampler | Device sampling/grammar masks (`f1a0be7`), 2-stage block-radix top-k (`<=64`) with disjoint scratch past `work_prob`, and in-graph FP32 `w34_sampler_step_fast_greedy_f16` pass deterministic, mixed stochastic+greedy, tight-scratch fallback, TP=1/TP=2 plain+MTP JSON-schema, and full-vocab regressions (`phase6_gpu_sampler` + `parser` unit tests). | Regression coverage passes |
 | 6.6 Remote images | Opt-in bounded HTTP(S) loading (`f4197dd`) + JPEG/FA2/cuBLASLt (`be40dda`); CLI 64 MiB and HTTP 16 MiB caps preserved. | Regression coverage passes |

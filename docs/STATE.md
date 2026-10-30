@@ -18,9 +18,9 @@ All Phase 6 exit gates in [`ROADMAP.md`](ROADMAP.md) §4 are verified green on t
 final working tree; see [`PHASE6_EVIDENCE.md`](PHASE6_EVIDENCE.md) for the full
 criterion-by-criterion ledger.
 
-- **Warm 8/16-client SSE serving beats `SGLang v0.5.19` across TTFT, ITL, and aggregate `tok/s`**
+- **Warm 8/16-client SSE serving beats both `vLLM 0.31.0` and `SGLang v0.5.19` across TTFT, ITL, and aggregate `tok/s`**
   (`tools/oracle/serve_bench.py --concurrency 8 16 --tokens 128 --warmup-repetitions 1`,
-  exact `request_sha256` match across all `8/8` and `16/16` requests):
+  exact `workload_sha256` match across all `8/8` `1fd21082...` and `16/16` `b9bc9736...` requests):
   - Implemented four strictly 0-ULP serving optimizations:
     1. In-graph `DecodeGraphSampleMode::FastGreedy` (`w34_sampler_step_fast_greedy_f16`
        FP32 split/merge argmax + `w34_sampler_scatter_ids_to_tokens` device-side
@@ -34,6 +34,10 @@ criterion-by-criterion ledger.
        overlapping `in_proj_qkvz + conv1d` across all 24 GDN layers).
     4. 8-CTA/SM `__launch_bounds__(128, 8)` occupancy with two-pass
        `smem_s4[16][17]` coalesced state staging in `gdn_recurrent_f16_kernel`.
+  - **`vLLM 0.31.0` `FP16`** (`torch.compile` + CUDA Graphs, `/tmp/w34-phase6-closeout/vllm-serve-warm.json`,
+    SHA-256 `00c9482f6ffddbc95e4be631cf04258900317815f01f05507558d724db0f6e52`):
+    `N=8` **`1256.04 tok/s`** (`815.26 ms`, mean TTFT **`45.84 ms`**, mean ITL **`6.046 ms`**);
+    `N=16` **`2038.01 tok/s`** (`1004.90 ms`, mean TTFT **`65.38 ms`**, mean ITL **`7.384 ms`**).
   - **`SGLang v0.5.19` `FP16`** (`/tmp/w34-phase6-sglang-serve-warm.json`):
     `N=8` **`1354.85 tok/s`** (`755.81 ms`, mean TTFT **`37.46 ms`**, mean ITL **`5.651 ms`**);
     `N=16` **`2194.17 tok/s`** (`933.38 ms`, mean TTFT **`57.97 ms`**, mean ITL **`6.882 ms`**).
