@@ -1,6 +1,7 @@
 [tools]
 "cargo:cargo-llvm-cov" = "0.8.3"
 rust = "1.99.0"
+python = "3.12.12"
 
 [env]
 _.file = { path = ".env", ignored_if_missing = true }
@@ -32,6 +33,22 @@ depends = ["fmt-check", "clippy", "clippy-cpu"]
 [tasks."test-quick"]
 description = "Unit tests only (lib target with CUDA)"
 run = "cargo test --release --features cuda --lib"
+
+[tasks."test-cpu"]
+description = "Fast unit test suite without CUDA (CPU-only)"
+run = "cargo test --lib"
+
+[tasks."doc-test"]
+description = "Run library documentation tests"
+run = "cargo test --doc"
+
+[tasks.coverage]
+description = "Fast library code coverage report with CUDA"
+run = "cargo llvm-cov --features cuda --lib --summary-only"
+
+[tasks."coverage-html"]
+description = "Generate HTML coverage report for lib with CUDA"
+run = "cargo llvm-cov --features cuda --lib --html"
 
 [tasks.test]
 description = "Full release test suite with CUDA"
