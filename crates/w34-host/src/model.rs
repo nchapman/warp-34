@@ -1472,6 +1472,35 @@ pub struct Qwen3_5ModelRank {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Default)]
+struct PoolCapacity {
+    kv_pages: Option<usize>,
+    state_slots: Option<usize>,
+}
+
+#[cfg(feature = "cuda")]
+fn serving_state_slots(max_num_seqs: usize) -> Result<usize> {
+    max_num_seqs
+        .checked_mul(4)
+        .filter(|&slots| slots != 0)
+        .ok_or_else(|| {
+            loader_err("serving max_num_seqs must be nonzero and fit four state slots per sequence")
+        })
+}
+
+// Preserve the minimum three-slot execution budget and the existing VRAM clamp.
+#[cfg(feature = "cuda")]
+fn clamp_state_slots(requested: usize, free: usize, fixed: usize, per_slot: usize) -> usize {
+    if per_slot == 0 {
+        requested
+    } else if free > fixed {
+        ((free - fixed) / per_slot).clamp(3, requested)
+    } else {
+        3usize.min(requested)
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl Qwen3_5ModelRank {
     pub fn load_rank(
         archive: &SafetensorsArchive,
@@ -1482,6 +1511,30 @@ impl Qwen3_5ModelRank {
         kv_policy: KvFormatPolicy,
         requested_kv_pages: Option<usize>,
     ) -> Result<Self> {
+        Self::load_rank_with_capacity(
+            archive,
+            cfg,
+            rank,
+            tp_size,
+            device_id,
+            kv_policy,
+            PoolCapacity {
+                kv_pages: requested_kv_pages,
+                ..PoolCapacity::default()
+            },
+        )
+    }
+
+    fn load_rank_with_capacity(
+        archive: &SafetensorsArchive,
+        cfg: &ModelConfig,
+        rank: usize,
+        tp_size: usize,
+        device_id: i32,
+        kv_policy: KvFormatPolicy,
+        capacity: PoolCapacity,
+    ) -> Result<Self> {
+        let requested_kv_pages = capacity.kv_pages;
         prepare_execution_plan(device_id)?;
         let device = CudaDevice::set_current(device_id)?;
         let stream = CudaStream::new(device_id)?;
@@ -1881,6 +1934,7 @@ impl Qwen3_5ModelRank {
         } else {
             24usize
         };
+        let requested_state_slots = capacity.state_slots.unwrap_or(default_state_slots);
         let default_pages = requested_kv_pages.or(Some(256));
         let req_kv_bytes = default_pages.unwrap_or(256) * bytes_per_kv_page_all_layers;
         let base_fixed = weight_arena
@@ -1888,13 +1942,27 @@ impl Qwen3_5ModelRank {
             .saturating_add(scratch_arena.capacity())
             .saturating_add(crate::cuda::MIN_HEADROOM_BYTES)
             .saturating_add(req_kv_bytes);
-        let total_state_slots = if bytes_per_state_slot == 0 {
-            default_state_slots
-        } else if free_vram > base_fixed {
-            ((free_vram - base_fixed) / bytes_per_state_slot).clamp(3, default_state_slots)
+        let (state_budget_free, state_budget_fixed) = if capacity.state_slots.is_some() {
+            // Serving can request many more slots than single-request defaults.
+            // Account for live arena capacity (not just used weight bytes) and
+            // all auxiliary allocations before spending the remaining VRAM.
+            let available = device.mem_info()?.0;
+            let reserved = crate::cuda::MIN_HEADROOM_BYTES.saturating_add(req_kv_bytes);
+            if available < reserved.saturating_add(bytes_per_state_slot.saturating_mul(3)) {
+                return Err(loader_err(
+                    "insufficient VRAM for serving state pool and headroom",
+                ));
+            }
+            (available, reserved)
         } else {
-            3usize.min(default_state_slots)
+            (free_vram, base_fixed)
         };
+        let total_state_slots = clamp_state_slots(
+            requested_state_slots,
+            state_budget_free,
+            state_budget_fixed,
+            bytes_per_state_slot,
+        );
         let state_pool = StateBundlePool::new(
             device_id,
             &gdn_layer_ids,
@@ -3963,6 +4031,34 @@ pub struct SpecVerifyMetrics {
 
 #[cfg(feature = "cuda")]
 impl Qwen3_5Engine {
+    /// Load with four state slots per sequence: three private slots and one
+    /// borrowed-prefix budget slot. The request is still clamped to available
+    /// memory after reserving KV pages and the standard 1 GiB headroom.
+    /// Non-serving loaders retain their original capacity defaults.
+    pub fn load_for_serving(
+        model_spec: &str,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        requested_kv_pages: Option<usize>,
+        use_cuda_graph: bool,
+        max_num_seqs: usize,
+    ) -> Result<Self> {
+        let state_slots = serving_state_slots(max_num_seqs)?;
+        assert!(tp_size == 1 || tp_size == 2, "tp_size must be 1 or 2");
+        let dir =
+            resolve_hf_model_dir(model_spec).map_err(|_| loader_err("resolve_hf_model_dir"))?;
+        Self::load_from_dir_with_capacity(
+            &dir,
+            tp_size,
+            kv_policy,
+            PoolCapacity {
+                kv_pages: requested_kv_pages,
+                state_slots: Some(state_slots),
+            },
+            use_cuda_graph,
+        )
+    }
+
     pub fn load(
         model_spec: &str,
         tp_size: usize,
@@ -3983,6 +4079,25 @@ impl Qwen3_5Engine {
         requested_kv_pages: Option<usize>,
         use_cuda_graph: bool,
     ) -> Result<Self> {
+        Self::load_from_dir_with_capacity(
+            dir,
+            tp_size,
+            kv_policy,
+            PoolCapacity {
+                kv_pages: requested_kv_pages,
+                ..PoolCapacity::default()
+            },
+            use_cuda_graph,
+        )
+    }
+
+    fn load_from_dir_with_capacity(
+        dir: &Path,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        capacity: PoolCapacity,
+        use_cuda_graph: bool,
+    ) -> Result<Self> {
         let cfg = ModelConfig::from_dir(dir).map_err(|_| loader_err("ModelConfig::from_dir"))?;
         let archive =
             SafetensorsArchive::open(dir).map_err(|_| loader_err("SafetensorsArchive::open"))?;
@@ -3996,14 +4111,8 @@ impl Qwen3_5Engine {
 
         let mut ranks = Vec::with_capacity(tp_size);
         for r in 0..tp_size {
-            let rank_model = Qwen3_5ModelRank::load_rank(
-                &archive,
-                &cfg,
-                r,
-                tp_size,
-                r as i32,
-                kv_policy,
-                requested_kv_pages,
+            let rank_model = Qwen3_5ModelRank::load_rank_with_capacity(
+                &archive, &cfg, r, tp_size, r as i32, kv_policy, capacity,
             )?;
             ranks.push(rank_model);
         }
@@ -7261,5 +7370,28 @@ impl Qwen3_5Engine {
             .into_iter()
             .map(|id| results_by_id.remove(&id).unwrap_or_default())
             .collect())
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod serving_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn serving_budget_is_checked() {
+        assert_eq!(serving_state_slots(16).unwrap(), 64);
+        assert!(serving_state_slots(0).is_err());
+        assert!(serving_state_slots(usize::MAX / 4 + 1).is_err());
+    }
+
+    #[test]
+    fn serving_budget_respects_memory_clamp() {
+        assert_eq!(clamp_state_slots(64, 1000, 400, 10), 60);
+        assert_eq!(clamp_state_slots(64, 2000, 400, 10), 64);
+        assert_eq!(clamp_state_slots(24, 2000, 400, 10), 24);
+        assert_eq!(clamp_state_slots(10, 2000, 400, 10), 10);
+        assert_eq!(clamp_state_slots(64, 400, 400, 10), 3);
+        assert_eq!(clamp_state_slots(64, 410, 400, 10), 3);
+        assert_eq!(clamp_state_slots(64, 0, 400, 0), 64);
     }
 }

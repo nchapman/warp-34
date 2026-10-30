@@ -1290,16 +1290,22 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
         }
         "serve" => {
             let bind_addr = format!("{host}:{port}");
-            println!("[w34 serve] model={model} tp={tp} listening on http://{bind_addr}");
+            println!("[w34 serve] loading model={model} tp={tp} for http://{bind_addr}");
             let worker_model = model.clone();
             let state = w34_host::server::OpenAiServerState::from_loader(
                 model,
                 allow_remote_images,
                 move || {
                     let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
-                    let mut engine =
-                        Qwen3_5Engine::load(&worker_model, tp, policy, pages, use_cuda_graph)
-                            .map_err(|e| e.to_string())?;
+                    let mut engine = Qwen3_5Engine::load_for_serving(
+                        &worker_model,
+                        tp,
+                        policy,
+                        pages,
+                        use_cuda_graph,
+                        w34_host::scheduler::SchedulerConfig::default().max_num_seqs,
+                    )
+                    .map_err(|e| e.to_string())?;
                     if let Some(config) = &spec_config {
                         engine
                             .enable_speculative(config)

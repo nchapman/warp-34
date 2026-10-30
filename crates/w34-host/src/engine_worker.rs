@@ -326,6 +326,23 @@ fn run(
             requests.remove(&id);
         }
 
+        // Yield only at a committed tick boundary. Verification has resolved its
+        // StateTx and released extra slots; the final emitted anchor is still
+        // unconsumed, exactly as ordinary scheduler decode expects. Keep target
+        // state, generated tokens, and sampler intact. pending_ingest contains
+        // only deferred drafter features, not uncommitted target work.
+        // Partial prefill stays speculative until its final chunk commits.
+        if !sched.waiting.is_empty()
+            && let Some(id) = speculative_id
+            && let Some(seq) = sched.active.iter_mut().find(|s| s.req_id == id)
+            && seq.is_prefill_complete()
+        {
+            engine.speculative.as_mut().unwrap().abort_scheduled();
+            pending_ingest.clear();
+            speculative_id = None;
+            seq.custom_prefill = false;
+        }
+
         // A lone request uses the trained proposer. Bursts use batched target decode.
         // Proposer context is currently single-request; never interleave target taps with it.
         if speculative_id.is_none() {

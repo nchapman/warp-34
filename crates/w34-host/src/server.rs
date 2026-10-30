@@ -6,6 +6,73 @@ mod http;
 #[cfg(feature = "cuda")]
 pub use http::*;
 
+/// Endpoint-specific wire validation; chat retains its boolean logprobs contract.
+pub fn completion_sampling_params(
+    req: &serde_json::Value,
+    max_tokens: usize,
+) -> Result<crate::parser::SamplingParams, String> {
+    if !req.is_object() {
+        return Err("completion request must be a JSON object".into());
+    }
+    let mut normalized = req.clone();
+    let count = match req.get("logprobs") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .filter(|&n| n <= w34_kernels::ffi::W34_MAX_TOP_LOGPROBS as u64)
+                .ok_or_else(|| {
+                    format!(
+                        "logprobs must be an integer in 0..={}",
+                        w34_kernels::ffi::W34_MAX_TOP_LOGPROBS
+                    )
+                })?,
+        ),
+    };
+    // top_logprobs is a chat-only option, not an override for the integer count.
+    if req.get("top_logprobs").is_some_and(|v| !v.is_null()) {
+        return Err("top_logprobs is only supported for chat completions".into());
+    }
+    normalized["logprobs"] = serde_json::json!(count.is_some());
+    normalized["top_logprobs"] = serde_json::json!(count.unwrap_or(0));
+    native_sampling_params(&normalized, max_tokens)
+}
+
+/// Convert token records to the legacy parallel-array wire shape. Offsets are
+/// Unicode character positions in generated text (the prompt is not echoed).
+pub fn completion_logprobs(logs: &[serde_json::Value], offset: &mut usize) -> serde_json::Value {
+    use serde_json::{Value, json};
+    let mut tokens = Vec::new();
+    let mut probabilities = Vec::new();
+    let mut alternatives = Vec::new();
+    let mut offsets = Vec::new();
+    for log in logs {
+        let token = log["token"].as_str().unwrap_or_default();
+        // Serving records carry positions from the response's incremental decoder.
+        // Single-token decoding can contain replacement characters for byte fragments.
+        if let Some(position) = log["_text_offset"].as_u64() {
+            offsets.push(position as usize);
+            *offset = position as usize;
+        } else {
+            // Compatibility for callers supplying already-decoded token records.
+            offsets.push(*offset);
+            *offset += token.chars().count();
+        }
+        tokens.push(token);
+        probabilities.push(log["logprob"].clone());
+        let mut top = serde_json::Map::new();
+        if let Some(entries) = log["top_logprobs"].as_array() {
+            for entry in entries {
+                if let Some(token) = entry["token"].as_str() {
+                    top.insert(token.to_owned(), entry["logprob"].clone());
+                }
+            }
+        }
+        alternatives.push(Value::Object(top));
+    }
+    json!({"tokens":tokens,"token_logprobs":probabilities,"top_logprobs":alternatives,"text_offset":offsets})
+}
+
 pub fn native_sampling_params(
     req: &serde_json::Value,
     max_tokens: usize,

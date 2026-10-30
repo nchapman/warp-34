@@ -262,6 +262,27 @@ fn axum_live_sse_concurrency_disconnect_backpressure_and_shutdown() {
             assert_eq!(sse.matches("[DONE]").count(),1);
             assert!(!sse.contains("\"error\""),"{sse}");
 
+            // Legacy completions use integer logprobs and parallel arrays, in both transports.
+            let mut legacy = json!({"prompt":"The positive integers are 1, 2, 3,","max_tokens":8,"temperature":0,"ignore_eos":true,"logprobs":2});
+            let response = client.post(format!("{url}/v1/completions")).json(&legacy).send().await.unwrap();
+            assert!(response.status().is_success());
+            let full: Value = response.json().await.unwrap();
+            let full_logs = &full["choices"][0]["logprobs"];
+            for field in ["tokens","token_logprobs","top_logprobs","text_offset"] {
+                assert_eq!(full_logs[field].as_array().unwrap().len(),8,"{full}");
+            }
+            assert!(full_logs["token_logprobs"].as_array().unwrap().iter().all(|p| p.as_f64().is_some_and(f64::is_finite)));
+            legacy["stream"] = json!(true);
+            let response = client.post(format!("{url}/v1/completions")).json(&legacy).send().await.unwrap();
+            assert!(response.status().is_success());
+            let sse = response.text().await.unwrap();
+            assert_eq!(sse.matches("[DONE]").count(),1);
+            let records: Vec<Value> = sse.lines().filter_map(|line| line.strip_prefix("data: ")).filter(|data| *data != "[DONE]").map(|data| serde_json::from_str(data).unwrap()).collect();
+            for field in ["tokens","text_offset"] {
+                let flattened: Vec<Value> = records.iter().filter_map(|r| r["choices"][0]["logprobs"][field].as_array()).flatten().cloned().collect();
+                assert_eq!(flattened,*full_logs[field].as_array().unwrap(),"{sse}");
+            }
+
             let mut warm_request = json!({"prompt":"hello ".repeat(100),"max_tokens":8,"temperature":0});
             let first: Value = client.post(format!("{url}/v1/completions")).json(&warm_request).send().await.unwrap().json().await.unwrap();
             let stop = first["choices"][0]["text"].as_str().unwrap().chars().next().unwrap().to_string();
@@ -282,4 +303,117 @@ fn axum_live_sse_concurrency_disconnect_backpressure_and_shutdown() {
             assert!(state.worker.submit(vec![100],SamplingParams::default(),None).is_err());
         }).await.expect("serving test deadline");
     });
+}
+
+#[test]
+fn legacy_terminal_token_logprobs_live() {
+    let _gpu = GPU_LOCK.lock().unwrap();
+    let state = OpenAiServerState::from_loader("terminal-test".into(), false, || {
+        Qwen3_5Engine::load(
+            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+            1,
+            KvFormatPolicy::Tq4,
+            Some(64),
+            true,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/v1/completions", listener.local_addr().unwrap());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(serve(listener, state.clone(), async {
+                let _ = rx.await;
+            }));
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap();
+            // Force an ordinary hidden stop token and a real EOS, without ignore_eos.
+            for (id, explicit_stop) in [(100, true), (state.worker.eos_token_ids[0], false)] {
+                let mut request = json!({"prompt":"Hello", "temperature":0, "max_tokens":8,
+                "logprobs":2, "logit_bias":{id.to_string():100},
+                "stream_options":{"include_usage":true}});
+                if explicit_stop {
+                    request["stop_token_ids"] = json!([id]);
+                }
+                let full: Value = client
+                    .post(&url)
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                request["stream"] = json!(true);
+                let sse = client
+                    .post(&url)
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                assert_eq!(full["usage"]["completion_tokens"], 1, "{full}");
+                assert_eq!(full["choices"][0]["text"], "");
+                assert_eq!(full["choices"][0]["finish_reason"], "stop");
+                let lp = &full["choices"][0]["logprobs"];
+                for key in ["tokens", "token_logprobs", "top_logprobs", "text_offset"] {
+                    assert_eq!(lp[key].as_array().unwrap().len(), 1, "{key}: {full}");
+                }
+                assert_eq!(lp["text_offset"], json!([0]));
+                assert_eq!(
+                    lp["tokens"][0],
+                    state
+                        .worker
+                        .tokenizer
+                        .as_ref()
+                        .unwrap()
+                        .decode(&[id as u32], false)
+                        .unwrap()
+                );
+                assert_eq!(sse.matches("data: [DONE]").count(), 1, "{sse}");
+                let events: Vec<Value> = sse
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                let mut records = Vec::new();
+                let mut finishes = 0;
+                let mut usages = 0;
+                for event in events {
+                    if !event["usage"].is_null() {
+                        assert_eq!(event["usage"], full["usage"]);
+                        usages += 1;
+                    }
+                    for choice in event["choices"].as_array().unwrap() {
+                        assert_eq!(choice["text"], "");
+                        if !choice["finish_reason"].is_null() {
+                            assert_eq!(choice["finish_reason"], "stop");
+                            finishes += 1;
+                        }
+                        if !choice["logprobs"].is_null() {
+                            records.push(choice["logprobs"].clone());
+                        }
+                    }
+                }
+                assert_eq!(records, vec![lp.clone()], "{sse}");
+                assert_eq!(finishes, 1);
+                assert_eq!(usages, 1);
+            }
+            tx.send(()).unwrap();
+            server.await.unwrap().unwrap();
+        });
 }

@@ -142,7 +142,7 @@ async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
             "text/plain; version=0.0.4",
         )],
         format!(
-            "w34_requests_total {}\nw34_tokens_generated_total {}\nw34_prompt_tokens_total {}\nw34_cached_prompt_tokens_total {}\nw34_radix_cache_hit_rate {}\nw34_last_ttft_ms {}\nw34_last_itl_ms {}\nw34_active_requests {}\nw34_cancelled_requests_total {}\n",
+            "w34_requests_total {}\nw34_tokens_generated_total {}\nw34_prompt_tokens_total {}\nw34_cached_prompt_tokens_total {}\nw34_radix_cache_hit_rate {}\nw34_last_ttft_ms {}\nw34_last_itl_ms {}\nw34_active_requests {}\nw34_cancelled_requests_total {}\nw34_peak_active_requests {}\nw34_decode_bucket_mask {}\n",
             load(&m.requests_total),
             load(&m.tokens_generated_total),
             prompts,
@@ -151,7 +151,9 @@ async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
             load(&m.last_ttft_us) as f64 / 1000.0,
             load(&m.last_itl_us) as f64 / 1000.0,
             load(&s.worker.stats.active),
-            load(&s.worker.stats.cancelled)
+            load(&s.worker.stats.cancelled),
+            load(&s.worker.stats.peak_active),
+            load(&s.worker.stats.decode_bucket_mask)
         ),
     )
 }
@@ -280,7 +282,11 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
     if max_tokens == 0 {
         return Err("max_tokens must be positive".into());
     }
-    let mut params = super::native_sampling_params(&request, max_tokens)?;
+    let mut params = if chat {
+        super::native_sampling_params(&request, max_tokens)?
+    } else {
+        super::completion_sampling_params(&request, max_tokens)?
+    };
     if params
         .stop_token_ids
         .iter()
@@ -536,6 +542,8 @@ fn output_stream(
         let mut done = false;
         let mut stopped = false;
         let mut logs = Vec::new();
+        let mut legacy_offset = 0;
+        let mut decoded_offset = 0;
         let mut tool_index = 0;
         let mut last_token = Instant::now();
         let id = format!("{}-{request_id}",if chat { "chatcmpl" } else { "cmpl" });
@@ -554,19 +562,39 @@ fn output_stream(
                     if count == 1 { s.metrics.last_ttft_us.store(start.elapsed().as_micros() as u64,Ordering::Relaxed); }
                     else { s.metrics.last_itl_us.store(last_token.elapsed().as_micros() as u64,Ordering::Relaxed); }
                     last_token = Instant::now();
-                    let lp = logprobs.as_ref().map(|lp| logprob_value(lp,&tokenizer));
-                    if let Some(lp) = &lp { logs.push(lp.clone()); }
-                    if count >= params.min_tokens && params.is_stop_or_eos(id,&s.worker.eos_token_ids) { stopped = true; continue; }
+                    let mut lp = logprobs.as_ref().map(|lp| logprob_value(lp,&tokenizer));
+                    if chat && let Some(lp) = &lp { logs.push(lp.clone()); }
+                    if count >= params.min_tokens && params.is_stop_or_eos(id,&s.worker.eos_token_ids) {
+                        // The hidden terminal token still counts toward usage. Record its
+                        // position without decoding it or exposing stop/EOS text. Emit a
+                        // logprob-only legacy delta so SSE and collected arrays agree.
+                        if !chat && let Some(mut lp) = lp {
+                            lp["_text_offset"] = json!(decoded_offset);
+                            logs.push(lp.clone());
+                            yield Output::Delta(chunk(json!({"content":""}),super::completion_logprobs(&[lp], &mut legacy_offset)));
+                        }
+                        stopped = true;
+                        continue;
+                    }
                     let decoded = match decoder.step(id as u32) {
-                        Ok(Some(text)) => text, Ok(None) => continue,
+                        Ok(Some(text)) => text, Ok(None) if chat => continue, Ok(None) => String::new(),
                         Err(e) => { yield Output::Error(e.to_string()); return; }
                     };
+                    if !chat {
+                        if let Some(lp) = &mut lp {
+                            lp["_text_offset"] = json!(decoded_offset);
+                            logs.push(lp.clone());
+                        }
+                        // Advance even without logprobs; decoder None contributes zero.
+                        // Stop buffering may delay emission, but does not change positions.
+                        decoded_offset += decoded.chars().count();
+                    }
                     let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
                     let (visible, matched) = stops.push(&decoded, active_stops);
                     text.push_str(&visible);
                     let delta = if chat { delta_value(parser.push_str(&visible),&mut tool_index) } else { json!({"content":visible}) };
                     if delta.as_object().is_some_and(|o| !o.is_empty()) || lp.is_some() {
-                        yield Output::Delta(chunk(delta,lp.map_or(Value::Null,|v| json!({"content":[v]}))));
+                        yield Output::Delta(chunk(delta,lp.map_or(Value::Null,|v| if chat { json!({"content":[v]}) } else { super::completion_logprobs(&[v], &mut legacy_offset) })));
                     }
                     if matched { stopped = true; done = true; break; }
                 }
@@ -588,7 +616,7 @@ fn output_stream(
         if chat && delta.as_object().is_some_and(|o| !o.is_empty()) { yield Output::Delta(chunk(delta,Value::Null)); }
         let finish = if chat && !turn.tool_calls.is_empty() { "tool_calls" } else if !stopped && count >= params.max_tokens { "length" } else { "stop" };
         s.metrics.cached_prompt_tokens_total.fetch_add(cached as u64,Ordering::Relaxed);
-        let lp = if params.logprobs { json!({"content":logs}) } else { Value::Null };
+        let lp = if !params.logprobs { Value::Null } else if chat { json!({"content":logs}) } else { super::completion_logprobs(&logs, &mut 0) };
         let choice = if chat { json!({"index":0,"message":{"role":"assistant","content":turn.content,"reasoning_content":turn.reasoning_content,"tool_calls":turn.tool_calls},"finish_reason":finish,"logprobs":lp}) }
             else { json!({"index":0,"text":text,"finish_reason":finish,"logprobs":lp}) };
         yield Output::Complete(json!({"id":id,"object":if chat {"chat.completion"} else {"text_completion"},"created":created,"model":s.model_name,"choices":[choice],"usage":{"prompt_tokens":prompt_len,"completion_tokens":count,"total_tokens":prompt_len+count,"prompt_tokens_details":{"cached_tokens":cached}}}));
@@ -645,6 +673,7 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
                 return Err(error);
             }
         };
+        eprintln!("[w34 serve] ready on http://{}", listener.local_addr()?);
         serve(listener, state, async {
             #[cfg(unix)]
             {
