@@ -32,7 +32,7 @@ ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # Use the supported v3 API directly: the safe wrapper lacks memory/scan limits.
 # Bundled static libjpeg-turbo; no system library or Python runtime required.
-turbojpeg-sys = { version = "=1.1.1", default-features = false, features = ["cmake"] }
+turbojpeg-sys = { version = "=1.2.0", default-features = false, features = ["cmake"] }
 
 [dev-dependencies]
 sha2 = "0.10"
