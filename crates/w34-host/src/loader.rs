@@ -527,6 +527,23 @@ impl ModelConfig {
 
     pub fn from_json(root: &Json) -> io::Result<Self> {
         let tc = root.get("text_config").unwrap_or(root);
+        let is_truthy = |v: &serde_json::Value| -> bool {
+            match v {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Null => false,
+                serde_json::Value::Number(n) => n.as_f64().is_some_and(|x| x != 0.0),
+                serde_json::Value::String(s) => s != "false" && s != "0" && !s.is_empty(),
+                _ => true,
+            }
+        };
+        if tc.get("layer_scale").is_some_and(is_truthy)
+            || root.get("layer_scale").is_some_and(is_truthy)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "layer_scale is not supported on this engine",
+            ));
+        }
         let architectures = root
             .get("architectures")
             .and_then(|v| v.as_array())
@@ -1046,5 +1063,26 @@ mod tests {
         assert_eq!(cfg.vocab_size, 152064);
         assert_eq!(cfg.rms_norm_eps, 1e-6);
         assert_eq!(cfg.layer_types.len(), 4);
+    }
+
+    #[test]
+    fn test_model_config_layer_scale_rejected() {
+        let json_bool = serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 20,
+            "layer_scale": true
+        });
+        assert!(ModelConfig::from_json(&json_bool).is_err());
+
+        let json_num = serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 20,
+            "layer_scale": 1
+        });
+        assert!(ModelConfig::from_json(&json_num).is_err());
     }
 }

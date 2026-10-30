@@ -14,6 +14,15 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### Cross-check hardening, test elevation, and code review closure (2026-10-30)
+
+Following cross-check exploration against external engines (`mistral.rs`, `vLLM 0.31.0`, `transformers`), 4 targeted hardening fixes were implemented, verified, and triaged through the multi-lens code review pipeline:
+1. **`layer_scale` fail-closed rejection (`loader.rs`)**: Rejects any truthy specification (`layer_scale: true`, `1`, non-zero numeric/string) in `text_config` or root `config.json` to prevent silent numerical divergence on unsupported layer scaling architectures.
+2. **Unified image aspect ratio validation & non-panicking grid clamp (`vision.rs`, `server.rs`, `main.rs`)**: Introduced `MAX_IMAGE_ASPECT_RATIO = 200` and `validate_image_aspect_ratio(h, w) -> Result<(), String>` matching `transformers/models/qwen2_vl`. Both HTTP (`server.rs`) and CLI (`main.rs`) reject out-of-bounds ratios with clean user errors. `smart_resize` clamps extreme dimensions rather than panicking, preventing pathological grid allocations across any caller.
+3. **Whitespace-tolerant Qwen3-XML tool parsing & delimiter draining (`parser.rs`)**: Aligned delimiter matching with `vLLM`'s `_PARAM_RE` regex pattern (`<\s*parameter\s*=\s*...>`, `<\s*/\s*parameter\s*>`, and `</\s*tool_call\s*>`). Draining dynamically scans to the closing tag `>` ensuring zero leftover whitespace leaks into assistant `content_delta` or `turn.content`.
+4. **Wire-compatible SSE error framing (`server_http.rs`)**: Emits standard unnamed SSE data frames for `Output::Error`, preserving strict wire compatibility with OpenAI-compatible SSE readers.
+5. **Dual-compilation test & review verification**: All 56 CPU-only tests (`mise run test-cpu`), 61 release unit tests + 4 kernel tests + 149 integration tests + 7 doc-tests (`mise run test-quick`), and 69 python oracle tests (`mise run oracle-check`) pass cleanly. Verified through `review` with all important findings resolved.
+
 All Phase 6 exit gates in [`ROADMAP.md`](ROADMAP.md) §4 are verified green on the
 final working tree; see [`PHASE6_EVIDENCE.md`](PHASE6_EVIDENCE.md) for the full
 criterion-by-criterion ledger.

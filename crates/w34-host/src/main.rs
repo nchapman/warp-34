@@ -64,6 +64,7 @@ fn prepare_multimodal_prompt_and_images(
     for url in image_urls {
         let (rgb, h, w) = w34_host::vision::load_cli_image_with_policy(url, allow_remote_images)
             .map_err(|e| e.to_string())?;
+        w34_host::vision::validate_image_aspect_ratio(h, w)?;
         let pre = w34_host::vision::preprocess_rgb_image(
             &rgb,
             h,

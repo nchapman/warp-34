@@ -663,14 +663,41 @@ impl Qwen3Parser {
                 _ => Ok(start), // Native XML also allows unquoted text values.
             }
         }
+        fn match_tag(rest: &str, delimiter: &str) -> bool {
+            if rest.starts_with(delimiter) {
+                return true;
+            }
+            let Some(after_lt) = rest.strip_prefix('<') else {
+                return false;
+            };
+            let after_lt = after_lt.trim_start();
+            if let Some(after_delim_lt) = delimiter.strip_prefix('<') {
+                if after_delim_lt.starts_with('/') {
+                    let Some(after_slash) = after_lt.strip_prefix('/') else {
+                        return false;
+                    };
+                    let tag = after_delim_lt.trim_start_matches('/').trim_end_matches('>');
+                    let after_tag = after_slash.trim_start();
+                    if let Some(after_match) = after_tag.strip_prefix(tag) {
+                        return after_match.trim_start().starts_with('>');
+                    }
+                } else if after_delim_lt.ends_with('=') {
+                    let tag = after_delim_lt.trim_end_matches('=');
+                    if let Some(after_tag) = after_lt.strip_prefix(tag) {
+                        return after_tag.trim_start().starts_with('=');
+                    }
+                }
+            }
+            false
+        }
         let mut cursor = skip_json(text, 0).ok()?;
         while cursor < text.len() {
             let next = cursor + text[cursor..].find('<')?;
             let rest = &text[next..];
-            if rest.starts_with(delimiter) {
+            if match_tag(rest, delimiter) {
                 return Some(next);
             }
-            if rest.starts_with("<parameter=") {
+            if match_tag(rest, "<parameter=") {
                 let value_start = next + rest.find('>')? + 1;
                 cursor = skip_json(text, value_start).ok()?;
             } else {
@@ -689,31 +716,50 @@ impl Qwen3Parser {
         }
 
         // 1. Check Qwen3-XML format: `<function=func_name>...`
-        if let Some(after_prefix) = body.strip_prefix("<function=") {
-            let close_angle = after_prefix.find('>')?;
-            let fn_name = after_prefix[..close_angle].trim().to_string();
-            let rest = &after_prefix[close_angle + 1..];
-            let fn_body = match Self::find_tool_delimiter(rest, "</function>") {
-                Some(end_idx) => &rest[..end_idx],
-                None => rest,
-            };
+        let xml_fn = if let Some(after_lt) = body.strip_prefix('<') {
+            let after_func = after_lt.trim_start();
+            if let Some(after_func_word) = after_func.strip_prefix("function") {
+                if let Some(after_eq) = after_func_word.trim_start().strip_prefix('=') {
+                    let close_angle = after_eq.find('>')?;
+                    let fn_name = after_eq[..close_angle].trim().to_string();
+                    let rest = &after_eq[close_angle + 1..];
+                    let fn_body = match Self::find_tool_delimiter(rest, "</function>") {
+                        Some(end_idx) => &rest[..end_idx],
+                        None => rest,
+                    };
+                    Some((fn_name, fn_body))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
+        if let Some((fn_name, fn_body)) = xml_fn {
             let mut params = serde_json::Map::new();
             let mut search = fn_body;
             while let Some(p_start) = Self::find_tool_delimiter(search, "<parameter=") {
-                let after_p = &search[p_start + "<parameter=".len()..];
+                let after_p = &search[p_start..];
                 let Some(p_angle) = after_p.find('>') else {
                     break;
                 };
-                let param_name = after_p[..p_angle].trim().to_string();
+                let tag_inside = &after_p[1..p_angle];
+                let Some((_, param_name)) = tag_inside.split_once('=') else {
+                    break;
+                };
+                let param_name = param_name.trim().to_string();
                 let val_start = &after_p[p_angle + 1..];
                 let (raw_val, next_slice) = if let Some(p_end) =
                     Self::find_tool_delimiter(val_start, "</parameter>")
                 {
-                    (
-                        &val_start[..p_end],
-                        &val_start[p_end + "</parameter>".len()..],
-                    )
+                    let after_close = match val_start[p_end..].find('>') {
+                        Some(close_gt) => &val_start[p_end + close_gt + 1..],
+                        None => "",
+                    };
+                    (&val_start[..p_end], after_close)
                 } else if let Some(next_p) = Self::find_tool_delimiter(val_start, "<parameter=") {
                     (&val_start[..next_p], &val_start[next_p..])
                 } else {
@@ -788,7 +834,11 @@ impl Qwen3Parser {
             if self.in_tool_call {
                 if let Some(end_pos) = Self::find_tool_delimiter(&self.buffer, Self::TOOL_END) {
                     let body = self.buffer[..end_pos].to_string();
-                    self.buffer.drain(..end_pos + Self::TOOL_END.len());
+                    let drain_end = match self.buffer[end_pos..].find('>') {
+                        Some(gt) => end_pos + gt + 1,
+                        None => end_pos + Self::TOOL_END.len(),
+                    };
+                    self.buffer.drain(..drain_end);
                     self.in_tool_call = false;
                     if let Some(tc) = Self::parse_tool_body(&body, self.next_tool_idx) {
                         self.next_tool_idx += 1;
@@ -1108,6 +1158,23 @@ mod tests {
         let tc = &delta.completed_tool_calls[0];
         assert_eq!(tc.function.name, "get_current_weather");
         assert_eq!(tc.function.arguments, "{\"location\":\"Tokyo\"}");
+    }
+
+    #[test]
+    fn test_qwen3_parser_xml_whitespace_tolerance() {
+        let mut parser = Qwen3Parser::new(false);
+        // Models occasionally emit spaces around delimiters: <function = name >, <parameter = key >, and </ tool_call >
+        let stream_text = "<tool_call><function = get_current_weather ><parameter = location >Tokyo</ parameter ></ function ></ tool_call >";
+        let delta = parser.push_str(stream_text);
+
+        assert_eq!(delta.completed_tool_calls.len(), 1);
+        let tc = &delta.completed_tool_calls[0];
+        assert_eq!(tc.function.name, "get_current_weather");
+        assert_eq!(tc.function.arguments, "{\"location\":\"Tokyo\"}");
+        assert_eq!(delta.content_delta, None);
+
+        let (_, turn) = parser.finish();
+        assert_eq!(turn.content.as_deref().unwrap_or(""), "");
     }
 
     #[test]

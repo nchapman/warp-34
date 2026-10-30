@@ -134,6 +134,21 @@ impl PreprocessedImage {
     }
 }
 
+pub const MAX_IMAGE_ASPECT_RATIO: usize = 200;
+
+/// Validates that an image's aspect ratio does not exceed `MAX_IMAGE_ASPECT_RATIO` (200:1),
+/// matching official Qwen2-VL / Qwen3-VL processor bounds.
+pub fn validate_image_aspect_ratio(height: usize, width: usize) -> std::result::Result<(), String> {
+    let min_dim = height.min(width).max(1);
+    let max_dim = height.max(width);
+    if max_dim > min_dim * MAX_IMAGE_ASPECT_RATIO {
+        return Err(format!(
+            "image aspect ratio ({max_dim}:{min_dim}) exceeds maximum allowed ratio of {MAX_IMAGE_ASPECT_RATIO}:1"
+        ));
+    }
+    Ok(())
+}
+
 /// `Qwen2VLImageProcessorFast` / `Qwen3VL` `smart_resize`:
 /// Rounds `(height, width)` to multiples of `factor = patch_size * spatial_merge_size` (32)
 /// while clamping total pixels into `[min_pixels, max_pixels]`.
@@ -154,19 +169,29 @@ pub fn smart_resize(
     min_pixels: usize,
     max_pixels: usize,
 ) -> (usize, usize) {
+    let h_in = height.max(1);
+    let w_in = width.max(1);
+    // Clamp extreme aspect ratio to MAX_IMAGE_ASPECT_RATIO (200:1) to prevent pathological grid allocations
+    let (h_in, w_in) = if h_in > w_in * MAX_IMAGE_ASPECT_RATIO {
+        (w_in * MAX_IMAGE_ASPECT_RATIO, w_in)
+    } else if w_in > h_in * MAX_IMAGE_ASPECT_RATIO {
+        (h_in, h_in * MAX_IMAGE_ASPECT_RATIO)
+    } else {
+        (h_in, w_in)
+    };
     let f = factor.max(1) as f64;
     let round_factor =
         |v: f64| -> usize { ((v / f).round_ties_even() as usize).max(1) * factor.max(1) };
-    let mut h_bar = round_factor(height as f64);
-    let mut w_bar = round_factor(width as f64);
+    let mut h_bar = round_factor(h_in as f64);
+    let mut w_bar = round_factor(w_in as f64);
     if h_bar * w_bar > max_pixels {
-        let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
-        h_bar = (((height as f64 / beta / f).floor() as usize).max(1)) * factor.max(1);
-        w_bar = (((width as f64 / beta / f).floor() as usize).max(1)) * factor.max(1);
+        let beta = ((h_in * w_in) as f64 / max_pixels as f64).sqrt();
+        h_bar = (((h_in as f64 / beta / f).floor() as usize).max(1)) * factor.max(1);
+        w_bar = (((w_in as f64 / beta / f).floor() as usize).max(1)) * factor.max(1);
     } else if h_bar * w_bar < min_pixels {
-        let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
-        h_bar = (((height as f64 * beta / f).ceil() as usize).max(1)) * factor.max(1);
-        w_bar = (((width as f64 * beta / f).ceil() as usize).max(1)) * factor.max(1);
+        let beta = (min_pixels as f64 / (h_in * w_in) as f64).sqrt();
+        h_bar = (((h_in as f64 * beta / f).ceil() as usize).max(1)) * factor.max(1);
+        w_bar = (((w_in as f64 * beta / f).ceil() as usize).max(1)) * factor.max(1);
     }
     (h_bar, w_bar)
 }
@@ -1484,5 +1509,26 @@ mod tests {
         assert_eq!(prep.grid_thw[2], 4); // W = 64 / 16 = 4
         assert_eq!(prep.num_patches(), 16);
         assert_eq!(prep.num_merged_tokens(2), 4); // 16 / 4 = 4
+    }
+
+    #[test]
+    fn test_validate_image_aspect_ratio() {
+        assert!(validate_image_aspect_ratio(100, 200).is_ok());
+        assert!(validate_image_aspect_ratio(1, 200).is_ok());
+        assert!(validate_image_aspect_ratio(1, 201).is_err());
+        assert!(validate_image_aspect_ratio(201, 1).is_err());
+        assert!(validate_image_aspect_ratio(2, 400).is_ok());
+        assert!(validate_image_aspect_ratio(2, 401).is_err());
+    }
+
+    #[test]
+    fn test_smart_resize_extreme_aspect_ratio_clamped() {
+        // Does not panic; clamps long dimension to 200 * min_dim
+        let (h, w) = smart_resize(1, 500, 32, 1024, 1024 * 1024);
+        assert_eq!((h, w), (32, 192));
+        assert!(h.max(w) <= h.min(w) * MAX_IMAGE_ASPECT_RATIO);
+
+        let (h_large, w_large) = smart_resize(32, 70_000, 32, 1024, 1024 * 1024);
+        assert!(h_large.max(w_large) <= h_large.min(w_large) * MAX_IMAGE_ASPECT_RATIO);
     }
 }

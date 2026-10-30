@@ -259,6 +259,8 @@ pub fn parse_openai_messages_with_image_policy(
                                 deadline,
                             )
                             .map_err(|e| format!("invalid image_url: {e}"))?;
+                            crate::vision::validate_image_aspect_ratio(h, w)
+                                .map_err(|e| format!("invalid image_url: {e}"))?;
                             let prep = crate::vision::preprocess_rgb_image(
                                 &rgb,
                                 h,

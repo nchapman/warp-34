@@ -474,7 +474,11 @@ async fn generate(
                         yield Ok(Event::default().data(final_chunk.to_string()));
                         if include_usage { final_chunk["choices"] = json!([]); final_chunk["usage"] = value["usage"].clone(); yield Ok(Event::default().data(final_chunk.to_string())); }
                     }
-                    Output::Error(message) => { yield Ok(Event::default().data(json!({"error":{"message":message,"type":"server_error"}}).to_string())); }
+                    Output::Error(message) => {
+                        yield Ok(Event::default().data(
+                            json!({"error":{"message":message,"type":"server_error"}}).to_string(),
+                        ));
+                    }
                 }
             }
             yield Ok(Event::default().data("[DONE]"));
