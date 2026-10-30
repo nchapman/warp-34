@@ -1,5 +1,6 @@
 # warp-34 — Comprehensive Feature Audit & Oracle Cross-Check Matrix
 
+> **Audit Date:** 2026-10-30
 > **Audit Objective:** Complete structural audit of every layer of the `warp-34` inference pipeline on 1–2× RTX 3090 Ti (`sm_86`), documenting implementation existence, donor provenance, foundational contracts, and verification status, followed by targeted subagent cross-checks against authoritative oracles (`vLLM 0.31.0`, `SGLang v0.5.19`, `vllm.cpp`, and `warp3090`).
 
 ---
