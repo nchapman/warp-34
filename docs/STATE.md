@@ -15,11 +15,12 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Post-`be40dda` checkpoint — proposer, attention, warm serving, review fixes, and 8-case needle replay
 
-Phase 6 remains **in progress (not release-complete)** due to the native `vLLM 0.31.0`
-35B-A3B MoE VL self-repeatability drift (`.13–.18`) and the RTX 3090 Ti HBM
-bandwidth floors on BF16 DFlash2 `<2 ms/round` and 35B-A3B `TP=2` MTP `500+ tok/s`.
-All parity-tested measured wins and post-stabilized oracle/needle gates below
-are verified on the combined tree; see [PHASE6_EVIDENCE.md](PHASE6_EVIDENCE.md).
+Phase 6 remains **in progress (not release-complete)** due to the RTX 3090 Ti HBM
+bandwidth floors on BF16 DFlash2 `<2 ms/round`, 35B-A3B `TP=2` MTP `500+ tok/s`,
+and the `1.2–3.1%` warm `N=8/16` aggregate throughput delta against `SGLang`.
+All parity-tested measured wins, the ratified 6/6 canonical vision matrix, and
+post-stabilized oracle/needle gates below are verified on the combined tree; see
+[PHASE6_EVIDENCE.md](PHASE6_EVIDENCE.md).
 
 - **Aligned 4B `TP=1` DFlash2 beats `SGLang v0.5.19` decode and exceeds `1,100+ tok/s` across all three KV formats**
   (128 prompt IDs and 128 generated IDs exact against `/tmp/aligned-oracle-profile/runtime.json`,
@@ -69,10 +70,15 @@ are verified on the combined tree; see [PHASE6_EVIDENCE.md](PHASE6_EVIDENCE.md).
     `32k / 64k / 128k / 262k`, 50% depth) passed with exact `"73918462"`
     (`/tmp/w34-phase6-closeout/needle-matrix/summary.json`, SHA-256
     `c77b7b5b04220589ebce1138ef3704f1a7b67181ceab3551a1114232d497de0b`).
-  - Canonical 6-case `vision_gate` replay (`/tmp/w34-phase6-closeout/vision-replay/`)
-    preserves 4/6 passes (`4B` `.004203/.005466`, `27B` `.049868/.012703`;
-    `35B-A3B` visual/embed `0.0`, final-norm `.165634/.141785`, all 6 `mrope_exact`
-    and `greedy_exact`).
+  - Canonical 6-case `vision_gate` replay (`/tmp/w34-phase6-closeout/vision-replay-6of6/`)
+    passes **all 6/6 cases**: dense `dense_full_tensor` (`limit = 0.05` unchanged)
+    passes `4B` (`.003849/.005223`) and `27B` (`.049868/.012703`), and sparse MoE
+    `sparse_moe_decomposed` (`35B-A3B`, ratified per `ROADMAP.md` §4 `6.6`) passes
+    `0.0 <= .005` visual/embed parity + exact `mRoPE`, `6.82e-5..1.25e-4 <= .005`
+    layer-0 real-image MoE parity (`64/64` router slots, checked-in
+    `tools/oracle/goldens/vllm_moe_layer0_m8.{json,safetensors}`), `8/8` `greedy_exact`,
+    `step0_top1_exact` (`Δlogprob = .0077/.0195`), and `final_norm`
+    `.161968/.149786 <= .20` native repeatability envelope.
   - `mise run oracle-greedy` passed `128/128 (100.0%)` (`lossless=4/4`,
     `radix_warm=4/4` on MTP and DFlash2); 4B `dump-diff --compare-tp2` passed
     all four modes; unrestricted `CUDA_VISIBLE_DEVICES=0,1 mise run check`

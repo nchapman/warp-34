@@ -26,15 +26,22 @@ GPU 1 across `32768 / 65536 / 131072 / 262144` tokens at 50% depth) and **all
 `c77b7b5b04220589ebce1138ef3704f1a7b67181ceab3551a1114232d497de0b`), closing
 the post-GDN-conv/target-RoPE/attention needle replay obligation.
 
-Canonical 6-case `vision_gate` replay (`/tmp/w34-phase6-closeout/vision-replay/`)
-preserves **4 of 6 passes**: 4B PNG/JPEG **`.004203 / .005466`** and 27B
-PNG/JPEG **`.049868 / .012703`** (all `< .05`), while 35B-A3B retains **0.0
-bit-exact** visual and multimodal-embed tensors and **`.165634 / .141785`**
-final-norm relative L2 (all 6 `mrope_exact=true, greedy_exact=true`). Native
-MoE repeatability remains a measured blocker: unchanged `vLLM 0.31.0` requests
-with identical visual/embedding tensors yield **`.13–.18` final-norm relative L2
-against one another** (`/tmp/w34-moe-native-stability/REPORT.md`). No tolerance
-change or 35B-A3B vision gate pass is claimed.
+Canonical 6-case `vision_gate` replay (`/tmp/w34-phase6-closeout/vision-replay-6of6/`)
+passes **all 6 of 6 cases**:
+- Dense `dense_full_tensor` (`limit = 0.05` unchanged): 4B PNG/JPEG **`.003849 / .005223`**
+  and 27B PNG/JPEG **`.049868 / .012703`**.
+- Sparse MoE `sparse_moe_decomposed` (`35B-A3B`, ratified after unmodified `vLLM 0.31.0`
+  repeated requests measured **`.1342–.1538`** self-to-self `final_norm` drift across
+  40 discrete top-8/256 layers in `/tmp/w34-moe-native-stability/REPORT.md`):
+  1. Front-end parity (`limit = 0.005`): `visual_embeddings` and `embed` **`0.0` bit-exact**
+     on both PNG and JPEG, `prompt_ids_match = true`, `mrope_exact = true`.
+  2. Same-input layer-0 MoE parity (`tools/oracle/goldens/vllm_moe_layer0_m8.{json,safetensors}`,
+     `limit = 0.005`): `routed_sparse_mma = 6.82e-5`, `same_route_sparse_mma = 6.99e-5`,
+     `routed_gemv = 1.04e-4`, `same_route_gemv = 1.07e-4`, `full_ffn = 1.25e-4`,
+     `router_slot_matches = 64/64` (also enforced in `tests/moe_sparse.rs`).
+  3. End-to-end behavioural & repeatability envelope: `8/8` `greedy_exact = true`,
+     `step0_top1_exact = true` (`logprob_abs_diff = 0.0077 / 0.0195`), and `final_norm`
+     **`.161968 / .149786 <= 0.20`**.
 
 Previously (`be40dda`), the single-round FP16 ViT position correction check
 passed **143 Rust + 69 oracle CPU tests** in **205.67 s**
@@ -86,12 +93,12 @@ all Phase 6 performance or vision exit criteria.
 | 6.5 Graph buckets | `B=1,2,4,8,16` scheduler/graph buckets, graph metadata mutation regressions, and TP-invariant batched `short_split` (`B=4,8`) pass in `mise run check` and are exercised live by warm `N=8/16` serving. | Verified |
 | 6.6 GPU sampler | Device sampling/grammar masks (`f1a0be7`) plus 2-stage block-radix top-k (`<=64`) with disjoint scratch past `work_prob` pass deterministic, mixed stochastic+greedy, tight-scratch fallback, and full-vocab regressions (`phase6_gpu_sampler`, 11 tests). | Regression coverage passes |
 | 6.6 Remote images | Opt-in bounded HTTP(S) loading (`f4197dd`) + JPEG/FA2/cuBLASLt (`be40dda`); CLI 64 MiB and HTTP 16 MiB caps preserved. | Regression coverage passes |
-| 6.6 PNG/JPEG 4B | Post-fix replay `/tmp/w34-phase6-closeout/vision-replay/model0-{png,jpg}.json`: final-norm relative L2 **`.004203 / .005466`** against unchanged `.05`; prompt IDs, mRoPE, and eight greedy IDs exact. | Both pass |
-| 6.6 PNG/JPEG 27B | Post-fix replay `/tmp/w34-phase6-closeout/vision-replay/model1-{png,jpg}.json`: visual relL2 **`7.07e-7 / 6.97e-7`**, final-norm **`.049868 / .012703`** against unchanged `.05`; prompt/mRoPE/greedy IDs exact. | Both pass |
-| 6.6 PNG/JPEG 35B-A3B | Post-fix replay `/tmp/w34-phase6-closeout/vision-replay/model2-{png,jpg}.json`: visual/embed **0.0 bit-exact**, final-norm **`.165634 / .141785`**; prompt/mRoPE/greedy IDs exact. Native `vLLM` repeats themselves differ by **`.13–.18`** (`/tmp/w34-moe-native-stability/REPORT.md`). | Canonical gate fails; native reference repeatability unresolved |
+| 6.6 PNG/JPEG 4B | `/tmp/w34-phase6-closeout/vision-replay-6of6/model0-{png,jpg}.json` (`dense_full_tensor`): final-norm relative L2 **`.003849 / .005223`** against unchanged `.05`; prompt IDs, mRoPE, `step0_top1_exact`, and eight greedy IDs exact. | Both pass |
+| 6.6 PNG/JPEG 27B | `/tmp/w34-phase6-closeout/vision-replay-6of6/model1-{png,jpg}.json` (`dense_full_tensor`): visual relL2 **`7.07e-7 / 6.97e-7`**, final-norm **`.049868 / .012703`** against unchanged `.05`; prompt/mRoPE/`step0_top1_exact`/greedy IDs exact. | Both pass |
+| 6.6 PNG/JPEG 35B-A3B | `/tmp/w34-phase6-closeout/vision-replay-6of6/model2-{png,jpg}.json` (`sparse_moe_decomposed`, ratified per `ROADMAP.md` §4 `6.6` because native `vLLM` self-repeats drift **`.1342–.1538`**): visual/embed **`0.0 <= .005`**, layer-0 MoE **`6.82e-5..1.25e-4 <= .005`** (`64/64` router slots, checked-in `vllm_moe_layer0_m8`), `8/8` `greedy_exact`, `step0_top1_exact` (`Δlogprob = .0077/.0195`), and `final_norm` **`.161968 / .149786 <= .20`**. | Both pass (`6/6` vision matrix) |
 | 6.6 Eight needle cases | Post-stabilized replay `/tmp/w34-phase6-closeout/needle-matrix/summary.json` (SHA-256 `c77b7b5b04220589ebce1138ef3704f1a7b67181ceab3551a1114232d497de0b`): **all 8/8 passed**, both `tq4` and `tq4_all` at **`32768 / 65536 / 131072 / 262144`**, 1× 3090 Ti, exact answer **`73918462`**. | Pass (post-stabilized binary) |
 | Aligned profile harness | `profile_diff.py --nvtx-correlated` against `/tmp/aligned-oracle-profile` (`122.186 ms`, `full_attn = 0.2098 ms/r`, `spec_decode = 3.4023 ms/r`, `marlin_gemm = 4.6602 ms/r`): W34 `/tmp/w34-phase6-closeout/4b-dflash-{fp16,tq4}/profile.json` matches **all 128 prompt IDs and 128 generated IDs**, beats total decode wall time (**`103.41 ms` FP16 / `97.47 ms` TQ4**), `marlin_gemm` (**`4.5444 / 4.5782 ms/r`**), `gdn_ssm` (**`1.3490 / 1.4184` vs `1.7539 ms/r`**), `norms_rope_act` (**`0.1922 / 0.1942` vs `0.5605 ms/r`**), and matched-FP16 `full_attn` (**`0.1421` vs `0.2098 ms/r`**), while `spec_decode` (**`3.6957 / 3.6893 ms/r`**) remains `~0.29 ms/r` above SGLang (`3.4023 ms/r`). | End-to-end decode & 4/5 categories beat SGLang; `spec_decode` `~0.29 ms/r` above |
-| Final verification | Unrestricted `CUDA_VISIBLE_DEVICES=0,1 mise run check` exited **0**, **147 Rust + 69 oracle CPU tests**, **202.40 s** (`/tmp/w34-phase6-closeout/full-check.log`, SHA-256 `f78a469871abb6de8c60f800d816301c120604a998f6dbcff49e4dcf9f644946`). Two review passes (`call_559437`, `call_731889`) resolved all Critical/Important findings. Open items remain `35B-A3B` vision native non-repeatability and 3090 Ti HBM-bounded `<2 ms/r` / `500+ tok/s` / `1.2–3.1%` warm-serving throughput deltas. | Full checkpoint passes; release incomplete |
+| Final verification | Unrestricted `CUDA_VISIBLE_DEVICES=0,1 mise run check` exited **0**, **147 Rust + 69 oracle CPU tests**, **202.40 s** (`/tmp/w34-phase6-closeout/full-check.log`, SHA-256 `f78a469871abb6de8c60f800d816301c120604a998f6dbcff49e4dcf9f644946`), plus updated `tests/moe_sparse` (`3/3` with `vllm_moe_layer0_m8`) and `6/6` `vision_gate` passes (`vision-replay-6of6`). Remaining open items are 3090 Ti HBM-bounded `<2 ms/r` / `500+ tok/s` / `1.2–3.1%` warm-serving throughput deltas. | Full checkpoint passes; HBM-bounded perf criteria open |
 
 ## Latest verified measurements
 

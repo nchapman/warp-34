@@ -147,6 +147,73 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             }))?,
         )?;
     }
+    let is_sparse_moe = engine.cfg.num_experts > 1;
+    let gate_mode = if is_sparse_moe {
+        "sparse_moe_decomposed"
+    } else {
+        "dense_full_tensor"
+    };
+    let mut moe_frontend_limit = 0.05f64;
+    let mut moe_layer0_limit = 0.05f64;
+    let mut moe_envelope_limit = 0.05f64;
+    let mut moe_repeat_range = serde_json::Value::Null;
+    let moe_layer0 = if is_sparse_moe {
+        let golden_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/oracle/goldens");
+        let meta_path = golden_dir.join("vllm_moe_layer0_m8.json");
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
+        if meta["vllm_version"] != "0.31.0" {
+            return Err("unsupported MoE layer-0 golden vLLM version".into());
+        }
+        let expected_cfg_sha = meta["config_sha256"]
+            .as_str()
+            .ok_or("missing MoE golden config_sha256")?;
+        if hash(&std::path::Path::new(model).join("config.json"))? != expected_cfg_sha {
+            return Err(
+                "MoE checkpoint config.json does not match layer-0 golden provenance".into(),
+            );
+        }
+        let st_name = meta["safetensors_file"]
+            .as_str()
+            .ok_or("missing MoE golden safetensors_file")?;
+        let st_path = golden_dir.join(st_name);
+        let expected_st_sha = meta["safetensors_sha256"]
+            .as_str()
+            .ok_or("missing MoE golden safetensors_sha256")?;
+        if hash(&st_path)? != expected_st_sha {
+            return Err("MoE layer-0 golden safetensors digest mismatch".into());
+        }
+        let parse_pos_limit = |v: &serde_json::Value, name: &str| -> Result<f64, String> {
+            let x = v
+                .as_f64()
+                .ok_or_else(|| format!("missing MoE golden limit {name}"))?;
+            if !(x.is_finite() && x > 0.0) {
+                return Err(format!("non-positive MoE golden limit {name}"));
+            }
+            Ok(x)
+        };
+        moe_frontend_limit =
+            parse_pos_limit(&meta["frontend_rel_l2_limit"], "frontend_rel_l2_limit")?;
+        moe_layer0_limit = parse_pos_limit(&meta["layer0_rel_l2_limit"], "layer0_rel_l2_limit")?;
+        let env_obj = &meta["native_self_repeat_final_norm_rel_l2"];
+        moe_envelope_limit = parse_pos_limit(&env_obj["envelope_limit"], "envelope_limit")?;
+        let lower_path = image_path.to_ascii_lowercase();
+        moe_repeat_range = if lower_path.ends_with(".png") {
+            env_obj["png_range"].clone()
+        } else if lower_path.ends_with(".jpg") || lower_path.ends_with(".jpeg") {
+            env_obj["jpg_range"].clone()
+        } else {
+            return Err("unsupported image extension for MoE repeatability range".into());
+        };
+        if !moe_repeat_range.is_array() {
+            return Err("missing format repeatability range in MoE golden".into());
+        }
+        let moe_archive = SafetensorsArchive::open(&st_path)?;
+        Some(engine.verify_moe_layer0_golden(&moe_archive, moe_layer0_limit)?)
+    } else {
+        None
+    };
+
     let mut tensors = serde_json::Map::new();
     let mut tensors_passed = true;
     let mut keys = vec!["visual_embeddings", "embed", "final_norm"];
@@ -174,11 +241,27 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             max_abs = max_abs.max((a - b).abs());
         }
         let rel_l2 = (err_sq / ref_sq.max(1e-30)).sqrt();
-        tensors_passed &= rel_l2 <= 0.05;
-        tensors.insert(
-            key.to_string(),
-            serde_json::json!({"shape":shape,"max_abs":max_abs,"rel_l2":rel_l2,"limit":0.05}),
-        );
+        let limit = if is_sparse_moe {
+            match key {
+                "visual_embeddings" | "embed" => moe_frontend_limit,
+                "layer_0_hidden_after" => moe_layer0_limit,
+                "final_norm" => moe_envelope_limit,
+                _ => 0.05,
+            }
+        } else {
+            0.05
+        };
+        tensors_passed &= rel_l2 <= limit;
+        let mut entry = serde_json::json!({
+            "shape": shape,
+            "max_abs": max_abs,
+            "rel_l2": rel_l2,
+            "limit": limit,
+        });
+        if is_sparse_moe && key == "final_norm" {
+            entry["native_repeat_rel_l2_range"] = moe_repeat_range.clone();
+        }
+        tensors.insert(key.to_string(), entry);
     }
     let image_token_id = engine.cfg.vision_config.as_ref().unwrap().image_token_id;
     let (positions, _) =
@@ -189,6 +272,13 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         return Err("invalid mrope tensor schema".into());
     }
     let mrope_exact = positions.concat() == archive.read_i32("mrope_positions")?;
+    let step0_top1_exact = dump.greedy_token_id == expected_ids[0];
+    let step0_logprob_diff = generation
+        .get("steps")
+        .and_then(|s| s.get(0))
+        .and_then(|s0| s0.get("logprob"))
+        .and_then(serde_json::Value::as_f64)
+        .map(|exp_lp| (f64::from(dump.top5_logprobs[0]) - exp_lp).abs());
     let metrics = engine.generate_multimodal_with_radix_cache(
         &prompt,
         &images,
@@ -200,12 +290,22 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     let canonical_oracle = req
         .get("diagnostic_override_visual")
         .is_none_or(serde_json::Value::is_null);
-    let passed = exact && tensors_passed && mrope_exact && canonical_oracle;
-    let report = serde_json::json!({"passed":passed,"model_snapshot":model,"image_sha256":req["image"]["sha256"],
+    let moe_layer0_passed = moe_layer0.as_ref().is_none_or(|r| r.passed);
+    let passed = exact
+        && step0_top1_exact
+        && tensors_passed
+        && moe_layer0_passed
+        && mrope_exact
+        && canonical_oracle;
+    let mut report = serde_json::json!({"passed":passed,"gate_mode":gate_mode,"model_snapshot":model,"image_sha256":req["image"]["sha256"],
         "prompt_ids_match":true,"prompt_tokens":prompt.len(),"tensors":tensors,"mrope_exact":mrope_exact,
+        "step0_top1_exact":step0_top1_exact,"step0_top1_logprob_abs_diff":step0_logprob_diff,
         "greedy_exact":exact,"expected_ids":expected_ids,"actual_ids":metrics.generated_token_ids,
         "ttft_ms":metrics.ttft_ms,"decode_tok_per_s":metrics.decode_tok_per_s,
         "tp":1,"kv_policy":"fp16","prefill_chunk_size":64,"oracle_dir":root,"canonical_oracle":canonical_oracle});
+    if let Some(moe_rep) = moe_layer0 {
+        report["moe_layer0_same_input"] = serde_json::to_value(moe_rep)?;
+    }
     std::fs::write(&args[1], serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(if passed {

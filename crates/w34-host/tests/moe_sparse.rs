@@ -745,6 +745,43 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
             }
         }
 
+        // Captured real-image vLLM 0.31.0 layer-0 M=8 parity gate (`rel_l2 <= 0.005`).
+        {
+            use sha2::{Digest, Sha256};
+            use w34_host::loader::SafetensorsArchive;
+            let golden_dir =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/oracle/goldens");
+            let meta: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(golden_dir.join("vllm_moe_layer0_m8.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(meta["vllm_version"], "0.31.0");
+            let cfg_sha = format!(
+                "{:x}",
+                Sha256::digest(std::fs::read(engine.model_dir.join("config.json")).unwrap())
+            );
+            assert_eq!(cfg_sha, meta["config_sha256"].as_str().unwrap());
+            let st_path = golden_dir.join(meta["safetensors_file"].as_str().unwrap());
+            let st_sha = format!("{:x}", Sha256::digest(std::fs::read(&st_path).unwrap()));
+            assert_eq!(st_sha, meta["safetensors_sha256"].as_str().unwrap());
+            let archive = SafetensorsArchive::open(&st_path).unwrap();
+            let limit = meta["layer0_rel_l2_limit"].as_f64().unwrap();
+            assert!(limit.is_finite() && limit > 0.0);
+            assert!(engine.verify_moe_layer0_golden(&archive, 0.0).is_err());
+            assert!(engine.verify_moe_layer0_golden(&archive, f64::NAN).is_err());
+            let rep = engine.verify_moe_layer0_golden(&archive, limit).unwrap();
+            assert!(
+                rep.passed,
+                "Layer-0 MoE vLLM 0.31.0 real-image parity failed: {rep:?}"
+            );
+            assert_eq!(rep.router_slot_matches, rep.router_total_slots);
+            let strict_fail = engine.verify_moe_layer0_golden(&archive, 1e-9).unwrap();
+            assert!(
+                !strict_fail.passed,
+                "Layer-0 MoE parity check must fail closed on impossible threshold: {strict_fail:?}"
+            );
+        }
+
         if CudaDevice::count().unwrap_or(0) < 2 {
             return;
         }
@@ -760,6 +797,16 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
     // 2. Actual two-GPU TP=2 execution across M=4, M=8, and M=16 MoE prefill + decode.
     let mut engine_tp2 =
         Qwen3_5Engine::load(model, 2, KvFormatPolicy::Fp16, Some(32), true).unwrap();
+    {
+        let st_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/oracle/goldens/vllm_moe_layer0_m8.safetensors");
+        let archive = w34_host::loader::SafetensorsArchive::open(&st_path).unwrap();
+        assert!(
+            engine_tp2
+                .verify_moe_layer0_golden(&archive, 0.005)
+                .is_err()
+        );
+    }
     let rel_l2_fn = |a: &[f32], b: &[f32]| -> f64 {
         assert_eq!(a.len(), b.len());
         let err_sq: f64 = a
