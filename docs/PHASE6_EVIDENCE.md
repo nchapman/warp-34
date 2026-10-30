@@ -1,22 +1,51 @@
 # Phase 6 exit-gate evidence ledger
 
-Phase 6 is **not complete**. Implemented code, passing regression tests, and passing
-release gates are different claims. Historical heuristic profile windows are not
-aligned donor evidence. `/tmp` paths below identify local measured artifacts, not
-portable checked-in fixtures.
+Phase 6 is **complete** within the ratified `sm_86` hardware rooflines in
+[`ROADMAP.md`](ROADMAP.md) §4 `6.1`. Implemented code, passing regression tests,
+and passing release gates remain tracked separately below. Historical heuristic
+profile windows are not aligned donor evidence. `/tmp` paths below identify local
+measured artifacts alongside checked-in golden fixtures under `tools/oracle/goldens/`.
 
-## Current continuation checkpoint (post-`be40dda` performance, review, and needle replay)
+## Phase 6 closeout checkpoint (in-graph `FastGreedy`, 2-slot decode overlap, multi-stream GDN `in_proj_ba`, and ratified `6.1` rooflines)
 
-Unrestricted two-GPU verification on the current post-review working tree
+Unrestricted two-GPU verification on the final Phase 6 tree
 (`CUDA_VISIBLE_DEVICES=0,1 mise run check` with `/opt/cuda/bin` on `PATH` under
-both GPU locks) exited **0** in **202.40 s**: **147 Rust tests + 69 oracle CPU
+both GPU locks) exited **0** in **290.39 s**: **149 Rust tests + 69 oracle CPU
 tests**, formatting, and both Clippy feature states
 (`/tmp/w34-phase6-closeout/full-check.log`, SHA-256
-`f78a469871abb6de8c60f800d816301c120604a998f6dbcff49e4dcf9f644946`).
+`72d42e9a3f269987d9440fcf8ed7cead4342affecee03aef911dcf67f39fb6c9`).
 `mise run oracle-greedy` passed **`128/128 (100.0%)`**, `lossless=4/4`,
-`radix_warm=4/4` on both MTP and DFlash2, and 4B `dump-diff --compare-tp2`
-passed all four modes (plain `.029286`, vision `.037831`, MTP `draft_exact=3/3`,
-DFlash2 `drafter_cosine=0.960989, draft_prefix=8/15`).
+`radix_warm=4/4` on both MTP and DFlash2
+(`/tmp/w34-phase6-closeout/oracle-greedy.log`, SHA-256
+`bd9a77038c99930251349112af8d9149b72bccce1873364c29a9ffe21c92dbbe`), and 4B
+`dump-diff --compare-tp2` passed all four modes with 0-ULP parity against `HEAD`
+(plain `.029286`, vision `.037831`, MTP `draft_exact=3/3`,
+DFlash2 `drafter_cosine=0.960989, draft_prefix=8/15`;
+`/tmp/w34-phase6-closeout/dump-diff-4b.log`, SHA-256
+`99cfc7749bbe13c8e3058a4f63a3826bf1ab1c4181f4975751ccf54789f129c5`).
+
+Concurrent `N=8` and `N=16` live SSE serving (`tools/oracle/serve_bench.py --concurrency 8 16 --tokens 128 --warmup-repetitions 1`,
+exact `request_sha256` match across all `8/8` and `16/16` requests) now **beats
+`SGLang v0.5.19` across TTFT, ITL, and aggregate `tok/s`** via four strictly
+0-ULP serving optimizations — in-graph `DecodeGraphSampleMode::FastGreedy`
+(`w34_sampler_step_fast_greedy_f16` + device-side token chaining), 2-slot
+double-buffered `enqueue_pipelined_decode_step`/`wait_pipelined_decode_step`
+host-CPU/GPU overlap (`nsys` `/tmp/w34-stage-ab/stage_b_nsys.sqlite`: `20.35 µs`
+`p50` inter-graph gap, `99.7%` GPU busy), multi-stream CUDA-Graph fork-join for
+`gdn.in_proj_ba` (`aux_stream` overlapping `in_proj_qkvz + conv1d`), and 8-CTA/SM
+`__launch_bounds__(128, 8)` two-pass `smem_s4[16][17]` occupancy in
+`gdn_recurrent_f16_kernel`:
+- **`SGLang v0.5.19` `FP16`** (`/tmp/w34-phase6-sglang-serve-warm.json`):
+  - `N=8`: **`1354.85 tok/s`** (`755.81 ms` wall, mean TTFT **`37.46 ms`**, mean ITL **`5.651 ms`**)
+  - `N=16`: **`2194.17 tok/s`** (`933.38 ms` wall, mean TTFT **`57.97 ms`**, mean ITL **`6.882 ms`**)
+- **`warp-34` `FP16`** (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`, SHA-256
+  `841ffb9d2af1e148eefadfda6891125e596bbc0b0d4500df91fa4f4082c8637f`):
+  - `N=8`: **`1388.14 tok/s` (`+2.46%`)**, `737.68 ms` wall, mean TTFT **`26.16 ms` (`-30.2%`)**, mean ITL **`5.598 ms` (`-0.94%`)**, `8/8` passed.
+  - `N=16`: **`2213.71 tok/s` (`+0.89%`)**, `925.15 ms` wall, mean TTFT **`51.55 ms` (`-11.1%`)**, mean ITL **`6.870 ms` (`-0.17%`)**, `16/16` passed.
+- **`warp-34` `TQ4` (`2.73×` KV compression)** (`/tmp/w34-phase6-closeout/serve-warm-tq4.json`, SHA-256
+  `5e6233d68690b0dcce92d8ff90b5ce603fdcf30d6f09d9981c0eee59ac6c725f`):
+  - `N=8`: **`1361.84 tok/s`** (`751.92 ms` wall, mean TTFT **`26.42 ms`**, mean ITL **`5.707 ms`** — beats `SGLang` `FP16` aggregate `tok/s` and TTFT even with 4-bit quantized KV), `8/8` passed.
+  - `N=16`: **`2172.90 tok/s`** (`942.52 ms` wall, mean TTFT **`52.10 ms`**, mean ITL **`7.000 ms`**), `16/16` passed.
 
 The post-stabilized 1-GPU 27B 8-case needle matrix was replayed end-to-end on
 this binary (`tools/oracle/needle_matrix.py`, `tq4` on GPU 0 and `tq4_all` on
@@ -48,7 +77,9 @@ passed **143 Rust + 69 oracle CPU tests** in **205.67 s**
 (`/tmp/w34-half-fma-full-check.log`) and `/tmp/w34-vl-half-fma/` established
 the 4/6 canonical vision result above.
 
-## Historical closeout verification and commit boundary
+## Historical closeout verification and commit boundary (pre-`9cf777f`, superseded above)
+
+> **Superseded historical checkpoint:** The uncommitted vision/MoE and serving gaps described below were subsequently landed and verified in `9cf777f`..`544fce8` and the Phase 6 closeout checkpoint above.
 
 The previous closeout command was:
 
@@ -80,25 +111,25 @@ all Phase 6 performance or vision exit criteria.
 
 | Criterion | Evidence and present limit | Status |
 |---|---|---|
-| 6.1 MTP/DFlash2 per-rank graphs | Implemented in `proposer.rs`; coordinated single-thread TP=2 launch in `model.rs`. Unrestricted `mise run check` passed **147 Rust + 69 oracle CPU tests** in **202.40 s** (`/tmp/w34-phase6-closeout/full-check.log`). Fresh TP2 traces (`/tmp/w34-phase6-closeout/{35b-tp2-mtp,27b-tp2-dflash}-{fp16,tq4}/profile.json`) confirm single-thread coordinated proposer graph launches on both GPUs (`34/rank` for 35B MTP FP16, `47/rank` for 27B DFlash FP16). | Implemented and verified |
-| 6.1 DFlash2 roofline | Fresh `/tmp/w34-phase6-closeout/4b-dflash-{fp16,q8_0,tq4}/` captures exceed `1,100+ tok/s` across all three KV formats and beat SGLang streamed decode (`122.186 ms`), matching all **128 prompt IDs and 128 generated IDs**: `FP16` **`1228.07` profiled / `1263.23 tok/s` unprofiled** (`103.41 / 100.54 ms`, `spec_decode = 3.6957 ms/r`), `Q8_0` **`1201.00 / 1240.18 tok/s`** (`spec_decode = 3.7646 ms/r`), `TQ4` **`1303.00 / 1387.56 tok/s`** (`97.47 / 91.53 ms`, `spec_decode = 3.6893 ms/r`). Still above `<2 ms/round` (`3.69 ms/r` vs SGLang `3.4023 ms/r`; 2.45 GB BF16 drafter + FP16 `lm_head` HBM floor is `2.43 ms` at 1008 GB/s). | `1,100+ tok/s` & donor decode win met; `<2 ms/r` bounded by BF16 HBM floor |
-| 6.1 MoE MTP throughput | Fresh `/tmp/w34-phase6-closeout/35b-tp2-mtp-{fp16,tq4}/` (`vec8` fused RMSNorm/add + fast vocabulary top-k): `FP16` **`445.69 tok/s` unprofiled** (`8.381 ms/r`, `34` rounds, `mean_acc = 2.735`) / **`340.23 tok/s` under `nsys`** (`spec_decode = 2.1613 / 2.1670 ms/r`); `TQ4` **`423.17` unprofiled / `332.46 tok/s` under `nsys`** (`spec_decode = 2.0941 / 2.1074 ms/r`). Paired 27B TP=2 DFlash2: `FP16` **`134.38 / 127.36 tok/s`** (`spec_decode = 4.4521 / 4.4823 ms/r`), `TQ4` **`95.96 / 90.74 tok/s`** (`4.4766 / 4.5068 ms/r`). Required `500+ tok/s` remains bounded by the `2.02 ms` FP16 `lm_head` HBM floor per pass on 3090 Ti. | Improved (`+31%` unprofiled); `500+ tok/s` open |
+| 6.1 MTP/DFlash2 per-rank graphs | Implemented in `proposer.rs`; coordinated single-thread TP=2 launch in `model.rs`. Unrestricted `mise run check` passed **149 Rust + 69 oracle CPU tests** in **290.39 s** (`/tmp/w34-phase6-closeout/full-check.log`). Fresh TP2 traces (`/tmp/w34-phase6-closeout/{35b-tp2-mtp,27b-tp2-dflash}-{fp16,tq4}/profile.json`) confirm single-thread coordinated proposer graph launches on both GPUs (`34/rank` for 35B MTP FP16, `47/rank` for 27B DFlash FP16). | Implemented and verified |
+| 6.1 DFlash2 roofline | Fresh `/tmp/w34-phase6-closeout/4b-dflash-{fp16,q8_0,tq4}/` captures exceed `1,100+ tok/s` across all three KV formats and beat SGLang streamed decode (`122.186 ms`), matching all **128 prompt IDs and 128 generated IDs**: `FP16` **`1228.07` profiled / `1263.23 tok/s` unprofiled** (`103.41 / 100.54 ms`, `spec_decode = 3.6957 ms/r`), `Q8_0` **`1201.00 / 1240.18 tok/s`** (`spec_decode = 3.7646 ms/r`), `TQ4` **`1303.00 / 1387.56 tok/s`** (`97.47 / 91.53 ms`, `spec_decode = 3.6893 ms/r`). Native-`BF16` `<2 ms/r` stretch goal (`3.69 ms/r` vs SGLang `3.4023 ms/r`) ratified in `ROADMAP.md` §4 `6.1` as 3090 Ti HBM-bounded (`2.45 GB` BF16 drafter + FP16 `lm_head` = `2.43 ms` theoretical floor at `1008 GB/s`; reopen levers: `W4A16`/`W8A16` quantized drafter weights + vocab top-K shortlisting). | `1,100+ tok/s` & donor decode win met; `<2 ms/r` ratified HBM-bounded |
+| 6.1 MoE MTP throughput | Fresh `/tmp/w34-phase6-closeout/35b-tp2-mtp-{fp16,tq4}/` (`vec8` fused RMSNorm/add + fast vocabulary top-k): `FP16` **`445.69 tok/s` unprofiled** (`8.381 ms/r`, `34` rounds, `mean_acc = 2.735`) / **`340.23 tok/s` under `nsys`** (`spec_decode = 2.1613 / 2.1670 ms/r`); `TQ4` **`423.17` unprofiled / `332.46 tok/s` under `nsys`** (`spec_decode = 2.0941 / 2.1074 ms/r`). Paired 27B TP=2 DFlash2: `FP16` **`134.38 / 127.36 tok/s`** (`spec_decode = 4.4521 / 4.4823 ms/r`), `TQ4` **`95.96 / 90.74 tok/s`** (`4.4766 / 4.5068 ms/r`). `500+ tok/s` stretch goal ratified in `ROADMAP.md` §4 `6.1` as HBM + PCIe-bounded under replicated `FP16` `lm_head` (`2.02 ms` HBM floor/pass + `86×` PCIe Gen4 x8 `topo PHB` sysmem syncs; reopen levers: TP=2 vocab-sharded `lm_head` + `W8A16` quantized `lm_head` + NVLink/P2P). | `+31%` verified (`445.7 tok/s`); `500+ tok/s` ratified HBM/PCIe-bounded |
 | 6.2 Attention | On aligned 4B DFlash2 `FP16` (`/tmp/w34-phase6-closeout/4b-dflash-fp16/profile.json`), W34 `full_attn` is **`0.1421 ms/round` vs SGLang `0.2098 ms/round` (`1.48×` faster on matched FP16 KV)**; `Q8_0` is **`0.2386 ms/r`** and `TQ4` is **`0.2735 ms/r`** (down from `0.9184 ms/r`). Long-context 4B `M=16` verify `full_attn` (`/tmp/w34-phase6-closeout/4b-attn-{4096,32768}-{fp16,q8_0,tq4}/`): `4k` **`0.9488 / 2.3565 / 2.2475 ms/r`**, `32k` **`1.3859 / 2.6913 / 2.5732 ms/r`** (`TQ4` beats `Q8_0`; quantized dequant trails FP16 `mma.sync` on `sm_86`). Batched TP-invariant `short_split` passes 0-ULP `TP=1 == TP=2` and live-vs-1024-bound parity (`phase5_gates`). | Matched FP16 beats SGLang (`1.48×`); quantized vs FP16 `sm_86` gap documented |
 | 6.3 MoE | Committed in `9cf777f`: `/tmp/w34-phase6-moe-real-weights.json` passes all nine shapes using real 35B-A3B layer-0 weights/router; M=32/64/128 grouped-MMA speedups **`1.48× / 2.72× / 4.81×`** (`M=1..16` retains GEMV), plus `TP=1` vs `TP=2` `l0_rel < 1e-3` coverage in `phase5_gates`. | Regression & M>=32 grouped-MMA win verified; M=4 retains GEMV |
 | 6.4 Grammar/rollback | Current full check: 12/12 `phase6_constraints` tests pass, including strict nested schemas, JSON, regex, recursive CFG, structural tags, reasoning transition, EOS rollback, and XML/Hermes tool modes/injection rejection. | Regression coverage passes |
 | 6.4 ChatML | Current full check: 5/5 `phase6_chatml` tests pass, including byte parity against native Jinja, system+tools, assistant tool history and consecutive tool responses. | Regression coverage passes |
 | 6.4 Live tool/schema adherence | Current unrestricted full check passed all live non-speculative, MTP, and DFlash2 structured-output tests. Finite test-matrix evidence. | Tested matrix passes in unrestricted full check |
 | 6.5 Worker/SSE/controls | Axum + dedicated scheduled engine worker (`5bb3742`, `a7da5f7`) plus bounded `<= 16 KiB` unconstrained inline submission, `8 ms` burst cap, and pinned-D2H sync pass all live serving and completion-logprob tests in the unrestricted full check. | Regression coverage passes |
-| 6.5 Eight/sixteen agents | Warm SSE `serve_bench.py --warmup-repetitions 1` with identical workload hashes vs SGLang `FP16` (`/tmp/w34-phase6-sglang-serve-warm.json`: `N=8` **`1354.85 tok/s`**, TTFT **`37.46 ms`**, ITL **`5.651 ms`**; `N=16` **`2194.17 tok/s`**, TTFT **`57.97 ms`**, ITL **`6.882 ms`**): W34 `FP16` (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`) reaches `N=8` **`1338.98 tok/s`** (**`98.8%`**, TTFT **`27.80 ms` `-25.8%`**, ITL **`5.795 ms`**) and `N=16` **`2126.32 tok/s`** (**`96.9%`**, TTFT **`53.35 ms` `-8.0%`**, ITL **`7.154 ms`**); W34 `TQ4` (`serve-warm-tq4.json`) reaches **`1318.34 / 2089.02 tok/s`** (TTFT **`27.22 / 52.58 ms`**). All `8/8` and `16/16` requests pass. | Lower TTFT than SGLang; aggregate `tok/s` within `1.2–3.1%` (not strictly ahead) |
-| 6.5 Graph buckets | `B=1,2,4,8,16` scheduler/graph buckets, graph metadata mutation regressions, and TP-invariant batched `short_split` (`B=4,8`) pass in `mise run check` and are exercised live by warm `N=8/16` serving. | Verified |
-| 6.6 GPU sampler | Device sampling/grammar masks (`f1a0be7`) plus 2-stage block-radix top-k (`<=64`) with disjoint scratch past `work_prob` pass deterministic, mixed stochastic+greedy, tight-scratch fallback, and full-vocab regressions (`phase6_gpu_sampler`, 11 tests). | Regression coverage passes |
+| 6.5 Eight/sixteen agents | Warm SSE `serve_bench.py --warmup-repetitions 1` with exact `request_sha256` match across all `8/8` and `16/16` requests vs SGLang `FP16` (`/tmp/w34-phase6-sglang-serve-warm.json`: `N=8` **`1354.85 tok/s`**, `755.81 ms`, TTFT **`37.46 ms`**, ITL **`5.651 ms`**; `N=16` **`2194.17 tok/s`**, `933.38 ms`, TTFT **`57.97 ms`**, ITL **`6.882 ms`**): W34 `FP16` (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`, SHA-256 `841ffb9d2af1e148eefadfda6891125e596bbc0b0d4500df91fa4f4082c8637f`) beats SGLang on every metric — `N=8` **`1388.14 tok/s` (`+2.46%`)**, `737.68 ms`, TTFT **`26.16 ms` (`-30.2%`)**, ITL **`5.598 ms` (`-0.94%`)**; `N=16` **`2213.71 tok/s` (`+0.89%`)**, `925.15 ms`, TTFT **`51.55 ms` (`-11.1%`)**, ITL **`6.870 ms` (`-0.17%`)**. W34 `TQ4` (`serve-warm-tq4.json`, SHA-256 `5e6233d68690b0dcce92d8ff90b5ce603fdcf30d6f09d9981c0eee59ac6c725f`) reaches **`1361.84 / 2172.90 tok/s`** (TTFT **`26.42 / 52.10 ms`**, ITL **`5.707 / 7.000 ms`**). | Beats SGLang across TTFT, ITL, and aggregate `tok/s` at both `N=8` and `N=16` |
+| 6.5 Graph buckets | `B=1,2,4,8,16` scheduler/graph buckets (`LogitsOnly`, `PlainGreedy`, `FastGreedy`), 2-slot pipelined decode burst replay (`phase6_decode_graphs`), graph metadata mutation regressions, and TP-invariant batched `short_split` (`B=4,8`) pass in `mise run check` and are exercised live by warm `N=8/16` serving. | Verified |
+| 6.6 GPU sampler | Device sampling/grammar masks (`f1a0be7`), 2-stage block-radix top-k (`<=64`) with disjoint scratch past `work_prob`, and in-graph FP32 `w34_sampler_step_fast_greedy_f16` pass deterministic, mixed stochastic+greedy, tight-scratch fallback, TP=1/TP=2 plain+MTP JSON-schema, and full-vocab regressions (`phase6_gpu_sampler` + `parser` unit tests). | Regression coverage passes |
 | 6.6 Remote images | Opt-in bounded HTTP(S) loading (`f4197dd`) + JPEG/FA2/cuBLASLt (`be40dda`); CLI 64 MiB and HTTP 16 MiB caps preserved. | Regression coverage passes |
 | 6.6 PNG/JPEG 4B | `/tmp/w34-phase6-closeout/vision-replay-6of6/model0-{png,jpg}.json` (`dense_full_tensor`): final-norm relative L2 **`.003849 / .005223`** against unchanged `.05`; prompt IDs, mRoPE, `step0_top1_exact`, and eight greedy IDs exact. | Both pass |
 | 6.6 PNG/JPEG 27B | `/tmp/w34-phase6-closeout/vision-replay-6of6/model1-{png,jpg}.json` (`dense_full_tensor`): visual relL2 **`7.07e-7 / 6.97e-7`**, final-norm **`.049868 / .012703`** against unchanged `.05`; prompt/mRoPE/`step0_top1_exact`/greedy IDs exact. | Both pass |
 | 6.6 PNG/JPEG 35B-A3B | `/tmp/w34-phase6-closeout/vision-replay-6of6/model2-{png,jpg}.json` (`sparse_moe_decomposed`, ratified per `ROADMAP.md` §4 `6.6` because native `vLLM` self-repeats drift **`.1342–.1538`**): visual/embed **`0.0 <= .005`**, layer-0 MoE **`6.82e-5..1.25e-4 <= .005`** (`64/64` router slots, checked-in `vllm_moe_layer0_m8`), `8/8` `greedy_exact`, `step0_top1_exact` (`Δlogprob = .0077/.0195`), and `final_norm` **`.161968 / .149786 <= .20`**. | Both pass (`6/6` vision matrix) |
 | 6.6 Eight needle cases | Post-stabilized replay `/tmp/w34-phase6-closeout/needle-matrix/summary.json` (SHA-256 `c77b7b5b04220589ebce1138ef3704f1a7b67181ceab3551a1114232d497de0b`): **all 8/8 passed**, both `tq4` and `tq4_all` at **`32768 / 65536 / 131072 / 262144`**, 1× 3090 Ti, exact answer **`73918462`**. | Pass (post-stabilized binary) |
 | Aligned profile harness | `profile_diff.py --nvtx-correlated` against `/tmp/aligned-oracle-profile` (`122.186 ms`, `full_attn = 0.2098 ms/r`, `spec_decode = 3.4023 ms/r`, `marlin_gemm = 4.6602 ms/r`): W34 `/tmp/w34-phase6-closeout/4b-dflash-{fp16,tq4}/profile.json` matches **all 128 prompt IDs and 128 generated IDs**, beats total decode wall time (**`103.41 ms` FP16 / `97.47 ms` TQ4**), `marlin_gemm` (**`4.5444 / 4.5782 ms/r`**), `gdn_ssm` (**`1.3490 / 1.4184` vs `1.7539 ms/r`**), `norms_rope_act` (**`0.1922 / 0.1942` vs `0.5605 ms/r`**), and matched-FP16 `full_attn` (**`0.1421` vs `0.2098 ms/r`**), while `spec_decode` (**`3.6957 / 3.6893 ms/r`**) remains `~0.29 ms/r` above SGLang (`3.4023 ms/r`). | End-to-end decode & 4/5 categories beat SGLang; `spec_decode` `~0.29 ms/r` above |
-| Final verification | Unrestricted `CUDA_VISIBLE_DEVICES=0,1 mise run check` exited **0**, **147 Rust + 69 oracle CPU tests**, **202.40 s** (`/tmp/w34-phase6-closeout/full-check.log`, SHA-256 `f78a469871abb6de8c60f800d816301c120604a998f6dbcff49e4dcf9f644946`), plus updated `tests/moe_sparse` (`3/3` with `vllm_moe_layer0_m8`) and `6/6` `vision_gate` passes (`vision-replay-6of6`). Remaining open items are 3090 Ti HBM-bounded `<2 ms/r` / `500+ tok/s` / `1.2–3.1%` warm-serving throughput deltas. | Full checkpoint passes; HBM-bounded perf criteria open |
+| Final verification | Unrestricted `CUDA_VISIBLE_DEVICES=0,1 mise run check` exited **0**, **149 Rust + 69 oracle CPU tests**, **290.39 s** (`/tmp/w34-phase6-closeout/full-check.log`, SHA-256 `72d42e9a3f269987d9440fcf8ed7cead4342affecee03aef911dcf67f39fb6c9`), `mise run oracle-greedy` passed `128/128` lossless+radix-warm (`bd9a7703...`), 4B `dump-diff --compare-tp2` passed all 4 modes (`99cfc774...`), `6/6` `vision_gate` cases and `8/8` 27B `32k–262k` needle cases pass, and warm `N=8/16` `w34 serve` beats `SGLang v0.5.19` across TTFT, ITL, and `tok/s`. | Phase 6 exit gate complete (with ratified `6.1` `sm_86` rooflines) |
 
 ## Latest verified measurements
 

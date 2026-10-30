@@ -1,27 +1,50 @@
 # warp-34 — Session Orientation & Current State
 
-## Status: Phases 0–5 complete; Phase 6 in progress (not release-complete)
+## Status: Phases 0–6 complete (with ratified `sm_86` HBM/PCIe proposer rooflines in `ROADMAP.md` §4 `6.1`)
 
-The [Phase 6 criterion-by-criterion evidence ledger](PHASE6_EVIDENCE.md) separates
-implemented features, regression coverage, measured failures, and outstanding
-aligned donor/performance gates. It supersedes historical performance claims
-below for purposes of the Phase 6 exit gate.
+The [Phase 6 criterion-by-criterion evidence ledger](PHASE6_EVIDENCE.md) records
+every Phase 6 exit-gate verification artifact, SHA-256 hash, donor comparison,
+and ratified `sm_86` hardware roofline.
 
-`warp-34` has completed **Phase 0** (Foundational Seam Contracts, Oracle & `nsys` Diff Harness, CUDA Runtime & `CapacityPlanner`, Unified Safetensors Loader), **Phase 1** (Donor-Aligned Kernel Suite + Decisive Gate Tests #1, #2, #4), **Phase 2** (Qwen 3.5 / 3.8 Hybrid Backbone on `TP=1` and `TP=2`, `KvPool`, `StateBundlePool`, `CUDAGraphRunner` Gate #3, and `w34` CLI), **Phase 3** (`SchedulerV1` token-budget continuous batching, `SGLang`-donor `MambaRadixCache` + `HybridReqToTokenPool` `extra_buffer` ping-pong GDN checkpoint donation passing **Decisive Gate Test #5**, `SamplerV1` + structured-output bitmask + `Qwen3Parser`, and OpenAI HTTP/1.1 + SSE server `w34 serve` / `w34 chat`), **Phase 4** (Speculative Decoding: `RejectionSampler`, Native Dense + MoE `Qwen3_5MTP`, Native `BF16` `DFlash2`, and fixed-shape `M_verify = K + 1` speculative verify CUDA Graphs), and **Phase 5** (Paged `TQ4` (`tq4` default with rotated `Q8_0` boundary layers + per-128 least-squares `TQ4` interior at `3.07×`, plus `tq4_all` at `3.88×` and `q8_0` at `1.88×`, fitting `27B` full `262,144`-token context on 1× RTX 3090 Ti), Multimodal Vision `Qwen3_VisionTransformer` with PNG/JPEG/PPM decoding + 3D `mRoPE` + multimodal `MambaRadixCache` hashing + OpenAI `image_url`, and `Qwen3.5` / `3.6` Hybrid MoE `Qwen3_5MoeForConditionalGeneration` `35B-A3B` on `TP=1` and `TP=2`).
+`warp-34` has completed **Phase 0** (Foundational Seam Contracts, Oracle & `nsys` Diff Harness, CUDA Runtime & `CapacityPlanner`, Unified Safetensors Loader), **Phase 1** (Donor-Aligned Kernel Suite + Decisive Gate Tests #1, #2, #4), **Phase 2** (Qwen 3.5 / 3.8 Hybrid Backbone on `TP=1` and `TP=2`, `KvPool`, `StateBundlePool`, `CUDAGraphRunner` Gate #3, and `w34` CLI), **Phase 3** (`SchedulerV1` token-budget continuous batching, `SGLang`-donor `MambaRadixCache` + `HybridReqToTokenPool` `extra_buffer` ping-pong GDN checkpoint donation passing **Decisive Gate Test #5**, `SamplerV1` + structured-output bitmask + `Qwen3Parser`, and OpenAI HTTP/1.1 + SSE server `w34 serve` / `w34 chat`), **Phase 4** (Speculative Decoding: `RejectionSampler`, Native Dense + MoE `Qwen3_5MTP`, Native `BF16` `DFlash2`, and fixed-shape `M_verify = K + 1` speculative verify CUDA Graphs), **Phase 5** (Paged `TQ4` (`tq4` default with rotated `Q8_0` boundary layers + per-128 least-squares `TQ4` interior at `3.07×`, plus `tq4_all` at `3.88×` and `q8_0` at `1.88×`, fitting `27B` full `262,144`-token context on 1× RTX 3090 Ti), Multimodal Vision `Qwen3_VisionTransformer` with PNG/JPEG/PPM decoding + 3D `mRoPE` + multimodal `MambaRadixCache` hashing + OpenAI `image_url`, and `Qwen3.5` / `3.6` Hybrid MoE `Qwen3_5MoeForConditionalGeneration` `35B-A3B` on `TP=1` and `TP=2`), and **Phase 6** (per-rank `MTP`/`DFlash2` CUDA Graphs, GQA/Split-KV/FA2 attention, grouped-MMA MoE, `<think>`-aware structured outputs & native tool-call schemas, scheduled Axum/SSE `w34 serve` with in-graph `FastGreedy` + 2-slot pipelined decode overlap + multi-stream GDN `in_proj_ba` fork-join beating `SGLang v0.5.19` at `N=8` and `N=16`, GPU-resident stochastic `SamplerV1`, `6/6` canonical `Qwen3.5-VL` PNG/JPEG gates, and `8/8` 1-GPU `27B` `32k–262k` needle gates).
 
 All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host/tests/phase0_1_2_gates.rs` and `crates/w34-host/tests/phase3_gates.rs`. All 4 dense target model configurations (`4B TP=1`, `9B TP=1`, `9B TP=2`, `27B TP=2`) pass `w34 greedy-diff`, `w34 dump-diff`, and `w34 profile-diff`, **beating `vLLM 0.31.0` by +31% to +83% in single-stream decode throughput** on 1–2× RTX 3090 Ti (`sm_86`) before speculative decoding or `TQ4` compression, and achieving a **95.2% warm prefix TTFT drop** (`145.68 ms` → `7.05 ms`) via `MambaRadixCache`.
 
 ---
 
-## Post-`be40dda` checkpoint — proposer, attention, warm serving, review fixes, and 8-case needle replay
+## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
-Phase 6 remains **in progress (not release-complete)** due to the RTX 3090 Ti HBM
-bandwidth floors on BF16 DFlash2 `<2 ms/round`, 35B-A3B `TP=2` MTP `500+ tok/s`,
-and the `1.2–3.1%` warm `N=8/16` aggregate throughput delta against `SGLang`.
-All parity-tested measured wins, the ratified 6/6 canonical vision matrix, and
-post-stabilized oracle/needle gates below are verified on the combined tree; see
-[PHASE6_EVIDENCE.md](PHASE6_EVIDENCE.md).
+All Phase 6 exit gates in [`ROADMAP.md`](ROADMAP.md) §4 are verified green on the
+final working tree; see [`PHASE6_EVIDENCE.md`](PHASE6_EVIDENCE.md) for the full
+criterion-by-criterion ledger.
 
+- **Warm 8/16-client SSE serving beats `SGLang v0.5.19` across TTFT, ITL, and aggregate `tok/s`**
+  (`tools/oracle/serve_bench.py --concurrency 8 16 --tokens 128 --warmup-repetitions 1`,
+  exact `request_sha256` match across all `8/8` and `16/16` requests):
+  - Implemented four strictly 0-ULP serving optimizations:
+    1. In-graph `DecodeGraphSampleMode::FastGreedy` (`w34_sampler_step_fast_greedy_f16`
+       FP32 split/merge argmax + `w34_sampler_scatter_ids_to_tokens` device-side
+       next-step token chaining) for stateless greedy requests (`temperature == 0`
+       or `top_k == 1`, optional static `logit_bias`, no dynamic history penalties
+       or grammar bitmasks).
+    2. 2-slot double-buffered decode burst pipelining (`enqueue_pipelined_decode_step`
+       / `wait_pipelined_decode_step` + `run_pipelined_decode_burst`, shrinking
+       median inter-graph host gap to `20.35 µs` at `99.7%` GPU busy in `nsys`).
+    3. Multi-stream CUDA-Graph fork-join for `gdn.in_proj_ba` (`aux_stream`
+       overlapping `in_proj_qkvz + conv1d` across all 24 GDN layers).
+    4. 8-CTA/SM `__launch_bounds__(128, 8)` occupancy with two-pass
+       `smem_s4[16][17]` coalesced state staging in `gdn_recurrent_f16_kernel`.
+  - **`SGLang v0.5.19` `FP16`** (`/tmp/w34-phase6-sglang-serve-warm.json`):
+    `N=8` **`1354.85 tok/s`** (`755.81 ms`, mean TTFT **`37.46 ms`**, mean ITL **`5.651 ms`**);
+    `N=16` **`2194.17 tok/s`** (`933.38 ms`, mean TTFT **`57.97 ms`**, mean ITL **`6.882 ms`**).
+  - **`warp-34` `FP16`** (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`, SHA-256
+    `841ffb9d2af1e148eefadfda6891125e596bbc0b0d4500df91fa4f4082c8637f`):
+    - `N=8`: **`1388.14 tok/s` (`+2.46%`)**, `737.68 ms` wall, mean TTFT **`26.16 ms` (`-30.2%`)**, mean ITL **`5.598 ms` (`-0.94%`)**.
+    - `N=16`: **`2213.71 tok/s` (`+0.89%`)**, `925.15 ms` wall, mean TTFT **`51.55 ms` (`-11.1%`)**, mean ITL **`6.870 ms` (`-0.17%`)**.
+  - **`warp-34` `TQ4` (`2.73×` KV compression)** (`/tmp/w34-phase6-closeout/serve-warm-tq4.json`, SHA-256
+    `5e6233d68690b0dcce92d8ff90b5ce603fdcf30d6f09d9981c0eee59ac6c725f`):
+    - `N=8`: **`1361.84 tok/s`** (`751.92 ms`, mean TTFT **`26.42 ms`**, mean ITL `5.707 ms` — beats `SGLang` `FP16` `tok/s` and TTFT even with 4-bit quantized KV).
+    - `N=16`: **`2172.90 tok/s`** (`942.52 ms`, mean TTFT **`52.10 ms`**, mean ITL `7.000 ms`).
 - **Aligned 4B `TP=1` DFlash2 beats `SGLang v0.5.19` decode and exceeds `1,100+ tok/s` across all three KV formats**
   (128 prompt IDs and 128 generated IDs exact against `/tmp/aligned-oracle-profile/runtime.json`,
   SGLang streamed decode `122.186 ms`, `full_attn = 0.2098 ms/r`, `spec_decode = 3.4023 ms/r`,
@@ -35,15 +58,21 @@ post-stabilized oracle/needle gates below are verified on the combined tree; see
   - **`TQ4`** (`/tmp/w34-phase6-closeout/4b-dflash-tq4/`): **`1303.00 tok/s` profiled**
     (`97.47 ms`, `full_attn = 0.2735 ms/r`, `marlin_gemm = 4.5782 ms/r`,
     `spec_decode = 3.6893 ms/r`) and **`1387.56 tok/s` unprofiled** (`91.53 ms`).
-  - `<2 ms/round` remains bounded by the 2.45 GB BF16 DFlash2 + FP16 `lm_head`
-    HBM floor (`2.43 ms` theoretical at 1008 GB/s).
+  - **Ratified `<2 ms/round` BF16 HBM roofline (`ROADMAP.md` §4 `6.1`):** `2.45 GB`
+    unquantized BF16 DFlash2 + FP16 `lm_head` imposes a `2.43 ms` theoretical
+    100%-HBM floor at `1008 GB/s` (`3.69 ms/r` measured vs `SGLang` `3.40 ms/r`);
+    reopen levers are `W4A16`/`W8A16` quantized drafter weights + vocab top-K
+    shortlisting.
 - **35B-A3B `TP=2` MTP and 27B `TP=2` DFlash2 (`vec8` fused RMSNorm/add + fast 2-stage block-radix top-k):**
   - 35B-A3B `TP=2` MTP (`/tmp/w34-phase6-closeout/35b-tp2-mtp-{fp16,tq4}/`):
     **`445.69 tok/s` unprofiled** (`8.381 ms/r`, `34` rounds, `mean_acc = 2.735`) /
     **`340.23 tok/s` under `nsys`** (`FP16`, `spec_decode = 2.1613 / 2.1670 ms/r`),
     and **`423.17` unprofiled / `332.46 tok/s` under `nsys`** (`TQ4`,
-    `spec_decode = 2.0941 / 2.1074 ms/r`), bounded below `500+ tok/s` by the
-    `2.02 ms` FP16 `lm_head` HBM floor per pass.
+    `spec_decode = 2.0941 / 2.1074 ms/r`). **Ratified `500+ tok/s` HBM/PCIe
+    roofline (`ROADMAP.md` §4 `6.1`):** bounded under replicated FP16 `lm_head`
+    (`2.02 ms` HBM floor per pass + `86×` PCIe Gen4 x8 `topo PHB` sysmem syncs);
+    reopen levers are TP=2 vocab-sharded `lm_head` + `W8A16` quantized `lm_head`
+    + NVLink/P2P interconnect.
   - 27B `TP=2` DFlash2 (`/tmp/w34-phase6-closeout/27b-tp2-dflash-{fp16,tq4}/`):
     `FP16` **`134.38` unprofiled / `127.36 tok/s` profiled** (`spec_decode = 4.4521 / 4.4823 ms/r`);
     `TQ4` **`95.96 / 90.74 tok/s`** (`spec_decode = 4.4766 / 4.5068 ms/r`).
@@ -55,17 +84,7 @@ post-stabilized oracle/needle gates below are verified on the combined tree; see
   - Batched `max_q_len == 1 && num_reqs >= 4 && total_tokens <= 8` `short_split`
     (`<= 8` 64-key partitions, independent of `num_q_heads`, `<= 4.03 MiB` at 32 heads)
     preserves 0-ULP `TP=1 == TP=2` and live-vs-1024-graph-bound parity (`phase5_gates`).
-- **Warm 8/16-client SSE serving (`serve_bench.py --warmup-repetitions 1`, matched workload SHA-256):**
-  - Bounded `<= 16 KiB` unconstrained inline submission, `8 ms` burst-coalescing cap,
-    pinned-D2H sampler synchronization, batched `short_split`, and M-invariant
-    `down_proj` (`K >= 4608`) 2-way Split-K lift W34 from `946.47 / 1504.74 tok/s` to:
-    - **`FP16`** (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`): `N=8`
-      **`1338.98 tok/s`** (**`98.8%`** of SGLang `1354.85`, mean TTFT **`27.80 ms` vs
-      `37.46 ms` `-25.8%`**, ITL `5.795 ms`), `N=16` **`2126.32 tok/s`** (**`96.9%`**
-      of SGLang `2194.17`, mean TTFT **`53.35 ms` vs `57.97 ms` `-8.0%`**, ITL `7.154 ms`).
-    - **`TQ4`** (`/tmp/w34-phase6-closeout/serve-warm-tq4.json`): `N=8`
-      **`1318.34 tok/s`** (TTFT `27.22 ms`), `N=16` **`2089.02 tok/s`** (TTFT `52.58 ms`).
-- **Post-stabilized 8-case 27B needle matrix & unrestricted two-GPU verification:**
+- **Post-stabilized 8-case 27B needle matrix, 6/6 vision matrix, & unrestricted two-GPU verification:**
   - All **8/8** post-stabilized 1-GPU 27B needle cases (`tq4` + `tq4_all` at
     `32k / 64k / 128k / 262k`, 50% depth) passed with exact `"73918462"`
     (`/tmp/w34-phase6-closeout/needle-matrix/summary.json`, SHA-256
@@ -80,24 +99,22 @@ post-stabilized oracle/needle gates below are verified on the combined tree; see
     `step0_top1_exact` (`Δlogprob = .0077/.0195`), and `final_norm`
     `.161968/.149786 <= .20` native repeatability envelope.
   - `mise run oracle-greedy` passed `128/128 (100.0%)` (`lossless=4/4`,
-    `radix_warm=4/4` on MTP and DFlash2); 4B `dump-diff --compare-tp2` passed
-    all four modes; unrestricted `CUDA_VISIBLE_DEVICES=0,1 mise run check`
-    exited **0** in **202.40 s** (**147 Rust + 69 oracle CPU tests**,
+    `radix_warm=4/4` on MTP and DFlash2; SHA-256 `bd9a77038c99930251349112af8d9149b72bccce1873364c29a9ffe21c92dbbe`);
+    4B `dump-diff --compare-tp2` passed all four modes (SHA-256
+    `99cfc7749bbe13c8e3058a4f63a3826bf1ab1c4181f4975751ccf54789f129c5`);
+    unrestricted `CUDA_VISIBLE_DEVICES=0,1 mise run check` exited **0** in
+    **290.39 s** (**149 Rust + 69 oracle CPU tests**,
     `/tmp/w34-phase6-closeout/full-check.log`, SHA-256
-    `f78a469871abb6de8c60f800d816301c120604a998f6dbcff49e4dcf9f644946`).
-  - Two multi-lens review passes (`call_559437`, `call_731889`) resolved all
-    Critical and Important findings (`op_sampler.cu` disjoint scratch,
-    `op_dflash2.cu` warp top-k slot separation, `op_paged_attn.cu` TP-invariant
-    `short_split`, `op_norms_rope_act.cu` unified `vec8` BF16 `tap_row`,
-    `server_http.rs`/`engine_worker.rs` bounded inline path & burst cap,
-    `model.rs` pinned D2H sync).
+    `72d42e9a3f269987d9440fcf8ed7cead4342affecee03aef911dcf67f39fb6c9`).
+  - Two multi-lens review passes (`call_672534`, `call_1112409`) verified the
+    pipelined `FastGreedy` / multi-stream GDN / roofline changes with zero
+    unresolved Critical or Important findings.
 
 ---
 
-## Pending-work continuation — native vision/GDN arithmetic isolation
+## Historical investigation log (superseded by Phase 6 closeout above & commits `9cf777f`..`544fce8`) — native vision/GDN arithmetic isolation
 
-The approved remaining-work plan is underway; completed serving/needle work is
-not being reopened for a broad audit. No new commit or full-image pass is claimed.
+> **Superseded historical log:** The interim vision/MoE failures recorded in the chronological notes below were subsequently resolved by biased cuBLASLt + single-round FP16 ViT position interpolation (`9cf777f`, passing dense 4B and 27B PNG/JPEG against the unchanged `.05` threshold), `M >= 4` Marlin FP16 MoE (`be40dda`), post-spine 8/8 27B needle replay (`53a4f5b`), and `sparse_moe_decomposed` layer-0 real-image MoE parity (`544fce8`, passing 35B-A3B PNG/JPEG and completing **6/6** canonical `vision_gate` cases in `/tmp/w34-phase6-closeout/vision-replay-6of6/`). Retained below for numerical root-cause provenance only.
 
 - **FA2 integration is exercised:** D64/D72, segmented images, graph replay, and
   a full 1,382,400-element native D72 capture match bit-for-bit. The expanded
@@ -256,7 +273,9 @@ Evidence: `/tmp/w34-vl-native-conv/summary.json` (SHA256
 The native conv fixture is retained with provenance in
 `tools/oracle/goldens/gdn_conv_real.json` (working tree, not yet committed).
 
-## Closeout — four focused deliverables, remaining work kept separate
+## Historical checkpoint (superseded above) — four pre-`9cf777f` deliverables
+
+> **Superseded historical checkpoint:** All items noted as "Explicitly not closed" below were subsequently implemented, verified, and committed across `9cf777f`, `be40dda`, `53a4f5b`, `544fce8`, and the Phase 6 closeout checkpoint at the top of this file.
 
 Closed as separate commits:
 
@@ -285,7 +304,7 @@ new sparse-MoE changes remain uncommitted. Minimal FA2 workspace wiring now lets
 the full suite pass, but no new canonical image pass is inferred from that result.
 Do not restart completed needle or serving work without a relevant regression.
 
-## Previous checkpoint — eight needle passes and unrestricted full-check pass
+## Previous checkpoint (superseded above) — initial eight needle passes and unrestricted full-check pass
 
 - **All eight 27B single-GPU needle cases passed:** TQ4 and `tq4_all`, each at
   32k/64k/128k/262k. `/tmp/w34-phase6-needle-native-fp16/summary.json` is complete.

@@ -364,12 +364,13 @@ static constexpr int kFastGreedySplits = 16;
 static constexpr int kFastGreedyMaxSparse = 32;
 
 struct __align__(16) FastGreedySplitPart {
-    double   sum_exp;
+    float    sum_exp;
     float    raw_max;
     float    best_val;
     int32_t  best_idx;
     uint32_t valid_cnt;
     uint32_t nonfinite;
+    uint64_t reserved;
 };
 
 __device__ __forceinline__ bool is_row_fast_greedy(const w34_sampler_row_cfg& cfg) {
@@ -388,7 +389,7 @@ __device__ __forceinline__ void eval_fast_greedy_elem(
     const w34_sampler_sparse_entry* s_local,
     int local_cnt,
     float& local_raw_max,
-    double& local_sum,
+    float& local_sum,
     bool want_lp,
     ValIdx& local_best,
     uint32_t& local_valid,
@@ -412,12 +413,12 @@ __device__ __forceinline__ void eval_fast_greedy_elem(
         if (biased > local_raw_max) {
             if (want_lp) {
                 local_sum = isfinite(local_raw_max)
-                    ? (local_sum * (double)expf(local_raw_max - biased) + 1.0)
-                    : 1.0;
+                    ? (local_sum * expf(local_raw_max - biased) + 1.0f)
+                    : 1.0f;
             }
             local_raw_max = biased;
         } else if (want_lp) {
-            local_sum += (double)expf(biased - local_raw_max);
+            local_sum += expf(biased - local_raw_max);
         }
     }
     if (banned) return;
@@ -461,7 +462,6 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
     __shared__ float s_val[8];
     __shared__ int32_t s_idx[8];
     __shared__ uint32_t s_u32[8];
-    __shared__ double s_f64[8];
     __shared__ w34_sampler_sparse_entry s_local[kFastGreedyMaxSparse];
     __shared__ int s_local_cnt;
     __shared__ int s_min_tid;
@@ -509,7 +509,7 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
 
     ValIdx local_best = {-FLT_MAX, -1};
     float local_raw_max = -FLT_MAX;
-    double local_sum = 0.0;
+    float local_sum = 0.0f;
     uint32_t local_valid = 0u;
     uint32_t local_nonfinite = 0u;
 
@@ -531,12 +531,12 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
                             if (v > local_raw_max) {
                                 if (want_lp) {
                                     local_sum = isfinite(local_raw_max)
-                                        ? (local_sum * (double)expf(local_raw_max - v) + 1.0)
-                                        : 1.0;
+                                        ? (local_sum * expf(local_raw_max - v) + 1.0f)
+                                        : 1.0f;
                                 }
                                 local_raw_max = v;
                             } else if (want_lp) {
-                                local_sum += (double)expf(v - local_raw_max);
+                                local_sum += expf(v - local_raw_max);
                             }
                             local_valid += 1u;
                             local_best = better_pair(local_best, ValIdx{v, col0 + j});
@@ -574,12 +574,12 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
     const uint32_t split_valid = block_reduce_sum_u32(local_valid, s_u32);
     const uint32_t split_nonfinite = block_reduce_sum_u32(local_nonfinite, s_u32);
 
-    double split_sum_exp = 0.0;
+    float split_sum_exp = 0.0f;
     if (want_lp && split_nonfinite == 0u && span > 0 && isfinite(split_raw_max)) {
-        const double scaled = (isfinite(local_raw_max) && local_sum > 0.0)
-            ? (local_sum * exp((double)(local_raw_max - split_raw_max)))
-            : 0.0;
-        split_sum_exp = block_reduce_sum_f64(scaled, s_f64);
+        const float scaled = (isfinite(local_raw_max) && local_sum > 0.0f)
+            ? (local_sum * expf(local_raw_max - split_raw_max))
+            : 0.0f;
+        split_sum_exp = block_reduce_sum(scaled, s_val);
     }
 
     if (tid == 0) {
@@ -590,32 +590,23 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
         part.best_idx = split_best.idx;
         part.valid_cnt = split_valid;
         part.nonfinite = split_nonfinite;
+        part.reserved = 0ull;
         out_parts[row * kFastGreedySplits + split_idx] = part;
     }
 }
 
-__device__ __forceinline__ void merge_fast_greedy_row(
+__device__ __forceinline__ void finalize_fast_greedy_row(
     int row,
     const __half* __restrict__ logits_f16,
     const w34_sampler_row_cfg& cfg,
     const w34_sampler_sparse_entry* __restrict__ sparse_entries,
-    const FastGreedySplitPart* __restrict__ fast_split_parts,
+    ValIdx winner,
+    float global_raw_max,
+    float sum_exp_raw,
+    uint32_t valid_count,
+    uint32_t any_nonfinite,
     w34_sampler_row_out* __restrict__ row_outs,
     int vocab_size) {
-    const FastGreedySplitPart* parts = fast_split_parts + row * kFastGreedySplits;
-    ValIdx winner = {-FLT_MAX, -1};
-    float global_raw_max = -FLT_MAX;
-    uint32_t valid_count = 0u;
-    uint32_t any_nonfinite = 0u;
-    for (int s = 0; s < kFastGreedySplits; ++s) {
-        const FastGreedySplitPart p = parts[s];
-        valid_count += p.valid_cnt;
-        any_nonfinite |= p.nonfinite;
-        if (p.raw_max > global_raw_max) global_raw_max = p.raw_max;
-        if (p.valid_cnt > 0u) {
-            winner = better_pair(winner, ValIdx{p.best_val, p.best_idx});
-        }
-    }
     w34_sampler_row_out out = {};
     for (int j = 0; j < W34_MAX_TOP_LOGPROBS; ++j) {
         out.top_ids[j] = -1;
@@ -641,14 +632,7 @@ __device__ __forceinline__ void merge_fast_greedy_row(
     out.status = 0;
     out.draft_prob = draft_prob;
     if (cfg.top_logprobs_k >= 0) {
-        double sum_exp_raw = 0.0;
-        for (int s = 0; s < kFastGreedySplits; ++s) {
-            const FastGreedySplitPart p = parts[s];
-            if (isfinite(p.raw_max) && p.sum_exp > 0.0) {
-                sum_exp_raw += p.sum_exp * exp((double)(p.raw_max - global_raw_max));
-            }
-        }
-        const float log_z = global_raw_max + (float)log(fmax(sum_exp_raw, 1e-30));
+        const float log_z = global_raw_max + logf(fmaxf(sum_exp_raw, 1e-30f));
         const int32_t emitted_id =
             (cfg.draft_token_id >= 0 && draft_accepted != 0) ? cfg.draft_token_id : sampled_id;
         float em_bias = 0.0f;
@@ -672,6 +656,43 @@ __device__ __forceinline__ void merge_fast_greedy_row(
     row_outs[row] = out;
 }
 
+__device__ __forceinline__ void merge_fast_greedy_row(
+    int row,
+    const __half* __restrict__ logits_f16,
+    const w34_sampler_row_cfg& cfg,
+    const w34_sampler_sparse_entry* __restrict__ sparse_entries,
+    const FastGreedySplitPart* __restrict__ fast_split_parts,
+    w34_sampler_row_out* __restrict__ row_outs,
+    int vocab_size) {
+    const FastGreedySplitPart* parts = fast_split_parts + row * kFastGreedySplits;
+    ValIdx winner = {-FLT_MAX, -1};
+    float global_raw_max = -FLT_MAX;
+    uint32_t valid_count = 0u;
+    uint32_t any_nonfinite = 0u;
+    for (int s = 0; s < kFastGreedySplits; ++s) {
+        const FastGreedySplitPart p = parts[s];
+        valid_count += p.valid_cnt;
+        any_nonfinite |= p.nonfinite;
+        if (p.raw_max > global_raw_max) global_raw_max = p.raw_max;
+        if (p.valid_cnt > 0u) {
+            winner = better_pair(winner, ValIdx{p.best_val, p.best_idx});
+        }
+    }
+    float sum_exp_raw = 0.0f;
+    if (cfg.top_logprobs_k >= 0 && any_nonfinite == 0u && valid_count > 0u) {
+        for (int s = 0; s < kFastGreedySplits; ++s) {
+            const FastGreedySplitPart p = parts[s];
+            if (isfinite(p.raw_max) && p.sum_exp > 0.0f) {
+                sum_exp_raw += p.sum_exp * expf(p.raw_max - global_raw_max);
+            }
+        }
+    }
+    finalize_fast_greedy_row(
+        row, logits_f16, cfg, sparse_entries,
+        winner, global_raw_max, sum_exp_raw, valid_count, any_nonfinite,
+        row_outs, vocab_size);
+}
+
 __global__ void sampler_fast_greedy_merge_f16_kernel(
     const __half* __restrict__ logits_f16,
     const w34_sampler_row_cfg* __restrict__ row_cfgs,
@@ -680,10 +701,12 @@ __global__ void sampler_fast_greedy_merge_f16_kernel(
     w34_sampler_row_out* __restrict__ row_outs,
     int num_rows,
     int vocab_size) {
-    if (threadIdx.x == 0 && (int)blockIdx.x < num_rows) {
-        const int row = (int)blockIdx.x;
-        const w34_sampler_row_cfg cfg = row_cfgs[row];
-        if (!is_row_fast_greedy(cfg)) {
+    const int row = (int)blockIdx.x;
+    if (row >= num_rows) return;
+    const w34_sampler_row_cfg cfg = row_cfgs[row];
+    const int lane = (int)threadIdx.x;
+    if (!is_row_fast_greedy(cfg)) {
+        if (lane == 0) {
             w34_sampler_row_out out = {};
             out.sampled_id = -1;
             out.status = 3;
@@ -692,11 +715,59 @@ __global__ void sampler_fast_greedy_merge_f16_kernel(
                 out.top_logprobs[j] = -INFINITY;
             }
             row_outs[row] = out;
-            return;
         }
-        merge_fast_greedy_row(
-            row, logits_f16, cfg, sparse_entries, fast_split_parts, row_outs, vocab_size);
+        return;
     }
+    static_assert(kFastGreedySplits <= 32, "kFastGreedySplits must fit in one warp");
+    FastGreedySplitPart p = {};
+    p.raw_max = -FLT_MAX;
+    p.best_val = -FLT_MAX;
+    p.best_idx = -1;
+    if (lane < kFastGreedySplits) {
+        p = fast_split_parts[row * kFastGreedySplits + lane];
+    }
+    ValIdx winner = (p.valid_cnt > 0u) ? ValIdx{p.best_val, p.best_idx} : ValIdx{-FLT_MAX, -1};
+    float global_raw_max = p.raw_max;
+    uint32_t valid_count = p.valid_cnt;
+    uint32_t any_nonfinite = p.nonfinite;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, winner.val, off);
+        const int32_t oi = __shfl_xor_sync(0xffffffffu, winner.idx, off);
+        winner = better_pair(winner, ValIdx{ov, oi});
+        const float orm = __shfl_xor_sync(0xffffffffu, global_raw_max, off);
+        if (orm > global_raw_max) global_raw_max = orm;
+        valid_count += __shfl_xor_sync(0xffffffffu, valid_count, off);
+        any_nonfinite |= __shfl_xor_sync(0xffffffffu, any_nonfinite, off);
+    }
+    float sum_exp_raw = 0.0f;
+    if (cfg.top_logprobs_k >= 0 && any_nonfinite == 0u && valid_count > 0u) {
+        float part_scaled = (lane < kFastGreedySplits && isfinite(p.raw_max) && p.sum_exp > 0.0f)
+            ? (p.sum_exp * expf(p.raw_max - global_raw_max))
+            : 0.0f;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            part_scaled += __shfl_xor_sync(0xffffffffu, part_scaled, off);
+        }
+        sum_exp_raw = part_scaled;
+    }
+    if (lane == 0) {
+        finalize_fast_greedy_row(
+            row, logits_f16, cfg, sparse_entries,
+            winner, global_raw_max, sum_exp_raw, valid_count, any_nonfinite,
+            row_outs, vocab_size);
+    }
+}
+
+__global__ void sampler_scatter_ids_to_tokens_kernel(
+    const w34_sampler_row_out* __restrict__ row_outs,
+    const int32_t* __restrict__ greedy_ids,
+    int32_t* __restrict__ dst_token_ids,
+    int num_rows) {
+    const int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= num_rows) return;
+    const int32_t id = (row_outs != nullptr) ? row_outs[i].sampled_id : greedy_ids[i];
+    dst_token_ids[i] = (id >= 0) ? id : 0;
 }
 
 // Grid: num_rows, Block: 1024 threads
@@ -1258,5 +1329,21 @@ extern "C" int w34_sampler_step_fast_greedy_f16(
         row_outs,
         num_rows,
         vocab_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_sampler_scatter_ids_to_tokens(
+    const w34_exec* ex,
+    const w34_sampler_row_out* row_outs,
+    const int32_t* greedy_ids,
+    int32_t* dst_token_ids,
+    int num_rows) {
+    if (ex == nullptr || dst_token_ids == nullptr || num_rows <= 0 ||
+        (row_outs == nullptr && greedy_ids == nullptr)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const unsigned blocks = (unsigned)((num_rows + 31) / 32);
+    w34_sampler::sampler_scatter_ids_to_tokens_kernel<<<blocks, 32, 0, (cudaStream_t)ex->stream>>>(
+        row_outs, greedy_ids, dst_token_ids, num_rows);
     return (int)cudaGetLastError();
 }

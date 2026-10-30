@@ -282,6 +282,13 @@ impl CudaStream {
             scratch_size,
         }
     }
+
+    pub fn wait_event(&self, event: &CudaEvent) -> Result<()> {
+        check_rc(
+            unsafe { ffi::w34_stream_wait_event(self.handle, event.handle) },
+            "w34_stream_wait_event",
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -319,6 +326,10 @@ impl CudaEvent {
             unsafe { ffi::w34_set_device(self.device_id) },
             "w34_set_device",
         )?;
+        self.record_in_current_ctx(stream)
+    }
+
+    pub fn record_in_current_ctx(&self, stream: &CudaStream) -> Result<()> {
         check_rc(
             unsafe { ffi::w34_event_record(self.handle, stream.handle) },
             "w34_event_record",
@@ -1759,6 +1770,18 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )
         },
         "warmup w34_sampler_step_f16 fast_greedy",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_sampler_scatter_ids_to_tokens(
+                &ex_sampler,
+                sampler_out_dev as *const ffi::W34SamplerRowOut,
+                core::ptr::null(),
+                buf_b as *mut i32,
+                1,
+            )
+        },
+        "warmup w34_sampler_scatter_ids_to_tokens",
     )?;
     check_rc(
         unsafe {

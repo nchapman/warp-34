@@ -441,6 +441,12 @@ int w34_sampler_step_fast_greedy_f16(const w34_exec* ex,
                                      int num_rows,
                                      int vocab_size);
 
+int w34_sampler_scatter_ids_to_tokens(const w34_exec* ex,
+                                      const w34_sampler_row_out* row_outs,
+                                      const int32_t* greedy_ids,
+                                      int32_t* dst_token_ids,
+                                      int num_rows);
+
 // Rejection outputs: emitted [R,k+1], accepted [R], status [R].
 // Only emitted[0..accepted+1] is live; suffix is -1. Masked requests return
 // accepted=-1,status=0; invalid request data returns accepted=-1,status=1.

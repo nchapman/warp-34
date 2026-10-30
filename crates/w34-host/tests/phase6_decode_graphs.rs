@@ -1,13 +1,18 @@
 //! Padded multi-request decode graph replay versus eager execution.
 #![cfg(feature = "cuda")]
 
+use std::sync::Mutex;
+
 use w34_host::{
     cache::KvFormatPolicy,
     model::{EngineBatchSlice, Qwen3_5Engine},
 };
 
+static GPU_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn decode_buckets_replay_mutated_requests_match_eager() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for tp in [1, 2] {
         let mut engine = Qwen3_5Engine::load(
             "nchapman/Qwen3.5-4B-W4A16-GPTQ",
@@ -96,4 +101,114 @@ fn decode_buckets_replay_mutated_requests_match_eager() {
             vec![(1, false), (2, false), (4, false), (8, false), (16, false)]
         );
     }
+}
+
+#[test]
+fn pipelined_fast_greedy_burst_matches_single_and_handles_staggered_finish_and_chunk_boundary() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::sync::atomic::Ordering;
+    use w34_host::{
+        engine_worker::GenerationEvent, parser::SamplingParams, server::OpenAiServerState,
+    };
+
+    let prompts: Vec<Vec<i32>> = vec![
+        vec![785, 6722, 315, 9625, 374],
+        vec![198, 2610, 525, 264, 10950],
+        vec![3838, 374, 220, 17, 10, 17],
+        vec![760, 1143, 279, 810, 419],
+    ];
+    let lengths = [12usize, 70, 25, 70];
+
+    let mut ref_engine = Qwen3_5Engine::load(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        1,
+        KvFormatPolicy::Fp16,
+        Some(128),
+        false,
+    )
+    .unwrap();
+    let expected: Vec<Vec<i32>> = prompts
+        .iter()
+        .zip(lengths)
+        .map(|(p, len)| {
+            ref_engine
+                .generate_tokens(p, len, false)
+                .unwrap()
+                .generated_token_ids
+        })
+        .collect();
+    drop(ref_engine);
+
+    let state = OpenAiServerState::from_loader("pipelined-fast-greedy".into(), false, || {
+        Qwen3_5Engine::load(
+            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+            1,
+            KvFormatPolicy::Fp16,
+            Some(128),
+            true,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .unwrap();
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut streams = Vec::new();
+            for (p, len) in prompts.iter().zip(lengths) {
+                streams.push(
+                    state
+                        .worker
+                        .submit(
+                            p.clone(),
+                            SamplingParams {
+                                max_tokens: len,
+                                temperature: 0.0,
+                                ignore_eos: true,
+                                logprobs: true,
+                                top_logprobs: 0,
+                                ..SamplingParams::default()
+                            },
+                            None,
+                        )
+                        .unwrap(),
+                );
+            }
+
+            let mut tasks = Vec::new();
+            for mut s in streams {
+                tasks.push(tokio::spawn(async move {
+                    let mut ids = Vec::new();
+                    while let Some(ev) = s.events.recv().await {
+                        match ev {
+                            GenerationEvent::Token { id, logprobs } => {
+                                let lp = logprobs.expect("fast greedy must emit logprobs");
+                                assert_eq!(lp.token_id, id);
+                                assert!(lp.logprob.is_finite());
+                                assert!(lp.top_logprobs.is_empty());
+                                ids.push(id);
+                            }
+                            GenerationEvent::Finished {
+                                generated_tokens, ..
+                            } => {
+                                assert_eq!(generated_tokens, ids.len());
+                                break;
+                            }
+                            GenerationEvent::Error(e) => panic!("unexpected worker error: {e}"),
+                        }
+                    }
+                    ids
+                }));
+            }
+
+            for (i, t) in tasks.into_iter().enumerate() {
+                let got = t.await.unwrap();
+                assert_eq!(got, expected[i], "pipelined burst mismatch on req {i}");
+            }
+            assert_eq!(state.worker.stats.active.load(Ordering::Relaxed), 0);
+            assert_eq!(state.worker.stats.completed.load(Ordering::Relaxed), 4);
+            state.worker.shutdown().await.unwrap();
+        });
 }

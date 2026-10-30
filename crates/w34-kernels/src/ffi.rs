@@ -730,6 +730,13 @@ unsafe extern "C" {
         num_rows: i32,
         vocab_size: i32,
     ) -> i32;
+    pub fn w34_sampler_scatter_ids_to_tokens(
+        ex: *const W34Exec,
+        row_outs: *const W34SamplerRowOut,
+        greedy_ids: *const i32,
+        dst_token_ids: *mut i32,
+        num_rows: i32,
+    ) -> i32;
 
     pub fn w34_embed_lookup_f16_to_bf16(
         ex: *const W34Exec,

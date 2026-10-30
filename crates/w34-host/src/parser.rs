@@ -363,6 +363,32 @@ impl SamplerV1 {
         false
     }
 
+    /// Returns true when this row satisfies `w34_sampler_step_fast_greedy_f16` (`is_row_fast_greedy`)
+    /// AND its `W34SamplerRowCfg` + `W34SamplerSparseEntry` slice are invariant across subsequent
+    /// decode steps (no stateful grammar constraint, no history-dependent penalties or `min_tokens`
+    /// transition, and no multi-token `stop_strings`).
+    pub fn is_fast_greedy_stateless(&self, model_eos_len: usize) -> bool {
+        let is_greedy = self.params.temperature <= 1e-6 || self.params.top_k == 1;
+        let lp_at_most_zero = !self.params.logprobs || self.params.top_logprobs == 0;
+        let no_penalties = (self.params.repetition_penalty - 1.0).abs() <= 1e-6
+            && self.params.frequency_penalty.abs() <= 1e-6
+            && self.params.presence_penalty.abs() <= 1e-6;
+        let past_min_tokens = self.output_history.len() >= self.params.min_tokens;
+        let max_sparse = self.params.logit_bias.len()
+            + if self.params.ignore_eos {
+                model_eos_len + self.params.eos_token_ids.len()
+            } else {
+                0
+            };
+        self.constraint.is_none()
+            && is_greedy
+            && lp_at_most_zero
+            && no_penalties
+            && past_min_tokens
+            && self.params.stop_strings.is_empty()
+            && max_sparse <= 32
+    }
+
     /// Appends one row's GPU sampler config, optional packed grammar bitmask words, and
     /// deduplicated sparse penalty/bias/ban entries for `w34_sampler_step_f16`.
     #[allow(clippy::too_many_arguments)]
@@ -927,5 +953,86 @@ impl Qwen3Parser {
         let mut p = Self::new(enable_thinking);
         let _ = p.push_str(text);
         p.finish().1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_greedy_stateless_classification() {
+        let base = SamplingParams {
+            temperature: 0.0,
+            logprobs: true,
+            top_logprobs: 0,
+            ignore_eos: true,
+            ..SamplingParams::default()
+        };
+        assert!(SamplerV1::new(base.clone(), &[], None).is_fast_greedy_stateless(2));
+
+        let top_k_one = SamplingParams {
+            temperature: 0.8,
+            top_k: 1,
+            logprobs: true,
+            ..base.clone()
+        };
+        assert!(SamplerV1::new(top_k_one, &[], None).is_fast_greedy_stateless(2));
+
+        // Plain greedy rows are also stateless-fast-greedy compatible (allowing mixed
+        // plain + logprob=0 batches to pipeline together), while an all-plain batch
+        // selects the lighter `PlainGreedy` graph via `!needs_gpu`.
+        let plain = SamplingParams {
+            temperature: 0.0,
+            logprobs: false,
+            ..SamplingParams::default()
+        };
+        assert!(plain.is_plain_greedy(false));
+        assert!(SamplerV1::new(plain, &[], None).is_fast_greedy_stateless(2));
+
+        // Stateful or stochastic parameters must not be classified as stateless fast greedy.
+        for bad in [
+            SamplingParams {
+                temperature: 0.7,
+                ..base.clone()
+            },
+            SamplingParams {
+                top_logprobs: 1,
+                ..base.clone()
+            },
+            SamplingParams {
+                min_tokens: 1,
+                ignore_eos: false,
+                ..base.clone()
+            },
+            SamplingParams {
+                repetition_penalty: 1.1,
+                ..base.clone()
+            },
+            SamplingParams {
+                frequency_penalty: 0.1,
+                ..base.clone()
+            },
+            SamplingParams {
+                presence_penalty: 0.1,
+                ..base.clone()
+            },
+            SamplingParams {
+                stop_strings: vec!["STOP".into()],
+                ..base.clone()
+            },
+        ] {
+            assert!(!SamplerV1::new(bad, &[], None).is_fast_greedy_stateless(2));
+        }
+
+        let mask = TokenBitmaskConstraint::from_allowed_tokens(1024, vec![1, 2, 3]);
+        assert!(!SamplerV1::new(base.clone(), &[], Some(mask)).is_fast_greedy_stateless(2));
+
+        let mut too_many_biases = base;
+        for tok in 0..27 {
+            too_many_biases.logit_bias.insert(tok, 1.0);
+        }
+        assert!(SamplerV1::new(too_many_biases.clone(), &[], None).is_fast_greedy_stateless(1));
+        assert!(!SamplerV1::new(too_many_biases, &[], None).is_fast_greedy_stateless(2));
     }
 }

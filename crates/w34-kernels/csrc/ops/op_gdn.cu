@@ -136,6 +136,75 @@ __global__ void gdn_causal_conv1d_f16_kernel(
     }
 }
 
+template <int NW>
+__device__ __forceinline__ void gdn_load_coalesced_s4(
+    float4 (&smem_s4)[16][17],
+    const float4* __restrict__ row_in4,
+    int vi,
+    int wk,
+    float (&rr)[16]) {
+    smem_s4[vi][0 * NW + wk] = __ldg(&row_in4[0 * NW + wk]);
+    smem_s4[vi][1 * NW + wk] = __ldg(&row_in4[1 * NW + wk]);
+    __syncwarp();
+    if (wk < 4) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float4 v4 = smem_s4[vi][wk * 4 + j];
+            rr[j * 4 + 0] = v4.x;
+            rr[j * 4 + 1] = v4.y;
+            rr[j * 4 + 2] = v4.z;
+            rr[j * 4 + 3] = v4.w;
+        }
+    }
+    __syncwarp();
+    smem_s4[vi][0 * NW + wk] = __ldg(&row_in4[2 * NW + wk]);
+    smem_s4[vi][1 * NW + wk] = __ldg(&row_in4[3 * NW + wk]);
+    __syncwarp();
+    if (wk >= 4) {
+        const int half_wk = wk - 4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float4 v4 = smem_s4[vi][half_wk * 4 + j];
+            rr[j * 4 + 0] = v4.x;
+            rr[j * 4 + 1] = v4.y;
+            rr[j * 4 + 2] = v4.z;
+            rr[j * 4 + 3] = v4.w;
+        }
+    }
+}
+
+template <int NW>
+__device__ __forceinline__ void gdn_store_coalesced_s4(
+    float4 (&smem_s4)[16][17],
+    float4* __restrict__ row_out4,
+    int vi,
+    int wk,
+    const float (&rr)[16]) {
+    __syncwarp();
+    if (wk < 4) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            smem_s4[vi][wk * 4 + j] = make_float4(
+                rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+        }
+    }
+    __syncwarp();
+    row_out4[0 * NW + wk] = smem_s4[vi][0 * NW + wk];
+    row_out4[1 * NW + wk] = smem_s4[vi][1 * NW + wk];
+    __syncwarp();
+    if (wk >= 4) {
+        const int half_wk = wk - 4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            smem_s4[vi][half_wk * 4 + j] = make_float4(
+                rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+        }
+    }
+    __syncwarp();
+    row_out4[2 * NW + wk] = smem_s4[vi][0 * NW + wk];
+    row_out4[3 * NW + wk] = smem_s4[vi][1 * NW + wk];
+}
+
 // Ported from vllm.cpp GdnDecodeFusedKernel / GdnSpecDecodeFusedKernel with in-kernel
 // q/k L2-normalization and g/beta gating:
 // Grid: (dv / BV, num_reqs * num_v_heads), where BV = 16, NW = 8, threads = 128.
@@ -143,8 +212,10 @@ __global__ void gdn_causal_conv1d_f16_kernel(
 // Each row vi in 0..16 is partitioned across NW=8 consecutive lanes (16 dk cols/lane),
 // so the dot product and state update stay in registers (`rr[16]`) with an 8-lane
 // `__shfl_xor_sync` butterfly reduction!
+// `__launch_bounds__(BV * NW, 8)` + two-pass `smem_s4[16][17]` (`4.35 KiB` + `1.03 KiB` =
+// `5.38 KiB`/CTA) fits 8 CTAs/SM (`1024` resident threads/SM, up from 5 CTAs/SM) on `sm_86`.
 template <int BV, int NW>
-__global__ void gdn_recurrent_f16_kernel(
+__global__ __launch_bounds__(BV * NW, 8) void gdn_recurrent_f16_kernel(
     w34_gdn_batch batch,
     const __half* __restrict__ qkv_conv_out,
     const __half* __restrict__ q_in,
@@ -186,10 +257,10 @@ __global__ void gdn_recurrent_f16_kernel(
 
     // Load initial [BV, head_k_dim] FP32 state slice into registers rr[16].
     // When NW == 8 and head_k_dim == 128, all 8 lanes wk = 0..7 of row vi reside in the
-    // same warp, so staging through smem_s4[16][33] converts 64-byte-strided global float4
-    // accesses into 100%-coalesced contiguous 128-byte warp accesses while preserving
-    // bit-exact 0-ULP register ownership rr[0..15].
-    __shared__ float4 smem_s4[16][33];
+    // same warp, so two-pass staging through smem_s4[16][17] converts 64-byte-strided global
+    // float4 accesses into 100%-coalesced contiguous 128-byte warp accesses while preserving
+    // bit-exact 0-ULP register ownership rr[0..15] and fitting 8 CTAs/SM on sm_86.
+    __shared__ float4 smem_s4[16][17];
     const bool coalesced_s4 = (NW == 8) && (BV == 16) && (head_k_dim == 128) && ((vbase + BV) <= head_v_dim);
     float rr[16];
 #pragma unroll
@@ -203,19 +274,7 @@ __global__ void gdn_recurrent_f16_kernel(
             const float4* row_in4 = reinterpret_cast<const float4*>(
                 ssm_state_pool + ((size_t)slot_in * num_v_heads + hv) * head_state_elems +
                 (size_t)vrow * head_k_dim);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                smem_s4[vi][j * 8 + wk] = __ldg(&row_in4[j * 8 + wk]);
-            }
-            __syncwarp();
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float4 v4 = smem_s4[vi][wk * 4 + j];
-                rr[j * 4 + 0] = v4.x;
-                rr[j * 4 + 1] = v4.y;
-                rr[j * 4 + 2] = v4.z;
-                rr[j * 4 + 3] = v4.w;
-            }
+            gdn_load_coalesced_s4<NW>(smem_s4, row_in4, vi, wk, rr);
         } else if (vrow < head_v_dim) {
             const float* s_in = ssm_state_pool
                                 + ((size_t)slot_in * num_v_heads + hv) * head_state_elems
@@ -325,20 +384,10 @@ __global__ void gdn_recurrent_f16_kernel(
             const int32_t spec_slot = batch.spec_state_indices[req * batch.max_verify_tokens + step];
             if (spec_slot >= 0 && spec_slot < total_state_slots) {
                 if (coalesced_s4) {
-                    __syncwarp();
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        smem_s4[vi][wk * 4 + j] = make_float4(
-                            rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
-                    }
-                    __syncwarp();
                     float4* row_spec4 = reinterpret_cast<float4*>(
                         ssm_state_pool + ((size_t)spec_slot * num_v_heads + hv) * head_state_elems +
                         (size_t)vrow * head_k_dim);
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        row_spec4[j * 8 + wk] = smem_s4[vi][j * 8 + wk];
-                    }
+                    gdn_store_coalesced_s4<NW>(smem_s4, row_spec4, vi, wk, rr);
                     if (step == seqlen - 1) last_spec_slot = spec_slot;
                 } else if (vrow < head_v_dim) {
                     float* s_spec = ssm_state_pool
@@ -363,20 +412,10 @@ __global__ void gdn_recurrent_f16_kernel(
                     const int32_t chk_slot = batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
                     if (chk_slot >= 0 && chk_slot < total_state_slots) {
                         if (coalesced_s4) {
-                            __syncwarp();
-#pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                smem_s4[vi][wk * 4 + j] = make_float4(
-                                    rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
-                            }
-                            __syncwarp();
                             float4* row_chk4 = reinterpret_cast<float4*>(
                                 ssm_state_pool + ((size_t)chk_slot * num_v_heads + hv) * head_state_elems +
                                 (size_t)vrow * head_k_dim);
-#pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                row_chk4[j * 8 + wk] = smem_s4[vi][j * 8 + wk];
-                            }
+                            gdn_store_coalesced_s4<NW>(smem_s4, row_chk4, vi, wk, rr);
                         } else if (vrow < head_v_dim) {
                             float* s_chk = ssm_state_pool
                                            + ((size_t)chk_slot * num_v_heads + hv) * head_state_elems
@@ -399,20 +438,10 @@ __global__ void gdn_recurrent_f16_kernel(
         const int32_t slot_out = batch.state_out_indices[req];
         if (slot_out >= 0 && slot_out < total_state_slots && slot_out != last_spec_slot) {
             if (coalesced_s4) {
-                __syncwarp();
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    smem_s4[vi][wk * 4 + j] = make_float4(
-                        rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
-                }
-                __syncwarp();
                 float4* row_out4 = reinterpret_cast<float4*>(
                     ssm_state_pool + ((size_t)slot_out * num_v_heads + hv) * head_state_elems +
                     (size_t)vrow * head_k_dim);
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    row_out4[j * 8 + wk] = smem_s4[vi][j * 8 + wk];
-                }
+                gdn_store_coalesced_s4<NW>(smem_s4, row_out4, vi, wk, rr);
             } else if (vrow < head_v_dim) {
                 float* s_out = ssm_state_pool
                                + ((size_t)slot_out * num_v_heads + hv) * head_state_elems

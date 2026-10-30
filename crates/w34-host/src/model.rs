@@ -1314,44 +1314,109 @@ pub fn decode_graph_bucket(num_reqs: usize) -> Option<usize> {
     }
 }
 
+/// Sampler mode captured inside a `batched_decode_graph`.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DecodeGraphSampleMode {
+    LogitsOnly,
+    PlainGreedy,
+    FastGreedy,
+}
+
+#[cfg(feature = "cuda")]
+pub struct InFlightDecodeTicket {
+    pub slot: usize,
+    pub num_reqs: usize,
+    pub fast_greedy: bool,
+}
+
+#[cfg(feature = "cuda")]
+pub enum PipelinedDecodeOutput {
+    PlainGreedy(Vec<i32>),
+    FastGreedy(Vec<ffi::W34SamplerRowOut>),
+}
+
 /// Static device buffers used for padded multi-request `B in {1, 2, 4, 8, 16}` decode
 /// CUDA Graph capture and replay (`valid_req_mask` + `valid_token_mask` padding).
 #[cfg(feature = "cuda")]
 pub struct BatchedDecodeGraphIo {
     pub meta_i32: DeviceBuffer,
-    pub masks_u8: DeviceBuffer,
     pub block_tables: DeviceBuffer,
     pub out_greedy_ids: DeviceBuffer,
+    pub fast_greedy_cfgs: DeviceBuffer,
+    pub fast_greedy_sparse: DeviceBuffer,
+    pub fast_greedy_outs: DeviceBuffer,
     pub pinned_staging: crate::cuda::MappedHostBuffer,
     pub pinned_in_flight: std::sync::atomic::AtomicBool,
     pub pinned_sampler_in_flight: std::sync::atomic::AtomicBool,
+    pub cached_block_tables: std::sync::Mutex<Vec<Vec<i32>>>,
+    pub cached_fast_greedy_cfgs: std::sync::Mutex<Vec<u8>>,
+    pub cached_fast_greedy_sparse: std::sync::Mutex<Vec<u8>>,
+    pub pipeline_done_events: [crate::cuda::CudaEvent; 2],
     pub max_blocks_per_req: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl BatchedDecodeGraphIo {
+    pub const TOKEN_IDS_BYTES: usize = MAX_BATCHED_DECODE_REQS * 4;
+    pub const MASKS_DEV_OFFSET: usize = (BATCHED_DECODE_META_I32_LEN * 4 + 63) & !63;
+    pub const META_AND_MASKS_BYTES: usize = Self::MASKS_DEV_OFFSET + BATCHED_DECODE_MASKS_U8_LEN;
+    pub const MAX_FAST_GREEDY_SPARSE: usize = MAX_BATCHED_DECODE_REQS * 32;
     pub const PINNED_META_BYTES: usize = 160 * 1024;
     pub const PINNED_SAMPLER_OFFSET: usize = 160 * 1024;
     pub const PINNED_SAMPLER_BYTES: usize = 96 * 1024;
+    pub const PINNED_PIPELINE_OUT_OFFSET: usize = 224 * 1024;
+    pub const PINNED_SLOT_BYTES: usize = Self::PINNED_META_BYTES + Self::PINNED_SAMPLER_BYTES;
 
     pub fn new(device_id: i32, max_blocks_per_req: usize, _stream: &CudaStream) -> Result<Self> {
         let max_blocks = max_blocks_per_req.max(1);
-        let meta_i32 = DeviceBuffer::alloc(device_id, BATCHED_DECODE_META_I32_LEN * 4)?;
-        let masks_u8 = DeviceBuffer::alloc(device_id, BATCHED_DECODE_MASKS_U8_LEN)?;
+        let meta_i32 = DeviceBuffer::alloc(device_id, Self::META_AND_MASKS_BYTES)?;
         let block_tables =
             DeviceBuffer::alloc(device_id, MAX_BATCHED_DECODE_REQS * max_blocks * 4)?;
         let out_greedy_ids = DeviceBuffer::alloc(device_id, MAX_BATCHED_DECODE_REQS * 4)?;
-        let pinned_staging = crate::cuda::MappedHostBuffer::alloc(
-            Self::PINNED_META_BYTES + Self::PINNED_SAMPLER_BYTES,
+        let fast_greedy_cfgs = DeviceBuffer::alloc(
+            device_id,
+            MAX_BATCHED_DECODE_REQS * core::mem::size_of::<ffi::W34SamplerRowCfg>(),
         )?;
+        let fast_greedy_sparse = DeviceBuffer::alloc(
+            device_id,
+            Self::MAX_FAST_GREEDY_SPARSE * core::mem::size_of::<ffi::W34SamplerSparseEntry>(),
+        )?;
+        let fast_greedy_outs = DeviceBuffer::alloc(
+            device_id,
+            MAX_BATCHED_DECODE_REQS * core::mem::size_of::<ffi::W34SamplerRowOut>(),
+        )?;
+        let pinned_staging = crate::cuda::MappedHostBuffer::alloc(2 * Self::PINNED_SLOT_BYTES)?;
+        let pipeline_done_events = [
+            crate::cuda::CudaEvent::new(device_id, false)?,
+            crate::cuda::CudaEvent::new(device_id, false)?,
+        ];
+        unsafe {
+            for slot in 0..2 {
+                core::ptr::write_bytes(
+                    pinned_staging
+                        .host_ptr
+                        .cast::<u8>()
+                        .add(slot * Self::PINNED_SLOT_BYTES),
+                    0,
+                    Self::META_AND_MASKS_BYTES,
+                );
+            }
+        }
         Ok(Self {
             meta_i32,
-            masks_u8,
             block_tables,
             out_greedy_ids,
+            fast_greedy_cfgs,
+            fast_greedy_sparse,
+            fast_greedy_outs,
             pinned_staging,
             pinned_in_flight: std::sync::atomic::AtomicBool::new(false),
             pinned_sampler_in_flight: std::sync::atomic::AtomicBool::new(false),
+            cached_block_tables: std::sync::Mutex::new(Vec::new()),
+            cached_fast_greedy_cfgs: std::sync::Mutex::new(Vec::new()),
+            cached_fast_greedy_sparse: std::sync::Mutex::new(Vec::new()),
+            pipeline_done_events,
             max_blocks_per_req: max_blocks,
         })
     }
@@ -1399,15 +1464,15 @@ impl BatchedDecodeGraphIo {
     }
     #[inline]
     pub fn has_initial_state_ptr(&self) -> u64 {
-        self.masks_u8.addr()
+        self.meta_i32.addr() + Self::MASKS_DEV_OFFSET as u64
     }
     #[inline]
     pub fn valid_req_mask_ptr(&self) -> u64 {
-        self.masks_u8.addr() + MAX_BATCHED_DECODE_REQS as u64
+        self.has_initial_state_ptr() + MAX_BATCHED_DECODE_REQS as u64
     }
     #[inline]
     pub fn valid_token_mask_ptr(&self) -> u64 {
-        self.masks_u8.addr() + (2 * MAX_BATCHED_DECODE_REQS) as u64
+        self.has_initial_state_ptr() + (2 * MAX_BATCHED_DECODE_REQS) as u64
     }
 
     pub fn pack_meta(
@@ -1480,15 +1545,27 @@ impl BatchedDecodeGraphIo {
         slices: &[EngineBatchSlice<'_>],
         stream: &CudaStream,
     ) -> Result<()> {
+        self.upload_inputs_slot(0, meta, masks, slices, false, false, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_inputs_slot(
+        &self,
+        slot: usize,
+        meta: &[i32; BATCHED_DECODE_META_I32_LEN],
+        masks: &[u8; BATCHED_DECODE_MASKS_U8_LEN],
+        slices: &[EngineBatchSlice<'_>],
+        tokens_already_on_device: bool,
+        pipelined: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let slot = slot & 1;
         let meta_bytes = BATCHED_DECODE_META_I32_LEN * 4;
-        if meta_bytes > self.meta_i32.len_bytes {
+        if Self::META_AND_MASKS_BYTES > self.meta_i32.len_bytes {
             return Err(loader_err("batched decode meta_i32 buffer too small"));
         }
-        if BATCHED_DECODE_MASKS_U8_LEN > self.masks_u8.len_bytes {
-            return Err(loader_err("batched decode masks_u8 buffer too small"));
-        }
-        let masks_off = (meta_bytes + 63) & !63;
-        let bt_off = (masks_off + BATCHED_DECODE_MASKS_U8_LEN + 63) & !63;
+        let masks_off = Self::MASKS_DEV_OFFSET;
+        let bt_off = (Self::META_AND_MASKS_BYTES + 63) & !63;
         let row_bytes = self.max_blocks_per_req * 4;
         let mut last_bt_end = 0usize;
         for (r, s) in slices.iter().enumerate() {
@@ -1504,52 +1581,73 @@ impl BatchedDecodeGraphIo {
         if last_bt_end > self.block_tables.len_bytes {
             return Err(loader_err("batched decode block_tables buffer too small"));
         }
-        if bt_off + last_bt_end <= Self::PINNED_META_BYTES.min(self.pinned_staging.len_bytes) {
-            if self
-                .pinned_in_flight
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        let bt_unchanged = {
+            let guard = self.cached_block_tables.lock().unwrap();
+            guard.len() == slices.len()
+                && guard
+                    .iter()
+                    .zip(slices)
+                    .all(|(c, s)| c.as_slice() == s.block_table)
+        };
+        let slot_end = (slot + 1) * Self::PINNED_SLOT_BYTES;
+        if bt_off + last_bt_end <= Self::PINNED_META_BYTES
+            && slot_end <= self.pinned_staging.len_bytes
+        {
+            let _ = pipelined;
+            if slot == 0
+                && self
+                    .pinned_in_flight
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
             {
                 stream.synchronize()?;
             }
-            let base = self.pinned_staging.host_ptr.cast::<u8>();
+            let base = unsafe {
+                self.pinned_staging
+                    .host_ptr
+                    .cast::<u8>()
+                    .add(slot * Self::PINNED_SLOT_BYTES)
+            };
+            let h2d_off = if tokens_already_on_device {
+                Self::TOKEN_IDS_BYTES
+            } else {
+                0
+            };
             unsafe {
-                core::ptr::copy_nonoverlapping(meta.as_ptr().cast::<u8>(), base, meta_bytes);
+                core::ptr::copy_nonoverlapping(
+                    meta.as_ptr().cast::<u8>().add(h2d_off),
+                    base.add(h2d_off),
+                    meta_bytes - h2d_off,
+                );
                 core::ptr::copy_nonoverlapping(
                     masks.as_ptr(),
                     base.add(masks_off),
                     BATCHED_DECODE_MASKS_U8_LEN,
                 );
-                for (r, s) in slices.iter().enumerate() {
-                    if !s.block_table.is_empty() {
-                        core::ptr::copy_nonoverlapping(
-                            s.block_table.as_ptr().cast::<u8>(),
-                            base.add(bt_off + r * row_bytes),
-                            s.block_table.len() * 4,
-                        );
+                if !bt_unchanged {
+                    for (r, s) in slices.iter().enumerate() {
+                        if !s.block_table.is_empty() {
+                            core::ptr::copy_nonoverlapping(
+                                s.block_table.as_ptr().cast::<u8>(),
+                                base.add(bt_off + r * row_bytes),
+                                s.block_table.len() * 4,
+                            );
+                        }
                     }
                 }
-                // Arm before the first async H2D so a later error cannot leave an untracked DMA.
-                self.pinned_in_flight
-                    .store(true, std::sync::atomic::Ordering::Release);
+                if slot == 0 {
+                    self.pinned_in_flight
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 check_rc(
                     ffi::w34_memcpy_h2d_async(
-                        self.meta_i32.addr() as *mut c_void,
-                        base.cast(),
-                        meta_bytes,
+                        (self.meta_i32.addr() + h2d_off as u64) as *mut c_void,
+                        base.add(h2d_off).cast(),
+                        Self::META_AND_MASKS_BYTES - h2d_off,
                         stream.handle,
                     ),
-                    "upload pinned batched decode meta",
+                    "upload pinned batched decode meta+masks",
                 )?;
-                check_rc(
-                    ffi::w34_memcpy_h2d_async(
-                        self.masks_u8.addr() as *mut c_void,
-                        base.add(masks_off).cast(),
-                        BATCHED_DECODE_MASKS_U8_LEN,
-                        stream.handle,
-                    ),
-                    "upload pinned batched decode masks",
-                )?;
-                if last_bt_end > 0 {
+                if !bt_unchanged && last_bt_end > 0 {
                     check_rc(
                         ffi::w34_memcpy_h2d_async(
                             self.block_tables.addr() as *mut c_void,
@@ -1561,25 +1659,188 @@ impl BatchedDecodeGraphIo {
                     )?;
                 }
             }
+            if !bt_unchanged {
+                let mut guard = self.cached_block_tables.lock().unwrap();
+                guard.clear();
+                guard.extend(slices.iter().map(|s| s.block_table.to_vec()));
+            }
             return Ok(());
         }
-        self.meta_i32.copy_from_host(meta, stream)?;
-        self.masks_u8.copy_from_host(masks, stream)?;
-        let bt_base = self.block_tables.addr();
-        for (r, s) in slices.iter().enumerate() {
-            if !s.block_table.is_empty() {
+        let mut combined = [0u8; Self::META_AND_MASKS_BYTES];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                meta.as_ptr().cast::<u8>(),
+                combined.as_mut_ptr(),
+                meta_bytes,
+            );
+            core::ptr::copy_nonoverlapping(
+                masks.as_ptr(),
+                combined.as_mut_ptr().add(masks_off),
+                BATCHED_DECODE_MASKS_U8_LEN,
+            );
+        }
+        let h2d_off = if tokens_already_on_device {
+            Self::TOKEN_IDS_BYTES
+        } else {
+            0
+        };
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_h2d_async(
+                    (self.meta_i32.addr() + h2d_off as u64) as *mut c_void,
+                    combined.as_ptr().add(h2d_off).cast(),
+                    Self::META_AND_MASKS_BYTES - h2d_off,
+                    stream.handle,
+                )
+            },
+            "upload batched decode meta+masks fallback",
+        )?;
+        if !bt_unchanged {
+            let bt_base = self.block_tables.addr();
+            for (r, s) in slices.iter().enumerate() {
+                if !s.block_table.is_empty() {
+                    check_rc(
+                        unsafe {
+                            ffi::w34_memcpy_h2d_async(
+                                (bt_base + (r * row_bytes) as u64) as *mut c_void,
+                                s.block_table.as_ptr().cast(),
+                                s.block_table.len() * 4,
+                                stream.handle,
+                            )
+                        },
+                        "upload batched decode block_table row",
+                    )?;
+                }
+            }
+            let mut guard = self.cached_block_tables.lock().unwrap();
+            guard.clear();
+            guard.extend(slices.iter().map(|s| s.block_table.to_vec()));
+        }
+        Ok(())
+    }
+
+    pub fn upload_fast_greedy_slot(
+        &self,
+        slot: usize,
+        row_cfgs: &[ffi::W34SamplerRowCfg],
+        sparse_entries: &[ffi::W34SamplerSparseEntry],
+        bucket_b: usize,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if bucket_b > MAX_BATCHED_DECODE_REQS || row_cfgs.len() > bucket_b {
+            return Err(loader_err(
+                "fast_greedy row_cfgs exceed decode graph bucket",
+            ));
+        }
+        if sparse_entries.len() > Self::MAX_FAST_GREEDY_SPARSE {
+            return Err(loader_err(
+                "fast_greedy sparse_entries exceed static graph buffer",
+            ));
+        }
+        let pad_cfg = ffi::W34SamplerRowCfg {
+            temperature: 0.0,
+            top_k: 1,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            uniform_sample: 0.0,
+            recovery_uniform: 0.0,
+            draft_token_id: -1,
+            has_bitmask: 0,
+            row_bitmask_word_offset: -1,
+            sparse_offset: 0,
+            sparse_count: 0,
+            top_logprobs_k: -1,
+            use_token_id_cdf: 0,
+        };
+        let mut padded_cfgs = [pad_cfg; MAX_BATCHED_DECODE_REQS];
+        padded_cfgs[..row_cfgs.len()].copy_from_slice(row_cfgs);
+        let cfg_bytes = bucket_b * core::mem::size_of::<ffi::W34SamplerRowCfg>();
+        let cfg_raw =
+            unsafe { core::slice::from_raw_parts(padded_cfgs.as_ptr().cast::<u8>(), cfg_bytes) };
+        let sparse_bytes = core::mem::size_of_val(sparse_entries);
+        let sparse_raw = unsafe {
+            core::slice::from_raw_parts(sparse_entries.as_ptr().cast::<u8>(), sparse_bytes)
+        };
+
+        let cfg_unchanged = {
+            let guard = self.cached_fast_greedy_cfgs.lock().unwrap();
+            guard.as_slice() == cfg_raw
+        };
+        let sparse_unchanged = {
+            let guard = self.cached_fast_greedy_sparse.lock().unwrap();
+            guard.as_slice() == sparse_raw
+        };
+        if cfg_unchanged && sparse_unchanged {
+            return Ok(());
+        }
+
+        let slot = slot & 1;
+        if slot == 0
+            && self
+                .pinned_sampler_in_flight
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            stream.synchronize()?;
+        }
+        let pbase = unsafe {
+            self.pinned_staging
+                .host_ptr
+                .cast::<u8>()
+                .add(slot * Self::PINNED_SLOT_BYTES + Self::PINNED_SAMPLER_OFFSET)
+        };
+        let sparse_off = (cfg_bytes + 63) & !63;
+        unsafe {
+            let mut queued_h2d = false;
+            if !cfg_unchanged {
+                core::ptr::copy_nonoverlapping(cfg_raw.as_ptr(), pbase, cfg_bytes);
+                if slot == 0 {
+                    self.pinned_sampler_in_flight
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    queued_h2d = true;
+                }
                 check_rc(
-                    unsafe {
-                        ffi::w34_memcpy_h2d_async(
-                            (bt_base + (r * row_bytes) as u64) as *mut c_void,
-                            s.block_table.as_ptr().cast(),
-                            s.block_table.len() * 4,
-                            stream.handle,
-                        )
-                    },
-                    "upload batched decode block_table row",
+                    ffi::w34_memcpy_h2d_async(
+                        self.fast_greedy_cfgs.addr() as *mut c_void,
+                        pbase.cast(),
+                        cfg_bytes,
+                        stream.handle,
+                    ),
+                    "upload fast_greedy_cfgs",
                 )?;
             }
+            if !sparse_unchanged && sparse_bytes > 0 {
+                core::ptr::copy_nonoverlapping(
+                    sparse_raw.as_ptr(),
+                    pbase.add(sparse_off),
+                    sparse_bytes,
+                );
+                if slot == 0 && !queued_h2d {
+                    self.pinned_sampler_in_flight
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                check_rc(
+                    ffi::w34_memcpy_h2d_async(
+                        self.fast_greedy_sparse.addr() as *mut c_void,
+                        pbase.add(sparse_off).cast(),
+                        sparse_bytes,
+                        stream.handle,
+                    ),
+                    "upload fast_greedy_sparse",
+                )?;
+            }
+        }
+        if !cfg_unchanged {
+            let mut guard = self.cached_fast_greedy_cfgs.lock().unwrap();
+            guard.clear();
+            guard.extend_from_slice(cfg_raw);
+        }
+        if !sparse_unchanged {
+            let mut guard = self.cached_fast_greedy_sparse.lock().unwrap();
+            guard.clear();
+            guard.extend_from_slice(sparse_raw);
         }
         Ok(())
     }
@@ -1611,7 +1872,11 @@ pub struct Qwen3_5ModelRank {
     pub spec_verify_io: SpecVerifyGraphIo,
     pub spec_verify_graph: Option<((usize, bool), CudaGraph)>,
     pub batched_decode_io: BatchedDecodeGraphIo,
-    pub batched_decode_graphs: Vec<((usize, bool), u64, CudaGraph)>,
+    pub batched_decode_graphs: Vec<((usize, bool, DecodeGraphSampleMode), u64, CudaGraph)>,
+    pub aux_stream: CudaStream,
+    pub aux_marlin_ws: DeviceBuffer,
+    pub aux_fork_event: crate::cuda::CudaEvent,
+    pub aux_join_event: crate::cuda::CudaEvent,
     pub capacity_plan: CapacityPlan,
     pub tap_layer_ids: Vec<usize>,
     pub tap_aux_bf16: Option<DeviceBuffer>,
@@ -2159,6 +2424,10 @@ impl Qwen3_5ModelRank {
             SpecVerifyGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         let batched_decode_io =
             BatchedDecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
+        let aux_stream = CudaStream::new(device_id)?;
+        let aux_marlin_ws = DeviceBuffer::alloc(device_id, 84 * 64 * 4)?;
+        let aux_fork_event = crate::cuda::CudaEvent::new(device_id, false)?;
+        let aux_join_event = crate::cuda::CudaEvent::new(device_id, false)?;
         device.synchronize()?;
 
         Ok(Self {
@@ -2186,6 +2455,10 @@ impl Qwen3_5ModelRank {
             spec_verify_graph: None,
             batched_decode_io,
             batched_decode_graphs: Vec::new(),
+            aux_stream,
+            aux_marlin_ws,
+            aux_fork_event,
+            aux_join_event,
             capacity_plan,
             tap_layer_ids: Vec::new(),
             tap_aux_bf16: None,
@@ -2571,6 +2844,27 @@ impl Qwen3_5ModelRank {
                     )?;
                 }
                 LayerBlockWeights::LinearAttention(gdn) => {
+                    let can_fork_ba = !matches!(
+                        gdn.in_proj_ba,
+                        LinearProj::DenseF16 { size_n, size_k, .. }
+                            if size_n > 256 || !size_k.is_multiple_of(8)
+                    );
+                    if can_fork_ba {
+                        self.aux_fork_event.record_in_current_ctx(&self.stream)?;
+                        self.aux_stream.wait_event(&self.aux_fork_event)?;
+                        let ex_aux = self.aux_stream.exec(0, 0);
+                        gdn.in_proj_ba.forward(
+                            &ex_aux,
+                            &self.cublas,
+                            self.aux_marlin_ws.addr(),
+                            self.aux_marlin_ws.len_bytes / 4,
+                            normed_buf,
+                            ba_buf,
+                            num_tokens,
+                        )?;
+                        self.aux_join_event
+                            .record_in_current_ctx(&self.aux_stream)?;
+                    }
                     gdn.in_proj_qkvz.forward(
                         &ex,
                         &self.cublas,
@@ -2580,15 +2874,17 @@ impl Qwen3_5ModelRank {
                         qkvz_buf,
                         num_tokens,
                     )?;
-                    gdn.in_proj_ba.forward(
-                        &ex,
-                        &self.cublas,
-                        marlin_ws_ptr,
-                        marlin_ws_ints,
-                        normed_buf,
-                        ba_buf,
-                        num_tokens,
-                    )?;
+                    if !can_fork_ba {
+                        gdn.in_proj_ba.forward(
+                            &ex,
+                            &self.cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            normed_buf,
+                            ba_buf,
+                            num_tokens,
+                        )?;
+                    }
                     let qkvz_row_stride = (conv_dim + gdn_v_dim) as i32;
                     let ba_row_stride = (2 * local_v_heads) as i32;
                     let qkv_ptr = qkvz_buf;
@@ -2615,6 +2911,9 @@ impl Qwen3_5ModelRank {
                         },
                         "w34_gdn_causal_conv1d_strided_f16",
                     )?;
+                    if can_fork_ba {
+                        self.stream.wait_event(&self.aux_join_event)?;
+                    }
                     check_rc(
                         unsafe {
                             ffi::w34_gdn_recurrent_strided_f16(
@@ -2988,6 +3287,7 @@ impl Qwen3_5ModelRank {
                 tp2,
                 selected_rows,
                 None,
+                false,
             )?;
             self.stream.synchronize()?;
             self.speculative_logits_rows = 0;
@@ -3004,6 +3304,7 @@ impl Qwen3_5ModelRank {
             tp2,
             selected_rows,
             None,
+            true,
         )?;
         let num_selected = selected_rows.len();
         let mut out_ids = vec![0i32; num_selected];
@@ -3036,6 +3337,7 @@ impl Qwen3_5ModelRank {
         tp2: Option<&Tp2Collectives>,
         selected_rows: &[usize],
         out_greedy_ids_override: Option<u64>,
+        emit_device_greedy: bool,
     ) -> Result<(u64, bool)> {
         if attn_batch.num_reqs <= 1 {
             self.validate_tap_rows(num_tokens)?;
@@ -3174,13 +3476,14 @@ impl Qwen3_5ModelRank {
         } else {
             0
         };
-        let pre_out_greedy = if num_selected_pre > 0 && out_greedy_ids_override.is_none() {
-            self.scratch_arena.alloc_aligned(num_selected_pre * 4)?
-        } else {
-            0
-        };
+        let pre_out_greedy =
+            if emit_device_greedy && num_selected_pre > 0 && out_greedy_ids_override.is_none() {
+                self.scratch_arena.alloc_aligned(num_selected_pre * 4)?
+            } else {
+                0
+            };
         let (pre_local_ids, pre_local_vals, pre_global_vals) =
-            if num_selected_pre > 0 && tp2.is_some() {
+            if emit_device_greedy && num_selected_pre > 0 && tp2.is_some() {
                 (
                     self.scratch_arena.alloc_aligned(num_selected_pre * 4)?,
                     self.scratch_arena.alloc_aligned(num_selected_pre * 4)?,
@@ -3353,6 +3656,27 @@ impl Qwen3_5ModelRank {
                     )?;
                 }
                 LayerBlockWeights::LinearAttention(gdn) => {
+                    let can_fork_ba = !matches!(
+                        gdn.in_proj_ba,
+                        LinearProj::DenseF16 { size_n, size_k, .. }
+                            if size_n > 256 || !size_k.is_multiple_of(8)
+                    );
+                    if can_fork_ba {
+                        self.aux_fork_event.record_in_current_ctx(&self.stream)?;
+                        self.aux_stream.wait_event(&self.aux_fork_event)?;
+                        let ex_aux = self.aux_stream.exec(0, 0);
+                        gdn.in_proj_ba.forward(
+                            &ex_aux,
+                            &self.cublas,
+                            self.aux_marlin_ws.addr(),
+                            self.aux_marlin_ws.len_bytes / 4,
+                            normed_buf,
+                            ba_buf,
+                            num_tokens,
+                        )?;
+                        self.aux_join_event
+                            .record_in_current_ctx(&self.aux_stream)?;
+                    }
                     gdn.in_proj_qkvz.forward(
                         &ex,
                         &self.cublas,
@@ -3362,15 +3686,17 @@ impl Qwen3_5ModelRank {
                         qkvz_buf,
                         num_tokens,
                     )?;
-                    gdn.in_proj_ba.forward(
-                        &ex,
-                        &self.cublas,
-                        marlin_ws_ptr,
-                        marlin_ws_ints,
-                        normed_buf,
-                        ba_buf,
-                        num_tokens,
-                    )?;
+                    if !can_fork_ba {
+                        gdn.in_proj_ba.forward(
+                            &ex,
+                            &self.cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            normed_buf,
+                            ba_buf,
+                            num_tokens,
+                        )?;
+                    }
                     let qkvz_row_stride = (conv_dim + gdn_v_dim) as i32;
                     let ba_row_stride = (2 * local_v_heads) as i32;
                     let qkv_ptr = qkvz_buf;
@@ -3397,6 +3723,9 @@ impl Qwen3_5ModelRank {
                         },
                         "w34_gdn_causal_conv1d_strided_f16",
                     )?;
+                    if can_fork_ba {
+                        self.stream.wait_event(&self.aux_join_event)?;
+                    }
                     check_rc(
                         unsafe {
                             ffi::w34_gdn_recurrent_strided_f16(
@@ -3605,6 +3934,10 @@ impl Qwen3_5ModelRank {
             all_logits_buf,
             num_selected,
         )?;
+
+        if !emit_device_greedy {
+            return Ok((0, use_spec_buf));
+        }
 
         let out_greedy_ids_dev = out_greedy_ids_override.unwrap_or(pre_out_greedy);
         if let Some(comm) = tp2 {
@@ -3965,6 +4298,7 @@ impl Qwen3_5ModelRank {
             tp2,
             &selected_rows,
             Some(out_ids_ptr),
+            true,
         );
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
@@ -3987,10 +4321,11 @@ impl Qwen3_5ModelRank {
         &self,
         bucket_b: usize,
         long_ctx: bool,
+        sample_mode: DecodeGraphSampleMode,
     ) -> Option<(u64, &CudaGraph)> {
         self.batched_decode_graphs
             .iter()
-            .find(|(k, _, _)| *k == (bucket_b, long_ctx))
+            .find(|(k, _, _)| *k == (bucket_b, long_ctx, sample_mode))
             .map(|(_, ptr, g)| (*ptr, g))
     }
 
@@ -3999,9 +4334,13 @@ impl Qwen3_5ModelRank {
         &mut self,
         bucket_b: usize,
         long_ctx: bool,
+        sample_mode: DecodeGraphSampleMode,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
-        if self.find_batched_decode_graph(bucket_b, long_ctx).is_some() {
+        if self
+            .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
+            .is_some()
+        {
             return Ok(());
         }
         let max_seq_len = if long_ctx {
@@ -4056,16 +4395,44 @@ impl Qwen3_5ModelRank {
             unsafe { ffi::w34_graph_begin_capture(stream_handle) },
             "w34_graph_begin_capture (batched_decode)",
         )?;
-        let res = self.forward_selected_rows_device(
-            tok_ptr,
-            pos_ptr,
-            bucket_b,
-            &attn_batch,
-            &gdn_batch,
-            tp2,
-            &selected_rows,
-            Some(out_ids_ptr),
-        );
+        let emit_device_greedy = sample_mode == DecodeGraphSampleMode::PlainGreedy;
+        let res = self
+            .forward_selected_rows_device(
+                tok_ptr,
+                pos_ptr,
+                bucket_b,
+                &attn_batch,
+                &gdn_batch,
+                tp2,
+                &selected_rows,
+                emit_device_greedy.then_some(out_ids_ptr),
+                emit_device_greedy,
+            )
+            .and_then(|v| {
+                if sample_mode == DecodeGraphSampleMode::FastGreedy {
+                    let (sampler_ws_ptr, sampler_ws_cap) =
+                        self.sampler_workspace_around_last_logits(bucket_b)?;
+                    let ex_sampler = self.stream.exec(sampler_ws_ptr, sampler_ws_cap);
+                    check_rc(
+                        unsafe {
+                            ffi::w34_sampler_step_fast_greedy_f16(
+                                &ex_sampler,
+                                self.last_logits_ptr as *const c_void,
+                                self.batched_decode_io.fast_greedy_cfgs.addr()
+                                    as *const ffi::W34SamplerRowCfg,
+                                self.batched_decode_io.fast_greedy_sparse.addr()
+                                    as *const ffi::W34SamplerSparseEntry,
+                                self.batched_decode_io.fast_greedy_outs.addr()
+                                    as *mut ffi::W34SamplerRowOut,
+                                bucket_b as i32,
+                                self.cfg.vocab_size as i32,
+                            )
+                        },
+                        "w34_sampler_step_fast_greedy_f16 (graph capture)",
+                    )?;
+                }
+                Ok(v)
+            });
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
         let end_rc = unsafe {
@@ -4080,7 +4447,7 @@ impl Qwen3_5ModelRank {
         check_rc(end_rc, "w34_graph_end_capture (batched_decode)")?;
         let logits_ptr = self.last_logits_ptr;
         self.batched_decode_graphs
-            .push(((bucket_b, long_ctx), logits_ptr, captured));
+            .push(((bucket_b, long_ctx, sample_mode), logits_ptr, captured));
         Ok(())
     }
 
@@ -6345,9 +6712,10 @@ impl Qwen3_5Engine {
         let mut keys: Vec<(usize, bool)> = self.ranks[0]
             .batched_decode_graphs
             .iter()
-            .map(|(k, _, _)| *k)
+            .map(|(k, _, _)| (k.0, k.1))
             .collect();
         keys.sort_unstable();
+        keys.dedup();
         keys
     }
 
@@ -6375,6 +6743,11 @@ impl Qwen3_5Engine {
                 "tp2 batch staging bytes exceed max_stage_bytes_per_epoch",
             ));
         }
+        let sample_mode = if skip_host_greedy {
+            DecodeGraphSampleMode::LogitsOnly
+        } else {
+            DecodeGraphSampleMode::PlainGreedy
+        };
         // Capture records nodes; it never executes collectives. Complete all uploads
         // and captures before launching either rank, including on first-use buckets.
         let result = replay_ranks(self.ranks.len(), |phase, rank| {
@@ -6386,11 +6759,12 @@ impl Qwen3_5Engine {
                         .upload_inputs(&host_meta, &host_masks, slices, &r.stream)
                 }
                 ReplayPhase::Capture => {
-                    r.ensure_batched_decode_graph(bucket_b, long_ctx, comm.as_deref())
+                    r.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, comm.as_deref())
                 }
                 ReplayPhase::Launch => {
-                    let (logits_ptr, graph) =
-                        r.find_batched_decode_graph(bucket_b, long_ctx).unwrap();
+                    let (logits_ptr, graph) = r
+                        .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
+                        .unwrap();
                     graph.launch(&r.stream)?;
                     r.speculative_logits_rows = if r.has_spec_logits_capacity(bucket_b) {
                         bucket_b
@@ -6437,6 +6811,231 @@ impl Qwen3_5Engine {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         Ok(out_ids.into_iter().map(|t| vec![t]).collect())
+    }
+
+    pub fn can_pipeline_decode_slices(&self, slices: &[EngineBatchSlice<'_>]) -> bool {
+        if self.tp_size != 1 || !self.use_cuda_graph || slices.is_empty() {
+            return false;
+        }
+        let Some(_bucket_b) = decode_graph_bucket(slices.len()) else {
+            return false;
+        };
+        let r0 = &self.ranks[0];
+        if r0.current_pos_plane_stride != 0 || r0.pending_visual_splice.is_some() {
+            return false;
+        }
+        let max_pages = r0.kv_pool.num_pages;
+        let max_blocks = r0.batched_decode_io.max_blocks_per_req;
+        slices.iter().all(|s| {
+            let seq_after = s.ctx_len_before + 1;
+            s.tokens.len() == 1
+                && s.spec_slots.is_empty()
+                && s.checkpoints.len() <= 1
+                && s.block_table.len() <= max_blocks
+                && seq_after.div_ceil(16) <= s.block_table.len()
+                && s.block_table
+                    .iter()
+                    .all(|&p| p >= 0 && (p as usize) < max_pages)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_pipelined_decode_step(
+        &mut self,
+        slot: usize,
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+        tokens_already_on_device: bool,
+        scatter_next_tokens_on_device: bool,
+        fast_greedy_inputs: Option<(&[ffi::W34SamplerRowCfg], &[ffi::W34SamplerSparseEntry])>,
+    ) -> Result<InFlightDecodeTicket> {
+        if self.tp_size != 1 {
+            return Err(loader_err("pipelined decode overlap requires tp_size == 1"));
+        }
+        if let Some(deltas) = rope_pos_deltas
+            && deltas.len() != slices.len()
+        {
+            return Err(loader_err("rope_pos_deltas length mismatch"));
+        }
+        let bucket_b = decode_graph_bucket(slices.len())
+            .ok_or_else(|| loader_err("invalid batch size for pipelined decode graph"))?;
+        let max_seq_after = slices
+            .iter()
+            .map(|s| s.ctx_len_before + 1)
+            .max()
+            .unwrap_or(1);
+        let long_ctx = max_seq_after > 1024;
+        let sample_mode = if fast_greedy_inputs.is_some() {
+            DecodeGraphSampleMode::FastGreedy
+        } else {
+            DecodeGraphSampleMode::PlainGreedy
+        };
+
+        let slot = slot & 1;
+        let n = slices.len();
+        let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta(slices, rope_pos_deltas)?;
+        let r0 = &mut self.ranks[0];
+        r0.device.make_current()?;
+        if tokens_already_on_device
+            && r0
+                .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
+                .is_none()
+        {
+            return Err(loader_err(
+                "pipelined lookahead step missing pre-captured decode graph",
+            ));
+        }
+        r0.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, None)?;
+        r0.batched_decode_io.upload_inputs_slot(
+            slot,
+            &host_meta,
+            &host_masks,
+            slices,
+            tokens_already_on_device,
+            true,
+            &r0.stream,
+        )?;
+        if let Some((cfgs, sparse)) = fast_greedy_inputs {
+            r0.batched_decode_io
+                .upload_fast_greedy_slot(slot, cfgs, sparse, bucket_b, &r0.stream)?;
+        }
+        let (logits_ptr, graph) = r0
+            .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
+            .unwrap();
+        graph.launch(&r0.stream)?;
+        r0.speculative_logits_rows = if r0.has_spec_logits_capacity(bucket_b) {
+            bucket_b
+        } else {
+            0
+        };
+        r0.last_logits_ptr = logits_ptr;
+        r0.last_logits_rows = bucket_b;
+
+        if scatter_next_tokens_on_device {
+            let ex0 = r0.stream.exec(0, 0);
+            let (row_outs_ptr, greedy_ids_ptr) = if fast_greedy_inputs.is_some() {
+                (
+                    r0.batched_decode_io.fast_greedy_outs.addr() as *const ffi::W34SamplerRowOut,
+                    core::ptr::null(),
+                )
+            } else {
+                (
+                    core::ptr::null(),
+                    r0.batched_decode_io.out_greedy_ids.addr() as *const i32,
+                )
+            };
+            check_rc(
+                unsafe {
+                    ffi::w34_sampler_scatter_ids_to_tokens(
+                        &ex0,
+                        row_outs_ptr,
+                        greedy_ids_ptr,
+                        r0.batched_decode_io.token_ids_ptr() as *mut i32,
+                        n as i32,
+                    )
+                },
+                "w34_sampler_scatter_ids_to_tokens",
+            )?;
+        }
+
+        let pout = unsafe {
+            r0.batched_decode_io
+                .pinned_staging
+                .host_ptr
+                .cast::<u8>()
+                .add(
+                    slot * BatchedDecodeGraphIo::PINNED_SLOT_BYTES
+                        + BatchedDecodeGraphIo::PINNED_PIPELINE_OUT_OFFSET,
+                )
+        };
+        let (dev_out_ptr, d2h_bytes) = if fast_greedy_inputs.is_some() {
+            (
+                r0.batched_decode_io.fast_greedy_outs.addr(),
+                n * core::mem::size_of::<ffi::W34SamplerRowOut>(),
+            )
+        } else {
+            (r0.batched_decode_io.out_greedy_ids.addr(), n * 4)
+        };
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    pout.cast(),
+                    dev_out_ptr as *const c_void,
+                    d2h_bytes,
+                    r0.stream.handle,
+                )
+            },
+            "pipelined decode D2H output",
+        )?;
+        r0.batched_decode_io.pipeline_done_events[slot].record(&r0.stream)?;
+
+        Ok(InFlightDecodeTicket {
+            slot,
+            num_reqs: n,
+            fast_greedy: fast_greedy_inputs.is_some(),
+        })
+    }
+
+    pub fn wait_pipelined_decode_step(
+        &mut self,
+        ticket: InFlightDecodeTicket,
+    ) -> Result<PipelinedDecodeOutput> {
+        let r0 = &mut self.ranks[0];
+        r0.device.make_current()?;
+        r0.batched_decode_io.pipeline_done_events[ticket.slot].synchronize()?;
+        if ticket.slot == 0 {
+            r0.batched_decode_io
+                .pinned_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            r0.batched_decode_io
+                .pinned_sampler_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        let pout = unsafe {
+            r0.batched_decode_io
+                .pinned_staging
+                .host_ptr
+                .cast::<u8>()
+                .add(
+                    ticket.slot * BatchedDecodeGraphIo::PINNED_SLOT_BYTES
+                        + BatchedDecodeGraphIo::PINNED_PIPELINE_OUT_OFFSET,
+                )
+        };
+        if ticket.fast_greedy {
+            let mut outs = vec![ffi::W34SamplerRowOut::default(); ticket.num_reqs];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pout.cast::<ffi::W34SamplerRowOut>(),
+                    outs.as_mut_ptr(),
+                    ticket.num_reqs,
+                );
+            }
+            Ok(PipelinedDecodeOutput::FastGreedy(outs))
+        } else {
+            let mut ids = vec![0i32; ticket.num_reqs];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pout.cast::<i32>(),
+                    ids.as_mut_ptr(),
+                    ticket.num_reqs,
+                );
+            }
+            Ok(PipelinedDecodeOutput::PlainGreedy(ids))
+        }
+    }
+
+    pub fn abort_pipelined_decode(&mut self) {
+        for r in &self.ranks {
+            let _ = r.device.make_current();
+            let _ = r.stream.synchronize();
+            let _ = r.aux_stream.synchronize();
+            r.batched_decode_io
+                .pinned_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            r.batched_decode_io
+                .pinned_sampler_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Executes a multi-request / speculative / checkpoint-capturing batch step across `TP=1` or `TP=2`.

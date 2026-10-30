@@ -11,9 +11,9 @@ use std::{
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::{
-    model::{EngineBatchSlice, Qwen3_5Engine},
+    model::{EngineBatchSlice, PipelinedDecodeOutput, Qwen3_5Engine},
     parser::{SamplerV1, SamplingParams, StepLogprobs, TokenBitmaskConstraint},
-    scheduler::{SchedulerConfig, SchedulerV1},
+    scheduler::{ScheduledReqSlice, SchedulerConfig, SchedulerV1},
 };
 
 #[derive(Debug)]
@@ -557,7 +557,7 @@ fn run(
             }
             result.map_err(|e| e.to_string())
         } else {
-            step_plain(&mut engine, &mut sched, &mut requests)
+            step_plain(&mut engine, &mut sched, &mut requests, &receiver, &shutdown)
         };
         if let Err(error) = result {
             // GPU errors invalidate this batch; abort private state rather than publishing it.
@@ -635,6 +635,8 @@ fn step_plain(
     engine: &mut Qwen3_5Engine,
     sched: &mut SchedulerV1,
     requests: &mut HashMap<u64, Request>,
+    receiver: &Receiver<Request>,
+    shutdown: &AtomicBool,
 ) -> Result<(), String> {
     let _batch_range = crate::profiling::Range::new(c"w34.serve.batch");
     // Vision prefill uses the same scheduler commit seam, but its 3-plane embedding
@@ -744,6 +746,29 @@ fn step_plain(
                 .is_plain_greedy(r.sampler.constraint.is_some())
         }
     });
+    let all_pure_decode = slices.iter().all(|s| !s.is_prefill_chunk)
+        && sched
+            .active
+            .iter()
+            .all(|seq| seq.finished || seq.is_prefill_complete());
+    let stateless_decode_ok = if needs_gpu {
+        engine.cfg.vocab_size >= 1024
+            && slices.iter().all(|s| {
+                requests[&s.req_id]
+                    .sampler
+                    .is_fast_greedy_stateless(engine.cfg.eos_token_ids.len())
+            })
+    } else {
+        slices
+            .iter()
+            .all(|s| requests[&s.req_id].sampler.params.stop_strings.is_empty())
+    };
+    if all_pure_decode && stateless_decode_ok && engine.can_pipeline_decode_slices(&batch) {
+        return run_pipelined_decode_burst(
+            engine, sched, requests, receiver, shutdown, slices, &deltas, needs_gpu,
+        );
+    }
+
     let greedy = engine
         .step_batch_slices_for_sampler(&batch, Some(&deltas), needs_gpu)
         .map_err(|e| e.to_string())?;
@@ -754,10 +779,15 @@ fn step_plain(
         let mut rows = Vec::new();
         for s in &slices {
             let sampler = &requests[&s.req_id].sampler;
+            let u1 = if sampler.params.temperature <= 1e-6 || sampler.params.top_k == 1 {
+                0.0
+            } else {
+                SamplerV1::uniform_f32(sampler.params.seed, sampler.output_history.len())
+            };
             rows.push(sampler.append_gpu_row(
                 engine.cfg.vocab_size,
                 &engine.cfg.eos_token_ids,
-                SamplerV1::uniform_f32(sampler.params.seed, sampler.output_history.len()),
+                u1,
                 0.0,
                 -1,
                 false,
@@ -821,4 +851,342 @@ fn step_plain(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pipelined_decode_burst(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &mut HashMap<u64, Request>,
+    receiver: &Receiver<Request>,
+    shutdown: &AtomicBool,
+    initial_slices: Vec<ScheduledReqSlice>,
+    deltas: &[i32],
+    needs_gpu: bool,
+) -> Result<(), String> {
+    let fg_storage = if needs_gpu {
+        let mut masks = Vec::new();
+        let mut sparse = Vec::new();
+        let mut rows = Vec::new();
+        for s in &initial_slices {
+            let sampler = &requests[&s.req_id].sampler;
+            rows.push(sampler.append_gpu_row(
+                engine.cfg.vocab_size,
+                &engine.cfg.eos_token_ids,
+                0.0,
+                0.0,
+                -1,
+                false,
+                &mut masks,
+                &mut sparse,
+            )?);
+        }
+        debug_assert!(masks.is_empty());
+        Some((rows, sparse))
+    } else {
+        None
+    };
+    let fg_ref = fg_storage
+        .as_ref()
+        .map(|(rows, sparse)| (rows.as_slice(), sparse.as_slice()));
+
+    let mut cur_slot = 0usize;
+    let mut slices_cur = initial_slices;
+    let mut ticket_cur = {
+        let checkpoints: Vec<Vec<_>> = slices_cur
+            .iter()
+            .map(|s| {
+                s.planned_checkpoints
+                    .iter()
+                    .map(|p| (p.trigger_offset_1based, p.dst_slot))
+                    .collect()
+            })
+            .collect();
+        let batch_cur: Vec<_> = slices_cur
+            .iter()
+            .zip(&checkpoints)
+            .map(|(s, cp)| {
+                let seq = sched
+                    .active
+                    .iter()
+                    .find(|seq| seq.req_id == s.req_id)
+                    .unwrap();
+                EngineBatchSlice {
+                    tokens: &s.query_tokens,
+                    ctx_len_before: s.ctx_len_before,
+                    block_table: &seq.radix_state.kv_pages,
+                    state_in_slot: s.state_in_slot,
+                    state_out_slot: s.state_out_slot,
+                    has_initial_state: s.has_initial_state,
+                    spec_slots: &[],
+                    checkpoints: cp,
+                    emit_all_query_tokens: false,
+                }
+            })
+            .collect();
+        engine
+            .enqueue_pipelined_decode_step(cur_slot, &batch_cur, Some(deltas), false, true, fg_ref)
+            .map_err(|e| {
+                engine.abort_pipelined_decode();
+                e.to_string()
+            })?
+    };
+
+    loop {
+        let max_seq_cur = slices_cur
+            .iter()
+            .map(|s| s.ctx_len_before + 1)
+            .max()
+            .unwrap_or(1);
+        let max_seq_next = max_seq_cur + 1;
+        let max_pages = engine.ranks[0].kv_pool.num_pages;
+        let max_blocks = engine.ranks[0].batched_decode_io.max_blocks_per_req;
+        let can_overlap_next = !shutdown.load(Ordering::Acquire)
+            && receiver.is_empty()
+            && sched.waiting.is_empty()
+            && ((max_seq_next > 1024) == (max_seq_cur > 1024))
+            && slices_cur.iter().all(|s| {
+                let r = &requests[&s.req_id];
+                let seq = sched
+                    .active
+                    .iter()
+                    .find(|seq| seq.req_id == s.req_id)
+                    .unwrap();
+                let next_after = s.ctx_len_before + 2;
+                !r.cancelled.load(Ordering::Acquire)
+                    && r.sampler.params.stop_strings.is_empty()
+                    && !seq.finished
+                    && seq.generated_tokens.len() + 1 < seq.max_new_tokens
+                    && !next_after.is_multiple_of(sched.cfg.mamba_chunk_size)
+                    && seq.radix_state.kv_pages.len() <= max_blocks
+                    && next_after.div_ceil(16) <= seq.radix_state.kv_pages.len()
+                    && seq
+                        .radix_state
+                        .kv_pages
+                        .iter()
+                        .all(|&p| p >= 0 && (p as usize) < max_pages)
+            });
+
+        if !can_overlap_next {
+            let out_cur = engine.wait_pipelined_decode_step(ticket_cur).map_err(|e| {
+                engine.abort_pipelined_decode();
+                e.to_string()
+            })?;
+            commit_pipelined_step(engine, sched, requests, &slices_cur, &out_cur, None);
+            return Ok(());
+        }
+
+        let next_slot = cur_slot ^ 1;
+        let mut slices_next: Vec<ScheduledReqSlice> = slices_cur
+            .iter()
+            .map(|s| {
+                let seq = sched
+                    .active
+                    .iter()
+                    .find(|seq| seq.req_id == s.req_id)
+                    .unwrap();
+                ScheduledReqSlice {
+                    req_id: s.req_id,
+                    is_prefill_chunk: false,
+                    is_final_prefill_chunk: false,
+                    ctx_len_before: s.ctx_len_before + 1,
+                    query_tokens: vec![0],
+                    state_in_slot: seq.radix_state.active_state_slot,
+                    state_out_slot: seq.radix_state.active_state_slot,
+                    has_initial_state: true,
+                    planned_checkpoints: Vec::new(),
+                }
+            })
+            .collect();
+
+        let ticket_next = {
+            let batch_next: Vec<_> = slices_next
+                .iter()
+                .map(|s| {
+                    let seq = sched
+                        .active
+                        .iter()
+                        .find(|seq| seq.req_id == s.req_id)
+                        .unwrap();
+                    EngineBatchSlice {
+                        tokens: &s.query_tokens,
+                        ctx_len_before: s.ctx_len_before,
+                        block_table: &seq.radix_state.kv_pages,
+                        state_in_slot: s.state_in_slot,
+                        state_out_slot: s.state_out_slot,
+                        has_initial_state: s.has_initial_state,
+                        spec_slots: &[],
+                        checkpoints: &[],
+                        emit_all_query_tokens: false,
+                    }
+                })
+                .collect();
+            engine
+                .enqueue_pipelined_decode_step(
+                    next_slot,
+                    &batch_next,
+                    Some(deltas),
+                    true,
+                    true,
+                    fg_ref,
+                )
+                .map_err(|e| {
+                    engine.abort_pipelined_decode();
+                    e.to_string()
+                })?
+        };
+
+        let out_cur = engine.wait_pipelined_decode_step(ticket_cur).map_err(|e| {
+            engine.abort_pipelined_decode();
+            e.to_string()
+        })?;
+
+        let mut deferred_releases = Vec::new();
+        let mut deferred_failures = Vec::new();
+        let mut emitted_ids = vec![None; slices_cur.len()];
+        let mut any_stopped = false;
+
+        for (i, s) in slices_cur.iter().enumerate() {
+            let r = requests.get_mut(&s.req_id).unwrap();
+            let parsed = match &out_cur {
+                PipelinedDecodeOutput::FastGreedy(rows) => {
+                    let out = &rows[i];
+                    if out.status != 0 {
+                        Err(format!("GPU sampler status {}", out.status))
+                    } else {
+                        Ok((
+                            out.sampled_id,
+                            r.sampler.params.logprobs.then(|| {
+                                Qwen3_5Engine::extract_step_logprobs(
+                                    out.sampled_id,
+                                    out,
+                                    r.sampler.params.top_logprobs,
+                                )
+                            }),
+                        ))
+                    }
+                }
+                PipelinedDecodeOutput::PlainGreedy(ids) => Ok((ids[i], None)),
+            };
+            let (id, lp) = match parsed {
+                Ok(v) => v,
+                Err(err) => {
+                    deferred_failures.push((s.req_id, err));
+                    any_stopped = true;
+                    continue;
+                }
+            };
+            if let Err(err) = r.sampler.try_commit_token(id) {
+                deferred_failures.push((s.req_id, err));
+                any_stopped = true;
+                continue;
+            }
+            emit(r, id, lp);
+            emitted_ids[i] = Some(id);
+            let outcome = sched.commit_slice(s, Some(id), || None);
+            if outcome.is_some() || r.cancelled.load(Ordering::Acquire) {
+                any_stopped = true;
+            }
+            deferred_releases.push(outcome);
+        }
+
+        if any_stopped {
+            let out_next = engine
+                .wait_pipelined_decode_step(ticket_next)
+                .map_err(|e| {
+                    engine.abort_pipelined_decode();
+                    e.to_string()
+                })?;
+            for outcome in deferred_releases {
+                release(engine, outcome);
+            }
+            for (req_id, err) in deferred_failures {
+                fail_request(engine, sched, requests, req_id, err);
+            }
+            let mut active_mask = vec![false; slices_next.len()];
+            for (i, sn) in slices_next.iter_mut().enumerate() {
+                if let Some(tok_prev) = emitted_ids[i] {
+                    sn.query_tokens[0] = tok_prev;
+                    let still_running = sched
+                        .active
+                        .iter()
+                        .any(|seq| seq.req_id == sn.req_id && !seq.finished)
+                        && requests
+                            .get(&sn.req_id)
+                            .is_some_and(|r| !r.cancelled.load(Ordering::Acquire));
+                    active_mask[i] = still_running;
+                }
+            }
+            commit_pipelined_step(
+                engine,
+                sched,
+                requests,
+                &slices_next,
+                &out_next,
+                Some(&active_mask),
+            );
+            return Ok(());
+        }
+
+        for outcome in deferred_releases {
+            release(engine, outcome);
+        }
+        for (i, sn) in slices_next.iter_mut().enumerate() {
+            sn.query_tokens[0] = emitted_ids[i].unwrap();
+        }
+        cur_slot = next_slot;
+        ticket_cur = ticket_next;
+        slices_cur = slices_next;
+    }
+}
+
+fn commit_pipelined_step(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &mut HashMap<u64, Request>,
+    slices: &[ScheduledReqSlice],
+    out: &PipelinedDecodeOutput,
+    active_mask: Option<&[bool]>,
+) {
+    for (i, s) in slices.iter().enumerate() {
+        if active_mask.is_some_and(|m| !m[i]) {
+            continue;
+        }
+        let Some(r) = requests.get_mut(&s.req_id) else {
+            continue;
+        };
+        let parsed = match out {
+            PipelinedDecodeOutput::FastGreedy(rows) => {
+                let row = &rows[i];
+                if row.status != 0 {
+                    Err(format!("GPU sampler status {}", row.status))
+                } else {
+                    Ok((
+                        row.sampled_id,
+                        r.sampler.params.logprobs.then(|| {
+                            Qwen3_5Engine::extract_step_logprobs(
+                                row.sampled_id,
+                                row,
+                                r.sampler.params.top_logprobs,
+                            )
+                        }),
+                    ))
+                }
+            }
+            PipelinedDecodeOutput::PlainGreedy(ids) => Ok((ids[i], None)),
+        };
+        let (id, lp) = match parsed {
+            Ok(v) => v,
+            Err(err) => {
+                fail_request(engine, sched, requests, s.req_id, err);
+                continue;
+            }
+        };
+        if let Err(err) = r.sampler.try_commit_token(id) {
+            fail_request(engine, sched, requests, s.req_id, err);
+            continue;
+        }
+        emit(r, id, lp);
+        release(engine, sched.commit_slice(s, Some(id), || None));
+    }
 }
