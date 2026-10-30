@@ -300,3 +300,80 @@ pub fn parse_openai_messages_with_image_policy(
     }
     Ok((out, images))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_completion_sampling_params_validation() {
+        let valid_req = serde_json::json!({
+            "temperature": 0.7,
+            "max_tokens": 100,
+            "logprobs": 5
+        });
+        let params = completion_sampling_params(&valid_req, 100).unwrap();
+        assert_eq!(params.temperature, 0.7);
+        assert!(params.logprobs);
+        assert_eq!(params.top_logprobs, 5);
+
+        // Invalid: non-object
+        assert!(completion_sampling_params(&serde_json::json!("not an object"), 100).is_err());
+
+        // Invalid: logprobs exceeds W34_MAX_TOP_LOGPROBS
+        let oversized = serde_json::json!({
+            "logprobs": w34_kernels::ffi::W34_MAX_TOP_LOGPROBS + 1
+        });
+        assert!(completion_sampling_params(&oversized, 100).is_err());
+
+        // Invalid: top_logprobs specified in legacy completion endpoint
+        let chat_opt = serde_json::json!({
+            "logprobs": 2,
+            "top_logprobs": 2
+        });
+        assert!(completion_sampling_params(&chat_opt, 100).is_err());
+    }
+
+    #[test]
+    fn test_completion_logprobs_wire_format() {
+        let logs = vec![
+            serde_json::json!({
+                "token": "Hello",
+                "logprob": -0.5,
+                "top_logprobs": [{"token": "Hello", "logprob": -0.5}, {"token": "Hi", "logprob": -1.2}]
+            }),
+            serde_json::json!({
+                "token": " world",
+                "logprob": -0.1,
+                "top_logprobs": [{"token": " world", "logprob": -0.1}]
+            }),
+        ];
+
+        let mut offset = 0;
+        let result = completion_logprobs(&logs, &mut offset);
+
+        assert_eq!(result["tokens"], serde_json::json!(["Hello", " world"]));
+        assert_eq!(result["token_logprobs"], serde_json::json!([-0.5, -0.1]));
+        assert_eq!(result["text_offset"], serde_json::json!([0, 5]));
+        assert_eq!(offset, 11); // "Hello world" has length 11
+    }
+
+    #[test]
+    fn test_native_sampling_params_bounds() {
+        // max_tokens = 0 must fail
+        assert!(native_sampling_params(&serde_json::json!({}), 0).is_err());
+        // max_tokens > 4096 must fail
+        assert!(native_sampling_params(&serde_json::json!({}), 5000).is_err());
+
+        // Valid request
+        let req = serde_json::json!({
+            "temperature": 0.8,
+            "top_p": 0.95,
+            "seed": 42
+        });
+        let params = native_sampling_params(&req, 128).unwrap();
+        assert_eq!(params.temperature, 0.8);
+        assert_eq!(params.top_p, 0.95);
+        assert_eq!(params.seed, 42);
+    }
+}

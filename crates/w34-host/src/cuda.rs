@@ -37,6 +37,14 @@ pub fn check_rc(rc: i32, context: &'static str) -> Result<()> {
 }
 
 /// Converts IEEE-754 binary16 bits (`u16`) to `f32`.
+///
+/// # Examples
+///
+/// ```
+/// use w34_host::cuda::{f16_to_f32, f32_to_f16};
+///
+/// assert_eq!(f16_to_f32(f32_to_f16(1.0)), 1.0);
+/// ```
 #[inline]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits & 0x8000) as u32) << 16;
@@ -2369,4 +2377,91 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
 
     dev.synchronize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_f16_f32_conversions_and_specials() {
+        // Zero and negative zero
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x8000), -0.0);
+        assert_eq!(f32_to_f16(0.0), 0x0000);
+        assert_eq!(f32_to_f16(-0.0), 0x8000);
+
+        // Exact powers of 2
+        assert_eq!(f16_to_f32(f32_to_f16(1.0)), 1.0);
+        assert_eq!(f16_to_f32(f32_to_f16(-1.0)), -1.0);
+        assert_eq!(f16_to_f32(f32_to_f16(0.5)), 0.5);
+        assert_eq!(f16_to_f32(f32_to_f16(2.0)), 2.0);
+
+        // Max representable FP16: 65504.0
+        assert_eq!(f16_to_f32(0x7bff), 65504.0);
+        assert_eq!(f32_to_f16(65504.0), 0x7bff);
+
+        // Infinities
+        assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
+        assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
+        assert_eq!(f32_to_f16(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_f16(f32::NEG_INFINITY), 0xfc00);
+
+        // NaN
+        assert!(f16_to_f32(0x7e00).is_nan());
+        let nan_f16 = f32_to_f16(f32::NAN);
+        assert_eq!(nan_f16 & 0x7c00, 0x7c00);
+        assert_ne!(nan_f16 & 0x03ff, 0);
+    }
+
+    #[test]
+    fn test_bf16_f32_conversions() {
+        assert_eq!(bf16_to_f32(0x0000), 0.0);
+        assert_eq!(bf16_to_f32(f32_to_bf16(1.0)), 1.0);
+        assert_eq!(bf16_to_f32(f32_to_bf16(-2.5)), -2.5);
+
+        // Overflow of FP16 (e.g. 70000.0) is preserved in BF16!
+        let big = 70000.0f32;
+        let big_bf16 = f32_to_bf16(big);
+        let roundtrip = bf16_to_f32(big_bf16);
+        assert!((roundtrip - big).abs() / big < 0.01);
+    }
+
+    #[test]
+    fn test_capacity_planner_budgeting_logic() {
+        let total_vram = 24 * 1024 * 1024 * 1024; // 24 GiB
+        let free_vram = 22 * 1024 * 1024 * 1024; // 22 GiB
+        let weight_arena = 8 * 1024 * 1024 * 1024; // 8 GiB
+        let scratch_arena = 1024 * 1024 * 1024; // 1 GiB
+        let state_bundle = 512 * 1024 * 1024; // 512 MiB
+        let bytes_per_page = 16 * 1024; // 16 KiB
+
+        // Auto page calculation
+        let plan = CapacityPlanner::plan(
+            total_vram,
+            free_vram,
+            weight_arena,
+            scratch_arena,
+            state_bundle,
+            bytes_per_page,
+            None,
+        )
+        .unwrap();
+
+        assert!(plan.max_kv_pages_per_layer > 0);
+        assert!(plan.headroom_bytes >= MIN_HEADROOM_BYTES);
+
+        // Explicit requested pages exceeding capacity should fail
+        let huge_req = plan.max_kv_pages_per_layer + 1_000_000;
+        let err = CapacityPlanner::plan(
+            total_vram,
+            free_vram,
+            weight_arena,
+            scratch_arena,
+            state_bundle,
+            bytes_per_page,
+            Some(huge_req),
+        );
+        assert!(err.is_err());
+    }
 }

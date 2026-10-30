@@ -252,3 +252,86 @@ fn categorical(weights: &[f64], uniform: f64) -> Result<i32> {
     }
     Ok(last_positive.expect("positive total implies positive entry"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_greedy_rejection_all_accepted() {
+        let drafts = vec![10, 20, 30];
+        let target_ids = vec![10, 20, 30, 40]; // 4 target IDs for 3 drafts + 1 bonus
+
+        let v = RejectionSampler::greedy(&drafts, &target_ids).unwrap();
+        assert_eq!(v.accepted_drafts(), 3);
+        assert_eq!(v.processed_rows(), 4);
+        assert_eq!(v.emitted_tokens(), &[10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn test_greedy_rejection_partial_accepted() {
+        let drafts = vec![10, 20, 30];
+        let target_ids = vec![10, 99, 30, 40]; // mismatch at index 1
+
+        let v = RejectionSampler::greedy(&drafts, &target_ids).unwrap();
+        assert_eq!(v.accepted_drafts(), 1);
+        assert_eq!(v.processed_rows(), 2);
+        assert_eq!(v.emitted_tokens(), &[10, 99]);
+    }
+
+    #[test]
+    fn test_greedy_rejection_first_mismatch() {
+        let drafts = vec![10, 20, 30];
+        let target_ids = vec![99, 20, 30, 40]; // immediate mismatch at index 0
+
+        let v = RejectionSampler::greedy(&drafts, &target_ids).unwrap();
+        assert_eq!(v.accepted_drafts(), 0);
+        assert_eq!(v.processed_rows(), 1);
+        assert_eq!(v.emitted_tokens(), &[99]);
+    }
+
+    #[test]
+    fn test_greedy_rejection_empty_drafts() {
+        let drafts = vec![];
+        let target_ids = vec![42]; // only the bonus token
+
+        let v = RejectionSampler::greedy(&drafts, &target_ids).unwrap();
+        assert_eq!(v.accepted_drafts(), 0);
+        assert_eq!(v.processed_rows(), 1);
+        assert_eq!(v.emitted_tokens(), &[42]);
+    }
+
+    #[test]
+    fn test_greedy_rejection_geometry_validation() {
+        // Mismatched length (must be drafts.len() + 1)
+        assert!(RejectionSampler::greedy(&[10, 20], &[10, 20]).is_err());
+        assert!(RejectionSampler::greedy(&[10, 20], &[10, 20, 30, 40]).is_err());
+
+        // Negative token IDs
+        assert!(RejectionSampler::greedy(&[-1, 20], &[10, 20, 30]).is_err());
+        assert!(RejectionSampler::greedy(&[10, 20], &[10, -1, 30]).is_err());
+    }
+
+    #[test]
+    fn test_stochastic_rejection_identical_distributions() {
+        let p = vec![0.1f32, 0.7f32, 0.1f32, 0.1f32];
+        let drafts = vec![1]; // draft predicted token 1 (highest prob)
+        let target_probs = vec![p.clone(), p.clone()];
+        let draft_probs = vec![p.clone()];
+        let accept_uniforms = vec![0.2f64];
+        let recovery_uniform = 0.5f64;
+
+        let v = RejectionSampler::stochastic(
+            &drafts,
+            &target_probs,
+            &draft_probs,
+            &accept_uniforms,
+            recovery_uniform,
+        )
+        .unwrap();
+        // Since target == draft, p(1)/q(1) = 1.0, uniform 0.2 <= 1.0, accepted!
+        assert_eq!(v.accepted_drafts(), 1);
+        assert_eq!(v.emitted_tokens().len(), 2); // 1 accepted draft + 1 bonus token
+        assert_eq!(v.emitted_tokens()[0], 1);
+    }
+}

@@ -1,7 +1,7 @@
 //! Phase 5.2: `Qwen3_VisionTransformer` (`model.visual.*`), `smart_resize` + bicubic +
 //! normalize preprocessing, 2D bilinear `pos_embed` interpolation, 2D axial RoPE,
 //! `PatchMerger`, 3D `mRoPE` position builder, and multimodal `MambaRadixCache` hashing.
-#![allow(clippy::too_many_arguments, clippy::undocumented_unsafe_blocks)]
+#![allow(clippy::too_many_arguments)]
 
 use serde::Deserialize;
 
@@ -137,6 +137,16 @@ impl PreprocessedImage {
 /// `Qwen2VLImageProcessorFast` / `Qwen3VL` `smart_resize`:
 /// Rounds `(height, width)` to multiples of `factor = patch_size * spatial_merge_size` (32)
 /// while clamping total pixels into `[min_pixels, max_pixels]`.
+///
+/// # Examples
+///
+/// ```
+/// use w34_host::vision::smart_resize;
+///
+/// let (h, w) = smart_resize(128, 256, 32, 1024, 1024 * 1024);
+/// assert_eq!(h % 32, 0);
+/// assert_eq!(w % 32, 0);
+/// ```
 pub fn smart_resize(
     height: usize,
     width: usize,
@@ -1029,6 +1039,8 @@ impl Qwen3VisionEncoder {
                         for row in [0, rows / 2, rows - 1] {
                             let mut host = vec![0u16; cols];
                             check_rc(
+                                // SAFETY: host is allocated for `cols` half elements (`cols * 2` bytes),
+                                // device address is within the source device buffer, and stream is synchronized before read.
                                 unsafe {
                                     ffi::w34_memcpy_d2h_async(
                                         host.as_mut_ptr() as *mut c_void,
@@ -1122,6 +1134,8 @@ impl Qwen3VisionEncoder {
         )?;
         sample!("patch_embed", d_x, total_patches, hidden);
         check_rc(
+            // SAFETY: `d_x` and `d_pos_interp` are valid device buffers of length `total_patches * hidden * 2`
+            // bytes, execution stream is valid, and null bias indicates no additive bias vector.
             unsafe {
                 ffi::w34_vision_bias_add_f16(
                     &ex,
@@ -1142,6 +1156,8 @@ impl Qwen3VisionEncoder {
         for (index, blk) in self.blocks.iter().enumerate() {
             sample!(format!("blocks.{index}.input"), d_x, total_patches, hidden);
             check_rc(
+                // SAFETY: `d_x` and `d_norm` are valid device buffers with capacity for `total_patches * hidden * 2` bytes,
+                // norm1 weight and bias pointers are valid weights loaded from safetensors, and epsilon is positive.
                 unsafe {
                     ffi::w34_vision_layernorm_f16(
                         &ex,
@@ -1180,6 +1196,8 @@ impl Qwen3VisionEncoder {
             );
 
             check_rc(
+                // SAFETY: `d_qkv` contains valid packed QKV data, `d_pos_hw` and `d_cu_seqlens` are valid device integer
+                // arrays for the image batch, `d_attn_out` has capacity for `total_patches * hidden * 2` bytes, and theta is 10000.0.
                 unsafe {
                     ffi::w34_vision_qkv_rope_attn_f16(
                         &ex,
@@ -1221,6 +1239,8 @@ impl Qwen3VisionEncoder {
             );
 
             check_rc(
+                // SAFETY: `d_proj_out` and `d_x` are valid device buffers of length `total_patches * hidden * 2` bytes,
+                // executed on the active stream context.
                 unsafe {
                     ffi::w34_vision_bias_add_f16(
                         &ex,
@@ -1236,6 +1256,8 @@ impl Qwen3VisionEncoder {
             )?;
 
             check_rc(
+                // SAFETY: `d_x` and `d_norm` are valid device buffers of length `total_patches * hidden * 2` bytes,
+                // norm2 weight and bias pointers are valid device weights.
                 unsafe {
                     ffi::w34_vision_layernorm_f16(
                         &ex,
@@ -1274,6 +1296,8 @@ impl Qwen3VisionEncoder {
             );
 
             check_rc(
+                // SAFETY: `d_mlp_interm` is a valid device buffer of length `total_patches * interm * 2` bytes,
+                // in-place activation execution on active stream.
                 unsafe {
                     ffi::w34_vision_bias_gelu_f16(
                         &ex,
@@ -1305,6 +1329,8 @@ impl Qwen3VisionEncoder {
             );
 
             check_rc(
+                // SAFETY: `d_proj_out` and `d_x` are valid device buffers of length `total_patches * hidden * 2` bytes,
+                // in-place residual addition on active stream.
                 unsafe {
                     ffi::w34_vision_bias_add_f16(
                         &ex,
@@ -1325,6 +1351,8 @@ impl Qwen3VisionEncoder {
 
         // 3. PatchMerger: LayerNorm(hidden_size) -> view [total_merged, 4 * hidden_size] -> fc1 -> exact GELU -> fc2
         check_rc(
+            // SAFETY: `d_x` and `d_norm` are valid device buffers with capacity for `total_patches * hidden * 2` bytes,
+            // merger norm weights are valid device weights.
             unsafe {
                 ffi::w34_vision_layernorm_f16(
                     &ex,
@@ -1353,8 +1381,9 @@ impl Qwen3VisionEncoder {
             merger_hidden as i32,
         )?;
 
-        // Note: Qwen3_VisionPatchMerger uses nn.GELU() (exact erf GELU, use_tanh = 0)
         check_rc(
+            // SAFETY: `d_merger_mid` is a valid device buffer of length `total_merged * merger_hidden * 2` bytes,
+            // in-place exact GELU on active stream.
             unsafe {
                 ffi::w34_vision_bias_gelu_f16(
                     &ex,
@@ -1381,5 +1410,79 @@ impl Qwen3VisionEncoder {
 
         sample!("merger.output", d_visual_out, total_merged, out_hidden);
         Ok(d_visual_out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_smart_resize_rounding_and_clamps() {
+        let factor = 32;
+        let min_pixels = 32 * 32;
+        let max_pixels = 512 * 512;
+
+        // Image already multiple of 32
+        let (h, w) = smart_resize(128, 256, factor, min_pixels, max_pixels);
+        assert_eq!(h % 32, 0);
+        assert_eq!(w % 32, 0);
+        assert_eq!((h, w), (128, 256));
+
+        // Image with arbitrary size rounded to factor
+        let (h2, w2) = smart_resize(130, 250, factor, min_pixels, max_pixels);
+        assert_eq!(h2 % 32, 0);
+        assert_eq!(w2 % 32, 0);
+
+        // Clamping to max_pixels
+        let (h_big, w_big) = smart_resize(2000, 2000, factor, min_pixels, max_pixels);
+        assert!(h_big * w_big <= max_pixels);
+        assert_eq!(h_big % 32, 0);
+        assert_eq!(w_big % 32, 0);
+
+        // Clamping to min_pixels
+        let (h_small, w_small) = smart_resize(10, 10, factor, min_pixels, max_pixels);
+        assert!(h_small * w_small >= min_pixels);
+        assert_eq!(h_small % 32, 0);
+        assert_eq!(w_small % 32, 0);
+    }
+
+    #[test]
+    fn test_fnv1a_hash_stability() {
+        let b1 = b"hello world";
+        let b2 = b"hello world";
+        let b3 = b"hello world!";
+
+        assert_eq!(fnv1a_hash_bytes(b1), fnv1a_hash_bytes(b2));
+        assert_ne!(fnv1a_hash_bytes(b1), fnv1a_hash_bytes(b3));
+    }
+
+    #[test]
+    fn test_decode_base64() {
+        assert_eq!(decode_base64("aGVsbG8="), Some(b"hello".to_vec()));
+        assert_eq!(decode_base64("d2FycC0zNA=="), Some(b"warp-34".to_vec()));
+        assert_eq!(decode_base64(""), Some(vec![]));
+    }
+
+    #[test]
+    fn test_preprocess_rgb_image_geometry() {
+        // Small 64x64 RGB image
+        let rgb = vec![128u8; 64 * 64 * 3];
+        let prep = preprocess_rgb_image(
+            &rgb,
+            64,
+            64,
+            16, // patch_size
+            2,  // spatial_merge_size
+            2,  // temporal_patch_size
+            32 * 32,
+            512 * 512,
+        );
+
+        assert_eq!(prep.grid_thw[0], 1); // T
+        assert_eq!(prep.grid_thw[1], 4); // H = 64 / 16 = 4
+        assert_eq!(prep.grid_thw[2], 4); // W = 64 / 16 = 4
+        assert_eq!(prep.num_patches(), 16);
+        assert_eq!(prep.num_merged_tokens(2), 4); // 16 / 4 = 4
     }
 }

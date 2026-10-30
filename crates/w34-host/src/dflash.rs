@@ -2,7 +2,7 @@
 //! Committed target taps are projected once into a separate paged KV namespace.
 //! A proposal writes only a private, disposable M-row suffix; it never advances
 //! committed context. Attention/MLP are TP-sharded; context FC and convs replicated.
-#![allow(clippy::too_many_arguments, clippy::undocumented_unsafe_blocks)]
+#![allow(clippy::too_many_arguments)]
 use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
 use crate::loader::{ModelConfig, SafetensorsArchive};
@@ -576,6 +576,7 @@ impl DFlash2Rank {
         rows: usize,
     ) -> Result<()> {
         check_rc(
+            // SAFETY: device pointers x, residual, w, and y are valid allocations for rows * hidden_size BF16 elements on t.stream.
             unsafe {
                 ffi::w34_rms_norm_bf16(
                     &t.stream.exec(0, 0),
@@ -605,6 +606,7 @@ impl DFlash2Rank {
         rows: usize,
     ) -> Result<()> {
         check_rc(
+            // SAFETY: device pointers and write_slot_mapping are valid allocations for rows BF16 QKV entries according to kv_layout.
             unsafe {
                 ffi::w34_dflash_qk_norm_rope_kv_write_bf16_f32_table(
                     &t.stream.exec(0, 0),
@@ -711,6 +713,7 @@ impl DFlash2Rank {
             c.projection.run(t, x, coeff, self.cfg.block_size)?;
         }
         check_rc(
+            // SAFETY: device pointers x, coeff, c.base, and y are valid allocations for block_size * hidden_size BF16 elements.
             unsafe {
                 ffi::w34_dflash_conv_bf16(
                     &t.stream.exec(0, 0),
@@ -810,6 +813,7 @@ impl DFlash2Rank {
         let act = self.graph_io.forward_arena.alloc_aligned(m * i * 2)?;
         let ex = t.stream.exec(0, 0);
         check_rc(
+            // SAFETY: ids_ptr contains m valid token IDs, embed_tokens_ptr is valid device memory of vocab_size * h half elements, residual has capacity for m * h BF16 elements.
             unsafe {
                 ffi::w34_embed_lookup_f16_to_bf16(
                     &ex,
@@ -846,6 +850,7 @@ impl DFlash2Rank {
                 m,
             )?;
             check_rc(
+                // SAFETY: kv layout and attention batch describe valid paged memory, qb and attn are valid device buffers for m * q elements.
                 unsafe {
                     ffi::w34_paged_attention_bf16(
                         &ex,
@@ -867,6 +872,7 @@ impl DFlash2Rank {
             self.conv(t, &layer.mlp_conv, normed, coeff, filtered, 0)?;
             layer.gate_up.run(t, filtered, gu, m)?;
             check_rc(
+                // SAFETY: gu is valid input buffer with m * 2 * i elements, act has capacity for m * i BF16 elements.
                 unsafe {
                     ffi::w34_silu_and_mul_bf16(
                         &ex,
@@ -894,6 +900,7 @@ impl DFlash2Rank {
             .alloc_aligned((m - 1) * t.local_vocab_size * 2)?;
         // Explicit dtype boundary into the target's single resident FP16 head.
         check_rc(
+            // SAFETY: draft_hidden contains (m - 1) * h BF16 elements, head_input has capacity for (m - 1) * h FP16 elements.
             unsafe {
                 ffi::w34_cast_bf16_to_f16(
                     &ex,
@@ -924,6 +931,7 @@ impl DFlash2Rank {
             .forward_arena
             .alloc_aligned(topk_elems * num_splits * 4)?;
         check_rc(
+            // SAFETY: logits contains valid FP16 rows, workspace and output device pointers are valid and aligned.
             unsafe {
                 ffi::w34_topk_rows_split_f16(
                     &ex,
@@ -987,6 +995,7 @@ impl DFlash2Rank {
         let graph = CudaGraph::capture(&t.stream, || {
             self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, None)?;
             check_rc(
+                // SAFETY: device arrays topk_ids, topk_scores, projected, pred, succ, out_path, and ids_ptr are valid and sized for k proposals and n candidates.
                 unsafe {
                     ffi::w34_dflash_select_greedy_dev_anchor_bf16(
                         &t.stream.exec(0, 0),
@@ -1039,6 +1048,7 @@ impl DFlash2Rank {
             top_k: self.cfg.top_k,
         };
         check_rc(
+            // SAFETY: out.ids has capacity for topk_elems i32 elements, source is valid device memory, stream is active.
             unsafe {
                 ffi::w34_memcpy_d2h_async(
                     out.ids.as_mut_ptr().cast(),
@@ -1050,6 +1060,7 @@ impl DFlash2Rank {
             "DFlash top-k ids copy",
         )?;
         check_rc(
+            // SAFETY: out.scores has capacity for topk_elems f32 elements, source is valid device memory, stream is active.
             unsafe {
                 ffi::w34_memcpy_d2h_async(
                     out.scores.as_mut_ptr().cast(),
@@ -1156,6 +1167,7 @@ impl DFlash2Rank {
         if self.cfg.selector_rank <= 256 && n <= 32 && k <= 16 {
             let path_dev = self.scratch.alloc_aligned(k * 4)?;
             check_rc(
+                // SAFETY: ids, vals, projected, pred, succ, and path_dev are valid device buffers on t.stream.
                 unsafe {
                     ffi::w34_dflash_select_greedy_bf16(
                         &t.stream.exec(0, 0),
@@ -1176,6 +1188,7 @@ impl DFlash2Rank {
             )?;
             let mut path = vec![0i32; k];
             check_rc(
+                // SAFETY: path has capacity for k i32 elements, path_dev is valid device buffer of k * 4 bytes.
                 unsafe {
                     ffi::w34_memcpy_d2h_async(
                         path.as_mut_ptr().cast(),
@@ -1194,6 +1207,7 @@ impl DFlash2Rank {
         }
         let edges = self.scratch.alloc_aligned(k * n * n * 4)?;
         check_rc(
+            // SAFETY: ids, vals, projected, pred, succ, and edges are valid device allocations on t.stream.
             unsafe {
                 ffi::w34_dflash_edges_bf16(
                     &t.stream.exec(0, 0),
@@ -1214,6 +1228,7 @@ impl DFlash2Rank {
         )?;
         let mut scores = vec![0f32; k * n * n];
         check_rc(
+            // SAFETY: scores has capacity for k * n * n f32 elements, edges is valid device memory of k * n * n * 4 bytes.
             unsafe {
                 ffi::w34_memcpy_d2h_async(
                     scores.as_mut_ptr().cast(),
@@ -1230,6 +1245,7 @@ impl DFlash2Rank {
         }
         let mut candidate_ids = vec![0i32; k * n];
         check_rc(
+            // SAFETY: candidate_ids has capacity for k * n i32 elements, ids is valid device memory of k * n * 4 bytes.
             unsafe {
                 ffi::w34_memcpy_d2h_async(
                     candidate_ids.as_mut_ptr().cast(),

@@ -429,3 +429,127 @@ impl SchedulerV1 {
         done
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scheduler_config_defaults() {
+        let cfg = SchedulerConfig::default();
+        assert_eq!(cfg.max_num_batched_tokens, 512);
+        assert_eq!(cfg.max_num_seqs, 16);
+        assert_eq!(cfg.page_size, 16);
+        assert_eq!(cfg.mamba_chunk_size, 64);
+        assert_eq!(cfg.chunk_prefill_size, 256);
+        assert!(cfg.chunk_prefill_size.is_multiple_of(cfg.mamba_chunk_size));
+    }
+
+    #[test]
+    fn test_seq_entry_stop_token_logic() {
+        let mut entry = SeqEntry {
+            req_id: 1,
+            prompt_tokens: vec![1, 2, 3],
+            radix_key_tokens: vec![1, 2, 3],
+            generated_tokens: Vec::new(),
+            max_new_tokens: 10,
+            min_tokens: 3,
+            ignore_eos: false,
+            stop_token_ids: vec![99],
+            eos_token_ids: vec![151643],
+            custom_prefill: false,
+            prefilled_tokens: 3,
+            cached_prefix_tokens: 0,
+            radix_state: ReqRadixState::new(16, 64, 0, [1, 2]),
+            finished: false,
+            resources_released: false,
+        };
+
+        // Before min_tokens (len < 3), neither EOS nor stop tokens should stop
+        assert!(!entry.should_stop_on_token(151643));
+        assert!(!entry.should_stop_on_token(99));
+
+        // After reaching min_tokens
+        entry.generated_tokens = vec![10, 11, 12];
+        assert!(entry.should_stop_on_token(151643));
+        assert!(entry.should_stop_on_token(99));
+        assert!(!entry.should_stop_on_token(42));
+
+        // When ignore_eos is true
+        entry.ignore_eos = true;
+        assert!(!entry.should_stop_on_token(151643));
+        assert!(entry.should_stop_on_token(99));
+    }
+
+    #[test]
+    fn test_scheduler_submit_admit_and_prefill_step() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 4,
+            page_size: 16,
+            mamba_chunk_size: 64,
+            chunk_prefill_size: 128,
+        };
+        let mut sched = SchedulerV1::new(cfg);
+
+        // Submit two requests with 70 tokens each
+        let prompt_a: Vec<i32> = (0..70).collect();
+        let prompt_b: Vec<i32> = (100..170).collect();
+
+        let id_a = sched.submit_request(prompt_a, 20, vec![99]);
+        let id_b = sched.submit_request(prompt_b, 20, vec![99]);
+        assert_eq!(id_a, 1);
+        assert_eq!(id_b, 2);
+        assert_eq!(sched.waiting.len(), 2);
+
+        // Mock state slot allocator providing slots (active, [pp0, pp1])
+        let mut slot_counter = 10;
+        let mut alloc_slots = |_radix: &mut MambaRadixCache| {
+            let act = slot_counter;
+            let pp0 = slot_counter + 1;
+            let pp1 = slot_counter + 2;
+            slot_counter += 3;
+            Some((act, [pp0, pp1]))
+        };
+
+        sched.admit_waiting(&mut alloc_slots);
+        assert_eq!(sched.active.len(), 2);
+        assert_eq!(sched.waiting.len(), 0);
+
+        // Assign mock KV page allocations to the active sequences (5 pages each for 70 tokens)
+        sched.active[0].radix_state.kv_pages = vec![1, 2, 3, 4, 5];
+        sched.active[1].radix_state.kv_pages = vec![6, 7, 8, 9, 10];
+
+        // Schedule first step: both sequences need prefill
+        // Req A prefill chunk up to chunk_prefill_size (70 <= 128)
+        // Token budget is 256, so both 70-token prefills fit (70 + 70 = 140 <= 256)
+        let slices = sched.schedule_step();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].req_id, id_a);
+        assert_eq!(slices[0].query_tokens.len(), 70);
+        assert!(slices[0].is_prefill_chunk);
+        assert!(slices[0].is_final_prefill_chunk);
+
+        assert_eq!(slices[1].req_id, id_b);
+        assert_eq!(slices[1].query_tokens.len(), 70);
+        assert!(slices[1].is_prefill_chunk);
+        assert!(slices[1].is_final_prefill_chunk);
+
+        // Commit step tokens for both requests: 1 generated token each
+        sched.commit_slice(&slices[0], Some(500), || Some(999));
+        sched.commit_slice(&slices[1], Some(600), || Some(999));
+
+        assert!(sched.active[0].is_prefill_complete());
+        assert_eq!(sched.active[0].generated_tokens, vec![500]);
+        assert!(sched.active[1].is_prefill_complete());
+        assert_eq!(sched.active[1].generated_tokens, vec![600]);
+
+        // Next step is decode: 1 token each (total 2 tokens <= 256 budget)
+        let decode_slices = sched.schedule_step();
+        assert_eq!(decode_slices.len(), 2);
+        assert!(!decode_slices[0].is_prefill_chunk);
+        assert_eq!(decode_slices[0].query_tokens, vec![500]);
+        assert!(!decode_slices[1].is_prefill_chunk);
+        assert_eq!(decode_slices[1].query_tokens, vec![600]);
+    }
+}

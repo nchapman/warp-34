@@ -11,6 +11,17 @@ use w34_kernels::ffi::{
 #[cfg(feature = "cuda")]
 use w34_kernels::ffi::{W34_KV_NAMESPACE_TARGET_FULL_ATTN, W34KvLayerLayout};
 
+/// Policy governing KV cache storage precision and transforms across layers.
+///
+/// # Examples
+///
+/// ```
+/// use w34_host::cache::KvFormatPolicy;
+///
+/// let policy = KvFormatPolicy::Tq4;
+/// let bytes = policy.bytes_per_token(16, 8, 256);
+/// assert!(bytes > 0);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvFormatPolicy {
     Fp16,
@@ -97,6 +108,16 @@ impl KvFormatPolicy {
     }
 }
 
+/// Returns the row bytes for a single attention head in the specified format.
+///
+/// # Examples
+///
+/// ```
+/// use w34_host::cache::kv_format_row_bytes;
+/// use w34_kernels::ffi::W34_KV_FORMAT_FP16;
+///
+/// assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_FP16, 256), 512);
+/// ```
 #[inline]
 pub fn kv_format_row_bytes(format: i32, head_dim: usize) -> usize {
     match format {
@@ -379,5 +400,126 @@ impl StateBundlePool {
 
     pub fn reset_all_slots(&mut self) {
         self.free_slots = (0..self.total_slots as i32).rev().collect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use w34_kernels::ffi::{
+        W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4,
+        W34_KV_TRANSFORM_IDENTITY, W34_KV_TRANSFORM_RADEMACHER_WHT256,
+    };
+
+    #[test]
+    fn test_kv_format_row_bytes_dimensions() {
+        // Head dim 256 (standard target model)
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_FP16, 256), 512);
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_BF16, 256), 512);
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_TQ4, 256), 132);
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_Q8_0, 256), 272);
+
+        // Head dim 128 (proposer draft context)
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_FP16, 128), 256);
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_BF16, 128), 256);
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_TQ4, 128), 66);
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_Q8_0, 128), 136);
+    }
+
+    #[test]
+    fn test_kv_format_policy_resolve_layer_invariants() {
+        let num_layers = 16;
+
+        // Fp16 policy: all layers FP16 with Identity
+        for layer in 0..num_layers {
+            let (k_fmt, v_fmt, k_tf, v_tf) = KvFormatPolicy::Fp16.resolve_layer(layer, num_layers);
+            assert_eq!(k_fmt, W34_KV_FORMAT_FP16);
+            assert_eq!(v_fmt, W34_KV_FORMAT_FP16);
+            assert_eq!(k_tf, W34_KV_TRANSFORM_IDENTITY);
+            assert_eq!(v_tf, W34_KV_TRANSFORM_IDENTITY);
+        }
+
+        // Tq4All policy: all layers TQ4 with Rademacher-WHT256
+        for layer in 0..num_layers {
+            let (k_fmt, v_fmt, k_tf, v_tf) =
+                KvFormatPolicy::Tq4All.resolve_layer(layer, num_layers);
+            assert_eq!(k_fmt, W34_KV_FORMAT_TQ4);
+            assert_eq!(v_fmt, W34_KV_FORMAT_TQ4);
+            assert_eq!(k_tf, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+            assert_eq!(v_tf, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+        }
+
+        // Tq4 boundary-anchored policy: first 2 and last 2 are Q8_0, interior are TQ4
+        for layer in 0..num_layers {
+            let (k_fmt, v_fmt, k_tf, v_tf) = KvFormatPolicy::Tq4.resolve_layer(layer, num_layers);
+            assert_eq!(k_tf, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+            assert_eq!(v_tf, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+
+            let is_boundary = layer < 2 || layer >= num_layers - 2;
+            if is_boundary {
+                assert_eq!(k_fmt, W34_KV_FORMAT_Q8_0);
+                assert_eq!(v_fmt, W34_KV_FORMAT_Q8_0);
+            } else {
+                assert_eq!(k_fmt, W34_KV_FORMAT_TQ4);
+                assert_eq!(v_fmt, W34_KV_FORMAT_TQ4);
+            }
+        }
+    }
+
+    #[test]
+    fn test_kv_format_policy_bytes_per_token_calculation() {
+        let num_full_attn_layers = 16;
+        let kv_heads = 8;
+        let head_dim = 256;
+
+        let fp16_bytes =
+            KvFormatPolicy::Fp16.bytes_per_token(num_full_attn_layers, kv_heads, head_dim);
+        assert_eq!(fp16_bytes, 16 * 8 * (512 + 512)); // 131,072 bytes/tok
+
+        let tq4_all_bytes =
+            KvFormatPolicy::Tq4All.bytes_per_token(num_full_attn_layers, kv_heads, head_dim);
+        assert_eq!(tq4_all_bytes, 16 * 8 * (132 + 132)); // 33,792 bytes/tok (~3.88x)
+
+        let tq4_boundary_bytes =
+            KvFormatPolicy::Tq4.bytes_per_token(num_full_attn_layers, kv_heads, head_dim);
+        // 4 boundary layers * 8 * (272 + 272) + 12 interior layers * 8 * (132 + 132)
+        let expected_tq4 = 4 * 8 * 544 + 12 * 8 * 264;
+        assert_eq!(tq4_boundary_bytes, expected_tq4); // 42,752 bytes/tok (~3.07x)
+    }
+
+    #[test]
+    fn test_state_tx_lifecycle_and_rollback() {
+        let mut tx = StateTx::new(42);
+        assert_eq!(tx.phase, StateTxPhase::Idle);
+        assert_eq!(tx.committed_slot, 42);
+        assert!(!tx.has_initial_state);
+
+        tx.begin_prefill();
+        assert_eq!(tx.phase, StateTxPhase::Prefilling);
+
+        tx.commit_prefill(64);
+        assert_eq!(tx.phase, StateTxPhase::Decoding);
+        assert!(tx.has_initial_state);
+        assert_eq!(tx.kv_seq_len_before, 64);
+
+        // Speculative verify round with 3 draft proposals (total 4 tokens: anchor + 3 drafts)
+        tx.begin_spec_verify(vec![101, 102, 103]);
+        assert_eq!(tx.phase, StateTxPhase::SpecVerifying);
+        assert_eq!(tx.verify_slot_schedule(), vec![42, 101, 102, 103]);
+
+        // Scenario A: Partial accept of 2 tokens (accepted_len = 2 -> winner is slot 101)
+        let freed = tx.resolve_spec_verify(2);
+        assert_eq!(tx.committed_slot, 101);
+        assert_eq!(freed, vec![42, 102, 103]);
+        assert_eq!(tx.kv_seq_len_before, 66);
+        assert_eq!(tx.phase, StateTxPhase::RolledBack);
+
+        // Scenario B: Full accept
+        tx.begin_spec_verify(vec![201, 202]);
+        let freed_full = tx.resolve_spec_verify(3); // accepted all 3 (winner is 202)
+        assert_eq!(tx.committed_slot, 202);
+        assert_eq!(freed_full, vec![101, 201]);
+        assert_eq!(tx.kv_seq_len_before, 69);
+        assert_eq!(tx.phase, StateTxPhase::Decoding);
     }
 }

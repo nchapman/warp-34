@@ -1120,3 +1120,152 @@ impl ReqRadixState {
         self.donate_committed_checkpoint(radix, None, true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_radix_cache_initialization_and_sanity() {
+        let cache = MambaRadixCache::new(16, 64);
+        assert_eq!(cache.page_size, 16);
+        assert_eq!(cache.mamba_chunk_size, 64);
+        assert_eq!(cache.total_lookups, 0);
+        assert_eq!(cache.total_hit_tokens, 0);
+        assert!(cache.sanity_check().is_ok());
+    }
+
+    #[test]
+    fn test_radix_insert_exact_and_match() {
+        let mut cache = MambaRadixCache::new(16, 64);
+        let tokens: Vec<i32> = (0..64).collect();
+        let kv_pages = vec![101, 102, 103, 104];
+        let draft_pages = vec![201, 202, 203, 204];
+
+        let ins = cache.insert(&tokens, &kv_pages, &draft_pages, 42, 0);
+        assert_eq!(ins.existing_prefix_tokens, 0);
+        assert!(!ins.mamba_already_existed);
+        assert!(ins.freed_duplicate_kv_pages.is_empty());
+        assert!(cache.sanity_check().is_ok());
+
+        // Exact match
+        let m = cache.match_prefix(&tokens);
+        assert_eq!(m.matched_tokens, 64);
+        assert_eq!(m.kv_pages, kv_pages);
+        assert_eq!(m.draft_pages, draft_pages);
+        assert_eq!(m.mamba_slot, Some(42));
+        assert_eq!(m.last_node, ins.terminal_node);
+
+        // Query with extra tokens should still match the 64-token prefix
+        let mut query_longer = tokens.clone();
+        query_longer.extend_from_slice(&[999, 1000]);
+        let m_longer = cache.match_prefix(&query_longer);
+        assert_eq!(m_longer.matched_tokens, 64);
+        assert_eq!(m_longer.mamba_slot, Some(42));
+
+        // Query with fewer tokens (e.g. 48 tokens = 3 pages)
+        let query_shorter: Vec<i32> = (0..48).collect();
+        let m_shorter = cache.match_prefix(&query_shorter);
+        // Prefix of 48 tokens splits the 64-token node into a 48-token prefix (tombstone) and 16-token leaf.
+        // Since the 48-token node has no Mamba checkpoint (checkpoint was at token 64), match returns 0 tokens
+        // with mamba_branching_seqlen recording the KV branch.
+        assert_eq!(m_shorter.matched_tokens, 0);
+        assert_eq!(m_shorter.mamba_slot, None);
+    }
+
+    #[test]
+    fn test_radix_split_and_branch_invariants() {
+        let mut cache = MambaRadixCache::new(16, 64);
+
+        // Insert prompt A: 64 tokens [0..64]
+        let tokens_a: Vec<i32> = (0..64).collect();
+        let kv_a = vec![1, 2, 3, 4];
+        cache.insert(&tokens_a, &kv_a, &[], 10, 0);
+        assert!(cache.sanity_check().is_ok());
+
+        // Insert prompt B: sharing first 32 tokens (2 pages), diverging in last 32 tokens
+        let mut tokens_b: Vec<i32> = (0..32).collect();
+        tokens_b.extend(100..132);
+        let kv_b = vec![1, 2, 5, 6];
+        let ins_b = cache.insert(&tokens_b, &kv_b, &[], 20, 0);
+
+        assert_eq!(ins_b.existing_prefix_tokens, 32);
+        // Pages 1 and 2 were duplicate of existing tree pages
+        assert_eq!(ins_b.freed_duplicate_kv_pages, vec![1, 2]);
+        assert!(cache.sanity_check().is_ok());
+
+        // Verify match A
+        let match_a = cache.match_prefix(&tokens_a);
+        assert_eq!(match_a.matched_tokens, 64);
+        assert_eq!(match_a.mamba_slot, Some(10));
+        assert_eq!(match_a.kv_pages, vec![1, 2, 3, 4]);
+
+        // Verify match B
+        let match_b = cache.match_prefix(&tokens_b);
+        assert_eq!(match_b.matched_tokens, 64);
+        assert_eq!(match_b.mamba_slot, Some(20));
+        assert_eq!(match_b.kv_pages, vec![1, 2, 5, 6]);
+    }
+
+    #[test]
+    fn test_radix_dual_lock_and_eviction() {
+        let mut cache = MambaRadixCache::new(16, 64);
+        let tokens: Vec<i32> = (0..64).collect();
+        let kv_pages = vec![10, 20, 30, 40];
+        let ins = cache.insert(&tokens, &kv_pages, &[], 99, 0);
+
+        // Lock node
+        cache.inc_lock_ref(ins.terminal_node);
+        assert!(cache.sanity_check().is_ok());
+
+        // Eviction while locked must free nothing
+        let ev_locked = cache.evict_full_pages(4);
+        assert!(ev_locked.freed_kv_pages.is_empty());
+
+        let ev_mamba_locked = cache.evict_mamba(1);
+        assert!(ev_mamba_locked.freed_mamba_slots.is_empty());
+
+        // Unlock node
+        cache.dec_lock_ref(ins.terminal_node);
+        assert!(cache.sanity_check().is_ok());
+
+        // Evict leaf via evict_full_pages
+        let ev_full = cache.evict_full_pages(4);
+        assert_eq!(ev_full.freed_kv_pages, vec![10, 20, 30, 40]);
+        assert_eq!(ev_full.freed_mamba_slots, vec![99]);
+        assert!(cache.sanity_check().is_ok());
+        assert_eq!(ev_full.freed_kv_pages, vec![10, 20, 30, 40]);
+        assert!(cache.sanity_check().is_ok());
+    }
+
+    #[test]
+    fn test_req_radix_state_planning_and_donation() {
+        let mut radix = MambaRadixCache::new(16, 64);
+        let mut req = ReqRadixState::new(16, 64, 5, [6, 7]);
+
+        assert_eq!(req.current_state_in_slot(), 5);
+        assert_eq!(req.plan_checkpoints(32), vec![]); // doesn't cross 64 boundary
+
+        let ckpts = req.plan_checkpoints(64);
+        assert_eq!(ckpts.len(), 1);
+        assert_eq!(ckpts[0].trigger_offset_1based, 64);
+        assert_eq!(ckpts[0].dst_slot, 6);
+        assert_eq!(ckpts[0].abs_seq_len, 64);
+
+        let tokens: Vec<i32> = (0..64).collect();
+        req.kv_pages = vec![100, 101, 102, 103];
+        req.commit_tokens(&tokens, &ckpts);
+        assert_eq!(req.last_track_seqlen, Some(64));
+        assert_eq!(req.token_ids.len(), 64);
+
+        // Donate committed checkpoint into radix cache with a replacement slot
+        let outcome = req.donate_committed_checkpoint(&mut radix, Some(8), false);
+        assert_eq!(outcome.donated_seq_len, 64);
+        assert!(radix.sanity_check().is_ok());
+
+        // Match the donated prefix
+        let match_res = radix.match_prefix(&tokens);
+        assert_eq!(match_res.matched_tokens, 64);
+        assert_eq!(match_res.mamba_slot, Some(6));
+    }
+}

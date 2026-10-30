@@ -13,7 +13,7 @@
 //! replicated (algebraically the donor's column-shard + gather), attention
 //! and dense/MoE FFN are TP-sharded. Vocabulary storage is borrowed, never copied.
 //! TP2 callers must run both ranks concurrently with the same collective order.
-#![allow(clippy::too_many_arguments, clippy::undocumented_unsafe_blocks)]
+#![allow(clippy::too_many_arguments)]
 use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
 use crate::loader::{ModelConfig, QuantScheme, SafetensorsArchive};
@@ -590,6 +590,7 @@ impl Qwen3_5MtpRank {
                 reserved: 0,
             };
             check_rc(
+                // SAFETY: token_ids_ptr contains valid token ID, embed_tokens_ptr is valid device memory of vocab_size * h_dim half elements, embed has capacity for h_dim half elements.
                 unsafe {
                     ffi::w34_embed_lookup_f16(
                         &ex,
@@ -613,6 +614,7 @@ impl Qwen3_5MtpRank {
                 ),
             ] {
                 check_rc(
+                    // SAFETY: input and output are valid device pointers with capacity for h_dim half elements, weight is valid norm weight.
                     unsafe {
                         ffi::w34_gemma_rms_norm_f16(
                             &ex,
@@ -630,6 +632,7 @@ impl Qwen3_5MtpRank {
             }
             Self::project(&self.fc, &ex, t, concat, residual_buf, 1)?;
             check_rc(
+                // SAFETY: residual_buf and normed_buf are valid device allocations for h_dim half elements, weight is valid norm weight.
                 unsafe {
                     ffi::w34_gemma_rms_norm_f16(
                         &ex,
@@ -647,6 +650,7 @@ impl Qwen3_5MtpRank {
             let fa = &self.fa;
             Self::project(&fa.qkv_proj, &ex, t, normed_buf, qkv_proj_buf, 1)?;
             check_rc(
+                // SAFETY: q_gate_ptr, k_raw_ptr, and output buffers are valid strided device buffers for 1 token, positions_ptr contains valid position on t.stream.
                 unsafe {
                     ffi::w34_fused_qk_rmsnorm_rope_gate_strided_f16(
                         &ex,
@@ -677,6 +681,7 @@ impl Qwen3_5MtpRank {
                 "w34_fused_qk_rmsnorm_rope_gate_strided_f16",
             )?;
             check_rc(
+                // SAFETY: kv_layout describes valid paged memory, k_buf and v_ptr are valid device buffers with capacity for kv_dim elements.
                 unsafe {
                     ffi::w34_kv_cache_write_strided(
                         &ex,
@@ -691,6 +696,7 @@ impl Qwen3_5MtpRank {
                 "w34_kv_cache_write_strided",
             )?;
             check_rc(
+                // SAFETY: kv_layout and attn_batch describe valid paged attention batch, q_buf and attn_out_buf have capacity for local_q_heads * head_dim elements.
                 unsafe {
                     ffi::w34_paged_attention_f16(
                         &ex,
@@ -704,6 +710,7 @@ impl Qwen3_5MtpRank {
                 "w34_paged_attention_f16",
             )?;
             check_rc(
+                // SAFETY: attn_out_buf and gate_buf are valid device buffers of local_q_heads * head_dim half elements, gated_attn_buf has equal capacity.
                 unsafe {
                     ffi::w34_apply_attn_output_gate_f16(
                         &ex,
@@ -737,6 +744,7 @@ impl Qwen3_5MtpRank {
                 )?;
             } else {
                 check_rc(
+                    // SAFETY: block_out_buf and residual_buf are valid device buffers for h_dim half elements, post_ln_ptr is valid norm weight, normed_buf has capacity for h_dim half elements.
                     unsafe {
                         ffi::w34_fused_add_gemma_rms_norm_f16(
                             &ex,
@@ -760,6 +768,7 @@ impl Qwen3_5MtpRank {
                 } => {
                     Self::project(gate_up_proj, &ex, t, normed_buf, gate_up_buf, 1)?;
                     check_rc(
+                        // SAFETY: gate_up_buf and act_buf are valid device buffers for 1 row of local_interm elements on active stream.
                         unsafe {
                             ffi::w34_silu_and_mul_f16(
                                 &ex,
@@ -816,6 +825,7 @@ impl Qwen3_5MtpRank {
                 )?;
             } else {
                 check_rc(
+                    // SAFETY: mlp_out_buf and residual_buf are valid device buffers for h_dim half elements, final norm weight is valid, hidden buffer has capacity for h_dim half elements.
                     unsafe {
                         ffi::w34_fused_add_gemma_rms_norm_f16(
                             &ex,
@@ -834,6 +844,7 @@ impl Qwen3_5MtpRank {
             }
             if step + 1 == k {
                 check_rc(
+                    // SAFETY: batch_hidden and hidden are valid device buffers with capacity for h_dim * 2 bytes on t.stream.
                     unsafe {
                         ffi::w34_memcpy_d2d_async(
                             self.batch_hidden.addr() as *mut c_void,
@@ -847,6 +858,7 @@ impl Qwen3_5MtpRank {
             }
             Self::project(&t.lm_head, &ex, t, self.hidden.addr(), logits_buf, 1)?;
             check_rc(
+                // SAFETY: logits_buf contains local_vocab_size valid half logits, output pointers have capacity for argmax results.
                 unsafe {
                     ffi::w34_sampler_greedy_top5_f16(
                         &ex,
@@ -878,6 +890,7 @@ impl Qwen3_5MtpRank {
             }
             if step + 1 < k {
                 check_rc(
+                    // SAFETY: token_ids_ptr and out_id are valid device pointers with capacity for 4 bytes on t.stream.
                     unsafe {
                         ffi::w34_memcpy_d2d_async(
                             token_ids_ptr as *mut c_void,
@@ -934,6 +947,7 @@ impl Qwen3_5MtpRank {
             .copy_from_host(&meta, &target.stream)?;
         if target_hidden != self.hidden.addr() {
             check_rc(
+                // SAFETY: hidden and target_hidden are valid device buffers with capacity for hidden_size * 2 bytes on target.stream.
                 unsafe {
                     ffi::w34_memcpy_d2d_async(
                         self.hidden.addr() as *mut c_void,
@@ -1226,6 +1240,7 @@ impl Qwen3_5MtpRank {
             reserved: 0,
         };
         check_rc(
+            // SAFETY: token_ids_ptr contains num_tokens valid token IDs, embed_tokens_ptr is valid device memory of vocab_size * h_dim half elements, embed has capacity for num_tokens * h_dim half elements.
             unsafe {
                 ffi::w34_embed_lookup_f16(
                     &ex,
@@ -1246,6 +1261,7 @@ impl Qwen3_5MtpRank {
                 (input_hidden, self.norms[1], concat + (h_dim * 2) as u64),
             ] {
                 check_rc(
+                    // SAFETY: input and output are valid device pointers with capacity for h_dim half elements, weight is valid norm weight.
                     unsafe {
                         ffi::w34_gemma_rms_norm_f16(
                             &ex,
@@ -1268,6 +1284,7 @@ impl Qwen3_5MtpRank {
                 (input_hidden, self.norms[1], hidden_norm),
             ] {
                 check_rc(
+                    // SAFETY: input and output are valid device pointers for num_tokens * h_dim half elements, weight is valid norm weight.
                     unsafe {
                         ffi::w34_gemma_rms_norm_f16(
                             &ex,
@@ -1284,6 +1301,7 @@ impl Qwen3_5MtpRank {
                 )?;
             }
             check_rc(
+                // SAFETY: normed_buf and hidden_norm contain num_tokens * h_dim half elements each, concat has capacity for num_tokens * 2 * h_dim half elements.
                 unsafe {
                     ffi::w34_concat_cols_2_f16(
                         &ex,
@@ -1300,6 +1318,7 @@ impl Qwen3_5MtpRank {
         }
         Self::project(&self.fc, &ex, t, concat, residual_buf, num_tokens)?;
         check_rc(
+            // SAFETY: residual_buf and normed_buf are valid device allocations for num_tokens * h_dim half elements, self.norms[2] is valid norm weight.
             unsafe {
                 ffi::w34_gemma_rms_norm_f16(
                     &ex,
@@ -1321,6 +1340,7 @@ impl Qwen3_5MtpRank {
         let k_raw_ptr = qkv_proj_buf + (q_gate_dim * 2) as u64;
         let v_ptr = qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64;
         check_rc(
+            // SAFETY: q_gate_ptr, k_raw_ptr, and output buffers are valid strided device buffers for num_tokens, positions_ptr contains valid positions on t.stream.
             unsafe {
                 ffi::w34_fused_qk_rmsnorm_rope_gate_strided_f16(
                     &ex,
@@ -1352,6 +1372,7 @@ impl Qwen3_5MtpRank {
         )?;
         let kv_layout = &self.kv.layers[fa.kv_layer_ordinal].layout;
         check_rc(
+            // SAFETY: kv_layout describes valid paged memory, k_buf and v_ptr are valid device buffers with capacity for num_tokens * kv_dim elements.
             unsafe {
                 ffi::w34_kv_cache_write_strided(
                     &ex,
@@ -1374,6 +1395,7 @@ impl Qwen3_5MtpRank {
             return Ok(None);
         }
         check_rc(
+            // SAFETY: kv_layout and attn_batch describe valid paged attention batch, q_buf and attn_out_buf have capacity for num_tokens * local_q_heads * head_dim elements.
             unsafe {
                 ffi::w34_paged_attention_f16(
                     &ex,
@@ -1387,6 +1409,7 @@ impl Qwen3_5MtpRank {
             "w34_paged_attention_f16",
         )?;
         check_rc(
+            // SAFETY: attn_out_buf and gate_buf are valid device buffers of num_tokens * local_q_heads * head_dim half elements, gated_attn_buf has equal capacity.
             unsafe {
                 ffi::w34_apply_attn_output_gate_f16(
                     &ex,
@@ -1428,6 +1451,7 @@ impl Qwen3_5MtpRank {
         } else {
             // Post-attention RMSNorm + MLP
             check_rc(
+                // SAFETY: block_out_buf and residual_buf are valid device buffers for num_tokens * h_dim half elements, post_ln_ptr is valid norm weight.
                 unsafe {
                     ffi::w34_fused_add_gemma_rms_norm_f16(
                         &ex,
@@ -1452,6 +1476,7 @@ impl Qwen3_5MtpRank {
             } => {
                 Self::project(gate_up_proj, &ex, t, normed_buf, gate_up_buf, num_tokens)?;
                 check_rc(
+                    // SAFETY: gate_up_buf and act_buf are valid device buffers for num_tokens rows of local_interm elements on active stream.
                     unsafe {
                         ffi::w34_silu_and_mul_f16(
                             &ex,
@@ -1508,6 +1533,7 @@ impl Qwen3_5MtpRank {
             )?;
         } else {
             check_rc(
+                // SAFETY: mlp_out_buf and residual_buf are valid device buffers for num_tokens * h_dim half elements, self.norms[4] is valid norm weight, batch_hidden has capacity for num_tokens * h_dim half elements.
                 unsafe {
                     ffi::w34_fused_add_gemma_rms_norm_f16(
                         &ex,
@@ -1526,6 +1552,7 @@ impl Qwen3_5MtpRank {
         }
         let last_hidden_ptr = self.batch_hidden.addr() + ((num_tokens - 1) * h_dim * 2) as u64;
         check_rc(
+            // SAFETY: hidden and last_hidden_ptr are valid device buffers with capacity for h_dim * 2 bytes on t.stream.
             unsafe {
                 ffi::w34_memcpy_d2d_async(
                     self.hidden.addr() as *mut c_void,
@@ -1544,6 +1571,7 @@ impl Qwen3_5MtpRank {
             let local_val = self.scratch.alloc_aligned(4)?;
             let global_val = self.scratch.alloc_aligned(4)?;
             check_rc(
+                // SAFETY: logits_buf contains local_vocab_size valid half logits, output pointers have capacity for argmax results.
                 unsafe {
                     ffi::w34_sampler_greedy_top5_f16(
                         &ex,
@@ -1575,6 +1603,7 @@ impl Qwen3_5MtpRank {
             }
             let mut out = [0i32];
             check_rc(
+                // SAFETY: out has capacity for 1 i32 element (4 bytes), out_id is valid device memory of 4 bytes on t.stream.
                 unsafe {
                     ffi::w34_memcpy_d2h_async(
                         out.as_mut_ptr().cast(),

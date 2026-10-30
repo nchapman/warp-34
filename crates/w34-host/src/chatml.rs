@@ -105,6 +105,22 @@ fn template_json(value: &Value) -> String {
 
 const TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
+/// Formats a list of chat messages into a ChatML prompt string.
+///
+/// # Examples
+///
+/// ```
+/// use w34_host::chatml::{ChatMessage, format_chatml_prompt};
+///
+/// let messages = vec![ChatMessage {
+///     role: "user".into(),
+///     content: Some("Hello".into()),
+///     reasoning_content: None,
+///     tool_calls: Vec::new(),
+/// }];
+/// let prompt = format_chatml_prompt(&messages, None, false);
+/// assert!(prompt.contains("Hello"));
+/// ```
 pub fn format_chatml_prompt(
     messages: &[ChatMessage],
     tools: Option<&Value>,
@@ -226,4 +242,143 @@ pub fn format_chatml_prompt_with_options(
         out.push_str("<think>\n\n</think>\n\n");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chatml_user_and_assistant_formatting() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some("What is the capital of France?".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("The capital of France is Paris.".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+
+        let prompt = format_chatml_prompt(&messages, None, false);
+        assert!(prompt.contains("<|im_start|>user\nWhat is the capital of France?<|im_end|>\n"));
+        assert!(prompt.contains("<|im_start|>assistant\n<think>\n\n</think>\n\nThe capital of France is Paris.<|im_end|>\n"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn test_chatml_thinking_enabled_vs_disabled() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some("Hello".into()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        }];
+
+        // Thinking enabled: leaves open `<think>\n` tag for assistant to fill
+        let p_enabled = format_chatml_prompt(&messages, None, true);
+        assert!(p_enabled.ends_with("<|im_start|>assistant\n<think>\n"));
+
+        // Thinking disabled: emits closed `<think>\n\n</think>\n\n`
+        let p_disabled = format_chatml_prompt(&messages, None, false);
+        assert!(p_disabled.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn test_chatml_reasoning_stripping_and_preservation() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Question 1".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Answer 1".into()),
+                reasoning_content: Some("Old private reasoning that should be stripped".into()),
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Question 2".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Answer 2".into()),
+                reasoning_content: Some("Current turn reasoning".into()),
+                tool_calls: Vec::new(),
+            },
+        ];
+
+        // Default: strips older reasoning
+        let p_default = format_chatml_prompt_with_options(&messages, None, true, false);
+        assert!(!p_default.contains("Old private reasoning that should be stripped"));
+        assert!(p_default.contains("Current turn reasoning"));
+
+        // Preserve thinking: retains all reasoning
+        let p_preserved = format_chatml_prompt_with_options(&messages, None, true, true);
+        assert!(p_preserved.contains("Old private reasoning that should be stripped"));
+        assert!(p_preserved.contains("Current turn reasoning"));
+    }
+
+    #[test]
+    fn test_chatml_tool_calls_and_instructions() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup_stock",
+                "description": "Look up stock ticker",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ticker": {"type": "string"}
+                    },
+                    "required": ["ticker"]
+                }
+            }
+        }]);
+
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: Some("What is AAPL stock?".into()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+        }];
+
+        let prompt = format_chatml_prompt(&messages, Some(&tools), false);
+        assert!(prompt.contains("# Tools"));
+        assert!(prompt.contains("lookup_stock"));
+        assert!(prompt.contains(TOOL_INSTRUCTIONS));
+    }
+
+    #[test]
+    fn test_parse_history_tools_validation() {
+        // Valid tool call
+        let valid_json = serde_json::json!([{
+            "function": {
+                "name": "search",
+                "arguments": {"query": "rust"}
+            }
+        }]);
+        let parsed = parse_history_tools(Some(&valid_json)).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].function.name, "search");
+
+        // Invalid tool call with XML delimiter in function name
+        let invalid_json = serde_json::json!([{
+            "function": {
+                "name": "bad<tag>",
+                "arguments": {}
+            }
+        }]);
+        assert!(parse_history_tools(Some(&invalid_json)).is_err());
+    }
 }

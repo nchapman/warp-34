@@ -31,6 +31,12 @@ pub mod tool_constraints;
 pub mod vision;
 
 /// Returns whether the crate was compiled with the `cuda` feature enabled.
+///
+/// # Examples
+///
+/// ```
+/// let _ = w34_host::cuda_enabled();
+/// ```
 pub const fn cuda_enabled() -> bool {
     w34_kernels::cuda_enabled()
 }

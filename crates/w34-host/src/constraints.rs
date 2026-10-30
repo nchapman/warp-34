@@ -364,3 +364,62 @@ impl TokenBitmaskConstraint {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_token_bitmask_allowed_tokens() {
+        let mask = TokenBitmaskConstraint::from_allowed_tokens(128, vec![0, 31, 32, 63, 64]);
+        assert_eq!(mask.vocab_size, 128);
+
+        // Word 0 (tokens 0..32): bit 0 and bit 31 set
+        assert!(mask.is_token_allowed(0));
+        assert!(mask.is_token_allowed(31));
+        assert!(!mask.is_token_allowed(1));
+        assert!(!mask.is_token_allowed(30));
+
+        // Word 1 (tokens 32..64): bit 0 and bit 31 set
+        assert!(mask.is_token_allowed(32));
+        assert!(mask.is_token_allowed(63));
+        assert!(!mask.is_token_allowed(33));
+
+        // Word 2 (tokens 64..96): bit 0 set
+        assert!(mask.is_token_allowed(64));
+        assert!(!mask.is_token_allowed(65));
+
+        // Out of bounds
+        assert!(!mask.is_token_allowed(-1));
+        assert!(!mask.is_token_allowed(128));
+        assert!(!mask.is_token_allowed(200));
+    }
+
+    #[test]
+    fn test_token_bitmask_u32_slice_packing() {
+        let mask = TokenBitmaskConstraint::from_allowed_tokens(64, vec![0, 33]);
+        let slice = mask.mask_words();
+        assert_eq!(slice.len(), 2);
+        assert_eq!(slice[0], 1u32); // bit 0
+        assert_eq!(slice[1], 1u32 << 1); // bit 1 of word 1 (token 33 = 32 + 1)
+    }
+
+    #[test]
+    fn test_strict_schema_options_validation() {
+        let valid = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}
+            }
+        });
+        assert!(validate_strict_schema_options(&valid).is_ok());
+
+        let invalid = serde_json::json!({
+            "type": "object",
+            "x-guidance": {
+                "lenient": true
+            }
+        });
+        assert!(validate_strict_schema_options(&invalid).is_err());
+    }
+}

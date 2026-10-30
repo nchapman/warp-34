@@ -116,6 +116,35 @@ criterion-by-criterion ledger.
 
 ---
 
+## Codebase Quality, Safety Audit, & Unit Test Elevation (Post-Phase 6 Enforcements)
+
+- **Safety Documentation & Strict Clippy Enforcement:**
+  - Workspace-level `clippy::undocumented_unsafe_blocks = "warn"` and `missing_safety_doc = "warn"` strictly enforced in `Cargo.toml`.
+  - Removed blanket `#![allow(clippy::undocumented_unsafe_blocks)]` in `crates/w34-host/src/vision.rs`, `dflash.rs`, and `mtp.rs`.
+  - Audited all raw pointers, device transfers, and FFI invocations across `vision.rs`, `dflash.rs`, `mtp.rs`, `cuda.rs`, and `model.rs`, adding granular `// SAFETY:` justifications detailing alignment, buffer lifecycle, non-overlapping pointers, and execution stream guarantees.
+- **Deterministic Unit & Doc Test Coverage:**
+  - Added **61 unit tests** (57 in `w34-host`, 4 in `w34-kernels`) and **7 doc-tests** across host and kernel modules with **0.00s–0.21s** execution time.
+  - `crates/w34-kernels/src/lib.rs`: **100% line coverage** (C FFI struct sizes, alignments, constants, struct defaults for `W34Exec`, `W34KvLayerLayout`, `W34AttentionBatch`, `W34GdnBatch`, `W34SamplerRowCfg`, `W34SamplerSparseEntry`, `W34SamplerRowOut`).
+  - `crates/w34-host/src/cache.rs`: **54.9% line coverage** (`kv_format_row_bytes`, `KvFormatPolicy::resolve_layer`, `bytes_per_token`, and transactional `StateTx` allocation/rollback).
+  - `crates/w34-host/src/radix.rs`: **83.5% line coverage / 83.0% function coverage** (radix node splitting, exact prefix matching, dual-lock ref-counting, tombstone cascades, and `ReqRadixState` checkpoint planning and donation).
+  - `crates/w34-host/src/scheduler.rs`: **82.0% line coverage** (`SchedulerConfig` defaults, sequence entry stop-token checks, request submission/admission, and prefill chunking).
+  - `crates/w34-host/src/speculative.rs`: **72.5% line coverage / 76.7% function coverage** (full, partial, empty, mismatch greedy rejection, stochastic rejection, and input geometry validation).
+  - `crates/w34-host/src/parser.rs`: **61.4% line coverage** (sampling parameters validation bounds, Qwen3 XML & Hermes JSON tool-call extraction, streaming reasoning and content separation, repetition penalty scaling).
+  - `crates/w34-host/src/chatml.rs`: **82.7% line coverage** (user/assistant formatting, thinking enabled/disabled tags, reasoning stripping and preservation, tool call schemas, and tool call history parsing).
+  - `crates/w34-host/src/constraints.rs`: Token bitmask creation, word packing, allowed token queries, and strict JSON schema options validation.
+  - `crates/w34-host/src/server.rs`: **51.6% line coverage** (OpenAI completion sampling parameters normalization, logprobs wire translation, and bounds checking).
+  - `crates/w34-host/src/loader.rs`: `TensorInfo::num_elems`, GPTQ K-major to N-major transpose, and `ModelConfig::from_json` parsing.
+  - `crates/w34-host/src/cuda.rs`: `f16_to_f32`, `f32_to_f16`, `bf16_to_f32`, `f32_to_bf16` special value and boundary preservation, and `CapacityPlanner` VRAM budgeting.
+  - `crates/w34-host/src/vision.rs`: `smart_resize` aspect ratio and clamp mathematics, FNV-1a hash stability, base64 decoding, and patch grid layout geometry.
+- **Verification & Review:**
+  - `mise run check-quick`: 0 warnings across `fmt-check`, `clippy` (with CUDA), and `clippy-cpu` (without CUDA).
+  - `cargo test --lib`: 56 CPU-only tests pass cleanly.
+  - `cargo test --release --features cuda`: All 61 release unit tests, all release integration tests, and all doc-tests pass with 0 failures.
+  - `python3 -m unittest discover -s tools/oracle`: All 69 python oracle tests pass.
+  - Multi-lens review pipeline (`review` tool) passed on the full diff with **zero actionable findings**.
+
+---
+
 ## Historical investigation log (superseded by Phase 6 closeout above & commits `9cf777f`..`544fce8`) — native vision/GDN arithmetic isolation
 
 > **Superseded historical log:** The interim vision/MoE failures recorded in the chronological notes below were subsequently resolved by biased cuBLASLt + single-round FP16 ViT position interpolation (`9cf777f`, passing dense 4B and 27B PNG/JPEG against the unchanged `.05` threshold), `M >= 4` Marlin FP16 MoE (`be40dda`), post-spine 8/8 27B needle replay (`53a4f5b`), and `sparse_moe_decomposed` layer-0 real-image MoE parity (`544fce8`, passing 35B-A3B PNG/JPEG and completing **6/6** canonical `vision_gate` cases in `/tmp/w34-phase6-closeout/vision-replay-6of6/`). Retained below for numerical root-cause provenance only.

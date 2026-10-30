@@ -1035,4 +1035,112 @@ mod tests {
         assert!(SamplerV1::new(too_many_biases.clone(), &[], None).is_fast_greedy_stateless(1));
         assert!(!SamplerV1::new(too_many_biases, &[], None).is_fast_greedy_stateless(2));
     }
+
+    #[test]
+    fn test_sampling_params_validation_bounds() {
+        let valid = SamplingParams::default();
+        assert!(valid.validate().is_ok());
+
+        let invalid_temp = SamplingParams {
+            temperature: -0.1,
+            ..Default::default()
+        };
+        assert!(invalid_temp.validate().is_err());
+
+        let invalid_top_k = SamplingParams {
+            top_k: -2,
+            ..Default::default()
+        };
+        assert!(invalid_top_k.validate().is_err());
+
+        let valid_top_k_neg1 = SamplingParams {
+            top_k: -1, // -1 means disabled, valid in HF
+            ..Default::default()
+        };
+        assert!(valid_top_k_neg1.validate().is_ok());
+
+        let invalid_top_p = SamplingParams {
+            top_p: 1.5,
+            ..Default::default()
+        };
+        assert!(invalid_top_p.validate().is_err());
+
+        let invalid_min_p = SamplingParams {
+            min_p: -0.05,
+            ..Default::default()
+        };
+        assert!(invalid_min_p.validate().is_err());
+
+        let invalid_rep_pen = SamplingParams {
+            repetition_penalty: -1.0,
+            ..Default::default()
+        };
+        assert!(invalid_rep_pen.validate().is_err());
+    }
+
+    #[test]
+    fn test_qwen3_parser_reasoning_and_content_separation() {
+        let mut parser = Qwen3Parser::new(true);
+
+        let delta1 = parser.push_str("<think>Let me calculate ");
+        assert_eq!(delta1.reasoning_delta.as_deref(), Some("Let me calculate "));
+        assert_eq!(delta1.content_delta, None);
+
+        let delta2 = parser.push_str("2 + 2 = 4.</think>The answer is 4.");
+        assert_eq!(delta2.reasoning_delta.as_deref(), Some("2 + 2 = 4."));
+        assert_eq!(delta2.content_delta.as_deref(), Some("The answer is 4."));
+
+        let (_, turn) = parser.finish();
+        assert_eq!(
+            turn.reasoning_content.as_deref(),
+            Some("Let me calculate 2 + 2 = 4.")
+        );
+        assert_eq!(turn.content.as_deref(), Some("The answer is 4."));
+    }
+
+    #[test]
+    fn test_qwen3_parser_xml_tool_call_extraction() {
+        let mut parser = Qwen3Parser::new(false);
+        let stream_text = "<tool_call><function=get_current_weather><parameter=location>Tokyo</parameter></function></tool_call>";
+        let delta = parser.push_str(stream_text);
+
+        assert_eq!(delta.completed_tool_calls.len(), 1);
+        let tc = &delta.completed_tool_calls[0];
+        assert_eq!(tc.function.name, "get_current_weather");
+        assert_eq!(tc.function.arguments, "{\"location\":\"Tokyo\"}");
+    }
+
+    #[test]
+    fn test_qwen3_parser_hermes_tool_call_extraction() {
+        let mut parser = Qwen3Parser::new(false);
+        let stream_text = "<tool_call>{\"name\": \"search_web\", \"arguments\": {\"query\": \"warp-34\"}}</tool_call>";
+        let delta = parser.push_str(stream_text);
+
+        assert_eq!(delta.completed_tool_calls.len(), 1);
+        let tc = &delta.completed_tool_calls[0];
+        assert_eq!(tc.function.name, "search_web");
+        assert!(tc.function.arguments.contains("warp-34"));
+    }
+
+    #[test]
+    fn test_sampler_repetition_penalties() {
+        let params = SamplingParams {
+            temperature: 1.0,
+            repetition_penalty: 2.0,
+            ..Default::default()
+        };
+
+        let sampler = SamplerV1::new(params, &[10], None);
+        // Candidate 10 is in prompt history, candidate 20 is not.
+        // With positive logits, candidate 10's logit should be halved by repetition_penalty=2.0.
+        let logits = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 4.0,
+        ];
+        let probs = sampler.processed_distribution(&logits).unwrap();
+
+        // Token 10 had logit 4.0 / 2.0 = 2.0; token 20 had logit 4.0.
+        // Therefore prob[20] should be strictly greater than prob[10].
+        assert!(probs[20] > probs[10]);
+    }
 }

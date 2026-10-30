@@ -988,3 +988,63 @@ pub fn transpose_gptq_qweight_k8_n_to_n_major(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tensor_info_num_elems() {
+        let t = TensorInfo {
+            name: "test.weight".into(),
+            shard_file: "model.safetensors".into(),
+            offset: 0,
+            len_bytes: 1024,
+            dtype: "F16".into(),
+            shape: vec![4, 8, 16],
+        };
+        assert_eq!(t.num_elems(), 4 * 8 * 16);
+    }
+
+    #[test]
+    fn test_transpose_gptq_qweight_k8_n_to_n_major() {
+        // size_k = 16 (k8 = 2), size_n = 3
+        // input is [k8, size_n] = [2, 3]
+        // row 0: [1, 2, 3]
+        // row 1: [4, 5, 6]
+        let input = vec![1u32, 2, 3, 4, 5, 6];
+        let out = transpose_gptq_qweight_k8_n_to_n_major(&input, 16, 3);
+        // output should be [size_n, k8] = [3, 2]
+        // col 0: [1, 4]
+        // col 1: [2, 5]
+        // col 2: [3, 6]
+        assert_eq!(out, vec![1, 4, 2, 5, 3, 6]);
+    }
+
+    #[test]
+    fn test_model_config_from_json_parsing() {
+        let json = serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 152064,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+        });
+
+        let cfg = ModelConfig::from_json(&json).unwrap();
+        assert_eq!(cfg.model_type, "qwen3_5");
+        assert_eq!(cfg.hidden_size, 2560);
+        assert_eq!(cfg.num_hidden_layers, 32);
+        assert_eq!(cfg.num_attention_heads, 20);
+        assert_eq!(cfg.num_key_value_heads, 4);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.vocab_size, 152064);
+        assert_eq!(cfg.rms_norm_eps, 1e-6);
+        assert_eq!(cfg.layer_types.len(), 4);
+    }
+}
