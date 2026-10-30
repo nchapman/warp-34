@@ -577,6 +577,7 @@ fn step_plain(
     sched: &mut SchedulerV1,
     requests: &mut HashMap<u64, Request>,
 ) -> Result<(), String> {
+    let _batch_range = crate::profiling::Range::new(c"w34.serve.batch");
     // Vision prefill uses the same scheduler commit seam, but its 3-plane embedding
     // splice cannot share an ordinary text prefill batch. Decode can share batches.
     let vision_ids: Vec<_> = sched
@@ -688,6 +689,7 @@ fn step_plain(
         }
     });
     let sampled = if needs_gpu {
+        let _sampler_range = crate::profiling::Range::new(c"w34.serve.sampler");
         let mut masks = Vec::new();
         let mut sparse = Vec::new();
         let mut rows = Vec::new();

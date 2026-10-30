@@ -17,6 +17,7 @@ import shlex
 import sqlite3
 import subprocess
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 
 CATEGORIES = [
@@ -75,7 +76,7 @@ def classify_kernel(name: str, in_spec_span: bool = False) -> str:
         )
     ):
         return "norms_rope_act"
-    if any(k in s for k in ("flash_attn", "fattn", "paged_attn", "paged_attention", "kv_cache_write", "fmha", "attn")):
+    if any(k in s for k in ("flash_attn", "fattn", "paged_attn", "paged_attention", "kv_cache_write", "fmha", "attn", "batchprefillwithpagedkvcache", "batchdecodewithpagedkvcache")):
         return "full_attn"
     if any(
         k in s
@@ -140,6 +141,260 @@ def _find_target_passes(rows: list[tuple[str, int, int]]) -> list[tuple[int, int
     return passes
 
 
+def nvtx_candidates(path: Path) -> dict:
+    """CPU intervals only: never use these directly as GPU-time boundaries."""
+    with sqlite3.connect(str(path)) as conn:
+        rows = conn.execute("""
+            SELECT COALESCE(n.text, s.value), n.start, n.end, n.globalTid
+            FROM NVTX_EVENTS n LEFT JOIN StringIds s ON n.textId = s.id
+            WHERE n.end > n.start ORDER BY n.start
+        """).fetchall()
+    measured = [r for r in rows if r[0] == "w34.bench.measured"]
+    if not measured:
+        raise ValueError("No completed w34.bench.measured range")
+    last = measured[-1]
+    decode = [r for r in rows if r[0] == "w34.decode" and
+              r[3] == last[3] and last[1] <= r[1] < r[2] <= last[2]]
+    if not decode:
+        raise ValueError("Last measured range has no nested decode range")
+    return {"measured_cpu_interval": last, "decode_cpu_candidates": decode,
+            "warning": "CPU times only; CUDA runtime/graph correlation not implemented"}
+
+
+def parse_nvtx_correlated(path: Path, metadata: dict) -> dict:
+    """Attribute launches, not GPU timestamp overlap; all threads/devices in marker PID."""
+    if not isinstance(metadata, dict):
+        raise ValueError("bench telemetry must be an object")
+    rounds = metadata.get("verify_rounds")
+    if rounds is None:
+        rounds = metadata.get("measured_rounds")
+    if type(rounds) is not int or rounds <= 0:
+        raise ValueError("bench telemetry requires positive explicit verify_rounds/measured_rounds")
+    mask = ~((1 << 24) - 1)
+    with sqlite3.connect(str(path)) as conn:
+        spans = conn.execute("""
+            SELECT COALESCE(n.text,s.value),n.start,n.end,n.globalTid,n.endGlobalTid
+            FROM NVTX_EVENTS n LEFT JOIN StringIds s ON n.textId=s.id
+        """).fetchall()
+        measured = [r for r in spans if r[0] == 'w34.bench.measured']
+        if not measured:
+            raise ValueError("Missing measured NVTX marker")
+        latest = max(r[1] for r in measured)
+        last = [r for r in measured if r[1] == latest]
+        if len(last) != 1:
+            raise ValueError("Ambiguous measured marker")
+        _, a, b, tid, etid = last[0]
+        if b is None or b <= a or tid is None or etid not in (None, 0, tid):
+            raise ValueError("Invalid measured marker")
+        dec = [r for r in spans if r[0] == 'w34.decode' and r[3] == tid
+               and r[1] >= a and r[1] < b]
+        if len(dec) != 1:
+            raise ValueError("Missing/ambiguous nested decode marker")
+        _, start, end, _, etid = dec[0]
+        if end is None or not start < end <= b or etid not in (None, 0, tid):
+            raise ValueError("Invalid decode marker")
+        pid = tid & mask
+        runtime = conn.execute("""
+            SELECT r.start,r.end,r.globalTid,r.correlationId,s.value,r.returnValue
+            FROM CUPTI_ACTIVITY_KIND_RUNTIME r LEFT JOIN StringIds s ON r.nameId=s.id
+        """).fetchall()
+        by_key = {}
+        for r in runtime:
+            if r[2] is not None and r[2] & mask == pid:
+                by_key.setdefault(r[3], []).append(r)
+        kernels = conn.execute("""
+            SELECT k.start,k.end,k.deviceId,k.correlationId,s.value
+            FROM CUPTI_ACTIVITY_KIND_KERNEL k LEFT JOIN StringIds s ON k.demangledName=s.id
+            WHERE k.globalPid=? ORDER BY k.start
+        """, (pid,)).fetchall()
+    ns = dict.fromkeys(CATEGORIES, 0)
+    counts = dict.fromkeys(CATEGORIES, 0)
+    selected = []
+    devices = {}
+    proposer = [r for r in spans if r[0] == 'w34.proposer' and r[3] is not None
+                and r[3] & mask == pid and r[2] is not None and start <= r[1] < r[2] <= end]
+    for ka, kb, device, corr, name in kernels:
+        matches = by_key.get(corr, [])
+        inside = [r for r in matches if start <= r[0] < end]
+        if not inside:
+            continue
+        if len(matches) != 1:
+            raise ValueError("Ambiguous runtime correlation")
+        ra, rb, rt, _, api, status = inside[0]
+        if not ra <= rb <= end or status != 0 or not api or 'launch' not in api.lower():
+            raise ValueError("Invalid correlated launch")
+        if kb <= ka or not name:
+            raise ValueError("Invalid kernel metadata")
+        spec = any(t == rt and pa <= ra <= rb <= pb for _, pa, pb, t, _ in proposer)
+        cat = classify_kernel(name, spec)
+        ns[cat] += kb - ka
+        counts[cat] += 1
+        d = devices.setdefault(str(device), {
+            'ns': dict.fromkeys(CATEGORIES, 0),
+            'counts': dict.fromkeys(CATEGORIES, 0),
+            'proposer_graph_launches': set(), 'proposer_graph_launch_threads': set(),
+        })
+        d['ns'][cat] += kb - ka
+        d['counts'][cat] += 1
+        if spec and api.startswith('cudaGraphLaunch'):
+            d['proposer_graph_launches'].add(corr)
+            d['proposer_graph_launch_threads'].add(rt)
+        selected.append((ka, kb, device))
+    if not selected:
+        raise ValueError("No correlated kernels")
+    cats = {c: {"ms_per_round": ns[c] / 1e6 / rounds,
+                "launches_per_round": counts[c] / rounds} for c in CATEGORIES}
+    per_device = {
+        device: {
+            'kernel_count': sum(d['counts'].values()),
+            'summed_gpu_kernel_ms': sum(d['ns'].values()) / 1e6,
+            'categories': {c: {'ms_per_round': d['ns'][c] / 1e6 / rounds,
+                               'launches_per_round': d['counts'][c] / rounds}
+                           for c in CATEGORIES},
+            'proposer_graph_launch_count': len(d['proposer_graph_launches']),
+            'proposer_graph_launch_threads': sorted(d['proposer_graph_launch_threads']),
+        }
+        for device, d in sorted(devices.items(), key=lambda item: int(item[0]))
+    }
+    return {"source": str(path), "measurement_mode": "nvtx_correlated",
+            "devices": per_device,
+            "boundary_verified": True, "gate_eligible": False, "rounds": rounds,
+            "metadata": metadata, "decode_cpu_interval_ns": [start, end],
+            "kernel_count": len(selected), "device_ids": sorted({r[2] for r in selected}),
+            "categories": cats, "summed_gpu_kernel_ms": sum(ns.values()) / 1e6,
+            "total_ms_per_round": (end-start) / 1e6 / rounds,
+            "gpu_extent_ns": [min(r[0] for r in selected), max(r[1] for r in selected)],
+            "cost_semantics": "categories are summed GPU kernel time across devices, NOT wall time; total is CPU decode wall time; host gap unavailable",
+            "limitations": "Workload alignment unverified; donor comparison not valid. Categories heuristic except thread-local proposer launch spans."}
+
+
+def parse_oracle_nvtx_correlated(path: Path, metadata: dict) -> dict:
+    """TP1 RID ranges; runtime correlation includes every node of graph launches.
+
+    Nsight globalPid and telemetry PID live in different namespaces. Match the
+    unique measured worker by RID and count, never by numerical PID equality.
+    """
+    if not isinstance(metadata, dict):
+        raise ValueError('oracle telemetry must be an object')
+    rounds = metadata.get('verify_rounds')
+    if type(rounds) is not int or rounds <= 0:
+        raise ValueError('positive worker verify_rounds required')
+    events = [e for e in metadata.get('worker_events', [])
+              if e.get('kind') == 'decode' and e.get('rids') == ['oracle-measured']]
+    if len(events) != rounds or len({e.get('pid') for e in events}) != 1:
+        raise ValueError('require one TP1 telemetry worker with matching round count')
+    mask = ~((1 << 24) - 1)
+    with sqlite3.connect(str(path)) as conn:
+        spans = conn.execute('''SELECT COALESCE(n.text,s.value),n.start,n.end,
+            n.globalTid,n.endGlobalTid FROM NVTX_EVENTS n
+            LEFT JOIN StringIds s ON n.textId=s.id''').fetchall()
+        dec = sorted([r for r in spans if r[0] == 'oracle.decode.round:oracle-measured'], key=lambda r:r[1])
+        if not dec:
+            raise ValueError('Missing measured RID marker')
+        if any(b is None or t is None or b <= a or et not in (None, 0, t)
+               for _, a, b, t, et in dec):
+            raise ValueError('Incomplete/invalid measured RID range')
+        pids = {r[3] & mask for r in dec}
+        if len(pids) != 1 or len(dec) != rounds:
+            raise ValueError('Ambiguous worker PID or telemetry/range count mismatch')
+        if any(x[2] > y[1] for x,y in zip(dec,dec[1:])):
+            raise ValueError('Duplicate/overlapping worker ranges')
+        pid = next(iter(pids))
+        runtime = conn.execute('''SELECT r.start,r.end,r.globalTid,r.correlationId,
+            s.value,r.returnValue FROM CUPTI_ACTIVITY_KIND_RUNTIME r
+            LEFT JOIN StringIds s ON r.nameId=s.id''').fetchall()
+        kernels = conn.execute('''SELECT k.start,k.end,k.deviceId,k.correlationId,s.value
+            FROM CUPTI_ACTIVITY_KIND_KERNEL k LEFT JOIN StringIds s ON k.demangledName=s.id
+            WHERE k.globalPid=? ORDER BY k.start''', (pid,)).fetchall()
+    by_key = {}
+    for r in runtime:
+        if r[2] is not None and r[2] & mask == pid:
+            by_key.setdefault(r[3], []).append(r)
+    proposer = [r for r in spans if r[0] == 'w34.proposer' and r[3] is not None
+                and r[3] & mask == pid and r[2] is not None]
+    ns, counts = dict.fromkeys(CATEGORIES,0), dict.fromkeys(CATEGORIES,0)
+    selected, seen_rounds = [], set()
+    for ka,kb,device,corr,name in kernels:
+        matches = by_key.get(corr, [])
+        inside = [(r,i) for r in matches for i,(_,a,b,_,_) in enumerate(dec) if a <= r[0] < b]
+        if not inside:
+            continue
+        if len(matches) != 1 or len(inside) != 1:
+            raise ValueError('Ambiguous runtime correlation')
+        (ra,rb,rt,_,api,status),i = inside[0]
+        if not ra <= rb <= dec[i][2] or status != 0 or not api or 'launch' not in api.lower():
+            raise ValueError('Invalid correlated launch')
+        if kb <= ka or not name:
+            raise ValueError('Invalid kernel metadata')
+        spec = any(t == rt and dec[i][1] <= a <= ra <= rb <= b <= dec[i][2]
+                   for _,a,b,t,_ in proposer)
+        cat = classify_kernel(name,spec)
+        ns[cat] += kb-ka
+        counts[cat] += 1
+        selected.append((ka,kb,device))
+        seen_rounds.add(i)
+    if len(seen_rounds) != rounds:
+        raise ValueError('Missing correlated kernels in worker rounds (unflushed trace?)')
+    cpu_ms = sum(r[2]-r[1] for r in dec)/1e6
+    return dict(source=str(path), measurement_mode='oracle_nvtx_correlated',
+        boundary_verified=True, gate_eligible=False, rounds=rounds,
+        scheduler_verify_rounds=metadata.get('scheduler_verify_rounds'),
+        trace_global_pid=pid, telemetry_container_pid=events[0]['pid'],
+        pid_matching='Unique TP1 measured RID worker and exact telemetry count; no numeric cross-namespace PID comparison',
+        categories={c:dict(ms_per_round=ns[c]/1e6/rounds, launches_per_round=counts[c]/rounds) for c in CATEGORIES},
+        kernel_count=len(selected), device_ids=sorted({r[2] for r in selected}),
+        summed_gpu_kernel_ms=sum(ns.values())/1e6,
+        summed_gpu_kernel_ms_per_round=sum(ns.values())/1e6/rounds,
+        total_ms_per_round=cpu_ms/rounds, worker_cpu_range_ms=cpu_ms,
+        streamed_decode_ms=metadata.get('decode_ms'),
+        gpu_extent_ns=[min(r[0] for r in selected),max(r[1] for r in selected)],
+        cost_semantics='Categories sum GPU kernel durations, not elapsed wall time. Total is mean worker CPU range duration including synchronous telemetry; streamed decode is first-to-last delivered token. No host-gap estimate.',
+        limitations='Input/output alignment not checked; no winner/gate claim. Proposer ingest+propose classified by thread-local NVTX launch scopes; remaining kernels use name heuristics. Overlap-scheduled extra work is retained, not normalized to scheduler rounds.')
+
+
+def parse_explicit_window(path: Path, start: int, end: int, metadata: Path,
+                          device_id: int = 0) -> dict:
+    """Strict external GPU window. Reject partial kernels rather than clipping."""
+    meta = json.loads(metadata.read_text())
+    if not isinstance(meta, dict):
+        raise ValueError("metadata must be an object")
+    rounds = meta.get("rounds")
+    if type(rounds) is not int or rounds <= 0:
+        raise ValueError("metadata.rounds must be an exact positive integer")
+    if start is None or end is None or start >= end:
+        raise ValueError("Strict mode requires ordered explicit GPU-time boundaries")
+    with sqlite3.connect(str(path)) as conn:
+        rows = conn.execute("""
+            SELECT s.value, k.start, k.end FROM CUPTI_ACTIVITY_KIND_KERNEL k
+            LEFT JOIN StringIds s ON k.shortName = s.id
+            WHERE k.deviceId = ? AND k.end > ? AND k.start < ? ORDER BY k.start
+        """, (device_id, start, end)).fetchall()
+    if not rows:
+        raise ValueError("No kernels in explicit window")
+    if any(not name for name, _, _ in rows):
+        raise ValueError("Invalid kernel metadata: unnamed kernel")
+    if any(a < start or b > end or b <= a for _, a, b in rows):
+        raise ValueError("Kernel crosses window boundary or has invalid duration")
+    ns = dict.fromkeys(CATEGORIES, 0)
+    launches = dict.fromkeys(CATEGORIES, 0)
+    gap, previous = 0, start
+    for name, a, b in rows:
+        cat = classify_kernel(name)
+        ns[cat] += b - a
+        launches[cat] += 1
+        gap += max(0, a - previous)
+        previous = max(previous, b)
+    gap += end - previous
+    cats = {c: {"ms_per_round": ns[c] / 1e6 / rounds,
+                "launches_per_round": launches[c] / rounds} for c in CATEGORIES}
+    cats["host_gap"] = {"ms_per_round": gap / 1e6 / rounds, "launches_per_round": 0}
+    return {"source": str(path), "measurement_mode": "explicit_gpu_window",
+            "gate_eligible": False, "rounds": rounds, "metadata": meta,
+            "window_start_ns": start, "window_end_ns": end, "categories": cats,
+            "total_ms_per_round": (end - start) / 1e6 / rounds,
+            "limitations": "Externally supplied boundaries; alignment unverified; categories heuristic"}
+
+
 def parse_nsys_sqlite(sqlite_path: Path, rounds: int = 128, device_id: int = 0) -> dict:
     conn = sqlite3.connect(str(sqlite_path))
     cur = conn.cursor()
@@ -158,14 +413,7 @@ def parse_nsys_sqlite(sqlite_path: Path, rounds: int = 128, device_id: int = 0) 
     cat_ns = {c: 0 for c in CATEGORIES}
     cat_launches = {c: 0 for c in CATEGORIES}
     if not rows:
-        return {
-            "rounds": rounds,
-            "categories": {
-                c: {"ms_per_round": 0.0, "launches_per_round": 0.0}
-                for c in CATEGORIES + ["host_gap"]
-            },
-            "total_ms_per_round": 0.0,
-        }
+        raise ValueError("No kernel data in trace")
 
     target_passes = _find_target_passes(rows)
     spec_indices: set[int] = set()
@@ -231,6 +479,8 @@ def parse_nsys_sqlite(sqlite_path: Path, rounds: int = 128, device_id: int = 0) 
     out_cats["host_gap"] = {"ms_per_round": round(gap_ms_r, 4), "launches_per_round": 0.0}
     total_ms += gap_ms_r
     return {
+        "measurement_mode": "legacy_heuristic",
+        "gate_eligible": False,
         "source": str(sqlite_path),
         "rounds": round(effective_rounds, 1),
         "categories": out_cats,
@@ -239,8 +489,10 @@ def parse_nsys_sqlite(sqlite_path: Path, rounds: int = 128, device_id: int = 0) 
     }
 
 
-def run_live_nsys(live_cmd: str, rounds: int, device_id: int) -> dict:
-    with tempfile.TemporaryDirectory(prefix="w34_nsys_") as tmpdir:
+def run_live_nsys(live_cmd: str, rounds: int, device_id: int, retain_trace: str | None = None, nvtx_correlated: bool = False) -> dict:
+    if retain_trace:
+        Path(retain_trace).mkdir(parents=True, exist_ok=True)
+    with (nullcontext(retain_trace) if retain_trace else tempfile.TemporaryDirectory(prefix="w34_nsys_")) as tmpdir:
         rep_prefix = Path(tmpdir) / "trace"
         rep_file = Path(tmpdir) / "trace.nsys-rep"
         sqlite_file = Path(tmpdir) / "trace.sqlite"
@@ -252,7 +504,7 @@ def run_live_nsys(live_cmd: str, rounds: int, device_id: int) -> dict:
         nsys_cmd = [
             "nsys",
             "profile",
-            "--trace=cuda",
+            "--trace=cuda,nvtx",
             "--cuda-graph-trace=node",
             "--sample=none",
             "--cpuctxsw=none",
@@ -293,6 +545,11 @@ def run_live_nsys(live_cmd: str, rounds: int, device_id: int) -> dict:
             except json.JSONDecodeError:
                 bench_json = None
 
+        if retain_trace:
+            (Path(tmpdir) / "stdout.txt").write_text(stdout)
+            (Path(tmpdir) / "stderr.txt").write_text(proc.stderr)
+            (Path(tmpdir) / "stdout.json").write_text(json.dumps(bench_json, indent=2))
+
         actual_rounds = rounds
         if isinstance(bench_json, dict):
             if bench_json.get("verify_rounds") is not None:
@@ -300,7 +557,8 @@ def run_live_nsys(live_cmd: str, rounds: int, device_id: int) -> dict:
             elif bench_json.get("gen_len") is not None:
                 actual_rounds = max(1, int(bench_json["gen_len"]) - 1)
 
-        prof = parse_nsys_sqlite(sqlite_file, rounds=actual_rounds, device_id=device_id)
+        prof = (parse_nvtx_correlated(sqlite_file, bench_json or {}) if nvtx_correlated
+                else parse_nsys_sqlite(sqlite_file, rounds=actual_rounds, device_id=device_id))
         prof["source"] = f"live nsys ({live_cmd})"
         if isinstance(bench_json, dict):
             if "decode_tok_per_s" in bench_json:
@@ -330,7 +588,9 @@ def load_profile(path: Path, rounds: int, device_id: int, preset: str | None = N
 
 
 def render_scoreboard(oracle_label: str, oracle: dict, w34_label: str, w34: dict) -> str:
-    lines = []
+    lines = ["Diagnostic only — not a performance gate. "
+             f"Modes: oracle={oracle.get('measurement_mode', 'unverified summary')}, "
+             f"w34={w34.get('measurement_mode', 'unverified summary')}"]
     lines.append(f"=== warp-34 vs {oracle_label} Kernel Scoreboard (ms/round) ===")
     header = f"{'Category':<18} | {oracle_label + ' (ms/r)':>16} | {w34_label + ' (ms/r)':>16} | {'Delta (ms/r)':>13} | {'Speedup':>9}"
     lines.append(header)
@@ -359,7 +619,7 @@ def render_scoreboard(oracle_label: str, oracle: dict, w34_label: str, w34: dict
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--oracle", required=True, help="Oracle nsys .sqlite or .json profile")
+    ap.add_argument("--oracle", required=False, help="Oracle nsys .sqlite or .json profile")
     ap.add_argument("--preset", default=None, help="Preset key inside oracle_baselines.json")
     ap.add_argument("--oracle-label", default=None, help="Oracle column header")
     ap.add_argument("--w34", default=None, help="warp-34 nsys .sqlite or .json profile")
@@ -368,13 +628,59 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=128, help="Nominal rounds in trace")
     ap.add_argument("--device", type=int, default=0, help="CUDA deviceId in nsys trace")
     ap.add_argument("--json-out", default=None, help="Optional JSON report path")
+    ap.add_argument("--mode", choices=["legacy-heuristic", "strict"], default="legacy-heuristic")
+    ap.add_argument("--window-start-ns", type=int)
+    ap.add_argument("--window-end-ns", type=int)
+    ap.add_argument("--metadata", type=Path, help='JSON with exact {"rounds": N}')
+    ap.add_argument("--oracle-nvtx-correlated", action="store_true")
+    ap.add_argument("--nvtx-correlated", action="store_true", help="Exact launch attribution, all devices; requires bench telemetry")
+    ap.add_argument("--nvtx-candidates", type=Path, help="Report CPU intervals only and exit")
+    ap.add_argument("--retain-trace", nargs="?", const="w34-profile-trace")
     args = ap.parse_args()
+    if args.oracle_nvtx_correlated:
+        if not args.oracle or not args.metadata or args.w34 or args.live_cmd:
+            ap.error('--oracle-nvtx-correlated requires --oracle SQLite and --metadata runtime JSON')
+        prof = parse_oracle_nvtx_correlated(Path(args.oracle), json.loads(args.metadata.read_text()))
+        text = json.dumps(prof, indent=2)
+        print(text)
+        if args.json_out:
+            Path(args.json_out).write_text(text)
+        return
+    if args.nvtx_candidates:
+        print(json.dumps(nvtx_candidates(args.nvtx_candidates), indent=2))
+        return
+    if args.nvtx_correlated:
+        if args.mode != "legacy-heuristic" or args.oracle or bool(args.w34) == bool(args.live_cmd):
+            ap.error("--nvtx-correlated requires exactly one of --w34/--live-cmd; no donor comparison")
+        if args.live_cmd:
+            prof = run_live_nsys(args.live_cmd, args.rounds, args.device, args.retain_trace, True)
+        else:
+            if not args.metadata:
+                ap.error("--nvtx-correlated --w34 requires --metadata bench JSON")
+            prof = parse_nvtx_correlated(Path(args.w34), json.loads(args.metadata.read_text()))
+        text = json.dumps(prof, indent=2)
+        print(text)
+        if args.json_out:
+            Path(args.json_out).write_text(text)
+        return
+    if args.mode == "strict":
+        if not args.w34 or not args.metadata or args.live_cmd or args.oracle:
+            ap.error("strict mode requires --w34 SQLite and --metadata; no live/comparison mode")
+        prof = parse_explicit_window(Path(args.w34), args.window_start_ns,
+                                     args.window_end_ns, args.metadata, args.device)
+        text = json.dumps(prof, indent=2)
+        print(text)
+        if args.json_out:
+            Path(args.json_out).write_text(text)
+        return
+    if not args.oracle:
+        ap.error("legacy diagnostic mode requires --oracle")
 
     oracle_prof = load_profile(Path(args.oracle), args.rounds, args.device, args.preset)
     if args.w34:
         w34_prof = load_profile(Path(args.w34), args.rounds, args.device, args.preset)
     elif args.live_cmd:
-        w34_prof = run_live_nsys(args.live_cmd, args.rounds, args.device)
+        w34_prof = run_live_nsys(args.live_cmd, args.rounds, args.device, args.retain_trace)
     else:
         w34_prof = oracle_prof
 

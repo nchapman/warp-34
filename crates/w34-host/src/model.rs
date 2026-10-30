@@ -4091,6 +4091,7 @@ impl Qwen3_5Engine {
         if num_rows == 0 {
             return Ok(Vec::new());
         }
+        let _sampler_range = crate::profiling::Range::new(c"w34.sampler");
         let vocab_size = self.cfg.vocab_size;
         let (ws_base, ws_cap) = self.ranks[0].sampler_workspace_around_last_logits(num_rows)?;
 
@@ -5226,6 +5227,7 @@ impl Qwen3_5Engine {
             gen_ids.push(first_tok);
         }
 
+        let decode_range = crate::profiling::Range::new(c"w34.decode");
         let t_dec_start = std::time::Instant::now();
         let mut cur_tok = first_tok;
         for (ctx_len, _) in (prompt_token_ids.len()..).zip(1..max_new_tokens) {
@@ -5237,6 +5239,7 @@ impl Qwen3_5Engine {
             gen_ids.push(next_tok);
             cur_tok = next_tok;
         }
+        drop(decode_range);
         let decode_ms = t_dec_start.elapsed().as_secs_f64() * 1000.0;
         let decode_steps = gen_ids.len().saturating_sub(1);
         let decode_tok_per_s = if decode_ms > 0.0 && decode_steps > 0 {

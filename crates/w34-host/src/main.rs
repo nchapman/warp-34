@@ -466,9 +466,12 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
             let mut decode_summary = serde_json::Value::Null;
             if matches!(bench_stage.as_str(), "decode" | "all") {
                 engine.reset_all_states().map_err(|e| e.to_string())?;
-                let metrics = engine
-                    .generate_tokens(&synth_prompt, gen_len, false)
-                    .map_err(|e| e.to_string())?;
+                let metrics = {
+                    let _measured = w34_host::profiling::Range::new(c"w34.bench.measured");
+                    engine
+                        .generate_tokens(&synth_prompt, gen_len, false)
+                        .map_err(|e| e.to_string())?
+                };
                 let accepted = engine.speculative.as_ref().map(|p| p.last_accepted.clone());
                 let verify_rounds = accepted.as_ref().map(Vec::len);
                 let total_accepted: usize = accepted
@@ -507,6 +510,9 @@ fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
                     "speculative": spec_label,
                     "accepted_drafts_per_round": accepted,
                     "verify_rounds": verify_rounds,
+                    "measured_rounds": verify_rounds.unwrap_or(metrics.gen_len.saturating_sub(1)),
+                    "prompt_token_ids": synth_prompt,
+                    "generated_token_ids": metrics.generated_token_ids,
                     "mean_accepted_drafts": mean_accepted_drafts,
                     "mean_tokens_per_round": mean_tokens_per_round,
                     "ms_per_verify_round": ms_per_verify_round,

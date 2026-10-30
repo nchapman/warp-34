@@ -39,7 +39,7 @@ run = "cargo test --release --features cuda"
 
 [tasks.check]
 description = "Format check, clippy (both states), and full release test suite"
-depends = ["fmt-check", "clippy", "clippy-cpu", "test"]
+depends = ["fmt-check", "clippy", "clippy-cpu", "test", "oracle-check"]
 
 [tasks."oracle-dump"]
 description = "Run w34 dump-diff TP=1 vs TP=2 parity across plain, Vision, MTP, DFlash2, and 35B-A3B MoE"
@@ -81,3 +81,7 @@ run = """
 ./target/release/w34 profile-diff --live --preset sglang_4b_tp1_dflash2_m16 --model nchapman/Qwen3.5-4B-W4A16-GPTQ --tp 1 --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
 ./target/release/w34 profile-diff --live --preset vllm_35b_moe_tp2_decode --model llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4 --tp 2 --kv-format tq4 --kv-pages 128
 """
+
+[tasks."oracle-check"]
+description = "Host-only validation of oracle and benchmark harnesses"
+run = "python3 -m unittest discover -s tools/oracle -p 'test_*.py' -v"

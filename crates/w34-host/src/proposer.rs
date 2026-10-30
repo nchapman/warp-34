@@ -885,6 +885,7 @@ impl NativeProposer {
                 }
                 generated.push(anchor);
             }
+            let _decode_range = crate::profiling::Range::new(c"w34.decode");
             let mut pending_ingest: Vec<i32> = Vec::new();
             while generated.len() < max_new
                 && !(stop_eos
@@ -894,6 +895,7 @@ impl NativeProposer {
                         .is_stop_or_eos(anchor, &engine.cfg.eos_token_ids))
             {
                 let k = self.k.min(max_new - generated.len() - 1);
+                let proposer_range = crate::profiling::Range::new(c"w34.proposer");
                 let mut drafts = if pending_ingest.is_empty() {
                     self.propose(engine, anchor, k)?
                 } else {
@@ -903,6 +905,7 @@ impl NativeProposer {
                     pending_ingest.clear();
                     out
                 };
+                drop(proposer_range);
                 if stop_eos
                     && let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
                         let pos_before = generated.len() + idx;
