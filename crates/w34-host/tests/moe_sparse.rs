@@ -795,3 +795,177 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
         );
     }
 }
+
+#[test]
+fn dual_small_n_gemm_and_warp256_router_match_references() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(dev.device_id).unwrap();
+    let ex = stream.exec(0, 0);
+
+    // 1. Fused dual small-N GEMM (`N0 = 256` router + `N1 = 1` shared gate) must be 0-ULP
+    // bit-identical to two separate `w34_small_n_gemm_f16` launches across M = 1, 4, 8.
+    let size_k = 2048usize;
+    let n0 = 256usize;
+    let n1 = 1usize;
+    let w0_host: Vec<u16> = (0..n0 * size_k)
+        .map(|i| f32_to_f16(((i % 67) as f32 - 33.0) * 0.015625))
+        .collect();
+    let w1_host: Vec<u16> = (0..n1 * size_k)
+        .map(|i| f32_to_f16(((i % 41) as f32 - 20.0) * 0.03125))
+        .collect();
+    let d_w0 = DeviceBuffer::alloc(dev.device_id, w0_host.len() * 2).unwrap();
+    let d_w1 = DeviceBuffer::alloc(dev.device_id, w1_host.len() * 2).unwrap();
+    d_w0.copy_from_host(&w0_host, &stream).unwrap();
+    d_w1.copy_from_host(&w1_host, &stream).unwrap();
+
+    for m in [1usize, 4, 8] {
+        let x_host: Vec<u16> = (0..m * size_k)
+            .map(|i| f32_to_f16(((i % 89) as f32 - 44.0) * 0.02))
+            .collect();
+        let d_x = DeviceBuffer::alloc(dev.device_id, x_host.len() * 2).unwrap();
+        d_x.copy_from_host(&x_host, &stream).unwrap();
+        let d_ref0 = DeviceBuffer::alloc(dev.device_id, m * n0 * 2).unwrap();
+        let d_ref1 = DeviceBuffer::alloc(dev.device_id, m * n1 * 2).unwrap();
+        let d_got0 = DeviceBuffer::alloc(dev.device_id, m * n0 * 2).unwrap();
+        let d_got1 = DeviceBuffer::alloc(dev.device_id, m * n1 * 2).unwrap();
+
+        assert_eq!(
+            unsafe {
+                ffi::w34_small_n_gemm_f16(
+                    &ex,
+                    d_x.addr() as *const c_void,
+                    d_w0.addr() as *const c_void,
+                    d_ref0.addr() as *mut c_void,
+                    m as i32,
+                    n0 as i32,
+                    size_k as i32,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                ffi::w34_small_n_gemm_f16(
+                    &ex,
+                    d_x.addr() as *const c_void,
+                    d_w1.addr() as *const c_void,
+                    d_ref1.addr() as *mut c_void,
+                    m as i32,
+                    n1 as i32,
+                    size_k as i32,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                ffi::w34_small_n_gemm_dual_f16(
+                    &ex,
+                    d_x.addr() as *const c_void,
+                    d_w0.addr() as *const c_void,
+                    d_got0.addr() as *mut c_void,
+                    n0 as i32,
+                    d_w1.addr() as *const c_void,
+                    d_got1.addr() as *mut c_void,
+                    n1 as i32,
+                    m as i32,
+                    size_k as i32,
+                )
+            },
+            0
+        );
+        let mut ref0 = vec![0u16; m * n0];
+        let mut ref1 = vec![0u16; m * n1];
+        let mut got0 = vec![0u16; m * n0];
+        let mut got1 = vec![0u16; m * n1];
+        d_ref0.copy_to_host(&mut ref0, &stream).unwrap();
+        d_ref1.copy_to_host(&mut ref1, &stream).unwrap();
+        d_got0.copy_to_host(&mut got0, &stream).unwrap();
+        d_got1.copy_to_host(&mut got1, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(got0, ref0, "dual_small_n out0 0-ULP mismatch at M={m}");
+        assert_eq!(got1, ref1, "dual_small_n out1 0-ULP mismatch at M={m}");
+    }
+
+    // 2. Single-warp `moe_topk_router_warp256_f16` (`num_experts = 256, top_k = 8`) vs
+    // `cta128` (`num_experts = 257`, last column = -65504 so top-8 selection is identical).
+    let rows = 5usize;
+    let top_k = 8usize;
+    let mut logits_256 = vec![0u16; rows * 256];
+    let mut logits_257 = vec![0u16; rows * 257];
+    for r in 0..rows {
+        for e in 0..256 {
+            let v = (((r * 73 + e * 19) % 512) as f32 - 256.0) * 0.03125;
+            let bits = f32_to_f16(v);
+            logits_256[r * 256 + e] = bits;
+            logits_257[r * 257 + e] = bits;
+        }
+        logits_257[r * 257 + 256] = f32_to_f16(-65504.0);
+    }
+    let d_l256 = DeviceBuffer::alloc(dev.device_id, logits_256.len() * 2).unwrap();
+    let d_l257 = DeviceBuffer::alloc(dev.device_id, logits_257.len() * 2).unwrap();
+    d_l256.copy_from_host(&logits_256, &stream).unwrap();
+    d_l257.copy_from_host(&logits_257, &stream).unwrap();
+    let d_w256 = DeviceBuffer::alloc(dev.device_id, rows * top_k * 4).unwrap();
+    let d_w257 = DeviceBuffer::alloc(dev.device_id, rows * top_k * 4).unwrap();
+    let d_i256 = DeviceBuffer::alloc(dev.device_id, rows * top_k * 4).unwrap();
+    let d_i257 = DeviceBuffer::alloc(dev.device_id, rows * top_k * 4).unwrap();
+
+    for norm_topk in [0i32, 1] {
+        for use_sigmoid in [0i32, 1] {
+            // For softmax (`use_sigmoid == 0`), an extra `-65504` column adds exp(-65504) == 0.0f in FP32!
+            assert_eq!(
+                unsafe {
+                    ffi::w34_moe_topk_router_f16(
+                        &ex,
+                        d_l256.addr() as *const c_void,
+                        d_w256.addr() as *mut f32,
+                        d_i256.addr() as *mut i32,
+                        rows as i32,
+                        256,
+                        top_k as i32,
+                        norm_topk,
+                        use_sigmoid,
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    ffi::w34_moe_topk_router_f16(
+                        &ex,
+                        d_l257.addr() as *const c_void,
+                        d_w257.addr() as *mut f32,
+                        d_i257.addr() as *mut i32,
+                        rows as i32,
+                        257,
+                        top_k as i32,
+                        norm_topk,
+                        use_sigmoid,
+                    )
+                },
+                0
+            );
+            let mut ids256 = vec![0i32; rows * top_k];
+            let mut ids257 = vec![0i32; rows * top_k];
+            let mut w256 = vec![0f32; rows * top_k];
+            let mut w257 = vec![0f32; rows * top_k];
+            d_i256.copy_to_host(&mut ids256, &stream).unwrap();
+            d_i257.copy_to_host(&mut ids257, &stream).unwrap();
+            d_w256.copy_to_host(&mut w256, &stream).unwrap();
+            d_w257.copy_to_host(&mut w257, &stream).unwrap();
+            stream.synchronize().unwrap();
+            assert_eq!(
+                ids256, ids257,
+                "router top-k IDs mismatch (norm={norm_topk}, sig={use_sigmoid})"
+            );
+            for (a, b) in w256.iter().zip(w257.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "router weight mismatch {a} vs {b} (norm={norm_topk}, sig={use_sigmoid})"
+                );
+            }
+        }
+    }
+}

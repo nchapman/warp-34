@@ -1176,19 +1176,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_fused_qk_rmsnorm_rope_gate_f16",
     )?;
-    check_rc(
-        unsafe {
-            ffi::w34_silu_and_mul_f16(
-                &ex,
-                buf_a as *const c_void,
-                buf_c as *mut c_void,
-                core::ptr::null(),
-                1,
-                128,
-            )
-        },
-        "warmup w34_silu_and_mul_f16",
-    )?;
+    for d_warm in [128i32, 132] {
+        check_rc(
+            unsafe {
+                ffi::w34_silu_and_mul_f16(
+                    &ex,
+                    buf_a as *const c_void,
+                    buf_c as *mut c_void,
+                    core::ptr::null(),
+                    1,
+                    d_warm,
+                )
+            },
+            "warmup w34_silu_and_mul_f16",
+        )?;
+    }
     check_rc(
         unsafe {
             ffi::w34_apply_attn_output_gate_f16(
@@ -1250,6 +1252,23 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )
         },
         "warmup w34_small_n_gemm_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_small_n_gemm_dual_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                64,
+                buf_b as *const c_void,
+                buf_d as *mut c_void,
+                1,
+                1,
+                128,
+            )
+        },
+        "warmup w34_small_n_gemm_dual_f16",
     )?;
     for hs in [128i32, 3072, 5120, 6144] {
         let sig_u32_len = (unsafe { ffi::w34_tp2_signal_bytes() } as usize).div_ceil(4);
@@ -1421,45 +1440,91 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     attn_batch_split.max_seq_len = 2048;
     let split_ws = arena.alloc_aligned(512 * 1024)?;
     let ex_split = stream.exec(split_ws, 512 * 1024);
-    check_rc(
-        unsafe {
-            ffi::w34_paged_attention_f16(
-                &ex,
-                &layout_256,
-                &attn_batch,
-                buf_c as *const c_void,
-                buf_d as *mut c_void,
-                4,
-            )
-        },
-        "warmup w34_paged_attention_f16 gqa_vec_m1",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_paged_attention_f16(
-                &ex_split,
-                &layout_256,
-                &attn_batch_m2,
-                buf_c as *const c_void,
-                buf_d as *mut c_void,
-                4,
-            )
-        },
-        "warmup w34_paged_attention_f16 gqa_mma_split_kv",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_paged_attention_f16(
-                &ex_split,
-                &layout_256,
-                &attn_batch_split,
-                buf_c as *const c_void,
-                buf_d as *mut c_void,
-                4,
-            )
-        },
-        "warmup w34_paged_attention_f16 split_kv",
-    )?;
+    for q_heads in [4i32, 6, 8] {
+        check_rc(
+            unsafe {
+                ffi::w34_paged_attention_f16(
+                    &ex,
+                    &layout_256,
+                    &attn_batch,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    q_heads,
+                )
+            },
+            "warmup w34_paged_attention_f16 gqa_vec_m1",
+        )?;
+        check_rc(
+            unsafe {
+                ffi::w34_paged_attention_f16(
+                    &ex_split,
+                    &layout_256,
+                    &attn_batch_m2,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    q_heads,
+                )
+            },
+            "warmup w34_paged_attention_f16 gqa_mma_split_kv",
+        )?;
+        check_rc(
+            unsafe {
+                ffi::w34_paged_attention_f16(
+                    &ex_split,
+                    &layout_256,
+                    &attn_batch_split,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    q_heads,
+                )
+            },
+            "warmup w34_paged_attention_f16 split_kv",
+        )?;
+    }
+    let tq4_buf = arena.upload_slice(&vec![0u8; 16 * 132], &stream)?;
+    let layout_256_tq4 = W34KvLayerLayout {
+        k_base: tq4_buf,
+        v_base: tq4_buf,
+        k_token_stride_bytes: 132,
+        v_token_stride_bytes: 132,
+        k_head_stride_bytes: 16 * 132,
+        v_head_stride_bytes: 16 * 132,
+        k_page_stride_bytes: 16 * 132,
+        v_page_stride_bytes: 16 * 132,
+        k_format: ffi::W34_KV_FORMAT_TQ4,
+        v_format: ffi::W34_KV_FORMAT_TQ4,
+        k_transform: ffi::W34_KV_TRANSFORM_RADEMACHER_WHT256,
+        v_transform: ffi::W34_KV_TRANSFORM_RADEMACHER_WHT256,
+        ..layout_256
+    };
+    for q_heads in [4i32, 6, 8] {
+        check_rc(
+            unsafe {
+                ffi::w34_paged_attention_f16(
+                    &ex,
+                    &layout_256_tq4,
+                    &attn_batch,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    q_heads,
+                )
+            },
+            "warmup w34_paged_attention_f16 tq4 gqa_vec_m1",
+        )?;
+        check_rc(
+            unsafe {
+                ffi::w34_paged_attention_f16(
+                    &ex_split,
+                    &layout_256_tq4,
+                    &attn_batch_m2,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    q_heads,
+                )
+            },
+            "warmup w34_paged_attention_f16 tq4 gqa_mma_split_kv",
+        )?;
+    }
 
     let bf16_layout = W34KvLayerLayout {
         namespace_id: ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
@@ -1490,7 +1555,39 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 2,
             )
         },
-        "warmup w34_paged_attention_bf16",
+        "warmup w34_paged_attention_bf16 hd128",
+    )?;
+    let bf16_layout_256 = W34KvLayerLayout {
+        namespace_id: ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
+        k_format: ffi::W34_KV_FORMAT_BF16,
+        v_format: ffi::W34_KV_FORMAT_BF16,
+        ..layout_256
+    };
+    check_rc(
+        unsafe {
+            ffi::w34_paged_attention_bf16(
+                &ex,
+                &bf16_layout_256,
+                &attn_batch,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                2,
+            )
+        },
+        "warmup w34_paged_attention_bf16 hd256",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_paged_attention_bf16(
+                &ex,
+                &bf16_layout,
+                &attn_batch,
+                (buf_c + 4) as *const c_void,
+                buf_d as *mut c_void,
+                2,
+            )
+        },
+        "warmup w34_paged_attention_bf16 fallback",
     )?;
 
     // 4. GDN conv1d & recurrent
@@ -1619,6 +1716,49 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )
         },
         "warmup w34_sampler_step_f16",
+    )?;
+    let greedy_sampler_cfg = ffi::W34SamplerRowCfg {
+        temperature: 0.0,
+        top_k: 1,
+        sparse_count: 1,
+        top_logprobs_k: 0,
+        ..sampler_cfg
+    };
+    let greedy_sampler_cfg_dev = arena.upload_slice(&[greedy_sampler_cfg], &stream)?;
+    check_rc(
+        unsafe {
+            ffi::w34_sampler_step_fast_greedy_f16(
+                &ex_sampler,
+                buf_a as *const c_void,
+                greedy_sampler_cfg_dev as *const ffi::W34SamplerRowCfg,
+                sampler_sparse_dev as *const ffi::W34SamplerSparseEntry,
+                sampler_out_dev as *mut ffi::W34SamplerRowOut,
+                1,
+                1024,
+            )
+        },
+        "warmup w34_sampler_step_fast_greedy_f16",
+    )?;
+    let plain_greedy_cfg = ffi::W34SamplerRowCfg {
+        sparse_count: 0,
+        ..greedy_sampler_cfg
+    };
+    let plain_greedy_cfg_dev = arena.upload_slice(&[plain_greedy_cfg], &stream)?;
+    check_rc(
+        unsafe {
+            ffi::w34_sampler_step_f16(
+                &ex_sampler,
+                buf_a as *const c_void,
+                plain_greedy_cfg_dev as *const ffi::W34SamplerRowCfg,
+                core::ptr::null(),
+                core::ptr::null(),
+                sampler_out_dev as *mut ffi::W34SamplerRowOut,
+                1,
+                1024,
+                0,
+            )
+        },
+        "warmup w34_sampler_step_f16 fast_greedy",
     )?;
     check_rc(
         unsafe {
@@ -1759,7 +1899,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 2048,
                 0,
                 16,
-                8,
+                16,
             )
         },
         "warmup w34_topk_rows_split_f16",
@@ -1833,6 +1973,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             )
         },
         "warmup rms_norm_bf16 vec8",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_rms_norm_bf16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                1,
+                2560,
+                1e-6,
+            )
+        },
+        "warmup rms_norm_bf16 vec8 h2560",
     )?;
     check_rc(
         unsafe {
@@ -2029,7 +2184,23 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 0,
             )
         },
-        "warmup w34_moe_topk_router_f16",
+        "warmup w34_moe_topk_router_f16 (warp256)",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_moe_topk_router_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut f32,
+                reject_ids as *mut i32,
+                1,
+                512,
+                2,
+                1,
+                0,
+            )
+        },
+        "warmup w34_moe_topk_router_f16 (cta128)",
     )?;
     check_rc(
         unsafe {

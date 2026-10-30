@@ -382,3 +382,336 @@ fn tp1_and_tp2_gpu_sampler_and_bitmask_parity_plain_and_speculative() {
     assert_eq!(mlp1, mlp2);
     assert!(!tp1_mtp.is_empty() && !tp2_mtp.is_empty());
 }
+
+#[test]
+fn fast_greedy_sampler_matches_full_sampler_and_rejects_ineligible_rows() {
+    let _guard = GPU_LOCK.lock().unwrap();
+    let dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(dev.device_id).unwrap();
+
+    // Vocab size matches Qwen3.5 (`248320`, >= 1024 fast-greedy threshold).
+    let vocab_size = 248_320usize;
+    let num_rows = 8usize;
+    let mut logits_f16 = vec![0u16; num_rows * vocab_size];
+    for r in 0..num_rows {
+        for v in 0..vocab_size {
+            let val = (((r * 131 + v * 17) % 1024) as f32 - 512.0) * 0.015625;
+            logits_f16[r * vocab_size + v] = f32_to_f16(val);
+        }
+        // Plant distinct peaks (including one penalized peak on even rows so sparse penalties flip argmax).
+        let primary = 10_000 + r * 7777;
+        let secondary = 50_000 + r * 3333;
+        logits_f16[r * vocab_size + primary] = f32_to_f16(11.5);
+        logits_f16[r * vocab_size + secondary] = f32_to_f16(11.25);
+    }
+
+    let mut row_cfgs = Vec::with_capacity(num_rows);
+    let mut sparse = Vec::new();
+    for r in 0..num_rows {
+        let primary = (10_000 + r * 7777) as i32;
+        let tertiary = (90_000 + r * 1111) as i32;
+        let off = sparse.len() as i32;
+        let cnt = if r % 2 == 0 {
+            sparse.push(W34SamplerSparseEntry {
+                token_id: primary,
+                output_count: 3,
+                logit_bias: -1.5,
+                in_prompt: 1,
+                banned: 0,
+            });
+            sparse.push(W34SamplerSparseEntry {
+                token_id: tertiary,
+                output_count: 0,
+                logit_bias: 0.5,
+                in_prompt: 0,
+                banned: if r == 4 { 1 } else { 0 },
+            });
+            2
+        } else {
+            0
+        };
+        row_cfgs.push(W34SamplerRowCfg {
+            temperature: 0.0,
+            top_k: if r % 3 == 0 { -1 } else { 1 },
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: if r % 2 == 0 { 1.2 } else { 1.0 },
+            frequency_penalty: if r % 2 == 0 { 0.25 } else { 0.0 },
+            presence_penalty: if r % 2 == 0 { 0.35 } else { 0.0 },
+            uniform_sample: 0.5,
+            recovery_uniform: 0.5,
+            draft_token_id: -1,
+            has_bitmask: 0,
+            row_bitmask_word_offset: 0,
+            sparse_offset: off,
+            sparse_count: cnt,
+            top_logprobs_k: 0,
+            use_token_id_cdf: 0,
+        });
+    }
+
+    let mut arena = DeviceArena::new(dev.device_id, 256 * 1024 * 1024).unwrap();
+    let d_logits = arena.upload_slice(&logits_f16, &stream).unwrap();
+    let d_cfgs = arena.upload_slice(&row_cfgs, &stream).unwrap();
+    let d_sparse = arena.upload_slice(&sparse, &stream).unwrap();
+    let out_bytes = num_rows * core::mem::size_of::<W34SamplerRowOut>();
+    let d_out_fast = arena.alloc_aligned(out_bytes).unwrap();
+    let d_out_auto = arena.alloc_aligned(out_bytes).unwrap();
+    let (ws_ptr, ws_cap) = arena.remaining_workspace();
+    // Reserve room for follow-up allocations (`d_nosparse_cfgs`, `d_full_cfgs`, etc.) by allocating an explicit workspace slice.
+    let _ = (ws_ptr, ws_cap);
+    let ws_full = (num_rows * vocab_size * 4 * 4 + 4096) & !255;
+    let d_ws = arena.alloc_aligned(ws_full).unwrap();
+    let ex = stream.exec(d_ws, ws_full);
+
+    // Direct fast-greedy entrypoint (supports sparse penalties/biases/bans).
+    // SAFETY: all device pointers belong to `arena` on device 0 and remain live past `stream.synchronize()`.
+    let rc_fast = unsafe {
+        ffi::w34_sampler_step_fast_greedy_f16(
+            &ex,
+            d_logits as *const c_void,
+            d_cfgs as *const W34SamplerRowCfg,
+            d_sparse as *const W34SamplerSparseEntry,
+            d_out_fast as *mut W34SamplerRowOut,
+            num_rows as i32,
+            vocab_size as i32,
+        )
+    };
+    assert_eq!(rc_fast, 0);
+    // Automatic `w34_sampler_step_f16` fast-path dispatch when `total_sparse_entries == 0`.
+    let mut nosparse_cfgs = row_cfgs.clone();
+    for c in &mut nosparse_cfgs {
+        c.sparse_offset = 0;
+        c.sparse_count = 0;
+        c.repetition_penalty = 1.0;
+        c.frequency_penalty = 0.0;
+        c.presence_penalty = 0.0;
+    }
+    let d_nosparse_cfgs = arena.upload_slice(&nosparse_cfgs, &stream).unwrap();
+    // SAFETY: device buffers in `arena` hold `num_rows * vocab_size` halves and `num_rows` row configs/outputs.
+    let rc_auto = unsafe {
+        ffi::w34_sampler_step_f16(
+            &ex,
+            d_logits as *const c_void,
+            d_nosparse_cfgs as *const W34SamplerRowCfg,
+            core::ptr::null(),
+            core::ptr::null(),
+            d_out_auto as *mut W34SamplerRowOut,
+            num_rows as i32,
+            vocab_size as i32,
+            0,
+        )
+    };
+    assert_eq!(rc_auto, 0);
+
+    // Reference full 9-step path: set `top_logprobs_k = 1` so `w34_sampler_step_f16` forces the full path
+    // without changing greedy `sampled_id` or `sampled_logprob`.
+    let mut full_cfgs = row_cfgs.clone();
+    for c in &mut full_cfgs {
+        c.top_logprobs_k = 1;
+    }
+    let d_full_cfgs = arena.upload_slice(&full_cfgs, &stream).unwrap();
+    let d_out_ref = arena.alloc_aligned(out_bytes).unwrap();
+    // SAFETY: `d_full_cfgs`, `d_sparse`, and `d_out_ref` are valid device allocations on device 0.
+    let rc_ref = unsafe {
+        ffi::w34_sampler_step_f16(
+            &ex,
+            d_logits as *const c_void,
+            d_full_cfgs as *const W34SamplerRowCfg,
+            core::ptr::null(),
+            d_sparse as *const W34SamplerSparseEntry,
+            d_out_ref as *mut W34SamplerRowOut,
+            num_rows as i32,
+            vocab_size as i32,
+            sparse.len() as i32,
+        )
+    };
+    assert_eq!(rc_ref, 0);
+    let mut full_nosparse_cfgs = nosparse_cfgs.clone();
+    for c in &mut full_nosparse_cfgs {
+        c.top_logprobs_k = 1;
+    }
+    let d_full_nosparse_cfgs = arena.upload_slice(&full_nosparse_cfgs, &stream).unwrap();
+    let d_out_nosparse_ref = arena.alloc_aligned(out_bytes).unwrap();
+    // SAFETY: `d_full_nosparse_cfgs` and `d_out_nosparse_ref` are valid device allocations on device 0.
+    let rc_nosparse_ref = unsafe {
+        ffi::w34_sampler_step_f16(
+            &ex,
+            d_logits as *const c_void,
+            d_full_nosparse_cfgs as *const W34SamplerRowCfg,
+            core::ptr::null(),
+            core::ptr::null(),
+            d_out_nosparse_ref as *mut W34SamplerRowOut,
+            num_rows as i32,
+            vocab_size as i32,
+            0,
+        )
+    };
+    assert_eq!(rc_nosparse_ref, 0);
+
+    let zero_out = W34SamplerRowOut::default();
+    let mut got_fast = vec![zero_out; num_rows];
+    let mut got_auto = vec![zero_out; num_rows];
+    let mut got_ref = vec![zero_out; num_rows];
+    let mut got_nosparse_ref = vec![zero_out; num_rows];
+    // SAFETY: each host Vec and device buffer has exact length `out_bytes` and outlives `stream.synchronize()`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_fast.as_mut_ptr() as *mut c_void,
+                d_out_fast as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_auto.as_mut_ptr() as *mut c_void,
+                d_out_auto as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_ref.as_mut_ptr() as *mut c_void,
+                d_out_ref as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_nosparse_ref.as_mut_ptr() as *mut c_void,
+                d_out_nosparse_ref as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+
+    for r in 0..num_rows {
+        assert_eq!(got_fast[r].sampled_id, got_ref[r].sampled_id, "row {r} id");
+        assert_eq!(
+            got_auto[r].sampled_id, got_nosparse_ref[r].sampled_id,
+            "row {r} auto id"
+        );
+        assert!(
+            (got_fast[r].sampled_logprob - got_ref[r].sampled_logprob).abs() < 1e-4,
+            "row {r} logprob fast={} vs ref={}",
+            got_fast[r].sampled_logprob,
+            got_ref[r].sampled_logprob
+        );
+        assert!(
+            (got_auto[r].sampled_logprob - got_nosparse_ref[r].sampled_logprob).abs() < 1e-4,
+            "row {r} auto logprob={} vs ref={}",
+            got_auto[r].sampled_logprob,
+            got_nosparse_ref[r].sampled_logprob
+        );
+    }
+
+    // Direct `w34_sampler_step_fast_greedy_f16` rejects `vocab_size < 1024` (`cudaErrorInvalidValue == 1`),
+    // while `w34_sampler_step_f16` seamlessly falls back per-row when a batch mixes greedy and stochastic rows.
+    // SAFETY: `vocab_size < 1024` returns immediately before launching any kernel.
+    let rc_small = unsafe {
+        ffi::w34_sampler_step_fast_greedy_f16(
+            &ex,
+            d_logits as *const c_void,
+            d_cfgs as *const W34SamplerRowCfg,
+            d_sparse as *const W34SamplerSparseEntry,
+            d_out_fast as *mut W34SamplerRowOut,
+            num_rows as i32,
+            512,
+        )
+    };
+    assert_eq!(rc_small, 1);
+    let mut mixed_cfgs = nosparse_cfgs;
+    // Row 0 is stochastic (`work_prob[0..vocab_size]` written by `sampler_step_f16_kernel`),
+    // while rows 1..num_rows take the fast-greedy split path (`fast_parts` must not alias `work_prob`).
+    mixed_cfgs[0].temperature = 0.7;
+    let d_mixed = arena.upload_slice(&mixed_cfgs, &stream).unwrap();
+    let mut got_mixed = vec![W34SamplerRowOut::default(); num_rows];
+    // SAFETY: `d_mixed` and `d_out_auto` are valid device allocations on device 0.
+    let rc_mixed = unsafe {
+        ffi::w34_sampler_step_f16(
+            &ex,
+            d_logits as *const c_void,
+            d_mixed as *const W34SamplerRowCfg,
+            core::ptr::null(),
+            core::ptr::null(),
+            d_out_auto as *mut W34SamplerRowOut,
+            num_rows as i32,
+            vocab_size as i32,
+            0,
+        )
+    };
+    assert_eq!(rc_mixed, 0);
+    // SAFETY: `got_mixed` and `d_out_auto` have length `out_bytes` on `stream`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_mixed.as_mut_ptr() as *mut c_void,
+                d_out_auto as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(got_mixed[0].status, 0);
+    assert!((0..vocab_size as i32).contains(&got_mixed[0].sampled_id));
+    for r in 1..num_rows {
+        assert_eq!(got_mixed[r].status, 0, "mixed row {r} status");
+        assert_eq!(
+            got_mixed[r].sampled_id, got_nosparse_ref[r].sampled_id,
+            "mixed row {r} greedy id corrupted by stochastic row 0"
+        );
+        assert!(
+            (got_mixed[r].sampled_logprob - got_nosparse_ref[r].sampled_logprob).abs() < 1e-4,
+            "mixed row {r} logprob={} vs ref={}",
+            got_mixed[r].sampled_logprob,
+            got_nosparse_ref[r].sampled_logprob
+        );
+    }
+
+    // Tight `2 * slice_bytes` scratch without room for `fast_parts` still succeeds via full-kernel fallback.
+    let slice_bytes = ((num_rows * vocab_size * 4) + 255) & !255;
+    let ex_tight = stream.exec(d_ws, slice_bytes * 2);
+    let mut got_tight = vec![W34SamplerRowOut::default(); num_rows];
+    // SAFETY: `ex_tight` provides exact `2 * slice_bytes` workspace required by `w34_sampler_step_f16`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_sampler_step_f16(
+                &ex_tight,
+                d_logits as *const c_void,
+                d_mixed as *const W34SamplerRowCfg,
+                core::ptr::null(),
+                core::ptr::null(),
+                d_out_auto as *mut W34SamplerRowOut,
+                num_rows as i32,
+                vocab_size as i32,
+                0,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_tight.as_mut_ptr() as *mut c_void,
+                d_out_auto as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+    for r in 1..num_rows {
+        assert_eq!(got_tight[r].sampled_id, got_nosparse_ref[r].sampled_id);
+    }
+}

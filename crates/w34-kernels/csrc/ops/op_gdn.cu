@@ -184,7 +184,13 @@ __global__ void gdn_recurrent_f16_kernel(
     const int ck = head_k_dim / NW; // 16 when head_k_dim == 128, NW == 8
     const int c0 = wk * ck;
 
-    // Load initial [BV, head_k_dim] FP32 state slice into registers rr[16]
+    // Load initial [BV, head_k_dim] FP32 state slice into registers rr[16].
+    // When NW == 8 and head_k_dim == 128, all 8 lanes wk = 0..7 of row vi reside in the
+    // same warp, so staging through smem_s4[16][33] converts 64-byte-strided global float4
+    // accesses into 100%-coalesced contiguous 128-byte warp accesses while preserving
+    // bit-exact 0-ULP register ownership rr[0..15].
+    __shared__ float4 smem_s4[16][33];
+    const bool coalesced_s4 = (NW == 8) && (BV == 16) && (head_k_dim == 128) && ((vbase + BV) <= head_v_dim);
     float rr[16];
 #pragma unroll
     for (int j = 0; j < 16; j++) rr[j] = 0.0f;
@@ -192,18 +198,37 @@ __global__ void gdn_recurrent_f16_kernel(
     const bool has_init = (batch.has_initial_state == nullptr) || (batch.has_initial_state[req] != 0);
     const int32_t slot_in = (batch.state_in_indices != nullptr) ? batch.state_in_indices[req] : -1;
     const size_t head_state_elems = (size_t)head_v_dim * head_k_dim;
-    if (has_init && slot_in >= 0 && slot_in < total_state_slots && vrow < head_v_dim) {
-        const float* s_in = ssm_state_pool
-                            + ((size_t)slot_in * num_v_heads + hv) * head_state_elems
-                            + (size_t)vrow * head_k_dim;
-        const float4* s_in4 = reinterpret_cast<const float4*>(s_in + c0);
+    if (has_init && slot_in >= 0 && slot_in < total_state_slots) {
+        if (coalesced_s4) {
+            const float4* row_in4 = reinterpret_cast<const float4*>(
+                ssm_state_pool + ((size_t)slot_in * num_v_heads + hv) * head_state_elems +
+                (size_t)vrow * head_k_dim);
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            float4 v4 = s_in4[j];
-            rr[j * 4 + 0] = v4.x;
-            rr[j * 4 + 1] = v4.y;
-            rr[j * 4 + 2] = v4.z;
-            rr[j * 4 + 3] = v4.w;
+            for (int j = 0; j < 4; ++j) {
+                smem_s4[vi][j * 8 + wk] = __ldg(&row_in4[j * 8 + wk]);
+            }
+            __syncwarp();
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float4 v4 = smem_s4[vi][wk * 4 + j];
+                rr[j * 4 + 0] = v4.x;
+                rr[j * 4 + 1] = v4.y;
+                rr[j * 4 + 2] = v4.z;
+                rr[j * 4 + 3] = v4.w;
+            }
+        } else if (vrow < head_v_dim) {
+            const float* s_in = ssm_state_pool
+                                + ((size_t)slot_in * num_v_heads + hv) * head_state_elems
+                                + (size_t)vrow * head_k_dim;
+            const float4* s_in4 = reinterpret_cast<const float4*>(s_in + c0);
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float4 v4 = s_in4[j];
+                rr[j * 4 + 0] = v4.x;
+                rr[j * 4 + 1] = v4.y;
+                rr[j * 4 + 2] = v4.z;
+                rr[j * 4 + 3] = v4.w;
+            }
         }
     }
 
@@ -298,17 +323,35 @@ __global__ void gdn_recurrent_f16_kernel(
         // Speculative per-step snapshot into spec_state_indices[req, step]
         if (batch.spec_state_indices != nullptr && step < batch.max_verify_tokens) {
             const int32_t spec_slot = batch.spec_state_indices[req * batch.max_verify_tokens + step];
-            if (spec_slot >= 0 && spec_slot < total_state_slots && vrow < head_v_dim) {
-                float* s_spec = ssm_state_pool
-                                + ((size_t)spec_slot * num_v_heads + hv) * head_state_elems
-                                + (size_t)vrow * head_k_dim;
-                float4* s_spec4 = reinterpret_cast<float4*>(s_spec + c0);
+            if (spec_slot >= 0 && spec_slot < total_state_slots) {
+                if (coalesced_s4) {
+                    __syncwarp();
 #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    s_spec4[j] = make_float4(
-                        rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                    for (int j = 0; j < 4; ++j) {
+                        smem_s4[vi][wk * 4 + j] = make_float4(
+                            rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                    }
+                    __syncwarp();
+                    float4* row_spec4 = reinterpret_cast<float4*>(
+                        ssm_state_pool + ((size_t)spec_slot * num_v_heads + hv) * head_state_elems +
+                        (size_t)vrow * head_k_dim);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        row_spec4[j * 8 + wk] = smem_s4[vi][j * 8 + wk];
+                    }
+                    if (step == seqlen - 1) last_spec_slot = spec_slot;
+                } else if (vrow < head_v_dim) {
+                    float* s_spec = ssm_state_pool
+                                    + ((size_t)spec_slot * num_v_heads + hv) * head_state_elems
+                                    + (size_t)vrow * head_k_dim;
+                    float4* s_spec4 = reinterpret_cast<float4*>(s_spec + c0);
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        s_spec4[j] = make_float4(
+                            rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                    }
+                    if (step == seqlen - 1) last_spec_slot = spec_slot;
                 }
-                if (step == seqlen - 1) last_spec_slot = spec_slot;
             }
         }
 
@@ -318,15 +361,32 @@ __global__ void gdn_recurrent_f16_kernel(
                 const int32_t trig_off = batch.checkpoint_token_offsets[req * batch.max_checkpoints_per_req + e];
                 if (trig_off == step + 1) {
                     const int32_t chk_slot = batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
-                    if (chk_slot >= 0 && chk_slot < total_state_slots && vrow < head_v_dim) {
-                        float* s_chk = ssm_state_pool
-                                       + ((size_t)chk_slot * num_v_heads + hv) * head_state_elems
-                                       + (size_t)vrow * head_k_dim;
-                        float4* s_chk4 = reinterpret_cast<float4*>(s_chk + c0);
+                    if (chk_slot >= 0 && chk_slot < total_state_slots) {
+                        if (coalesced_s4) {
+                            __syncwarp();
 #pragma unroll
-                        for (int j = 0; j < 4; j++) {
-                            s_chk4[j] = make_float4(
-                                rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                            for (int j = 0; j < 4; ++j) {
+                                smem_s4[vi][wk * 4 + j] = make_float4(
+                                    rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                            }
+                            __syncwarp();
+                            float4* row_chk4 = reinterpret_cast<float4*>(
+                                ssm_state_pool + ((size_t)chk_slot * num_v_heads + hv) * head_state_elems +
+                                (size_t)vrow * head_k_dim);
+#pragma unroll
+                            for (int j = 0; j < 4; ++j) {
+                                row_chk4[j * 8 + wk] = smem_s4[vi][j * 8 + wk];
+                            }
+                        } else if (vrow < head_v_dim) {
+                            float* s_chk = ssm_state_pool
+                                           + ((size_t)chk_slot * num_v_heads + hv) * head_state_elems
+                                           + (size_t)vrow * head_k_dim;
+                            float4* s_chk4 = reinterpret_cast<float4*>(s_chk + c0);
+#pragma unroll
+                            for (int j = 0; j < 4; j++) {
+                                s_chk4[j] = make_float4(
+                                    rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                            }
                         }
                     }
                 }
@@ -335,17 +395,34 @@ __global__ void gdn_recurrent_f16_kernel(
     }
 
     // Write final state to state_out_indices[req] (skip if already written to the same spec_slot)
-    if (batch.state_out_indices != nullptr && vrow < head_v_dim) {
+    if (batch.state_out_indices != nullptr) {
         const int32_t slot_out = batch.state_out_indices[req];
         if (slot_out >= 0 && slot_out < total_state_slots && slot_out != last_spec_slot) {
-            float* s_out = ssm_state_pool
-                           + ((size_t)slot_out * num_v_heads + hv) * head_state_elems
-                           + (size_t)vrow * head_k_dim;
-            float4* s_out4 = reinterpret_cast<float4*>(s_out + c0);
+            if (coalesced_s4) {
+                __syncwarp();
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                s_out4[j] = make_float4(
-                    rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                for (int j = 0; j < 4; ++j) {
+                    smem_s4[vi][wk * 4 + j] = make_float4(
+                        rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                }
+                __syncwarp();
+                float4* row_out4 = reinterpret_cast<float4*>(
+                    ssm_state_pool + ((size_t)slot_out * num_v_heads + hv) * head_state_elems +
+                    (size_t)vrow * head_k_dim);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    row_out4[j * 8 + wk] = smem_s4[vi][j * 8 + wk];
+                }
+            } else if (vrow < head_v_dim) {
+                float* s_out = ssm_state_pool
+                               + ((size_t)slot_out * num_v_heads + hv) * head_state_elems
+                               + (size_t)vrow * head_k_dim;
+                float4* s_out4 = reinterpret_cast<float4*>(s_out + c0);
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    s_out4[j] = make_float4(
+                        rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+                }
             }
         }
     }

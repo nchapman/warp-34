@@ -297,6 +297,7 @@ fn run(
         } else {
             None
         };
+        let was_idle = first.is_some();
         // The engine retains the canonical radix between ticks (including diagnostics).
         std::mem::swap(&mut engine.radix, &mut sched.radix);
         if let Some(r) = first {
@@ -307,6 +308,47 @@ fn run(
             match receiver.try_recv() {
                 Ok(r) => enqueue(&engine, &mut sched, &mut requests, r),
                 Err(_) => break,
+            }
+        }
+        // When waking from idle, briefly coalesce concurrent HTTP burst peers that are
+        // finishing socket connect + tokenization (including Python client GIL bursts) so
+        // simultaneous N=8/16 arrivals batch onto tick 1 instead of staggering request 0
+        // into lone speculation.
+        if was_idle && requests.len() < config.max_num_seqs && !shutdown.load(Ordering::Acquire) {
+            let burst_start = std::time::Instant::now();
+            let mut last_arrival = burst_start;
+            let spec_active = engine.speculative.is_some();
+            while requests.len() < config.max_num_seqs && !shutdown.load(Ordering::Acquire) {
+                let max_window = if requests.len() >= 2 {
+                    std::time::Duration::from_millis(8)
+                } else {
+                    std::time::Duration::from_micros(3000)
+                };
+                if burst_start.elapsed() >= max_window {
+                    break;
+                }
+                match receiver.try_recv() {
+                    Ok(r) => {
+                        enqueue(&engine, &mut sched, &mut requests, r);
+                        last_arrival = std::time::Instant::now();
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        let quiet_cap = if requests.len() <= 1 {
+                            if spec_active {
+                                std::time::Duration::from_micros(2500)
+                            } else {
+                                std::time::Duration::from_micros(600)
+                            }
+                        } else {
+                            std::time::Duration::from_micros(1500)
+                        };
+                        if last_arrival.elapsed() >= quiet_cap {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(40));
+                    }
+                }
             }
         }
         let cancelled: Vec<_> = requests
@@ -694,9 +736,6 @@ fn step_plain(
                 .map_or(0, |v| v.position_delta)
         })
         .collect();
-    let greedy = engine
-        .step_batch_slices_with_pos_deltas(&batch, Some(&deltas))
-        .map_err(|e| e.to_string())?;
     let needs_gpu = slices.iter().any(|s| {
         (!s.is_prefill_chunk || s.is_final_prefill_chunk) && {
             let r = &requests[&s.req_id];
@@ -705,6 +744,9 @@ fn step_plain(
                 .is_plain_greedy(r.sampler.constraint.is_some())
         }
     });
+    let greedy = engine
+        .step_batch_slices_for_sampler(&batch, Some(&deltas), needs_gpu)
+        .map_err(|e| e.to_string())?;
     let sampled = if needs_gpu {
         let _sampler_range = crate::profiling::Range::new(c"w34.serve.sampler");
         let mut masks = Vec::new();

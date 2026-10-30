@@ -941,6 +941,274 @@ fn phase6_2_short_split_kv_parity() {
     for seq_len in [128usize, 192, 256, 512, 1024] {
         check_gqa_split_kv_parity(seq_len);
     }
+    check_batched_decode_short_split_tp1_tp2_0ulp();
+}
+
+#[cfg(feature = "cuda")]
+fn check_batched_decode_short_split_tp1_tp2_0ulp() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let d_ws = DeviceBuffer::alloc(0, 8 * 1024 * 1024).unwrap();
+    let ex_split = stream.exec(d_ws.addr(), d_ws.len_bytes);
+
+    let num_reqs = 8usize;
+    let seq_len = 256usize;
+    let pages_per_req = seq_len / 16;
+    let total_pages = num_reqs * pages_per_req;
+    let kv_heads_tp1 = 4usize;
+    let q_heads_tp1 = 16usize;
+    let kv_heads_tp2 = 2usize;
+    let q_heads_tp2 = 8usize;
+    let head_dim = 256usize;
+    let layer_ids = [0usize, 1, 2];
+
+    let total_kv_tokens = num_reqs * seq_len;
+    let mut k_tp1 = vec![0u16; total_kv_tokens * kv_heads_tp1 * head_dim];
+    let mut v_tp1 = vec![0u16; total_kv_tokens * kv_heads_tp1 * head_dim];
+    for t in 0..total_kv_tokens {
+        for h in 0..kv_heads_tp1 {
+            for c in 0..head_dim {
+                let kv = (((t * 17 + h * 11 + c * 5) % 97) as f32 - 48.0) * 0.02;
+                let vv = (((t * 23 + h * 13 + c * 7) % 89) as f32 - 44.0) * 0.02;
+                let idx = (t * kv_heads_tp1 + h) * head_dim + c;
+                k_tp1[idx] = f32_to_f16(kv);
+                v_tp1[idx] = f32_to_f16(vv);
+            }
+        }
+    }
+    let split_kv_shard = |src: &[u16], rank: usize| -> Vec<u16> {
+        let mut out = vec![0u16; total_kv_tokens * kv_heads_tp2 * head_dim];
+        for t in 0..total_kv_tokens {
+            for h in 0..kv_heads_tp2 {
+                let src_off = (t * kv_heads_tp1 + rank * kv_heads_tp2 + h) * head_dim;
+                let dst_off = (t * kv_heads_tp2 + h) * head_dim;
+                out[dst_off..dst_off + head_dim].copy_from_slice(&src[src_off..src_off + head_dim]);
+            }
+        }
+        out
+    };
+    let mut q_tp1 = vec![0u16; num_reqs * q_heads_tp1 * head_dim];
+    for r in 0..num_reqs {
+        for h in 0..q_heads_tp1 {
+            for c in 0..head_dim {
+                let qv = (((r * 29 + h * 7 + c * 3) % 83) as f32 - 41.0) * 0.025;
+                q_tp1[(r * q_heads_tp1 + h) * head_dim + c] = f32_to_f16(qv);
+            }
+        }
+    }
+    let split_q_shard = |rank: usize| -> Vec<u16> {
+        let mut out = vec![0u16; num_reqs * q_heads_tp2 * head_dim];
+        for r in 0..num_reqs {
+            for h in 0..q_heads_tp2 {
+                let src_off = (r * q_heads_tp1 + rank * q_heads_tp2 + h) * head_dim;
+                let dst_off = (r * q_heads_tp2 + h) * head_dim;
+                out[dst_off..dst_off + head_dim]
+                    .copy_from_slice(&q_tp1[src_off..src_off + head_dim]);
+            }
+        }
+        out
+    };
+
+    let pool_tp1 = KvPool::new(
+        0,
+        0,
+        &layer_ids,
+        kv_heads_tp1,
+        head_dim,
+        16,
+        total_pages,
+        KvFormatPolicy::Tq4,
+    )
+    .unwrap();
+    let pool_r0 = KvPool::new(
+        0,
+        0,
+        &layer_ids,
+        kv_heads_tp2,
+        head_dim,
+        16,
+        total_pages,
+        KvFormatPolicy::Tq4,
+    )
+    .unwrap();
+    let pool_r1 = KvPool::new(
+        0,
+        0,
+        &layer_ids,
+        kv_heads_tp2,
+        head_dim,
+        16,
+        total_pages,
+        KvFormatPolicy::Tq4,
+    )
+    .unwrap();
+
+    let slots_w: Vec<i32> = (0..total_kv_tokens as i32).collect();
+    let d_qs_w = DeviceBuffer::alloc(0, 8).unwrap();
+    let d_ctx_w = DeviceBuffer::alloc(0, 4).unwrap();
+    let d_seq_w = DeviceBuffer::alloc(0, 4).unwrap();
+    let d_bt = DeviceBuffer::alloc(0, total_pages * 4).unwrap();
+    let d_slots_w = DeviceBuffer::alloc(0, total_kv_tokens * 4).unwrap();
+    d_qs_w
+        .copy_from_host(&[0i32, total_kv_tokens as i32], &stream)
+        .unwrap();
+    d_ctx_w.copy_from_host(&[0i32], &stream).unwrap();
+    d_seq_w
+        .copy_from_host(&[total_kv_tokens as i32], &stream)
+        .unwrap();
+    let bt_host: Vec<i32> = (0..total_pages as i32).collect();
+    d_bt.copy_from_host(&bt_host, &stream).unwrap();
+    d_slots_w.copy_from_host(&slots_w, &stream).unwrap();
+
+    let wb = W34AttentionBatch {
+        query_start_loc: d_qs_w.addr() as *const i32,
+        context_lens_before: d_ctx_w.addr() as *const i32,
+        seq_lens_after: d_seq_w.addr() as *const i32,
+        block_tables: d_bt.addr() as *const i32,
+        write_slot_mapping: d_slots_w.addr() as *const i32,
+        valid_token_mask: core::ptr::null(),
+        valid_req_mask: core::ptr::null(),
+        num_reqs: 1,
+        total_tokens: total_kv_tokens as i32,
+        max_blocks_per_req: total_pages as i32,
+        max_q_len: total_kv_tokens as i32,
+        max_seq_len: total_kv_tokens as i32,
+        mask_mode: W34_ATTN_MASK_CAUSAL,
+        sliding_window: 0,
+        sm_scale: 1.0 / (head_dim as f32).sqrt(),
+        reserved: 0,
+    };
+    let populate = |layout: &ffi::W34KvLayerLayout, kh: &[u16], vh: &[u16]| {
+        let dk = DeviceBuffer::alloc(0, kh.len() * 2).unwrap();
+        let dv = DeviceBuffer::alloc(0, vh.len() * 2).unwrap();
+        dk.copy_from_host(kh, &stream).unwrap();
+        dv.copy_from_host(vh, &stream).unwrap();
+        // SAFETY: `dk`, `dv`, `wb`, and `layout` live on device 0 with matching dimensions.
+        assert_eq!(
+            unsafe {
+                ffi::w34_kv_cache_write(
+                    &ex_split,
+                    layout,
+                    &wb,
+                    dk.addr() as *const c_void,
+                    dv.addr() as *const c_void,
+                )
+            },
+            0
+        );
+    };
+    populate(&pool_tp1.layers[1].layout, &k_tp1, &v_tp1);
+    populate(
+        &pool_r0.layers[1].layout,
+        &split_kv_shard(&k_tp1, 0),
+        &split_kv_shard(&v_tp1, 0),
+    );
+    populate(
+        &pool_r1.layers[1].layout,
+        &split_kv_shard(&k_tp1, 1),
+        &split_kv_shard(&v_tp1, 1),
+    );
+
+    let qs_host: Vec<i32> = (0..=num_reqs as i32).collect();
+    let ctx_host = vec![(seq_len - 1) as i32; num_reqs];
+    let seq_host = vec![seq_len as i32; num_reqs];
+    let d_qs = DeviceBuffer::alloc(0, qs_host.len() * 4).unwrap();
+    let d_ctx = DeviceBuffer::alloc(0, ctx_host.len() * 4).unwrap();
+    let d_seq = DeviceBuffer::alloc(0, seq_host.len() * 4).unwrap();
+    d_qs.copy_from_host(&qs_host, &stream).unwrap();
+    d_ctx.copy_from_host(&ctx_host, &stream).unwrap();
+    d_seq.copy_from_host(&seq_host, &stream).unwrap();
+
+    let d_q_tp1 = DeviceBuffer::alloc(0, q_tp1.len() * 2).unwrap();
+    let d_q_r0 = DeviceBuffer::alloc(0, q_tp1.len()).unwrap();
+    let d_q_r1 = DeviceBuffer::alloc(0, q_tp1.len()).unwrap();
+    d_q_tp1.copy_from_host(&q_tp1, &stream).unwrap();
+    d_q_r0.copy_from_host(&split_q_shard(0), &stream).unwrap();
+    d_q_r1.copy_from_host(&split_q_shard(1), &stream).unwrap();
+
+    let d_out_tp1 = DeviceBuffer::alloc(0, q_tp1.len() * 2).unwrap();
+    let d_out_r0 = DeviceBuffer::alloc(0, q_tp1.len()).unwrap();
+    let d_out_r1 = DeviceBuffer::alloc(0, q_tp1.len()).unwrap();
+
+    for max_seq_bound in [seq_len as i32, 1024i32] {
+        let ab = W34AttentionBatch {
+            query_start_loc: d_qs.addr() as *const i32,
+            context_lens_before: d_ctx.addr() as *const i32,
+            seq_lens_after: d_seq.addr() as *const i32,
+            block_tables: d_bt.addr() as *const i32,
+            write_slot_mapping: core::ptr::null(),
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: num_reqs as i32,
+            total_tokens: num_reqs as i32,
+            max_blocks_per_req: pages_per_req as i32,
+            max_q_len: 1,
+            max_seq_len: max_seq_bound,
+            mask_mode: W34_ATTN_MASK_CAUSAL,
+            sliding_window: 0,
+            sm_scale: 1.0 / (head_dim as f32).sqrt(),
+            reserved: 0,
+        };
+        // SAFETY: all device buffers and layouts match `ab` on device 0.
+        unsafe {
+            assert_eq!(
+                ffi::w34_paged_attention_f16(
+                    &ex_split,
+                    &pool_tp1.layers[1].layout,
+                    &ab,
+                    d_q_tp1.addr() as *const c_void,
+                    d_out_tp1.addr() as *mut c_void,
+                    q_heads_tp1 as i32,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::w34_paged_attention_f16(
+                    &ex_split,
+                    &pool_r0.layers[1].layout,
+                    &ab,
+                    d_q_r0.addr() as *const c_void,
+                    d_out_r0.addr() as *mut c_void,
+                    q_heads_tp2 as i32,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::w34_paged_attention_f16(
+                    &ex_split,
+                    &pool_r1.layers[1].layout,
+                    &ab,
+                    d_q_r1.addr() as *const c_void,
+                    d_out_r1.addr() as *mut c_void,
+                    q_heads_tp2 as i32,
+                ),
+                0
+            );
+        }
+        let mut h_tp1 = vec![0u16; q_tp1.len()];
+        let mut h_r0 = vec![0u16; q_tp1.len() / 2];
+        let mut h_r1 = vec![0u16; q_tp1.len() / 2];
+        d_out_tp1.copy_to_host(&mut h_tp1, &stream).unwrap();
+        d_out_r0.copy_to_host(&mut h_r0, &stream).unwrap();
+        d_out_r1.copy_to_host(&mut h_r1, &stream).unwrap();
+        for r in 0..num_reqs {
+            let tp1_r0 =
+                &h_tp1[(r * q_heads_tp1) * head_dim..(r * q_heads_tp1 + q_heads_tp2) * head_dim];
+            let tp1_r1 = &h_tp1
+                [(r * q_heads_tp1 + q_heads_tp2) * head_dim..(r + 1) * q_heads_tp1 * head_dim];
+            let got_r0 = &h_r0[(r * q_heads_tp2) * head_dim..(r + 1) * q_heads_tp2 * head_dim];
+            let got_r1 = &h_r1[(r * q_heads_tp2) * head_dim..(r + 1) * q_heads_tp2 * head_dim];
+            assert_eq!(
+                tp1_r0, got_r0,
+                "0-ULP TP=1 == TP=2 rank 0 violated at req {r} max_seq_bound={max_seq_bound}"
+            );
+            assert_eq!(
+                tp1_r1, got_r1,
+                "0-ULP TP=1 == TP=2 rank 1 violated at req {r} max_seq_bound={max_seq_bound}"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]

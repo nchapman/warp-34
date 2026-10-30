@@ -64,7 +64,7 @@ pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> 
 }
 
 struct MtpGraphIo {
-    propose_graph: Option<(usize, CudaGraph)>,
+    propose_graph: Option<(usize, bool, CudaGraph)>,
     propose_arena: DeviceArena,
     meta_dev: DeviceBuffer,
     out_ids_dev: DeviceBuffer,
@@ -276,7 +276,7 @@ impl Qwen3_5MtpRank {
             .ok_or_else(|| loader_err("MTP scratch size overflow"))?;
         let propose_arena_bytes = row_elements
             .checked_mul(2)
-            .and_then(|n| n.checked_add(131072))
+            .and_then(|n| n.checked_add(2 * 1024 * 1024 + 131072))
             .ok_or_else(|| loader_err("MTP propose arena overflow"))?;
         let graph_io = MtpGraphIo {
             propose_graph: None,
@@ -344,6 +344,43 @@ impl Qwen3_5MtpRank {
         target_hidden: u64,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        self.ingest_inner(target, next_tokens, target_hidden, tp2, false)
+    }
+    /// Populate only `mtp.layers.0` KV cache rows for committed historical tokens when the
+    /// caller will seed the next proposal directly from the target model's final hidden state.
+    /// Because MTP has a single transformer layer, post-KV attention, `o_proj`, MoE/FFN, and
+    /// `TP=2` all-reduces on ingested rows have zero effect on `self.kv` or subsequent proposals.
+    pub fn ingest_kv_only_no_sync(
+        &mut self,
+        target: &Qwen3_5ModelRank,
+        next_tokens: &[i32],
+        target_hidden: u64,
+        tp2: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        self.ingest_inner(target, next_tokens, target_hidden, tp2, true)
+    }
+    pub fn ingest_kv_only(
+        &mut self,
+        target: &Qwen3_5ModelRank,
+        next_tokens: &[i32],
+        target_hidden: u64,
+        tp2: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        self.ingest_kv_only_no_sync(target, next_tokens, target_hidden, tp2)?;
+        if !next_tokens.is_empty() {
+            target.device.make_current()?;
+            target.stream.synchronize()?;
+        }
+        Ok(())
+    }
+    fn ingest_inner(
+        &mut self,
+        target: &Qwen3_5ModelRank,
+        next_tokens: &[i32],
+        target_hidden: u64,
+        tp2: Option<&Tp2Collectives>,
+        kv_only: bool,
+    ) -> Result<()> {
         if self.len != self.committed {
             return Err(loader_err("truncate provisional MTP rows before ingest"));
         }
@@ -356,7 +393,15 @@ impl Qwen3_5MtpRank {
             return Err(loader_err("invalid MTP ingest rows"));
         }
         if !next_tokens.is_empty() {
-            self.forward_inner(target, next_tokens, target_hidden, tp2, false, false)?;
+            self.forward_inner(
+                target,
+                next_tokens,
+                target_hidden,
+                tp2,
+                false,
+                false,
+                kv_only,
+            )?;
             self.committed = self.len;
         }
         Ok(())
@@ -376,10 +421,11 @@ impl Qwen3_5MtpRank {
         Ok(())
     }
     pub fn has_propose_graph(&self, k: usize) -> bool {
+        let long_ctx = self.len + k > 1024;
         self.graph_io
             .propose_graph
             .as_ref()
-            .is_some_and(|(cap_k, _)| *cap_k == k)
+            .is_some_and(|(cap_k, cap_long, _)| *cap_k == k && *cap_long == long_ctx)
     }
     fn validate_propose_args(
         &self,
@@ -417,10 +463,10 @@ impl Qwen3_5MtpRank {
         &mut self,
         t: &Qwen3_5ModelRank,
         k: usize,
+        long_ctx: bool,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
         self.graph_io.propose_arena.reset();
-        let ex = t.stream.exec(0, 0);
         let h_dim = t.cfg.hidden_size;
         let head_dim = t.cfg.head_dim;
         let local_q_heads = t.cfg.num_attention_heads / t.tp_size;
@@ -504,6 +550,8 @@ impl Qwen3_5MtpRank {
         let local_id = arena.alloc_aligned(4)?;
         let local_val = arena.alloc_aligned(4)?;
         let global_val = arena.alloc_aligned(4)?;
+        let (ws_ptr, ws_cap) = arena.remaining_workspace();
+        let ex = t.stream.exec(ws_ptr, ws_cap);
 
         let meta_base = self.graph_io.meta_dev.addr();
         let token_ids_ptr = meta_base;
@@ -531,7 +579,11 @@ impl Qwen3_5MtpRank {
                 total_tokens: 1,
                 max_blocks_per_req: self.pages.len() as i32,
                 max_q_len: 1,
-                max_seq_len: self.capacity as i32,
+                max_seq_len: if long_ctx {
+                    self.capacity as i32
+                } else {
+                    self.capacity.min(1024) as i32
+                },
                 mask_mode: W34_ATTN_MASK_CAUSAL,
                 sliding_window: 0,
                 sm_scale: (head_dim as f32).powf(-0.5),
@@ -849,15 +901,16 @@ impl Qwen3_5MtpRank {
         if self.has_propose_graph(k) {
             return Ok(());
         }
+        let long_ctx = self.len + k > 1024;
         target.device.make_current()?;
         target.stream.synchronize()?;
         let graph = CudaGraph::capture(&target.stream, || {
-            self.enqueue_propose_steps(target, k, tp2)
+            self.enqueue_propose_steps(target, k, long_ctx, tp2)
         })?;
-        self.graph_io.propose_graph = Some((k, graph));
+        self.graph_io.propose_graph = Some((k, long_ctx, graph));
         Ok(())
     }
-    pub fn launch_propose_graph_async(
+    pub fn prepare_propose_graph_inputs_async(
         &mut self,
         target: &Qwen3_5ModelRank,
         anchor: i32,
@@ -892,13 +945,28 @@ impl Qwen3_5MtpRank {
                 "MTP seed hidden",
             )?;
         }
-        let (_, graph) = self
+        Ok(())
+    }
+    pub fn replay_propose_graph_async(&self, target: &Qwen3_5ModelRank, k: usize) -> Result<()> {
+        let long_ctx = self.len + k > 1024;
+        target.device.make_current()?;
+        let (_, _, graph) = self
             .graph_io
             .propose_graph
             .as_ref()
-            .filter(|(cap_k, _)| *cap_k == k)
+            .filter(|(cap_k, cap_long, _)| *cap_k == k && *cap_long == long_ctx)
             .ok_or_else(|| loader_err("MTP propose graph not captured"))?;
         graph.launch(&target.stream)
+    }
+    pub fn launch_propose_graph_async(
+        &mut self,
+        target: &Qwen3_5ModelRank,
+        anchor: i32,
+        target_hidden: u64,
+        k: usize,
+    ) -> Result<()> {
+        self.prepare_propose_graph_inputs_async(target, anchor, target_hidden, k)?;
+        self.replay_propose_graph_async(target, k)
     }
     pub fn collect_propose_host(
         &mut self,
@@ -993,7 +1061,7 @@ impl Qwen3_5MtpRank {
         input_hidden: u64,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<i32> {
-        self.forward_inner(target, tokens, input_hidden, tp2, true, true)?
+        self.forward_inner(target, tokens, input_hidden, tp2, true, true, false)?
             .ok_or_else(|| loader_err("MTP forward did not sample token"))
     }
     fn forward_inner(
@@ -1004,6 +1072,7 @@ impl Qwen3_5MtpRank {
         tp2: Option<&Tp2Collectives>,
         sample_last: bool,
         sync_stream: bool,
+        kv_only: bool,
     ) -> Result<Option<i32>> {
         let t = target;
         if t.embed_tokens_ptr != self.target_embedding {
@@ -1296,6 +1365,14 @@ impl Qwen3_5MtpRank {
             },
             "w34_kv_cache_write_strided",
         )?;
+        if kv_only {
+            if sync_stream {
+                t.stream.synchronize()?;
+            }
+            self.batch_hidden_rows = 0;
+            self.len += num_tokens;
+            return Ok(None);
+        }
         check_rc(
             unsafe {
                 ffi::w34_paged_attention_f16(

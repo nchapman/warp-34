@@ -255,6 +255,10 @@ int w34_split_cols_3_f16(const w34_exec* ex, const void* src, void* dst0, void* 
                          int num_tokens, int dim0, int dim1, int dim2);
 int w34_small_n_gemm_f16(const w34_exec* ex, const void* x, const void* w, void* out,
                          int m, int size_n, int size_k);
+int w34_small_n_gemm_dual_f16(const w34_exec* ex, const void* x,
+                              const void* w0, void* out0, int size_n0,
+                              const void* w1, void* out1, int size_n1,
+                              int m, int size_k);
 
 // --- Marlin Repack & GEMMs (op_marlin.cu) ---
 int w34_zero_i32(const w34_exec* ex, void* ptr, int64_t count);
@@ -428,6 +432,14 @@ int w34_sampler_step_f16(const w34_exec* ex,
                          int num_rows,
                          int vocab_size,
                          int total_sparse_entries);
+
+int w34_sampler_step_fast_greedy_f16(const w34_exec* ex,
+                                     const void* logits_f16,
+                                     const w34_sampler_row_cfg* row_cfgs,
+                                     const w34_sampler_sparse_entry* sparse_entries,
+                                     w34_sampler_row_out* row_outs,
+                                     int num_rows,
+                                     int vocab_size);
 
 // Rejection outputs: emitted [R,k+1], accepted [R], status [R].
 // Only emitted[0..accepted+1] is live; suffix is -1. Masked requests return

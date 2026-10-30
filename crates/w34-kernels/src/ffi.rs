@@ -440,6 +440,18 @@ unsafe extern "C" {
         size_n: i32,
         size_k: i32,
     ) -> i32;
+    pub fn w34_small_n_gemm_dual_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        w0: *const c_void,
+        out0: *mut c_void,
+        size_n0: i32,
+        w1: *const c_void,
+        out1: *mut c_void,
+        size_n1: i32,
+        m: i32,
+        size_k: i32,
+    ) -> i32;
 
     pub fn w34_zero_i32(ex: *const W34Exec, ptr: *mut c_void, count: i64) -> i32;
     pub fn w34_marlin_repack_int4(
@@ -708,6 +720,15 @@ unsafe extern "C" {
         num_rows: i32,
         vocab_size: i32,
         total_sparse_entries: i32,
+    ) -> i32;
+    pub fn w34_sampler_step_fast_greedy_f16(
+        ex: *const W34Exec,
+        logits_f16: *const c_void,
+        row_cfgs: *const W34SamplerRowCfg,
+        sparse_entries: *const W34SamplerSparseEntry,
+        row_outs: *mut W34SamplerRowOut,
+        num_rows: i32,
+        vocab_size: i32,
     ) -> i32;
 
     pub fn w34_embed_lookup_f16_to_bf16(

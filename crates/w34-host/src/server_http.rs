@@ -47,6 +47,7 @@ pub struct OpenAiServerState {
     pub metrics: ServerMetrics,
     pub allow_remote_images: bool,
     constraint_factory: Option<crate::constraints::ConstraintFactory>,
+    decoded_vocab: Vec<std::sync::OnceLock<Box<str>>>,
     preprocessing: Arc<Semaphore>,
     admission: Arc<Semaphore>,
 }
@@ -85,13 +86,21 @@ impl OpenAiServerState {
         let constraint_factory = worker.tokenizer.as_ref().and_then(|t| {
             crate::constraints::ConstraintFactory::new(t.clone(), worker.vocab_size, &eos).ok()
         });
+        let decoded_vocab = if worker.tokenizer.is_some() {
+            (0..worker.vocab_size)
+                .map(|_| std::sync::OnceLock::new())
+                .collect()
+        } else {
+            Vec::new()
+        };
         Arc::new(Self {
             model_name,
             worker,
             allow_remote_images,
             constraint_factory,
+            decoded_vocab,
             metrics: ServerMetrics::default(),
-            preprocessing: Arc::new(Semaphore::new(8)),
+            preprocessing: Arc::new(Semaphore::new(32)),
             admission: Arc::new(Semaphore::new(32)),
         })
     }
@@ -158,6 +167,12 @@ async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
     )
 }
 async fn read_json(state: &OpenAiServerState, req: Request) -> Result<Value, ApiError> {
+    read_json_with_len(state, req).await.map(|(v, _)| v)
+}
+async fn read_json_with_len(
+    state: &OpenAiServerState,
+    req: Request,
+) -> Result<(Value, usize), ApiError> {
     let bytes = tokio::time::timeout(BODY_TIMEOUT, to_bytes(req.into_body(), BODY_LIMIT))
         .await
         .map_err(|_| {
@@ -167,8 +182,16 @@ async fn read_json(state: &OpenAiServerState, req: Request) -> Result<Value, Api
             )
         })?
         .map_err(|e| error(StatusCode::PAYLOAD_TOO_LARGE, e))?;
+    let len = bytes.len();
+    if len <= 16 * 1024 {
+        return serde_json::from_slice(&bytes)
+            .map(|v| (v, len))
+            .map_err(bad);
+    }
     cpu(state, move || {
-        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+        serde_json::from_slice(&bytes)
+            .map(|v| (v, len))
+            .map_err(|e| e.to_string())
     })
     .await
 }
@@ -200,12 +223,16 @@ async fn tokenize(
         .try_acquire_owned()
         .map_err(|_| busy())?;
     let body = read_json(&s, req).await?;
-    let tokenizer = s
-        .worker
-        .tokenizer
-        .clone()
-        .ok_or_else(|| bad("tokenizer unavailable"))?;
+    if s.worker.tokenizer.is_none() {
+        return Err(bad("tokenizer unavailable"));
+    }
+    let s_tok = s.clone();
     cpu(&s, move || {
+        let tokenizer = s_tok
+            .worker
+            .tokenizer
+            .as_ref()
+            .ok_or("tokenizer unavailable")?;
         let text = body
             .get("prompt")
             .or_else(|| body.get("text"))
@@ -228,12 +255,16 @@ async fn detokenize(
         .try_acquire_owned()
         .map_err(|_| busy())?;
     let body = read_json(&s, req).await?;
-    let tokenizer = s
-        .worker
-        .tokenizer
-        .clone()
-        .ok_or_else(|| bad("tokenizer unavailable"))?;
+    if s.worker.tokenizer.is_none() {
+        return Err(bad("tokenizer unavailable"));
+    }
+    let s_tok = s.clone();
     cpu(&s, move || {
+        let tokenizer = s_tok
+            .worker
+            .tokenizer
+            .as_ref()
+            .ok_or("tokenizer unavailable")?;
         let ids: Vec<u32> =
             serde_json::from_value(body.get("tokens").cloned().ok_or("missing tokens")?)
                 .map_err(|e| e.to_string())?;
@@ -382,9 +413,24 @@ async fn generate(
         .try_acquire_owned()
         .map_err(|_| busy())?;
     let start = Instant::now();
-    let json = read_json(&s, request).await?;
+    let (json, body_len) = read_json_with_len(&s, request).await?;
     let prep_state = s.clone();
-    let prepared = cpu(&s, move || prepare(&prep_state, json, chat)).await?;
+    let inline_fast = !chat
+        && body_len <= 16 * 1024
+        && json.get("prompt").is_some_and(Value::is_string)
+        && json
+            .get("prompt")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.len() <= 4096)
+        && matches!(
+            crate::request_constraints::RequestConstraint::parse(&json),
+            Ok(None)
+        );
+    let prepared = if inline_fast {
+        prepare(&prep_state, json, chat).map_err(bad)?
+    } else {
+        cpu(&s, move || prepare(&prep_state, json, chat)).await?
+    };
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
@@ -513,10 +559,28 @@ fn delta_value(d: StreamParseDelta, tool_index: &mut usize) -> Value {
     }
     value
 }
-fn logprob_value(lp: &StepLogprobs, tokenizer: &tokenizers::Tokenizer) -> Value {
-    let token = |id: i32| tokenizer.decode(&[id as u32], false).unwrap_or_default();
-    let text = token(lp.token_id);
-    json!({"token":text,"logprob":lp.logprob,"bytes":text.as_bytes(),"top_logprobs":lp.top_logprobs.iter().map(|p| { let text = token(p.token_id); json!({"token":text,"logprob":p.logprob,"bytes":text.as_bytes()}) }).collect::<Vec<_>>()})
+fn logprob_value(
+    lp: &StepLogprobs,
+    tokenizer: &tokenizers::Tokenizer,
+    decoded_vocab: &[std::sync::OnceLock<Box<str>>],
+) -> Value {
+    let token_str = |id: i32| -> String {
+        if id >= 0
+            && let Some(cell) = decoded_vocab.get(id as usize)
+        {
+            return cell
+                .get_or_init(|| {
+                    tokenizer
+                        .decode(&[id as u32], false)
+                        .unwrap_or_default()
+                        .into_boxed_str()
+                })
+                .to_string();
+        }
+        tokenizer.decode(&[id as u32], false).unwrap_or_default()
+    };
+    let text = token_str(lp.token_id);
+    json!({"token":text,"logprob":lp.logprob,"bytes":text.as_bytes(),"top_logprobs":lp.top_logprobs.iter().map(|p| { let text = token_str(p.token_id); json!({"token":text,"logprob":p.logprob,"bytes":text.as_bytes()}) }).collect::<Vec<_>>()})
 }
 #[allow(clippy::too_many_arguments)]
 fn output_stream(
@@ -532,7 +596,7 @@ fn output_stream(
 ) -> impl Stream<Item = Output> + Send {
     async_stream::stream! {
         let _admission = admission;
-        let tokenizer = s.worker.tokenizer.clone().unwrap();
+        let tokenizer = s.worker.tokenizer.as_ref().unwrap();
         let mut decoder = tokenizer.decode_stream(false);
         let mut parser = Qwen3Parser::new(thinking);
         let mut stops = StopBuffer::default();
@@ -562,7 +626,7 @@ fn output_stream(
                     if count == 1 { s.metrics.last_ttft_us.store(start.elapsed().as_micros() as u64,Ordering::Relaxed); }
                     else { s.metrics.last_itl_us.store(last_token.elapsed().as_micros() as u64,Ordering::Relaxed); }
                     last_token = Instant::now();
-                    let mut lp = logprobs.as_ref().map(|lp| logprob_value(lp,&tokenizer));
+                    let mut lp = logprobs.as_ref().map(|lp| logprob_value(lp, tokenizer, &s.decoded_vocab));
                     if chat && let Some(lp) = &lp { logs.push(lp.clone()); }
                     if count >= params.min_tokens && params.is_stop_or_eos(id,&s.worker.eos_token_ids) {
                         // The hidden terminal token still counts toward usage. Record its
@@ -628,8 +692,12 @@ pub async fn serve(
     state: Arc<OpenAiServerState>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    use axum::serve::ListenerExt;
     use std::future::IntoFuture;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let listener = listener.tap_io(|tcp_stream| {
+        let _ = tcp_stream.set_nodelay(true);
+    });
     let mut serving = Box::pin(
         axum::serve(listener, router(state.clone()))
             .with_graceful_shutdown(async {

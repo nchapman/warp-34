@@ -387,7 +387,7 @@ impl NativeProposer {
                                 }
                                 (tokens, shifted.addr())
                             };
-                            r.ingest(t, ids, input, comm)?;
+                            r.ingest_kv_only(t, ids, input, comm)?;
                             check_rc(
                                 // SAFETY: tokens is nonempty and ptr spans every captured row;
                                 // tail owns exactly one H-element row and survives synchronization.
@@ -525,76 +525,93 @@ impl NativeProposer {
             }
             Ranks::Mtp(rs) => {
                 if self.current.is_none() && engine.use_cuda_graph {
+                    use crate::coordinated::{ReplayPhase, replay_ranks};
                     let h = engine.cfg.hidden_size;
                     let before = self.processed;
                     let comm = engine.tp2_comm.as_deref();
-                    let run_res: Result<Vec<Vec<i32>>> = (|| {
-                        for (r, t) in rs.iter_mut().zip(&engine.ranks) {
-                            r.ensure_propose_graph(t, k, comm)?;
-                        }
-                        for ((((r, t), tail), shifted), &ptr) in rs
-                            .iter_mut()
-                            .zip(&engine.ranks)
-                            .zip(&self.tail)
-                            .zip(&self.shifted)
-                            .zip(features)
-                        {
-                            t.device.make_current()?;
-                            r.truncate(before.saturating_sub(1))?;
-                            let (ids, input) = if before == 0 {
-                                (&tokens[1..], ptr)
-                            } else {
+                    let replay_res = replay_ranks(rs.len(), |phase, rank| {
+                        let r = &mut rs[rank];
+                        let t = &engine.ranks[rank];
+                        let tail = &self.tail[rank];
+                        let shifted = &self.shifted[rank];
+                        let ptr = features[rank];
+                        t.device.make_current()?;
+                        match phase {
+                            ReplayPhase::Upload => {
+                                r.truncate(before.saturating_sub(1))?;
+                                let (ids, input) = if before == 0 {
+                                    (&tokens[1..], ptr)
+                                } else {
+                                    check_rc(
+                                        // SAFETY: both resident buffers hold at least H FP16 elements.
+                                        unsafe {
+                                            ffi::w34_memcpy_d2d_async(
+                                                shifted.addr() as *mut _,
+                                                tail.addr() as *const _,
+                                                h * 2,
+                                                t.stream.handle,
+                                            )
+                                        },
+                                        "MTP preceding hidden",
+                                    )?;
+                                    if tokens.len() > 1 {
+                                        check_rc(
+                                            // SAFETY: rows<=max_rows and the final shifted row fits;
+                                            // source is the owned live capture for this whole batch.
+                                            unsafe {
+                                                ffi::w34_memcpy_d2d_async(
+                                                    (shifted.addr() + (h * 2) as u64) as *mut _,
+                                                    ptr as *const _,
+                                                    (tokens.len() - 1) * h * 2,
+                                                    t.stream.handle,
+                                                )
+                                            },
+                                            "MTP shifted hidden",
+                                        )?;
+                                    }
+                                    (tokens, shifted.addr())
+                                };
+                                r.ingest_kv_only_no_sync(t, ids, input, comm)?;
                                 check_rc(
-                                    // SAFETY: both resident buffers hold at least H FP16 elements.
+                                    // SAFETY: tokens is nonempty and ptr spans every captured row;
+                                    // tail owns exactly one H-element row on this device.
                                     unsafe {
                                         ffi::w34_memcpy_d2d_async(
-                                            shifted.addr() as *mut _,
-                                            tail.addr() as *const _,
+                                            tail.addr() as *mut _,
+                                            (ptr + ((tokens.len() - 1) * h * 2) as u64) as *const _,
                                             h * 2,
                                             t.stream.handle,
                                         )
                                     },
-                                    "MTP preceding hidden",
+                                    "MTP tail hidden",
                                 )?;
-                                if tokens.len() > 1 {
-                                    check_rc(
-                                        // SAFETY: rows<=max_rows and the final shifted row fits;
-                                        // source is the owned live capture for this whole batch.
-                                        unsafe {
-                                            ffi::w34_memcpy_d2d_async(
-                                                (shifted.addr() + (h * 2) as u64) as *mut _,
-                                                ptr as *const _,
-                                                (tokens.len() - 1) * h * 2,
-                                                t.stream.handle,
-                                            )
-                                        },
-                                        "MTP shifted hidden",
-                                    )?;
-                                }
-                                (tokens, shifted.addr())
-                            };
-                            r.ingest_no_sync(t, ids, input, comm)?;
-                            check_rc(
-                                // SAFETY: tokens is nonempty and ptr spans every captured row;
-                                // tail owns exactly one H-element row on this device.
-                                unsafe {
-                                    ffi::w34_memcpy_d2d_async(
-                                        tail.addr() as *mut _,
-                                        (ptr + ((tokens.len() - 1) * h * 2) as u64) as *const _,
-                                        h * 2,
-                                        t.stream.handle,
-                                    )
-                                },
-                                "MTP tail hidden",
-                            )?;
-                            r.launch_propose_graph_async(t, anchor, tail.addr(), k)?;
+                                r.prepare_propose_graph_inputs_async(t, anchor, tail.addr(), k)
+                            }
+                            ReplayPhase::Capture => r.ensure_propose_graph(t, k, comm),
+                            ReplayPhase::Launch => r.replay_propose_graph_async(t, k),
                         }
-                        rs.iter_mut()
-                            .zip(&engine.ranks)
-                            .map(|(r, t)| r.collect_propose_host(t, k))
-                            .collect::<Result<Vec<_>>>()
-                    })();
-                    let outputs = match run_res {
+                    });
+                    if let Err(error) = replay_res {
+                        if error.partial_launch {
+                            eprintln!(
+                                "[w34] fatal: asymmetric MTP TP graph launch failure: {}",
+                                error.source
+                            );
+                            std::process::abort();
+                        }
+                        for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                            let _ = t.device.make_current();
+                            let _ = t.stream.synchronize();
+                            let _ = r.truncate(before.saturating_sub(1));
+                        }
+                        return Err(error.source);
+                    }
+                    let outputs = match rs
+                        .iter_mut()
+                        .zip(&engine.ranks)
+                        .map(|(r, t)| r.collect_propose_host(t, k))
+                        .collect::<Result<Vec<_>>>()
+                    {
                         Ok(o) => o,
                         Err(e) => {
                             for (r, t) in rs.iter_mut().zip(&engine.ranks) {
@@ -630,11 +647,29 @@ impl NativeProposer {
                     r.use_cuda_graph = use_graph;
                 }
                 let outputs = if use_graph {
-                    for (r, t) in rs.iter_mut().zip(&engine.ranks) {
-                        r.ensure_propose_graph(t, k, comm)?;
-                    }
-                    for ((r, t), tail) in rs.iter_mut().zip(&engine.ranks).zip(&self.tail) {
-                        r.launch_propose_graph_async(t, anchor, tail.addr(), k)?;
+                    use crate::coordinated::{ReplayPhase, replay_ranks};
+                    let replay_res = replay_ranks(rs.len(), |phase, rank| {
+                        let r = &mut rs[rank];
+                        let t = &engine.ranks[rank];
+                        let tail = &self.tail[rank];
+                        t.device.make_current()?;
+                        match phase {
+                            ReplayPhase::Upload => {
+                                r.prepare_propose_graph_inputs_async(t, anchor, tail.addr(), k)
+                            }
+                            ReplayPhase::Capture => r.ensure_propose_graph(t, k, comm),
+                            ReplayPhase::Launch => r.replay_propose_graph_async(t, k),
+                        }
+                    });
+                    if let Err(error) = replay_res {
+                        if error.partial_launch {
+                            eprintln!(
+                                "[w34] fatal: asymmetric MTP TP graph launch failure: {}",
+                                error.source
+                            );
+                            std::process::abort();
+                        }
+                        return Err(error.source);
                     }
                     rs.iter_mut()
                         .zip(&engine.ranks)

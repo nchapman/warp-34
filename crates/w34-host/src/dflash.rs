@@ -914,7 +914,7 @@ impl DFlash2Rank {
             m - 1,
         )?;
         let topk_elems = (m - 1) * self.cfg.top_k;
-        let num_splits = (128 / self.cfg.top_k).clamp(1, 8);
+        let num_splits = (256 / self.cfg.top_k).clamp(1, 16);
         let split_ids_ws = self
             .graph_io
             .forward_arena

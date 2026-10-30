@@ -13,6 +13,243 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Post-`be40dda` checkpoint — proposer, attention, warm serving, review fixes, and 8-case needle replay
+
+Phase 6 remains **in progress (not release-complete)** due to the native `vLLM 0.31.0`
+35B-A3B MoE VL self-repeatability drift (`.13–.18`) and the RTX 3090 Ti HBM
+bandwidth floors on BF16 DFlash2 `<2 ms/round` and 35B-A3B `TP=2` MTP `500+ tok/s`.
+All parity-tested measured wins and post-stabilized oracle/needle gates below
+are verified on the combined tree; see [PHASE6_EVIDENCE.md](PHASE6_EVIDENCE.md).
+
+- **Aligned 4B `TP=1` DFlash2 beats `SGLang v0.5.19` decode and exceeds `1,100+ tok/s` across all three KV formats**
+  (128 prompt IDs and 128 generated IDs exact against `/tmp/aligned-oracle-profile/runtime.json`,
+  SGLang streamed decode `122.186 ms`, `full_attn = 0.2098 ms/r`, `spec_decode = 3.4023 ms/r`,
+  `marlin_gemm = 4.6602 ms/r`):
+  - **`FP16`** (`/tmp/w34-phase6-closeout/4b-dflash-fp16/`): **`1228.07 tok/s` profiled**
+    (`103.41 ms`, `full_attn = 0.1421 ms/r` = **`1.48×` faster than SGLang**,
+    `marlin_gemm = 4.5444 ms/r`, `gdn_ssm = 1.3490 ms/r`, `norms_rope_act = 0.1922 ms/r`,
+    `spec_decode = 3.6957 ms/r`) and **`1263.23 tok/s` unprofiled** (`100.54 ms`).
+  - **`Q8_0`** (`/tmp/w34-phase6-closeout/4b-dflash-q8_0/`): **`1201.00 tok/s` profiled**
+    (`full_attn = 0.2386 ms/r`, `spec_decode = 3.7646 ms/r`) and **`1240.18 tok/s` unprofiled**.
+  - **`TQ4`** (`/tmp/w34-phase6-closeout/4b-dflash-tq4/`): **`1303.00 tok/s` profiled**
+    (`97.47 ms`, `full_attn = 0.2735 ms/r`, `marlin_gemm = 4.5782 ms/r`,
+    `spec_decode = 3.6893 ms/r`) and **`1387.56 tok/s` unprofiled** (`91.53 ms`).
+  - `<2 ms/round` remains bounded by the 2.45 GB BF16 DFlash2 + FP16 `lm_head`
+    HBM floor (`2.43 ms` theoretical at 1008 GB/s).
+- **35B-A3B `TP=2` MTP and 27B `TP=2` DFlash2 (`vec8` fused RMSNorm/add + fast 2-stage block-radix top-k):**
+  - 35B-A3B `TP=2` MTP (`/tmp/w34-phase6-closeout/35b-tp2-mtp-{fp16,tq4}/`):
+    **`445.69 tok/s` unprofiled** (`8.381 ms/r`, `34` rounds, `mean_acc = 2.735`) /
+    **`340.23 tok/s` under `nsys`** (`FP16`, `spec_decode = 2.1613 / 2.1670 ms/r`),
+    and **`423.17` unprofiled / `332.46 tok/s` under `nsys`** (`TQ4`,
+    `spec_decode = 2.0941 / 2.1074 ms/r`), bounded below `500+ tok/s` by the
+    `2.02 ms` FP16 `lm_head` HBM floor per pass.
+  - 27B `TP=2` DFlash2 (`/tmp/w34-phase6-closeout/27b-tp2-dflash-{fp16,tq4}/`):
+    `FP16` **`134.38` unprofiled / `127.36 tok/s` profiled** (`spec_decode = 4.4521 / 4.4823 ms/r`);
+    `TQ4` **`95.96 / 90.74 tok/s`** (`spec_decode = 4.4766 / 4.5068 ms/r`).
+- **Long-context attention & TP-invariant batched `short_split`:**
+  - 4B `M=16` verify `full_attn` across `FP16 / Q8_0 / TQ4`
+    (`/tmp/w34-phase6-closeout/4b-attn-{4096,32768}-{fp16,q8_0,tq4}/`):
+    `4,096` context **`0.9488 / 2.3565 / 2.2475 ms/r`**; `32,768` context
+    **`1.3859 / 2.6913 / 2.5732 ms/r`**.
+  - Batched `max_q_len == 1 && num_reqs >= 4 && total_tokens <= 8` `short_split`
+    (`<= 8` 64-key partitions, independent of `num_q_heads`, `<= 4.03 MiB` at 32 heads)
+    preserves 0-ULP `TP=1 == TP=2` and live-vs-1024-graph-bound parity (`phase5_gates`).
+- **Warm 8/16-client SSE serving (`serve_bench.py --warmup-repetitions 1`, matched workload SHA-256):**
+  - Bounded `<= 16 KiB` unconstrained inline submission, `8 ms` burst-coalescing cap,
+    pinned-D2H sampler synchronization, batched `short_split`, and M-invariant
+    `down_proj` (`K >= 4608`) 2-way Split-K lift W34 from `946.47 / 1504.74 tok/s` to:
+    - **`FP16`** (`/tmp/w34-phase6-closeout/serve-warm-fp16.json`): `N=8`
+      **`1338.98 tok/s`** (**`98.8%`** of SGLang `1354.85`, mean TTFT **`27.80 ms` vs
+      `37.46 ms` `-25.8%`**, ITL `5.795 ms`), `N=16` **`2126.32 tok/s`** (**`96.9%`**
+      of SGLang `2194.17`, mean TTFT **`53.35 ms` vs `57.97 ms` `-8.0%`**, ITL `7.154 ms`).
+    - **`TQ4`** (`/tmp/w34-phase6-closeout/serve-warm-tq4.json`): `N=8`
+      **`1318.34 tok/s`** (TTFT `27.22 ms`), `N=16` **`2089.02 tok/s`** (TTFT `52.58 ms`).
+- **Post-stabilized 8-case 27B needle matrix & unrestricted two-GPU verification:**
+  - All **8/8** post-stabilized 1-GPU 27B needle cases (`tq4` + `tq4_all` at
+    `32k / 64k / 128k / 262k`, 50% depth) passed with exact `"73918462"`
+    (`/tmp/w34-phase6-closeout/needle-matrix/summary.json`, SHA-256
+    `c77b7b5b04220589ebce1138ef3704f1a7b67181ceab3551a1114232d497de0b`).
+  - Canonical 6-case `vision_gate` replay (`/tmp/w34-phase6-closeout/vision-replay/`)
+    preserves 4/6 passes (`4B` `.004203/.005466`, `27B` `.049868/.012703`;
+    `35B-A3B` visual/embed `0.0`, final-norm `.165634/.141785`, all 6 `mrope_exact`
+    and `greedy_exact`).
+  - `mise run oracle-greedy` passed `128/128 (100.0%)` (`lossless=4/4`,
+    `radix_warm=4/4` on MTP and DFlash2); 4B `dump-diff --compare-tp2` passed
+    all four modes; unrestricted `CUDA_VISIBLE_DEVICES=0,1 mise run check`
+    exited **0** in **202.40 s** (**147 Rust + 69 oracle CPU tests**,
+    `/tmp/w34-phase6-closeout/full-check.log`, SHA-256
+    `f78a469871abb6de8c60f800d816301c120604a998f6dbcff49e4dcf9f644946`).
+  - Two multi-lens review passes (`call_559437`, `call_731889`) resolved all
+    Critical and Important findings (`op_sampler.cu` disjoint scratch,
+    `op_dflash2.cu` warp top-k slot separation, `op_paged_attn.cu` TP-invariant
+    `short_split`, `op_norms_rope_act.cu` unified `vec8` BF16 `tap_row`,
+    `server_http.rs`/`engine_worker.rs` bounded inline path & burst cap,
+    `model.rs` pinned D2H sync).
+
+---
+
+## Pending-work continuation — native vision/GDN arithmetic isolation
+
+The approved remaining-work plan is underway; completed serving/needle work is
+not being reopened for a broad audit. No new commit or full-image pass is claimed.
+
+- **FA2 integration is exercised:** D64/D72, segmented images, graph replay, and
+  a full 1,382,400-element native D72 capture match bit-for-bit. The expanded
+  `vision_fa2_probe.py` also checks nonzero axial positions against native
+  `RotaryEmbedding` + `ApplyRotaryEmb` + FA2, with exact QKV and attention output.
+- **Small-angle vision RoPE fix:** explicit accurate libdevice sine/cosine avoids
+  fast-math MUFU absolute error. The new Rust regression first failed (half bits
+  2515 versus native 2516), then passed. Both nonzero-position native probes pass.
+- **GDN convolution fix:** native compiled Triton materializes each product in
+  FP16 before FP32 accumulation. The uniform-all-query-length correction matches
+  all **3,133,440 real native outputs exactly** (previously 920,688 differed).
+  The retained small native fixture passes chunk sizes 1/3/8/16 and final-state
+  checks; **Gate #2 and Gate #5 pass**. Same-input 306-token graph microbenchmark:
+  approximately **0.130 ms before / 0.132 ms after**; no speedup claimed.
+- **Full-model gates remain open:** FA2-only replay initially passed both 4B
+  formats; accurate RoPE plus convolution currently passes only **4B PNG**.
+  The 4B JPEG tensor regression is not excused by operator-level correctness.
+  Latest final-norm relative L2 (PNG/JPEG): **4B .034474/.053076**, **27B
+  .148751/.088038**, **MoE .211115/.198865**, unchanged limit **.05**.
+  All six retain exact prompt IDs, mRoPE, and eight-token greedy parity.
+- **Checks through GELU + paged-FA2 integration:** unrestricted two-GPU
+  `mise run check` passes **139 Rust + 69 oracle CPU tests** in **210.26 s**
+  (`/tmp/w34-gelu-paged-fa2-full-check.log`), after correcting formatting and
+  Clippy safety-comment issues in the newly added tests. A bounded follow-up
+  integration review found no Critical/Important findings in the new adapter,
+  scratch/warmup/graph integration, target RoPE and GELU changes.
+- **Further isolated findings:** replacing all 48 native GDN prefill calls with
+  native recurrence produces final-norm relL2 **.046092** (prepared Q/K) or
+  **.048543** (raw Q/K with in-kernel normalization), with bit-exact visual/embed
+  boundaries. This does not alone explain W34's larger error. Native target
+  attention is FA2; identical-QKV layer 3/39 replay differs from W34 by only
+  **.000111/.000154** relL2. W34 chunk64 and full306 outputs are bit-identical;
+  both are close to FP64 math. Core timings: native paged FA2 about **54 µs**,
+  W34 full306 **95 µs**, W34 chunk64 total **162 µs**.
+- **Target RoPE:** the same small-angle fix, plus native
+  `reciprocal(pow(theta, exponent))` frequency construction, passes new failing-
+  first regressions. Native unit-basis Q/K/gate output is now exact; random
+  128-token Q retains three half-value differences (relL2 **9.57e-7**), K/gate
+  exact. Target-RoPE-stage replay `/tmp/w34-vl-target-rope/`: final-norm PNG/JPEG
+  **4B .035250/.053072**, **27B .149657/.087436**, **MoE .218756/.202557**;
+  still only 4B PNG passes. No full-model improvement is claimed.
+- **Vision GELU correction:** accurate libdevice `tanhf` matches native PyTorch
+  for all **63,488 finite FP16 bit patterns** and **5,164,800 values each** at
+  actual 27B ViT block 0/12 activation boundaries. The fast intrinsic differed
+  at 645 distinct finite half values and 952,535/299,656 captured activations.
+  A failing-first exhaustive probe and a focused Rust regression retain this
+  evidence (`tools/oracle/vision_gelu_probe.py`, `/tmp/w34-vision-activation/`).
+- **Target paged FP16 FA2:** bounded D256/page16/causal/single-request/M>16/null-
+  mask adapter is integrated, with unchanged fallback for all other paths,
+  LSE-only checked scratch, and dedicated eligible per-device warmup. All
+  **12 native comparisons are half-bit exact** (full306, five chunks, both TP2
+  head slices). Production-dispatch graph timings improve full306 by
+  **1.75–1.76×**, five chunks by **1.44–1.46×**; head slices are not actual TP2
+  validation. Evidence: `/tmp/w34-paged-fa2/production-results.json`. Subsequent
+  fresh-process **27B TP2 FP16, prompt256/gen8, CUDA-graph-enabled** bench passes:
+  TTFT **167.55 ms**, decode **76.13 tok/s**. Cold two-rank initialization and
+  execution evidence: `/tmp/w34-paged-fa2/cold-tp2.json` and `.log`; this is a
+  smoke measurement, not a matched throughput gate.
+- **GELU + paged FA2 replay, before Lt:** `/tmp/w34-vl-gelu-paged-fa2/`
+  passes **both 4B PNG/JPEG**. Final-norm relL2 PNG/JPEG: **4B .003895/.004818**,
+  **27B .151981/.078051**, **MoE .210656/.190316**. All prompt IDs, mRoPE and
+  eight greedy IDs remain exact. 4B visual relL2 is now about **2e-6**; larger
+  vision towers retain **.0017–.0031** visual error. Four full-model cases still
+  fail `.05`; no full vision closeout or completion commit is justified yet.
+- **Biased vision Lt integration:** the native-policy FP32-compute/FP16-data
+  bias epilogue is now production code. All four captured block 0/12 linears
+  and graph replays are half-bit exact; formerly the two fc2 captures differed
+  at 2,462/4,824 values. Captured fc1/fc2 graph latencies improve; a synthetic
+  small-M 1152/4304 case regresses about 5 µs. Per-handle 1 MiB workspace and
+  a bounded FIFO plan cache preserve graph replay across cache replacement.
+  The cache-cap regression failed at shape 264 before correction and passes
+  afterward. Evidence: `/tmp/w34-vision-lt-production/`. Focused review found
+  no Critical/Important defects. Full-suite validation exposed capture/test
+  concurrency and stream-before-owner teardown issues; tests now serialize
+  CUDA lifecycles and include explicit post-stream owner destruction. The new
+  unrestricted full check passes **142 Rust + 69 oracle CPU tests** in
+  **218.66 s** (`/tmp/w34-lt-full-check.log`). Fresh-process 27B TP2 FP16,
+  graph-enabled prompt256/gen8 also passes: TTFT **165.95 ms**, decode
+  **76.42 tok/s** (`/tmp/w34-vision-lt-production/cold-tp2.json`).
+- **Canonical replay with Lt, before single-round position correction:** `/tmp/w34-vl-lt/` retains 4B PNG/JPEG
+  passes at **.003895/.004818** final-norm relL2. **MoE visual/embed tensors are
+  now bit-exact for both formats**, but final-norm remains **.163637/.151928**.
+  27B visual relL2 remains **.001742/.001852**, final **.139643/.082806**.
+  All six retain exact prompt IDs, mRoPE and eight greedy IDs; four final-tensor
+  gates remain failed. Neither the tolerance nor canonical oracle was changed.
+- **27B vision position fix and latest canonical matrix:** full tracing, not
+  three-row samples, isolated exactly one differing block-0 input. The patch
+  projection is bit-exact over all **1,382,400** values. At position row235,
+  channel25, CPU FP32 FMA followed by FP16 rounding produced **.039123535**
+  rather than native FP16 FMA's **.039093018**. FP64 evaluation with a sticky
+  round-to-odd FP32 intermediate now preserves single FP16 rounding. The
+  captured-corner regression failed before correction and passes afterward;
+  all eleven existing native full-grid fingerprints are unchanged. Independent
+  full captured-position replay matches **all 1,382,400 values** with single
+  rounding (`/tmp/w34-vision-rope-actual/position-report.json`).
+  `/tmp/w34-vl-half-fma/` now passes **4B and 27B PNG/JPEG**: final-norm relL2
+  **4B .003895/.004818; 27B .049868/.012703** (PNG narrowly below `.05`).
+  27B visual relL2 is **7.07e-7/6.97e-7**. MoE remains **.163637/.151928**
+  with bit-exact visual/embed tensors. All six retain exact prompt IDs, mRoPE
+  and eight greedy IDs. The final unrestricted two-GPU check passes **143 Rust
+  + 69 oracle CPU tests** in **205.67 s** (`/tmp/w34-half-fma-full-check.log`).
+  Focused numeric review found no finite-half arithmetic defect; the proof
+  comment and widened-half input contract were clarified. Post-review format
+  and diff checks pass. No completion commit or threshold change was made.
+- **MoE oracle repeatability blocker:** unmodified native arithmetic, identical
+  visual/embed tensors and routing, repeated canonical requests: native/native
+  final-norm relL2 is **.13–.18**, above the unchanged `.05` threshold, while
+  all eight greedy IDs remain exact. Two further bounded capture sessions
+  locate the first observed difference in **layer-0 routed Marlin gate/up**;
+  GDN inputs/initial state/output, router logits/IDs/weights, shared expert and
+  GEMM input are exact. Gate/up relL2 is only **5e-7–5e-6** before amplification.
+  Source explicitly disables atomic-add reduction; no kernel mechanism is
+  claimed. This invalidates attributing the MoE native-recurrence A/B drift
+  solely to GDN. Reports: `/tmp/w34-moe-native-repeat/differences.json` and
+  `/tmp/w34-moe-native-stability/REPORT.md`. No deterministic replacement,
+  loosened tolerance, or gate pass has been authorized or claimed.
+- **MoE candidate, not implemented:** installed Marlin PTX uses FP16 scaled
+  weights before MMA and FP16 gate/up outputs before activation. A real-weight,
+  synthetic-input, single-expert replay confirms that W34 GEMV and sparse MMA
+  agree with each other more closely than with native. A temporary half-scaled
+  MMA variant modestly improves local error, but actual top-8/shared-expert
+  inputs and full-model impact were initially unmeasured.
+- **Actual-image MoE replay:** `/tmp/w34-moe-real-capture/REPORT.md` now retains
+  layer-0 actual top-8 routes, routed and shared intermediates, native combined
+  output, full306 and M8/M16 captures. All 256 experts' repacked weights/scales
+  match runtime Marlin bits. Existing GEMV/MMA combined outputs, also replaying
+  the shared MLP, have relL2 **.0005985/.0005984 (M8)** and
+  **.0005923/.0005922 (M16)**, maxabs **.0001221**; routed MMA versus GEMV relL2
+  is **6.39e-6/8.26e-6**. Router/shared-gate projections remain native in this
+  isolation; no correction candidate or actual TP2 was measured. The full306
+  scratch-limited replay used GEMV fallback, not MMA. This local agreement does
+  not explain the larger end-to-end image drift.
+- **Diagnostic provenance:** the resolved 27B D72 vision investigation used
+  `/tmp/w34-vl-27b-png-vision-trace-boundaries/rank_0.safetensors` (the similarly
+  named boundary-trace JSON is old W34, not native). Before the position fix,
+  sampled patch/block-0 input/norm/QKV/fc1/fc2/output were exact, while sampled
+  attention had two tiny half differences. Actual loaded-model block-0/1 native-input replay now establishes
+  bit-exact production RoPE (**4,147,200 values each**) and FA2 (**1,382,400 each**).
+  The actual 8192×36 cache equals GPU construction; CPU construction differs
+  outside the used 0..39 positions, so cache provenance is not the image error.
+  Evidence: `/tmp/w34-vision-rope-actual/`. Full W34 first-block traces located
+  the single position value described above. Temporary full-row instrumentation
+  was removed; only its diagnostic binary/artifacts remain under `/tmp`.
+  System/wheel cuBLAS binaries differ despite matching version 13.8.0, but
+  preloading wheel libraries left the earlier 27B PNG errors unchanged.
+  Do not loosen `.05`, select arithmetic by query length, or weaken
+  split/snapshot invariants. Additional reports:
+  `/tmp/w34-gdn-full-isolation/REPORT.md`,
+  `/tmp/w34-text-attn-isolation/REPORT.md`,
+  `/tmp/w34-moe-native-isolation/REPORT.md`.
+
+Evidence: `/tmp/w34-vl-native-conv/summary.json` (SHA256
+`26a79b0e6e92216529a33f1fe39e7fd23183a6cbc9ec9196b4ec59178fa1cdcf`),
+`/tmp/w34-vision-fa2-nonzero.log`, `/tmp/w34-gdn-isolation/REPORT.md`,
+`/tmp/w34-gdn-fixed-probe.json`, `/tmp/w34-vision-current-check-quick.log`.
+The native conv fixture is retained with provenance in
+`tools/oracle/goldens/gdn_conv_real.json` (working tree, not yet committed).
+
 ## Closeout — four focused deliverables, remaining work kept separate
 
 Closed as separate commits:

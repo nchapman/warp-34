@@ -63,6 +63,116 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
     return v;
 }
 
+// Fast 1-warp (32-thread) register-only router for num_experts <= 256 and top_k <= 32.
+// Eliminates all shared memory and CTA barriers.
+__global__ void moe_topk_router_warp256_f16_kernel(
+    const __half* __restrict__ router_logits,
+    float* __restrict__ topk_weights,
+    int32_t* __restrict__ topk_ids,
+    int num_tokens,
+    int num_experts,
+    int top_k,
+    int norm_topk_prob,
+    int scoring_func) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+
+    const int lane = threadIdx.x & 31;
+    const __half* row = router_logits + (size_t)tok * num_experts;
+
+    float p[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int e = lane + i * 32;
+        p[i] = (e < num_experts) ? __half2float(__ldg(&row[e])) : -FLT_MAX;
+    }
+
+    if (scoring_func == 1) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int e = lane + i * 32;
+            p[i] = (e < num_experts) ? (1.0f / (1.0f + expf(-p[i]))) : -2.0f;
+        }
+    } else {
+        float local_max = -FLT_MAX;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            local_max = fmaxf(local_max, p[i]);
+        }
+        const float max_val = warp_reduce_max(local_max);
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int e = lane + i * 32;
+            if (e < num_experts) {
+                const float v = expf(p[i] - max_val);
+                p[i] = v;
+                local_sum += v;
+            } else {
+                p[i] = -2.0f;
+            }
+        }
+        const float sum_val = warp_reduce_sum(local_sum);
+        const float inv_sum = (sum_val > 0.0f) ? (1.0f / sum_val) : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int e = lane + i * 32;
+            if (e < num_experts) {
+                p[i] *= inv_sum;
+            }
+        }
+    }
+
+    float w_sum = 0.0f;
+    float my_w = 0.0f;
+    int32_t my_id = 0;
+
+    for (int k = 0; k < top_k; ++k) {
+        float best_v = -1.0f;
+        int best_e = num_experts;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int e = lane + i * 32;
+            if (e < num_experts) {
+                const float v = p[i];
+                if (v > best_v || (v == best_v && e < best_e)) {
+                    best_v = v;
+                    best_e = e;
+                }
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best_v, off);
+            const int oe = __shfl_xor_sync(0xffffffffu, best_e, off);
+            if (ov > best_v || (ov == best_v && oe < best_e)) {
+                best_v = ov;
+                best_e = oe;
+            }
+        }
+        const float win_v = __shfl_sync(0xffffffffu, best_v, 0);
+        const int win_e = __shfl_sync(0xffffffffu, best_e, 0);
+        w_sum += win_v;
+        if (lane == k) {
+            my_w = win_v;
+            my_id = win_e;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (lane + i * 32 == win_e) {
+                p[i] = -2.0f;
+            }
+        }
+    }
+
+    if (lane < top_k) {
+        const float scale = (norm_topk_prob != 0 && w_sum > 1e-12f) ? (1.0f / w_sum) : 1.0f;
+        topk_weights[(size_t)tok * top_k + lane] = my_w * scale;
+        topk_ids[(size_t)tok * top_k + lane] = my_id;
+    }
+}
+
 // One block (128 threads) per token row.
 // Supports arbitrary num_experts <= 1024 and top_k <= 32.
 // Computes softmax (scoring_func == 0) or sigmoid (scoring_func == 1) over router_logits,
@@ -368,10 +478,11 @@ __global__ void moe_f16_gate_up_silu_kernel(
 
     float g_acc = 0.0f;
     float u_acc = 0.0f;
+#pragma unroll 4
     for (int c = lane; c < k_hidden; c += 32) {
-        const float xf = __half2float(x_row[c]);
-        g_acc += xf * __half2float(gw[c]);
-        u_acc += xf * __half2float(uw[c]);
+        const float xf = __half2float(__ldg(&x_row[c]));
+        g_acc += xf * __half2float(__ldg(&gw[c]));
+        u_acc += xf * __half2float(__ldg(&uw[c]));
     }
     g_acc = warp_reduce_sum(g_acc);
     u_acc = warp_reduce_sum(u_acc);
@@ -414,8 +525,9 @@ __global__ void moe_f16_down_accum_kernel(
         const __half* dw_row = down_w + ((size_t)expert_id * k_hidden + out_col) * n_interm;
 
         float dot = 0.0f;
+#pragma unroll 4
         for (int c = lane; c < n_interm; c += 32) {
-            dot += __half2float(x_row[c]) * __half2float(dw_row[c]);
+            dot += __half2float(__ldg(&x_row[c])) * __half2float(__ldg(&dw_row[c]));
         }
         dot = warp_reduce_sum(dot);
         total_sum += tw * dot;
@@ -801,7 +913,7 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
 // K in {128, 256, 512, 1024, 2048}), with a 4-row register-cached `valid_cnt == 1`
 // fast path and a low-register per-slot loop for `valid_cnt >= 2` to preserve SM occupancy.
 template <bool GATE>
-__global__ void moe_sparse_vec4_kernel(
+__global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
     const __half * __restrict__ x,
     const uint32_t * __restrict__ w,
     const __half * __restrict__ scales,
@@ -940,11 +1052,24 @@ __global__ void moe_sparse_vec4_kernel(
             break;
         const size_t g_row_idx = (size_t)e * total_rows + row;
         const size_t u_row_idx = g_row_idx + N;
-        for (int m = 0; m < valid_cnt; ++m) {
-            const size_t xm_base = (size_t)xr_v[m] * x_u4_per_row;
-            float gv = 0.0f, uv = 0.0f;
+
+        for (int mb = 0; mb < valid_cnt; mb += 2) {
+            const int p0 = (mb == 0) ? pair_v[0] : pair_v[2];
+            const int p1 = (mb == 0) ? pair_v[1] : pair_v[3];
+            const int xr0 = (mb == 0) ? xr_v[0] : xr_v[2];
+            const int xr1 = (mb == 0) ? xr_v[1] : xr_v[3];
+            const __half tw0 = (mb == 0) ? tw_v[0] : tw_v[2];
+            const __half tw1 = (mb == 0) ? tw_v[1] : tw_v[3];
+            const bool has1 = (mb + 1 < valid_cnt);
+            const size_t xm0 = (size_t)xr0 * x_u4_per_row;
+            const size_t xm1 = has1 ? ((size_t)xr1 * x_u4_per_row) : 0;
+
+            float gv0 = 0.0f, uv0 = 0.0f;
+            float gv1 = 0.0f, uv1 = 0.0f;
+
             for (int w_col = sub_lane; w_col < k_u4_per_row; w_col += lpr) {
                 const int g_idx = w_col >> 2;
+                const int x_col0 = w_col * 4;
                 const uint4 gw4 = __ldg(&w_u4[g_row_idx * k_u4_per_row + w_col]);
                 const __half2 gs_h2 =
                     __half2half2(__ldg(&scales[g_row_idx * groups_per_row + g_idx]));
@@ -956,37 +1081,58 @@ __global__ void moe_sparse_vec4_kernel(
                 }
                 const uint32_t *gw_words = reinterpret_cast<const uint32_t *>(&gw4);
                 const uint32_t *uw_words = reinterpret_cast<const uint32_t *>(&uw4);
-                const int x_col0 = w_col * 4;
+
 #pragma unroll
                 for (int word_i = 0; word_i < 4; ++word_i) {
                     const uint32_t gw_v = gw_words[word_i];
                     const uint32_t uw_v = GATE ? uw_words[word_i] : 0u;
-                    const uint4 xv = __ldg(&x_u4[xm_base + x_col0 + word_i]);
-                    const __half2 *xh2 = reinterpret_cast<const __half2 *>(&xv);
+                    const uint4 xv0 = __ldg(&x_u4[xm0 + x_col0 + word_i]);
+                    const uint4 xv1 = has1 ? __ldg(&x_u4[xm1 + x_col0 + word_i]) : make_uint4(0, 0, 0, 0);
+                    const __half2 *xh0 = reinterpret_cast<const __half2 *>(&xv0);
+                    const __half2 *xh1 = reinterpret_cast<const __half2 *>(&xv1);
 #pragma unroll
                     for (int p = 0; p < 4; ++p) {
-                        const float x0 = __low2float(xh2[p]);
-                        const float x1 = __high2float(xh2[p]);
                         const __half2 gd = unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
-                        gv += __low2float(gd) * x0 + __high2float(gd) * x1;
+                        const float gd_l = __low2float(gd), gd_h = __high2float(gd);
+                        float ud_l = 0.0f, ud_h = 0.0f;
                         if (GATE) {
                             const __half2 ud = unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
-                            uv += __low2float(ud) * x0 + __high2float(ud) * x1;
+                            ud_l = __low2float(ud);
+                            ud_h = __high2float(ud);
+                        }
+                        const float x0_l = __low2float(xh0[p]), x0_h = __high2float(xh0[p]);
+                        gv0 += gd_l * x0_l + gd_h * x0_h;
+                        if (GATE) uv0 += ud_l * x0_l + ud_h * x0_h;
+                        if (has1) {
+                            const float x1_l = __low2float(xh1[p]), x1_h = __high2float(xh1[p]);
+                            gv1 += gd_l * x1_l + gd_h * x1_h;
+                            if (GATE) uv1 += ud_l * x1_l + ud_h * x1_h;
                         }
                     }
                 }
             }
+
             for (int off = lpr >> 1; off > 0; off >>= 1) {
-                gv += __shfl_xor_sync(0xffffffffu, gv, off);
-                if (GATE) uv += __shfl_xor_sync(0xffffffffu, uv, off);
+                gv0 += __shfl_xor_sync(0xffffffffu, gv0, off);
+                if (GATE) uv0 += __shfl_xor_sync(0xffffffffu, uv0, off);
+                if (has1) {
+                    gv1 += __shfl_xor_sync(0xffffffffu, gv1, off);
+                    if (GATE) uv1 += __shfl_xor_sync(0xffffffffu, uv1, off);
+                }
             }
             if (sub_lane == 0) {
-                const int p = pair_v[m];
                 if (GATE) {
-                    intermediate[(size_t)p * N + row] =
-                        marlin_silu_and_mul_f16(__float2half_rn(gv), __float2half_rn(uv));
+                    intermediate[(size_t)p0 * N + row] =
+                        marlin_silu_and_mul_f16(__float2half_rn(gv0), __float2half_rn(uv0));
+                    if (has1) {
+                        intermediate[(size_t)p1 * N + row] =
+                            marlin_silu_and_mul_f16(__float2half_rn(gv1), __float2half_rn(uv1));
+                    }
                 } else {
-                    down[(size_t)p * N + row] = __hmul(__float2half_rn(gv), tw_v[m]);
+                    down[(size_t)p0 * N + row] = __hmul(__float2half_rn(gv0), tw0);
+                    if (has1) {
+                        down[(size_t)p1 * N + row] = __hmul(__float2half_rn(gv1), tw1);
+                    }
                 }
             }
         }
@@ -1281,9 +1427,15 @@ extern "C" int w34_moe_topk_router_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens == 0) return 0;
-    w34_moe::moe_topk_router_f16_kernel<<<(unsigned)num_tokens, 128, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)router_logits, topk_weights, topk_ids, num_tokens, num_experts, top_k,
-        norm_topk_prob, scoring_func);
+    if (num_experts <= 256) {
+        w34_moe::moe_topk_router_warp256_f16_kernel<<<(unsigned)num_tokens, 32, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)router_logits, topk_weights, topk_ids, num_tokens, num_experts, top_k,
+            norm_topk_prob, scoring_func);
+    } else {
+        w34_moe::moe_topk_router_f16_kernel<<<(unsigned)num_tokens, 128, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)router_logits, topk_weights, topk_ids, num_tokens, num_experts, top_k,
+            norm_topk_prob, scoring_func);
+    }
     return (int)cudaGetLastError();
 }
 

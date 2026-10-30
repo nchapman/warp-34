@@ -603,15 +603,57 @@ impl FfnBlockWeights {
                 )
             }
             Self::Moe(moe) => {
-                moe.router_gate.forward(
-                    ex,
-                    cublas,
-                    marlin_ws_ptr,
-                    marlin_ws_ints,
-                    normed_buf,
-                    moe_router_logits_buf,
-                    num_tokens,
-                )?;
+                let fused_dual_small_n = match (
+                    &moe.router_gate,
+                    &moe.shared_expert_gate,
+                    moe.shared_gate_up_proj.is_some() && moe.shared_down_proj.is_some(),
+                ) {
+                    (
+                        LinearProj::DenseF16 {
+                            weight_ptr: w0,
+                            size_n: n0,
+                            size_k: k0,
+                        },
+                        Some(LinearProj::DenseF16 {
+                            weight_ptr: w1,
+                            size_n: n1,
+                            size_k: k1,
+                        }),
+                        true,
+                    ) if *n0 <= 256 && *n1 <= 256 && *k0 == *k1 && k0.is_multiple_of(8) => {
+                        Some((*w0, *n0, *w1, *n1, *k0))
+                    }
+                    _ => None,
+                };
+                if let Some((w0, n0, w1, n1, k)) = fused_dual_small_n {
+                    check_rc(
+                        unsafe {
+                            ffi::w34_small_n_gemm_dual_f16(
+                                ex,
+                                normed_buf as *const c_void,
+                                w0 as *const c_void,
+                                moe_router_logits_buf as *mut c_void,
+                                n0 as i32,
+                                w1 as *const c_void,
+                                moe_sh_gate_buf as *mut c_void,
+                                n1 as i32,
+                                num_tokens as i32,
+                                k as i32,
+                            )
+                        },
+                        "w34_small_n_gemm_dual_f16",
+                    )?;
+                } else {
+                    moe.router_gate.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        moe_router_logits_buf,
+                        num_tokens,
+                    )?;
+                }
                 check_rc(
                     unsafe {
                         ffi::w34_moe_topk_router_f16(
@@ -664,15 +706,17 @@ impl FfnBlockWeights {
                         num_tokens,
                     )?;
                     let sg_ptr = if let Some(sh_gate) = &moe.shared_expert_gate {
-                        sh_gate.forward(
-                            ex,
-                            cublas,
-                            marlin_ws_ptr,
-                            marlin_ws_ints,
-                            normed_buf,
-                            moe_sh_gate_buf,
-                            num_tokens,
-                        )?;
+                        if fused_dual_small_n.is_none() {
+                            sh_gate.forward(
+                                ex,
+                                cublas,
+                                marlin_ws_ptr,
+                                marlin_ws_ints,
+                                normed_buf,
+                                moe_sh_gate_buf,
+                                num_tokens,
+                            )?;
+                        }
                         moe_sh_gate_buf as *const c_void
                     } else {
                         core::ptr::null()
@@ -1260,11 +1304,18 @@ pub struct BatchedDecodeGraphIo {
     pub masks_u8: DeviceBuffer,
     pub block_tables: DeviceBuffer,
     pub out_greedy_ids: DeviceBuffer,
+    pub pinned_staging: crate::cuda::MappedHostBuffer,
+    pub pinned_in_flight: std::sync::atomic::AtomicBool,
+    pub pinned_sampler_in_flight: std::sync::atomic::AtomicBool,
     pub max_blocks_per_req: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl BatchedDecodeGraphIo {
+    pub const PINNED_META_BYTES: usize = 160 * 1024;
+    pub const PINNED_SAMPLER_OFFSET: usize = 160 * 1024;
+    pub const PINNED_SAMPLER_BYTES: usize = 96 * 1024;
+
     pub fn new(device_id: i32, max_blocks_per_req: usize, _stream: &CudaStream) -> Result<Self> {
         let max_blocks = max_blocks_per_req.max(1);
         let meta_i32 = DeviceBuffer::alloc(device_id, BATCHED_DECODE_META_I32_LEN * 4)?;
@@ -1272,11 +1323,17 @@ impl BatchedDecodeGraphIo {
         let block_tables =
             DeviceBuffer::alloc(device_id, MAX_BATCHED_DECODE_REQS * max_blocks * 4)?;
         let out_greedy_ids = DeviceBuffer::alloc(device_id, MAX_BATCHED_DECODE_REQS * 4)?;
+        let pinned_staging = crate::cuda::MappedHostBuffer::alloc(
+            Self::PINNED_META_BYTES + Self::PINNED_SAMPLER_BYTES,
+        )?;
         Ok(Self {
             meta_i32,
             masks_u8,
             block_tables,
             out_greedy_ids,
+            pinned_staging,
+            pinned_in_flight: std::sync::atomic::AtomicBool::new(false),
+            pinned_sampler_in_flight: std::sync::atomic::AtomicBool::new(false),
             max_blocks_per_req: max_blocks,
         })
     }
@@ -1405,10 +1462,92 @@ impl BatchedDecodeGraphIo {
         slices: &[EngineBatchSlice<'_>],
         stream: &CudaStream,
     ) -> Result<()> {
+        let meta_bytes = BATCHED_DECODE_META_I32_LEN * 4;
+        if meta_bytes > self.meta_i32.len_bytes {
+            return Err(loader_err("batched decode meta_i32 buffer too small"));
+        }
+        if BATCHED_DECODE_MASKS_U8_LEN > self.masks_u8.len_bytes {
+            return Err(loader_err("batched decode masks_u8 buffer too small"));
+        }
+        let masks_off = (meta_bytes + 63) & !63;
+        let bt_off = (masks_off + BATCHED_DECODE_MASKS_U8_LEN + 63) & !63;
+        let row_bytes = self.max_blocks_per_req * 4;
+        let mut last_bt_end = 0usize;
+        for (r, s) in slices.iter().enumerate() {
+            if s.block_table.len() > self.max_blocks_per_req {
+                return Err(loader_err(
+                    "batched decode row block_table exceeds max_blocks_per_req",
+                ));
+            }
+            if !s.block_table.is_empty() {
+                last_bt_end = r * row_bytes + s.block_table.len() * 4;
+            }
+        }
+        if last_bt_end > self.block_tables.len_bytes {
+            return Err(loader_err("batched decode block_tables buffer too small"));
+        }
+        if bt_off + last_bt_end <= Self::PINNED_META_BYTES.min(self.pinned_staging.len_bytes) {
+            if self
+                .pinned_in_flight
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                stream.synchronize()?;
+            }
+            let base = self.pinned_staging.host_ptr.cast::<u8>();
+            unsafe {
+                core::ptr::copy_nonoverlapping(meta.as_ptr().cast::<u8>(), base, meta_bytes);
+                core::ptr::copy_nonoverlapping(
+                    masks.as_ptr(),
+                    base.add(masks_off),
+                    BATCHED_DECODE_MASKS_U8_LEN,
+                );
+                for (r, s) in slices.iter().enumerate() {
+                    if !s.block_table.is_empty() {
+                        core::ptr::copy_nonoverlapping(
+                            s.block_table.as_ptr().cast::<u8>(),
+                            base.add(bt_off + r * row_bytes),
+                            s.block_table.len() * 4,
+                        );
+                    }
+                }
+                // Arm before the first async H2D so a later error cannot leave an untracked DMA.
+                self.pinned_in_flight
+                    .store(true, std::sync::atomic::Ordering::Release);
+                check_rc(
+                    ffi::w34_memcpy_h2d_async(
+                        self.meta_i32.addr() as *mut c_void,
+                        base.cast(),
+                        meta_bytes,
+                        stream.handle,
+                    ),
+                    "upload pinned batched decode meta",
+                )?;
+                check_rc(
+                    ffi::w34_memcpy_h2d_async(
+                        self.masks_u8.addr() as *mut c_void,
+                        base.add(masks_off).cast(),
+                        BATCHED_DECODE_MASKS_U8_LEN,
+                        stream.handle,
+                    ),
+                    "upload pinned batched decode masks",
+                )?;
+                if last_bt_end > 0 {
+                    check_rc(
+                        ffi::w34_memcpy_h2d_async(
+                            self.block_tables.addr() as *mut c_void,
+                            base.add(bt_off).cast(),
+                            last_bt_end,
+                            stream.handle,
+                        ),
+                        "upload pinned batched decode block_tables",
+                    )?;
+                }
+            }
+            return Ok(());
+        }
         self.meta_i32.copy_from_host(meta, stream)?;
         self.masks_u8.copy_from_host(masks, stream)?;
         let bt_base = self.block_tables.addr();
-        let row_bytes = self.max_blocks_per_req * 4;
         for (r, s) in slices.iter().enumerate() {
             if !s.block_table.is_empty() {
                 check_rc(
@@ -4256,63 +4395,199 @@ impl Qwen3_5Engine {
         let r0 = &mut self.ranks[0];
         r0.device.make_current()?;
         r0.batch_meta_arena.reset();
-        let cfg_dev = r0.batch_meta_arena.upload_slice(row_cfgs, &r0.stream)?;
-        let mask_dev = if bitmask_words.is_empty() {
-            0
-        } else {
-            r0.batch_meta_arena
-                .upload_slice(bitmask_words, &r0.stream)?
-        };
-        let sparse_dev = if sparse_entries.is_empty() {
-            0
-        } else {
-            r0.batch_meta_arena
-                .upload_slice(sparse_entries, &r0.stream)?
-        };
+        let cfg_bytes = core::mem::size_of_val(row_cfgs);
+        let sparse_bytes = core::mem::size_of_val(sparse_entries);
         let out_bytes = num_rows * core::mem::size_of::<ffi::W34SamplerRowOut>();
+        let cfg_off = 0usize;
+        let sparse_off = (cfg_bytes + 63) & !63;
+        let out_off = (sparse_off + sparse_bytes + 63) & !63;
+        let use_pinned_sampler = bitmask_words.is_empty()
+            && (out_off + out_bytes <= BatchedDecodeGraphIo::PINNED_SAMPLER_BYTES);
+        let (cfg_dev, mask_dev, sparse_dev) = if use_pinned_sampler {
+            if r0
+                .batched_decode_io
+                .pinned_sampler_in_flight
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                r0.stream.synchronize()?;
+            }
+            let pbase = unsafe {
+                r0.batched_decode_io
+                    .pinned_staging
+                    .host_ptr
+                    .cast::<u8>()
+                    .add(BatchedDecodeGraphIo::PINNED_SAMPLER_OFFSET)
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    row_cfgs.as_ptr().cast::<u8>(),
+                    pbase.add(cfg_off),
+                    cfg_bytes,
+                );
+                if sparse_bytes > 0 {
+                    core::ptr::copy_nonoverlapping(
+                        sparse_entries.as_ptr().cast::<u8>(),
+                        pbase.add(sparse_off),
+                        sparse_bytes,
+                    );
+                }
+            }
+            let h2d_bytes = if sparse_bytes > 0 {
+                sparse_off + sparse_bytes
+            } else {
+                cfg_bytes
+            };
+            let dev_base = r0.batch_meta_arena.alloc_aligned(h2d_bytes.max(64))?;
+            r0.batched_decode_io
+                .pinned_sampler_in_flight
+                .store(true, std::sync::atomic::Ordering::Release);
+            check_rc(
+                unsafe {
+                    ffi::w34_memcpy_h2d_async(
+                        dev_base as *mut c_void,
+                        pbase.cast(),
+                        h2d_bytes,
+                        r0.stream.handle,
+                    )
+                },
+                "upload pinned GPU sampler inputs",
+            )?;
+            let sp_dev = if sparse_bytes > 0 {
+                dev_base + sparse_off as u64
+            } else {
+                0
+            };
+            (dev_base, 0u64, sp_dev)
+        } else {
+            let c_dev = r0.batch_meta_arena.upload_slice(row_cfgs, &r0.stream)?;
+            let m_dev = if bitmask_words.is_empty() {
+                0
+            } else {
+                r0.batch_meta_arena
+                    .upload_slice(bitmask_words, &r0.stream)?
+            };
+            let s_dev = if sparse_entries.is_empty() {
+                0
+            } else {
+                r0.batch_meta_arena
+                    .upload_slice(sparse_entries, &r0.stream)?
+            };
+            (c_dev, m_dev, s_dev)
+        };
         let out_dev = r0.batch_meta_arena.alloc_aligned(out_bytes)?;
         let ex_sampler = r0.stream.exec(sampler_ws_ptr, sampler_ws_cap);
-        check_rc(
-            unsafe {
-                ffi::w34_sampler_step_f16(
-                    &ex_sampler,
-                    full_logits_ptr as *const c_void,
-                    cfg_dev as *const ffi::W34SamplerRowCfg,
-                    if mask_dev == 0 {
-                        core::ptr::null()
-                    } else {
-                        mask_dev as *const u32
-                    },
-                    if sparse_dev == 0 {
-                        core::ptr::null()
-                    } else {
-                        sparse_dev as *const ffi::W34SamplerSparseEntry
-                    },
-                    out_dev as *mut ffi::W34SamplerRowOut,
-                    num_rows as i32,
-                    vocab_size as i32,
-                    sparse_entries.len() as i32,
-                )
-            },
-            "w34_sampler_step_f16",
-        )?;
+        let use_fast_greedy = vocab_size >= 1024
+            && bitmask_words.is_empty()
+            && row_cfgs.iter().all(|c| {
+                (c.temperature <= 1e-6 || c.top_k == 1)
+                    && (c.has_bitmask == 0 || c.row_bitmask_word_offset < 0)
+                    && (0..=32).contains(&c.sparse_count)
+                    && c.top_logprobs_k <= 0
+            });
+        if use_fast_greedy {
+            check_rc(
+                unsafe {
+                    ffi::w34_sampler_step_fast_greedy_f16(
+                        &ex_sampler,
+                        full_logits_ptr as *const c_void,
+                        cfg_dev as *const ffi::W34SamplerRowCfg,
+                        if sparse_dev == 0 {
+                            core::ptr::null()
+                        } else {
+                            sparse_dev as *const ffi::W34SamplerSparseEntry
+                        },
+                        out_dev as *mut ffi::W34SamplerRowOut,
+                        num_rows as i32,
+                        vocab_size as i32,
+                    )
+                },
+                "w34_sampler_step_fast_greedy_f16",
+            )?;
+        } else {
+            check_rc(
+                unsafe {
+                    ffi::w34_sampler_step_f16(
+                        &ex_sampler,
+                        full_logits_ptr as *const c_void,
+                        cfg_dev as *const ffi::W34SamplerRowCfg,
+                        if mask_dev == 0 {
+                            core::ptr::null()
+                        } else {
+                            mask_dev as *const u32
+                        },
+                        if sparse_dev == 0 {
+                            core::ptr::null()
+                        } else {
+                            sparse_dev as *const ffi::W34SamplerSparseEntry
+                        },
+                        out_dev as *mut ffi::W34SamplerRowOut,
+                        num_rows as i32,
+                        vocab_size as i32,
+                        sparse_entries.len() as i32,
+                    )
+                },
+                "w34_sampler_step_f16",
+            )?;
+        }
 
         let mut outs = vec![ffi::W34SamplerRowOut::default(); num_rows];
-        check_rc(
+        if use_pinned_sampler {
+            let pout = unsafe {
+                r0.batched_decode_io
+                    .pinned_staging
+                    .host_ptr
+                    .cast::<u8>()
+                    .add(BatchedDecodeGraphIo::PINNED_SAMPLER_OFFSET + out_off)
+            };
+            check_rc(
+                unsafe {
+                    ffi::w34_memcpy_d2h_async(
+                        pout.cast(),
+                        out_dev as *const c_void,
+                        out_bytes,
+                        r0.stream.handle,
+                    )
+                },
+                "copy pinned GPU sampler outputs",
+            )?;
+            r0.stream.synchronize()?;
+            r0.batched_decode_io
+                .pinned_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            r0.batched_decode_io
+                .pinned_sampler_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
             unsafe {
-                ffi::w34_memcpy_d2h_async(
-                    outs.as_mut_ptr().cast(),
-                    out_dev as *const c_void,
-                    out_bytes,
-                    r0.stream.handle,
-                )
-            },
-            "copy GPU sampler outputs",
-        )?;
-        r0.stream.synchronize()?;
+                core::ptr::copy_nonoverlapping(
+                    pout.cast::<ffi::W34SamplerRowOut>(),
+                    outs.as_mut_ptr(),
+                    num_rows,
+                );
+            }
+        } else {
+            check_rc(
+                unsafe {
+                    ffi::w34_memcpy_d2h_async(
+                        outs.as_mut_ptr().cast(),
+                        out_dev as *const c_void,
+                        out_bytes,
+                        r0.stream.handle,
+                    )
+                },
+                "copy GPU sampler outputs",
+            )?;
+            r0.stream.synchronize()?;
+            r0.batched_decode_io
+                .pinned_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         if self.tp_size == 2 {
             self.ranks[1].device.make_current()?;
             self.ranks[1].stream.synchronize()?;
+            self.ranks[1]
+                .batched_decode_io
+                .pinned_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
         }
         Ok(outs)
     }
@@ -5787,6 +6062,7 @@ impl Qwen3_5Engine {
         rope_pos_deltas: Option<&[i32]>,
         bucket_b: usize,
         long_ctx: bool,
+        skip_host_greedy: bool,
     ) -> Result<Vec<Vec<i32>>> {
         let n = slices.len();
         let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta(slices, rope_pos_deltas)?;
@@ -5845,15 +6121,25 @@ impl Qwen3_5Engine {
             }
             return Err(error.source);
         }
+        if skip_host_greedy {
+            return Ok(Vec::new());
+        }
         let mut out_ids = vec![0i32; n];
         self.ranks[0].device.make_current()?;
         self.ranks[0]
             .batched_decode_io
             .out_greedy_ids
             .copy_to_host(&mut out_ids, &self.ranks[0].stream)?;
+        self.ranks[0]
+            .batched_decode_io
+            .pinned_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
         for r in &self.ranks[1..] {
             r.device.make_current()?;
             r.stream.synchronize()?;
+            r.batched_decode_io
+                .pinned_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
         }
         Ok(out_ids.into_iter().map(|t| vec![t]).collect())
     }
@@ -5869,6 +6155,17 @@ impl Qwen3_5Engine {
         &mut self,
         slices: &[EngineBatchSlice<'_>],
         rope_pos_deltas: Option<&[i32]>,
+    ) -> Result<Vec<Vec<i32>>> {
+        self.step_batch_slices_for_sampler(slices, rope_pos_deltas, false)
+    }
+
+    /// Internal batch-step entrypoint that optionally skips host greedy argmax D2H (`Ok(Vec::new())`)
+    /// when `skip_host_greedy == true` and the caller immediately samples device logits via `run_gpu_sampler_rows`.
+    pub(crate) fn step_batch_slices_for_sampler(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+        skip_host_greedy: bool,
     ) -> Result<Vec<Vec<i32>>> {
         if slices.is_empty() {
             return Ok(Vec::new());
@@ -5909,7 +6206,13 @@ impl Qwen3_5Engine {
             let long_ctx = max_seq_after > 1024;
             // Failed preparation/capture has not run a forward pass. Surface the error
             // without disabling unrelated graph families or replaying mutable state.
-            return self.step_batched_decode_graph(slices, rope_pos_deltas, bucket_b, long_ctx);
+            return self.step_batched_decode_graph(
+                slices,
+                rope_pos_deltas,
+                bucket_b,
+                long_ctx,
+                skip_host_greedy,
+            );
         }
         if slices.len() == 1 && rope_pos_deltas.is_none() {
             let s = &slices[0];
@@ -6221,6 +6524,9 @@ impl Qwen3_5Engine {
             res0??
         };
 
+        if skip_host_greedy {
+            return Ok(Vec::new());
+        }
         let mut out_per_req = Vec::with_capacity(num_reqs);
         let mut cursor = 0usize;
         for count in row_counts_per_req {

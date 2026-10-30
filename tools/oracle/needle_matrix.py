@@ -18,10 +18,12 @@ WINDOWS = (32768, 65536, 131072, 262144)
 POLICIES = ("tq4", "tq4_all")
 
 
-def cases(depths):
+def cases(depths, policies=POLICIES):
     if not depths or any(not 0 <= d <= 100 for d in depths):
         raise ValueError("depths must be nonempty percentages in 0..100")
-    return [(policy, window, depth) for policy in POLICIES for window in WINDOWS for depth in depths]
+    if not policies or any(p not in POLICIES for p in policies):
+        raise ValueError(f"policies must be a nonempty subset of {POLICIES}")
+    return [(policy, window, depth) for policy in policies for window in WINDOWS for depth in depths]
 
 
 def passes_report(status, measured, policy, window, depth):
@@ -46,10 +48,12 @@ def main():
     ap.add_argument("--model", default="nchapman/Qwen3.8-27B-W4A16-GPTQ")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "outputs/needle")
     ap.add_argument("--depths", type=int, nargs="+", default=[50])
+    ap.add_argument("--policies", nargs="+", choices=POLICIES, default=list(POLICIES))
+    ap.add_argument("--skip-build", action="store_true", help="use an already-built target/release/examples/needle_gate")
     ap.add_argument("--timeout", type=float, default=3600, help="hard seconds per model process")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    matrix = cases(args.depths)
+    matrix = cases(args.depths, tuple(args.policies))
     if args.timeout <= 0:
         ap.error("timeout must be positive")
     devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
@@ -63,7 +67,8 @@ def main():
                "expected_cases": len(matrix), "results": results}
     if not args.dry_run:
         (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-        subprocess.run(["cargo", "build", "--release", "--features", "cuda", "--example", "needle_gate"], cwd=ROOT, check=True)
+        if not args.skip_build:
+            subprocess.run(["cargo", "build", "--release", "--features", "cuda", "--example", "needle_gate"], cwd=ROOT, check=True)
     for policy, window, depth in matrix:
         name = f"{policy}-{window}-depth{depth}"
         report = args.out_dir / f"{name}.json"

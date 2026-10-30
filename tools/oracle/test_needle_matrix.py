@@ -11,9 +11,14 @@ class NeedleMatrixTests(unittest.TestCase):
 
     def test_multiple_depths_are_measured_independently(self):
         self.assertEqual(len(cases([0, 25, 50, 75, 100])), 40)
+        self.assertEqual(len(cases([50], ("tq4",))), 4)
+        self.assertEqual({policy for policy, _, _ in cases([50], ("tq4_all",))}, {"tq4_all"})
         for depths in ([], [-1], [101]):
             with self.assertRaises(ValueError):
                 cases(depths)
+        for policies in ([], ("fp16",)):
+            with self.assertRaises(ValueError):
+                cases([50], policies)
 
     def test_gate_requires_successful_process_exact_retrieval_and_matching_geometry(self):
         report = {"passed": True, "context_window": 32768, "kv_policy": "tq4", "depth_percent": 50,

@@ -358,7 +358,12 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     const int4* S_ptr = (const int4*)S;
 
     constexpr int stages = 4;
-    int max_par = prob_n <= 4096 ? 128 : 16;
+    // For large-K `down_proj` (`prob_n >= 2048`, `(prob_n / 64) * 2 <= sms`, `prob_k >= 4608`,
+    // so both TP=1 `K=9216` and TP=2 `K=4608` take 2-way M-invariant Split-K while `K<=4096`
+    // projections stay 1-slice), keep `max_par = 1` and deterministic lock reduction.
+    const bool enable_m_invariant_split_k =
+        (prob_m <= 16) && (prob_n >= 2048) && (((prob_n / 64) * 2 <= sms) && (prob_k >= 4608));
+    int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : 16);
     int rest_m = prob_m;
 
     while (rest_m > 0) {
@@ -375,7 +380,8 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
             prob_m_split, prob_n, prob_k, thread_m_blocks, m_block_size_8,
             group_blocks, num_bits, stages, max_shared_mem);
         if (th_cfg.thread_n != -1) {
-            if ((prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16) * 4 <= sms) {
+            if (enable_m_invariant_split_k ||
+                (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16) * 4 <= sms) {
                 thread_config_t cfg128 = {128, 64, 128};
                 if (is_valid_config(cfg128, thread_m_blocks, prob_m_split, prob_n, prob_k,
                                     num_bits, group_blocks * 16, stages, max_shared_mem) &&
@@ -386,9 +392,17 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         }
         if (th_cfg.thread_k == -1) return (int)cudaErrorInvalidValue;
 
-        int blocks = sms;
         int mn_tiles = (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
-        if (blocks > mn_tiles) blocks = mn_tiles;
+        int blocks = sms;
+        if (enable_m_invariant_split_k && th_cfg.thread_k == 128 && th_cfg.thread_n == 64 && mn_tiles > 0) {
+            int k_tiles = prob_k / th_cfg.thread_k;
+            int max_k_splits = std::min(sms / mn_tiles, k_tiles / 4);
+            if (max_k_splits > 2) max_k_splits = 2;
+            if (max_k_splits < 1) max_k_splits = 1;
+            blocks = mn_tiles * max_k_splits;
+        } else if (blocks > mn_tiles) {
+            blocks = mn_tiles;
+        }
         if (blocks < 1) blocks = 1;
 
         auto kernel = get_marlin_kernel_f16(th_cfg, num_bits, thread_m_blocks, m_block_size_8, group_blocks);
@@ -397,7 +411,7 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem) != cudaSuccess) {
             return (int)cudaGetLastError();
         }
-        bool part_use_atomic_add = div_ceil(prob_m_split, 64) * prob_n <= 2048;
+        bool part_use_atomic_add = !enable_m_invariant_split_k && (div_ceil(prob_m_split, 64) * prob_n <= 2048);
 
         kernel<<<blocks, th_cfg.num_threads, max_shared_mem, stream>>>(
             A_ptr, B_ptr, C_ptr, nullptr,

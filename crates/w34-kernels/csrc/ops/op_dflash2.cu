@@ -83,6 +83,81 @@ union HalfVec8 {
     __half h[8];
 };
 
+// 1-warp (1 row/CTA), compile-time unrolled, register-resident (zero .local stack spill),
+// 128-bit vectorized BF16 RMSNorm preserving the exact 32-lane x vec=8 FP32 reduction tree
+// of FlashInfer's <=3072-width norm while spreading `rows` across `rows` SMs.
+template <int ROUNDS>
+__global__ void norm_bf16_vec8_1warp(
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ y,
+    int rows,
+    float eps) {
+    constexpr int HIDDEN = ROUNDS << 8;
+    const int lane = threadIdx.x & 31;
+    const int row = (int)blockIdx.x;
+    if (row >= rows) return;
+
+    const int64_t base = (int64_t)row * HIDDEN;
+    float vals[ROUNDS][8];
+    float sq = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < ROUNDS; ++i) {
+        const int col0 = ((i << 5) + lane) << 3;
+        Bf16Vec8 xv;
+        xv.u = *reinterpret_cast<const uint4*>(x + base + col0);
+        if (residual) {
+            Bf16Vec8 rv;
+            rv.u = *reinterpret_cast<const uint4*>(residual + base + col0);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = (float)xv.b[j] + (float)rv.b[j];
+                vals[i][j] = v;
+                sq += v * v;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = (float)xv.b[j];
+                vals[i][j] = v;
+                sq += v * v;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        sq += __shfl_xor_sync(0xffffffffu, sq, offset);
+    }
+
+    float inv;
+    const float var_eps = sq / (float)HIDDEN + eps;
+    asm volatile("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(var_eps));
+
+#pragma unroll
+    for (int i = 0; i < ROUNDS; ++i) {
+        const int col0 = ((i << 5) + lane) << 3;
+        Bf16Vec8 wv;
+        wv.u = *reinterpret_cast<const uint4*>(weight + col0);
+        if (residual) {
+            Bf16Vec8 rv_out;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                rv_out.b[j] = __float2bfloat16(vals[i][j]);
+            }
+            *reinterpret_cast<uint4*>(residual + base + col0) = rv_out.u;
+        }
+        Bf16Vec8 yv;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            yv.b[j] = __float2bfloat16(vals[i][j] * inv * (float)wv.b[j]);
+        }
+        *reinterpret_cast<uint4*>(y + base + col0) = yv.u;
+    }
+}
+
 // 4-warp (4 rows/CTA), register-cached, 128-bit vectorized BF16 RMSNorm preserving
 // the exact 32-lane x vec=8 FP32 reduction tree of FlashInfer's <=3072-width norm.
 __global__ void norm_bf16_vec8_4warp(
@@ -608,6 +683,213 @@ __device__ __forceinline__ void topk_insert_smem(
     }
 }
 
+// Encodes an FP16 `__half` bit pattern + local column index `local_col < 65535` into a
+// strictly monotonic `uint32_t` key such that `key_a > key_b` matches
+// `(val_a > val_b) || (val_a == val_b && id_a < id_b)` across all 65,536 FP16 bit patterns:
+// - `NaN` (`(u & 0x7fff) > 0x7c00`) and `-Inf` (`u == 0xfc00`) map to `0u` (never > `min_top >= 0u`,
+//   matching IEEE `v > -FLT_MAX == false` in `topk_insert_smem`).
+// - `-0.0` (`u == 0x8000`) normalizes to `+0.0` (`0x0000`) so signed-zero ties break by lowest ID.
+// - Finite negatives (`0x8001..0xfbff`) map to `ord = (~u) & 0x7fff` in `0x0400..0x7ffe`.
+// - `+0.0`, finite positives, and `+Inf` (`0x0000..0x7c00`) map to `ord = u | 0x8000` in `0x8000..0xfc00`.
+__device__ __forceinline__ uint32_t pack_f16_topk_key(uint16_t u, int local_col) {
+    if ((u & 0x7fffu) > 0x7c00u || u == 0xfc00u) return 0u;
+    if (u == 0x8000u) u = 0x0000u;
+    const uint32_t ord = ((u & 0x8000u) == 0u)
+        ? (uint32_t)(u | 0x8000u)
+        : (uint32_t)((~u) & 0x7fffu);
+    return (ord << 16) | (uint32_t)(0xffffu - (uint32_t)local_col);
+}
+
+__device__ __forceinline__ float unpack_f16_topk_val(uint32_t key) {
+    const uint32_t ord = key >> 16;
+    if (ord == 0u) return -FLT_MAX;
+    const uint16_t u = (ord >= 0x8000u)
+        ? (uint16_t)(ord & 0x7fffu)
+        : (uint16_t)((~ord) | 0x8000u);
+    return __half2float(__ushort_as_half(u));
+}
+
+__device__ __forceinline__ void topk_insert_packed_smem(
+    uint32_t key,
+    int tid,
+    int last,
+    uint32_t (&sk)[16][128],
+    uint32_t& min_top) {
+    if (key > min_top) {
+        int pos = last;
+        while (pos > 0 && key > sk[pos - 1][tid]) {
+            sk[pos][tid] = sk[pos - 1][tid];
+            --pos;
+        }
+        sk[pos][tid] = key;
+        min_top = sk[last][tid];
+    }
+}
+
+__device__ __forceinline__ uint32_t warp_reduce_max_u32(uint32_t v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const uint32_t o = __shfl_xor_sync(0xffffffffu, v, off);
+        if (o > v) v = o;
+    }
+    return v;
+}
+
+// High-occupancy (8 KB smem, 128 threads = 4 warps, 5-6 CTAs/SM) packed-u32 top-k extraction
+// for splits with `chunk_elems <= 65535` (covers all `num_splits >= 4` up to 1M local vocab).
+__global__ void topk_rows_packed_u32_f16_kernel(
+    const __half* __restrict__ logits,
+    int32_t* __restrict__ out_ids,
+    float* __restrict__ out_vals,
+    int num_rows,
+    int local_vocab_size,
+    int vocab_offset,
+    int top_k,
+    int num_splits) {
+    constexpr int MAX_K = 16;
+    const int split_idx = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= num_rows || split_idx >= num_splits) return;
+    const __half* row_logits = logits + (int64_t)row * local_vocab_size;
+    const int tid = threadIdx.x;
+
+    const int chunk_elems = ((local_vocab_size + num_splits - 1) / num_splits + 7) & ~7;
+    const int col_start = split_idx * chunk_elems;
+    const int col_end = min(local_vocab_size, col_start + chunk_elems);
+    const int span = col_end - col_start;
+
+    __shared__ uint32_t sk[MAX_K][128];
+    __shared__ uint32_t warp_k[4];
+    __shared__ uint32_t s_win_k;
+
+#pragma unroll
+    for (int m = 0; m < MAX_K; ++m) {
+        sk[m][tid] = 0u;
+    }
+
+    uint32_t min_top = 0u;
+    const int last = top_k - 1;
+    const uint16_t* split_u16 = reinterpret_cast<const uint16_t*>(row_logits + col_start);
+    const bool aligned16 = (((uintptr_t)split_u16) & 15u) == 0u;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    if (aligned16 && span > 0) {
+        const int vec_end = span & ~7;
+        // Pre-seed CTA-wide `top_k`-th largest threshold from the first 1,024 tokens so >98%
+        // of remaining `uint4` loads reject all 8 keys in registers via a single `max8 <= min_top`.
+        int start_lc = (tid << 3);
+        if (vec_end >= 1024) {
+            const uint4 u4 = *reinterpret_cast<const uint4*>(split_u16 + start_lc);
+            const uint32_t k0 = pack_f16_topk_key((uint16_t)(u4.x & 0xffffu), start_lc + 0);
+            const uint32_t k1 = pack_f16_topk_key((uint16_t)(u4.x >> 16), start_lc + 1);
+            const uint32_t k2 = pack_f16_topk_key((uint16_t)(u4.y & 0xffffu), start_lc + 2);
+            const uint32_t k3 = pack_f16_topk_key((uint16_t)(u4.y >> 16), start_lc + 3);
+            const uint32_t k4 = pack_f16_topk_key((uint16_t)(u4.z & 0xffffu), start_lc + 4);
+            const uint32_t k5 = pack_f16_topk_key((uint16_t)(u4.z >> 16), start_lc + 5);
+            const uint32_t k6 = pack_f16_topk_key((uint16_t)(u4.w & 0xffffu), start_lc + 6);
+            const uint32_t k7 = pack_f16_topk_key((uint16_t)(u4.w >> 16), start_lc + 7);
+            topk_insert_packed_smem(k0, tid, last, sk, min_top);
+            topk_insert_packed_smem(k1, tid, last, sk, min_top);
+            topk_insert_packed_smem(k2, tid, last, sk, min_top);
+            topk_insert_packed_smem(k3, tid, last, sk, min_top);
+            topk_insert_packed_smem(k4, tid, last, sk, min_top);
+            topk_insert_packed_smem(k5, tid, last, sk, min_top);
+            topk_insert_packed_smem(k6, tid, last, sk, min_top);
+            topk_insert_packed_smem(k7, tid, last, sk, min_top);
+            __syncthreads();
+            int seed_cur = 0;
+            uint32_t seed_kth = 0u;
+            for (int m = 0; m < top_k; ++m) {
+                uint32_t cand = (seed_cur < top_k) ? sk[seed_cur][tid] : 0u;
+                cand = warp_reduce_max_u32(cand);
+                if (lane == 0) warp_k[wid] = cand;
+                __syncthreads();
+                if (wid == 0) {
+                    uint32_t w = (lane < 4) ? warp_k[lane] : 0u;
+                    w = warp_reduce_max_u32(w);
+                    if (lane == 0) s_win_k = w;
+                }
+                __syncthreads();
+                seed_kth = s_win_k;
+                if (seed_cur < top_k && seed_kth != 0u && sk[seed_cur][tid] == seed_kth) {
+                    ++seed_cur;
+                }
+            }
+            if (seed_kth > min_top) min_top = seed_kth;
+            start_lc += 1024;
+        }
+        for (int lc = start_lc; lc < vec_end; lc += 128 * 8) {
+            const uint4 u4 = *reinterpret_cast<const uint4*>(split_u16 + lc);
+            const uint32_t k0 = pack_f16_topk_key((uint16_t)(u4.x & 0xffffu), lc + 0);
+            const uint32_t k1 = pack_f16_topk_key((uint16_t)(u4.x >> 16), lc + 1);
+            const uint32_t k2 = pack_f16_topk_key((uint16_t)(u4.y & 0xffffu), lc + 2);
+            const uint32_t k3 = pack_f16_topk_key((uint16_t)(u4.y >> 16), lc + 3);
+            const uint32_t k4 = pack_f16_topk_key((uint16_t)(u4.z & 0xffffu), lc + 4);
+            const uint32_t k5 = pack_f16_topk_key((uint16_t)(u4.z >> 16), lc + 5);
+            const uint32_t k6 = pack_f16_topk_key((uint16_t)(u4.w & 0xffffu), lc + 6);
+            const uint32_t k7 = pack_f16_topk_key((uint16_t)(u4.w >> 16), lc + 7);
+            const uint32_t m01 = (k0 > k1) ? k0 : k1;
+            const uint32_t m23 = (k2 > k3) ? k2 : k3;
+            const uint32_t m45 = (k4 > k5) ? k4 : k5;
+            const uint32_t m67 = (k6 > k7) ? k6 : k7;
+            const uint32_t m03 = (m01 > m23) ? m01 : m23;
+            const uint32_t m47 = (m45 > m67) ? m45 : m67;
+            const uint32_t max8 = (m03 > m47) ? m03 : m47;
+            if (max8 > min_top) {
+                topk_insert_packed_smem(k0, tid, last, sk, min_top);
+                topk_insert_packed_smem(k1, tid, last, sk, min_top);
+                topk_insert_packed_smem(k2, tid, last, sk, min_top);
+                topk_insert_packed_smem(k3, tid, last, sk, min_top);
+                topk_insert_packed_smem(k4, tid, last, sk, min_top);
+                topk_insert_packed_smem(k5, tid, last, sk, min_top);
+                topk_insert_packed_smem(k6, tid, last, sk, min_top);
+                topk_insert_packed_smem(k7, tid, last, sk, min_top);
+            }
+        }
+        for (int lc = vec_end + tid; lc < span; lc += 128) {
+            topk_insert_packed_smem(pack_f16_topk_key(split_u16[lc], lc), tid, last, sk, min_top);
+        }
+    } else {
+        for (int lc = tid; lc < span; lc += 128) {
+            topk_insert_packed_smem(pack_f16_topk_key(split_u16[lc], lc), tid, last, sk, min_top);
+        }
+    }
+    __syncthreads();
+
+    int cur = 0;
+    const int64_t out_base = ((int64_t)row * num_splits + split_idx) * top_k;
+    for (int m = 0; m < top_k; ++m) {
+        uint32_t cand = (cur < top_k) ? sk[cur][tid] : 0u;
+        cand = warp_reduce_max_u32(cand);
+        if (lane == 0) {
+            warp_k[wid] = cand;
+        }
+        __syncthreads();
+
+        if (wid == 0) {
+            uint32_t w = (lane < 4) ? warp_k[lane] : 0u;
+            w = warp_reduce_max_u32(w);
+            if (lane == 0) {
+                s_win_k = w;
+                if (w != 0u) {
+                    const int local_col = (int)(0xffffu - (w & 0xffffu));
+                    out_vals[out_base + m] = unpack_f16_topk_val(w);
+                    out_ids[out_base + m] = vocab_offset + col_start + local_col;
+                } else {
+                    out_vals[out_base + m] = -FLT_MAX;
+                    out_ids[out_base + m] = -1;
+                }
+            }
+        }
+        __syncthreads();
+
+        const uint32_t win_k = s_win_k;
+        if (cur < top_k && win_k != 0u && sk[cur][tid] == win_k) {
+            ++cur;
+        }
+    }
+}
+
 // Bank-conflict-free, spill-free top-k extraction (top_k <= 16) over [col_start, col_end).
 // Uses 128-bit uint4 (8x FP16) vectorized global loads when 16-byte aligned.
 __global__ void topk_rows_range_f16_kernel(
@@ -634,6 +916,7 @@ __global__ void topk_rows_range_f16_kernel(
     __shared__ int32_t si[MAX_K][256];
     __shared__ float warp_v[8];
     __shared__ int32_t warp_i[8];
+    __shared__ int32_t s_win_i;
 
 #pragma unroll
     for (int m = 0; m < MAX_K; ++m) {
@@ -688,21 +971,21 @@ __global__ void topk_rows_range_f16_kernel(
                 : TopkPair{-FLT_MAX, -1};
             w = warp_reduce_topk_pair(w);
             if (lane == 0) {
-                warp_v[0] = w.val;
-                warp_i[0] = w.id;
+                s_win_i = w.id;
                 out_vals[out_base + m] = w.val;
                 out_ids[out_base + m] = w.id;
             }
         }
         __syncthreads();
 
-        if (cur < top_k && si[cur][tid] == warp_i[0] && warp_i[0] >= 0) {
+        const int32_t win_i = s_win_i;
+        if (cur < top_k && win_i >= 0 && si[cur][tid] == win_i) {
             ++cur;
         }
     }
 }
 
-// Merges `num_splits * top_k <= 128` candidates per row in registers (128 threads/block).
+// Merges `num_splits * top_k <= 256` candidates per row in registers (256 threads/block).
 __global__ void topk_rows_merge_kernel(
     const int32_t* __restrict__ split_ids,
     const float* __restrict__ split_vals,
@@ -717,8 +1000,9 @@ __global__ void topk_rows_merge_kernel(
     const int lane = tid & 31;
     const int wid = tid >> 5;
 
-    __shared__ float warp_v[4];
-    __shared__ int32_t warp_i[4];
+    __shared__ float warp_v[8];
+    __shared__ int32_t warp_i[8];
+    __shared__ int32_t s_win_i;
 
     TopkPair my_cand = (tid < total_cands)
         ? TopkPair{split_vals[(int64_t)row * total_cands + tid], split_ids[(int64_t)row * total_cands + tid]}
@@ -732,17 +1016,17 @@ __global__ void topk_rows_merge_kernel(
         }
         __syncthreads();
         if (wid == 0) {
-            TopkPair g = (lane < 4) ? TopkPair{warp_v[lane], warp_i[lane]} : TopkPair{-FLT_MAX, -1};
+            TopkPair g = (lane < 8) ? TopkPair{warp_v[lane], warp_i[lane]} : TopkPair{-FLT_MAX, -1};
             g = warp_reduce_topk_pair(g);
             if (lane == 0) {
-                warp_v[0] = g.val;
-                warp_i[0] = g.id;
+                s_win_i = g.id;
                 out_vals[(int64_t)row * top_k + m] = g.val;
                 out_ids[(int64_t)row * top_k + m] = g.id;
             }
         }
         __syncthreads();
-        if (my_cand.id == warp_i[0] && warp_i[0] >= 0) {
+        const int32_t win_i = s_win_i;
+        if (win_i >= 0 && my_cand.id == win_i) {
             my_cand = TopkPair{-FLT_MAX, -1};
         }
     }
@@ -882,6 +1166,13 @@ int w34_rms_norm_bf16(
     if (rows == 0) return 0;
     const bool aligned16 =
         (((uintptr_t)x | (uintptr_t)weight | (uintptr_t)y | (uintptr_t)residual) & 15u) == 0u;
+    if (aligned16 && hidden == 2560) {
+        norm_bf16_vec8_1warp<10><<<(unsigned)rows, 32, 0, (cudaStream_t)ex->stream>>>(
+            (const __nv_bfloat16*)x, (__nv_bfloat16*)residual,
+            (const __nv_bfloat16*)weight, (__nv_bfloat16*)y,
+            rows, eps);
+        return (int)cudaGetLastError();
+    }
     if (aligned16 && hidden >= 256 && hidden <= 3072 && (hidden & 255) == 0) {
         const unsigned blocks = (unsigned)((rows + 3) / 4);
         norm_bf16_vec8_4warp<<<blocks, 128, 0, (cudaStream_t)ex->stream>>>(
@@ -1166,7 +1457,7 @@ int w34_topk_rows_split_f16(
     int num_splits) {
     if (!ex || !logits_f16 || !out_ids || !out_vals || num_rows < 0 ||
         local_vocab_size <= 0 || top_k <= 0 || top_k > 16 ||
-        num_splits <= 0 || num_splits > 8 || num_splits * top_k > 128 ||
+        num_splits <= 0 || num_splits > 32 || num_splits * top_k > 256 ||
         (num_splits > 1 && (!split_ids_ws || !split_vals_ws))) {
         return (int)cudaErrorInvalidValue;
     }
@@ -1175,16 +1466,29 @@ int w34_topk_rows_split_f16(
         return w34_topk_rows_f16(
             ex, logits_f16, out_ids, out_vals, num_rows, local_vocab_size, vocab_offset, top_k);
     }
-    topk_rows_range_f16_kernel<<<dim3((unsigned)num_splits, (unsigned)num_rows), 256, 0, (cudaStream_t)ex->stream>>>(
-        static_cast<const __half*>(logits_f16),
-        split_ids_ws,
-        split_vals_ws,
-        num_rows,
-        local_vocab_size,
-        vocab_offset,
-        top_k,
-        num_splits);
-    topk_rows_merge_kernel<<<(unsigned)num_rows, 128, 0, (cudaStream_t)ex->stream>>>(
+    const int chunk_elems = ((local_vocab_size + num_splits - 1) / num_splits + 7) & ~7;
+    if (chunk_elems <= 65535) {
+        topk_rows_packed_u32_f16_kernel<<<dim3((unsigned)num_splits, (unsigned)num_rows), 128, 0, (cudaStream_t)ex->stream>>>(
+            static_cast<const __half*>(logits_f16),
+            split_ids_ws,
+            split_vals_ws,
+            num_rows,
+            local_vocab_size,
+            vocab_offset,
+            top_k,
+            num_splits);
+    } else {
+        topk_rows_range_f16_kernel<<<dim3((unsigned)num_splits, (unsigned)num_rows), 256, 0, (cudaStream_t)ex->stream>>>(
+            static_cast<const __half*>(logits_f16),
+            split_ids_ws,
+            split_vals_ws,
+            num_rows,
+            local_vocab_size,
+            vocab_offset,
+            top_k,
+            num_splits);
+    }
+    topk_rows_merge_kernel<<<(unsigned)num_rows, 256, 0, (cudaStream_t)ex->stream>>>(
         split_ids_ws,
         split_vals_ws,
         out_ids,
