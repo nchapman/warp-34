@@ -12,6 +12,8 @@ def render(directory):
     manifest = json.loads((directory / "manifest.json").read_text())
     summary_path = directory / "summary.json"
     rows = json.loads(summary_path.read_text()) if summary_path.exists() else []
+    coverage_path = directory / "coverage.json"
+    coverage = json.loads(coverage_path.read_text()) if coverage_path.exists() else []
     groups = {}
     for row in rows:
         groups.setdefault((row["engine_id"], row["case_id"]), []).append(row)
@@ -45,12 +47,30 @@ def render(directory):
                      f"{speed} | {value(median('first_output_ms', 'p50'))}/{value(median('first_output_ms', 'p95'))} | "
                      f"{value(median('e2e_ms', 'p95'))} |")
         for trial in trials:
-            flat.append({k: trial[k] for k in ("engine_id", "case_id", "repetition", "gpu_count",
+            failed = (trial["failed_requests"] or not trial["token_accounting_complete"]
+                      or trial["successful_sessions"] != trial["sessions"])
+            flat.append({"row_type": "trial", "status": "measurement_failed" if failed else "measured", "reason": "",
+                         **{k: trial[k] for k in ("engine_id", "case_id", "repetition", "gpu_count",
                                               "weight_format", "kv_format", "speculation", "cache",
                                               "duration_s", "requests", "successful_requests", "failed_requests",
-                                              "completion_tokens_s", "successful_requests_s", "slo_goodput_requests_s")})
+                                              "completion_tokens_s", "successful_requests_s", "slo_goodput_requests_s")}})
     if not rows:
-        lines.extend(["", "No measured trial completed. Inspect requests.jsonl for warmup/partial-request failures."])
+        message = ("No runnable deployments selected; no requests were sent."
+                   if manifest["status"] == "skipped" else
+                   "No measured trial completed. Inspect requests.jsonl for warmup/partial-request failures.")
+        lines.extend(["", message])
+    if coverage:
+        lines.extend(["", "## Campaign coverage", "",
+                      "Unsupported/disabled/filtered entries are not failures or zero-throughput measurements.", "",
+                      "| Deployment | Case | GPUs | Status | Repetitions completed | Reason |",
+                      "|---|---|---:|---|---:|---|"])
+        for cell in coverage:
+            lines.append(f"| {escape(cell['engine_id'])} | {escape(cell['case_id'])} | {cell['gpu_count']} | "
+                         f"{escape(cell['status'])} | {cell['completed_repetitions']}/{cell['required_repetitions']} | "
+                         f"{escape(cell['reason'] or '')} |")
+            flat.append({"row_type": "coverage", **{k: cell[k] for k in
+                         ("engine_id", "case_id", "gpu_count", "status", "reason", "support",
+                          "completed_repetitions", "required_repetitions")}})
     lines.extend(["", "## Publication checklist / limitations", ""])
     for (engine, case), trials in groups.items():
         reasons = sorted({r for t in trials for r in t["publication_blockers"]})
@@ -58,7 +78,11 @@ def render(directory):
         if any(t["tail_warning"] for t in trials):
             lines.append("  - Fewer than 100 successes/trial: p99 is exploratory, not a stable tail claim.")
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=list(flat[0]) if flat else [])
+    fields = ("row_type", "status", "reason", "engine_id", "case_id", "repetition", "gpu_count",
+              "weight_format", "kv_format", "speculation", "cache", "duration_s", "requests",
+              "successful_requests", "failed_requests", "completion_tokens_s", "successful_requests_s",
+              "slo_goodput_requests_s", "support", "completed_repetitions", "required_repetitions")
+    writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     writer.writerows(flat)
     return "\n".join(lines) + "\n", output.getvalue()

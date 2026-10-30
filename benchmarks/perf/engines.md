@@ -18,8 +18,9 @@ that all 4-bit formats use exactly four bits/parameter or have equal quality.
    measured quality and artifact size, not the format name alone. Q4_K_M mixes
    precision. Record per-tensor exceptions, imatrix/calibration dataset, converter
    revision and command, and effective weight bytes/parameter.
-4. For ninfer choose a compatible v3 4-bit artifact (groupwise INT4 or NVFP4 as
-   available). NVFP4 is not GPTQ INT4. Record artifact source/conversion, scale
+4. For ninfer choose a compatible v3 groupwise integer 4-bit artifact for `sm_86`.
+   The NVFP4/FP8 Blackwell artifact is **not** an RTX 3090 Ti candidate.
+   NVFP4 is not GPTQ INT4. Record artifact source/conversion, scale
    precision, activation route, embedding/lm_head exceptions, GDN state precision,
    and any fused/dequantization tradeoffs. No private grafts or hidden adapters.
 5. Independently qualify each **weight × KV × speculation** deployment on public
@@ -44,7 +45,7 @@ release pins deliberately and retain older reports for longitudinal comparisons.
 | Engine | Initial pin / source | 1 card | 2 cards | Current qualification |
 |---|---|---|---|---|
 | warp-34 | current local commit, record exact binary hash | native | tensor parallel 2 | Local runner smoke; full campaign pending |
-| vLLM | 0.31.0 (existing installed donor) | native | `--tensor-parallel-size 2` | Recipe only in this suite |
+| vLLM | 0.31.0 (existing installed donor) | native | `--tensor-parallel-size 2` | 27B eager/text-only one-card HTTP smoke passes; optimized/two-card qualification pending |
 | SGLang | 0.5.19 | native | `--tp-size 2` | Recipe only in this suite |
 | llama.cpp | `5047748f114564fcf271e6a648f60e2d2eae6264` | all layers GPU | layer split (`--split-mode layer --tensor-split 1,1`) | Candidate source pin; artifact/build/runtime pending |
 | Don-Chad/ninfer-3090 | `d8c29253f2c0845611a794d87057950107a4956b` | native | Linux pipeline `--devices 0,1` | Single-card artifact/build pending; dual-card **experimental/unqualified** |
@@ -83,6 +84,81 @@ Source references (read at the pin, not floating `master`):
 - https://github.com/Don-Chad/ninfer-3090/tree/d8c29253f2c0845611a794d87057950107a4956b
 - `README.md`, `docs/serving.md`, `docs/cli.md`, `src/serve/serve_options.cpp`
 - https://github.com/ggml-org/llama.cpp/tree/5047748f114564fcf271e6a648f60e2d2eae6264
+
+## 27B candidate mapping (2026-10-30)
+
+Machine-readable evidence: [`qualification/27b-candidates.json`](qualification/27b-candidates.json).
+This is a candidate shortlist, **not a frozen common-source or quality-qualified
+campaign**. No large model downloads were performed. HF API metadata was queried
+for repository revisions, sizes and LFS SHA-256s; remote hashes below are
+advertised values, not verification of local GGUF/ninfer bytes.
+
+| Artifact | Immutable revision | Bytes | Status |
+|---|---|---:|---|
+| `nchapman/Qwen3.8-27B-W4A16-GPTQ` | `c11a884fe4b659eccdce66761f26d3775cf7696c` | 19,438,009,793 (11 visible files incl. MTP/tokenizer/template) | Cached; full streaming inventory + re-verification pass |
+| `WarlaxZ/Qwen3.8-27B-NInfer-3090/qwen3_8_27b.ninfer` | `ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1` | 18,982,458,624 | 3090-specific candidate, not downloaded |
+| `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` | 16,464,440,224 | Candidate, not downloaded |
+| Same repo, `Qwen3.8-27B-UD-Q4_K_XL.gguf` | same revision | 17,559,178,144 | Candidate, not downloaded |
+
+The 3090 NInfer card/manifest at the pinned source explicitly declares base
+`Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`, making that
+the **source candidate**. It uses importance-weighted scale-search mixed Q4/Q5,
+Q4 embeddings, Q6 output head, and extra vision/MTP/DFlash/proposal components.
+It is not the generic `neroued/Qwen3.8-27B-NInfer` artifact or the Blackwell
+NVFP4 variant. Its documented quality/speed results are upstream claims, not
+independent suite qualifications. Its imatrix came from the pinned Unsloth repo;
+that does **not** prove the GGUF's exact base revision or equal quantized weights.
+
+The cached GPTQ README/recipe/config name the base repo but **do not record its
+source commit**. Do not fill `source_model_revision` from the model name, a current
+HF ref, or the NInfer card. The newer cached GPTQ `0df81ea...` is a different
+artifact with changed model bytes/index and an extra Q4 MTP sidecar; don't silently
+interchange them. Snapshot `c11a88...`'s index references both present safetensors
+files. Its tokenizer and froggeric v22.5 template differ from the official base
+metadata and need explicit alignment/audit. A same-artifact GPTQ smoke is valid
+without claiming cross-format source/quality equivalence.
+
+Local inventory evidence is `/tmp/w34-perf-27b-gptq-inventory.json`, stable hash
+`cfef8c491913394b330a74c92a1738a474e9e04e09d4f2cd422b0ad7cd8f2cf2`.
+The evidence JSON records principal file hashes; retain the full inventory with
+future run bundles. Inventory includes sidecars, so its total size is **not**
+text-only loaded weight bytes or VRAM usage.
+
+Runtime inventory found installed vLLM **0.31.0**, SGLang **v0.5.19** image
+`sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9`,
+and a llama.cpp server CUDA image
+`sha256:b2497f8834f5ecb4e38530f6bf2734b8e0be107ff48e4720145911c86930f2ce`.
+An image being cached does not qualify its model support or associate it with
+the candidate source pin. No host llama.cpp/NInfer binaries or local 27B GGUF/
+`.ninfer` artifacts were found. Freeze builds and retain startup evidence before
+using their recipe rows in results.
+
+### vLLM 27B single-card smoke (not a speed result)
+
+Installed vLLM 0.31.0 successfully served the **exact cached GPTQ `c11a884...`**
+on one RTX 3090 Ti, using `--dtype half --language-model-only --enforce-eager`,
+`--max-model-len 2048 --max-num-seqs 2 --gpu-memory-utilization 0.90`,
+`--cpu-offload-gb 0`, offline HF mode and no speculation. Startup logs confirm
+compressed-tensors Marlin weights, FP16 activation/KV auto mode, and Triton GDN.
+They explicitly report eager mode disables torch compilation/CUDA graphs; this
+is **not** the optimized publication recipe. `/v1/models` advertised the expected
+`qwen38-gptq-smoke` ID. Two sequential + two concurrent (C2) requests and a
+four-turn agent replay all succeeded: **8/8 measured requests**, valid server
+usage, one repetition and 32-token output ceilings. The reduced `batch-8` case
+was **C2, not C8**; resolved values are in its manifest.
+
+Evidence: `/tmp/w34-perf-vllm27-eager-smoke/` (full resolved config, raw SSE,
+coverage, summary, checksums), `/tmp/w34-perf-vllm27-startup.log`,
+`/tmp/w34-perf-vllm27-models.json`, and
+`/tmp/w34-perf-vllm-serve-help-all.txt`. Principal evidence hashes are in the
+candidate JSON. The server was stopped; quality, optimized graph mode, long
+contexts, and vLLM two-card runs are not qualified by this smoke.
+
+Next gates: recover or reproduce GPTQ base-revision provenance, establish GGUF
+source/converter provenance, acquire/check candidate bytes, independently test
+quality, and qualify each real Linux runtime/KV mode. Two-card NInfer stays
+**disabled/unverified** until an explicit successful pipeline probe; use
+`--gpus 1` for a single-card-only campaign without deleting matrix entries.
 
 ## KV-cache sweep (same 4-bit weights)
 

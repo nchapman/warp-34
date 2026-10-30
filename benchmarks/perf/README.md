@@ -44,11 +44,93 @@ two profiles sharing an endpoint is rejected to prevent accidental relabeling.
 Multiple `--engine`s require distinct already-running endpoints and isolated
 hardware. Don't run competing engines simultaneously on the same cards.
 
-`run` exits 0 for completed, usage-accounted trials; 1 for request/session or
+`run` exits 0 for completed, usage-accounted trials **or an explicitly all-skipped
+selection** (see coverage); 1 for request/session or
 token-accounting failures; 2 for configuration/setup errors; 130 on interrupt.
 A zero exit does **not** mean the run is publication-ready. Unknown provenance,
 quality evidence, failures, and release-audit requirements are visible in reports.
 No engine has been automatically installed, modified, or tuned.
+
+## Optional two-card runs and coverage
+
+Use the same filters for `plan` (offline) and `run`:
+
+```sh
+python3 -m w34perf plan suite.toml --gpus 1
+python3 -m w34perf run suite.toml --engine warp34-1-fp16 --gpus 1 \
+  --case smoke --out results/single-only-001
+# Exclusions can be repeated; other already-running selected endpoints still run.
+python3 -m w34perf plan suite.toml --gpus 2 --exclude-engine ninfer-2-experimental
+```
+
+Each deployment has `enabled = true` by default and `support = "unverified"`.
+Use `support = "supported"` only after direct qualification; unverified profiles
+remain runnable for probes, with a publication blocker. Mark a known missing
+backend `support = "unsupported"`, or temporarily opt out with `enabled = false`.
+Either requires a nonempty `skip_reason`. Minimal placeholders need no fake URL,
+model, launch command or quantization fields:
+
+```toml
+[[engines]]
+id = "example-2"
+engine = "example"
+gpu_count = 2
+support = "unsupported"
+skip_reason = "This release only supports one CUDA device"
+```
+
+The ninfer two-card example is **disabled/unverified**, not declared unsupported:
+upstream documents a Linux pipeline but has not requalified it. Opt in only for
+an explicit probe. No automatic GPU-count, KV, or parallelism fallback occurs.
+
+`coverage.json` retains every configured deployment × **selected case**, including
+`unsupported`, `disabled`, `not_selected`, `excluded`, `filtered`, `not_run`,
+`in_progress`, `failed`/`interrupted`, `measurement_failed`, and `measured` cells.
+Availability reasons take precedence over operator filters. Completed repetitions
+count trials that produced a summary, even if usage/requests failed. If nothing
+runnable remains, the run writes `status=skipped`, an empty journal/summary and
+checksummed coverage **without network calls, credentials, or GPU probes**.
+Skipped rows have no latency/throughput values, not zero. Markdown includes a
+coverage table; CSV uses `row_type=trial|coverage` with blank measurement columns
+for coverage. Filter `row_type=trial` before computing performance statistics.
+
+## Offline artifact inventory
+
+Hash a pinned snapshot (including tokenizer/template and optional sidecars), or
+a single GGUF/`.ninfer` file, independently of engine internals:
+
+```sh
+python3 -m w34perf inventory /models/pinned-snapshot --out results/weights-001.json
+python3 -m w34perf verify results/weights-001.json
+# Relocated copies can be checked without changing the original inventory:
+python3 -m w34perf verify results/weights-001.json --root /other/pinned-snapshot
+# Optional repeated relative-name globs deliberately narrow the inventory:
+python3 -m w34perf inventory /models/pinned-snapshot \
+  --include '*.safetensors' --include '*.json' --include '*.jinja' \
+  --out results/selected-files-001.json
+```
+
+Inventories are exclusive-create, outside the model directory, and use streaming
+SHA-256 over file **contents** (including HF blob symlinks). They record logical
+names, sizes, total bytes and a path-independent `inventory_sha256` for the
+`artifact_sha256` field. Verification rehashes the same visible-file/glob scope,
+checks missing/added/changed files, and exits 1 on mismatch (2 for setup errors).
+Dotfiles/directories and symlink directories are excluded. Include globs are
+saved: an intentionally narrower inventory does **not** certify excluded files.
+Inventories, like configs, are **trusted operator inputs**: the recorded `root`
+and `include` control which local paths are read. Inspect received inventories
+and choose `--root` yourself; do not verify untrusted files blindly. Hashes detect
+byte differences against a trusted inventory, **not authenticity**: there is no
+signature, and a replacement inventory can certify replacement bytes. Retain
+an out-of-band trusted hash or externally sign the evidence for publication.
+
+This checks local bytes, not shard-index completeness, source-model equivalence,
+quality, advertised model IDs, or what an HTTP server actually loaded. Those
+remain separate qualification gates. No model downloads occur.
+
+See [27B candidate evidence](qualification/27b-candidates.json) and
+[qualification notes](engines.md#27b-candidate-mapping-2026-10-30) for verified
+local hashes versus remote-advertised hashes and unresolved provenance.
 
 ## Configuration and extension
 
@@ -60,7 +142,7 @@ Profiles can point to containers or another host. Local GPU metadata then
 identifies the **client**, not the remote server: attach server-side provenance
 and explicitly label remote/network latency in your release audit.
 
-Required deployment fields: `id`, `engine`, `version`, `model`, `base_url`,
+Required **runnable** deployment fields: `id`, `engine`, `version`, `model`, `base_url`,
 `gpu_count` (1 or 2), `parallelism`, `weight_format`, `kv_format`, `speculation`,
 `cache_config`, and `launch_command`. Shared fields go in `[engine_defaults]`.
 Before release, also fill `gpu_ids` (physical UUIDs), `source_model_revision`,
@@ -181,6 +263,8 @@ Each directory contains:
   payloads and hashes, every parsed SSE event with client timestamp, content,
   reasoning/tool deltas, usage, finish reason, timings, and errors. Warmup,
   priming, and measurement phases are separate. Interrupted runs retain evidence.
+- `coverage.json`: deployment × selected-case availability, selection reasons,
+  measurement status and completed/required repetitions, including skips.
 - `summary.json`: per-trial distributions and publication blockers (written
   after each measured trial).
 - `SHA256SUMS.json`: finalized artifact-file hashes. Derived Markdown/CSV reports

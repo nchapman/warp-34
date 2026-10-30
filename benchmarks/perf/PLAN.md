@@ -77,20 +77,30 @@ HTTP tests; configured one/two-card profiles; clear failure/partial-run behavior
 
 ## Phase B — Artifact and engine qualification (next, publication blocking)
 
-- [ ] Select the shared **27B source revision** after mapping available `.ninfer`
-      and GGUF artifacts. Do not assume similarly named Qwen 3.5/3.6/3.8 are identical.
+- [x] Map 27B candidate artifacts with immutable HF revisions/sizes/hashes and
+      distinguish local byte verification from remote-advertised hashes
+      (`qualification/27b-candidates.json`, `engines.md`).
+- [ ] Freeze the shared **27B source revision** after completing provenance for `.ninfer`,
+      GPTQ and GGUF artifacts. Do not assume similarly named Qwen 3.5/3.6/3.8 are identical.
 - [ ] Acquire/convert closest 4-bit GPTQ/GGUF/ninfer artifacts; retain license,
       conversion/calibration commands and revisions, file sizes and shard SHA-256s.
-- [ ] Add an artifact inventory/preflight command that verifies local weight,
-      tokenizer and template hashes and matches advertised `/v1/models` IDs.
+- [x] Add offline streaming `inventory`/`verify` for local weight/tokenizer/template
+      bytes, symlinked HF snapshots, file/glob scope, relocation and drift detection.
+- [ ] Add online preflight matching configured IDs against `/v1/models`, index/shard
+      completeness and automatic attachment of trusted inventories to run bundles.
+      vLLM's 27B smoke model ID was checked manually and response retained.
 - [ ] Freeze separate release pins/container digests and verified launch recipes
       for each engine on this Linux machine; save `--help` and startup logs.
 - [ ] Run each engine's real 1-card smoke, then 2-card smoke with documented strategy.
       Verify no CPU weight offload/fallback unless explicitly in that lane.
 - [ ] Probe ninfer Linux pipeline; retain unsupported/failing result if unqualified.
       No claim of TP=2 or multi-GPU DFlash2 without direct evidence.
-- [ ] Add a machine-readable campaign coverage ledger with required/passed/failed/
-      unsupported/not-tested cells, exact launch failures and reasons.
+- [x] Add explicit support/enable states, mandatory skip reasons, shared `plan`/`run`
+      GPU filters/exclusions and machine-readable measured/failed/skipped/not-run
+      deployment × selected-case coverage. All-skipped runs retain evidence without
+      network/GPU probes. No precision/parallelism fallback.
+- [ ] Record managed launch failures/OOM/quality failures in the campaign ledger
+      (current externally managed launches cannot observe pre-HTTP startup errors).
 - [ ] Add opt-in managed server launch/readiness/process-group cleanup and GPU
       reservation. Keep externally managed endpoints as the universal extension path.
 
@@ -186,5 +196,56 @@ use raw flushed evidence and don't interpret that as a completed run. A carried-
 over Docker health/liveness suggestion is unrelated to this suite and remains
 explicitly documented as HTTP responsiveness in the repository README.
 
-Next concrete task: **Phase B source-model/4-bit artifact mapping**, followed by
-real competitor 1-/2-card qualification. No comparative leaderboard is claimed.
+## Optional dual-card coverage and qualification follow-up
+
+- Implemented `enabled`, `support = supported|unverified|unsupported`, mandatory
+  `skip_reason` for disabled/unsupported entries, minimal non-runnable placeholders,
+  `--gpus 1|2` and repeatable `--exclude-engine` on both `plan`/`run`. Ninfer Linux
+  pipeline is disabled/unverified by default, not mislabeled unsupported.
+- Coverage includes all deployments for the selected cases, selection/availability
+  reasons and completed/required repetitions. All-skipped manifests use `skipped`;
+  CSV `row_type=coverage` entries have blank measurements, never zero tok/s.
+- Inventoried and re-verified **19,438,009,793 bytes / 11 visible files** in cached
+  GPTQ snapshot `c11a884...`; stable inventory hash is recorded in the candidate
+  evidence. No model downloads. Source candidate `Qwen/Qwen3.8-27B@1d4bf0f2...`
+  is documented by the 3090-specific NInfer artifact. GPTQ/GGUF exact source
+  provenance remains unresolved; **no frozen cross-format equivalence claim**.
+- Real vLLM **0.31.0**, **27B / TP1 / FP16 KV / eager / text-only** smoke succeeds:
+  two sequential requests, two at concurrency 2, four coding-agent replay turns;
+  **8/8 measured requests** with valid usage. `/v1/models` ID matches. Offline
+  cached snapshot, max context 2048, max sequences 2, GPU utilization 0.90,
+  explicit CPU offload 0, no speculation; startup logs show Marlin + Triton GDN.
+  `--enforce-eager` disables compilation/graphs: this is a startup/API smoke,
+  **not an optimized speed comparison**. Eager startup loaded 16.81 GiB model
+  memory per vLLM log (not a sampled peak). Reduced `batch-8` case used C2, not C8.
+  Server stopped and GPU processes cleared before final project checks.
+  Evidence: `/tmp/w34-perf-vllm27-eager-smoke/`,
+  `/tmp/w34-perf-vllm27-{startup.log,models.json}`,
+  `/tmp/w34-perf-vllm-serve-help-all.txt`,
+  `/tmp/w34-perf-27b-gptq-inventory.json`.
+- New regression coverage includes all-skipped no-network behavior, omitted
+  endpoint fields, credential rejection even in disabled metadata, filter/CLI
+  parity, failure/not-run distinctions, inventory drift/relocation/symlink names,
+  and complete deletion of included files. Initial tests exposed empty-exclusion
+  handling and symlink logical-name bugs; tests were observed failing before fixes.
+- Review returned **three nonblocking suggestions, no Important/Critical findings**.
+  Fixed complete-deletion verification misclassification with a reproduced failing
+  regression. Clarified that inventory hashes are **not signatures/authenticity**
+  and inventory root/include are trusted operator inputs. Declined mandatory
+  signatures/out-of-band trust-anchor flags and mandatory `--root` as unnecessary
+  for this offline trusted-operator tool; explicitly require independent trust or
+  external signing for publication. No follow-up review needed for these small
+  fixes/clarifications.
+- Final post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **209.38 s**:
+  **208 Rust tests/doc-tests + 69 oracle tests + 36 standalone performance tests**,
+  formatting and both Clippy feature states. Log:
+  `/tmp/w34-perf-selection-final-check.log`. Candidate JSON fields and suite local
+  doc links validated; `git diff --check` passes. Real CLI single-card planning
+  selects five profiles, and `/tmp/w34-perf-disabled-dual-smoke/` retains a skipped
+  ninfer two-card run with an empty journal and rendered coverage report.
+
+Next concrete tasks: finish source/converter provenance and independent quality;
+acquire selected GGUF/ninfer artifacts with verified checksums; qualify SGLang,
+llama.cpp and NInfer Linux one-card runtimes and optimized vLLM. Probe two-card
+routes only where useful/supported; retain explicit skips otherwise. No
+comparative leaderboard is claimed.

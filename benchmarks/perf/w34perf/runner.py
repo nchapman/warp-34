@@ -16,6 +16,7 @@ import time
 from . import __version__
 from .config import digest, public_config
 from .metrics import summarize
+from .selection import select
 from .transport import stream
 from .workloads import append_replay, body, messages
 
@@ -165,6 +166,8 @@ def run_trial(engine, case, run_cfg, phase, repetition, journal, *, namespace):
 
 def blockers(engine, cfg, summary):
     reasons = []
+    if engine.get("support", "unverified") != "supported":
+        reasons.append("deployment support has not been qualified")
     for key in ("version", "model_revision", "weight_format", "kv_format", "parallelism",
                 "speculation", "cache_config", "launch_command", "artifact_sha256",
                 "tokenizer_revision", "chat_template_sha256", "source_model_revision",
@@ -183,15 +186,9 @@ def blockers(engine, cfg, summary):
     return reasons
 
 
-def execute(cfg, out, engine_ids=None, case_ids=None):
-    engines = [e for e in cfg["engines"] if engine_ids is None or e["id"] in engine_ids]
-    cases = [c for c in cfg["cases"] if case_ids is None or c["id"] in case_ids]
-    if not engines or not cases:
-        raise ValueError("selection matched no engines or cases")
-    for selection, available, label in ((engine_ids, cfg["engines"], "engine"),
-                                        (case_ids, cfg["cases"], "case")):
-        if selection and set(selection) - {item["id"] for item in available}:
-            raise ValueError(f"unknown {label} selection")
+def execute(cfg, out, engine_ids=None, case_ids=None, *, gpu_count=None, exclude_ids=None):
+    engines, cases, coverage = select(cfg, engine_ids, case_ids,
+                                      gpu_count=gpu_count, exclude_ids=exclude_ids)
     if len({e["base_url"].rstrip("/") for e in engines}) != len(engines):
         raise ValueError("selected deployments share an endpoint; launch and measure one at a time")
     for engine in engines:
@@ -201,15 +198,30 @@ def execute(cfg, out, engine_ids=None, case_ids=None):
     out.mkdir(parents=True, exist_ok=False)
     manifest = {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
                 "config": public_config(cfg), "config_sha256": digest(cfg),
-                "provenance": provenance(), "status": "running",
+                "provenance": provenance() if engines else {"not_collected": "no runnable deployments"},
+                "status": "running", "gpu_count_filter": gpu_count,
+                "excluded_engines": exclude_ids or [],
+                "requested_engines": engine_ids,
                 "selected_engines": [e["id"] for e in engines],
                 "selected_cases": [c["id"] for c in cases]}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     journal = Journal(out / "requests.jsonl")
     summaries = []
+    (out / "summary.json").write_text("[]\n")
+
+    def save_coverage():
+        (out / "coverage.json").write_text(json.dumps(coverage, indent=2) + "\n")
+
+    save_coverage()
+    current = None
     try:
+        if not engines:
+            print("No runnable deployments selected; skip reasons retained in coverage.json", flush=True)
         for engine in engines:
             for case in cases:
+                current = next(c for c in coverage if c["engine_id"] == engine["id"] and c["case_id"] == case["id"])
+                current["status"] = "in_progress"
+                save_coverage()
                 print(f"{engine['id']} / {case['id']}", flush=True)
                 for repetition in range(cfg["run"]["repetitions"]):
                     ns = f"seed{cfg['run'].get('seed', 34)}:{case['id']}:rep{repetition}"
@@ -234,16 +246,29 @@ def execute(cfg, out, engine_ids=None, case_ids=None):
                            "fixture_sha256": case["fixture_sha256"],
                            "publication_blockers": blockers(engine, cfg, summary), **summary}
                     summaries.append(row)
+                    current["completed_repetitions"] += 1
+                    if (summary["failed_requests"] or not summary["token_accounting_complete"]
+                            or summary["successful_sessions"] != summary["sessions"]):
+                        current["status"] = "measurement_failed"
+                        current["reason"] = "request/session or usage-accounting failure; see summary.json"
+                    save_coverage()
                     (out / "summary.json").write_text(json.dumps(summaries, indent=2) + "\n")
                     print(f"  rep {repetition}: {summary['successful_requests']}/{summary['requests']} "
                           f"requests, {summary['completion_tokens_s']} tok/s", flush=True)
-        manifest["status"] = "complete"
+                if current["status"] == "in_progress":
+                    current["status"] = "measured"
+                save_coverage()
+        manifest["status"] = "complete" if engines else "skipped"
     except BaseException as exc:
         manifest["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
         manifest["error_type"] = type(exc).__name__
+        if current is not None:
+            current["status"] = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+            current["reason"] = f"{type(exc).__name__}; inspect requests.jsonl for evidence"
         raise
     finally:
         journal.close()
+        save_coverage()
         manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         inventory = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()

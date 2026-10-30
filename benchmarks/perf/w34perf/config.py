@@ -46,19 +46,37 @@ def load(path):
                for i in ids) or len(set(ids)) != len(ids):
             raise ValueError(f"{label} ids must be unique nonempty alphanumeric/_/- strings")
     for engine in engines:
-        url = urlsplit(engine.get("base_url", ""))
-        if (url.scheme not in ("http", "https") or not url.hostname or url.username
-                or url.password or url.query or url.fragment):
-            raise ValueError(f"{engine['id']}: base_url needs http(s), no credentials/query/fragment")
-        if url.port is not None and url.port == 0:
-            raise ValueError("base_url port must be in 1..65535")
+        if not isinstance(engine.get("engine"), str) or not engine["engine"].strip():
+            raise ValueError(f"{engine['id']}: engine name required")
+        if isinstance(engine.get("gpu_count"), bool) or engine.get("gpu_count") not in (1, 2):
+            raise ValueError(f"{engine['id']}: gpu_count must be 1 or 2")
+        engine.setdefault("enabled", True)
+        engine.setdefault("support", "unverified")
+        if not isinstance(engine["enabled"], bool):
+            raise ValueError("enabled must be a boolean")
+        if engine["support"] not in ("supported", "unverified", "unsupported"):
+            raise ValueError("support must be supported, unverified, or unsupported")
+        if not engine["enabled"] or engine["support"] == "unsupported":
+            if not isinstance(engine.get("skip_reason"), str) or not engine["skip_reason"].strip():
+                raise ValueError("disabled/unsupported deployments require a nonempty skip_reason")
+        if "base_url" in engine:
+            if not isinstance(engine["base_url"], str):
+                raise ValueError("base_url must be a string")
+            url = urlsplit(engine["base_url"])
+            if (url.scheme not in ("http", "https") or not url.hostname or url.username
+                    or url.password or url.query or url.fragment):
+                raise ValueError(f"{engine['id']}: base_url needs http(s), no credentials/query/fragment")
+            if url.port is not None and url.port == 0:
+                raise ValueError("base_url port must be in 1..65535")
         if "api_key_env" in engine and (not isinstance(engine["api_key_env"], str)
                 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", engine["api_key_env"])):
             raise ValueError("api_key_env must be an environment variable name")
+        if not engine["enabled"] or engine["support"] == "unsupported":
+            continue
+        if "base_url" not in engine:
+            raise ValueError("runnable deployments require a base_url string")
         if not isinstance(engine.get("model"), str) or not engine["model"]:
             raise ValueError(f"{engine['id']}: model required")
-        if isinstance(engine.get("gpu_count"), bool) or engine.get("gpu_count") not in (1, 2):
-            raise ValueError(f"{engine['id']}: gpu_count must be 1 or 2")
         for key in ("engine", "version", "model_revision", "weight_format", "kv_format",
                     "parallelism", "speculation", "cache_config", "launch_command"):
             if not isinstance(engine.get(key), str) or not engine[key]:

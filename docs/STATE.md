@@ -14,6 +14,43 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### Optional dual-card coverage and 27B qualification follow-up (2026-10-30)
+
+- The standalone [`benchmarks/perf/`](../benchmarks/perf/README.md) suite now has
+  shared `plan`/`run` `--gpus 1|2` filters, repeatable exclusions, deployment
+  support/enable states, mandatory skip reasons and minimal non-runnable profiles.
+  Ninfer's unqualified Linux pipeline is **disabled/unverified by default**;
+  no unsupported topology/precision is silently replaced with another one.
+- Checksummed `coverage.json` records each deployment × selected case, including
+  skipped, not-selected, not-run, failed, interrupted and measured states. An
+  all-skipped run sends no HTTP requests or GPU probes; CSV coverage rows have
+  **blank**, not zero, measurements. README documents the `row_type` distinction.
+- New offline streaming `inventory`/`verify` commands hash model/tokenizer/template
+  bytes and HF symlinks, preserve include scopes and detect drift. Cached 27B
+  GPTQ `c11a884...` inventory/re-verification passed for **19,438,009,793 bytes**.
+  [Candidate evidence](../benchmarks/perf/qualification/27b-candidates.json)
+  pins 3090-specific NInfer and GGUF artifacts, sizes and advertised hashes;
+  no large downloads. Exact GPTQ/GGUF base-source provenance is unresolved:
+  **common-source publication/quality qualification is still blocked**.
+- Real vLLM **0.31.0 / 27B GPTQ / one RTX 3090 Ti / eager text-only** HTTP smoke
+  passes **8/8 measured requests** with valid usage: sequential, C2 and four-turn
+  agent replay. Expected `/v1/models` ID verified; explicit zero CPU offload,
+  no speculation, max context 2048 and two active sequences. Eager disables
+  compilation/graphs: **not an optimized speed comparison**. Evidence lives in
+  `/tmp/w34-perf-vllm27-eager-smoke/` plus startup/help/model-ID logs referenced
+  in the suite ledger. Server stopped and GPU processes cleared before checks.
+- Review returned three nonblocking suggestions, no Important/Critical findings.
+  Fixed empty-tree verification classification with a reproduced regression;
+  clarified trusted inventory paths and that hashes are not signatures. Mandatory
+  signing/trust-anchor flags and mandatory `--root` are deferred as disproportionate
+  for a trusted offline operator tool; release bundles need independent trust.
+- Final post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **209.38 s**:
+  **208 Rust tests/doc-tests + 69 oracle tests + 36 standalone performance tests**,
+  formatting and both Clippy feature states. Log:
+  `/tmp/w34-perf-selection-final-check.log`. Candidate JSON fields, suite local
+  documentation links, single-card plan and real all-skipped CLI/report verified;
+  `git diff --check` passes.
+
 ### Independent publication performance suite (2026-10-30)
 
 - Added copyable stdlib-only Python suite at [`benchmarks/perf/`](../benchmarks/perf/README.md),

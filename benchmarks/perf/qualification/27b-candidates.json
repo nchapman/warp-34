@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "checked_date": "2026-10-30",
+  "purpose": "Candidate artifact mapping, not an equivalence or quality certification",
+  "campaign_source_candidate": {
+    "repo": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "evidence": "NInfer-3090 pinned model card and artifact-manifest.json; Hugging Face model API",
+    "frozen_for_publication": false
+  },
+  "artifacts": [
+    {
+      "repo": "nchapman/Qwen3.8-27B-W4A16-GPTQ",
+      "revision": "c11a884fe4b659eccdce66761f26d3775cf7696c",
+      "format": "compressed-tensors GPTQ W4A16 g128 symmetric static actorder",
+      "local": true,
+      "verification": "All 11 visible snapshot files SHA-256 inventoried and independently re-read by w34perf verify",
+      "inventory_sha256": "cfef8c491913394b330a74c92a1738a474e9e04e09d4f2cd422b0ad7cd8f2cf2",
+      "snapshot_total_bytes": 19438009793,
+      "files": [
+        {"name": "model.safetensors", "bytes": 18568390152, "sha256": "274dda58d3fc330ac5b70de2892f7093a75fd1fa18dac00133977ee8480e3d6a"},
+        {"name": "model_mtp.safetensors", "bytes": 849400392, "sha256": "1d8268aa85ace093a561e3e7b63b9d390dac1cd55a90cd55b5ec509c3c9da9fe"},
+        {"name": "tokenizer.json", "bytes": 19989438, "sha256": "67d8113912fabc4af848be59c550922fb4945e3f9ad0853948d5def219fc4e46"},
+        {"name": "chat_template.jinja", "bytes": 28234, "sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"}
+      ],
+      "source_revision": null,
+      "blockers": ["Exact base source revision not recorded in cached README/recipe/config", "Tokenizer/template differ from official source; audit before claiming aligned inputs", "No independent suite quality qualification"]
+    },
+    {
+      "repo": "WarlaxZ/Qwen3.8-27B-NInfer-3090",
+      "revision": "ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1",
+      "file": "qwen3_8_27b.ninfer",
+      "bytes": 18982458624,
+      "sha256": "7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706",
+      "local": false,
+      "verification": "HF API LFS metadata agrees with model card at ninfer source d8c29253f2c0845611a794d87057950107a4956b; artifact bytes not downloaded",
+      "format": "ninfer v3 grouped_search mixed Q4/Q5, Q4 embedding, Q6 output head",
+      "source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "source_evidence": "model-cards/Qwen3.8-27B-NInfer-3090/artifact-manifest.json at ninfer source pin (declaration, not independent source reconstruction)",
+      "blockers": ["Artifact acquisition, Linux build/runtime smoke and independent quality qualification pending", "Linux two-card pipeline explicitly unqualified; disabled by default"]
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+      "file": "Qwen3.8-27B-UD-Q4_K_M.gguf",
+      "bytes": 16464440224,
+      "sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482",
+      "local": false,
+      "verification": "HF API LFS metadata only; artifact bytes not downloaded",
+      "source_revision": null,
+      "blockers": ["Exact base revision and converter/calibration provenance unresolved", "Artifact acquisition, runtime and independent quality qualification pending"]
+    },
+    {
+      "repo": "unsloth/Qwen3.8-27B-GGUF",
+      "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+      "file": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "bytes": 17559178144,
+      "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+      "local": false,
+      "verification": "HF API LFS metadata only; artifact bytes not downloaded",
+      "source_revision": null,
+      "blockers": ["Exact base revision and converter/calibration provenance unresolved", "Artifact acquisition, runtime and independent quality qualification pending"]
+    }
+  ],
+  "local_runtimes": [
+    {
+      "engine": "vllm", "version": "0.31.0",
+      "evidence": "installed Python distribution metadata and real offline one-card serving smoke",
+      "smoke": {
+        "profile": "27B GPTQ c11a884 / TP1 / half activations / FP16 auto KV / text-only / eager / no speculation",
+        "measured_requests": 8,
+        "successful_requests": 8,
+        "usage_accounting_complete": true,
+        "model_id_checked": "qwen38-gptq-smoke",
+        "max_context": 2048,
+        "max_sequences": 2,
+        "cpu_offload_gb": 0,
+        "artifacts": "/tmp/w34-perf-vllm27-eager-smoke/",
+        "startup_log_sha256": "c989c3daa700de3c989799d75d06405ae4ffe8515ee6eb162cac9aa3f49d6ec2",
+        "models_response_sha256": "cc758117018394a3f9552e8334abf77ed052ba5f5de0e190ea10687e7d404adb",
+        "help_all_sha256": "ffe8229ce708cac8ba4ab0dfb5d94ba7052b9822644d3d217cc4e04097250146",
+        "publication_qualified": false,
+        "note": "One repetition, short outputs; eager disables compilation/CUDA graphs. Not a tuned speed result, source/quality equivalence still unresolved. Server stopped."
+      }
+    },
+    {"engine": "sglang", "container": "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9", "evidence": "local docker image inspect; not a serving qualification"},
+    {"engine": "llama.cpp", "container": "ghcr.io/ggml-org/llama.cpp@sha256:b2497f8834f5ecb4e38530f6bf2734b8e0be107ff48e4720145911c86930f2ce", "evidence": "local docker image inspect; source revision/build compatibility not inferred from mutable tag"}
+  ],
+  "sources": [
+    "https://huggingface.co/api/models/Qwen/Qwen3.8-27B?blobs=true",
+    "https://huggingface.co/api/models/WarlaxZ/Qwen3.8-27B-NInfer-3090?blobs=true",
+    "https://huggingface.co/api/models/unsloth/Qwen3.8-27B-GGUF?blobs=true",
+    "https://github.com/Don-Chad/ninfer-3090/tree/d8c29253f2c0845611a794d87057950107a4956b/model-cards/Qwen3.8-27B-NInfer-3090"
+  ]
+}

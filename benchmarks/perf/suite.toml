@@ -9,6 +9,8 @@ timeout_s = 300
 max_inflight = 64
 
 [engine_defaults]
+enabled = true
+support = "unverified" # qualification status, not a promise from CLI flags
 cohort = "4bit-deployment-equivalent"
 gpu_count = 1
 gpu_ids = "unknown"
@@ -132,6 +134,8 @@ request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 [[engines]]
 id = "ninfer-2-experimental"
 engine = "ninfer-3090"
+enabled = false
+skip_reason = "Linux pipeline has not been requalified on the current context engine; enable only for an explicit probe"
 version = "d8c29253f2c0845611a794d87057950107a4956b"
 model = "qwen-4bit"
 base_url = "http://127.0.0.1:8000/v1"
