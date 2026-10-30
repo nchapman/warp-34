@@ -2,13 +2,118 @@
 
 ## Status: Phases 0–5 complete; Phase 6 in progress (not release-complete)
 
+The [Phase 6 criterion-by-criterion evidence ledger](PHASE6_EVIDENCE.md) separates
+implemented features, regression coverage, measured failures, and outstanding
+aligned donor/performance gates. It supersedes historical performance claims
+below for purposes of the Phase 6 exit gate.
+
 `warp-34` has completed **Phase 0** (Foundational Seam Contracts, Oracle & `nsys` Diff Harness, CUDA Runtime & `CapacityPlanner`, Unified Safetensors Loader), **Phase 1** (Donor-Aligned Kernel Suite + Decisive Gate Tests #1, #2, #4), **Phase 2** (Qwen 3.5 / 3.8 Hybrid Backbone on `TP=1` and `TP=2`, `KvPool`, `StateBundlePool`, `CUDAGraphRunner` Gate #3, and `w34` CLI), **Phase 3** (`SchedulerV1` token-budget continuous batching, `SGLang`-donor `MambaRadixCache` + `HybridReqToTokenPool` `extra_buffer` ping-pong GDN checkpoint donation passing **Decisive Gate Test #5**, `SamplerV1` + structured-output bitmask + `Qwen3Parser`, and OpenAI HTTP/1.1 + SSE server `w34 serve` / `w34 chat`), **Phase 4** (Speculative Decoding: `RejectionSampler`, Native Dense + MoE `Qwen3_5MTP`, Native `BF16` `DFlash2`, and fixed-shape `M_verify = K + 1` speculative verify CUDA Graphs), and **Phase 5** (Paged `TQ4` (`tq4` default with rotated `Q8_0` boundary layers + per-128 least-squares `TQ4` interior at `3.07×`, plus `tq4_all` at `3.88×` and `q8_0` at `1.88×`, fitting `27B` full `262,144`-token context on 1× RTX 3090 Ti), Multimodal Vision `Qwen3_VisionTransformer` with PNG/JPEG/PPM decoding + 3D `mRoPE` + multimodal `MambaRadixCache` hashing + OpenAI `image_url`, and `Qwen3.5` / `3.6` Hybrid MoE `Qwen3_5MoeForConditionalGeneration` `35B-A3B` on `TP=1` and `TP=2`).
 
 All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host/tests/phase0_1_2_gates.rs` and `crates/w34-host/tests/phase3_gates.rs`. All 4 dense target model configurations (`4B TP=1`, `9B TP=1`, `9B TP=2`, `27B TP=2`) pass `w34 greedy-diff`, `w34 dump-diff`, and `w34 profile-diff`, **beating `vLLM 0.31.0` by +31% to +83% in single-stream decode throughput** on 1–2× RTX 3090 Ti (`sm_86`) before speculative decoding or `TQ4` compression, and achieving a **95.2% warm prefix TTFT drop** (`145.68 ms` → `7.05 ms`) via `MambaRadixCache`.
 
 ---
 
-## Verified Benchmark & Oracle Parity Scoreboard (`128` Decode Tokens, `CUDA_GRAPH=1`)
+## Closeout — four focused deliverables, remaining work kept separate
+
+Closed as separate commits:
+
+1. **`b3d29c3` — profiling and benchmark harnesses:** launch-correlated NVTX,
+   per-device costs/graph evidence, aligned donor capture, warm SSE measurements,
+   compact sampler D2H auditing, and oracle CPU tests in `mise run check`.
+2. **`a7da5f7` — serving fixes:** legacy logprobs/Unicode records, VRAM-aware
+   sixteen-request capacity, and lossless speculative-to-batched handoff.
+3. **`0f9b74c` — target rounding and needle gates:** native Gemma/RoPE arithmetic,
+   focused regressions/native fixture, and all eight required retrieval passes.
+4. **Attention/drafter optimization commit accompanying this update:** BF16
+   eight-key QK and capped short-graph split-KV, with measured improvements and
+   parity coverage. This closes these changes, not the remaining speed targets.
+
+**Final existing-tree verification:** `CUDA_VISIBLE_DEVICES=0,1 mise run check`
+(with `/opt/cuda/bin` on PATH, under the GPU1 lock) exited **0** in **245.80 s**:
+**133 Rust tests + 69 oracle CPU tests**, formatting and both Clippy feature states.
+Log: `/tmp/w34-closeout-check.log`; hashes and retained needle evidence are in
+[PHASE6_EVIDENCE.md](PHASE6_EVIDENCE.md). A bounded subagent confirmation review of
+all four staged groups found **no Critical or Important findings**. Verification
+was on the combined existing tree, not separate worktrees or isolated commits.
+
+**Explicitly not closed:** canonical full-model vision tensor parity; the remaining
+performance targets; M4 grouped-MoE acceleration. Vision/JPEG/FA2 integration and
+new sparse-MoE changes remain uncommitted. Minimal FA2 workspace wiring now lets
+the full suite pass, but no new canonical image pass is inferred from that result.
+Do not restart completed needle or serving work without a relevant regression.
+
+## Previous checkpoint — eight needle passes and unrestricted full-check pass
+
+- **All eight 27B single-GPU needle cases passed:** TQ4 and `tq4_all`, each at
+  32k/64k/128k/262k. `/tmp/w34-phase6-needle-native-fp16/summary.json` is complete.
+  This is one fixed secret at midpoint per case, not a statistical accuracy claim.
+- **`CUDA_VISIBLE_DEVICES=0,1 mise run check` exited 0** in **211.31 s**:
+  **132 Rust tests + 65 oracle CPU tests**, formatting and both Clippy feature
+  states. `/tmp/w34-final25-full-check.log`. Includes the serving handoff and
+  short-attention partition cap. Later changes still need their own verification.
+- **Serving:** final capacity regression reaches **16 active requests/B16**.
+  A completed-prefill speculative request now yields to target batching when
+  peers arrive; MTP/DFlash regressions preserve all 64 baseline tokens and prove
+  overlapping request progress. Partial prefill finishes before yielding.
+  Unprofiled warm repeat runs: N8 **946.47/911.67 tok/s**, N16
+  **1504.74/1509.04 tok/s**, below native **1354.85/2194.17**. Artifacts:
+  `/tmp/w34-serve-handoff-{after,repeat}/runtime.json`.
+- **Attention:** four-partition short-graph cap measures **0.45055/0.45124
+  ms/round**, preserving output IDs and the complete acceptance sequence versus
+  the previous 0.4825-ms result. Throughput **1083.26/1098.26 tok/s** remains below
+  the 1100 target. Native attention remains faster (different FP16 KV policy).
+- **Fresh TP2 captures:** `/tmp/w34-phase6-tp2-{moe-mtp,dense-dflash}/` measures
+  **339.02 tok/s** for 35B MTP and **149.66 tok/s** for 27B DFlash. Correlated
+  proposer graph launches occur on both GPUs from one host thread: 32/rank and
+  38/rank respectively. Per-device draft costs are **2.1539/2.1625** and
+  **4.6650/4.6918 ms/round**. These are not aligned native performance wins.
+- **Vision still fails five of six canonical tensor gates:** latest
+  `/tmp/w34-vl-welford/` final-norm relL2 PNG/JPEG: 4B **.024956/.059718**,
+  27B **.146638/.082821**, MoE **.190177/.220284**, unchanged limit **.05**.
+  All greedy IDs match. Native-exact patch/position/norm/QKV corrections do not
+  excuse the JPEG regression. Identical-input replay isolates FA2 attention
+  arithmetic; target GDN prefill drift is independently unresolved.
+- Follow-up review found no important findings; optional hardening suggestions
+  remain deferred. **Phase 6 is not complete and no commit is claimed.**
+
+## Continuation 23 — historical checkpoint, superseded above
+
+- Corrected-binary **27B TQ4 needle retrieval passed all four lengths: 32k,
+  64k, 128k, 262k**. `/tmp/w34-phase6-needle-native-fp16/summary.json`;
+  `tq4_all` comparison cases continue on GPU 0.
+- Actual correlated donor capture is available in `/tmp/aligned-oracle-profile/`.
+  Fresh W34 capture `/tmp/aligned-w34-profile/` matches **all 128 prompt IDs and
+  all 128 generated IDs**. W34/SGLang draft cost is **4.1074/3.4023 ms/round**,
+  target attention **0.9184/0.2098**: performance gates remain unmet. Denominators
+  are actual worker calls (W34 10, SGLang 11 including extra overlap work), and
+  KV policies differ (TQ4 versus FP16); the parser does not mark full gate eligibility.
+- Real 8/16-client SSE runs pass on both engines with identical workload hashes.
+  W34 aggregate **669.00/952.83 tok/s**; SGLang target-only **178.96/2191.16**.
+  Native 8-client startup includes compilation, so that result is not a
+  steady-state win. The 16-client throughput/latency comparison fails our goal.
+  Reports: `/tmp/w34-phase6-{serve-load,sglang-serve-load}.json`.
+- Native ViT boundary tracing now handles vLLM's direct-forward decorated
+  modules. It isolated cuBLAS reduced-precision reductions in biased GEMMs.
+  A realistic-shape regression failed on **all 1,382,400 outputs** before the
+  scoped math-mode fix and passes afterward; 27B patch projection now matches
+  native exactly. Canonical six-image replay still passes only 4B PNG/JPEG;
+  27B final-norm errors are **.139577/.077611**, MoE **.201405/.214607**.
+  Every case retains exact prompt/mRoPE/8-token greedy parity, but those do not
+  excuse tensor failures. `/tmp/w34-vl-strict-bias/` contains the new reports.
+- The important stale-drafter-symlink review finding is fixed, with regression
+  tests; donor source instrumentation restores original bytes on unwind.
+  Follow-up review found no important findings. Deferred suggestions include
+  pre-existing server authentication/tokenizer limits and optional legacy-wire
+  polish; the expanded unittest discovery now includes all host harness suites.
+- Final `mise run check` is **not passing yet**. Formatting/Clippy fixes are in;
+  the latest run with only GPU 1 visible reaches the mandatory TP=2 gate and
+  fails `CudaDevice(1)` with error 101. Do not weaken or skip that gate: rerun
+  with both devices after the needle matrix releases GPU 0. Log:
+  `/tmp/w34-phase6-final-qk8-check.log`. No completion or commit claim.
+
+## Historical Benchmark & Oracle Parity Scoreboard (`128` Decode Tokens, `CUDA_GRAPH=1`)
+
+The historical `profile-diff` figures below used heuristic measurement boundaries and do **not** establish the aligned Phase 6 performance gates. Current launch-correlated measurements and remaining alignment work are recorded in the continuation checkpoints below.
 
 | Model | TP | `vLLM 0.31.0` Decode | `warp-34` Decode (`ITL`) | Speedup vs `vLLM` | `greedy-diff` (`12` Prompts) | `nsys` `profile-diff` Speedup |
 |---|---:|---:|---:|---:|---|---:|
@@ -83,7 +188,7 @@ tests across Phases 0–4) passes in **55.13 s**.
 - **`w34 dump-diff` (`mise run oracle-dump`):** Captures target layer hidden states, `last_final_hidden_f16`, `tap_aux_bf16`, `drafter_hidden`, and `draft_proposal_ids` across plain, `--speculative mtp`, and `--speculative dflash2` runs; reports `max_abs_diff`, `rel_l2`, and `cosine_sim` against golden safetensors or `--compare-tp2` (`TP=1 vs TP=2` target `max_rel_l2 = 0.0023`, `MTP` drafter `rel_l2 = 0.0020` with `3/3` exact draft match, `DFlash2` drafter `cosine = 0.9849` with `9/15` prefix and `12/15` exact draft match) and fails with non-zero exit code on regression.
 - **`w34 greedy-diff` (`mise run oracle-greedy`):** Reports per-prompt and aggregate speculative acceptance telemetry (`rounds`, `accepted`, $\tau = 1 + \bar{a}$), supports `--verify-lossless` (verifying 100% bit-for-bit token identity between speculative and plain target greedy) and `--verify-radix-warm` (verifying 100% bit-for-bit token identity between cold and warm `MambaRadixCache` execution), and fails with non-zero exit code on any adjudication/lossless/radix failure.
 - **`w34 bench --stage decode|radix|scheduler|all` (`mise run bench-all`):** Benchmarks Stage 2 single-sequence decode + Stage 4 speculative telemetry (`verify_rounds`, `mean_accepted_drafts`, `mean_tokens_per_round`, `ms_per_verify_round`), Stage 3 `MambaRadixCache` cold-vs-warm TTFT speedup + proposer KV restore + lossless parity, and Stage 3 `SchedulerV1` continuous batching (`--batch-size`, with live `sched.radix` LRU eviction on page/state pool pressure).
-- **`w34 profile-diff --live` (`mise run profile-live`):** Runs `nsys profile --trace=cuda --cuda-graph-trace=node`, exports SQLite, slices the exact measured verification rounds from `w34 bench` JSON telemetry, classifies target vs `MTP`/`DFlash2` (`BF16`) proposer spans into the 7 canonical categories (`marlin_gemm`, `full_attn`, `gdn_ssm`, `norms_rope_act`, `tp_comm`, `spec_decode`, `host_gap`), and renders the side-by-side scoreboard against `vLLM 0.31.0` and `SGLang v0.5.19` presets in `tools/oracle/goldens/oracle_baselines.json`.
+- **`w34 profile-diff --live` (`mise run profile-live`):** Runs `nsys profile --trace=cuda --cuda-graph-trace=node`, exports SQLite, historically estimated verification windows using kernel-name heuristics plus `w34 bench` JSON telemetry (diagnostic only; use the new launch-correlated NVTX mode for verified measurement boundaries), classifies target vs `MTP`/`DFlash2` (`BF16`) proposer spans into the 7 canonical categories (`marlin_gemm`, `full_attn`, `gdn_ssm`, `norms_rope_act`, `tp_comm`, `spec_decode`, `host_gap`), and renders the side-by-side scoreboard against `vLLM 0.31.0` and `SGLang v0.5.19` presets in `tools/oracle/goldens/oracle_baselines.json`.
 
 7. **Phase 4 — Speculative Decoding (`RejectionSampler`, Native `Qwen3_5MTP`, & Native `BF16` `DFlash2`):**
    - **Host & GPU `RejectionSampler` (`src/speculative.rs`, `csrc/ops/op_rejection.cu`):** Consecutive greedy and canonical stochastic residual (`min(1, p/q)`, positive-residual recovery) verification over `[anchor, draft_1, ..., draft_k]`, typed `INT32` outputs, padded-request masking, `processed_len` vs `emitted_len` accounting, and atomic `StateTx` + `SamplerV1` + `TokenBitmaskConstraint` tentative-history rollback (`phase4_rejection` 10 tests, `phase4_gpu_rejection` 2 tests).
@@ -124,6 +229,49 @@ All 7 Phase 5 integration gates (`phase5_gates.rs`) pass in **2.63 s**, and the 
 ---
 
 ## Phase 6 Working State (`docs/ROADMAP.md` §4 Phase 6)
+
+### Continuation 21 — native residual-norm correction and measured profiling boundaries
+
+- Found and runtime-confirmed another genuine donor mismatch: installed vLLM `GemmaRMSNorm` normalizes the **unrounded FP32 sum** of FP16 input and residual, while storing the residual itself in FP16. Both TP1 and fused TP2 w34 kernels now preserve that distinction. The exact native-bit regression in `gemma_residual_rounding.rs` failed before the fix and passes afterward, including persistent residual and BF16 tap checks. No target storage dtype was changed. The existing fused-norm fixture was a false oracle that rounded too early. `CUDA_VISIBLE_DEVICES=1 python tools/oracle/vllm_dump.py --refresh-fused-gemma` recaptured actual installed vLLM CUDA/module-dispatch output with bitwise agreement: **8,368/40,960** normalized output elements changed, residual bits did not. All other **42 tensors** and all tolerances were preserved; scoped native provenance was added.
+- Also confirmed actual target `MRotaryEmbedding.cos_sin_cache` is **FP16** for the native 4B config (head 256, rotary 64, interleaved `[11,11,10]`). w34 incorrectly rotated with unrounded FP32 coefficients. The target kernel now rounds coefficients through FP16; the native exact-bit M=1/M=16 regression failed before and passes after, and existing phase1 fixtures still pass unchanged. This is a second real target fix, not an end-to-end parity claim. The post-fix **full check passed with both GPUs free: 125 Rust tests and 28 oracle host tests in 185.51 s**, `/tmp/w34-phase6-rope-final-check.log`. Subsequent canonical replay in `/tmp/w34-vl-target-rope-fix/` still passes 4B PNG/JPEG (**0.0400652 / 0.0424111**) but fails 27B (**0.1900746 / 0.1270071**) and MoE (**0.2232446 / 0.2054107**) final-norm gates; all six retain 8/8 greedy IDs. No tolerances changed.
+- Canonical six-case replay after the residual-norm correction (before target RoPE correction): `/tmp/w34-vl-gemma-fix/`. **4B PNG/JPEG pass**, final-norm relL2 **0.0407854 / 0.0422014**; **27B PNG/JPEG still fail**, **0.1899882 / 0.1265059**; **MoE PNG/JPEG still fail**, **0.2162264 / 0.2116164**. All six retain **8/8 exact greedy tokens**. The correction is real but does not resolve the large-model tensor gate.
+- `mise run check-quick` passed (fmt and CPU/CUDA Clippy), log `/tmp/w34-phase6-gemma-quick.log`. The prior focused command passed **22 Rust tests**, including three live Axum tests, in `/tmp/w34-phase6-vision-focused.log`. After freeing both GPUs, **`CUDA_VISIBLE_DEVICES=0,1 mise run check` passed in 184.62 s: 123 Rust tests plus 27 oracle host tests**, `/tmp/w34-phase6-two-gpu-final-check.log`. This includes TP2 graph/collective gates, GQA/MMA/split-KV parity, grouped-MoE/TP2 parity, TP1/TP2 GPU sampling, and live MTP/DFlash/MoE HTTP constraint tests. The earlier restricted-device failure was environmental. A subsequent review identified missing terminal-token legacy logprobs; that fix now passes **4 live Axum + 6 completion tests**, including forced EOS and custom stop tokens in stream/nonstream responses (`/tmp/w34-terminal-after.log`). Hidden terminal tokens receive logprob-only SSE records with empty text and aligned offsets/counts. The post-fix full-check rerun is tracked below.
+- Added launch-correlated NVTX measurement with process-aware CUDA runtime correlation (including graph nodes, worker-thread launches, and asynchronous completion); **10 profiling CPU tests pass**, including nullable speculative-round metadata falling back to an explicit measured-round count and rejecting non-object metadata. Direct test-file invocation now runs the correlated tests too. Command: `python tools/oracle/profile_diff.py --nvtx-correlated --w34 /tmp/w34-phase6-marked-4b/trace.sqlite --metadata /tmp/w34-phase6-marked-4b/stdout.json`. It measures **4,665 kernels over 10 rounds**, **128.038473 ms summed GPU time**, **131.681499 ms CPU decode wall time**, with `full_attn=0.920680` and `spec_decode=5.247384` summed GPU ms/round. Workload alignment remains unverified, so **gate_eligible=false**; this is not an oracle speedup claim. The trace predates the residual-norm correction.
+- `mise run oracle-check` passed **27 host tests** (7 vision capture, 2 native-norm fixture, 6 needle, 9 profile, 3 vision-matrix). Review fixes now clear stale needle summaries before builds, record launch/type failures without aborting the matrix, retain failing vision tensor metrics, and limit insecure-deserialization environment settings to the trusted local capture subprocess. The decoder preserves **64 MiB local input / 16 MiB HTTP ingress** limits; its large-local-input regression failed before the correction and passes afterward.
+- Stopped old-binary needle task `t-mvu0fv84` because the target arithmetic correction makes it unsuitable for final-tree validation. Its retained 32k/64k/128k TQ4 passes are historical only; the 262k case was interrupted and is **not a pass**. After the successful unrestricted full check, restarted the **entire eight-case matrix** with both target corrections: persistent task **`t-mvu3ybzf`**, GPU0, `/tmp/w34-phase6-needle-native-fp16/{summary.json,...}`, log `/tmp/w34-phase6-needle-native-fp16.log`. Per-case timeout is 10,800 s to avoid an artificial one-hour cutoff at 262k. GPU1 remains available for further parity work.
+- Pinned SGLang donor preflight now runs successfully inside `lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9`, without network/GPU access: `/tmp/aligned-oracle/plan.json` records exact cached target/draft commits, tokenizer/source hashes and deterministic prompt IDs. `test_aligned_sglang_bench.py` passes **5 additional CPU tests**. This is deliberately **preflight-only**, not a serving/profile runner: worker-boundary instrumentation, reset semantics and actual donor timing capture remain unimplemented. `--profile` refuses to fabricate results.
+- Review triage: fixed concrete decoder-limit, terminal-token legacy logprob and harness-reporting issues. Kept strict JPEG warning rejection as an intentional fail-closed policy. Deferred unchanged optional authentication/tokenizer-budget hardening and nullable custom-boolean compatibility; rejected a fractional KV reservation cap because it would prohibit intended full-context requests. No claim that exact profiling boundaries alone establish aligned donor performance. No commit while full verification and release gates remain open.
+
+### Vision numerical isolation and fixes (earlier checkpoint; superseded above where noted)
+
+- **4B real PNG and JPEG now pass the complete canonical gate** (three tensor boundaries, exact mRoPE, exact prompt IDs, **8/8 exact greedy tokens**), without changing the **0.05** tolerance. Results in `/tmp/w34-vl-native-fp16-fix/`: PNG `visual_relL2=0.004597`, `final_norm_relL2=0.040675`; JPEG `visual_relL2=0.005254`, `final_norm_relL2=0.042365`. The native vLLM captures were retained unchanged.
+- **27B and MoE remain failing:** final-norm relL2 is **0.190430 / 0.122358** (27B PNG/JPEG) and **0.218398 / 0.207304** (35B-A3B PNG/JPEG). All retain exact eight-token greedy outputs. These are not passing vision gates.
+- Fixed independently reproduced numerical mismatches: (1) bias sums materialize in FP16 before vision residual/GELU/RoPE operations; (2) vision RoPE coefficients use the native FP16 cache precision; (3) positional interpolation matches installed Triton’s FP16/FMA rounding sequence exactly across 72 explicit values and five grid fingerprints; (4) vision Linear uses FP32 GEMM accumulation plus bias **before** its FP16 output conversion (`beta=1` with bias-initialized output), with mandatory warmup in `prepare_execution_plan`. Regression example: old split GEMM/bias yielded **0.99951171875**, native/new path **1.0**. Biased GEMM adds a bias broadcast launch; final performance measurement remains required.
+- **JPEG decode was independently wrong at the pixel boundary:** the original decoder differed from Pillow in 25,318/1,843,200 temporally duplicated normalized FP16 patch elements. The pinned statically vendored `turbojpeg-sys=1.1.1` accurate-IDCT/fancy-upsampling path now matches Pillow’s full RGB SHA-256 for the JPEG fixture exactly, while retaining PNG behavior and enforcing 16 MiB input, 16 MP, 16,384-per-axis, 128 MiB native intermediate-memory, and 100 progressive-scan caps. CPU JPEG/transport regressions passed **8/8**. Building now requires CMake and a C compiler, not a system JPEG library.
+- Diagnostic-only native vLLM runs with w34’s exact visual embeddings isolate target drift: **4B final_norm relL2=0.003980**; **27B=0.083104**, with early-layer errors below 0.001 that amplify in late layers. Therefore vision drift explains much of the 4B failure, but not all 27B drift. `--diagnostic-override-visual` captures are explicitly non-canonical and cannot pass `vision_gate`. A uniform FP16-normalized-Q/K experiment only reduced the 27B identical-input error to **0.073253** and canonical error to **0.186870**; it was **reverted** rather than changing target arithmetic for a marginal gain. Rebuild before further GPU work: the last experimental example binary may still contain that reverted experiment.
+- Added NVTX `w34.bench.measured`, nested `w34.decode`, and `w34.proposer` scopes, trace retention, and strict explicit-GPU-window parsing with fail-closed CPU tests (**5/5**). Historical heuristic reports are now labeled diagnostic/non-gating. Automatic runtime-correlation mapping and aligned donor workload manifests are **not implemented**, so performance gates remain open.
+- Legacy completion validation/Unicode offset review fixes passed **6/6** focused tests; the extended real Axum suite passed **3/3 in 17.62 s**, including legacy nonstream/SSE logprob arrays and matching offsets. Diagnostic throughput was **786.61 / 908.15 generated tok/s** at 8/16 clients; this is not a matched donor benchmark.
+- The long-context task `t-mvu0fv84` still runs the **pre-vision-change binary** on GPU 0; its `tq4` 32k/64k/128k cases passed. New changes do not modify text execution arithmetic (the Q/K experiment is reverted), but final check/review/commit remain pending. A quick-check attempt caught missing NVTX safety comments and an unnecessary JPEG cast, both fixed; the current complete tree still needs re-verification. No completion claim or new commit.
+
+### Real-image and long-context oracle checkpoint (earlier measurements; superseded above where noted)
+
+- Serving checkpoint below is committed as **`5bb3742`**. New harnesses are `tools/oracle/{vllm_vl_dump,vision_matrix,needle_matrix}.py` and `crates/w34-host/examples/{vision_gate,needle_gate}.rs`. `vision_gate` verifies source-image/config SHA-256, exact processed prompt IDs, tensor shapes/finiteness, native mRoPE positions, and eight-token greedy output. It uses the HTTP preprocessing bounds (`1024..1048576` pixels); the older CLI helper has different bounds, so comparisons must not assume these paths are interchangeable for resized inputs.
+- **Actual vLLM 0.31.0 captures, not synthetic fixtures:** `CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 python tools/oracle/vision_matrix.py --out-dir /tmp/w34-vl-full-matrix` completed all six captures and returned **1**, correctly rejecting full-model tensor drift. Each real PNG/JPEG case has **exact prompt IDs, exact mRoPE, and 8/8 exact greedy tokens**. Relative-L2 values below compare all 306 prefill rows; the separate greedy run uses chunk size 64. The existing **0.05** tensor tolerance is unchanged.
+
+  | Model | Format | Visual embedding relL2 | Final-norm relL2 | Full gate |
+  |---|---|---:|---:|---|
+  | 4B | PNG | 0.011720 | 0.077648 | **FAIL** |
+  | 4B | JPEG | 0.018826 | 0.119220 | **FAIL** |
+  | 27B | PNG | 0.003764 | 0.183770 | **FAIL** |
+  | 27B | JPEG | 0.010490 | 0.254472 | **FAIL** |
+  | 35B-A3B | PNG | 0.007574 | 0.237131 | **FAIL** |
+  | 35B-A3B | JPEG | 0.019453 | 0.274170 | **FAIL** |
+
+- Captures and per-case JSON/logs are in `/tmp/w34-vl-full-matrix/`. Read-only source audit validates the comparison and identifies a candidate numerical difference: vLLM prefill materializes normalized Q/K in FP16 before its chunk GDN algorithm; w34 retains normalized Q/K in FP32 in its recurrent implementation. This is **a hypothesis to isolate**, not a demonstrated cause or an accepted excuse for the failed gate.
+- **Needle progress:** `CUDA_VISIBLE_DEVICES=0 python3 tools/oracle/needle_matrix.py --out-dir /tmp/w34-phase6-needle-matrix` is running the eight-case, single-GPU 27B matrix. At this checkpoint, `tq4` **32768, 65536, and 131072** windows passed exact retrieval of `73918462` at midpoint. The window includes 32 output and four reserved engine tokens; exact prompt IDs are retained. **262144 and all `tq4_all` results remain pending.** Persistent task `t-mvu0fv84`; log `/tmp/w34-phase6-needle-matrix.log`. This is one depth and one fixed secret per policy/window, not a broad statistical retrieval benchmark.
+- Latest live profile diagnostics: 4B DFlash **983.76 tok/s**, `spec_decode=4.4293 ms/round`; 27B TP2 DFlash **138.28 tok/s**, `spec_decode=5.0338 ms/round`, `full_attn=1.6871 ms/round`. Outputs are `/tmp/w34-phase6-{4b,27b}-dflash-profile.json`. **These do not establish aligned donor speedups/regressions:** stored baselines lack exact prompt/checkpoint/KV provenance and `profile_diff.py` identifies steady-state rounds heuristically, not from explicit timestamp boundaries. Fresh retained, marked traces and common workload manifests are required before performance gates can close; earlier claims of exact profile-window slicing below are too strong.
+- Legacy `/v1/completions` integer `logprobs` support has been added in the working tree with CPU regressions (integer 0 includes selected-token probability; null/omitted disables it). Review identified Unicode-fragment offset accounting and malformed-JSON helper validation to fix before verification. No CUDA worker/inference changes are part of this wire-format addition.
+- New harness host tests initially passed **10/10**; the legacy completion/ChatML/constraint CPU suites passed **21/21**. CUDA clippy subsequently caught two collapsible conditionals in the new HTTP code; these were fixed, but final re-verification remains pending. An initial review of this checkpoint has completed. **No fresh full `mise run check` or commit yet**: the needle run occupies GPU 0, full-model vision gates fail, and review fixes still need verification. The earlier 109-test result applies to `5bb3742`, not this working tree.
 
 ### Axum/Tokio serving checkpoint (verified; Phase 6 exit gates still pending)
 

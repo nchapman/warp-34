@@ -504,38 +504,46 @@ __global__ void paged_attention_kernel(
             }
             const int start_base = (min_kv_pos > 0) ? ((min_kv_pos / tile) * tile) : 0;
             for (int base = start_base; base <= max_kv_pos; base += tile) {
-                for (int t = wid; t < tile; t += 4) {
-                    int kv = base + t;
-                    float dot = -FLT_MAX;
-                    const uint8_t* vp = nullptr;
-                    if (kv >= min_kv_pos && kv <= max_kv_pos) {
+                // Use all eight N columns of each MMA for independent keys.
+                // Each QK dot retains the same K=16 contraction order; only the
+                // previously zero columns are populated, preserving FA2 rounding.
+                for (int t = wid * 8; t < tile; t += 32) {
+                    const int kv = base + t + (lane >> 2);
+                    const bool valid_k = kv >= min_kv_pos && kv <= max_kv_pos;
+                    const uint32_t* kp32 = nullptr;
+                    if (valid_k) {
                         const uint8_t* kp = (const uint8_t*)(uintptr_t)layout.k_base
                             + (size_t)req_blocks[kv / layout.block_size] * layout.k_page_stride_bytes
                             + (size_t)kv_head * layout.k_head_stride_bytes
                             + (size_t)(kv % layout.block_size) * layout.k_token_stride_bytes;
-                        vp = (const uint8_t*)(uintptr_t)layout.v_base
-                            + (size_t)req_blocks[kv / layout.block_size] * layout.v_page_stride_bytes
-                            + (size_t)kv_head * layout.v_head_stride_bytes
-                            + (size_t)(kv % layout.block_size) * layout.v_token_stride_bytes;
-                        dot = 0.f;
-                        const uint32_t* kp32 = (const uint32_t*)kp;
-                        for (int ks = 0; ks < k_steps; ++ks) {
-                            uint32_t a0 = qa0[ks];
-                            uint32_t a2 = qa2[ks];
-                            uint32_t b0 = (lane < 4) ? kp32[ks * 8 + lane] : 0u;
-                            uint32_t b1 = (lane < 4) ? kp32[ks * 8 + 4 + lane] : 0u;
-                            uint32_t z = 0u;
-                            float d1 = 0.f, d2 = 0.f, d3 = 0.f;
-                            asm volatile(
-                                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                                : "+f"(dot), "+f"(d1), "+f"(d2), "+f"(d3)
-                                : "r"(a0), "r"(z), "r"(a2), "r"(z), "r"(b0), "r"(b1));
-                        }
+                        kp32 = (const uint32_t*)kp;
                     }
-                    if (lane == 0) {
-                        scores[t] = dot;
-                        v_ptrs[t] = vp;
+                    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                    for (int ks = 0; ks < k_steps; ++ks) {
+                        const int pair = lane & 3;
+                        uint32_t b0 = valid_k ? kp32[ks * 8 + pair] : 0u;
+                        uint32_t b1 = valid_k ? kp32[ks * 8 + 4 + pair] : 0u;
+                        uint32_t z = 0u;
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                            : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                            : "r"(qa0[ks]), "r"(z), "r"(qa2[ks]), "r"(z), "r"(b0), "r"(b1));
+                    }
+                    if (lane < 4) {
+                        const int kv0 = base + t + 2 * lane;
+                        const int kv1 = kv0 + 1;
+                        scores[t + 2 * lane] = (kv0 >= min_kv_pos && kv0 <= max_kv_pos) ? d0 : -FLT_MAX;
+                        scores[t + 2 * lane + 1] = (kv1 >= min_kv_pos && kv1 <= max_kv_pos) ? d1 : -FLT_MAX;
+                    }
+                    if (lane < 8) {
+                        const int pos = base + t + lane;
+                        v_ptrs[t + lane] = (pos >= min_kv_pos && pos <= max_kv_pos)
+                            ? (const uint8_t*)(uintptr_t)layout.v_base
+                                + (size_t)req_blocks[pos / layout.block_size] * layout.v_page_stride_bytes
+                                + (size_t)kv_head * layout.v_head_stride_bytes
+                                + (size_t)(pos % layout.block_size) * layout.v_token_stride_bytes
+                            : nullptr;
                     }
                 }
                 __syncthreads();
@@ -856,7 +864,9 @@ __global__ void paged_attention_gqa_mma_f16_kernel(
     int num_splits) {
     constexpr int HEAD_DIM = 256;
     constexpr int SMEM_STRIDE = 264; // 264 * 2 = 528 B (16B-aligned + bank-conflict-free)
-    constexpr int MIN_PAGES_PER_SPLIT = 64; // 1,024 KV tokens minimum per active split
+    // Short verification uses ~64 keys per partition; retain the long-context floor.
+    const int MIN_PAGES_PER_SPLIT =
+        (batch.max_seq_len >= 128 && batch.max_seq_len <= 1024) ? 4 : 64;
 
     __shared__ __align__(16) __half s_q[16][SMEM_STRIDE];
     __shared__ __align__(16) __half s_kv[16][SMEM_STRIDE];
@@ -1454,19 +1464,22 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
     if (can_use_gqa_mma) {
         const int gqa_ratio = num_q_heads / layout->local_kv_heads;
 
-        // Parallel Split-KV for M <= 16 when max_seq_len > 1024 (> 64 pages)
-        // and aligned scratch workspace is provided in ex->scratch_ptr.
+        // Parallel Split-KV for short verification (128..1024 keys, M=2..16),
+        // or long contexts (>1024 keys), only when aligned scratch fits.
         // Note: num_splits depends ONLY on (total_tokens, max_seq_len, max_blocks_per_req) —
         // never on local_kv_heads — preserving 0-ULP TP=1 == TP=2 parity!
         int num_splits = 1;
         float* partial_acc = nullptr;
         float* partial_m = nullptr;
         float* partial_l = nullptr;
-        if (batch->total_tokens <= 16 && batch->max_seq_len > 1024 &&
-            batch->max_blocks_per_req > 64 &&
+        const bool short_split = batch->max_q_len > 1 && batch->total_tokens > 1 &&
+            batch->total_tokens <= 16 && batch->max_seq_len >= 128 && batch->max_seq_len <= 1024;
+        if ((short_split || (batch->total_tokens <= 16 && batch->max_seq_len > 1024 &&
+            batch->max_blocks_per_req > 64)) &&
             ex->scratch_ptr != 0 && (ex->scratch_ptr & 15u) == 0u) {
             const int cand_splits =
-                (batch->max_blocks_per_req > 1024 && batch->total_tokens <= 4) ? 32 : 16;
+                short_split ? ((batch->max_seq_len <= 256) ? (batch->max_seq_len + 63) / 64 : 4) :
+                ((batch->max_blocks_per_req > 1024 && batch->total_tokens <= 4) ? 32 : 16);
             const size_t total_slots = (size_t)batch->total_tokens * (size_t)num_q_heads * (size_t)cand_splits;
             const size_t acc_bytes = total_slots * 256u * sizeof(float);
             const size_t ml_bytes = total_slots * sizeof(float);
@@ -1502,6 +1515,15 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
             const int max_tt = 16 / q_group;
             tok_tile = (batch->total_tokens < max_tt) ? batch->total_tokens : max_tt;
             if (tok_tile < 1) tok_tile = 1;
+            // Short verification batches otherwise launch only a handful of CTAs
+            // (e.g. 16 for M=16, GQA=4). Keep each query in its own CTA to
+            // expose head/token parallelism without changing its reduction order.
+            // Short Split-KV keeps one query per CTA as well: 64 base CTAs
+            // become 128..256 for four KV heads and M=16. Cap short graphs
+            // at four partitions: their 1024-token bound can greatly exceed the
+            // actual device length, so more CTAs would mostly be idle. Long Split-KV
+            // and larger prefill batches retain their existing packing.
+            if (batch->total_tokens <= 16 && (num_splits == 1 || short_split)) tok_tile = 1;
         }
 
         const unsigned grid_x = (unsigned)((batch->total_tokens + tok_tile - 1) / tok_tile);

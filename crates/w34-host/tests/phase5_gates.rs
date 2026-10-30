@@ -931,6 +931,19 @@ fn phase5_3_moe_checkpoint_config_and_dense_f16_tp_parity() {
 #[cfg(feature = "cuda")]
 #[test]
 fn phase6_2_gqa_mma_and_split_kv_long_context_parity() {
+    check_gqa_split_kv_parity(4096);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn phase6_2_short_split_kv_parity() {
+    for seq_len in [128usize, 192, 256, 512, 1024] {
+        check_gqa_split_kv_parity(seq_len);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn check_gqa_split_kv_parity(seq_len: usize) {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _dev = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();
@@ -938,7 +951,6 @@ fn phase6_2_gqa_mma_and_split_kv_long_context_parity() {
     let ex_no_split = stream.exec(0, 0);
     let ex_split = stream.exec(d_ws.addr(), d_ws.len_bytes);
 
-    let seq_len = 4096usize; // 256 pages (> 1,024 Split-KV threshold -> 4 active splits)
     let num_pages = seq_len / 16;
     let local_kv_heads = 2usize;
     let num_q_heads = 8usize; // gqa_ratio = 4
@@ -1149,6 +1161,73 @@ fn phase6_2_gqa_mma_and_split_kv_long_context_parity() {
             d_out_single.copy_to_host(&mut h_single, &stream).unwrap();
             d_out_split_c.copy_to_host(&mut h_split_c, &stream).unwrap();
             d_out_split_p.copy_to_host(&mut h_split_p, &stream).unwrap();
+
+            if seq_len <= 256 {
+                // Captured short graphs declare 1024 keys even when live lengths
+                // are smaller. The bound must not change the active partitions.
+                let mut graph_batch = ab;
+                graph_batch.max_seq_len = 1024;
+                assert_eq!(
+                    // SAFETY: same live buffers and layout as the preceding launch;
+                    // device lengths still bound all KV accesses.
+                    unsafe {
+                        ffi::w34_paged_attention_f16(
+                            &ex_split,
+                            &layout_p,
+                            &graph_batch,
+                            d_q.addr() as *const c_void,
+                            d_out_split_p.addr() as *mut c_void,
+                            num_q_heads as i32,
+                        )
+                    },
+                    0
+                );
+                let mut graph_out = vec![0u16; q_elems];
+                d_out_split_p.copy_to_host(&mut graph_out, &stream).unwrap();
+                assert_eq!(h_split_p, graph_out, "graph-bound partition parity");
+            }
+
+            // M=16 uses one token per CTA; padding with one invalid token
+            // selects the packed prefill dispatch. Valid rows must remain bitwise
+            // identical: token packing must not alter QK/PV reduction order.
+            if q_len == 16 {
+                let padded_elems = 17 * num_q_heads * head_dim;
+                let mut padded_q = q_host.clone();
+                padded_q.resize(padded_elems, 0);
+                let d_padded_q = DeviceBuffer::alloc(0, padded_elems * 2).unwrap();
+                let d_padded_out = DeviceBuffer::alloc(0, padded_elems * 2).unwrap();
+                let d_mask = DeviceBuffer::alloc(0, 17).unwrap();
+                let mut mask = vec![1u8; 17];
+                mask[16] = 0;
+                d_padded_q.copy_from_host(&padded_q, &stream).unwrap();
+                d_mask.copy_from_host(&mask, &stream).unwrap();
+                d_qs.copy_from_host(&[0i32, 17], &stream).unwrap();
+                let mut packed = ab;
+                packed.block_tables = d_bt_c.addr() as *const i32;
+                packed.total_tokens = 17;
+                packed.max_q_len = 17;
+                packed.valid_token_mask = d_mask.addr() as *const u8;
+                assert_eq!(
+                    unsafe {
+                        ffi::w34_paged_attention_f16(
+                            &ex_no_split,
+                            &layout_c,
+                            &packed,
+                            d_padded_q.addr() as *const c_void,
+                            d_padded_out.addr() as *mut c_void,
+                            num_q_heads as i32,
+                        )
+                    },
+                    0
+                );
+                let mut packed_out = vec![0u16; padded_elems];
+                d_padded_out.copy_to_host(&mut packed_out, &stream).unwrap();
+                assert_eq!(
+                    h_single,
+                    packed_out[..q_elems],
+                    "0-ULP token-packing parity violated for policy={policy:?} ord={layer_ord}"
+                );
+            }
 
             assert_eq!(
                 h_split_c, h_split_p,
