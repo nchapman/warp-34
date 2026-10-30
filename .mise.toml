@@ -85,3 +85,7 @@ run = """
 [tasks."oracle-check"]
 description = "Host-only validation of oracle and benchmark harnesses"
 run = "python3 -m unittest discover -s tools/oracle -p 'test_*.py' -v"
+
+[tasks."needle-gates"]
+description = "Run all eight 1-GPU 27B TQ4/TQ4-all 32k-262k needle gates (set CUDA_VISIBLE_DEVICES to one GPU)"
+run = "python3 tools/oracle/needle_matrix.py"

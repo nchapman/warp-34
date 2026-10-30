@@ -11,13 +11,79 @@ Generates deterministic golden tensor fixtures (.safetensors) for:
    `fused_sigmoid_gating_delta_rule_update`) with FP16 conv_state and FP32 ssm_state,
    including multi-step speculative verify states (`spec_state_indices[req, 0..8]`).
 """
+from __future__ import annotations
+
 import argparse
+import json
+import hashlib
 import math
 from pathlib import Path
 
-import torch
-import torch.nn.functional as F
-from safetensors.torch import save_file
+def load_tensor_dependencies() -> None:
+    # Keep --help usable without PyTorch, safetensors, vLLM, or CUDA.
+    global torch, F, save_file
+    import torch
+    import torch.nn.functional as F
+    from safetensors.torch import save_file
+
+
+def capture_fused_gemma(x, residual, weight):
+    """Actual vLLM runtime, not a formula reference. Requires a visible CUDA GPU.
+
+    Select the intended physical GPU with CUDA_VISIBLE_DEVICES (e.g. 1).
+    Only a tiny GemmaRMSNorm operator is constructed; no model is loaded.
+    """
+    load_tensor_dependencies()
+    if not torch.cuda.is_available():
+        raise RuntimeError("Native fused Gemma capture requires CUDA; select CUDA_VISIBLE_DEVICES")
+    import vllm
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    with set_current_vllm_config(VllmConfig()), torch.inference_mode():
+        op = GemmaRMSNorm(x.shape[-1], eps=1e-6).to(device="cuda", dtype=weight.dtype)
+        op.weight.copy_(weight.to("cuda"))
+        args = lambda: (x.to("cuda").clone(), residual.to("cuda").clone())
+        direct = op.forward_cuda(*args())
+        dispatched = op(*args())
+        for a, b in zip(direct, dispatched):
+            if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
+                raise RuntimeError("Gemma forward_cuda and module dispatch disagree")
+        outputs = tuple(t.cpu().contiguous() for t in dispatched)
+    provenance = {
+        "vllm": vllm.__version__, "torch": torch.__version__,
+        "cuda": torch.version.cuda, "gpu": torch.cuda.get_device_name(),
+        "entrypoint": "GemmaRMSNorm.forward_cuda and module dispatch (bitwise agreement)",
+        "config": "VllmConfig()", "eps": 1e-6,
+        "inputs": ["gemma_rms_norm.x", "fused_add_gemma_rms_norm.res_in", "gemma_rms_norm.w"],
+        "scope": ["fused_add_gemma_rms_norm.out", "fused_add_gemma_rms_norm.res_out"],
+        "note": "Native CUDA capture only for scope; other tensors retain original provenance",
+    }
+    return outputs, provenance
+
+
+def refresh_fused_gemma(path: Path) -> None:
+    """Replace only the two native expectations, using existing saved inputs."""
+    load_tensor_dependencies()
+    from safetensors import safe_open
+    original_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        metadata = f.metadata() or {}
+        tensors = {key: f.get_tensor(key) for key in f.keys()}
+    (out, residual), provenance = capture_fused_gemma(
+        tensors["gemma_rms_norm.x"], tensors["fused_add_gemma_rms_norm.res_in"],
+        tensors["gemma_rms_norm.w"],
+    )
+    provenance["source_file_sha256"] = original_hash
+    for key, value in zip(provenance["scope"], (out, residual)):
+        old = tensors[key]
+        if old.shape != value.shape or old.dtype != value.dtype:
+            raise RuntimeError(f"Native capture changed shape/dtype: {key}")
+        print(f"{key}: {int((old != value).sum())} changed elements / {old.numel()}")
+        tensors[key] = value
+    metadata["fused_add_gemma_native_capture"] = json.dumps(provenance, sort_keys=True)
+    save_file(tensors, str(path), metadata=metadata)
+    print(json.dumps(provenance, sort_keys=True))
 
 
 def gemma_rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -129,6 +195,7 @@ def gdn_recurrent_step_ref(
 
 
 def generate_op_fixtures(out_path: Path) -> None:
+    load_tensor_dependencies()
     torch.manual_seed(34)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tensors: dict[str, torch.Tensor] = {}
@@ -141,10 +208,10 @@ def generate_op_fixtures(out_path: Path) -> None:
     tensors["gemma_rms_norm.w"] = w.cpu()
     tensors["gemma_rms_norm.out"] = gemma_rms_norm_ref(x, w).cpu()
 
-    x_sum = (x + res).to(torch.float16)
+    (fused_out, res_out), provenance = capture_fused_gemma(x, res, w)
     tensors["fused_add_gemma_rms_norm.res_in"] = res.cpu()
-    tensors["fused_add_gemma_rms_norm.res_out"] = x_sum.cpu()
-    tensors["fused_add_gemma_rms_norm.out"] = gemma_rms_norm_ref(x_sum, w).cpu()
+    tensors["fused_add_gemma_rms_norm.res_out"] = res_out
+    tensors["fused_add_gemma_rms_norm.out"] = fused_out
 
     # 2. silu_and_mul & RMSNormGated
     gate_up = torch.randn(16, 1024, device=device, dtype=torch.float16)
@@ -265,7 +332,9 @@ def generate_op_fixtures(out_path: Path) -> None:
     tensors["marlin.ref_m16"] = ref_m16.cpu()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, str(out_path))
+    save_file(tensors, str(out_path), metadata={
+        "fused_add_gemma_native_capture": json.dumps(provenance, sort_keys=True),
+    })
     print(f"Wrote {len(tensors)} golden tensors to {out_path}")
 
 
@@ -276,8 +345,13 @@ def main() -> None:
         default=str(Path(__file__).resolve().parent / "goldens" / "op_fixtures.safetensors"),
         help="Output safetensors path",
     )
+    ap.add_argument("--refresh-fused-gemma", action="store_true",
+                    help="Recapture ONLY fused Gemma expectations in existing --out from saved inputs; requires CUDA and vLLM")
     args = ap.parse_args()
-    generate_op_fixtures(Path(args.out))
+    if args.refresh_fused_gemma:
+        refresh_fused_gemma(Path(args.out))
+    else:
+        generate_op_fixtures(Path(args.out))
 
 
 if __name__ == "__main__":

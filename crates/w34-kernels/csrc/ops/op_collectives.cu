@@ -225,7 +225,10 @@ __global__ void __launch_bounds__(256, 1) tp2_all_reduce_residual_gemma_rms_norm
                 }
                 const __half sum_h = __hadd(ar_h, res_old);
                 res_row[i] = sum_h;
-                const float v = __half2float(sum_h);
+                // Preserve the FP16 all-reduce boundary, then normalize the
+                // unrounded FP32 residual sum, as native Gemma does. Only the
+                // persistent residual is rounded to FP16; the tap is unchanged.
+                const float v = __half2float(ar_h) + __half2float(res_old);
                 reg_v[k] = v;
                 sum_sq += v * v;
             }

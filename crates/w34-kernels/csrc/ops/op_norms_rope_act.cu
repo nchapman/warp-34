@@ -163,7 +163,9 @@ __global__ void fused_add_gemma_rms_norm_f16_kernel(
             }
             __half sum_h = __hadd(x_val, res_old);
             res_row[i] = sum_h;
-            float v = __half2float(sum_h);
+            // Native Gemma normalizes the unrounded FP32 sum (numerator and
+            // variance), while the persistent residual remains FP16.
+            float v = __half2float(x_val) + __half2float(res_old);
             reg_v[k] = v;
             sum_sq += v * v;
         }
@@ -306,6 +308,10 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
         const float angle = pos * inv_freq;
         float sin_a, cos_a;
         sincosf(angle, &sin_a, &cos_a);
+        // Native target MRotaryEmbedding stores its cache in the query dtype
+        // (FP16). Fused Triton loads those rounded coefficients into FP32.
+        sin_a = __half2float(__float2half_rn(sin_a));
+        cos_a = __half2float(__float2half_rn(cos_a));
 
         const float x1 = s_normed[i];
         const float x2 = s_normed[i + half_rot];
