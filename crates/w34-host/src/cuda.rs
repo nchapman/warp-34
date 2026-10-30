@@ -2103,6 +2103,39 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             "warmup w34_moe_w4a16_mlp_f16",
         )?;
     }
+    // Sparse M4 (BLOCK_M=4 vec4) and M8..128 (BLOCK_M=8 MMA) g128 dispatches have
+    // distinct sorting and kernel specializations. Warm both on each rank before
+    // any TP collective capture or replay.
+    let moe_ids_m8 = arena.upload_slice(&[0i32, 0, 2, 3, 4, 5, 6, 7], &stream)?;
+    let moe_w_m8 = arena.upload_slice(&[1.0f32; 8], &stream)?;
+    let moe_sparse_weights = arena.alloc_aligned(16 * 256 * 128 / 2)?;
+    for m_sparse in [4i32, 8] {
+        check_rc(
+            unsafe {
+                ffi::w34_moe_w4a16_mlp_f16(
+                    &ex_moe,
+                    buf_a as *const c_void,
+                    moe_sparse_weights as *const u32,
+                    buf_a as *const c_void,
+                    moe_sparse_weights as *const u32,
+                    buf_a as *const c_void,
+                    moe_ids_m8 as *const i32,
+                    moe_w_m8 as *const f32,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    buf_c as *mut c_void,
+                    buf_d as *mut c_void,
+                    m_sparse,
+                    1,
+                    16,
+                    128,
+                    128,
+                    128,
+                )
+            },
+            "warmup sparse w34_moe_w4a16_mlp_f16",
+        )?;
+    }
     check_rc(
         unsafe {
             ffi::w34_moe_f16_gate_up_silu(
