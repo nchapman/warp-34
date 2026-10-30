@@ -14,6 +14,30 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### Local slim Docker runtime (2026-10-30)
+
+- Added `Dockerfile` and a build-input allowlist in `.dockerignore`, with local
+  build/run instructions in `README.md`. No CI or publishing configuration.
+- Reused `warp3090`'s digest-pinned CUDA 13.4.1 builder and minimal Ubuntu 24.04
+  runtime approach: only `w34`, `libcudart`, `libcublas`, and `libcublasLt`, plus
+  system runtime dependencies. Rust 1.99.0, locked Cargo dependencies, `sm_86`,
+  non-root execution, and read-only model-cache mounts. Model downloads are not
+  supported by the current loader; models must already be cached or mounted.
+- Built local image `warp-34:local` successfully without build-time GPU access;
+  Docker reports **1,219,156,415 bytes (~1.22 GB)**. Runtime `ldd` resolves every
+  dependency; CLI usage works without GPUs.
+- Real container serving smoke tests passed on **TP=1 and TP=2** with cached
+  `nchapman/Qwen3.5-4B-W4A16-GPTQ`: `/health`, non-streaming chat, and SSE chat
+  through `[DONE]`, using the non-root default and read-only Hub cache. Both
+  returned `Hello! How can I help you today?`; test containers were stopped.
+- `CUDA_VISIBLE_DEVICES=0,1 mise run check` passed in **217.19 s** (formatting,
+  Clippy with/without CUDA, full CUDA release suite, doc-tests, and oracle tests).
+  Logs: `/tmp/w34-docker-{build,check,smoke}.log`.
+- Review found no blocking issues. Deferred the suggestion to make `/health`
+  reflect inference-worker liveness: that is existing server behavior outside
+  this local packaging change. README explicitly scopes the Docker health
+  check to HTTP responsiveness, not end-to-end inference.
+
 ### Cross-check hardening, test elevation, and code review closure (2026-10-30)
 
 Following cross-check exploration against external engines (`mistral.rs`, `vLLM 0.31.0`, `transformers`), 4 targeted hardening fixes were implemented, verified, and triaged through the multi-lens code review pipeline:

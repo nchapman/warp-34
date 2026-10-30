@@ -35,3 +35,70 @@ mise run build          # cargo build --release --features cuda
 mise run check-quick    # fmt --check + clippy (with and without cuda)
 mise run check          # fmt + clippy + release test suite
 ```
+
+## Local Docker
+
+Requires an x86-64 host with AVX2 (`x86-64-v3`), RTX 3090 Ti GPU(s), a
+CUDA 13.4-compatible NVIDIA driver, and NVIDIA Container Toolkit configured
+for Docker. Building needs no GPU; running inference requires `--gpus`.
+
+```sh
+docker build -t warp-34:local .
+# Optional on larger build hosts: --build-arg W34_NVCC_JOBS=16
+docker run --rm warp-34:local  # print CLI usage
+```
+
+The multi-stage build uses pinned CUDA 13.4.1 + Rust 1.99.0, then copies only
+`w34`, `libcudart`, `libcublas`, and `libcublasLt` into Ubuntu 24.04. No toolkit,
+Python, model weights, or NVIDIA driver is bundled in the runtime image.
+The locally verified image reports approximately **1.22 GB** via Docker image
+inspection (size can vary with base-image/package updates).
+BuildKit caches Cargo downloads and compilation across builds. This is a local
+image only; there is no CI or registry publishing setup.
+
+### Serve a cached model
+
+Models must already exist locally: **the current loader does not download from
+Hugging Face**. Mount the whole Hub cache (including `blobs`, `refs`, and
+`snapshots`, so relative symlinks resolve), read-only:
+
+```sh
+docker run --rm --name w34-local --gpus '"device=0"' \
+  -p 127.0.0.1:8000:8000 \
+  --mount type=bind,src="$HOME/.cache/huggingface/hub",dst=/home/w34/.cache/huggingface/hub,readonly \
+  warp-34:local serve \
+  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --host 0.0.0.0
+```
+
+In another terminal:
+
+```sh
+curl -fsS http://127.0.0.1:8000/health
+curl -fsS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nchapman/Qwen3.5-4B-W4A16-GPTQ","messages":[{"role":"user","content":"Hello!"}],"max_tokens":32}'
+docker stop w34-local
+```
+
+The process runs as a non-root user; mounted files must be readable and their
+directories traversable. If your cache is private to your host user, add
+`--user "$(id -u):$(id -g)"` before the image name; `HF_HUB_CACHE` still points
+to the mounted path. To use an unpacked model directory instead, mount it at
+`/models/model` and pass `--model /models/model`.
+
+For two GPUs, replace `--gpus '"device=0"'` with `--gpus '"device=0,1"'` and add
+`--tp 2`. Container-visible device indices are local to the selected GPUs.
+The engine uses pinned host memory for TP=2; no NCCL or `--ipc=host` is needed.
+For speculative decoding, mount the draft model in the same cache and append
+`--speculative dflash2 --draft-model <cached-repo-id>` (or `--speculative mtp`).
+
+Arguments after the image name go directly to `w34`, so `generate`, `bench`,
+and other native commands work too. Use `--no-healthcheck` before the image
+name for non-server commands. The server must bind `--host 0.0.0.0` inside the
+container; the localhost-only port publication above keeps it local to the
+host. The health check probes HTTP responsiveness via `/health`, not inference
+worker liveness; it is not an end-to-end generation check.
+The health check expects internal port 8000: change only the host side
+of `-p` to use another host port, or override `--health-cmd` if changing
+`serve --port`. Oracle profiling commands additionally need the development
+checkout and external Python/`nsys` tooling, which are not in this image.

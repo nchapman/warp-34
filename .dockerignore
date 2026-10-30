@@ -1,0 +1,18 @@
+# Allow only build inputs. Keep weights, .git, .env, target, and local
+# research/output directories out of the context. The vendored FA2/CUTLASS
+# headers under crates/w34-kernels/vendor ARE required build inputs.
+**
+!Cargo.toml
+!Cargo.lock
+!.cargo/
+!.cargo/config.toml
+!crates/
+!crates/*/
+!crates/*/Cargo.toml
+!crates/*/build.rs
+!crates/*/src/
+!crates/*/src/**
+!crates/w34-kernels/csrc/
+!crates/w34-kernels/csrc/**
+!crates/w34-kernels/vendor/
+!crates/w34-kernels/vendor/**
