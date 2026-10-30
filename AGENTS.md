@@ -22,6 +22,8 @@ mise run build                                                            # carg
 mise run check-quick                                                      # fmt --check + clippy (with and without cuda)
 mise run check                                                            # fmt + clippy (both states) + release test suite
 mise run test-quick                                                       # cargo test --release --features cuda --lib
+mise run test-cpu                                                         # cargo test --lib (fast CPU unit tests)
+mise run coverage                                                         # cargo llvm-cov --features cuda --lib --summary-only
 cargo test --release --features cuda --test <target> -- --test-threads=1 --exact <test>
 for p in $(pgrep -x w34); do kill "$p"; done                              # stop w34 processes safely
 ```
