@@ -145,6 +145,9 @@ int w34_graph_destroy(uintptr_t graph, uintptr_t graph_exec);
 int w34_cublas_create(uintptr_t* out_handle, uintptr_t stream);
 int w34_cublas_destroy(uintptr_t handle);
 // Computes C [M, N] = A [M, K] @ B^T [N, K] in row-major (B is [N, K] row-major).
+// C[M,N] = half(A[M,K] @ B[N,K]^T + bias[N]); positive dimensions required.
+int w34_cublas_gemm_f16_bias(uintptr_t handle, const void* a, const void* b,
+                            const void* bias, void* c, int m, int n, int k);
 int w34_cublas_gemm_f16(uintptr_t handle, const void* a, const void* b, void* c,
                         int m, int n, int k);
 int w34_cublas_gemm_bf16(uintptr_t handle, const void* a, const void* b, void* c,

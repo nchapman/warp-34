@@ -80,16 +80,20 @@ __global__ void gdn_causal_conv1d_f16_kernel(
 
         float acc = bias_val;
         if (kernel_size == 4) {
-            acc += w_reg[0] * hist[0];
-            acc += w_reg[1] * hist[1];
-            acc += w_reg[2] * hist[2];
-            acc += w_reg[3] * x_val;
+            // Native Triton conv (prefill and update) materializes each product
+            // in FP16 before adding to the FP32 accumulator. Keep this rule
+            // independent of query length to preserve exact split/state parity.
+            acc += __half2float(__float2half_rn(w_reg[0] * hist[0]));
+            acc += __half2float(__float2half_rn(w_reg[1] * hist[1]));
+            acc += __half2float(__float2half_rn(w_reg[2] * hist[2]));
+            acc += __half2float(__float2half_rn(w_reg[3] * x_val));
             hist[0] = hist[1];
             hist[1] = hist[2];
             hist[2] = x_val;
         } else {
-            for (int j = 0; j < state_len; j++) acc += w_reg[j] * hist[j];
-            acc += w_reg[state_len] * x_val;
+            for (int j = 0; j < state_len; j++)
+                acc += __half2float(__float2half_rn(w_reg[j] * hist[j]));
+            acc += __half2float(__float2half_rn(w_reg[state_len] * x_val));
             for (int j = 0; j < state_len - 1; j++) hist[j] = hist[j + 1];
             if (state_len > 0) hist[state_len - 1] = x_val;
         }

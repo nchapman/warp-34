@@ -41,6 +41,18 @@ run = "cargo test --release --features cuda"
 description = "Format check, clippy (both states), and full release test suite"
 depends = ["fmt-check", "clippy", "clippy-cpu", "test", "oracle-check"]
 
+[tasks."oracle-check"]
+description = "Host-only validation of real-image oracle and long-context gate harnesses"
+run = "python3 -m unittest discover -s tools/oracle -p 'test_*.py' -v"
+
+[tasks."vision-gates"]
+description = "Capture and replay six real PNG/JPEG vLLM oracles (select one free GPU)"
+run = "python3 tools/oracle/vision_matrix.py --out-dir outputs/vision-$(date +%Y%m%d-%H%M%S)"
+
+[tasks."needle-gates"]
+description = "Run all eight 1-GPU 27B TQ4/TQ4-all 32k-262k needle gates (set CUDA_VISIBLE_DEVICES to one GPU)"
+run = "python3 tools/oracle/needle_matrix.py"
+
 [tasks."oracle-dump"]
 description = "Run w34 dump-diff TP=1 vs TP=2 parity across plain, Vision, MTP, DFlash2, and 35B-A3B MoE"
 depends = ["build"]
@@ -81,11 +93,3 @@ run = """
 ./target/release/w34 profile-diff --live --preset sglang_4b_tp1_dflash2_m16 --model nchapman/Qwen3.5-4B-W4A16-GPTQ --tp 1 --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
 ./target/release/w34 profile-diff --live --preset vllm_35b_moe_tp2_decode --model llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4 --tp 2 --kv-format tq4 --kv-pages 128
 """
-
-[tasks."oracle-check"]
-description = "Host-only validation of oracle and benchmark harnesses"
-run = "python3 -m unittest discover -s tools/oracle -p 'test_*.py' -v"
-
-[tasks."needle-gates"]
-description = "Run all eight 1-GPU 27B TQ4/TQ4-all 32k-262k needle gates (set CUDA_VISIBLE_DEVICES to one GPU)"
-run = "python3 tools/oracle/needle_matrix.py"

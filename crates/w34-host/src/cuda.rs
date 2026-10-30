@@ -403,6 +403,43 @@ impl CublasHandle {
         )
     }
 
+    /// Row-major native FP16 Linear using the cuBLASLt BIAS epilogue.
+    ///
+    /// Warm each shape, bias address and pointer-alignment combination immediately
+    /// before capture (cold capture returns an error). The 256-entry FIFO plan
+    /// cache can evict older combinations without invalidating existing graphs.
+    /// The handle owns a persistent 1 MiB workspace: it and the tensors must
+    /// outlive every captured graph replay. Graph replays and ordinary biased
+    /// GEMMs sharing a handle must not overlap across different streams.
+    /// Ordinary calls submit on the stream passed to `new`; keep it alive.
+    /// The public handle value is opaque, not a vendor cuBLAS handle.
+    pub fn gemm_f16_bias(
+        &self,
+        a_ptr: u64,
+        b_ptr: u64,
+        bias_ptr: u64,
+        c_ptr: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<()> {
+        check_rc(
+            unsafe {
+                w34_kernels::w34_cublas_gemm_f16_bias(
+                    self.handle,
+                    a_ptr as *const c_void,
+                    b_ptr as *const c_void,
+                    bias_ptr as *const c_void,
+                    c_ptr as *mut c_void,
+                    m,
+                    n,
+                    k,
+                )
+            },
+            "w34_cublas_gemm_f16_bias",
+        )
+    }
+
     pub fn gemm_bf16(
         &self,
         a_ptr: u64,
@@ -1197,6 +1234,8 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         }
     }
     cublas.gemm_f16(buf_a, buf_b, buf_c, 1, 64, 128)?;
+    // Mandatory lazy-module warmup before TP workers/capture.
+    cublas.gemm_f16_bias(buf_a, buf_b, buf_d, buf_c, 1, 64, 128)?;
     cublas.gemm_bf16(buf_a, buf_b, buf_c, 1, 64, 128)?;
     check_rc(
         unsafe {
@@ -1312,6 +1351,45 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_paged_attention_f16",
     )?;
+    // Exercise the eligible paged FA2 branch on this selected device before capture.
+    // Dedicated zeroed inputs and LSE must not alias the generic arena workspace.
+    let fa_q = arena.upload_slice(&vec![0u16; 17 * 2 * 256], &stream)?;
+    let fa_k = arena.upload_slice(&vec![0u16; 32 * 256], &stream)?;
+    let fa_v = arena.upload_slice(&vec![0u16; 32 * 256], &stream)?;
+    let fa_o = arena.alloc_aligned(17 * 2 * 256 * 2)?;
+    let fa_ws = arena.alloc_aligned(17 * 2 * 4)?;
+    let fa_start = arena.upload_slice(&[0i32, 17], &stream)?;
+    let fa_seq = arena.upload_slice(&[17i32], &stream)?;
+    let fa_pages = arena.upload_slice(&[1i32, 0], &stream)?;
+    let fa_layout = W34KvLayerLayout {
+        k_base: fa_k,
+        v_base: fa_v,
+        ..layout
+    };
+    let fa_batch = W34AttentionBatch {
+        query_start_loc: fa_start as *const i32,
+        seq_lens_after: fa_seq as *const i32,
+        block_tables: fa_pages as *const i32,
+        total_tokens: 17,
+        max_q_len: 17,
+        max_seq_len: 17,
+        max_blocks_per_req: 2,
+        ..attn_batch
+    };
+    check_rc(
+        unsafe {
+            ffi::w34_paged_attention_f16(
+                &stream.exec(fa_ws, 17 * 2 * 4),
+                &fa_layout,
+                &fa_batch,
+                fa_q as *const c_void,
+                fa_o as *mut c_void,
+                2,
+            )
+        },
+        "warmup w34_paged_attention_f16 FA2",
+    )?;
+
     // Warm GQA mma.sync + Split-KV reduction specialization (head_dim = 256)
     let layout_256 = W34KvLayerLayout {
         head_dim: 256,
@@ -1903,24 +1981,27 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_vision_bias_gelu_f16",
     )?;
-    check_rc(
-        unsafe {
-            ffi::w34_vision_qkv_rope_attn_f16(
-                &ex,
-                buf_a as *mut c_void,
-                buf_b as *const c_void,
-                reject_ids as *const i32,
-                cu_seqlens as *const i32,
-                buf_c as *mut c_void,
-                1,
-                1,
-                2,
-                64,
-                10000.0,
-            )
-        },
-        "warmup w34_vision_qkv_rope_attn_f16",
-    )?;
+    let ex_vision = stream.exec(buf_ws, 64 * 1024);
+    for head_dim in [64, 72] {
+        check_rc(
+            unsafe {
+                ffi::w34_vision_qkv_rope_attn_f16(
+                    &ex_vision,
+                    buf_a as *mut c_void,
+                    buf_b as *const c_void,
+                    reject_ids as *const i32,
+                    cu_seqlens as *const i32,
+                    buf_c as *mut c_void,
+                    1,
+                    1,
+                    2,
+                    head_dim,
+                    10000.0,
+                )
+            },
+            "warmup w34_vision_qkv_rope_attn_f16",
+        )?;
+    }
     check_rc(
         unsafe {
             ffi::w34_embedding_splice_f16(

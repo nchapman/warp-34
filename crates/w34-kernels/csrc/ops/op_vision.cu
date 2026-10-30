@@ -6,6 +6,13 @@
 #include <float.h>
 #include <math.h>
 
+// Call the accurate libdevice functions explicitly: -use_fast_math otherwise
+// replaces sincosf with MUFU approximations whose absolute error loses FP16
+// precision for the small angles in the native rotary cache.
+extern "C" __device__ float __nv_sinf(float);
+extern "C" __device__ float __nv_cosf(float);
+extern "C" __device__ float __nv_tanhf(float);
+
 namespace w34_vision {
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
@@ -46,8 +53,74 @@ __global__ void vision_bias_add_f16_kernel(
     const size_t idx = (size_t)row * cols + col;
     float v = __half2float(x[idx]);
     if (bias != nullptr) v += __half2float(bias[col]);
+    // Native Linear materializes FP16 before the separate residual operation.
+    v = __half2float(__float2half_rn(v));
     if (residual != nullptr) v += __half2float(residual[idx]);
     out[idx] = __float2half(v);
+}
+
+// Donor: PyTorch 2.13.0+cu130, cf30153c4c131c8164ee7798e5022d810682e2cb,
+// aten/src/ATen/native/cuda/layer_norm_kernel.cu (cuWelfordOnlineSum,
+// cuWelfordCombine, compute_stats); thread_constants.h selects 32*4 threads.
+// Preserve reciprocal rounding despite this translation unit's --use_fast_math.
+struct VisionWelford { float mean, sigma2, count; };
+__device__ __forceinline__ VisionWelford vision_combine(VisionWelford b, VisionWelford a) {
+    float delta = b.mean - a.mean;
+    float count = a.count + b.count;
+    if (count == 0.f) return {0.f, 0.f, 0.f};
+    float coef = __frcp_rn(count);
+    float na = a.count * coef, nb = b.count * coef;
+    return {na * a.mean + nb * b.mean,
+            a.sigma2 + b.sigma2 + delta * delta * a.count * nb, count};
+}
+
+__global__ void vision_layernorm_vectorized_f16_kernel(
+    const __half* x, const __half* weight, const __half* bias, __half* out,
+    int cols, float eps) {
+    __shared__ float buf[6];
+    const int lane = threadIdx.x, warp = threadIdx.y;
+    const int tid = lane + 32 * warp;
+    const size_t base = (size_t)blockIdx.x * cols;
+    VisionWelford wd{0.f, 0.f, 0.f};
+    for (int i = tid; i < cols / 4; i += 128) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float v = __half2float(x[base + 4*i + j]);
+            float delta = v - wd.mean;
+            float count = wd.count + 1.f;
+            float mean = wd.mean + delta * __frcp_rn(count);
+            wd = {mean, wd.sigma2 + delta * (v - mean), count};
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        VisionWelford b{__shfl_down_sync(0xffffffffu, wd.mean, offset),
+                        __shfl_down_sync(0xffffffffu, wd.sigma2, offset),
+                        __shfl_down_sync(0xffffffffu, wd.count, offset)};
+        wd = vision_combine(wd, b);
+    }
+    for (int offset = 2; offset > 0; offset /= 2) {
+        if (lane == 0 && warp >= offset && warp < 2*offset) {
+            int y = warp - offset;
+            buf[2*y] = wd.mean; buf[2*y+1] = wd.sigma2; buf[4+y] = wd.count;
+        }
+        __syncthreads();
+        if (lane == 0 && warp < offset)
+            wd = vision_combine(wd, {buf[2*warp], buf[2*warp+1], buf[4+warp]});
+        __syncthreads();
+    }
+    if (tid == 0) { buf[0] = wd.mean; buf[1] = __fdiv_rn(wd.sigma2, (float)cols); }
+    __syncthreads();
+    float inv = rsqrtf(buf[1] + eps);
+    for (int i = tid; i < cols / 4; i += 128) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int c = 4*i+j;
+            float n = inv * (__half2float(x[base+c]) - buf[0]);
+            float w = weight ? __half2float(weight[c]) : 1.f;
+            float b = bias ? __half2float(bias[c]) : 0.f;
+            out[base+c] = __float2half_rn(w * n + b);
+        }
+    }
 }
 
 __global__ void vision_layernorm_f16_kernel(
@@ -99,11 +172,15 @@ __global__ void vision_bias_gelu_f16_kernel(
     const size_t idx = (size_t)row * cols + col;
     float v = __half2float(x[idx]);
     if (bias != nullptr) v += __half2float(bias[col]);
+    // GELU consumes the rounded FP16 Linear output, not an unrounded bias sum.
+    v = __half2float(__float2half_rn(v));
     float g;
     if (use_tanh != 0) {
         // gelu_pytorch_tanh: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        const float inner = 0.7978845608028654f * (v + 0.044715f * v * v * v);
-        g = 0.5f * v * (1.0f + tanhf(inner));
+        const float cube = v * v * v;
+        const float inner = 0.7978845608028654f * (v + 0.044715f * cube);
+        // Native PyTorch uses accurate tanhf, not fast-math's MUFU approximation.
+        g = 0.5f * v * (1.0f + __nv_tanhf(inner));
     } else {
         // Exact erf GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
         g = 0.5f * v * (1.0f + erff(v * 0.7071067811865475f));
@@ -139,8 +216,11 @@ __global__ void vision_qkv_bias_rope_inplace_f16_kernel(
         const float pos_val = (i < quarter_d) ? (float)h_pos : (float)w_pos;
         const int freq_idx = (i < quarter_d) ? i : (i - quarter_d);
         const float inv_freq = powf(rope_theta, -((float)(2 * freq_idx) / (float)half_d));
-        float sin_a, cos_a;
-        sincosf(pos_val * inv_freq, &sin_a, &cos_a);
+        float sin_a = __nv_sinf(pos_val * inv_freq);
+        float cos_a = __nv_cosf(pos_val * inv_freq);
+        // vLLM RotaryEmbedding caches these coefficients in the model dtype.
+        sin_a = __half2float(__float2half_rn(sin_a));
+        cos_a = __half2float(__float2half_rn(cos_a));
 
         // Rotate Q and K (p = 0 for Q, p = 1 for K)
 #pragma unroll
@@ -149,8 +229,8 @@ __global__ void vision_qkv_bias_rope_inplace_f16_kernel(
             const float b1 = (qkv_bias != nullptr) ? __half2float(qkv_bias[base + i]) : 0.0f;
             const float b2 =
                 (qkv_bias != nullptr) ? __half2float(qkv_bias[base + i + half_d]) : 0.0f;
-            const float x1 = __half2float(row[base + i]) + b1;
-            const float x2 = __half2float(row[base + i + half_d]) + b2;
+            const float x1 = __half2float(__float2half_rn(__half2float(row[base + i]) + b1));
+            const float x2 = __half2float(__float2half_rn(__half2float(row[base + i + half_d]) + b2));
             row[base + i] = __float2half(x1 * cos_a - x2 * sin_a);
             row[base + i + half_d] = __float2half(x2 * cos_a + x1 * sin_a);
         }
@@ -337,6 +417,12 @@ extern "C" int w34_vision_layernorm_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (rows == 0) return 0;
+    if (cols % 4 == 0 && cols <= (1 << 24) &&
+        (((uintptr_t)x | (uintptr_t)weight | (uintptr_t)bias | (uintptr_t)out) & 7) == 0) {
+        w34_vision::vision_layernorm_vectorized_f16_kernel<<<(unsigned)rows, dim3(32, 4), 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (const __half*)bias, (__half*)out, cols, eps);
+        return (int)cudaGetLastError();
+    }
     w34_vision::vision_layernorm_f16_kernel<<<(unsigned)rows, 256, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)x, (const __half*)weight, (const __half*)bias, (__half*)out, rows, cols, eps);
     return (int)cudaGetLastError();
@@ -361,6 +447,9 @@ extern "C" int w34_vision_bias_gelu_f16(
     return (int)cudaGetLastError();
 }
 
+extern "C" int w34_vision_fa2_validate(const w34_exec*, const void*, const void*, int, int, int, int);
+extern "C" int w34_vision_fa2(const w34_exec*, const void*, const int32_t*, void*, int, int, int, int);
+
 extern "C" int w34_vision_qkv_rope_attn_f16(
     const w34_exec* ex,
     void* qkv,
@@ -379,11 +468,17 @@ extern "C" int w34_vision_qkv_rope_attn_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (total_patches == 0) return 0;
+    if (head_dim == 64 || head_dim == 72) {
+        int rc = w34_vision_fa2_validate(ex, qkv, out, total_patches, num_images, num_heads, head_dim);
+        if (rc) return rc;
+    }
     dim3 grid((unsigned)total_patches, (unsigned)num_heads);
     w34_vision::vision_qkv_bias_rope_inplace_f16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
         (__half*)qkv, (const __half*)qkv_bias, pos_hw, total_patches, num_heads, head_dim, rope_theta);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return (int)err;
+    if (head_dim == 64 || head_dim == 72)
+        return w34_vision_fa2(ex, qkv, cu_seqlens, out, total_patches, num_images, num_heads, head_dim);
     w34_vision::vision_mha_f16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)qkv, cu_seqlens, (__half*)out, total_patches, num_images, num_heads, head_dim);
     return (int)cudaGetLastError();

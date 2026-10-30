@@ -8,6 +8,12 @@
 #include <cuda_runtime.h>
 #include <math.h>
 
+// Preserve native FP16 rotary-cache precision at small angles despite this
+// translation unit's -use_fast_math flag (MUFU sine has absolute error).
+extern "C" __device__ float __nv_sinf(float);
+extern "C" __device__ float __nv_cosf(float);
+extern "C" __device__ float __nv_powf(float, float);
+
 namespace w34 {
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
@@ -304,10 +310,12 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
             plane = 2;
         }
         const float pos = (float)positions[(size_t)plane * pos_plane_stride + tok];
-        const float inv_freq = powf(rope_theta, -((float)(2 * i) / (float)rotary_dim));
+        // Native cache construction computes reciprocal(pow(theta, exponent)),
+        // not pow(theta, -exponent); near sine zeros the difference is observable.
+        const float inv_freq = __fdiv_rn(1.0f, __nv_powf(rope_theta, (float)(2 * i) / (float)rotary_dim));
         const float angle = pos * inv_freq;
-        float sin_a, cos_a;
-        sincosf(angle, &sin_a, &cos_a);
+        float sin_a = __nv_sinf(angle);
+        float cos_a = __nv_cosf(angle);
         // Native target MRotaryEmbedding stores its cache in the query dtype
         // (FP16). Fused Triton loads those rounded coefficients into FP32.
         sin_a = __half2float(__float2half_rn(sin_a));

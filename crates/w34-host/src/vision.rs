@@ -12,6 +12,10 @@ use crate::cuda::{
 };
 #[cfg(feature = "cuda")]
 use crate::loader::SafetensorsArchive;
+
+/// Bounded diagnostic samples keyed by vision stage: shape and host FP32 values.
+#[cfg(feature = "cuda")]
+pub type VisionTrace = std::collections::BTreeMap<String, (Vec<usize>, Vec<f32>)>;
 #[cfg(feature = "cuda")]
 use std::ffi::c_void;
 #[cfg(feature = "cuda")]
@@ -317,6 +321,9 @@ fn decode_standard_raster(
     let _guard = DECODE_LOCK
         .lock()
         .map_err(|_| "image decoder unavailable")?;
+    if fmt == image::ImageFormat::Jpeg {
+        return decode_jpeg_rgb(raw_bytes);
+    }
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(raw_bytes), fmt);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
@@ -340,23 +347,85 @@ fn decode_standard_raster(
     Ok((rgb.into_raw(), h, w))
 }
 
+// libjpeg-turbo's accurate integer IDCT and fancy chroma upsampling match Pillow.
+// The v3 API exposes limits missing from the high-level turbojpeg wrapper.
+fn decode_jpeg_rgb(raw: &[u8]) -> std::result::Result<(Vec<u8>, usize, usize), String> {
+    use turbojpeg_sys::*;
+    struct Decoder(tjhandle);
+    impl Drop for Decoder {
+        fn drop(&mut self) {
+            // SAFETY: this owns the non-null handle, destroyed exactly once.
+            unsafe { tj3Destroy(self.0) }
+        }
+    }
+    // SAFETY: all calls use a live, exclusively owned decompressor. Input slices
+    // remain live for each call. Header dimensions are checked before allocating
+    // an RGB buffer of exactly width * height * 3; pitch 0 means packed rows.
+    unsafe {
+        let handle = tj3Init(TJINIT_TJINIT_DECOMPRESS as i32);
+        if handle.is_null() {
+            return Err("JPEG decoder unavailable".into());
+        }
+        let decoder = Decoder(handle);
+        let error = || {
+            let message = std::ffi::CStr::from_ptr(tj3GetErrorStr(decoder.0));
+            format!("invalid JPEG image: {}", message.to_string_lossy())
+        };
+        for (param, value) in [
+            (TJPARAM_TJPARAM_MAXMEMORY, 128),
+            (TJPARAM_TJPARAM_MAXPIXELS, 16 * 1024 * 1024),
+            (TJPARAM_TJPARAM_SCANLIMIT, 100),
+            (TJPARAM_TJPARAM_STOPONWARNING, 1),
+            (TJPARAM_TJPARAM_FASTDCT, 0),
+            (TJPARAM_TJPARAM_FASTUPSAMPLE, 0),
+        ] {
+            if tj3Set(decoder.0, param as i32, value) != 0 {
+                return Err(error());
+            }
+        }
+        if tj3DecompressHeader(decoder.0, raw.as_ptr(), raw.len() as _) != 0 {
+            return Err(error());
+        }
+        let w = tj3Get(decoder.0, TJPARAM_TJPARAM_JPEGWIDTH as i32);
+        let h = tj3Get(decoder.0, TJPARAM_TJPARAM_JPEGHEIGHT as i32);
+        if !(1..=16_384).contains(&w) || !(1..=16_384).contains(&h) {
+            return Err("invalid JPEG dimensions (maximum 16384 per axis)".into());
+        }
+        let (w, h) = (w as usize, h as usize);
+        if w * h > 16 * 1024 * 1024 {
+            return Err("source image exceeds 16 megapixel limit".into());
+        }
+        let mut rgb = vec![0; w * h * 3];
+        if tj3Decompress8(
+            decoder.0,
+            raw.as_ptr(),
+            raw.len() as _,
+            rgb.as_mut_ptr(),
+            0,
+            TJPF_TJPF_RGB,
+        ) != 0
+        {
+            return Err(error());
+        }
+        Ok((rgb, h, w))
+    }
+}
+
 fn decode_ppm_p6(raw_bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
     if !raw_bytes.starts_with(b"P6") {
         return None;
     }
     let mut pos = 2;
-    let skip_ws_and_comments = |data: &[u8], p: &mut usize| {
-        loop {
-            while *p < data.len() && data[*p].is_ascii_whitespace() {
+    let skip_ws_and_comments = |data: &[u8], p: &mut usize| loop {
+        while *p < data.len() && data[*p].is_ascii_whitespace() {
+            *p += 1;
+        }
+        if *p < data.len() && data[*p] == b'#' {
+            while *p < data.len() && data[*p] != b'\n' {
                 *p += 1;
             }
-            if *p < data.len() && data[*p] == b'#' {
-                while *p < data.len() && data[*p] != b'\n' {
-                    *p += 1;
-                }
-            } else {
-                break;
-            }
+        } else {
+            break;
         }
     };
     let next_token = |data: &[u8], p: &mut usize| -> Option<usize> {
@@ -396,6 +465,11 @@ pub fn decode_image_bytes_to_rgb(
 ) -> std::result::Result<(Vec<u8>, usize, usize), String> {
     if raw_bytes.is_empty() {
         return Err("empty image payload".to_string());
+    }
+    // Local files retain their 64 MiB allowance; HTTP ingress separately caps
+    // both base64 and fetched payloads at 16 MiB before reaching this decoder.
+    if raw_bytes.len() > 64 * 1024 * 1024 {
+        return Err("image exceeds 64 MiB input limit".into());
     }
     let mime = mime_hint.unwrap_or("").to_ascii_lowercase();
     if raw_bytes.starts_with(b"\x89PNG\r\n\x1a\n") || mime == "image/png" {
@@ -533,9 +607,32 @@ pub fn load_cli_image_with_policy(
     decode_image_bytes_to_rgb(&raw_bytes, None, true)
 }
 
+/// Single-rounded FP16 FMA for operands already representable as FP16.
+#[inline]
+fn fused_half_mul_add(a: f32, b: f32, c: f32) -> f32 {
+    // FP64 preserves the information needed to round finite half operands to FP16.
+    // Round-to-odd at the intermediate FP32 boundary preserves the sticky bit:
+    // ordinary FP32 rounding can manufacture a half-way tie before FP16 rounding.
+    let exact = (a as f64) * (b as f64) + c as f64;
+    let rounded = exact as f32;
+    let sticky = if exact.is_finite() && f64::from(rounded) != exact {
+        let bits = rounded.to_bits();
+        let odd_bits = if f64::from(rounded).abs() < exact.abs() {
+            bits | 1
+        } else {
+            (bits - 1) | 1
+        };
+        f32::from_bits(odd_bits)
+    } else {
+        rounded
+    };
+    crate::cuda::f16_to_f32(crate::cuda::f32_to_f16(sticky))
+}
+
 /// Computes the 2D bilinearly interpolated `pos_embed` `[total_patches, hidden_size]`
 /// and 2D axial RoPE `[total_patches, 2]` `(h_pos, w_pos)` matching `Qwen3_VisionTransformer`
 /// (`fast_pos_embed_interpolate` and `rot_pos_ids` in `vllm/model_executor/models/qwen3_vl.py`).
+/// Weights must be FP16 model parameters widened to FP32, as in the model loader.
 pub fn interpolate_pos_embed_and_rot_ids(
     pos_embed_weight_f32: &[f32],
     num_grid_per_side: usize,
@@ -543,6 +640,11 @@ pub fn interpolate_pos_embed_and_rot_ids(
     spatial_merge_size: usize,
     grid_thw_list: &[[usize; 3]],
 ) -> (Vec<f32>, Vec<i32>, Vec<i32>) {
+    // vLLM's Triton kernel casts coefficients to the FP16 output dtype.
+    // The compiled kernel contracts terms 01 and 11 into FP16 FMAs; term 10
+    // depends on the thread layout below. Keep the native single rounding.
+    // These public conversion helpers also work without CUDA.
+    let half = |x: f32| crate::cuda::f16_to_f32(crate::cuda::f32_to_f16(x));
     let num_grid_per_side = num_grid_per_side.max(1);
     let mut total_patches = 0usize;
     let mut cu_seqlens = Vec::with_capacity(grid_thw_list.len() + 1);
@@ -556,24 +658,16 @@ pub fn interpolate_pos_embed_and_rot_ids(
     let mut pos_hw = Vec::with_capacity(total_patches * 2);
 
     for &[t, h, w] in grid_thw_list {
-        let h_idxs: Vec<f32> = (0..h)
-            .map(|i| {
-                if h <= 1 {
-                    0.0
-                } else {
-                    (i as f32) * ((num_grid_per_side - 1) as f32) / ((h - 1) as f32)
-                }
-            })
-            .collect();
-        let w_idxs: Vec<f32> = (0..w)
-            .map(|i| {
-                if w <= 1 {
-                    0.0
-                } else {
-                    (i as f32) * ((num_grid_per_side - 1) as f32) / ((w - 1) as f32)
-                }
-            })
-            .collect();
+        // Python computes scales in double, then passes FP32 kernel arguments.
+        let scale = |size: usize| {
+            if size <= 1 {
+                0.0
+            } else {
+                ((num_grid_per_side - 1) as f64 / (size - 1) as f64) as f32
+            }
+        };
+        let h_scale = scale(h);
+        let w_scale = scale(w);
 
         let bh_max = h / spatial_merge_size;
         let bw_max = w / spatial_merge_size;
@@ -587,18 +681,20 @@ pub fn interpolate_pos_embed_and_rot_ids(
                             pos_hw.push(ih as i32);
                             pos_hw.push(iw as i32);
 
-                            let hy = h_idxs[ih];
-                            let wx = w_idxs[iw];
+                            let hy = ih as f32 * h_scale;
+                            let wx = iw as f32 * w_scale;
                             let hf = (hy.floor() as usize).min(num_grid_per_side - 1);
                             let hc = (hf + 1).min(num_grid_per_side - 1);
                             let wf = (wx.floor() as usize).min(num_grid_per_side - 1);
                             let wc = (wf + 1).min(num_grid_per_side - 1);
 
-                            let dh = hy - (hf as f32);
-                            let dw = wx - (wf as f32);
+                            // Triton contracts coordinate subtraction and w10/w01
+                            // into FP32 FMAs; floor still uses the rounded product.
+                            let dh = (ih as f32).mul_add(h_scale, -(hf as f32));
+                            let dw = (iw as f32).mul_add(w_scale, -(wf as f32));
                             let w11 = dh * dw;
-                            let w10 = dh - w11;
-                            let w01 = dw - w11;
+                            let w10 = (-dh).mul_add(dw, dh);
+                            let w01 = (-dh).mul_add(dw, dw);
                             let w00 = 1.0 - dh - w01;
 
                             let r00 = &pos_embed_weight_f32
@@ -610,8 +706,23 @@ pub fn interpolate_pos_embed_and_rot_ids(
                             let r11 = &pos_embed_weight_f32
                                 [(hc * num_grid_per_side + wc) * hidden_size..];
 
+                            let (w00, w01, w10, w11) = (half(w00), half(w01), half(w10), half(w11));
                             for c in 0..hidden_size {
-                                let v = w00 * r00[c] + w01 * r01[c] + w10 * r10[c] + w11 * r11[c];
+                                let p00 = half(w00 * r00[c]);
+                                let s01 = fused_half_mul_add(w01, r01[c], p00);
+                                // Native Triton uses four warps (128 threads).
+                                // With multiple elements per thread its compiled
+                                // FP16 chain contracts all three additions; the
+                                // single-element layout leaves the middle product
+                                // materialized. Verified against installed 3.7.1
+                                // sm86 PTX at sampled widths 3..128 and 129..1152, plus
+                                // independent full-grid model-width fingerprints.
+                                let s10 = if hidden_size > 128 {
+                                    fused_half_mul_add(w10, r10[c], s01)
+                                } else {
+                                    half(s01 + half(w10 * r10[c]))
+                                };
+                                let v = fused_half_mul_add(w11, r11[c], s10);
                                 pos_interp.push(v);
                             }
                         }
@@ -895,8 +1006,48 @@ impl Qwen3VisionEncoder {
         cublas: &CublasHandle,
         stream: &CudaStream,
     ) -> Result<DeviceBuffer> {
+        self.encode_images_with_trace(images, cublas, stream, None)
+    }
+
+    /// Diagnostic replay only: three rows per stage, widened on the host.
+    /// Shapes are normalized to [rows, channels], removing native singleton axes.
+    pub fn encode_images_with_trace(
+        &self,
+        images: &[PreprocessedImage],
+        cublas: &CublasHandle,
+        stream: &CudaStream,
+        mut trace: Option<&mut VisionTrace>,
+    ) -> Result<DeviceBuffer> {
+        macro_rules! sample {
+            ($name:expr, $buf:expr, $rows:expr, $cols:expr) => {
+                if let Some(ref mut trace) = trace {
+                    let rows: usize = $rows;
+                    let cols: usize = $cols;
+                    let key = format!("vision_trace.{}", $name);
+                    if rows > 0 && !trace.contains_key(&key) {
+                        let mut data = Vec::with_capacity(3 * cols);
+                        for row in [0, rows / 2, rows - 1] {
+                            let mut host = vec![0u16; cols];
+                            check_rc(
+                                unsafe {
+                                    ffi::w34_memcpy_d2h_async(
+                                        host.as_mut_ptr() as *mut c_void,
+                                        ($buf.addr() + (row * cols * 2) as u64) as *const c_void,
+                                        cols * 2,
+                                        stream.handle,
+                                    )
+                                },
+                                "vision trace row",
+                            )?;
+                            stream.synchronize()?;
+                            data.extend(host.into_iter().map(f16_to_f32));
+                        }
+                        trace.insert(key, (vec![3, cols], data));
+                    }
+                }
+            };
+        }
         let _dev = CudaDevice::set_current(self.device_id)?;
-        let ex = stream.exec(0, 0);
 
         let patch_dim = self.cfg.patch_input_dim();
         let hidden = self.cfg.hidden_size;
@@ -914,6 +1065,18 @@ impl Qwen3VisionEncoder {
             total_patches += img.num_patches();
         }
         let total_merged = total_patches / merge_unit;
+        // FA2 writes per-head logsumexp separately from QKV/output. Keep this
+        // workspace alive and reuse it across all vision blocks on this stream.
+        let attention_scratch_bytes = total_patches
+            .checked_mul(num_heads)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or(CudaError {
+                code: -1,
+                context: "vision attention scratch overflow",
+            })?;
+        let attention_scratch =
+            DeviceBuffer::alloc(self.device_id, attention_scratch_bytes.max(4))?;
+        let ex = stream.exec(attention_scratch.addr(), attention_scratch_bytes.max(4));
 
         let mut patches_f16 = Vec::with_capacity(total_patches * patch_dim);
         for img in images {
@@ -948,20 +1111,22 @@ impl Qwen3VisionEncoder {
         let d_mlp_interm = DeviceBuffer::alloc(self.device_id, total_patches * interm * 2)?;
 
         // 1. patch_embed.proj + bias + pos_embed
-        cublas.gemm_f16(
+        cublas.gemm_f16_bias(
             d_patches.addr(),
             self.patch_proj_w,
+            self.patch_proj_b,
             d_x.addr(),
             total_patches as i32,
             hidden as i32,
             patch_dim as i32,
         )?;
+        sample!("patch_embed", d_x, total_patches, hidden);
         check_rc(
             unsafe {
                 ffi::w34_vision_bias_add_f16(
                     &ex,
                     d_x.addr() as *const c_void,
-                    self.patch_proj_b as *const c_void,
+                    core::ptr::null(),
                     d_pos_interp.addr() as *const c_void,
                     d_x.addr() as *mut c_void,
                     total_patches as i32,
@@ -974,7 +1139,8 @@ impl Qwen3VisionEncoder {
         let use_tanh = i32::from(self.cfg.hidden_act.contains("tanh"));
 
         // 2. Transformer blocks 0..depth
-        for blk in &self.blocks {
+        for (index, blk) in self.blocks.iter().enumerate() {
+            sample!(format!("blocks.{index}.input"), d_x, total_patches, hidden);
             check_rc(
                 unsafe {
                     ffi::w34_vision_layernorm_f16(
@@ -990,22 +1156,35 @@ impl Qwen3VisionEncoder {
                 },
                 "w34_vision_layernorm_f16(norm1)",
             )?;
+            sample!(
+                format!("blocks.{index}.norm1"),
+                d_norm,
+                total_patches,
+                hidden
+            );
 
-            cublas.gemm_f16(
+            cublas.gemm_f16_bias(
                 d_norm.addr(),
                 blk.qkv_w,
+                blk.qkv_b,
                 d_qkv.addr(),
                 total_patches as i32,
                 (3 * hidden) as i32,
                 hidden as i32,
             )?;
+            sample!(
+                format!("blocks.{index}.qkv"),
+                d_qkv,
+                total_patches,
+                3 * hidden
+            );
 
             check_rc(
                 unsafe {
                     ffi::w34_vision_qkv_rope_attn_f16(
                         &ex,
                         d_qkv.addr() as *mut c_void,
-                        blk.qkv_b as *const c_void,
+                        core::ptr::null(),
                         d_pos_hw.addr() as *const i32,
                         d_cu_seqlens.addr() as *const i32,
                         d_attn_out.addr() as *mut c_void,
@@ -1018,22 +1197,35 @@ impl Qwen3VisionEncoder {
                 },
                 "w34_vision_qkv_rope_attn_f16",
             )?;
+            sample!(
+                format!("blocks.{index}.attn_output"),
+                d_attn_out,
+                total_patches,
+                hidden
+            );
 
-            cublas.gemm_f16(
+            cublas.gemm_f16_bias(
                 d_attn_out.addr(),
                 blk.proj_w,
+                blk.proj_b,
                 d_proj_out.addr(),
                 total_patches as i32,
                 hidden as i32,
                 hidden as i32,
             )?;
+            sample!(
+                format!("blocks.{index}.proj"),
+                d_proj_out,
+                total_patches,
+                hidden
+            );
 
             check_rc(
                 unsafe {
                     ffi::w34_vision_bias_add_f16(
                         &ex,
                         d_proj_out.addr() as *const c_void,
-                        blk.proj_b as *const c_void,
+                        core::ptr::null(),
                         d_x.addr() as *const c_void,
                         d_x.addr() as *mut c_void,
                         total_patches as i32,
@@ -1058,22 +1250,35 @@ impl Qwen3VisionEncoder {
                 },
                 "w34_vision_layernorm_f16(norm2)",
             )?;
+            sample!(
+                format!("blocks.{index}.norm2"),
+                d_norm,
+                total_patches,
+                hidden
+            );
 
-            cublas.gemm_f16(
+            cublas.gemm_f16_bias(
                 d_norm.addr(),
                 blk.fc1_w,
+                blk.fc1_b,
                 d_mlp_interm.addr(),
                 total_patches as i32,
                 interm as i32,
                 hidden as i32,
             )?;
+            sample!(
+                format!("blocks.{index}.fc1"),
+                d_mlp_interm,
+                total_patches,
+                interm
+            );
 
             check_rc(
                 unsafe {
                     ffi::w34_vision_bias_gelu_f16(
                         &ex,
                         d_mlp_interm.addr() as *const c_void,
-                        blk.fc1_b as *const c_void,
+                        core::ptr::null(),
                         d_mlp_interm.addr() as *mut c_void,
                         total_patches as i32,
                         interm as i32,
@@ -1083,21 +1288,28 @@ impl Qwen3VisionEncoder {
                 "w34_vision_bias_gelu_f16(mlp.fc1)",
             )?;
 
-            cublas.gemm_f16(
+            cublas.gemm_f16_bias(
                 d_mlp_interm.addr(),
                 blk.fc2_w,
+                blk.fc2_b,
                 d_proj_out.addr(),
                 total_patches as i32,
                 hidden as i32,
                 interm as i32,
             )?;
+            sample!(
+                format!("blocks.{index}.fc2"),
+                d_proj_out,
+                total_patches,
+                hidden
+            );
 
             check_rc(
                 unsafe {
                     ffi::w34_vision_bias_add_f16(
                         &ex,
                         d_proj_out.addr() as *const c_void,
-                        blk.fc2_b as *const c_void,
+                        core::ptr::null(),
                         d_x.addr() as *const c_void,
                         d_x.addr() as *mut c_void,
                         total_patches as i32,
@@ -1106,7 +1318,10 @@ impl Qwen3VisionEncoder {
                 },
                 "w34_vision_bias_add_f16(mlp.fc2)",
             )?;
+            sample!(format!("blocks.{index}.output"), d_x, total_patches, hidden);
         }
+
+        sample!("merger.input", d_x, total_patches, hidden);
 
         // 3. PatchMerger: LayerNorm(hidden_size) -> view [total_merged, 4 * hidden_size] -> fc1 -> exact GELU -> fc2
         check_rc(
@@ -1128,9 +1343,10 @@ impl Qwen3VisionEncoder {
         let d_merger_mid = DeviceBuffer::alloc(self.device_id, total_merged * merger_hidden * 2)?;
         let d_visual_out = DeviceBuffer::alloc(self.device_id, total_merged * out_hidden * 2)?;
 
-        cublas.gemm_f16(
+        cublas.gemm_f16_bias(
             d_norm.addr(),
             self.merger_fc1_w,
+            self.merger_fc1_b,
             d_merger_mid.addr(),
             total_merged as i32,
             merger_hidden as i32,
@@ -1143,7 +1359,7 @@ impl Qwen3VisionEncoder {
                 ffi::w34_vision_bias_gelu_f16(
                     &ex,
                     d_merger_mid.addr() as *const c_void,
-                    self.merger_fc1_b as *const c_void,
+                    core::ptr::null(),
                     d_merger_mid.addr() as *mut c_void,
                     total_merged as i32,
                     merger_hidden as i32,
@@ -1153,30 +1369,17 @@ impl Qwen3VisionEncoder {
             "w34_vision_bias_gelu_f16(merger.fc1)",
         )?;
 
-        cublas.gemm_f16(
+        cublas.gemm_f16_bias(
             d_merger_mid.addr(),
             self.merger_fc2_w,
+            self.merger_fc2_b,
             d_visual_out.addr(),
             total_merged as i32,
             out_hidden as i32,
             merger_hidden as i32,
         )?;
 
-        check_rc(
-            unsafe {
-                ffi::w34_vision_bias_add_f16(
-                    &ex,
-                    d_visual_out.addr() as *const c_void,
-                    self.merger_fc2_b as *const c_void,
-                    core::ptr::null(),
-                    d_visual_out.addr() as *mut c_void,
-                    total_merged as i32,
-                    out_hidden as i32,
-                )
-            },
-            "w34_vision_bias_add_f16(merger.fc2)",
-        )?;
-
+        sample!("merger.output", d_visual_out, total_merged, out_hidden);
         Ok(d_visual_out)
     }
 }

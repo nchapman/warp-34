@@ -27,6 +27,11 @@ fn main() {
     let mut sources = Vec::new();
     let mut headers = Vec::new();
     walk_csrc(&csrc, &mut sources, &mut headers);
+    let vendor = csrc.parent().unwrap().join("vendor/vision-fa2");
+    let mut vendor_headers = Vec::new();
+    // Never discover/compile vendor translation units or tests.
+    walk_vendor(&vendor, &mut vendor_headers);
+    let vendor_epoch = newest_mtime(&vendor_headers).unwrap_or(0);
     sources.sort();
     headers.sort();
 
@@ -56,7 +61,15 @@ fn main() {
         let stem = src.file_stem().unwrap().to_str().unwrap();
         let obj = out.join(format!("{stem}.o"));
         let stamp = stamps.join(format!("{stem}.stamp"));
-        let content = format!("{flags}\n{}\n{header_epoch}\n", mtime(src).unwrap_or(0));
+        let dependency_epoch = if matches!(stem, "op_vision_fa2" | "op_paged_fa2") {
+            vendor_epoch
+        } else {
+            0
+        };
+        let content = format!(
+            "{flags}\n{}\n{header_epoch}\n{dependency_epoch}\n",
+            mtime(src).unwrap_or(0)
+        );
         let up_to_date = obj.exists()
             && fs::read_to_string(&stamp)
                 .map(|s| s == content)
@@ -114,11 +127,16 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=cudart");
     println!("cargo:rustc-link-lib=cublas");
+    println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cuda");
     println!("cargo:rustc-link-lib=stdc++");
 
     println!("cargo:rerun-if-changed={}", csrc.display());
-    for p in sources.iter().chain(headers.iter()) {
+    for p in sources
+        .iter()
+        .chain(headers.iter())
+        .chain(vendor_headers.iter())
+    {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -128,7 +146,23 @@ fn main() {
 }
 
 fn compile_one(nvcc: &Path, flags: &str, csrc: &Path, src: &Path, obj: &Path) {
-    let st = Command::new(nvcc)
+    let mut command = Command::new(nvcc);
+    if matches!(
+        src.file_stem().and_then(|s| s.to_str()),
+        Some("op_vision_fa2" | "op_paged_fa2")
+    ) {
+        let vendor = csrc.parent().unwrap().join("vendor/vision-fa2");
+        for path in ["flash-attn/src", "flash-attn/stubs", "cutlass/include"] {
+            command.arg("-I").arg(vendor.join(path));
+        }
+        command
+            .arg("-include")
+            .arg(vendor.join("flash-attn/fa2_compat_prelude.h"));
+        for feature in ["DROPOUT", "ALIBI", "SOFTCAP", "LOCAL"] {
+            command.arg(format!("-DFLASHATTENTION_DISABLE_{feature}"));
+        }
+    }
+    let st = command
         .args(flags.split_whitespace())
         .arg("-c")
         .arg("-I")
@@ -152,7 +186,7 @@ fn walk_csrc(dir: &Path, sources: &mut Vec<PathBuf>, headers: &mut Vec<PathBuf>)
         } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
             match ext {
                 "cu" => sources.push(p),
-                "h" | "cuh" => headers.push(p),
+                "h" | "cuh" | "hpp" => headers.push(p),
                 _ => {}
             }
         }
@@ -172,4 +206,18 @@ fn mtime(p: &Path) -> Option<u64> {
 
 fn newest_mtime(paths: &[PathBuf]) -> Option<u64> {
     paths.iter().filter_map(|p| mtime(p)).max()
+}
+
+fn walk_vendor(dir: &Path, headers: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            walk_vendor(&p, headers);
+        } else {
+            headers.push(p);
+        }
+    }
 }

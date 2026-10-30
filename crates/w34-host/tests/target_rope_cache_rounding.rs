@@ -23,6 +23,36 @@ fn target_rope_uses_native_half_cache_coefficients() {
         15533, 15704, 15638, 15620, 15580, 15432, 15426, 15414, 15377, 15375, 15372, 15364, 15363,
         15363, 15361, 15361, 15361, 15360, 15360, 15360, 15360, 15360, 15360, 15360, 15360,
     ];
+    check_native_rope(&native_q, &[15360; 256], [31, 47, 63], 15360);
+}
+
+#[test]
+fn target_rope_preserves_native_small_angle_coefficients() {
+    // Same installed native fused operator as above, with positions [1,1,1]
+    // and Q[32:64]=0. This exposes small sin terms hidden by all-ones inputs.
+    let native_q = [
+        14496, 15114, 15358, 15404, 15421, 15427, 15430, 15430, 15431, 15431, 15431, 15431, 15431,
+        15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431,
+        15431, 15431, 15431, 15431, 15431, 15431, 15154, 14557, 13852, 13181, 12429, 11650, 10922,
+        10247, 9438, 8674, 7964, 7244, 6449, 5703, 5014, 4245, 3466, 2738, 2060, 1252, 756, 458,
+        276, 167, 101, 61, 36, 22, 14, 9, 5, 3,
+    ];
+    let mut q = [15360; 256];
+    q[32..64].fill(0);
+    check_native_rope(&native_q, &q, [1, 1, 1], 15431);
+    // Near a sine zero, pow(theta, -exponent) and the native reciprocal of
+    // pow(theta, exponent) can produce distinct FP16 cache coefficients.
+    let native_q = [
+        15160, 14755, 48199, 48009, 15180, 48142, 15138, 13605, 14892, 15422, 15389, 15415, 15430,
+        15429, 15430, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431, 15431,
+        15431, 15431, 15431, 15431, 15431, 15431, 47255, 14960, 7678, 14349, 47223, 46448, 14520,
+        15380, 14828, 12390, 13495, 12735, 10186, 11319, 10521, 7904, 9074, 8320, 5650, 6802, 6129,
+        3420, 4557, 3842, 1210, 2335, 1584, 267, 579, 350, 59, 127,
+    ];
+    check_native_rope(&native_q, &q, [12, 43, 43], 15431);
+}
+
+fn check_native_rope(native_q: &[u16; 64], q: &[u16; 256], planes: [i32; 3], unrotated: u16) {
     let device = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(device.device_id).unwrap();
     let ex = stream.exec(0, 0);
@@ -34,16 +64,16 @@ fn target_rope_uses_native_half_cache_coefficients() {
     for m in [1usize, 16] {
         let mut qg = Vec::new();
         for _ in 0..m {
-            qg.extend_from_slice(&[15360; 256]);
+            qg.extend_from_slice(q);
             qg.extend_from_slice(&[14336; 256]);
         }
         let qg = upload(&qg);
-        let k = upload(&vec![48128; m * 256]);
+        let k = upload(&q.iter().map(|v| v ^ 0x8000).collect::<Vec<_>>().repeat(m));
         let w = upload(&[0; 256]);
         let qout = upload(&vec![0; m * 256]);
         let kout = upload(&vec![0; m * 256]);
         let gout = upload(&vec![0; m * 256]);
-        let positions: Vec<i32> = [31, 47, 63].into_iter().flat_map(|p| vec![p; m]).collect();
+        let positions: Vec<i32> = planes.into_iter().flat_map(|p| vec![p; m]).collect();
         let pos = DeviceBuffer::alloc(device.device_id, positions.len() * 4).unwrap();
         pos.copy_from_host(&positions, &stream).unwrap();
         // SAFETY: buffers sized for m rows, one Q/K head, 256 channels;
@@ -83,7 +113,7 @@ fn target_rope_uses_native_half_cache_coefficients() {
                     let expected = if name == "gate" {
                         14336
                     } else {
-                        let q = if i < 64 { native_q[i] } else { 15360 };
+                        let q = if i < 64 { native_q[i] } else { unrotated };
                         if name == "k" { q ^ 0x8000 } else { q }
                     };
                     assert_eq!(

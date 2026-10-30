@@ -529,7 +529,8 @@ fn phase5_2_vision_cuda_kernels_and_embedding_splice() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _dev = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();
-    let ex = stream.exec(0, 0);
+    let attention_scratch = DeviceBuffer::alloc(0, 4 * 2 * 4).unwrap();
+    let ex = stream.exec(attention_scratch.addr(), 4 * 2 * 4);
 
     // Test LayerNorm + 2D RoPE full attention + GELU + embedding splice
     let total_tokens = 4usize;

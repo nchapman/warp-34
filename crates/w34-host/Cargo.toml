@@ -30,6 +30,10 @@ toktrie_hf_tokenizers = "=1.9.1"
 # Resolver API is unversioned; pin the audited public-address filtering seam.
 ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Use the supported v3 API directly: the safe wrapper lacks memory/scan limits.
+# Bundled static libjpeg-turbo; no system library or Python runtime required.
+turbojpeg-sys = { version = "=1.1.1", default-features = false, features = ["cmake"] }
 
 [dev-dependencies]
+sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

@@ -1440,6 +1440,9 @@ extern "C" int w34_paged_attention_bf16(const w34_exec* ex, const w34_kv_layer_l
     return (int)cudaGetLastError();
 }
 
+extern "C" int w34_paged_fa2_try(const w34_exec*, const w34_kv_layer_layout*,
+    const w34_attention_batch*, const void*, void*, int);
+
 extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_layout* layout,
                                        const w34_attention_batch* batch,
                                        const void* q_in, void* attn_out,
@@ -1448,6 +1451,9 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
         return (int)cudaErrorInvalidValue;
     }
     if (batch->total_tokens <= 0 || num_q_heads <= 0) return 0;
+
+    const int fa2_rc = w34_paged_fa2_try(ex, layout, batch, q_in, attn_out, num_q_heads);
+    if (fa2_rc != -1) return fa2_rc; // CUDA failure is not fallback eligibility.
 
     const bool can_use_gqa_mma =
         (layout->head_dim == 256) &&
