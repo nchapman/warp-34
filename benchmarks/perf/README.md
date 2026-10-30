@@ -1,0 +1,209 @@
+# Standalone serving performance suite
+
+Engine-neutral, **4-bit-weight deployment comparisons** for 1–2× RTX 3090 Ti.
+Python 3.11+ standard library only. Copy this directory to another machine and
+run it without Cargo, CUDA libraries, engine packages, or `tools/oracle`.
+This is a black-box HTTP client, **not** an oracle, profiler, kernel microbench,
+or automatic benchmark-results claim.
+
+- [Plan and persistent task list](PLAN.md)
+- [Engine recipes, qualification, and KV matrix](engines.md)
+- [Experiment template](suite.toml) — 10 deployment profiles, 13 workload cases
+
+## Quick start
+
+From the repository root, start **one** server (no download or process management
+is performed by the suite):
+
+```sh
+export PATH="/opt/cuda/bin:$PATH"
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
+  --model nchapman/Qwen3.5-4B-W4A16-GPTQ \
+  --kv-format fp16 --kv-pages 4096 --port 8000
+```
+
+In another terminal:
+
+```sh
+cd benchmarks/perf
+python3 -m w34perf validate suite.toml
+python3 -m w34perf plan suite.toml                 # no network or GPU access
+python3 -m w34perf run suite.toml --engine warp34-1-fp16 \
+  --case smoke --out results/warp34-fp16-smoke-001
+python3 -m w34perf report results/warp34-fp16-smoke-001 > /tmp/perf-report.md
+python3 -m w34perf report results/warp34-fp16-smoke-001 --format csv > /tmp/perf-report.csv
+```
+
+An existing output directory is never overwritten. Select several `--case`s or
+omit `--case` to run the entire battery. Engine selection is mandatory. Each
+profile describes the server **you have actually launched**; the runner never
+runs `launch_command`. Most template profiles deliberately share a port: run
+those one at a time, stopping/relaunching the server between profiles. Selecting
+two profiles sharing an endpoint is rejected to prevent accidental relabeling.
+Multiple `--engine`s require distinct already-running endpoints and isolated
+hardware. Don't run competing engines simultaneously on the same cards.
+
+`run` exits 0 for completed, usage-accounted trials; 1 for request/session or
+token-accounting failures; 2 for configuration/setup errors; 130 on interrupt.
+A zero exit does **not** mean the run is publication-ready. Unknown provenance,
+quality evidence, failures, and release-audit requirements are visible in reports.
+No engine has been automatically installed, modified, or tuned.
+
+## Configuration and extension
+
+Copy `suite.toml` alongside its `fixtures/` directory (or adjust relative fixture
+paths). Add an `[[engines]]` table to support another OpenAI-compatible endpoint;
+no Python change is needed. `base_url` includes `/v1`. For a different API, add a
+small transport adapter and the same HTTP contract tests; do not fork metrics.
+Profiles can point to containers or another host. Local GPU metadata then
+identifies the **client**, not the remote server: attach server-side provenance
+and explicitly label remote/network latency in your release audit.
+
+Required deployment fields: `id`, `engine`, `version`, `model`, `base_url`,
+`gpu_count` (1 or 2), `parallelism`, `weight_format`, `kv_format`, `speculation`,
+`cache_config`, and `launch_command`. Shared fields go in `[engine_defaults]`.
+Before release, also fill `gpu_ids` (physical UUIDs), `source_model_revision`,
+`model_revision`, `artifact_sha256` (an inventory hash for sharded weights),
+`tokenizer_revision`, `chat_template_sha256`, `quantization_details`, and
+`quality_evidence` (path/hash of separately retained functional-quality results).
+`unknown` is allowed for exploration but becomes a publication blocker.
+**Metadata is operator-supplied, not proof that the server used that setting.**
+
+`request_overrides` holds engine-specific sampling/template options; e.g.
+`chat_template_kwargs.enable_thinking = false`. Workload, model, streaming,
+choice count, and usage-request fields cannot be overridden. For authentication,
+set `api_key_env = "BENCH_API_KEY"`; only the environment-variable name is saved,
+not the resolved key. Do not put secrets in URLs, commands, prompts, or config.
+There are no implicit retries: a 429, OOM, timeout, bad stream, or rejection stays
+in the trial. The client does not consult proxy environment variables.
+
+Cases support:
+
+- `requests`: text requests or **agent sessions**; `concurrency`: outstanding
+  closed-loop requests/sessions. Agent turns are sequential within each session.
+- `arrival = "closed"` (default), `"fixed"`, or `"poisson"`. Open-loop
+  `rate_rps` is offered **sessions/s** (requests/s for text). A fixed-seed
+  schedule is generated independently of completions. `run.max_inflight` caps
+  simultaneous sessions, not server admission; exhausted client slots are
+  recorded as `client_overload`, never hidden in an executor queue.
+- `max_tokens` is a ceiling, **not forced output length**. Natural EOS is kept.
+  `context_repetitions` scales fixture context; it is not a token-count promise.
+  Actual server usage is retained. Calibrate pinned token/context buckets before
+  publishing comparisons at exact 8K/32K/128K/262K lengths.
+- `mix` cycles deterministic `{context_repetitions, max_tokens}` shapes for
+  mixed prefill/decode traffic. All payloads are saved; shape-specific slicing
+  can be done from the raw journal.
+- `cache = "unique"`: a different leading session tag before shared system
+  text for each request, and a disjoint tag for warmup. This avoids full shared
+  prefixes; it does not prove a completely cold cache or disable cache lookup.
+- `cache = "primed"`: explicitly replay the entire identical input set before
+  each trial. Priming artifacts are retained but excluded from measured totals.
+  Capacity/eviction may prevent hits: primed means **attempted reuse**, not a
+  verified 100% hit rate. Actual cache settings and counters require audit.
+- `cache = "natural"`: shared system context and growing agent histories.
+  Each repetition uses a new namespace. Engine JIT warmups use a disjoint one.
+- Optional `ttft_slo_ms`, `e2e_slo_ms`, `tpot_slo_ms`. The legacy-style TTFT
+  name is the threshold for **first observable output**, not a verified first
+  generated token. Goodput is successful requests satisfying all supplied SLOs
+  divided by the entire measured wall interval.
+
+## Battery and agent replay
+
+Included: smoke, single-client interactive, long generation, prefill-heavy,
+long-context, concurrency 8/16, primed prefix reuse, Poisson arrivals, mixed
+traffic, and coding-agent replay at 1/8/16 concurrent sessions. Duplicate cases
+to sweep concurrency, request rate, context, and output ceilings. Settings are
+explicit data, not special cases in engine implementations.
+
+The original checked-in coding-agent fixture covers repository discovery,
+issue triage, file reads/search, regression-test feedback, patch proposal, and
+final review. Each four-turn session retains the **actual preceding generated
+assistant responses**, appends recorded tool-call/result pairs, and waits a
+configurable simulated tool/think interval between turns. Different sessions
+can interleave. Tools never read files, run tests, execute commands, or call
+external services. This isolates inference costs and repeatable prefix/growing-
+context pressure. Unexpected live tool calls fail the replay session.
+
+This is a **realistic agent-shaped replay**, not a SWE-bench score, autonomous
+agent, or validated tool-selection/patch-success benchmark. Identical fixture
+inputs do not guarantee identical later inputs: generated histories can differ.
+The report must not claim token-aligned multi-turn workloads. Autonomous tool
+loops and additional research/support fixtures are explicit follow-up tasks.
+
+## Measurement contract
+
+Every HTTP request uses a new connection. E2E and first-output latency include
+connect/TLS overhead, request transmission, queueing, and transport. This is a
+consistent client-observed serving baseline, not kernel decode speed. Connection
+pooling and remote-client isolation are future lanes.
+
+- **First output**: first nonempty content, reasoning, or tool-call delta;
+  role-only, usage-only, and keepalive events are excluded.
+- **First text**: first nonempty `content` delta, separately recorded.
+- **E2E**: submission to `[DONE]`, including final usage. Finish reason and
+  observable output are required; truncated/error SSE streams fail closed.
+- **Completion tokens**: server-reported `usage.completion_tokens`, validated
+  as a positive integer. Counts include whatever the engine reports (potentially
+  reasoning and hidden terminal tokens). Full usage, including cache/reasoning
+  detail where present, is saved. No output retokenization or chunk-count fallback.
+  If any successful response lacks valid usage, trial token throughput is `null`.
+- **tok/s**: successful accounted completion tokens over full trial wall time,
+  including fill, drain, errors, agent think time, and client-side overhead.
+  This is finite-run throughput, **not steady-state saturation capacity**.
+- **TPOT estimate**: `(last output event - first output event)/(usage tokens-1)`.
+  It is only a usage/span estimate, **not ITL**; buffered/speculative output,
+  hidden tokens, and reasoning can bias it. Single-burst streams yield `null`.
+- **Chunk gaps**: actual output-event gaps, labeled as chunks. No token-arrival
+  histogram or GPU decode-latency claim is made from these.
+- **Failures** and offered sessions remain visible. Failed partial outputs do
+  not contribute successful throughput. Schedule lag reveals client limitations.
+  Per-request hard deadlines also cover trickle streams. Response bytes are bounded.
+- **Statistics**: p50/p90/p95/p99, mean, max, sample counts; median and min/max
+  throughput across independent configured trials. Trials are never pooled into
+  a misleading p99. Fewer than 100 successes warns against tail claims; meaningful
+  p99 work needs much larger samples. No confidence interval is fabricated.
+
+Agent session latency includes tool delays; per-turn latency does not. Session
+throughput and request throughput are both saved. Session completion measures
+transport/replay completion only, not answer quality. Early EOS, stop reasons,
+and actual output-length distributions must accompany claims.
+
+## Evidence and reproducibility
+
+Each directory contains:
+
+- `manifest.json`: resolved config, parsed fixture data and hashes, selected
+  cases/deployments, suite source inventory/hash/version, Git revision/status,
+  timestamps, Python/platform, local GPU UUID/model/driver/power limit/link and
+  topology snapshots, GPU processes, completion/failure state.
+- `requests.jsonl`: flushed append-only request/session records, exact wire
+  payloads and hashes, every parsed SSE event with client timestamp, content,
+  reasoning/tool deltas, usage, finish reason, timings, and errors. Warmup,
+  priming, and measurement phases are separate. Interrupted runs retain evidence.
+- `summary.json`: per-trial distributions and publication blockers (written
+  after each measured trial).
+- `SHA256SUMS.json`: finalized artifact-file hashes. Derived Markdown/CSV reports
+  go to stdout and don't mutate signed/raw evidence.
+
+Runs stay under ignored `results/` by default. Raw prompts, tool results, and
+model responses may be sensitive; **use only public/sanitized fixtures** for
+shareable runs. Do not blindly publish arbitrary real agent traces.
+
+Before sharing, attach exact server executable/container digest, full launch
+log/config, immutable weight-file inventory and byte size, source-model mapping,
+quality evidence, hardware/OS/driver/runtime details, cache/speculation settings,
+GPU clocks/temperature/power conditions, and all failure/unsupported rows. Local
+snapshots are not sampled peak VRAM or energy measurements. There is deliberately
+no automatic speedup/winner ranking across unqualified deployments.
+
+## Testing
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m w34perf validate suite.toml
+# From repo root: mise run perf-check (also included in mise run check).
+```
+
+Tests use pure calculations and real local HTTP/SSE servers. No engine, GPU,
+or oracle fixtures are needed. See `PLAN.md` for remaining release gates.

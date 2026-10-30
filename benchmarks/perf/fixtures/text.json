@@ -1,0 +1,14 @@
+{
+  "system": "You are a concise technical assistant. Answer the task directly, without a thinking preamble.",
+  "context": "Service design notes: The service has three stateless API workers and a Redis cache. Requests have a 250ms deadline. The cache uses a 60-second TTL. Invalidation occurs after the database transaction commits. Background refresh uses a bounded queue and exponential backoff. The database is authoritative. Stale reads are permitted only for the product catalog, not inventory. Each request carries a trace ID. Errors and latency histograms are emitted per route. ",
+  "prompts": [
+    "Explain three likely causes of a sudden p95 latency regression in an API service, and how to distinguish them.",
+    "Write a Python function that merges two sorted iterators without loading either into memory. Include a small example.",
+    "Review this cache policy: get a cached value, fall back to the database, then cache for 60 seconds. Explain the invalidation race and suggest a practical fix.",
+    "Draft a concise incident summary for a database connection-pool exhaustion event: impact, root cause, mitigation, and follow-up work.",
+    "Compare optimistic and pessimistic concurrency control for a shopping-cart update API. Give a recommendation and tradeoffs.",
+    "Describe a safe rollout plan for changing the schema of a high-traffic service without downtime.",
+    "Implement a bounded asynchronous work queue in Python and explain cancellation behavior.",
+    "Give a checklist for diagnosing memory growth in a long-running inference HTTP server. Prioritize the first five measurements."
+  ]
+}

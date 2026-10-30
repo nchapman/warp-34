@@ -56,7 +56,11 @@ run = "cargo test --release --features cuda"
 
 [tasks.check]
 description = "Format check, clippy (both states), and full release test suite"
-depends = ["fmt-check", "clippy", "clippy-cpu", "test", "oracle-check"]
+depends = ["fmt-check", "clippy", "clippy-cpu", "test", "oracle-check", "perf-check"]
+
+[tasks."perf-check"]
+description = "CPU-only tests and manifest validation for the independent performance suite"
+run = "cd benchmarks/perf && python3 -m unittest discover -s tests -v && python3 -m w34perf validate suite.toml"
 
 [tasks."oracle-check"]
 description = "Host-only validation of real-image oracle and long-context gate harnesses"

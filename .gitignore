@@ -2,6 +2,7 @@
 /target-cov/
 /vendor/
 /models/
+/benchmarks/perf/results/
 *.nsys-rep
 *.sqlite
 __pycache__/

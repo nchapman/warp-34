@@ -14,6 +14,40 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### Independent publication performance suite (2026-10-30)
+
+- Added copyable stdlib-only Python suite at [`benchmarks/perf/`](../benchmarks/perf/README.md),
+  independent of `tools/oracle` and engine internals. Its [plan/task ledger](../benchmarks/perf/PLAN.md)
+  separates implemented runner work from remaining artifact/engine qualification,
+  KV quality/capacity coverage, and release campaigns.
+- **4-bit weights are the primary comparison common ground**: share GPTQ artifacts
+  where possible; qualify nearest GGUF/ninfer equivalents with source-model,
+  quantization, tokenizer/template and artifact provenance. KV precision is a
+  separate axis; no claim that all 4-bit formats or model families are equivalent.
+- Includes 10 candidate one-/two-card profiles for warp-34, vLLM, SGLang,
+  llama.cpp and Don-Chad/ninfer-3090, plus 13 serving/agent cases. Ninfer Linux
+  pipeline is explicitly experimental/unqualified; no TP=2/DFlash claim.
+  Competitor launch/artifact qualification and the common 27B selection are **not done**.
+- Implements finite closed-loop and fixed/Poisson open-loop trials, client-overload
+  recording, warmup/priming separation, actual-usage token accounting, client
+  first-output/text/E2E, explicitly estimated TPOT (not token ITL), SLO goodput,
+  multi-turn coding-agent tool-result replay, flushed raw request/SSE/session
+  evidence, provenance/artifact hashes, and derived Markdown/CSV reports.
+- Local cached 4B warp-34 HTTP validation passes **TP1 FP16 KV** (16 measured
+  requests across reduced smoke/concurrent/prefix/Poisson/agent cases) and
+  **TP2 TQ4 KV** (12 measured short/mixed/agent requests), with valid usage.
+  Artifacts: `/tmp/w34-perf-tp1-smoke-fixed/`, `/tmp/w34-perf-tp2-smoke/`.
+  These are one-repetition harness smoke tests, **not comparative speed results**.
+  Both test servers were stopped. The earlier failed replay is retained and
+  fixed with tested explicit `tool_choice=none`.
+- Final `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **212.22 s**:
+  208 Rust tests/doc-tests, 69 oracle tests, **22 independent performance tests**,
+  formatting and both Clippy feature states (`/tmp/w34-perf-final-check.log`).
+  Initial and bounded follow-up reviews completed; all three Important issues
+  fixed with reproduced regressions, no Important/Critical findings remain.
+  Nonblocking hardening suggestions and the unrelated existing Docker health
+  suggestion are explicitly triaged in the suite task ledger.
+
 ### Local slim Docker runtime (2026-10-30)
 
 - Added `Dockerfile` and a build-input allowlist in `.dockerignore`, with local

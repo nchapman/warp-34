@@ -36,6 +36,25 @@ mise run check-quick    # fmt --check + clippy (with and without cuda)
 mise run check          # fmt + clippy + release test suite
 ```
 
+## Standalone performance comparisons
+
+[`benchmarks/perf/`](benchmarks/perf/README.md) is a separate, engine-neutral
+HTTP performance suite for warp-34, vLLM, SGLang, llama.cpp, and ninfer-3090.
+It uses approximately equivalent **4-bit weights**, treats KV precision as a
+separate axis, and includes single-/dual-card deployment profiles, serving load,
+prefix reuse, mixed traffic, and multi-turn coding-agent replay. It does not
+import development oracles. See its [plan and task ledger](benchmarks/perf/PLAN.md)
+for remaining artifact/engine qualification and publication gates.
+
+```sh
+mise run perf-check  # CPU-only suite tests + experiment validation
+cd benchmarks/perf
+python3 -m w34perf plan suite.toml
+# Start the chosen server separately, then:
+python3 -m w34perf run suite.toml --engine warp34-1-fp16 --case smoke \
+  --out results/warp34-smoke-001
+```
+
 ## Local Docker
 
 Requires an x86-64 host with AVX2 (`x86-64-v3`), RTX 3090 Ti GPU(s), a
