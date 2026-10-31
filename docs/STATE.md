@@ -14,6 +14,18 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### 1-GPU 27B FP16 (`0df`) kernel, scheduler, and serving sweep — 4/4 win over `vLLM 0.31.0` and `SGLang v0.5.19` (2026-10-30)
+
+- Optimized `TP=1` 27B FP16 (`0df81ead...`, frozen `benchmarks/perf/campaigns/27b-fp16-first.toml` on GPU 0, `kv_pages = 512`, `tool_choice = "none"` grammar intact) across kernels, scheduler, and serving without altering precision (`FP16` spine, `FP32` `ssm_state`) or 0-ULP `M`-invariance / continuation parity:
+  - **Norms, small-N GEMM, Marlin, Attention, and GDN (`w34-kernels`):** `vec8` `uint4` `GemmaRMSNorm` + `SiLU*Mul` up to `hidden_size = 6144`; 3-tier 256-thread 0-ULP `M`-invariant `small_n_gemm_f16` / `small_n_gemm_dual_f16` (`<1,4>` at `M=1`, `<4,4>` at `M<=16`, low-register `4x4` at `M>16`); Marlin `M_BLOCKS = 3` (`M=33..48`), 1-slice `80`-SM `cfg128 = {128, 64, 128}` for `prob_m_split <= 64` wide-`N` (`N=5120`), and `max_par = 64` (eliminating extra `14.5 GB` weight passes at `M=1331`); `short_split` + `MIN_PAGES_PER_SPLIT = 4` GQA-MMA paged attention; token-tiled `gdn_causal_conv1d_f16`, write-back `<8,6>` (`nh>=96`) / `<4,12>` GDN decode, and bank-conflict-free SoA `TILE_S = 16` `<8,5>` (`nh>=96`) / `<4,5>` GDN prefill. All new specializations are warmed in `prepare_execution_plan()` with `STACK:0` verified via `cuobjdump --dump-resource-usage`.
+  - **Scheduler & serving (`w34-host`):** `SchedulerConfig` `max_num_batched_tokens = 1408` / `chunk_prefill_size = 1408` with scratch-arena safety clamp; wave-aware `prev_active_peak` idle burst coalescing (`3.5 ms` quiet cap); deferred `llguidance` post-launch bitmask overlap + `96 KiB` pinned sampler DMA; checkpoint-aware `detect_default_preserve_thinking` (handling both `chat_template.jinja` and string/list `tokenizer_config.json`).
+- **Final frozen-campaign comparison (`benchmarks/perf/results/27b-fp16-final-20261030-215439`, 96/96 requests ok, binary SHA-256 `1cf2e2dc...`) vs [first 3-engine baseline](../benchmarks/perf/campaigns/27b-fp16-first.md) (`warp-34` trial median / 3-rep aggregate vs `vLLM 0.31.0` / `SGLang v0.5.19`):**
+  - `decode-c1`: **51.76 / 51.73 tok/s** (TTFT p50 **162.83 ms**, TPOT **18.74 ms**, E2E p50 **4943.90 ms**) vs baseline `45.47` (`vLLM` `50.75`, `SGLang` `51.70`).
+  - `throughput-c8`: **310.17 / 309.25 tok/s** (TTFT p50 **981.68 ms**, TPOT **22.01 ms**, E2E p95 **6599.77 ms**) vs baseline `287.02` (`vLLM` `309.14`, E2E p95 `6708.87 ms`; `SGLang` `226.58`, E2E p95 `9206.99 ms`).
+  - `agent-c1`: **48.55 / 48.65 tok/s** (TTFT p50 **128.38 ms**, TPOT **19.06 ms**, E2E p95 **2661.70 ms**) vs baseline `39.35` (`vLLM` `41.10`, `SGLang` `45.72`).
+  - `prefill-primed-c1`: **51.95 / 51.95 tok/s** (TTFT p50 **31.31 ms**, TPOT **19.15 ms**, E2E p95 **2469.54 ms**) vs baseline `44.69` (`vLLM` `42.91`, `SGLang` `50.64`).
+- Full post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **268.06 s** (`fmt-check`, `clippy` with/without CUDA, 69 oracle tests, 47 `w34perf` tests, and all Rust unit/doc/GPU integration gates across `TP=1` and `TP=2`), and `w34 serve` is stopped with both GPUs clear.
+
 ### First fresh three-engine 27B FP16 comparison (2026-10-30)
 
 - [Results and exact campaign](../benchmarks/perf/campaigns/27b-fp16-first.md):

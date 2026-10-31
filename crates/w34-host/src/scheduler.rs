@@ -22,11 +22,11 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            max_num_batched_tokens: 512,
+            max_num_batched_tokens: 1408,
             max_num_seqs: 16,
             page_size: 16,
             mamba_chunk_size: 64,
-            chunk_prefill_size: 256,
+            chunk_prefill_size: 1408,
         }
     }
 }
@@ -437,11 +437,11 @@ mod tests {
     #[test]
     fn test_scheduler_config_defaults() {
         let cfg = SchedulerConfig::default();
-        assert_eq!(cfg.max_num_batched_tokens, 512);
+        assert_eq!(cfg.max_num_batched_tokens, 1408);
         assert_eq!(cfg.max_num_seqs, 16);
         assert_eq!(cfg.page_size, 16);
         assert_eq!(cfg.mamba_chunk_size, 64);
-        assert_eq!(cfg.chunk_prefill_size, 256);
+        assert_eq!(cfg.chunk_prefill_size, 1408);
         assert!(cfg.chunk_prefill_size.is_multiple_of(cfg.mamba_chunk_size));
     }
 

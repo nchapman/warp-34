@@ -92,9 +92,9 @@ fn vec8_rms_norm_and_silu_mul_match_vec2_fallback_zero_ulp() {
     let stream = CudaStream::new(device.device_id).unwrap();
     let ex = stream.exec(0, 0);
 
-    // 1. Fused residual + GemmaRMSNorm: compare 16B-aligned `vec8` against +4B-offset `vec2`
-    // across `hidden_size = 2560` (4B) and `4096`, including a masked invalid token row.
-    for hs in [2560usize, 4096] {
+    // 1. Fused residual + GemmaRMSNorm: compare 16B-aligned `vec8` against +4B-offset scalar
+    // fallback across `hidden_size = 2560` (4B), `4096`, and `5120` (27B), including a masked row.
+    for hs in [2560usize, 4096, 5120] {
         let rows = 3usize;
         let pad_u16 = 2usize; // +4 bytes breaks 16B alignment while preserving 4B `vec2` alignment
         let mut x_host = vec![0u16; pad_u16 + rows * hs];

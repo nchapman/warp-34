@@ -866,7 +866,9 @@ fn dual_small_n_gemm_and_warp256_router_match_references() {
     d_w0.copy_from_host(&w0_host, &stream).unwrap();
     d_w1.copy_from_host(&w1_host, &stream).unwrap();
 
-    for m in [1usize, 4, 8] {
+    let mut ref0_m23 = Vec::new();
+    let mut ref1_m23 = Vec::new();
+    for m in [23usize, 17, 16, 8, 7, 4, 1] {
         let x_host: Vec<u16> = (0..m * size_k)
             .map(|i| f32_to_f16(((i % 89) as f32 - 44.0) * 0.02))
             .collect();
@@ -933,6 +935,21 @@ fn dual_small_n_gemm_and_warp256_router_match_references() {
         stream.synchronize().unwrap();
         assert_eq!(got0, ref0, "dual_small_n out0 0-ULP mismatch at M={m}");
         assert_eq!(got1, ref1, "dual_small_n out1 0-ULP mismatch at M={m}");
+        if m == 23 {
+            ref0_m23 = ref0;
+            ref1_m23 = ref1;
+        } else {
+            assert_eq!(
+                &ref0[..],
+                &ref0_m23[..m * n0],
+                "small_n_gemm_f16 out0 0-ULP M-invariance mismatch at M={m} vs M=23"
+            );
+            assert_eq!(
+                &ref1[..],
+                &ref1_m23[..m * n1],
+                "small_n_gemm_f16 out1 0-ULP M-invariance mismatch at M={m} vs M=23"
+            );
+        }
     }
 
     // 2. Single-warp `moe_topk_router_warp256_f16` (`num_experts = 256, top_k = 8`) vs

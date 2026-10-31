@@ -247,6 +247,9 @@ static MarlinFuncPtr get_marlin_kernel_f16u4(thread_config_t const& th_config,
         MARLIN_CASE_F16U4(64, 256, 256, 2, false, 2)
         MARLIN_CASE_F16U4(64, 128, 128, 2, false, 2)
         MARLIN_CASE_F16U4(128, 64, 128, 2, false, 2)
+        MARLIN_CASE_F16U4(64, 256, 256, 3, false, 2)
+        MARLIN_CASE_F16U4(64, 128, 128, 3, false, 2)
+        MARLIN_CASE_F16U4(128, 64, 128, 3, false, 2)
         MARLIN_CASE_F16U4(64, 256, 256, 4, false, 2)
         MARLIN_CASE_F16U4(64, 128, 128, 4, false, 2)
         MARLIN_CASE_F16U4(128, 64, 128, 4, false, 2)
@@ -262,6 +265,9 @@ static MarlinFuncPtr get_marlin_kernel_f16u4(thread_config_t const& th_config,
         MARLIN_CASE_F16U4(64, 256, 256, 2, false, 8)
         MARLIN_CASE_F16U4(64, 128, 128, 2, false, 8)
         MARLIN_CASE_F16U4(128, 64, 128, 2, false, 8)
+        MARLIN_CASE_F16U4(64, 256, 256, 3, false, 8)
+        MARLIN_CASE_F16U4(64, 128, 128, 3, false, 8)
+        MARLIN_CASE_F16U4(128, 64, 128, 3, false, 8)
         MARLIN_CASE_F16U4(64, 256, 256, 4, false, 8)
         MARLIN_CASE_F16U4(64, 128, 128, 4, false, 8)
         MARLIN_CASE_F16U4(128, 64, 128, 4, false, 8)
@@ -282,6 +288,9 @@ static MarlinFuncPtr get_marlin_kernel_f16u8(thread_config_t const& th_config,
     MARLIN_CASE_F16U8(64, 256, 256, 2, false, 2)
     MARLIN_CASE_F16U8(64, 128, 128, 2, false, 2)
     MARLIN_CASE_F16U8(128, 64, 128, 2, false, 2)
+    MARLIN_CASE_F16U8(64, 256, 256, 3, false, 2)
+    MARLIN_CASE_F16U8(64, 128, 128, 3, false, 2)
+    MARLIN_CASE_F16U8(128, 64, 128, 3, false, 2)
     MARLIN_CASE_F16U8(64, 256, 256, 4, false, 2)
     MARLIN_CASE_F16U8(64, 128, 128, 4, false, 2)
     MARLIN_CASE_F16U8(128, 64, 128, 4, false, 2)
@@ -358,21 +367,21 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     const int4* S_ptr = (const int4*)S;
 
     constexpr int stages = 4;
-    // For large-K `down_proj` (`prob_n >= 2048`, `(prob_n / 64) * 2 <= sms`, `prob_k >= 4608`,
-    // so both TP=1 `K=9216` and TP=2 `K=4608` take 2-way M-invariant Split-K while `K<=4096`
-    // projections stay 1-slice), keep `max_par = 1` and deterministic lock reduction.
+    // When `(prob_n / 64) * 2 <= sms` and `prob_k >= 4608` (e.g. 4B `down_proj` [9728 -> 2560]),
+    // `mn_tiles = 40` leaves over half of the 84 SMs idle. Force `max_par = 1` + deterministic
+    // 2-slice Split-K (`blocks = mn_tiles * 2 = 80`) across ALL `M = 1..16` with lock-based
+    // sequential reduction (no atomicAdd) so `M = 1..16` stay 0-ULP M-invariant!
+    // For wider `N` where `prob_n / 64 >= 80` (e.g. 27B `N = 5120 -> 80` tiles), 1-slice
+    // `cfg128 = {128, 64, 128}` already fills 80/84 SMs without Split-K reduction overhead.
     const bool enable_m_invariant_split_k =
-        (prob_m <= 16) && (prob_n >= 2048) && (((prob_n / 64) * 2 <= sms) && (prob_k >= 4608));
-    int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : 16);
+        (prob_m <= 16) && (prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608);
+    int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : 64);
     int rest_m = prob_m;
 
     while (rest_m > 0) {
         int par_count = rest_m / 64;
         if (par_count > max_par) par_count = max_par;
         int prob_m_split = par_count > 0 ? (par_count * 64) : rest_m;
-        if (prob_m_split > 32 && prob_m_split <= 48) {
-            prob_m_split = 32;
-        }
         int thread_m_blocks = std::min(div_ceil(prob_m_split, 16), 4);
         bool m_block_size_8 = prob_m_split <= 8;
 
@@ -380,8 +389,11 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
             prob_m_split, prob_n, prob_k, thread_m_blocks, m_block_size_8,
             group_blocks, num_bits, stages, max_shared_mem);
         if (th_cfg.thread_n != -1) {
+            const int cur_mn_tiles =
+                (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
             if (enable_m_invariant_split_k ||
-                (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16) * 4 <= sms) {
+                (prob_m_split <= 64 && cur_mn_tiles < sms && (prob_n / 64) * 2 > sms) ||
+                cur_mn_tiles * 4 <= sms) {
                 thread_config_t cfg128 = {128, 64, 128};
                 if (is_valid_config(cfg128, thread_m_blocks, prob_m_split, prob_n, prob_k,
                                     num_bits, group_blocks * 16, stages, max_shared_mem) &&

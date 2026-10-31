@@ -338,9 +338,14 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
             s.allow_remote_images,
         )?;
         let preserve = request
-            .pointer("/chat_template_kwargs/preserve_thinking")
+            .pointer("/chat_template_kwargs/preserve_reasoning")
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .or_else(|| {
+                request
+                    .pointer("/chat_template_kwargs/preserve_thinking")
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(s.worker.default_preserve_thinking);
         (
             super::format_chatml_prompt_with_options(
                 &messages,

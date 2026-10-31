@@ -26,8 +26,9 @@ __device__ __forceinline__ float softplus_f32(float x) {
     return (x > 20.0f) ? x : log1pf(expf(x));
 }
 
-// Grid: (ceil(conv_dim / 256), num_reqs), Block: 256 threads.
-// Processes one (request, channel) sliding window across the request's query tokens,
+// Grid: (ceil(conv_dim / 256), num_reqs, z_tiles), Block: 256 threads.
+// Processes one (request, channel) sliding window across the request's query tokens
+// (parallelized across `gridDim.z` token chunks of >= 32 tokens during prefill),
 // writing intermediate snapshots to spec_state_indices / checkpoint_dst_indices and
 // final state to state_out_indices.
 __global__ void gdn_causal_conv1d_f16_kernel(
@@ -53,15 +54,36 @@ __global__ void gdn_causal_conv1d_f16_kernel(
     if (seqlen <= 0) return;
 
     const int state_len = kernel_size - 1;  // 3 for kernel_size = 4
-    float hist[3] = {0.0f, 0.0f, 0.0f};
+    int step_start = 0;
+    int step_end = seqlen;
+    if (gridDim.z > 1) {
+        int steps_per_z = (seqlen + (int)gridDim.z - 1) / (int)gridDim.z;
+        if (steps_per_z < 32) steps_per_z = 32;
+        step_start = (int)blockIdx.z * steps_per_z;
+        if (step_start >= seqlen) return;
+        step_end = step_start + steps_per_z;
+        if (step_end > seqlen) step_end = seqlen;
+    }
 
+    float hist[3] = {0.0f, 0.0f, 0.0f};
     const bool has_init = (batch.has_initial_state == nullptr) || (batch.has_initial_state[req] != 0);
     const int32_t slot_in = (batch.state_in_indices != nullptr) ? batch.state_in_indices[req] : -1;
-    if (has_init && slot_in >= 0 && slot_in < total_state_slots) {
-        const __half* s_in = conv_state_pool + ((size_t)slot_in * conv_dim + c) * state_len;
+    if (step_start == 0) {
+        if (has_init && slot_in >= 0 && slot_in < total_state_slots) {
+            const __half* s_in = conv_state_pool + ((size_t)slot_in * conv_dim + c) * state_len;
+#pragma unroll
+            for (int j = 0; j < 3; j++) {
+                if (j < state_len) hist[j] = __half2float(s_in[j]);
+            }
+        }
+    } else {
+        // `step_start >= 32 >= state_len`, so history comes strictly from immutable `x_in`.
 #pragma unroll
         for (int j = 0; j < 3; j++) {
-            if (j < state_len) hist[j] = __half2float(s_in[j]);
+            if (j < state_len) {
+                const int src_tok = lo + step_start - state_len + j;
+                hist[j] = __half2float(x_in[(size_t)src_tok * x_in_row_stride + c]);
+            }
         }
     }
 
@@ -74,7 +96,7 @@ __global__ void gdn_causal_conv1d_f16_kernel(
     const float bias_val = (conv_bias != nullptr) ? __half2float(conv_bias[c]) : 0.0f;
 
     int32_t last_spec_slot = -1;
-    for (int step = 0; step < seqlen; step++) {
+    for (int step = step_start; step < step_end; step++) {
         const int tok = lo + step;
         const float x_val = __half2float(x_in[(size_t)tok * x_in_row_stride + c]);
 
@@ -126,96 +148,171 @@ __global__ void gdn_causal_conv1d_f16_kernel(
         }
     }
 
-    // Write final state to state_out_indices[req] (skip if already written to the same spec_slot)
-    if (batch.state_out_indices != nullptr) {
+    // Write final state from `blockIdx.z == 0` AFTER reading `slot_in`, avoiding any
+    // cross-block race when `slot_in == slot_out` under `gridDim.z > 1`.
+    if (blockIdx.z == 0 && batch.state_out_indices != nullptr) {
         const int32_t slot_out = batch.state_out_indices[req];
         if (slot_out >= 0 && slot_out < total_state_slots && slot_out != last_spec_slot) {
             __half* s_out = conv_state_pool + ((size_t)slot_out * conv_dim + c) * state_len;
-            for (int j = 0; j < state_len; j++) s_out[j] = __float2half(hist[j]);
+            if (step_end == seqlen) {
+                for (int j = 0; j < state_len; j++) s_out[j] = __float2half(hist[j]);
+            } else {
+                // `step_end < seqlen` implies `seqlen > 32 >= state_len`.
+                for (int j = 0; j < state_len; j++) {
+                    const int final_tok = lo + seqlen - state_len + j;
+                    s_out[j] = x_in[(size_t)final_tok * x_in_row_stride + c];
+                }
+            }
         }
     }
 }
 
-template <int NW>
-__device__ __forceinline__ void gdn_load_coalesced_s4(
-    float4 (&smem_s4)[16][17],
-    const float4* __restrict__ row_in4,
-    int vi,
-    int wk,
-    float (&rr)[16]) {
-    smem_s4[vi][0 * NW + wk] = __ldg(&row_in4[0 * NW + wk]);
-    smem_s4[vi][1 * NW + wk] = __ldg(&row_in4[1 * NW + wk]);
-    __syncwarp();
-    if (wk < 4) {
+__device__ __forceinline__ void gdn_norm_qk_warp(
+    const __half* __restrict__ q_tok_hk,
+    const __half* __restrict__ k_tok_hk,
+    int lane,
+    float scale,
+    float4& bq4_out,
+    float4& bk4_out) {
+    const int c = lane << 2;
+    float q0, q1, q2, q3;
+    if ((((uintptr_t)(q_tok_hk + c)) & 7u) == 0u) {
+        const uint2 qu = __ldg(reinterpret_cast<const uint2*>(q_tok_hk + c));
+        const __half* qh = reinterpret_cast<const __half*>(&qu);
+        q0 = __half2float(qh[0]);
+        q1 = __half2float(qh[1]);
+        q2 = __half2float(qh[2]);
+        q3 = __half2float(qh[3]);
+    } else {
+        q0 = __half2float(q_tok_hk[c + 0]);
+        q1 = __half2float(q_tok_hk[c + 1]);
+        q2 = __half2float(q_tok_hk[c + 2]);
+        q3 = __half2float(q_tok_hk[c + 3]);
+    }
+    float k0, k1, k2, k3;
+    if ((((uintptr_t)(k_tok_hk + c)) & 7u) == 0u) {
+        const uint2 ku = __ldg(reinterpret_cast<const uint2*>(k_tok_hk + c));
+        const __half* kh = reinterpret_cast<const __half*>(&ku);
+        k0 = __half2float(kh[0]);
+        k1 = __half2float(kh[1]);
+        k2 = __half2float(kh[2]);
+        k3 = __half2float(kh[3]);
+    } else {
+        k0 = __half2float(k_tok_hk[c + 0]);
+        k1 = __half2float(k_tok_hk[c + 1]);
+        k2 = __half2float(k_tok_hk[c + 2]);
+        k3 = __half2float(k_tok_hk[c + 3]);
+    }
+    float q_sq = (q0 * q0 + q1 * q1) + (q2 * q2 + q3 * q3);
+    float k_sq = (k0 * k0 + k1 * k1) + (k2 * k2 + k3 * k3);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float4 v4 = smem_s4[vi][wk * 4 + j];
-            rr[j * 4 + 0] = v4.x;
-            rr[j * 4 + 1] = v4.y;
-            rr[j * 4 + 2] = v4.z;
-            rr[j * 4 + 3] = v4.w;
+    for (int off = 16; off > 0; off >>= 1) {
+        q_sq += __shfl_xor_sync(0xffffffffu, q_sq, off);
+        k_sq += __shfl_xor_sync(0xffffffffu, k_sq, off);
+    }
+    const float q_inv = rsqrtf(q_sq + 1e-6f) * scale;
+    const float k_inv = rsqrtf(k_sq + 1e-6f);
+    bq4_out = make_float4(q0 * q_inv, q1 * q_inv, q2 * q_inv, q3 * q_inv);
+    bk4_out = make_float4(k0 * k_inv, k1 * k_inv, k2 * k_inv, k3 * k_inv);
+}
+
+__device__ __forceinline__ float4 ldg_cs_f4(const float4* p) {
+    float4 v;
+    asm volatile("ld.global.cs.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p));
+    return v;
+}
+
+__device__ __forceinline__ void stg_cs_f4(float4* p, float4 v) {
+    asm volatile("st.global.cs.v4.f32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
+}
+
+template <int ROWS>
+__device__ __forceinline__ void gdn_step_rows_warp(
+    float4 (&rr)[ROWS],
+    const float4& bq4,
+    const float4& bk4,
+    float decay,
+    float beta,
+    const float (&vv)[ROWS],
+    __half* __restrict__ out_hv,
+    int vrow_base,
+    int head_v_dim,
+    int lane) {
+    float dot[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        rr[r].x *= decay;
+        rr[r].y *= decay;
+        rr[r].z *= decay;
+        rr[r].w *= decay;
+        dot[r] = (rr[r].x * bk4.x + rr[r].y * bk4.y) +
+                 (rr[r].z * bk4.z + rr[r].w * bk4.w);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            dot[r] += __shfl_xor_sync(0xffffffffu, dot[r], off);
         }
     }
-    __syncwarp();
-    smem_s4[vi][0 * NW + wk] = __ldg(&row_in4[2 * NW + wk]);
-    smem_s4[vi][1 * NW + wk] = __ldg(&row_in4[3 * NW + wk]);
-    __syncwarp();
-    if (wk >= 4) {
-        const int half_wk = wk - 4;
+    float o[ROWS];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float4 v4 = smem_s4[vi][half_wk * 4 + j];
-            rr[j * 4 + 0] = v4.x;
-            rr[j * 4 + 1] = v4.y;
-            rr[j * 4 + 2] = v4.z;
-            rr[j * 4 + 3] = v4.w;
+    for (int r = 0; r < ROWS; ++r) {
+        const float vp = (vv[r] - dot[r]) * beta;
+        rr[r].x += vp * bk4.x;
+        rr[r].y += vp * bk4.y;
+        rr[r].z += vp * bk4.z;
+        rr[r].w += vp * bk4.w;
+        o[r] = (rr[r].x * bq4.x + rr[r].y * bq4.y) +
+               (rr[r].z * bq4.z + rr[r].w * bq4.w);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            o[r] += __shfl_xor_sync(0xffffffffu, o[r], off);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if ((vrow_base + r) < head_v_dim) {
+                out_hv[vrow_base + r] = __float2half(o[r]);
+            }
         }
     }
 }
 
-template <int NW>
-__device__ __forceinline__ void gdn_store_coalesced_s4(
-    float4 (&smem_s4)[16][17],
-    float4* __restrict__ row_out4,
-    int vi,
-    int wk,
-    const float (&rr)[16]) {
-    __syncwarp();
-    if (wk < 4) {
+template <int ROWS>
+__device__ __forceinline__ void gdn_store_rows_warp(
+    float* __restrict__ ssm_state_pool,
+    int32_t slot,
+    int num_v_heads,
+    int hv,
+    size_t head_state_elems,
+    int vrow_base,
+    int head_v_dim,
+    int lane,
+    const float4 (&rr)[ROWS]) {
+    float* head_dst = ssm_state_pool + ((size_t)slot * num_v_heads + hv) * head_state_elems;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            smem_s4[vi][wk * 4 + j] = make_float4(
-                rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
+    for (int r = 0; r < ROWS; ++r) {
+        const int vr = vrow_base + r;
+        if (vr < head_v_dim) {
+            reinterpret_cast<float4*>(head_dst + (size_t)vr * 128)[lane] = rr[r];
         }
     }
-    __syncwarp();
-    row_out4[0 * NW + wk] = smem_s4[vi][0 * NW + wk];
-    row_out4[1 * NW + wk] = smem_s4[vi][1 * NW + wk];
-    __syncwarp();
-    if (wk >= 4) {
-        const int half_wk = wk - 4;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            smem_s4[vi][half_wk * 4 + j] = make_float4(
-                rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
-        }
-    }
-    __syncwarp();
-    row_out4[2 * NW + wk] = smem_s4[vi][0 * NW + wk];
-    row_out4[3 * NW + wk] = smem_s4[vi][1 * NW + wk];
 }
 
-// Ported from vllm.cpp GdnDecodeFusedKernel / GdnSpecDecodeFusedKernel with in-kernel
-// q/k L2-normalization and g/beta gating:
-// Grid: (dv / BV, num_reqs * num_v_heads), where BV = 16, NW = 8, threads = 128.
-// Each block owns a [BV=16, dk=128] slice of ssm_state for one (req, v_head).
-// Each row vi in 0..16 is partitioned across NW=8 consecutive lanes (16 dk cols/lane),
-// so the dot product and state update stay in registers (`rr[16]`) with an 8-lane
-// `__shfl_xor_sync` butterfly reduction!
-// `__launch_bounds__(BV * NW, 8)` + two-pass `smem_s4[16][17]` (`4.35 KiB` + `1.03 KiB` =
-// `5.38 KiB`/CTA) fits 8 CTAs/SM (`1024` resident threads/SM, up from 5 CTAs/SM) on `sm_86`.
-template <int BV, int NW>
-__global__ __launch_bounds__(BV * NW, 8) void gdn_recurrent_f16_kernel(
+// Zero-smem, zero-barrier warp-coalesced GDN decode kernel (`ROWS = 4` -> `BV = 16` at small batch,
+// `ROWS = 8` -> `BV = 32` when `num_reqs * num_v_heads >= 96` to halve redundant Q/K norms and
+// GDDR6X R/W turnaround at B>=2).
+template <int ROWS, int MIN_BLOCKS>
+__global__ __launch_bounds__(128, MIN_BLOCKS) void gdn_recurrent_decode_f16_kernel(
     w34_gdn_batch batch,
     const __half* __restrict__ qkv_conv_out,
     const __half* __restrict__ q_in,
@@ -233,6 +330,7 @@ __global__ __launch_bounds__(BV * NW, 8) void gdn_recurrent_f16_kernel(
     int head_v_dim,
     int ba_row_stride,
     int total_state_slots) {
+    constexpr int BV = ROWS * 4;
     const int i_v = blockIdx.x;
     const int i_nh = blockIdx.y;
     const int req = i_nh / num_v_heads;
@@ -247,185 +345,270 @@ __global__ __launch_bounds__(BV * NW, 8) void gdn_recurrent_f16_kernel(
 
     const int gqa_ratio = num_v_heads / num_k_heads;
     const int hk = hv / gqa_ratio;
-    const int vbase = i_v * BV;
     const int tid = threadIdx.x;
-    const int vi = tid / NW;       // 0..16
-    const int wk = tid % NW;       // 0..8
-    const int vrow = vbase + vi;
-    const int ck = head_k_dim / NW; // 16 when head_k_dim == 128, NW == 8
-    const int c0 = wk * ck;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    const int vbase = i_v * BV;
+    const int vrow_base = vbase + wid * ROWS;
 
-    // Load initial [BV, head_k_dim] FP32 state slice into registers rr[16].
-    // When NW == 8 and head_k_dim == 128, all 8 lanes wk = 0..7 of row vi reside in the
-    // same warp, so two-pass staging through smem_s4[16][17] converts 64-byte-strided global
-    // float4 accesses into 100%-coalesced contiguous 128-byte warp accesses while preserving
-    // bit-exact 0-ULP register ownership rr[0..15] and fitting 8 CTAs/SM on sm_86.
-    __shared__ float4 smem_s4[16][17];
-    const bool coalesced_s4 = (NW == 8) && (BV == 16) && (head_k_dim == 128) && ((vbase + BV) <= head_v_dim);
-    float rr[16];
-#pragma unroll
-    for (int j = 0; j < 16; j++) rr[j] = 0.0f;
-
+    float4 rr[ROWS];
     const bool has_init = (batch.has_initial_state == nullptr) || (batch.has_initial_state[req] != 0);
     const int32_t slot_in = (batch.state_in_indices != nullptr) ? batch.state_in_indices[req] : -1;
-    const size_t head_state_elems = (size_t)head_v_dim * head_k_dim;
+    const size_t head_state_elems = (size_t)head_v_dim * 128u;
     if (has_init && slot_in >= 0 && slot_in < total_state_slots) {
-        if (coalesced_s4) {
-            const float4* row_in4 = reinterpret_cast<const float4*>(
-                ssm_state_pool + ((size_t)slot_in * num_v_heads + hv) * head_state_elems +
-                (size_t)vrow * head_k_dim);
-            gdn_load_coalesced_s4<NW>(smem_s4, row_in4, vi, wk, rr);
-        } else if (vrow < head_v_dim) {
-            const float* s_in = ssm_state_pool
-                                + ((size_t)slot_in * num_v_heads + hv) * head_state_elems
-                                + (size_t)vrow * head_k_dim;
-            const float4* s_in4 = reinterpret_cast<const float4*>(s_in + c0);
+        const float* head_in = ssm_state_pool + ((size_t)slot_in * num_v_heads + hv) * head_state_elems;
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                float4 v4 = s_in4[j];
-                rr[j * 4 + 0] = v4.x;
-                rr[j * 4 + 1] = v4.y;
-                rr[j * 4 + 2] = v4.z;
-                rr[j * 4 + 3] = v4.w;
-            }
+        for (int r = 0; r < ROWS; ++r) {
+            const int vr = vrow_base + r;
+            rr[r] = (vr < head_v_dim)
+                ? ldg_cs_f4(reinterpret_cast<const float4*>(head_in + (size_t)vr * 128) + lane)
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            rr[r] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
     }
 
-    __shared__ float smem_qk[256 + 8];
-    float* bq = smem_qk;            // [128]
-    float* bk = smem_qk + 128;      // [128]
-    float* s_red = smem_qk + 256;   // [8]
-
     const float scale = rsqrtf((float)head_k_dim);
-    const float a_log_hv = a_log[hv];
+    const float neg_exp_a = -expf(a_log[hv]);
     const float dt_bias_hv = dt_bias[hv];
-    const int k_total_dim = num_k_heads * head_k_dim;
+    const int k_total_dim = num_k_heads * 128;
     const int v_total_dim = num_v_heads * head_v_dim;
     const int qkv_stride = 2 * k_total_dim + v_total_dim;
+    const bool has_checkpoints =
+        (batch.checkpoint_dst_indices != nullptr && batch.checkpoint_token_offsets != nullptr &&
+         batch.max_checkpoints_per_req > 0);
 
     int32_t last_spec_slot = -1;
-    for (int step = 0; step < seqlen; step++) {
+    for (int step = 0; step < seqlen; ++step) {
         const int tok = lo + step;
-        if (step > 0) __syncthreads();
-
-        // Load q and k for (tok, hk) and L2-normalize in FP32
         const __half* q_tok_hk = (qkv_conv_out != nullptr)
-                                     ? (qkv_conv_out + (size_t)tok * qkv_stride + (size_t)hk * head_k_dim)
-                                     : (q_in + ((size_t)tok * num_k_heads + hk) * head_k_dim);
+            ? (qkv_conv_out + (size_t)tok * qkv_stride + (size_t)hk * 128)
+            : (q_in + ((size_t)tok * num_k_heads + hk) * 128);
         const __half* k_tok_hk = (qkv_conv_out != nullptr)
-                                     ? (qkv_conv_out + (size_t)tok * qkv_stride + k_total_dim + (size_t)hk * head_k_dim)
-                                     : (k_in + ((size_t)tok * num_k_heads + hk) * head_k_dim);
+            ? (qkv_conv_out + (size_t)tok * qkv_stride + k_total_dim + (size_t)hk * 128)
+            : (k_in + ((size_t)tok * num_k_heads + hk) * 128);
         const __half* v_tok_hv = (qkv_conv_out != nullptr)
-                                     ? (qkv_conv_out + (size_t)tok * qkv_stride + 2 * k_total_dim + (size_t)hv * head_v_dim)
-                                     : (v_in + ((size_t)tok * num_v_heads + hv) * head_v_dim);
+            ? (qkv_conv_out + (size_t)tok * qkv_stride + 2 * k_total_dim + (size_t)hv * head_v_dim)
+            : (v_in + ((size_t)tok * num_v_heads + hv) * head_v_dim);
 
-        float q_val = (tid < head_k_dim) ? __half2float(q_tok_hk[tid]) : 0.0f;
-        float k_val = (tid < head_k_dim) ? __half2float(k_tok_hk[tid]) : 0.0f;
-
-        // Warp-tree L2 norm over 128 threads
-        float q_sq = q_val * q_val;
-        float k_sq = k_val * k_val;
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            q_sq += __shfl_xor_sync(0xffffffffu, q_sq, off);
-            k_sq += __shfl_xor_sync(0xffffffffu, k_sq, off);
-        }
-        if ((tid & 31) == 0) {
-            s_red[tid >> 5] = q_sq;
-            s_red[4 + (tid >> 5)] = k_sq;
-        }
-        __syncthreads();
-        if (tid < head_k_dim) {
-            const float q_inv = rsqrtf(s_red[0] + s_red[1] + s_red[2] + s_red[3] + 1e-6f) * scale;
-            const float k_inv = rsqrtf(s_red[4] + s_red[5] + s_red[6] + s_red[7] + 1e-6f);
-            bq[tid] = q_val * q_inv;
-            bk[tid] = k_val * k_inv;
-        }
-        __syncthreads();
+        float4 bq4, bk4;
+        gdn_norm_qk_warp(q_tok_hk, k_tok_hk, lane, scale, bq4, bk4);
 
         const float a_val = __half2float(a_in[(size_t)tok * ba_row_stride + hv]);
         const float b_val = __half2float(b_in[(size_t)tok * ba_row_stride + hv]);
-        const float g = -expf(a_log_hv) * softplus_f32(a_val + dt_bias_hv);
-        const float decay = expf(g);
+        const float decay = expf(neg_exp_a * softplus_f32(a_val + dt_bias_hv));
         const float beta = 1.0f / (1.0f + expf(-b_val));
-
-        float pdot = 0.0f;
+        float vv[ROWS];
 #pragma unroll
-        for (int j = 0; j < 16; j++) {
-            rr[j] *= decay;
-            pdot += rr[j] * bk[c0 + j];
+        for (int r = 0; r < ROWS; ++r) {
+            const int vr = vrow_base + r;
+            vv[r] = (vr < head_v_dim) ? __half2float(v_tok_hv[vr]) : 0.0f;
         }
-        float dot = pdot;
-#pragma unroll
-        for (int off = 1; off < NW; off <<= 1) {
-            dot += __shfl_xor_sync(0xffffffffu, dot, off);
-        }
+        gdn_step_rows_warp<ROWS>(
+            rr, bq4, bk4, decay, beta, vv,
+            out_f16 + ((size_t)tok * num_v_heads + hv) * head_v_dim,
+            vrow_base, head_v_dim, lane);
 
-        const float vv = (vrow < head_v_dim) ? __half2float(v_tok_hv[vrow]) : 0.0f;
-        const float vp = (vv - dot) * beta;
-
-        float po = 0.0f;
-#pragma unroll
-        for (int j = 0; j < 16; j++) {
-            rr[j] += vp * bk[c0 + j];
-            po += rr[j] * bq[c0 + j];
-        }
-        float o = po;
-#pragma unroll
-        for (int off = 1; off < NW; off <<= 1) {
-            o += __shfl_xor_sync(0xffffffffu, o, off);
-        }
-        if (vrow < head_v_dim && wk == 0) {
-            out_f16[((size_t)tok * num_v_heads + hv) * head_v_dim + vrow] = __float2half(o);
-        }
-
-        // Speculative per-step snapshot into spec_state_indices[req, step]
         if (batch.spec_state_indices != nullptr && step < batch.max_verify_tokens) {
             const int32_t spec_slot = batch.spec_state_indices[req * batch.max_verify_tokens + step];
             if (spec_slot >= 0 && spec_slot < total_state_slots) {
-                if (coalesced_s4) {
-                    float4* row_spec4 = reinterpret_cast<float4*>(
-                        ssm_state_pool + ((size_t)spec_slot * num_v_heads + hv) * head_state_elems +
-                        (size_t)vrow * head_k_dim);
-                    gdn_store_coalesced_s4<NW>(smem_s4, row_spec4, vi, wk, rr);
-                    if (step == seqlen - 1) last_spec_slot = spec_slot;
-                } else if (vrow < head_v_dim) {
-                    float* s_spec = ssm_state_pool
-                                    + ((size_t)spec_slot * num_v_heads + hv) * head_state_elems
-                                    + (size_t)vrow * head_k_dim;
-                    float4* s_spec4 = reinterpret_cast<float4*>(s_spec + c0);
-#pragma unroll
-                    for (int j = 0; j < 4; j++) {
-                        s_spec4[j] = make_float4(
-                            rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
-                    }
-                    if (step == seqlen - 1) last_spec_slot = spec_slot;
-                }
+                gdn_store_rows_warp<ROWS>(ssm_state_pool, spec_slot, num_v_heads, hv, head_state_elems,
+                                          vrow_base, head_v_dim, lane, rr);
+                if (step == seqlen - 1) last_spec_slot = spec_slot;
             }
         }
-
-        // Chunk-aligned radix/ping-pong checkpoint snapshot
-        if (batch.checkpoint_dst_indices != nullptr && batch.checkpoint_token_offsets != nullptr) {
+        if (has_checkpoints) {
             for (int e = 0; e < batch.max_checkpoints_per_req; e++) {
                 const int32_t trig_off = batch.checkpoint_token_offsets[req * batch.max_checkpoints_per_req + e];
                 if (trig_off == step + 1) {
                     const int32_t chk_slot = batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
                     if (chk_slot >= 0 && chk_slot < total_state_slots) {
-                        if (coalesced_s4) {
-                            float4* row_chk4 = reinterpret_cast<float4*>(
-                                ssm_state_pool + ((size_t)chk_slot * num_v_heads + hv) * head_state_elems +
-                                (size_t)vrow * head_k_dim);
-                            gdn_store_coalesced_s4<NW>(smem_s4, row_chk4, vi, wk, rr);
-                        } else if (vrow < head_v_dim) {
-                            float* s_chk = ssm_state_pool
-                                           + ((size_t)chk_slot * num_v_heads + hv) * head_state_elems
-                                           + (size_t)vrow * head_k_dim;
-                            float4* s_chk4 = reinterpret_cast<float4*>(s_chk + c0);
+                        gdn_store_rows_warp<ROWS>(ssm_state_pool, chk_slot, num_v_heads, hv, head_state_elems,
+                                                  vrow_base, head_v_dim, lane, rr);
+                    }
+                }
+            }
+        }
+    }
+
+    if (batch.state_out_indices != nullptr) {
+        const int32_t slot_out = batch.state_out_indices[req];
+        if (slot_out >= 0 && slot_out < total_state_slots && slot_out != last_spec_slot) {
+            gdn_store_rows_warp<ROWS>(ssm_state_pool, slot_out, num_v_heads, hv, head_state_elems,
+                                      vrow_base, head_v_dim, lane, rr);
+        }
+    }
+}
+
+// Multi-step warp-parallel GDN prefill/verify kernel (`ROWS = 4` -> `BV = 16`, or `ROWS = 8` ->
+// `BV = 32` when `num_reqs * num_v_heads >= 96`; `TILE_S = 16` steps normalized cooperatively per
+// barrier in bank-conflict-free SoA shared memory).
+// Shares the exact `gdn_norm_qk_warp` + `gdn_step_rows_warp` helpers with decode for 0-ULP parity.
+template <int ROWS, int MIN_BLOCKS>
+__global__ __launch_bounds__(128, MIN_BLOCKS) void gdn_recurrent_prefill_f16_kernel(
+    w34_gdn_batch batch,
+    const __half* __restrict__ qkv_conv_out,
+    const __half* __restrict__ q_in,
+    const __half* __restrict__ k_in,
+    const __half* __restrict__ v_in,
+    const __half* __restrict__ b_in,
+    const __half* __restrict__ a_in,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ ssm_state_pool,
+    __half* __restrict__ out_f16,
+    int num_k_heads,
+    int head_k_dim,
+    int num_v_heads,
+    int head_v_dim,
+    int ba_row_stride,
+    int total_state_slots) {
+    constexpr int BV = ROWS * 4;
+    constexpr int TILE_S = 16;
+    const int i_v = blockIdx.x;
+    const int i_nh = blockIdx.y;
+    const int req = i_nh / num_v_heads;
+    const int hv = i_nh % num_v_heads;
+    if (req >= batch.num_reqs) return;
+    if (batch.valid_req_mask != nullptr && batch.valid_req_mask[req] == 0) return;
+
+    const int lo = batch.query_start_loc[req];
+    const int hi = batch.query_start_loc[req + 1];
+    const int seqlen = hi - lo;
+    if (seqlen <= 0) return;
+
+    const int gqa_ratio = num_v_heads / num_k_heads;
+    const int hk = hv / gqa_ratio;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    const int vbase = i_v * BV;
+    const int vrow_base = vbase + wid * ROWS;
+
+    float4 rr[ROWS];
+    const bool has_init = (batch.has_initial_state == nullptr) || (batch.has_initial_state[req] != 0);
+    const int32_t slot_in = (batch.state_in_indices != nullptr) ? batch.state_in_indices[req] : -1;
+    const size_t head_state_elems = (size_t)head_v_dim * 128u;
+    if (has_init && slot_in >= 0 && slot_in < total_state_slots) {
+        const float* head_in = ssm_state_pool + ((size_t)slot_in * num_v_heads + hv) * head_state_elems;
 #pragma unroll
-                            for (int j = 0; j < 4; j++) {
-                                s_chk4[j] = make_float4(
-                                    rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
-                            }
+        for (int r = 0; r < ROWS; ++r) {
+            const int vr = vrow_base + r;
+            rr[r] = (vr < head_v_dim)
+                ? ldg_cs_f4(reinterpret_cast<const float4*>(head_in + (size_t)vr * 128) + lane)
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            rr[r] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
+
+    const float scale = rsqrtf((float)head_k_dim);
+    const float neg_exp_a = -expf(a_log[hv]);
+    const float dt_bias_hv = dt_bias[hv];
+    const int k_total_dim = num_k_heads * 128;
+    const int v_total_dim = num_v_heads * head_v_dim;
+    const int qkv_stride = 2 * k_total_dim + v_total_dim;
+
+    __shared__ float s_bq_x[TILE_S][32];
+    __shared__ float s_bq_y[TILE_S][32];
+    __shared__ float s_bq_z[TILE_S][32];
+    __shared__ float s_bq_w[TILE_S][32];
+    __shared__ float s_bk_x[TILE_S][32];
+    __shared__ float s_bk_y[TILE_S][32];
+    __shared__ float s_bk_z[TILE_S][32];
+    __shared__ float s_bk_w[TILE_S][32];
+    __shared__ float s_v[TILE_S][BV];
+    __shared__ float s_decay[TILE_S];
+    __shared__ float s_beta[TILE_S];
+
+    const bool has_checkpoints =
+        (batch.checkpoint_dst_indices != nullptr && batch.checkpoint_token_offsets != nullptr &&
+         batch.max_checkpoints_per_req > 0);
+
+    int32_t last_spec_slot = -1;
+    for (int base_s = 0; base_s < seqlen; base_s += TILE_S) {
+        if (base_s > 0) __syncthreads();
+        const int tile_len = (seqlen - base_s < TILE_S) ? (seqlen - base_s) : TILE_S;
+        for (int s_norm = wid; s_norm < tile_len; s_norm += 4) {
+            const int tok = lo + base_s + s_norm;
+            const __half* q_tok_hk = (qkv_conv_out != nullptr)
+                ? (qkv_conv_out + (size_t)tok * qkv_stride + (size_t)hk * 128)
+                : (q_in + ((size_t)tok * num_k_heads + hk) * 128);
+            const __half* k_tok_hk = (qkv_conv_out != nullptr)
+                ? (qkv_conv_out + (size_t)tok * qkv_stride + k_total_dim + (size_t)hk * 128)
+                : (k_in + ((size_t)tok * num_k_heads + hk) * 128);
+            const __half* v_tok_hv = (qkv_conv_out != nullptr)
+                ? (qkv_conv_out + (size_t)tok * qkv_stride + 2 * k_total_dim + (size_t)hv * head_v_dim)
+                : (v_in + ((size_t)tok * num_v_heads + hv) * head_v_dim);
+
+            float4 bq4, bk4;
+            gdn_norm_qk_warp(q_tok_hk, k_tok_hk, lane, scale, bq4, bk4);
+            s_bq_x[s_norm][lane] = bq4.x;
+            s_bq_y[s_norm][lane] = bq4.y;
+            s_bq_z[s_norm][lane] = bq4.z;
+            s_bq_w[s_norm][lane] = bq4.w;
+            s_bk_x[s_norm][lane] = bk4.x;
+            s_bk_y[s_norm][lane] = bk4.y;
+            s_bk_z[s_norm][lane] = bk4.z;
+            s_bk_w[s_norm][lane] = bk4.w;
+            if (lane < BV) {
+                const int vr = vbase + lane;
+                s_v[s_norm][lane] = (vr < head_v_dim) ? __half2float(v_tok_hv[vr]) : 0.0f;
+            }
+            if (lane == 0) {
+                const float a_val = __half2float(a_in[(size_t)tok * ba_row_stride + hv]);
+                const float b_val = __half2float(b_in[(size_t)tok * ba_row_stride + hv]);
+                s_decay[s_norm] = expf(neg_exp_a * softplus_f32(a_val + dt_bias_hv));
+                s_beta[s_norm] = 1.0f / (1.0f + expf(-b_val));
+            }
+        }
+        __syncthreads();
+
+        const bool tile_has_spec =
+            (batch.spec_state_indices != nullptr && base_s < batch.max_verify_tokens);
+        for (int s = 0; s < tile_len; ++s) {
+            const int step = base_s + s;
+            const int tok = lo + step;
+            const float4 bq4 = make_float4(
+                s_bq_x[s][lane], s_bq_y[s][lane], s_bq_z[s][lane], s_bq_w[s][lane]);
+            const float4 bk4 = make_float4(
+                s_bk_x[s][lane], s_bk_y[s][lane], s_bk_z[s][lane], s_bk_w[s][lane]);
+            const float decay = s_decay[s];
+            const float beta = s_beta[s];
+            float vv[ROWS];
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                vv[r] = s_v[s][wid * ROWS + r];
+            }
+            gdn_step_rows_warp<ROWS>(
+                rr, bq4, bk4, decay, beta, vv,
+                out_f16 + ((size_t)tok * num_v_heads + hv) * head_v_dim,
+                vrow_base, head_v_dim, lane);
+
+            if (tile_has_spec && step < batch.max_verify_tokens) {
+                const int32_t spec_slot = batch.spec_state_indices[req * batch.max_verify_tokens + step];
+                if (spec_slot >= 0 && spec_slot < total_state_slots) {
+                    gdn_store_rows_warp<ROWS>(ssm_state_pool, spec_slot, num_v_heads, hv, head_state_elems,
+                                              vrow_base, head_v_dim, lane, rr);
+                    if (step == seqlen - 1) last_spec_slot = spec_slot;
+                }
+            }
+            if (has_checkpoints) {
+                for (int e = 0; e < batch.max_checkpoints_per_req; e++) {
+                    const int32_t trig_off =
+                        batch.checkpoint_token_offsets[req * batch.max_checkpoints_per_req + e];
+                    if (trig_off == step + 1) {
+                        const int32_t chk_slot =
+                            batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
+                        if (chk_slot >= 0 && chk_slot < total_state_slots) {
+                            gdn_store_rows_warp<ROWS>(ssm_state_pool, chk_slot, num_v_heads, hv, head_state_elems,
+                                                      vrow_base, head_v_dim, lane, rr);
                         }
                     }
                 }
@@ -433,26 +616,11 @@ __global__ __launch_bounds__(BV * NW, 8) void gdn_recurrent_f16_kernel(
         }
     }
 
-    // Write final state to state_out_indices[req] (skip if already written to the same spec_slot)
     if (batch.state_out_indices != nullptr) {
         const int32_t slot_out = batch.state_out_indices[req];
         if (slot_out >= 0 && slot_out < total_state_slots && slot_out != last_spec_slot) {
-            if (coalesced_s4) {
-                float4* row_out4 = reinterpret_cast<float4*>(
-                    ssm_state_pool + ((size_t)slot_out * num_v_heads + hv) * head_state_elems +
-                    (size_t)vrow * head_k_dim);
-                gdn_store_coalesced_s4<NW>(smem_s4, row_out4, vi, wk, rr);
-            } else if (vrow < head_v_dim) {
-                float* s_out = ssm_state_pool
-                               + ((size_t)slot_out * num_v_heads + hv) * head_state_elems
-                               + (size_t)vrow * head_k_dim;
-                float4* s_out4 = reinterpret_cast<float4*>(s_out + c0);
-#pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    s_out4[j] = make_float4(
-                        rr[j * 4 + 0], rr[j * 4 + 1], rr[j * 4 + 2], rr[j * 4 + 3]);
-                }
-            }
+            gdn_store_rows_warp<ROWS>(ssm_state_pool, slot_out, num_v_heads, hv, head_state_elems,
+                                      vrow_base, head_v_dim, lane, rr);
         }
     }
 }
@@ -478,7 +646,17 @@ extern "C" int w34_gdn_causal_conv1d_strided_f16(
     }
     if (batch->num_reqs <= 0 || batch->total_tokens <= 0 || conv_dim <= 0) return 0;
     if (x_in_row_stride < conv_dim) return (int)cudaErrorInvalidValue;
-    dim3 grid((unsigned)((conv_dim + 255) / 256), (unsigned)batch->num_reqs);
+    unsigned z_tiles = 1u;
+    if (batch->spec_state_indices == nullptr &&
+        x_in != x_out &&
+        kernel_size >= 1 && kernel_size <= 4 &&
+        batch->total_tokens > batch->num_reqs * 32) {
+        const int avg_t = (batch->total_tokens + batch->num_reqs - 1) / batch->num_reqs;
+        int cand_z = (avg_t + 31) / 32;
+        if (cand_z > 64) cand_z = 64;
+        if (cand_z > 1) z_tiles = (unsigned)cand_z;
+    }
+    dim3 grid((unsigned)((conv_dim + 255) / 256), (unsigned)batch->num_reqs, z_tiles);
     w34_gdn::gdn_causal_conv1d_f16_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
         *batch, (const __half*)x_in, (const __half*)conv_weight,
         (const __half*)conv_bias, (__half*)conv_state_pool, (__half*)x_out,
@@ -532,28 +710,109 @@ extern "C" int w34_gdn_recurrent_strided_f16(
     if (batch->num_reqs <= 0 || batch->total_tokens <= 0) return 0;
     if (head_k_dim != 128 || ba_row_stride < num_v_heads) return (int)cudaErrorInvalidValue;
 
-    constexpr int BV = 16;
-    constexpr int NW = 8;
-    const int v_tiles = (head_v_dim + BV - 1) / BV;
-    dim3 grid((unsigned)v_tiles, (unsigned)(batch->num_reqs * num_v_heads));
-    w34_gdn::gdn_recurrent_f16_kernel<BV, NW><<<grid, BV * NW, 0, (cudaStream_t)ex->stream>>>(
-        *batch,
-        (const __half*)qkv_conv_out,
-        (const __half*)q_in,
-        (const __half*)k_in,
-        (const __half*)v_in,
-        (const __half*)b_in,
-        (const __half*)a_in,
-        a_log,
-        dt_bias,
-        ssm_state_pool,
-        (__half*)out_f16,
-        num_k_heads,
-        head_k_dim,
-        num_v_heads,
-        head_v_dim,
-        ba_row_stride,
-        total_state_slots);
+    if (batch->total_tokens <= batch->num_reqs * 2) {
+        const int nh = batch->num_reqs * num_v_heads;
+        if (nh >= 96 && head_v_dim >= 32) {
+            constexpr int ROWS = 8;
+            constexpr int BV = ROWS * 4;
+            const int v_tiles = (head_v_dim + BV - 1) / BV;
+            dim3 grid((unsigned)v_tiles, (unsigned)nh);
+            w34_gdn::gdn_recurrent_decode_f16_kernel<ROWS, 6>
+                <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                    *batch,
+                    (const __half*)qkv_conv_out,
+                    (const __half*)q_in,
+                    (const __half*)k_in,
+                    (const __half*)v_in,
+                    (const __half*)b_in,
+                    (const __half*)a_in,
+                    a_log,
+                    dt_bias,
+                    ssm_state_pool,
+                    (__half*)out_f16,
+                    num_k_heads,
+                    head_k_dim,
+                    num_v_heads,
+                    head_v_dim,
+                    ba_row_stride,
+                    total_state_slots);
+        } else {
+            constexpr int ROWS = 4;
+            constexpr int BV = ROWS * 4;
+            const int v_tiles = (head_v_dim + BV - 1) / BV;
+            dim3 grid((unsigned)v_tiles, (unsigned)nh);
+            w34_gdn::gdn_recurrent_decode_f16_kernel<ROWS, 12>
+                <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                    *batch,
+                    (const __half*)qkv_conv_out,
+                    (const __half*)q_in,
+                    (const __half*)k_in,
+                    (const __half*)v_in,
+                    (const __half*)b_in,
+                    (const __half*)a_in,
+                    a_log,
+                    dt_bias,
+                    ssm_state_pool,
+                    (__half*)out_f16,
+                    num_k_heads,
+                    head_k_dim,
+                    num_v_heads,
+                    head_v_dim,
+                    ba_row_stride,
+                    total_state_slots);
+        }
+    } else {
+        const int nh = batch->num_reqs * num_v_heads;
+        if (nh >= 96 && head_v_dim >= 32) {
+            constexpr int ROWS = 8;
+            constexpr int BV = ROWS * 4;
+            const int v_tiles = (head_v_dim + BV - 1) / BV;
+            dim3 grid((unsigned)v_tiles, (unsigned)nh);
+            w34_gdn::gdn_recurrent_prefill_f16_kernel<ROWS, 5>
+                <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                    *batch,
+                    (const __half*)qkv_conv_out,
+                    (const __half*)q_in,
+                    (const __half*)k_in,
+                    (const __half*)v_in,
+                    (const __half*)b_in,
+                    (const __half*)a_in,
+                    a_log,
+                    dt_bias,
+                    ssm_state_pool,
+                    (__half*)out_f16,
+                    num_k_heads,
+                    head_k_dim,
+                    num_v_heads,
+                    head_v_dim,
+                    ba_row_stride,
+                    total_state_slots);
+        } else {
+            constexpr int ROWS = 4;
+            constexpr int BV = ROWS * 4;
+            const int v_tiles = (head_v_dim + BV - 1) / BV;
+            dim3 grid((unsigned)v_tiles, (unsigned)nh);
+            w34_gdn::gdn_recurrent_prefill_f16_kernel<ROWS, 5>
+                <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                    *batch,
+                    (const __half*)qkv_conv_out,
+                    (const __half*)q_in,
+                    (const __half*)k_in,
+                    (const __half*)v_in,
+                    (const __half*)b_in,
+                    (const __half*)a_in,
+                    a_log,
+                    dt_bias,
+                    ssm_state_pool,
+                    (__half*)out_f16,
+                    num_k_heads,
+                    head_k_dim,
+                    num_v_heads,
+                    head_v_dim,
+                    ba_row_stride,
+                    total_state_slots);
+        }
+    }
     return (int)cudaGetLastError();
 }
 

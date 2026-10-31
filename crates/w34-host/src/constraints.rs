@@ -214,6 +214,7 @@ impl ConstraintFactory {
             matcher: Some(matcher),
             eos_ids: self.eos_ids.clone(),
             terminal_eos: false,
+            pending_token: None,
             mask,
             committed: 0,
         })
@@ -251,6 +252,7 @@ pub struct TokenBitmaskConstraint {
     matcher: Option<Matcher>,
     eos_ids: Vec<i32>,
     terminal_eos: bool,
+    pending_token: Option<i32>,
     mask: Vec<u32>,
     committed: usize,
 }
@@ -260,6 +262,7 @@ impl std::fmt::Debug for TokenBitmaskConstraint {
         f.debug_struct("TokenBitmaskConstraint")
             .field("vocab_size", &self.vocab_size)
             .field("grammar", &self.matcher.is_some())
+            .field("pending_token", &self.pending_token)
             .field("committed", &self.committed)
             .field("mask", &self.mask)
             .finish()
@@ -277,6 +280,7 @@ impl TokenBitmaskConstraint {
             matcher: None,
             eos_ids: Vec::new(),
             terminal_eos: false,
+            pending_token: None,
             mask,
             committed: 0,
         }
@@ -294,9 +298,15 @@ impl TokenBitmaskConstraint {
             matcher: None,
             eos_ids: Vec::new(),
             terminal_eos: false,
+            pending_token: None,
             mask,
             committed: 0,
         }
+    }
+
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        self.pending_token.is_some()
     }
 
     pub fn committed_len(&self) -> usize {
@@ -304,21 +314,80 @@ impl TokenBitmaskConstraint {
     }
 
     pub fn current_bitmask(&self) -> Vec<u32> {
+        debug_assert!(
+            self.pending_token.is_none(),
+            "materialize_pending() must run before reading current_bitmask()"
+        );
         self.mask.clone()
     }
 
     pub fn mask_words(&self) -> &[u32] {
+        debug_assert!(
+            self.pending_token.is_none(),
+            "materialize_pending() must run before reading mask_words()"
+        );
         &self.mask
     }
 
     pub fn is_token_allowed(&self, id: i32) -> bool {
+        debug_assert!(
+            self.pending_token.is_none(),
+            "materialize_pending() must run before checking is_token_allowed()"
+        );
         id >= 0
             && (id as usize) < self.vocab_size
             && self.mask[id as usize / 32] & (1 << (id as usize % 32)) != 0
     }
 
+    /// Materializes a deferred `advance_deferred` token (`consume_token` + `compute_mask_or_eos`)
+    /// in-place while the next GPU forward pass is already executing on the device stream.
+    pub fn materialize_pending(&mut self) -> Result<(), String> {
+        let Some(id) = self.pending_token.take() else {
+            return Ok(());
+        };
+        if let Some(matcher) = &mut self.matcher {
+            if let Err(e) = matcher.consume_token(id as u32) {
+                self.pending_token = Some(id);
+                return Err(e.to_string());
+            }
+            match matcher.compute_mask_or_eos() {
+                Ok(mask) => {
+                    self.mask.clear();
+                    self.mask.extend_from_slice(mask.as_slice());
+                }
+                Err(e) => {
+                    let _ = matcher.rollback(1);
+                    self.pending_token = Some(id);
+                    return Err(e.to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates `id` against the active bitmask and records it for deferred `llguidance`
+    /// materialization during the next GPU forward pass.
+    pub fn advance_deferred(&mut self, id: i32) -> Result<(), String> {
+        self.materialize_pending()?;
+        if !self.is_token_allowed(id) {
+            return Err(format!("token {id} violates grammar"));
+        }
+        if self.matcher.is_some() && self.eos_ids.contains(&id) {
+            self.terminal_eos = true;
+            self.mask.fill(0);
+            self.committed += 1;
+            return Ok(());
+        }
+        if self.matcher.is_some() {
+            self.pending_token = Some(id);
+        }
+        self.committed += 1;
+        Ok(())
+    }
+
     /// Publish only after consuming and computing the successor mask succeeds.
     pub fn advance(&mut self, id: i32) -> Result<(), String> {
+        self.materialize_pending()?;
         if !self.is_token_allowed(id) {
             return Err(format!("token {id} violates grammar"));
         }
@@ -331,12 +400,20 @@ impl TokenBitmaskConstraint {
             self.committed += 1;
             return Ok(());
         }
-        if let Some(matcher) = &self.matcher {
-            let mut next = matcher.clone();
-            next.consume_token(id as u32).map_err(|e| e.to_string())?;
-            let mask = next.compute_mask_or_eos().map_err(|e| e.to_string())?;
-            self.mask = mask.as_slice().to_vec();
-            self.matcher = Some(next);
+        if let Some(matcher) = &mut self.matcher {
+            matcher
+                .consume_token(id as u32)
+                .map_err(|e| e.to_string())?;
+            match matcher.compute_mask_or_eos() {
+                Ok(mask) => {
+                    self.mask.clear();
+                    self.mask.extend_from_slice(mask.as_slice());
+                }
+                Err(e) => {
+                    let _ = matcher.rollback(1);
+                    return Err(e.to_string());
+                }
+            }
         }
         self.committed += 1;
         Ok(())
@@ -349,18 +426,28 @@ impl TokenBitmaskConstraint {
         if count == 0 {
             return Ok(());
         }
+        let mut rem = count;
+        if self.pending_token.is_some() {
+            self.pending_token = None;
+            self.committed -= 1;
+            rem -= 1;
+            if rem == 0 {
+                return Ok(());
+            }
+        }
         if let Some(matcher) = &self.matcher {
             let mut next = matcher.clone();
-            let grammar_count = count - usize::from(self.terminal_eos);
+            let grammar_count = rem - usize::from(self.terminal_eos);
             if grammar_count > 0 {
                 next.rollback(grammar_count).map_err(|e| e.to_string())?;
             }
             let mask = next.compute_mask_or_eos().map_err(|e| e.to_string())?;
-            self.mask = mask.as_slice().to_vec();
+            self.mask.clear();
+            self.mask.extend_from_slice(mask.as_slice());
             self.matcher = Some(next);
         }
         self.terminal_eos = false;
-        self.committed -= count;
+        self.committed -= rem;
         Ok(())
     }
 }

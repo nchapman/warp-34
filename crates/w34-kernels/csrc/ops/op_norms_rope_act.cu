@@ -85,6 +85,63 @@ __global__ void copy_masked_rows_f16_kernel(
     }
 }
 
+template <int VEC_ITERS>
+__global__ void gemma_rms_norm_vec8_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int hidden_size,
+    float eps) {
+    const int row = blockIdx.x;
+    const int vec_cols = hidden_size >> 3;
+    uint4* out_v = reinterpret_cast<uint4*>(out + (size_t)row * hidden_size);
+    if (valid_token_mask != nullptr && valid_token_mask[row] == 0) {
+        for (int vi = (int)threadIdx.x; vi < vec_cols; vi += (int)blockDim.x) {
+            out_v[vi] = make_uint4(0u, 0u, 0u, 0u);
+        }
+        return;
+    }
+    const uint4* x_v = reinterpret_cast<const uint4*>(x + (size_t)row * hidden_size);
+    const uint4* w_v = reinterpret_cast<const uint4*>(weight);
+
+    __shared__ float s_warp[32];
+    float reg_v8[VEC_ITERS][8];
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < VEC_ITERS; ++k) {
+        const int vi = (int)threadIdx.x + k * (int)blockDim.x;
+        if (vi < vec_cols) {
+            const uint4 xv = __ldg(&x_v[vi]);
+            const __half* xh = reinterpret_cast<const __half*>(&xv);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float vf = __half2float(xh[j]);
+                reg_v8[k][j] = vf;
+                sum_sq += vf * vf;
+            }
+        }
+    }
+    sum_sq = block_reduce_sum(sum_sq, s_warp);
+    const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+#pragma unroll
+    for (int k = 0; k < VEC_ITERS; ++k) {
+        const int vi = (int)threadIdx.x + k * (int)blockDim.x;
+        if (vi < vec_cols) {
+            const uint4 wv = __ldg(&w_v[vi]);
+            uint4 ov;
+            const __half* wh = reinterpret_cast<const __half*>(&wv);
+            __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                oh[j] = __float2half((reg_v8[k][j] * inv_rms) * (1.0f + __half2float(wh[j])));
+            }
+            out_v[vi] = ov;
+        }
+    }
+}
+
 template <int MAX_ITERS>
 __global__ void gemma_rms_norm_f16_kernel(
     const __half* __restrict__ x,
@@ -129,6 +186,85 @@ __global__ void gemma_rms_norm_f16_kernel(
     }
 }
 
+template <int VEC_ITERS>
+__global__ void fused_add_gemma_rms_norm_vec8_f16_kernel(
+    const __half* __restrict__ x,
+    __half* __restrict__ residual,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    __nv_bfloat16* __restrict__ tap_dst_bf16,
+    const uint8_t* __restrict__ valid_token_mask,
+    int hidden_size,
+    float eps,
+    int tap_row_stride,
+    int tap_col_offset) {
+    const int row = blockIdx.x;
+    const int vec_cols = hidden_size >> 3;
+    uint4* out_v = reinterpret_cast<uint4*>(out + (size_t)row * hidden_size);
+    if (valid_token_mask != nullptr && valid_token_mask[row] == 0) {
+        for (int vi = (int)threadIdx.x; vi < vec_cols; vi += (int)blockDim.x) {
+            out_v[vi] = make_uint4(0u, 0u, 0u, 0u);
+        }
+        return;
+    }
+    const uint4* x_v = reinterpret_cast<const uint4*>(x + (size_t)row * hidden_size);
+    uint4* res_v = reinterpret_cast<uint4*>(residual + (size_t)row * hidden_size);
+    uint4* tap_v = (tap_dst_bf16 != nullptr)
+        ? reinterpret_cast<uint4*>(tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
+        : nullptr;
+    const uint4* w_v = reinterpret_cast<const uint4*>(weight);
+
+    __shared__ float s_warp[32];
+    float reg_v8[VEC_ITERS][8];
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < VEC_ITERS; ++k) {
+        const int vi = (int)threadIdx.x + k * (int)blockDim.x;
+        if (vi < vec_cols) {
+            const uint4 xv = __ldg(&x_v[vi]);
+            const uint4 rv = res_v[vi];
+            uint4 sv;
+            const __half* xh = reinterpret_cast<const __half*>(&xv);
+            const __half* rh = reinterpret_cast<const __half*>(&rv);
+            __half* sh = reinterpret_cast<__half*>(&sv);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                sh[j] = __hadd(xh[j], rh[j]);
+                const float vf = __half2float(xh[j]) + __half2float(rh[j]);
+                reg_v8[k][j] = vf;
+                sum_sq += vf * vf;
+            }
+            res_v[vi] = sv;
+            if (tap_v != nullptr) {
+                uint4 tv;
+                __nv_bfloat16* tbh = reinterpret_cast<__nv_bfloat16*>(&tv);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    tbh[j] = __float2bfloat16(reg_v8[k][j]);
+                }
+                tap_v[vi] = tv;
+            }
+        }
+    }
+    sum_sq = block_reduce_sum(sum_sq, s_warp);
+    const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+#pragma unroll
+    for (int k = 0; k < VEC_ITERS; ++k) {
+        const int vi = (int)threadIdx.x + k * (int)blockDim.x;
+        if (vi < vec_cols) {
+            const uint4 wv = __ldg(&w_v[vi]);
+            uint4 ov;
+            const __half* wh = reinterpret_cast<const __half*>(&wv);
+            __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                oh[j] = __float2half((reg_v8[k][j] * inv_rms) * (1.0f + __half2float(wh[j])));
+            }
+            out_v[vi] = ov;
+        }
+    }
+}
+
 template <int MAX_ITERS>
 __global__ void fused_add_gemma_rms_norm_f16_kernel(
     const __half* __restrict__ x,
@@ -156,69 +292,6 @@ __global__ void fused_add_gemma_rms_norm_f16_kernel(
         : nullptr;
 
     __shared__ float s_warp[32];
-    const bool vec8_ok =
-        (hidden_size <= 4096) && ((hidden_size & 7) == 0) &&
-        ((((uintptr_t)x_row | (uintptr_t)res_row | (uintptr_t)tap_row |
-           (uintptr_t)weight | (uintptr_t)out_row) & 15u) == 0u);
-    if (vec8_ok) {
-        constexpr int VEC_ITERS = (MAX_ITERS + 7) / 8;
-        const int vec_cols = hidden_size >> 3;
-        const uint4* x_v = reinterpret_cast<const uint4*>(x_row);
-        uint4* res_v = reinterpret_cast<uint4*>(res_row);
-        uint4* tap_v = reinterpret_cast<uint4*>(tap_row);
-        const uint4* w_v = reinterpret_cast<const uint4*>(weight);
-        uint4* out_v = reinterpret_cast<uint4*>(out_row);
-        float reg_v8[VEC_ITERS][8];
-        float sum_sq = 0.0f;
-#pragma unroll
-        for (int k = 0; k < VEC_ITERS; ++k) {
-            const int vi = (int)threadIdx.x + k * (int)blockDim.x;
-            if (vi < vec_cols) {
-                const uint4 xv = __ldg(&x_v[vi]);
-                const uint4 rv = res_v[vi];
-                uint4 sv;
-                const __half* xh = reinterpret_cast<const __half*>(&xv);
-                const __half* rh = reinterpret_cast<const __half*>(&rv);
-                __half* sh = reinterpret_cast<__half*>(&sv);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    sh[j] = __hadd(xh[j], rh[j]);
-                    const float vf = __half2float(xh[j]) + __half2float(rh[j]);
-                    reg_v8[k][j] = vf;
-                    sum_sq += vf * vf;
-                }
-                res_v[vi] = sv;
-                if (tap_v != nullptr) {
-                    uint4 tv;
-                    __nv_bfloat16* tbh = reinterpret_cast<__nv_bfloat16*>(&tv);
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        tbh[j] = __float2bfloat16(reg_v8[k][j]);
-                    }
-                    tap_v[vi] = tv;
-                }
-            }
-        }
-        sum_sq = block_reduce_sum(sum_sq, s_warp);
-        const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
-#pragma unroll
-        for (int k = 0; k < VEC_ITERS; ++k) {
-            const int vi = (int)threadIdx.x + k * (int)blockDim.x;
-            if (vi < vec_cols) {
-                const uint4 wv = __ldg(&w_v[vi]);
-                uint4 ov;
-                const __half* wh = reinterpret_cast<const __half*>(&wv);
-                __half* oh = reinterpret_cast<__half*>(&ov);
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    oh[j] = __float2half((reg_v8[k][j] * inv_rms) * (1.0f + __half2float(wh[j])));
-                }
-                out_v[vi] = ov;
-            }
-        }
-        return;
-    }
-
     float reg_v[MAX_ITERS];
     float sum_sq = 0.0f;
 #pragma unroll
@@ -502,6 +575,25 @@ extern "C" int w34_gemma_rms_norm_f16(const w34_exec* ex, const void* x, const v
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens <= 0 || hidden_size <= 0) return 0;
+    const bool vec8_ok =
+        (hidden_size <= 6144) && ((hidden_size & 7) == 0) &&
+        ((((uintptr_t)x | (uintptr_t)weight | (uintptr_t)out) & 15u) == 0u);
+    if (vec8_ok) {
+        if (hidden_size <= 2048) {
+            w34::gemma_rms_norm_vec8_f16_kernel<1><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)x, (const __half*)weight, (__half*)out,
+                valid_token_mask, hidden_size, eps);
+        } else if (hidden_size <= 4096) {
+            w34::gemma_rms_norm_vec8_f16_kernel<1><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)x, (const __half*)weight, (__half*)out,
+                valid_token_mask, hidden_size, eps);
+        } else {
+            w34::gemma_rms_norm_vec8_f16_kernel<2><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)x, (const __half*)weight, (__half*)out,
+                valid_token_mask, hidden_size, eps);
+        }
+        return (int)cudaGetLastError();
+    }
     if (hidden_size <= 2560) {
         w34::gemma_rms_norm_f16_kernel<10><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)x, (const __half*)weight, (__half*)out,
@@ -542,6 +634,30 @@ extern "C" int w34_fused_add_gemma_rms_norm_tap_f16(
     if (hidden_size > 6144) return (int)cudaErrorInvalidValue;
     if (tap_dst_bf16 != nullptr && (tap_col_offset < 0 || tap_row_stride < tap_col_offset + hidden_size)) {
         return (int)cudaErrorInvalidValue;
+    }
+    const bool vec8_ok =
+        ((hidden_size & 7) == 0) &&
+        ((tap_dst_bf16 == nullptr) || (((tap_row_stride | tap_col_offset) & 7) == 0)) &&
+        ((((uintptr_t)x | (uintptr_t)residual | (uintptr_t)tap_dst_bf16 |
+           (uintptr_t)weight | (uintptr_t)out) & 15u) == 0u);
+    if (vec8_ok) {
+        if (hidden_size <= 2048) {
+            w34::fused_add_gemma_rms_norm_vec8_f16_kernel<1><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out,
+                (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+                tap_row_stride, tap_col_offset);
+        } else if (hidden_size <= 4096) {
+            w34::fused_add_gemma_rms_norm_vec8_f16_kernel<1><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out,
+                (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+                tap_row_stride, tap_col_offset);
+        } else {
+            w34::fused_add_gemma_rms_norm_vec8_f16_kernel<2><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)x, (__half*)residual, (const __half*)weight, (__half*)out,
+                (__nv_bfloat16*)tap_dst_bf16, valid_token_mask, hidden_size, eps,
+                tap_row_stride, tap_col_offset);
+        }
+        return (int)cudaGetLastError();
     }
     if (hidden_size <= 2560) {
         w34::fused_add_gemma_rms_norm_f16_kernel<10><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
@@ -798,8 +914,11 @@ namespace w34 {
 
 // Batch-size-invariant FP16 GEMM for small-N projections (e.g. GDN in_proj_ba, size_n <= 256):
 // out[m, size_n] = x[m, size_k] * w[size_n, size_k]^T.
-// Each warp computes one output column `n` across up to 8 rows `m_base .. m_base + 7`,
-// accumulating in FP32 with identical per-row operation order for any `m >= 1`.
+// One 256-thread (8-warp) CTA computes one output column `n` across up to `MAX_ROWS` rows
+// (`1` for `m == 1`, `4` for `m >= 2` so `m = 8` launches 192 CTAs fitting in a single wave
+// across 84 SMs at 52 regs/thread), preserving an identical 256-thread -> 8-warp FP32 reduction
+// tree for every `m >= 1` (0-ULP M-invariant).
+template <int MAX_ROWS, int K_UNROLL>
 __global__ void small_n_gemm_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ w,
@@ -809,16 +928,21 @@ __global__ void small_n_gemm_f16_kernel(
     int size_k) {
     const int wid = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * 4 + wid;
-    const int m_base = blockIdx.y * 8;
+    const int n = (int)blockIdx.x;
+    const int m_base = (int)blockIdx.y * MAX_ROWS;
     if (n >= size_n || m_base >= m) return;
 
-    const int rows = (m - m_base < 8) ? (m - m_base) : 8;
+    const int rows = (m - m_base < MAX_ROWS) ? (m - m_base) : MAX_ROWS;
     const __half* w_row = w + (size_t)n * size_k;
 
-    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll 4
-    for (int k = lane * 8; k < size_k; k += 256) {
+    float acc[MAX_ROWS];
+#pragma unroll
+    for (int r = 0; r < MAX_ROWS; r++) {
+        acc[r] = 0.0f;
+    }
+
+#pragma unroll K_UNROLL
+    for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
         const uint4 wv = *reinterpret_cast<const uint4*>(w_row + k);
         const __half* wh = reinterpret_cast<const __half*>(&wv);
         float wf[8];
@@ -827,7 +951,7 @@ __global__ void small_n_gemm_f16_kernel(
             wf[j] = __half2float(wh[j]);
         }
 #pragma unroll
-        for (int r = 0; r < 8; r++) {
+        for (int r = 0; r < MAX_ROWS; r++) {
             if (r < rows) {
                 const uint4 xv = *reinterpret_cast<const uint4*>(
                     x + (size_t)(m_base + r) * size_k + k);
@@ -840,8 +964,9 @@ __global__ void small_n_gemm_f16_kernel(
         }
     }
 
+    __shared__ float s_warp[MAX_ROWS][8];
 #pragma unroll
-    for (int r = 0; r < 8; r++) {
+    for (int r = 0; r < MAX_ROWS; r++) {
         if (r < rows) {
             float sum = acc[r];
 #pragma unroll
@@ -849,18 +974,34 @@ __global__ void small_n_gemm_f16_kernel(
                 sum += __shfl_xor_sync(0xffffffffu, sum, off);
             }
             if (lane == 0) {
-                out[(size_t)(m_base + r) * size_n + n] = __float2half(sum);
+                s_warp[r][wid] = sum;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+#pragma unroll
+        for (int r = 0; r < MAX_ROWS; r++) {
+            if (r < rows) {
+                float sum = (lane < 8) ? s_warp[r][lane] : 0.0f;
+                sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+                if (lane == 0) {
+                    out[(size_t)(m_base + r) * size_n + n] = __float2half(sum);
+                }
             }
         }
     }
 }
 
+template <int MAX_ROWS, int K_UNROLL>
 __global__ void small_n_gemm_dual_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ w0,
     __half* __restrict__ out0,
     int size_n0,
-    int blocks_n0,
     const __half* __restrict__ w1,
     __half* __restrict__ out1,
     int size_n1,
@@ -868,22 +1009,26 @@ __global__ void small_n_gemm_dual_f16_kernel(
     int size_k) {
     const int wid = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int m_base = blockIdx.y * 8;
+    const int m_base = (int)blockIdx.y * MAX_ROWS;
     if (m_base >= m) return;
 
-    const bool second = ((int)blockIdx.x >= blocks_n0);
-    const int local_bx = second ? ((int)blockIdx.x - blocks_n0) : (int)blockIdx.x;
+    const bool second = ((int)blockIdx.x >= size_n0);
+    const int n = second ? ((int)blockIdx.x - size_n0) : (int)blockIdx.x;
     const int size_n = second ? size_n1 : size_n0;
-    const int n = local_bx * 4 + wid;
     if (n >= size_n) return;
 
     const __half* w_row = (second ? w1 : w0) + (size_t)n * size_k;
     __half* out = second ? out1 : out0;
-    const int rows = (m - m_base < 8) ? (m - m_base) : 8;
+    const int rows = (m - m_base < MAX_ROWS) ? (m - m_base) : MAX_ROWS;
 
-    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll 4
-    for (int k = lane * 8; k < size_k; k += 256) {
+    float acc[MAX_ROWS];
+#pragma unroll
+    for (int r = 0; r < MAX_ROWS; r++) {
+        acc[r] = 0.0f;
+    }
+
+#pragma unroll K_UNROLL
+    for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
         const uint4 wv = *reinterpret_cast<const uint4*>(w_row + k);
         const __half* wh = reinterpret_cast<const __half*>(&wv);
         float wf[8];
@@ -892,7 +1037,7 @@ __global__ void small_n_gemm_dual_f16_kernel(
             wf[j] = __half2float(wh[j]);
         }
 #pragma unroll
-        for (int r = 0; r < 8; r++) {
+        for (int r = 0; r < MAX_ROWS; r++) {
             if (r < rows) {
                 const uint4 xv = *reinterpret_cast<const uint4*>(
                     x + (size_t)(m_base + r) * size_k + k);
@@ -905,8 +1050,9 @@ __global__ void small_n_gemm_dual_f16_kernel(
         }
     }
 
+    __shared__ float s_warp[MAX_ROWS][8];
 #pragma unroll
-    for (int r = 0; r < 8; r++) {
+    for (int r = 0; r < MAX_ROWS; r++) {
         if (r < rows) {
             float sum = acc[r];
 #pragma unroll
@@ -914,7 +1060,221 @@ __global__ void small_n_gemm_dual_f16_kernel(
                 sum += __shfl_xor_sync(0xffffffffu, sum, off);
             }
             if (lane == 0) {
-                out[(size_t)(m_base + r) * size_n + n] = __float2half(sum);
+                s_warp[r][wid] = sum;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+#pragma unroll
+        for (int r = 0; r < MAX_ROWS; r++) {
+            if (r < rows) {
+                float sum = (lane < 8) ? s_warp[r][lane] : 0.0f;
+                sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+                if (lane == 0) {
+                    out[(size_t)(m_base + r) * size_n + n] = __float2half(sum);
+                }
+            }
+        }
+    }
+}
+
+// 4x4 2D-tiled 256-thread GEMM for `m > 16`: each CTA computes up to 4 rows x 4 columns,
+// cutting `x` L2 reads by 4x (`8` `uint4` loads per 128 FMAs instead of 17) while preserving
+// the exact same 256-thread -> 8-warp FP32 reduction tree per `(row, col)` as `m == 1`.
+__global__ void small_n_gemm_4x4_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w,
+    __half* __restrict__ out,
+    int m,
+    int size_n,
+    int size_k) {
+    const int wid = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n_base = (int)blockIdx.x * 4;
+    const int m_base = (int)blockIdx.y * 4;
+    if (n_base >= size_n || m_base >= m) return;
+
+    const int rows = (m - m_base < 4) ? (m - m_base) : 4;
+    const int cols = (size_n - n_base < 4) ? (size_n - n_base) : 4;
+
+    float acc[4][4];
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            acc[r][c] = 0.0f;
+        }
+    }
+
+#pragma unroll 1
+    for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
+        uint4 xv[4];
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (r < rows) {
+                xv[r] = *reinterpret_cast<const uint4*>(
+                    x + (size_t)(m_base + r) * size_k + k);
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            if (c < cols) {
+                const uint4 wv = *reinterpret_cast<const uint4*>(
+                    w + (size_t)(n_base + c) * size_k + k);
+                const __half* wh = reinterpret_cast<const __half*>(&wv);
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (r < rows) {
+                        const __half* xh = reinterpret_cast<const __half*>(&xv[r]);
+#pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            acc[r][c] = fmaf(__half2float(xh[j]), __half2float(wh[j]), acc[r][c]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    __shared__ float s_warp[4][4][8];
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r < rows) {
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                if (c < cols) {
+                    float sum = acc[r][c];
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+                    }
+                    if (lane == 0) {
+                        s_warp[c][r][wid] = sum;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    if (wid < cols) {
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (r < rows) {
+                float sum = (lane < 8) ? s_warp[wid][r][lane] : 0.0f;
+                sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+                if (lane == 0) {
+                    out[(size_t)(m_base + r) * size_n + (n_base + wid)] = __float2half(sum);
+                }
+            }
+        }
+    }
+}
+
+__global__ void small_n_gemm_dual_4x4_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ w0,
+    __half* __restrict__ out0,
+    int size_n0,
+    int tiles_n0,
+    const __half* __restrict__ w1,
+    __half* __restrict__ out1,
+    int size_n1,
+    int m,
+    int size_k) {
+    const int wid = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int m_base = (int)blockIdx.y * 4;
+    if (m_base >= m) return;
+
+    const bool second = ((int)blockIdx.x >= tiles_n0);
+    const int tile_x = second ? ((int)blockIdx.x - tiles_n0) : (int)blockIdx.x;
+    const int n_base = tile_x * 4;
+    const int size_n = second ? size_n1 : size_n0;
+    if (n_base >= size_n) return;
+
+    const __half* w = second ? w1 : w0;
+    __half* out = second ? out1 : out0;
+    const int rows = (m - m_base < 4) ? (m - m_base) : 4;
+    const int cols = (size_n - n_base < 4) ? (size_n - n_base) : 4;
+
+    float acc[4][4];
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            acc[r][c] = 0.0f;
+        }
+    }
+
+#pragma unroll 1
+    for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
+        uint4 xv[4];
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (r < rows) {
+                xv[r] = *reinterpret_cast<const uint4*>(
+                    x + (size_t)(m_base + r) * size_k + k);
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < 4; c++) {
+            if (c < cols) {
+                const uint4 wv = *reinterpret_cast<const uint4*>(
+                    w + (size_t)(n_base + c) * size_k + k);
+                const __half* wh = reinterpret_cast<const __half*>(&wv);
+#pragma unroll
+                for (int r = 0; r < 4; r++) {
+                    if (r < rows) {
+                        const __half* xh = reinterpret_cast<const __half*>(&xv[r]);
+#pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            acc[r][c] = fmaf(__half2float(xh[j]), __half2float(wh[j]), acc[r][c]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    __shared__ float s_warp[4][4][8];
+#pragma unroll
+    for (int r = 0; r < 4; r++) {
+        if (r < rows) {
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                if (c < cols) {
+                    float sum = acc[r][c];
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+                    }
+                    if (lane == 0) {
+                        s_warp[c][r][wid] = sum;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    if (wid < cols) {
+#pragma unroll
+        for (int r = 0; r < 4; r++) {
+            if (r < rows) {
+                float sum = (lane < 8) ? s_warp[wid][r][lane] : 0.0f;
+                sum += __shfl_xor_sync(0xffffffffu, sum, 4);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+                sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+                if (lane == 0) {
+                    out[(size_t)(m_base + r) * size_n + (n_base + wid)] = __float2half(sum);
+                }
             }
         }
     }
@@ -935,9 +1295,20 @@ extern "C" int w34_small_n_gemm_f16(
     }
     if (m <= 0 || size_n <= 0 || size_k <= 0) return 0;
     if ((size_k & 7) != 0) return (int)cudaErrorInvalidValue;
-    dim3 grid((unsigned)((size_n + 3) / 4), (unsigned)((m + 7) / 8));
-    w34::small_n_gemm_f16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);
+    cudaStream_t stream = (cudaStream_t)ex->stream;
+    if (m == 1) {
+        dim3 grid((unsigned)size_n, 1u);
+        w34::small_n_gemm_f16_kernel<1, 4><<<grid, 256, 0, stream>>>(
+            (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);
+    } else if (m <= 16) {
+        dim3 grid((unsigned)size_n, (unsigned)((m + 3) / 4));
+        w34::small_n_gemm_f16_kernel<4, 4><<<grid, 256, 0, stream>>>(
+            (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);
+    } else {
+        dim3 grid((unsigned)((size_n + 3) / 4), (unsigned)((m + 3) / 4));
+        w34::small_n_gemm_4x4_f16_kernel<<<grid, 256, 0, stream>>>(
+            (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);
+    }
     return (int)cudaGetLastError();
 }
 
@@ -958,19 +1329,24 @@ extern "C" int w34_small_n_gemm_dual_f16(
     }
     if (m <= 0 || size_n0 <= 0 || size_n1 <= 0 || size_k <= 0) return 0;
     if ((size_k & 7) != 0) return (int)cudaErrorInvalidValue;
-    const int b0 = (size_n0 + 3) / 4;
-    const int b1 = (size_n1 + 3) / 4;
-    dim3 grid((unsigned)(b0 + b1), (unsigned)((m + 7) / 8));
-    w34::small_n_gemm_dual_f16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)x,
-        (const __half*)w0,
-        (__half*)out0,
-        size_n0,
-        b0,
-        (const __half*)w1,
-        (__half*)out1,
-        size_n1,
-        m,
-        size_k);
+    cudaStream_t stream = (cudaStream_t)ex->stream;
+    if (m == 1) {
+        dim3 grid((unsigned)(size_n0 + size_n1), 1u);
+        w34::small_n_gemm_dual_f16_kernel<1, 4><<<grid, 256, 0, stream>>>(
+            (const __half*)x, (const __half*)w0, (__half*)out0, size_n0,
+            (const __half*)w1, (__half*)out1, size_n1, m, size_k);
+    } else if (m <= 16) {
+        dim3 grid((unsigned)(size_n0 + size_n1), (unsigned)((m + 3) / 4));
+        w34::small_n_gemm_dual_f16_kernel<4, 4><<<grid, 256, 0, stream>>>(
+            (const __half*)x, (const __half*)w0, (__half*)out0, size_n0,
+            (const __half*)w1, (__half*)out1, size_n1, m, size_k);
+    } else {
+        const int t0 = (size_n0 + 3) / 4;
+        const int t1 = (size_n1 + 3) / 4;
+        dim3 grid((unsigned)(t0 + t1), (unsigned)((m + 3) / 4));
+        w34::small_n_gemm_dual_4x4_f16_kernel<<<grid, 256, 0, stream>>>(
+            (const __half*)x, (const __half*)w0, (__half*)out0, size_n0, t0,
+            (const __half*)w1, (__half*)out1, size_n1, m, size_k);
+    }
     return (int)cudaGetLastError();
 }

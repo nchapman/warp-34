@@ -4782,12 +4782,13 @@ impl Qwen3_5Engine {
         r0.batch_meta_arena.reset();
         let cfg_bytes = core::mem::size_of_val(row_cfgs);
         let sparse_bytes = core::mem::size_of_val(sparse_entries);
+        let mask_bytes = core::mem::size_of_val(bitmask_words);
         let out_bytes = num_rows * core::mem::size_of::<ffi::W34SamplerRowOut>();
         let cfg_off = 0usize;
         let sparse_off = (cfg_bytes + 63) & !63;
-        let out_off = (sparse_off + sparse_bytes + 63) & !63;
-        let use_pinned_sampler = bitmask_words.is_empty()
-            && (out_off + out_bytes <= BatchedDecodeGraphIo::PINNED_SAMPLER_BYTES);
+        let mask_off = (sparse_off + sparse_bytes + 63) & !63;
+        let out_off = (mask_off + mask_bytes + 63) & !63;
+        let use_pinned_sampler = out_off + out_bytes <= BatchedDecodeGraphIo::PINNED_SAMPLER_BYTES;
         let (cfg_dev, mask_dev, sparse_dev) = if use_pinned_sampler {
             if r0
                 .batched_decode_io
@@ -4816,8 +4817,17 @@ impl Qwen3_5Engine {
                         sparse_bytes,
                     );
                 }
+                if mask_bytes > 0 {
+                    core::ptr::copy_nonoverlapping(
+                        bitmask_words.as_ptr().cast::<u8>(),
+                        pbase.add(mask_off),
+                        mask_bytes,
+                    );
+                }
             }
-            let h2d_bytes = if sparse_bytes > 0 {
+            let h2d_bytes = if mask_bytes > 0 {
+                mask_off + mask_bytes
+            } else if sparse_bytes > 0 {
                 sparse_off + sparse_bytes
             } else {
                 cfg_bytes
@@ -4837,12 +4847,17 @@ impl Qwen3_5Engine {
                 },
                 "upload pinned GPU sampler inputs",
             )?;
+            let mk_dev = if mask_bytes > 0 {
+                dev_base + mask_off as u64
+            } else {
+                0
+            };
             let sp_dev = if sparse_bytes > 0 {
                 dev_base + sparse_off as u64
             } else {
                 0
             };
-            (dev_base, 0u64, sp_dev)
+            (dev_base, mk_dev, sp_dev)
         } else {
             let c_dev = r0.batch_meta_arena.upload_slice(row_cfgs, &r0.stream)?;
             let m_dev = if bitmask_words.is_empty() {
@@ -5004,6 +5019,9 @@ impl Qwen3_5Engine {
         &mut self,
         sampler: &mut crate::parser::SamplerV1,
     ) -> Result<(i32, Option<crate::parser::StepLogprobs>)> {
+        sampler
+            .materialize_pending_constraint()
+            .map_err(|_| loader_err("GPU sampler grammar materialization failed"))?;
         let mut bitmask_words = Vec::new();
         let mut sparse_entries = Vec::new();
         let u = crate::parser::SamplerV1::uniform_f32(

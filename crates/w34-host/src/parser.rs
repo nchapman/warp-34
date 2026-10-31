@@ -333,6 +333,7 @@ impl SamplerV1 {
     }
 
     pub fn try_sample_from_logits(&mut self, logits: &[f32]) -> Result<i32, String> {
+        self.materialize_pending_constraint()?;
         let probs = self.processed_candidates(logits)?;
         let norm_sum: f32 = probs.iter().map(|x| x.1).sum();
         let u = Self::uniform_f32(self.params.seed, self.output_history.len()) * norm_sum;
@@ -406,6 +407,9 @@ impl SamplerV1 {
         self.params.validate()?;
         let mask_words_per_row = vocab_size.div_ceil(32);
         let (has_bitmask, row_bitmask_word_offset) = if let Some(ref c) = self.constraint {
+            if c.has_pending() {
+                return Err("unmaterialized token constraint before append_gpu_row".to_string());
+            }
             let off = i32::try_from(bitmask_words_out.len())
                 .map_err(|_| "bitmask buffer overflow".to_string())?;
             let start = bitmask_words_out.len();
@@ -529,6 +533,13 @@ impl SamplerV1 {
         })
     }
 
+    pub fn materialize_pending_constraint(&mut self) -> Result<(), String> {
+        if let Some(ref mut c) = self.constraint {
+            c.materialize_pending()?;
+        }
+        Ok(())
+    }
+
     pub fn commit_token(&mut self, token_id: i32) {
         self.try_commit_token(token_id)
             .expect("invalid sampler token commit");
@@ -537,6 +548,17 @@ impl SamplerV1 {
     pub fn try_commit_token(&mut self, token_id: i32) -> Result<(), String> {
         if let Some(ref mut c) = self.constraint {
             c.advance(token_id)?;
+        }
+        self.output_history.push(token_id);
+        *self.output_counts.entry(token_id).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Commits `token_id` to `output_history` / `output_counts` immediately while deferring
+    /// `llguidance` mask materialization until the next GPU forward pass is already in flight.
+    pub fn try_commit_token_deferred(&mut self, token_id: i32) -> Result<(), String> {
+        if let Some(ref mut c) = self.constraint {
+            c.advance_deferred(token_id)?;
         }
         self.output_history.push(token_id);
         *self.output_counts.entry(token_id).or_insert(0) += 1;

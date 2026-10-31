@@ -870,6 +870,147 @@ fn test_gate2_gdn_continuation_checkpoint_and_rejection_parity() {
         &all_ssm[11 * state_elems..12 * state_elems],
         "Gate #2: 0-ULP GDN speculative rejection state parity (slot 6 == slot 11)"
     );
+
+    // Also verify 27B geometry (`hk=16, hv=96, dk=128, dv=128` -> `<8, 5>` TILE_S=16 prefill
+    // vs `<8, 6>` single-token decode) across 35 tokens (> 2 * TILE_S + partial tail tile).
+    {
+        let hk96 = 16usize;
+        let hv96 = 96usize;
+        let conv_dim96 = 2 * hk96 * dk + hv96 * dv; // 16384
+        let seq96 = 35usize;
+        let qkv_host96: Vec<u16> = (0..(seq96 * conv_dim96))
+            .map(|i| f32_to_f16(((i % 97) as f32 - 48.0) * 0.008))
+            .collect();
+        let b_host96: Vec<u16> = (0..(seq96 * hv96))
+            .map(|i| f32_to_f16(((i % 19) as f32 - 9.0) * 0.1))
+            .collect();
+        let a_host96: Vec<u16> = (0..(seq96 * hv96))
+            .map(|i| f32_to_f16(((i % 23) as f32 - 11.0) * 0.05))
+            .collect();
+        let a_log96: Vec<f32> = (0..hv96).map(|i| -1.5 - 0.02 * (i as f32)).collect();
+        let dt_bias96: Vec<f32> = (0..hv96).map(|i| -0.1 + 0.005 * (i as f32)).collect();
+
+        let d_qkv96 = DeviceBuffer::alloc(0, qkv_host96.len() * 2).unwrap();
+        let d_b96 = DeviceBuffer::alloc(0, b_host96.len() * 2).unwrap();
+        let d_a96 = DeviceBuffer::alloc(0, a_host96.len() * 2).unwrap();
+        let d_alog96 = DeviceBuffer::alloc(0, a_log96.len() * 4).unwrap();
+        let d_dtb96 = DeviceBuffer::alloc(0, dt_bias96.len() * 4).unwrap();
+        d_qkv96.copy_from_host(&qkv_host96, &stream).unwrap();
+        d_b96.copy_from_host(&b_host96, &stream).unwrap();
+        d_a96.copy_from_host(&a_host96, &stream).unwrap();
+        d_alog96.copy_from_host(&a_log96, &stream).unwrap();
+        d_dtb96.copy_from_host(&dt_bias96, &stream).unwrap();
+
+        let pool96 = StateBundlePool::new(0, &[0], 2, conv_dim96, 4, hv96, dk, dv).unwrap();
+        let st96 = &pool96.layers[0];
+        let d_out_prefill = DeviceBuffer::alloc(0, seq96 * hv96 * dv * 2).unwrap();
+        let d_out_decode = DeviceBuffer::alloc(0, seq96 * hv96 * dv * 2).unwrap();
+
+        // Prefill 35 tokens into slot 0
+        let meta_pf: [i32; 5] = [0, seq96 as i32, -1, 0, 0];
+        d_meta.copy_from_host(&meta_pf, &stream).unwrap();
+        let batch_pf = W34GdnBatch {
+            query_start_loc: d_meta.addr() as *const i32,
+            state_in_indices: (d_meta.addr() + 8) as *const i32,
+            state_out_indices: (d_meta.addr() + 12) as *const i32,
+            spec_state_indices: core::ptr::null(),
+            checkpoint_dst_indices: core::ptr::null(),
+            checkpoint_token_offsets: core::ptr::null(),
+            has_initial_state: (d_meta.addr() + 16) as *const u8,
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: seq96 as i32,
+            max_verify_tokens: 0,
+            max_checkpoints_per_req: 0,
+        };
+        assert_eq!(
+            unsafe {
+                ffi::w34_gdn_recurrent_f16(
+                    &ex,
+                    &batch_pf,
+                    d_qkv96.addr() as *const c_void,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    d_b96.addr() as *const c_void,
+                    d_a96.addr() as *const c_void,
+                    d_alog96.addr() as *const f32,
+                    d_dtb96.addr() as *const f32,
+                    st96.ssm_state.addr() as *mut f32,
+                    d_out_prefill.addr() as *mut c_void,
+                    hk96 as i32,
+                    dk as i32,
+                    hv96 as i32,
+                    dv as i32,
+                    2,
+                )
+            },
+            0
+        );
+
+        // Decode 35 single tokens step-by-step into slot 1
+        for step in 0..seq96 {
+            let meta_dec: [i32; 5] = [0, 1, if step == 0 { -1 } else { 1 }, 1, i32::from(step > 0)];
+            d_meta.copy_from_host(&meta_dec, &stream).unwrap();
+            let batch_dec = W34GdnBatch {
+                query_start_loc: d_meta.addr() as *const i32,
+                state_in_indices: (d_meta.addr() + 8) as *const i32,
+                state_out_indices: (d_meta.addr() + 12) as *const i32,
+                spec_state_indices: core::ptr::null(),
+                checkpoint_dst_indices: core::ptr::null(),
+                checkpoint_token_offsets: core::ptr::null(),
+                has_initial_state: (d_meta.addr() + 16) as *const u8,
+                valid_req_mask: core::ptr::null(),
+                num_reqs: 1,
+                total_tokens: 1,
+                max_verify_tokens: 0,
+                max_checkpoints_per_req: 0,
+            };
+            assert_eq!(
+                unsafe {
+                    ffi::w34_gdn_recurrent_f16(
+                        &ex,
+                        &batch_dec,
+                        (d_qkv96.addr() + (step * conv_dim96 * 2) as u64) as *const c_void,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        (d_b96.addr() + (step * hv96 * 2) as u64) as *const c_void,
+                        (d_a96.addr() + (step * hv96 * 2) as u64) as *const c_void,
+                        d_alog96.addr() as *const f32,
+                        d_dtb96.addr() as *const f32,
+                        st96.ssm_state.addr() as *mut f32,
+                        (d_out_decode.addr() + (step * hv96 * dv * 2) as u64) as *mut c_void,
+                        hk96 as i32,
+                        dk as i32,
+                        hv96 as i32,
+                        dv as i32,
+                        2,
+                    )
+                },
+                0
+            );
+        }
+
+        let mut out_pf = vec![0u16; seq96 * hv96 * dv];
+        let mut out_dec = vec![0u16; seq96 * hv96 * dv];
+        d_out_prefill.copy_to_host(&mut out_pf, &stream).unwrap();
+        d_out_decode.copy_to_host(&mut out_dec, &stream).unwrap();
+        let state_elems96 = hv96 * dv * dk;
+        let mut ssm96 = vec![0.0f32; 2 * state_elems96];
+        st96.ssm_state.copy_to_host(&mut ssm96, &stream).unwrap();
+        stream.synchronize().unwrap();
+
+        assert_eq!(
+            out_pf, out_dec,
+            "Gate #2: 0-ULP hv=96 GDN TILE_S=16 prefill vs single-step decode output parity"
+        );
+        assert_eq!(
+            &ssm96[..state_elems96],
+            &ssm96[state_elems96..],
+            "Gate #2: 0-ULP hv=96 GDN TILE_S=16 prefill vs single-step decode ssm_state parity"
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]

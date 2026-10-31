@@ -867,9 +867,10 @@ __global__ void paged_attention_gqa_mma_f16_kernel(
     int num_splits) {
     constexpr int HEAD_DIM = 256;
     constexpr int SMEM_STRIDE = 264; // 264 * 2 = 528 B (16B-aligned + bank-conflict-free)
-    // Short verification uses ~64 keys per partition; retain the long-context floor.
-    const int MIN_PAGES_PER_SPLIT =
-        (batch.max_seq_len >= 128 && batch.max_seq_len <= 1024) ? 4 : 64;
+    // Keep Split-KV partitions down to 4 pages (64 keys) across both short and long
+    // max_seq_len CUDA-graph buckets so 1K-4K decode spreads across 52-64 active CTAs
+    // instead of collapsing to 4-8 CTAs when max_seq_len > 1024.
+    constexpr int MIN_PAGES_PER_SPLIT = 4;
 
     __shared__ __align__(16) __half s_q[16][SMEM_STRIDE];
     __shared__ __align__(16) __half s_kv[16][SMEM_STRIDE];
@@ -1828,7 +1829,7 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
         float* partial_l = nullptr;
         const bool short_split =
             ((batch->max_q_len > 1 && batch->total_tokens > 1) ||
-             (batch->max_q_len == 1 && batch->num_reqs >= 4 && batch->total_tokens <= 8)) &&
+             (batch->max_q_len == 1 && batch->num_reqs >= 1 && batch->total_tokens <= 8)) &&
             batch->total_tokens <= 16 && batch->max_seq_len >= 128 && batch->max_seq_len <= 1024;
         if ((short_split || (batch->total_tokens <= 16 && batch->max_seq_len > 1024 &&
             batch->max_blocks_per_req > 64)) &&
@@ -1854,8 +1855,7 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
             }
         }
 
-        if (batch->total_tokens == 1 && num_splits == 1 &&
-            (layout->k_format != W34_KV_FORMAT_TQ4 || gqa_ratio < 4)) {
+        if (batch->total_tokens == 1 && num_splits == 1 && gqa_ratio < 2) {
             dim3 grid(1u, (unsigned)num_q_heads);
             w34_attn::paged_attention_kernel<__half><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 *layout, *batch, (const __half*)q_in, (__half*)attn_out, num_q_heads);

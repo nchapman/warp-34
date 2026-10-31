@@ -405,3 +405,40 @@ fn unsupported_grammars_fail_closed() {
     assert!(ConstraintFactory::new(tokenizer(), 260, &[]).is_err());
     assert!(ConstraintFactory::new(tokenizer(), 260, &[999]).is_err());
 }
+
+#[test]
+fn deferred_advance_and_rollback_match_eager_bitmasks() {
+    let (tok, factory) = setup();
+    let schema = json!({
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" } },
+        "required": ["ok"],
+        "additionalProperties": false
+    });
+    let mut eager = factory.json_schema(schema.clone(), false).unwrap();
+    let mut deferred = factory.json_schema(schema, false).unwrap();
+    let ids: Vec<i32> = tok
+        .encode(r#"{"ok":true}"#, false)
+        .unwrap()
+        .get_ids()
+        .iter()
+        .map(|&id| id as i32)
+        .collect();
+
+    for &id in &ids {
+        let before = deferred.current_bitmask();
+        deferred.advance_deferred(id).unwrap();
+        assert!(deferred.has_pending());
+        // Unmaterialized rollback restores exact pre-step state without touching matcher.
+        deferred.rollback(1).unwrap();
+        assert!(!deferred.has_pending());
+        assert_eq!(deferred.current_bitmask(), before);
+
+        eager.advance(id).unwrap();
+        deferred.advance_deferred(id).unwrap();
+        deferred.materialize_pending().unwrap();
+        assert!(!deferred.has_pending());
+        assert_eq!(deferred.current_bitmask(), eager.current_bitmask());
+    }
+    assert!(deferred.is_token_allowed(EOS));
+}

@@ -244,6 +244,48 @@ pub fn format_chatml_prompt_with_options(
     out
 }
 
+/// Inspects a checkpoint directory's `chat_template.jinja` (falling back to
+/// `tokenizer_config.json` `chat_template`) to determine whether the model's
+/// Jinja chat template defaults `preserve_thinking` / `_preserve_thinking` to `true`
+/// (e.g. `Qwen3.8` and `qwen3.8-froggeric-v22.5` templates) or `false` (official `Qwen3.5` / `Qwen3.6`).
+pub fn detect_default_preserve_thinking(model_dir: &std::path::Path) -> bool {
+    let tmpl = std::fs::read_to_string(model_dir.join("chat_template.jinja"))
+        .ok()
+        .or_else(|| {
+            let tc = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok()?;
+            extract_chat_template_from_tokenizer_config(&tc)
+        });
+    detect_preserve_thinking_from_template(tmpl.as_deref().unwrap_or(""))
+}
+
+fn extract_chat_template_from_tokenizer_config(json_text: &str) -> Option<String> {
+    let root = serde_json::from_str::<serde_json::Value>(json_text).ok()?;
+    let ct = root.get("chat_template")?;
+    if let Some(s) = ct.as_str() {
+        return Some(s.to_owned());
+    }
+    let arr = ct.as_array()?;
+    arr.iter()
+        .find(|item| item.get("name").and_then(|n| n.as_str()) == Some("default"))
+        .or_else(|| arr.first())
+        .and_then(|item| item.get("template").and_then(|t| t.as_str()))
+        .map(str::to_owned)
+}
+
+pub fn detect_preserve_thinking_from_template(template: &str) -> bool {
+    let norm = template
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let compact: String = norm.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    compact.contains("_preserve_thinking=true")
+        || compact.contains("preserve_thinking|default(true)")
+        || norm.contains("preserve_thinking is undefined or ")
+        || (norm.contains("preserve_thinking is undefined")
+            && compact.contains("setpreserve_thinking=true"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +422,40 @@ mod tests {
             }
         }]);
         assert!(parse_history_tools(Some(&invalid_json)).is_err());
+    }
+
+    #[test]
+    fn test_detect_preserve_thinking_from_template_variants() {
+        // Official Qwen3.5 (no preserve_thinking flag) -> false
+        assert!(!detect_preserve_thinking_from_template(
+            "{%- if loop.index0 > ns.last_query_index %}"
+        ));
+        // Official Qwen3.6 (explicitly requires preserve_thinking is defined and true) -> false
+        assert!(!detect_preserve_thinking_from_template(
+            "{%- if (preserve_thinking is defined and preserve_thinking is true) or (loop.index0 > ns.last_query_index) %}"
+        ));
+        // Qwen3.8 standard template -> true
+        assert!(detect_preserve_thinking_from_template(
+            "{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}"
+        ));
+        // froggeric v22.5 template -> true
+        assert!(detect_preserve_thinking_from_template(
+            "{%- if preserve_reasoning is defined %}{%- set _preserve_thinking = preserve_reasoning %}{%- else %}{%- set _preserve_thinking = true %}{%- endif %}"
+        ));
+        // default(true) filter template (including uppercase True / tight spacing) -> true
+        assert!(detect_preserve_thinking_from_template(
+            "{%- set preserve_thinking = preserve_thinking | default(true) %}"
+        ));
+        assert!(detect_preserve_thinking_from_template(
+            "{%- set preserve_thinking=preserve_thinking|default( True ) %}"
+        ));
+        // Explicit undefined -> false guard must NOT false-positive -> false
+        assert!(!detect_preserve_thinking_from_template(
+            "{%- if preserve_thinking is undefined %}{%- set preserve_thinking = false %}{%- endif %}"
+        ));
+        // Modern list-form `chat_template` in `tokenizer_config.json`
+        let list_cfg = r#"{"chat_template":[{"name":"tool_use","template":"x"},{"name":"default","template":"{%- set _preserve_thinking = true %}"}]}"#;
+        let extracted = extract_chat_template_from_tokenizer_config(list_cfg).unwrap();
+        assert!(detect_preserve_thinking_from_template(&extracted));
     }
 }

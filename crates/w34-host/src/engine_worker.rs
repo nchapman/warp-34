@@ -71,6 +71,7 @@ pub struct EngineWorker {
     pub tokenizer: Option<tokenizers::Tokenizer>,
     pub eos_token_ids: Vec<i32>,
     pub vocab_size: usize,
+    pub default_preserve_thinking: bool,
 }
 impl EngineWorker {
     pub fn start(engine: Qwen3_5Engine, config: SchedulerConfig) -> Self {
@@ -93,10 +94,13 @@ impl EngineWorker {
             .name("w34-cuda".into())
             .spawn(move || match loader() {
                 Ok(engine) => {
+                    let default_preserve_thinking =
+                        crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
                     let info = (
                         engine.tokenizer.clone(),
                         engine.cfg.eos_token_ids.clone(),
                         engine.cfg.vocab_size,
+                        default_preserve_thinking,
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
                         run(engine, config, receiver, stop, worker_stats);
@@ -107,17 +111,18 @@ impl EngineWorker {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let (tokenizer, eos_token_ids, vocab_size) = match ready_rx.recv() {
-            Ok(Ok(info)) => info,
-            Ok(Err(error)) => {
-                let _ = thread.join();
-                return Err(error);
-            }
-            Err(error) => {
-                let _ = thread.join();
-                return Err(error.to_string());
-            }
-        };
+        let (tokenizer, eos_token_ids, vocab_size, default_preserve_thinking) =
+            match ready_rx.recv() {
+                Ok(Ok(info)) => info,
+                Ok(Err(error)) => {
+                    let _ = thread.join();
+                    return Err(error);
+                }
+                Err(error) => {
+                    let _ = thread.join();
+                    return Err(error.to_string());
+                }
+            };
         Ok(Self {
             sender: Mutex::new(Some(sender)),
             thread: Mutex::new(Some(thread)),
@@ -126,6 +131,7 @@ impl EngineWorker {
             tokenizer,
             eos_token_ids,
             vocab_size,
+            default_preserve_thinking,
         })
     }
 
@@ -276,15 +282,27 @@ fn enqueue(
 
 fn run(
     mut engine: Qwen3_5Engine,
-    config: SchedulerConfig,
+    mut config: SchedulerConfig,
     mut receiver: Receiver<Request>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<WorkerStats>,
 ) {
+    // Compact 128 MiB scratch arenas (used when 27B TP=1 reserves >= 8192 KV pages)
+    // hold ~440 tokens of transient activations; clamp token budget to 256 so those
+    // ultra-long-KV configurations never overflow `scratch_arena`.
+    if let Some(r0) = engine.ranks.first()
+        && r0.scratch_arena.capacity() < 256 * 1024 * 1024
+    {
+        let chunk = config.mamba_chunk_size.max(1);
+        let cap = (256usize.max(chunk) / chunk) * chunk;
+        config.max_num_batched_tokens = config.max_num_batched_tokens.min(cap);
+        config.chunk_prefill_size = config.chunk_prefill_size.min(cap);
+    }
     let mut sched = SchedulerV1::new(config);
     let mut requests = HashMap::new();
     let mut speculative_id = None;
     let mut pending_ingest = Vec::new();
+    let mut prev_active_peak = 1usize;
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
@@ -311,15 +329,18 @@ fn run(
             }
         }
         // When waking from idle, briefly coalesce concurrent HTTP burst peers that are
-        // finishing socket connect + tokenization (including Python client GIL bursts) so
-        // simultaneous N=8/16 arrivals batch onto tick 1 instead of staggering request 0
-        // into lone speculation.
+        // finishing socket connect + tokenization (including Python client GIL bursts and
+        // wave-to-wave batch turnarounds) so simultaneous N=8/16 arrivals batch onto tick 1
+        // instead of staggering request 0 into a lone prefill pass.
         if was_idle && requests.len() < config.max_num_seqs && !shutdown.load(Ordering::Acquire) {
             let burst_start = std::time::Instant::now();
             let mut last_arrival = burst_start;
             let spec_active = engine.speculative.is_some();
             while requests.len() < config.max_num_seqs && !shutdown.load(Ordering::Acquire) {
-                let max_window = if requests.len() >= 2 {
+                if prev_active_peak >= 2 && requests.len() >= prev_active_peak {
+                    break;
+                }
+                let max_window = if requests.len() >= 2 || prev_active_peak >= 2 {
                     std::time::Duration::from_millis(8)
                 } else {
                     std::time::Duration::from_micros(3000)
@@ -334,7 +355,9 @@ fn run(
                     }
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
                     Err(mpsc::error::TryRecvError::Empty) => {
-                        let quiet_cap = if requests.len() <= 1 {
+                        let quiet_cap = if prev_active_peak >= 2 {
+                            std::time::Duration::from_micros(3500)
+                        } else if requests.len() <= 1 {
                             if spec_active {
                                 std::time::Duration::from_micros(2500)
                             } else {
@@ -350,6 +373,9 @@ fn run(
                     }
                 }
             }
+        }
+        if !requests.is_empty() {
+            prev_active_peak = requests.len();
         }
         let cancelled: Vec<_> = requests
             .iter()
@@ -507,6 +533,14 @@ fn run(
                 .sampler
                 .params
                 .is_plain_greedy(r.sampler.constraint.is_some());
+            if let Err(err) = r.sampler.materialize_pending_constraint() {
+                engine.speculative = Some(proposer);
+                fail_request(&mut engine, &mut sched, &mut requests, id, err);
+                speculative_id = None;
+                pending_ingest.clear();
+                std::mem::swap(&mut engine.radix, &mut sched.radix);
+                continue;
+            }
             let result = if !seq.is_prefill_complete() {
                 proposer
                     .step_scheduled_prefill_chunk(
@@ -772,13 +806,39 @@ fn step_plain(
     let greedy = engine
         .step_batch_slices_for_sampler(&batch, Some(&deltas), needs_gpu)
         .map_err(|e| e.to_string())?;
+    let mut pending_errors: Vec<Option<String>> = vec![None; slices.len()];
     let sampled = if needs_gpu {
         let _sampler_range = crate::profiling::Range::new(c"w34.serve.sampler");
         let mut masks = Vec::new();
         let mut sparse = Vec::new();
         let mut rows = Vec::new();
-        for s in &slices {
-            let sampler = &requests[&s.req_id].sampler;
+        for (i, s) in slices.iter().enumerate() {
+            let r = requests.get_mut(&s.req_id).unwrap();
+            if (!s.is_prefill_chunk || s.is_final_prefill_chunk)
+                && let Err(err) = r.sampler.materialize_pending_constraint()
+            {
+                pending_errors[i] = Some(err);
+                rows.push(w34_kernels::ffi::W34SamplerRowCfg {
+                    temperature: 0.0,
+                    top_k: 1,
+                    top_p: 1.0,
+                    min_p: 0.0,
+                    repetition_penalty: 1.0,
+                    frequency_penalty: 0.0,
+                    presence_penalty: 0.0,
+                    uniform_sample: 0.0,
+                    recovery_uniform: 0.0,
+                    draft_token_id: -1,
+                    has_bitmask: 0,
+                    row_bitmask_word_offset: 0,
+                    sparse_offset: 0,
+                    sparse_count: 0,
+                    top_logprobs_k: -1,
+                    use_token_id_cdf: 0,
+                });
+                continue;
+            }
+            let sampler = &r.sampler;
             let u1 = if sampler.params.temperature <= 1e-6 || sampler.params.top_k == 1 {
                 0.0
             } else {
@@ -805,6 +865,10 @@ fn step_plain(
     };
     for (i, s) in slices.iter().enumerate() {
         let token = if !s.is_prefill_chunk || s.is_final_prefill_chunk {
+            if let Some(error) = pending_errors[i].take() {
+                fail_request(engine, sched, requests, s.req_id, error);
+                continue;
+            }
             let r = requests.get_mut(&s.req_id).unwrap();
             let (id, lp) = if let Some(rows) = &sampled {
                 let out = &rows[i];
@@ -831,7 +895,7 @@ fn step_plain(
             } else {
                 (greedy[i][0], None)
             };
-            if let Err(error) = r.sampler.try_commit_token(id) {
+            if let Err(error) = r.sampler.try_commit_token_deferred(id) {
                 fail_request(engine, sched, requests, s.req_id, error);
                 continue;
             }
