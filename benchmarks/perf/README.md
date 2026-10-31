@@ -161,7 +161,10 @@ startup log and run bundle together. Inventory/root paths remain trusted inputs.
 
 The checked-in [one-card preset](qualification/27b-one-card.toml) pins the newer
 GPTQ `0df81ea...` for three separate probes: C1, **offered C8** and four-turn agent
-replay, three repetitions and 64-token ceilings. Never start these profiles
+replay, three repetitions and 64-token ceilings. This is the **only current GPTQ
+candidate**: obsolete `c11a884...` was removed from the local cache and local
+`refs/main` now points to 0df. Old hashes/failures remain historical evidence,
+not instructions to fetch or reuse c11. Never start these profiles
 simultaneously on the same GPU/port. See the [qualification ledger](qualification/27b-one-card.json)
 for startup failures and successful probes. SGLang's BF16 activation/KV probe is
 **not an FP16 pass**; its active-request limit is 2, so offered C8 includes server

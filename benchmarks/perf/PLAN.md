@@ -293,6 +293,30 @@ explicitly documented as HTTP responsiveness in the repository README.
   rendered Markdown/CSV for all three runs. `git diff --check` passes and GPUs
   are free. Raw evidence remains in `/tmp`; archive before any public release.
 
+## Retire obsolete GPTQ cache revision
+
+- User-directed policy: **use only `0df81eadcfd59601cb82ccece2f16ea7d39244bf`
+  for current GPTQ runs**. Older c11 results/failure cells/golden provenance stay
+  historical; never substitute their hashes or relabel their evidence as 0df.
+- Found local `refs/main` still pointing to c11. Updated it to 0df, then used
+  `hf cache rm c11a884fe4b659eccdce66761f26d3775cf7696c --yes --json` after a
+  dry-run and inactive-process check. Exactly one revision was deleted;
+  Hugging Face reports **18.6 GB freed**. Removed the obsolete weight blob,
+  preserved shared files and did not run a global cache prune. Separate RTN
+  experiments and unrelated incomplete downloads were left untouched.
+- Verified old snapshot/weight absence, new snapshot links and local main ref.
+  Re-read the full current inventory after deletion: **19,610,855,960 bytes**,
+  hash `82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03`,
+  no differences. Candidate JSON/current documentation now mark c11 retired.
+  Cached refs are local state, not a claim about upstream `main`; pin explicit
+  0df revisions/paths for reproducible downloads and runs.
+- Deletion receipt: `/tmp/w34-perf-old-snapshot-removal.json`; re-verification:
+  `/tmp/w34-perf-new-snapshot-after-retirement.json`. Full post-retirement
+  `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **216.60 s**, including
+  **208 Rust tests/doc-tests + 69 oracle tests + 47 performance tests**, fmt and
+  both Clippy feature states (`/tmp/w34-old-quant-retirement-check.log`). Preset,
+  JSON/doc links and `git diff --check` pass. No engine/test behavior changed.
+
 Next concrete tasks: finish source/converter provenance and independent quality;
 acquire selected GGUF/ninfer artifacts with verified checksums; qualify llama.cpp
 and NInfer Linux one-card runtimes. Resolve or deliberately retain SGLang's FP16

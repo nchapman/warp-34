@@ -95,7 +95,8 @@ advertised values, not verification of local GGUF/ninfer bytes.
 
 | Artifact | Immutable revision | Bytes | Status |
 |---|---|---:|---|
-| `nchapman/Qwen3.8-27B-W4A16-GPTQ` | `c11a884fe4b659eccdce66761f26d3775cf7696c` | 19,438,009,793 (11 visible files incl. MTP/tokenizer/template) | Cached; full streaming inventory + re-verification pass |
+| `nchapman/Qwen3.8-27B-W4A16-GPTQ` | `0df81eadcfd59601cb82ccece2f16ea7d39244bf` | 19,610,855,960 (13 visible files incl. sidecars/tokenizer/template) | **Current GPTQ candidate**; full inventory re-verified after old-cache removal |
+| Same repo, obsolete quant | `c11a884fe4b659eccdce66761f26d3775cf7696c` | 19,438,009,793 (historical inventory) | **Retired/deleted locally**; historical evidence only |
 | `WarlaxZ/Qwen3.8-27B-NInfer-3090/qwen3_8_27b.ninfer` | `ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1` | 18,982,458,624 | 3090-specific candidate, not downloaded |
 | `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` | 16,464,440,224 | Candidate, not downloaded |
 | Same repo, `Qwen3.8-27B-UD-Q4_K_XL.gguf` | same revision | 17,559,178,144 | Candidate, not downloaded |
@@ -113,15 +114,23 @@ The cached GPTQ README/recipe/config name the base repo but **do not record its
 source commit**. Do not fill `source_model_revision` from the model name, a current
 HF ref, or the NInfer card. The newer cached GPTQ `0df81ea...` is a different
 artifact with changed model bytes/index and an extra Q4 MTP sidecar; don't silently
-interchange them. Snapshot `c11a88...`'s index references both present safetensors
-files. Its tokenizer and froggeric v22.5 template differ from the official base
+interchange them. **Only `0df81ea...` is approved for current GPTQ runs.** The
+obsolete `c11a88...` snapshot and unshared blobs were deleted locally, reclaiming
+18.6 GB; shared tokenizer/template/MTP blobs were preserved. The stale local
+`refs/main` was changed from c11 to 0df, so offline repo-ID resolution also uses
+the newer snapshot. Still pin explicit revisions/paths: online upstream refs
+can move independently. A separate `rtn-gptq` experiment was left untouched and
+is not a selected candidate. Historical fixtures/results are not relabeled.
+The tokenizer and froggeric v22.5 template differ from the official base
 metadata and need explicit alignment/audit. A same-artifact GPTQ smoke is valid
 without claiming cross-format source/quality equivalence.
 
-Local inventory evidence is `/tmp/w34-perf-27b-gptq-inventory.json`, stable hash
-`cfef8c491913394b330a74c92a1738a474e9e04e09d4f2cd422b0ad7cd8f2cf2`.
-The evidence JSON records principal file hashes; retain the full inventory with
-future run bundles. Inventory includes sidecars, so its total size is **not**
+Current local inventory is [`qualification/27b-gptq-0df.inventory.json`](qualification/27b-gptq-0df.inventory.json),
+stable hash `82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03`.
+Old `/tmp/w34-perf-27b-gptq-inventory.json` and hash
+`cfef8c491913394b330a74c92a1738a474e9e04e09d4f2cd422b0ad7cd8f2cf2`
+are **historical c11 evidence**, not an inventory to use for new runs.
+Retain the full current inventory with future run bundles. Inventory includes sidecars, so its total size is **not**
 text-only loaded weight bytes or VRAM usage.
 
 Runtime inventory found installed vLLM **0.31.0**, SGLang **v0.5.19** image
@@ -133,7 +142,7 @@ the candidate source pin. No host llama.cpp/NInfer binaries or local 27B GGUF/
 `.ninfer` artifacts were found. Freeze builds and retain startup evidence before
 using their recipe rows in results.
 
-### vLLM 27B single-card smoke (not a speed result)
+### Historical vLLM c11 single-card smoke (retired artifact; not a speed result)
 
 Installed vLLM 0.31.0 successfully served the **exact cached GPTQ `c11a884...`**
 on one RTX 3090 Ti, using `--dtype half --language-model-only --enforce-eager`,

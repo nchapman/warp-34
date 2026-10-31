@@ -14,6 +14,23 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### Obsolete 27B GPTQ cache retired (2026-10-30)
+
+- **Only GPTQ `0df81eadcfd59601cb82ccece2f16ea7d39244bf` is approved for current
+  runs.** Found the local HF `refs/main` still pointing to obsolete c11; changed
+  it to 0df and removed c11 via revision-aware `hf cache rm`, freeing **18.6 GB**.
+  Old snapshot/weight blob are gone; shared files and unrelated experiments/
+  downloads were preserved. Historical result/fixture provenance is unchanged.
+- Re-verified the entire newer snapshot after deletion: **19,610,855,960 bytes**,
+  inventory hash `82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03`,
+  no differences. Candidate metadata/current guidance mark c11 retired; disabled
+  failure cells are historical only. Online refs can move: continue pinning 0df.
+- Full `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes after retirement in
+  **216.60 s**: 208 Rust tests/doc-tests, 69 oracle tests, 47 performance tests,
+  formatting and both Clippy feature states. Log:
+  `/tmp/w34-old-quant-retirement-check.log`. Preset, JSON/doc links and
+  `git diff --check` also pass.
+
 ### Repeated one-card 27B operational qualification (2026-10-30)
 
 - Added standalone `w34perf preflight`: trusted local byte/profile hashes,

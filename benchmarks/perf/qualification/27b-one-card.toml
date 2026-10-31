@@ -59,6 +59,7 @@ rendering_note = "Built-in ChatML renderer, not artifact Jinja execution; templa
 launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format fp16 --kv-pages 1024 --host 127.0.0.1 --port 18034"
 
 # Failed variants remain explicit, not swapped in-place or asserted globally unsupported.
+# c11 is historical only: its local snapshot/blobs were retired. Do not re-enable it.
 [[engines]]
 id = "sglang27-1-fp16-c11-failed"
 engine = "sglang"
