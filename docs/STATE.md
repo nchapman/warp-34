@@ -12,6 +12,40 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Post-Phase-6 `sm_86` 6-item performance roadmap complete — `35B-A3B` `1,009.7 tok/s`, batched `B=2..4` `MTP`, `128K` `TQ4`, large-`M` prefill, `TP=2` pipelined collectives, and unified prefill+decode
+
+Completed all 6 items of the `sm_86` performance roadmap across `w34-kernels` (`STACK:0` verified via `cuobjdump --dump-resource-usage` on every touched kernel) and `w34-host`, preserving the `FP16` target spine (`BF16` `DFlash2` drafter, `FP32` `ssm_state`), 0-ULP `M`-invariance / continuation parity, and the frozen `benchmarks/perf/campaigns/27b-fp16-first.toml` baseline:
+
+1. **`35B-A3B` Hybrid MoE (`TP=2` FP16 & `TP=1` `TQ4`) `w34perf` campaign ([`35b-a3b-moe-serving.toml`](../benchmarks/perf/campaigns/35b-a3b-moe-serving.toml)) & `op_moe.cu` / Marlin optimization:**
+   - Enabled 0-ULP `M`-invariant 2..4-slice Split-K in `op_marlin.cu` for narrow `35B-A3B` projections (`prob_m <= 16`, `prob_n in [512, 2048]`, `prob_k in [1024, 2048]`) and routed `op_moe.cu` `regime == 3` (`M > 128`) through chunked `BLOCK_M = 8` `moe_sparse_mma_kernel` (`M = 256` MoE layer latency `1.0427 ms` → **`0.6405 ms`**, **`1.63×`**, `STACK:0`, `tests/moe_sparse.rs` 3/3 green).
+   - **Live HTTP `w34perf` results vs `vLLM 0.31.0` (`TP=2` FP16) on 2× RTX 3090 Ti (100% requests ok):**
+     - `decode-c1`: `warp-34 TP=2 FP16` **`250.65 tok/s`** (TTFT p50 `37.71 ms`, E2E p95 `511.36 ms`) vs `vLLM 0.31.0` `191.42 tok/s` (**`+30.9%`**); `warp-34 TP=2 + MTP k=2` **`319.60 tok/s`** (**`+67.0%`** over `vLLM`, `457.41 tok/s` native CLI); **`warp-34 TP=1 TQ4` (1× 24 GiB 3090 Ti!) `186.50 tok/s`**.
+     - `spec-c2` / `spec-c4`: `warp-34 TP=2 FP16` **`414.56` / `641.87 tok/s`** vs `vLLM` `316.70` / `546.90 tok/s` (**`+30.9%` / `+17.4%`**); `warp-34 TP=1 TQ4` **`303.13` / `473.55 tok/s`**.
+     - `throughput-c8`: `warp-34 TP=2 FP16` **`1,009.72 tok/s`** (`[1008.05, 1011.39]`, E2E p95 `1,012.80 ms`) vs `vLLM` `856.95 tok/s` (**`+17.8%`**); `warp-34 TP=1 TQ4` **`710.18 tok/s`** on a single card.
+     - `mixed-poisson` (open-loop mixed prompt lengths): `warp-34 TP=2 FP16` / `MTP k=2` E2E p95 **`606.23 ms` / `560.08 ms`** vs `vLLM` `786.03 ms` (**`-22.9%` / `-28.7%`** tail latency).
+
+2. **Speculative serving (`Qwen3_5MTP` & `DFlash2`) `w34perf` campaign ([`27b-spec-and-tp2.toml`](../benchmarks/perf/campaigns/27b-spec-and-tp2.toml)) & batched `B=2..4` `MTP` verification (`mtp.rs`, `proposer.rs`, `engine_worker.rs`, `model.rs`):**
+   - Extended `MtpEngine` (`MAX_MTP_BATCH_SLOTS = 4`), `Proposer::step_scheduled_batched_mtp_verify_round`, `Qwen3_5Engine::verify_batched_speculative_gpu_steps` (supporting greedy soft-bans / `ignore_eos`), and `engine_worker.rs` to verify `B = 2..4` concurrent sequences per target forward pass (`k_cap = 1` at `B >= 3` to stay inside `M <= 8` Split-K/MoE regimes). Verified bit-exact `B=4` vs `B=1` lossless parity under `TQ4` in `tests/phase6_speculative_handoff.rs` (`batched_mtp_b4_matches_single_stream_losslessly`).
+   - **Live HTTP `27B` (`0df81ead...`) `TP=2` speculative serving results:** `decode-c1` jumps from `81.85 tok/s` (plain `TP=2`) to **`127.26 tok/s` (`+55.5%`)** with `Qwen3_5MTP k=2` and **`152.83 tok/s` (`1.87×`)** with `DFlash2` (`M=8` `BF16` drafter); at `spec-c2` (`C=2`), batched `MTP` reaches **`172.37 tok/s`** (`+13.5%` over plain `TP=2` `151.88 tok/s`, TTFT p50 **`144.42 ms` vs `195.08 ms`**, `-26.0%`), and `501.22 tok/s` at 256-token `B=2` steady-state on `35B-A3B`.
+
+3. **Paged `TQ4` (`3.07×` / `3.88×`) capacity & `8K–128K` / `C8–C16` serving ([`27b-tq4-longctx.toml`](../benchmarks/perf/campaigns/27b-tq4-longctx.toml)) + `op_paged_attn.cu` tuning:**
+   - Vectorized `TQ4` WHT-256 shared-memory stores (`uint2`), raised `TQ4` Split-KV cap to `64` splits above `32K` (`STACK:0` on both `paged_attention_gqa_mma_f16_kernel` and `paged_attention_split_kv_reduce_f16_kernel`), packed non-power-of-2 GQA prefill (`gqa_ratio = 6` → `q_group = 2, tok_tile = 8`, 16/16 MMA rows, cutting `27B TP=1 TQ4` `64K` prefill from `116.8 s` → **`96.1 s`**, **`+21.5%`**), and cleared stale `tokenizer.json` `truncation.max_length = 4096` on load (`normalize_hf_tokenizer`) + tiered `SchedulerConfig::clamp_for_scratch_bytes`.
+   - **1-GPU `27B` (`0df`) `8K–128K` & `C8–C16` results:** Where `FP16` (`65,536 B/tok`, `8.0 GiB` KV) OOMs `8,192` pages (`128K`) on 1× 24 GiB 3090 Ti, `TQ4` (`21,376 B/tok`, `3.07×`) sustains **`47.94 / 43.56 / 42.46 / 40.56 / 33.59 tok/s`** at **`8K / 16K / 32K / 64K / 128K`** (`129,024` tokens) on `TP=1` (**`47.44 tok/s`** at **`128K`** on `TP=2`), and `TQ4_all` (`16,896 B/tok`, `3.88×`) sustains **`41.07 tok/s`** at `64K` (`8,192` pages resident). `nsys` `16K` `TQ4` decode: `paged_attention_gqa_mma_f16_kernel` = **`268.32 µs/layer`** (`4.29 ms/tok`, `80.4%` effective `sm_86` HBM+WHT+MMA efficiency). Live HTTP `C=8` / `C=16` (`2,048` pages = `32K` pool on 1× GPU): **`266.61` / `258.55 tok/s`** (`tq4`) and **`264.27` / `256.29 tok/s`** (`tq4_all`), 32/32 requests ok.
+
+4. **Large-`M` prefill compute on `sm_86` (`op_marlin.cu`, `op_gdn.cu`):**
+   - Promoted wide-`N` (`N % 256 == 0`) large-`M` Marlin dispatch to `{64, 256, 256}` whenever `(prob_n / 256) * m_tiles >= sms` (2× `A`-tile reuse across 8 warps; `W4A8` INT8 IMMA audited and rejected for unweighted `g128` GPTQ due to activation-outlier precision loss without `FP16` spine changes) and added `STACK:0` `ROWS = 8` (`256` threads) `TP=2` GDN prefill (`gdn_prefill_f16_kernel` `~54 ms` → **`32.5 ms`**).
+   - **`27B` (`0df`) `M = 1,331` & `2,048` prefill latency:** `TP=1` `M=1,331` TTFT **`846 ms`** (`1,573 tok/s`, matching `vLLM`'s `850 ms` without breaking 0-ULP `FP16` parity); `TP=2` `M=1,331` TTFT `795.48 ms` → **`726.41 ms`** (**`1,832.3 tok/s`**), `M=2,048` **`1,091.31 ms`** (**`1,876.6 tok/s`**).
+
+5. **2-GPU (`TP=2`) PCIe Gen4 x8 serving ([`27b-spec-and-tp2.toml`](../benchmarks/perf/campaigns/27b-spec-and-tp2.toml)) & odd-stage pipelined sysmem `AllReduce` (`op_collectives.cu`):**
+   - Vectorized `tp2_all_reduce_residual_gemma_rms_norm_f16_kernel` staging (`uint4`), pipelined large payloads across odd stage counts (`1`, `3`, `5`) to overlap Rank-0/Rank-1 PCIe Gen4 x8 TX and RX while preserving `flag[blockIdx.x]` parity, and hardened `barrier_epoch_release` with a wrap-safe monotonic signed delta check (`< 0`, `STACK:0`).
+   - **`27B` `TP=2` vs `2× TP=1` data-parallel replicas across PCIe Gen4 x8 (`topo PHB`):** `TP=2` beats `2× TP=1` across every regime — `decode-c1` **`81.85` vs `50.17 tok/s` (`+63.1%`**, or **`152.83 tok/s` `+204.6%`** with `DFlash2`), `spec-c2` **`151.88` vs `100.39 tok/s` (`+51.3%`**, **`172.37` `+71.7%`** with batched `MTP`), `throughput-c8` **`410.59` vs `332.96 tok/s` (`+23.3%`**, E2E p95 **`2,492.27 ms` vs `3,088.32 ms`**), and `prefill-3k-c1` TTFT p50 **`1,648.94 ms` vs `2,232.58 ms` (`-26.1%`)**.
+
+6. **Unified prefill + decode continuous batching (`scheduler.rs`, `engine_worker.rs`):**
+   - Added `mixed_chunk_prefill_size = 256` (`SchedulerConfig::effective_mixed_prefill_budget`) so active decode tokens (`1` token/seq) co-execute in a single unified `ForwardBatch` alongside bounded `256`-token prefill chunks instead of stalling behind `1,408`-token pure-prefill waves.
+   - Verified by `scheduler::tests::test_unified_prefill_decode_bounds_mixed_step_tokens` and live open-loop mid-decode `~1,050`-token prompt injection on `35B-A3B TP=2` (active decode ITL **`p50 = 3.72 ms, p95 = 48.98 ms, max = 50.37 ms`** across 4 chunks vs `>160 ms` unchunked stall) plus `mixed-poisson` `w34perf` E2E p95 **`560.08–606.23 ms` vs `vLLM` `786.03 ms`**.
+
+---
+
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
 ### 1-GPU 27B FP16 (`0df`) kernel, scheduler, and serving sweep — 4/4 win over `vLLM 0.31.0` and `SGLang v0.5.19` (2026-10-30)

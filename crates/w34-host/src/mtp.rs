@@ -63,8 +63,10 @@ pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> 
     Ok(())
 }
 
+pub const MAX_MTP_BATCH_SLOTS: usize = 4;
+
 struct MtpGraphIo {
-    propose_graph: Option<(usize, bool, CudaGraph)>,
+    propose_graphs: [Option<(usize, bool, CudaGraph)>; MAX_MTP_BATCH_SLOTS],
     propose_arena: DeviceArena,
     meta_dev: DeviceBuffer,
     out_ids_dev: DeviceBuffer,
@@ -78,14 +80,20 @@ pub struct Qwen3_5MtpRank {
     target_embedding: u64,
     hidden_size: usize,
     capacity: usize,
+    total_capacity: usize,
     graph_io: MtpGraphIo,
     _weights: DeviceArena,
     scratch: DeviceArena,
     kv: KvPool,
+    all_pages: Vec<i32>,
+    all_pages_dev: u64,
     pages: Vec<i32>,
     pages_dev: u64,
     len: usize,
     committed: usize,
+    active_slot: usize,
+    batch_mode: bool,
+    slot_state: [(usize, usize); MAX_MTP_BATCH_SLOTS],
     fc: LinearProj,
     fa: FullAttentionLayerWeights,
     ffn: FfnBlockWeights,
@@ -279,25 +287,32 @@ impl Qwen3_5MtpRank {
             .and_then(|n| n.checked_add(2 * 1024 * 1024 + 131072))
             .ok_or_else(|| loader_err("MTP propose arena overflow"))?;
         let graph_io = MtpGraphIo {
-            propose_graph: None,
+            propose_graphs: std::array::from_fn(|_| None),
             propose_arena: DeviceArena::new(target.device.device_id, propose_arena_bytes)?,
             meta_dev: DeviceBuffer::alloc(target.device.device_id, 16 * 4)?,
             out_ids_dev: DeviceBuffer::alloc(target.device.device_id, 4 * 4)?,
         };
         target.stream.synchronize()?;
+        let all_pages = pages.clone();
         Ok(Self {
             use_cuda_graph: true,
             target_embedding: target.embed_tokens_ptr,
             hidden_size: h,
             capacity,
+            total_capacity: capacity,
             graph_io,
             _weights: weights,
             scratch: DeviceArena::new(target.device.device_id, scratch_bytes)?,
             kv,
+            all_pages,
+            all_pages_dev: pages_dev,
             pages,
             pages_dev,
             len: 0,
             committed: 0,
+            active_slot: 0,
+            batch_mode: false,
+            slot_state: [(0, 0); MAX_MTP_BATCH_SLOTS],
             fc,
             fa,
             ffn,
@@ -320,6 +335,72 @@ impl Qwen3_5MtpRank {
     pub fn kv_layout(&self) -> &ffi::W34KvLayerLayout {
         &self.kv.layers[0].layout
     }
+    pub fn batch_slot_capacity(&self) -> usize {
+        (self.all_pages.len() / MAX_MTP_BATCH_SLOTS) * 16
+    }
+    pub fn is_batch_mode(&self) -> bool {
+        self.batch_mode
+    }
+    pub fn set_batch_mode(&mut self, batch_mode: bool) -> Result<()> {
+        if batch_mode && self.batch_slot_capacity() < 32 {
+            return Err(loader_err("insufficient MTP KV pages for batched slots"));
+        }
+        if self.batch_mode != batch_mode {
+            self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+            self.batch_mode = batch_mode;
+        }
+        self.slot_state = [(0, 0); MAX_MTP_BATCH_SLOTS];
+        self.active_slot = 0;
+        self.len = 0;
+        self.committed = 0;
+        if batch_mode {
+            let slot_pages = self.all_pages.len() / MAX_MTP_BATCH_SLOTS;
+            self.pages = self.all_pages[..slot_pages].to_vec();
+            self.pages_dev = self.all_pages_dev;
+            self.capacity = slot_pages * 16;
+        } else {
+            self.pages = self.all_pages.clone();
+            self.pages_dev = self.all_pages_dev;
+            self.capacity = self.total_capacity;
+        }
+        Ok(())
+    }
+    pub fn promote_single_to_batch_slot0(&mut self) -> Result<()> {
+        let slot_cap = self.batch_slot_capacity();
+        if slot_cap < 32 || self.len > slot_cap {
+            return Err(loader_err(
+                "single-slot MTP state exceeds batch slot 0 capacity",
+            ));
+        }
+        if !self.batch_mode {
+            self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+            self.batch_mode = true;
+        }
+        self.slot_state = [(0, 0); MAX_MTP_BATCH_SLOTS];
+        self.slot_state[0] = (self.len, self.committed);
+        self.active_slot = 0;
+        let slot_pages = self.all_pages.len() / MAX_MTP_BATCH_SLOTS;
+        self.pages = self.all_pages[..slot_pages].to_vec();
+        self.pages_dev = self.all_pages_dev;
+        self.capacity = slot_cap;
+        Ok(())
+    }
+    pub fn select_batch_slot(&mut self, slot: usize) -> Result<()> {
+        if !self.batch_mode || slot >= MAX_MTP_BATCH_SLOTS {
+            return Err(loader_err("invalid MTP batch slot"));
+        }
+        if slot == self.active_slot {
+            return Ok(());
+        }
+        self.slot_state[self.active_slot] = (self.len, self.committed);
+        self.active_slot = slot;
+        (self.len, self.committed) = self.slot_state[slot];
+        let slot_pages = self.all_pages.len() / MAX_MTP_BATCH_SLOTS;
+        self.pages = self.all_pages[slot * slot_pages..(slot + 1) * slot_pages].to_vec();
+        self.pages_dev = self.all_pages_dev + (slot * slot_pages * 4) as u64;
+        self.capacity = slot_pages * 16;
+        Ok(())
+    }
     /// Discard provisional suffix. Stale bytes remain unreachable and are overwritten.
     /// Even accepted draft rows must be replayed using TARGET hidden rows before
     /// another round: recurrent draft hidden is not the committed target hidden.
@@ -329,6 +410,7 @@ impl Qwen3_5MtpRank {
         }
         self.len = len;
         self.committed = self.committed.min(len);
+        self.slot_state[self.active_slot] = (self.len, self.committed);
         Ok(())
     }
     /// Ingest shifted committed pairs: next_tokens[j] is token[start+j+1],
@@ -422,8 +504,8 @@ impl Qwen3_5MtpRank {
     }
     pub fn has_propose_graph(&self, k: usize) -> bool {
         let long_ctx = self.len + k > 1024;
-        self.graph_io
-            .propose_graph
+        let idx = if self.batch_mode { self.active_slot } else { 0 };
+        self.graph_io.propose_graphs[idx]
             .as_ref()
             .is_some_and(|(cap_k, cap_long, _)| *cap_k == k && *cap_long == long_ctx)
     }
@@ -920,7 +1002,8 @@ impl Qwen3_5MtpRank {
         let graph = CudaGraph::capture(&target.stream, || {
             self.enqueue_propose_steps(target, k, long_ctx, tp2)
         })?;
-        self.graph_io.propose_graph = Some((k, long_ctx, graph));
+        let idx = if self.batch_mode { self.active_slot } else { 0 };
+        self.graph_io.propose_graphs[idx] = Some((k, long_ctx, graph));
         Ok(())
     }
     pub fn prepare_propose_graph_inputs_async(
@@ -964,9 +1047,8 @@ impl Qwen3_5MtpRank {
     pub fn replay_propose_graph_async(&self, target: &Qwen3_5ModelRank, k: usize) -> Result<()> {
         let long_ctx = self.len + k > 1024;
         target.device.make_current()?;
-        let (_, _, graph) = self
-            .graph_io
-            .propose_graph
+        let idx = if self.batch_mode { self.active_slot } else { 0 };
+        let (_, _, graph) = self.graph_io.propose_graphs[idx]
             .as_ref()
             .filter(|(cap_k, cap_long, _)| *cap_k == k && *cap_long == long_ctx)
             .ok_or_else(|| loader_err("MTP propose graph not captured"))?;

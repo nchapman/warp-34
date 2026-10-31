@@ -203,16 +203,16 @@ impl RawLinearHost {
         default_group_size: usize,
     ) -> Result<Self> {
         let packed_key = format!("{base_prefix}.weight_packed");
-        if let Some(real_packed) = archive.resolve_name(&packed_key) {
-            let scale_key = archive
-                .resolve_name(&format!("{base_prefix}.weight_scale"))
-                .ok_or_else(|| loader_err("missing weight_scale"))?;
-            let p_info = archive
-                .tensor_info(&real_packed)
-                .map_err(|_| loader_err("tensor_info weight_packed"))?;
-            let s_info = archive
-                .tensor_info(&scale_key)
-                .map_err(|_| loader_err("tensor_info weight_scale"))?;
+        if let Some(real_packed) = archive.resolve_name(&packed_key)
+            && let Some(scale_key) = archive.resolve_name(&format!("{base_prefix}.weight_scale"))
+            && let Ok(p_info) = archive.tensor_info(&real_packed)
+            && let Ok(s_info) = archive.tensor_info(&scale_key)
+            && p_info.shape.len() == 2
+            && s_info.shape.len() == 2
+            && s_info.shape[1] > 0
+            && matches!(p_info.dtype.as_str(), "I32" | "U32")
+            && matches!(s_info.dtype.as_str(), "F16" | "BF16")
+        {
             let n = p_info.shape[0];
             let k = p_info.shape[1] * 8;
             let num_groups = s_info.shape[1];
@@ -1975,7 +1975,7 @@ impl Qwen3_5ModelRank {
         } else {
             match (cfg.num_hidden_layers, tp_size) {
                 (64, 2) => 12 * 1024 * 1024 * 1024, // 27B TP=2 (~9.5 GiB/rank)
-                (64, _) => 16_960 * 1024 * 1024,    // 27B TP=1 (~16.36 GiB actual weights)
+                (64, _) => 16_960 * 1024 * 1024,    // 27B TP=1 (~16.5 GiB actual weights + repack)
                 (_, 2) => 5 * 1024 * 1024 * 1024,   // 4B/9B TP=2
                 _ => 8 * 1024 * 1024 * 1024,        // 4B/9B TP=1
             }
@@ -1985,6 +1985,8 @@ impl Qwen3_5ModelRank {
             && requested_kv_pages.unwrap_or(0) >= 8192
         {
             128 * 1024 * 1024
+        } else if tp_size == 1 && est_weight_bytes >= 16 * 1024 * 1024 * 1024 {
+            384 * 1024 * 1024
         } else {
             512 * 1024 * 1024
         };
@@ -4643,7 +4645,9 @@ impl Qwen3_5Engine {
 
         let tok_path = dir.join("tokenizer.json");
         let tokenizer = if tok_path.exists() {
-            Tokenizer::from_file(&tok_path).ok()
+            Tokenizer::from_file(&tok_path)
+                .ok()
+                .map(normalize_hf_tokenizer)
         } else {
             None
         };
@@ -5141,6 +5145,89 @@ impl Qwen3_5Engine {
         }
         Ok((decision, step_lps))
     }
+
+    /// Runs GPU-resident speculative rejection verification across a batch of `B = 2..=4`
+    /// greedy requests in a single `run_gpu_sampler_rows` launch (`sum(1 + k_b)` total rows).
+    pub fn verify_batched_speculative_gpu_steps(
+        &mut self,
+        items: &[(&crate::parser::SamplerV1, &[i32])],
+    ) -> Result<Vec<crate::speculative::Verification>> {
+        let total_rows: usize = items.iter().map(|(_, d)| d.len() + 1).sum();
+        let mut row_cfgs = Vec::with_capacity(total_rows);
+        let mut bitmask_words = Vec::new();
+        let mut sparse_entries = Vec::new();
+
+        for &(sampler, drafts) in items {
+            let mut hypothetical = sampler.clone();
+            let pos = sampler.output_history.len();
+            let recovery_u = crate::parser::SamplerV1::uniform_f32(
+                sampler.params.seed ^ 0xe7037ed1a0b428db,
+                pos,
+            );
+            for (row, &draft_id) in drafts.iter().enumerate() {
+                let accept_u = crate::parser::SamplerV1::uniform_f32(
+                    sampler.params.seed ^ 0xa0761d6478bd642f,
+                    pos + row,
+                );
+                let cfg = hypothetical
+                    .append_gpu_row(
+                        self.cfg.vocab_size,
+                        &self.cfg.eos_token_ids,
+                        accept_u,
+                        recovery_u,
+                        draft_id,
+                        false,
+                        &mut bitmask_words,
+                        &mut sparse_entries,
+                    )
+                    .map_err(|_| loader_err("invalid batched speculative GPU sampler row"))?;
+                row_cfgs.push(cfg);
+                hypothetical
+                    .try_commit_token(draft_id)
+                    .map_err(|_| loader_err("batched verification draft grammar commit failed"))?;
+            }
+            let bonus_cfg = hypothetical
+                .append_gpu_row(
+                    self.cfg.vocab_size,
+                    &self.cfg.eos_token_ids,
+                    0.0,
+                    recovery_u,
+                    -1,
+                    true,
+                    &mut bitmask_words,
+                    &mut sparse_entries,
+                )
+                .map_err(|_| loader_err("invalid batched speculative bonus GPU sampler row"))?;
+            row_cfgs.push(bonus_cfg);
+        }
+
+        let outs = self.run_gpu_sampler_rows(&row_cfgs, &bitmask_words, &sparse_entries)?;
+        if outs.iter().any(|o| o.status != 0) {
+            return Err(loader_err(
+                "batched speculative GPU verification encountered invalid target distribution",
+            ));
+        }
+        let mut decisions = Vec::with_capacity(items.len());
+        let mut cursor = 0usize;
+        for &(_, drafts) in items {
+            let k = drafts.len();
+            let slice = &outs[cursor..cursor + k + 1];
+            cursor += k + 1;
+            let accepted = slice[..k]
+                .iter()
+                .take_while(|o| o.draft_accepted != 0)
+                .count();
+            let bonus_or_recovered = slice[accepted].sampled_id;
+            let decision = crate::speculative::RejectionSampler::from_gpu_verified(
+                drafts,
+                accepted,
+                bonus_or_recovered,
+            )
+            .map_err(|_| loader_err("batched GPU speculative verification failed"))?;
+            decisions.push(decision);
+        }
+        Ok(decisions)
+    }
     pub fn encode(&self, text: &str) -> Result<Vec<i32>> {
         let tok = self
             .tokenizer
@@ -5217,8 +5304,13 @@ impl Qwen3_5Engine {
         if num_tokens == 0 {
             return Err(loader_err("step_tokens requires at least 1 token"));
         }
-        const MAX_PREFILL_CHUNK: usize = 1024;
-        if num_tokens > MAX_PREFILL_CHUNK
+        let max_prefill_chunk: usize = if self.ranks[0].scratch_arena.capacity() < 256 * 1024 * 1024
+        {
+            256
+        } else {
+            1024
+        };
+        if num_tokens > max_prefill_chunk
             && custom_positions.is_none()
             && dump_out.is_none()
             && self.ranks[0].tap_layer_ids.is_empty()
@@ -5228,7 +5320,7 @@ impl Qwen3_5Engine {
             let mut offset = 0usize;
             let mut last = (0i32, [0i32; 5], [0.0f32; 5]);
             while offset < num_tokens {
-                let end = (offset + MAX_PREFILL_CHUNK).min(num_tokens);
+                let end = (offset + max_prefill_chunk).min(num_tokens);
                 let in_slot = if offset == 0 {
                     state_in_slot
                 } else {
@@ -8591,9 +8683,38 @@ impl Qwen3_5Engine {
     }
 }
 
+/// Strip stale `truncation` / `padding` settings embedded by HF `save_pretrained`
+/// in `tokenizer.json` so long-context prompts (>4096 tokens) are never silently
+/// truncated before KV-pool admission checks.
+fn normalize_hf_tokenizer(mut tok: Tokenizer) -> Tokenizer {
+    let _ = tok.with_truncation(None);
+    tok.with_padding(None);
+    tok
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod serving_capacity_tests {
     use super::*;
+
+    #[test]
+    fn normalize_hf_tokenizer_clears_embedded_truncation() {
+        let mut tok = Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+        tok.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::whitespace::Whitespace));
+        tok.add_tokens(&[
+            tokenizers::AddedToken::from("hello", false),
+            tokenizers::AddedToken::from("world", false),
+        ]);
+        tok.with_truncation(Some(tokenizers::TruncationParams {
+            max_length: 2,
+            ..Default::default()
+        }))
+        .unwrap();
+        let prompt = "hello world hello world hello";
+        assert_eq!(tok.encode(prompt, false).unwrap().get_ids().len(), 2);
+
+        let tok = normalize_hf_tokenizer(tok);
+        assert_eq!(tok.encode(prompt, false).unwrap().get_ids().len(), 5);
+    }
 
     #[test]
     fn serving_budget_is_checked() {

@@ -1691,6 +1691,67 @@ extern "C" int w34_moe_w4a16_mlp_f16(
     }
 
     if (regime == 3) {
+        // Prefer coalesced BLOCK_M=8 sparse_mma chunks whenever geometry matches g128
+        // (1.7-2x faster than BLOCK_M=16 strided grouped_mma on 256-expert MoE prefill).
+        if (num_experts <= 1024 && (n_interm % 64) == 0 && (k_hidden % 64) == 0 &&
+            (n_interm % group_size) == 0 && (k_hidden % group_size) == 0 && group_size == 128 &&
+            ex->scratch_ptr && !(ex->scratch_ptr & 15u)) {
+            int sparse_chunks = 0;
+            for (int cand = 1; cand <= num_tokens; ++cand) {
+                const int cm = (num_tokens + cand - 1) / cand;
+                const int np = cm * top_k;
+                const int nt = w34_moe::compute_moe_max_tiles<8>(np, num_experts);
+                const size_t pb = (size_t)nt * 8 * sizeof(int32_t);
+                const size_t eb = ((size_t)nt * sizeof(int32_t) + 15) & ~size_t(15);
+                const size_t need = pb + eb + (size_t)np * k_hidden * sizeof(__half);
+                if (need <= ex->scratch_size) {
+                    sparse_chunks = cand;
+                    break;
+                }
+            }
+            if (sparse_chunks > 0) {
+                cudaStream_t st = (cudaStream_t)ex->stream;
+                const int base_m = num_tokens / sparse_chunks;
+                const int rem_m = num_tokens % sparse_chunks;
+                int tok_off = 0;
+                for (int c = 0; c < sparse_chunks; ++c) {
+                    const int cm = base_m + ((c < rem_m) ? 1 : 0);
+                    const int np = cm * top_k;
+                    const int nt = w34_moe::compute_moe_max_tiles<8>(np, num_experts);
+                    const size_t pb = (size_t)nt * 8 * sizeof(int32_t);
+                    const size_t eb = ((size_t)nt * sizeof(int32_t) + 15) & ~size_t(15);
+                    auto pairs = reinterpret_cast<int32_t *>((uintptr_t)ex->scratch_ptr);
+                    auto experts = reinterpret_cast<int32_t *>((char *)pairs + pb);
+                    auto down = reinterpret_cast<__half *>((char *)experts + eb);
+                    const __half *x_c = (const __half *)x + (size_t)tok_off * k_hidden;
+                    const int32_t *ids_c = topk_ids + (size_t)tok_off * top_k;
+                    const float *tw_c = topk_weights + (size_t)tok_off * top_k;
+                    __half *interm_c = (__half *)interm_buf + (size_t)tok_off * top_k * n_interm;
+                    const __half *sh_out_c = (shared_expert_out != nullptr)
+                        ? ((const __half *)shared_expert_out + (size_t)tok_off * k_hidden)
+                        : nullptr;
+                    const __half *sh_gate_c = (shared_expert_gate_logits != nullptr)
+                        ? ((const __half *)shared_expert_gate_logits + tok_off)
+                        : nullptr;
+                    __half *out_c = (__half *)out + (size_t)tok_off * k_hidden;
+
+                    w34_moe::moe_align_block_size_kernel<8>
+                        <<<1, 256, 0, st>>>(ids_c, pairs, experts, np, num_experts, nt);
+                    w34_moe::moe_sparse_mma_kernel<true><<<dim3(n_interm / 16, nt), 128, 0, st>>>(
+                        x_c, gate_up_packed, (const __half *)gate_up_scales, pairs, experts,
+                        tw_c, interm_c, down, top_k, n_interm, k_hidden);
+                    w34_moe::moe_sparse_mma_kernel<false><<<dim3(k_hidden / 32, nt), 128, 0, st>>>(
+                        interm_c, down_packed, (const __half *)down_scales, pairs, experts,
+                        tw_c, interm_c, down, top_k, k_hidden, n_interm);
+                    w34_moe::moe_down_topk_reduce_f16_kernel
+                        <<<dim3((k_hidden + 511) / 512, cm), 128, 0, st>>>(
+                            down, ids_c, sh_out_c, sh_gate_c, out_c, cm, top_k, num_experts,
+                            k_hidden);
+                    tok_off += cm;
+                }
+                return (int)cudaGetLastError();
+            }
+        }
         const int num_chunks = w34_moe::plan_grouped_mma_chunks(
             ex, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
         uint8_t* ws = reinterpret_cast<uint8_t*>((uintptr_t)ex->scratch_ptr);

@@ -1,0 +1,64 @@
+# Qwen3.8-27B-W4A16-GPTQ (0df81eadcfd59601cb82ccece2f16ea7d39244bf) Paged TQ4 (3.07x / 3.88x)
+# high-concurrency (C8-C16) & long-context serving campaign on 1x 24 GiB RTX 3090 Ti (TP=1).
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 2
+warmup_requests = 1
+max_inflight = 16
+timeout_s = 240
+
+[engine_defaults]
+support = "supported"
+cohort = "27b-0df-tq4-longctx-sm86"
+gpu_count = 1
+gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
+parallelism = "single"
+base_url = "http://127.0.0.1:18034/v1"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+weight_format = "compressed-tensors-GPTQ-int4"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "tq4"
+speculation = "none"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-27b-tp1-tq4-32k"
+engine = "warp-34"
+version = "5492c39+sm86-roadmap"
+kv_format = "tq4"
+cache_config = "TQ4 (3.07x, 21376 B/tok) 2048 pages (32768 tokens) on 1x 24 GiB RTX 3090 Ti"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-27b-tp1-tq4all-32k"
+engine = "warp-34"
+version = "5492c39+sm86-roadmap"
+kv_format = "tq4_all"
+cache_config = "TQ4_all (3.88x, 16896 B/tok) 2048 pages (32768 tokens) on 1x 24 GiB RTX 3090 Ti"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[cases]]
+id = "throughput-c8"
+fixture = "../fixtures/text.json"
+requests = 16
+concurrency = 8
+max_tokens = 128
+
+[[cases]]
+id = "throughput-c16"
+fixture = "../fixtures/text.json"
+requests = 16
+concurrency = 16
+max_tokens = 128
+
+[[cases]]
+id = "longctx-8k-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 80
+requests = 2
+concurrency = 1
+max_tokens = 64

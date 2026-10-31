@@ -203,17 +203,21 @@ __device__ __forceinline__ void gdn_norm_qk_warp(
         k2 = __half2float(k_tok_hk[c + 2]);
         k3 = __half2float(k_tok_hk[c + 3]);
     }
-    float q_sq = (q0 * q0 + q1 * q1) + (q2 * q2 + q3 * q3);
-    float k_sq = (k0 * k0 + k1 * k1) + (k2 * k2 + k3 * k3);
+    float q_sq = __fadd_rn(__fmaf_rn(q0, q0, __fmul_rn(q1, q1)),
+                           __fmaf_rn(q2, q2, __fmul_rn(q3, q3)));
+    float k_sq = __fadd_rn(__fmaf_rn(k0, k0, __fmul_rn(k1, k1)),
+                           __fmaf_rn(k2, k2, __fmul_rn(k3, k3)));
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        q_sq += __shfl_xor_sync(0xffffffffu, q_sq, off);
-        k_sq += __shfl_xor_sync(0xffffffffu, k_sq, off);
+        q_sq = __fadd_rn(q_sq, __shfl_xor_sync(0xffffffffu, q_sq, off));
+        k_sq = __fadd_rn(k_sq, __shfl_xor_sync(0xffffffffu, k_sq, off));
     }
-    const float q_inv = rsqrtf(q_sq + 1e-6f) * scale;
-    const float k_inv = rsqrtf(k_sq + 1e-6f);
-    bq4_out = make_float4(q0 * q_inv, q1 * q_inv, q2 * q_inv, q3 * q_inv);
-    bk4_out = make_float4(k0 * k_inv, k1 * k_inv, k2 * k_inv, k3 * k_inv);
+    const float q_inv = __fmul_rn(rsqrtf(__fadd_rn(q_sq, 1e-6f)), scale);
+    const float k_inv = rsqrtf(__fadd_rn(k_sq, 1e-6f));
+    bq4_out = make_float4(__fmul_rn(q0, q_inv), __fmul_rn(q1, q_inv),
+                          __fmul_rn(q2, q_inv), __fmul_rn(q3, q_inv));
+    bk4_out = make_float4(__fmul_rn(k0, k_inv), __fmul_rn(k1, k_inv),
+                          __fmul_rn(k2, k_inv), __fmul_rn(k3, k_inv));
 }
 
 __device__ __forceinline__ float4 ldg_cs_f4(const float4* p) {
@@ -245,39 +249,54 @@ __device__ __forceinline__ void gdn_step_rows_warp(
     float dot[ROWS];
 #pragma unroll
     for (int r = 0; r < ROWS; ++r) {
-        rr[r].x *= decay;
-        rr[r].y *= decay;
-        rr[r].z *= decay;
-        rr[r].w *= decay;
-        dot[r] = (rr[r].x * bk4.x + rr[r].y * bk4.y) +
-                 (rr[r].z * bk4.z + rr[r].w * bk4.w);
+        rr[r].x = __fmul_rn(rr[r].x, decay);
+        rr[r].y = __fmul_rn(rr[r].y, decay);
+        rr[r].z = __fmul_rn(rr[r].z, decay);
+        rr[r].w = __fmul_rn(rr[r].w, decay);
+        dot[r] = __fadd_rn(__fmaf_rn(rr[r].x, bk4.x, __fmul_rn(rr[r].y, bk4.y)),
+                           __fmaf_rn(rr[r].z, bk4.z, __fmul_rn(rr[r].w, bk4.w)));
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
-            dot[r] += __shfl_xor_sync(0xffffffffu, dot[r], off);
+            dot[r] = __fadd_rn(dot[r], __shfl_xor_sync(0xffffffffu, dot[r], off));
         }
     }
     float o[ROWS];
 #pragma unroll
     for (int r = 0; r < ROWS; ++r) {
-        const float vp = (vv[r] - dot[r]) * beta;
-        rr[r].x += vp * bk4.x;
-        rr[r].y += vp * bk4.y;
-        rr[r].z += vp * bk4.z;
-        rr[r].w += vp * bk4.w;
-        o[r] = (rr[r].x * bq4.x + rr[r].y * bq4.y) +
-               (rr[r].z * bq4.z + rr[r].w * bq4.w);
+        const float vp = __fmul_rn(__fsub_rn(vv[r], dot[r]), beta);
+        rr[r].x = __fmaf_rn(vp, bk4.x, rr[r].x);
+        rr[r].y = __fmaf_rn(vp, bk4.y, rr[r].y);
+        rr[r].z = __fmaf_rn(vp, bk4.z, rr[r].z);
+        rr[r].w = __fmaf_rn(vp, bk4.w, rr[r].w);
+        o[r] = __fadd_rn(__fmaf_rn(rr[r].x, bq4.x, __fmul_rn(rr[r].y, bq4.y)),
+                         __fmaf_rn(rr[r].z, bq4.z, __fmul_rn(rr[r].w, bq4.w)));
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
-            o[r] += __shfl_xor_sync(0xffffffffu, o[r], off);
+            o[r] = __fadd_rn(o[r], __shfl_xor_sync(0xffffffffu, o[r], off));
         }
     }
     if (lane == 0) {
+        if constexpr ((ROWS % 4) == 0) {
+            if (((vrow_base & 3) == 0) && (vrow_base + ROWS <= head_v_dim) &&
+                ((((uintptr_t)(out_hv + vrow_base)) & 7u) == 0u)) {
+#pragma unroll
+                for (int r = 0; r < ROWS; r += 4) {
+                    const __half2 h01 = __halves2half2(__float2half(o[r]), __float2half(o[r + 1]));
+                    const __half2 h23 = __halves2half2(__float2half(o[r + 2]), __float2half(o[r + 3]));
+                    uint2 packed;
+                    packed.x = *reinterpret_cast<const uint32_t*>(&h01);
+                    packed.y = *reinterpret_cast<const uint32_t*>(&h23);
+                    *reinterpret_cast<uint2*>(out_hv + vrow_base + r) = packed;
+                }
+                return;
+            }
+        }
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) {
             if ((vrow_base + r) < head_v_dim) {
@@ -763,7 +782,7 @@ extern "C" int w34_gdn_recurrent_strided_f16(
         }
     } else {
         const int nh = batch->num_reqs * num_v_heads;
-        if (nh >= 96 && head_v_dim >= 32) {
+        if (head_v_dim >= 32 && nh * ((head_v_dim + 31) / 32) >= 84) {
             constexpr int ROWS = 8;
             constexpr int BV = ROWS * 4;
             const int v_tiles = (head_v_dim + BV - 1) / BV;

@@ -312,13 +312,21 @@ static MarlinFuncPtr get_marlin_kernel_f16(thread_config_t const& th_config,
 static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
                                             int thread_m_blocks, bool m_block_size_8,
                                             int group_blocks, int num_bits,
-                                            int stages, int max_shared_mem) {
+                                            int stages, int max_shared_mem,
+                                            int sms) {
     thread_config_t* table = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
     int groupsize = group_blocks * 16;
     if (thread_m_blocks > 1) {
+        const int m_tiles = div_ceil(prob_m, thread_m_blocks * 16);
         int want = -1;
-        if (prob_n >= 32768) want = 0;
-        else if (prob_n >= 8192) want = 1;
+        // Prefer `{64, 256, 256}` (2x A-tile reuse across 8 warps) whenever `prob_n >= 32768`
+        // OR whenever `{64, 256, 256}` already saturates all SMs (`mn_tiles_256 >= sms`).
+        // Step down to `{64, 128, 128}` only when `mn_tiles_256 < sms` (e.g. M=64, N=8192..17408).
+        if (prob_n >= 32768 || ((prob_n % 256) == 0 && (prob_n / 256) * m_tiles >= sms)) {
+            want = 0;
+        } else if (prob_n >= 8192) {
+            want = 1;
+        }
         if (want >= 0 &&
             is_valid_config(table[want], thread_m_blocks, prob_m, prob_n, prob_k,
                             num_bits, groupsize, stages, max_shared_mem - 512) &&
@@ -367,14 +375,17 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     const int4* S_ptr = (const int4*)S;
 
     constexpr int stages = 4;
-    // When `(prob_n / 64) * 2 <= sms` and `prob_k >= 4608` (e.g. 4B `down_proj` [9728 -> 2560]),
-    // `mn_tiles = 40` leaves over half of the 84 SMs idle. Force `max_par = 1` + deterministic
-    // 2-slice Split-K (`blocks = mn_tiles * 2 = 80`) across ALL `M = 1..16` with lock-based
-    // sequential reduction (no atomicAdd) so `M = 1..16` stay 0-ULP M-invariant!
-    // For wider `N` where `prob_n / 64 >= 80` (e.g. 27B `N = 5120 -> 80` tiles), 1-slice
+    // When `(prob_n / 64) * 2 <= sms` and `prob_k >= 1024` (e.g. 4B `down_proj` [9728 -> 2560]
+    // and 35B-A3B MoE projections [2048..4096 -> 512..2048]), `mn_tiles <= 42` leaves 50-90% of
+    // the 84 SMs idle. Force `max_par = 1` + deterministic 2..4-slice Split-K across ALL
+    // `M = 1..16` with lock-based sequential reduction (no atomicAdd) so `M = 1..16` stay
+    // 0-ULP M-invariant!
+    // For wider `N` where `(prob_n / 64) * 2 > sms` (e.g. 27B `N = 5120 -> 80` tiles), 1-slice
     // `cfg128 = {128, 64, 128}` already fills 80/84 SMs without Split-K reduction overhead.
     const bool enable_m_invariant_split_k =
-        (prob_m <= 16) && (prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608);
+        (prob_m <= 16) &&
+        (((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
+         ((prob_n >= 512) && (prob_n <= 2048) && (prob_k >= 1024) && (prob_k <= 2048)));
     int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : 64);
     int rest_m = prob_m;
 
@@ -387,7 +398,7 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
 
         thread_config_t th_cfg = choose_thread_config(
             prob_m_split, prob_n, prob_k, thread_m_blocks, m_block_size_8,
-            group_blocks, num_bits, stages, max_shared_mem);
+            group_blocks, num_bits, stages, max_shared_mem, sms);
         if (th_cfg.thread_n != -1) {
             const int cur_mn_tiles =
                 (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
@@ -408,8 +419,9 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         int blocks = sms;
         if (enable_m_invariant_split_k && th_cfg.thread_k == 128 && th_cfg.thread_n == 64 && mn_tiles > 0) {
             int k_tiles = prob_k / th_cfg.thread_k;
+            int cap_splits = (mn_tiles <= 20) ? 4 : 2;
             int max_k_splits = std::min(sms / mn_tiles, k_tiles / 4);
-            if (max_k_splits > 2) max_k_splits = 2;
+            if (max_k_splits > cap_splits) max_k_splits = cap_splits;
             if (max_k_splits < 1) max_k_splits = 1;
             blocks = mn_tiles * max_k_splits;
         } else if (blocks > mn_tiles) {

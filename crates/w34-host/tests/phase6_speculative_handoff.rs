@@ -10,31 +10,37 @@ use w34_host::{
     scheduler::SchedulerConfig,
 };
 
-fn worker(kind: SpeculativeKind) -> EngineWorker {
+fn worker_with_policy(kind: Option<SpeculativeKind>, policy: KvFormatPolicy) -> EngineWorker {
     EngineWorker::from_loader(
         move || {
             let mut engine = Qwen3_5Engine::load_for_serving(
                 "nchapman/Qwen3.5-4B-W4A16-GPTQ",
                 1,
-                KvFormatPolicy::Tq4,
+                policy,
                 Some(256),
                 true,
                 16,
             )
             .map_err(|e| e.to_string())?;
-            engine
-                .enable_speculative(&SpeculativeConfig {
-                    kind,
-                    mtp_k: 3,
-                    draft_model: (kind == SpeculativeKind::DFlash2)
-                        .then(|| "nchapman/Qwen3.5-4B-DFlash2".into()),
-                })
-                .map_err(|e| e.to_string())?;
+            if let Some(kind) = kind {
+                engine
+                    .enable_speculative(&SpeculativeConfig {
+                        kind,
+                        mtp_k: 3,
+                        draft_model: (kind == SpeculativeKind::DFlash2)
+                            .then(|| "nchapman/Qwen3.5-4B-DFlash2".into()),
+                    })
+                    .map_err(|e| e.to_string())?;
+            }
             Ok(engine)
         },
         SchedulerConfig::default(),
     )
     .unwrap()
+}
+
+fn worker(kind: SpeculativeKind) -> EngineWorker {
+    worker_with_policy(Some(kind), KvFormatPolicy::Tq4)
 }
 
 fn params() -> SamplingParams {
@@ -131,4 +137,92 @@ fn native_speculation_yields_to_late_peer_losslessly() {
         assert_eq!(worker.stats.completed.load(Ordering::Relaxed), 2);
         assert_eq!(worker.stats.cancelled.load(Ordering::Relaxed), 0);
     }
+}
+
+#[test]
+fn batched_mtp_b4_matches_single_stream_losslessly() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let texts = [
+        "The capital of France is",
+        "In computer architecture, cache coherence ensures",
+        "Rust ownership rules guarantee memory safety by",
+        "Binary search finds an element in a sorted array in",
+    ];
+    let baseline_worker = worker(SpeculativeKind::Mtp);
+    let prompts: Vec<Vec<i32>> = texts
+        .iter()
+        .map(|s| {
+            baseline_worker
+                .tokenizer
+                .as_ref()
+                .unwrap()
+                .encode(*s, false)
+                .unwrap()
+                .get_ids()
+                .iter()
+                .map(|&id| id as i32)
+                .collect()
+        })
+        .collect();
+    let baselines = rt.block_on(async {
+        let mut outs = Vec::with_capacity(prompts.len());
+        for p in &prompts {
+            let mut st = baseline_worker.submit(p.clone(), params(), None).unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(120), collect(&mut st, vec![]))
+                .await
+                .unwrap()
+                .unwrap();
+            outs.push(got);
+        }
+        baseline_worker.shutdown().await.unwrap();
+        outs
+    });
+
+    let batch_worker = worker(SpeculativeKind::Mtp);
+    let got_all = rt.block_on(async {
+        let mut s0 = batch_worker
+            .submit(prompts[0].clone(), params(), None)
+            .unwrap();
+        let mut s1 = batch_worker
+            .submit(prompts[1].clone(), params(), None)
+            .unwrap();
+        let mut s2 = batch_worker
+            .submit(prompts[2].clone(), params(), None)
+            .unwrap();
+        let mut s3 = batch_worker
+            .submit(prompts[3].clone(), params(), None)
+            .unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(120), async {
+            let (o0, o1, o2, o3) = tokio::join!(
+                collect(&mut s0, vec![]),
+                collect(&mut s1, vec![]),
+                collect(&mut s2, vec![]),
+                collect(&mut s3, vec![]),
+            );
+            Ok::<_, String>(vec![o0?, o1?, o2?, o3?])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        batch_worker.shutdown().await.unwrap();
+        res
+    });
+
+    assert_eq!(
+        got_all, baselines,
+        "batched B=4 MTP (TQ4) must match single-stream B=1 MTP greedy bit-for-bit across all 4 slots"
+    );
+    assert_eq!(batch_worker.stats.peak_active.load(Ordering::Relaxed), 4);
+    assert!(
+        batch_worker.stats.verify_rounds.load(Ordering::Relaxed) >= 40,
+        "expected batched MTP verify rounds across all 4 slots, got {}",
+        batch_worker.stats.verify_rounds.load(Ordering::Relaxed)
+    );
+    assert!(
+        batch_worker.stats.accepted_drafts.load(Ordering::Relaxed) > 0,
+        "expected accepted MTP drafts in batched B=4 verify"
+    );
 }

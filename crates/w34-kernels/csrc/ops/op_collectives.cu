@@ -16,7 +16,8 @@
 
 namespace w34_comm {
 
-constexpr int kMaxBlocks = 36;
+constexpr int kMaxBlocks = 84;
+constexpr int kSmallMaxBlocks = 36;
 constexpr int kRanks = 16;
 
 struct Signal {
@@ -24,7 +25,7 @@ struct Signal {
     alignas(128) uint32_t end[kMaxBlocks][kRanks];
     alignas(128) uint32_t flag[kMaxBlocks];
 };
-static_assert(sizeof(Signal) == 4864, "Signal ABI size mismatch");
+static_assert(sizeof(Signal) == 11136, "Signal ABI size mismatch");
 
 __device__ __forceinline__ void st_flag_release(uint32_t* addr, uint32_t val) {
     asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(val), "l"(addr) : "memory");
@@ -42,14 +43,14 @@ __device__ __forceinline__ void barrier_epoch_release(
     Signal* self_sg,
     int rank,
     uint32_t* out_epoch) {
-    Signal* signals[2] = {sig0, sig1};
     __syncthreads();
     uint32_t epoch = self_sg->flag[blockIdx.x] + 1;
     if (threadIdx.x < 2) {
-        uint32_t* peer_counter = &signals[threadIdx.x]->start[blockIdx.x][rank];
+        Signal* target_sg = (threadIdx.x == 0) ? sig0 : sig1;
+        uint32_t* peer_counter = &target_sg->start[blockIdx.x][rank];
         uint32_t* self_counter = &self_sg->start[blockIdx.x][threadIdx.x];
         st_flag_release(peer_counter, epoch);
-        while (ld_flag_acquire(self_counter) != epoch) {
+        while (static_cast<int32_t>(ld_flag_acquire(self_counter) - epoch) < 0) {
             __nanosleep(128);
         }
     }
@@ -105,22 +106,55 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
     __half* __restrict__ my_s = (rank == 0) ? s0_buf : s1_buf;
     const __half* __restrict__ peer_s = (rank == 0) ? s1_buf : s0_buf;
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-        my_s[i] = local_in[i];
+    const bool vec8 = ((num_elems & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)my_s | (uintptr_t)peer_s) & 15u) == 0);
+    if (vec8) {
+        const int vec_elems = num_elems >> 3;
+        const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+        uint4* my_v = reinterpret_cast<uint4*>(my_s);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+            my_v[i] = local_v[i];
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+            my_s[i] = local_in[i];
+        }
     }
 
     uint32_t epoch = 0;
     barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-        const float fl = __half2float(local_in[i]);
-        const float fp = __half2float(peer_s[i]);
-        out[i] = __float2half((rank == 0) ? (fl + fp) : (fp + fl));
+    if (vec8) {
+        const int vec_elems = num_elems >> 3;
+        const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+        const uint4* peer_v = reinterpret_cast<const uint4*>(peer_s);
+        uint4* out_v = reinterpret_cast<uint4*>(out);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+            const uint4 lv = local_v[i];
+            const uint4 pv = peer_v[i];
+            const __half* lh = reinterpret_cast<const __half*>(&lv);
+            const __half* ph = reinterpret_cast<const __half*>(&pv);
+            uint4 ov;
+            __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const float fl = __half2float(lh[d]);
+                const float fp = __half2float(ph[d]);
+                oh[d] = __float2half((rank == 0) ? (fl + fp) : (fp + fl));
+            }
+            out_v[i] = ov;
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+            const float fl = __half2float(local_in[i]);
+            const float fp = __half2float(peer_s[i]);
+            out[i] = __float2half((rank == 0) ? (fl + fp) : (fp + fl));
+        }
     }
 }
 
 template <int MAX_ITERS>
-__global__ void __launch_bounds__(256, 1) tp2_all_reduce_residual_gemma_rms_norm_f16_kernel(
+__global__ void __launch_bounds__(256, 2) tp2_all_reduce_residual_gemma_rms_norm_f16_kernel(
     const __half* local_in,
     __half* ar_out,
     __half* __restrict__ residual,
@@ -149,104 +183,176 @@ __global__ void __launch_bounds__(256, 1) tp2_all_reduce_residual_gemma_rms_norm
 
     constexpr int VEC_ITERS = (MAX_ITERS + 7) / 8;
     const bool vec8 = ((hidden_size & 7) == 0) &&
-                      ((((uintptr_t)local_in | (uintptr_t)my_s | (uintptr_t)peer_s) & 15u) == 0);
-    if (vec8) {
-        const int vec_cols = hidden_size >> 3;
-        for (int row = blockIdx.x; row < num_tokens; row += gridDim.x) {
-            const uint4* src_v = reinterpret_cast<const uint4*>(local_in + (size_t)row * hidden_size);
-            uint4* dst_v = reinterpret_cast<uint4*>(my_s + (size_t)row * hidden_size);
-#pragma unroll
-            for (int k = 0; k < VEC_ITERS; ++k) {
-                const int c = threadIdx.x + k * 256;
-                if (c < vec_cols) {
-                    dst_v[c] = src_v[c];
-                }
-            }
-        }
-    } else {
-        for (int row = blockIdx.x; row < num_tokens; row += gridDim.x) {
-            const __half* src_r = local_in + (size_t)row * hidden_size;
-            __half* dst_r = my_s + (size_t)row * hidden_size;
-            for (int c = threadIdx.x; c < hidden_size; c += 256) {
-                dst_r[c] = src_r[c];
-            }
-        }
-    }
-
-    uint32_t epoch = 0;
-    barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+                      ((((uintptr_t)local_in | (uintptr_t)my_s | (uintptr_t)peer_s |
+                         (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)out |
+                         (uintptr_t)ar_out) & 15u) == 0);
+    // Odd stage count (1, 3, or 5) overlaps PCIe Gen4 x8 TX and RX in full duplex across
+    // disjoint row slices on large-M prefill while guaranteeing `self_sg->flag[blockIdx.x]`
+    // flips odd/even double-buffer parity on every kernel invocation (CUDA Graph safe).
+    const int num_stages = (num_tokens > (int)gridDim.x * 12)
+        ? 5
+        : ((num_tokens > (int)gridDim.x * 4) ? 3 : 1);
+    const int stage_rows = (num_tokens + num_stages - 1) / num_stages;
 
     __shared__ float s_warp[32];
-    __shared__ __align__(16) __half s_peer[MAX_ITERS * 256];
-    for (int row = blockIdx.x; row < num_tokens; row += gridDim.x) {
-        const __half* local_row = local_in + (size_t)row * hidden_size;
-        const __half* peer_row = peer_s + (size_t)row * hidden_size;
-        __half* ar_row = (ar_out != nullptr) ? (ar_out + (size_t)row * hidden_size) : nullptr;
-        __half* res_row = residual + (size_t)row * hidden_size;
-        __half* out_row = out + (size_t)row * hidden_size;
-        __nv_bfloat16* tap_row = (tap_dst_bf16 != nullptr)
-            ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
-            : nullptr;
+    __shared__ float s_v[MAX_ITERS * 256];
+
+    for (int stage = 0; stage < num_stages; ++stage) {
+        const int row_begin = stage * stage_rows;
+        int row_end = row_begin + stage_rows;
+        if (row_end > num_tokens) row_end = num_tokens;
 
         if (vec8) {
             const int vec_cols = hidden_size >> 3;
-            const uint4* peer_v = reinterpret_cast<const uint4*>(peer_row);
-            uint4* s_peer_v = reinterpret_cast<uint4*>(s_peer);
+            for (int row = row_begin + (int)blockIdx.x; row < row_end; row += (int)gridDim.x) {
+                const uint4* src_v = reinterpret_cast<const uint4*>(local_in + (size_t)row * hidden_size);
+                uint4* dst_v = reinterpret_cast<uint4*>(my_s + (size_t)row * hidden_size);
 #pragma unroll
-            for (int k = 0; k < VEC_ITERS; ++k) {
-                const int c = threadIdx.x + k * 256;
-                if (c < vec_cols) {
-                    s_peer_v[c] = peer_v[c];
+                for (int k = 0; k < VEC_ITERS; ++k) {
+                    const int c = threadIdx.x + k * 256;
+                    if (c < vec_cols) {
+                        dst_v[c] = src_v[c];
+                    }
                 }
             }
         } else {
-            for (int c = threadIdx.x; c < hidden_size; c += 256) {
-                s_peer[c] = peer_row[c];
-            }
-        }
-        __syncthreads();
-
-        float reg_v[MAX_ITERS];
-        float sum_sq = 0.0f;
-#pragma unroll
-        for (int k = 0; k < MAX_ITERS; k++) {
-            const int i = threadIdx.x + k * 256;
-            if (i < hidden_size) {
-                const float local_f = __half2float(local_row[i]);
-                const float peer_f = __half2float(s_peer[i]);
-                const float ar_f = (rank == 0) ? (local_f + peer_f) : (peer_f + local_f);
-                const __half ar_h = __float2half(ar_f);
-                if (ar_row != nullptr) {
-                    ar_row[i] = ar_h;
+            for (int row = row_begin + (int)blockIdx.x; row < row_end; row += (int)gridDim.x) {
+                const __half* src_r = local_in + (size_t)row * hidden_size;
+                __half* dst_r = my_s + (size_t)row * hidden_size;
+                for (int c = threadIdx.x; c < hidden_size; c += 256) {
+                    dst_r[c] = src_r[c];
                 }
-                const __half res_old = res_row[i];
-                if (tap_row != nullptr) {
-                    tap_row[i] = __float2bfloat16(__half2float(res_old) + __half2float(ar_h));
-                }
-                const __half sum_h = __hadd(ar_h, res_old);
-                res_row[i] = sum_h;
-                // Preserve the FP16 all-reduce boundary, then normalize the
-                // unrounded FP32 residual sum, as native Gemma does. Only the
-                // persistent residual is rounded to FP16; the tap is unchanged.
-                const float v = __half2float(ar_h) + __half2float(res_old);
-                reg_v[k] = v;
-                sum_sq += v * v;
             }
         }
-        sum_sq = block_reduce_sum_256(sum_sq, s_warp);
-        const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+        uint32_t epoch = 0;
+        barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+
+        if (vec8) {
+            const int vec_cols = hidden_size >> 3;
+            const uint4* weight_v = reinterpret_cast<const uint4*>(weight);
+            for (int row = row_begin + (int)blockIdx.x; row < row_end; row += (int)gridDim.x) {
+                const uint4* local_v = reinterpret_cast<const uint4*>(local_in + (size_t)row * hidden_size);
+                const uint4* peer_v = reinterpret_cast<const uint4*>(peer_s + (size_t)row * hidden_size);
+                uint4* ar_v = (ar_out != nullptr)
+                    ? reinterpret_cast<uint4*>(ar_out + (size_t)row * hidden_size)
+                    : nullptr;
+                uint4* res_v = reinterpret_cast<uint4*>(residual + (size_t)row * hidden_size);
+                uint4* out_v = reinterpret_cast<uint4*>(out + (size_t)row * hidden_size);
+                __nv_bfloat16* tap_row = (tap_dst_bf16 != nullptr)
+                    ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
+                    : nullptr;
+
+                float sum_sq = 0.0f;
+#pragma unroll
+                for (int k = 0; k < VEC_ITERS; ++k) {
+                    const int c = threadIdx.x + k * 256;
+                    if (c < vec_cols) {
+                        const uint4 lv = local_v[c];
+                        const uint4 pv = peer_v[c];
+                        const uint4 rv = res_v[c];
+                        const __half* lh = reinterpret_cast<const __half*>(&lv);
+                        const __half* ph = reinterpret_cast<const __half*>(&pv);
+                        const __half* rh = reinterpret_cast<const __half*>(&rv);
+                        uint4 arv, sumv;
+                        __half* arh = reinterpret_cast<__half*>(&arv);
+                        __half* sh = reinterpret_cast<__half*>(&sumv);
+                        const int base_i = c << 3;
+#pragma unroll
+                        for (int d = 0; d < 8; ++d) {
+                            const float lf = __half2float(lh[d]);
+                            const float pf = __half2float(ph[d]);
+                            const float ar_f = (rank == 0) ? (lf + pf) : (pf + lf);
+                            const __half ar_h = __float2half(ar_f);
+                            arh[d] = ar_h;
+                            const __half res_old = rh[d];
+                            const float ar_hf = __half2float(ar_h);
+                            const float res_hf = __half2float(res_old);
+                            if (tap_row != nullptr) {
+                                tap_row[base_i + d] = __float2bfloat16(res_hf + ar_hf);
+                            }
+                            sh[d] = __hadd(ar_h, res_old);
+                            const float v = ar_hf + res_hf;
+                            s_v[base_i + d] = v;
+                            sum_sq += v * v;
+                        }
+                        if (ar_v != nullptr) {
+                            ar_v[c] = arv;
+                        }
+                        res_v[c] = sumv;
+                    }
+                }
+                sum_sq = block_reduce_sum_256(sum_sq, s_warp);
+                const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
 
 #pragma unroll
-        for (int k = 0; k < MAX_ITERS; k++) {
-            const int i = threadIdx.x + k * 256;
-            if (i < hidden_size) {
-                const float v = reg_v[k] * inv_rms;
-                const float w = 1.0f + __half2float(weight[i]);
-                out_row[i] = __float2half(v * w);
+                for (int k = 0; k < VEC_ITERS; ++k) {
+                    const int c = threadIdx.x + k * 256;
+                    if (c < vec_cols) {
+                        const uint4 wv = weight_v[c];
+                        const __half* wh = reinterpret_cast<const __half*>(&wv);
+                        uint4 ov;
+                        __half* oh = reinterpret_cast<__half*>(&ov);
+                        const int base_i = c << 3;
+#pragma unroll
+                        for (int d = 0; d < 8; ++d) {
+                            const float v = s_v[base_i + d] * inv_rms;
+                            const float w = 1.0f + __half2float(wh[d]);
+                            oh[d] = __float2half(v * w);
+                        }
+                        out_v[c] = ov;
+                    }
+                }
+                __syncthreads();
             }
-        }
-        if (row + gridDim.x < num_tokens) {
-            __syncthreads();
+        } else {
+            for (int row = row_begin + (int)blockIdx.x; row < row_end; row += (int)gridDim.x) {
+                const __half* local_row = local_in + (size_t)row * hidden_size;
+                const __half* peer_row = peer_s + (size_t)row * hidden_size;
+                __half* ar_row = (ar_out != nullptr) ? (ar_out + (size_t)row * hidden_size) : nullptr;
+                __half* res_row = residual + (size_t)row * hidden_size;
+                __half* out_row = out + (size_t)row * hidden_size;
+                __nv_bfloat16* tap_row = (tap_dst_bf16 != nullptr)
+                    ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
+                    : nullptr;
+
+                float sum_sq = 0.0f;
+#pragma unroll
+                for (int k = 0; k < MAX_ITERS; k++) {
+                    const int i = threadIdx.x + k * 256;
+                    if (i < hidden_size) {
+                        const float local_f = __half2float(local_row[i]);
+                        const float peer_f = __half2float(peer_row[i]);
+                        const float ar_f = (rank == 0) ? (local_f + peer_f) : (peer_f + local_f);
+                        const __half ar_h = __float2half(ar_f);
+                        if (ar_row != nullptr) {
+                            ar_row[i] = ar_h;
+                        }
+                        const __half res_old = res_row[i];
+                        if (tap_row != nullptr) {
+                            tap_row[i] = __float2bfloat16(__half2float(res_old) + __half2float(ar_h));
+                        }
+                        const __half sum_h = __hadd(ar_h, res_old);
+                        res_row[i] = sum_h;
+                        const float v = __half2float(ar_h) + __half2float(res_old);
+                        s_v[i] = v;
+                        sum_sq += v * v;
+                    }
+                }
+                sum_sq = block_reduce_sum_256(sum_sq, s_warp);
+                const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+#pragma unroll
+                for (int k = 0; k < MAX_ITERS; k++) {
+                    const int i = threadIdx.x + k * 256;
+                    if (i < hidden_size) {
+                        const float v = s_v[i] * inv_rms;
+                        const float w = 1.0f + __half2float(weight[i]);
+                        out_row[i] = __float2half(v * w);
+                    }
+                }
+                __syncthreads();
+            }
         }
     }
 }
@@ -400,7 +506,27 @@ __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
     __half* s1_buf = odd ? (s1 + num_elems) : s1;
     const int full_vocab = local_vocab_size * 2;
 
-    if (rank == 1) {
+    const bool vec8 = ((local_vocab_size & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)s1_buf | (uintptr_t)rank0_full_out) & 15u) == 0);
+    if (vec8) {
+        const int vec_vocab = local_vocab_size >> 3;
+        const int vec_full = full_vocab >> 3;
+        const int vec_elems = num_rows * vec_vocab;
+        const uint4* in_v = reinterpret_cast<const uint4*>(local_in);
+        uint4* s1_v = reinterpret_cast<uint4*>(s1_buf);
+        uint4* out_v = reinterpret_cast<uint4*>(rank0_full_out);
+        if (rank == 1) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+                s1_v[i] = in_v[i];
+            }
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+                const int row = i / vec_vocab;
+                const int col = i - row * vec_vocab;
+                out_v[(size_t)row * vec_full + col] = in_v[i];
+            }
+        }
+    } else if (rank == 1) {
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
             s1_buf[i] = local_in[i];
         }
@@ -416,10 +542,23 @@ __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
     barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
 
     if (rank == 0) {
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-            const int row = i / local_vocab_size;
-            const int col = i - row * local_vocab_size;
-            rank0_full_out[(size_t)row * full_vocab + local_vocab_size + col] = s1_buf[i];
+        if (vec8) {
+            const int vec_vocab = local_vocab_size >> 3;
+            const int vec_full = full_vocab >> 3;
+            const int vec_elems = num_rows * vec_vocab;
+            const uint4* s1_v = reinterpret_cast<const uint4*>(s1_buf);
+            uint4* out_v = reinterpret_cast<uint4*>(rank0_full_out);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+                const int row = i / vec_vocab;
+                const int col = i - row * vec_vocab;
+                out_v[(size_t)row * vec_full + vec_vocab + col] = s1_v[i];
+            }
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+                const int row = i / local_vocab_size;
+                const int col = i - row * local_vocab_size;
+                rank0_full_out[(size_t)row * full_vocab + local_vocab_size + col] = s1_buf[i];
+            }
         }
     }
 }
@@ -439,7 +578,8 @@ extern "C" int w34_tp2_all_reduce_f16(const w34_exec* ex, const void* local_in, 
         return (int)cudaErrorInvalidValue;
     }
     int blocks = (num_elems + 511) / 512;
-    if (blocks > w34_comm::kMaxBlocks) blocks = w34_comm::kMaxBlocks;
+    const int cap = (num_elems <= 36 * 5120) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)local_in, (__half*)out,
@@ -481,7 +621,8 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
     }
     if (num_tokens == 0) return 0;
     int blocks = num_tokens;
-    if (blocks > w34_comm::kMaxBlocks) blocks = w34_comm::kMaxBlocks;
+    const int cap = (num_tokens <= 36) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    if (blocks > cap) blocks = cap;
     if (hidden_size <= 2560) {
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<10>
             <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
@@ -527,7 +668,8 @@ extern "C" int w34_tp2_all_reduce_bf16(const w34_exec* ex, const void* local_in,
         return (int)cudaErrorInvalidValue;
     }
     int blocks = (num_elems + 511) / 512;
-    if (blocks > w34_comm::kMaxBlocks) blocks = w34_comm::kMaxBlocks;
+    const int cap = (num_elems <= 36 * 5120) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_bf16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
         (const __nv_bfloat16*)local_in, (__nv_bfloat16*)out,
@@ -546,7 +688,8 @@ extern "C" int w34_tp2_all_reduce_f32(const w34_exec* ex, const float* local_in,
         return (int)cudaErrorInvalidValue;
     }
     int blocks = (num_elems + 511) / 512;
-    if (blocks > w34_comm::kMaxBlocks) blocks = w34_comm::kMaxBlocks;
+    const int cap = (num_elems <= 36 * 5120) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_f32_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
         local_in, out, stage0, stage1,
@@ -616,7 +759,8 @@ extern "C" int w34_tp2_gather_vocab_f16(
     }
     const int num_elems = num_rows * local_vocab_size;
     int blocks = (num_elems + 511) / 512;
-    if (blocks > w34_comm::kMaxBlocks) blocks = w34_comm::kMaxBlocks;
+    const int cap = (num_elems <= 36 * 5120) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)local_logits_f16,

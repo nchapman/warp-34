@@ -826,10 +826,16 @@ __device__ __forceinline__ void decode_kv_row_256_to_smem_f16(
         const float c11 = __shfl_sync(0xffffffffu, tq4_lut, (int)((p1 >> 4) & 0x0Fu));
         const float c12 = __shfl_sync(0xffffffffu, tq4_lut, (int)((p1 >> 8) & 0x0Fu));
         const float c13 = __shfl_sync(0xffffffffu, tq4_lut, (int)((p1 >> 12) & 0x0Fu));
-        *reinterpret_cast<__half2*>(dst + (lane << 2)) = __floats2half2_rn(d0 * c00, d0 * c01);
-        *reinterpret_cast<__half2*>(dst + (lane << 2) + 2) = __floats2half2_rn(d0 * c02, d0 * c03);
-        *reinterpret_cast<__half2*>(dst + 128 + (lane << 2)) = __floats2half2_rn(d1 * c10, d1 * c11);
-        *reinterpret_cast<__half2*>(dst + 128 + (lane << 2) + 2) = __floats2half2_rn(d1 * c12, d1 * c13);
+        const __half2 h00 = __floats2half2_rn(d0 * c00, d0 * c01);
+        const __half2 h01 = __floats2half2_rn(d0 * c02, d0 * c03);
+        const __half2 h10 = __floats2half2_rn(d1 * c10, d1 * c11);
+        const __half2 h11 = __floats2half2_rn(d1 * c12, d1 * c13);
+        *reinterpret_cast<uint2*>(dst + (lane << 2)) =
+            make_uint2(*reinterpret_cast<const uint32_t*>(&h00),
+                       *reinterpret_cast<const uint32_t*>(&h01));
+        *reinterpret_cast<uint2*>(dst + 128 + (lane << 2)) =
+            make_uint2(*reinterpret_cast<const uint32_t*>(&h10),
+                       *reinterpret_cast<const uint32_t*>(&h11));
         return;
     }
     if (format == W34_KV_FORMAT_Q8_0) {
@@ -1831,13 +1837,14 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
             ((batch->max_q_len > 1 && batch->total_tokens > 1) ||
              (batch->max_q_len == 1 && batch->num_reqs >= 1 && batch->total_tokens <= 8)) &&
             batch->total_tokens <= 16 && batch->max_seq_len >= 128 && batch->max_seq_len <= 1024;
-        if ((short_split || (batch->total_tokens <= 16 && batch->max_seq_len > 1024 &&
+        if ((short_split || (batch->total_tokens <= 32 && batch->max_seq_len > 1024 &&
             batch->max_blocks_per_req > 64)) &&
             ex->scratch_ptr != 0 && (ex->scratch_ptr & 15u) == 0u) {
             int cand_splits =
                 short_split ? ((batch->max_seq_len <= 256) ? (batch->max_seq_len + 63) / 64 : 4) :
-                ((batch->max_blocks_per_req > 1024 && batch->total_tokens <= 4) ? 32 :
-                 (batch->total_tokens <= 8 ? 16 : 8));
+                ((batch->max_blocks_per_req > 2048 && batch->total_tokens <= 2) ? 64 :
+                 (batch->max_blocks_per_req > 1024 && batch->total_tokens <= 4) ? 32 :
+                 (batch->total_tokens <= 8 ? 16 : (batch->total_tokens <= 16 ? 8 : 4)));
             if (short_split && batch->max_q_len == 1 && batch->total_tokens >= 6 &&
                 cand_splits > 2) {
                 cand_splits = 2;
@@ -1863,7 +1870,19 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
         }
 
         int q_group = gqa_ratio;
-        if (q_group > 8) {
+        if (batch->num_reqs == 1 && batch->total_tokens > 32 && num_splits == 1 &&
+            (16 % gqa_ratio) != 0) {
+            // For chunked prefill on non-power-of-2 GQA ratios (e.g. 27B gqa_ratio = 6),
+            // picking a divisor of both `gqa_ratio` and 16 (q_group = 2, tok_tile = 8)
+            // fills all 16/16 mma.sync.m16n8k16 rows instead of 12/16, cutting redundant
+            // TQ4/WHT-256 KV page decodes by 25% with 0-ULP invariance.
+            for (int d = 8; d >= 1; --d) {
+                if ((gqa_ratio % d) == 0 && (16 % d) == 0) {
+                    q_group = d;
+                    break;
+                }
+            }
+        } else if (q_group > 8) {
             for (int d = 8; d >= 1; --d) {
                 if (gqa_ratio % d == 0) {
                     q_group = d;
