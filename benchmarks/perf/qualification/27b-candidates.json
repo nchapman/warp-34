@@ -27,6 +27,19 @@
       "blockers": ["Exact base source revision not recorded in cached README/recipe/config", "Tokenizer/template differ from official source; audit before claiming aligned inputs", "No independent suite quality qualification"]
     },
     {
+      "repo": "nchapman/Qwen3.8-27B-W4A16-GPTQ",
+      "revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "format": "compressed-tensors GPTQ W4A16 g128 symmetric static actorder; GDN a/b projections unquantized",
+      "local": true,
+      "verification": "All 13 visible snapshot files SHA-256 inventoried and independently re-read by w34perf verify/preflight",
+      "inventory": "27b-gptq-0df.inventory.json",
+      "inventory_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
+      "snapshot_total_bytes": 19610855960,
+      "source_revision": null,
+      "qualification": "27b-one-card.json",
+      "blockers": ["Exact base source revision unresolved", "Not interchangeable with c11a884; changed quantization exceptions/model bytes and extra Q4 MTP sidecar", "No independent functional-quality qualification; BF16/FP16 and renderer differences must stay explicit"]
+    },
+    {
       "repo": "WarlaxZ/Qwen3.8-27B-NInfer-3090",
       "revision": "ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1",
       "file": "qwen3_8_27b.ninfer",
@@ -65,6 +78,7 @@
   "local_runtimes": [
     {
       "engine": "vllm", "version": "0.31.0",
+      "graph_enabled_qualification": "27b-one-card.json",
       "evidence": "installed Python distribution metadata and real offline one-card serving smoke",
       "smoke": {
         "profile": "27B GPTQ c11a884 / TP1 / half activations / FP16 auto KV / text-only / eager / no speculation",
@@ -83,7 +97,7 @@
         "note": "One repetition, short outputs; eager disables compilation/CUDA graphs. Not a tuned speed result, source/quality equivalence still unresolved. Server stopped."
       }
     },
-    {"engine": "sglang", "container": "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9", "evidence": "local docker image inspect; not a serving qualification"},
+    {"engine": "sglang", "container": "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9", "evidence": "digest/version inspected; 0df BF16 operational probe passes, FP16 startup failures retained", "qualification": "27b-one-card.json"},
     {"engine": "llama.cpp", "container": "ghcr.io/ggml-org/llama.cpp@sha256:b2497f8834f5ecb4e38530f6bf2734b8e0be107ff48e4720145911c86930f2ce", "evidence": "local docker image inspect; source revision/build compatibility not inferred from mutable tag"}
   ],
   "sources": [

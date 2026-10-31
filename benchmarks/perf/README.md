@@ -124,13 +124,49 @@ byte differences against a trusted inventory, **not authenticity**: there is no
 signature, and a replacement inventory can certify replacement bytes. Retain
 an out-of-band trusted hash or externally sign the evidence for publication.
 
-This checks local bytes, not shard-index completeness, source-model equivalence,
-quality, advertised model IDs, or what an HTTP server actually loaded. Those
-remain separate qualification gates. No model downloads occur.
+`verify` checks local bytes, not shard-index completeness, source-model equivalence,
+quality, advertised model IDs, or what an HTTP server actually loaded. No model
+downloads occur. Use the separate preflight for indexed shards and model discovery:
 
 See [27B candidate evidence](qualification/27b-candidates.json) and
 [qualification notes](engines.md#27b-candidate-mapping-2026-10-30) for verified
 local hashes versus remote-advertised hashes and unresolved provenance.
+
+## Online preflight and 27B one-card probes
+
+After starting a server, verify a **trusted** inventory and its indexed shard
+references, then compare the configured model ID to `/v1/models`:
+
+```sh
+python3 -m w34perf preflight qualification/27b-one-card.toml \
+  --engine vllm27-1-fp16-0df \
+  --inventory qualification/27b-gptq-0df.inventory.json \
+  --out results/vllm27-preflight-001.json
+# Add --root /other/pinned-snapshot if local artifact bytes were relocated.
+python3 -m w34perf run qualification/27b-one-card.toml \
+  --engine vllm27-1-fp16-0df --gpus 1 --out results/vllm27-probe-001
+```
+
+Preflight is single-attempt, deadline/response-size bounded and exclusive-create.
+It retains passed/failed/skipped evidence, checks the profile's inventory hash
+when known, and refuses missing, uninventoried or parent-traversing indexed shards.
+Local drift/index failure happens **before HTTP**; disabled/unsupported profiles
+skip without reading inventories or contacting servers. Exit 0 means passed or
+explicitly skipped; 1 failed inventory/index/discovery checks (including missing
+or invalid inventory inputs); 2 config/selection/evidence-file setup errors.
+Ctrl-C writes `status=interrupted` evidence and exits 130. It does
+**not** attest which bytes the server loaded, prove rendering/quality equivalence,
+or automatically attach evidence to a subsequent run. Keep inventory, preflight,
+startup log and run bundle together. Inventory/root paths remain trusted inputs.
+
+The checked-in [one-card preset](qualification/27b-one-card.toml) pins the newer
+GPTQ `0df81ea...` for three separate probes: C1, **offered C8** and four-turn agent
+replay, three repetitions and 64-token ceilings. Never start these profiles
+simultaneously on the same GPU/port. See the [qualification ledger](qualification/27b-one-card.json)
+for startup failures and successful probes. SGLang's BF16 activation/KV probe is
+**not an FP16 pass**; its active-request limit is 2, so offered C8 includes server
+queueing. Warp-34's built-in renderer is not the artifact's Jinja executor.
+These are operational probes, not token-aligned or quality-qualified rankings.
 
 ## Configuration and extension
 

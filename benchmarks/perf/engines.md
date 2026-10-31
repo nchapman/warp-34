@@ -44,9 +44,9 @@ release pins deliberately and retain older reports for longitudinal comparisons.
 
 | Engine | Initial pin / source | 1 card | 2 cards | Current qualification |
 |---|---|---|---|---|
-| warp-34 | current local commit, record exact binary hash | native | tensor parallel 2 | Local runner smoke; full campaign pending |
-| vLLM | 0.31.0 (existing installed donor) | native | `--tensor-parallel-size 2` | 27B eager/text-only one-card HTTP smoke passes; optimized/two-card qualification pending |
-| SGLang | 0.5.19 | native | `--tp-size 2` | Recipe only in this suite |
+| warp-34 | current local commit, record exact binary hash | native | tensor parallel 2 | 4B runner smoke and repeated 27B 0df FP16 one-card probes pass; full campaign pending |
+| vLLM | 0.31.0 (existing installed donor) | native | `--tensor-parallel-size 2` | 27B eager c11 smoke and compiled/CUDA-graph 0df one-card probes pass; quality/two-card pending |
+| SGLang | 0.5.19 / image below | native | `--tp-size 2` | 27B 0df **BF16** one-card probes pass; c11 Marlin and 0df FP16 startup failures retained |
 | llama.cpp | `5047748f114564fcf271e6a648f60e2d2eae6264` | all layers GPU | layer split (`--split-mode layer --tensor-split 1,1`) | Candidate source pin; artifact/build/runtime pending |
 | Don-Chad/ninfer-3090 | `d8c29253f2c0845611a794d87057950107a4956b` | native | Linux pipeline `--devices 0,1` | Single-card artifact/build pending; dual-card **experimental/unqualified** |
 
@@ -159,6 +159,63 @@ source/converter provenance, acquire/check candidate bytes, independently test
 quality, and qualify each real Linux runtime/KV mode. Two-card NInfer stays
 **disabled/unverified** until an explicit successful pipeline probe; use
 `--gpus 1` for a single-card-only campaign without deleting matrix entries.
+
+### Repeated 27B one-card operational probes
+
+The [probe preset](qualification/27b-one-card.toml), [full inventory](qualification/27b-gptq-0df.inventory.json),
+and [machine-readable launch/probe ledger](qualification/27b-one-card.json) retain
+this follow-up. It deliberately selects **newer snapshot `0df81ea...` for all
+three runnable profiles**, rather than pretending SGLang used `c11a884...`.
+All **13 files / 19,610,855,960 bytes** were inventoried and re-verified, stable
+hash `82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03`.
+The newer snapshot leaves small GDN a/b projections unquantized and adds a Q4
+MTP sidecar. Source provenance remains unresolved. No model downloads or engine
+source patches were needed.
+
+Retained SGLang v0.5.19 failures, not zero-throughput rows:
+
+1. Original `c11a884...` / FP16: Marlin repack rejects width 96 (tile width 64).
+   The Docker client exited **0 despite worker failure**; logs, not exit alone,
+   establish failure before HTTP startup.
+2. New `0df81ea...` plus `--language-model-only`: this flag accepts only
+   MuseGlimmer in this image, not Qwen3.5. Its generic help is insufficient proof.
+3. New `0df81ea...` / FP16 without that flag: weights load, then Triton GDN
+   causal-convolution compilation fails with BF16/FP16 branch-type mismatch
+   during prefill graph initialization. Runtime also caps requested active 8 to
+   3 (16 Mamba slots / five slots per request) and KV capacity to 11,739 tokens.
+
+An **explicitly different BF16** SGLang profile passes preflight and **42/42
+measured requests / nine trials**, with FP32 SSM, BF16 KV (16,384 tokens), active
+limit 2, 12 Mamba slots, zero CPU offload, and both prefill/decode graph capture.
+Offered C8 therefore includes queueing behind two active requests; it is **not**
+eight simultaneously GPU-active sequences or a successful FP16 qualification.
+Vision remains loaded because the text-only flag is unsupported for this model.
+
+vLLM 0.31.0 on the **same `0df81ea...` bytes**, FP16 activation/auto KV, FP32 SSM,
+text-only, max context 8192, active limit 8, zero CPU offload and no speculation
+passes preflight and **42/42 requests / nine trials**. Startup confirms **21.25 s
+of torch.compile and piecewise/full CUDA graph captures**, not `--enforce-eager`.
+Its profiled KV pool holds 17,347 tokens; pools and memory are not matched to
+SGLang. This is the graph-enabled qualification recipe, not exhaustive tuning.
+
+Warp-34 also passes preflight and **42/42 requests / nine trials** on those exact
+bytes with FP16 activation/KV, FP32 SSM, target-only and 1024 requested KV pages
+(16,384 tokens). Its CLI leaves CUDA graphs enabled; this HTTP suite does not
+independently profile graph execution. The exact binary hash is in the ledger.
+All three servers were stopped before full project verification.
+
+The preset uses three repetitions of short C1 (two requests), **offered C8**
+(eight requests), and a four-turn C1 coding-agent replay, with 64-token output
+ceilings. Raw resolved configs, SSE, coverage, summaries, checksums, startup logs
+and preflight paths/hashes are in the ledger. Inventory, model ID and indexed
+shards pass the new `preflight` command; this is **not remote loaded-byte
+attestation**. Warp-34 uses its own ChatML renderer rather than executing the
+artifact Jinja: matching stored template hashes do not establish token-aligned
+prompts. Different dtypes, rendering and admission must remain visible.
+
+No speed leaderboard, quality pass, tail-latency conclusion, long-context,
+saturation or two-card claim follows from these operational probes. Archive
+raw `/tmp` evidence and independently anchor/sign hashes before publication.
 
 ## KV-cache sweep (same 4-bit weights)
 

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-10-30T23:38:46.236241+00:00",
+  "root": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+  "include": [],
+  "files": {
+    "README.md": {"bytes": 1388, "sha256": "29702d72cf8cfdccfbd596151e425d5932788e9de83a763e45b280f7b56be09d"},
+    "SHA256SUMS": {"bytes": 855, "sha256": "80a15ecc8662404c720ff026f23ba63cbed2c0126d725020bd842732653f5a4e"},
+    "chat_template.jinja": {"bytes": 28234, "sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"},
+    "config.json": {"bytes": 15365, "sha256": "ccaf8c6239c41f02ffb2e4921c5fc6596e3ded1395483be3f6b516d11ba0a536"},
+    "generation_config.json": {"bytes": 177, "sha256": "11d5b4c8b437a81ee371542021797873bc37ea760cd54770b9cdc573faa0269a"},
+    "model.safetensors": {"bytes": 18603383720, "sha256": "da08e0675ea9f7e88cebcd5e54353dfdd2b325466ee036b423e8ccad4f5e9910"},
+    "model.safetensors.index.json": {"bytes": 160920, "sha256": "328bbb63da16c697ef12bc0dd601f2d960c39e0752d69ed5e07257aa1a7cb007"},
+    "model_mtp.safetensors": {"bytes": 849400392, "sha256": "1d8268aa85ace093a561e3e7b63b9d390dac1cd55a90cd55b5ec509c3c9da9fe"},
+    "model_mtp_q4.safetensors": {"bytes": 137872360, "sha256": "97503b821951aaf3337d6ae6c85935b0ecad9644c91e5d2496d59476b4bbfc32"},
+    "processor_config.json": {"bytes": 1220, "sha256": "bfbc24af59a3e73a9cd0653b8d4ae758dfaec4e3e6c15dfb1c6c8ee8d5683c85"},
+    "recipe.yaml": {"bytes": 386, "sha256": "ae386feb66b8e2b24cf4c44e8520a013e4e253118c4606bd370e51ee9c34f3ba"},
+    "tokenizer.json": {"bytes": 19989438, "sha256": "67d8113912fabc4af848be59c550922fb4945e3f9ad0853948d5def219fc4e46"},
+    "tokenizer_config.json": {"bytes": 1505, "sha256": "2984c03425a28d242744e234a5003786fd289b3713db79fe0958c65eb59d85b2"}
+  },
+  "total_bytes": 19610855960,
+  "inventory_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03"
+}

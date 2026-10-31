@@ -14,6 +14,42 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### Repeated one-card 27B operational qualification (2026-10-30)
+
+- Added standalone `w34perf preflight`: trusted local byte/profile hashes,
+  indexed-shard completeness and advertised model-ID checks, bounded single
+  attempt, exclusive passed/failed/skipped/interrupted evidence. This does not
+  attest server-loaded bytes, establish quality or auto-attach a run bundle.
+- New [one-card preset](../benchmarks/perf/qualification/27b-one-card.toml) and
+  [outcome/failure ledger](../benchmarks/perf/qualification/27b-one-card.json)
+  explicitly select GPTQ **`0df81ead...` for all runnable probes**, separate from
+  earlier `c11a884...`. Full checked-in inventory re-verifies **13 files /
+  19,610,855,960 bytes**. No downloads or engine modifications.
+- SGLang v0.5.19 original c11/FP16 fails Marlin width-96 repack. New 0df/FP16
+  loads weights but fails Triton GDN convolution BF16/FP16 type compilation;
+  Qwen3.5 also rejects that image's text-only flag. All failures retained,
+  including Docker exit 0 despite worker failure. No silent precision fallback.
+- Explicit **BF16 SGLang**, compiled/CUDA-graph **FP16 vLLM 0.31.0**, and **FP16
+  warp-34** each pass preflight and **42/42 measured requests / nine trials**:
+  three repetitions of C1, offered C8 and four-turn C1 agent replay, 64-token
+  ceilings, FP32 SSM, no speculation/CPU weight offload. All servers stopped.
+- These are operational passes, **not a speed leaderboard or quality pass**.
+  SGLang's active limit 2 means C8 queues; its BF16 KV/vision allocations differ
+  from text-only FP16 vLLM. Warp-34's renderer is not artifact Jinja execution.
+  Source provenance, quality, aligned rendering/dtype/admission/memory, GGUF/
+  ninfer acquisition and other runtimes/topologies remain publication blockers.
+- Review found **two suggestions, no Important/Critical issues**. Clarified
+  preflight exit codes; fixed reproduced empty evidence on Ctrl-C. Kept the
+  hard discovery deadline through JSON validation rather than accepting late
+  responses. Detailed triage is in the suite [task ledger](../benchmarks/perf/PLAN.md).
+- Post-review full `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **214.83 s**:
+  **208 Rust tests/doc-tests + 69 oracle tests + 47 suite tests**, formatting and
+  Clippy with/without CUDA (`/tmp/w34-perf-one-card-final-check.log`). Final
+  `perf-check`, preset validation, JSON/doc links, all ledger/bundle checksums,
+  executed config hashes and Markdown/CSV rendering pass; `git diff --check`
+  passes and GPUs are free. Raw `/tmp` evidence still needs archival/signing
+  before any public release.
+
 ### Optional dual-card coverage and 27B qualification follow-up (2026-10-30)
 
 - The standalone [`benchmarks/perf/`](../benchmarks/perf/README.md) suite now has

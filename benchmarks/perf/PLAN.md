@@ -86,9 +86,11 @@ HTTP tests; configured one/two-card profiles; clear failure/partial-run behavior
       conversion/calibration commands and revisions, file sizes and shard SHA-256s.
 - [x] Add offline streaming `inventory`/`verify` for local weight/tokenizer/template
       bytes, symlinked HF snapshots, file/glob scope, relocation and drift detection.
-- [ ] Add online preflight matching configured IDs against `/v1/models`, index/shard
-      completeness and automatic attachment of trusted inventories to run bundles.
-      vLLM's 27B smoke model ID was checked manually and response retained.
+- [x] Add online preflight matching configured IDs against `/v1/models`, checking
+      local inventory/profile hashes and indexed-shard completeness; retain new
+      passed/failed/skipped JSON without attesting remote loaded bytes.
+- [ ] Automatically attach trusted inventory/preflight/startup evidence to run
+      bundles. For now retain the separate files and ledger hashes together.
 - [ ] Freeze separate release pins/container digests and verified launch recipes
       for each engine on this Linux machine; save `--help` and startup logs.
 - [ ] Run each engine's real 1-card smoke, then 2-card smoke with documented strategy.
@@ -99,8 +101,10 @@ HTTP tests; configured one/two-card profiles; clear failure/partial-run behavior
       GPU filters/exclusions and machine-readable measured/failed/skipped/not-run
       deployment × selected-case coverage. All-skipped runs retain evidence without
       network/GPU probes. No precision/parallelism fallback.
-- [ ] Record managed launch failures/OOM/quality failures in the campaign ledger
-      (current externally managed launches cannot observe pre-HTTP startup errors).
+- [x] Manually retain observed pre-HTTP launch failures and probe outcomes in
+      `qualification/27b-one-card.json`, including explicit BF16 vs FP16 variants.
+- [ ] Automatically record managed launch failures/OOM/quality failures; the HTTP
+      runner alone cannot observe externally managed pre-HTTP startup errors.
 - [ ] Add opt-in managed server launch/readiness/process-group cleanup and GPU
       reservation. Keep externally managed endpoints as the universal extension path.
 
@@ -244,8 +248,54 @@ explicitly documented as HTTP responsiveness in the repository README.
   selects five profiles, and `/tmp/w34-perf-disabled-dual-smoke/` retains a skipped
   ninfer two-card run with an empty journal and rendered coverage report.
 
+## Repeated one-card 27B qualification follow-up
+
+- Added `preflight` with trusted local inventory/profile hash verification,
+  safetensors index/shard checks, bounded single-attempt authenticated `/models`
+  discovery, configured-ID matching and exclusive passed/failed/skipped evidence.
+  This is not server loaded-byte attestation or automatic run-bundle attachment.
+- Explicitly selected newer cached **`0df81ead...` for all three runnable probes**:
+  13 files / **19,610,855,960 bytes**, full checked-in inventory and independent
+  verification. Original `c11a884...` evidence remains intact and distinct.
+- Retained SGLang v0.5.19 startup failures: c11 quantized width 96 rejected by
+  Marlin; 0df text-only flag unsupported for Qwen3.5; 0df FP16 GDN convolution
+  BF16/FP16 Triton branch mismatch. Worker failure can yield Docker exit 0;
+  never infer serving readiness from that code alone. No engine patches.
+- Explicit **BF16 SGLang**, graph-enabled **FP16 vLLM 0.31.0**, and **FP16 warp-34**
+  each pass preflight and **42/42 measured requests / nine trials**: three
+  repetitions of short C1, offered C8 and four-turn C1 agent replay. Preset and
+  machine-readable outcomes/hashes are in `qualification/27b-one-card.{toml,json}`.
+  The recorded executed config is in each raw manifest; a later metadata-only
+  correction pins the disabled c11 placeholder separately from 0df defaults.
+- SGLang is active-limit 2, BF16 KV and loads vision; vLLM requests active 8,
+  text-only, FP16 KV and confirmed torch.compile + piecewise/full graph captures.
+  Warp-34 uses its built-in renderer, not artifact Jinja. These remain **different
+  operational deployments**, not token/dtype/admission/memory-aligned rankings.
+- All temporary servers stopped; no downloads, engine patches, quality pass,
+  autonomous-agent success, long-context, saturation or two-card claim.
+- Review returned **two nonblocking suggestions, no Important/Critical findings**.
+  Clarified that missing/invalid inventory checks produce retained failed evidence
+  (exit 1), while config/selection/evidence-file setup errors exit 2. Reproduced
+  empty output on interrupted inventory read, then fixed Ctrl-C to retain
+  `status=interrupted` before propagating exit 130. Unexpected termination/deeply
+  malformed trusted operator JSON remain outside graceful-interrupt guarantees.
+  Declined the proposed timer-success override: the hard discovery deadline
+  intentionally includes reading **and validating** the JSON; expiry before
+  validation completes fails closed, consistent with SSE transport. A response
+  at the exact deadline is not promised a pass. No follow-up review needed for
+  this small error-path fix and documentation clarifications.
+- Final post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **214.83 s**:
+  **208 Rust tests/doc-tests + 69 oracle tests + 47 standalone suite tests**,
+  formatting and both Clippy feature states. Log:
+  `/tmp/w34-perf-one-card-final-check.log`. Final `mise run perf-check` also passes
+  after metadata corrections. Validated the five-profile/three-case preset, all
+  JSON and doc links, every ledger/run-bundle checksum and executed config hash;
+  rendered Markdown/CSV for all three runs. `git diff --check` passes and GPUs
+  are free. Raw evidence remains in `/tmp`; archive before any public release.
+
 Next concrete tasks: finish source/converter provenance and independent quality;
-acquire selected GGUF/ninfer artifacts with verified checksums; qualify SGLang,
-llama.cpp and NInfer Linux one-card runtimes and optimized vLLM. Probe two-card
-routes only where useful/supported; retain explicit skips otherwise. No
-comparative leaderboard is claimed.
+acquire selected GGUF/ninfer artifacts with verified checksums; qualify llama.cpp
+and NInfer Linux one-card runtimes. Resolve or deliberately retain SGLang's FP16
+startup failures, then align rendering/dtype/admission for controlled comparisons.
+Probe two-card routes only where useful/supported; retain explicit skips otherwise.
+No comparative leaderboard is claimed.

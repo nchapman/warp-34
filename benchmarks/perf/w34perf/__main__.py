@@ -8,6 +8,7 @@ import sys
 from .config import load
 from .artifacts import save_inventory, verify_inventory
 from .selection import select
+from .preflight import preflight
 from .report import render
 from .runner import execute, MeasurementError
 
@@ -36,6 +37,12 @@ def main(argv=None):
     verify = subs.add_parser("verify", help="verify an immutable offline artifact inventory")
     verify.add_argument("inventory", type=Path)
     verify.add_argument("--root", type=Path, help="relocated artifact path")
+    pre = subs.add_parser("preflight", help="check local inventory, indexed shards and advertised model ID")
+    pre.add_argument("config", type=Path)
+    pre.add_argument("--engine", required=True)
+    pre.add_argument("--inventory", type=Path, required=True)
+    pre.add_argument("--root", type=Path, help="local artifact root, if relocated")
+    pre.add_argument("--out", type=Path, required=True, help="new evidence JSON file")
     args = parser.parse_args(argv)
     try:
         if args.command == "report":
@@ -51,6 +58,10 @@ def main(argv=None):
             print(json.dumps(result, indent=2))
             return 1 if result.get("status") == "mismatch" else 0
         cfg = load(args.config)
+        if args.command == "preflight":
+            result = preflight(cfg, args.engine, args.inventory, args.out, args.root)
+            print(json.dumps(result, indent=2))
+            return 1 if result["status"] == "failed" else 0
         if args.command == "validate":
             print(f"valid: {len(cfg['engines'])} deployments, {len(cfg['cases'])} cases")
         elif args.command == "plan":

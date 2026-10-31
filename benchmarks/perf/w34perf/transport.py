@@ -12,6 +12,72 @@ MAX_LINE = 4 * 1024 * 1024
 MAX_RESPONSE = 64 * 1024 * 1024
 
 
+def authorization(engine):
+    if not engine.get("api_key_env"):
+        return {}
+    key = os.environ.get(engine["api_key_env"])
+    if not key:
+        raise ValueError(f"missing credential environment variable {engine['api_key_env']}")
+    if any(ord(c) < 33 or ord(c) > 126 for c in key):
+        raise ValueError("invalid credential format")
+    return {"Authorization": "Bearer " + key}
+
+
+def models(engine, timeout_s):
+    """Bounded, single-attempt GET /models, preserving successful JSON evidence."""
+    start = time.perf_counter()
+    result = {"status": "error", "error": None, "http_status": None, "data": None}
+    url = urlsplit(engine["base_url"])
+    cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    connection = cls(url.hostname, url.port, timeout=timeout_s)
+    timer = None
+    expired = threading.Event()
+
+    def abort(sock):
+        expired.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    try:
+        headers = {"Accept": "application/json", **authorization(engine)}
+        connection.connect()
+        remaining = timeout_s - (time.perf_counter() - start)
+        if remaining <= 0:
+            raise TimeoutError("model discovery deadline exceeded")
+        sock = connection.sock
+        sock.settimeout(remaining)
+        timer = threading.Timer(remaining, abort, args=(sock,))
+        timer.daemon = True
+        timer.start()
+        connection.request("GET", url.path.rstrip("/") + "/models", headers=headers)
+        response = connection.getresponse()
+        result["http_status"] = response.status
+        if response.status != 200:
+            raise ValueError(f"HTTP {response.status}")
+        limit = 1024 * 1024
+        raw = response.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError("model discovery response exceeded byte limit")
+        try:
+            data = json.loads(raw)
+            json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (ValueError, UnicodeError, RecursionError):
+            raise ValueError("invalid model discovery JSON") from None
+        result.update(status="ok", data=data)
+    except (OSError, ValueError, TypeError, http.client.HTTPException) as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"[:500]
+    finally:
+        if timer:
+            timer.cancel()
+        if expired.is_set():
+            result.update(status="error", error="model discovery timeout", data=None)
+        result["e2e_ms"] = (time.perf_counter() - start) * 1000
+        connection.close()
+    return result
+
+
 def stream(engine, payload, timeout_s):
     start = time.perf_counter()
     result = {"status": "error", "error": None, "http_status": None, "usage": None,
@@ -43,14 +109,7 @@ def stream(engine, payload, timeout_s):
             pass
 
     try:
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
-        if engine.get("api_key_env"):
-            key = os.environ.get(engine["api_key_env"])
-            if not key:
-                raise ValueError(f"missing credential environment variable {engine['api_key_env']}")
-            if any(ord(c) < 33 or ord(c) > 126 for c in key):
-                raise ValueError("invalid credential format")
-            headers["Authorization"] = "Bearer " + key
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream", **authorization(engine)}
         # Establish separately so the socket remains available even on Connection: close.
         connection.connect()
         sock = connection.sock
