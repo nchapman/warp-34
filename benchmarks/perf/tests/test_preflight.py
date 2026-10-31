@@ -178,10 +178,15 @@ class PreflightTests(unittest.TestCase):
         inventory = json.loads((ROOT / "qualification" / "27b-gptq-0df.inventory.json").read_text())
         self.assertEqual(digest(inventory["files"]), inventory["inventory_sha256"])
         runnable = [e for e in cfg["engines"] if e["enabled"]]
-        self.assertEqual(len(runnable), 3)
+        self.assertEqual(len(runnable), 4)
         self.assertEqual({e["artifact_sha256"] for e in runnable}, {inventory["inventory_sha256"]})
         self.assertEqual({e["model_revision"] for e in runnable}, {"0df81eadcfd59601cb82ccece2f16ea7d39244bf"})
         self.assertEqual({e["kv_format"] for e in runnable}, {"bf16", "fp16", "fp16-auto"})
+        fp16_sglang = next(e for e in runnable if e["engine"] == "sglang" and e["activation_dtype"] == "float16")
+        self.assertEqual(fp16_sglang["conv_state_dtype"], "float16")
+        self.assertIn("-e SGLANG_MAMBA_CONV_DTYPE=float16", fp16_sglang["launch_command"])
+        snapshot_arg = "--model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/" + fp16_sglang["model_revision"]
+        self.assertIn(snapshot_arg, fp16_sglang["launch_command"])
         failed = [e for e in cfg["engines"] if not e["enabled"]]
         self.assertEqual(len(failed), 2)
         self.assertTrue(all(e["skip_reason"].startswith("Observed") for e in failed))

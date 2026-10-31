@@ -46,7 +46,7 @@ release pins deliberately and retain older reports for longitudinal comparisons.
 |---|---|---|---|---|
 | warp-34 | current local commit, record exact binary hash | native | tensor parallel 2 | 4B runner smoke and repeated 27B 0df FP16 one-card probes pass; full campaign pending |
 | vLLM | 0.31.0 (existing installed donor) | native | `--tensor-parallel-size 2` | 27B eager c11 smoke and compiled/CUDA-graph 0df one-card probes pass; quality/two-card pending |
-| SGLang | 0.5.19 / image below | native | `--tp-size 2` | 27B 0df **BF16** one-card probes pass; c11 Marlin and 0df FP16 startup failures retained |
+| SGLang | 0.5.19 / image below | native | `--tp-size 2` | 27B 0df BF16 probes pass; FP16 needs explicit FP16 convolution history (see below); earlier startup failures retained |
 | llama.cpp | `5047748f114564fcf271e6a648f60e2d2eae6264` | all layers GPU | layer split (`--split-mode layer --tensor-split 1,1`) | Candidate source pin; artifact/build/runtime pending |
 | Don-Chad/ninfer-3090 | `d8c29253f2c0845611a794d87057950107a4956b` | native | Linux pipeline `--devices 0,1` | Single-card artifact/build pending; dual-card **experimental/unqualified** |
 
@@ -225,6 +225,59 @@ prompts. Different dtypes, rendering and admission must remain visible.
 No speed leaderboard, quality pass, tail-latency conclusion, long-context,
 saturation or two-card claim follows from these operational probes. Archive
 raw `/tmp` evidence and independently anchor/sign hashes before publication.
+
+### SGLang FP16 convolution-cache setting
+
+Deleting old c11 fixed stale local repo-ID resolution, **not** the remaining
+FP16 error. A fresh offline repo-ID trial (`sglang27-q5-fp16-after-retirement`)
+explicitly logged resolution to 0df, loaded its weights, then reproduced the
+same BF16/FP16 Triton convolution error. This rules out stale artifact selection.
+
+Source inspection at the exact SGLang pin found the missing launch setting:
+
+```sh
+# Pass inside the Docker container, alongside --dtype float16:
+-e SGLANG_MAMBA_CONV_DTYPE=float16
+# Keep recurrent SSM state FP32:
+--mamba-ssm-dtype float32
+```
+
+`--dtype float16` alone does not change convolution-history dtype: SGLang's
+`python/sglang/srt/environ.py` defaults `SGLANG_MAMBA_CONV_DTYPE` to `bfloat16`.
+`configs/mamba_utils.py` resolves that setting separately from recurrent SSM
+state; `mem_cache/memory_pool.py` allocates the corresponding convolution tensor.
+The Triton kernel's initial-history branch loaded BF16 while its zero-history
+branch used FP16 input dtype, producing the compiler mismatch. This was an
+**incomplete FP16 launch configuration**, not evidence of a malformed newer
+quant or a general lack of FP16 support. No model JSON override is needed.
+
+This option is documented at the pinned source:
+
+- `docs/docs/references/environment_variables.mdx`, Mamba convolution dtype.
+- `test/registered/models_e2e/test_generation_models.py` sets it to match
+  inference dtype for a hybrid model.
+- Source pin: `0bcd822377da7b5718e674eaf9c870d349424dd1`.
+
+The new `sglang27-1-fp16-conv16-0df` preset keeps FP16 activations, KV and
+convolution history, FP32 recurrent SSM, and the same weights/pools/graph settings
+as the BF16 probe. With the supported environment option, both prefill and decode
+graph captures and HTTP startup succeed. Preflight re-verifies all newer bytes,
+then **48/48 measured requests over 12 trials** pass: the original 42-request
+battery plus six longer primed-prefill requests (~3,020 reported prompt tokens,
+over the 2,048 chunk size). Logs report both chunked prefill and positive cached
+token counts (maximum 3,008); HTTP cache details are null, so no per-request hit
+ratio is inferred. Raw evidence/hashes are in `qualification/27b-one-card.json`.
+Short/prefill output spot-checks are coherent English, not a quality gate.
+**6/12 agent replies contain raw `<tool_call>` text despite `tool_choice=none`**,
+with no structured API tool calls; the BF16 control has the same count. This
+known replay-policy caveat is not silently counted as task-quality success.
+The container is stopped and GPUs are free after the probe. Review then pinned
+the saved launch recipe to the absolute 0df snapshot path; the executed trial
+intentionally used repo ID to test corrected offline resolution, and retains its
+own manifest/config hash. No raw evidence was relabeled.
+The preset adds a longer primed-prefill case (32 context repetitions, 32-token
+output ceiling) to exercise chunking and attempted prefix/history reuse. Earlier
+three-engine evidence remains the original three cases, not this expanded run.
 
 ## KV-cache sweep (same 4-bit weights)
 

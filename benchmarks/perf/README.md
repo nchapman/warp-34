@@ -160,14 +160,21 @@ or automatically attach evidence to a subsequent run. Keep inventory, preflight,
 startup log and run bundle together. Inventory/root paths remain trusted inputs.
 
 The checked-in [one-card preset](qualification/27b-one-card.toml) pins the newer
-GPTQ `0df81ea...` for three separate probes: C1, **offered C8** and four-turn agent
-replay, three repetitions and 64-token ceilings. This is the **only current GPTQ
+GPTQ `0df81ea...` for C1, **offered C8**, four-turn agent replay and an added
+primed longer-prefill case, three repetitions and 64-token ceilings (32 for
+primed prefill). Earlier three-engine runs used only the original three cases;
+their raw manifests remain authoritative. The additional SGLang FP16 profile
+explicitly sets its supported `SGLANG_MAMBA_CONV_DTYPE=float16` environment
+option: `--dtype float16` alone does not change its default BF16 convolution
+history. FP32 recurrent SSM state remains separate. This is the **only current GPTQ
 candidate**: obsolete `c11a884...` was removed from the local cache and local
 `refs/main` now points to 0df. Old hashes/failures remain historical evidence,
 not instructions to fetch or reuse c11. Never start these profiles
 simultaneously on the same GPU/port. See the [qualification ledger](qualification/27b-one-card.json)
-for startup failures and successful probes. SGLang's BF16 activation/KV probe is
-**not an FP16 pass**; its active-request limit is 2, so offered C8 includes server
+for startup failures and successful probes. SGLang's original BF16 probe is
+**not relabeled as FP16**: the separate explicit-convolution FP16 run passes
+**48/48 measured requests over 12 trials**, including six added longer-prefill
+requests. Both variants have active-request limit 2, so offered C8 includes server
 queueing. Warp-34's built-in renderer is not the artifact's Jinja executor.
 These are operational probes, not token-aligned or quality-qualified rankings.
 

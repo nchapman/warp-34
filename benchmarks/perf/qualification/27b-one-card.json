@@ -4,7 +4,7 @@
   "purpose": "Retained startup failures and repeated operational probes; not a competitive or quality qualification",
   "preset": "27b-one-card.toml",
   "executed_config_sha256": "f443f1fa7226433ead75cefe2d5f98268cf5897ff8593befbdac9c8cfe82944c",
-  "preset_note": "Resolved executed config is retained in each run manifest. After probes, only the disabled c11 failure placeholder was given explicit c11 artifact metadata instead of inherited 0df defaults; runnable profiles and workloads are unchanged.",
+  "preset_note": "Resolved executed config is retained in each run manifest. The top-level executed hash applies to the original three-engine probes. Later edits corrected the disabled c11 placeholder, added the explicit FP16 convolution-cache SGLang profile and a primed-prefill case; later probes carry their own executed config hash. Original evidence is not relabeled.",
   "artifact_inventory": "27b-gptq-0df.inventory.json",
   "inventory_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
   "publication_qualified": false,
@@ -58,6 +58,22 @@
       "log": "/tmp/w34-perf-sglang27-q3-startup.log",
       "log_sha256": "9d04e7b04ec9dbc0022a696a7efbd7d1d08b07a63eda3cedfa4d60f7cae8d80b",
       "note": "Weights loaded successfully; failed during default breakable prefill graph initialization. Not an FP16 pass."
+    },
+    {
+      "id": "sglang27-q5-fp16-after-retirement",
+      "engine": "sglang 0.5.19",
+      "container": "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9",
+      "status": "startup_error",
+      "artifact_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model_spec": "nchapman/Qwen3.8-27B-W4A16-GPTQ",
+      "settings_relative_to": "sglang27-1-bf16-0df",
+      "changes": "Explicit float16 instead of bfloat16; repo ID instead of snapshot path; HF_HUB_CACHE=/models/hub, offline mode, corrected local main, obsolete c11 absent. Other launch settings unchanged.",
+      "resolution_evidence": "2026-10-31 00:36:26 UTC: Found local HF snapshot at /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf; skipping download",
+      "error": "Triton GDN causal-convolution compilation: Mismatched type for col0 between then block bf16 and else block fp16",
+      "log": "/tmp/w34-perf-sglang27-q5-fp16-startup.log",
+      "log_sha256": "410bee44117bb0b4e9233dc4adb9894be6787b5e778bd8a43d3a10030a78d5c8",
+      "server_stopped": true,
+      "note": "Fresh container, no engine patches. Newer weights loaded successfully; failed in breakable prefill graph initialization. Docker client exit 0 did not mean serving success. Cleanup corrected default selection but did not fix FP16; GPUs free after exit."
     }
   ],
   "operational_probes": [
@@ -82,6 +98,37 @@
       "startup_log_sha256": "1b7ea28afc509e0648ea680b9af2f522a4080d7b7a4b4ce81466905dfde11d61",
       "server_stopped": true,
       "caveats": ["Explicit BF16 variant, not an FP16 pass", "Offered C8 queues behind max-active=2; not eight GPU-active sequences", "Vision tower loaded; not memory-matched to text-only vLLM", "Startup allocated 17.65 GiB model memory; not sampled peak VRAM", "No quality, long-context, saturation or tail-latency qualification"]
+    },
+    {
+      "engine_id": "sglang27-1-fp16-conv16-0df",
+      "status": "passed",
+      "executed_config_sha256": "308ef10adfd28a62452861e3ca4936e42a26d1aea157af5fcb419801a241ce17",
+      "activation_dtype": "float16",
+      "kv_dtype": "float16",
+      "conv_state_dtype": "float16",
+      "ssm_dtype": "float32",
+      "environment_setting": "SGLANG_MAMBA_CONV_DTYPE=float16",
+      "launch_binding_note": "Executed trial intentionally used repo ID to verify corrected offline main; startup/config evidence resolved 0df. Review then pinned the future preset launch to the exact 0df snapshot path. Raw trial manifest/config hash remains the executed repo-ID version, not the later recipe.",
+      "max_active_requests": 2,
+      "kv_tokens": 16384,
+      "graphs": "breakable prefill [512,1024,2048] and full decode [1,2] captured; runtime log also reports prefill graph use",
+      "trials": 12,
+      "measured_requests": 48,
+      "successful_requests": 48,
+      "token_accounting_complete": true,
+      "additional_case": "prefill-primed-c1: 2 requests x 3 repetitions, 32-token output ceiling, 3019/3022 reported measured prompt tokens; original three cases contribute the other 42 requests",
+      "cache_evidence": "Server log: 27 positive cached-token entries, max 3008; six 2048-new-token chunk entries. HTTP prompt_tokens_details was null; no per-request hit ratio claim.",
+      "run": "/tmp/w34-perf-sglang27-q6-fp16-conv16/",
+      "bundle_index_sha256": "5ab4176912faa2b66ccad0020530ec1763d5c8f22fde75afd5289935731c3d03",
+      "preflight": "/tmp/w34-perf-sglang27-q6-fp16-conv16-preflight.json",
+      "preflight_sha256": "32bce2a9e1e98dd91d34deca65f47977fbcc8a9ee087d6a5b45f2d0b2204cb01",
+      "startup_log": "/tmp/w34-perf-sglang27-q6-fp16-conv16-startup.log",
+      "startup_log_sha256": "c50b72e99fb13ef23bdeaf73eb712506cc272cf3adc3053e445f87760bff1ba7",
+      "config_evidence": "/tmp/w34-perf-sglang27-q6-config-evidence.json",
+      "config_evidence_sha256": "ed9cd1c1a816fea95d5f225b6a11f143254d452e92a5b4813e327c0b887a5783",
+      "source_evidence": "SGLang 0bcd822377da7b5718e674eaf9c870d349424dd1: environ.py default, configs/mamba_utils.py dtype selection, mem_cache/memory_pool.py allocation, documented environment_variables.mdx and generation test usage",
+      "server_stopped": true,
+      "caveats": ["Supported runtime precision setting; no engine patches, model-config overrides or artifact changes", "Offered C8 still queues behind max-active=2; vision loaded; memory/admission not matched to other engines", "Original BF16 and failing default-convolution trials remain separate", "6/12 measured agent replies contain raw <tool_call> markup despite tool_choice=none (also 6/12 in BF16 control); no structured tool_calls were returned. HTTP/accounting pass is not replay-policy or task-quality qualification", "No independent quality, saturation, long-context maximum or tail-latency qualification"]
     },
     {
       "engine_id": "vllm27-1-fp16-0df",
@@ -129,6 +176,12 @@
       "caveats": ["Built-in ChatML renderer, not execution of artifact Jinja; not token-aligned rendering", "Default serving scheduler/radix admission, not matched to other engines", "No quality, long-context, saturation or tail-latency qualification"]
     }
   ],
+  "descriptive_sglang_native16_comparison": {
+    "metric": "Median aggregate completion_tokens_s over three measured repetitions for each common case, including workload overhead",
+    "bf16": {"short-c1": 48.07, "short-c8": 76.68, "agent-c1": 39.03},
+    "fp16_conv16": {"short-c1": 48.10, "short-c8": 78.19, "agent-c1": 37.90},
+    "limitations": "Existing short operational runs, not a randomized controlled speedup study or quality-qualified ranking. Both cap active requests at two; C8 is offered concurrency. No clear general throughput improvement."
+  },
   "remaining_gates": [
     "Exact base-checkpoint provenance and cross-format mapping",
     "Independent functional-quality and long-context qualification",

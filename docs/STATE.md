@@ -14,6 +14,37 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### SGLang FP16 needs explicit convolution-cache dtype (2026-10-30)
+
+- Fresh offline FP16 repo-ID retry after retirement explicitly resolves 0df,
+  loads newer weights, and reproduces the same GDN BF16/FP16 compile mismatch.
+  Cleanup fixed default artifact selection, not that independent dtype issue.
+- Exact-source investigation found the missing **supported runtime setting**:
+  `SGLANG_MAMBA_CONV_DTYPE=float16` inside Docker, alongside `--dtype float16`
+  and `--mamba-ssm-dtype float32`. SGLang otherwise allocates BF16 convolution
+  history independently of the activation dtype. No engine or model-byte edits.
+- Added an explicit FP16-convolution profile to the one-card preset, retaining
+  BF16 and all historical failures. Prefill/decode graphs, HTTP startup, full-byte
+  preflight and **48/48 measured requests / 12 trials** pass: original C1/C8/agent
+  battery plus six longer primed-prefill requests (~3,020 prompt tokens over
+  chunk size 2,048). Logs show chunking and positive cached tokens, max 3,008;
+  HTTP cache details are null, not per-request cache-hit evidence. No independent
+  quality/equivalence/saturation qualification is claimed. Server stopped.
+- Evidence: `benchmarks/perf/qualification/27b-one-card.json`; new raw bundle
+  `/tmp/w34-perf-sglang27-q6-fp16-conv16/`. Preset regression confirms the explicit
+  dtype metadata/env setting. Review fixed the future recipe's mutable repo-ID
+  binding to an exact 0df snapshot path; the executed trial/config hash remain
+  unchanged. 6/12 agent replies emit raw tool markup despite `tool_choice=none`
+  (same count in BF16), with no structured API calls: HTTP/accounting success is
+  not replay-policy or task-quality success. Native-16 smoke throughputs are
+  roughly unchanged (C1 ~48 tok/s; offered C8 ~77 BF16 / ~78 FP16); no general
+  speedup claim.
+- Full post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **209.98 s**:
+  208 Rust tests/doc-tests, 69 oracle tests, 47 performance tests, fmt and both
+  Clippy feature states. Log `/tmp/w34-sglang-conv16-pinned-final-check.log`.
+  Evidence checksums/counts, pinned launch/inventory-root binding, JSON/doc links
+  and `git diff --check` also pass.
+
 ### Obsolete 27B GPTQ cache retired (2026-10-30)
 
 - **Only GPTQ `0df81eadcfd59601cb82ccece2f16ea7d39244bf` is approved for current

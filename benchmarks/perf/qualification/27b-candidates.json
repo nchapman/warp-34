@@ -102,7 +102,7 @@
         "note": "One repetition, short outputs; eager disables compilation/CUDA graphs. Not a tuned speed result, source/quality equivalence still unresolved. Server stopped."
       }
     },
-    {"engine": "sglang", "container": "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9", "evidence": "digest/version inspected; 0df BF16 operational probe passes, FP16 startup failures retained", "qualification": "27b-one-card.json"},
+    {"engine": "sglang", "container": "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9", "evidence": "digest/version inspected; 0df BF16 and explicit-convolution-FP16 operational probes pass; earlier default-convolution FP16 failures retained", "qualification": "27b-one-card.json"},
     {"engine": "llama.cpp", "container": "ghcr.io/ggml-org/llama.cpp@sha256:b2497f8834f5ecb4e38530f6bf2734b8e0be107ff48e4720145911c86930f2ce", "evidence": "local docker image inspect; source revision/build compatibility not inferred from mutable tag"}
   ],
   "sources": [

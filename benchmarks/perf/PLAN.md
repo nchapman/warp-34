@@ -317,9 +317,52 @@ explicitly documented as HTTP responsiveness in the repository README.
   both Clippy feature states (`/tmp/w34-old-quant-retirement-check.log`). Preset,
   JSON/doc links and `git diff --check` pass. No engine/test behavior changed.
 
+## SGLang explicit FP16 convolution history
+
+- Retried FP16 in a fresh offline container **after c11 retirement**, using the
+  repo ID and corrected local main. Startup explicitly resolved 0df and loaded
+  weights, but reproduced the BF16/FP16 GDN convolution error (`q5` in the ledger).
+  Stale artifact selection is ruled out as the source of that failure.
+- Read-only investigation of the exact SGLang source pin found a documented
+  independent convolution-cache dtype setting. Its default is BF16 regardless
+  of `--dtype float16`; set **`SGLANG_MAMBA_CONV_DTYPE=float16` inside Docker**
+  while retaining `--mamba-ssm-dtype float32`. This aligns the kernel's history
+  and zero-history branches. No engine patches or model JSON overrides.
+- Added explicit `sglang27-1-fp16-conv16-0df` profile, preserving the BF16 variant
+  and original failed trials. The new profile reaches prefill/decode graph
+  capture and HTTP startup, passes full-byte preflight and **48/48 measured
+  requests / 12 trials** (original 42 plus six added longer-prefill requests).
+  Measured longer prompts report 3,019/3,022 tokens with chunk size 2,048; logs
+  show chunked prefill and positive cached tokens (max 3,008). HTTP cache details
+  are null; no per-request hit ratio or independent quality claim. The container
+  is stopped and GPUs were free after the run. Raw bundle/preflight/log hashes
+  are recorded separately in the ledger. Quality spot-check: 6/12 agent replies
+  contain raw tool markup despite `tool_choice=none`, also 6/12 in BF16; no
+  structured tool calls. Operational success is not replay-policy/task quality.
+- Review caught mutable local-ref dependence in the saved repo-ID launch. Pinned
+  the future recipe to the exact 0df snapshot path; a regression first reproduced
+  the missing binding and now verifies it. The executed repo-ID trial remains
+  unchanged with its own config hash and explicit 0df resolution evidence.
+- Expanded the preset with longer primed prefill to exercise chunking and
+  attempted prefix/history reuse; old runs remain the original three-case
+  battery in their immutable manifests. A preset regression first failed for
+  the missing FP16 variant, then passed with explicit convolution dtype metadata
+  and environment setting. The runner/transport implementation is unchanged.
+- Native-16 medians are roughly unchanged: BF16 vs FP16 aggregate tok/s over
+  three repetitions: C1 **48.07 / 48.10**, offered C8 **76.68 / 78.19**, agent
+  **39.03 / 37.90**. These are descriptive smoke figures, not a randomized
+  controlled speedup study or task-quality ranking.
+- Full post-review `CUDA_VISIBLE_DEVICES=0,1 mise run check` passes in **209.98 s**:
+  **208 Rust tests/doc-tests + 69 oracle tests + 47 performance tests**, fmt and
+  both Clippy feature states. Log `/tmp/w34-sglang-conv16-pinned-final-check.log`.
+  Evidence checksums/counts, pinned launch/inventory-root binding, JSON/doc links
+  and `git diff --check` pass. One Important review finding (mutable local ref)
+  fixed with failing-first regression; no further implementation changes.
+
 Next concrete tasks: finish source/converter provenance and independent quality;
 acquire selected GGUF/ninfer artifacts with verified checksums; qualify llama.cpp
-and NInfer Linux one-card runtimes. Resolve or deliberately retain SGLang's FP16
-startup failures, then align rendering/dtype/admission for controlled comparisons.
+and NInfer Linux one-card runtimes. Retain SGLang's earlier default-convolution
+failures as history; use its explicit convolution dtype profile for FP16. Align
+rendering/admission/cache budgets for controlled comparisons.
 Probe two-card routes only where useful/supported; retain explicit skips otherwise.
 No comparative leaderboard is claimed.
