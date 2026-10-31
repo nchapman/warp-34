@@ -539,6 +539,16 @@ unsafe extern "C" {
         num_q_heads: i32,
     ) -> i32;
 
+    pub fn w34_paged_attention_f16_force_kernel_for_test(
+        ex: *const W34Exec,
+        layout: *const W34KvLayerLayout,
+        batch: *const W34AttentionBatch,
+        q_in: *const c_void,
+        attn_out: *mut c_void,
+        num_q_heads: i32,
+        use_64q: i32,
+    ) -> i32;
+
     pub fn w34_gdn_causal_conv1d_f16(
         ex: *const W34Exec,
         batch: *const W34GdnBatch,

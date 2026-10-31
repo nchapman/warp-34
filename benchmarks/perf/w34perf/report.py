@@ -59,6 +59,52 @@ def render(directory):
                    if manifest["status"] == "skipped" else
                    "No measured trial completed. Inspect requests.jsonl for warmup/partial-request failures.")
         lines.extend(["", message])
+    has_longctx = any(
+        (t.get("peak_prompt_tokens") or 0) >= 4096 or t.get("cached_prompt_tokens") is not None
+        for t in rows
+    )
+    if has_longctx:
+        lines.extend([
+            "", "## Long-context & prefix-cache breakdown", "",
+            "Cold bursts have >= 4,096 uncached prompt tokens; warm turns have cached_tokens > 0 and < 4,096 uncached tokens.",
+            "",
+            "| Deployment | Case | Peak prompt tok | Cache hit % | Warm-turn TTFT p50 ms | Cold-burst TTFT p50 ms | Cold prefill tok/s p50 | TPOT p50 ms |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+        ])
+        for (engine, case), trials in groups.items():
+            def med_opt(key, sub=None):
+                vals = [t.get(key, {}).get(sub) if sub else t.get(key) for t in trials]
+                valid = [v for v in vals if v is not None]
+                return statistics.median(valid) if len(valid) == len(trials) and valid else None
+            peak_tok = med_opt("peak_prompt_tokens")
+            hit_ratio = med_opt("prefix_cache_hit_ratio")
+            lines.append(
+                f"| {escape(engine)} | {escape(case)} | "
+                f"{'n/a' if peak_tok is None else int(round(peak_tok))} | "
+                f"{'n/a' if hit_ratio is None else f'{hit_ratio * 100:.1f}%'} | "
+                f"{value(med_opt('warm_turn_ttft_ms', 'p50'))} | "
+                f"{value(med_opt('cold_burst_ttft_ms', 'p50'))} | "
+                f"{value(med_opt('cold_prefill_tokens_s', 'p50'))} | "
+                f"{value(med_opt('usage_span_tpot_estimate_ms', 'p50'))} |"
+            )
+    if any(t.get("steps") for t in rows):
+        lines.extend(["", "## Agent replay per-step latency", "",
+                      "Step numbers are zero-based. Token counts and TTFT are medians of per-trial p50s; missing cache usage stays unknown.", "",
+                      "| Deployment | Case | Step | Req OK/total | Prompt tok | Cached tok | Uncached tok | TTFT ms |",
+                      "|---|---|---:|---:|---:|---:|---:|---:|"])
+        for (engine, case), trials in groups.items():
+            steps = sorted({s["step"] for t in trials for s in t.get("steps", [])})
+            for step in steps:
+                entries = [s for t in trials for s in t.get("steps", []) if s["step"] == step]
+                def step_median(key):
+                    vals = [(s.get(key) or {}).get("p50") for s in entries]
+                    return (statistics.median(vals) if len(vals) == len(trials)
+                            and all(v is not None for v in vals) else None)
+                ok = sum(s["successful_requests"] for s in entries)
+                total = sum(s["requests"] for s in entries)
+                lines.append(f"| {escape(engine)} | {escape(case)} | {step} | {ok}/{total} | "
+                             f"{value(step_median('prompt_tokens'))} | {value(step_median('cached_tokens'))} | "
+                             f"{value(step_median('uncached_tokens'))} | {value(step_median('first_output_ms'))} |")
     if coverage:
         lines.extend(["", "## Campaign coverage", "",
                       "Unsupported/disabled/filtered entries are not failures or zero-throughput measurements.", "",

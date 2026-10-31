@@ -1,0 +1,92 @@
+# Single-card 262K (16384 pages = 262,144 tokens) Open-SWE-Traces coding-agent benchmark
+# on 1x 24 GiB RTX 3090 Ti (TP=1, default --kv-format tq4):
+# Qwen3.8-27B-W4A16-GPTQ (0df81eadcfd59601cb82ccece2f16ea7d39244bf) from 60K -> 120K -> 252K context.
+# vLLM's measured 65,536-token TP=1 launch OOMs. SGLang TP=1 is excluded here;
+# its full 262K FP16 KV plus weights exceed one 24 GiB card.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 1
+warmup_requests = 0
+max_inflight = 4
+timeout_s = 720
+
+[engine_defaults]
+cohort = "27b-0df-tp1-262k-open-swe-sm86"
+gpu_count = 1
+parallelism = "TP=1"
+model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+weight_format = "compressed-tensors-GPTQ-int4"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+speculation = "none"
+
+[[engines]]
+id = "warp34-27b-tp1-tq4-262k"
+engine = "warp-34"
+support = "supported"
+version = "0.1.0+prefill64q"
+base_url = "http://127.0.0.1:18034/v1"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+kv_format = "tq4"
+cache_config = "TQ4 (3.07x, 21376 B/tok) 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB RTX 3090 Ti, FP32 SSM, hybrid GDN+KV radix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-27b-tp1-tq4all-262k"
+engine = "warp-34"
+support = "supported"
+version = "0.1.0+prefill64q"
+base_url = "http://127.0.0.1:18035/v1"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+kv_format = "tq4_all"
+cache_config = "TQ4_all 16384 pages (262144 tokens, 16896 B/tok), FP32 SSM, hybrid GDN+KV radix cache"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035"
+
+[[engines]]
+id = "vllm-27b-tp1-fp16"
+engine = "vllm"
+enabled = false
+support = "unsupported"
+skip_reason = "OOM on 1x 24 GiB RTX 3090 Ti at >= 65536 tokens: ValueError: To serve at least one request with the model's max seq len (65536), (4.31 GiB KV cache is needed, which is larger than the available KV cache memory (4.09 GiB))"
+
+[[engines]]
+id = "sglang-27b-tp1-fp16"
+engine = "sglang"
+enabled = false
+support = "unverified"
+skip_reason = "Excluded from this TP=1 campaign: full 262K FP16 KV requires 16 GiB in addition to approximately 16.5 GiB GPTQ weights. A 64K SGLang TP=1 OOM was not independently retained; use the TP=2 campaign for measured comparisons."
+
+[[cases]]
+id = "swe-agent-64k-c1"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_64k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+
+[[cases]]
+id = "swe-agent-120k-c1"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_120k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+
+[[cases]]
+id = "swe-agent-252k-c1"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_252k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+
+[[cases]]
+id = "cold-file-read-115k-c1"
+fixture = "../fixtures/open_swe_cold_read_60k.json"
+context_repetitions = 2
+cache = "unique"
+requests = 1
+concurrency = 1
+max_tokens = 64

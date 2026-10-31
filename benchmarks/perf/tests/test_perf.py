@@ -351,6 +351,116 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(rows[0]["failed_requests"], 2)
             self.assertEqual(rows[0]["requests"], 2)
 
+    def test_open_swe_tool_only_followup_turns_and_prefix_cache_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            fixture = {
+                "system": "You are a coding agent.",
+                "turns": [
+                    {
+                        "user": "Fix bug in parser.py",
+                        "tools": [{"name": "read_file", "arguments": {"path": "parser.py"}, "result": "x = 1\n" * 2000}],
+                    },
+                    {
+                        "user": None,
+                        "tools": [{"name": "grep", "arguments": {"pattern": "x"}, "result": "parser.py:1:x = 1"}],
+                    },
+                    {
+                        "user": None,
+                        "tools": [{"name": "read_file", "arguments": {"path": "big.py"}, "result": "y = 2\n" * 4000}],
+                    },
+                ],
+            }
+            (tmp_dir / "fixture.json").write_text(json.dumps(fixture))
+            toml_text = """
+schema_version = 1
+[run]
+repetitions = 1
+warmup_requests = 0
+
+[[engines]]
+id = "w34"
+engine = "warp-34"
+gpu_count = 1
+base_url = "http://127.0.0.1:18034/v1"
+model = "qwen"
+version = "0.1.0"
+model_revision = "rev"
+weight_format = "W4A16"
+kv_format = "TQ4"
+parallelism = "TP=1"
+speculation = "none"
+cache_config = "radix"
+launch_command = "w34 serve"
+
+[[cases]]
+id = "swe"
+kind = "agent_replay"
+fixture = "fixture.json"
+requests = 1
+concurrency = 1
+max_tokens = 32
+"""
+            cfg_path = tmp_dir / "camp.toml"
+            cfg_path.write_text(toml_text)
+            cfg = load(cfg_path)
+
+            # Reject tool-empty follow-up turn with user = None
+            bad_fix = copy.deepcopy(fixture)
+            bad_fix["turns"][1]["tools"] = []
+            (tmp_dir / "bad.json").write_text(json.dumps(bad_fix))
+            (tmp_dir / "bad.toml").write_text(toml_text.replace("fixture.json", "bad.json"))
+            with self.assertRaises(ValueError):
+                load(tmp_dir / "bad.toml")
+
+            step_usages = [
+                (8192, 0, 2000.0),       # Step 0: cold 8K prefill burst (4096 tok/s)
+                (9000, 8192, 250.0),     # Step 1: warm incremental turn (+808 uncached tok)
+                (25384, 8960, 4106.0),   # Step 2: mid-session cold +16,424 file-read burst (~4000 tok/s)
+            ]
+            seen_payloads = []
+
+            def fake_stream(_engine, payload, _timeout):
+                idx = len(seen_payloads)
+                seen_payloads.append(copy.deepcopy(payload))
+                ptok, ctok, ttft = step_usages[idx]
+                r = result()
+                r["first_output_ms"] = ttft
+                r["last_output_ms"] = ttft + 100.0
+                r["e2e_ms"] = ttft + 105.0
+                r["reasoning"] = f"think_{idx}"
+                r["usage"] = {
+                    "prompt_tokens": ptok,
+                    "completion_tokens": 16,
+                    "prompt_tokens_details": {"cached_tokens": ctok},
+                }
+                return r
+
+            with patch("w34perf.runner.stream", side_effect=fake_stream), \
+                    patch("w34perf.runner.provenance", return_value={}):
+                out = tmp_dir / "out"
+                rows = execute(cfg, out)
+                md, _ = render(out)
+
+            self.assertEqual(len(seen_payloads), 3)
+            # Only 1 `user` role message exists across all 3 steps, preserving `<think>` prefix caching,
+            # and `tool_choice == "none"` grammar enforcement remains intact on every step.
+            for p in seen_payloads:
+                self.assertEqual(p["tool_choice"], "none")
+                self.assertEqual(sum(1 for m in p["messages"] if m["role"] == "user"), 1)
+            row = rows[0]
+            self.assertEqual(row["peak_prompt_tokens"], 25384)
+            self.assertEqual(row["cached_prompt_tokens"], 8192 + 8960)
+            self.assertEqual(row["uncached_prompt_tokens"], (8192 + 9000 + 25384) - (8192 + 8960))
+            self.assertEqual(row["warm_turn_ttft_ms"]["n"], 1)
+            self.assertAlmostEqual(row["warm_turn_ttft_ms"]["p50"], 250.0)
+            self.assertEqual(row["cold_burst_ttft_ms"]["n"], 2)
+            self.assertGreater(row["cold_prefill_tokens_s"]["p50"], 3900.0)
+            self.assertIn("## Long-context & prefix-cache breakdown", md)
+            self.assertIn("## Agent replay per-step latency", md)
+            self.assertIn("| w34 | swe | 1 | 1/1 | 9000.00 | 8192.00 | 808.00 | 250.00 |", md)
+            self.assertIn("25384", md)
+
 
 if __name__ == "__main__":
     unittest.main()

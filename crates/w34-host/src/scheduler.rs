@@ -34,8 +34,8 @@ impl SchedulerConfig {
     }
 
     /// Clamp batched-token budgets to fit a rank's transient `scratch_arena` capacity:
-    /// - `< 256 MiB` (compact 128 MiB arena for 27B TP=1 >= 8192 KV pages) -> `256` tokens.
-    /// - `< 512 MiB` (384 MiB single-GPU large-model arena for 27B/35B TP=1) -> `1024` tokens.
+    /// - `< 256 MiB` (fallback for compact arenas) -> `256` tokens.
+    /// - `< 512 MiB` (336 MiB extreme-context or 384 MiB large-model arena) -> `1024` tokens.
     pub fn clamp_for_scratch_bytes(&mut self, scratch_cap_bytes: usize) {
         let raw_cap = if scratch_cap_bytes < 256 * 1024 * 1024 {
             Some(256usize)
@@ -250,23 +250,41 @@ impl SchedulerV1 {
             let Some(w) = self.waiting.front().cloned() else {
                 break;
             };
-            let Some((active_slot, ping_pong_slots)) = alloc_three_state_slots(&mut self.radix)
-            else {
-                break;
-            };
-            self.waiting.pop_front();
-
             // Match up to `radix_key_tokens.len() - 1` so at least the final prompt token is
             // evaluated through `lm_head` to produce the first output token.
+            // Pin any warm prefix hit BEFORE `alloc_three_state_slots` so tight Mamba pools
+            // (e.g. 262K single-GPU serving) never evict the checkpoint this request itself
+            // is about to resume from; release the pin immediately and fall back to cold
+            // eviction only when a minimal 3-slot pool has no fourth slot.
             let lookup_len = w.radix_key_tokens.len().saturating_sub(1);
             let raw_hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
-            let match_res = if raw_hit.matched_tokens > 0
+            let mut match_res = if raw_hit.matched_tokens > 0
                 && !allow_prefix_hit(w.req_id, &w.prompt_tokens, raw_hit.matched_tokens)
             {
                 self.radix.match_prefix(&[])
             } else {
                 raw_hit
             };
+            let pinned_hit = match_res.matched_tokens > 0 && match_res.mamba_slot.is_some();
+            if pinned_hit {
+                self.radix.inc_lock_ref(match_res.last_node);
+            }
+            let pinned_slots = alloc_three_state_slots(&mut self.radix);
+            if pinned_hit {
+                self.radix.dec_lock_ref(match_res.last_node);
+            }
+            let (active_slot, ping_pong_slots) = match pinned_slots {
+                Some(slots) => slots,
+                None if pinned_hit => {
+                    let Some(fallback_slots) = alloc_three_state_slots(&mut self.radix) else {
+                        break;
+                    };
+                    match_res = self.radix.match_prefix(&[]);
+                    fallback_slots
+                }
+                None => break,
+            };
+            self.waiting.pop_front();
 
             let mut radix_state = ReqRadixState::new(
                 self.cfg.page_size,
@@ -700,10 +718,65 @@ mod tests {
         assert_eq!(tp1_large.chunk_prefill_size, 1024);
         assert_eq!(tp1_large.mixed_chunk_prefill_size, 256);
 
+        let mut extreme_context = SchedulerConfig::default();
+        extreme_context.clamp_for_scratch_bytes(336 * 1024 * 1024);
+        assert_eq!(extreme_context.max_num_batched_tokens, 1024);
+        assert_eq!(extreme_context.chunk_prefill_size, 1024);
+        assert_eq!(extreme_context.mixed_chunk_prefill_size, 256);
+
         let mut tp2_full = SchedulerConfig::default();
         tp2_full.clamp_for_scratch_bytes(512 * 1024 * 1024);
         assert_eq!(tp2_full.max_num_batched_tokens, 1408);
         assert_eq!(tp2_full.chunk_prefill_size, 1408);
         assert_eq!(tp2_full.mixed_chunk_prefill_size, 256);
+    }
+
+    #[test]
+    fn test_admit_pins_matched_prefix_under_tight_state_pool() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        let p_a: Vec<i32> = (0..64).collect();
+        let p_b: Vec<i32> = (1000..1064).collect();
+        // Admission refreshes p_b to MRU; exhausting a three-slot pool must try
+        // evicting both cached checkpoints, not just the unrelated LRU entry.
+        sched.radix.insert(&p_a, &[0, 1, 2, 3], &[], 0, 0);
+        sched.radix.insert(&p_b, &[4, 5, 6, 7], &[], 1, 0);
+        let _ = sched.radix.match_prefix(&p_a);
+
+        // A warm resume needs its checkpoint plus three working slots. With only
+        // three slots total, admission must release the pin and restart cold.
+        // Without pinning, allocation succeeds using the evicted matched slot,
+        // and the stale match incorrectly claims a 64-token cache hit.
+        let mut free_pool = vec![2i32];
+        let alloc_one = |pool: &mut Vec<i32>, radix: &mut MambaRadixCache| -> Option<i32> {
+            if let Some(s) = pool.pop() {
+                return Some(s);
+            }
+            let ev = radix.evict_mamba(1);
+            pool.extend(ev.freed_mamba_slots);
+            pool.pop()
+        };
+
+        let mut turn2 = p_b.clone();
+        turn2.extend(2000..2032);
+        let req_id = sched.submit_request(turn2, 8, vec![]);
+        sched.admit_waiting(|radix| {
+            let s0 = alloc_one(&mut free_pool, radix)?;
+            let Some(s1) = alloc_one(&mut free_pool, radix) else {
+                free_pool.push(s0);
+                return None;
+            };
+            let Some(s2) = alloc_one(&mut free_pool, radix) else {
+                free_pool.push(s1);
+                free_pool.push(s0);
+                return None;
+            };
+            Some((s0, [s1, s2]))
+        });
+
+        assert_eq!(sched.active.len(), 1);
+        assert_eq!(sched.active[0].req_id, req_id);
+        assert_eq!(sched.active[0].cached_prefix_tokens, 0);
+        assert_eq!(sched.active[0].prefilled_tokens, 0);
+        assert!(free_pool.is_empty());
     }
 }

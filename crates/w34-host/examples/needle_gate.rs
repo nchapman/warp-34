@@ -47,8 +47,9 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         "needle: model={} policy={} window={window} prompt={prompt_len} needle_offset={needle_offset} depth={depth}%",
         args[0], args[1]
     );
+    let prefill_chunk_size = 1024usize;
     let start = std::time::Instant::now();
-    let metrics = engine.generate_with_radix_cache(&prompt, max_new, 256, true)?;
+    let metrics = engine.generate_with_radix_cache(&prompt, max_new, prefill_chunk_size, true)?;
     let answer_ids: Vec<_> = metrics
         .generated_token_ids
         .iter()
@@ -63,7 +64,7 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         "reserved_tokens":4,"max_new_tokens":max_new,"depth_percent":depth,"needle_token_offset":needle_offset,
         "expected":"73918462","answer":answer,"passed":passed,
         "generated_token_ids":metrics.generated_token_ids,"generated_tokens":metrics.gen_len,
-        "cached_prefix_tokens":metrics.cached_prefix_tokens,"prefill_chunk_size":256,
+        "cached_prefix_tokens":metrics.cached_prefix_tokens,"prefill_chunk_size":prefill_chunk_size,
         "ttft_ms":metrics.ttft_ms,"decode_tok_per_s":metrics.decode_tok_per_s,
         "elapsed_seconds":start.elapsed().as_secs_f64(),"prompt_token_ids":prompt
     });

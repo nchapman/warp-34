@@ -1975,16 +1975,21 @@ impl Qwen3_5ModelRank {
         } else {
             match (cfg.num_hidden_layers, tp_size) {
                 (64, 2) => 12 * 1024 * 1024 * 1024, // 27B TP=2 (~9.5 GiB/rank)
-                (64, _) => 16_960 * 1024 * 1024,    // 27B TP=1 (~16.5 GiB actual weights + repack)
-                (_, 2) => 5 * 1024 * 1024 * 1024,   // 4B/9B TP=2
-                _ => 8 * 1024 * 1024 * 1024,        // 4B/9B TP=1
+                (64, _) if requested_kv_pages.unwrap_or(0) >= 14_336 => {
+                    // Extreme-context budget for the qualified 27B GPTQ snapshot:
+                    // 16,862.5 MiB includes uploaded/repacked backbone weights.
+                    16_896 * 1024 * 1024
+                }
+                (64, _) => 16_960 * 1024 * 1024, // Preserve normal-context arena margin.
+                (_, 2) => 5 * 1024 * 1024 * 1024, // 4B/9B TP=2
+                _ => 8 * 1024 * 1024 * 1024,     // 4B/9B TP=1
             }
         };
         let scratch_bytes = if tp_size == 1
             && cfg.num_hidden_layers >= 64
-            && requested_kv_pages.unwrap_or(0) >= 8192
+            && requested_kv_pages.unwrap_or(0) >= 14_336
         {
-            128 * 1024 * 1024
+            336 * 1024 * 1024
         } else if tp_size == 1 && est_weight_bytes >= 16 * 1024 * 1024 * 1024 {
             384 * 1024 * 1024
         } else {
@@ -2361,17 +2366,25 @@ impl Qwen3_5ModelRank {
         let requested_state_slots = capacity.state_slots.unwrap_or(default_state_slots);
         let default_pages = requested_kv_pages.or(Some(256));
         let req_kv_bytes = default_pages.unwrap_or(256) * bytes_per_kv_page_all_layers;
+        let required_headroom = if tp_size == 1
+            && cfg.num_hidden_layers >= 64
+            && default_pages.unwrap_or(0) >= 14_336
+        {
+            crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES
+        } else {
+            crate::cuda::MIN_HEADROOM_BYTES
+        };
         let base_fixed = weight_arena
             .used()
             .saturating_add(scratch_arena.capacity())
-            .saturating_add(crate::cuda::MIN_HEADROOM_BYTES)
+            .saturating_add(required_headroom)
             .saturating_add(req_kv_bytes);
         let (state_budget_free, state_budget_fixed) = if capacity.state_slots.is_some() {
             // Serving can request many more slots than single-request defaults.
             // Account for live arena capacity (not just used weight bytes) and
             // all auxiliary allocations before spending the remaining VRAM.
             let available = device.mem_info()?.0;
-            let reserved = crate::cuda::MIN_HEADROOM_BYTES.saturating_add(req_kv_bytes);
+            let reserved = required_headroom.saturating_add(req_kv_bytes);
             if available < reserved.saturating_add(bytes_per_state_slot.saturating_mul(3)) {
                 return Err(loader_err(
                     "insufficient VRAM for serving state pool and headroom",
@@ -2399,7 +2412,7 @@ impl Qwen3_5ModelRank {
         )?;
         let state_pool_bytes = total_state_slots * bytes_per_state_slot;
 
-        let capacity_plan = CapacityPlanner::plan(
+        let capacity_plan = CapacityPlanner::plan_with_headroom(
             total_vram,
             free_vram,
             weight_arena.used(),
@@ -2407,6 +2420,7 @@ impl Qwen3_5ModelRank {
             state_pool_bytes,
             bytes_per_kv_page_all_layers,
             default_pages,
+            required_headroom,
         )
         .map_err(|_| loader_err("CapacityPlanner failed"))?;
 

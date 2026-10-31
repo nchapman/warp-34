@@ -12,6 +12,62 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Long-context coding-agent campaign complete — 538/538 HTTP requests, both single-card 262K KV policies qualified
+
+See [campaign measurements and limitations](../benchmarks/perf/campaigns/longctx-coding-agent.md)
+and [Open-SWE fixture attribution](../benchmarks/perf/fixtures/OPEN_SWE.md).
+The frozen `27b-fp16-first.toml` is unchanged.
+
+- Added 64-query-row paged-attention prefill, now including request-local tiling
+  for mixed/concurrent batches. Single-/multi-request FP16/Q8_0/TQ4 comparisons
+  pass 0-ULP parity; `REG:238 STACK:0 SHARED:43353 LOCAL:0`.
+- 27B TP=1 default-TQ4 **262,144-window needle passed** at 50% depth:
+  262,108 prompt tokens, exact `73918462`; final-code repeat TTFT **629.60 s**,
+  decode **22.54 tok/s** (earlier pre-multi-request-extension run: **592.98 s**,
+  **23.48 tok/s**). Runs overlapped work on the other GPU, not a controlled
+  cross-run timing comparison.
+  Extreme-context scratch is now 336 MiB (1024-token chunk tier), rather than the
+  earlier 128 MiB configuration. Default-TQ4 HTTP (no KV-format override) now
+  passed **29/29 requests**, reaching **252,112 prompt tokens**; 82.7% prefix hits,
+  **3.99 s** warm-turn p50 TTFT, last turn reused **250,688 tokens**. TQ4-all passed the
+  262,144-window needle: exact `73918462`, **542.18 s** TTFT, **23.88 tok/s** decode.
+  That run used GPU 1 while default-TQ4 HTTP replay ran on GPU 0. TQ4-all HTTP
+  also passed **29/29 requests**, reaching **252,112 tokens**, 82.7% prefix hits,
+  and **3.60 s** warm-turn p50 TTFT. Both policies now qualify live HTTP serving.
+- 9B TP=1 three-engine comparison completed (78/78 requests per deployment).
+  At 59K C2, multi-request tiling improved warp-34 FP16 **13.43 → 21.53 tok/s**
+  and TQ4 **8.41 → 17.58 tok/s**, but competitors remain ahead (~28.8 tok/s).
+  At 115K cold prefill, warp-34 FP16 **40.07 s** vs vLLM **36.39 s** and
+  SGLang **37.59 s**: do not claim a broad long-context speed win.
+- 27B TP=2 all four deployments completed (42/42 each): 59K agent FP16
+  **12.68 vs 11.97 tok/s**, warm TTFT **901 vs 1231 ms**; 118K throughput
+  **6.38 vs 6.40 tok/s**; cold 115K **86.41 vs 83.15 s**. SGLang measured
+  **12.00 / 6.44 tok/s**, cold 115K **85.07 s**. Cache details remain unknown for
+  some SGLang requests despite enabling reporting; no missing counts are imputed.
+- Direct cold-prefill A/B: 27B TQ4 32K TTFT **35.13 → 28.90 s** (+21.6% prompt
+  throughput), attention kernel time **12.35 → 6.16 s**. 9B TQ4 64K TTFT
+  **34.48 → 23.33 s** (+47.8% prompt throughput) against a clean `a77ce42` build.
+  Both pairs generate identical token IDs. Compact metrics and raw-file hashes
+  are retained in `benchmarks/perf/campaigns/longctx-coding-agent.results.json`.
+- Optional tool-only follow-up turns preserve Qwen's last-user boundary and
+  `tool_choice: "none"`. Added prefix-hit, warm/cold TTFT and per-step reporting;
+  **51 Python tests pass**. Actual prompt lengths are ~59K/118K/252K, not exact
+  capacity limits; fixtures combine multiple repositories and are not SWE task
+  correctness evaluations. Older 9B competitor runs lack cache-detail flags;
+  updated launch profiles enable those flags without inventing missing usage.
+- Initial review's important finding was a non-discriminating scheduler pinning
+  regression. Replaced with a three-slot/two-eviction case: fails with pinning
+  disabled (stale 64-token hit), passes with pinning restored. `check-quick`
+  (fmt and clippy, both feature states) passes. Follow-up review has only
+  nonblocking suggestions (triage in campaign report); CPU Rust and 69 oracle
+  tests pass. All ten serving deployments completed **538/538 requests**; both
+  final-code 262K needle policies pass. Final **`CUDA_VISIBLE_DEVICES=0,1 mise run
+  check` passed** (288.44 s): fmt, clippy with/without CUDA, **216 Rust tests**
+  including doctests (0 failed/ignored), **69 oracle tests**, **51 perf tests**.
+  Full log SHA-256 and measurement hashes are in the campaign results JSON.
+  Performance scope is explicit: direct prefill speedups and a 27B 59K agent win,
+  not a general defeat of vLLM/SGLang on cold reads or 9B C2 workloads.
+
 ## Post-Phase-6 `sm_86` 6-item performance roadmap complete — `35B-A3B` `1,009.7 tok/s`, batched `B=2..4` `MTP`, `128K` `TQ4`, large-`M` prefill, `TP=2` pipelined collectives, and unified prefill+decode
 
 Completed all 6 items of the `sm_86` performance roadmap across `w34-kernels` (`STACK:0` verified via `cuobjdump --dump-resource-usage` on every touched kernel) and `w34-host`, preserving the `FP16` target spine (`BF16` `DFlash2` drafter, `FP32` `ssm_state`), 0-ULP `M`-invariance / continuation parity, and the frozen `benchmarks/perf/campaigns/27b-fp16-first.toml` baseline:

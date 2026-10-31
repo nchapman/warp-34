@@ -10,6 +10,11 @@ use w34_kernels::ffi::{self, W34AttentionBatch, W34Exec, W34GdnBatch, W34KvLayer
 
 /// Minimum free VRAM headroom required per rank after weight, scratch, state, and KV allocation.
 pub const MIN_HEADROOM_BYTES: usize = 1024 * 1024 * 1024; // 1.0 GiB
+/// Tighter post-pool headroom for single-card 24 GiB 27B 224K-262K (`>= 14,336` pages)
+/// serving, where `weight_arena` and `scratch_arena` (336 MiB) are already pre-allocated
+/// and `repack_staging` is already freed. This is the planner reserve, not a guarantee
+/// of free driver memory after subsequent decode/verify graph capture.
+pub const EXTREME_LONGCTX_HEADROOM_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CudaError {
@@ -161,15 +166,39 @@ impl CapacityPlanner {
         bytes_per_kv_page_across_layers: usize,
         requested_kv_pages: Option<usize>,
     ) -> std::result::Result<CapacityPlan, String> {
+        Self::plan_with_headroom(
+            total_vram_bytes,
+            free_vram_bytes,
+            weight_arena_bytes,
+            scratch_arena_bytes,
+            state_bundle_pool_bytes,
+            bytes_per_kv_page_across_layers,
+            requested_kv_pages,
+            MIN_HEADROOM_BYTES,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_with_headroom(
+        total_vram_bytes: usize,
+        free_vram_bytes: usize,
+        weight_arena_bytes: usize,
+        scratch_arena_bytes: usize,
+        state_bundle_pool_bytes: usize,
+        bytes_per_kv_page_across_layers: usize,
+        requested_kv_pages: Option<usize>,
+        min_headroom_bytes: usize,
+    ) -> std::result::Result<CapacityPlan, String> {
         let fixed = weight_arena_bytes
             .saturating_add(scratch_arena_bytes)
             .saturating_add(state_bundle_pool_bytes)
-            .saturating_add(MIN_HEADROOM_BYTES);
+            .saturating_add(min_headroom_bytes);
         if fixed > free_vram_bytes {
             return Err(format!(
-                "CapacityPlanner: fixed footprint ({:.2} GiB) exceeds free VRAM ({:.2} GiB); need >= 1.0 GiB headroom",
+                "CapacityPlanner: fixed footprint ({:.2} GiB) exceeds free VRAM ({:.2} GiB); need >= {:.2} GiB headroom",
                 fixed as f64 / (1024.0 * 1024.0 * 1024.0),
                 free_vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                min_headroom_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             ));
         }
         let max_avail_for_kv = free_vram_bytes - fixed;
@@ -1432,6 +1461,55 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup w34_paged_attention_f16 FA2",
     )?;
 
+    // Warm 64-query-row TQ4 FlashAttention-2 prefill specialization before TP capture.
+    let fa64_q = arena.upload_slice(&vec![0u16; 64 * 8 * 256], &stream)?;
+    let fa64_k = arena.upload_slice(&vec![0u8; 4 * 4 * 16 * 132], &stream)?;
+    let fa64_v = arena.upload_slice(&vec![0u8; 4 * 4 * 16 * 132], &stream)?;
+    let fa64_o = arena.alloc_aligned(64 * 8 * 256 * 2)?;
+    let fa64_start = arena.upload_slice(&[0i32, 64], &stream)?;
+    let fa64_seq = arena.upload_slice(&[64i32], &stream)?;
+    let fa64_pages = arena.upload_slice(&[0i32, 1, 2, 3], &stream)?;
+    let fa64_layout = W34KvLayerLayout {
+        k_base: fa64_k,
+        v_base: fa64_v,
+        k_token_stride_bytes: 132,
+        v_token_stride_bytes: 132,
+        k_head_stride_bytes: 16 * 132,
+        v_head_stride_bytes: 16 * 132,
+        k_page_stride_bytes: 4 * 16 * 132,
+        v_page_stride_bytes: 4 * 16 * 132,
+        local_kv_heads: 4,
+        k_format: ffi::W34_KV_FORMAT_TQ4,
+        v_format: ffi::W34_KV_FORMAT_TQ4,
+        k_transform: ffi::W34_KV_TRANSFORM_RADEMACHER_WHT256,
+        v_transform: ffi::W34_KV_TRANSFORM_RADEMACHER_WHT256,
+        ..layout
+    };
+    let fa64_batch = W34AttentionBatch {
+        query_start_loc: fa64_start as *const i32,
+        seq_lens_after: fa64_seq as *const i32,
+        block_tables: fa64_pages as *const i32,
+        total_tokens: 64,
+        max_q_len: 64,
+        max_seq_len: 64,
+        max_blocks_per_req: 4,
+        ..attn_batch
+    };
+    check_rc(
+        unsafe {
+            ffi::w34_paged_attention_f16_force_kernel_for_test(
+                &ex,
+                &fa64_layout,
+                &fa64_batch,
+                fa64_q as *const c_void,
+                fa64_o as *mut c_void,
+                8,
+                1,
+            )
+        },
+        "warmup w34_paged_attention_prefill_64q_mma_f16",
+    )?;
+
     // Warm GQA mma.sync + Split-KV reduction specialization (head_dim = 256)
     let layout_256 = W34KvLayerLayout {
         head_dim: 256,
@@ -2546,5 +2624,261 @@ mod tests {
             Some(huge_req),
         );
         assert!(err.is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_prefill_64q_zero_ulp_parity_across_kv_formats() {
+        let _dev = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let mut arena = DeviceArena::new(0, 64 * 1024 * 1024).unwrap();
+        let ex = stream.exec(arena.buf.addr(), 4 * 1024 * 1024);
+        let _ = arena.alloc_aligned(4 * 1024 * 1024).unwrap();
+
+        let num_pages = 32usize;
+        let kv_heads = 4usize;
+        let head_dim = 256usize;
+        let max_tokens = num_pages * 16; // 512
+
+        // Deterministic pseudo-random FP16 inputs for Q, K, and V across 512 tokens.
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_f16 = || -> u16 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let val = ((rng & 0xFFFF) as f32 / 65535.0 - 0.5) * 1.5;
+            f32_to_f16(val)
+        };
+
+        let max_q_heads = 24usize;
+        let q_host: Vec<u16> = (0..max_tokens * max_q_heads * head_dim)
+            .map(|_| next_f16())
+            .collect();
+        let k_host: Vec<u16> = (0..max_tokens * kv_heads * head_dim)
+            .map(|_| next_f16())
+            .collect();
+        let v_host: Vec<u16> = (0..max_tokens * kv_heads * head_dim)
+            .map(|_| next_f16())
+            .collect();
+
+        let q_dev = arena.upload_slice(&q_host, &stream).unwrap();
+        let k_in_dev = arena.upload_slice(&k_host, &stream).unwrap();
+        let v_in_dev = arena.upload_slice(&v_host, &stream).unwrap();
+        let out_16q = DeviceBuffer::alloc(0, max_tokens * max_q_heads * head_dim * 2).unwrap();
+        let out_64q = DeviceBuffer::alloc(0, max_tokens * max_q_heads * head_dim * 2).unwrap();
+
+        // Permuted page table to exercise non-contiguous physical page lookups.
+        let block_table_host: Vec<i32> = (0..num_pages as i32)
+            .map(|i| (i * 7 + 3) % (num_pages as i32))
+            .collect();
+        let block_table_dev = arena.upload_slice(&block_table_host, &stream).unwrap();
+        let write_slots_host: Vec<i32> = (0..max_tokens)
+            .map(|t| block_table_host[t / 16] * 16 + (t % 16) as i32)
+            .collect();
+        let write_slots_dev = arena.upload_slice(&write_slots_host, &stream).unwrap();
+
+        for (fmt, transform, row_bytes) in [
+            (
+                ffi::W34_KV_FORMAT_FP16,
+                ffi::W34_KV_TRANSFORM_IDENTITY,
+                512usize,
+            ),
+            (
+                ffi::W34_KV_FORMAT_Q8_0,
+                ffi::W34_KV_TRANSFORM_RADEMACHER_WHT256,
+                272usize,
+            ),
+            (
+                ffi::W34_KV_FORMAT_TQ4,
+                ffi::W34_KV_TRANSFORM_RADEMACHER_WHT256,
+                132usize,
+            ),
+        ] {
+            let pool_bytes = num_pages * kv_heads * 16 * row_bytes;
+            let k_pool = DeviceBuffer::alloc(0, pool_bytes).unwrap();
+            let v_pool = DeviceBuffer::alloc(0, pool_bytes).unwrap();
+            let layout = W34KvLayerLayout {
+                k_base: k_pool.addr(),
+                v_base: v_pool.addr(),
+                k_page_stride_bytes: (kv_heads * 16 * row_bytes) as u64,
+                v_page_stride_bytes: (kv_heads * 16 * row_bytes) as u64,
+                k_head_stride_bytes: (16 * row_bytes) as u64,
+                v_head_stride_bytes: (16 * row_bytes) as u64,
+                k_token_stride_bytes: row_bytes as u64,
+                v_token_stride_bytes: row_bytes as u64,
+                namespace_id: ffi::W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+                layer_id: 0,
+                local_kv_heads: kv_heads as i32,
+                head_dim: head_dim as i32,
+                block_size: 16,
+                k_format: fmt,
+                v_format: fmt,
+                k_transform: transform,
+                v_transform: transform,
+                reserved: 0,
+            };
+
+            // Populate all 512 KV positions via the real w34_kv_cache_write_strided kernel.
+            let q_start_all = arena
+                .upload_slice(&[0i32, max_tokens as i32], &stream)
+                .unwrap();
+            let ctx_zero = arena.upload_slice(&[0i32], &stream).unwrap();
+            let seq_all = arena.upload_slice(&[max_tokens as i32], &stream).unwrap();
+            let write_batch = W34AttentionBatch {
+                query_start_loc: q_start_all as *const i32,
+                context_lens_before: ctx_zero as *const i32,
+                seq_lens_after: seq_all as *const i32,
+                block_tables: block_table_dev as *const i32,
+                write_slot_mapping: write_slots_dev as *const i32,
+                valid_token_mask: core::ptr::null(),
+                valid_req_mask: core::ptr::null(),
+                num_reqs: 1,
+                total_tokens: max_tokens as i32,
+                max_blocks_per_req: num_pages as i32,
+                max_q_len: max_tokens as i32,
+                max_seq_len: max_tokens as i32,
+                mask_mode: ffi::W34_ATTN_MASK_CAUSAL,
+                sliding_window: 0,
+                sm_scale: 0.0625,
+                reserved: 0,
+            };
+            check_rc(
+                unsafe {
+                    ffi::w34_kv_cache_write(
+                        &ex,
+                        &layout,
+                        &write_batch,
+                        k_in_dev as *const c_void,
+                        v_in_dev as *const c_void,
+                    )
+                },
+                "populate kv pool for 64q test",
+            )
+            .unwrap();
+
+            // Test both 9B/35B GQA=4 (16 Q heads) and 27B GQA=6 (24 Q heads),
+            // including odd chunk sizes and non-zero prefix offsets.
+            for num_q_heads in [16usize, 24usize] {
+                for (q_len, ctx_before) in [(64usize, 0usize), (65, 19), (137, 128), (256, 200)] {
+                    let seq_after = ctx_before + q_len;
+                    let q_start = arena.upload_slice(&[0i32, q_len as i32], &stream).unwrap();
+                    let ctx_dev = arena.upload_slice(&[ctx_before as i32], &stream).unwrap();
+                    let seq_dev = arena.upload_slice(&[seq_after as i32], &stream).unwrap();
+                    let batch = W34AttentionBatch {
+                        query_start_loc: q_start as *const i32,
+                        context_lens_before: ctx_dev as *const i32,
+                        seq_lens_after: seq_dev as *const i32,
+                        block_tables: block_table_dev as *const i32,
+                        write_slot_mapping: core::ptr::null(),
+                        valid_token_mask: core::ptr::null(),
+                        valid_req_mask: core::ptr::null(),
+                        num_reqs: 1,
+                        total_tokens: q_len as i32,
+                        max_blocks_per_req: num_pages as i32,
+                        max_q_len: q_len as i32,
+                        max_seq_len: seq_after as i32,
+                        mask_mode: ffi::W34_ATTN_MASK_CAUSAL,
+                        sliding_window: 0,
+                        sm_scale: 0.0625,
+                        reserved: 0,
+                    };
+                    for (use_64q, dst) in [(0i32, out_16q.addr()), (1i32, out_64q.addr())] {
+                        check_rc(
+                            unsafe {
+                                ffi::w34_paged_attention_f16_force_kernel_for_test(
+                                    &ex,
+                                    &layout,
+                                    &batch,
+                                    q_dev as *const c_void,
+                                    dst as *mut c_void,
+                                    num_q_heads as i32,
+                                    use_64q,
+                                )
+                            },
+                            "run 16q vs 64q paged attention",
+                        )
+                        .unwrap();
+                    }
+
+                    let elems = q_len * num_q_heads * head_dim;
+                    let mut h16 = vec![0u16; elems];
+                    let mut h64 = vec![0u16; elems];
+                    out_16q.copy_to_host(&mut h16, &stream).unwrap();
+                    out_64q.copy_to_host(&mut h64, &stream).unwrap();
+                    stream.synchronize().unwrap();
+                    for idx in 0..elems {
+                        assert_eq!(
+                            h16[idx], h64[idx],
+                            "non-zero ULP mismatch fmt={fmt} q_heads={num_q_heads} q_len={q_len} ctx={ctx_before} idx={idx}: 16q=0x{:04x} vs 64q=0x{:04x}",
+                            h16[idx], h64[idx]
+                        );
+                    }
+                }
+
+                // Multi-request mixed decode + concurrent prefill (num_reqs = 3: 1 decode + 99 prefill + 156 prefill)
+                let q_starts_mr = [0i32, 1, 100, 256];
+                let ctx_mr = [143i32, 64, 95];
+                let seq_mr = [144i32, 163, 251];
+                let max_blk_mr = 16usize;
+                let mut bt_mr = Vec::with_capacity(3 * max_blk_mr);
+                for r in 0..3usize {
+                    for p in 0..max_blk_mr {
+                        bt_mr.push(((p + r * 5) % num_pages) as i32);
+                    }
+                }
+                let q_start_dev = arena.upload_slice(&q_starts_mr, &stream).unwrap();
+                let ctx_mr_dev = arena.upload_slice(&ctx_mr, &stream).unwrap();
+                let seq_mr_dev = arena.upload_slice(&seq_mr, &stream).unwrap();
+                let bt_mr_dev = arena.upload_slice(&bt_mr, &stream).unwrap();
+                let mr_batch = W34AttentionBatch {
+                    query_start_loc: q_start_dev as *const i32,
+                    context_lens_before: ctx_mr_dev as *const i32,
+                    seq_lens_after: seq_mr_dev as *const i32,
+                    block_tables: bt_mr_dev as *const i32,
+                    write_slot_mapping: core::ptr::null(),
+                    valid_token_mask: core::ptr::null(),
+                    valid_req_mask: core::ptr::null(),
+                    num_reqs: 3,
+                    total_tokens: 256,
+                    max_blocks_per_req: max_blk_mr as i32,
+                    max_q_len: 156,
+                    max_seq_len: 251,
+                    mask_mode: ffi::W34_ATTN_MASK_CAUSAL,
+                    sliding_window: 0,
+                    sm_scale: 0.0625,
+                    reserved: 0,
+                };
+                for (use_64q, dst) in [(0i32, out_16q.addr()), (1i32, out_64q.addr())] {
+                    check_rc(
+                        unsafe {
+                            ffi::w34_paged_attention_f16_force_kernel_for_test(
+                                &ex,
+                                &layout,
+                                &mr_batch,
+                                q_dev as *const c_void,
+                                dst as *mut c_void,
+                                num_q_heads as i32,
+                                use_64q,
+                            )
+                        },
+                        "run multi-req 16q vs 64q paged attention",
+                    )
+                    .unwrap();
+                }
+                let elems = 256 * num_q_heads * head_dim;
+                let mut h16 = vec![0u16; elems];
+                let mut h64 = vec![0u16; elems];
+                out_16q.copy_to_host(&mut h16, &stream).unwrap();
+                out_64q.copy_to_host(&mut h64, &stream).unwrap();
+                stream.synchronize().unwrap();
+                for idx in 0..elems {
+                    assert_eq!(
+                        h16[idx], h64[idx],
+                        "multi-req non-zero ULP mismatch fmt={fmt} q_heads={num_q_heads} idx={idx}: 16q=0x{:04x} vs 64q=0x{:04x}",
+                        h16[idx], h64[idx]
+                    );
+                }
+            }
+        }
     }
 }

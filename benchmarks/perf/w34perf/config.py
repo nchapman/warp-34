@@ -133,10 +133,19 @@ def load(path):
             if (not isinstance(data.get("system"), str) or not data.get("turns")
                     or not isinstance(data["turns"], list)):
                 raise ValueError("agent fixture requires system and turns")
-            for turn in data["turns"]:
-                if not isinstance(turn.get("user"), str):
-                    raise ValueError("agent turn needs user text")
-                for tool in turn.get("tools", []):
+            for turn_idx, turn in enumerate(data["turns"]):
+                user_text = turn.get("user")
+                tools = turn.get("tools", [])
+                if not isinstance(tools, list):
+                    raise ValueError("agent turn tools must be a list")
+                if turn_idx == 0:
+                    if not isinstance(user_text, str) or not user_text:
+                        raise ValueError("first agent turn needs nonempty user text")
+                elif user_text is not None and not isinstance(user_text, str):
+                    raise ValueError("agent turn user must be a string or null")
+                elif user_text is None and not tools:
+                    raise ValueError("tool-only follow-up agent turn needs at least one tool")
+                for tool in tools:
                     if not all(isinstance(tool.get(k), str) for k in ("name", "result")):
                         raise ValueError("replayed tool needs name, result, and arguments")
                     if not isinstance(tool.get("arguments"), dict):

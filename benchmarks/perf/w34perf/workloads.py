@@ -35,8 +35,12 @@ def append_replay(history, turn, session, step):
 
     Tools never execute commands or read the local filesystem. Actual generated
     assistant prose is kept in history by the runner before this is called.
+    Follow-up turns in Open-SWE-Traces-style tool loops may omit `user` (`None`)
+    so the single initial user query remains `last_query` and prior `<think>`
+    blocks stay prefix-cached verbatim across engines.
     """
-    history.append({"role": "user", "content": turn["user"]})
+    if turn.get("user") is not None:
+        history.append({"role": "user", "content": turn["user"]})
     tools = turn.get("tools", [])
     if tools:
         calls = [{"id": f"replay_{session}_{step}_{i}", "type": "function",
