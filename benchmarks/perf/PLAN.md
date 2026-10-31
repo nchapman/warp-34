@@ -103,6 +103,9 @@ HTTP tests; configured one/two-card profiles; clear failure/partial-run behavior
       network/GPU probes. No precision/parallelism fallback.
 - [x] Manually retain observed pre-HTTP launch failures and probe outcomes in
       `qualification/27b-one-card.json`, including explicit BF16 vs FP16 variants.
+- [x] Run the first fresh newer-27B FP16 comparison across warp-34, vLLM and
+      SGLang: three repetitions, 96 measured requests per engine, checked-in
+      [numbers and evidence hashes](campaigns/27b-fp16-first.md).
 - [ ] Automatically record managed launch failures/OOM/quality failures; the HTTP
       runner alone cannot observe externally managed pre-HTTP startup errors.
 - [ ] Add opt-in managed server launch/readiness/process-group cleanup and GPU
@@ -358,6 +361,34 @@ explicitly documented as HTTP responsiveness in the repository README.
   Evidence checksums/counts, pinned launch/inventory-root binding, JSON/doc links
   and `git diff --check` pass. One Important review finding (mutable local ref)
   fixed with failing-first regression; no further implementation changes.
+
+## First fresh three-engine comparison
+
+- Added `campaigns/27b-fp16-first.toml` and reproducible result tables/JSON/CSV:
+  one 3090 Ti/GPU 0, same newer 0df GPTQ, FP16, no speculation, serial engines.
+  Each engine completes **96/96 measured requests over 12 trials** (288 total).
+- Longer workloads: C1 four requests and C8 sixteen requests per repetition with
+  256-token ceilings; two four-turn agent sessions and four primed ~3k prefill
+  requests per repetition with 128-token ceilings. Three repetitions each.
+- SGLang cached8/no_buffer first failed the 0.90 memory budget, then at 0.95
+  reached C8 but OOMed on a 1008 MiB recurrent-state copy. Kept logs and failed
+  bundle. Final comparison explicitly uses no-cache/eight-active for unique
+  decode/C8 and cache-on/two-active for the C1 agent/prefill cases. No dtype,
+  artifact or topology substitution. Both final SGLang profiles pass.
+- Aggregate output tok/s (warp/vLLM/SGLang): C1 **45.5/50.7/51.7**; C8
+  **287.0/309.1/226.6**; agent **39.4/41.1/45.7**; primed prefill
+  **44.7/42.9/50.6**. Primed-prefix TTFT **35.0/492.9/81.1 ms**.
+- Full raw evidence and one-second GPU telemetry persist under
+  `results/27b-fp16-first-2026-10-30/`, rather than `/tmp`; checked-in result JSON
+  anchors all successful raw bundle indexes and startup/preflight/sample hashes.
+  Operator and summary scripts are archived alongside them. The suite remains
+  externally managed and engine-neutral; no engine/runner implementation edits.
+- Focused report review found two edge cases: missing/null usage totals and
+  single-burst TPOT. Reused the tested suite accounting/TPOT helpers; failure
+  rows retain null metrics rather than crashing or reporting zero TPOT.
+- `mise run perf-check` passes **47 tests**; campaign validates; all four raw
+  bundle hashes/counts, receipts, JSON/CSV/Markdown, doc links and
+  `git diff --check` pass. All benchmark servers stopped and GPUs free.
 
 Next concrete tasks: finish source/converter provenance and independent quality;
 acquire selected GGUF/ninfer artifacts with verified checksums; qualify llama.cpp

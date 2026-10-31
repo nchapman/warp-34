@@ -9,6 +9,7 @@ or automatic benchmark-results claim.
 - [Plan and persistent task list](PLAN.md)
 - [Engine recipes, qualification, and KV matrix](engines.md)
 - [Experiment template](suite.toml) — 10 deployment profiles, 13 workload cases
+- [First 27B FP16 comparison](campaigns/27b-fp16-first.md) — warp-34, vLLM, SGLang
 
 ## Quick start
 

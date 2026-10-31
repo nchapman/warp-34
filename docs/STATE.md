@@ -14,6 +14,27 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Phase 6 closeout checkpoint — concurrent `w34 serve` donor win, ratified `6.1` rooflines, 6/6 VL, and 8/8 needle gates
 
+### First fresh three-engine 27B FP16 comparison (2026-10-30)
+
+- [Results and exact campaign](../benchmarks/perf/campaigns/27b-fp16-first.md):
+  newer GPTQ 0df, one RTX 3090 Ti/GPU 0, FP16, no speculation, serial engines,
+  three repetitions, 256-token decode and 128-token agent/prefill ceilings.
+  **288/288 measured requests pass: 96 per engine.** All servers stopped.
+- Aggregate output tok/s (warp-34 / vLLM / SGLang): C1 **45.5 / 50.7 / 51.7**;
+  C8 **287.0 / 309.1 / 226.6**; agent **39.4 / 41.1 / 45.7**; primed ~3k
+  prefill **44.7 / 42.9 / 50.6**. Warp trails the best decode throughput in this
+  run; its clear win is warm-prefix first output: **35.0 / 492.9 / 81.1 ms**.
+- SGLang cached eight-active mode OOMed on a 1008 MiB recurrent-state copy.
+  Retained that failed attempt; final unique C1/C8 uses cache-off/eight active,
+  agent/prefill uses cache-on/two active. Both final modes pass every request.
+- Raw bundles, preflight/startup evidence, execution/summary scripts and one-second
+  GPU samples live in `benchmarks/perf/results/27b-fp16-first-2026-10-30/`.
+  Checked-in JSON/CSV/Markdown retain metrics and raw-evidence hashes. All four
+  bundle checksum indexes, counts and preflight receipts verified. Report review
+  fixed missing-accounting and single-burst TPOT handling using suite helpers.
+- `mise run perf-check` passes (47 suite tests); campaign validates, documentation
+  links and `git diff --check` pass. No engine or benchmark implementation changed.
+
 ### SGLang FP16 needs explicit convolution-cache dtype (2026-10-30)
 
 - Fresh offline FP16 repo-ID retry after retirement explicitly resolves 0df,

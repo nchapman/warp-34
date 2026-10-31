@@ -1,0 +1,96 @@
+# First fresh three-engine comparison: one RTX 3090 Ti, GPTQ 0df, FP16, no speculation.
+# Launch one server at a time on GPU 0; keep all raw run bundles.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 3
+warmup_requests = 1
+max_inflight = 8
+timeout_s = 180
+
+[engine_defaults]
+support = "unverified"
+cohort = "27b-0df-fp16-first-comparison"
+gpu_count = 1
+gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
+parallelism = "single"
+base_url = "http://127.0.0.1:18034/v1"
+model = "qwen38-gptq"
+model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+source_model_revision = "unknown"
+artifact_sha256 = "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03"
+tokenizer_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+weight_format = "compressed-tensors-GPTQ-int4"
+quantization_details = "g128 symmetric static actorder; same pinned snapshot for all three engines"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "fp16"
+speculation = "none"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "sglang27-fp16-uncached"
+engine = "sglang"
+version = "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1"
+container = "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9"
+cache_config = "FP16 KV 8192 tokens, FP16 convolution history, FP32 SSM; active 8, Mamba slots 8; radix off for unique decode/throughput cases; overlap on; prefill chunks 1024; GPU budget 0.90; CPU offload 0; vision loaded"
+launch_command = "docker run --rm --name w34-perf-27b-compare-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-gptq --dtype float16 --tp-size 1 --context-length 8192 --max-running-requests 8 --max-mamba-cache-size 8 --disable-radix-cache --mamba-ssm-dtype float32 --max-total-tokens 8192 --mem-fraction-static 0.90 --chunked-prefill-size 1024 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --cpu-offload-gb 0 --random-seed 34 --host 0.0.0.0 --port 18034"
+
+[[engines]]
+id = "sglang27-fp16-cached"
+engine = "sglang"
+version = "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1"
+container = "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9"
+cache_config = "FP16 KV 8192 tokens, FP16 convolution history, FP32 SSM; active 2, Mamba slots 12; radix on, overlap on; prefill chunks 1024; GPU budget 0.90; CPU offload 0; vision loaded; C1 agent/prefill cases only"
+launch_command = "docker run --rm --name w34-perf-27b-compare-sglang-cached --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-gptq --dtype float16 --tp-size 1 --context-length 8192 --max-running-requests 2 --max-mamba-cache-size 12 --mamba-ssm-dtype float32 --max-total-tokens 8192 --mem-fraction-static 0.90 --chunked-prefill-size 1024 --cuda-graph-bs-decode 1 2 --cuda-graph-bs-prefill 512 1024 --cpu-offload-gb 0 --random-seed 34 --host 0.0.0.0 --port 18034"
+
+[[engines]]
+id = "vllm27-fp16"
+engine = "vllm"
+version = "0.31.0"
+cache_config = "FP16 auto KV, FP32 SSM; active 8; prefix on; prefill token budget 1024; GPU budget 0.90; CPU offload 0; language-model-only"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-fp16"
+engine = "warp-34"
+version = "eae8923 tree; binary sha256 25a2877a246a91b759ffcf77488b060fe34e63f6908a5f29067fe047f92c3d79"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+cache_config = "FP16 KV 512 pages (8192 tokens), FP32 SSM; built-in scheduler/radix/graphs; default admission; no CPU offload"
+rendering_note = "Built-in ChatML renderer"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format fp16 --kv-pages 512 --host 127.0.0.1 --port 18034"
+
+[[cases]]
+id = "decode-c1"
+fixture = "../fixtures/text.json"
+requests = 4
+concurrency = 1
+max_tokens = 256
+
+[[cases]]
+id = "throughput-c8"
+fixture = "../fixtures/text.json"
+requests = 16
+concurrency = 8
+max_tokens = 256
+
+[[cases]]
+id = "agent-c1"
+kind = "agent_replay"
+fixture = "../fixtures/coding_agent.json"
+requests = 2
+concurrency = 1
+max_tokens = 128
+cache = "natural"
+think_time_s = 0.05
+
+[[cases]]
+id = "prefill-primed-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 32
+requests = 4
+concurrency = 1
+max_tokens = 128
+cache = "primed"
