@@ -1511,12 +1511,13 @@ fn shared_mamba_branch_hint<'a>(
 async fn run_one_candidate_query(
     s: Arc<OpenAiServerState>,
     prompt: Vec<i32>,
+    images: Vec<crate::vision::PreprocessedImage>,
     cands: Vec<i32>,
     branch_hint: Option<usize>,
 ) -> Result<(Vec<f64>, usize), ApiError> {
     let (mut stream, rx) = s
         .worker
-        .submit_decision_candidate_logits(prompt, cands, branch_hint)
+        .submit_decision_candidate_logits_with_images(prompt, images, cands, branch_hint)
         .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let tap = rx
         .await
@@ -1550,13 +1551,58 @@ async fn run_one_candidate_query(
 async fn run_one_hidden_query(
     s: Arc<OpenAiServerState>,
     prompt: Vec<i32>,
+    images: Vec<crate::vision::PreprocessedImage>,
     positions: Vec<usize>,
     prefix_cap: Option<usize>,
     branch_hint: Option<usize>,
 ) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
     let (mut stream, rx) = s
         .worker
-        .submit_decision_hidden_positions(prompt, positions, prefix_cap, branch_hint)
+        .submit_decision_hidden_positions_with_images(
+            prompt,
+            images,
+            positions,
+            prefix_cap,
+            branch_hint,
+        )
+        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let tap = rx
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut cached_done = 0usize;
+    while let Some(ev) = stream.events.recv().await {
+        match ev {
+            GenerationEvent::Finished { cached_tokens, .. } => {
+                cached_done = cached_tokens;
+                break;
+            }
+            GenerationEvent::Error(msg) => {
+                return Err(error(StatusCode::INTERNAL_SERVER_ERROR, msg));
+            }
+            GenerationEvent::Token { .. } => {}
+        }
+    }
+    match tap {
+        crate::engine_worker::DecisionTapOutput::HiddenRows {
+            rows,
+            cached_tokens,
+        } => Ok((rows, cached_tokens.max(cached_done))),
+        crate::engine_worker::DecisionTapOutput::CandidateLogits { .. } => Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected decision tap variant",
+        )),
+    }
+}
+
+async fn run_one_full_hidden_query(
+    s: Arc<OpenAiServerState>,
+    prompt: Vec<i32>,
+    images: Vec<crate::vision::PreprocessedImage>,
+) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+    let (mut stream, rx) = s
+        .worker
+        .submit_decision_full_hidden_with_images(prompt, images, None)
         .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let tap = rx
         .await
@@ -1590,6 +1636,7 @@ async fn run_one_hidden_query(
 async fn run_candidate_queries_radix_shared(
     s: &Arc<OpenAiServerState>,
     queries: Vec<(Vec<i32>, Vec<i32>)>,
+    images: &[crate::vision::PreprocessedImage],
 ) -> Result<Vec<(Vec<f64>, usize)>, ApiError> {
     if queries.is_empty() {
         return Ok(Vec::new());
@@ -1600,14 +1647,15 @@ async fn run_candidate_queries_radix_shared(
     let (p0, c0) = iter.next().unwrap();
     let rest: Vec<_> = iter.collect();
     let branch0 = shared_mamba_branch_hint(&p0, rest.iter().map(|(p, _)| p.as_slice()), None);
-    results.push(run_one_candidate_query(s.clone(), p0, c0, branch0).await?);
+    results.push(run_one_candidate_query(s.clone(), p0, images.to_vec(), c0, branch0).await?);
 
     for wave in rest.chunks(8) {
         let mut handles = Vec::with_capacity(wave.len());
         for (p, c) in wave.iter().cloned() {
             let st = s.clone();
+            let imgs = images.to_vec();
             handles.push(tokio::spawn(async move {
-                run_one_candidate_query(st, p, c, None).await
+                run_one_candidate_query(st, p, imgs, c, None).await
             }));
         }
         for h in handles {
@@ -1625,19 +1673,33 @@ async fn execute_systemone_json(
     body: Value,
 ) -> Result<Value, ApiError> {
     let prep_state = s.clone();
-    let (req_model, batch) = cpu(s, move || {
-        Ok::<_, String>({
+    let (req_model, batch, images) = cpu(s, move || {
+        Ok::<_, String>((|| {
             let Some(tokenizer) = prep_state.worker.tokenizer.as_ref() else {
-                return Ok(Err(bad("loaded model has no tokenizer")));
+                return Err(bad("loaded model has no tokenizer"));
             };
-            crate::decision::prepare_decision_batch(
+            let vctx = crate::decision::DecisionVisionContext {
+                vision_config: prep_state.worker.vision_config.clone(),
+                has_vision_weights: prep_state.worker.has_vision_weights,
+                allow_remote_images: prep_state.allow_remote_images,
+            };
+            let images = crate::decision::parse_decision_images(
+                &body,
+                &prep_state.worker.decision_profile,
+                &vctx,
+            )
+            .map_err(decision_err)?;
+            let (req_model, batch) = crate::decision::prepare_decision_batch_with_images(
                 &prep_state.worker.decision_profile,
                 tokenizer,
                 prep_state.worker.kv_token_capacity,
                 &body,
+                prep_state.worker.vision_config.as_ref(),
+                &images,
             )
-            .map_err(decision_err)
-        })
+            .map_err(decision_err)?;
+            Ok((req_model, batch, images))
+        })())
     })
     .await??;
 
@@ -1647,6 +1709,38 @@ async fn execute_systemone_json(
     let mut cached_tokens = 0usize;
 
     match batch {
+        crate::decision::PreparedDecisionBatch::Clef {
+            head,
+            fields,
+            record,
+        } => {
+            input_tokens = record.input_ids.len();
+            let (hidden_rows, cached) =
+                run_one_full_hidden_query(s.clone(), record.input_ids.clone(), images).await?;
+            cached_tokens += cached;
+            let (questions, all_logits) = cpu(s, move || {
+                Ok::<_, String>(
+                    head.forward(&hidden_rows, &record.input_ids, &record.questions)
+                        .map(|logits| (record.questions, logits)),
+                )
+            })
+            .await?
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            for (field, (q_enc, raw_logits)) in
+                fields.iter().zip(questions.iter().zip(all_logits.iter()))
+            {
+                let ordered = crate::clef::reorder_clef_question_logits(q_enc, field, raw_logits)
+                    .map_err(decision_err)?;
+                let ans = crate::decision::answer_from_logits(
+                    field,
+                    &ordered,
+                    1.0,
+                    crate::decision::ConfidenceKind::MaxProbability,
+                )
+                .map_err(decision_err)?;
+                answers.insert(field.name.clone(), ans);
+            }
+        }
         crate::decision::PreparedDecisionBatch::CandidateLogits {
             temperature,
             conf_kind,
@@ -1659,7 +1753,7 @@ async fn execute_systemone_json(
                 input_tokens += p.len();
             }
             let pairs: Vec<_> = prompts.into_iter().zip(candidates).collect();
-            let outs = run_candidate_queries_radix_shared(s, pairs).await?;
+            let outs = run_candidate_queries_radix_shared(s, pairs, &images).await?;
             for (field, (logits, cached)) in fields.iter().zip(outs) {
                 cached_tokens += cached;
                 let ans =
@@ -1689,13 +1783,17 @@ async fn execute_systemone_json(
                 let rest: Vec<_> = iter.collect();
                 let branch0 =
                     shared_mamba_branch_hint(&p0, rest.iter().map(|(p, _, _)| p.as_slice()), cap0);
-                outs.push(run_one_hidden_query(s.clone(), p0, pos0, cap0, branch0).await?);
+                outs.push(
+                    run_one_hidden_query(s.clone(), p0, images.clone(), pos0, cap0, branch0)
+                        .await?,
+                );
                 for wave in rest.chunks(8) {
                     let mut handles = Vec::with_capacity(wave.len());
                     for (p, pos, cap) in wave.iter().cloned() {
                         let st = s.clone();
+                        let imgs = images.clone();
                         handles.push(tokio::spawn(async move {
-                            run_one_hidden_query(st, p, pos, cap, None).await
+                            run_one_hidden_query(st, p, imgs, pos, cap, None).await
                         }));
                     }
                     for h in handles {
@@ -1737,7 +1835,7 @@ async fn execute_systemone_json(
                 pairs.push((fwd, cands.clone()));
                 pairs.push((rev, cands));
             }
-            let outs = run_candidate_queries_radix_shared(s, pairs).await?;
+            let outs = run_candidate_queries_radix_shared(s, pairs, &images).await?;
             for (i, field) in fields.iter().enumerate() {
                 let (fwd_logits, c_fwd) = &outs[2 * i];
                 let (rev_logits, c_rev) = &outs[2 * i + 1];

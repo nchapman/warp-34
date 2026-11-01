@@ -1,16 +1,22 @@
 //! TypeSafe SystemOne (`/v1/systemone`) and `/v1/decisions` decision-model serving.
 //!
 //! Supports Qwen-backbone decision model families without modifying generative routes:
+//! - `Clef` (`ClefModel` + `joint_head.safetensors` `JointSchemaHead` joint multi-question cross-attention + multimodal `images`)
 //! - `Kev` (`KevModel` + `head.safetensors` `PointerHead` over `<|box_end|>` and `<|fim_suffix|>`)
 //! - `Nimble` (`NimbleModel` parallel-schema prompt with `SafeJson` and `nimble_temperature`)
 //! - `Tev1` (`Tev1Model` and default Qwen 3.5 / 3.6 / 3.8 generative scoring over `A..X`)
 //! - `OpenJev` (`A..Z` + `a..z` single-token labels, `true`-first `noul`)
 //! - `Xor` / `Lev` (`XorModel` / `LevModel` forward + reverse option-order probability averaging)
 
+use crate::clef::{
+    CLEF_DEFAULT_MAX_LENGTH, ClefEncodedRecord, ClefJointHead, ClefMediaTokens, clef_encode_record,
+    detect_clef_image_pixel_bounds,
+};
 use crate::cuda::{bf16_to_f32, f16_to_f32};
 use crate::loader::{ModelConfig, SafetensorsArchive};
 use serde_json::{Map, Value, json};
 use std::path::Path;
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 pub const MAX_SYSTEMONE_QUESTIONS: usize = 64;
@@ -306,6 +312,12 @@ pub fn kev_encode_question(
 
 #[derive(Clone, Debug)]
 pub enum DecisionModelProfile {
+    Clef {
+        head: Arc<ClefJointHead>,
+        max_length: usize,
+        image_min_pixels: usize,
+        image_max_pixels: usize,
+    },
     Kev {
         head: KevPointerHead,
         temperature: f64,
@@ -329,6 +341,7 @@ pub enum DecisionModelProfile {
 impl DecisionModelProfile {
     pub fn family_name(&self) -> &'static str {
         match self {
+            Self::Clef { .. } => "clef",
             Self::Kev { .. } => "kev",
             Self::Nimble { .. } => "nimble",
             Self::Tev1 { .. } => "tev1",
@@ -341,6 +354,17 @@ impl DecisionModelProfile {
                 lev_noul_9_scale: false,
                 ..
             } => "xor",
+        }
+    }
+
+    pub fn image_pixel_bounds(&self) -> (usize, usize) {
+        match self {
+            Self::Clef {
+                image_min_pixels,
+                image_max_pixels,
+                ..
+            } => (*image_min_pixels, *image_max_pixels),
+            _ => (32 * 32, 1024 * 1024),
         }
     }
 
@@ -360,6 +384,18 @@ impl DecisionModelProfile {
             .as_deref()
             .unwrap_or("")
             .to_ascii_lowercase();
+
+        let joint_head_path = dir.join("joint_head.safetensors");
+        if has_arch("ClefModel") || dt == "clef" || joint_head_path.is_file() {
+            let head = ClefJointHead::from_dir_and_config(dir, cfg)?;
+            let (image_min_pixels, image_max_pixels) = detect_clef_image_pixel_bounds(dir);
+            return Ok(Self::Clef {
+                head: Arc::new(head),
+                max_length: CLEF_DEFAULT_MAX_LENGTH,
+                image_min_pixels,
+                image_max_pixels,
+            });
+        }
 
         let head_path = dir.join("head.safetensors");
         if has_arch("KevModel") || dt == "kev" || head_path.is_file() {
@@ -456,6 +492,8 @@ pub enum ConfidenceKind {
     NormalizedEntropy,
     /// `ChoiceConfidence` `(max_p - 1/K) / (1 - 1/K)` + mode-distance `ScoreConfidence` (`Kev`, `OpenJev`, `Xor`/`Lev`).
     MarginAndModeDistance,
+    /// `max_i p_i` across options (`Clef` `systemone_answer`).
+    MaxProbability,
 }
 
 #[derive(Clone, Debug)]
@@ -524,14 +562,7 @@ fn dump_python_into(v: &Value, out: &mut String) -> Result<(), DecisionError> {
             out.push('}');
         }
         Value::Number(n) => {
-            if let Some(f) = n.as_f64()
-                && !f.is_finite()
-            {
-                return Err(DecisionError::bad_request(
-                    "Non-finite JSON number in the request",
-                ));
-            }
-            out.push_str(&v.to_string());
+            out.push_str(&crate::clef::format_python_json_number(n));
         }
         _ => {
             out.push_str(
@@ -605,7 +636,12 @@ pub fn compile_systemone_request(
     let Some(obj) = body.as_object() else {
         return Err(DecisionError::bad_request("request body must be an object"));
     };
-    require_keys(obj, &["model", "state", "questions"], "request")?;
+    require_keys(
+        obj,
+        &["model", "state", "questions", "images", "videos"],
+        "request",
+    )?;
+    validate_decision_media_fields(obj)?;
 
     let model = match obj.get("model") {
         None => None,
@@ -1157,6 +1193,7 @@ pub fn answer_from_probabilities(
         let conf = match conf_kind {
             ConfidenceKind::NormalizedEntropy => entropy_confidence(probs),
             ConfidenceKind::MarginAndModeDistance => mode_distance_score_confidence(probs),
+            ConfidenceKind::MaxProbability => probs.iter().copied().fold(0.0, f64::max),
         };
         let mut out = Map::new();
         out.insert("type".into(), Value::String("score".into()));
@@ -1176,6 +1213,7 @@ pub fn answer_from_probabilities(
     let conf = match conf_kind {
         ConfidenceKind::NormalizedEntropy => entropy_confidence(probs),
         ConfidenceKind::MarginAndModeDistance => margin_choice_confidence(probs),
+        ConfidenceKind::MaxProbability => probs[best],
     };
     let mut out = Map::new();
     out.insert("type".into(), Value::String("choice".into()));
@@ -1208,6 +1246,12 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
         }
         if let Some(st) = obj.get("state").or_else(|| obj.get("context")) {
             canonical.insert("state".into(), st.clone());
+        }
+        if let Some(imgs) = obj.get("images") {
+            canonical.insert("images".into(), imgs.clone());
+        }
+        if let Some(vids) = obj.get("videos") {
+            canonical.insert("videos".into(), vids.clone());
         }
         canonical.insert("questions".into(), obj["questions"].clone());
         return Ok(Value::Object(canonical));
@@ -1295,6 +1339,12 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
         canonical.insert("model".into(), m.clone());
     }
     canonical.insert("state".into(), state.clone());
+    if let Some(imgs) = obj.get("images") {
+        canonical.insert("images".into(), imgs.clone());
+    }
+    if let Some(vids) = obj.get("videos") {
+        canonical.insert("videos".into(), vids.clone());
+    }
     canonical.insert("questions".into(), Value::Object(questions));
     Ok(Value::Object(canonical))
 }
@@ -1327,9 +1377,140 @@ pub fn format_decisions_adapter_response(systemone_resp: &Value) -> Value {
     })
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DecisionVisionContext {
+    pub vision_config: Option<crate::vision::VisionConfig>,
+    pub has_vision_weights: bool,
+    pub allow_remote_images: bool,
+}
+
+/// Decodes and preprocesses optional `images` on a `/v1/systemone` or `/v1/decisions` request.
+fn validate_decision_media_fields(
+    obj: &Map<String, Value>,
+) -> Result<Option<&[Value]>, DecisionError> {
+    if let Some(vids) = obj.get("videos")
+        && !vids.is_null()
+        && !vids.as_array().is_some_and(Vec::is_empty)
+    {
+        return Err(DecisionError::bad_request("video inputs are not supported"));
+    }
+    let Some(imgs_val) = obj.get("images") else {
+        return Ok(None);
+    };
+    if imgs_val.is_null() {
+        return Ok(None);
+    }
+    let Some(arr) = imgs_val.as_array() else {
+        return Err(DecisionError::bad_request("images must be an array"));
+    };
+    if arr.len() > crate::vision::MAX_IMAGES_PER_REQUEST {
+        return Err(DecisionError::bad_request(format!(
+            "at most {} images are allowed per request",
+            crate::vision::MAX_IMAGES_PER_REQUEST
+        )));
+    }
+    if arr.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(arr.as_slice()))
+}
+
+pub fn parse_decision_images(
+    body: &Value,
+    profile: &DecisionModelProfile,
+    ctx: &DecisionVisionContext,
+) -> Result<Vec<crate::vision::PreprocessedImage>, DecisionError> {
+    let Some(obj) = body.as_object() else {
+        return Err(DecisionError::bad_request("request body must be an object"));
+    };
+    let Some(arr) = validate_decision_media_fields(obj)? else {
+        return Ok(Vec::new());
+    };
+    let (Some(vcfg), true) = (ctx.vision_config.as_ref(), ctx.has_vision_weights) else {
+        return Err(DecisionError::bad_request(
+            "loaded model does not have vision weights; image inputs are not supported",
+        ));
+    };
+    let (min_pixels, max_pixels) = profile.image_pixel_bounds();
+    let deadline = std::time::Instant::now() + crate::remote_images::REMOTE_IMAGE_TIMEOUT;
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let url: String = if let Some(s) = item.as_str() {
+            s.to_owned()
+        } else if let Some(m) = item.as_object() {
+            if let Some(u) = m.get("url").and_then(Value::as_str) {
+                u.to_owned()
+            } else if let Some(u) = m
+                .get("image_url")
+                .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(Value::as_str)))
+            {
+                u.to_owned()
+            } else if let Some(data) = m.get("data").and_then(Value::as_str) {
+                let mt = m
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png");
+                format!("data:{mt};base64,{data}")
+            } else {
+                return Err(DecisionError::bad_request(format!(
+                    "images[{idx}] missing 'url' or 'data'"
+                )));
+            }
+        } else {
+            return Err(DecisionError::bad_request(format!(
+                "images[{idx}] must be an image URL string or object"
+            )));
+        };
+        let (rgb, h, w) =
+            crate::vision::parse_image_url_with_deadline(&url, ctx.allow_remote_images, deadline)
+                .map_err(|e| DecisionError::bad_request(format!("images[{idx}]: {e}")))?;
+        crate::vision::validate_image_aspect_ratio(h, w)
+            .map_err(|e| DecisionError::bad_request(format!("images[{idx}]: {e}")))?;
+        out.push(crate::vision::preprocess_rgb_image(
+            &rgb,
+            h,
+            w,
+            vcfg.patch_size,
+            vcfg.temporal_patch_size,
+            vcfg.spatial_merge_size,
+            min_pixels,
+            max_pixels,
+        ));
+    }
+    Ok(out)
+}
+
+fn build_media_prefix_tokens(
+    tokenizer: &Tokenizer,
+    media: Option<(ClefMediaTokens, &[usize])>,
+) -> Result<Vec<i32>, DecisionError> {
+    let Some((mtoks, counts)) = media else {
+        return Ok(Vec::new());
+    };
+    if counts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut prefix = Vec::new();
+    for &n in counts {
+        prefix.push(mtoks.vision_start_id);
+        prefix.resize(prefix.len() + n, mtoks.image_pad_id);
+        prefix.push(mtoks.vision_end_id);
+    }
+    let nl = tokenizer
+        .encode("\n", false)
+        .map_err(|e| DecisionError::internal(format!("tokenize newline: {e}")))?;
+    prefix.extend(nl.get_ids().iter().map(|&x| x as i32));
+    Ok(prefix)
+}
+
 /// Prepared query plans ready for execution on `EngineWorker`.
 #[derive(Clone, Debug)]
 pub enum PreparedDecisionBatch {
+    Clef {
+        head: Arc<ClefJointHead>,
+        fields: Vec<DecisionField>,
+        record: ClefEncodedRecord,
+    },
     Kev {
         head: KevPointerHead,
         temperature: f64,
@@ -1359,7 +1540,70 @@ pub fn prepare_decision_batch(
     max_prompt_tokens: usize,
     body: &Value,
 ) -> Result<(Option<String>, PreparedDecisionBatch), DecisionError> {
+    if let Some(obj) = body.as_object()
+        && validate_decision_media_fields(obj)?.is_some()
+    {
+        return Err(DecisionError::bad_request(
+            "image inputs require prepare_decision_batch_with_images on a vision-capable model",
+        ));
+    }
+    prepare_decision_batch_with_images(profile, tokenizer, max_prompt_tokens, body, None, &[])
+}
+
+pub fn prepare_decision_batch_with_images(
+    profile: &DecisionModelProfile,
+    tokenizer: &Tokenizer,
+    max_prompt_tokens: usize,
+    body: &Value,
+    vision_config: Option<&crate::vision::VisionConfig>,
+    images: &[crate::vision::PreprocessedImage],
+) -> Result<(Option<String>, PreparedDecisionBatch), DecisionError> {
+    let merged_counts: Vec<usize>;
+    let media = if !images.is_empty() {
+        let vcfg = vision_config.ok_or_else(|| {
+            DecisionError::bad_request(
+                "loaded model does not have vision_config; image inputs are not supported",
+            )
+        })?;
+        merged_counts = images
+            .iter()
+            .map(|img| img.num_merged_tokens(vcfg.spatial_merge_size))
+            .collect();
+        Some((
+            ClefMediaTokens {
+                vision_start_id: vcfg.vision_start_token_id,
+                image_pad_id: vcfg.image_token_id,
+                vision_end_id: vcfg.vision_end_token_id,
+            },
+            merged_counts.as_slice(),
+        ))
+    } else {
+        None
+    };
+
     match profile {
+        DecisionModelProfile::Clef {
+            head, max_length, ..
+        } => {
+            let req = compile_systemone_request(
+                body,
+                CompileLimits {
+                    max_choices: MAX_SYSTEMONE_ANSWERS,
+                    too_wide_reason: "clef supports at most 64 options per question",
+                    noul_true_first: true,
+                },
+            )?;
+            let effective_max = (*max_length).min(max_prompt_tokens);
+            let record = clef_encode_record(tokenizer, body, effective_max, media)?;
+            Ok((
+                req.model,
+                PreparedDecisionBatch::Clef {
+                    head: head.clone(),
+                    fields: req.fields,
+                    record,
+                },
+            ))
+        }
         DecisionModelProfile::Kev { head, temperature } => {
             let req = compile_systemone_request(
                 body,
@@ -1378,7 +1622,8 @@ pub fn prepare_decision_batch(
                     .map(|e| e.get_ids().iter().map(|&x| x as i32).collect())
                     .map_err(|e| DecisionError::internal(format!("kev tokenize: {e}")))
             };
-            let state_tokens = enc_text(&req.context)?;
+            let mut state_tokens = build_media_prefix_tokens(tokenizer, media)?;
+            state_tokens.extend(enc_text(&req.context)?);
             let mut encoded = Vec::with_capacity(req.fields.len());
             let mut longest = 0usize;
             for f in &req.fields {
@@ -1420,7 +1665,7 @@ pub fn prepare_decision_batch(
             )?;
             let prompt_strs = build_nimble_prompts(&req)?;
             let limit = (*max_length).saturating_sub(1).min(max_prompt_tokens);
-            let (prompts, candidates) = tokenize_candidate_prompts(
+            let (prompts, candidates) = tokenize_candidate_prompts_with_media(
                 tokenizer,
                 &req.fields,
                 &prompt_strs,
@@ -1428,6 +1673,7 @@ pub fn prepare_decision_batch(
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
                 limit,
                 "nimble",
+                media,
             )?;
             Ok((
                 req.model,
@@ -1451,7 +1697,7 @@ pub fn prepare_decision_batch(
                 },
             )?;
             let prompt_strs = build_tev1_prompts(&req)?;
-            let (prompts, candidates) = tokenize_candidate_prompts(
+            let (prompts, candidates) = tokenize_candidate_prompts_with_media(
                 tokenizer,
                 &req.fields,
                 &prompt_strs,
@@ -1459,6 +1705,7 @@ pub fn prepare_decision_batch(
                 b"ABCDEFGHIJKLMNOPQRSTUVWX",
                 max_prompt_tokens,
                 "tev1",
+                media,
             )?;
             Ok((
                 req.model,
@@ -1482,7 +1729,7 @@ pub fn prepare_decision_batch(
                 },
             )?;
             let prompt_strs = build_openjev_prompts(&req)?;
-            let (prompts, candidates) = tokenize_candidate_prompts(
+            let (prompts, candidates) = tokenize_candidate_prompts_with_media(
                 tokenizer,
                 &req.fields,
                 &prompt_strs,
@@ -1490,6 +1737,7 @@ pub fn prepare_decision_batch(
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
                 max_prompt_tokens,
                 "openjev",
+                media,
             )?;
             Ok((
                 req.model,
@@ -1515,6 +1763,7 @@ pub fn prepare_decision_batch(
                     noul_true_first: false,
                 },
             )?;
+            let media_prefix = build_media_prefix_tokens(tokenizer, media)?;
             let mut variants = Vec::with_capacity(req.fields.len());
             let mut longest = 0usize;
             for f in &req.fields {
@@ -1527,20 +1776,24 @@ pub fn prepare_decision_batch(
                 let fwd_str = build_xor_prompt(&req.context, &f.field_type, &f.description, &opts);
                 let rev_str =
                     build_xor_prompt(&req.context, &f.field_type, &f.description, &rev_opts);
-                let fwd_ids: Vec<i32> = tokenizer
-                    .encode(fwd_str.as_str(), false)
-                    .map_err(|e| DecisionError::internal(format!("xor tokenize: {e}")))?
-                    .get_ids()
-                    .iter()
-                    .map(|&x| x as i32)
-                    .collect();
-                let rev_ids: Vec<i32> = tokenizer
-                    .encode(rev_str.as_str(), false)
-                    .map_err(|e| DecisionError::internal(format!("xor tokenize: {e}")))?
-                    .get_ids()
-                    .iter()
-                    .map(|&x| x as i32)
-                    .collect();
+                let mut fwd_ids = media_prefix.clone();
+                fwd_ids.extend(
+                    tokenizer
+                        .encode(fwd_str.as_str(), false)
+                        .map_err(|e| DecisionError::internal(format!("xor tokenize: {e}")))?
+                        .get_ids()
+                        .iter()
+                        .map(|&x| x as i32),
+                );
+                let mut rev_ids = media_prefix.clone();
+                rev_ids.extend(
+                    tokenizer
+                        .encode(rev_str.as_str(), false)
+                        .map_err(|e| DecisionError::internal(format!("xor tokenize: {e}")))?
+                        .get_ids()
+                        .iter()
+                        .map(|&x| x as i32),
+                );
                 longest = longest.max(fwd_ids.len()).max(rev_ids.len());
                 let cands = candidate_token_ids(
                     tokenizer,
@@ -1570,7 +1823,8 @@ pub fn prepare_decision_batch(
 
 type TokenizedCandidates = (Vec<Vec<i32>>, Vec<Vec<i32>>);
 
-fn tokenize_candidate_prompts(
+#[allow(clippy::too_many_arguments)]
+fn tokenize_candidate_prompts_with_media(
     tokenizer: &Tokenizer,
     fields: &[DecisionField],
     prompt_strs: &[String],
@@ -1578,7 +1832,9 @@ fn tokenize_candidate_prompts(
     alphabet: &[u8],
     max_prompt_tokens: usize,
     model_label: &str,
+    media: Option<(ClefMediaTokens, &[usize])>,
 ) -> Result<TokenizedCandidates, DecisionError> {
+    let media_prefix = build_media_prefix_tokens(tokenizer, media)?;
     let special_token_strs: Vec<String> = tokenizer
         .get_added_tokens_decoder()
         .into_values()
@@ -1590,10 +1846,42 @@ fn tokenize_candidate_prompts(
     let mut longest = 0usize;
     for p in prompt_strs {
         let safe_p = escape_added_special_tokens_in_chatml_user_turn(p, &special_token_strs);
-        let enc = tokenizer
-            .encode(safe_p.as_str(), false)
-            .map_err(|e| DecisionError::internal(format!("{model_label}: tokenize: {e}")))?;
-        let ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+        let ids: Vec<i32> = if !media_prefix.is_empty() {
+            const USER_OPEN: &str = "<|im_end|>\n<|im_start|>user\n";
+            if let Some(u_pos) = safe_p.find(USER_OPEN) {
+                let split_at = u_pos + USER_OPEN.len();
+                let head_enc = tokenizer.encode(&safe_p[..split_at], false).map_err(|e| {
+                    DecisionError::internal(format!("{model_label}: tokenize: {e}"))
+                })?;
+                let body_enc = tokenizer.encode(&safe_p[split_at..], false).map_err(|e| {
+                    DecisionError::internal(format!("{model_label}: tokenize: {e}"))
+                })?;
+                let mut combined =
+                    Vec::with_capacity(head_enc.len() + media_prefix.len() + body_enc.len());
+                combined.extend(head_enc.get_ids().iter().map(|&x| x as i32));
+                combined.extend_from_slice(&media_prefix);
+                combined.extend(body_enc.get_ids().iter().map(|&x| x as i32));
+                combined
+            } else if safe_p.contains("<|im_start|>") {
+                return Err(DecisionError::internal(format!(
+                    "{model_label}: ChatML prompt missing user turn boundary"
+                )));
+            } else {
+                // Non-ChatML plain-text prompts (Xor / Lev) begin directly with state at offset 0.
+                let enc = tokenizer.encode(safe_p.as_str(), false).map_err(|e| {
+                    DecisionError::internal(format!("{model_label}: tokenize: {e}"))
+                })?;
+                let mut combined = Vec::with_capacity(media_prefix.len() + enc.len());
+                combined.extend_from_slice(&media_prefix);
+                combined.extend(enc.get_ids().iter().map(|&x| x as i32));
+                combined
+            }
+        } else {
+            let enc = tokenizer
+                .encode(safe_p.as_str(), false)
+                .map_err(|e| DecisionError::internal(format!("{model_label}: tokenize: {e}")))?;
+            enc.get_ids().iter().map(|&x| x as i32).collect()
+        };
         longest = longest.max(ids.len());
         prompts.push(ids);
     }
@@ -2324,6 +2612,193 @@ mod tests {
             let prof = DecisionModelProfile::from_dir_and_config(&tmp, &cfg, None).unwrap();
             assert_eq!(prof.family_name(), expected_family);
         }
+
+        // Clef detection (`ClefModel`, `decision_config.type == "clef"`, and `joint_head.safetensors`
+        // precedence over `head.safetensors`) + `processor_config.json` pixel-bounds parsing.
+        let clef_dir = tmp.join("clef_detect");
+        std::fs::create_dir_all(&clef_dir).unwrap();
+        std::fs::write(
+            clef_dir.join("joint_head_config.json"),
+            r#"{"hidden_size":4,"width":4,"routing_layers":1,"layers":1,"heads":2,"feedforward":8}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            clef_dir.join("processor_config.json"),
+            r#"{"size":{"shortest_edge":49152,"longest_edge":2097152}}"#,
+        )
+        .unwrap();
+        let zero_bytes = |n: usize| vec![0u8; n * 4];
+        let one_bytes = |n: usize| {
+            std::iter::repeat_n(1.0f32, n)
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        let z16 = zero_bytes(16);
+        let z4 = zero_bytes(4);
+        let z8 = zero_bytes(8);
+        let z12 = zero_bytes(12);
+        let z32 = zero_bytes(32);
+        let z48 = zero_bytes(48);
+        let z64 = zero_bytes(64);
+        let o4 = one_bytes(4);
+        let scalar1 = 2.0f32.to_le_bytes().to_vec();
+        make_safetensors_file(
+            &clef_dir.join("joint_head.safetensors"),
+            &[
+                ("hidden_norm.weight", "F32", &[4], &o4),
+                ("hidden_norm.bias", "F32", &[4], &z4),
+                ("memory_projection.weight", "F32", &[4, 4], &z16),
+                ("question_projection.weight", "F32", &[4, 4], &z16),
+                ("option_question_projection.weight", "F32", &[4, 4], &z16),
+                ("global_projection.weight", "F32", &[4, 4], &z16),
+                ("option_context_projection.weight", "F32", &[4, 4], &z16),
+                ("option_lexical_projection.weight", "F32", &[4, 4], &z16),
+                ("type_embedding.weight", "F32", &[3, 4], &z12),
+                ("evidence_layers.0.query_norm.weight", "F32", &[4], &o4),
+                ("evidence_layers.0.query_norm.bias", "F32", &[4], &z4),
+                ("evidence_layers.0.memory_norm.weight", "F32", &[4], &o4),
+                ("evidence_layers.0.memory_norm.bias", "F32", &[4], &z4),
+                (
+                    "evidence_layers.0.attention.in_proj_weight",
+                    "F32",
+                    &[12, 4],
+                    &z48,
+                ),
+                (
+                    "evidence_layers.0.attention.in_proj_bias",
+                    "F32",
+                    &[12],
+                    &z12,
+                ),
+                (
+                    "evidence_layers.0.attention.out_proj.weight",
+                    "F32",
+                    &[4, 4],
+                    &z16,
+                ),
+                (
+                    "evidence_layers.0.attention.out_proj.bias",
+                    "F32",
+                    &[4],
+                    &z4,
+                ),
+                (
+                    "evidence_layers.0.feedforward_norm.weight",
+                    "F32",
+                    &[4],
+                    &o4,
+                ),
+                ("evidence_layers.0.feedforward_norm.bias", "F32", &[4], &z4),
+                (
+                    "evidence_layers.0.feedforward.0.weight",
+                    "F32",
+                    &[8, 4],
+                    &z32,
+                ),
+                ("evidence_layers.0.feedforward.0.bias", "F32", &[8], &z8),
+                (
+                    "evidence_layers.0.feedforward.3.weight",
+                    "F32",
+                    &[4, 8],
+                    &z32,
+                ),
+                ("evidence_layers.0.feedforward.3.bias", "F32", &[4], &z4),
+                ("option_summary_norm.weight", "F32", &[4], &o4),
+                ("option_summary_norm.bias", "F32", &[4], &z4),
+                ("layers.0.norm1.weight", "F32", &[4], &o4),
+                ("layers.0.norm1.bias", "F32", &[4], &z4),
+                ("layers.0.self_attn.in_proj_weight", "F32", &[12, 4], &z48),
+                ("layers.0.self_attn.in_proj_bias", "F32", &[12], &z12),
+                ("layers.0.self_attn.out_proj.weight", "F32", &[4, 4], &z16),
+                ("layers.0.self_attn.out_proj.bias", "F32", &[4], &z4),
+                ("layers.0.norm2.weight", "F32", &[4], &o4),
+                ("layers.0.norm2.bias", "F32", &[4], &z4),
+                (
+                    "layers.0.multihead_attn.in_proj_weight",
+                    "F32",
+                    &[12, 4],
+                    &z48,
+                ),
+                ("layers.0.multihead_attn.in_proj_bias", "F32", &[12], &z12),
+                (
+                    "layers.0.multihead_attn.out_proj.weight",
+                    "F32",
+                    &[4, 4],
+                    &z16,
+                ),
+                ("layers.0.multihead_attn.out_proj.bias", "F32", &[4], &z4),
+                ("layers.0.norm3.weight", "F32", &[4], &o4),
+                ("layers.0.norm3.bias", "F32", &[4], &z4),
+                ("layers.0.linear1.weight", "F32", &[8, 4], &z32),
+                ("layers.0.linear1.bias", "F32", &[8], &z8),
+                ("layers.0.linear2.weight", "F32", &[4, 8], &z32),
+                ("layers.0.linear2.bias", "F32", &[4], &z4),
+                ("field_norm.weight", "F32", &[4], &o4),
+                ("field_norm.bias", "F32", &[4], &z4),
+                ("option_norm.weight", "F32", &[4], &o4),
+                ("option_norm.bias", "F32", &[4], &z4),
+                ("residual_scorer.0.weight", "F32", &[4, 16], &z64),
+                ("residual_scorer.0.bias", "F32", &[4], &z4),
+                ("residual_scorer.3.weight", "F32", &[1, 4], &z4),
+                ("residual_scorer.3.bias", "F32", &[1], &zero_bytes(1)),
+                ("prior_logit_scale", "F32", &[], &scalar1),
+                ("joint_logit_scale", "F32", &[], &scalar1),
+                ("residual_gate", "F32", &[], &scalar1),
+            ],
+        );
+        make_safetensors_file(
+            &clef_dir.join("model.safetensors"),
+            &[("lm_head.weight", "F32", &[16, 4], &zero_bytes(64))],
+        );
+        // Also place `head.safetensors` alongside `joint_head.safetensors` to verify Clef precedence over Kev.
+        make_safetensors_file(
+            &clef_dir.join("head.safetensors"),
+            &[
+                ("q.weight", "F32", &[2, 4], &z8),
+                ("q.bias", "F32", &[2], &zero_bytes(2)),
+                ("k.weight", "F32", &[2, 4], &z8),
+                ("k.bias", "F32", &[2], &zero_bytes(2)),
+            ],
+        );
+        for clef_cfg_json in [
+            json!({
+                "architectures": ["ClefModel"],
+                "hidden_size": 4,
+                "num_hidden_layers": 2,
+                "vocab_size": 16
+            }),
+            json!({
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "hidden_size": 4,
+                "num_hidden_layers": 2,
+                "vocab_size": 16,
+                "decision_config": {"type": "clef"}
+            }),
+            json!({
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+                "hidden_size": 4,
+                "num_hidden_layers": 2,
+                "vocab_size": 16
+            }),
+        ] {
+            let c = ModelConfig::from_json(&clef_cfg_json).unwrap();
+            let prof = DecisionModelProfile::from_dir_and_config(&clef_dir, &c, None).unwrap();
+            assert_eq!(prof.family_name(), "clef");
+            assert!(matches!(prof, DecisionModelProfile::Clef { .. }));
+            assert_eq!(prof.image_pixel_bounds(), (49152, 1048576));
+        }
+        std::fs::remove_file(clef_dir.join("joint_head.safetensors")).unwrap();
+        let fallback_cfg = ModelConfig::from_json(&json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "vocab_size": 16,
+            "kev_head_dim": 2
+        }))
+        .unwrap();
+        let kev_prof =
+            DecisionModelProfile::from_dir_and_config(&clef_dir, &fallback_cfg, None).unwrap();
+        assert_eq!(kev_prof.family_name(), "kev");
         let _ = std::fs::remove_dir_all(&tmp);
 
         // Verify ordinary HTML tags (`<b>`, `<internal>`) stay unescaped for tev1_goldens.inc parity
@@ -2799,5 +3274,251 @@ mod tests {
         assert!(err_tev1.contains("Tev1Model: decision_temperature"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn decision_images_parsing_max_probability_confidence_and_adapter_forwarding() {
+        let profile = DecisionModelProfile::Tev1 { temperature: 1.0 };
+        let vcfg: crate::vision::VisionConfig = serde_json::from_value(json!({})).unwrap();
+        let ctx_ok = DecisionVisionContext {
+            vision_config: Some(vcfg),
+            has_vision_weights: true,
+            allow_remote_images: false,
+        };
+        let ctx_no_vis = DecisionVisionContext {
+            vision_config: None,
+            has_vision_weights: false,
+            allow_remote_images: false,
+        };
+
+        // 1x1 red PNG in base64 for object `data` + `media_type` coverage, plus `rgb://` fixtures
+        let png_1x1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        let body = json!({
+            "state": "check tiles",
+            "images": [
+                "rgb://tile-a",
+                {"url": "rgb://tile-b"},
+                {"image_url": {"url": "rgb://tile-c"}},
+                {"media_type": "image/png", "data": png_1x1}
+            ],
+            "questions": {"q": {"type": "noul", "instructions": "ok?"}}
+        });
+        let imgs = parse_decision_images(&body, &profile, &ctx_ok).unwrap();
+        assert_eq!(imgs.len(), 4);
+
+        // Rejects images when model lacks vision weights
+        let err_novis = parse_decision_images(&body, &profile, &ctx_no_vis).unwrap_err();
+        assert!(err_novis.is_bad_request);
+        assert!(err_novis.message.contains("vision weights"));
+
+        // Rejects > MAX_IMAGES_PER_REQUEST, non-array images, non-empty videos, bad entry
+        for bad in [
+            json!({"state": "x", "images": "rgb://a", "questions": {"q": {"type": "noul", "instructions": "y"}}}),
+            json!({"state": "x", "images": ["rgb://1", "rgb://2", "rgb://3", "rgb://4", "rgb://5"], "questions": {"q": {"type": "noul", "instructions": "y"}}}),
+            json!({"state": "x", "images": [123], "questions": {"q": {"type": "noul", "instructions": "y"}}}),
+            json!({"state": "x", "images": [{}], "questions": {"q": {"type": "noul", "instructions": "y"}}}),
+            json!({"state": "x", "videos": ["https://example.com/v.mp4"], "questions": {"q": {"type": "noul", "instructions": "y"}}}),
+        ] {
+            let err = parse_decision_images(&bad, &profile, &ctx_ok).unwrap_err();
+            assert!(
+                err.is_bad_request,
+                "expected bad_request for {bad}, got {err:?}"
+            );
+        }
+
+        // Adapter forwards images/videos
+        let norm = normalize_decisions_adapter_request(&json!({
+            "context": "hello",
+            "images": ["rgb://adapter-1"],
+            "decisions": [{"id": "d1", "type": "noul", "question": "ok?"}]
+        }))
+        .unwrap();
+        assert_eq!(norm["images"], json!(["rgb://adapter-1"]));
+
+        // MaxProbability confidence for choice and score
+        let choice_field = DecisionField {
+            name: "c".into(),
+            field_type: "choice".into(),
+            description: "pick".into(),
+            values: vec![json!("a"), json!("b")],
+            value_descriptions: vec!["A".into(), "B".into()],
+            keys: vec!["a".into(), "b".into()],
+        };
+        let choice_ans =
+            answer_from_probabilities(&choice_field, &[0.25, 0.75], ConfidenceKind::MaxProbability)
+                .unwrap();
+        assert_eq!(choice_ans["choice"], "b");
+        assert!((choice_ans["confidence"].as_f64().unwrap() - 0.75).abs() < 1e-12);
+
+        let score_field = DecisionField {
+            name: "s".into(),
+            field_type: "score".into(),
+            description: "rate".into(),
+            values: vec![json!("0"), json!("1"), json!("2")],
+            value_descriptions: vec!["low".into(), "mid".into(), "high".into()],
+            keys: vec!["0".into(), "1".into(), "2".into()],
+        };
+        let score_ans = answer_from_probabilities(
+            &score_field,
+            &[0.10, 0.60, 0.30],
+            ConfidenceKind::MaxProbability,
+        )
+        .unwrap();
+        assert!((score_ans["confidence"].as_f64().unwrap() - 0.60).abs() < 1e-12);
+
+        // Synthetic in-memory BPE tokenizer so multimodal prompt-insertion assertions run
+        // unconditionally on every machine and CI without any external HF cache dependency.
+        let tok = {
+            use tokenizers::AddedToken;
+            use tokenizers::models::bpe::{BPE, Vocab};
+
+            let mut vocab = Vocab::default();
+            vocab.insert("[UNK]".to_owned(), 0);
+            for (next_id, ch) in (1u32..).zip(
+                ['\t', '\n', '\r']
+                    .into_iter()
+                    .chain((0x20u8..=0x7eu8).map(|b| b as char)),
+            ) {
+                vocab.insert(ch.to_string(), next_id);
+            }
+            let bpe = BPE::builder()
+                .vocab_and_merges(vocab, Vec::new())
+                .unk_token("[UNK]".to_owned())
+                .build()
+                .unwrap();
+            let mut t = Tokenizer::new(bpe);
+            let added: Vec<AddedToken> = [
+                "<|endoftext|>",
+                "<|im_start|>",
+                "<|im_end|>",
+                "<|vision_start|>",
+                "<|vision_end|>",
+                "<|image_pad|>",
+                "<think>",
+                "</think>",
+                "<tool_call>",
+                "</tool_call>",
+            ]
+            .iter()
+            .map(|&s| AddedToken::from(s, true))
+            .collect();
+            t.add_special_tokens(&added);
+            t
+        };
+
+        let mut vcfg: crate::vision::VisionConfig = serde_json::from_value(json!({})).unwrap();
+        vcfg.vision_start_token_id = tok.token_to_id("<|vision_start|>").unwrap() as i32;
+        vcfg.image_token_id = tok.token_to_id("<|image_pad|>").unwrap() as i32;
+        vcfg.vision_end_token_id = tok.token_to_id("<|vision_end|>").unwrap() as i32;
+        let nl_id = tok.token_to_id("\n").unwrap() as i32;
+
+        let tev1_mm_req = json!({
+            "state": "Inspect tile",
+            "images": ["rgb://mm-tev1"],
+            "questions": {
+                "color": {
+                    "type": "choice",
+                    "instructions": "Pick color",
+                    "criteria": {"red": "Red", "green": "Green"}
+                }
+            }
+        });
+
+        // `prepare_decision_batch` (text-only wrapper) rejects non-empty `images` instead of dropping them.
+        let err_dropped = prepare_decision_batch(&profile, &tok, 4096, &tev1_mm_req).unwrap_err();
+        assert!(err_dropped.is_bad_request);
+        assert!(
+            err_dropped
+                .message
+                .contains("prepare_decision_batch_with_images")
+        );
+
+        // `prepare_decision_batch_with_images` rejects `videos`, non-array `images`, and `> 4` images.
+        for bad_compile in [
+            json!({"state": "x", "videos": ["v.mp4"], "questions": {"q": {"type": "noul", "instructions": "y"}}}),
+            json!({"state": "x", "images": "rgb://a", "questions": {"q": {"type": "noul", "instructions": "y"}}}),
+            json!({"state": "x", "images": ["rgb://1","rgb://2","rgb://3","rgb://4","rgb://5"], "questions": {"q": {"type": "noul", "instructions": "y"}}}),
+        ] {
+            let err = prepare_decision_batch_with_images(
+                &profile,
+                &tok,
+                4096,
+                &bad_compile,
+                Some(&vcfg),
+                &[],
+            )
+            .unwrap_err();
+            assert!(err.is_bad_request, "expected bad_request for {bad_compile}");
+        }
+
+        // Exact insertion index & `<|image_pad|>` repeat count right after `<|im_end|>\n<|im_start|>user\n`.
+        let expected_head: Vec<i32> = tok
+            .encode(
+                format!("<|im_start|>system\n{TEV1_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n"),
+                false,
+            )
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
+        let n_merged = imgs[0].num_merged_tokens(vcfg.spatial_merge_size);
+        let (_, batch) = prepare_decision_batch_with_images(
+            &profile,
+            &tok,
+            4096,
+            &tev1_mm_req,
+            Some(&vcfg),
+            &imgs[..1],
+        )
+        .unwrap();
+        match batch {
+            PreparedDecisionBatch::CandidateLogits { prompts, .. } => {
+                let p0 = &prompts[0];
+                let insert_at = expected_head.len();
+                assert_eq!(&p0[..insert_at], expected_head.as_slice());
+                assert_eq!(p0[insert_at], vcfg.vision_start_token_id);
+                assert!(
+                    p0[insert_at + 1..insert_at + 1 + n_merged]
+                        .iter()
+                        .all(|&id| id == vcfg.image_token_id)
+                );
+                assert_eq!(p0[insert_at + 1 + n_merged], vcfg.vision_end_token_id);
+                assert_eq!(p0[insert_at + 2 + n_merged], nl_id);
+            }
+            other => panic!("expected CandidateLogits, got {other:?}"),
+        }
+
+        // Malformed ChatML prompt without `<|im_end|>\n<|im_start|>user\n` fails explicitly
+        // instead of silently splicing media tokens before `<|im_start|>system`.
+        let media = Some((
+            ClefMediaTokens {
+                vision_start_id: vcfg.vision_start_token_id,
+                image_pad_id: vcfg.image_token_id,
+                vision_end_id: vcfg.vision_end_token_id,
+            },
+            &[n_merged][..],
+        ));
+        let malformed_err = tokenize_candidate_prompts_with_media(
+            &tok,
+            std::slice::from_ref(&choice_field),
+            &["<|im_start|>system\nno-user-turn".to_owned()],
+            "\n\n",
+            b"AB",
+            4096,
+            "tev1",
+            media,
+        )
+        .unwrap_err();
+        assert!(
+            malformed_err.message.contains("missing user turn boundary"),
+            "{malformed_err:?}"
+        );
+
+        // `dump_python_json` formats exponent-range floats identically to Python `json.dumps`.
+        assert_eq!(
+            dump_python_json(&json!({"big": 1e20, "tiny": 1.5e-7})).unwrap(),
+            r#"{"big": 1e+20, "tiny": 1.5e-07}"#
+        );
     }
 }

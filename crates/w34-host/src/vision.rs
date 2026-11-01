@@ -4,6 +4,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 use crate::cuda::{
@@ -116,7 +117,8 @@ impl VisionConfig {
 #[derive(Clone, Debug)]
 pub struct PreprocessedImage {
     /// Flattened patches `[num_patches, patch_input_dim]` in `2x2` merge-grouped order.
-    pub patches_f32: Vec<f32>,
+    /// Shared via `Arc<[f32]>` so multi-query fan-out clones are O(1) without duplicating patch memory.
+    pub patches_f32: Arc<[f32]>,
     /// `[t, h_grid, w_grid]` in patch units (`h_grid` and `w_grid` are multiples of `spatial_merge_size`).
     pub grid_thw: [usize; 3],
     /// Deterministic 64-bit content digest of the image for `MambaRadixCache` multimodal keys.
@@ -316,7 +318,7 @@ pub fn preprocess_rgb_image(
     }
 
     PreprocessedImage {
-        patches_f32: patches,
+        patches_f32: patches.into(),
         grid_thw: [grid_t, grid_h, grid_w],
         content_hash,
     }
@@ -1117,7 +1119,7 @@ impl Qwen3VisionEncoder {
 
         let mut patches_f16 = Vec::with_capacity(total_patches * patch_dim);
         for img in images {
-            for &v in &img.patches_f32 {
+            for &v in img.patches_f32.iter() {
                 patches_f16.push(f32_to_f16(v));
             }
         }

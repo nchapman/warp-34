@@ -51,7 +51,7 @@ fn invalid_vision_request_does_not_abort_text_peer() {
                 Some(GenerationEvent::Token { .. })
             ));
             let image = w34_host::vision::PreprocessedImage {
-                patches_f32: vec![0.0; 6144],
+                patches_f32: vec![0.0; 6144].into(),
                 grid_thw: [1, 2, 2],
                 content_hash: 123,
             };

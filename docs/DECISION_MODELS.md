@@ -18,6 +18,8 @@ Decision models ("System-1 classifiers / structured scorers") evaluate one or mo
   - `tev1_inference.cpp` — `Tev1` (`togethercomputer/Tev1-4B`, `Tev1-0.8B`) & general Qwen3.5 generative-scoring prompt contract (`state`-first JSON ordering + `enable_thinking=false` `<think>\n\n</think>\n\n` boundary).
   - `kev.h`, `kev_head.cpp`, `kev_registry.cpp` — `KevModel` Qwen3.5 FIM/box delimiter encoding (`<|fim_prefix|>`, `<|fim_middle|>`, `<|box_start|>`, `<|box_end|>`, `<|fim_suffix|>`), pre-`lm_head` hidden-state readout, `head.safetensors` `PointerHead` (`q`, `k` `[head_dim, hidden_size]`), and perturbation-gated golden tests.
   - `xor_inference.h` — `XorModel` Qwen3.5 MoE dual-order logit readout.
+- **`Cloudflare/clef-flash` & `Cloudflare/clef` (`joint_schema_model.py`, `joint_head_config.json`, `joint_head.safetensors`)**:
+  - Single-pass joint-schema record encoding (`STATE:` + optional `<|vision_start|><|image_pad|>...<|vision_end|>\n` media block + `SCHEMA FIELDS:` with tracked `question_span` and `option_spans` + `JOINT SCHEMA DECISIONS:`), sorted-key compact JSON `render()`, `JointSchemaHead` (`EvidenceRoutingLayer` cross-attention + `TransformerDecoderLayer` joint field self/cross-attention + lexical `lm_head.weight` prior & residual cosine scorer), and `ConfidenceKind::MaxProbability` (`max_i p_i`).
 
 ---
 
@@ -27,7 +29,8 @@ Decision models ("System-1 classifiers / structured scorers") evaluate one or mo
 
 | Profile | Detection Rule | Backbone | Readout Mechanism | Max Options & Special Rules |
 |---|---|---|---|---|
-| **`Kev`** | `architectures` contains `"KevModel"`, `decision.type == "kev"`, or `head.safetensors` (`q.weight`, `q.bias`, `k.weight`, `k.bias`) present alongside Qwen3.5 weights | Qwen 3.5 dense | **Post-final-`GemmaRMSNorm` hidden states** at `<\|box_end\|>` (`opt_idx[k]`) and `<\|fim_suffix\|>` (`decide_idx`) + `f64`-accumulated `PointerHeadForward` (`lm_head` GEMM skipped) | **2–64 options**; `kev_head_dim` (default `256`), `kev_temperature` (default `1.0`); `<\|...\|>` -> `<¦...¦>` sanitization. |
+| **`Clef`** | `architectures` contains `"ClefModel"`, `decision.type == "clef"`, or `joint_head.safetensors` + `joint_head_config.json` present alongside Qwen3.5 weights | Qwen 3.5 VL / dense (`Cloudflare/clef-flash` 9B, `Cloudflare/clef` 27B) | **Full-sequence post-final-`GemmaRMSNorm` hidden states** from **one joint prefill pass** across all questions + `ClefJointHead` (`EvidenceRoutingLayer` + `TransformerDecoderLayer` + on-demand `pread` option-token lexical embeddings from `lm_head.weight`) | **2–64 options**, **1–64 joint questions** in one pass; `noul` `true`-first; `choice` keys sorted in prompt & permuted back to caller order; `ConfidenceKind::MaxProbability`; native multimodal `images` (`processor_config.json` `shortest_edge` respected). |
+| **`Kev`** | `architectures` contains `"KevModel"`, `decision.type == "kev"`, or `head.safetensors` (`q.weight`, `q.bias`, `k.weight`, `k.bias`) present alongside Qwen3.5 weights | Qwen 3.5 dense / VL | **Post-final-`GemmaRMSNorm` hidden states** at `<\|box_end\|>` (`opt_idx[k]`) and `<\|fim_suffix\|>` (`decide_idx`) + `f64`-accumulated `PointerHeadForward` (`lm_head` GEMM skipped) | **2–64 options**; `kev_head_dim` (default `256`), `kev_temperature` (default `1.0`); `<\|...\|>` -> `<¦...¦>` sanitization. |
 | **`Nimble`** | `architectures` contains `"NimbleModel"`, `decision.type == "nimble"`, or `config.json` defines `nimble_temperature` | Qwen 3.5 dense (`Bespoke-Nimble-9B`) | **Last-row `lm_head` candidate-token logits** at single-token codes `A..Z` | **2–26 options** (`parallel_schema.py` one-letter contract); `SafeJson` escaping; `nimble_temperature` calibration. |
 | **`OpenJev`** | `architectures` contains `"OpenJevModel"` or `decision.type == "openjev"` | Qwen 3.5 dense | **Last-row `lm_head` candidate-token logits** at single-token letters `A..Z`, `a..z` | **2–52 options**; `noul_true_first = true`; RFC 8259 special-token delimiter escaping. |
 | **`Lev` / `Xor`** | `architectures` contains `"XorModel"` / `"LevModel"` or `decision.type` in `{"lev", "xor"}` | Qwen 3.5 dense (`lev`) or Qwen 3.5 MoE (`xor`) | **Last-row `lm_head` candidate-token logits** at single-token codes `A..Z` | **2–26 options**; **2 variants (forward + reverse option order)** averaged to cancel position bias; **9-level rating scale (`0..8`)** for `noul` on `Lev`; `<\|...\|>` sanitization. |
@@ -82,8 +85,9 @@ Bidirectional encoder-only decision models (`laya` on ModernBERT, `GLiNER2.5` on
 
 #### Validation Rules
 - `state`: required, non-null (`string`, `object`, or `array`; string or serialized representation must be non-blank).
+- `images`: optional array (`0..=4` entries) of `"data:image/{png,jpeg,x-portable-pixmap};base64,..."` strings, objects (`{"url": ...}`, `{"image_url": ...}`, or `{"media_type": ..., "data": ...}`), or public `http(s)://` URLs when `--allow-remote-images` is enabled (SSRF-guarded). Requires a vision-capable loaded checkpoint (`has_vision_weights == true`); non-empty `videos` fail fast with HTTP 400.
 - `questions`: required non-empty JSON object (`1..=64` entries; key order preserved deterministically):
-  - `type == "noul"`: `instructions` required (non-blank); `criteria` optional object with optional `"true"` and `"false"` string descriptions (defaults: `"Yes"` / `"No"`, with `false` ordered before `true` except on `OpenJev`).
+  - `type == "noul"`: `instructions` required (non-blank); `criteria` optional object with optional `"true"` and `"false"` string descriptions (defaults: `"Yes"` / `"No"`, with `false` ordered before `true` except on `Clef` and `OpenJev`; `Clef` defaults to `"The proposition is true or the answer is yes."` / `"The proposition is false or the answer is no."`).
   - `type == "choice"`: `instructions` required; `criteria` required non-empty object (`2..=max_options` entries, keys non-blank, values `string` or `null`; `Tev1` requires non-blank descriptions per `decide.py`).
   - `type == "score"`: `instructions` required; `criteria` required array of `2..=max_options` level descriptions (`string`, non-blank for `Tev1`), indexed `"0"`, `"1"`, ..., `"K-1"`.
 
@@ -202,12 +206,15 @@ All probability and confidence computations execute in IEEE-754 `f64` (`server-d
      $$\text{confidence}_{\text{entropy}}(p) = \begin{cases} 1.0 & K < 2 \\ \text{clamp}_{[0,1]}\!\left(1.0 + \frac{\sum_{i: p_i > 0} p_i \ln p_i}{\ln K}\right) & K \ge 2 \end{cases}$$
    - **`ConfidenceKind::MarginAndModeDistance` (`Kev`, `OpenJev`, `Lev`, `Xor`)**, with uniform baseline $u = 1 / K$:
      $$\text{confidence}_{\text{choice}}(p) = \begin{cases} 1.0 & K < 2 \\ \text{clamp}_{[0,1]}\!\left(\frac{\max_i p_i - u}{1.0 - u}\right) & K \ge 2 \end{cases}$$
+   - **`ConfidenceKind::MaxProbability` (`Clef`)**:
+     $$\text{confidence}_{\max}(p) = \max_{0 \le i < K} p_i$$
 
 4. **`score` readout & per-family confidence**:
    - Expected score: $\text{score} = \sum_{i=0}^{K-1} i \cdot p_i$.
    - **`ConfidenceKind::NormalizedEntropy` (`Nimble`, `Tev1`)**: uses $\text{confidence}_{\text{entropy}}(p)$ above.
    - **`ConfidenceKind::MarginAndModeDistance` (`Kev`, `OpenJev`, `Lev`, `Xor`)** (`vllm.cpp` `decision_scorer.cpp`), with mode $m = \arg\max_i p_i$:
      $$s = \sum_{i=0}^{K-1} p_i \cdot |i - m|, \qquad \text{confidence}_{\text{score}}(p) = \begin{cases} 1.0 & K < 2 \\ \text{clamp}_{[0,1]}\!\left(1.0 - \frac{s}{K - 1}\right) & K \ge 2 \end{cases}$$
+   - **`ConfidenceKind::MaxProbability` (`Clef`)**: uses $\text{confidence}_{\max}(p) = \max_{0 \le i < K} p_i$.
 
 ---
 
@@ -233,17 +240,20 @@ Because Qwen 3.5 / 3.6 / 3.8 interleaves 3 GDN recurrent layers per 1 full-atten
 3. **Zero-Decode Readout Seams in `Qwen3_5Engine`**:
    - **`CandidateLogits`**: Runs `forward_batch_tokens(..., selected_rows = &[last_row_per_seq])` — `lm_head` executes **only** on the `B` final sequence rows (never on prompt interior rows), gathers the `K` candidate token logits per task on host, releases sequence KV/GDN slots (committing prefix snapshots to `MambaRadixCache`), and performs **zero decode steps** (`output_tokens = 0`).
    - **`KevPointer` (`forward_batch_hidden_rows`)**: Adds a clean pre-`lm_head` exit after final `GemmaRMSNorm` in `Qwen3_5Engine` that gathers `selected_rows` (`option_positions` + `decide_position`, `[K + 1, hidden_size]` `FP16`) directly from `normed_hidden` (already replicated across ranks after `all_reduce_rmsnorm` under `TP=2`!), skips the `248,320`-vocab `lm_head` GEMM completely, converts the `(K + 1) * hidden_size` elements to `f32`, and runs `PointerHeadForward` (`f64` dot-product accumulation).
+   - **`Clef` (`FullHiddenSequence` + `ClefJointHead`)**: Runs a single joint prefill pass (including `ScheduledVision` 3-plane `mRoPE` + ViT embedding splice when `images` are supplied), streams contiguous post-final-`GemmaRMSNorm` chunks via `Qwen3_5Engine::read_norm_hidden_range_f32`, fetches option-span lexical rows on demand via `SafetensorsArchive::read_row_f32` (`pread` + bounded row cache, zero host/VRAM `lm_head` duplication), and evaluates `ClefJointHead::forward` (AVX2+FMA-accelerated `EvidenceRoutingLayer` & `TransformerDecoderLayer`) on the CPU pool off the CUDA worker thread.
 
 ---
 
 ## 6. Verification & Parity Gates
 
 1. **Donor Golden Unit Tests (`cargo test --lib`)**:
+   - **`Clef` `JointSchemaHead` & `encode_record` Goldens (`clef::tests::*`)**: Verify exact PyTorch `JointSchemaHead` logit parity (`< 2e-6`), cross-question field self-attention perturbation gate, sorted-key `clef_render_value`, and exact 274-token text / 341-token multimodal token-ID & `(question_span, option_spans)` parity against `Cloudflare/clef-flash` `joint_schema_model.py`.
    - **`Kev` PointerHead & Sequence Encoding**: Port PyTorch golden vectors and all three silent-bug perturbation gates from `vllm.cpp` (`kev_head_goldens.inc` / `test_kev.cpp`: exact logit match `< 1e-5`, swapped `q/k` rejection, omitted-bias rejection, wrong `1/sqrt(head_dim)` scale rejection, `<|tag|>` -> `<¦tag¦>` sanitization, and YAML-style `decision_kev_render`).
    - **`Nimble` & `Tev1` Prompt + Scorer Goldens**: Port prompt-rendering and logit-to-answer golden checks from `vllm.cpp` (`test_nimble.cpp`, `test_tev1_systemone.cpp`: `SafeJson` `<`/`>` escaping, `state`-first JSON serialization, `noul`/`choice`/`score` validation errors, blank-description rejection on `Tev1`).
-   - **Confidence & `Lev`/`Xor` Dual-Variant Math**: Verify `entropy_confidence` (uniform -> `0.0`, one-hot -> `1.0`), `margin_choice_confidence`, `mode_distance_score_confidence` (`1 - s/(K - 1)`), `Xor`/`Lev` forward+reverse variant averaging, and `Lev` 9-level `noul` expected value against `vllm.cpp` `decision_scorer.cpp` / `test_xor.cpp`.
+   - **Confidence, Multimodal `images`, & `Lev`/`Xor` Dual-Variant Math**: Verify `entropy_confidence` (uniform -> `0.0`, one-hot -> `1.0`), `margin_choice_confidence`, `mode_distance_score_confidence` (`1 - s/(K - 1)`), `MaxProbability`, multimodal `parse_decision_images` validation, `Xor`/`Lev` forward+reverse variant averaging, and `Lev` 9-level `noul` expected value against `vllm.cpp` `decision_scorer.cpp` / `test_xor.cpp`.
 2. **GPU & Live HTTP Integration Tests (`crates/w34-host/tests/decision_models.rs`, `--features cuda`)**:
+   - **`ClefModel` Joint Multi-Question + Multimodal `images` Parity**: Verify `ClefJointHead` + `Qwen3VisionEncoder` + `FullHiddenSequence` over `/v1/decisions` and `/v1/systemone` (caller-order `choice` probability preservation and visual counterfactual sensitivity), plus live `Cloudflare/clef-flash` (9B) parity against PyTorch `joint_schema_model.py` (`systemone`: 404-token 3-question text delta `<= 0.0025`, 313-token PNG multimodal delta `<= 0.0009`).
    - **`KevModel` `head.safetensors` GPU Parity**: Load `KevPointerHead` (`q.weight`, `q.bias`, `k.weight`, `k.bias`) from `head.safetensors` alongside `Qwen3.5-4B-W4A16-GPTQ` and verify `/v1/systemone` (with `MambaRadixCache` shared-state reuse via `max_prefix_lookup_len`) matches an uncached full-prefill GPU reference to `< 1e-4`.
-   - **Live `/v1/systemone` & `/v1/decisions` across `Tev1`, `Kev`, `Lev`, and `Nimble`**:
+   - **Live `/v1/systemone` & `/v1/decisions` across `Clef`, `Tev1`, `Kev`, `Lev`, and `Nimble`**:
      - Multi-question requests (`noul` + `choice` + `score`) over a shared `state`: verify exact 146-token `tev1_goldens.inc` Qwen3.5 token-ID parity, special-token injection immunity, semantically accurate classifications, `usage.output_tokens == 0`, and `usage.cached_tokens > 0` proving `MambaRadixCache` `mamba_branching_seqlen` shared-prefix reuse across sub-queries.
-     - `/v1/decisions` ordered-array adapter (`object: "decision.list"`, duplicate-id HTTP 400 validation, `decisions[]` + `answers{}` parity).
+     - `/v1/decisions` ordered-array adapter (`object: "decision.list"`, duplicate-id HTTP 400 validation, `decisions[]` + `answers{}` parity, multimodal `images` forwarding).

@@ -3,6 +3,7 @@
 pub mod anthropic_api;
 pub mod cache;
 pub mod chatml;
+pub mod clef;
 pub mod constraints;
 #[cfg(feature = "cuda")]
 mod coordinated;

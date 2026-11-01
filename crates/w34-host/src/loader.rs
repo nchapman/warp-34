@@ -256,6 +256,10 @@ impl SafetensorsArchive {
         })
     }
 
+    pub fn iter_entries(&self) -> impl Iterator<Item = (&str, &TensorInfo)> {
+        self.entries.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Resolves either `<prefix>.<suffix>` or `model.language_model.<stripped>.<suffix>`.
     pub fn resolve_name(&self, canonical: &str) -> Option<String> {
         if self.entries.contains_key(canonical) {
@@ -331,6 +335,71 @@ impl SafetensorsArchive {
                 io::ErrorKind::InvalidData,
                 format!("unsupported dtype {other} for read_f32({name})"),
             )),
+        }
+    }
+
+    /// Reads a single row `row` (`[cols]`) of a 2-D floating-point tensor (`F32`, `F16`, `BF16`)
+    /// via `pread` without reading the entire tensor into host memory.
+    pub fn read_row_f32(&self, name: &str, row: usize) -> io::Result<Vec<f32>> {
+        let info = self.tensor_info(name)?;
+        if info.shape.len() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tensor {name} is not 2-D: {:?}", info.shape),
+            ));
+        }
+        let rows = info.shape[0];
+        let cols = info.shape[1];
+        if row >= rows {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("row {row} out of range for {name} ([{rows}, {cols}])"),
+            ));
+        }
+        let elem_bytes: usize = match info.dtype.as_str() {
+            "F32" => 4,
+            "F16" | "BF16" => 2,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported dtype {other} for read_row_f32({name})"),
+                ));
+            }
+        };
+        let row_bytes = cols.checked_mul(elem_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "row byte length overflow")
+        })?;
+        let rel_off = (row as u64)
+            .checked_mul(row_bytes as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "row offset overflow"))?;
+        if rel_off.saturating_add(row_bytes as u64) > info.len_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("row {row} of {name} exceeds tensor byte slice"),
+            ));
+        }
+        let f = self.files.get(&info.shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shard '{}' not open", info.shard_file),
+            )
+        })?;
+        let mut buf = vec![0u8; row_bytes];
+        f.read_exact_at(&mut buf, info.offset + rel_off)?;
+        match info.dtype.as_str() {
+            "F32" => Ok(buf
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()),
+            "F16" => Ok(buf
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect()),
+            "BF16" => Ok(buf
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect()),
+            _ => unreachable!(),
         }
     }
 
@@ -1129,5 +1198,80 @@ mod tests {
             "layer_scale": 1
         });
         assert!(ModelConfig::from_json(&json_num).is_err());
+    }
+
+    #[test]
+    fn test_read_row_f32_dtypes_and_bounds() {
+        use crate::cuda::{f32_to_bf16, f32_to_f16};
+        let tmp = std::env::temp_dir().join(format!("w34_loader_row_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let st_path = tmp.join("model.safetensors");
+
+        let f32_vals: [f32; 6] = [1.0, -2.5, 3.25, -4.0, 5.5, 6.75];
+        let f32_bytes: Vec<u8> = f32_vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bf16_bytes: Vec<u8> = f32_vals
+            .iter()
+            .flat_map(|&v| f32_to_bf16(v).to_le_bytes())
+            .collect();
+        let f16_bytes: Vec<u8> = f32_vals
+            .iter()
+            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+            .collect();
+        let i32_bytes: Vec<u8> = [10i32, 20, 30, 40]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        let tensors: &[(&str, &str, &[usize], &[u8])] = &[
+            ("mat_f32", "F32", &[3, 2], &f32_bytes),
+            ("mat_bf16", "BF16", &[3, 2], &bf16_bytes),
+            ("mat_f16", "F16", &[3, 2], &f16_bytes),
+            ("vec_1d", "F32", &[6], &f32_bytes),
+            ("mat_i32", "I32", &[2, 2], &i32_bytes),
+            ("mat_trunc", "F32", &[3, 2], &f32_bytes[..16]),
+        ];
+        let mut header = serde_json::Map::new();
+        let mut off = 0usize;
+        for (name, dtype, shape, bytes) in tensors {
+            header.insert(
+                (*name).to_owned(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [off, off + bytes.len()],
+                }),
+            );
+            off += bytes.len();
+        }
+        let mut hdr_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        while !hdr_bytes.len().is_multiple_of(8) {
+            hdr_bytes.push(b' ');
+        }
+        let mut file_bytes = (hdr_bytes.len() as u64).to_le_bytes().to_vec();
+        file_bytes.extend_from_slice(&hdr_bytes);
+        for (_, _, _, bytes) in tensors {
+            file_bytes.extend_from_slice(bytes);
+        }
+        std::fs::write(&st_path, file_bytes).unwrap();
+
+        let archive = SafetensorsArchive::open(&st_path).unwrap();
+        assert_eq!(archive.read_row_f32("mat_f32", 0).unwrap(), vec![1.0, -2.5]);
+        assert_eq!(
+            archive.read_row_f32("mat_f32", 1).unwrap(),
+            vec![3.25, -4.0]
+        );
+        assert_eq!(archive.read_row_f32("mat_f32", 2).unwrap(), vec![5.5, 6.75]);
+        assert_eq!(
+            archive.read_row_f32("mat_bf16", 1).unwrap(),
+            vec![3.25, -4.0]
+        );
+        assert_eq!(archive.read_row_f32("mat_f16", 2).unwrap(), vec![5.5, 6.75]);
+
+        assert!(archive.read_row_f32("mat_f32", 3).is_err());
+        assert!(archive.read_row_f32("vec_1d", 0).is_err());
+        assert!(archive.read_row_f32("mat_i32", 0).is_err());
+        assert!(archive.read_row_f32("mat_trunc", 2).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

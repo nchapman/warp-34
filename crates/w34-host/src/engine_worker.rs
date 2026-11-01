@@ -67,12 +67,19 @@ enum DecisionReadoutTap {
         captured: Vec<Option<Vec<f32>>>,
         tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
     },
+    FullHiddenSequence {
+        total_tokens: usize,
+        captured: Vec<Vec<f32>>,
+        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
+    },
 }
 
 impl DecisionReadoutTap {
     fn fail(self, error: String) {
         match self {
-            Self::CandidateLogits { tx, .. } | Self::HiddenPositions { tx, .. } => {
+            Self::CandidateLogits { tx, .. }
+            | Self::HiddenPositions { tx, .. }
+            | Self::FullHiddenSequence { tx, .. } => {
                 let _ = tx.send(Err(error));
             }
         }
@@ -115,6 +122,8 @@ pub struct EngineWorker {
     pub vocab_size: usize,
     pub default_preserve_thinking: bool,
     pub decision_profile: crate::decision::DecisionModelProfile,
+    pub vision_config: Option<crate::vision::VisionConfig>,
+    pub has_vision_weights: bool,
     pub kv_token_capacity: usize,
 }
 impl EngineWorker {
@@ -157,6 +166,8 @@ impl EngineWorker {
                         engine.cfg.vocab_size,
                         default_preserve_thinking,
                         engine.decision_profile.clone(),
+                        engine.cfg.vision_config.clone(),
+                        engine.has_vision_weights,
                         kv_token_capacity,
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
@@ -174,6 +185,8 @@ impl EngineWorker {
             vocab_size,
             default_preserve_thinking,
             decision_profile,
+            vision_config,
+            has_vision_weights,
             kv_token_capacity,
         ) = match ready_rx.recv() {
             Ok(Ok(info)) => info,
@@ -196,6 +209,8 @@ impl EngineWorker {
             vocab_size,
             default_preserve_thinking,
             decision_profile,
+            vision_config,
+            has_vision_weights,
             kv_token_capacity,
         })
     }
@@ -280,9 +295,31 @@ impl EngineWorker {
         ),
         String,
     > {
+        self.submit_decision_candidate_logits_with_images(
+            prompt,
+            Vec::new(),
+            token_ids,
+            mamba_branching_seqlen,
+        )
+    }
+
+    pub fn submit_decision_candidate_logits_with_images(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        token_ids: Vec<i32>,
+        mamba_branching_seqlen: Option<usize>,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+        ),
+        String,
+    > {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let stream = self.submit_decision_internal(
             prompt,
+            images,
             None,
             mamba_branching_seqlen,
             DecisionReadoutTap::CandidateLogits { token_ids, tx },
@@ -303,10 +340,34 @@ impl EngineWorker {
         ),
         String,
     > {
+        self.submit_decision_hidden_positions_with_images(
+            prompt,
+            Vec::new(),
+            positions,
+            max_prefix_lookup_len,
+            mamba_branching_seqlen,
+        )
+    }
+
+    pub fn submit_decision_hidden_positions_with_images(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        positions: Vec<usize>,
+        max_prefix_lookup_len: Option<usize>,
+        mamba_branching_seqlen: Option<usize>,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+        ),
+        String,
+    > {
         let captured = vec![None; positions.len()];
         let (tx, rx) = tokio::sync::oneshot::channel();
         let stream = self.submit_decision_internal(
             prompt,
+            images,
             max_prefix_lookup_len,
             mamba_branching_seqlen,
             DecisionReadoutTap::HiddenPositions {
@@ -318,9 +379,41 @@ impl EngineWorker {
         Ok((stream, rx))
     }
 
+    pub fn submit_decision_full_hidden_with_images(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        mamba_branching_seqlen: Option<usize>,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+        ),
+        String,
+    > {
+        let total_tokens = prompt.len();
+        let captured = Vec::with_capacity(total_tokens);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // FullHiddenSequence requires evaluating every token [0..total_tokens], so disable
+        // radix prefix skipping (`max_prefix_lookup_len: Some(0)`).
+        let stream = self.submit_decision_internal(
+            prompt,
+            images,
+            Some(0),
+            mamba_branching_seqlen,
+            DecisionReadoutTap::FullHiddenSequence {
+                total_tokens,
+                captured,
+                tx,
+            },
+        )?;
+        Ok((stream, rx))
+    }
+
     fn submit_decision_internal(
         &self,
         prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
         max_prefix_lookup_len: Option<usize>,
         mamba_branching_seqlen: Option<usize>,
         tap: DecisionReadoutTap,
@@ -345,7 +438,7 @@ impl EngineWorker {
             .ok_or("engine worker stopped")?
             .try_send(Request {
                 prompt,
-                images: Vec::new(),
+                images,
                 vision: None,
                 reserved_pages: 0,
                 cached_tokens: cached_tokens.clone(),
@@ -426,6 +519,9 @@ fn enqueue(
         ) {
             Ok(vision) => request.vision = Some(vision),
             Err(error) => {
+                if let Some(tap) = request.decision_tap.take() {
+                    tap.fail(error.clone());
+                }
                 let _ = request.output.try_send(GenerationEvent::Error(error));
                 return;
             }
@@ -1210,6 +1306,110 @@ fn fail_request(
     release(engine, sched.cancel_request(id));
 }
 
+fn capture_decision_tap(
+    engine: &Qwen3_5Engine,
+    s: &crate::scheduler::ScheduledReqSlice,
+    tok_off: usize,
+    selected_row: Option<usize>,
+    cached_toks: usize,
+    req: &mut Request,
+) {
+    let slice_len = s.query_tokens.len();
+    let mut tap_done = None;
+    match &mut req.decision_tap {
+        None => {}
+        Some(DecisionReadoutTap::CandidateLogits { token_ids, .. }) => {
+            if let Some(sel_row) = selected_row {
+                let res = engine
+                    .read_selected_row_candidate_logits(sel_row, token_ids)
+                    .map(|logits| DecisionTapOutput::CandidateLogits {
+                        logits,
+                        cached_tokens: cached_toks,
+                    })
+                    .map_err(|e| e.to_string());
+                if let Some(DecisionReadoutTap::CandidateLogits { tx, .. }) =
+                    req.decision_tap.take()
+                {
+                    tap_done = Some((tx, res));
+                }
+            }
+        }
+        Some(DecisionReadoutTap::HiddenPositions {
+            positions,
+            captured,
+            ..
+        }) => {
+            let chunk_start = s.ctx_len_before;
+            let chunk_end = chunk_start + slice_len;
+            let mut read_err = None;
+            for (p_idx, &pos) in positions.iter().enumerate() {
+                if (chunk_start..chunk_end).contains(&pos) {
+                    match engine.read_norm_hidden_row_f32(tok_off + (pos - chunk_start)) {
+                        Ok(row) => captured[p_idx] = Some(row),
+                        Err(e) => {
+                            read_err = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            if (read_err.is_some() || s.is_final_prefill_chunk)
+                && let Some(DecisionReadoutTap::HiddenPositions {
+                    mut captured, tx, ..
+                }) = req.decision_tap.take()
+            {
+                let res = if let Some(err) = read_err {
+                    Err(err)
+                } else if captured.iter().all(Option::is_some) {
+                    Ok(DecisionTapOutput::HiddenRows {
+                        rows: captured.drain(..).map(Option::unwrap).collect(),
+                        cached_tokens: cached_toks,
+                    })
+                } else {
+                    Err("kev: missing hidden position after final prefill chunk".into())
+                };
+                tap_done = Some((tx, res));
+            }
+        }
+        Some(DecisionReadoutTap::FullHiddenSequence {
+            total_tokens,
+            captured,
+            ..
+        }) => {
+            let read_err = match check_full_hidden_chunk_offset(captured.len(), s.ctx_len_before) {
+                Err(msg) => Some(msg),
+                Ok(()) => match engine.read_norm_hidden_range_f32(tok_off, slice_len) {
+                    Ok(rows) => {
+                        captured.extend(rows);
+                        None
+                    }
+                    Err(e) => Some(e.to_string()),
+                },
+            };
+            let expected_total = *total_tokens;
+            if (read_err.is_some() || s.is_final_prefill_chunk)
+                && let Some(DecisionReadoutTap::FullHiddenSequence { captured, tx, .. }) =
+                    req.decision_tap.take()
+            {
+                let res = if let Some(err) = read_err {
+                    Err(err)
+                } else {
+                    check_full_hidden_final_count(captured.len(), expected_total).map(|()| {
+                        DecisionTapOutput::HiddenRows {
+                            rows: captured,
+                            cached_tokens: cached_toks,
+                        }
+                    })
+                };
+                tap_done = Some((tx, res));
+            }
+        }
+    }
+    if let Some((tx, res)) = tap_done {
+        let _ = tx.send(res);
+    }
+}
+
 fn step_plain(
     engine: &mut Qwen3_5Engine,
     sched: &mut SchedulerV1,
@@ -1230,6 +1430,7 @@ fn step_plain(
         .collect();
     for id in vision_ids {
         let seq = sched.active.iter().find(|seq| seq.req_id == id).unwrap();
+        let cached_toks = seq.cached_prefix_tokens;
         let request = requests.get_mut(&id).unwrap();
         let (greedy, slice) = request
             .vision
@@ -1237,30 +1438,44 @@ fn step_plain(
             .unwrap()
             .step_prefill(engine, seq, sched.cfg.chunk_prefill_size)
             .map_err(|e| e.to_string())?;
+        //ScheduledVision::step_prefill executes forward_selected_rows on a 1-request slice
+        // with selected_rows = [q_len - 1] (selected_row index 0 on every chunk).
+        capture_decision_tap(
+            engine,
+            &slice,
+            0,
+            slice.is_final_prefill_chunk.then_some(0),
+            cached_toks,
+            request,
+        );
         let token = if slice.is_final_prefill_chunk {
-            let sample = if request
-                .sampler
-                .params
-                .is_plain_greedy(request.sampler.constraint.is_some())
-            {
-                request
+            if request.sampler.params.max_tokens > 0 {
+                let sample = if request
                     .sampler
-                    .try_commit_token(greedy)
-                    .map(|()| (greedy, None))
+                    .params
+                    .is_plain_greedy(request.sampler.constraint.is_some())
+                {
+                    request
+                        .sampler
+                        .try_commit_token(greedy)
+                        .map(|()| (greedy, None))
+                } else {
+                    engine
+                        .sample_single_gpu_step(&mut request.sampler)
+                        .map_err(|e| e.to_string())
+                };
+                let (token, lp) = match sample {
+                    Ok(value) => value,
+                    Err(error) => {
+                        fail_request(engine, sched, requests, id, error);
+                        continue;
+                    }
+                };
+                emit(request, token, lp);
+                Some(token)
             } else {
-                engine
-                    .sample_single_gpu_step(&mut request.sampler)
-                    .map_err(|e| e.to_string())
-            };
-            let (token, lp) = match sample {
-                Ok(value) => value,
-                Err(error) => {
-                    fail_request(engine, sched, requests, id, error);
-                    continue;
-                }
-            };
-            emit(request, token, lp);
-            Some(token)
+                Some(greedy)
+            }
         } else {
             None
         };
@@ -1376,66 +1591,14 @@ fn step_plain(
             let Some(req) = requests.get_mut(&s.req_id) else {
                 continue;
             };
-            let mut tap_done = None;
-            match &mut req.decision_tap {
-                None => {}
-                Some(DecisionReadoutTap::CandidateLogits { token_ids, .. }) => {
-                    if is_selected {
-                        let res = engine
-                            .read_selected_row_candidate_logits(sel_row, token_ids)
-                            .map(|logits| DecisionTapOutput::CandidateLogits {
-                                logits,
-                                cached_tokens: cached_toks,
-                            })
-                            .map_err(|e| e.to_string());
-                        if let Some(DecisionReadoutTap::CandidateLogits { tx, .. }) =
-                            req.decision_tap.take()
-                        {
-                            tap_done = Some((tx, res));
-                        }
-                    }
-                }
-                Some(DecisionReadoutTap::HiddenPositions {
-                    positions,
-                    captured,
-                    ..
-                }) => {
-                    let chunk_start = s.ctx_len_before;
-                    let chunk_end = chunk_start + slice_len;
-                    let mut read_err = None;
-                    for (p_idx, &pos) in positions.iter().enumerate() {
-                        if (chunk_start..chunk_end).contains(&pos) {
-                            match engine.read_norm_hidden_row_f32(tok_off + (pos - chunk_start)) {
-                                Ok(row) => captured[p_idx] = Some(row),
-                                Err(e) => {
-                                    read_err = Some(e.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (read_err.is_some() || s.is_final_prefill_chunk)
-                        && let Some(DecisionReadoutTap::HiddenPositions {
-                            mut captured, tx, ..
-                        }) = req.decision_tap.take()
-                    {
-                        let res = if let Some(err) = read_err {
-                            Err(err)
-                        } else if captured.iter().all(Option::is_some) {
-                            Ok(DecisionTapOutput::HiddenRows {
-                                rows: captured.drain(..).map(Option::unwrap).collect(),
-                                cached_tokens: cached_toks,
-                            })
-                        } else {
-                            Err("kev: missing hidden position after final prefill chunk".into())
-                        };
-                        tap_done = Some((tx, res));
-                    }
-                }
-            }
-            if let Some((tx, res)) = tap_done {
-                let _ = tx.send(res);
-            }
+            capture_decision_tap(
+                engine,
+                s,
+                tok_off,
+                is_selected.then_some(sel_row),
+                cached_toks,
+                req,
+            );
         }
     }
     let mut pending_errors: Vec<Option<String>> = vec![None; slices.len()];
@@ -1890,5 +2053,52 @@ fn commit_pipelined_step(
         }
         emit(r, id, lp);
         release(engine, sched.commit_slice(s, Some(id), || None));
+    }
+}
+
+fn check_full_hidden_chunk_offset(
+    captured_len: usize,
+    ctx_len_before: usize,
+) -> std::result::Result<(), String> {
+    if ctx_len_before != captured_len {
+        return Err(format!(
+            "clef: non-contiguous prefill chunk (expected offset {captured_len}, got {ctx_len_before})"
+        ));
+    }
+    Ok(())
+}
+
+fn check_full_hidden_final_count(
+    captured_len: usize,
+    expected_total: usize,
+) -> std::result::Result<(), String> {
+    if captured_len != expected_total {
+        return Err(format!(
+            "clef: captured {captured_len} hidden rows after final prefill chunk, expected {expected_total}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod full_hidden_tap_tests {
+    use super::*;
+
+    #[test]
+    fn full_hidden_tap_accounting_detects_gaps_and_short_counts() {
+        assert!(check_full_hidden_chunk_offset(0, 0).is_ok());
+        assert!(check_full_hidden_chunk_offset(256, 256).is_ok());
+        let gap_err = check_full_hidden_chunk_offset(128, 192).unwrap_err();
+        assert!(
+            gap_err.contains("expected offset 128, got 192"),
+            "{gap_err}"
+        );
+
+        assert!(check_full_hidden_final_count(404, 404).is_ok());
+        let short_err = check_full_hidden_final_count(380, 404).unwrap_err();
+        assert!(
+            short_err.contains("captured 380 hidden rows after final prefill chunk, expected 404"),
+            "{short_err}"
+        );
     }
 }

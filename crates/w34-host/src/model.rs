@@ -2034,6 +2034,24 @@ impl Qwen3_5ModelRank {
             } else {
                 19_200 * 1024 * 1024 // 35B-A3B MoE TP=1 (~18.3 GiB actual target weights)
             }
+        } else if matches!(cfg.quant, QuantScheme::Unquantized) && cfg.num_hidden_layers < 64 {
+            let mut sharded_fp16_bytes = 0usize;
+            let mut replicated_fp16_bytes = 0usize;
+            for (name, info) in archive.iter_entries() {
+                if name.contains("visual") || name.contains("mtp") {
+                    continue;
+                }
+                let aligned = (info.num_elems().saturating_mul(2)).saturating_add(255) & !255;
+                if name.contains("embed_tokens") {
+                    replicated_fp16_bytes = replicated_fp16_bytes.saturating_add(aligned);
+                } else {
+                    sharded_fp16_bytes = sharded_fp16_bytes.saturating_add(aligned);
+                }
+            }
+            replicated_fp16_bytes
+                .saturating_add(sharded_fp16_bytes.div_ceil(tp_size))
+                .saturating_add(512 * 1024 * 1024)
+                .max(256 * 1024 * 1024)
         } else {
             match (cfg.num_hidden_layers, tp_size) {
                 (64, 2) => 12 * 1024 * 1024 * 1024, // 27B TP=2 (~9.5 GiB/rank)
@@ -2446,7 +2464,17 @@ impl Qwen3_5ModelRank {
             // Account for live arena capacity (not just used weight bytes) and
             // all auxiliary allocations before spending the remaining VRAM.
             let available = device.mem_info()?.0;
-            let reserved = required_headroom.saturating_add(req_kv_bytes);
+            let vision_reserve = if rank == 0
+                && matches!(cfg.quant, QuantScheme::Unquantized)
+                && cfg.vision_config.is_some()
+            {
+                1536 * 1024 * 1024
+            } else {
+                0
+            };
+            let reserved = required_headroom
+                .saturating_add(vision_reserve)
+                .saturating_add(req_kv_bytes);
             if available < reserved.saturating_add(bytes_per_state_slot.saturating_mul(3)) {
                 return Err(loader_err(
                     "insufficient VRAM for serving state pool and headroom",
@@ -4536,6 +4564,7 @@ pub struct Qwen3_5Engine {
     pub radix: MambaRadixCache,
     pub speculative: Option<crate::proposer::NativeProposer>,
     pub vision_encoder: Option<crate::vision::Qwen3VisionEncoder>,
+    pub has_vision_weights: bool,
     pub decision_profile: crate::decision::DecisionModelProfile,
 }
 
@@ -4653,6 +4682,13 @@ impl Qwen3_5Engine {
         let decision_profile =
             crate::decision::DecisionModelProfile::from_dir_and_config(dir, &cfg, Some(&archive))
                 .map_err(|_| loader_err("DecisionModelProfile::from_dir_and_config"))?;
+        let has_vision_weights = cfg.vision_config.is_some()
+            && (archive
+                .resolve_name("model.visual.patch_embed.proj.weight")
+                .is_some()
+                || archive
+                    .resolve_name("visual.patch_embed.proj.weight")
+                    .is_some());
 
         let tp2_comm = if tp_size == 2 {
             // Max collective payload: 4096 tokens * 5120 hidden_size * 2 bytes = 40 MiB
@@ -4689,6 +4725,7 @@ impl Qwen3_5Engine {
             radix: MambaRadixCache::new(16, 64),
             speculative: None,
             vision_encoder: None,
+            has_vision_weights,
             decision_profile,
         })
     }
@@ -4770,6 +4807,48 @@ impl Qwen3_5Engine {
         )?;
         r0.stream.synchronize()?;
         Ok(raw.into_iter().map(crate::cuda::f16_to_f32).collect())
+    }
+
+    /// Reads `count` contiguous post-final-`GemmaRMSNorm` hidden rows `[count, hidden_size]`
+    /// starting at `start_row` in a single D2H transfer from rank 0.
+    pub fn read_norm_hidden_range_f32(
+        &self,
+        start_row: usize,
+        count: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let r0 = &self.ranks[0];
+        let end_row = start_row
+            .checked_add(count)
+            .ok_or_else(|| loader_err("norm hidden row range overflow"))?;
+        if end_row > r0.last_norm_hidden_rows || r0.last_norm_hidden_ptr == 0 {
+            return Err(loader_err("norm hidden row range out of bounds"));
+        }
+        let h_dim = self.cfg.hidden_size;
+        let total_elems = count
+            .checked_mul(h_dim)
+            .ok_or_else(|| loader_err("norm hidden elem overflow"))?;
+        let mut raw = vec![0u16; total_elems];
+        r0.device.make_current()?;
+        let src = r0.last_norm_hidden_ptr + (start_row * h_dim * 2) as u64;
+        check_rc(
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    raw.as_mut_ptr().cast(),
+                    src as *const c_void,
+                    total_elems * 2,
+                    r0.stream.handle,
+                )
+            },
+            "read norm hidden range f16",
+        )?;
+        r0.stream.synchronize()?;
+        Ok(raw
+            .chunks_exact(h_dim)
+            .map(|row| row.iter().copied().map(crate::cuda::f16_to_f32).collect())
+            .collect())
     }
 
     /// Enable one native proposer before target graph capture. The proposer

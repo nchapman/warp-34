@@ -590,5 +590,219 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
         );
     }));
 
+    // 6. Live GPU HTTP test D: ClefModel JointSchemaHead (joint multi-question scoring + multimodal `images`).
+    {
+        use w34_host::clef::{
+            CLEF_DEFAULT_MAX_LENGTH, CLEF_DEFAULT_MAX_PIXELS, CLEF_DEFAULT_MIN_PIXELS,
+            ClefHeadConfig, ClefJointHead, ClefOutputEmbeddings,
+        };
+        let head_cfg = ClefHeadConfig {
+            hidden_size: cfg.hidden_size,
+            width: 64,
+            routing_layers: 1,
+            layers: 1,
+            heads: 4,
+            feedforward: 128,
+        };
+        let tmp_clef =
+            std::env::temp_dir().join(format!("w34_clef_gpu_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_clef);
+        std::fs::create_dir_all(&tmp_clef).unwrap();
+
+        let h = head_cfg.hidden_size;
+        let w = head_cfg.width;
+        let ff = head_cfg.feedforward;
+        let specs: Vec<(&str, Vec<usize>, f32)> = vec![
+            ("hidden_norm.weight", vec![h], 1.0),
+            ("hidden_norm.bias", vec![h], 0.02),
+            ("memory_projection.weight", vec![w, h], 0.08),
+            ("question_projection.weight", vec![w, h], 0.08),
+            ("option_question_projection.weight", vec![w, h], 0.08),
+            ("global_projection.weight", vec![w, h], 0.08),
+            ("option_context_projection.weight", vec![w, h], 0.08),
+            ("option_lexical_projection.weight", vec![w, h], 0.08),
+            ("type_embedding.weight", vec![3, w], 0.1),
+            ("evidence_layers.0.query_norm.weight", vec![w], 1.0),
+            ("evidence_layers.0.query_norm.bias", vec![w], 0.02),
+            ("evidence_layers.0.memory_norm.weight", vec![w], 1.0),
+            ("evidence_layers.0.memory_norm.bias", vec![w], 0.02),
+            (
+                "evidence_layers.0.attention.in_proj_weight",
+                vec![3 * w, w],
+                0.08,
+            ),
+            (
+                "evidence_layers.0.attention.in_proj_bias",
+                vec![3 * w],
+                0.02,
+            ),
+            (
+                "evidence_layers.0.attention.out_proj.weight",
+                vec![w, w],
+                0.08,
+            ),
+            ("evidence_layers.0.attention.out_proj.bias", vec![w], 0.02),
+            ("evidence_layers.0.feedforward_norm.weight", vec![w], 1.0),
+            ("evidence_layers.0.feedforward_norm.bias", vec![w], 0.02),
+            ("evidence_layers.0.feedforward.0.weight", vec![ff, w], 0.08),
+            ("evidence_layers.0.feedforward.0.bias", vec![ff], 0.02),
+            ("evidence_layers.0.feedforward.3.weight", vec![w, ff], 0.08),
+            ("evidence_layers.0.feedforward.3.bias", vec![w], 0.02),
+            ("option_summary_norm.weight", vec![w], 1.0),
+            ("option_summary_norm.bias", vec![w], 0.02),
+            ("layers.0.norm1.weight", vec![w], 1.0),
+            ("layers.0.norm1.bias", vec![w], 0.02),
+            ("layers.0.self_attn.in_proj_weight", vec![3 * w, w], 0.08),
+            ("layers.0.self_attn.in_proj_bias", vec![3 * w], 0.02),
+            ("layers.0.self_attn.out_proj.weight", vec![w, w], 0.08),
+            ("layers.0.self_attn.out_proj.bias", vec![w], 0.02),
+            ("layers.0.norm2.weight", vec![w], 1.0),
+            ("layers.0.norm2.bias", vec![w], 0.02),
+            (
+                "layers.0.multihead_attn.in_proj_weight",
+                vec![3 * w, w],
+                0.08,
+            ),
+            ("layers.0.multihead_attn.in_proj_bias", vec![3 * w], 0.02),
+            ("layers.0.multihead_attn.out_proj.weight", vec![w, w], 0.08),
+            ("layers.0.multihead_attn.out_proj.bias", vec![w], 0.02),
+            ("layers.0.norm3.weight", vec![w], 1.0),
+            ("layers.0.norm3.bias", vec![w], 0.02),
+            ("layers.0.linear1.weight", vec![ff, w], 0.08),
+            ("layers.0.linear1.bias", vec![ff], 0.02),
+            ("layers.0.linear2.weight", vec![w, ff], 0.08),
+            ("layers.0.linear2.bias", vec![w], 0.02),
+            ("field_norm.weight", vec![w], 1.0),
+            ("field_norm.bias", vec![w], 0.02),
+            ("option_norm.weight", vec![w], 1.0),
+            ("option_norm.bias", vec![w], 0.02),
+            ("residual_scorer.0.weight", vec![w, 4 * w], 0.08),
+            ("residual_scorer.0.bias", vec![w], 0.02),
+            ("residual_scorer.3.weight", vec![1, w], 0.08),
+            ("residual_scorer.3.bias", vec![1], 0.02),
+            ("prior_logit_scale", vec![], 0.5),
+            ("joint_logit_scale", vec![], 0.5),
+            ("residual_gate", vec![], 0.5),
+        ];
+        let mut header_map = serde_json::Map::new();
+        let mut data_blob = Vec::new();
+        for (t_idx, (name, shape, scale)) in specs.iter().enumerate() {
+            let elems: usize = shape.iter().product::<usize>().max(1);
+            let start = data_blob.len();
+            for e in 0..elems {
+                let mut z =
+                    ((t_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_add(e as u64);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = ((z >> 11) as f64) * (1.0 / ((1u64 << 53) as f64));
+                let val = ((u * 2.0 - 1.0) as f32) * *scale;
+                data_blob.extend_from_slice(&val.to_le_bytes());
+            }
+            let end = data_blob.len();
+            header_map.insert(
+                (*name).to_string(),
+                json!({
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            );
+        }
+        let mut hdr_bytes = serde_json::to_vec(&Value::Object(header_map)).unwrap();
+        while !hdr_bytes.len().is_multiple_of(8) {
+            hdr_bytes.push(b' ');
+        }
+        let mut st_file = Vec::with_capacity(8 + hdr_bytes.len() + data_blob.len());
+        st_file.extend_from_slice(&(hdr_bytes.len() as u64).to_le_bytes());
+        st_file.extend_from_slice(&hdr_bytes);
+        st_file.extend_from_slice(&data_blob);
+        let clef_head_path = tmp_clef.join("joint_head.safetensors");
+        std::fs::write(&clef_head_path, st_file).unwrap();
+
+        let clef_head_arc = SafetensorsArchive::open(&clef_head_path).unwrap();
+        let resolved_4b_dir =
+            w34_host::loader::resolve_hf_model_dir("nchapman/Qwen3.5-4B-W4A16-GPTQ").unwrap();
+        let backbone_arc = Arc::new(SafetensorsArchive::open(&resolved_4b_dir).unwrap());
+        let out_emb = ClefOutputEmbeddings::from_archive_and_config(backbone_arc, &cfg).unwrap();
+        let clef_head =
+            Arc::new(ClefJointHead::from_archive(&clef_head_arc, head_cfg, out_emb).unwrap());
+        let clef_profile = DecisionModelProfile::Clef {
+            head: clef_head,
+            max_length: CLEF_DEFAULT_MAX_LENGTH,
+            image_min_pixels: CLEF_DEFAULT_MIN_PIXELS,
+            image_max_pixels: CLEF_DEFAULT_MAX_PIXELS,
+        };
+
+        let state_clef =
+            OpenAiServerState::from_loader("qwen3.5-4b-clef".into(), false, move || {
+                let mut engine = Qwen3_5Engine::load(
+                    "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                    1,
+                    KvFormatPolicy::Fp16,
+                    Some(256),
+                    false,
+                )
+                .map_err(|e| e.to_string())?;
+                engine.decision_profile = clef_profile;
+                Ok(engine)
+            })
+            .unwrap();
+
+        rt.block_on(run_with_state(state_clef, |base_url, _state| async move {
+            let client = reqwest::Client::new();
+            // Multimodal /v1/decisions with two distinct images verifies ViT + mRoPE + FullHiddenSequence + ClefJointHead
+            let make_mm_req = |img_seed: &str| {
+                json!({
+                    "context": {"ticket": 99, "summary": "Inspect attached tile"},
+                    "images": [img_seed],
+                    "decisions": [
+                        {"id": "urgent", "type": "noul", "question": "Is it urgent?"},
+                        {
+                            "id": "queue",
+                            "type": "choice",
+                            "question": "Which queue?",
+                            "criteria": {"zeta": "Zeta queue", "alpha": null}
+                        }
+                    ]
+                })
+            };
+            let r1 = client
+                .post(format!("{base_url}/v1/decisions"))
+                .json(&make_mm_req("rgb://clef-tile-alpha"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r1.status().as_u16(), 200);
+            let b1: Value = r1.json().await.unwrap();
+            assert_eq!(b1["object"], "decision.list");
+            assert_eq!(b1["usage"]["output_tokens"], 0);
+            // Caller key order preserved ("zeta", "alpha") even though Clef prompt sorts ("alpha", "zeta")
+            let prob_keys: Vec<&String> = b1["answers"]["queue"]["probabilities"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect();
+            assert_eq!(prob_keys, vec!["zeta", "alpha"]);
+
+            let r2 = client
+                .post(format!("{base_url}/v1/decisions"))
+                .json(&make_mm_req("rgb://clef-tile-beta"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r2.status().as_u16(), 200);
+            let b2: Value = r2.json().await.unwrap();
+            let p1 = b1["answers"]["urgent"]["noul"].as_f64().unwrap();
+            let p2 = b2["answers"]["urgent"]["noul"].as_f64().unwrap();
+            assert!(
+                (p1 - p2).abs() > 1e-6,
+                "visual input change must perturb joint Clef hidden sequence: {p1} vs {p2}"
+            );
+        }));
+
+        let _ = std::fs::remove_dir_all(&tmp_clef);
+    }
+
     let _ = std::fs::remove_dir_all(&tmp_kev);
 }

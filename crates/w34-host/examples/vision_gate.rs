@@ -96,7 +96,7 @@ fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
         std::fs::write(
             path,
             serde_json::to_vec(
-                &serde_json::json!({"visual_embeddings":visual,"patches_f32":images[0].patches_f32}),
+                &serde_json::json!({"visual_embeddings":visual,"patches_f32":&*images[0].patches_f32}),
             )?,
         )?;
     }
