@@ -25,6 +25,8 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 - **Fail-Fast Loader & Capacity Diagnostics:**
   - `ModelConfig::parse_quant` validates quantization configurations strictly, falling back to standalone `quantize_config.json` when `config.json` lacks quant settings.
   - Immediate, descriptive errors with sanitized strings for: unsupported methods (`fp8`, `mxfp4`, `nvfp4`, `bitsandbytes`), activation quantization (`W8A8`), asymmetric 8-bit, dynamic actorder (`actorder != "static"`), desc_act with grouping, non-sequential `g_idx` permutations, AWQ `version != "gemm"`, 8-bit MoE, and quantized DFlash2 drafters.
+  - Strict model-level fail-fast invariant enforcement: non-default `rope_scaling` / `rope_type`, `attention_bias: true`, `hidden_act != "silu"` / `"swiglu"`, `sliding_window > 0`, non-128 `linear_key_head_dim` (matching GDN kernel stride bounds), non-TP-divisible `moe_intermediate_size`, and non-256 `head_dim` under TQ4/Q8_0 KV quantization.
+  - DFlash2 drafter fail-fast enforcement rejecting unhandled `output_multiplier != 1.0` and `final_logit_softcapping > 0`.
   - Archive-derived `weight_arena` calculation reserving exact sharded/replicated bytes plus aligned headroom, with pre-boot VRAM capacity enforcement (`min_boot_bytes > free_vram`).
   - Dynamically sized repack staging buffer (`(128 MiB).max(3 * max_packed_tensor_bytes)`) preventing unbudgeted runtime allocations during load.
 - **Audit & Verification:**
