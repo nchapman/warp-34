@@ -1597,13 +1597,12 @@ async fn run_one_hidden_query(
 
 async fn run_one_clef_query(
     s: Arc<OpenAiServerState>,
-    head: Arc<crate::clef::ClefJointHead>,
     record: Arc<crate::clef::ClefEncodedRecord>,
     images: Vec<crate::vision::PreprocessedImage>,
 ) -> Result<(Vec<Vec<f64>>, usize), ApiError> {
     let (mut stream, rx) = s
         .worker
-        .submit_decision_clef_with_images(record.clone(), images)
+        .submit_decision_clef_with_images(record, images)
         .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let tap = rx
         .await
@@ -1627,16 +1626,6 @@ async fn run_one_clef_query(
             logits,
             cached_tokens,
         } => Ok((logits, cached_tokens.max(cached_done))),
-        crate::engine_worker::DecisionTapOutput::HiddenRows {
-            rows,
-            cached_tokens,
-        } => {
-            let logits = cpu(&s, move || {
-                head.forward(&rows, &record.input_ids, &record.questions)
-            })
-            .await?;
-            Ok((logits, cached_tokens.max(cached_done)))
-        }
         _ => Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected decision tap variant",
@@ -1720,15 +1709,11 @@ async fn execute_systemone_json(
     let mut cached_tokens = 0usize;
 
     match batch {
-        crate::decision::PreparedDecisionBatch::Clef {
-            head,
-            fields,
-            record,
-        } => {
+        crate::decision::PreparedDecisionBatch::Clef { fields, record } => {
             input_tokens = record.input_ids.len();
             let record_arc = Arc::new(record);
             let (all_logits, cached) =
-                run_one_clef_query(s.clone(), head, record_arc.clone(), images).await?;
+                run_one_clef_query(s.clone(), record_arc.clone(), images).await?;
             cached_tokens += cached;
             for (field, (q_enc, raw_logits)) in fields
                 .iter()

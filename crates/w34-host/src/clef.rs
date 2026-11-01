@@ -28,10 +28,12 @@ pub const CLEF_SYSTEM_PROMPT: &str = "Read the complete state and schema. Decide
 const CLEF_NOUL_TRUE_DEFAULT: &str = "The proposition is true or the answer is yes.";
 const CLEF_NOUL_FALSE_DEFAULT: &str = "The proposition is false or the answer is no.";
 
+#[cfg(test)]
 unsafe extern "C" {
     fn erf(x: f64) -> f64;
 }
 
+#[cfg(test)]
 #[inline]
 fn exact_gelu(x: f32) -> f32 {
     let xd = x as f64;
@@ -91,6 +93,13 @@ impl ClefHeadConfig {
             return Err(format!(
                 "clef invalid head geometry: hidden_size={}, width={}, heads={}, feedforward={}",
                 self.hidden_size, self.width, self.heads, self.feedforward
+            ));
+        }
+        let head_dim = self.width / self.heads;
+        if self.width > 2048 || head_dim > 256 {
+            return Err(format!(
+                "clef head geometry exceeds GPU kernel bounds (width={} <= 2048, head_dim={} <= 256)",
+                self.width, head_dim
             ));
         }
         if self.routing_layers > 32 || self.layers > 32 {
@@ -338,6 +347,7 @@ impl LayerNormWeights {
         Ok(Self { weight, bias })
     }
 
+    #[cfg(test)]
     fn apply_row(&self, input: &[f32], out: &mut [f32]) {
         let d = self.weight.len();
         debug_assert_eq!(input.len(), d);
@@ -359,6 +369,7 @@ impl LayerNormWeights {
         }
     }
 
+    #[cfg(test)]
     fn apply_matrix(&self, input: &[f32], rows: usize) -> Vec<f32> {
         let d = self.weight.len();
         debug_assert_eq!(input.len(), rows * d);
@@ -373,7 +384,9 @@ impl LayerNormWeights {
 
 #[derive(Clone, Debug)]
 struct LinearWeights {
+    #[cfg(test)]
     out_dim: usize,
+    #[cfg(test)]
     in_dim: usize,
     weight: Vec<f32>,
     bias: Option<Vec<f32>>,
@@ -396,15 +409,18 @@ impl LinearWeights {
             None
         };
         Ok(Self {
+            #[cfg(test)]
             out_dim,
+            #[cfg(test)]
             in_dim,
             weight,
             bias,
         })
     }
 
+    #[cfg(test)]
     fn apply(&self, input: &[f32], rows: usize) -> Vec<f32> {
-        matmul_nt(
+        matmul_nt_scalar(
             input,
             rows,
             self.in_dim,
@@ -417,7 +433,9 @@ impl LinearWeights {
 
 #[derive(Clone, Debug)]
 struct MultiheadAttnWeights {
+    #[cfg(test)]
     width: usize,
+    #[cfg(test)]
     heads: usize,
     q_proj: LinearWeights,
     kv_proj: LinearWeights,
@@ -431,18 +449,24 @@ impl MultiheadAttnWeights {
         width: usize,
         heads: usize,
     ) -> Result<Self, String> {
+        #[cfg(not(test))]
+        let _ = heads;
         let w_name = format!("{prefix}.in_proj_weight");
         let b_name = format!("{prefix}.in_proj_bias");
         let in_w = read_exact_2d(archive, &w_name, 3 * width, width)?;
         let in_b = read_exact_1d(archive, &b_name, 3 * width)?;
         let q_proj = LinearWeights {
+            #[cfg(test)]
             out_dim: width,
+            #[cfg(test)]
             in_dim: width,
             weight: in_w[..width * width].to_vec(),
             bias: Some(in_b[..width].to_vec()),
         };
         let kv_proj = LinearWeights {
+            #[cfg(test)]
             out_dim: 2 * width,
+            #[cfg(test)]
             in_dim: width,
             weight: in_w[width * width..].to_vec(),
             bias: Some(in_b[width..].to_vec()),
@@ -450,7 +474,9 @@ impl MultiheadAttnWeights {
         let out_proj =
             LinearWeights::load(archive, &format!("{prefix}.out_proj"), width, width, true)?;
         Ok(Self {
+            #[cfg(test)]
             width,
+            #[cfg(test)]
             heads,
             q_proj,
             kv_proj,
@@ -458,6 +484,7 @@ impl MultiheadAttnWeights {
         })
     }
 
+    #[cfg(test)]
     fn forward(&self, queries: &[f32], q_len: usize, memory: &[f32], m_len: usize) -> Vec<f32> {
         let w = self.width;
         let h = self.heads;
@@ -479,7 +506,7 @@ impl MultiheadAttnWeights {
                 let mut max_s = f64::NEG_INFINITY;
                 for mi in 0..m_len {
                     let k_head = &kv[mi * (2 * w) + h_off..mi * (2 * w) + h_off + hd];
-                    let s = (dot_f32(q_head, k_head) as f64) * scale;
+                    let s = (dot_f32_scalar(q_head, k_head) as f64) * scale;
                     scores[mi] = s;
                     if s > max_s {
                         max_s = s;
@@ -559,6 +586,7 @@ impl EvidenceRoutingLayerWeights {
         })
     }
 
+    #[cfg(test)]
     fn forward(&self, queries: &[f32], q_len: usize, memory: &[f32], m_len: usize) -> Vec<f32> {
         let norm_q = self.query_norm.apply_matrix(queries, q_len);
         let norm_m = self.memory_norm.apply_matrix(memory, m_len);
@@ -629,6 +657,7 @@ impl DecoderLayerWeights {
         })
     }
 
+    #[cfg(test)]
     fn forward(&self, tgt: &[f32], q_len: usize, memory: &[f32], m_len: usize) -> Vec<f32> {
         let n1 = self.norm1.apply_matrix(tgt, q_len);
         let sa = self.self_attn.forward(&n1, q_len, &n1, q_len);
@@ -654,6 +683,7 @@ impl DecoderLayerWeights {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 pub struct ClefJointHead {
     pub config: ClefHeadConfig,
     hidden_norm: LayerNormWeights,
@@ -674,10 +704,66 @@ pub struct ClefJointHead {
     prior_logit_scale: f32,
     joint_logit_scale: f32,
     residual_gate: f32,
-    output_embeddings: ClefOutputEmbeddings,
+    output_embeddings: Arc<ClefOutputEmbeddings>,
 }
 
 impl ClefJointHead {
+    /// Exact 256B-aligned `FP16` `DeviceArena` capacity required to hold all head weights.
+    pub fn weight_arena_bytes(&self) -> usize {
+        let mut total_bytes = 0usize;
+        fn count_slice(total: &mut usize, elems: usize) {
+            let aligned = (*total + 255) & !255usize;
+            *total = aligned + (elems * 2).max(16);
+        }
+        fn count_ln(total: &mut usize, ln: &LayerNormWeights) {
+            count_slice(total, ln.weight.len());
+            count_slice(total, ln.bias.len());
+        }
+        fn count_lin(total: &mut usize, lin: &LinearWeights) {
+            count_slice(total, lin.weight.len());
+            if let Some(b) = &lin.bias {
+                count_slice(total, b.len());
+            }
+        }
+        count_ln(&mut total_bytes, &self.hidden_norm);
+        count_lin(&mut total_bytes, &self.memory_projection);
+        count_lin(&mut total_bytes, &self.question_projection);
+        count_lin(&mut total_bytes, &self.option_question_projection);
+        count_lin(&mut total_bytes, &self.global_projection);
+        count_lin(&mut total_bytes, &self.option_context_projection);
+        count_lin(&mut total_bytes, &self.option_lexical_projection);
+        count_slice(&mut total_bytes, self.type_embedding.len());
+        for ev in &self.evidence_layers {
+            count_ln(&mut total_bytes, &ev.query_norm);
+            count_ln(&mut total_bytes, &ev.memory_norm);
+            count_lin(&mut total_bytes, &ev.attention.q_proj);
+            count_lin(&mut total_bytes, &ev.attention.kv_proj);
+            count_lin(&mut total_bytes, &ev.attention.out_proj);
+            count_ln(&mut total_bytes, &ev.feedforward_norm);
+            count_lin(&mut total_bytes, &ev.ff0);
+            count_lin(&mut total_bytes, &ev.ff3);
+        }
+        count_ln(&mut total_bytes, &self.option_summary_norm);
+        for dec in &self.layers {
+            count_ln(&mut total_bytes, &dec.norm1);
+            count_lin(&mut total_bytes, &dec.self_attn.q_proj);
+            count_lin(&mut total_bytes, &dec.self_attn.kv_proj);
+            count_lin(&mut total_bytes, &dec.self_attn.out_proj);
+            count_ln(&mut total_bytes, &dec.norm2);
+            count_lin(&mut total_bytes, &dec.multihead_attn.q_proj);
+            count_lin(&mut total_bytes, &dec.multihead_attn.kv_proj);
+            count_lin(&mut total_bytes, &dec.multihead_attn.out_proj);
+            count_ln(&mut total_bytes, &dec.norm3);
+            count_lin(&mut total_bytes, &dec.linear1);
+            count_lin(&mut total_bytes, &dec.linear2);
+        }
+        count_ln(&mut total_bytes, &self.field_norm);
+        count_ln(&mut total_bytes, &self.option_norm);
+        count_lin(&mut total_bytes, &self.residual_0);
+        count_lin(&mut total_bytes, &self.residual_3);
+        total_bytes + 4096
+    }
+
     pub fn from_dir_and_config(dir: &Path, model_cfg: &ModelConfig) -> Result<Self, String> {
         let cfg_path = dir.join("joint_head_config.json");
         let head_cfg = ClefHeadConfig::from_path(&cfg_path)?;
@@ -779,12 +865,13 @@ impl ClefJointHead {
             prior_logit_scale,
             joint_logit_scale,
             residual_gate,
-            output_embeddings,
+            output_embeddings: Arc::new(output_embeddings),
         })
     }
 
-    /// Evaluates `JointSchemaHead.forward` for one encoded record, returning one logit vector
-    /// per question (ordered matching `questions[i].option_ids`).
+    /// Reference scalar `JointSchemaHead.forward` oracle used by unit tests to verify
+    /// `ClefJointHeadGpu` against PyTorch goldens.
+    #[cfg(test)]
     pub fn forward(
         &self,
         hidden_rows: &[Vec<f32>],
@@ -904,7 +991,8 @@ impl ClefJointHead {
             let mut weights = vec![0.0f64; n_opts];
             let mut max_s = f64::NEG_INFINITY;
             for oi in 0..n_opts {
-                let s = (dot_f32(&opts[oi * w..(oi + 1) * w], field_row) as f64) * inv_sqrt_w;
+                let s =
+                    (dot_f32_scalar(&opts[oi * w..(oi + 1) * w], field_row) as f64) * inv_sqrt_w;
                 weights[oi] = s;
                 if s > max_s {
                     max_s = s;
@@ -988,7 +1076,7 @@ impl ClefJointHead {
             for (oi, &res_val) in residuals.iter().enumerate().take(n_opts) {
                 let mut lex_row = lexical_options[qi][oi * h..(oi + 1) * h].to_vec();
                 l2_normalize_in_place(&mut lex_row, 1e-12);
-                let prior = prior_scale * (dot_f32(&lex_row, &anchor) as f64);
+                let prior = prior_scale * (dot_f32_scalar(&lex_row, &anchor) as f64);
 
                 let opt_row = &options[oi * w..(oi + 1) * w];
                 let cosine = cosine_similarity_f32(field_row, opt_row, 1e-8) as f64;
@@ -1084,6 +1172,7 @@ fn read_scalar_f32(archive: &SafetensorsArchive, name: &str) -> Result<f32, Stri
     Ok(vals[0])
 }
 
+#[cfg(test)]
 fn mean_span_into(
     matrix: &[f32],
     rows: usize,
@@ -1111,6 +1200,7 @@ fn mean_span_into(
     Ok(())
 }
 
+#[cfg(any(feature = "cuda", test))]
 fn l2_normalize_in_place(v: &mut [f32], eps: f32) {
     let norm = (v
         .iter()
@@ -1124,6 +1214,7 @@ fn l2_normalize_in_place(v: &mut [f32], eps: f32) {
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
 fn cosine_similarity_f32(a: &[f32], b: &[f32], eps: f32) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut dot = 0.0f64;
@@ -1140,20 +1231,7 @@ fn cosine_similarity_f32(a: &[f32], b: &[f32], eps: f32) -> f32 {
     (dot / denom) as f32
 }
 
-#[inline]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
-        {
-            // SAFETY: AVX2 and FMA availability was checked dynamically above, and `a`/`b` have equal length.
-            return unsafe { dot_f32_avx2(a, b) };
-        }
-    }
-    dot_f32_scalar(a, b)
-}
-
+#[cfg(any(feature = "cuda", test))]
 #[inline]
 fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
@@ -1184,68 +1262,7 @@ fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    let n = a.len();
-    let ap = a.as_ptr();
-    let bp = b.as_ptr();
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
-    let mut i = 0usize;
-    while i + 16 <= n {
-        // SAFETY: `i + 16 <= n` bounds both `a` and `b` reads.
-        unsafe {
-            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(i)), _mm256_loadu_ps(bp.add(i)), acc0);
-            acc1 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(ap.add(i + 8)),
-                _mm256_loadu_ps(bp.add(i + 8)),
-                acc1,
-            );
-        }
-        i += 16;
-    }
-    // SAFETY: AVX2+FMA enabled on this function.
-    let mut out = unsafe { hsum256_ps(_mm256_add_ps(acc0, acc1)) };
-    while i < n {
-        out += a[i] * b[i];
-        i += 1;
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn hsum256_ps(v: std::arch::x86_64::__m256) -> f32 {
-    use std::arch::x86_64::*;
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let s128 = _mm_add_ps(lo, hi);
-    let shuf = _mm_movehdup_ps(s128);
-    let sums = _mm_add_ps(s128, shuf);
-    let shuf2 = _mm_movehl_ps(shuf, sums);
-    _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
-}
-
-/// Computes `C[m, n] = A[m, k] @ B[n, k]^T + bias[n]` (`A` is `[m, k]`, `B` is `[n, k]`).
-fn matmul_nt(a: &[f32], m: usize, k: usize, b: &[f32], n: usize, bias: Option<&[f32]>) -> Vec<f32> {
-    assert_eq!(a.len(), m * k);
-    assert_eq!(b.len(), n * k);
-    if let Some(bs) = bias {
-        assert_eq!(bs.len(), n);
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
-        {
-            // SAFETY: AVX2 and FMA availability was checked dynamically above, and slice bounds are asserted.
-            return unsafe { matmul_nt_avx2(a, m, k, b, n, bias) };
-        }
-    }
-    matmul_nt_scalar(a, m, k, b, n, bias)
-}
-
+#[cfg(test)]
 fn matmul_nt_scalar(
     a: &[f32],
     m: usize,
@@ -1254,6 +1271,11 @@ fn matmul_nt_scalar(
     n: usize,
     bias: Option<&[f32]>,
 ) -> Vec<f32> {
+    assert_eq!(a.len(), m * k);
+    assert_eq!(b.len(), n * k);
+    if let Some(bs) = bias {
+        assert_eq!(bs.len(), n);
+    }
     let mut c = vec![0.0f32; m * n];
     for row in 0..m {
         let a_row = &a[row * k..(row + 1) * k];
@@ -1261,122 +1283,6 @@ fn matmul_nt_scalar(
             let b_row = &b[col * k..(col + 1) * k];
             let bi = bias.map_or(0.0, |bs| bs[col]);
             c[row * n + col] = dot_f32_scalar(a_row, b_row) + bi;
-        }
-    }
-    c
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn matmul_nt_avx2(
-    a: &[f32],
-    m: usize,
-    k: usize,
-    b: &[f32],
-    n: usize,
-    bias: Option<&[f32]>,
-) -> Vec<f32> {
-    use std::arch::x86_64::*;
-    let mut c = vec![0.0f32; m * n];
-    if let Some(bs) = bias {
-        for row in 0..m {
-            c[row * n..(row + 1) * n].copy_from_slice(bs);
-        }
-    }
-    const KC: usize = 512;
-    let m2 = m / 2;
-    let n4 = n / 4;
-    let k8 = k / 8 * 8;
-
-    let mut kb = 0usize;
-    while kb < k8 {
-        let kend = (kb + KC).min(k8);
-        for ni in 0..n4 {
-            let c0 = ni * 4;
-            // SAFETY: `c0 + 3 < n`, so `(c0 + 3) * k <= b.len()`.
-            let (bp0, bp1, bp2, bp3) = unsafe {
-                (
-                    b.as_ptr().add(c0 * k),
-                    b.as_ptr().add((c0 + 1) * k),
-                    b.as_ptr().add((c0 + 2) * k),
-                    b.as_ptr().add((c0 + 3) * k),
-                )
-            };
-
-            for mi in 0..m2 {
-                let r0 = mi * 2;
-                // SAFETY: `r0 + 1 < m`, so `(r0 + 1) * k <= a.len()`.
-                let (ap0, ap1) = unsafe { (a.as_ptr().add(r0 * k), a.as_ptr().add((r0 + 1) * k)) };
-
-                let mut acc00 = _mm256_setzero_ps();
-                let mut acc01 = _mm256_setzero_ps();
-                let mut acc02 = _mm256_setzero_ps();
-                let mut acc03 = _mm256_setzero_ps();
-                let mut acc10 = _mm256_setzero_ps();
-                let mut acc11 = _mm256_setzero_ps();
-                let mut acc12 = _mm256_setzero_ps();
-                let mut acc13 = _mm256_setzero_ps();
-
-                let mut p = kb;
-                while p < kend {
-                    // SAFETY: `r0 + 1 < m`, `c0 + 3 < n`, and `p + 8 <= kend <= k8 <= k`.
-                    unsafe {
-                        let va0 = _mm256_loadu_ps(ap0.add(p));
-                        let va1 = _mm256_loadu_ps(ap1.add(p));
-                        let vb0 = _mm256_loadu_ps(bp0.add(p));
-                        let vb1 = _mm256_loadu_ps(bp1.add(p));
-                        acc00 = _mm256_fmadd_ps(va0, vb0, acc00);
-                        acc10 = _mm256_fmadd_ps(va1, vb0, acc10);
-                        acc01 = _mm256_fmadd_ps(va0, vb1, acc01);
-                        acc11 = _mm256_fmadd_ps(va1, vb1, acc11);
-                        let vb2 = _mm256_loadu_ps(bp2.add(p));
-                        let vb3 = _mm256_loadu_ps(bp3.add(p));
-                        acc02 = _mm256_fmadd_ps(va0, vb2, acc02);
-                        acc12 = _mm256_fmadd_ps(va1, vb2, acc12);
-                        acc03 = _mm256_fmadd_ps(va0, vb3, acc03);
-                        acc13 = _mm256_fmadd_ps(va1, vb3, acc13);
-                    }
-                    p += 8;
-                }
-                // SAFETY: `hsum256_ps` requires AVX2+FMA which is enabled on this function.
-                unsafe {
-                    c[r0 * n + c0] += hsum256_ps(acc00);
-                    c[r0 * n + c0 + 1] += hsum256_ps(acc01);
-                    c[r0 * n + c0 + 2] += hsum256_ps(acc02);
-                    c[r0 * n + c0 + 3] += hsum256_ps(acc03);
-                    c[(r0 + 1) * n + c0] += hsum256_ps(acc10);
-                    c[(r0 + 1) * n + c0 + 1] += hsum256_ps(acc11);
-                    c[(r0 + 1) * n + c0 + 2] += hsum256_ps(acc12);
-                    c[(r0 + 1) * n + c0 + 3] += hsum256_ps(acc13);
-                }
-            }
-        }
-        kb = kend;
-    }
-
-    for row in 0..(m2 * 2) {
-        let a_row = &a[row * k..row * k + k8];
-        for col in (n4 * 4)..n {
-            let b_row = &b[col * k..col * k + k8];
-            // SAFETY: AVX2+FMA enabled on this function.
-            c[row * n + col] += unsafe { dot_f32_avx2(a_row, b_row) };
-        }
-    }
-    for row in (m2 * 2)..m {
-        let a_row = &a[row * k..row * k + k8];
-        for col in 0..n {
-            let b_row = &b[col * k..col * k + k8];
-            // SAFETY: AVX2+FMA enabled on this function.
-            c[row * n + col] += unsafe { dot_f32_avx2(a_row, b_row) };
-        }
-    }
-    if k8 < k {
-        for row in 0..m {
-            let a_tail = &a[row * k + k8..(row + 1) * k];
-            for col in 0..n {
-                let b_tail = &b[col * k + k8..(col + 1) * k];
-                c[row * n + col] += dot_f32_scalar(a_tail, b_tail);
-            }
         }
     }
     c
@@ -1897,7 +1803,11 @@ impl ClefDeviceRequestState {
 #[cfg(feature = "cuda")]
 pub struct ClefJointHeadGpu {
     device_id: i32,
-    host_head: Arc<ClefJointHead>,
+    config: ClefHeadConfig,
+    output_embeddings: Arc<ClefOutputEmbeddings>,
+    prior_logit_scale: f32,
+    joint_logit_scale: f32,
+    residual_gate: f32,
     _weight_arena: crate::cuda::DeviceArena,
     scratch_arena: crate::cuda::DeviceArena,
     free_slots: Vec<ClefDeviceSlot>,
@@ -1927,63 +1837,8 @@ const CLEF_GPU_MAX_CACHED_SLOT_BYTES: usize = 36 * 1024 * 1024;
 
 #[cfg(feature = "cuda")]
 impl ClefJointHeadGpu {
-    pub fn supports_config(cfg: &ClefHeadConfig) -> bool {
-        cfg.width <= 2048 && cfg.heads > 0 && (cfg.width / cfg.heads) <= 256
-    }
-
     pub fn weight_arena_bytes(host_head: &ClefJointHead) -> usize {
-        let mut total_bytes = 0usize;
-        fn count_slice(total: &mut usize, elems: usize) {
-            let aligned = (*total + 255) & !255usize;
-            *total = aligned + (elems * 2).max(16);
-        }
-        fn count_ln(total: &mut usize, ln: &LayerNormWeights) {
-            count_slice(total, ln.weight.len());
-            count_slice(total, ln.bias.len());
-        }
-        fn count_lin(total: &mut usize, lin: &LinearWeights) {
-            count_slice(total, lin.weight.len());
-            if let Some(b) = &lin.bias {
-                count_slice(total, b.len());
-            }
-        }
-        count_ln(&mut total_bytes, &host_head.hidden_norm);
-        count_lin(&mut total_bytes, &host_head.memory_projection);
-        count_lin(&mut total_bytes, &host_head.question_projection);
-        count_lin(&mut total_bytes, &host_head.option_question_projection);
-        count_lin(&mut total_bytes, &host_head.global_projection);
-        count_lin(&mut total_bytes, &host_head.option_context_projection);
-        count_lin(&mut total_bytes, &host_head.option_lexical_projection);
-        count_slice(&mut total_bytes, host_head.type_embedding.len());
-        for ev in &host_head.evidence_layers {
-            count_ln(&mut total_bytes, &ev.query_norm);
-            count_ln(&mut total_bytes, &ev.memory_norm);
-            count_lin(&mut total_bytes, &ev.attention.q_proj);
-            count_lin(&mut total_bytes, &ev.attention.kv_proj);
-            count_lin(&mut total_bytes, &ev.attention.out_proj);
-            count_ln(&mut total_bytes, &ev.feedforward_norm);
-            count_lin(&mut total_bytes, &ev.ff0);
-            count_lin(&mut total_bytes, &ev.ff3);
-        }
-        count_ln(&mut total_bytes, &host_head.option_summary_norm);
-        for dec in &host_head.layers {
-            count_ln(&mut total_bytes, &dec.norm1);
-            count_lin(&mut total_bytes, &dec.self_attn.q_proj);
-            count_lin(&mut total_bytes, &dec.self_attn.kv_proj);
-            count_lin(&mut total_bytes, &dec.self_attn.out_proj);
-            count_ln(&mut total_bytes, &dec.norm2);
-            count_lin(&mut total_bytes, &dec.multihead_attn.q_proj);
-            count_lin(&mut total_bytes, &dec.multihead_attn.kv_proj);
-            count_lin(&mut total_bytes, &dec.multihead_attn.out_proj);
-            count_ln(&mut total_bytes, &dec.norm3);
-            count_lin(&mut total_bytes, &dec.linear1);
-            count_lin(&mut total_bytes, &dec.linear2);
-        }
-        count_ln(&mut total_bytes, &host_head.field_norm);
-        count_ln(&mut total_bytes, &host_head.option_norm);
-        count_lin(&mut total_bytes, &host_head.residual_0);
-        count_lin(&mut total_bytes, &host_head.residual_3);
-        total_bytes + 4096
+        host_head.weight_arena_bytes()
     }
 
     /// Rank-0 VRAM headroom covering the weight arena, resting scratch arena, and bounded
@@ -2056,15 +1911,13 @@ impl ClefJointHeadGpu {
         total + 4096
     }
 
-    pub fn try_from_host(
+    pub fn from_host(
         device_id: i32,
         stream: &crate::cuda::CudaStream,
-        host_head: Arc<ClefJointHead>,
-    ) -> Result<Option<Self>, String> {
-        if !Self::supports_config(&host_head.config) {
-            return Ok(None);
-        }
-        let arena_bytes = Self::weight_arena_bytes(&host_head);
+        host_head: &ClefJointHead,
+    ) -> Result<Self, String> {
+        host_head.config.validate()?;
+        let arena_bytes = Self::weight_arena_bytes(host_head);
         let mut arena = crate::cuda::DeviceArena::new(device_id, arena_bytes)
             .map_err(|e| format!("clef gpu weight arena alloc ({arena_bytes} B): {e}"))?;
 
@@ -2165,9 +2018,13 @@ impl ClefJointHeadGpu {
         let scratch_arena = crate::cuda::DeviceArena::new(device_id, init_scratch)
             .map_err(|e| format!("clef gpu scratch alloc: {e}"))?;
 
-        Ok(Some(Self {
+        Ok(Self {
             device_id,
-            host_head,
+            config: host_head.config.clone(),
+            output_embeddings: host_head.output_embeddings.clone(),
+            prior_logit_scale: host_head.prior_logit_scale,
+            joint_logit_scale: host_head.joint_logit_scale,
+            residual_gate: host_head.residual_gate,
             _weight_arena: arena,
             scratch_arena,
             free_slots: Vec::new(),
@@ -2186,7 +2043,7 @@ impl ClefJointHeadGpu {
             option_norm,
             residual_0,
             residual_3,
-        }))
+        })
     }
 
     pub fn recycle_request_state(&mut self, mut state: ClefDeviceRequestState) {
@@ -2280,8 +2137,8 @@ impl ClefJointHeadGpu {
             }
         }
 
-        let h = self.host_head.config.hidden_size;
-        let w = self.host_head.config.width;
+        let h = self.config.hidden_size;
+        let w = self.config.width;
         let mem_bytes = seq_len * w * 2;
         let bounds_bytes = span_bounds.len() * 4;
         let spans_bytes = num_spans * h * 4;
@@ -2383,8 +2240,8 @@ impl ClefJointHeadGpu {
                 state.total_tokens
             ));
         }
-        let h = self.host_head.config.hidden_size;
-        let w = self.host_head.config.width;
+        let h = self.config.hidden_size;
+        let w = self.config.width;
         self.ensure_scratch(chunk_len * h * 2 + 4096, stream)?;
         let d_chunk_normed = self
             .scratch_arena
@@ -2492,10 +2349,10 @@ impl ClefJointHeadGpu {
         let num_q = state.num_q;
         let total_opts = state.total_opts;
         let num_spans = state.num_spans;
-        let h = self.host_head.config.hidden_size;
-        let w = self.host_head.config.width;
-        let ff = self.host_head.config.feedforward;
-        let heads = self.host_head.config.heads;
+        let h = self.config.hidden_size;
+        let w = self.config.width;
+        let ff = self.config.feedforward;
+        let heads = self.config.heads;
         let hd = w / heads;
 
         // Fetch lexical embeddings on host via cached Safetensors pread (~10–20 µs).
@@ -2507,10 +2364,7 @@ impl ClefJointHeadGpu {
         for (qi, q) in record.questions.iter().enumerate() {
             q_types.push(q.question_type as i32);
             for &(s, e) in &q.option_spans {
-                let lex = self
-                    .host_head
-                    .output_embeddings
-                    .mean_rows(&record.input_ids[s..e])?;
+                let lex = self.output_embeddings.mean_rows(&record.input_ids[s..e])?;
                 lexical_f32.extend_from_slice(&lex);
                 opt_q_idx.push(qi as i32);
             }
@@ -3070,9 +2924,9 @@ impl ClefJointHeadGpu {
             .collect();
 
         let max_clamp = 100.0f64.ln() as f32;
-        let prior_scale = (self.host_head.prior_logit_scale.min(max_clamp) as f64).exp();
-        let joint_scale = (self.host_head.joint_logit_scale.min(max_clamp) as f64).exp();
-        let gate = 1.0 / (1.0 + (-(self.host_head.residual_gate as f64)).exp());
+        let prior_scale = (self.prior_logit_scale.min(max_clamp) as f64).exp();
+        let joint_scale = (self.joint_logit_scale.min(max_clamp) as f64).exp();
+        let gate = 1.0 / (1.0 + (-(self.residual_gate as f64)).exp());
 
         let mut results = Vec::with_capacity(num_q);
         let mut opt_offset = 0usize;
@@ -3091,7 +2945,7 @@ impl ClefJointHeadGpu {
                 let g_oi = opt_offset + oi;
                 let mut lex_row = lexical_f32[g_oi * h..(g_oi + 1) * h].to_vec();
                 l2_normalize_in_place(&mut lex_row, 1e-12);
-                let prior = prior_scale * (dot_f32(&lex_row, &anchor) as f64);
+                let prior = prior_scale * (dot_f32_scalar(&lex_row, &anchor) as f64);
 
                 let opt_row = &h_opts[g_oi * w..(g_oi + 1) * w];
                 let cosine = cosine_similarity_f32(field_row, opt_row, 1e-8) as f64;
@@ -3178,41 +3032,6 @@ mod tests {
                 expected,
                 "float {val:e}"
             );
-        }
-    }
-
-    #[test]
-    fn clef_matmul_nt_and_dot_avx2_match_scalar_across_tail_and_blocking_shapes() {
-        for len in 0..=35 {
-            let a = splitmix_vec("dot_a", len, 1.0);
-            let b = splitmix_vec("dot_b", len, 1.0);
-            let got = dot_f32(&a, &b);
-            let exp = dot_f32_scalar(&a, &b);
-            assert!(
-                (got - exp).abs() <= 1e-5,
-                "dot_f32 mismatch at len={len}: got {got}, exp {exp}"
-            );
-        }
-
-        for m in [1usize, 2, 3, 5] {
-            for n in [1usize, 3, 4, 5, 7] {
-                for k in [1usize, 7, 8, 9, 17, 512, 520, 1029] {
-                    let a = splitmix_vec("mm_a", m * k, 0.5);
-                    let b = splitmix_vec("mm_b", n * k, 0.5);
-                    let bias = splitmix_vec("mm_bias", n, 0.25);
-                    for opt_bias in [None, Some(bias.as_slice())] {
-                        let c_disp = matmul_nt(&a, m, k, &b, n, opt_bias);
-                        let c_ref = matmul_nt_scalar(&a, m, k, &b, n, opt_bias);
-                        for (idx, (&g, &e)) in c_disp.iter().zip(&c_ref).enumerate() {
-                            assert!(
-                                (g - e).abs() <= 1e-4,
-                                "matmul_nt mismatch at (m={m}, n={n}, k={k}, bias={}, idx={idx}): got {g}, exp {e}",
-                                opt_bias.is_some()
-                            );
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -3378,6 +3197,41 @@ mod tests {
                 "routing_layers": 2,
                 "layers": 4,
                 "heads": 15,
+                "feedforward": 4096
+            }))
+            .is_err()
+        );
+        // exact GPU kernel upper boundary (width == 2048, head_dim == 256) is accepted
+        assert!(
+            ClefHeadConfig::from_json(&json!({
+                "hidden_size": 5120,
+                "width": 2048,
+                "routing_layers": 2,
+                "layers": 4,
+                "heads": 8,
+                "feedforward": 8192
+            }))
+            .is_ok()
+        );
+        // exceeds GPU kernel bounds (width > 2048 or head_dim > 256)
+        assert!(
+            ClefHeadConfig::from_json(&json!({
+                "hidden_size": 4096,
+                "width": 4096,
+                "routing_layers": 2,
+                "layers": 4,
+                "heads": 16,
+                "feedforward": 4096
+            }))
+            .is_err()
+        );
+        assert!(
+            ClefHeadConfig::from_json(&json!({
+                "hidden_size": 4096,
+                "width": 1024,
+                "routing_layers": 2,
+                "layers": 4,
+                "heads": 2,
                 "feedforward": 4096
             }))
             .is_err()
@@ -3617,10 +3471,8 @@ mod tests {
             let _dev = crate::cuda::CudaDevice::set_current(0).unwrap();
             let stream = crate::cuda::CudaStream::new(0).unwrap();
             let cublas = crate::cuda::CublasHandle::new(&stream).unwrap();
-            let head_arc = Arc::new(head);
-            let mut gpu = ClefJointHeadGpu::try_from_host(0, &stream, head_arc.clone())
-                .unwrap()
-                .expect("ClefJointHeadGpu supported");
+            let mut gpu = ClefJointHeadGpu::from_host(0, &stream, &head).unwrap();
+            drop(head); // prove GPU head runs independently after host f32 weights are freed
 
             // Upload FP16-quantized input hidden sequence so CPU FP16-rounded input and GPU match.
             let seq_f16: Vec<u16> = seq_flat

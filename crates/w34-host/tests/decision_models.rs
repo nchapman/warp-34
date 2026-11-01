@@ -728,7 +728,7 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
         let clef_head =
             Arc::new(ClefJointHead::from_archive(&clef_head_arc, head_cfg, out_emb).unwrap());
         let clef_profile = DecisionModelProfile::Clef {
-            head: clef_head,
+            head: Some(clef_head),
             max_length: CLEF_DEFAULT_MAX_LENGTH,
             image_min_pixels: CLEF_DEFAULT_MIN_PIXELS,
             image_max_pixels: CLEF_DEFAULT_MAX_PIXELS,

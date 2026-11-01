@@ -313,7 +313,8 @@ pub fn kev_encode_question(
 #[derive(Clone, Debug)]
 pub enum DecisionModelProfile {
     Clef {
-        head: Arc<ClefJointHead>,
+        /// Loaded at startup and taken/dropped once `ClefJointHeadGpu` uploads FP16 weights to Rank 0.
+        head: Option<Arc<ClefJointHead>>,
         max_length: usize,
         image_min_pixels: usize,
         image_max_pixels: usize,
@@ -368,6 +369,13 @@ impl DecisionModelProfile {
         }
     }
 
+    pub fn take_clef_host_head(&mut self) -> Option<Arc<ClefJointHead>> {
+        match self {
+            Self::Clef { head, .. } => head.take(),
+            _ => None,
+        }
+    }
+
     pub fn from_dir_and_config(
         dir: &Path,
         cfg: &ModelConfig,
@@ -390,7 +398,7 @@ impl DecisionModelProfile {
             let head = ClefJointHead::from_dir_and_config(dir, cfg)?;
             let (image_min_pixels, image_max_pixels) = detect_clef_image_pixel_bounds(dir);
             return Ok(Self::Clef {
-                head: Arc::new(head),
+                head: Some(Arc::new(head)),
                 max_length: CLEF_DEFAULT_MAX_LENGTH,
                 image_min_pixels,
                 image_max_pixels,
@@ -1507,7 +1515,6 @@ fn build_media_prefix_tokens(
 #[derive(Clone, Debug)]
 pub enum PreparedDecisionBatch {
     Clef {
-        head: Arc<ClefJointHead>,
         fields: Vec<DecisionField>,
         record: ClefEncodedRecord,
     },
@@ -1582,9 +1589,7 @@ pub fn prepare_decision_batch_with_images(
     };
 
     match profile {
-        DecisionModelProfile::Clef {
-            head, max_length, ..
-        } => {
+        DecisionModelProfile::Clef { max_length, .. } => {
             let req = compile_systemone_request(
                 body,
                 CompileLimits {
@@ -1598,7 +1603,6 @@ pub fn prepare_decision_batch_with_images(
             Ok((
                 req.model,
                 PreparedDecisionBatch::Clef {
-                    head: head.clone(),
                     fields: req.fields,
                     record,
                 },

@@ -4687,9 +4687,12 @@ impl Qwen3_5Engine {
         let cfg = ModelConfig::from_dir(dir).map_err(|_| loader_err("ModelConfig::from_dir"))?;
         let archive =
             SafetensorsArchive::open(dir).map_err(|_| loader_err("SafetensorsArchive::open"))?;
-        let decision_profile =
+        let mut decision_profile =
             crate::decision::DecisionModelProfile::from_dir_and_config(dir, &cfg, Some(&archive))
-                .map_err(|_| loader_err("DecisionModelProfile::from_dir_and_config"))?;
+                .map_err(|e| {
+                eprintln!("[w34] DecisionModelProfile::from_dir_and_config failed: {e}");
+                loader_err("DecisionModelProfile::from_dir_and_config")
+            })?;
         let has_vision_weights = cfg.vision_config.is_some()
             && (archive
                 .resolve_name("model.visual.patch_embed.proj.weight")
@@ -4707,8 +4710,9 @@ impl Qwen3_5Engine {
 
         let mut rank_capacity = capacity;
         #[cfg(feature = "cuda")]
-        if let crate::decision::DecisionModelProfile::Clef { head, .. } = &decision_profile
-            && crate::clef::ClefJointHeadGpu::supports_config(&head.config)
+        if let crate::decision::DecisionModelProfile::Clef {
+            head: Some(head), ..
+        } = &decision_profile
         {
             rank_capacity.rank0_extra_headroom_bytes = rank_capacity
                 .rank0_extra_headroom_bytes
@@ -4741,20 +4745,21 @@ impl Qwen3_5Engine {
             }
         }
 
-        let clef_head_gpu =
-            if let crate::decision::DecisionModelProfile::Clef { head, .. } = &decision_profile {
-                crate::clef::ClefJointHeadGpu::try_from_host(
+        let clef_head_gpu = if let Some(head) = decision_profile.take_clef_host_head() {
+            Some(
+                crate::clef::ClefJointHeadGpu::from_host(
                     ranks[0].device.device_id,
                     &ranks[0].stream,
-                    head.clone(),
+                    &head,
                 )
                 .map_err(|e| {
-                    eprintln!("[w34] ClefJointHeadGpu::try_from_host failed: {e}");
-                    loader_err("ClefJointHeadGpu::try_from_host")
-                })?
-            } else {
-                None
-            };
+                    eprintln!("[w34] ClefJointHeadGpu::from_host failed: {e}");
+                    loader_err("ClefJointHeadGpu::from_host")
+                })?,
+            )
+        } else {
+            None
+        };
 
         let tok_path = dir.join("tokenizer.json");
         let tokenizer = if tok_path.exists() {
@@ -4861,64 +4866,25 @@ impl Qwen3_5Engine {
         Ok(raw.into_iter().map(crate::cuda::f16_to_f32).collect())
     }
 
-    /// Reads `count` contiguous post-final-`GemmaRMSNorm` hidden rows `[count, hidden_size]`
-    /// starting at `start_row` in a single D2H transfer from rank 0.
-    pub fn read_norm_hidden_range_f32(
-        &self,
-        start_row: usize,
-        count: usize,
-    ) -> Result<Vec<Vec<f32>>> {
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let r0 = &self.ranks[0];
-        let end_row = start_row
-            .checked_add(count)
-            .ok_or_else(|| loader_err("norm hidden row range overflow"))?;
-        if end_row > r0.last_norm_hidden_rows || r0.last_norm_hidden_ptr == 0 {
-            return Err(loader_err("norm hidden row range out of bounds"));
-        }
-        let h_dim = self.cfg.hidden_size;
-        let total_elems = count
-            .checked_mul(h_dim)
-            .ok_or_else(|| loader_err("norm hidden elem overflow"))?;
-        let mut raw = vec![0u16; total_elems];
-        r0.device.make_current()?;
-        let src = r0.last_norm_hidden_ptr + (start_row * h_dim * 2) as u64;
-        check_rc(
-            unsafe {
-                ffi::w34_memcpy_d2h_async(
-                    raw.as_mut_ptr().cast(),
-                    src as *const c_void,
-                    total_elems * 2,
-                    r0.stream.handle,
-                )
-            },
-            "read norm hidden range f16",
-        )?;
-        r0.stream.synchronize()?;
-        Ok(raw
-            .chunks_exact(h_dim)
-            .map(|row| row.iter().copied().map(crate::cuda::f16_to_f32).collect())
-            .collect())
-    }
-
     pub fn set_decision_profile(
         &mut self,
-        profile: crate::decision::DecisionModelProfile,
+        mut profile: crate::decision::DecisionModelProfile,
     ) -> std::result::Result<(), String> {
-        self.clef_head_gpu =
-            if let crate::decision::DecisionModelProfile::Clef { head, .. } = &profile {
+        self.clef_head_gpu = match &profile {
+            crate::decision::DecisionModelProfile::Clef { .. } => {
+                let head = profile
+                    .take_clef_host_head()
+                    .ok_or_else(|| "clef profile missing host head weights".to_string())?;
                 let r0 = &self.ranks[0];
                 r0.device.make_current().map_err(|e| e.to_string())?;
-                crate::clef::ClefJointHeadGpu::try_from_host(
+                Some(crate::clef::ClefJointHeadGpu::from_host(
                     r0.device.device_id,
                     &r0.stream,
-                    head.clone(),
-                )?
-            } else {
-                None
-            };
+                    &head,
+                )?)
+            }
+            _ => None,
+        };
         self.decision_profile = profile;
         Ok(())
     }

@@ -74,7 +74,6 @@ enum DecisionReadoutTap {
     ClefJoint {
         record: Arc<crate::clef::ClefEncodedRecord>,
         gpu_state: Option<crate::clef::ClefDeviceRequestState>,
-        cpu_fallback_rows: Vec<Vec<f32>>,
         tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
     },
 }
@@ -429,7 +428,6 @@ impl EngineWorker {
             DecisionReadoutTap::ClefJoint {
                 record,
                 gpu_state: None,
-                cpu_fallback_rows: Vec::new(),
                 tx,
             },
         )?;
@@ -1402,68 +1400,39 @@ fn capture_decision_tap(
             }
         }
         Some(DecisionReadoutTap::ClefJoint {
-            record,
-            gpu_state,
-            cpu_fallback_rows,
-            ..
+            record, gpu_state, ..
         }) => {
             let expected_total = record.input_ids.len();
-            let use_gpu = engine.clef_head_gpu.is_some();
-            let read_err = if use_gpu {
-                if gpu_state.is_none() {
-                    match check_full_hidden_chunk_offset(0, s.ctx_len_before)
-                        .and_then(|()| engine.clef_begin_request(record))
-                    {
-                        Ok(st) => {
-                            *gpu_state = Some(st);
-                            None
-                        }
-                        Err(e) => Some(e),
+            let read_err = if gpu_state.is_none() {
+                match check_full_hidden_chunk_offset(0, s.ctx_len_before)
+                    .and_then(|()| engine.clef_begin_request(record))
+                {
+                    Ok(st) => {
+                        *gpu_state = Some(st);
+                        None
                     }
-                } else {
-                    None
+                    Err(e) => Some(e),
                 }
-                .or_else(|| {
-                    let st = gpu_state.as_mut().unwrap();
-                    check_full_hidden_chunk_offset(st.next_offset(), s.ctx_len_before)
-                        .and_then(|()| {
-                            engine.clef_ingest_norm_hidden_range(
-                                st,
-                                tok_off,
-                                s.ctx_len_before,
-                                slice_len,
-                            )
-                        })
-                        .err()
-                })
             } else {
-                const MAX_CPU_FALLBACK_HIDDEN_BYTES: usize = 128 * 1024 * 1024;
-                let fallback_bytes = expected_total
-                    .saturating_mul(engine.cfg.hidden_size)
-                    .saturating_mul(core::mem::size_of::<f32>());
-                if fallback_bytes > MAX_CPU_FALLBACK_HIDDEN_BYTES {
-                    Some(format!(
-                        "clef cpu fallback hidden buffer ({fallback_bytes} B) exceeds 128 MiB cap"
-                    ))
-                } else {
-                    match check_full_hidden_chunk_offset(cpu_fallback_rows.len(), s.ctx_len_before)
-                    {
-                        Err(msg) => Some(msg),
-                        Ok(()) => match engine.read_norm_hidden_range_f32(tok_off, slice_len) {
-                            Ok(rows) => {
-                                cpu_fallback_rows.extend(rows);
-                                None
-                            }
-                            Err(e) => Some(e.to_string()),
-                        },
-                    }
-                }
-            };
+                None
+            }
+            .or_else(|| {
+                let st = gpu_state.as_mut().unwrap();
+                check_full_hidden_chunk_offset(st.next_offset(), s.ctx_len_before)
+                    .and_then(|()| {
+                        engine.clef_ingest_norm_hidden_range(
+                            st,
+                            tok_off,
+                            s.ctx_len_before,
+                            slice_len,
+                        )
+                    })
+                    .err()
+            });
             if (read_err.is_some() || s.is_final_prefill_chunk)
                 && let Some(DecisionReadoutTap::ClefJoint {
                     record,
                     gpu_state,
-                    cpu_fallback_rows,
                     tx,
                 }) = req.decision_tap.take()
             {
@@ -1480,12 +1449,7 @@ fn capture_decision_tap(
                             cached_tokens: cached_toks,
                         })
                 } else {
-                    check_full_hidden_final_count(cpu_fallback_rows.len(), expected_total).map(
-                        |()| DecisionTapOutput::HiddenRows {
-                            rows: cpu_fallback_rows,
-                            cached_tokens: cached_toks,
-                        },
-                    )
+                    Err("clef gpu request state missing".into())
                 };
                 tap_done = Some((tx, res));
             }
