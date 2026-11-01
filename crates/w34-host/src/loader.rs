@@ -795,6 +795,47 @@ impl ModelConfig {
         let rope_params = tc
             .get("rope_parameters")
             .or_else(|| root.get("rope_parameters"));
+
+        let rope_scaling = tc
+            .get("rope_scaling")
+            .or_else(|| root.get("rope_scaling"))
+            .or_else(|| rope_params.and_then(|rp| rp.get("rope_scaling")));
+        if let Some(rs) = rope_scaling
+            && !rs.is_null()
+        {
+            let rtype = rs
+                .get("type")
+                .or_else(|| rs.get("rope_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if !rtype.eq_ignore_ascii_case("default") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported rope_scaling type='{}' (only standard unscaled RoPE is supported)",
+                        sanitize_diag(rtype)
+                    ),
+                ));
+            }
+        }
+
+        let rope_type = tc
+            .get("rope_type")
+            .or_else(|| root.get("rope_type"))
+            .or_else(|| rope_params.and_then(|rp| rp.get("rope_type")))
+            .or_else(|| rope_params.and_then(|rp| rp.get("type")))
+            .and_then(|v| v.as_str());
+        if let Some(rt) = rope_type
+            && !rt.eq_ignore_ascii_case("default")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported rope_type='{}' (only standard unscaled RoPE is supported)",
+                    sanitize_diag(rt)
+                ),
+            ));
+        }
         let rope_theta = rope_params
             .and_then(|rp| rp.get("rope_theta"))
             .or_else(|| tc.get("rope_theta"))
@@ -824,6 +865,17 @@ impl ModelConfig {
             .or_else(|| root.get("tie_word_embeddings"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let attention_bias = tc
+            .get("attention_bias")
+            .or_else(|| root.get("attention_bias"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if attention_bias {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported attention_bias=true (Qwen3.5/3.6/3.8 backbone layers are bias-free)",
+            ));
+        }
         let attn_output_gate = tc
             .get("attn_output_gate")
             .and_then(|v| v.as_bool())
@@ -841,6 +893,14 @@ impl ModelConfig {
             .get("linear_key_head_dim")
             .and_then(|v| v.as_u64())
             .unwrap_or(128) as usize;
+        if linear_key_head_dim != 128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported linear_key_head_dim={linear_key_head_dim} (op_gdn kernel requires linear_key_head_dim == 128)"
+                ),
+            ));
+        }
         let linear_value_head_dim = tc
             .get("linear_value_head_dim")
             .and_then(|v| v.as_u64())
@@ -2422,5 +2482,49 @@ mod tests {
                 assert_eq!(deq_u8[n * size_k + k], f32_to_f16((q as f32) * s));
             }
         }
+    }
+
+    #[test]
+    fn test_model_config_rejects_unsupported_rope_scaling_and_biases() {
+        let base_json = serde_json::json!({
+            "hidden_size": 2560,
+            "intermediate_size": 6912,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 28,
+            "vocab_size": 152064
+        });
+
+        // Valid base parses cleanly
+        ModelConfig::from_json(&base_json).unwrap();
+
+        // rope_scaling: default is allowed
+        let mut ok_rope = base_json.clone();
+        ok_rope["rope_scaling"] = serde_json::json!({ "type": "default" });
+        ModelConfig::from_json(&ok_rope).unwrap();
+
+        // rope_scaling: yarn / dynamic fails fast
+        let mut bad_rope = base_json.clone();
+        bad_rope["rope_scaling"] = serde_json::json!({ "type": "yarn" });
+        let err = ModelConfig::from_json(&bad_rope).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported rope_scaling type='yarn'")
+        );
+
+        // attention_bias=true fails fast
+        let mut bad_bias = base_json.clone();
+        bad_bias["attention_bias"] = serde_json::json!(true);
+        let err = ModelConfig::from_json(&bad_bias).unwrap_err();
+        assert!(err.to_string().contains("unsupported attention_bias=true"));
+
+        // linear_key_head_dim != 128 fails fast
+        let mut bad_gdn = base_json.clone();
+        bad_gdn["linear_key_head_dim"] = serde_json::json!(64);
+        let err = ModelConfig::from_json(&bad_gdn).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported linear_key_head_dim=64")
+        );
     }
 }

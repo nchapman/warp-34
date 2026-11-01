@@ -122,6 +122,16 @@ impl DFlash2Config {
                 .and_then(Value::as_bool)
                 == Some(true)
             || body.get("attention_bias").and_then(Value::as_bool) == Some(true)
+            || body
+                .get("output_multiplier")
+                .or_else(|| root.get("output_multiplier"))
+                .and_then(Value::as_f64)
+                .is_some_and(|v| (v - 1.0).abs() > 1e-5)
+            || body
+                .get("final_logit_softcapping")
+                .or_else(|| root.get("final_logit_softcapping"))
+                .and_then(Value::as_f64)
+                .is_some_and(|v| v > 0.0)
         {
             return Err(loader_err("unsupported DFlash2 checkpoint geometry"));
         }

@@ -1864,6 +1864,12 @@ pub(crate) fn load_moe_layer_weights(
     let router_gate = raw_router.upload(weight_arena, stream, repack_staging)?;
 
     let full_interm = cfg.moe_intermediate_size;
+    if !full_interm.is_multiple_of(tp_size) {
+        return Err(loader_err_msg(format!(
+            "moe_intermediate_size {} is not divisible by TP={tp_size}",
+            full_interm
+        )));
+    }
     let local_moe_interm = full_interm / tp_size;
     let num_exp = cfg.num_experts;
     let top_k = cfg.num_experts_per_tok.max(1);
