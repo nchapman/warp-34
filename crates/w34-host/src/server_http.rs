@@ -1541,7 +1541,7 @@ async fn run_one_candidate_query(
             logits,
             cached_tokens,
         } => Ok((logits, cached_tokens.max(cached_done))),
-        crate::engine_worker::DecisionTapOutput::HiddenRows { .. } => Err(error(
+        _ => Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected decision tap variant",
         )),
@@ -1588,21 +1588,22 @@ async fn run_one_hidden_query(
             rows,
             cached_tokens,
         } => Ok((rows, cached_tokens.max(cached_done))),
-        crate::engine_worker::DecisionTapOutput::CandidateLogits { .. } => Err(error(
+        _ => Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected decision tap variant",
         )),
     }
 }
 
-async fn run_one_full_hidden_query(
+async fn run_one_clef_query(
     s: Arc<OpenAiServerState>,
-    prompt: Vec<i32>,
+    head: Arc<crate::clef::ClefJointHead>,
+    record: Arc<crate::clef::ClefEncodedRecord>,
     images: Vec<crate::vision::PreprocessedImage>,
-) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+) -> Result<(Vec<Vec<f64>>, usize), ApiError> {
     let (mut stream, rx) = s
         .worker
-        .submit_decision_full_hidden_with_images(prompt, images, None)
+        .submit_decision_clef_with_images(record.clone(), images)
         .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
     let tap = rx
         .await
@@ -1622,11 +1623,21 @@ async fn run_one_full_hidden_query(
         }
     }
     match tap {
+        crate::engine_worker::DecisionTapOutput::ClefLogits {
+            logits,
+            cached_tokens,
+        } => Ok((logits, cached_tokens.max(cached_done))),
         crate::engine_worker::DecisionTapOutput::HiddenRows {
             rows,
             cached_tokens,
-        } => Ok((rows, cached_tokens.max(cached_done))),
-        crate::engine_worker::DecisionTapOutput::CandidateLogits { .. } => Err(error(
+        } => {
+            let logits = cpu(&s, move || {
+                head.forward(&rows, &record.input_ids, &record.questions)
+            })
+            .await?;
+            Ok((logits, cached_tokens.max(cached_done)))
+        }
+        _ => Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected decision tap variant",
         )),
@@ -1715,19 +1726,13 @@ async fn execute_systemone_json(
             record,
         } => {
             input_tokens = record.input_ids.len();
-            let (hidden_rows, cached) =
-                run_one_full_hidden_query(s.clone(), record.input_ids.clone(), images).await?;
+            let record_arc = Arc::new(record);
+            let (all_logits, cached) =
+                run_one_clef_query(s.clone(), head, record_arc.clone(), images).await?;
             cached_tokens += cached;
-            let (questions, all_logits) = cpu(s, move || {
-                Ok::<_, String>(
-                    head.forward(&hidden_rows, &record.input_ids, &record.questions)
-                        .map(|logits| (record.questions, logits)),
-                )
-            })
-            .await?
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            for (field, (q_enc, raw_logits)) in
-                fields.iter().zip(questions.iter().zip(all_logits.iter()))
+            for (field, (q_enc, raw_logits)) in fields
+                .iter()
+                .zip(record_arc.questions.iter().zip(all_logits.iter()))
             {
                 let ordered = crate::clef::reorder_clef_question_logits(q_enc, field, raw_logits)
                     .map_err(decision_err)?;

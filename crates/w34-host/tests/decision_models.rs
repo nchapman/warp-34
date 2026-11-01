@@ -745,7 +745,8 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
                     false,
                 )
                 .map_err(|e| e.to_string())?;
-                engine.decision_profile = clef_profile_tp1;
+                engine.set_decision_profile(clef_profile_tp1)?;
+                assert!(engine.clef_head_gpu.is_some());
                 Ok(engine)
             })
             .unwrap();
@@ -827,7 +828,8 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
                         engine.ranks[0].state_pool.total_slots,
                         engine.ranks[1].state_pool.total_slots
                     );
-                    engine.decision_profile = clef_profile_tp2;
+                    engine.set_decision_profile(clef_profile_tp2)?;
+                    assert!(engine.clef_head_gpu.is_some());
                     Ok(engine)
                 })
                 .unwrap();

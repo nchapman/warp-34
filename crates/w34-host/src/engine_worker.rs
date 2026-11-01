@@ -55,6 +55,10 @@ pub enum DecisionTapOutput {
         rows: Vec<Vec<f32>>,
         cached_tokens: usize,
     },
+    ClefLogits {
+        logits: Vec<Vec<f64>>,
+        cached_tokens: usize,
+    },
 }
 
 enum DecisionReadoutTap {
@@ -67,9 +71,10 @@ enum DecisionReadoutTap {
         captured: Vec<Option<Vec<f32>>>,
         tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
     },
-    FullHiddenSequence {
-        total_tokens: usize,
-        captured: Vec<Vec<f32>>,
+    ClefJoint {
+        record: Arc<crate::clef::ClefEncodedRecord>,
+        gpu_state: Option<crate::clef::ClefDeviceRequestState>,
+        cpu_fallback_rows: Vec<Vec<f32>>,
         tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
     },
 }
@@ -79,9 +84,31 @@ impl DecisionReadoutTap {
         match self {
             Self::CandidateLogits { tx, .. }
             | Self::HiddenPositions { tx, .. }
-            | Self::FullHiddenSequence { tx, .. } => {
+            | Self::ClefJoint { tx, .. } => {
                 let _ = tx.send(Err(error));
             }
+        }
+    }
+
+    fn recycle_into(self, engine: &mut Qwen3_5Engine) {
+        if let Self::ClefJoint {
+            gpu_state: Some(st),
+            ..
+        } = self
+        {
+            engine.clef_recycle_request(st);
+        }
+    }
+
+    fn fail_and_recycle(self, engine: &mut Qwen3_5Engine, error: String) {
+        match self {
+            Self::ClefJoint { gpu_state, tx, .. } => {
+                if let Some(st) = gpu_state {
+                    engine.clef_recycle_request(st);
+                }
+                let _ = tx.send(Err(error));
+            }
+            other => other.fail(error),
         }
     }
 }
@@ -379,11 +406,10 @@ impl EngineWorker {
         Ok((stream, rx))
     }
 
-    pub fn submit_decision_full_hidden_with_images(
+    pub fn submit_decision_clef_with_images(
         &self,
-        prompt: Vec<i32>,
+        record: Arc<crate::clef::ClefEncodedRecord>,
         images: Vec<crate::vision::PreprocessedImage>,
-        mamba_branching_seqlen: Option<usize>,
     ) -> Result<
         (
             GenerationStream,
@@ -391,19 +417,19 @@ impl EngineWorker {
         ),
         String,
     > {
-        let total_tokens = prompt.len();
-        let captured = Vec::with_capacity(total_tokens);
+        let prompt = record.input_ids.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // FullHiddenSequence requires evaluating every token [0..total_tokens], so disable
+        // Clef JointSchemaHead cross-attends over every token [0..total_tokens], so disable
         // radix prefix skipping (`max_prefix_lookup_len: Some(0)`).
         let stream = self.submit_decision_internal(
             prompt,
             images,
             Some(0),
-            mamba_branching_seqlen,
-            DecisionReadoutTap::FullHiddenSequence {
-                total_tokens,
-                captured,
+            None,
+            DecisionReadoutTap::ClefJoint {
+                record,
+                gpu_state: None,
+                cpu_fallback_rows: Vec::new(),
                 tx,
             },
         )?;
@@ -662,7 +688,11 @@ fn run(
                 let _ = p.set_mtp_batch_mode(false);
             }
             release(&mut engine, sched.cancel_request(id));
-            requests.remove(&id);
+            if let Some(mut r) = requests.remove(&id)
+                && let Some(tap) = r.decision_tap.take()
+            {
+                tap.recycle_into(&mut engine);
+            }
         }
 
         let is_batched_mtp_eligible = |r: &Request| -> bool {
@@ -1299,7 +1329,7 @@ fn fail_request(
 ) {
     if let Some(mut r) = requests.remove(&id) {
         if let Some(tap) = r.decision_tap.take() {
-            tap.fail(error.clone());
+            tap.fail_and_recycle(engine, error.clone());
         }
         let _ = r.output.try_send(GenerationEvent::Error(error));
     }
@@ -1307,7 +1337,7 @@ fn fail_request(
 }
 
 fn capture_decision_tap(
-    engine: &Qwen3_5Engine,
+    engine: &mut Qwen3_5Engine,
     s: &crate::scheduler::ScheduledReqSlice,
     tok_off: usize,
     selected_row: Option<usize>,
@@ -1371,35 +1401,91 @@ fn capture_decision_tap(
                 tap_done = Some((tx, res));
             }
         }
-        Some(DecisionReadoutTap::FullHiddenSequence {
-            total_tokens,
-            captured,
+        Some(DecisionReadoutTap::ClefJoint {
+            record,
+            gpu_state,
+            cpu_fallback_rows,
             ..
         }) => {
-            let read_err = match check_full_hidden_chunk_offset(captured.len(), s.ctx_len_before) {
-                Err(msg) => Some(msg),
-                Ok(()) => match engine.read_norm_hidden_range_f32(tok_off, slice_len) {
-                    Ok(rows) => {
-                        captured.extend(rows);
-                        None
+            let expected_total = record.input_ids.len();
+            let use_gpu = engine.clef_head_gpu.is_some();
+            let read_err = if use_gpu {
+                if gpu_state.is_none() {
+                    match check_full_hidden_chunk_offset(0, s.ctx_len_before)
+                        .and_then(|()| engine.clef_begin_request(record))
+                    {
+                        Ok(st) => {
+                            *gpu_state = Some(st);
+                            None
+                        }
+                        Err(e) => Some(e),
                     }
-                    Err(e) => Some(e.to_string()),
-                },
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    let st = gpu_state.as_mut().unwrap();
+                    check_full_hidden_chunk_offset(st.next_offset(), s.ctx_len_before)
+                        .and_then(|()| {
+                            engine.clef_ingest_norm_hidden_range(
+                                st,
+                                tok_off,
+                                s.ctx_len_before,
+                                slice_len,
+                            )
+                        })
+                        .err()
+                })
+            } else {
+                const MAX_CPU_FALLBACK_HIDDEN_BYTES: usize = 128 * 1024 * 1024;
+                let fallback_bytes = expected_total
+                    .saturating_mul(engine.cfg.hidden_size)
+                    .saturating_mul(core::mem::size_of::<f32>());
+                if fallback_bytes > MAX_CPU_FALLBACK_HIDDEN_BYTES {
+                    Some(format!(
+                        "clef cpu fallback hidden buffer ({fallback_bytes} B) exceeds 128 MiB cap"
+                    ))
+                } else {
+                    match check_full_hidden_chunk_offset(cpu_fallback_rows.len(), s.ctx_len_before)
+                    {
+                        Err(msg) => Some(msg),
+                        Ok(()) => match engine.read_norm_hidden_range_f32(tok_off, slice_len) {
+                            Ok(rows) => {
+                                cpu_fallback_rows.extend(rows);
+                                None
+                            }
+                            Err(e) => Some(e.to_string()),
+                        },
+                    }
+                }
             };
-            let expected_total = *total_tokens;
             if (read_err.is_some() || s.is_final_prefill_chunk)
-                && let Some(DecisionReadoutTap::FullHiddenSequence { captured, tx, .. }) =
-                    req.decision_tap.take()
+                && let Some(DecisionReadoutTap::ClefJoint {
+                    record,
+                    gpu_state,
+                    cpu_fallback_rows,
+                    tx,
+                }) = req.decision_tap.take()
             {
                 let res = if let Some(err) = read_err {
+                    if let Some(st) = gpu_state {
+                        engine.clef_recycle_request(st);
+                    }
                     Err(err)
-                } else {
-                    check_full_hidden_final_count(captured.len(), expected_total).map(|()| {
-                        DecisionTapOutput::HiddenRows {
-                            rows: captured,
+                } else if let Some(st) = gpu_state {
+                    check_full_hidden_final_count(st.next_offset(), expected_total)
+                        .and_then(|()| engine.clef_finalize_request(st, &record))
+                        .map(|logits| DecisionTapOutput::ClefLogits {
+                            logits,
                             cached_tokens: cached_toks,
-                        }
-                    })
+                        })
+                } else {
+                    check_full_hidden_final_count(cpu_fallback_rows.len(), expected_total).map(
+                        |()| DecisionTapOutput::HiddenRows {
+                            rows: cpu_fallback_rows,
+                            cached_tokens: cached_toks,
+                        },
+                    )
                 };
                 tap_done = Some((tx, res));
             }

@@ -2616,6 +2616,108 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup w34_moe_f16_down_accum",
     )?;
 
+    // Warm Clef JointSchemaHead kernels across TP ranks before collective capture.
+    check_rc(
+        unsafe {
+            ffi::w34_clef_accum_spans_f16_to_f32(
+                &ex,
+                buf_a as *const c_void,
+                cu_seqlens as *const i32,
+                buf_c as *mut f32,
+                0,
+                1,
+                1,
+                64,
+            )
+        },
+        "warmup w34_clef_accum_spans_f16_to_f32",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_clef_cast_f32_to_f16(&ex, buf_c as *const f32, buf_d as *mut c_void, 64)
+        },
+        "warmup w34_clef_cast_f32_to_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_clef_build_option_queries_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_a as *const c_void,
+                zero_i32 as *const i32,
+                buf_c as *mut c_void,
+                1,
+                1,
+                64,
+            )
+        },
+        "warmup w34_clef_build_option_queries_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_clef_mha_attn_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                1,
+                2,
+                32,
+            )
+        },
+        "warmup w34_clef_mha_attn_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_clef_option_summaries_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                cu_seqlens as *const i32,
+                buf_c as *mut c_void,
+                1,
+                1,
+                64,
+            )
+        },
+        "warmup w34_clef_option_summaries_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_clef_build_fields_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                zero_i32 as *const i32,
+                buf_c as *mut c_void,
+                1,
+                64,
+            )
+        },
+        "warmup w34_clef_build_fields_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_clef_build_residual_features_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                zero_i32 as *const i32,
+                buf_c as *mut c_void,
+                1,
+                1,
+                64,
+            )
+        },
+        "warmup w34_clef_build_residual_features_f16",
+    )?;
+
     dev.synchronize()
 }
 

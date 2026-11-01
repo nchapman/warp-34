@@ -1960,6 +1960,7 @@ pub struct Qwen3_5ModelRank {
 struct PoolCapacity {
     kv_pages: Option<usize>,
     state_slots: Option<usize>,
+    rank0_extra_headroom_bytes: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -2446,7 +2447,7 @@ impl Qwen3_5ModelRank {
         let requested_state_slots = capacity.state_slots.unwrap_or(default_state_slots);
         let default_pages = requested_kv_pages.or(Some(256));
         let req_kv_bytes = default_pages.unwrap_or(256) * bytes_per_kv_page_all_layers;
-        let required_headroom = if tp_size == 1
+        let base_headroom = if tp_size == 1
             && cfg.num_hidden_layers >= 64
             && default_pages.unwrap_or(0) >= 14_336
         {
@@ -2454,6 +2455,11 @@ impl Qwen3_5ModelRank {
         } else {
             crate::cuda::MIN_HEADROOM_BYTES
         };
+        let required_headroom = base_headroom.saturating_add(if rank == 0 {
+            capacity.rank0_extra_headroom_bytes
+        } else {
+            0
+        });
         let base_fixed = weight_arena
             .used()
             .saturating_add(scratch_arena.capacity())
@@ -4566,6 +4572,7 @@ pub struct Qwen3_5Engine {
     pub vision_encoder: Option<crate::vision::Qwen3VisionEncoder>,
     pub has_vision_weights: bool,
     pub decision_profile: crate::decision::DecisionModelProfile,
+    pub clef_head_gpu: Option<crate::clef::ClefJointHeadGpu>,
 }
 
 #[derive(Clone, Debug)]
@@ -4632,6 +4639,7 @@ impl Qwen3_5Engine {
             PoolCapacity {
                 kv_pages: requested_kv_pages,
                 state_slots: Some(state_slots),
+                ..PoolCapacity::default()
             },
             use_cuda_graph,
         )
@@ -4697,10 +4705,26 @@ impl Qwen3_5Engine {
             None
         };
 
+        let mut rank_capacity = capacity;
+        #[cfg(feature = "cuda")]
+        if let crate::decision::DecisionModelProfile::Clef { head, .. } = &decision_profile
+            && crate::clef::ClefJointHeadGpu::supports_config(&head.config)
+        {
+            rank_capacity.rank0_extra_headroom_bytes = rank_capacity
+                .rank0_extra_headroom_bytes
+                .saturating_add(crate::clef::ClefJointHeadGpu::reserved_rank0_headroom_bytes(head));
+        }
+
         let mut ranks = Vec::with_capacity(tp_size);
         for r in 0..tp_size {
             let rank_model = Qwen3_5ModelRank::load_rank_with_capacity(
-                &archive, &cfg, r, tp_size, r as i32, kv_policy, capacity,
+                &archive,
+                &cfg,
+                r,
+                tp_size,
+                r as i32,
+                kv_policy,
+                rank_capacity,
             )?;
             ranks.push(rank_model);
         }
@@ -4716,6 +4740,21 @@ impl Qwen3_5Engine {
                 r.state_pool.truncate_slots(common_slots);
             }
         }
+
+        let clef_head_gpu =
+            if let crate::decision::DecisionModelProfile::Clef { head, .. } = &decision_profile {
+                crate::clef::ClefJointHeadGpu::try_from_host(
+                    ranks[0].device.device_id,
+                    &ranks[0].stream,
+                    head.clone(),
+                )
+                .map_err(|e| {
+                    eprintln!("[w34] ClefJointHeadGpu::try_from_host failed: {e}");
+                    loader_err("ClefJointHeadGpu::try_from_host")
+                })?
+            } else {
+                None
+            };
 
         let tok_path = dir.join("tokenizer.json");
         let tokenizer = if tok_path.exists() {
@@ -4739,6 +4778,7 @@ impl Qwen3_5Engine {
             vision_encoder: None,
             has_vision_weights,
             decision_profile,
+            clef_head_gpu,
         })
     }
 
@@ -4861,6 +4901,86 @@ impl Qwen3_5Engine {
             .chunks_exact(h_dim)
             .map(|row| row.iter().copied().map(crate::cuda::f16_to_f32).collect())
             .collect())
+    }
+
+    pub fn set_decision_profile(
+        &mut self,
+        profile: crate::decision::DecisionModelProfile,
+    ) -> std::result::Result<(), String> {
+        self.clef_head_gpu =
+            if let crate::decision::DecisionModelProfile::Clef { head, .. } = &profile {
+                let r0 = &self.ranks[0];
+                r0.device.make_current().map_err(|e| e.to_string())?;
+                crate::clef::ClefJointHeadGpu::try_from_host(
+                    r0.device.device_id,
+                    &r0.stream,
+                    head.clone(),
+                )?
+            } else {
+                None
+            };
+        self.decision_profile = profile;
+        Ok(())
+    }
+
+    pub fn clef_begin_request(
+        &mut self,
+        record: &crate::clef::ClefEncodedRecord,
+    ) -> std::result::Result<crate::clef::ClefDeviceRequestState, String> {
+        let r0 = &self.ranks[0];
+        r0.device.make_current().map_err(|e| e.to_string())?;
+        let gpu = self
+            .clef_head_gpu
+            .as_mut()
+            .ok_or_else(|| "clef gpu head not initialized".to_string())?;
+        gpu.begin_request(record, &r0.stream)
+    }
+
+    pub fn clef_ingest_norm_hidden_range(
+        &mut self,
+        state: &mut crate::clef::ClefDeviceRequestState,
+        start_row: usize,
+        ctx_len_before: usize,
+        count: usize,
+    ) -> std::result::Result<(), String> {
+        if count == 0 {
+            return Ok(());
+        }
+        let r0 = &self.ranks[0];
+        let end_row = start_row
+            .checked_add(count)
+            .ok_or_else(|| "clef norm hidden row range overflow".to_string())?;
+        if end_row > r0.last_norm_hidden_rows || r0.last_norm_hidden_ptr == 0 {
+            return Err("clef norm hidden row range out of bounds".into());
+        }
+        let h_dim = self.cfg.hidden_size;
+        let src = r0.last_norm_hidden_ptr + (start_row * h_dim * 2) as u64;
+        r0.device.make_current().map_err(|e| e.to_string())?;
+        let gpu = self
+            .clef_head_gpu
+            .as_mut()
+            .ok_or_else(|| "clef gpu head not initialized".to_string())?;
+        gpu.ingest_chunk(state, src, ctx_len_before, count, &r0.cublas, &r0.stream)
+    }
+
+    pub fn clef_finalize_request(
+        &mut self,
+        state: crate::clef::ClefDeviceRequestState,
+        record: &crate::clef::ClefEncodedRecord,
+    ) -> std::result::Result<Vec<Vec<f64>>, String> {
+        let r0 = &self.ranks[0];
+        r0.device.make_current().map_err(|e| e.to_string())?;
+        let gpu = self
+            .clef_head_gpu
+            .as_mut()
+            .ok_or_else(|| "clef gpu head not initialized".to_string())?;
+        gpu.finalize(state, record, &r0.cublas, &r0.stream)
+    }
+
+    pub fn clef_recycle_request(&mut self, state: crate::clef::ClefDeviceRequestState) {
+        if let Some(gpu) = self.clef_head_gpu.as_mut() {
+            gpu.recycle_request_state(state);
+        }
     }
 
     /// Enable one native proposer before target graph capture. The proposer
