@@ -734,6 +734,7 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
             image_max_pixels: CLEF_DEFAULT_MAX_PIXELS,
         };
 
+        let clef_profile_tp1 = clef_profile.clone();
         let state_clef =
             OpenAiServerState::from_loader("qwen3.5-4b-clef".into(), false, move || {
                 let mut engine = Qwen3_5Engine::load(
@@ -744,11 +745,13 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
                     false,
                 )
                 .map_err(|e| e.to_string())?;
-                engine.decision_profile = clef_profile;
+                engine.decision_profile = clef_profile_tp1;
                 Ok(engine)
             })
             .unwrap();
 
+        let tp1_pair = Arc::new(std::sync::Mutex::new(None::<(Value, Value)>));
+        let tp1_pair_sink = tp1_pair.clone();
         rt.block_on(run_with_state(state_clef, |base_url, _state| async move {
             let client = reqwest::Client::new();
             // Multimodal /v1/decisions with two distinct images verifies ViT + mRoPE + FullHiddenSequence + ClefJointHead
@@ -799,7 +802,145 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
                 (p1 - p2).abs() > 1e-6,
                 "visual input change must perturb joint Clef hidden sequence: {p1} vs {p2}"
             );
+            *tp1_pair_sink.lock().unwrap() = Some((b1, b2));
         }));
+
+        if w34_host::cuda::CudaDevice::count().unwrap_or(0) >= 2 {
+            let (tp1_b1, tp1_b2) = tp1_pair.lock().unwrap().take().unwrap();
+            let clef_profile_tp2 = clef_profile.clone();
+            let state_clef_tp2 =
+                OpenAiServerState::from_loader("qwen3.5-4b-clef-tp2".into(), false, move || {
+                    let mut engine = Qwen3_5Engine::load_for_serving(
+                        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                        2,
+                        KvFormatPolicy::Fp16,
+                        Some(256),
+                        false,
+                        8,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    assert_eq!(
+                        engine.ranks[0].kv_pool.num_pages,
+                        engine.ranks[1].kv_pool.num_pages
+                    );
+                    assert_eq!(
+                        engine.ranks[0].state_pool.total_slots,
+                        engine.ranks[1].state_pool.total_slots
+                    );
+                    engine.decision_profile = clef_profile_tp2;
+                    Ok(engine)
+                })
+                .unwrap();
+
+            rt.block_on(run_with_state(
+                state_clef_tp2,
+                |base_url, _state| async move {
+                    let client = reqwest::Client::new();
+                    let make_mm_req = |img_seed: &str| {
+                        json!({
+                            "context": {"ticket": 99, "summary": "Inspect attached tile"},
+                            "images": [img_seed],
+                            "decisions": [
+                                {"id": "urgent", "type": "noul", "question": "Is it urgent?"},
+                                {
+                                    "id": "queue",
+                                    "type": "choice",
+                                    "question": "Which queue?",
+                                    "criteria": {"zeta": "Zeta queue", "alpha": null}
+                                }
+                            ]
+                        })
+                    };
+                    let b1: Value = client
+                        .post(format!("{base_url}/v1/decisions"))
+                        .json(&make_mm_req("rgb://clef-tile-alpha"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    let b2: Value = client
+                        .post(format!("{base_url}/v1/decisions"))
+                        .json(&make_mm_req("rgb://clef-tile-beta"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    for (tp1_b, tp2_b, label) in [(&tp1_b1, &b1, "alpha"), (&tp1_b2, &b2, "beta")]
+                    {
+                        let n1 = tp1_b["answers"]["urgent"]["noul"].as_f64().unwrap();
+                        let n2 = tp2_b["answers"]["urgent"]["noul"].as_f64().unwrap();
+                        assert!(
+                            (n1 - n2).abs() < 3e-3,
+                            "Clef TP=1 vs TP=2 noul mismatch ({label}): tp1={n1} vs tp2={n2}"
+                        );
+                        for k in ["zeta", "alpha"] {
+                            let c1 = tp1_b["answers"]["queue"]["probabilities"][k]
+                                .as_f64()
+                                .unwrap();
+                            let c2 = tp2_b["answers"]["queue"]["probabilities"][k]
+                                .as_f64()
+                                .unwrap();
+                            assert!(
+                                (c1 - c2).abs() < 3e-3,
+                                "Clef TP=1 vs TP=2 choice[{k}] mismatch ({label}): tp1={c1} vs tp2={c2}"
+                            );
+                        }
+                    }
+                },
+            ));
+
+            // Also verify TP=2 sharded `lm_head` CandidateLogits + multimodal `images` + MambaRadixCache reuse on Tev1.
+            let state_tev1_tp2 =
+                OpenAiServerState::from_loader("qwen3.5-4b-tev1-tp2".into(), false, || {
+                    Qwen3_5Engine::load_for_serving(
+                        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                        2,
+                        KvFormatPolicy::Fp16,
+                        Some(256),
+                        false,
+                        8,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+                .unwrap();
+
+            rt.block_on(run_with_state(
+                state_tev1_tp2,
+                |base_url, _state| async move {
+                    let client = reqwest::Client::new();
+                    let mm_tev1 = json!({
+                        "state": "Inspect the attached status tile across multiple production regions and service clusters in us-east-1 and eu-west-1.",
+                        "images": ["rgb://tev1-mm-tp2-shared"],
+                        "questions": {
+                            "healthy": {"type": "noul", "instructions": "Does the tile indicate healthy state?"},
+                            "team": {
+                                "type": "choice",
+                                "instructions": "Which team should inspect it?",
+                                "criteria": {"sre": "Site reliability", "frontend": "UI engineering"}
+                            }
+                        }
+                    });
+                    let resp = client
+                        .post(format!("{base_url}/v1/systemone"))
+                        .json(&mm_tev1)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status().as_u16(), 200);
+                    let body: Value = resp.json().await.unwrap();
+                    assert_eq!(body["usage"]["output_tokens"], 0);
+                    assert!(
+                        body["usage"]["cached_tokens"].as_u64().unwrap() >= 64,
+                        "expected multimodal MambaRadixCache prefix reuse across TP=2 Tev1 sub-queries, got {:?}",
+                        body["usage"]
+                    );
+                },
+            ));
+        }
 
         let _ = std::fs::remove_dir_all(&tmp_clef);
     }

@@ -331,6 +331,15 @@ impl KvPool {
     pub fn reset_all_pages(&mut self) {
         self.free_pages.reset();
     }
+
+    /// Clamps logical page capacity downward so `TP=2` ranks operate in lockstep even when
+    /// per-GPU free VRAM or rank-0 vision reservation produces slightly different initial budgets.
+    pub fn truncate_pages(&mut self, max_pages: usize) {
+        if max_pages < self.num_pages {
+            self.num_pages = max_pages;
+            self.free_pages = PageBitmap::new(max_pages);
+        }
+    }
 }
 
 /// Lifecycle states defined in `docs/contracts/state-transaction.md`.
@@ -493,6 +502,14 @@ impl StateBundlePool {
 
     pub fn reset_all_slots(&mut self) {
         self.free_slots = (0..self.total_slots as i32).rev().collect();
+    }
+
+    /// Clamps logical state-slot capacity downward so `TP=2` ranks operate in lockstep.
+    pub fn truncate_slots(&mut self, max_slots: usize) {
+        if max_slots < self.total_slots {
+            self.total_slots = max_slots;
+            self.reset_all_slots();
+        }
     }
 }
 

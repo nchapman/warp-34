@@ -4704,6 +4704,18 @@ impl Qwen3_5Engine {
             )?;
             ranks.push(rank_model);
         }
+        if ranks.len() > 1 {
+            let common_pages = ranks.iter().map(|r| r.kv_pool.num_pages).min().unwrap_or(0);
+            let common_slots = ranks
+                .iter()
+                .map(|r| r.state_pool.total_slots)
+                .min()
+                .unwrap_or(0);
+            for r in &mut ranks {
+                r.kv_pool.truncate_pages(common_pages);
+                r.state_pool.truncate_slots(common_slots);
+            }
+        }
 
         let tok_path = dir.join("tokenizer.json");
         let tokenizer = if tok_path.exists() {

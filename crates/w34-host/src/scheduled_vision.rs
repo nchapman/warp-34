@@ -141,7 +141,13 @@ impl ScheduledVision {
                 "scheduled vision sequence does not match prefill state",
             ));
         }
-        let take = (self.prompt.len() - start).min(chunk_size.max(1));
+        let mut take = (self.prompt.len() - start).min(chunk_size.max(1));
+        if let Some(branch_end) = seq.mamba_branching_seqlen {
+            let aligned_branch = (branch_end / 64) * 64;
+            if aligned_branch > start && aligned_branch < self.prompt.len() {
+                take = take.min(aligned_branch - start);
+            }
+        }
         let end = start + take;
         let planned = seq.radix_state.plan_checkpoints(take);
         let slice = ScheduledReqSlice {
