@@ -765,6 +765,40 @@ impl ModelConfig {
             .unwrap_or("qwen3_5_text")
             .to_string();
 
+        if let Some(act) = tc
+            .get("hidden_act")
+            .or_else(|| root.get("hidden_act"))
+            .and_then(|v| v.as_str())
+            && !act.eq_ignore_ascii_case("silu")
+            && !act.eq_ignore_ascii_case("swiglu")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported hidden_act='{}' (expected 'silu')",
+                    sanitize_diag(act)
+                ),
+            ));
+        }
+
+        if tc
+            .get("use_sliding_window")
+            .or_else(|| root.get("use_sliding_window"))
+            .and_then(|v| v.as_bool())
+            == Some(true)
+            || tc
+                .get("sliding_window")
+                .or_else(|| root.get("sliding_window"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported sliding_window in backbone attention (warp-34 targets full causal attention)",
+            ));
+        }
+
         let hidden_size = tc["hidden_size"].as_u64().unwrap_or(2560) as usize;
         let intermediate_size = tc
             .get("intermediate_size")
@@ -2526,5 +2560,17 @@ mod tests {
             err.to_string()
                 .contains("unsupported linear_key_head_dim=64")
         );
+
+        // hidden_act != silu fails fast
+        let mut bad_act = base_json.clone();
+        bad_act["hidden_act"] = serde_json::json!("gelu");
+        let err = ModelConfig::from_json(&bad_act).unwrap_err();
+        assert!(err.to_string().contains("unsupported hidden_act='gelu'"));
+
+        // sliding_window > 0 fails fast
+        let mut bad_swa = base_json.clone();
+        bad_swa["sliding_window"] = serde_json::json!(4096);
+        let err = ModelConfig::from_json(&bad_swa).unwrap_err();
+        assert!(err.to_string().contains("unsupported sliding_window"));
     }
 }
