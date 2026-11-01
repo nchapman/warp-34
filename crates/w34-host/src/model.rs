@@ -3340,6 +3340,13 @@ impl Qwen3_5ModelRank {
         capacity: PoolCapacity,
     ) -> Result<Self> {
         Self::validate_tp_geometry(cfg, tp_size)?;
+        if cfg.head_dim != 256 && !matches!(kv_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16)
+        {
+            return Err(loader_err_msg(format!(
+                "unsupported KV format {kv_policy:?} for head_dim={} (TQ4 and Q8_0 require head_dim=256; use --kv fp16)",
+                cfg.head_dim
+            )));
+        }
         let requested_kv_pages = capacity.kv_pages;
         prepare_execution_plan(device_id)?;
         let device = CudaDevice::set_current(device_id)?;
