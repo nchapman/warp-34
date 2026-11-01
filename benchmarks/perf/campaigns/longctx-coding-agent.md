@@ -12,7 +12,79 @@ single-card 262K qualification, short 64-token outputs, exploratory
 performance measurements only. Values are medians of per-trial statistics.
 These traces do not measure successful software repair.
 
-## 9B, TP=1
+## Qualified candidate (`goal-*` serial final-binary qualification)
+
+All six candidate suites below were measured serially on a single frozen release
+build (`crates_tree_sha256=e1b67ef230877a0facb487401ab037c3ba15660c5e969444b782bfadfc6350e0`,
+`w34` `binary_sha256=b125f589aa1f567420f6ce11e0a713db1e4dd1e202ca3df45bb6f648f12fcb4b`,
+`needle_gate` `d347dde3399f0e73827ab6f88361c424564b667b5af08fdd5cd1a87963bab6c3`,
+recorded in `results/goal-provenance.json`) with no GPU co-residency, reusing the
+identical fixtures, TOMLs, and pinned model snapshots; retained competitor rows
+(`vLLM 0.31.0`, `SGLang 0.5.19`) were not rerun.
+
+Shipped optimizations (all custom kernels `STACK:0`, FP16 spine + FP32 SSM,
+strict 256-token mixed decode/prefill cap preserved):
+- **`op_gdn.cu`**: bank-conflict-free padded WY Stage 1 (`kWyStage1SmemBytes=36608`,
+  116 regs, `STACK:0`), Stage 2 dedicated `s_wh_full` with register-prefetched
+  `U`/`K` and `__half2` `s_H` stores (`kWyStage2SmemBytes=43520`, 128 regs, `STACK:0`),
+  paired `__half2` `gdn_causal_conv1d_pair_f16_kernel` (`REG:40 STACK:0`, 4B alignment
+  guard), and exact `grid_upper_chunks` checkpoint `H`-slot sizing.
+- **`op_sampler.cu`**: two-stage `w34_sampler_step_fast_greedy_masked_f16` (`REG:40/31 STACK:0`)
+  replacing the 174 µs scalar masked sampler under stateful `tool_choice: "none"` bitmasks
+  with 0-ULP parity.
+- **Attention, scratch & scheduler**: packed multi-request FP16 FA2 (`64x64`), Q8_0-only
+  128-row prefill dispatch (`REG:234 STACK:0`), pre-scaled FP16 TQ4 LUTs, overlaid
+  FA/GDN/FFN scratch with model-derived prefill chunks up to 2048 tokens, Marlin prefill
+  Split-K, and fair 64-token-tile pure-prefill budget sharing across concurrent prefills
+  while strictly retaining the 256-token mixed decode/prefill cap.
+
+### 9B TP=1: 156/156 candidate HTTP requests passed (78/78 FP16, 78/78 TQ4)
+
+| Deployment | 59K agent C1 tok/s | 59K agent C2 tok/s | 118K agent C1 tok/s | Cold 57.6K TTFT s | Cold 115.1K TTFT s |
+|---|---:|---:|---:|---:|---:|
+| **warp-34 FP16 (`goal-9b-fp16`)** | **27.02** | **28.91** | **14.51** | **14.61** | **36.28** |
+| **warp-34 TQ4 (`goal-9b-tq4`)** | **22.07** | **20.79** | **10.74** | **18.15** | **50.07** |
+| vLLM 0.31.0 FP16 (retained) | 25.98 | 28.74 | 13.75 | 14.86 | 36.39 |
+| SGLang 0.5.19 FP16 (retained) | 26.14 | 28.81 | 13.62 | 15.26 | 37.59 |
+
+On 9B TP=1 FP16, `warp-34` exceeds both `vLLM 0.31.0` and `SGLang 0.5.19` across
+all five cases (59K C1 `+4.0% / +3.4%`, 59K C2 `+0.6% / +0.4%` with warm-turn p50
+TTFT `383 / 517 ms`, 118K C1 `+5.6% / +6.6%` with warm-turn p50 TTFT `462 ms`, and
+lower cold 57.6K / 115.1K TTFT). 9B TQ4 improves `+8.7% / +18.3% / +10.8%` on
+59K C1 / 59K C2 / 118K C1 and `-10.4% / -11.3%` on 57.6K / 115.1K cold TTFT vs the
+original `warp-34` TQ4 baseline.
+
+### 27B TP=2: 84/84 candidate HTTP requests passed (42/42 FP16, 42/42 TQ4)
+
+| Deployment | 59K agent C1 tok/s | 118K agent C1 tok/s | Cold 57.6K TTFT s | Cold 115.1K TTFT s | Warm-turn TTFT 59K / 118K ms |
+|---|---:|---:|---:|---:|---:|
+| **warp-34 FP16 (`goal-27b-tp2-fp16`)** | **13.60** | **6.96** | **33.96** | **78.79** | **837 / 1,012** |
+| **warp-34 TQ4 (`goal-27b-tp2-tq4`)** | **11.97** | **5.62** | **39.18** | **98.11** | **1,013 / 1,272** |
+| vLLM 0.31.0 FP16 (retained) | 11.97 | 6.40 | 35.68 | 83.15 | 1,231 / 1,667 |
+| SGLang 0.5.19 FP16 (retained) | 12.00 | 6.44 | 36.58 | 85.07 | 1,339 / 1,307 |
+
+On 27B TP=2 FP16 over PCIe Gen4 x8 (no P2P/NVLink), `warp-34` exceeds both
+`vLLM 0.31.0` and `SGLang 0.5.19` across all four cases (59K C1 `+13.6% / +13.3%`,
+118K C1 `+8.8% / +8.1%`, cold 57.6K TTFT `-4.8% / -7.2%`, cold 115.1K TTFT
+`-5.2% / -7.4%`, and warm-turn p50 TTFT `-32.0% / -37.5%` at 59K and `-39.3% / -22.5%`
+at 118K).
+
+### Single-card 27B TP=1 262K retention (`goal-27b-tp1-262k` + `goal-needle`)
+
+- **Live HTTP (`goal-27b-tp1-262k`)**: **29/29 requests passed** on 1× 24 GiB RTX 3090 Ti
+  (`--kv-format tq4 --kv-pages 16384`), reaching **252,112 peak prompt tokens** with
+  **82.7% prefix hits**: ~59K / ~118K / ~252K session output **`7.77 / 3.63 / 1.12 tok/s`**
+  (warm-turn p50 TTFT **`1,597 / 1,922 / 3,154 ms`**) and 115K unique cold read TTFT
+  **`149.48 s`** (down from `171.40 s`).
+- **262,144-window 50%-depth needle (`goal-needle`)**: **passed**, `262,108` prompt tokens,
+  exact `"73918462"`, TTFT **`584.14 s`**, decode **`23.36 tok/s`**.
+- **Verification**: `CUDA_VISIBLE_DEVICES=0,1 mise run check` exited 0 (**234 Rust
+  tests/doctests**, **0 failed**, **69 oracle tests**, **51 perf tests**); review
+  (`.pi/review/call_49568.md`) reported **0 critical/important findings**. All five
+  `goal-*` HTTP bundles, `goal-needle`, and `goal-provenance.json` are indexed in
+  [`longctx-coding-agent.results.json`](longctx-coding-agent.results.json).
+
+## Original campaign: 9B, TP=1
 
 Revision: `42e302203ae5d3428ce2682d7b443578ef04d5dd`.
 All four deployments completed 78/78 measured requests each. Total output tok/s

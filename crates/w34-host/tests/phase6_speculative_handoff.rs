@@ -70,9 +70,12 @@ async fn collect(stream: &mut GenerationStream, mut tokens: Vec<i32>) -> Result<
     Err("stream closed without Finished".into())
 }
 
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Run with flock /tmp/w34-gpu1.lock and CUDA_VISIBLE_DEVICES=1.
 #[test]
 fn native_speculation_yields_to_late_peer_losslessly() {
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -141,6 +144,7 @@ fn native_speculation_yields_to_late_peer_losslessly() {
 
 #[test]
 fn batched_mtp_b4_matches_single_stream_losslessly() {
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

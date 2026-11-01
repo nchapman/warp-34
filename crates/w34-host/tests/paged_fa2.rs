@@ -226,3 +226,294 @@ fn prefill_reference_graph_and_fallback_canaries() {
     s.synchronize().unwrap();
     assert!(got.iter().all(|&x| x == 0x5500));
 }
+
+#[test]
+fn multi_request_mixed_decode_and_prefill_fa2() {
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let s = CudaStream::new(0).unwrap();
+    w34_host::cuda::prepare_execution_plan(0).unwrap();
+
+    // 48 physical pages of 16 tokens x 256 head_dim: Req 0 uses 13 pages (200 tok: 199 ctx + 1 decode),
+    // Req 1 uses 22 pages (337 tok: 47 ctx + 290 prefill).
+    let total_q = 1 + 290;
+    let max_q = 290;
+    let max_blocks = 24;
+    let q = upload(&s, &vec![0u16; total_q * 4 * 256]);
+    let k = upload(&s, &vec![0u16; 48 * 16 * 256]);
+    let values: Vec<u16> = (0..48 * 16 * 256)
+        .map(|i| {
+            if (i / 256 + (i % 256) * 2) % 5 == 0 {
+                0x3c00
+            } else {
+                0xbc00
+            }
+        })
+        .collect();
+    let v = upload(&s, &values);
+    let out = upload(&s, &vec![0x5500u16; total_q * 4 * 256]);
+    let starts = upload(&s, &[0i32, 1, 291]);
+    let ctx = upload(&s, &[199i32, 47]);
+    let seq = upload(&s, &[200i32, 337]);
+
+    let perm0: Vec<i32> = (0..max_blocks).map(|i| (i * 5 + 3) % 24).collect();
+    let perm1: Vec<i32> = (0..max_blocks).map(|i| 24 + ((i * 7 + 1) % 24)).collect();
+    let mut table = Vec::with_capacity((2 * max_blocks) as usize);
+    table.extend_from_slice(&perm0);
+    table.extend_from_slice(&perm1);
+    let pages = upload(&s, &table);
+
+    let lse_bytes = 2 * 4 * max_q * 4;
+    let ws = upload(&s, &vec![0xa5u8; lse_bytes + 32]);
+    let layout = ffi::W34KvLayerLayout {
+        k_base: k.addr(),
+        v_base: v.addr(),
+        k_page_stride_bytes: 8192,
+        v_page_stride_bytes: 8192,
+        k_head_stride_bytes: 512,
+        v_head_stride_bytes: 512,
+        k_token_stride_bytes: 512,
+        v_token_stride_bytes: 512,
+        namespace_id: ffi::W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+        layer_id: 0,
+        local_kv_heads: 1,
+        head_dim: 256,
+        block_size: 16,
+        k_format: ffi::W34_KV_FORMAT_FP16,
+        v_format: ffi::W34_KV_FORMAT_FP16,
+        k_transform: 0,
+        v_transform: 0,
+        reserved: 0,
+    };
+    let b = ffi::W34AttentionBatch {
+        query_start_loc: starts.addr() as *const i32,
+        context_lens_before: ctx.addr() as *const i32,
+        seq_lens_after: seq.addr() as *const i32,
+        block_tables: pages.addr() as *const i32,
+        write_slot_mapping: std::ptr::null(),
+        valid_token_mask: std::ptr::null(),
+        valid_req_mask: std::ptr::null(),
+        num_reqs: 2,
+        total_tokens: total_q as i32,
+        max_blocks_per_req: max_blocks,
+        max_q_len: max_q as i32,
+        max_seq_len: 337,
+        mask_mode: ffi::W34_ATTN_MASK_CAUSAL,
+        sliding_window: 0,
+        sm_scale: 0.0625,
+        reserved: 0,
+    };
+    check_rc(
+        // SAFETY: allocations cover the descriptors and remain live through stream synchronization.
+        unsafe {
+            ffi::w34_paged_attention_f16(
+                &s.exec(ws.addr() + 16, lse_bytes),
+                &layout,
+                &b,
+                q.addr() as *const c_void,
+                out.addr() as *mut c_void,
+                4,
+            )
+        },
+        "multi-req paged FA2",
+    )
+    .unwrap();
+
+    let mut guard = vec![0u8; lse_bytes + 32];
+    let mut got = vec![0u16; total_q * 4 * 256];
+    ws.copy_to_host(&mut guard, &s).unwrap();
+    out.copy_to_host(&mut got, &s).unwrap();
+    s.synchronize().unwrap();
+
+    assert!(
+        guard[..16]
+            .iter()
+            .chain(guard[guard.len() - 16..].iter())
+            .all(|&x| x == 0xa5),
+        "canaries around multi-req LSE workspace must stay intact"
+    );
+    assert!(
+        guard[16..guard.len() - 16].iter().any(|&x| x != 0xa5),
+        "multi-req mixed decode+prefill must take FA2 path and write LSE"
+    );
+
+    for (q_base, q_len, ctx_before, perm) in [
+        (0usize, 1usize, 199usize, &perm0[..]),
+        (1, 290, 47, &perm1[..]),
+    ] {
+        for row in 0..q_len {
+            let end = ctx_before + row + 1;
+            for col in 0..256 {
+                let expected: f32 = (0..end)
+                    .map(|t| half(values[(perm[t / 16] as usize * 16 + t % 16) * 256 + col]))
+                    .sum::<f32>()
+                    / end as f32;
+                for h in 0..4 {
+                    let actual = half(got[((q_base + row) * 4 + h) * 256 + col]);
+                    assert!(
+                        (actual - expected).abs() < 0.002,
+                        "q_base={q_base} row={row} h={h} col={col}: got={actual} expected={expected}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn single_request_long_context_graph_matches_eager() {
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let s = CudaStream::new(0).unwrap();
+    w34_host::cuda::prepare_execution_plan(0).unwrap();
+
+    // Warm coding-agent turn shape: q_len = 97 (<= 256), context = 2400 -> seq_after = 2497 (>= 2048).
+    let n_pages = 160usize;
+    let q_len = 97usize;
+    let ctx_before = 2400usize;
+    let seq_after = ctx_before + q_len;
+    let q = upload(&s, &vec![0u16; q_len * 4 * 256]);
+    let k = upload(&s, &vec![0u16; n_pages * 16 * 256]);
+    let values: Vec<u16> = (0..n_pages * 16 * 256)
+        .map(|i| {
+            if (i / 256 + i % 17) % 4 == 0 {
+                0x3c00
+            } else {
+                0xbc00
+            }
+        })
+        .collect();
+    let v = upload(&s, &values);
+    let out = upload(&s, &vec![0x5500u16; q_len * 4 * 256]);
+    let starts = upload(&s, &[0i32, q_len as i32]);
+    let ctx = upload(&s, &[ctx_before as i32]);
+    let seq = upload(&s, &[seq_after as i32]);
+    let perm: Vec<i32> = (0..n_pages as i32)
+        .map(|i| (i * 13 + 7) % (n_pages as i32))
+        .collect();
+    let pages = upload(&s, &perm);
+
+    // Large scratch must not change the arithmetic between eager and graph execution.
+    let ws_size = 2 * 1024 * 1024;
+    let ws = upload(&s, &vec![0xa5u8; ws_size]);
+    let layout = ffi::W34KvLayerLayout {
+        k_base: k.addr(),
+        v_base: v.addr(),
+        k_page_stride_bytes: 8192,
+        v_page_stride_bytes: 8192,
+        k_head_stride_bytes: 512,
+        v_head_stride_bytes: 512,
+        k_token_stride_bytes: 512,
+        v_token_stride_bytes: 512,
+        namespace_id: ffi::W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+        layer_id: 0,
+        local_kv_heads: 1,
+        head_dim: 256,
+        block_size: 16,
+        k_format: ffi::W34_KV_FORMAT_FP16,
+        v_format: ffi::W34_KV_FORMAT_FP16,
+        k_transform: 0,
+        v_transform: 0,
+        reserved: 0,
+    };
+    let b = ffi::W34AttentionBatch {
+        query_start_loc: starts.addr() as *const i32,
+        context_lens_before: ctx.addr() as *const i32,
+        seq_lens_after: seq.addr() as *const i32,
+        block_tables: pages.addr() as *const i32,
+        write_slot_mapping: std::ptr::null(),
+        valid_token_mask: std::ptr::null(),
+        valid_req_mask: std::ptr::null(),
+        num_reqs: 1,
+        total_tokens: q_len as i32,
+        max_blocks_per_req: n_pages as i32,
+        max_q_len: q_len as i32,
+        max_seq_len: seq_after as i32,
+        mask_mode: ffi::W34_ATTN_MASK_CAUSAL,
+        sliding_window: 0,
+        sm_scale: 0.0625,
+        reserved: 0,
+    };
+    check_rc(
+        // SAFETY: allocations cover the descriptors and remain live through stream synchronization.
+        unsafe {
+            ffi::w34_paged_attention_f16(
+                &s.exec(ws.addr(), ws_size),
+                &layout,
+                &b,
+                q.addr() as *const c_void,
+                out.addr() as *mut c_void,
+                4,
+            )
+        },
+        "long-context paged FA2",
+    )
+    .unwrap();
+
+    let mut got = vec![0u16; q_len * 4 * 256];
+    out.copy_to_host(&mut got, &s).unwrap();
+    s.synchronize().unwrap();
+
+    for row in [0usize, 15, 63, 64, 96] {
+        let end = ctx_before + row + 1;
+        for col in 0..256 {
+            let expected: f32 = (0..end)
+                .map(|t| half(values[(perm[t / 16] as usize * 16 + t % 16) * 256 + col]))
+                .sum::<f32>()
+                / end as f32;
+            for h in 0..4 {
+                let actual = half(got[(row * 4 + h) * 256 + col]);
+                assert!(
+                    (actual - expected).abs() < 0.003,
+                    "row={row} h={h} col={col}: got={actual} expected={expected}"
+                );
+            }
+        }
+    }
+
+    // Nonuniform scores expose reduction/rounding differences hidden by Q=K=0.
+    let pattern = |i: usize| [0x3800u16, 0xb400, 0x3000, 0x3a00, 0xb800][(i * 7 + i / 257) % 5];
+    q.copy_from_host(&(0..q_len * 4 * 256).map(pattern).collect::<Vec<_>>(), &s)
+        .unwrap();
+    k.copy_from_host(
+        &(0..n_pages * 16 * 256).map(pattern).collect::<Vec<_>>(),
+        &s,
+    )
+    .unwrap();
+    let invoke = || {
+        check_rc(
+            // SAFETY: captured allocations remain live; replay lengths stay within their bounds.
+            unsafe {
+                ffi::w34_paged_attention_f16(
+                    &s.exec(ws.addr(), ws_size),
+                    &layout,
+                    &b,
+                    q.addr() as *const c_void,
+                    out.addr() as *mut c_void,
+                    4,
+                )
+            },
+            "long-context graph/eager FA2",
+        )
+    };
+    invoke().unwrap();
+    out.copy_to_host(&mut got, &s).unwrap();
+    s.synchronize().unwrap();
+    let graph = CudaGraph::capture(&s, invoke).unwrap();
+    graph.launch(&s).unwrap();
+    let mut replay = vec![0u16; got.len()];
+    out.copy_to_host(&mut replay, &s).unwrap();
+    s.synchronize().unwrap();
+    assert_eq!(got, replay, "graph and eager must be bit-exact");
+
+    // Replay shorter device lengths without recapture; inactive output stays untouched.
+    starts.copy_from_host(&[0i32, 65], &s).unwrap();
+    seq.copy_from_host(&[(ctx_before + 65) as i32], &s).unwrap();
+    out.copy_from_host(&vec![0x5500u16; got.len()], &s).unwrap();
+    graph.launch(&s).unwrap();
+    out.copy_to_host(&mut replay, &s).unwrap();
+    s.synchronize().unwrap();
+    assert!(replay[65 * 4 * 256..].iter().all(|&x| x == 0x5500));
+    invoke().unwrap();
+    out.copy_to_host(&mut got, &s).unwrap();
+    s.synchronize().unwrap();
+    assert_eq!(got, replay, "shortened replay must match eager");
+}

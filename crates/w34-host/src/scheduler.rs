@@ -24,6 +24,18 @@ pub struct SchedulerConfig {
 }
 
 impl SchedulerConfig {
+    /// Clamp without ever rounding a model-derived capacity upward.
+    pub fn clamp_for_token_capacity(&mut self, capacity: usize) {
+        let chunk = self.mamba_chunk_size.max(1);
+        let cap = capacity / chunk * chunk;
+        assert!(cap >= chunk, "scratch capacity below scheduler chunk size");
+        self.max_num_batched_tokens = self.max_num_batched_tokens.min(cap);
+        self.chunk_prefill_size = self.chunk_prefill_size.min(cap);
+        if self.mixed_chunk_prefill_size > 0 {
+            self.mixed_chunk_prefill_size = self.mixed_chunk_prefill_size.min(cap);
+        }
+    }
+
     #[inline]
     pub fn effective_mixed_prefill_budget(&self) -> usize {
         if self.mixed_chunk_prefill_size == 0 {
@@ -59,11 +71,11 @@ impl SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            max_num_batched_tokens: 1408,
+            max_num_batched_tokens: 2048,
             max_num_seqs: 16,
             page_size: 16,
             mamba_chunk_size: 64,
-            chunk_prefill_size: 1408,
+            chunk_prefill_size: 2048,
             mixed_chunk_prefill_size: 256,
         }
     }
@@ -349,20 +361,19 @@ impl SchedulerV1 {
         }
 
         // 2. Schedule chunked prefill slices aligned to `mamba_chunk_size = 64`.
-        // When active decode sequences are present in this unified batch, cap co-scheduled
-        // prefill tokens to `effective_mixed_prefill_budget()` (default 256) so open-loop
-        // arrivals do not stall active decodes for a full 1408-token prefill wave.
+        // Bound total co-scheduled prefill even for long prompts and low decode concurrency:
+        // a larger chunk would stall active decode streams for its entire execution time.
         let has_active_decodes = !batch.is_empty();
-        let per_req_chunk_cap = if has_active_decodes {
-            self.cfg.effective_mixed_prefill_budget()
-        } else {
-            self.cfg.chunk_prefill_size
-        };
         let mut prefill_budget = if has_active_decodes {
             budget.min(self.cfg.effective_mixed_prefill_budget())
         } else {
             budget
         };
+        let mut pending_prefills = self
+            .active
+            .iter()
+            .filter(|seq| !seq.finished && !seq.is_prefill_complete() && !seq.custom_prefill)
+            .count();
         for seq in &self.active {
             if seq.finished || seq.is_prefill_complete() || seq.custom_prefill {
                 continue;
@@ -372,7 +383,18 @@ impl SchedulerV1 {
             }
             let start = seq.prefilled_tokens;
             let rem = seq.prompt_tokens.len() - start;
-            let max_take = rem.min(per_req_chunk_cap).min(prefill_budget);
+            // Share pure-prefill waves so one bulk request does not enter decode while
+            // another is still starved, forcing the remainder through the mixed-step cap.
+            // Active decodes always retain their existing latency-bounded policy.
+            let share = if !has_active_decodes && pending_prefills > 1 {
+                let aligned = (prefill_budget / pending_prefills / self.cfg.mamba_chunk_size)
+                    * self.cfg.mamba_chunk_size;
+                aligned.max(self.cfg.mamba_chunk_size).min(prefill_budget)
+            } else {
+                prefill_budget
+            };
+            pending_prefills -= 1;
+            let max_take = rem.min(self.cfg.chunk_prefill_size).min(share);
             if max_take == 0 {
                 continue;
             }
@@ -519,11 +541,11 @@ mod tests {
     #[test]
     fn test_scheduler_config_defaults() {
         let cfg = SchedulerConfig::default();
-        assert_eq!(cfg.max_num_batched_tokens, 1408);
+        assert_eq!(cfg.max_num_batched_tokens, 2048);
         assert_eq!(cfg.max_num_seqs, 16);
         assert_eq!(cfg.page_size, 16);
         assert_eq!(cfg.mamba_chunk_size, 64);
-        assert_eq!(cfg.chunk_prefill_size, 1408);
+        assert_eq!(cfg.chunk_prefill_size, 2048);
         assert!(cfg.chunk_prefill_size.is_multiple_of(cfg.mamba_chunk_size));
     }
 
@@ -705,6 +727,89 @@ mod tests {
     }
 
     #[test]
+    fn test_long_context_mixed_step_retains_decode_latency_cap() {
+        let cfg = SchedulerConfig::default();
+        let mut sched = SchedulerV1::new(cfg);
+        let mut slot_counter = 1;
+
+        let id_dec = sched.submit_request((0..64).collect(), 10, vec![]);
+        sched.admit_waiting(|_radix| {
+            let s = (slot_counter, [slot_counter + 1, slot_counter + 2]);
+            slot_counter += 3;
+            Some(s)
+        });
+        sched.active[0].radix_state.kv_pages = (0..8).collect();
+        let s0 = sched.schedule_step();
+        sched.commit_slice(&s0[0], Some(700), || Some(99));
+
+        // A long-context turn must retain the same mixed-step cap as short arrivals,
+        // even at low decode concurrency and with most of its prompt already cached.
+        let id_long = sched.submit_request((0..5000).collect(), 10, vec![]);
+        sched.admit_waiting(|_radix| {
+            let s = (slot_counter, [slot_counter + 1, slot_counter + 2]);
+            slot_counter += 3;
+            Some(s)
+        });
+        sched.active[1].cached_prefix_tokens = 3584;
+        sched.active[1].prefilled_tokens = 3584;
+        sched.active[1].radix_state.token_ids = (0..3584).collect();
+        sched.active[1].radix_state.kv_pages = (8..330).collect();
+
+        let slices = sched.schedule_step();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].req_id, id_dec);
+        assert!(!slices[0].is_prefill_chunk);
+        assert_eq!(slices[1].req_id, id_long);
+        assert!(slices[1].is_prefill_chunk);
+        assert!(!slices[1].is_final_prefill_chunk);
+        assert_eq!(slices[1].query_tokens.len(), 256);
+    }
+
+    #[test]
+    fn test_pure_prefill_shares_budget_between_long_requests() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        sched.submit_request((0..8192).collect(), 10, vec![]);
+        sched.submit_request((10000..18192).collect(), 10, vec![]);
+        let mut slot = 0;
+        sched.admit_waiting(|_| {
+            let slots = (slot, [slot + 1, slot + 2]);
+            slot += 3;
+            Some(slots)
+        });
+        for (i, seq) in sched.active.iter_mut().enumerate() {
+            seq.radix_state.kv_pages = ((i * 512) as i32..((i + 1) * 512) as i32).collect();
+        }
+        let slices = sched.schedule_step();
+        assert_eq!(
+            slices.len(),
+            2,
+            "do not starve a second bulk prefill until the first decodes"
+        );
+        assert_eq!(slices[0].query_tokens.len(), 1024);
+        assert_eq!(slices[1].query_tokens.len(), 1024);
+        assert!(
+            slices
+                .iter()
+                .all(|s| s.is_prefill_chunk && !s.is_final_prefill_chunk)
+        );
+    }
+
+    #[test]
+    fn test_model_token_capacity_clamp() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.clamp_for_token_capacity(1471);
+        assert_eq!(cfg.max_num_batched_tokens, 1408);
+        assert_eq!(cfg.chunk_prefill_size, 1408);
+        assert_eq!(cfg.mixed_chunk_prefill_size, 256);
+        cfg.clamp_for_token_capacity(2048);
+        assert_eq!(cfg.chunk_prefill_size, 1408);
+        cfg.mixed_chunk_prefill_size = 0;
+        cfg.clamp_for_token_capacity(128);
+        assert_eq!(cfg.chunk_prefill_size, 128);
+        assert_eq!(cfg.mixed_chunk_prefill_size, 0);
+    }
+
+    #[test]
     fn test_clamp_for_scratch_bytes_tiers() {
         let mut compact = SchedulerConfig::default();
         compact.clamp_for_scratch_bytes(128 * 1024 * 1024);
@@ -726,8 +831,8 @@ mod tests {
 
         let mut tp2_full = SchedulerConfig::default();
         tp2_full.clamp_for_scratch_bytes(512 * 1024 * 1024);
-        assert_eq!(tp2_full.max_num_batched_tokens, 1408);
-        assert_eq!(tp2_full.chunk_prefill_size, 1408);
+        assert_eq!(tp2_full.max_num_batched_tokens, 2048);
+        assert_eq!(tp2_full.chunk_prefill_size, 2048);
         assert_eq!(tp2_full.mixed_chunk_prefill_size, 256);
     }
 

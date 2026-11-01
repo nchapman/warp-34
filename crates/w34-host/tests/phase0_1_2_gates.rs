@@ -1015,6 +1015,659 @@ fn test_gate2_gdn_continuation_checkpoint_and_rejection_parity() {
 
 #[cfg(feature = "cuda")]
 #[test]
+fn test_gdn_conv_paired_prefill_matches_chunked_scalar() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(dev.device_id).unwrap();
+    let ex = stream.exec(0, 0);
+    let channels = 512usize;
+    let tokens = 257usize;
+    let state_size = channels * 3;
+    let x: Vec<u16> = (0..tokens * channels)
+        .map(|i| f32_to_f16(((i % 97) as f32 - 48.0) * 0.037))
+        .collect();
+    let w: Vec<u16> = (0..channels * 4)
+        .map(|i| f32_to_f16(((i % 31) as f32 - 15.0) * 0.019))
+        .collect();
+    let mut state = vec![0u16; 6 * state_size];
+    for i in 0..state_size {
+        state[i] = f32_to_f16(((i % 41) as f32 - 20.0) * 0.027);
+        state[state_size + i] = state[i];
+    }
+    let dx = DeviceBuffer::alloc(0, x.len() * 2).unwrap();
+    let dw = DeviceBuffer::alloc(0, w.len() * 2).unwrap();
+    let ds = DeviceBuffer::alloc(0, state.len() * 2).unwrap();
+    let dm = DeviceBuffer::alloc(0, 256).unwrap();
+    let out = DeviceBuffer::alloc(0, x.len() * 2).unwrap();
+    let reference = DeviceBuffer::alloc(0, x.len() * 2).unwrap();
+    dx.copy_from_host(&x, &stream).unwrap();
+    dw.copy_from_host(&w, &stream).unwrap();
+    ds.copy_from_host(&state, &stream).unwrap();
+    // Both paths update their initial state in-place; checkpoints split interior tiles.
+    for mode in 0..2 {
+        let chunk = if mode == 0 { tokens } else { 64 };
+        for start in (0..tokens).step_by(chunk) {
+            let len = chunk.min(tokens - start);
+            let offsets = [63i32 - start as i32, 191i32 - start as i32];
+            let meta = [
+                0i32,
+                len as i32,
+                mode,
+                mode,
+                2 + 2 * mode,
+                3 + 2 * mode,
+                offsets[0],
+                offsets[1],
+                1,
+            ];
+            dm.copy_from_host(&meta, &stream).unwrap();
+            let batch = W34GdnBatch {
+                query_start_loc: dm.addr() as *const i32,
+                state_in_indices: (dm.addr() + 8) as *const i32,
+                state_out_indices: (dm.addr() + 12) as *const i32,
+                spec_state_indices: core::ptr::null(),
+                checkpoint_dst_indices: (dm.addr() + 16) as *const i32,
+                checkpoint_token_offsets: (dm.addr() + 24) as *const i32,
+                has_initial_state: (dm.addr() + 32) as *const u8,
+                valid_req_mask: core::ptr::null(),
+                num_reqs: 1,
+                total_tokens: len as i32,
+                max_verify_tokens: 0,
+                max_checkpoints_per_req: 2,
+            };
+            let dst = if mode == 0 { &out } else { &reference };
+            unsafe {
+                assert_eq!(
+                    ffi::w34_gdn_causal_conv1d_f16(
+                        &ex,
+                        &batch,
+                        (dx.addr() + (start * channels * 2) as u64) as *const c_void,
+                        dw.addr() as *const c_void,
+                        core::ptr::null(),
+                        ds.addr() as *mut c_void,
+                        (dst.addr() + (start * channels * 2) as u64) as *mut c_void,
+                        channels as i32,
+                        4,
+                        6,
+                        1
+                    ),
+                    0
+                );
+            }
+        }
+    }
+    let mut actual = vec![0u16; x.len()];
+    let mut expected = vec![0u16; x.len()];
+    out.copy_to_host(&mut actual, &stream).unwrap();
+    reference.copy_to_host(&mut expected, &stream).unwrap();
+    ds.copy_to_host(&mut state, &stream).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        actual, expected,
+        "paired conv must preserve FP16 product rounding"
+    );
+    for (a, b) in [(0, 1), (2, 4), (3, 5)] {
+        assert_eq!(
+            &state[a * state_size..(a + 1) * state_size],
+            &state[b * state_size..(b + 1) * state_size],
+            "conv state slots {a}/{b}"
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_gdn_wy_split_and_fallback_prefill_parity() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).expect("CudaDevice(0)");
+    let stream = CudaStream::new(dev.device_id).expect("stream");
+    let ex_zero = stream.exec(0, 0);
+
+    let hk = 2usize;
+    let hv = 6usize; // gqa_ratio = 3 (matches 27B ratio)
+    let dk = 128usize;
+    let dv = 128usize;
+    let conv_dim = 2 * hk * dk + hv * dv;
+    let init_len = 40usize;
+    let wy_len = 260usize; // >= 256 triggers WY; non-multiple of 64
+    let total_len = init_len + wy_len;
+
+    let qkv_host: Vec<u16> = (0..(total_len * conv_dim))
+        .map(|i| f32_to_f16(((i % 109) as f32 - 54.0) * 0.009))
+        .collect();
+    let b_host: Vec<u16> = (0..(total_len * hv))
+        .map(|i| f32_to_f16(((i % 19) as f32 - 9.0) * 0.1))
+        .collect();
+    let a_host: Vec<u16> = (0..(total_len * hv))
+        .map(|i| f32_to_f16(((i % 23) as f32 - 11.0) * 0.05))
+        .collect();
+    let a_log: Vec<f32> = (0..hv).map(|i| -1.5 - 0.08 * (i as f32)).collect();
+    let dt_bias: Vec<f32> = (0..hv).map(|i| -0.1 + 0.02 * (i as f32)).collect();
+
+    let d_qkv = DeviceBuffer::alloc(0, qkv_host.len() * 2).unwrap();
+    let d_b = DeviceBuffer::alloc(0, b_host.len() * 2).unwrap();
+    let d_a = DeviceBuffer::alloc(0, a_host.len() * 2).unwrap();
+    let d_alog = DeviceBuffer::alloc(0, a_log.len() * 4).unwrap();
+    let d_dtb = DeviceBuffer::alloc(0, dt_bias.len() * 4).unwrap();
+    d_qkv.copy_from_host(&qkv_host, &stream).unwrap();
+    d_b.copy_from_host(&b_host, &stream).unwrap();
+    d_a.copy_from_host(&a_host, &stream).unwrap();
+    d_alog.copy_from_host(&a_log, &stream).unwrap();
+    d_dtb.copy_from_host(&dt_bias, &stream).unwrap();
+
+    // Slots: 0 = init_state after 40 tokens;
+    // Reference recurrent: ckpts [1, 2, 3] at offsets [1, 2, 3], final = 4
+    // Split WY (with K_norm): ckpts [5, 6, 7], final = 8
+    // Split WY (no K_norm, 27B TP=1 budget): ckpts [9, 10, 11], final = 12
+    // Fallback WY (zero scratch): ckpts [13, 14, 15], final = 16
+    // Tight-scratch fallback: ckpts [18, 19, 20], final = 21
+    let num_slots = 22usize;
+    let pool = StateBundlePool::new(0, &[0], num_slots, conv_dim, 4, hv, dk, dv).unwrap();
+    let st = &pool.layers[0];
+    let d_meta = DeviceBuffer::alloc(0, 256).unwrap();
+
+    // 1. Seed initial state in slot 0 via 40-token recurrent prefill.
+    let d_out_init = DeviceBuffer::alloc(0, init_len * hv * dv * 2).unwrap();
+    let meta_init: [i32; 5] = [0, init_len as i32, -1, 0, 0];
+    d_meta.copy_from_host(&meta_init, &stream).unwrap();
+    let batch_init = W34GdnBatch {
+        query_start_loc: d_meta.addr() as *const i32,
+        state_in_indices: (d_meta.addr() + 8) as *const i32,
+        state_out_indices: (d_meta.addr() + 12) as *const i32,
+        spec_state_indices: core::ptr::null(),
+        checkpoint_dst_indices: core::ptr::null(),
+        checkpoint_token_offsets: core::ptr::null(),
+        has_initial_state: (d_meta.addr() + 16) as *const u8,
+        valid_req_mask: core::ptr::null(),
+        num_reqs: 1,
+        total_tokens: init_len as i32,
+        max_verify_tokens: 0,
+        max_checkpoints_per_req: 0,
+    };
+    unsafe {
+        assert_eq!(
+            ffi::w34_gdn_recurrent_f16(
+                &ex_zero,
+                &batch_init,
+                d_qkv.addr() as *const c_void,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                d_b.addr() as *const c_void,
+                d_a.addr() as *const c_void,
+                d_alog.addr() as *const f32,
+                d_dtb.addr() as *const f32,
+                st.ssm_state.addr() as *mut f32,
+                d_out_init.addr() as *mut c_void,
+                hk as i32,
+                dk as i32,
+                hv as i32,
+                dv as i32,
+                num_slots as i32,
+            ),
+            0
+        );
+    }
+
+    let qkv_wy_ptr = (d_qkv.addr() + (init_len * conv_dim * 2) as u64) as *const c_void;
+    let b_wy_ptr = (d_b.addr() + (init_len * hv * 2) as u64) as *const c_void;
+    let a_wy_ptr = (d_a.addr() + (init_len * hv * 2) as u64) as *const c_void;
+
+    // 2. Reference: run 260 tokens as two <256 recurrent chunks (130 + 130) from slot 0.
+    let d_out_ref = DeviceBuffer::alloc(0, wy_len * hv * dv * 2).unwrap();
+    for (sub_off, sub_len, s_in, s_out, ck_dst, ck_off) in [
+        (0usize, 130usize, 0i32, 17i32, [1i32, 2, 3], [1i32, 2, 3]),
+        (
+            130usize,
+            130usize,
+            17i32,
+            4i32,
+            [-1i32, -1, -1],
+            [-1i32, -1, -1],
+        ),
+    ] {
+        let meta_ref: [i32; 11] = [
+            0,
+            sub_len as i32,
+            s_in,
+            s_out,
+            ck_dst[0],
+            ck_dst[1],
+            ck_dst[2],
+            ck_off[0],
+            ck_off[1],
+            ck_off[2],
+            1,
+        ];
+        d_meta.copy_from_host(&meta_ref, &stream).unwrap();
+        let batch_ref = W34GdnBatch {
+            query_start_loc: d_meta.addr() as *const i32,
+            state_in_indices: (d_meta.addr() + 8) as *const i32,
+            state_out_indices: (d_meta.addr() + 12) as *const i32,
+            spec_state_indices: core::ptr::null(),
+            checkpoint_dst_indices: (d_meta.addr() + 16) as *const i32,
+            checkpoint_token_offsets: (d_meta.addr() + 28) as *const i32,
+            has_initial_state: (d_meta.addr() + 40) as *const u8,
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: sub_len as i32,
+            max_verify_tokens: 0,
+            max_checkpoints_per_req: 3,
+        };
+        unsafe {
+            assert_eq!(
+                ffi::w34_gdn_recurrent_f16(
+                    &ex_zero,
+                    &batch_ref,
+                    (qkv_wy_ptr as u64 + (sub_off * conv_dim * 2) as u64) as *const c_void,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    (b_wy_ptr as u64 + (sub_off * hv * 2) as u64) as *const c_void,
+                    (a_wy_ptr as u64 + (sub_off * hv * 2) as u64) as *const c_void,
+                    d_alog.addr() as *const f32,
+                    d_dtb.addr() as *const f32,
+                    st.ssm_state.addr() as *mut f32,
+                    (d_out_ref.addr() + (sub_off * hv * dv * 2) as u64) as *mut c_void,
+                    hk as i32,
+                    dk as i32,
+                    hv as i32,
+                    dv as i32,
+                    num_slots as i32,
+                ),
+                0
+            );
+        }
+    }
+
+    // 3. Run the WY modes on all 260 tokens with checkpoints at [1, 2, 3] AND IN-PLACE
+    //    `state_in == state_out == base_slot + 3` (reproducing production chunked-prefill aliasing!):
+    //    - split_knorm (4 MiB scratch: K_norm cached)
+    //    - split_noknorm (exact split workspace budget, with no space for K_norm)
+    //    - fallback_wy (0 scratch: gdn_wy_chunk64_prefill_f16_kernel)
+    //    - tight_fallback (old budget, insufficient for checkpoint-induced chunks)
+    let state_elems = hv * dv * dk;
+    let mut init_ssm_slot0 = vec![0.0f32; state_elems];
+    let mut all_ssm_tmp = vec![0.0f32; num_slots * state_elems];
+    st.ssm_state
+        .copy_to_host(&mut all_ssm_tmp, &stream)
+        .unwrap();
+    stream.synchronize().unwrap();
+    init_ssm_slot0.copy_from_slice(&all_ssm_tmp[..state_elems]);
+
+    let d_ws = DeviceBuffer::alloc(0, 4 * 1024 * 1024).unwrap();
+    let h_slot_bytes = hv * 128 * 128 * 2;
+    let align256 = |n: usize| n.div_ceil(256) * 256;
+    // Mirror the split-WY descriptor layout: header, one span, chunk descriptors, G, W.
+    let needed_h_slots = wy_len.div_ceil(64) + 1 + 3;
+    let off_h = 256
+        + 256
+        + align256(needed_h_slots * 32)
+        + align256(wy_len * hv * 4)
+        + align256(wy_len * hv * 256);
+    let noknorm_cap = off_h + needed_h_slots * h_slot_bytes;
+    let knorm_threshold = noknorm_cap + align256(wy_len * hk * 256);
+    assert!(noknorm_cap < knorm_threshold && knorm_threshold <= d_ws.len_bytes);
+    let tight_cap = off_h + (wy_len.div_ceil(64) + 1) * h_slot_bytes;
+    let ex_tight = stream.exec(d_ws.addr(), tight_cap);
+    let ex_knorm = stream.exec(d_ws.addr(), d_ws.len_bytes);
+    let ex_noknorm = stream.exec(d_ws.addr(), noknorm_cap);
+
+    let mut wy_outs = Vec::new();
+    for base_slot in [5i32, 9i32, 13i32, 18i32] {
+        let inplace_slot = (base_slot + 3) as usize;
+        all_ssm_tmp[inplace_slot * state_elems..(inplace_slot + 1) * state_elems]
+            .copy_from_slice(&init_ssm_slot0);
+    }
+    st.ssm_state.copy_from_host(&all_ssm_tmp, &stream).unwrap();
+
+    for (ex_mode, base_slot) in [
+        (ex_knorm, 5i32),
+        (ex_noknorm, 9i32),
+        (ex_zero, 13i32),
+        (ex_tight, 18i32),
+    ] {
+        let d_out_wy = DeviceBuffer::alloc(0, wy_len * hv * dv * 2).unwrap();
+        let meta_wy: [i32; 11] = [
+            0,
+            wy_len as i32,
+            base_slot + 3,
+            base_slot + 3,
+            base_slot,
+            base_slot + 1,
+            base_slot + 2,
+            1,
+            2,
+            3,
+            1,
+        ];
+        d_meta.copy_from_host(&meta_wy, &stream).unwrap();
+        let batch_wy = W34GdnBatch {
+            query_start_loc: d_meta.addr() as *const i32,
+            state_in_indices: (d_meta.addr() + 8) as *const i32,
+            state_out_indices: (d_meta.addr() + 12) as *const i32,
+            spec_state_indices: core::ptr::null(),
+            checkpoint_dst_indices: (d_meta.addr() + 16) as *const i32,
+            checkpoint_token_offsets: (d_meta.addr() + 28) as *const i32,
+            has_initial_state: (d_meta.addr() + 40) as *const u8,
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: wy_len as i32,
+            max_verify_tokens: 0,
+            max_checkpoints_per_req: 3,
+        };
+        unsafe {
+            assert_eq!(
+                ffi::w34_gdn_recurrent_f16(
+                    &ex_mode,
+                    &batch_wy,
+                    qkv_wy_ptr,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    b_wy_ptr,
+                    a_wy_ptr,
+                    d_alog.addr() as *const f32,
+                    d_dtb.addr() as *const f32,
+                    st.ssm_state.addr() as *mut f32,
+                    d_out_wy.addr() as *mut c_void,
+                    hk as i32,
+                    dk as i32,
+                    hv as i32,
+                    dv as i32,
+                    num_slots as i32,
+                ),
+                0
+            );
+        }
+        let mut out_host = vec![0u16; wy_len * hv * dv];
+        d_out_wy.copy_to_host(&mut out_host, &stream).unwrap();
+        wy_outs.push(out_host);
+    }
+
+    let mut out_ref = vec![0u16; wy_len * hv * dv];
+    d_out_ref.copy_to_host(&mut out_ref, &stream).unwrap();
+    let mut ssm_all = vec![0.0f32; num_slots * state_elems];
+    st.ssm_state.copy_to_host(&mut ssm_all, &stream).unwrap();
+    stream.synchronize().unwrap();
+
+    // Split with K_norm and split without K_norm must be 0-ULP identical!
+    assert_eq!(
+        wy_outs[0], wy_outs[1],
+        "split WY with K_norm vs without K_norm must match 0-ULP"
+    );
+    assert_eq!(
+        &ssm_all[5 * state_elems..9 * state_elems],
+        &ssm_all[9 * state_elems..13 * state_elems],
+        "split WY ssm_state with K_norm vs without K_norm must match 0-ULP"
+    );
+
+    assert_eq!(
+        wy_outs[2], wy_outs[3],
+        "tight workspace must fall back, not silently skip GDN"
+    );
+    assert_eq!(
+        &ssm_all[13 * state_elems..17 * state_elems],
+        &ssm_all[18 * state_elems..22 * state_elems]
+    );
+
+    for (mode_idx, (mode_name, base_slot)) in [
+        ("split_knorm", 5usize),
+        ("split_noknorm", 9usize),
+        ("fallback_chunk64", 13usize),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let max_out_err = out_ref
+            .iter()
+            .zip(wy_outs[mode_idx].iter())
+            .map(|(&r, &g)| (f16_to_f32(r) - f16_to_f32(g)).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_out_err < 3e-3,
+            "WY {mode_name} output max_abs_err={max_out_err} exceeded 3e-3"
+        );
+        for ck in 0..4usize {
+            let ref_s = &ssm_all[(1 + ck) * state_elems..(2 + ck) * state_elems];
+            let got_s =
+                &ssm_all[(base_slot + ck) * state_elems..(base_slot + ck + 1) * state_elems];
+            let max_s_err = ref_s
+                .iter()
+                .zip(got_s.iter())
+                .map(|(&r, &g)| (r - g).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_s_err < 3e-3,
+                "WY {mode_name} slot+{ck} ssm_state max_abs_err={max_s_err} exceeded 3e-3"
+            );
+        }
+    }
+}
+
+/// Runs one `w34_gdn_recurrent_f16` call over `num_reqs` requests described by host metadata
+/// `[query_start_loc[R+1], state_in[R], state_out[R]]` (all requests have initial state).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn run_gdn_batch(
+    ex: &w34_kernels::ffi::W34Exec,
+    stream: &CudaStream,
+    d_meta: &DeviceBuffer,
+    qsl: &[i32],
+    state_in: &[i32],
+    state_out: &[i32],
+    qkv: *const c_void,
+    b: *const c_void,
+    a: *const c_void,
+    d_alog: &DeviceBuffer,
+    d_dtb: &DeviceBuffer,
+    ssm_state: u64,
+    out: u64,
+    dims: (usize, usize, usize, usize, usize),
+) {
+    let (hk, dk, hv, dv, num_slots) = dims;
+    let r = state_in.len();
+    let mut meta: Vec<i32> = Vec::new();
+    meta.extend_from_slice(qsl);
+    meta.extend_from_slice(state_in);
+    meta.extend_from_slice(state_out);
+    let has_init_off = meta.len() * 4;
+    meta.push(0x0101_0101); // has_initial_state bytes (up to 4 requests)
+    d_meta.copy_from_host(&meta, stream).unwrap();
+    let batch = W34GdnBatch {
+        query_start_loc: d_meta.addr() as *const i32,
+        state_in_indices: (d_meta.addr() + (qsl.len() * 4) as u64) as *const i32,
+        state_out_indices: (d_meta.addr() + ((qsl.len() + r) * 4) as u64) as *const i32,
+        spec_state_indices: core::ptr::null(),
+        checkpoint_dst_indices: core::ptr::null(),
+        checkpoint_token_offsets: core::ptr::null(),
+        has_initial_state: (d_meta.addr() + has_init_off as u64) as *const u8,
+        valid_req_mask: core::ptr::null(),
+        num_reqs: r as i32,
+        total_tokens: qsl[r] - qsl[0],
+        max_verify_tokens: 0,
+        max_checkpoints_per_req: 0,
+    };
+    unsafe {
+        assert_eq!(
+            ffi::w34_gdn_recurrent_f16(
+                ex,
+                &batch,
+                qkv,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                b,
+                a,
+                d_alog.addr() as *const f32,
+                d_dtb.addr() as *const f32,
+                ssm_state as *mut f32,
+                out as *mut c_void,
+                hk as i32,
+                dk as i32,
+                hv as i32,
+                dv as i32,
+                num_slots as i32,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+}
+
+/// A mixed continuous-batching step (`q_len = [1, 256]`) takes the Tensor-Core WY path: the
+/// prefill request must be 0-ULP identical to running it alone, and the 1-token decode request
+/// must stay within WY-vs-recurrent tolerance of the dedicated decode kernel.
+#[cfg(feature = "cuda")]
+#[test]
+fn test_gdn_wy_mixed_decode_prefill_batch_parity() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).expect("CudaDevice(0)");
+    let stream = CudaStream::new(dev.device_id).expect("stream");
+
+    let (hk, hv, dk, dv) = (2usize, 6usize, 128usize, 128usize);
+    let conv_dim = 2 * hk * dk + hv * dv;
+    let prefill_len = 256usize;
+    let total_len = 1 + prefill_len;
+    let num_slots = 6usize;
+    let dims = (hk, dk, hv, dv, num_slots);
+
+    let qkv_host: Vec<u16> = (0..(total_len * conv_dim))
+        .map(|i| f32_to_f16(((i % 113) as f32 - 56.0) * 0.009))
+        .collect();
+    let b_host: Vec<u16> = (0..(total_len * hv))
+        .map(|i| f32_to_f16(((i % 17) as f32 - 8.0) * 0.1))
+        .collect();
+    let a_host: Vec<u16> = (0..(total_len * hv))
+        .map(|i| f32_to_f16(((i % 29) as f32 - 14.0) * 0.05))
+        .collect();
+    let a_log: Vec<f32> = (0..hv).map(|i| -1.5 - 0.08 * (i as f32)).collect();
+    let dt_bias: Vec<f32> = (0..hv).map(|i| -0.1 + 0.02 * (i as f32)).collect();
+    let d_qkv = DeviceBuffer::alloc(0, qkv_host.len() * 2).unwrap();
+    let d_b = DeviceBuffer::alloc(0, b_host.len() * 2).unwrap();
+    let d_a = DeviceBuffer::alloc(0, a_host.len() * 2).unwrap();
+    let d_alog = DeviceBuffer::alloc(0, a_log.len() * 4).unwrap();
+    let d_dtb = DeviceBuffer::alloc(0, dt_bias.len() * 4).unwrap();
+    d_qkv.copy_from_host(&qkv_host, &stream).unwrap();
+    d_b.copy_from_host(&b_host, &stream).unwrap();
+    d_a.copy_from_host(&a_host, &stream).unwrap();
+    d_alog.copy_from_host(&a_log, &stream).unwrap();
+    d_dtb.copy_from_host(&dt_bias, &stream).unwrap();
+
+    // Slots: 0 = decode-request init, 1 = prefill-request init, 2/3 = solo outputs,
+    // 4/5 = mixed-batch outputs.
+    let pool = StateBundlePool::new(0, &[0], num_slots, conv_dim, 4, hv, dk, dv).unwrap();
+    let st = &pool.layers[0];
+    let state_elems = hv * dv * dk;
+    let mut ssm_init = vec![0.0f32; num_slots * state_elems];
+    for (i, v) in ssm_init[..2 * state_elems].iter_mut().enumerate() {
+        *v = ((i % 97) as f32 - 48.0) * 0.002;
+    }
+    st.ssm_state.copy_from_host(&ssm_init, &stream).unwrap();
+
+    let d_meta = DeviceBuffer::alloc(0, 256).unwrap();
+    let d_ws = DeviceBuffer::alloc(0, 4 * 1024 * 1024).unwrap();
+    let ex = stream.exec(d_ws.addr(), d_ws.len_bytes);
+    let row_bytes = (hv * dv * 2) as u64;
+    let qkv_at = |tok: usize| (d_qkv.addr() + (tok * conv_dim * 2) as u64) as *const c_void;
+    let b_at = |tok: usize| (d_b.addr() + (tok * hv * 2) as u64) as *const c_void;
+    let a_at = |tok: usize| (d_a.addr() + (tok * hv * 2) as u64) as *const c_void;
+    let ssm = st.ssm_state.addr();
+
+    let d_out_solo = DeviceBuffer::alloc(0, total_len * hv * dv * 2).unwrap();
+    run_gdn_batch(
+        &ex,
+        &stream,
+        &d_meta,
+        &[0, 1],
+        &[0],
+        &[2],
+        qkv_at(0),
+        b_at(0),
+        a_at(0),
+        &d_alog,
+        &d_dtb,
+        ssm,
+        d_out_solo.addr(),
+        dims,
+    );
+    run_gdn_batch(
+        &ex,
+        &stream,
+        &d_meta,
+        &[0, prefill_len as i32],
+        &[1],
+        &[3],
+        qkv_at(1),
+        b_at(1),
+        a_at(1),
+        &d_alog,
+        &d_dtb,
+        ssm,
+        d_out_solo.addr() + row_bytes,
+        dims,
+    );
+    let d_out_mixed = DeviceBuffer::alloc(0, total_len * hv * dv * 2).unwrap();
+    run_gdn_batch(
+        &ex,
+        &stream,
+        &d_meta,
+        &[0, 1, total_len as i32],
+        &[0, 1],
+        &[4, 5],
+        qkv_at(0),
+        b_at(0),
+        a_at(0),
+        &d_alog,
+        &d_dtb,
+        ssm,
+        d_out_mixed.addr(),
+        dims,
+    );
+
+    let mut out_solo = vec![0u16; total_len * hv * dv];
+    let mut out_mixed = vec![0u16; total_len * hv * dv];
+    let mut ssm_all = vec![0.0f32; num_slots * state_elems];
+    d_out_solo.copy_to_host(&mut out_solo, &stream).unwrap();
+    d_out_mixed.copy_to_host(&mut out_mixed, &stream).unwrap();
+    st.ssm_state.copy_to_host(&mut ssm_all, &stream).unwrap();
+    stream.synchronize().unwrap();
+
+    let row = hv * dv;
+    let slot = |s: usize| &ssm_all[s * state_elems..(s + 1) * state_elems];
+    assert_eq!(
+        out_mixed[row..],
+        out_solo[row..],
+        "mixed-batch prefill output must match solo WY prefill 0-ULP"
+    );
+    assert_eq!(
+        slot(5),
+        slot(3),
+        "mixed-batch prefill ssm_state must match solo 0-ULP"
+    );
+
+    let max_out_err = out_solo[..row]
+        .iter()
+        .zip(out_mixed[..row].iter())
+        .map(|(&r, &g)| (f16_to_f32(r) - f16_to_f32(g)).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_out_err < 3e-3,
+        "mixed decode output max_abs_err={max_out_err}"
+    );
+    let max_s_err = slot(2)
+        .iter()
+        .zip(slot(4).iter())
+        .map(|(&r, &g)| (r - g).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_s_err < 3e-3,
+        "mixed decode ssm_state max_abs_err={max_s_err}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
 fn test_gate3_and_gate4_cuda_graph_spec_rollback_and_tp2_collectives() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Gate #4: Cold-start TP=2 init & typed collectives stress (including token IDs > 65504)

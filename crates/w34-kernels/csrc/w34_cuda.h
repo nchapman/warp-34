@@ -441,6 +441,15 @@ int w34_sampler_step_fast_greedy_f16(const w34_exec* ex,
                                      int num_rows,
                                      int vocab_size);
 
+int w34_sampler_step_fast_greedy_masked_f16(const w34_exec* ex,
+                                            const void* logits_f16,
+                                            const w34_sampler_row_cfg* row_cfgs,
+                                            const uint32_t* bitmask_u32,
+                                            const w34_sampler_sparse_entry* sparse_entries,
+                                            w34_sampler_row_out* row_outs,
+                                            int num_rows,
+                                            int vocab_size);
+
 int w34_sampler_scatter_ids_to_tokens(const w34_exec* ex,
                                       const w34_sampler_row_out* row_outs,
                                       const int32_t* greedy_ids,

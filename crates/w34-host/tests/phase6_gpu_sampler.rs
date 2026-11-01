@@ -734,3 +734,278 @@ fn fast_greedy_sampler_matches_full_sampler_and_rejects_ineligible_rows() {
         assert_eq!(got_tight[r].sampled_id, got_nosparse_ref[r].sampled_id);
     }
 }
+
+#[test]
+fn test_fast_greedy_masked_matches_full_sampler_and_edges() {
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(dev) = CudaDevice::set_current(0) else {
+        return;
+    };
+    let stream = CudaStream::new(dev.device_id).unwrap();
+    // Use an odd non-multiple-of-8 vocab size above 248,320 so both vectorized `uint4` and tail
+    // bitmask paths are exercised across all 16 splits.
+    let vocab_size = 248_323usize;
+    let words_per_row = vocab_size.div_ceil(32);
+    let num_rows = 6usize;
+
+    let mut logits_f16 = vec![0u16; num_rows * vocab_size];
+    for r in 0..num_rows {
+        for v in 0..vocab_size {
+            let x = (((v * 1103515245 + r * 12345 + 7) & 0x7ff) as f32 - 1024.0) * 0.003;
+            logits_f16[r * vocab_size + v] = f32_to_f16(x);
+        }
+    }
+    let mut bitmasks = vec![u32::MAX; num_rows * words_per_row];
+    let clear_bit = |masks: &mut [u32], row: usize, tok: usize| {
+        masks[row * words_per_row + (tok >> 5)] &= !(1u32 << (tok & 31));
+    };
+
+    // Row 0: mask out global peaks + tail peak + a masked-out NaN; winner must be `allowed_win`.
+    let banned_peaks_r0 = [17usize, 62_080, 199_999, vocab_size - 1];
+    for &t in &banned_peaks_r0 {
+        logits_f16[t] = f32_to_f16(14.0);
+        clear_bit(&mut bitmasks, 0, t);
+    }
+    // Masked-out NaN must be ignored (matching full reference Pass 0).
+    logits_f16[12_345] = 0x7e00;
+    clear_bit(&mut bitmasks, 0, 12_345);
+    let allowed_win_r0 = vocab_size - 2;
+    logits_f16[allowed_win_r0] = f32_to_f16(11.75);
+
+    // Row 1: unmasked row with sparse penalty mixed in same `fast_greedy_masked` launch.
+    logits_f16[vocab_size + 500] = f32_to_f16(12.0);
+    logits_f16[vocab_size + 501] = f32_to_f16(11.5);
+    let sparse = [W34SamplerSparseEntry {
+        token_id: 500,
+        output_count: 1,
+        logit_bias: -2.0,
+        in_prompt: 0,
+        banned: 0,
+    }];
+
+    // Row 2: masked row with matching draft token.
+    logits_f16[2 * vocab_size + 88_888] = f32_to_f16(13.0);
+    clear_bit(&mut bitmasks, 2, 88_888);
+    logits_f16[2 * vocab_size + 88_889] = f32_to_f16(10.5);
+
+    // Row 3: masked row with mismatching draft token.
+    logits_f16[3 * vocab_size + 140_000] = f32_to_f16(13.0);
+    clear_bit(&mut bitmasks, 3, 140_000);
+    logits_f16[3 * vocab_size + 140_001] = f32_to_f16(10.25);
+
+    // Row 4: all-zero bitmask -> status 1.
+    for w in 0..words_per_row {
+        bitmasks[4 * words_per_row + w] = 0;
+    }
+
+    // Row 5: allowed +Inf logit -> status 2.
+    logits_f16[5 * vocab_size + 77_777] = 0x7c00;
+
+    let base_cfg = W34SamplerRowCfg {
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        min_p: 0.0,
+        repetition_penalty: 1.0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        uniform_sample: 0.5,
+        recovery_uniform: 0.5,
+        draft_token_id: -1,
+        has_bitmask: 1,
+        row_bitmask_word_offset: 0,
+        sparse_offset: 0,
+        sparse_count: 0,
+        top_logprobs_k: -1,
+        use_token_id_cdf: 0,
+    };
+    let cfgs = vec![
+        W34SamplerRowCfg {
+            row_bitmask_word_offset: 0,
+            ..base_cfg
+        },
+        W34SamplerRowCfg {
+            has_bitmask: 0,
+            row_bitmask_word_offset: -1,
+            sparse_offset: 0,
+            sparse_count: 1,
+            top_logprobs_k: 0,
+            ..base_cfg
+        },
+        W34SamplerRowCfg {
+            row_bitmask_word_offset: (2 * words_per_row) as i32,
+            draft_token_id: 88_889,
+            ..base_cfg
+        },
+        W34SamplerRowCfg {
+            row_bitmask_word_offset: (3 * words_per_row) as i32,
+            draft_token_id: 140_000,
+            ..base_cfg
+        },
+        W34SamplerRowCfg {
+            row_bitmask_word_offset: (4 * words_per_row) as i32,
+            ..base_cfg
+        },
+        W34SamplerRowCfg {
+            row_bitmask_word_offset: (5 * words_per_row) as i32,
+            ..base_cfg
+        },
+    ];
+
+    let mut arena = DeviceArena::new(dev.device_id, 128 * 1024 * 1024).unwrap();
+    let d_logits = arena.upload_slice(&logits_f16, &stream).unwrap();
+    let d_masks = arena.upload_slice(&bitmasks, &stream).unwrap();
+    let d_sparse = arena.upload_slice(&sparse, &stream).unwrap();
+    let d_cfgs = arena.upload_slice(&cfgs, &stream).unwrap();
+    let out_bytes = num_rows * core::mem::size_of::<W34SamplerRowOut>();
+    let d_out_fast = arena.alloc_aligned(out_bytes).unwrap();
+    let d_out_ref = arena.alloc_aligned(out_bytes).unwrap();
+    let ws_full = (num_rows * vocab_size * 4 * 4 + 4096) & !255;
+    let d_ws = arena.alloc_aligned(ws_full).unwrap();
+    let ex = stream.exec(d_ws, ws_full);
+
+    // SAFETY: all pointers belong to `arena` on device 0 and remain valid past `synchronize()`.
+    let rc_fast = unsafe {
+        ffi::w34_sampler_step_fast_greedy_masked_f16(
+            &ex,
+            d_logits as *const c_void,
+            d_cfgs as *const W34SamplerRowCfg,
+            d_masks as *const u32,
+            d_sparse as *const W34SamplerSparseEntry,
+            d_out_fast as *mut W34SamplerRowOut,
+            num_rows as i32,
+            vocab_size as i32,
+        )
+    };
+    assert_eq!(rc_fast, 0);
+
+    // Force full 1-CTA reference path via `total_sparse_entries == 1` (`fast_parts == null`).
+    let slice_bytes = ((num_rows * vocab_size * 4) + 255) & !255;
+    let ex_ref_sparse = stream.exec(d_ws, slice_bytes * 4);
+    // SAFETY: `ex_ref_sparse` provides `4 * slice_bytes` scratch and all device pointers belong to `arena`.
+    let rc_ref = unsafe {
+        ffi::w34_sampler_step_f16(
+            &ex_ref_sparse,
+            d_logits as *const c_void,
+            d_cfgs as *const W34SamplerRowCfg,
+            d_masks as *const u32,
+            d_sparse as *const W34SamplerSparseEntry,
+            d_out_ref as *mut W34SamplerRowOut,
+            num_rows as i32,
+            vocab_size as i32,
+            sparse.len() as i32,
+        )
+    };
+    assert_eq!(rc_ref, 0);
+
+    let mut got_fast = vec![W34SamplerRowOut::default(); num_rows];
+    let mut got_ref = vec![W34SamplerRowOut::default(); num_rows];
+    // SAFETY: host and device buffers are `out_bytes` bytes on `stream`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_fast.as_mut_ptr() as *mut c_void,
+                d_out_fast as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_ref.as_mut_ptr() as *mut c_void,
+                d_out_ref as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+
+    assert_eq!(got_fast[0].status, 0);
+    assert_eq!(got_fast[0].sampled_id, allowed_win_r0 as i32);
+    assert_eq!(got_fast[1].status, 0);
+    assert_eq!(got_fast[1].sampled_id, 501);
+    assert_eq!(got_fast[2].status, 0);
+    assert_eq!(got_fast[2].sampled_id, 88_889);
+    assert_eq!(got_fast[2].draft_accepted, 1);
+    assert_eq!(got_fast[2].draft_prob, 1.0);
+    assert_eq!(got_fast[3].status, 0);
+    assert_eq!(got_fast[3].sampled_id, 140_001);
+    assert_eq!(got_fast[3].draft_accepted, 0);
+    assert_eq!(got_fast[3].draft_prob, 0.0);
+    assert_eq!(got_fast[4].status, 1);
+    assert_eq!(got_fast[4].sampled_id, -1);
+    assert_eq!(got_fast[5].status, 2);
+    assert_eq!(got_fast[5].sampled_id, -1);
+
+    for r in 0..num_rows {
+        assert_eq!(got_fast[r].status, got_ref[r].status, "row {r} status");
+        assert_eq!(
+            got_fast[r].sampled_id, got_ref[r].sampled_id,
+            "row {r} sampled_id"
+        );
+        assert_eq!(
+            got_fast[r].draft_accepted, got_ref[r].draft_accepted,
+            "row {r} draft_accepted"
+        );
+        assert_eq!(
+            got_fast[r].draft_prob.to_bits(),
+            got_ref[r].draft_prob.to_bits(),
+            "row {r} draft_prob"
+        );
+    }
+
+    // Also verify `w34_sampler_step_f16` mixed batch `[stochastic row 1 + masked greedy rows]`
+    // with `total_sparse_entries == 0` exercises the automatic `fast_parts` masked split path.
+    let mut mixed_cfgs = cfgs.clone();
+    mixed_cfgs[1].temperature = 0.8;
+    mixed_cfgs[1].top_k = 32;
+    mixed_cfgs[1].sparse_count = 0;
+    mixed_cfgs[1].top_logprobs_k = -1;
+    let d_mixed_cfgs = arena.upload_slice(&mixed_cfgs, &stream).unwrap();
+    let mut got_mixed = vec![W34SamplerRowOut::default(); num_rows];
+    // SAFETY: `ex` has room for `2 * slice_bytes + parts_bytes`; all pointers live on `arena`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_sampler_step_f16(
+                &ex,
+                d_logits as *const c_void,
+                d_mixed_cfgs as *const W34SamplerRowCfg,
+                d_masks as *const u32,
+                core::ptr::null(),
+                d_out_fast as *mut W34SamplerRowOut,
+                num_rows as i32,
+                vocab_size as i32,
+                0,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                got_mixed.as_mut_ptr() as *mut c_void,
+                d_out_fast as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(got_mixed[1].status, 0);
+    for r in [0usize, 2, 3, 4, 5] {
+        assert_eq!(
+            got_mixed[r].status, got_ref[r].status,
+            "mixed row {r} status"
+        );
+        assert_eq!(
+            got_mixed[r].sampled_id, got_ref[r].sampled_id,
+            "mixed row {r} sampled_id"
+        );
+        assert_eq!(
+            got_mixed[r].draft_accepted, got_ref[r].draft_accepted,
+            "mixed row {r} draft_accepted"
+        );
+    }
+}

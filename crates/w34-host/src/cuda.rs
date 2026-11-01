@@ -1495,20 +1495,22 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         max_blocks_per_req: 4,
         ..attn_batch
     };
-    check_rc(
-        unsafe {
-            ffi::w34_paged_attention_f16_force_kernel_for_test(
-                &ex,
-                &fa64_layout,
-                &fa64_batch,
-                fa64_q as *const c_void,
-                fa64_o as *mut c_void,
-                8,
-                1,
-            )
-        },
-        "warmup w34_paged_attention_prefill_64q_mma_f16",
-    )?;
+    for variant in [1, 2] {
+        check_rc(
+            unsafe {
+                ffi::w34_paged_attention_f16_force_kernel_for_test(
+                    &ex,
+                    &fa64_layout,
+                    &fa64_batch,
+                    fa64_q as *const c_void,
+                    fa64_o as *mut c_void,
+                    8,
+                    variant,
+                )
+            },
+            "warmup w34_paged_attention_prefill_mma_f16",
+        )?;
+    }
 
     // Warm GQA mma.sync + Split-KV reduction specialization (head_dim = 256)
     let layout_256 = W34KvLayerLayout {
@@ -1806,30 +1808,83 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_gdn_recurrent_f16 prefill",
     )?;
+    let q_start_wy = arena.upload_slice(&[0i32, 256], &stream)?;
+    let gdn_batch_wy = W34GdnBatch {
+        query_start_loc: q_start_wy as *const i32,
+        total_tokens: 256,
+        ..gdn_batch
+    };
     check_rc(
         unsafe {
-            ffi::w34_gdn_recurrent_f16(
+            ffi::w34_gdn_causal_conv1d_f16(
                 &ex,
-                &gdn_batch_prefill,
-                buf_d as *const c_void,
-                core::ptr::null(),
-                core::ptr::null(),
-                core::ptr::null(),
+                &gdn_batch_wy,
                 buf_a as *const c_void,
-                buf_a as *const c_void,
-                buf_b as *const f32,
-                buf_b as *const f32,
-                gdn_ws_wide as *mut f32,
+                buf_b as *const c_void,
+                core::ptr::null(),
                 buf_c as *mut c_void,
+                buf_d as *mut c_void,
+                8,
+                4,
                 1,
-                128,
-                96,
-                32,
                 1,
             )
         },
-        "warmup w34_gdn_recurrent_f16 prefill wide",
+        "warmup w34_gdn_causal_conv1d_f16 paired prefill",
     )?;
+    let ex_wy_split = stream.exec(gdn_ws_wide + 1024 * 1024, 1024 * 1024);
+    for ex_wy in [&ex, &ex_wy_split] {
+        check_rc(
+            unsafe {
+                ffi::w34_gdn_recurrent_f16(
+                    ex_wy,
+                    &gdn_batch_wy,
+                    gdn_ws_wide as *const c_void,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    gdn_ws_wide as *const c_void,
+                    gdn_ws_wide as *const c_void,
+                    buf_b as *const f32,
+                    buf_b as *const f32,
+                    buf_ws as *mut f32,
+                    (gdn_ws_wide + 512 * 1024) as *mut c_void,
+                    1,
+                    128,
+                    1,
+                    128,
+                    1,
+                )
+            },
+            "warmup w34_gdn_recurrent_f16 wy prefill",
+        )?;
+    }
+    for (hv_warm, dv_warm) in [(96i32, 32i32), (24, 128), (32, 128)] {
+        check_rc(
+            unsafe {
+                ffi::w34_gdn_recurrent_f16(
+                    &ex,
+                    &gdn_batch_prefill,
+                    buf_d as *const c_void,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    buf_a as *const c_void,
+                    buf_a as *const c_void,
+                    buf_b as *const f32,
+                    buf_b as *const f32,
+                    gdn_ws_wide as *mut f32,
+                    buf_c as *mut c_void,
+                    1,
+                    128,
+                    hv_warm,
+                    dv_warm,
+                    1,
+                )
+            },
+            "warmup w34_gdn_recurrent_f16 prefill wide",
+        )?;
+    }
 
     // 5. Sampler & Phase 4 MTP / DFlash2 kernels
     check_rc(
@@ -1924,6 +1979,30 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ..greedy_sampler_cfg
     };
     let plain_greedy_cfg_dev = arena.upload_slice(&[plain_greedy_cfg], &stream)?;
+    let masked_greedy_cfg = ffi::W34SamplerRowCfg {
+        has_bitmask: 1,
+        row_bitmask_word_offset: 0,
+        sparse_count: 0,
+        top_logprobs_k: -1,
+        ..greedy_sampler_cfg
+    };
+    let masked_greedy_cfg_dev = arena.upload_slice(&[masked_greedy_cfg], &stream)?;
+    let masked_words_dev = arena.upload_slice(&[u32::MAX; 32], &stream)?;
+    check_rc(
+        unsafe {
+            ffi::w34_sampler_step_fast_greedy_masked_f16(
+                &ex_sampler,
+                buf_a as *const c_void,
+                masked_greedy_cfg_dev as *const ffi::W34SamplerRowCfg,
+                masked_words_dev as *const u32,
+                core::ptr::null(),
+                sampler_out_dev as *mut ffi::W34SamplerRowOut,
+                1,
+                1024,
+            )
+        },
+        "warmup w34_sampler_step_fast_greedy_masked_f16",
+    )?;
     check_rc(
         unsafe {
             ffi::w34_sampler_step_f16(
@@ -2629,6 +2708,18 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn test_prefill_64q_zero_ulp_parity_across_kv_formats() {
+        prefill_variant_fixture(false);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU microbenchmark; run serially on an idle card with --nocapture"]
+    fn bench_prefill_query_tiles() {
+        prefill_variant_fixture(true);
+    }
+
+    #[cfg(feature = "cuda")]
+    fn prefill_variant_fixture(benchmark: bool) {
         let _dev = CudaDevice::set_current(0).unwrap();
         let stream = CudaStream::new(0).unwrap();
         let mut arena = DeviceArena::new(0, 64 * 1024 * 1024).unwrap();
@@ -2651,7 +2742,8 @@ mod tests {
         };
 
         let max_q_heads = 24usize;
-        let q_host: Vec<u16> = (0..max_tokens * max_q_heads * head_dim)
+        let query_capacity = if benchmark { 1024 } else { max_tokens };
+        let q_host: Vec<u16> = (0..query_capacity * max_q_heads * head_dim)
             .map(|_| next_f16())
             .collect();
         let k_host: Vec<u16> = (0..max_tokens * kv_heads * head_dim)
@@ -2664,8 +2756,9 @@ mod tests {
         let q_dev = arena.upload_slice(&q_host, &stream).unwrap();
         let k_in_dev = arena.upload_slice(&k_host, &stream).unwrap();
         let v_in_dev = arena.upload_slice(&v_host, &stream).unwrap();
-        let out_16q = DeviceBuffer::alloc(0, max_tokens * max_q_heads * head_dim * 2).unwrap();
-        let out_64q = DeviceBuffer::alloc(0, max_tokens * max_q_heads * head_dim * 2).unwrap();
+        let out_16q = DeviceBuffer::alloc(0, query_capacity * max_q_heads * head_dim * 2).unwrap();
+        let out_64q = DeviceBuffer::alloc(0, query_capacity * max_q_heads * head_dim * 2).unwrap();
+        let out_128q = DeviceBuffer::alloc(0, query_capacity * max_q_heads * head_dim * 2).unwrap();
 
         // Permuted page table to exercise non-contiguous physical page lookups.
         let block_table_host: Vec<i32> = (0..num_pages as i32)
@@ -2756,6 +2849,67 @@ mod tests {
             )
             .unwrap();
 
+            if benchmark {
+                // Repeated physical pages isolate tile compute/dequant costs without a model.
+                // End-to-end cold-prefill benchmarks separately measure real HBM working sets.
+                let table: Vec<i32> = (0..4096).map(|i| block_table_host[i % num_pages]).collect();
+                let pages = arena.upload_slice(&table, &stream).unwrap();
+                for heads in [16, 24] {
+                    for (queries, context) in [(256, 8192), (1024, 8192), (1024, 64512)] {
+                        let starts = arena.upload_slice(&[0i32, queries], &stream).unwrap();
+                        let ctx = arena.upload_slice(&[context], &stream).unwrap();
+                        let seq = arena.upload_slice(&[context + queries], &stream).unwrap();
+                        let batch = W34AttentionBatch {
+                            query_start_loc: starts as *const i32,
+                            context_lens_before: ctx as *const i32,
+                            seq_lens_after: seq as *const i32,
+                            block_tables: pages as *const i32,
+                            write_slot_mapping: core::ptr::null(),
+                            total_tokens: queries,
+                            max_blocks_per_req: 4096,
+                            max_q_len: queries,
+                            max_seq_len: context + queries,
+                            ..write_batch
+                        };
+                        for variant in [1, 2] {
+                            let invoke = || {
+                                check_rc(
+                                    unsafe {
+                                        ffi::w34_paged_attention_f16_force_kernel_for_test(
+                                            &ex,
+                                            &layout,
+                                            &batch,
+                                            q_dev as *const c_void,
+                                            out_128q.addr() as *mut c_void,
+                                            heads,
+                                            variant,
+                                        )
+                                    },
+                                    "prefill tile benchmark",
+                                )
+                                .unwrap()
+                            };
+                            invoke();
+                            stream.synchronize().unwrap();
+                            let start = CudaEvent::new(0, true).unwrap();
+                            let end = CudaEvent::new(0, true).unwrap();
+                            start.record(&stream).unwrap();
+                            for _ in 0..5 {
+                                invoke();
+                            }
+                            end.record(&stream).unwrap();
+                            stream.synchronize().unwrap();
+                            eprintln!(
+                                "tile_bench fmt={fmt} heads={heads} q={queries} ctx={context} rows={} ms={:.4}",
+                                if variant == 1 { 64 } else { 128 },
+                                start.elapsed_ms(&end).unwrap() / 5.0
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Test both 9B/35B GQA=4 (16 Q heads) and 27B GQA=6 (24 Q heads),
             // including odd chunk sizes and non-zero prefix offsets.
             for num_q_heads in [16usize, 24usize] {
@@ -2782,7 +2936,11 @@ mod tests {
                         sm_scale: 0.0625,
                         reserved: 0,
                     };
-                    for (use_64q, dst) in [(0i32, out_16q.addr()), (1i32, out_64q.addr())] {
+                    for (use_64q, dst) in [
+                        (0i32, out_16q.addr()),
+                        (1i32, out_64q.addr()),
+                        (2i32, out_128q.addr()),
+                    ] {
                         check_rc(
                             unsafe {
                                 ffi::w34_paged_attention_f16_force_kernel_for_test(
@@ -2803,9 +2961,15 @@ mod tests {
                     let elems = q_len * num_q_heads * head_dim;
                     let mut h16 = vec![0u16; elems];
                     let mut h64 = vec![0u16; elems];
+                    let mut h128 = vec![0u16; elems];
+                    out_128q.copy_to_host(&mut h128, &stream).unwrap();
                     out_16q.copy_to_host(&mut h16, &stream).unwrap();
                     out_64q.copy_to_host(&mut h64, &stream).unwrap();
                     stream.synchronize().unwrap();
+                    assert_eq!(
+                        h16, h128,
+                        "128q mismatch fmt={fmt} heads={num_q_heads} q={q_len} ctx={ctx_before}"
+                    );
                     for idx in 0..elems {
                         assert_eq!(
                             h16[idx], h64[idx],
@@ -2848,7 +3012,11 @@ mod tests {
                     sm_scale: 0.0625,
                     reserved: 0,
                 };
-                for (use_64q, dst) in [(0i32, out_16q.addr()), (1i32, out_64q.addr())] {
+                for (use_64q, dst) in [
+                    (0i32, out_16q.addr()),
+                    (1i32, out_64q.addr()),
+                    (2i32, out_128q.addr()),
+                ] {
                     check_rc(
                         unsafe {
                             ffi::w34_paged_attention_f16_force_kernel_for_test(
@@ -2868,15 +3036,70 @@ mod tests {
                 let elems = 256 * num_q_heads * head_dim;
                 let mut h16 = vec![0u16; elems];
                 let mut h64 = vec![0u16; elems];
+                let mut h128 = vec![0u16; elems];
+                out_128q.copy_to_host(&mut h128, &stream).unwrap();
                 out_16q.copy_to_host(&mut h16, &stream).unwrap();
                 out_64q.copy_to_host(&mut h64, &stream).unwrap();
                 stream.synchronize().unwrap();
+                assert_eq!(
+                    h16, h128,
+                    "multi-req 128q mismatch fmt={fmt} heads={num_q_heads}"
+                );
                 for idx in 0..elems {
                     assert_eq!(
                         h16[idx], h64[idx],
                         "multi-req non-zero ULP mismatch fmt={fmt} q_heads={num_q_heads} idx={idx}: 16q=0x{:04x} vs 64q=0x{:04x}",
                         h16[idx], h64[idx]
                     );
+                }
+
+                // Skip the middle request entirely and mask rows around tile boundaries.
+                // Both kernels must preserve inactive outputs, including all-masked tiles.
+                let mut valid_tokens = vec![1u8; 256];
+                valid_tokens[100..164].fill(0);
+                valid_tokens[255] = 0;
+                let valid_tokens_dev = arena.upload_slice(&valid_tokens, &stream).unwrap();
+                let valid_reqs_dev = arena.upload_slice(&[1u8, 0, 1], &stream).unwrap();
+                let masked_batch = W34AttentionBatch {
+                    valid_token_mask: valid_tokens_dev as *const u8,
+                    valid_req_mask: valid_reqs_dev as *const u8,
+                    sliding_window: 33,
+                    ..mr_batch
+                };
+                for (variant, dst) in [(0, &out_16q), (2, &out_128q)] {
+                    dst.copy_from_host(&vec![0x5500u16; elems], &stream)
+                        .unwrap();
+                    check_rc(
+                        unsafe {
+                            ffi::w34_paged_attention_f16_force_kernel_for_test(
+                                &ex,
+                                &layout,
+                                &masked_batch,
+                                q_dev as *const c_void,
+                                dst.addr() as *mut c_void,
+                                num_q_heads as i32,
+                                variant,
+                            )
+                        },
+                        "masked sliding-window 16q vs 128q",
+                    )
+                    .unwrap();
+                }
+                out_16q.copy_to_host(&mut h16, &stream).unwrap();
+                out_128q.copy_to_host(&mut h128, &stream).unwrap();
+                stream.synchronize().unwrap();
+                assert_eq!(
+                    h16, h128,
+                    "masked 128q mismatch fmt={fmt} heads={num_q_heads}"
+                );
+                for row in 0..256 {
+                    if (1..100).contains(&row) || valid_tokens[row] == 0 {
+                        assert!(
+                            h128[row * num_q_heads * head_dim..(row + 1) * num_q_heads * head_dim]
+                                .iter()
+                                .all(|&v| v == 0x5500)
+                        );
+                    }
                 }
             }
         }

@@ -12,6 +12,25 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Long-context optimization round qualified — beats `vLLM 0.31.0` & `SGLang v0.5.19` across all 9B TP=1 and 27B TP=2 cases, retains 1-GPU 27B 262K HTTP & needle
+
+All six candidate suites completed serially with `exit=0` on a single frozen release binary (`crates_tree_sha256=e1b67ef230877a0facb487401ab037c3ba15660c5e969444b782bfadfc6350e0`, `w34` `binary_sha256=b125f589aa1f567420f6ce11e0a713db1e4dd1e202ca3df45bb6f648f12fcb4b`, `needle_gate` `d347dde3399f0e73827ab6f88361c424564b667b5af08fdd5cd1a87963bab6c3`, recorded in `benchmarks/perf/results/goal-provenance.json` and indexed in `benchmarks/perf/campaigns/longctx-coding-agent.results.json`; report in `benchmarks/perf/campaigns/longctx-coding-agent.md`):
+
+- **Shipped changes (all custom kernels `STACK:0`, FP16 spine + FP32 SSM, strict 256-token mixed decode/prefill cap preserved)**:
+  - **`op_gdn.cu`**: padded bank-conflict-free WY Stage 1 (`kWyStage1SmemBytes=36608`, 116 regs, `STACK:0`), Stage 2 dedicated `s_wh_full` with register-prefetched `U`/`K` and `__half2` `s_H` stores (`kWyStage2SmemBytes=43520`, 128 regs, `STACK:0`, 2 fewer barriers/chunk), paired `__half2` `gdn_causal_conv1d_pair_f16_kernel` (`REG:40 STACK:0`, 4B alignment guard), and exact `grid_upper_chunks` checkpoint `H`-slot sizing.
+  - **`op_sampler.cu`**: two-stage `w34_sampler_step_fast_greedy_masked_f16` (`REG:40/31 STACK:0`) replacing the 174 µs scalar masked sampler under stateful `tool_choice: "none"` bitmasks (0-ULP verified).
+  - **Attention, scratch & scheduler**: packed multi-request FP16 FA2 (`64x64`, retaining donor `STACK:128`), Q8_0-only 128-row prefill dispatch (`REG:234 STACK:0`), pre-scaled FP16 TQ4 LUTs, overlaid FA/GDN/FFN scratch with model-derived prefill chunks up to 2048 tokens, Marlin prefill Split-K, and fair 64-token-tile pure-prefill budget sharing across concurrent prefills while keeping mixed decode/prefill capped at 256 tokens.
+- **9B TP=1 (`goal-9b-fp16` 78/78, `goal-9b-tq4` 78/78)**:
+  - **FP16**: 59K C1 **`27.02 tok/s`** (vs `vLLM 25.98`, `SGLang 26.14`), 59K C2 **`28.91 tok/s`** (vs `vLLM 28.74`, `SGLang 28.81`), 118K C1 **`14.51 tok/s`** (vs `vLLM 13.75`, `SGLang 13.62`), cold 57.6K / 115.1K TTFT **`14.61 / 36.28 s`** (vs `vLLM 14.86 / 36.39 s`, `SGLang 15.26 / 37.59 s`) — ahead of both competitors on all 5 cases.
+  - **TQ4**: **`22.07 / 20.79 / 10.74 tok/s`**, cold 57.6K / 115.1K **`18.15 / 50.07 s`** (`+18.3%` C2 throughput and `-11.3%` 115K cold TTFT vs original TQ4 baseline).
+- **27B TP=2 (`goal-27b-tp2-fp16` 42/42, `goal-27b-tp2-tq4` 42/42)**:
+  - **FP16**: 59K C1 **`13.60 tok/s`** (vs `vLLM 11.97`, `SGLang 12.00`), 118K C1 **`6.96 tok/s`** (vs `vLLM 6.40`, `SGLang 6.44`), warm-turn p50 TTFT **`837 / 1,012 ms`** (vs `vLLM 1,231 / 1,667 ms`, `SGLang 1,339 / 1,307 ms`), cold 57.6K / 115.1K TTFT **`33.96 / 78.79 s`** (vs `vLLM 35.68 / 83.15 s`, `SGLang 36.58 / 85.07 s`) — ahead of both competitors on all 4 cases.
+  - **TQ4**: **`11.97 / 5.62 tok/s`**, warm-turn p50 **`1,013 / 1,272 ms`**, cold **`39.18 / 98.11 s`**.
+- **Single-card 27B TP=1 262K retention (`goal-27b-tp1-262k` 29/29 + `goal-needle`)**:
+  - Default-`tq4` live HTTP served **29/29 requests** up to **252,112 prompt tokens** (82.7% prefix hits): ~59K / ~118K / ~252K **`7.77 / 3.63 / 1.12 tok/s`** (warm-turn p50 **`1,597 / 1,922 / 3,154 ms`**), 115K cold read **`149.48 s`**.
+  - 262,144-window 50%-depth needle **passed**: `262,108` prompt tokens, exact `"73918462"`, TTFT **`584.14 s`**, decode **`23.36 tok/s`**.
+- **Verification & review**: `CUDA_VISIBLE_DEVICES=0,1 mise run check` passed (`exit=0`, **234 Rust tests/doctests**, **0 failed**, **69 oracle tests**, **51 perf tests**); code review (`.pi/review/call_49568.md`) reported **0 critical/important findings**.
+
 ## Long-context coding-agent campaign complete — 538/538 HTTP requests, both single-card 262K KV policies qualified
 
 See [campaign measurements and limitations](../benchmarks/perf/campaigns/longctx-coding-agent.md)

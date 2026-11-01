@@ -855,7 +855,8 @@ __device__ __forceinline__ void decode_kv_row_256_to_smem_f16(
     *reinterpret_cast<uint4*>(dst + (lane << 3)) = make_uint4(0u, 0u, 0u, 0u);
 }
 
-__device__ __forceinline__ void prefetch_tq4_4rows(
+template <int WARPS>
+__device__ __forceinline__ void prefetch_tq4_rows(
     const uint8_t* page_head,
     size_t token_stride,
     int kv_base,
@@ -863,13 +864,13 @@ __device__ __forceinline__ void prefetch_tq4_4rows(
     int union_max_kv,
     int wid,
     int lane,
-    uint32_t (&pf_d)[4],
-    uint32_t (&pf_p)[4],
+    uint32_t (&pf_d)[16 / WARPS],
+    uint32_t (&pf_p)[16 / WARPS],
     uint32_t& pf_mask) {
     pf_mask = 0u;
 #pragma unroll
-    for (int pass = 0; pass < 4; ++pass) {
-        const int t = pass * 4 + wid;
+    for (int pass = 0; pass < 16 / WARPS; ++pass) {
+        const int t = pass * WARPS + wid;
         const int kv_pos = kv_base + t;
         if (kv_pos >= union_min_kv && kv_pos <= union_max_kv) {
             const block_tq4_0* blks =
@@ -888,41 +889,39 @@ __device__ __forceinline__ void prefetch_tq4_4rows(
     }
 }
 
-__device__ __forceinline__ void unpack_tq4_4rows_to_smem_f16(
-    const uint32_t (&pf_d)[4],
-    const uint32_t (&pf_p)[4],
+template <int WARPS>
+__device__ __forceinline__ void unpack_tq4_rows_to_smem_f16(
+    const uint32_t (&pf_d)[16 / WARPS],
+    const uint32_t (&pf_p)[16 / WARPS],
     uint32_t pf_mask,
     __half (*s_kv)[264],
     int wid,
     int lane,
     float tq4_lut) {
 #pragma unroll
-    for (int pass = 0; pass < 4; ++pass) {
-        const int t = pass * 4 + wid;
+    for (int pass = 0; pass < 16 / WARPS; ++pass) {
+        const int t = pass * WARPS + wid;
         if ((pf_mask & (1u << pass)) != 0u) {
             const uint16_t d0_u16 = static_cast<uint16_t>(pf_d[pass] & 0xFFFFu);
             const uint16_t d1_u16 = static_cast<uint16_t>(pf_d[pass] >> 16);
             const float d0 = __half2float(*reinterpret_cast<const __half*>(&d0_u16));
             const float d1 = __half2float(*reinterpret_cast<const __half*>(&d1_u16));
             const uint32_t pp = pf_p[pass];
-            const float c00 = __shfl_sync(0xffffffffu, tq4_lut, (int)(pp & 0x0Fu));
-            const float c01 = __shfl_sync(0xffffffffu, tq4_lut, (int)((pp >> 4) & 0x0Fu));
-            const float c02 = __shfl_sync(0xffffffffu, tq4_lut, (int)((pp >> 8) & 0x0Fu));
-            const float c03 = __shfl_sync(0xffffffffu, tq4_lut, (int)((pp >> 12) & 0x0Fu));
-            const float c10 = __shfl_sync(0xffffffffu, tq4_lut, (int)((pp >> 16) & 0x0Fu));
-            const float c11 = __shfl_sync(0xffffffffu, tq4_lut, (int)((pp >> 20) & 0x0Fu));
-            const float c12 = __shfl_sync(0xffffffffu, tq4_lut, (int)((pp >> 24) & 0x0Fu));
-            const float c13 = __shfl_sync(0xffffffffu, tq4_lut, (int)((pp >> 28) & 0x0Fu));
-            const __half2 h00 = __floats2half2_rn(d0 * c00, d0 * c01);
-            const __half2 h01 = __floats2half2_rn(d0 * c02, d0 * c03);
-            const __half2 h10 = __floats2half2_rn(d1 * c10, d1 * c11);
-            const __half2 h11 = __floats2half2_rn(d1 * c12, d1 * c13);
+            // Each half-warp materializes one 16-entry scaled FP16 codebook. Moving
+            // the identical multiply + round before the lookup saves seven per lane.
+            const uint32_t lut = __half_as_ushort(__float2half_rn((lane < 16 ? d0 : d1) * tq4_lut));
+            const uint32_t c00 = __shfl_sync(0xffffffffu, lut, pp & 15u);
+            const uint32_t c01 = __shfl_sync(0xffffffffu, lut, (pp >> 4) & 15u);
+            const uint32_t c02 = __shfl_sync(0xffffffffu, lut, (pp >> 8) & 15u);
+            const uint32_t c03 = __shfl_sync(0xffffffffu, lut, (pp >> 12) & 15u);
+            const uint32_t c10 = __shfl_sync(0xffffffffu, lut, 16 + ((pp >> 16) & 15u));
+            const uint32_t c11 = __shfl_sync(0xffffffffu, lut, 16 + ((pp >> 20) & 15u));
+            const uint32_t c12 = __shfl_sync(0xffffffffu, lut, 16 + ((pp >> 24) & 15u));
+            const uint32_t c13 = __shfl_sync(0xffffffffu, lut, 16 + ((pp >> 28) & 15u));
             *reinterpret_cast<uint2*>(s_kv[t] + (lane << 2)) =
-                make_uint2(*reinterpret_cast<const uint32_t*>(&h00),
-                           *reinterpret_cast<const uint32_t*>(&h01));
+                make_uint2(c00 | (c01 << 16), c02 | (c03 << 16));
             *reinterpret_cast<uint2*>(s_kv[t] + 128 + (lane << 2)) =
-                make_uint2(*reinterpret_cast<const uint32_t*>(&h10),
-                           *reinterpret_cast<const uint32_t*>(&h11));
+                make_uint2(c10 | (c11 << 16), c12 | (c13 << 16));
         } else {
             *reinterpret_cast<uint4*>(&s_kv[t][lane << 3]) = make_uint4(0u, 0u, 0u, 0u);
         }
@@ -1335,12 +1334,12 @@ __global__ void paged_attention_gqa_mma_f16_kernel(
     }
 }
 
-// Phase 6.4: 64-query-row (4 warps x 16 independent query rows/warp) FlashAttention-2
-// paged prefill kernel (head_dim=256, block_size=16) for TQ4, Q8_0, and FP16 KV caches.
-// Cuts HBM KV reads and TQ4/Q8_0 page dequantization by 4x vs the 16-row kernel, uses
-// hardware ldmatrix (.x4 and .x4.trans) for Q, K, and V, and preserves the exact IEEE-754
-// two-half Q@K^T + tree-softmax reduction order for 0-ULP parity with the 16-row kernel.
-__global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_kernel(
+// 64/128-query-row paged prefill (4/8 warps x 16 independent query rows per warp).
+// A shared 16-key page preserves the reference two-half Q@K and online-softmax order.
+// The 128-row specialization halves KV reads/dequantization relative to 64 rows;
+// dynamic Q storage allows its 76 KiB total smem footprint on sm_86.
+template <int QROWS>
+__global__ void __launch_bounds__(QROWS * 2, 1) paged_attention_prefill_mma_f16_kernel(
     w34_kv_layer_layout layout,
     w34_attention_batch batch,
     const __half* __restrict__ q_in,
@@ -1353,13 +1352,15 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
     constexpr int HEAD_DIM = 256;
     constexpr int SMEM_STRIDE = 264; // 264 * 2 = 528 B (16B-aligned + bank-conflict-free)
 
-    __shared__ __align__(16) __half s_q[64][SMEM_STRIDE];
+    constexpr int WARPS = QROWS / 16;
+    static_assert(QROWS == 64 || QROWS == 128);
+    extern __shared__ __align__(16) __half s_q[][SMEM_STRIDE];
     __shared__ __align__(16) __half s_kv[16][SMEM_STRIDE];
-    __shared__ int s_row_tok[64];
-    __shared__ int s_row_qhead[64];
-    __shared__ int s_min_kv[64];
-    __shared__ int s_max_kv[64];
-    __shared__ uint8_t s_row_valid[64];
+    __shared__ int s_row_tok[QROWS];
+    __shared__ int s_row_qhead[QROWS];
+    __shared__ int s_min_kv[QROWS];
+    __shared__ int s_max_kv[QROWS];
+    __shared__ uint8_t s_row_valid[QROWS];
     __shared__ int s_req;
     __shared__ int s_req_q_start;
     __shared__ int s_req_q_end;
@@ -1418,7 +1419,7 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
     const int q_end = s_req_q_end;
     const int tok_base = s_tok_base;
 
-    if (tid < 64) {
+    if (tid < QROWS) {
         uint8_t valid = 0;
         int tok = 0;
         int qh = 0;
@@ -1461,7 +1462,7 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
         int u_min = INT_MAX;
         int u_max = -1;
         uint8_t any = 0;
-        for (int r = 0; r < 64; ++r) {
+        for (int r = 0; r < QROWS; ++r) {
             if (s_row_valid[r]) {
                 any = 1;
                 if (s_min_kv[r] <= s_max_kv[r]) {
@@ -1486,8 +1487,8 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
     const int my_page_start = first_page;
     const int my_page_end = (last_page >= first_page) ? (last_page + 1) : first_page;
 
-    // Stage and pre-rotate 64 Q rows into s_q[64][264].
-    for (int r = wid; r < 64; r += 4) {
+    // Stage and pre-rotate Q rows, one warp per row.
+    for (int r = wid; r < QROWS; r += WARPS) {
         if (s_row_valid[r]) {
             const __half* q_row = q_in + ((size_t)s_row_tok[r] * num_q_heads + s_row_qhead[r]) * HEAD_DIM;
             if (layout.k_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
@@ -1547,15 +1548,15 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
     const bool k_is_tq4 = (layout.k_format == W34_KV_FORMAT_TQ4);
     const bool v_is_tq4 = (layout.v_format == W34_KV_FORMAT_TQ4);
 
-    uint32_t pf_d[4] = {0u, 0u, 0u, 0u};
-    uint32_t pf_p[4] = {0u, 0u, 0u, 0u};
+    uint32_t pf_d[16 / WARPS] = {};
+    uint32_t pf_p[16 / WARPS] = {};
     uint32_t pf_mask = 0u;
     if (k_is_tq4 && my_page_start < my_page_end) {
         const int32_t phys0 = req_blocks[my_page_start];
         const uint8_t* k0_head = (const uint8_t*)(uintptr_t)layout.k_base
                                  + (size_t)phys0 * layout.k_page_stride_bytes
                                  + (size_t)kv_head * layout.k_head_stride_bytes;
-        prefetch_tq4_4rows(
+        prefetch_tq4_rows<WARPS>(
             k0_head,
             layout.k_token_stride_bytes,
             my_page_start << 4,
@@ -1578,14 +1579,14 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
                                      + (size_t)phys_page * layout.v_page_stride_bytes
                                      + (size_t)kv_head * layout.v_head_stride_bytes;
 
-        // 1. Cooperative 4-warp decode of 16 K rows into s_kv (shared across all 64 Q rows),
+        // 1. Cooperative decode of 16 K rows into s_kv (shared across all Q rows),
         // then immediately issue V[page_idx] HBM prefetch so V arrives during Q@K^T + softmax.
         if (k_is_tq4) {
-            unpack_tq4_4rows_to_smem_f16(pf_d, pf_p, pf_mask, s_kv, wid, lane, tq4_lut);
+            unpack_tq4_rows_to_smem_f16<WARPS>(pf_d, pf_p, pf_mask, s_kv, wid, lane, tq4_lut);
         } else {
 #pragma unroll
-            for (int pass = 0; pass < 4; ++pass) {
-                const int t = pass * 4 + wid;
+            for (int pass = 0; pass < 16 / WARPS; ++pass) {
+                const int t = pass * WARPS + wid;
                 const int kv_pos = kv_base + t;
                 if (kv_pos >= union_min_kv && kv_pos <= union_max_kv) {
                     decode_kv_row_256_to_smem_f16(
@@ -1600,7 +1601,7 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
             }
         }
         if (v_is_tq4) {
-            prefetch_tq4_4rows(
+            prefetch_tq4_rows<WARPS>(
                 v_page_head,
                 layout.v_token_stride_bytes,
                 kv_base,
@@ -1751,14 +1752,14 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
         }
         __syncthreads();
 
-        // 4. Cooperative 4-warp decode of 16 V rows into s_kv, then immediately prefetch
+        // 4. Cooperative decode of 16 V rows into s_kv, then immediately prefetch
         // K[page_idx + 1] from HBM so next page's K arrives during P@V mma.sync.
         if (v_is_tq4) {
-            unpack_tq4_4rows_to_smem_f16(pf_d, pf_p, pf_mask, s_kv, wid, lane, tq4_lut);
+            unpack_tq4_rows_to_smem_f16<WARPS>(pf_d, pf_p, pf_mask, s_kv, wid, lane, tq4_lut);
         } else {
 #pragma unroll
-            for (int pass = 0; pass < 4; ++pass) {
-                const int t = pass * 4 + wid;
+            for (int pass = 0; pass < 16 / WARPS; ++pass) {
+                const int t = pass * WARPS + wid;
                 const int kv_pos = kv_base + t;
                 if (kv_pos >= union_min_kv && kv_pos <= union_max_kv) {
                     decode_kv_row_256_to_smem_f16(
@@ -1777,7 +1778,7 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
             const uint8_t* next_k_head = (const uint8_t*)(uintptr_t)layout.k_base
                                          + (size_t)next_phys * layout.k_page_stride_bytes
                                          + (size_t)kv_head * layout.k_head_stride_bytes;
-            prefetch_tq4_4rows(
+            prefetch_tq4_rows<WARPS>(
                 next_k_head,
                 layout.k_token_stride_bytes,
                 (page_idx + 1) << 4,
@@ -1828,8 +1829,8 @@ __global__ void __launch_bounds__(128, 2) paged_attention_prefill_64q_mma_f16_ke
         __syncthreads();
     }
 
-    // Epilogue: reuse s_q (33,792 B) as per-warp disjoint float s_out_stage[32][256] (32,768 B)
-    // in 2 passes of 8 rows/warp (32 rows/pass across all 4 warps).
+    // Epilogue: reuse s_q as disjoint per-warp FP32 staging, in two passes of
+    // eight rows per warp. QROWS * 264 * 2 bytes covers QROWS / 2 * 256 * 4.
     float (*s_out_stage)[HEAD_DIM] = reinterpret_cast<float (*)[HEAD_DIM]>(s_q);
 #pragma unroll
     for (int half_idx = 0; half_idx < 2; ++half_idx) {
@@ -2333,18 +2334,45 @@ __global__ void paged_attention_gqa_bf16_kernel(
     }
 }
 
-inline void ensure_prefill_64q_smem_carveout() {
+template <int QROWS>
+int launch_prefill(const w34_exec* ex, const w34_kv_layer_layout* layout,
+    const w34_attention_batch* batch, const void* q_in, void* attn_out, int num_q_heads) {
     static std::atomic<uint32_t> configured_mask{0u};
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 32) return;
+    const int device_rc = (int)cudaGetDevice(&dev);
+    if (device_rc != 0) return device_rc;
+    if (dev < 0 || dev >= 32) return (int)cudaErrorInvalidDevice;
     const uint32_t bit = 1u << dev;
     if ((configured_mask.load(std::memory_order_relaxed) & bit) == 0u) {
-        (void)cudaFuncSetAttribute(
-            paged_attention_prefill_64q_mma_f16_kernel,
-            cudaFuncAttributePreferredSharedMemoryCarveout,
-            100);
+        int rc = (int)cudaFuncSetAttribute(
+            paged_attention_prefill_mma_f16_kernel<QROWS>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, QROWS * 264 * sizeof(__half));
+        if (rc != 0) return rc;
+        rc = (int)cudaFuncSetAttribute(
+            paged_attention_prefill_mma_f16_kernel<QROWS>,
+            cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        if (rc != 0) return rc;
         configured_mask.fetch_or(bit, std::memory_order_relaxed);
     }
+    const int gqa_ratio = num_q_heads / layout->local_kv_heads;
+    int q_group = 1;
+    for (int d = 16; d >= 1; --d) {
+        if (gqa_ratio % d == 0 && QROWS % d == 0) {
+            q_group = d;
+            break;
+        }
+    }
+    const int q_subgroups = gqa_ratio / q_group;
+    const int tok_tile = QROWS / q_group;
+    const unsigned grid_x = batch->num_reqs == 1
+        ? (unsigned)((batch->total_tokens + tok_tile - 1) / tok_tile)
+        : (unsigned)(batch->total_tokens / tok_tile + batch->num_reqs);
+    paged_attention_prefill_mma_f16_kernel<QROWS><<<
+        dim3(grid_x, layout->local_kv_heads * q_subgroups), QROWS * 2,
+        QROWS * 264 * sizeof(__half), (cudaStream_t)ex->stream>>>(
+        *layout, *batch, static_cast<const __half*>(q_in), static_cast<__half*>(attn_out),
+        num_q_heads, gqa_ratio, q_group, q_subgroups, tok_tile);
+    return (int)cudaGetLastError();
 }
 
 } // namespace w34_attn
@@ -2516,20 +2544,14 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
                 : (unsigned)((batch->total_tokens / tok_tile_64) + batch->num_reqs);
             const unsigned grid_y_64 = (unsigned)(layout->local_kv_heads * q_subgroups_64);
             if ((uint64_t)grid_x_64 * (uint64_t)grid_y_64 >= 42u || batch->max_seq_len >= 4096) {
-                w34_attn::ensure_prefill_64q_smem_carveout();
-                const dim3 grid_64(grid_x_64, grid_y_64, 1u);
-                w34_attn::paged_attention_prefill_64q_mma_f16_kernel<<<
-                    grid_64, 128, 0, (cudaStream_t)ex->stream>>>(
-                    *layout,
-                    *batch,
-                    static_cast<const __half*>(q_in),
-                    static_cast<__half*>(attn_out),
-                    num_q_heads,
-                    gqa_ratio,
-                    q_group_64,
-                    q_subgroups_64,
-                    tok_tile_64);
-                return (int)cudaGetLastError();
+                // Larger tiles amortize Q8 dequantization, but measurements show
+                // TQ4/FP16 favor two resident 64-row CTAs over one 128-row CTA.
+                if (batch->total_tokens >= 512 && batch->max_seq_len >= 4096 &&
+                    layout->k_format == W34_KV_FORMAT_Q8_0 &&
+                    layout->v_format == W34_KV_FORMAT_Q8_0) {
+                    return w34_attn::launch_prefill<128>(ex, layout, batch, q_in, attn_out, num_q_heads);
+                }
+                return w34_attn::launch_prefill<64>(ex, layout, batch, q_in, attn_out, num_q_heads);
             }
         }
 
@@ -2609,7 +2631,7 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
     return (int)cudaGetLastError();
 }
 
-// Explicit test-only dispatchers for 0-ULP comparison between the 16-row and 64-row GQA MMA kernels.
+// Test-only selector: 0 = 16 rows, 1 = 64 rows, 2 = 128 rows (same arithmetic).
 extern "C" int w34_paged_attention_f16_force_kernel_for_test(
     const w34_exec* ex,
     const w34_kv_layer_layout* layout,
@@ -2627,36 +2649,11 @@ extern "C" int w34_paged_attention_f16_force_kernel_for_test(
         return (int)cudaErrorInvalidValue;
     }
     const int gqa_ratio = num_q_heads / layout->local_kv_heads;
+    if (use_64q == 2) {
+        return w34_attn::launch_prefill<128>(ex, layout, batch, q_in, attn_out, num_q_heads);
+    }
     if (use_64q != 0) {
-        int q_group_64 = 1;
-        for (int d = 16; d >= 1; --d) {
-            if ((gqa_ratio % d) == 0 && (64 % d) == 0) {
-                q_group_64 = d;
-                break;
-            }
-        }
-        const int q_subgroups_64 = gqa_ratio / q_group_64;
-        const int tok_tile_64 = 64 / q_group_64;
-        w34_attn::ensure_prefill_64q_smem_carveout();
-        const unsigned grid_x_64 = (batch->num_reqs == 1)
-            ? (unsigned)((batch->total_tokens + tok_tile_64 - 1) / tok_tile_64)
-            : (unsigned)((batch->total_tokens / tok_tile_64) + batch->num_reqs);
-        const dim3 grid_64(
-            grid_x_64,
-            (unsigned)(layout->local_kv_heads * q_subgroups_64),
-            1u);
-        w34_attn::paged_attention_prefill_64q_mma_f16_kernel<<<
-            grid_64, 128, 0, (cudaStream_t)ex->stream>>>(
-            *layout,
-            *batch,
-            static_cast<const __half*>(q_in),
-            static_cast<__half*>(attn_out),
-            num_q_heads,
-            gqa_ratio,
-            q_group_64,
-            q_subgroups_64,
-            tok_tile_64);
-        return (int)cudaGetLastError();
+        return w34_attn::launch_prefill<64>(ex, layout, batch, q_in, attn_out, num_q_heads);
     }
 
     int q_group = gqa_ratio;

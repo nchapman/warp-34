@@ -94,6 +94,16 @@ impl EngineWorker {
             .name("w34-cuda".into())
             .spawn(move || match loader() {
                 Ok(engine) => {
+                    let mut clamped_cfg = config;
+                    for rank in &engine.ranks {
+                        match rank.ordinary_prefill_token_capacity(clamped_cfg.max_num_seqs) {
+                            Ok(cap) => clamped_cfg.clamp_for_token_capacity(cap),
+                            Err(e) => {
+                                let _ = ready_tx.send(Err(e.to_string()));
+                                return;
+                            }
+                        }
+                    }
                     let default_preserve_thinking =
                         crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
                     let info = (
@@ -103,7 +113,7 @@ impl EngineWorker {
                         default_preserve_thinking,
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
-                        run(engine, config, receiver, stop, worker_stats);
+                        run(engine, clamped_cfg, receiver, stop, worker_stats);
                     }
                 }
                 Err(e) => {
@@ -282,14 +292,11 @@ fn enqueue(
 
 fn run(
     mut engine: Qwen3_5Engine,
-    mut config: SchedulerConfig,
+    config: SchedulerConfig,
     mut receiver: Receiver<Request>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<WorkerStats>,
 ) {
-    if let Some(r0) = engine.ranks.first() {
-        config.clamp_for_scratch_bytes(r0.scratch_arena.capacity());
-    }
     let mut sched = SchedulerV1::new(config);
     let mut requests = HashMap::new();
     let mut speculative_id = None;
@@ -710,14 +717,12 @@ fn run(
                 .cached_tokens
                 .store(seq.cached_prefix_tokens as u64, Ordering::Release);
             let needed = requests[&seq.req_id].reserved_pages;
-            while seq.radix_state.kv_pages.len() < needed {
-                match engine.alloc_kv_page_from(&mut sched.radix) {
-                    Some(p) => seq.radix_state.kv_pages.push(p),
-                    None => {
-                        failed.push((seq.req_id, "KV pool exhausted".to_string()));
-                        break;
-                    }
-                }
+            if !engine.reserve_kv_pages_from(
+                &mut sched.radix,
+                &mut seq.radix_state.kv_pages,
+                needed,
+            ) {
+                failed.push((seq.req_id, "KV pool exhausted".to_string()));
             }
         }
         for (id, error) in failed {
@@ -1137,8 +1142,12 @@ fn step_plain(
                 .map_or(0, |v| v.position_delta)
         })
         .collect();
-    let needs_gpu = slices.iter().any(|s| {
-        (!s.is_prefill_chunk || s.is_final_prefill_chunk) && {
+    let emit_mask: Vec<bool> = slices
+        .iter()
+        .map(|s| !s.is_prefill_chunk || s.is_final_prefill_chunk)
+        .collect();
+    let needs_gpu = slices.iter().enumerate().any(|(i, s)| {
+        emit_mask[i] && {
             let r = &requests[&s.req_id];
             !r.sampler
                 .params
@@ -1169,7 +1178,7 @@ fn step_plain(
     }
 
     let greedy = engine
-        .step_batch_slices_for_sampler(&batch, Some(&deltas), needs_gpu)
+        .step_batch_slices_for_sampler_filtered(&batch, Some(&deltas), Some(&emit_mask), needs_gpu)
         .map_err(|e| e.to_string())?;
     let mut pending_errors: Vec<Option<String>> = vec![None; slices.len()];
     let sampled = if needs_gpu {
@@ -1178,10 +1187,11 @@ fn step_plain(
         let mut sparse = Vec::new();
         let mut rows = Vec::new();
         for (i, s) in slices.iter().enumerate() {
+            if !emit_mask[i] {
+                continue;
+            }
             let r = requests.get_mut(&s.req_id).unwrap();
-            if (!s.is_prefill_chunk || s.is_final_prefill_chunk)
-                && let Err(err) = r.sampler.materialize_pending_constraint()
-            {
+            if let Err(err) = r.sampler.materialize_pending_constraint() {
                 pending_errors[i] = Some(err);
                 rows.push(w34_kernels::ffi::W34SamplerRowCfg {
                     temperature: 0.0,
@@ -1228,15 +1238,18 @@ fn step_plain(
     } else {
         None
     };
+    let mut sample_idx = 0usize;
     for (i, s) in slices.iter().enumerate() {
-        let token = if !s.is_prefill_chunk || s.is_final_prefill_chunk {
+        let token = if emit_mask[i] {
+            let row_idx = sample_idx;
+            sample_idx += 1;
             if let Some(error) = pending_errors[i].take() {
                 fail_request(engine, sched, requests, s.req_id, error);
                 continue;
             }
             let r = requests.get_mut(&s.req_id).unwrap();
             let (id, lp) = if let Some(rows) = &sampled {
-                let out = &rows[i];
+                let out = &rows[row_idx];
                 if out.status != 0 {
                     fail_request(
                         engine,

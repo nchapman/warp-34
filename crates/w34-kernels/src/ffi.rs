@@ -740,6 +740,16 @@ unsafe extern "C" {
         num_rows: i32,
         vocab_size: i32,
     ) -> i32;
+    pub fn w34_sampler_step_fast_greedy_masked_f16(
+        ex: *const W34Exec,
+        logits_f16: *const c_void,
+        row_cfgs: *const W34SamplerRowCfg,
+        bitmask_u32: *const u32,
+        sparse_entries: *const W34SamplerSparseEntry,
+        row_outs: *mut W34SamplerRowOut,
+        num_rows: i32,
+        vocab_size: i32,
+    ) -> i32;
     pub fn w34_sampler_scatter_ids_to_tokens(
         ex: *const W34Exec,
         row_outs: *const W34SamplerRowOut,

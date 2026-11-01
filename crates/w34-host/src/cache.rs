@@ -135,13 +135,102 @@ pub struct KvLayerBuffer {
     pub layout: W34KvLayerLayout,
 }
 
+/// Ascending physical-order free-page bitmap (`O(1)` amortized scan via `next_word`).
+///
+/// Always allocates the lowest free `page_id` so batch eviction from `MambaRadixCache`
+/// coalesces freed leaf pages into monotonically increasing GDDR6X runs rather than
+/// LIFO-reversed scattered leaf order.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Clone, Debug)]
+pub(crate) struct PageBitmap {
+    num_pages: usize,
+    words: Vec<u64>,
+    free_count: usize,
+    next_word: usize,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl PageBitmap {
+    pub(crate) fn new(num_pages: usize) -> Self {
+        let mut bm = Self {
+            num_pages,
+            words: vec![0u64; num_pages.div_ceil(64)],
+            free_count: 0,
+            next_word: 0,
+        };
+        bm.reset();
+        bm
+    }
+
+    pub(crate) fn free_count(&self) -> usize {
+        self.free_count
+    }
+
+    pub(crate) fn reset(&mut self) {
+        let full_words = self.num_pages / 64;
+        let rem = self.num_pages % 64;
+        for w in &mut self.words[..full_words] {
+            *w = u64::MAX;
+        }
+        if rem > 0 {
+            self.words[full_words] = (1u64 << rem) - 1;
+        }
+        self.free_count = self.num_pages;
+        self.next_word = 0;
+    }
+
+    pub(crate) fn alloc(&mut self) -> Option<i32> {
+        if self.free_count == 0 {
+            return None;
+        }
+        let n = self.words.len();
+        for pass in 0..2 {
+            let range = if pass == 0 {
+                self.next_word..n
+            } else {
+                0..self.next_word
+            };
+            for w in range {
+                let word = self.words[w];
+                if word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    self.words[w] = word & !(1u64 << bit);
+                    self.free_count -= 1;
+                    self.next_word = w;
+                    return Some((w * 64 + bit) as i32);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn free(&mut self, page_id: i32) {
+        if page_id < 0 {
+            return;
+        }
+        let idx = page_id as usize;
+        if idx >= self.num_pages {
+            return;
+        }
+        let w = idx / 64;
+        let mask = 1u64 << (idx % 64);
+        if (self.words[w] & mask) == 0 {
+            self.words[w] |= mask;
+            self.free_count += 1;
+            if w < self.next_word {
+                self.next_word = w;
+            }
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct KvPool {
     pub device_id: i32,
     pub num_pages: usize,
     pub block_size: usize,
     pub layers: Vec<KvLayerBuffer>,
-    free_pages: Vec<i32>,
+    free_pages: PageBitmap,
 }
 
 #[cfg(feature = "cuda")]
@@ -196,7 +285,7 @@ impl KvPool {
                 layout,
             });
         }
-        let free_pages = (0..num_pages as i32).rev().collect();
+        let free_pages = PageBitmap::new(num_pages);
         Ok(Self {
             device_id,
             num_pages,
@@ -227,16 +316,20 @@ impl KvPool {
         )
     }
 
+    pub fn free_count(&self) -> usize {
+        self.free_pages.free_count()
+    }
+
     pub fn alloc_page(&mut self) -> Option<i32> {
-        self.free_pages.pop()
+        self.free_pages.alloc()
     }
 
     pub fn free_page(&mut self, page_id: i32) {
-        self.free_pages.push(page_id);
+        self.free_pages.free(page_id);
     }
 
     pub fn reset_all_pages(&mut self) {
-        self.free_pages = (0..self.num_pages as i32).rev().collect();
+        self.free_pages.reset();
     }
 }
 
@@ -521,5 +614,34 @@ mod tests {
         assert_eq!(freed_full, vec![101, 201]);
         assert_eq!(tx.kv_seq_len_before, 69);
         assert_eq!(tx.phase, StateTxPhase::Decoding);
+    }
+
+    #[test]
+    fn test_page_bitmap_ascending_coalescing_and_idempotent_free() {
+        let mut bm = PageBitmap::new(130);
+        assert_eq!(bm.free_count(), 130);
+        for expected in 0..130 {
+            assert_eq!(bm.alloc(), Some(expected));
+        }
+        assert_eq!(bm.alloc(), None);
+        assert_eq!(bm.free_count(), 0);
+
+        // Scattered + reverse leaf frees must coalesce into strictly ascending allocations.
+        for &p in &[129, 64, 65, 3, 2, 1, 0, 128, 63] {
+            bm.free(p);
+        }
+        // Duplicate and out-of-range frees must be ignored safely.
+        bm.free(64);
+        bm.free(-1);
+        bm.free(130);
+        assert_eq!(bm.free_count(), 9);
+
+        let reallocated: Vec<i32> = (0..9).map(|_| bm.alloc().unwrap()).collect();
+        assert_eq!(reallocated, vec![0, 1, 2, 3, 63, 64, 65, 128, 129]);
+        assert_eq!(bm.alloc(), None);
+
+        bm.reset();
+        assert_eq!(bm.free_count(), 130);
+        assert_eq!(bm.alloc(), Some(0));
     }
 }

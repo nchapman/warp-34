@@ -327,7 +327,71 @@ __global__ void fused_add_gemma_rms_norm_f16_kernel(
 }
 
 // RMSNormGated(norm_before_gate=True, activation="silu"):
-// Each block processes one (token, v_head) row of length head_dim (e.g. 128).
+// Specialized 1-warp-per-row kernel for head_dim == 128 (e.g. Qwen 3.5 / GDN).
+// Vectorized 64-bit uint2 loads, single intra-warp shuffle reduction, zero smem, zero syncthreads.
+__global__ void rms_norm_gated_silu_d128_warp_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ z,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int total_rows,
+    int num_v_heads,
+    int z_token_stride,
+    float eps) {
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * (blockDim.x >> 5) + wid;
+    if (row >= total_rows) return;
+
+    const int token_idx = row / num_v_heads;
+    const int head_idx = row % num_v_heads;
+    if (valid_token_mask != nullptr && valid_token_mask[token_idx] == 0) return;
+
+    const int col4 = lane * 4;
+    const __half* x_row = x + (size_t)row * 128 + col4;
+    const __half* z_row = z + (size_t)token_idx * z_token_stride + (size_t)head_idx * 128 + col4;
+    __half* out_row = out + (size_t)row * 128 + col4;
+
+    const uint2 xv_u2 = *reinterpret_cast<const uint2*>(x_row);
+    const __half2* xv_h2 = reinterpret_cast<const __half2*>(&xv_u2);
+    const float2 x01 = __half22float2(xv_h2[0]);
+    const float2 x23 = __half22float2(xv_h2[1]);
+
+    float sum_sq = (x01.x * x01.x + x01.y * x01.y) + (x23.x * x23.x + x23.y * x23.y);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(0xffffffffu, sum_sq, offset);
+    }
+    const float inv_rms = rsqrtf(sum_sq * 0.0078125f + eps);
+
+    const uint2 zv_u2 = *reinterpret_cast<const uint2*>(z_row);
+    const __half2* zv_h2 = reinterpret_cast<const __half2*>(&zv_u2);
+    const float2 z01 = __half22float2(zv_h2[0]);
+    const float2 z23 = __half22float2(zv_h2[1]);
+
+    const uint2 wv_u2 = *reinterpret_cast<const uint2*>(weight + col4);
+    const __half2* wv_h2 = reinterpret_cast<const __half2*>(&wv_u2);
+    const float2 w01 = __half22float2(wv_h2[0]);
+    const float2 w23 = __half22float2(wv_h2[1]);
+
+    const float g0 = z01.x / (1.0f + expf(-z01.x));
+    const float g1 = z01.y / (1.0f + expf(-z01.y));
+    const float g2 = z23.x / (1.0f + expf(-z23.x));
+    const float g3 = z23.y / (1.0f + expf(-z23.y));
+
+    const __half2 o01 = __floats2half2_rn(x01.x * inv_rms * w01.x * g0, x01.y * inv_rms * w01.y * g1);
+    const __half2 o23 = __floats2half2_rn(x23.x * inv_rms * w23.x * g2, x23.y * inv_rms * w23.y * g3);
+
+    uint2 out_u2;
+    __half2* out_h2 = reinterpret_cast<__half2*>(&out_u2);
+    out_h2[0] = o01;
+    out_h2[1] = o23;
+    *reinterpret_cast<uint2*>(out_row) = out_u2;
+}
+
+// Generic fallback: Each block processes one (token, v_head) row of length head_dim.
 __global__ void rms_norm_gated_silu_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ z,
@@ -709,9 +773,19 @@ extern "C" int w34_rms_norm_gated_silu_strided_f16(
     const int total_rows = num_tokens * num_v_heads;
     if (total_rows <= 0 || head_dim <= 0) return 0;
     if (z_token_stride < num_v_heads * head_dim) return (int)cudaErrorInvalidValue;
-    w34::rms_norm_gated_silu_f16_kernel<<<total_rows, 128, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)x, (const __half*)z, (const __half*)weight, (__half*)out,
-        valid_token_mask, num_v_heads, head_dim, z_token_stride, eps);
+    if (head_dim == 128 && ((uintptr_t)x & 7) == 0 && ((uintptr_t)z & 7) == 0 &&
+        ((uintptr_t)weight & 7) == 0 && ((uintptr_t)out & 7) == 0 && (z_token_stride % 4) == 0) {
+        constexpr int threads_per_block = 256;
+        constexpr int rows_per_block = threads_per_block / 32;
+        const int blocks = (total_rows + rows_per_block - 1) / rows_per_block;
+        w34::rms_norm_gated_silu_d128_warp_f16_kernel<<<blocks, threads_per_block, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)z, (const __half*)weight, (__half*)out,
+            valid_token_mask, total_rows, num_v_heads, z_token_stride, eps);
+    } else {
+        w34::rms_norm_gated_silu_f16_kernel<<<total_rows, 128, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)z, (const __half*)weight, (__half*)out,
+            valid_token_mask, num_v_heads, head_dim, z_token_stride, eps);
+    }
     return (int)cudaGetLastError();
 }
 

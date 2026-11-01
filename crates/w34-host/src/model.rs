@@ -22,6 +22,66 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 use w34_kernels::ffi::{self, W34_ATTN_MASK_CAUSAL, W34AttentionBatch, W34Exec, W34GdnBatch};
 
+#[cfg(any(feature = "cuda", test))]
+#[path = "model_scratch.rs"]
+mod model_scratch;
+
+type LayerScratchAddrs = ([u64; 6], [u64; 5], [u64; 10], u64);
+
+/// Reserve one high-water region; all offsets within a phase remain disjoint.
+/// Main-stream ordering separates FA/GDN from FFN and subsequent layers. GDN's
+/// ba auxiliary stream is joined before recurrent/out_proj and thus before reuse.
+/// Dumps copy and synchronize in record_dump_f16, retaining no scratch pointers.
+#[cfg(feature = "cuda")]
+fn alloc_layer_scratch(
+    arena: &mut DeviceArena,
+    cfg: &ModelConfig,
+    tp: usize,
+    tokens: usize,
+) -> Result<LayerScratchAddrs> {
+    let (bytes, fa_offsets, gdn_offsets, ffn_offsets) = layer_scratch_layout(cfg, tp, tokens)?;
+    let base = arena.alloc_aligned(bytes)?;
+    let overlay_end = base
+        .checked_add(bytes as u64)
+        .ok_or_else(|| loader_err("layer scratch layout overflow"))?;
+    Ok((
+        fa_offsets.map(|o| base + o as u64),
+        gdn_offsets.map(|o| base + o as u64),
+        ffn_offsets.map(|o| o.map_or(0, |o| base + o as u64)),
+        overlay_end,
+    ))
+}
+
+#[cfg(feature = "cuda")]
+fn layer_scratch_layout(
+    cfg: &ModelConfig,
+    tp: usize,
+    tokens: usize,
+) -> Result<model_scratch::LayerLayout> {
+    if tp == 0 {
+        return Err(loader_err("zero scratch TP size"));
+    }
+    let overflow = || loader_err("layer scratch layout overflow");
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
+    model_scratch::layer_layout(
+        model_scratch::Dimensions {
+            q: mul(cfg.num_attention_heads / tp, cfg.head_dim)?,
+            kv: mul(cfg.num_key_value_heads / tp, cfg.head_dim)?,
+            v_heads: cfg.linear_num_value_heads / tp,
+            v: mul(cfg.linear_num_value_heads / tp, cfg.linear_value_head_dim)?,
+            k: mul(cfg.linear_num_key_heads / tp, cfg.linear_key_head_dim)?,
+            interm: cfg.intermediate_size / tp,
+            experts: cfg.num_experts,
+            top_k: cfg.num_experts_per_tok,
+            moe: cfg.moe_intermediate_size / tp,
+            shared: cfg.shared_expert_intermediate_size / tp,
+            hidden: cfg.hidden_size,
+        },
+        tokens,
+    )
+    .ok_or_else(overflow)
+}
+
 #[inline]
 pub(crate) fn loader_err(context: &'static str) -> CudaError {
     CudaError { code: -10, context }
@@ -2562,6 +2622,22 @@ impl Qwen3_5ModelRank {
         Ok(())
     }
 
+    /// Maximum aligned ordinary prefill budget, including worst-case selected outputs.
+    pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
+        model_scratch::token_capacity(
+            self.scratch_arena.capacity(),
+            self.cfg.hidden_size,
+            self.local_vocab_size,
+            max_num_seqs,
+            |tokens| {
+                layer_scratch_layout(&self.cfg, self.tp_size, tokens)
+                    .ok()
+                    .map(|l| l.0)
+            },
+        )
+        .ok_or_else(|| loader_err("scratch cannot fit one 64-token prefill chunk"))
+    }
+
     /// Executes the full model spine for `num_tokens` tokens on this rank.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_device_batches(
@@ -2603,81 +2679,38 @@ impl Qwen3_5ModelRank {
         let kv_dim = local_kv_heads * head_dim;
         let gdn_v_dim = local_v_heads * head_v_dim;
 
-        let qkv_proj_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * (q_gate_dim + 2 * kv_dim) * 2)?;
-        let q_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
-        let k_buf = self.scratch_arena.alloc_aligned(num_tokens * kv_dim * 2)?;
-        let gate_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
-        let attn_out_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
-        let gated_attn_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
-
-        let qkvz_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * (conv_dim + gdn_v_dim) * 2)?;
-        let ba_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * 2 * local_v_heads * 2)?;
-        let qkv_conv_out_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * conv_dim * 2)?;
-        let gdn_raw_out_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
-        let gdn_normed_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
-
-        let gate_up_buf = if local_interm > 0 {
-            self.scratch_arena
-                .alloc_aligned(num_tokens * local_interm * 2 * 2)?
-        } else {
-            0
-        };
-        let act_buf = if local_interm > 0 {
-            self.scratch_arena
-                .alloc_aligned(num_tokens * local_interm * 2)?
-        } else {
-            0
-        };
         let (
-            moe_router_logits_buf,
-            moe_topk_weights_buf,
-            moe_topk_ids_buf,
-            moe_interm_buf,
-            moe_sh_gu_buf,
-            moe_sh_act_buf,
-            moe_sh_out_buf,
-            moe_sh_gate_buf,
-        ) = if self.cfg.num_experts > 0 {
-            let num_exp = self.cfg.num_experts;
-            let top_k = self.cfg.num_experts_per_tok.max(1);
-            let local_moe_interm = (self.cfg.moe_intermediate_size / self.tp_size).max(8);
-            let local_sh_interm = (self.cfg.shared_expert_intermediate_size / self.tp_size).max(8);
-            (
-                self.scratch_arena.alloc_aligned(num_tokens * num_exp * 2)?,
-                self.scratch_arena.alloc_aligned(num_tokens * top_k * 4)?,
-                self.scratch_arena.alloc_aligned(num_tokens * top_k * 4)?,
-                self.scratch_arena
-                    .alloc_aligned(num_tokens * top_k * local_moe_interm * 2)?,
-                self.scratch_arena
-                    .alloc_aligned(num_tokens * local_sh_interm * 2 * 2)?,
-                self.scratch_arena
-                    .alloc_aligned(num_tokens * local_sh_interm * 2)?,
-                self.scratch_arena.alloc_aligned(num_tokens * h_dim * 2)?,
-                self.scratch_arena.alloc_aligned(num_tokens * 2)?,
-            )
-        } else {
-            (0, 0, 0, 0, 0, 0, 0, 0)
-        };
+            [
+                qkv_proj_buf,
+                q_buf,
+                k_buf,
+                gate_buf,
+                attn_out_buf,
+                gated_attn_buf,
+            ],
+            [
+                qkvz_buf,
+                ba_buf,
+                qkv_conv_out_buf,
+                gdn_raw_out_buf,
+                gdn_normed_buf,
+            ],
+            [
+                gate_up_buf,
+                act_buf,
+                moe_router_logits_buf,
+                moe_topk_weights_buf,
+                moe_topk_ids_buf,
+                moe_interm_buf,
+                moe_sh_gu_buf,
+                moe_sh_act_buf,
+                moe_sh_out_buf,
+                moe_sh_gate_buf,
+            ],
+            layer_overlay_end,
+        ) = alloc_layer_scratch(&mut self.scratch_arena, &self.cfg, self.tp_size, num_tokens)?;
+        // Persistent outputs are allocated after the ENTIRE overlay reservation;
+        // remaining_workspace below cannot alias any phase, even the largest one.
         let logits_buf = self
             .scratch_arena
             .alloc_aligned(self.local_vocab_size * 2)?;
@@ -2930,10 +2963,16 @@ impl Qwen3_5ModelRank {
                     if can_fork_ba {
                         self.stream.wait_event(&self.aux_join_event)?;
                     }
+                    let gdn_tail_cap = layer_overlay_end.saturating_sub(gdn_normed_buf) as usize;
+                    let ex_gdn = if gdn_tail_cap > ex.scratch_size {
+                        self.stream.exec(gdn_normed_buf, gdn_tail_cap)
+                    } else {
+                        ex
+                    };
                     check_rc(
                         unsafe {
                             ffi::w34_gdn_recurrent_strided_f16(
-                                &ex,
+                                &ex_gdn,
                                 gdn_batch,
                                 qkv_conv_out_buf as *const c_void,
                                 core::ptr::null(),
@@ -3392,81 +3431,38 @@ impl Qwen3_5ModelRank {
         let block_out_buf = self.scratch_arena.alloc_aligned(num_tokens * h_dim * 2)?;
         let mlp_out_buf = self.scratch_arena.alloc_aligned(num_tokens * h_dim * 2)?;
 
-        let qkv_proj_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * (q_gate_dim + 2 * kv_dim) * 2)?;
-        let q_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
-        let k_buf = self.scratch_arena.alloc_aligned(num_tokens * kv_dim * 2)?;
-        let gate_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
-        let attn_out_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
-        let gated_attn_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * local_q_heads * head_dim * 2)?;
-
-        let qkvz_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * (conv_dim + gdn_v_dim) * 2)?;
-        let ba_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * 2 * local_v_heads * 2)?;
-        let qkv_conv_out_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * conv_dim * 2)?;
-        let gdn_raw_out_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
-        let gdn_normed_buf = self
-            .scratch_arena
-            .alloc_aligned(num_tokens * gdn_v_dim * 2)?;
-
-        let gate_up_buf = if local_interm > 0 {
-            self.scratch_arena
-                .alloc_aligned(num_tokens * local_interm * 2 * 2)?
-        } else {
-            0
-        };
-        let act_buf = if local_interm > 0 {
-            self.scratch_arena
-                .alloc_aligned(num_tokens * local_interm * 2)?
-        } else {
-            0
-        };
         let (
-            moe_router_logits_buf,
-            moe_topk_weights_buf,
-            moe_topk_ids_buf,
-            moe_interm_buf,
-            moe_sh_gu_buf,
-            moe_sh_act_buf,
-            moe_sh_out_buf,
-            moe_sh_gate_buf,
-        ) = if self.cfg.num_experts > 0 {
-            let num_exp = self.cfg.num_experts;
-            let top_k = self.cfg.num_experts_per_tok.max(1);
-            let local_moe_interm = (self.cfg.moe_intermediate_size / self.tp_size).max(8);
-            let local_sh_interm = (self.cfg.shared_expert_intermediate_size / self.tp_size).max(8);
-            (
-                self.scratch_arena.alloc_aligned(num_tokens * num_exp * 2)?,
-                self.scratch_arena.alloc_aligned(num_tokens * top_k * 4)?,
-                self.scratch_arena.alloc_aligned(num_tokens * top_k * 4)?,
-                self.scratch_arena
-                    .alloc_aligned(num_tokens * top_k * local_moe_interm * 2)?,
-                self.scratch_arena
-                    .alloc_aligned(num_tokens * local_sh_interm * 2 * 2)?,
-                self.scratch_arena
-                    .alloc_aligned(num_tokens * local_sh_interm * 2)?,
-                self.scratch_arena.alloc_aligned(num_tokens * h_dim * 2)?,
-                self.scratch_arena.alloc_aligned(num_tokens * 2)?,
-            )
-        } else {
-            (0, 0, 0, 0, 0, 0, 0, 0)
-        };
+            [
+                qkv_proj_buf,
+                q_buf,
+                k_buf,
+                gate_buf,
+                attn_out_buf,
+                gated_attn_buf,
+            ],
+            [
+                qkvz_buf,
+                ba_buf,
+                qkv_conv_out_buf,
+                gdn_raw_out_buf,
+                gdn_normed_buf,
+            ],
+            [
+                gate_up_buf,
+                act_buf,
+                moe_router_logits_buf,
+                moe_topk_weights_buf,
+                moe_topk_ids_buf,
+                moe_interm_buf,
+                moe_sh_gu_buf,
+                moe_sh_act_buf,
+                moe_sh_out_buf,
+                moe_sh_gate_buf,
+            ],
+            layer_overlay_end,
+        ) = alloc_layer_scratch(&mut self.scratch_arena, &self.cfg, self.tp_size, num_tokens)?;
+        // Persistent outputs are allocated after the ENTIRE overlay reservation;
+        // remaining_workspace below cannot alias any phase, even the largest one.
         let num_selected_pre = selected_rows.len();
         let use_spec_buf_pre = num_selected_pre > 0
             && self
@@ -3742,10 +3738,16 @@ impl Qwen3_5ModelRank {
                     if can_fork_ba {
                         self.stream.wait_event(&self.aux_join_event)?;
                     }
+                    let gdn_tail_cap = layer_overlay_end.saturating_sub(gdn_normed_buf) as usize;
+                    let ex_gdn = if gdn_tail_cap > ex.scratch_size {
+                        self.stream.exec(gdn_normed_buf, gdn_tail_cap)
+                    } else {
+                        ex
+                    };
                     check_rc(
                         unsafe {
                             ffi::w34_gdn_recurrent_strided_f16(
-                                &ex,
+                                &ex_gdn,
                                 gdn_batch,
                                 qkv_conv_out_buf as *const c_void,
                                 core::ptr::null(),
@@ -4894,21 +4896,34 @@ impl Qwen3_5Engine {
         };
         let out_dev = r0.batch_meta_arena.alloc_aligned(out_bytes)?;
         let ex_sampler = r0.stream.exec(sampler_ws_ptr, sampler_ws_cap);
+        let words_per_row = vocab_size.div_ceil(32);
         let use_fast_greedy = vocab_size >= 1024
-            && bitmask_words.is_empty()
             && row_cfgs.iter().all(|c| {
-                (c.temperature <= 1e-6 || c.top_k == 1)
-                    && (c.has_bitmask == 0 || c.row_bitmask_word_offset < 0)
+                let is_greedy = c.temperature <= 1e-6 || c.top_k == 1;
+                let unmasked_ok = (c.has_bitmask == 0 || c.row_bitmask_word_offset < 0)
                     && (0..=32).contains(&c.sparse_count)
-                    && c.top_logprobs_k <= 0
+                    && c.top_logprobs_k <= 0;
+                let masked_ok = mask_dev != 0
+                    && c.has_bitmask != 0
+                    && c.row_bitmask_word_offset >= 0
+                    && (c.row_bitmask_word_offset as usize).saturating_add(words_per_row)
+                        <= bitmask_words.len()
+                    && c.sparse_count == 0
+                    && c.top_logprobs_k < 0;
+                is_greedy && (unmasked_ok || masked_ok)
             });
         if use_fast_greedy {
             check_rc(
                 unsafe {
-                    ffi::w34_sampler_step_fast_greedy_f16(
+                    ffi::w34_sampler_step_fast_greedy_masked_f16(
                         &ex_sampler,
                         full_logits_ptr as *const c_void,
                         cfg_dev as *const ffi::W34SamplerRowCfg,
+                        if mask_dev == 0 {
+                            core::ptr::null()
+                        } else {
+                            mask_dev as *const u32
+                        },
                         if sparse_dev == 0 {
                             core::ptr::null()
                         } else {
@@ -4919,7 +4934,7 @@ impl Qwen3_5Engine {
                         vocab_size as i32,
                     )
                 },
-                "w34_sampler_step_fast_greedy_f16",
+                "w34_sampler_step_fast_greedy_masked_f16",
             )?;
         } else {
             check_rc(
@@ -5318,12 +5333,14 @@ impl Qwen3_5Engine {
         if num_tokens == 0 {
             return Err(loader_err("step_tokens requires at least 1 token"));
         }
-        let max_prefill_chunk: usize = if self.ranks[0].scratch_arena.capacity() < 256 * 1024 * 1024
-        {
-            256
-        } else {
-            1024
-        };
+        let max_prefill_chunk = self
+            .ranks
+            .iter()
+            .map(|rank| rank.ordinary_prefill_token_capacity(1))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .min()
+            .ok_or_else(|| loader_err("no model ranks"))?;
         if num_tokens > max_prefill_chunk
             && custom_positions.is_none()
             && dump_out.is_none()
@@ -5341,16 +5358,35 @@ impl Qwen3_5Engine {
                     state_out_slot
                 };
                 let init = if offset == 0 { has_initial_state } else { true };
-                last = self.step_tokens_with_positions(
-                    &tokens[offset..end],
-                    None,
-                    ctx_before + offset,
-                    block_table,
-                    in_slot,
-                    state_out_slot,
-                    init,
-                    None,
-                )?;
+                if end < num_tokens {
+                    let _ = self.step_batch_slices_for_sampler_filtered(
+                        &[EngineBatchSlice {
+                            tokens: &tokens[offset..end],
+                            ctx_len_before: ctx_before + offset,
+                            block_table,
+                            state_in_slot: in_slot,
+                            state_out_slot,
+                            has_initial_state: init,
+                            spec_slots: &[],
+                            checkpoints: &[],
+                            emit_all_query_tokens: false,
+                        }],
+                        None,
+                        Some(&[false]),
+                        true,
+                    )?;
+                } else {
+                    last = self.step_tokens_with_positions(
+                        &tokens[offset..end],
+                        None,
+                        ctx_before + offset,
+                        block_table,
+                        in_slot,
+                        state_out_slot,
+                        init,
+                        None,
+                    )?;
+                }
                 offset = end;
             }
             return Ok(last);
@@ -6637,6 +6673,44 @@ impl Qwen3_5Engine {
         None
     }
 
+    /// Evicts any deficit pages from `radix` in a single batch before allocating `target_pages`
+    /// from the ascending `KvPool` bitmap, preserving physical page contiguity across evictions.
+    pub fn reserve_kv_pages_from(
+        &mut self,
+        radix: &mut MambaRadixCache,
+        dst: &mut Vec<i32>,
+        target_pages: usize,
+    ) -> bool {
+        if dst.len() >= target_pages {
+            return true;
+        }
+        let missing = target_pages - dst.len();
+        let avail = self.ranks[0].kv_pool.free_count();
+        if avail < missing {
+            let ev = radix.evict_full_pages(missing - avail);
+            if !ev.freed_kv_pages.is_empty() || !ev.freed_mamba_slots.is_empty() {
+                self.free_kv_pages(&ev.freed_kv_pages);
+                self.free_state_slots(&ev.freed_mamba_slots);
+            }
+        }
+        if self.ranks[0].kv_pool.free_count() < missing {
+            return false;
+        }
+        dst.reserve(missing);
+        for _ in 0..missing {
+            let p0 = self.ranks[0]
+                .kv_pool
+                .alloc_page()
+                .expect("free_count verified before page allocation");
+            if self.tp_size == 2 {
+                let p1 = self.ranks[1].kv_pool.alloc_page();
+                debug_assert_eq!(Some(p0), p1);
+            }
+            dst.push(p0);
+        }
+        true
+    }
+
     pub fn free_kv_pages(&mut self, pages: &[i32]) {
         for r in &mut self.ranks {
             for &p in pages {
@@ -7185,6 +7259,19 @@ impl Qwen3_5Engine {
         rope_pos_deltas: Option<&[i32]>,
         skip_host_greedy: bool,
     ) -> Result<Vec<Vec<i32>>> {
+        self.step_batch_slices_for_sampler_filtered(slices, rope_pos_deltas, None, skip_host_greedy)
+    }
+
+    /// Batch-step entrypoint with an optional per-slice `emit_mask`. When `emit_mask[r] == false`
+    /// (e.g. non-final chunked-prefill slices whose logits are discarded), skips selecting/projecting
+    /// `lm_head` rows for slice `r`.
+    pub(crate) fn step_batch_slices_for_sampler_filtered(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+        emit_mask: Option<&[bool]>,
+        skip_host_greedy: bool,
+    ) -> Result<Vec<Vec<i32>>> {
         if slices.is_empty() {
             return Ok(Vec::new());
         }
@@ -7193,8 +7280,15 @@ impl Qwen3_5Engine {
         {
             return Err(loader_err("rope_pos_deltas length mismatch"));
         }
+        if let Some(mask) = emit_mask
+            && mask.len() != slices.len()
+        {
+            return Err(loader_err("emit_mask length mismatch"));
+        }
+        let all_emit = emit_mask.is_none_or(|m| m.iter().all(|&e| e));
         let max_pages = self.ranks[0].kv_pool.num_pages;
-        if let Some(bucket_b) = decode_graph_bucket(slices.len())
+        if all_emit
+            && let Some(bucket_b) = decode_graph_bucket(slices.len())
             && self.use_cuda_graph
             && slices.iter().all(|s| {
                 s.tokens.len() == 1
@@ -7362,7 +7456,10 @@ impl Qwen3_5Engine {
                 let page_off = (pos % 16) as i32;
                 flat_write_slots.push(page_id * 16 + page_off);
             }
-            if s.emit_all_query_tokens {
+            let emit_slice = emit_mask.is_none_or(|m| m[r]);
+            if !emit_slice {
+                row_counts_per_req.push(0);
+            } else if s.emit_all_query_tokens {
                 for step in 0..q_len {
                     selected_rows.push(base_tok + step);
                 }
@@ -7587,11 +7684,11 @@ impl Qwen3_5Engine {
         target_len: usize,
     ) -> Result<()> {
         let needed_pages = target_len.div_ceil(16);
-        while req_state.kv_pages.len() < needed_pages {
-            let p = self
-                .alloc_kv_page()
-                .ok_or_else(|| loader_err("KvPool out of pages"))?;
-            req_state.kv_pages.push(p);
+        let mut radix = std::mem::replace(&mut self.radix, MambaRadixCache::new(16, 64));
+        let ok = self.reserve_kv_pages_from(&mut radix, &mut req_state.kv_pages, needed_pages);
+        self.radix = radix;
+        if !ok {
+            return Err(loader_err("KvPool out of pages"));
         }
         Ok(())
     }
@@ -7684,18 +7781,26 @@ impl Qwen3_5Engine {
                     .iter()
                     .map(|c| (c.trigger_offset_1based, c.dst_slot))
                     .collect();
-                let batch_out = self.step_batch_slices(&[EngineBatchSlice {
-                    tokens: slice_tokens,
-                    ctx_len_before: cursor,
-                    block_table: &req_state.kv_pages,
-                    state_in_slot: req_state.current_state_in_slot(),
-                    state_out_slot: req_state.active_state_slot,
-                    has_initial_state: req_state.has_initial_state,
-                    spec_slots: &[],
-                    checkpoints: &ckpt_pairs,
-                    emit_all_query_tokens: false,
-                }])?;
-                first_tok = batch_out[0][0];
+                let is_final_chunk = cursor + take >= prompt_token_ids.len();
+                let batch_out = self.step_batch_slices_for_sampler_filtered(
+                    &[EngineBatchSlice {
+                        tokens: slice_tokens,
+                        ctx_len_before: cursor,
+                        block_table: &req_state.kv_pages,
+                        state_in_slot: req_state.current_state_in_slot(),
+                        state_out_slot: req_state.active_state_slot,
+                        has_initial_state: req_state.has_initial_state,
+                        spec_slots: &[],
+                        checkpoints: &ckpt_pairs,
+                        emit_all_query_tokens: false,
+                    }],
+                    None,
+                    Some(&[is_final_chunk]),
+                    is_final_chunk && use_gpu_sampler,
+                )?;
+                if is_final_chunk && !use_gpu_sampler {
+                    first_tok = batch_out[0][0];
+                }
                 req_state.commit_tokens(slice_tokens, &planned);
                 cursor += take;
             }
@@ -8414,18 +8519,26 @@ impl Qwen3_5Engine {
                     .iter()
                     .map(|c| (c.trigger_offset_1based, c.dst_slot))
                     .collect();
-                let batch_out = self.step_batch_slices(&[EngineBatchSlice {
-                    tokens: slice_tokens,
-                    ctx_len_before: cursor,
-                    block_table: &req_state.kv_pages,
-                    state_in_slot: req_state.current_state_in_slot(),
-                    state_out_slot: req_state.active_state_slot,
-                    has_initial_state: req_state.has_initial_state,
-                    spec_slots: &[],
-                    checkpoints: &ckpt_pairs,
-                    emit_all_query_tokens: false,
-                }])?;
-                anchor_tok = batch_out[0][0];
+                let is_final_chunk = cursor + take >= prompt_token_ids.len();
+                let batch_out = self.step_batch_slices_for_sampler_filtered(
+                    &[EngineBatchSlice {
+                        tokens: slice_tokens,
+                        ctx_len_before: cursor,
+                        block_table: &req_state.kv_pages,
+                        state_in_slot: req_state.current_state_in_slot(),
+                        state_out_slot: req_state.active_state_slot,
+                        has_initial_state: req_state.has_initial_state,
+                        spec_slots: &[],
+                        checkpoints: &ckpt_pairs,
+                        emit_all_query_tokens: false,
+                    }],
+                    None,
+                    Some(&[is_final_chunk]),
+                    false,
+                )?;
+                if is_final_chunk {
+                    anchor_tok = batch_out[0][0];
+                }
                 req_state.commit_tokens(slice_tokens, &planned);
                 cursor += take;
             }
@@ -8571,10 +8684,14 @@ impl Qwen3_5Engine {
         &mut self,
         prompts: &[Vec<i32>],
         max_new_tokens: usize,
-        sched_cfg: SchedulerConfig,
+        mut sched_cfg: SchedulerConfig,
     ) -> Result<Vec<(Vec<i32>, usize)>> {
         if sched_cfg.page_size != 16 {
             return Err(loader_err("SchedulerConfig.page_size must be 16"));
+        }
+        for rank in &self.ranks {
+            let cap = rank.ordinary_prefill_token_capacity(sched_cfg.max_num_seqs)?;
+            sched_cfg.clamp_for_token_capacity(cap);
         }
         let mut sched = SchedulerV1::new(sched_cfg);
         std::mem::swap(&mut sched.radix, &mut self.radix);
@@ -8606,11 +8723,12 @@ impl Qwen3_5Engine {
                         .and_then(|v| v.checked_add(4))
                         .ok_or_else(|| loader_err("token length overflow in scheduler"))?;
                     let needed = total_len.div_ceil(16);
-                    while seq.radix_state.kv_pages.len() < needed {
-                        let p = self
-                            .alloc_kv_page_from(&mut sched.radix)
-                            .ok_or_else(|| loader_err("KvPool out of pages in scheduler"))?;
-                        seq.radix_state.kv_pages.push(p);
+                    if !self.reserve_kv_pages_from(
+                        &mut sched.radix,
+                        &mut seq.radix_state.kv_pages,
+                        needed,
+                    ) {
+                        return Err(loader_err("KvPool out of pages in scheduler"));
                     }
                 }
 

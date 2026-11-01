@@ -386,7 +386,9 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         (prob_m <= 16) &&
         (((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
          ((prob_n >= 512) && (prob_n <= 2048) && (prob_k >= 1024) && (prob_k <= 2048)));
-    int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : 64);
+    // Match donor vLLM marlin.cu: cap M-parallelism to 16 (M <= 1024, 8 MiB A) when N > 4096
+    // so activations stay resident in sm_86's 6 MiB L2 across wide N tiles.
+    int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : 16);
     int rest_m = prob_m;
 
     while (rest_m > 0) {
@@ -416,16 +418,25 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         if (th_cfg.thread_k == -1) return (int)cudaErrorInvalidValue;
 
         int mn_tiles = (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
+        int k_tiles = prob_k / th_cfg.thread_k;
+        // Prefill (M > 16) intentionally uses donor-style SM-wide Split-K to avoid idle
+        // SMs on narrow projections. Its FP16 partial reductions need not be bit-identical
+        // to unsplit GEMMs; the M=1..16 decode/verify invariant below remains unchanged.
+        // workspace_ints >= sms is checked above. Callers supply zero-initialized locks,
+        // serialize reuse on one stream (aux GEMMs have separate locks), and the donor's
+        // final slice resets each lock. A failed CUDA execution invalidates that context.
         int blocks = sms;
         if (enable_m_invariant_split_k && th_cfg.thread_k == 128 && th_cfg.thread_n == 64 && mn_tiles > 0) {
-            int k_tiles = prob_k / th_cfg.thread_k;
             int cap_splits = (mn_tiles <= 20) ? 4 : 2;
             int max_k_splits = std::min(sms / mn_tiles, k_tiles / 4);
             if (max_k_splits > cap_splits) max_k_splits = cap_splits;
             if (max_k_splits < 1) max_k_splits = 1;
             blocks = mn_tiles * max_k_splits;
-        } else if (blocks > mn_tiles) {
+        } else if (prob_m <= 16 && blocks > mn_tiles) {
+            // Preserve 1-slice M=1..16 decode/verify invariance outside explicit Split-K shapes.
             blocks = mn_tiles;
+        } else if (blocks > mn_tiles * k_tiles) {
+            blocks = mn_tiles * k_tiles;
         }
         if (blocks < 1) blocks = 1;
 
@@ -435,7 +446,8 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem) != cudaSuccess) {
             return (int)cudaGetLastError();
         }
-        bool part_use_atomic_add = !enable_m_invariant_split_k && (div_ceil(prob_m_split, 64) * prob_n <= 2048);
+        bool part_use_atomic_add = (blocks <= mn_tiles) && !enable_m_invariant_split_k &&
+                                   (div_ceil(prob_m_split, 64) * prob_n <= 2048);
 
         kernel<<<blocks, th_cfg.num_threads, max_shared_mem, stream>>>(
             A_ptr, B_ptr, C_ptr, nullptr,
