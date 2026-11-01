@@ -5,8 +5,8 @@
 #![allow(clippy::too_many_arguments)]
 use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
-use crate::loader::{ModelConfig, SafetensorsArchive};
-use crate::model::{Qwen3_5ModelRank, loader_err};
+use crate::loader::{ModelConfig, QuantScheme, SafetensorsArchive};
+use crate::model::{Qwen3_5ModelRank, loader_err, loader_err_ctx};
 use core::ffi::c_void;
 use serde_json::Value;
 use std::path::Path;
@@ -27,11 +27,22 @@ pub struct DFlash2Config {
 impl DFlash2Config {
     pub fn load(dir: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(dir.join("config.json"))
-            .map_err(|_| loader_err("read DFlash config"))?;
-        let root: Value =
-            serde_json::from_str(&text).map_err(|_| loader_err("parse DFlash config"))?;
+            .map_err(|e| loader_err_ctx("read DFlash config", e.to_string()))?;
+        let root: Value = serde_json::from_str(&text)
+            .map_err(|e| loader_err_ctx("parse DFlash config", e.to_string()))?;
         let body = root.get("transformer_layer_config").unwrap_or(&root);
-        let model = ModelConfig::from_json(body).map_err(|_| loader_err("DFlash model config"))?;
+        let model = ModelConfig::from_json(body)
+            .map_err(|e| loader_err_ctx("DFlash model config", e.to_string()))?;
+        if model.quant != QuantScheme::Unquantized
+            || root
+                .get("quantization_config")
+                .is_some_and(|v| !v.is_null())
+        {
+            return Err(loader_err_ctx(
+                "DFlash model config",
+                "quantized DFlash2 drafters are not supported; DFlash2 requires unquantized BF16/FP16 drafter weights",
+            ));
+        }
         let dc = root.get("dflash_config").unwrap_or(&root);
         let integer = |key: &str| -> Result<usize> {
             dc.get(key)
@@ -262,8 +273,8 @@ impl DFlash2Rank {
             return Err(loader_err("DFlash target/rank/capacity mismatch"));
         }
         t.device.make_current()?;
-        let archive =
-            SafetensorsArchive::open(dir).map_err(|_| loader_err("open DFlash weights"))?;
+        let archive = SafetensorsArchive::open(dir)
+            .map_err(|e| loader_err_ctx("open DFlash weights", e.to_string()))?;
         let (q, kv, i) = (
             c.num_attention_heads * d / tp,
             c.num_key_value_heads * d / tp,
@@ -290,12 +301,18 @@ impl DFlash2Rank {
         fn read(a: &SafetensorsArchive, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
             let info = a
                 .tensor_info(name)
-                .map_err(|_| loader_err("missing DFlash tensor"))?;
-            if info.shape != shape || info.dtype != "BF16" {
-                return Err(loader_err("DFlash tensor shape/dtype"));
+                .map_err(|e| loader_err_ctx("missing DFlash tensor", e.to_string()))?;
+            if info.shape != shape || !matches!(info.dtype.as_str(), "BF16" | "F16" | "F32") {
+                return Err(loader_err_ctx(
+                    "DFlash tensor shape/dtype",
+                    format!(
+                        "tensor '{name}' has shape {:?} dtype {} (expected {shape:?} BF16/F16/F32)",
+                        info.shape, info.dtype
+                    ),
+                ));
             }
             a.read_bf16_bits(name)
-                .map_err(|_| loader_err("read DFlash BF16 tensor"))
+                .map_err(|e| loader_err_ctx("read DFlash BF16 tensor", e.to_string()))
         }
         let upload = |a: &mut DeviceArena, name: &str, shape: &[usize]| -> Result<u64> {
             a.upload_slice(&read(&archive, name, shape)?, &t.stream)

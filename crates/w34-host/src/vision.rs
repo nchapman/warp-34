@@ -939,10 +939,10 @@ impl Qwen3VisionEncoder {
         stream: &CudaStream,
     ) -> Result<Option<Self>> {
         if !cfg.deepstack_visual_indexes.is_empty() {
-            return Err(CudaError {
-                code: -10,
-                context: "non-empty deepstack_visual_indexes not supported in Qwen3_5VisionEncoder",
-            });
+            return Err(CudaError::new(
+                -10,
+                "non-empty deepstack_visual_indexes not supported in Qwen3_5VisionEncoder",
+            ));
         }
         let pfx = if archive
             .resolve_name("model.visual.patch_embed.proj.weight")
@@ -964,14 +964,12 @@ impl Qwen3VisionEncoder {
         let mut arena = DeviceArena::new(device_id, est_bytes)?;
 
         let upload_f16 = |arena: &mut DeviceArena, name: &str| -> Result<u64> {
-            let key = archive.resolve_name(name).ok_or(CudaError {
-                code: -10,
-                context: "missing vision tensor",
-            })?;
-            let bits = archive.read_f16_bits(&key).map_err(|_| CudaError {
-                code: -10,
-                context: "read vision tensor",
-            })?;
+            let key = archive
+                .resolve_name(name)
+                .ok_or_else(|| CudaError::with_detail(-10, "missing vision tensor", name))?;
+            let bits = archive
+                .read_f16_bits(&key)
+                .map_err(|e| CudaError::with_detail(-10, "read vision tensor", e.to_string()))?;
             arena.upload_slice(&bits, stream)
         };
 
@@ -980,14 +978,10 @@ impl Qwen3VisionEncoder {
 
         let pos_key = archive
             .resolve_name(&format!("{pfx}.pos_embed.weight"))
-            .ok_or(CudaError {
-                code: -10,
-                context: "missing pos_embed.weight",
-            })?;
-        let pos_f16 = archive.read_f16_bits(&pos_key).map_err(|_| CudaError {
-            code: -10,
-            context: "read pos_embed.weight",
-        })?;
+            .ok_or(CudaError::new(-10, "missing pos_embed.weight"))?;
+        let pos_f16 = archive
+            .read_f16_bits(&pos_key)
+            .map_err(|e| CudaError::with_detail(-10, "read pos_embed.weight", e.to_string()))?;
         let pos_embed_f32: Vec<f32> = pos_f16.iter().copied().map(f16_to_f32).collect();
 
         let mut blocks = Vec::with_capacity(cfg.depth);
@@ -1109,10 +1103,7 @@ impl Qwen3VisionEncoder {
         let attention_scratch_bytes = total_patches
             .checked_mul(num_heads)
             .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or(CudaError {
-                code: -1,
-                context: "vision attention scratch overflow",
-            })?;
+            .ok_or(CudaError::new(-1, "vision attention scratch overflow"))?;
         let attention_scratch =
             DeviceBuffer::alloc(self.device_id, attention_scratch_bytes.max(4))?;
         let ex = stream.exec(attention_scratch.addr(), attention_scratch_bytes.max(4));

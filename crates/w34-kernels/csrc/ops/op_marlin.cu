@@ -12,6 +12,7 @@
 
 namespace marlin {
 static constexpr int kF16 = vllm::ST_ID_F16;
+static constexpr int kU4 = vllm::ST_ID_U4;
 static constexpr int kU4B8 = vllm::ST_ID_U4B8;
 static constexpr int kU8B128 = vllm::ST_ID_U8B128;
 }  // namespace marlin
@@ -50,8 +51,14 @@ __global__ void gptq_marlin_repack_n_major_kernel(
     uint32_t* __restrict__ out_ptr,
     int size_k,
     int size_n) {
+    static_assert(num_bits == 4 || num_bits == 8, "num_bits must be 4 or 8");
     constexpr int pack_factor = 32 / num_bits;
     constexpr int tile_k = tile_k_size;
+    constexpr int tile_ints = tile_k / pack_factor;
+    constexpr int pair_ints = tile_ints * 2;
+    constexpr int pair_int4s = pair_ints / 4;
+    constexpr int cur_stage_int4s = tile_n_size * pair_int4s;
+    static_assert(cur_stage_int4s <= num_threads, "stage copy exceeds CTA threads");
 
     int k_pairs = size_k / (tile_k * 2);
     int n_tiles = size_n / tile_n_size;
@@ -74,13 +81,15 @@ __global__ void gptq_marlin_repack_n_major_kernel(
             return;
         }
         int first_n = n_tile_id * tile_n_size;
-        int first_word = k_pair * 4;
-        int4* sh_ptr = sh + stage_int4s * pipe;
-        if (threadIdx.x < stage_int4s) {
+        int4* sh_ptr = sh + cur_stage_int4s * pipe;
+        if (threadIdx.x < cur_stage_int4s) {
+            int row_off = threadIdx.x / pair_int4s;
+            int vec_off = threadIdx.x % pair_int4s;
+            int first_word = k_pair * pair_ints + vec_off * 4;
             cp_async4(
                 &sh_ptr[threadIdx.x],
                 reinterpret_cast<int4 const*>(
-                    &b_q_weight_ptr[(size_t)(first_n + threadIdx.x) * (size_k / pack_factor) + first_word]));
+                    &b_q_weight_ptr[(size_t)(first_n + row_off) * (size_k / pack_factor) + first_word]));
         }
         cp_async_fence();
     };
@@ -97,16 +106,10 @@ __global__ void gptq_marlin_repack_n_major_kernel(
         int cur_n = warp_id * 16 + tc_col;
         constexpr uint32_t mask = (1u << num_bits) - 1u;
 
-        uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh + stage_int4s * pipe);
-        constexpr int tile_ints = tile_k / pack_factor;
+        uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh + cur_stage_int4s * pipe);
 
-        uint32_t b1_vals[tile_ints];
-        uint32_t b2_vals[tile_ints];
-#pragma unroll
-        for (int i = 0; i < tile_ints; i++) {
-            b1_vals[i] = sh_stage_int_ptr[cur_n * 4 + sub * 2 + i];
-            b2_vals[i] = sh_stage_int_ptr[(cur_n + 8) * 4 + sub * 2 + i];
-        }
+        uint32_t const* sh_b1 = sh_stage_int_ptr + cur_n * pair_ints + sub * tile_ints;
+        uint32_t const* sh_b2 = sh_stage_int_ptr + (cur_n + 8) * pair_ints + sub * tile_ints;
 
         uint32_t vals[8];
 #pragma unroll
@@ -114,21 +117,33 @@ __global__ void gptq_marlin_repack_n_major_kernel(
             int cur_elem = tc_row + tc_offsets[i];
             int cur_int = cur_elem / pack_factor;
             int cur_pos = cur_elem % pack_factor;
-            vals[i] = (b1_vals[cur_int] >> (cur_pos * num_bits)) & mask;
-            vals[4 + i] = (b2_vals[cur_int] >> (cur_pos * num_bits)) & mask;
+            vals[i] = (sh_b1[cur_int] >> (cur_pos * num_bits)) & mask;
+            vals[4 + i] = (sh_b2[cur_int] >> (cur_pos * num_bits)) & mask;
         }
 
         constexpr int tile_out_size = tile_k * tile_n_size / pack_factor;
         int k_tile_id = k_pair * 2 + sub;
         int out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_out_size;
-        int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
-
-        uint32_t res = 0;
+        if constexpr (num_bits == 4) {
+            constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+            uint32_t res = 0;
 #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            res |= vals[pack_idx[i]] << (i * 4);
+            for (int i = 0; i < 8; i++) {
+                res |= vals[pack_idx[i]] << (i * 4);
+            }
+            out_ptr[out_offset + th_id * 4 + warp_id] = res;
+        } else {
+            constexpr int pack_idx[4] = {0, 2, 1, 3};
+            uint32_t res1 = 0;
+            uint32_t res2 = 0;
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                res1 |= vals[pack_idx[i]] << (i * 8);
+                res2 |= vals[4 + pack_idx[i]] << (i * 8);
+            }
+            out_ptr[out_offset + th_id * 8 + warp_id * 2 + 0] = res1;
+            out_ptr[out_offset + th_id * 8 + warp_id * 2 + 1] = res2;
         }
-        out_ptr[out_offset + th_id * 4 + warp_id] = res;
     };
 
     auto start_pipes = [&](int k_pair, int n_tile_id) {
@@ -180,8 +195,18 @@ static int get_scales_cache_size(thread_config_t const& th_config, int group_siz
     return tb_groups * tb_n * 2 * stages;
 }
 
+static int get_zp_cache_size(thread_config_t const& th_config, int group_size,
+                             int num_bits, bool has_zp, int stages) {
+    if (!has_zp) return 0;
+    int pack_factor = 32 / num_bits;
+    int tb_n = th_config.thread_n;
+    int tb_k = th_config.thread_k;
+    int tb_groups = group_size == -1 ? 1 : div_ceil(tb_k, group_size);
+    return tb_groups * (tb_n / pack_factor) * 4 * stages;
+}
+
 static int get_kernel_cache_size(thread_config_t const& th_config, int thread_m_blocks,
-                                 int num_bits, int group_size, int stages) {
+                                 int num_bits, int group_size, bool has_zp, int stages) {
     int pack_factor = 32 / num_bits;
     int tb_k = th_config.thread_k;
     int tb_n = th_config.thread_n;
@@ -193,12 +218,13 @@ static int get_kernel_cache_size(thread_config_t const& th_config, int thread_m_
     int tmp_size = (sh_b_size > sh_red_size ? sh_red_size : sh_b_size) + sh_bias_size;
     tmp_size = std::max(std::max(sh_b_size, sh_red_size), tmp_size);
     int sh_s_size = get_scales_cache_size(th_config, group_size, stages);
-    return tmp_size + sh_a_size + sh_s_size;
+    int sh_zp_size = get_zp_cache_size(th_config, group_size, num_bits, has_zp, stages);
+    return tmp_size + sh_a_size + sh_s_size + sh_zp_size;
 }
 
 static bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
                             int prob_m, int prob_n, int prob_k, int num_bits,
-                            int group_size, int stages, int max_shared_mem) {
+                            int group_size, bool has_zp, int stages, int max_shared_mem) {
     (void)prob_m;
     if (th_config.thread_k == -1 || th_config.thread_n == -1 || th_config.num_threads == -1) {
         return false;
@@ -209,68 +235,72 @@ static bool is_valid_config(thread_config_t const& th_config, int thread_m_block
     if (th_config.thread_n < marlin::min_thread_n || th_config.thread_k < marlin::min_thread_k) {
         return false;
     }
-    int cache_size = get_kernel_cache_size(th_config, thread_m_blocks, num_bits, group_size, stages);
+    int cache_size = get_kernel_cache_size(
+        th_config, thread_m_blocks, num_bits, group_size, has_zp, stages);
     return cache_size <= max_shared_mem;
 }
 
 typedef void (*MarlinFuncPtr)(MARLIN_KERNEL_PARAMS);
 
-#define MARLIN_CASE_F16U4(T_K, T_N, THR, M_BLOCKS, M8, GBX)                   \
+#define MARLIN_CASE_BTYPE(BTYPE, T_K, T_N, THR, M_BLOCKS, M8, GBX)            \
     if (th_config.thread_k == (T_K) && th_config.thread_n == (T_N) &&         \
         th_config.num_threads == (THR) && thread_m_blocks == (M_BLOCKS) &&    \
         m_block_size_8 == (M8)) {                                             \
-        return &Marlin<marlin::kF16, marlin::kU4B8, marlin::kF16,             \
+        return &Marlin<marlin::kF16, (BTYPE), marlin::kF16,                   \
                        marlin::kF16, (THR), (M_BLOCKS), (T_N) / 16,           \
                        (T_K) / 16, (M8), 4, (GBX), false>;                    \
     }
 
-#define MARLIN_CASE_F16U8(T_K, T_N, THR, M_BLOCKS, M8, GBX)                   \
-    if (th_config.thread_k == (T_K) && th_config.thread_n == (T_N) &&         \
-        th_config.num_threads == (THR) && thread_m_blocks == (M_BLOCKS) &&    \
-        m_block_size_8 == (M8)) {                                             \
-        return &Marlin<marlin::kF16, marlin::kU8B128, marlin::kF16,           \
-                       marlin::kF16, (THR), (M_BLOCKS), (T_N) / 16,           \
-                       (T_K) / 16, (M8), 4, (GBX), false>;                    \
-    }
+#define MARLIN_CASES_15(BTYPE, GBX)                                           \
+    MARLIN_CASE_BTYPE(BTYPE, 128, 128, 256, 1, false, GBX)                    \
+    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 1, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 1, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 128, 128, 256, 1, true, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 1, true, GBX)                      \
+    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 1, true, GBX)                      \
+    MARLIN_CASE_BTYPE(BTYPE, 64, 256, 256, 2, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 2, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 2, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 64, 256, 256, 3, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 3, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 3, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 64, 256, 256, 4, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 4, false, GBX)                     \
+    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 4, false, GBX)
 
 static MarlinFuncPtr get_marlin_kernel_f16u4(thread_config_t const& th_config,
                                              int thread_m_blocks,
                                              bool m_block_size_8,
                                              int group_blocks) {
     if (group_blocks == 2) {
-        MARLIN_CASE_F16U4(128, 128, 256, 1, false, 2)
-        MARLIN_CASE_F16U4(64, 128, 128, 1, false, 2)
-        MARLIN_CASE_F16U4(128, 64, 128, 1, false, 2)
-        MARLIN_CASE_F16U4(128, 128, 256, 1, true, 2)
-        MARLIN_CASE_F16U4(64, 128, 128, 1, true, 2)
-        MARLIN_CASE_F16U4(128, 64, 128, 1, true, 2)
-        MARLIN_CASE_F16U4(64, 256, 256, 2, false, 2)
-        MARLIN_CASE_F16U4(64, 128, 128, 2, false, 2)
-        MARLIN_CASE_F16U4(128, 64, 128, 2, false, 2)
-        MARLIN_CASE_F16U4(64, 256, 256, 3, false, 2)
-        MARLIN_CASE_F16U4(64, 128, 128, 3, false, 2)
-        MARLIN_CASE_F16U4(128, 64, 128, 3, false, 2)
-        MARLIN_CASE_F16U4(64, 256, 256, 4, false, 2)
-        MARLIN_CASE_F16U4(64, 128, 128, 4, false, 2)
-        MARLIN_CASE_F16U4(128, 64, 128, 4, false, 2)
+        MARLIN_CASES_15(marlin::kU4B8, 2)
+        return nullptr;
+    }
+    if (group_blocks == 4) {
+        MARLIN_CASES_15(marlin::kU4B8, 4)
         return nullptr;
     }
     if (group_blocks == 8) {
-        MARLIN_CASE_F16U4(128, 128, 256, 1, false, 8)
-        MARLIN_CASE_F16U4(64, 128, 128, 1, false, 8)
-        MARLIN_CASE_F16U4(128, 64, 128, 1, false, 8)
-        MARLIN_CASE_F16U4(128, 128, 256, 1, true, 8)
-        MARLIN_CASE_F16U4(64, 128, 128, 1, true, 8)
-        MARLIN_CASE_F16U4(128, 64, 128, 1, true, 8)
-        MARLIN_CASE_F16U4(64, 256, 256, 2, false, 8)
-        MARLIN_CASE_F16U4(64, 128, 128, 2, false, 8)
-        MARLIN_CASE_F16U4(128, 64, 128, 2, false, 8)
-        MARLIN_CASE_F16U4(64, 256, 256, 3, false, 8)
-        MARLIN_CASE_F16U4(64, 128, 128, 3, false, 8)
-        MARLIN_CASE_F16U4(128, 64, 128, 3, false, 8)
-        MARLIN_CASE_F16U4(64, 256, 256, 4, false, 8)
-        MARLIN_CASE_F16U4(64, 128, 128, 4, false, 8)
-        MARLIN_CASE_F16U4(128, 64, 128, 4, false, 8)
+        MARLIN_CASES_15(marlin::kU4B8, 8)
+        return nullptr;
+    }
+    return nullptr;
+}
+
+static MarlinFuncPtr get_marlin_kernel_f16u4_zp(thread_config_t const& th_config,
+                                                int thread_m_blocks,
+                                                bool m_block_size_8,
+                                                int group_blocks) {
+    if (group_blocks == 2) {
+        MARLIN_CASES_15(marlin::kU4, 2)
+        return nullptr;
+    }
+    if (group_blocks == 4) {
+        MARLIN_CASES_15(marlin::kU4, 4)
+        return nullptr;
+    }
+    if (group_blocks == 8) {
+        MARLIN_CASES_15(marlin::kU4, 8)
         return nullptr;
     }
     return nullptr;
@@ -278,44 +308,50 @@ static MarlinFuncPtr get_marlin_kernel_f16u4(thread_config_t const& th_config,
 
 static MarlinFuncPtr get_marlin_kernel_f16u8(thread_config_t const& th_config,
                                              int thread_m_blocks,
-                                             bool m_block_size_8) {
-    MARLIN_CASE_F16U8(128, 128, 256, 1, false, 2)
-    MARLIN_CASE_F16U8(64, 128, 128, 1, false, 2)
-    MARLIN_CASE_F16U8(128, 64, 128, 1, false, 2)
-    MARLIN_CASE_F16U8(128, 128, 256, 1, true, 2)
-    MARLIN_CASE_F16U8(64, 128, 128, 1, true, 2)
-    MARLIN_CASE_F16U8(128, 64, 128, 1, true, 2)
-    MARLIN_CASE_F16U8(64, 256, 256, 2, false, 2)
-    MARLIN_CASE_F16U8(64, 128, 128, 2, false, 2)
-    MARLIN_CASE_F16U8(128, 64, 128, 2, false, 2)
-    MARLIN_CASE_F16U8(64, 256, 256, 3, false, 2)
-    MARLIN_CASE_F16U8(64, 128, 128, 3, false, 2)
-    MARLIN_CASE_F16U8(128, 64, 128, 3, false, 2)
-    MARLIN_CASE_F16U8(64, 256, 256, 4, false, 2)
-    MARLIN_CASE_F16U8(64, 128, 128, 4, false, 2)
-    MARLIN_CASE_F16U8(128, 64, 128, 4, false, 2)
+                                             bool m_block_size_8,
+                                             int group_blocks) {
+    if (group_blocks == -1) {
+        MARLIN_CASES_15(marlin::kU8B128, -1)
+        return nullptr;
+    }
+    if (group_blocks == 2) {
+        MARLIN_CASES_15(marlin::kU8B128, 2)
+        return nullptr;
+    }
+    if (group_blocks == 4) {
+        MARLIN_CASES_15(marlin::kU8B128, 4)
+        return nullptr;
+    }
+    if (group_blocks == 8) {
+        MARLIN_CASES_15(marlin::kU8B128, 8)
+        return nullptr;
+    }
     return nullptr;
 }
 
 static MarlinFuncPtr get_marlin_kernel_f16(thread_config_t const& th_config,
                                            int num_bits,
+                                           bool has_zp,
                                            int thread_m_blocks,
                                            bool m_block_size_8,
                                            int group_blocks) {
     if (num_bits == 8) {
-        if (group_blocks != 2) return nullptr;
-        return get_marlin_kernel_f16u8(th_config, thread_m_blocks, m_block_size_8);
+        if (has_zp) return nullptr;
+        return get_marlin_kernel_f16u8(th_config, thread_m_blocks, m_block_size_8, group_blocks);
+    }
+    if (has_zp) {
+        return get_marlin_kernel_f16u4_zp(th_config, thread_m_blocks, m_block_size_8, group_blocks);
     }
     return get_marlin_kernel_f16u4(th_config, thread_m_blocks, m_block_size_8, group_blocks);
 }
 
 static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
                                             int thread_m_blocks, bool m_block_size_8,
-                                            int group_blocks, int num_bits,
+                                            int group_blocks, int num_bits, bool has_zp,
                                             int stages, int max_shared_mem,
                                             int sms) {
     thread_config_t* table = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
-    int groupsize = group_blocks * 16;
+    int groupsize = (group_blocks == -1) ? -1 : (group_blocks * 16);
     if (thread_m_blocks > 1) {
         const int m_tiles = div_ceil(prob_m, thread_m_blocks * 16);
         int want = -1;
@@ -329,15 +365,15 @@ static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
         }
         if (want >= 0 &&
             is_valid_config(table[want], thread_m_blocks, prob_m, prob_n, prob_k,
-                            num_bits, groupsize, stages, max_shared_mem - 512) &&
-            get_marlin_kernel_f16(table[want], num_bits, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
+                            num_bits, groupsize, has_zp, stages, max_shared_mem - 512) &&
+            get_marlin_kernel_f16(table[want], num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
             return table[want];
         }
     }
     for (int i = 0; i < 3; i++) {
         if (is_valid_config(table[i], thread_m_blocks, prob_m, prob_n, prob_k,
-                            num_bits, groupsize, stages, max_shared_mem - 512) &&
-            get_marlin_kernel_f16(table[i], num_bits, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
+                            num_bits, groupsize, has_zp, stages, max_shared_mem - 512) &&
+            get_marlin_kernel_f16(table[i], num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
             return table[i];
         }
     }
@@ -345,11 +381,12 @@ static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
 }
 
 static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
-                            const void* S, void* C, int32_t* workspace,
+                            const void* S, const void* ZP, void* C, int32_t* workspace,
                             int64_t m, int64_t n, int64_t k,
-                            int64_t workspace_ints, int group_blocks, int num_bits) {
+                            int64_t workspace_ints, int group_blocks, int num_bits,
+                            bool has_zp) {
     if (ex == nullptr || A == nullptr || B == nullptr || S == nullptr ||
-        C == nullptr || workspace == nullptr) {
+        C == nullptr || workspace == nullptr || (has_zp && ZP == nullptr)) {
         return (int)cudaErrorInvalidValue;
     }
     int sms = 0;
@@ -363,8 +400,11 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     if (workspace_ints < sms) return (int)cudaErrorInvalidValue;
 
     int prob_m = (int)m, prob_n = (int)n, prob_k = (int)k;
+    const bool valid_gb = (group_blocks == 2 || group_blocks == 4 || group_blocks == 8) ||
+                          (num_bits == 8 && !has_zp && group_blocks == -1);
     if (prob_m <= 0 || prob_n <= 0 || prob_k <= 0 || (prob_k % 32) != 0 ||
-        (prob_n % 64) != 0 || (group_blocks != 2 && group_blocks != 8)) {
+        (prob_n % 64) != 0 || !valid_gb ||
+        (group_blocks > 0 && (prob_k % (group_blocks * 16)) != 0)) {
         return (int)cudaErrorInvalidValue;
     }
 
@@ -373,6 +413,9 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     const int4* B_ptr = (const int4*)B;
     int4* C_ptr = (int4*)C;
     const int4* S_ptr = (const int4*)S;
+    const int4* ZP_ptr = (const int4*)ZP;
+    const int groupsize = (group_blocks == -1) ? -1 : (group_blocks * 16);
+    const int num_groups = (group_blocks == -1) ? 1 : (prob_k / groupsize);
 
     constexpr int stages = 4;
     // When `(prob_n / 64) * 2 <= sms` and `prob_k >= 1024` (e.g. 4B `down_proj` [9728 -> 2560]
@@ -400,7 +443,7 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
 
         thread_config_t th_cfg = choose_thread_config(
             prob_m_split, prob_n, prob_k, thread_m_blocks, m_block_size_8,
-            group_blocks, num_bits, stages, max_shared_mem, sms);
+            group_blocks, num_bits, has_zp, stages, max_shared_mem, sms);
         if (th_cfg.thread_n != -1) {
             const int cur_mn_tiles =
                 (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
@@ -409,8 +452,8 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
                 cur_mn_tiles * 4 <= sms) {
                 thread_config_t cfg128 = {128, 64, 128};
                 if (is_valid_config(cfg128, thread_m_blocks, prob_m_split, prob_n, prob_k,
-                                    num_bits, group_blocks * 16, stages, max_shared_mem) &&
-                    get_marlin_kernel_f16(cfg128, num_bits, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
+                                    num_bits, groupsize, has_zp, stages, max_shared_mem) &&
+                    get_marlin_kernel_f16(cfg128, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
                     th_cfg = cfg128;
                 }
             }
@@ -440,7 +483,8 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         }
         if (blocks < 1) blocks = 1;
 
-        auto kernel = get_marlin_kernel_f16(th_cfg, num_bits, thread_m_blocks, m_block_size_8, group_blocks);
+        auto kernel = get_marlin_kernel_f16(
+            th_cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks);
         if (kernel == nullptr) return (int)cudaErrorInvalidValue;
 
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem) != cudaSuccess) {
@@ -451,8 +495,8 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
 
         kernel<<<blocks, th_cfg.num_threads, max_shared_mem, stream>>>(
             A_ptr, B_ptr, C_ptr, nullptr,
-            nullptr, S_ptr, nullptr, nullptr, nullptr,
-            prob_k / (group_blocks * 16), prob_m_split, prob_n,
+            nullptr, S_ptr, nullptr, ZP_ptr, nullptr,
+            num_groups, prob_m_split, prob_n,
             prob_k, prob_k, workspace,
             false, part_use_atomic_add, max_shared_mem);
 
@@ -492,12 +536,39 @@ extern "C" int w34_marlin_repack_int4(const w34_exec* ex, const uint32_t* src_n_
     return (int)cudaGetLastError();
 }
 
+extern "C" int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_major,
+                                      uint32_t* dst_marlin, int64_t k, int64_t n) {
+    if (ex == nullptr || src_n_major == nullptr || dst_marlin == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (k <= 0 || n <= 0 || (k % 32) != 0 || (n % 64) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    int blocks = 0;
+    if (cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) {
+        return (int)cudaGetLastError();
+    }
+    size_t smem = (w34_marlin::stage_int4s * 2) * sizeof(int4) * w34_marlin::repack_stages;
+    w34_marlin::gptq_marlin_repack_n_major_kernel<w34_marlin::repack_threads, 8>
+        <<<(unsigned)blocks, w34_marlin::repack_threads, smem, (cudaStream_t)ex->stream>>>(
+            src_n_major, dst_marlin, (int)k, (int)n);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int w34_marlin_gemm_f16u4(const w34_exec* ex, const void* a, const void* b,
                                      const void* scales, void* c, int32_t* workspace,
                                      int64_t m, int64_t n, int64_t k,
                                      int64_t workspace_ints, int group_blocks) {
     return w34_marlin::marlin_gemm_impl(
-        ex, a, b, scales, c, workspace, m, n, k, workspace_ints, group_blocks, 4);
+        ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 4, false);
+}
+
+extern "C" int w34_marlin_gemm_f16u4_zp(const w34_exec* ex, const void* a, const void* b,
+                                        const void* scales, const void* zeros, void* c,
+                                        int32_t* workspace, int64_t m, int64_t n, int64_t k,
+                                        int64_t workspace_ints, int group_blocks) {
+    return w34_marlin::marlin_gemm_impl(
+        ex, a, b, scales, zeros, c, workspace, m, n, k, workspace_ints, group_blocks, 4, true);
 }
 
 extern "C" int w34_marlin_gemm_f16u8(const w34_exec* ex, const void* a, const void* b,
@@ -505,5 +576,5 @@ extern "C" int w34_marlin_gemm_f16u8(const w34_exec* ex, const void* a, const vo
                                      int64_t m, int64_t n, int64_t k,
                                      int64_t workspace_ints, int group_blocks) {
     return w34_marlin::marlin_gemm_impl(
-        ex, a, b, scales, c, workspace, m, n, k, workspace_ints, group_blocks, 8);
+        ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 8, false);
 }

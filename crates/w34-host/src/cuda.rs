@@ -20,11 +20,40 @@ pub const EXTREME_LONGCTX_HEADROOM_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 pub struct CudaError {
     pub code: i32,
     pub context: &'static str,
+    pub detail: Option<String>,
+}
+
+impl CudaError {
+    #[inline]
+    pub const fn new(code: i32, context: &'static str) -> Self {
+        Self {
+            code,
+            context,
+            detail: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_detail(code: i32, context: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            context,
+            detail: Some(detail.into()),
+        }
+    }
 }
 
 impl fmt::Display for CudaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CUDA error {} in {}", self.code, self.context)
+        if let Some(detail) = &self.detail {
+            write!(
+                f,
+                "CUDA error {} in {}: {}",
+                self.code, self.context, detail
+            )
+        } else {
+            write!(f, "CUDA error {} in {}", self.code, self.context)
+        }
     }
 }
 
@@ -37,7 +66,7 @@ pub fn check_rc(rc: i32, context: &'static str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(CudaError { code: rc, context })
+        Err(CudaError::new(rc, context))
     }
 }
 
@@ -646,10 +675,7 @@ impl DeviceBuffer {
     pub fn copy_from_host<T: Copy>(&self, src: &[T], stream: &CudaStream) -> Result<()> {
         let bytes = core::mem::size_of_val(src);
         if bytes > self.len_bytes {
-            return Err(CudaError {
-                code: -11,
-                context: "copy_from_host buffer overflow",
-            });
+            return Err(CudaError::new(-11, "copy_from_host buffer overflow"));
         }
         if bytes == 0 {
             return Ok(());
@@ -674,10 +700,7 @@ impl DeviceBuffer {
     pub fn copy_to_host<T: Copy>(&self, dst: &mut [T], stream: &CudaStream) -> Result<()> {
         let bytes = core::mem::size_of_val(dst);
         if bytes > self.len_bytes {
-            return Err(CudaError {
-                code: -11,
-                context: "copy_to_host buffer overflow",
-            });
+            return Err(CudaError::new(-11, "copy_to_host buffer overflow"));
         }
         if bytes == 0 {
             return Ok(());
@@ -728,6 +751,11 @@ impl DeviceArena {
     }
 
     #[inline]
+    pub fn device_id(&self) -> i32 {
+        self.buf.device_id
+    }
+
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.buf.len_bytes
     }
@@ -762,15 +790,19 @@ impl DeviceArena {
 
     pub fn alloc_aligned(&mut self, bytes: usize) -> Result<u64> {
         let aligned_off = (self.offset + 255) & !255usize;
-        let next = aligned_off.checked_add(bytes).ok_or(CudaError {
-            code: -1,
-            context: "DeviceArena::alloc_aligned overflow",
-        })?;
+        let next = aligned_off
+            .checked_add(bytes)
+            .ok_or(CudaError::new(-1, "DeviceArena::alloc_aligned overflow"))?;
         if next > self.buf.len_bytes {
-            return Err(CudaError {
-                code: 2, // cudaErrorMemoryAllocation
-                context: "DeviceArena capacity exceeded",
-            });
+            return Err(CudaError::with_detail(
+                2, // cudaErrorMemoryAllocation
+                "DeviceArena capacity exceeded",
+                format!(
+                    "requested {} MiB total > {} MiB arena capacity",
+                    next / (1024 * 1024),
+                    self.buf.len_bytes / (1024 * 1024)
+                ),
+            ));
         }
         self.offset = next;
         Ok(self.buf.addr() + aligned_off as u64)
@@ -1263,8 +1295,14 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_marlin_repack_int4",
     )?;
+    check_rc(
+        unsafe {
+            ffi::w34_marlin_repack_int8(&ex, buf_a as *const u32, buf_b as *mut u32, 128, 64)
+        },
+        "warmup w34_marlin_repack_int8",
+    )?;
     for m_warm in [1i64, 16, 40, 64] {
-        for group_blocks in [8i32, 2] {
+        for group_blocks in [8i32, 4, 2] {
             check_rc(
                 unsafe {
                     ffi::w34_marlin_gemm_f16u4(
@@ -1282,6 +1320,45 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                     )
                 },
                 "warmup w34_marlin_gemm_f16u4",
+            )?;
+            check_rc(
+                unsafe {
+                    ffi::w34_marlin_gemm_f16u4_zp(
+                        &ex,
+                        buf_a as *const c_void,
+                        buf_b as *const c_void,
+                        buf_c as *const c_void,
+                        buf_c as *const c_void,
+                        buf_d as *mut c_void,
+                        buf_ws as *mut i32,
+                        m_warm,
+                        64,
+                        128,
+                        2048,
+                        group_blocks,
+                    )
+                },
+                "warmup w34_marlin_gemm_f16u4_zp",
+            )?;
+        }
+        for group_blocks in [8i32, 4, 2, -1] {
+            check_rc(
+                unsafe {
+                    ffi::w34_marlin_gemm_f16u8(
+                        &ex,
+                        buf_a as *const c_void,
+                        buf_b as *const c_void,
+                        buf_c as *const c_void,
+                        buf_d as *mut c_void,
+                        buf_ws as *mut i32,
+                        m_warm,
+                        64,
+                        128,
+                        2048,
+                        group_blocks,
+                    )
+                },
+                "warmup w34_marlin_gemm_f16u8",
             )?;
         }
     }
@@ -2543,6 +2620,33 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 )
             },
             "warmup w34_moe_w4a16_mlp_f16",
+        )?;
+        check_rc(
+            unsafe {
+                ffi::w34_moe_w4a16_mlp_zp_f16(
+                    &ex_moe,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    moe_ids_m4 as *const i32,
+                    moe_w_m4 as *const f32,
+                    buf_a as *const c_void,
+                    buf_a as *const c_void,
+                    buf_c as *mut c_void,
+                    buf_d as *mut c_void,
+                    m_tok,
+                    1,
+                    n_exp,
+                    64,
+                    64,
+                    64,
+                )
+            },
+            "warmup w34_moe_w4a16_mlp_zp_f16",
         )?;
     }
     // Sparse M4 (BLOCK_M=4 vec4) and M8..128 (BLOCK_M=8 MMA) g128 dispatches have

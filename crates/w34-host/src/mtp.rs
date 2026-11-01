@@ -16,7 +16,7 @@
 #![allow(clippy::too_many_arguments)]
 use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
-use crate::loader::{ModelConfig, QuantScheme, SafetensorsArchive};
+use crate::loader::{ModelConfig, SafetensorsArchive};
 use crate::model::{
     FfnBlockWeights, FullAttentionLayerWeights, LinearProj, Qwen3_5ModelRank, RawLinearHost,
     load_moe_layer_weights, loader_err,
@@ -153,23 +153,16 @@ impl Qwen3_5MtpRank {
             + 8 * 1024 * 1024;
         let mut weights = DeviceArena::new(target.device.device_id, bytes)?;
         let staging = DeviceBuffer::alloc(target.device.device_id, 64 * 1024 * 1024)?;
-        let default_group_size = match &c.quant {
-            QuantScheme::CompressedTensors { group_size, .. }
-            | QuantScheme::Gptq { group_size, .. }
-            | QuantScheme::Awq { group_size, .. }
-            | QuantScheme::AutoRound { group_size, .. } => *group_size,
-            QuantScheme::Unquantized => 32,
-        };
         let load = |name: &str, n: usize, k: usize| -> Result<RawLinearHost> {
-            let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), default_group_size)?;
-            match &raw {
-                RawLinearHost::DenseF16 { n: rn, k: rk, .. }
-                | RawLinearHost::U4B8NMajor { n: rn, k: rk, .. }
-                    if *rn == n && *rk == k =>
-                {
-                    Ok(raw)
-                }
-                _ => Err(loader_err("MTP requires correctly shaped weights")),
+            let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), &c.quant)?;
+            if raw.dims() == (n, k) {
+                Ok(raw)
+            } else {
+                Err(crate::cuda::CudaError::with_detail(
+                    -301,
+                    "MTP requires correctly shaped weights",
+                    format!("mtp.{name} has dims {:?}, expected ({n}, {k})", raw.dims()),
+                ))
             }
         };
         let fc = load("fc", h, 2 * h)?.upload(&mut weights, &target.stream, &staging)?;
@@ -179,7 +172,7 @@ impl Qwen3_5MtpRank {
             load("layers.0.self_attn.k_proj", kv, h)?.slice_rows(r * kv / tp, (r + 1) * kv / tp);
         let vs =
             load("layers.0.self_attn.v_proj", kv, h)?.slice_rows(r * kv / tp, (r + 1) * kv / tp);
-        let qkv_proj = RawLinearHost::concat_rows(&[qs, ks, vs]).upload(
+        let qkv_proj = RawLinearHost::concat_rows(&[qs, ks, vs])?.upload(
             &mut weights,
             &target.stream,
             &staging,
@@ -194,7 +187,6 @@ impl Qwen3_5MtpRank {
                 "mtp.layers.0",
                 r,
                 tp,
-                default_group_size,
                 &mut weights,
                 &target.stream,
                 &staging,
@@ -202,7 +194,7 @@ impl Qwen3_5MtpRank {
         } else {
             let gs = load("layers.0.mlp.gate_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
             let us = load("layers.0.mlp.up_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
-            let gate_up_proj = RawLinearHost::concat_rows(&[gs, us]).upload(
+            let gate_up_proj = RawLinearHost::concat_rows(&[gs, us])?.upload(
                 &mut weights,
                 &target.stream,
                 &staging,
@@ -1139,7 +1131,9 @@ impl Qwen3_5MtpRank {
                 size_n as i32,
                 size_k as i32,
             ),
-            LinearProj::MarlinW4A16 { .. } => proj.forward(
+            LinearProj::MarlinW4A16 { .. }
+            | LinearProj::MarlinW4A16Zp { .. }
+            | LinearProj::MarlinW8A16 { .. } => proj.forward(
                 ex,
                 &t.cublas,
                 t.marlin_ws.addr(),

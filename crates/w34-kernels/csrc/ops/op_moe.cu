@@ -47,6 +47,38 @@ __device__ __forceinline__ uint32_t unpack_u4b8_pair_scaled(
     return *reinterpret_cast<const uint32_t*>(&h2);
 }
 
+__device__ __forceinline__ __half2 unpack_u4_zp_pair_scaled_h2(
+    uint32_t packed_w,
+    int tid_in_grp,
+    uint32_t zp_nibble,
+    __half2 scale_h2) {
+    const uint32_t byte_v = (packed_w >> (tid_in_grp << 3)) & 0xFFu;
+    const uint32_t h2_bits = ((byte_v & 0x0Fu) | ((byte_v & 0xF0u) << 12)) | 0x64006400u;
+    const uint32_t bias_bits = 0x64006400u | zp_nibble | (zp_nibble << 16);
+    const __half2 q_h2 = __hsub2(
+        *reinterpret_cast<const __half2*>(&h2_bits),
+        *reinterpret_cast<const __half2*>(&bias_bits));
+    return __hmul2(q_h2, scale_h2);
+}
+
+__device__ __forceinline__ uint32_t unpack_u4_zp_pair_scaled(
+    uint32_t packed_w,
+    int tid_in_grp,
+    uint32_t zp_nibble,
+    __half2 scale_h2) {
+    const __half2 h2 = unpack_u4_zp_pair_scaled_h2(packed_w, tid_in_grp, zp_nibble, scale_h2);
+    return *reinterpret_cast<const uint32_t*>(&h2);
+}
+
+__device__ __forceinline__ uint32_t load_zp_nibble(
+    const uint32_t* qzeros_exp,
+    int row_in_expert,
+    int groups_per_row,
+    int g_idx) {
+    const uint32_t packed_zp = __ldg(&qzeros_exp[(size_t)(row_in_expert >> 3) * groups_per_row + g_idx]);
+    return (packed_zp >> ((row_in_expert & 7) << 2)) & 0xFu;
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -292,14 +324,17 @@ __global__ void moe_topk_router_f16_kernel(
     }
 }
 
-// Stage 1 (W4A16 U4B8 N-major): Fused gate_proj + up_proj + SiLU(gate) * up.
+// Stage 1 (W4A16 U4B8 / U4+ZP N-major): Fused gate_proj + up_proj + SiLU(gate) * up.
 // gate_up_packed: [num_experts, 2 * n_interm, k_hidden / 8] uint32_t
 // gate_up_scales: [num_experts, 2 * n_interm, k_hidden / group_size] __half
+// gate_up_qzeros: [num_experts, (2 * n_interm) / 8, k_hidden / group_size] uint32_t (when HAS_ZP)
 // Grid: ((n_interm + 3) / 4, num_tokens * top_k), Block: 128 threads (4 warps).
+template <bool HAS_ZP = false>
 __global__ void moe_w4a16_gate_up_silu_f16_kernel(
     const __half* __restrict__ x,
     const uint32_t* __restrict__ gate_up_packed,
     const __half* __restrict__ gate_up_scales,
+    const uint32_t* __restrict__ gate_up_qzeros,
     const int32_t* __restrict__ topk_ids,
     __half* __restrict__ interm_out,
     int num_tokens,
@@ -332,6 +367,9 @@ __global__ void moe_w4a16_gate_up_silu_f16_kernel(
     const uint32_t* up_w = gate_up_packed + (exp_row_base + n_interm + col) * words_per_row;
     const __half* gate_s = gate_up_scales + (exp_row_base + col) * groups_per_row;
     const __half* up_s = gate_up_scales + (exp_row_base + n_interm + col) * groups_per_row;
+    const uint32_t* zp_exp = HAS_ZP
+        ? (gate_up_qzeros + (size_t)expert_id * (n_gate_up >> 3) * groups_per_row)
+        : nullptr;
 
     float gate_acc = 0.0f;
     float up_acc = 0.0f;
@@ -344,6 +382,12 @@ __global__ void moe_w4a16_gate_up_silu_f16_kernel(
         const int g_idx = w / words_per_group;
         const __half2 gs_h2 = __half2half2(__ldg(&gate_s[g_idx]));
         const __half2 us_h2 = __half2half2(__ldg(&up_s[g_idx]));
+        uint32_t g_zp = 8u;
+        uint32_t u_zp = 8u;
+        if constexpr (HAS_ZP) {
+            g_zp = load_zp_nibble(zp_exp, col, groups_per_row, g_idx);
+            u_zp = load_zp_nibble(zp_exp, n_interm + col, groups_per_row, g_idx);
+        }
 
 #pragma unroll
         for (int p = 0; p < 4; ++p) {
@@ -351,11 +395,15 @@ __global__ void moe_w4a16_gate_up_silu_f16_kernel(
             const float x_lo = __low2float(xh2);
             const float x_hi = __high2float(xh2);
 
-            const __half2 gwh2 = unpack_u4b8_pair_scaled_h2(gw, p, gs_h2);
+            const __half2 gwh2 = HAS_ZP
+                ? unpack_u4_zp_pair_scaled_h2(gw, p, g_zp, gs_h2)
+                : unpack_u4b8_pair_scaled_h2(gw, p, gs_h2);
             gate_acc += __low2float(gwh2) * x_lo;
             gate_acc += __high2float(gwh2) * x_hi;
 
-            const __half2 uwh2 = unpack_u4b8_pair_scaled_h2(uw, p, us_h2);
+            const __half2 uwh2 = HAS_ZP
+                ? unpack_u4_zp_pair_scaled_h2(uw, p, u_zp, us_h2)
+                : unpack_u4b8_pair_scaled_h2(uw, p, us_h2);
             up_acc += __low2float(uwh2) * x_lo;
             up_acc += __high2float(uwh2) * x_hi;
         }
@@ -370,14 +418,17 @@ __global__ void moe_w4a16_gate_up_silu_f16_kernel(
     }
 }
 
-// Stage 2 (W4A16 U4B8 N-major): Fused down_proj + topk_weights sum + optional shared_expert * sigmoid(gate).
+// Stage 2 (W4A16 U4B8 / U4+ZP N-major): Fused down_proj + topk_weights sum + optional shared_expert * sigmoid(gate).
 // down_packed: [num_experts, k_hidden, n_interm / 8] uint32_t
 // down_scales: [num_experts, k_hidden, n_interm / group_size] __half
+// down_qzeros: [num_experts, k_hidden / 8, n_interm / group_size] uint32_t (when HAS_ZP)
 // Grid: ((k_hidden + 3) / 4, num_tokens), Block: 128 threads (4 warps).
+template <bool HAS_ZP = false>
 __global__ void moe_w4a16_down_accum_f16_kernel(
     const __half* __restrict__ interm_in,
     const uint32_t* __restrict__ down_packed,
     const __half* __restrict__ down_scales,
+    const uint32_t* __restrict__ down_qzeros,
     const int32_t* __restrict__ topk_ids,
     const float* __restrict__ topk_weights,
     const __half* __restrict__ shared_expert_out,
@@ -413,18 +464,28 @@ __global__ void moe_w4a16_down_accum_f16_kernel(
         const size_t row_idx = (size_t)expert_id * k_hidden + out_col;
         const uint32_t* dw_ptr = down_packed + row_idx * words_per_row;
         const __half* ds_ptr = down_scales + row_idx * groups_per_row;
+        const uint32_t* zp_exp = HAS_ZP
+            ? (down_qzeros + (size_t)expert_id * (k_hidden >> 3) * groups_per_row)
+            : nullptr;
 
         float dot = 0.0f;
         for (int w = lane; w < words_per_row; w += 32) {
             const uint4 xv = __ldg(&x_vec4[w]);
             const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
             const uint32_t dw = __ldg(&dw_ptr[w]);
-            const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[w / words_per_group]));
+            const int g_idx = w / words_per_group;
+            const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
+            uint32_t d_zp = 8u;
+            if constexpr (HAS_ZP) {
+                d_zp = load_zp_nibble(zp_exp, out_col, groups_per_row, g_idx);
+            }
 
 #pragma unroll
             for (int p = 0; p < 4; ++p) {
                 const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
-                const __half2 dwh2 = unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
+                const __half2 dwh2 = HAS_ZP
+                    ? unpack_u4_zp_pair_scaled_h2(dw, p, d_zp, ds_h2)
+                    : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
                 dot += __low2float(dwh2) * __low2float(xh2);
                 dot += __high2float(dwh2) * __high2float(xh2);
             }
@@ -640,13 +701,15 @@ __global__ void moe_align_block_size_kernel(
     }
 }
 
-// Grouped Stage 1 (W4A16 U4B8 -> m16n8k16 mma.sync with FP32 post-group scale multiplication):
+// Grouped Stage 1 (W4A16 U4B8 / U4+ZP -> m16n8k16 mma.sync):
 // Computes gate_proj AND up_proj simultaneously (2x activation A register reuse) + SiLU(gate) * up.
 // Grid: ((n_interm + 31) / 32, max_tiles), Block: 128 (4 warps; 8 gate + 8 up cols/warp = 32 cols/CTA).
+template <bool HAS_ZP = false>
 __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
     const __half* __restrict__ x,
     const uint32_t* __restrict__ gate_up_packed,
     const __half* __restrict__ gate_up_scales,
+    const uint32_t* __restrict__ gate_up_qzeros,
     const int32_t* __restrict__ sorted_pair_ids,
     const int32_t* __restrict__ tile_expert_ids,
     __half* __restrict__ interm_out,
@@ -691,6 +754,9 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
     const __half* up_s_row = n_valid
         ? (gate_up_scales + (exp_base + (size_t)(n_interm + n_col)) * groups_per_row)
         : nullptr;
+    const uint32_t* zp_exp = HAS_ZP
+        ? (gate_up_qzeros + (size_t)expert_id * ((size_t)(2 * n_interm) >> 3) * groups_per_row)
+        : nullptr;
 
     float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
     float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
@@ -712,6 +778,14 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
         const int g_idx = kc / group_size;
         const __half2 gs_h2 = n_valid ? __half2half2(gate_s_row[g_idx]) : __float2half2_rn(0.0f);
         const __half2 us_h2 = n_valid ? __half2half2(up_s_row[g_idx]) : __float2half2_rn(0.0f);
+        uint32_t g_zp_64 = 8u;
+        uint32_t u_zp_64 = 8u;
+        if constexpr (HAS_ZP) {
+            if (n_valid && group_size >= 64) {
+                g_zp_64 = load_zp_nibble(zp_exp, n_col, groups_per_row, g_idx);
+                u_zp_64 = load_zp_nibble(zp_exp, n_interm + n_col, groups_per_row, g_idx);
+            }
+        }
 
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
@@ -725,16 +799,30 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
             uint32_t gb0 = 0u, gb1 = 0u, ub0 = 0u, ub1 = 0u;
             if (n_valid) {
                 const int w_idx = col_base >> 3;
+                const int cur_g = col_base / group_size;
                 const __half2 gs_cur = (group_size >= 64)
                     ? gs_h2
-                    : __half2half2(gate_s_row[col_base / group_size]);
+                    : __half2half2(gate_s_row[cur_g]);
                 const __half2 us_cur = (group_size >= 64)
                     ? us_h2
-                    : __half2half2(up_s_row[col_base / group_size]);
-                gb0 = unpack_u4b8_pair_scaled(gate_w_row[w_idx], tid_in_grp, gs_cur);
-                gb1 = unpack_u4b8_pair_scaled(gate_w_row[w_idx + 1], tid_in_grp, gs_cur);
-                ub0 = unpack_u4b8_pair_scaled(up_w_row[w_idx], tid_in_grp, us_cur);
-                ub1 = unpack_u4b8_pair_scaled(up_w_row[w_idx + 1], tid_in_grp, us_cur);
+                    : __half2half2(up_s_row[cur_g]);
+                if constexpr (HAS_ZP) {
+                    const uint32_t g_zp = (group_size >= 64)
+                        ? g_zp_64
+                        : load_zp_nibble(zp_exp, n_col, groups_per_row, cur_g);
+                    const uint32_t u_zp = (group_size >= 64)
+                        ? u_zp_64
+                        : load_zp_nibble(zp_exp, n_interm + n_col, groups_per_row, cur_g);
+                    gb0 = unpack_u4_zp_pair_scaled(gate_w_row[w_idx], tid_in_grp, g_zp, gs_cur);
+                    gb1 = unpack_u4_zp_pair_scaled(gate_w_row[w_idx + 1], tid_in_grp, g_zp, gs_cur);
+                    ub0 = unpack_u4_zp_pair_scaled(up_w_row[w_idx], tid_in_grp, u_zp, us_cur);
+                    ub1 = unpack_u4_zp_pair_scaled(up_w_row[w_idx + 1], tid_in_grp, u_zp, us_cur);
+                } else {
+                    gb0 = unpack_u4b8_pair_scaled(gate_w_row[w_idx], tid_in_grp, gs_cur);
+                    gb1 = unpack_u4b8_pair_scaled(gate_w_row[w_idx + 1], tid_in_grp, gs_cur);
+                    ub0 = unpack_u4b8_pair_scaled(up_w_row[w_idx], tid_in_grp, us_cur);
+                    ub1 = unpack_u4b8_pair_scaled(up_w_row[w_idx + 1], tid_in_grp, us_cur);
+                }
             }
             asm volatile(
                 "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -769,13 +857,15 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
     }
 }
 
-// Grouped Stage 2a (W4A16 U4B8 -> m16n8k16 mma.sync with donor Marlin FP16 pre-scaling):
+// Grouped Stage 2a (W4A16 U4B8 / U4+ZP -> m16n8k16 mma.sync with donor Marlin FP16 pre-scaling):
 // Computes FP16 topk_weights[pair] * FP16(interm_in[pair] @ W_down[expert]^T) into FP16 `stage2_pair_out`.
 // Grid: ((k_hidden + 63) / 64, max_tiles), Block: 128 (4 warps; 2x8 = 16 cols/warp = 64 cols/CTA).
+template <bool HAS_ZP = false>
 __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
     const __half* __restrict__ interm_in,
     const uint32_t* __restrict__ down_packed,
     const __half* __restrict__ down_scales,
+    const uint32_t* __restrict__ down_qzeros,
     const int32_t* __restrict__ sorted_pair_ids,
     const int32_t* __restrict__ tile_expert_ids,
     const float* __restrict__ topk_weights,
@@ -817,6 +907,9 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
     const uint32_t* dw_b = valid_b ? (down_packed + (exp_base + (size_t)col_b) * words_per_row) : nullptr;
     const __half* ds_a = valid_a ? (down_scales + (exp_base + (size_t)col_a) * groups_per_row) : nullptr;
     const __half* ds_b = valid_b ? (down_scales + (exp_base + (size_t)col_b) * groups_per_row) : nullptr;
+    const uint32_t* zp_exp = HAS_ZP
+        ? (down_qzeros + (size_t)expert_id * ((size_t)k_hidden >> 3) * groups_per_row)
+        : nullptr;
 
     float d0_0 = 0.0f, d0_1 = 0.0f, d0_2 = 0.0f, d0_3 = 0.0f;
     float d1_0 = 0.0f, d1_1 = 0.0f, d1_2 = 0.0f, d1_3 = 0.0f;
@@ -837,6 +930,14 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
         const int g_idx = kc / group_size;
         const __half2 sa_h2 = valid_a ? __half2half2(ds_a[g_idx]) : __float2half2_rn(0.0f);
         const __half2 sb_h2 = valid_b ? __half2half2(ds_b[g_idx]) : __float2half2_rn(0.0f);
+        uint32_t za_64 = 8u;
+        uint32_t zb_64 = 8u;
+        if constexpr (HAS_ZP) {
+            if (group_size >= 64) {
+                if (valid_a) za_64 = load_zp_nibble(zp_exp, col_a, groups_per_row, g_idx);
+                if (valid_b) zb_64 = load_zp_nibble(zp_exp, col_b, groups_per_row, g_idx);
+            }
+        }
 
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
@@ -848,20 +949,37 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
             const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&s_a[group_id + 8][k_off + 8 + 2 * tid_in_grp]);
 
             const int w_idx = col_base >> 3;
+            const int cur_g = col_base / group_size;
             uint32_t ba0 = 0u, ba1 = 0u, bb0 = 0u, bb1 = 0u;
             if (valid_a) {
                 const __half2 sa_cur = (group_size >= 64)
                     ? sa_h2
-                    : __half2half2(ds_a[col_base / group_size]);
-                ba0 = unpack_u4b8_pair_scaled(dw_a[w_idx], tid_in_grp, sa_cur);
-                ba1 = unpack_u4b8_pair_scaled(dw_a[w_idx + 1], tid_in_grp, sa_cur);
+                    : __half2half2(ds_a[cur_g]);
+                if constexpr (HAS_ZP) {
+                    const uint32_t za = (group_size >= 64)
+                        ? za_64
+                        : load_zp_nibble(zp_exp, col_a, groups_per_row, cur_g);
+                    ba0 = unpack_u4_zp_pair_scaled(dw_a[w_idx], tid_in_grp, za, sa_cur);
+                    ba1 = unpack_u4_zp_pair_scaled(dw_a[w_idx + 1], tid_in_grp, za, sa_cur);
+                } else {
+                    ba0 = unpack_u4b8_pair_scaled(dw_a[w_idx], tid_in_grp, sa_cur);
+                    ba1 = unpack_u4b8_pair_scaled(dw_a[w_idx + 1], tid_in_grp, sa_cur);
+                }
             }
             if (valid_b) {
                 const __half2 sb_cur = (group_size >= 64)
                     ? sb_h2
-                    : __half2half2(ds_b[col_base / group_size]);
-                bb0 = unpack_u4b8_pair_scaled(dw_b[w_idx], tid_in_grp, sb_cur);
-                bb1 = unpack_u4b8_pair_scaled(dw_b[w_idx + 1], tid_in_grp, sb_cur);
+                    : __half2half2(ds_b[cur_g]);
+                if constexpr (HAS_ZP) {
+                    const uint32_t zb = (group_size >= 64)
+                        ? zb_64
+                        : load_zp_nibble(zp_exp, col_b, groups_per_row, cur_g);
+                    bb0 = unpack_u4_zp_pair_scaled(dw_b[w_idx], tid_in_grp, zb, sb_cur);
+                    bb1 = unpack_u4_zp_pair_scaled(dw_b[w_idx + 1], tid_in_grp, zb, sb_cur);
+                } else {
+                    bb0 = unpack_u4b8_pair_scaled(dw_b[w_idx], tid_in_grp, sb_cur);
+                    bb1 = unpack_u4b8_pair_scaled(dw_b[w_idx + 1], tid_in_grp, sb_cur);
+                }
             }
             asm volatile(
                 "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -1473,15 +1591,15 @@ extern "C" int w34_moe_w4a16_gate_up_silu_f16(
         w34_moe::moe_align_block_size_kernel<16><<<1, 256, 0, st>>>(
             topk_ids, sorted_pair_ids, tile_expert_ids, total_pairs, num_experts, max_tiles16);
         dim3 grid((unsigned)((n_interm + 31) / 32), (unsigned)max_tiles16);
-        w34_moe::moe_w4a16_grouped_gate_up_silu_mma_f16_kernel<<<grid, 128, 0, st>>>(
-            (const __half*)x, gate_up_packed, (const __half*)gate_up_scales,
+        w34_moe::moe_w4a16_grouped_gate_up_silu_mma_f16_kernel<false><<<grid, 128, 0, st>>>(
+            (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, nullptr,
             sorted_pair_ids, tile_expert_ids, (__half*)interm_out,
             top_k, n_interm, k_hidden, group_size);
         return (int)cudaGetLastError();
     }
     dim3 grid((unsigned)((n_interm + 3) / 4), (unsigned)(num_tokens * top_k));
-    w34_moe::moe_w4a16_gate_up_silu_f16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, topk_ids,
+    w34_moe::moe_w4a16_gate_up_silu_f16_kernel<false><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, nullptr, topk_ids,
         (__half*)interm_out, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
     return (int)cudaGetLastError();
 }
@@ -1542,8 +1660,8 @@ extern "C" int w34_moe_w4a16_down_accum_f16(
             w34_moe::moe_align_block_size_kernel<16><<<1, 256, 0, st>>>(
                 ids_chunk, sorted_pair_ids, tile_expert_ids, chunk_pairs, num_experts, max_tiles16);
             dim3 g_down((unsigned)((k_hidden + 63) / 64), (unsigned)max_tiles16);
-            w34_moe::moe_w4a16_grouped_down_mma_f16_kernel<<<g_down, 128, 0, st>>>(
-                interm_chunk, down_packed, (const __half*)down_scales,
+            w34_moe::moe_w4a16_grouped_down_mma_f16_kernel<false><<<g_down, 128, 0, st>>>(
+                interm_chunk, down_packed, (const __half*)down_scales, nullptr,
                 sorted_pair_ids, tile_expert_ids, tw_chunk, stage2_pair_out,
                 k_hidden, n_interm, group_size);
             dim3 g_red((unsigned)((k_hidden + 511) / 512), (unsigned)chunk_m);
@@ -1555,8 +1673,8 @@ extern "C" int w34_moe_w4a16_down_accum_f16(
         return (int)cudaGetLastError();
     }
     dim3 grid((unsigned)((k_hidden + 3) / 4), (unsigned)num_tokens);
-    w34_moe::moe_w4a16_down_accum_f16_kernel<<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)interm_in, down_packed, (const __half*)down_scales, topk_ids, topk_weights,
+    w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
         (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
         num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
     return (int)cudaGetLastError();
@@ -1784,13 +1902,13 @@ extern "C" int w34_moe_w4a16_mlp_f16(
             w34_moe::moe_align_block_size_kernel<16><<<1, 256, 0, st>>>(
                 ids_chunk, sorted_pair_ids, tile_expert_ids, chunk_pairs, num_experts, max_tiles16);
             dim3 g_gu((unsigned)((n_interm + 31) / 32), (unsigned)max_tiles16);
-            w34_moe::moe_w4a16_grouped_gate_up_silu_mma_f16_kernel<<<g_gu, 128, 0, st>>>(
-                x_chunk, gate_up_packed, (const __half*)gate_up_scales,
+            w34_moe::moe_w4a16_grouped_gate_up_silu_mma_f16_kernel<false><<<g_gu, 128, 0, st>>>(
+                x_chunk, gate_up_packed, (const __half*)gate_up_scales, nullptr,
                 sorted_pair_ids, tile_expert_ids, interm_chunk,
                 top_k, n_interm, k_hidden, group_size);
             dim3 g_down((unsigned)((k_hidden + 63) / 64), (unsigned)max_tiles16);
-            w34_moe::moe_w4a16_grouped_down_mma_f16_kernel<<<g_down, 128, 0, st>>>(
-                interm_chunk, down_packed, (const __half*)down_scales,
+            w34_moe::moe_w4a16_grouped_down_mma_f16_kernel<false><<<g_down, 128, 0, st>>>(
+                interm_chunk, down_packed, (const __half*)down_scales, nullptr,
                 sorted_pair_ids, tile_expert_ids, tw_chunk, stage2_pair_out,
                 k_hidden, n_interm, group_size);
             dim3 g_red((unsigned)((k_hidden + 511) / 512), (unsigned)chunk_m);
@@ -1804,13 +1922,110 @@ extern "C" int w34_moe_w4a16_mlp_f16(
 
     cudaStream_t st = (cudaStream_t)ex->stream;
     dim3 g1((unsigned)((n_interm + 3) / 4), (unsigned)(num_tokens * top_k));
-    w34_moe::moe_w4a16_gate_up_silu_f16_kernel<<<g1, 128, 0, st>>>(
-        (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, topk_ids,
+    w34_moe::moe_w4a16_gate_up_silu_f16_kernel<false><<<g1, 128, 0, st>>>(
+        (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, nullptr, topk_ids,
         (__half*)interm_buf, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
     dim3 g2((unsigned)((k_hidden + 3) / 4), (unsigned)num_tokens);
-    w34_moe::moe_w4a16_down_accum_f16_kernel<<<g2, 128, 0, st>>>(
-        (const __half*)interm_buf, down_packed, (const __half*)down_scales, topk_ids, topk_weights,
+    w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<g2, 128, 0, st>>>(
+        (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
         (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+        num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_moe_w4a16_mlp_zp_f16(
+    const w34_exec* ex,
+    const void* x,
+    const uint32_t* gate_up_packed,
+    const void* gate_up_scales,
+    const uint32_t* gate_up_qzeros,
+    const uint32_t* down_packed,
+    const void* down_scales,
+    const uint32_t* down_qzeros,
+    const int32_t* topk_ids,
+    const float* topk_weights,
+    const void* shared_expert_out,
+    const void* shared_expert_gate_logits,
+    void* interm_buf,
+    void* out,
+    int num_tokens,
+    int top_k,
+    int num_experts,
+    int n_interm,
+    int k_hidden,
+    int group_size) {
+    if (ex == nullptr || x == nullptr || gate_up_packed == nullptr || gate_up_scales == nullptr ||
+        gate_up_qzeros == nullptr || down_packed == nullptr || down_scales == nullptr ||
+        down_qzeros == nullptr || topk_ids == nullptr || topk_weights == nullptr ||
+        interm_buf == nullptr || out == nullptr || num_tokens < 0 || top_k <= 0 ||
+        num_experts <= 0 || n_interm <= 0 || k_hidden <= 0 || (k_hidden % 8) != 0 ||
+        (n_interm % 8) != 0 || group_size <= 0 || (group_size % 8) != 0 ||
+        (k_hidden % group_size) != 0 || (n_interm % group_size) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens == 0) return 0;
+
+    const int num_chunks = w34_moe::plan_grouped_mma_chunks(
+        ex, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
+    if (num_chunks > 0) {
+        uint8_t* ws = reinterpret_cast<uint8_t*>((uintptr_t)ex->scratch_ptr);
+        cudaStream_t st = (cudaStream_t)ex->stream;
+        const int base_m = num_tokens / num_chunks;
+        const int rem_m = num_tokens % num_chunks;
+        int tok_off = 0;
+        for (int c = 0; c < num_chunks; ++c) {
+            const int chunk_m = base_m + ((c < rem_m) ? 1 : 0);
+            int max_tiles16 = 0;
+            size_t pairs16 = 0, tiles16 = 0;
+            w34_moe::grouped_mma_stage2_scratch_bytes(
+                chunk_m, top_k, num_experts, k_hidden, &max_tiles16, &pairs16, &tiles16);
+            int32_t* sorted_pair_ids = reinterpret_cast<int32_t*>(ws);
+            int32_t* tile_expert_ids = reinterpret_cast<int32_t*>(ws + pairs16);
+            __half* stage2_pair_out = reinterpret_cast<__half*>(ws + pairs16 + tiles16);
+            const int chunk_pairs = chunk_m * top_k;
+            const __half* x_chunk = (const __half*)x + (size_t)tok_off * k_hidden;
+            const int32_t* ids_chunk = topk_ids + (size_t)tok_off * top_k;
+            const float* tw_chunk = topk_weights + (size_t)tok_off * top_k;
+            __half* interm_chunk = (__half*)interm_buf + (size_t)tok_off * top_k * n_interm;
+            const __half* sh_out_chunk = (shared_expert_out != nullptr)
+                ? ((const __half*)shared_expert_out + (size_t)tok_off * k_hidden)
+                : nullptr;
+            const __half* sh_gate_chunk = (shared_expert_gate_logits != nullptr)
+                ? ((const __half*)shared_expert_gate_logits + tok_off)
+                : nullptr;
+            __half* out_chunk = (__half*)out + (size_t)tok_off * k_hidden;
+
+            w34_moe::moe_align_block_size_kernel<16><<<1, 256, 0, st>>>(
+                ids_chunk, sorted_pair_ids, tile_expert_ids, chunk_pairs, num_experts, max_tiles16);
+            dim3 g_gu((unsigned)((n_interm + 31) / 32), (unsigned)max_tiles16);
+            w34_moe::moe_w4a16_grouped_gate_up_silu_mma_f16_kernel<true><<<g_gu, 128, 0, st>>>(
+                x_chunk, gate_up_packed, (const __half*)gate_up_scales, gate_up_qzeros,
+                sorted_pair_ids, tile_expert_ids, interm_chunk,
+                top_k, n_interm, k_hidden, group_size);
+            dim3 g_down((unsigned)((k_hidden + 63) / 64), (unsigned)max_tiles16);
+            w34_moe::moe_w4a16_grouped_down_mma_f16_kernel<true><<<g_down, 128, 0, st>>>(
+                interm_chunk, down_packed, (const __half*)down_scales, down_qzeros,
+                sorted_pair_ids, tile_expert_ids, tw_chunk, stage2_pair_out,
+                k_hidden, n_interm, group_size);
+            dim3 g_red((unsigned)((k_hidden + 511) / 512), (unsigned)chunk_m);
+            w34_moe::moe_down_topk_reduce_f16_kernel<<<g_red, 128, 0, st>>>(
+                stage2_pair_out, ids_chunk, sh_out_chunk, sh_gate_chunk, out_chunk,
+                chunk_m, top_k, num_experts, k_hidden);
+            tok_off += chunk_m;
+        }
+        return (int)cudaGetLastError();
+    }
+
+    cudaStream_t st = (cudaStream_t)ex->stream;
+    dim3 g1((unsigned)((n_interm + 3) / 4), (unsigned)(num_tokens * top_k));
+    w34_moe::moe_w4a16_gate_up_silu_f16_kernel<true><<<g1, 128, 0, st>>>(
+        (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, gate_up_qzeros, topk_ids,
+        (__half*)interm_buf, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
+    dim3 g2((unsigned)((k_hidden + 3) / 4), (unsigned)num_tokens);
+    w34_moe::moe_w4a16_down_accum_f16_kernel<true><<<g2, 128, 0, st>>>(
+        (const __half*)interm_buf, down_packed, (const __half*)down_scales, down_qzeros,
+        topk_ids, topk_weights, (const __half*)shared_expert_out,
+        (const __half*)shared_expert_gate_logits, (__half*)out,
         num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
     return (int)cudaGetLastError();
 }

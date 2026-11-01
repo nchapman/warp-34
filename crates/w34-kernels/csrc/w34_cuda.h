@@ -264,10 +264,16 @@ int w34_small_n_gemm_dual_f16(const w34_exec* ex, const void* x,
 int w34_zero_i32(const w34_exec* ex, void* ptr, int64_t count);
 int w34_marlin_repack_int4(const w34_exec* ex, const uint32_t* src_n_major,
                            uint32_t* dst_marlin, int64_t k, int64_t n);
+int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_major,
+                           uint32_t* dst_marlin, int64_t k, int64_t n);
 int w34_marlin_gemm_f16u4(const w34_exec* ex, const void* a, const void* b,
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
                           int64_t workspace_ints, int group_blocks);
+int w34_marlin_gemm_f16u4_zp(const w34_exec* ex, const void* a, const void* b,
+                             const void* scales, const void* zeros, void* c,
+                             int32_t* workspace, int64_t m, int64_t n, int64_t k,
+                             int64_t workspace_ints, int group_blocks);
 int w34_marlin_gemm_f16u8(const w34_exec* ex, const void* a, const void* b,
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
@@ -567,6 +573,17 @@ int w34_moe_w4a16_mlp_f16(const w34_exec* ex, const void* x,
                           void* interm_buf, void* out,
                           int num_tokens, int top_k, int num_experts,
                           int n_interm, int k_hidden, int group_size);
+int w34_moe_w4a16_mlp_zp_f16(const w34_exec* ex, const void* x,
+                             const uint32_t* gate_up_packed, const void* gate_up_scales,
+                             const uint32_t* gate_up_qzeros,
+                             const uint32_t* down_packed, const void* down_scales,
+                             const uint32_t* down_qzeros,
+                             const int32_t* topk_ids, const float* topk_weights,
+                             const void* shared_expert_out,
+                             const void* shared_expert_gate_logits,
+                             void* interm_buf, void* out,
+                             int num_tokens, int top_k, int num_experts,
+                             int n_interm, int k_hidden, int group_size);
 int w34_moe_f16_gate_up_silu(const w34_exec* ex, const void* x, const void* gate_up_w,
                              const int32_t* topk_ids, void* interm_out,
                              int num_tokens, int top_k, int num_experts,

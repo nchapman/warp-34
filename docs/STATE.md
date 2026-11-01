@@ -12,6 +12,28 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Production-Hardened Quantization & Model-Loading Subsystem (sm_86 Native)
+
+`warp-34` supports common Qwen 3.5 / 3.6 / 3.8 HuggingFace quantized and unquantized checkpoints suited to 1–2× RTX 3090 Ti (`sm_86`) without silent corruption or opaque OOMs:
+- **Supported Quantization Formats & Geometries:**
+  - **Unquantized:** Native `BF16` / `FP16` / `FP32` weights uploaded directly to the unified `FP16` model spine.
+  - **Symmetric 4-bit (`U4B8`):** `group_size ∈ {32, 64, 128}` via `w34_marlin_gemm_f16u4` (`group_blocks ∈ {2, 4, 8}`).
+  - **Asymmetric 4-bit (`U4` with packed zero-points):** `group_size ∈ {32, 64, 128}` via `w34_marlin_gemm_f16u4_zp` (`marlin::kU4`, `group_blocks ∈ {2, 4, 8}`), unpacking AutoAWQ `[K, N/8]` + `[K/g, N/8]` (`UNDO_AWQ = [0, 4, 1, 5, 2, 6, 3, 7]`) and Compressed-Tensors `[N, K/8]` + `[N/8, K/g]` into N-major words with `scale_perm` + interleave zero-point permutation.
+  - **Dense Symmetric 8-bit (`W8A16` / `U8B128`):** `group_size ∈ {32, 64, 128}` (`group_blocks ∈ {2, 4, 8}`) and per-channel (`group_blocks = -1`, `group_size = K`) via `w34_marlin_gemm_f16u8` (`marlin::kU8B128`) and `w34_marlin_repack_int8` (`REG:40 STACK:0 LOCAL:0`).
+  - **Asymmetric MoE W4A16:** `w34_moe_w4a16_mlp_zp_f16` across `group_size ∈ {32, 64, 128}` supporting both GEMV (`M < 4`) and Grouped-MMA (`M >= 4`) execution plans with chunked scratch budget management.
+  - **Quantized Embedding Tokens:** Automatic host dequantization of `model.embed_tokens.weight_packed` or `.qweight` into FP16 for the embedding table.
+- **Fail-Fast Loader & Capacity Diagnostics:**
+  - `ModelConfig::parse_quant` validates quantization configurations strictly, falling back to standalone `quantize_config.json` when `config.json` lacks quant settings.
+  - Immediate, descriptive errors with sanitized strings for: unsupported methods (`fp8`, `mxfp4`, `nvfp4`, `bitsandbytes`), activation quantization (`W8A8`), asymmetric 8-bit, dynamic actorder (`actorder != "static"`), desc_act with grouping, non-sequential `g_idx` permutations, AWQ `version != "gemm"`, 8-bit MoE, and quantized DFlash2 drafters.
+  - Archive-derived `weight_arena` calculation reserving exact sharded/replicated bytes plus aligned headroom, with pre-boot VRAM capacity enforcement (`min_boot_bytes > free_vram`).
+  - Dynamically sized repack staging buffer (`(128 MiB).max(3 * max_packed_tensor_bytes)`) preventing unbudgeted runtime allocations during load.
+- **Audit & Verification:**
+  - All new custom kernels pass `cuobjdump --dump-resource-usage` audit with `STACK:0 LOCAL:0`.
+  - Scalar-reference parity tests pass 0-ULP and tight L2 tolerances across `M ∈ {1, 4, 8, 16, 130}` for all dense formats (`g32/g64/g128/channel`, sym/asym) and MoE.
+  - Full end-to-end load, prompt dump, and greedy token generation verified on 8 cached HuggingFace models: `Qwen/Qwen3.5-4B` (unquantized), `cyankiwi/Qwen3.5-9B-AWQ-4bit` (AWQ), `cyankiwi/Qwen3.8-27B-AWQ-INT4` (CT asym g32), `TheUnderscore/Swift-Qwen3.8-27b-W4A16-AWQ` (CT asym g128), `Lorbus/Qwen3.6-27B-int4-AutoRound` (AutoRound g128), `lued/Qwen3.8-27B-INT8-W8A16-DFlash2` (CT W8A16), `cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4` (MoE CT asym g32), and `llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4` (MoE GPTQ-Int4).
+
+---
+
 ## Generative Serving APIs (`/v1/responses`, `/v1/messages`, token-count endpoints) & Decision-Model Serving (`/v1/systemone`, `/v1/decisions`)
 
 Full wire specifications are documented in [`docs/GENERATIVE_APIS.md`](GENERATIVE_APIS.md) and [`docs/DECISION_MODELS.md`](DECISION_MODELS.md):
