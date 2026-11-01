@@ -34,9 +34,48 @@ pub struct GenerationStream {
     pub cached_tokens: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
 }
+impl GenerationStream {
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+}
 impl Drop for GenerationStream {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+pub enum DecisionTapOutput {
+    CandidateLogits {
+        logits: Vec<f64>,
+        cached_tokens: usize,
+    },
+    HiddenRows {
+        rows: Vec<Vec<f32>>,
+        cached_tokens: usize,
+    },
+}
+
+enum DecisionReadoutTap {
+    CandidateLogits {
+        token_ids: Vec<i32>,
+        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
+    },
+    HiddenPositions {
+        positions: Vec<usize>,
+        captured: Vec<Option<Vec<f32>>>,
+        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
+    },
+}
+
+impl DecisionReadoutTap {
+    fn fail(self, error: String) {
+        match self {
+            Self::CandidateLogits { tx, .. } | Self::HiddenPositions { tx, .. } => {
+                let _ = tx.send(Err(error));
+            }
+        }
     }
 }
 
@@ -49,6 +88,9 @@ struct Request {
     sampler: SamplerV1,
     output: Sender<GenerationEvent>,
     cancelled: Arc<AtomicBool>,
+    max_prefix_lookup_len: Option<usize>,
+    mamba_branching_seqlen: Option<usize>,
+    decision_tap: Option<DecisionReadoutTap>,
 }
 
 #[derive(Default)]
@@ -72,6 +114,8 @@ pub struct EngineWorker {
     pub eos_token_ids: Vec<i32>,
     pub vocab_size: usize,
     pub default_preserve_thinking: bool,
+    pub decision_profile: crate::decision::DecisionModelProfile,
+    pub kv_token_capacity: usize,
 }
 impl EngineWorker {
     pub fn start(engine: Qwen3_5Engine, config: SchedulerConfig) -> Self {
@@ -106,11 +150,14 @@ impl EngineWorker {
                     }
                     let default_preserve_thinking =
                         crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
+                    let kv_token_capacity = engine.ranks[0].kv_pool.num_pages * 16;
                     let info = (
                         engine.tokenizer.clone(),
                         engine.cfg.eos_token_ids.clone(),
                         engine.cfg.vocab_size,
                         default_preserve_thinking,
+                        engine.decision_profile.clone(),
+                        kv_token_capacity,
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
                         run(engine, clamped_cfg, receiver, stop, worker_stats);
@@ -121,18 +168,24 @@ impl EngineWorker {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let (tokenizer, eos_token_ids, vocab_size, default_preserve_thinking) =
-            match ready_rx.recv() {
-                Ok(Ok(info)) => info,
-                Ok(Err(error)) => {
-                    let _ = thread.join();
-                    return Err(error);
-                }
-                Err(error) => {
-                    let _ = thread.join();
-                    return Err(error.to_string());
-                }
-            };
+        let (
+            tokenizer,
+            eos_token_ids,
+            vocab_size,
+            default_preserve_thinking,
+            decision_profile,
+            kv_token_capacity,
+        ) = match ready_rx.recv() {
+            Ok(Ok(info)) => info,
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = thread.join();
+                return Err(error.to_string());
+            }
+        };
         Ok(Self {
             sender: Mutex::new(Some(sender)),
             thread: Mutex::new(Some(thread)),
@@ -142,6 +195,8 @@ impl EngineWorker {
             eos_token_ids,
             vocab_size,
             default_preserve_thinking,
+            decision_profile,
+            kv_token_capacity,
         })
     }
 
@@ -201,6 +256,105 @@ impl EngineWorker {
                 sampler,
                 output,
                 cancelled: cancelled.clone(),
+                max_prefix_lookup_len: None,
+                mamba_branching_seqlen: None,
+                decision_tap: None,
+            })
+            .map_err(|_| "engine queue unavailable or full")?;
+        Ok(GenerationStream {
+            events,
+            cancelled,
+            cached_tokens,
+        })
+    }
+
+    pub fn submit_decision_candidate_logits(
+        &self,
+        prompt: Vec<i32>,
+        token_ids: Vec<i32>,
+        mamba_branching_seqlen: Option<usize>,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+        ),
+        String,
+    > {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let stream = self.submit_decision_internal(
+            prompt,
+            None,
+            mamba_branching_seqlen,
+            DecisionReadoutTap::CandidateLogits { token_ids, tx },
+        )?;
+        Ok((stream, rx))
+    }
+
+    pub fn submit_decision_hidden_positions(
+        &self,
+        prompt: Vec<i32>,
+        positions: Vec<usize>,
+        max_prefix_lookup_len: Option<usize>,
+        mamba_branching_seqlen: Option<usize>,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+        ),
+        String,
+    > {
+        let captured = vec![None; positions.len()];
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let stream = self.submit_decision_internal(
+            prompt,
+            max_prefix_lookup_len,
+            mamba_branching_seqlen,
+            DecisionReadoutTap::HiddenPositions {
+                positions,
+                captured,
+                tx,
+            },
+        )?;
+        Ok((stream, rx))
+    }
+
+    fn submit_decision_internal(
+        &self,
+        prompt: Vec<i32>,
+        max_prefix_lookup_len: Option<usize>,
+        mamba_branching_seqlen: Option<usize>,
+        tap: DecisionReadoutTap,
+    ) -> Result<GenerationStream, String> {
+        if prompt.is_empty() {
+            return Err("decision prompt must be nonempty".into());
+        }
+        let (output, events) = mpsc::channel(8);
+        let cached_tokens = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 1,
+            max_tokens: 0,
+            ..SamplingParams::default()
+        };
+        let sampler = SamplerV1::new(params, &prompt, None);
+        self.sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or("engine worker stopped")?
+            .try_send(Request {
+                prompt,
+                images: Vec::new(),
+                vision: None,
+                reserved_pages: 0,
+                cached_tokens: cached_tokens.clone(),
+                sampler,
+                output,
+                cancelled: cancelled.clone(),
+                max_prefix_lookup_len,
+                mamba_branching_seqlen,
+                decision_tap: Some(tap),
             })
             .map_err(|_| "engine queue unavailable or full")?;
         Ok(GenerationStream {
@@ -231,9 +385,11 @@ fn enqueue(
     mut request: Request,
 ) {
     if requests.len() >= 32 {
-        let _ = request.output.try_send(GenerationEvent::Error(
-            "engine admission capacity exceeded".into(),
-        ));
+        let msg = "engine admission capacity exceeded".to_string();
+        if let Some(tap) = request.decision_tap.take() {
+            tap.fail(msg.clone());
+        }
+        let _ = request.output.try_send(GenerationEvent::Error(msg));
         return;
     }
     let vocab = engine.cfg.vocab_size;
@@ -253,9 +409,11 @@ fn enqueue(
             .checked_add(p.max_tokens)
             .is_some_and(|n| n.div_ceil(16) <= engine.ranks[0].kv_pool.num_pages);
     if !valid {
-        let _ = request.output.try_send(GenerationEvent::Error(
-            "invalid tokens or request exceeds KV capacity".into(),
-        ));
+        let msg = "invalid tokens or request exceeds KV capacity".to_string();
+        if let Some(tap) = request.decision_tap.take() {
+            tap.fail(msg.clone());
+        }
+        let _ = request.output.try_send(GenerationEvent::Error(msg));
         return;
     }
     request.reserved_pages = (request.prompt.len() + p.max_tokens).div_ceil(16);
@@ -277,7 +435,7 @@ fn enqueue(
         .vision
         .as_ref()
         .map_or_else(|| request.prompt.clone(), |v| v.radix_key.clone());
-    let id = sched.submit_request_configured(
+    let id = sched.submit_request_with_prefix_options(
         request.prompt.clone(),
         key,
         p.max_tokens,
@@ -286,6 +444,8 @@ fn enqueue(
         p.stop_token_ids.clone(),
         p.eos_token_ids.clone(),
         request.vision.is_some(),
+        request.max_prefix_lookup_len,
+        request.mamba_branching_seqlen,
     );
     requests.insert(id, request);
 }
@@ -409,10 +569,12 @@ fn run(
             requests.remove(&id);
         }
 
-        let is_batched_mtp_eligible = |s: &crate::parser::SamplerV1| -> bool {
-            s.constraint.is_none()
-                && (s.params.temperature <= 1e-6 || s.params.top_k == 1)
-                && !s.params.logprobs
+        let is_batched_mtp_eligible = |r: &Request| -> bool {
+            r.decision_tap.is_none()
+                && r.sampler.params.max_tokens > 0
+                && r.sampler.constraint.is_none()
+                && (r.sampler.params.temperature <= 1e-6 || r.sampler.params.top_k == 1)
+                && !r.sampler.params.logprobs
         };
 
         // Yield only at a committed tick boundary. Verification has resolved its
@@ -441,7 +603,7 @@ fn run(
             let can_promote_to_mtp_batch = sched.waiting.len() < crate::mtp::MAX_MTP_BATCH_SLOTS
                 && sched.waiting.len() < sched.cfg.max_num_seqs
                 && active_need + waiting_need <= engine.ranks[0].kv_pool.num_pages
-                && is_batched_mtp_eligible(&requests[&id].sampler)
+                && is_batched_mtp_eligible(&requests[&id])
                 && engine.speculative.as_ref().is_some_and(|p| {
                     p.is_mtp()
                         && p.fits_mtp_batch_slot_capacity(
@@ -451,7 +613,7 @@ fn run(
                         && sched.waiting.iter().all(|w| {
                             let r = &requests[&w.req_id];
                             !w.custom_prefill
-                                && is_batched_mtp_eligible(&r.sampler)
+                                && is_batched_mtp_eligible(r)
                                 && p.fits_mtp_batch_slot_capacity(
                                     w.prompt_tokens.len(),
                                     w.max_new_tokens,
@@ -509,7 +671,7 @@ fn run(
                         && sched.waiting.iter().all(|w| {
                             let r = &requests[&w.req_id];
                             !w.custom_prefill
-                                && is_batched_mtp_eligible(&r.sampler)
+                                && is_batched_mtp_eligible(r)
                                 && p.fits_mtp_batch_slot_capacity(
                                     w.prompt_tokens.len(),
                                     w.max_new_tokens,
@@ -574,6 +736,8 @@ fn run(
             if sched.active.is_empty()
                 && sched.waiting.len() == 1
                 && !sched.waiting[0].custom_prefill
+                && requests[&sched.waiting[0].req_id].decision_tap.is_none()
+                && requests[&sched.waiting[0].req_id].sampler.params.max_tokens > 0
                 && engine.speculative.is_some()
             {
                 let id = sched.waiting[0].req_id;
@@ -629,7 +793,7 @@ fn run(
                     && sched.waiting.iter().all(|w| {
                         let r = &requests[&w.req_id];
                         !w.custom_prefill
-                            && is_batched_mtp_eligible(&r.sampler)
+                            && is_batched_mtp_eligible(r)
                             && proposer.fits_mtp_batch_slot_capacity(
                                 w.prompt_tokens.len(),
                                 w.max_new_tokens,
@@ -701,10 +865,12 @@ fn run(
             let ids: Vec<_> = sched.waiting.iter().map(|w| w.req_id).collect();
             for id in ids {
                 sched.cancel_request(id);
-                if let Some(r) = requests.remove(&id) {
-                    let _ = r
-                        .output
-                        .try_send(GenerationEvent::Error("state pool exhausted".into()));
+                if let Some(mut r) = requests.remove(&id) {
+                    let msg = "state pool exhausted".to_string();
+                    if let Some(tap) = r.decision_tap.take() {
+                        tap.fail(msg.clone());
+                    }
+                    let _ = r.output.try_send(GenerationEvent::Error(msg));
                 }
             }
         }
@@ -726,7 +892,10 @@ fn run(
             }
         }
         for (id, error) in failed {
-            if let Some(r) = requests.remove(&id) {
+            if let Some(mut r) = requests.remove(&id) {
+                if let Some(tap) = r.decision_tap.take() {
+                    tap.fail(error.clone());
+                }
                 let _ = r.output.try_send(GenerationEvent::Error(error));
             }
             release(&mut engine, sched.cancel_request(id));
@@ -965,7 +1134,10 @@ fn run(
             // GPU errors invalidate this batch; abort private state rather than publishing it.
             let ids: Vec<_> = sched.active.iter().map(|s| s.req_id).collect();
             for id in ids {
-                if let Some(r) = requests.remove(&id) {
+                if let Some(mut r) = requests.remove(&id) {
+                    if let Some(tap) = r.decision_tap.take() {
+                        tap.fail(error.clone());
+                    }
                     let _ = r.output.try_send(GenerationEvent::Error(error.clone()));
                 }
                 release(&mut engine, sched.cancel_request(id));
@@ -1029,7 +1201,10 @@ fn fail_request(
     id: u64,
     error: String,
 ) {
-    if let Some(r) = requests.remove(&id) {
+    if let Some(mut r) = requests.remove(&id) {
+        if let Some(tap) = r.decision_tap.take() {
+            tap.fail(error.clone());
+        }
         let _ = r.output.try_send(GenerationEvent::Error(error));
     }
     release(engine, sched.cancel_request(id));
@@ -1180,6 +1355,89 @@ fn step_plain(
     let greedy = engine
         .step_batch_slices_for_sampler_filtered(&batch, Some(&deltas), Some(&emit_mask), needs_gpu)
         .map_err(|e| e.to_string())?;
+    {
+        let mut batch_tok_offset = 0usize;
+        let mut selected_row_idx = 0usize;
+        for (i, s) in slices.iter().enumerate() {
+            let slice_len = s.query_tokens.len();
+            let is_selected = emit_mask[i];
+            let sel_row = selected_row_idx;
+            if is_selected {
+                selected_row_idx += 1;
+            }
+            let tok_off = batch_tok_offset;
+            batch_tok_offset += slice_len;
+
+            let cached_toks = sched
+                .active
+                .iter()
+                .find(|seq| seq.req_id == s.req_id)
+                .map_or(0, |seq| seq.cached_prefix_tokens);
+            let Some(req) = requests.get_mut(&s.req_id) else {
+                continue;
+            };
+            let mut tap_done = None;
+            match &mut req.decision_tap {
+                None => {}
+                Some(DecisionReadoutTap::CandidateLogits { token_ids, .. }) => {
+                    if is_selected {
+                        let res = engine
+                            .read_selected_row_candidate_logits(sel_row, token_ids)
+                            .map(|logits| DecisionTapOutput::CandidateLogits {
+                                logits,
+                                cached_tokens: cached_toks,
+                            })
+                            .map_err(|e| e.to_string());
+                        if let Some(DecisionReadoutTap::CandidateLogits { tx, .. }) =
+                            req.decision_tap.take()
+                        {
+                            tap_done = Some((tx, res));
+                        }
+                    }
+                }
+                Some(DecisionReadoutTap::HiddenPositions {
+                    positions,
+                    captured,
+                    ..
+                }) => {
+                    let chunk_start = s.ctx_len_before;
+                    let chunk_end = chunk_start + slice_len;
+                    let mut read_err = None;
+                    for (p_idx, &pos) in positions.iter().enumerate() {
+                        if (chunk_start..chunk_end).contains(&pos) {
+                            match engine.read_norm_hidden_row_f32(tok_off + (pos - chunk_start)) {
+                                Ok(row) => captured[p_idx] = Some(row),
+                                Err(e) => {
+                                    read_err = Some(e.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (read_err.is_some() || s.is_final_prefill_chunk)
+                        && let Some(DecisionReadoutTap::HiddenPositions {
+                            mut captured, tx, ..
+                        }) = req.decision_tap.take()
+                    {
+                        let res = if let Some(err) = read_err {
+                            Err(err)
+                        } else if captured.iter().all(Option::is_some) {
+                            Ok(DecisionTapOutput::HiddenRows {
+                                rows: captured.drain(..).map(Option::unwrap).collect(),
+                                cached_tokens: cached_toks,
+                            })
+                        } else {
+                            Err("kev: missing hidden position after final prefill chunk".into())
+                        };
+                        tap_done = Some((tx, res));
+                    }
+                }
+            }
+            if let Some((tx, res)) = tap_done {
+                let _ = tx.send(res);
+            }
+        }
+    }
     let mut pending_errors: Vec<Option<String>> = vec![None; slices.len()];
     let sampled = if needs_gpu {
         let _sampler_range = crate::profiling::Range::new(c"w34.serve.sampler");
@@ -1273,11 +1531,13 @@ fn step_plain(
             } else {
                 (greedy[i][0], None)
             };
-            if let Err(error) = r.sampler.try_commit_token_deferred(id) {
-                fail_request(engine, sched, requests, s.req_id, error);
-                continue;
+            if r.sampler.params.max_tokens > 0 {
+                if let Err(error) = r.sampler.try_commit_token_deferred(id) {
+                    fail_request(engine, sched, requests, s.req_id, error);
+                    continue;
+                }
+                emit(r, id, lp);
             }
-            emit(r, id, lp);
             Some(id)
         } else {
             None

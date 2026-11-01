@@ -12,6 +12,24 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Generative Serving APIs (`/v1/responses`, `/v1/messages`, token-count endpoints) & Decision-Model Serving (`/v1/systemone`, `/v1/decisions`)
+
+Full wire specifications are documented in [`docs/GENERATIVE_APIS.md`](GENERATIVE_APIS.md) and [`docs/DECISION_MODELS.md`](DECISION_MODELS.md):
+
+- **OpenAI Responses API (`crates/w34-host/src/responses_api.rs`, `server_http.rs`)**:
+  - `POST /v1/responses`, `GET /v1/responses/{response_id}`, `DELETE /v1/responses/{response_id}`, `POST /v1/responses/{response_id}/cancel`, `POST /v1/responses/input_tokens`, and `POST /responses/input_tokens` (plus `POST /v1/chat/completions/input_tokens` and `POST /chat/completions/input_tokens`).
+  - Supports multi-turn `previous_response_id` chaining via an explicit opt-in (`"store": true`, requiring a non-empty `Authorization` or `x-api-key` credential header) bounded `ResponseStore` using 128-bit CSPRNG `resp_<32 hex>` identifiers with per-credential scope partitioning and per-scope eviction quotas; 0-indexed monotonic `sequence_number` SSE streaming (`response.reasoning_text.*`, `response.output_text.*`, `response.function_call_arguments.*`); flat & nested `function` tools (`tool_choice: "none" | "auto" | "required" | named`); `reasoning.effort` (`"none"` vs thinking); `text.format` (`json_schema` / `json_object` via `llguidance` bitmasks); and multimodal `input_image`.
+- **Anthropic Messages API (`crates/w34-host/src/anthropic_api.rs`, `server_http.rs`)**:
+  - `POST /v1/messages` (sync JSON + typed Anthropic SSE `message_start` → `content_block_start/delta/stop` for `thinking`, `text`, and `input_json_delta` `tool_use` → `message_delta` → `message_stop`) and `POST /v1/messages/count_tokens`.
+  - Translates `thinking: {type: "enabled"|"adaptive"|"disabled", budget_tokens}`, `tool_choice: {type: "auto"|"any"|"tool"|"none"}` (preserving stateful `<tool_call>` ban bitmask on `"none"`), multi-turn `tool_use` / `tool_result` + base64 `image` blocks, `usage.input_tokens = prompt_tokens - cache_read_input_tokens`, and strips volatile `x-anthropic-billing-header: ... cch=<hex>;` hashes to preserve `MambaRadixCache` prefix hits.
+- **Decision-Model Serving (`crates/w34-host/src/decision.rs`, `model.rs`, `engine_worker.rs`, `scheduler.rs`, `server_http.rs`)**:
+  - `POST /v1/systemone` (`/systemone`) and `POST /v1/decisions` (`/decisions`) supporting `KevModel` (`head.safetensors` `PointerHead` over post-final-`GemmaRMSNorm` `<|box_end|>` / `<|fim_suffix|>` hidden states), `NimbleModel` (`SafeJson`, `nimble_temperature`), `Tev1` (default Qwen3.5 generative scorer, 2–24 options `A..X`), `OpenJev` (`A..Z, a..z`, `noul` `true`-first), and `XorModel` / `LevModel` (forward+reverse option-order calibration + 9-level `noul` scale).
+  - Escapes ChatML/Qwen special-token delimiters inside untrusted `state`/question JSON (`\u003c` / `\u003e` and `<¦...¦>`) while preserving byte-for-byte donor prompt & token-ID golden parity (`kev_head_goldens.inc`, `nimble_goldens.inc`, `tev1_goldens.inc`).
+  - Wires `SchedulerV1` `mamba_branching_seqlen` `C = 64`-aligned intermediate checkpoint donation so Query 0 donates the exact shared `state` prefix into `MambaRadixCache` and subsequent decision sub-queries reuse cached KV + GDN `StateBundle` checkpoints in zero-decode (`max_new_tokens == 0`) waves.
+  - Verified by CPU unit tests (`decision::tests::*`, `responses_api::tests::*`, `anthropic_api::tests::*`) and live GPU HTTP+SSE integration suites `crates/w34-host/tests/generative_apis.rs` and `crates/w34-host/tests/decision_models.rs`.
+
+---
+
 ## Long-context optimization round qualified — beats `vLLM 0.31.0` & `SGLang v0.5.19` across all 9B TP=1 and 27B TP=2 cases, retains 1-GPU 27B 262K HTTP & needle
 
 All six candidate suites completed serially with `exit=0` on a single frozen release binary (`crates_tree_sha256=e1b67ef230877a0facb487401ab037c3ba15660c5e969444b782bfadfc6350e0`, `w34` `binary_sha256=b125f589aa1f567420f6ce11e0a713db1e4dd1e202ca3df45bb6f648f12fcb4b`, `needle_gate` `d347dde3399f0e73827ab6f88361c424564b667b5af08fdd5cd1a87963bab6c3`, recorded in `benchmarks/perf/results/goal-provenance.json` and indexed in `benchmarks/perf/campaigns/longctx-coding-agent.results.json`; report in `benchmarks/perf/campaigns/longctx-coding-agent.md`):

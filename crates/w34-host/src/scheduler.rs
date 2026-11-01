@@ -92,6 +92,8 @@ pub struct WaitingReq {
     pub stop_token_ids: Vec<i32>,
     pub eos_token_ids: Vec<i32>,
     pub custom_prefill: bool,
+    pub max_prefix_lookup_len: Option<usize>,
+    pub mamba_branching_seqlen: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +108,7 @@ pub struct SeqEntry {
     pub stop_token_ids: Vec<i32>,
     pub eos_token_ids: Vec<i32>,
     pub custom_prefill: bool,
+    pub mamba_branching_seqlen: Option<usize>,
     /// Number of prompt tokens already processed into KV + GDN state.
     pub prefilled_tokens: usize,
     /// Number of prompt tokens restored from `MambaRadixCache` on arrival.
@@ -218,6 +221,60 @@ impl SchedulerV1 {
         eos_token_ids: Vec<i32>,
         custom_prefill: bool,
     ) -> u64 {
+        self.submit_request_with_prefix_cap(
+            prompt_tokens,
+            radix_key_tokens,
+            max_new_tokens,
+            min_tokens,
+            ignore_eos,
+            stop_token_ids,
+            eos_token_ids,
+            custom_prefill,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_request_with_prefix_cap(
+        &mut self,
+        prompt_tokens: Vec<i32>,
+        radix_key_tokens: Vec<i32>,
+        max_new_tokens: usize,
+        min_tokens: usize,
+        ignore_eos: bool,
+        stop_token_ids: Vec<i32>,
+        eos_token_ids: Vec<i32>,
+        custom_prefill: bool,
+        max_prefix_lookup_len: Option<usize>,
+    ) -> u64 {
+        self.submit_request_with_prefix_options(
+            prompt_tokens,
+            radix_key_tokens,
+            max_new_tokens,
+            min_tokens,
+            ignore_eos,
+            stop_token_ids,
+            eos_token_ids,
+            custom_prefill,
+            max_prefix_lookup_len,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_request_with_prefix_options(
+        &mut self,
+        prompt_tokens: Vec<i32>,
+        radix_key_tokens: Vec<i32>,
+        max_new_tokens: usize,
+        min_tokens: usize,
+        ignore_eos: bool,
+        stop_token_ids: Vec<i32>,
+        eos_token_ids: Vec<i32>,
+        custom_prefill: bool,
+        max_prefix_lookup_len: Option<usize>,
+        mamba_branching_seqlen: Option<usize>,
+    ) -> u64 {
         assert!(
             !prompt_tokens.is_empty() && prompt_tokens.len() == radix_key_tokens.len(),
             "prompt_tokens and radix_key_tokens must be non-empty and equal length"
@@ -234,6 +291,8 @@ impl SchedulerV1 {
             stop_token_ids,
             eos_token_ids,
             custom_prefill,
+            max_prefix_lookup_len,
+            mamba_branching_seqlen,
         });
         id
     }
@@ -268,7 +327,10 @@ impl SchedulerV1 {
             // (e.g. 262K single-GPU serving) never evict the checkpoint this request itself
             // is about to resume from; release the pin immediately and fall back to cold
             // eviction only when a minimal 3-slot pool has no fourth slot.
-            let lookup_len = w.radix_key_tokens.len().saturating_sub(1);
+            let default_lookup = w.radix_key_tokens.len().saturating_sub(1);
+            let lookup_len = w
+                .max_prefix_lookup_len
+                .map_or(default_lookup, |cap| cap.min(default_lookup));
             let raw_hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
             let mut match_res = if raw_hit.matched_tokens > 0
                 && !allow_prefix_hit(w.req_id, &w.prompt_tokens, raw_hit.matched_tokens)
@@ -317,6 +379,9 @@ impl SchedulerV1 {
                 stop_token_ids: w.stop_token_ids,
                 eos_token_ids: w.eos_token_ids,
                 custom_prefill: w.custom_prefill,
+                mamba_branching_seqlen: w
+                    .mamba_branching_seqlen
+                    .or(match_res.mamba_branching_seqlen),
                 prefilled_tokens: match_res.matched_tokens,
                 cached_prefix_tokens: match_res.matched_tokens,
                 radix_state,
@@ -394,7 +459,14 @@ impl SchedulerV1 {
                 prefill_budget
             };
             pending_prefills -= 1;
-            let max_take = rem.min(self.cfg.chunk_prefill_size).min(share);
+            let mut max_take = rem.min(self.cfg.chunk_prefill_size).min(share);
+            if let Some(branch_end) = seq.mamba_branching_seqlen {
+                let aligned_branch =
+                    (branch_end / self.cfg.mamba_chunk_size) * self.cfg.mamba_chunk_size;
+                if aligned_branch > start && aligned_branch < seq.prompt_tokens.len() {
+                    max_take = max_take.min(aligned_branch - start);
+                }
+            }
             if max_take == 0 {
                 continue;
             }
@@ -459,12 +531,14 @@ impl SchedulerV1 {
             seq.prefilled_tokens += slice.query_tokens.len();
         }
         if let Some(tok) = emitted_token {
-            seq.generated_tokens.push(tok);
-            if seq.max_new_tokens == 0
-                || seq.generated_tokens.len() >= seq.max_new_tokens
-                || seq.should_stop_on_token(tok)
-            {
+            if seq.max_new_tokens == 0 {
                 seq.finished = true;
+            } else {
+                seq.generated_tokens.push(tok);
+                if seq.generated_tokens.len() >= seq.max_new_tokens || seq.should_stop_on_token(tok)
+                {
+                    seq.finished = true;
+                }
             }
         }
 
@@ -562,6 +636,7 @@ mod tests {
             stop_token_ids: vec![99],
             eos_token_ids: vec![151643],
             custom_prefill: false,
+            mamba_branching_seqlen: None,
             prefilled_tokens: 3,
             cached_prefix_tokens: 0,
             radix_state: ReqRadixState::new(16, 64, 0, [1, 2]),

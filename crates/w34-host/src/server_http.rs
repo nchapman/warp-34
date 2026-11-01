@@ -8,7 +8,7 @@ use crate::{
 use axum::{
     Json, Router,
     body::to_bytes,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     response::{
         IntoResponse, Response, Sse,
@@ -46,6 +46,7 @@ pub struct OpenAiServerState {
     pub worker: EngineWorker,
     pub metrics: ServerMetrics,
     pub allow_remote_images: bool,
+    pub response_store: crate::responses_api::ResponseStore,
     constraint_factory: Option<crate::constraints::ConstraintFactory>,
     decoded_vocab: Vec<std::sync::OnceLock<Box<str>>>,
     preprocessing: Arc<Semaphore>,
@@ -97,6 +98,7 @@ impl OpenAiServerState {
             model_name,
             worker,
             allow_remote_images,
+            response_store: crate::responses_api::ResponseStore::default(),
             constraint_factory,
             decoded_vocab,
             metrics: ServerMetrics::default(),
@@ -131,7 +133,23 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/chat/completions/input_tokens", post(chat_input_tokens))
+        .route("/chat/completions/input_tokens", post(chat_input_tokens))
         .route("/v1/completions", post(completion))
+        .route("/v1/responses", post(responses_create))
+        .route("/v1/responses/input_tokens", post(responses_input_tokens))
+        .route("/responses/input_tokens", post(responses_input_tokens))
+        .route(
+            "/v1/responses/{response_id}",
+            get(responses_get).delete(responses_delete),
+        )
+        .route("/v1/responses/{response_id}/cancel", post(responses_cancel))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
+        .route("/v1/systemone", post(systemone_decide))
+        .route("/systemone", post(systemone_decide))
+        .route("/v1/decisions", post(decisions_adapter))
+        .route("/decisions", post(decisions_adapter))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
         .with_state(state)
 }
@@ -522,11 +540,21 @@ struct StopBuffer {
 }
 impl StopBuffer {
     fn push(&mut self, chunk: &str, stops: &[String]) -> (String, bool) {
+        let (text, matched) = self.push_matched(chunk, stops);
+        (text, matched.is_some())
+    }
+
+    fn push_matched(&mut self, chunk: &str, stops: &[String]) -> (String, Option<String>) {
         self.pending.push_str(chunk);
-        if let Some(pos) = stops.iter().filter_map(|s| self.pending.find(s)).min() {
+        if let Some((pos, matched)) = stops
+            .iter()
+            .filter_map(|s| self.pending.find(s).map(|p| (p, s)))
+            .min_by_key(|(p, _)| *p)
+        {
+            let matched = matched.clone();
             let text = self.pending[..pos].to_owned();
             self.pending.clear();
-            return (text, true);
+            return (text, Some(matched));
         }
         let hold = stops
             .iter()
@@ -542,7 +570,7 @@ impl StopBuffer {
             .unwrap_or(0);
         let split = self.pending.len() - hold;
         let rest = self.pending.split_off(split);
-        (std::mem::replace(&mut self.pending, rest), false)
+        (std::mem::replace(&mut self.pending, rest), None)
     }
 }
 fn delta_value(d: StreamParseDelta, tool_index: &mut usize) -> Value {
@@ -694,6 +722,1103 @@ fn output_stream(
             else { json!({"index":0,"text":text,"finish_reason":finish,"logprobs":lp}) };
         yield Output::Complete(json!({"id":id,"object":if chat {"chat.completion"} else {"text_completion"},"created":created,"model":s.model_name,"choices":[choice],"usage":{"prompt_tokens":prompt_len,"completion_tokens":count,"total_tokens":prompt_len+count,"prompt_tokens_details":{"cached_tokens":cached}}}));
     }
+}
+
+fn responses_api_err(err: crate::responses_api::ResponsesApiError) -> ApiError {
+    let status = match err.kind {
+        crate::responses_api::ResponsesErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+        crate::responses_api::ResponsesErrorKind::NotFound => StatusCode::NOT_FOUND,
+    };
+    (status, Json(err.to_openai_json()))
+}
+
+fn anthropic_api_err(status: StatusCode, err: crate::anthropic_api::AnthropicApiError) -> ApiError {
+    (status, Json(err.to_json()))
+}
+
+fn to_anthropic_err((status, Json(body)): ApiError) -> ApiError {
+    let msg = body
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("request failed")
+        .to_owned();
+    let err_type = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            crate::anthropic_api::AnthropicErrorType::Authentication
+        }
+        StatusCode::NOT_FOUND => crate::anthropic_api::AnthropicErrorType::NotFound,
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+            crate::anthropic_api::AnthropicErrorType::Overloaded
+        }
+        s if s.is_client_error() => crate::anthropic_api::AnthropicErrorType::InvalidRequest,
+        _ => crate::anthropic_api::AnthropicErrorType::Api,
+    };
+    (
+        status,
+        Json(
+            crate::anthropic_api::AnthropicApiError {
+                error_type: err_type,
+                message: msg,
+            }
+            .to_json(),
+        ),
+    )
+}
+
+struct ActiveResponseGuard {
+    state: Arc<OpenAiServerState>,
+    id: String,
+}
+impl Drop for ActiveResponseGuard {
+    fn drop(&mut self) {
+        self.state.response_store.unregister_active(&self.id);
+    }
+}
+
+async fn chat_input_tokens(
+    State(s): State<Arc<OpenAiServerState>>,
+    req: Request,
+) -> Result<Json<Value>, ApiError> {
+    let _admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| busy())?;
+    let mut body = read_json(&s, req).await?;
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("max_tokens");
+        obj.remove("max_completion_tokens");
+    }
+    let prep_state = s.clone();
+    let count = cpu(&s, move || {
+        prepare(&prep_state, body, true).map(|p| p.prompt.len())
+    })
+    .await?;
+    Ok(Json(json!({
+        "object": "response.input_tokens",
+        "input_tokens": count,
+    })))
+}
+
+fn responses_caller_scope(
+    s: &OpenAiServerState,
+    headers: &axum::http::HeaderMap,
+) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .or_else(|| headers.get("x-api-key"))
+        .map(|v| v.as_bytes());
+    s.response_store.scope_for_credential(raw)
+}
+
+async fn responses_input_tokens(
+    State(s): State<Arc<OpenAiServerState>>,
+    req: Request,
+) -> Result<Json<Value>, ApiError> {
+    let _admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| busy())?;
+    let caller_scope = responses_caller_scope(&s, req.headers());
+    let mut body = read_json(&s, req).await?;
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("max_output_tokens");
+        obj.remove("max_tokens");
+    }
+    let (chat_req, _) = crate::responses_api::translate_responses_to_chat(
+        &body,
+        &s.model_name,
+        &s.response_store,
+        caller_scope.as_deref(),
+        0,
+    )
+    .map_err(responses_api_err)?;
+    let prep_state = s.clone();
+    let count = cpu(&s, move || {
+        prepare(&prep_state, chat_req, true).map(|p| p.prompt.len())
+    })
+    .await?;
+    Ok(Json(json!({
+        "object": "response.input_tokens",
+        "input_tokens": count,
+    })))
+}
+
+async fn anthropic_count_tokens(
+    State(s): State<Arc<OpenAiServerState>>,
+    req: Request,
+) -> Result<Json<Value>, ApiError> {
+    let _admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| to_anthropic_err(busy()))?;
+    let body = read_json(&s, req).await.map_err(to_anthropic_err)?;
+    let (mut chat_req, _) =
+        crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, 0, false)
+            .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
+    if let Some(obj) = chat_req.as_object_mut() {
+        obj.insert("max_tokens".into(), json!(256));
+    }
+    let prep_state = s.clone();
+    let count = cpu(&s, move || {
+        prepare(&prep_state, chat_req, true).map(|p| p.prompt.len())
+    })
+    .await
+    .map_err(to_anthropic_err)?;
+    Ok(Json(json!({
+        "input_tokens": count,
+    })))
+}
+
+async fn responses_get(
+    State(s): State<Arc<OpenAiServerState>>,
+    headers: axum::http::HeaderMap,
+    Path(response_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let not_found = || {
+        responses_api_err(crate::responses_api::ResponsesApiError::not_found(format!(
+            "response '{response_id}' not found"
+        )))
+    };
+    let caller_scope = responses_caller_scope(&s, &headers).ok_or_else(not_found)?;
+    s.response_store
+        .get_response(&response_id, &caller_scope)
+        .map(Json)
+        .ok_or_else(not_found)
+}
+
+async fn responses_delete(
+    State(s): State<Arc<OpenAiServerState>>,
+    headers: axum::http::HeaderMap,
+    Path(response_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let not_found = || {
+        responses_api_err(crate::responses_api::ResponsesApiError::not_found(format!(
+            "response '{response_id}' not found"
+        )))
+    };
+    let caller_scope = responses_caller_scope(&s, &headers).ok_or_else(not_found)?;
+    if s.response_store.delete(&response_id, &caller_scope) {
+        Ok(Json(json!({
+            "id": response_id,
+            "object": "response.deleted",
+            "deleted": true,
+        })))
+    } else {
+        Err(not_found())
+    }
+}
+
+async fn responses_cancel(
+    State(s): State<Arc<OpenAiServerState>>,
+    headers: axum::http::HeaderMap,
+    Path(response_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let not_found = || {
+        responses_api_err(crate::responses_api::ResponsesApiError::not_found(format!(
+            "response '{response_id}' not found"
+        )))
+    };
+    let caller_scope = responses_caller_scope(&s, &headers).ok_or_else(not_found)?;
+    s.response_store
+        .cancel(&response_id, &caller_scope)
+        .map(Json)
+        .ok_or_else(not_found)
+}
+
+fn count_reasoning_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    turn: &crate::parser::ParsedAssistantTurn,
+    output_tokens: usize,
+) -> usize {
+    match turn.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+        None => 0,
+        Some(text) => tokenizer
+            .encode(text, false)
+            .map(|e| e.len().min(output_tokens))
+            .unwrap_or(0),
+    }
+}
+
+async fn responses_create(
+    State(s): State<Arc<OpenAiServerState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| busy())?;
+    let start = Instant::now();
+    let caller_scope = responses_caller_scope(&s, request.headers());
+    let body = read_json(&s, request).await?;
+    let request_id = s.metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
+    let (chat_req, meta) = crate::responses_api::translate_responses_to_chat(
+        &body,
+        &s.model_name,
+        &s.response_store,
+        caller_scope.as_deref(),
+        request_id,
+    )
+    .map_err(responses_api_err)?;
+    let prep_state = s.clone();
+    let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true)).await?;
+    let prompt_len = prepared.prompt.len();
+    let generation = s
+        .worker
+        .submit_with_images(
+            prepared.prompt,
+            prepared.images,
+            prepared.params.clone(),
+            prepared.constraint,
+        )
+        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    if let Some(ref scope) = caller_scope {
+        s.response_store.register_active(
+            meta.response_id.clone(),
+            scope.clone(),
+            generation.cancel_handle(),
+        );
+    }
+    let active_guard = ActiveResponseGuard {
+        state: s.clone(),
+        id: meta.response_id.clone(),
+    };
+    s.metrics
+        .prompt_tokens_total
+        .fetch_add(prompt_len as u64, Ordering::Relaxed);
+
+    if meta.stream {
+        let params = prepared.params;
+        let thinking = prepared.thinking;
+        let events = async_stream::stream! {
+            let _admission = admission;
+            let _active_guard = active_guard;
+            let tokenizer = s.worker.tokenizer.as_ref().unwrap();
+            let mut decoder = tokenizer.decode_stream(false);
+            let mut parser = Qwen3Parser::new(thinking);
+            let mut stops = StopBuffer::default();
+            let mut sse = crate::responses_api::ResponsesSseFormatter::new(meta.clone());
+            let mut generation = generation;
+            let mut count = 0usize;
+            let mut cached = 0usize;
+            let mut done = false;
+            let mut stopped = false;
+            let mut last_token = Instant::now();
+
+            for (ev_name, payload) in sse.start() {
+                yield Ok::<_, Infallible>(Event::default().event(ev_name).data(payload.to_string()));
+            }
+
+            while let Some(event) = generation.events.recv().await {
+                match event {
+                    GenerationEvent::Token { id, .. } => {
+                        count += 1;
+                        s.metrics.tokens_generated_total.fetch_add(1, Ordering::Relaxed);
+                        if count == 1 {
+                            s.metrics.last_ttft_us.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        } else {
+                            s.metrics.last_itl_us.store(last_token.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        last_token = Instant::now();
+                        if count >= params.min_tokens && params.is_stop_or_eos(id, &s.worker.eos_token_ids) {
+                            stopped = true;
+                            continue;
+                        }
+                        let decoded = match decoder.step(id as u32) {
+                            Ok(Some(t)) => t,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                for (ev_name, payload) in sse.fail(&e.to_string()) {
+                                    yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                                }
+                                return;
+                            }
+                        };
+                        let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
+                        let (visible, matched) = stops.push(&decoded, active_stops);
+                        for (ev_name, payload) in sse.push_delta(parser.push_str(&visible)) {
+                            yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                        }
+                        if matched {
+                            stopped = true;
+                            done = true;
+                            break;
+                        }
+                    }
+                    GenerationEvent::Finished { cached_tokens, .. } => {
+                        cached = cached_tokens;
+                        done = true;
+                        break;
+                    }
+                    GenerationEvent::Error(message) => {
+                        for (ev_name, payload) in sse.fail(&message) {
+                            yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                        }
+                        return;
+                    }
+                }
+            }
+            cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+            drop(generation);
+            if !done {
+                for (ev_name, payload) in sse.fail("engine stream closed before completion") {
+                    yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                }
+                return;
+            }
+            let tail = std::mem::take(&mut stops.pending);
+            if !tail.is_empty() {
+                for (ev_name, payload) in sse.push_delta(parser.push_str(&tail)) {
+                    yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                }
+            }
+            let (tail_delta, turn) = parser.finish();
+            for (ev_name, payload) in sse.push_delta(tail_delta) {
+                yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+            }
+            let finish = if !turn.tool_calls.is_empty() {
+                "tool_calls"
+            } else if !stopped && count >= params.max_tokens {
+                "length"
+            } else {
+                "stop"
+            };
+            s.metrics.cached_prompt_tokens_total.fetch_add(cached as u64, Ordering::Relaxed);
+            let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
+            let (end_frames, final_resp, history) =
+                sse.finish(&turn, finish, prompt_len, cached, count, reasoning_tokens);
+            if meta.store
+                && let Some(ref scope) = caller_scope
+            {
+                s.response_store.insert(crate::responses_api::StoredResponse {
+                    id: meta.response_id.clone(),
+                    owner_scope: scope.clone(),
+                    response: final_resp,
+                    history_messages: history,
+                });
+            }
+            for (ev_name, payload) in end_frames {
+                yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+            }
+        };
+        Ok(Sse::new(events)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response())
+    } else {
+        let _admission = admission;
+        let _active_guard = active_guard;
+        let tokenizer = s.worker.tokenizer.as_ref().unwrap();
+        let mut decoder = tokenizer.decode_stream(false);
+        let mut parser = Qwen3Parser::new(prepared.thinking);
+        let mut stops = StopBuffer::default();
+        let mut generation = generation;
+        let mut count = 0usize;
+        let mut cached = 0usize;
+        let mut done = false;
+        let mut stopped = false;
+        let mut last_token = Instant::now();
+
+        while let Some(event) = generation.events.recv().await {
+            match event {
+                GenerationEvent::Token { id, .. } => {
+                    count += 1;
+                    s.metrics
+                        .tokens_generated_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if count == 1 {
+                        s.metrics
+                            .last_ttft_us
+                            .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    } else {
+                        s.metrics
+                            .last_itl_us
+                            .store(last_token.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    last_token = Instant::now();
+                    if count >= prepared.params.min_tokens
+                        && prepared.params.is_stop_or_eos(id, &s.worker.eos_token_ids)
+                    {
+                        stopped = true;
+                        continue;
+                    }
+                    let decoded = match decoder.step(id as u32) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => continue,
+                        Err(e) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, e)),
+                    };
+                    let active_stops = if count >= prepared.params.min_tokens {
+                        prepared.params.stop_strings.as_slice()
+                    } else {
+                        &[]
+                    };
+                    let (visible, matched) = stops.push(&decoded, active_stops);
+                    let _ = parser.push_str(&visible);
+                    if matched {
+                        stopped = true;
+                        done = true;
+                        break;
+                    }
+                }
+                GenerationEvent::Finished { cached_tokens, .. } => {
+                    cached = cached_tokens;
+                    done = true;
+                    break;
+                }
+                GenerationEvent::Error(message) => {
+                    return Err(error(StatusCode::INTERNAL_SERVER_ERROR, message));
+                }
+            }
+        }
+        cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+        drop(generation);
+        if !done {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "engine stream closed before completion",
+            ));
+        }
+        let tail = std::mem::take(&mut stops.pending);
+        if !tail.is_empty() {
+            let _ = parser.push_str(&tail);
+        }
+        let (_, turn) = parser.finish();
+        let finish = if !turn.tool_calls.is_empty() {
+            "tool_calls"
+        } else if !stopped && count >= prepared.params.max_tokens {
+            "length"
+        } else {
+            "stop"
+        };
+        s.metrics
+            .cached_prompt_tokens_total
+            .fetch_add(cached as u64, Ordering::Relaxed);
+        let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
+        let (resp, history) = crate::responses_api::build_response_object(
+            &meta,
+            &turn,
+            finish,
+            prompt_len,
+            cached,
+            count,
+            reasoning_tokens,
+        );
+        if meta.store
+            && let Some(scope) = caller_scope
+        {
+            s.response_store
+                .insert(crate::responses_api::StoredResponse {
+                    id: meta.response_id.clone(),
+                    owner_scope: scope,
+                    response: resp.clone(),
+                    history_messages: history,
+                });
+        }
+        Ok(Json(resp).into_response())
+    }
+}
+
+async fn anthropic_messages(
+    State(s): State<Arc<OpenAiServerState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| to_anthropic_err(busy()))?;
+    let start = Instant::now();
+    let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
+    let request_id = s.metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
+    let (chat_req, meta) =
+        crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
+            .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
+    let prep_state = s.clone();
+    let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true))
+        .await
+        .map_err(to_anthropic_err)?;
+    let prompt_len = prepared.prompt.len();
+    let generation = s
+        .worker
+        .submit_with_images(
+            prepared.prompt,
+            prepared.images,
+            prepared.params.clone(),
+            prepared.constraint,
+        )
+        .map_err(|e| {
+            anthropic_api_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::anthropic_api::AnthropicApiError::overloaded(e),
+            )
+        })?;
+    s.metrics
+        .prompt_tokens_total
+        .fetch_add(prompt_len as u64, Ordering::Relaxed);
+
+    if meta.stream {
+        let params = prepared.params;
+        let thinking = prepared.thinking;
+        let events = async_stream::stream! {
+            let _admission = admission;
+            let tokenizer = s.worker.tokenizer.as_ref().unwrap();
+            let mut decoder = tokenizer.decode_stream(false);
+            let mut parser = Qwen3Parser::new(thinking);
+            let mut stops = StopBuffer::default();
+            let mut sse = crate::anthropic_api::AnthropicSseFormatter::new(meta, prompt_len);
+            let mut generation = generation;
+            let mut count = 0usize;
+            let mut cached = 0usize;
+            let mut done = false;
+            let mut stopped = false;
+            let mut matched_stop: Option<String> = None;
+            let mut last_token = Instant::now();
+
+            while let Some(event) = generation.events.recv().await {
+                match event {
+                    GenerationEvent::Token { id, .. } => {
+                        count += 1;
+                        s.metrics.tokens_generated_total.fetch_add(1, Ordering::Relaxed);
+                        if count == 1 {
+                            s.metrics.last_ttft_us.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        } else {
+                            s.metrics.last_itl_us.store(last_token.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        last_token = Instant::now();
+                        cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+                        for (ev_name, payload) in sse.ensure_started(cached) {
+                            yield Ok::<_, Infallible>(Event::default().event(ev_name).data(payload.to_string()));
+                        }
+                        if count >= params.min_tokens && params.is_stop_or_eos(id, &s.worker.eos_token_ids) {
+                            stopped = true;
+                            continue;
+                        }
+                        let decoded = match decoder.step(id as u32) {
+                            Ok(Some(t)) => t,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&e.to_string());
+                                yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                                return;
+                            }
+                        };
+                        let active_stops = if count >= params.min_tokens { params.stop_strings.as_slice() } else { &[] };
+                        let (visible, m_stop) = stops.push_matched(&decoded, active_stops);
+                        for (ev_name, payload) in sse.push_delta(parser.push_str(&visible), cached) {
+                            yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                        }
+                        if let Some(seq) = m_stop {
+                            matched_stop = Some(seq);
+                            stopped = true;
+                            done = true;
+                            break;
+                        }
+                    }
+                    GenerationEvent::Finished { cached_tokens, .. } => {
+                        cached = cached.max(cached_tokens);
+                        done = true;
+                        break;
+                    }
+                    GenerationEvent::Error(message) => {
+                        let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&message);
+                        yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                        return;
+                    }
+                }
+            }
+            cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+            drop(generation);
+            if !done {
+                let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(
+                    "engine stream closed before completion",
+                );
+                yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                return;
+            }
+            let tail = std::mem::take(&mut stops.pending);
+            if !tail.is_empty() {
+                for (ev_name, payload) in sse.push_delta(parser.push_str(&tail), cached) {
+                    yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+                }
+            }
+            let (tail_delta, turn) = parser.finish();
+            for (ev_name, payload) in sse.push_delta(tail_delta, cached) {
+                yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+            }
+            let finish = if !turn.tool_calls.is_empty() {
+                "tool_calls"
+            } else if !stopped && count >= params.max_tokens {
+                "length"
+            } else {
+                "stop"
+            };
+            s.metrics.cached_prompt_tokens_total.fetch_add(cached as u64, Ordering::Relaxed);
+            for (ev_name, payload) in sse.finish(&turn, finish, matched_stop.as_deref(), cached, count) {
+                yield Ok(Event::default().event(ev_name).data(payload.to_string()));
+            }
+        };
+        Ok(Sse::new(events)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response())
+    } else {
+        let _admission = admission;
+        let tokenizer = s.worker.tokenizer.as_ref().unwrap();
+        let mut decoder = tokenizer.decode_stream(false);
+        let mut parser = Qwen3Parser::new(prepared.thinking);
+        let mut stops = StopBuffer::default();
+        let mut generation = generation;
+        let mut count = 0usize;
+        let mut cached = 0usize;
+        let mut done = false;
+        let mut stopped = false;
+        let mut matched_stop: Option<String> = None;
+        let mut last_token = Instant::now();
+
+        while let Some(event) = generation.events.recv().await {
+            match event {
+                GenerationEvent::Token { id, .. } => {
+                    count += 1;
+                    s.metrics
+                        .tokens_generated_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if count == 1 {
+                        s.metrics
+                            .last_ttft_us
+                            .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    } else {
+                        s.metrics
+                            .last_itl_us
+                            .store(last_token.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    last_token = Instant::now();
+                    if count >= prepared.params.min_tokens
+                        && prepared.params.is_stop_or_eos(id, &s.worker.eos_token_ids)
+                    {
+                        stopped = true;
+                        continue;
+                    }
+                    let decoded = match decoder.step(id as u32) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            return Err(anthropic_api_err(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                crate::anthropic_api::AnthropicApiError::api_error(e.to_string()),
+                            ));
+                        }
+                    };
+                    let active_stops = if count >= prepared.params.min_tokens {
+                        prepared.params.stop_strings.as_slice()
+                    } else {
+                        &[]
+                    };
+                    let (visible, m_stop) = stops.push_matched(&decoded, active_stops);
+                    let _ = parser.push_str(&visible);
+                    if let Some(seq) = m_stop {
+                        matched_stop = Some(seq);
+                        stopped = true;
+                        done = true;
+                        break;
+                    }
+                }
+                GenerationEvent::Finished { cached_tokens, .. } => {
+                    cached = cached_tokens;
+                    done = true;
+                    break;
+                }
+                GenerationEvent::Error(message) => {
+                    return Err(anthropic_api_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        crate::anthropic_api::AnthropicApiError::api_error(message),
+                    ));
+                }
+            }
+        }
+        cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
+        drop(generation);
+        if !done {
+            return Err(anthropic_api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::anthropic_api::AnthropicApiError::api_error(
+                    "engine stream closed before completion",
+                ),
+            ));
+        }
+        let tail = std::mem::take(&mut stops.pending);
+        if !tail.is_empty() {
+            let _ = parser.push_str(&tail);
+        }
+        let (_, turn) = parser.finish();
+        let finish = if !turn.tool_calls.is_empty() {
+            "tool_calls"
+        } else if !stopped && count >= prepared.params.max_tokens {
+            "length"
+        } else {
+            "stop"
+        };
+        s.metrics
+            .cached_prompt_tokens_total
+            .fetch_add(cached as u64, Ordering::Relaxed);
+        let msg = crate::anthropic_api::build_anthropic_message(
+            &meta,
+            &turn,
+            finish,
+            matched_stop.as_deref(),
+            prompt_len,
+            cached,
+            count,
+        );
+        Ok(Json(msg).into_response())
+    }
+}
+
+fn decision_err(err: crate::decision::DecisionError) -> ApiError {
+    if err.is_bad_request {
+        bad(err.message)
+    } else {
+        error(StatusCode::INTERNAL_SERVER_ERROR, err.message)
+    }
+}
+
+fn shared_mamba_branch_hint<'a>(
+    first: &[i32],
+    others: impl IntoIterator<Item = &'a [i32]>,
+    cap: Option<usize>,
+) -> Option<usize> {
+    let mut lcp = first.len();
+    if let Some(c) = cap {
+        lcp = lcp.min(c);
+    }
+    let mut has_other = false;
+    for other in others {
+        has_other = true;
+        let common = first[..lcp]
+            .iter()
+            .zip(other.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        lcp = lcp.min(common);
+    }
+    if !has_other {
+        return None;
+    }
+    let aligned = (lcp / 64) * 64;
+    (aligned >= 64 && aligned < first.len()).then_some(aligned)
+}
+
+async fn run_one_candidate_query(
+    s: Arc<OpenAiServerState>,
+    prompt: Vec<i32>,
+    cands: Vec<i32>,
+    branch_hint: Option<usize>,
+) -> Result<(Vec<f64>, usize), ApiError> {
+    let (mut stream, rx) = s
+        .worker
+        .submit_decision_candidate_logits(prompt, cands, branch_hint)
+        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let tap = rx
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut cached_done = 0usize;
+    while let Some(ev) = stream.events.recv().await {
+        match ev {
+            GenerationEvent::Finished { cached_tokens, .. } => {
+                cached_done = cached_tokens;
+                break;
+            }
+            GenerationEvent::Error(msg) => {
+                return Err(error(StatusCode::INTERNAL_SERVER_ERROR, msg));
+            }
+            GenerationEvent::Token { .. } => {}
+        }
+    }
+    match tap {
+        crate::engine_worker::DecisionTapOutput::CandidateLogits {
+            logits,
+            cached_tokens,
+        } => Ok((logits, cached_tokens.max(cached_done))),
+        crate::engine_worker::DecisionTapOutput::HiddenRows { .. } => Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected decision tap variant",
+        )),
+    }
+}
+
+async fn run_one_hidden_query(
+    s: Arc<OpenAiServerState>,
+    prompt: Vec<i32>,
+    positions: Vec<usize>,
+    prefix_cap: Option<usize>,
+    branch_hint: Option<usize>,
+) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+    let (mut stream, rx) = s
+        .worker
+        .submit_decision_hidden_positions(prompt, positions, prefix_cap, branch_hint)
+        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+    let tap = rx
+        .await
+        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
+        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut cached_done = 0usize;
+    while let Some(ev) = stream.events.recv().await {
+        match ev {
+            GenerationEvent::Finished { cached_tokens, .. } => {
+                cached_done = cached_tokens;
+                break;
+            }
+            GenerationEvent::Error(msg) => {
+                return Err(error(StatusCode::INTERNAL_SERVER_ERROR, msg));
+            }
+            GenerationEvent::Token { .. } => {}
+        }
+    }
+    match tap {
+        crate::engine_worker::DecisionTapOutput::HiddenRows {
+            rows,
+            cached_tokens,
+        } => Ok((rows, cached_tokens.max(cached_done))),
+        crate::engine_worker::DecisionTapOutput::CandidateLogits { .. } => Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected decision tap variant",
+        )),
+    }
+}
+
+async fn run_candidate_queries_radix_shared(
+    s: &Arc<OpenAiServerState>,
+    queries: Vec<(Vec<i32>, Vec<i32>)>,
+) -> Result<Vec<(Vec<f64>, usize)>, ApiError> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut results = Vec::with_capacity(queries.len());
+    let mut iter = queries.into_iter();
+    // Run Query 0 first to donate the shared state prefix into MambaRadixCache.
+    let (p0, c0) = iter.next().unwrap();
+    let rest: Vec<_> = iter.collect();
+    let branch0 = shared_mamba_branch_hint(&p0, rest.iter().map(|(p, _)| p.as_slice()), None);
+    results.push(run_one_candidate_query(s.clone(), p0, c0, branch0).await?);
+
+    for wave in rest.chunks(8) {
+        let mut handles = Vec::with_capacity(wave.len());
+        for (p, c) in wave.iter().cloned() {
+            let st = s.clone();
+            handles.push(tokio::spawn(async move {
+                run_one_candidate_query(st, p, c, None).await
+            }));
+        }
+        for h in handles {
+            let out = h
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))??;
+            results.push(out);
+        }
+    }
+    Ok(results)
+}
+
+async fn execute_systemone_json(
+    s: &Arc<OpenAiServerState>,
+    body: Value,
+) -> Result<Value, ApiError> {
+    let prep_state = s.clone();
+    let (req_model, batch) = cpu(s, move || {
+        Ok::<_, String>({
+            let Some(tokenizer) = prep_state.worker.tokenizer.as_ref() else {
+                return Ok(Err(bad("loaded model has no tokenizer")));
+            };
+            crate::decision::prepare_decision_batch(
+                &prep_state.worker.decision_profile,
+                tokenizer,
+                prep_state.worker.kv_token_capacity,
+                &body,
+            )
+            .map_err(decision_err)
+        })
+    })
+    .await??;
+
+    s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    let mut answers = serde_json::Map::new();
+    let mut input_tokens = 0usize;
+    let mut cached_tokens = 0usize;
+
+    match batch {
+        crate::decision::PreparedDecisionBatch::CandidateLogits {
+            temperature,
+            conf_kind,
+            fields,
+            prompts,
+            candidates,
+            ..
+        } => {
+            for p in &prompts {
+                input_tokens += p.len();
+            }
+            let pairs: Vec<_> = prompts.into_iter().zip(candidates).collect();
+            let outs = run_candidate_queries_radix_shared(s, pairs).await?;
+            for (field, (logits, cached)) in fields.iter().zip(outs) {
+                cached_tokens += cached;
+                let ans =
+                    crate::decision::answer_from_logits(field, &logits, temperature, conf_kind)
+                        .map_err(decision_err)?;
+                answers.insert(field.name.clone(), ans);
+            }
+        }
+        crate::decision::PreparedDecisionBatch::Kev {
+            head,
+            temperature,
+            fields,
+            encoded,
+        } => {
+            let mut queries = Vec::with_capacity(encoded.len());
+            for q_enc in &encoded {
+                input_tokens += q_enc.token_ids.len();
+                let mut positions = Vec::with_capacity(1 + q_enc.option_indices.len());
+                positions.push(q_enc.decide_index);
+                positions.extend_from_slice(&q_enc.option_indices);
+                let min_pos = positions.iter().copied().min().unwrap_or(0);
+                queries.push((q_enc.token_ids.clone(), positions, Some(min_pos)));
+            }
+            let mut outs = Vec::with_capacity(queries.len());
+            let mut iter = queries.into_iter();
+            if let Some((p0, pos0, cap0)) = iter.next() {
+                let rest: Vec<_> = iter.collect();
+                let branch0 =
+                    shared_mamba_branch_hint(&p0, rest.iter().map(|(p, _, _)| p.as_slice()), cap0);
+                outs.push(run_one_hidden_query(s.clone(), p0, pos0, cap0, branch0).await?);
+                for wave in rest.chunks(8) {
+                    let mut handles = Vec::with_capacity(wave.len());
+                    for (p, pos, cap) in wave.iter().cloned() {
+                        let st = s.clone();
+                        handles.push(tokio::spawn(async move {
+                            run_one_hidden_query(st, p, pos, cap, None).await
+                        }));
+                    }
+                    for h in handles {
+                        let out = h
+                            .await
+                            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))??;
+                        outs.push(out);
+                    }
+                }
+            }
+            for (field, (rows, cached)) in fields.iter().zip(outs) {
+                cached_tokens += cached;
+                let n_opts = field.keys.len();
+                let h_decide = &rows[0];
+                let h_opts: Vec<f32> = rows[1..].iter().flatten().copied().collect();
+                let raw_logits = head
+                    .forward(h_decide, &h_opts, n_opts)
+                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                let logits_f64: Vec<f64> = raw_logits.into_iter().map(|x| x as f64).collect();
+                let ans = crate::decision::answer_from_logits(
+                    field,
+                    &logits_f64,
+                    temperature,
+                    crate::decision::ConfidenceKind::MarginAndModeDistance,
+                )
+                .map_err(decision_err)?;
+                answers.insert(field.name.clone(), ans);
+            }
+        }
+        crate::decision::PreparedDecisionBatch::Xor {
+            temperature,
+            lev_noul_9_scale,
+            fields,
+            variants,
+        } => {
+            let mut pairs = Vec::with_capacity(variants.len() * 2);
+            for (fwd, rev, cands) in variants {
+                input_tokens += fwd.len() + rev.len();
+                pairs.push((fwd, cands.clone()));
+                pairs.push((rev, cands));
+            }
+            let outs = run_candidate_queries_radix_shared(s, pairs).await?;
+            for (i, field) in fields.iter().enumerate() {
+                let (fwd_logits, c_fwd) = &outs[2 * i];
+                let (rev_logits, c_rev) = &outs[2 * i + 1];
+                cached_tokens += *c_fwd + *c_rev;
+                let probs = crate::decision::calibrate_forward_reverse_logits(
+                    fwd_logits,
+                    rev_logits,
+                    temperature,
+                )
+                .map_err(decision_err)?;
+                let ans = if lev_noul_9_scale && field.field_type == "noul" {
+                    let expected: f64 = probs
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &p)| p * (idx as f64) / 8.0)
+                        .sum();
+                    json!({
+                        "type": "noul",
+                        "noul": expected,
+                    })
+                } else {
+                    crate::decision::answer_from_probabilities(
+                        field,
+                        &probs,
+                        crate::decision::ConfidenceKind::MarginAndModeDistance,
+                    )
+                    .map_err(decision_err)?
+                };
+                answers.insert(field.name.clone(), ans);
+            }
+        }
+    }
+
+    s.metrics
+        .prompt_tokens_total
+        .fetch_add(input_tokens as u64, Ordering::Relaxed);
+    s.metrics
+        .cached_prompt_tokens_total
+        .fetch_add(cached_tokens as u64, Ordering::Relaxed);
+
+    Ok(json!({
+        "model": req_model.unwrap_or_else(|| s.model_name.clone()),
+        "answers": Value::Object(answers),
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": 0,
+            "cached_tokens": cached_tokens,
+        }
+    }))
+}
+
+async fn systemone_decide(
+    State(s): State<Arc<OpenAiServerState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let _admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| busy())?;
+    let body = read_json(&s, request).await?;
+    let resp = execute_systemone_json(&s, body).await?;
+    Ok(Json(resp))
+}
+
+async fn decisions_adapter(
+    State(s): State<Arc<OpenAiServerState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let _admission = s
+        .admission
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| busy())?;
+    let body = read_json(&s, request).await?;
+    let canonical =
+        crate::decision::normalize_decisions_adapter_request(&body).map_err(decision_err)?;
+    let resp = execute_systemone_json(&s, canonical).await?;
+    Ok(Json(crate::decision::format_decisions_adapter_response(
+        &resp,
+    )))
 }
 
 pub async fn serve(

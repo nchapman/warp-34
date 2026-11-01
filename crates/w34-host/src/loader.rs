@@ -478,6 +478,16 @@ pub enum LayerKind {
     FullAttention,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DecisionConfigMeta {
+    pub kev_head_dim: Option<usize>,
+    pub kev_temperature: Option<f64>,
+    pub nimble_temperature: Option<f64>,
+    pub nimble_max_length: Option<usize>,
+    pub decision_type: Option<String>,
+    pub decision_temperature: Option<f64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
     pub architectures: Vec<String>,
@@ -514,6 +524,7 @@ pub struct ModelConfig {
     pub dflash_target_layer_ids: Vec<usize>,
     pub eos_token_ids: Vec<i32>,
     pub quant: QuantScheme,
+    pub decision_meta: DecisionConfigMeta,
 }
 
 impl ModelConfig {
@@ -757,6 +768,39 @@ impl ModelConfig {
             root.get("quantization_config")
                 .or_else(|| tc.get("quantization_config")),
         )?;
+        let get_f64 = |key: &str| {
+            root.get(key)
+                .or_else(|| tc.get(key))
+                .and_then(|v| v.as_f64())
+        };
+        let get_usize = |key: &str| {
+            root.get(key)
+                .or_else(|| tc.get(key))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+        };
+        let dc = root
+            .get("decision_config")
+            .or_else(|| tc.get("decision_config"));
+        let dc_f64 = |key: &str| dc.and_then(|d| d.get(key)).and_then(|v| v.as_f64());
+        let dc_usize = |key: &str| {
+            dc.and_then(|d| d.get(key))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+        };
+        let decision_meta = DecisionConfigMeta {
+            kev_head_dim: get_usize("kev_head_dim").or_else(|| dc_usize("head_dim")),
+            kev_temperature: get_f64("kev_temperature"),
+            nimble_temperature: get_f64("nimble_temperature"),
+            nimble_max_length: get_usize("nimble_max_length").or_else(|| dc_usize("max_length")),
+            decision_type: root
+                .get("decision_type")
+                .or_else(|| tc.get("decision_type"))
+                .or_else(|| dc.and_then(|d| d.get("type")))
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            decision_temperature: get_f64("decision_temperature").or_else(|| dc_f64("temperature")),
+        };
 
         Ok(Self {
             architectures,
@@ -793,6 +837,7 @@ impl ModelConfig {
             dflash_target_layer_ids,
             eos_token_ids,
             quant,
+            decision_meta,
         })
     }
 
