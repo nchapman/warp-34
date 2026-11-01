@@ -48,6 +48,14 @@ impl DecisionError {
     }
 }
 
+impl std::fmt::Display for DecisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for DecisionError {}
+
 #[derive(Clone, Debug)]
 pub struct KevPointerHead {
     pub hidden_size: usize,
@@ -1252,8 +1260,8 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
             {
                 let mut cm = Map::new();
                 for opt in arr {
-                    if let Some(s) = opt.as_str() {
-                        cm.insert(s.to_owned(), Value::String(s.to_owned()));
+                    let (k, desc) = if let Some(s) = opt.as_str() {
+                        (s.to_owned(), s.to_owned())
                     } else if let Some(om) = opt.as_object()
                         && let Some(k) = om
                             .get("key")
@@ -1261,12 +1269,18 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
                             .and_then(Value::as_str)
                     {
                         let desc = om.get("description").and_then(Value::as_str).unwrap_or(k);
-                        cm.insert(k.to_owned(), Value::String(desc.to_owned()));
+                        (k.to_owned(), desc.to_owned())
                     } else {
                         return Err(DecisionError::bad_request(format!(
                             "decision '{id}': invalid choice option entry"
                         )));
+                    };
+                    if cm.contains_key(&k) {
+                        return Err(DecisionError::bad_request(format!(
+                            "decision '{id}': duplicate choice option key '{k}'"
+                        )));
                     }
+                    cm.insert(k, Value::String(desc));
                 }
                 q.insert("criteria".into(), Value::Object(cm));
             } else {
@@ -1600,6 +1614,7 @@ fn tokenize_candidate_prompts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cuda::{f32_to_bf16, f32_to_f16};
 
     /// Exact FNV-1a -> SplitMix64 deterministic weight stream from `vllm.cpp` `test_kev.cpp`.
     fn donor_rand(name: &str, count: usize, scale: f64) -> Vec<f32> {
@@ -2340,5 +2355,449 @@ mod tests {
         assert_eq!(p.matches("<think>").count(), 1);
         assert_eq!(p.matches("</think>").count(), 1);
         assert_eq!(p.matches("<tool_call>").count(), 0);
+    }
+
+    fn make_safetensors_file(path: &Path, tensors: &[(&str, &str, &[usize], &[u8])]) {
+        let mut header_map = serde_json::Map::new();
+        let mut offset = 0usize;
+        let mut data_bytes = Vec::new();
+        for (name, dtype, shape, data) in tensors {
+            let start = offset;
+            let end = offset + data.len();
+            offset = end;
+            data_bytes.extend_from_slice(data);
+            header_map.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            );
+        }
+        let header_json = serde_json::to_vec(&serde_json::Value::Object(header_map)).unwrap();
+        let header_len = header_json.len() as u64;
+        let mut file_bytes = Vec::with_capacity(8 + header_json.len() + data_bytes.len());
+        file_bytes.extend_from_slice(&header_len.to_le_bytes());
+        file_bytes.extend_from_slice(&header_json);
+        file_bytes.extend_from_slice(&data_bytes);
+        std::fs::write(path, file_bytes).unwrap();
+    }
+
+    #[test]
+    fn decision_errors_and_safetensors_f16_parsing() {
+        let e1 = DecisionError::bad_request("bad param");
+        assert!(e1.is_bad_request);
+        assert_eq!(format!("{e1}"), "bad param");
+
+        let e2 = DecisionError::internal("crash");
+        assert!(!e2.is_bad_request);
+        assert_eq!(format!("{e2}"), "crash");
+
+        // Construct valid F16 safetensors with [2, 4] weights and [2] biases
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!(
+            "w34_dec_st_{}_{}_{}",
+            std::process::id(),
+            nanos,
+            count
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let head_path = tmp.join("head.safetensors");
+
+        let qw_f32 = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let qb_f32 = [0.1f32, 0.2];
+        let kw_f32 = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let kb_f32 = [0.3f32, 0.4];
+
+        let to_f16_bytes = |vals: &[f32]| -> Vec<u8> {
+            vals.iter()
+                .flat_map(|v| f32_to_f16(*v).to_le_bytes())
+                .collect()
+        };
+
+        let qw_bytes = to_f16_bytes(&qw_f32);
+        let qb_bytes = to_f16_bytes(&qb_f32);
+        let kw_bytes = to_f16_bytes(&kw_f32);
+        let kb_bytes = to_f16_bytes(&kb_f32);
+
+        make_safetensors_file(
+            &head_path,
+            &[
+                ("q.weight", "F16", &[2, 4], &qw_bytes),
+                ("q.bias", "F16", &[2], &qb_bytes),
+                ("k.weight", "F16", &[2, 4], &kw_bytes),
+                ("k.bias", "F16", &[2], &kb_bytes),
+            ],
+        );
+
+        let archive = SafetensorsArchive::open(&head_path).unwrap();
+        let head = KevPointerHead::from_archive(&archive, 4, Some(2)).unwrap();
+        assert_eq!(head.hidden_size, 4);
+        assert_eq!(head.head_dim, 2);
+
+        // Also test F32 and BF16 safetensors loading
+        let to_f32_bytes =
+            |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let to_bf16_bytes = |vals: &[f32]| -> Vec<u8> {
+            vals.iter()
+                .flat_map(|v| f32_to_bf16(*v).to_le_bytes())
+                .collect()
+        };
+        let head_f32_path = tmp.join("head_f32.safetensors");
+        make_safetensors_file(
+            &head_f32_path,
+            &[
+                ("q.weight", "F32", &[2, 4], &to_f32_bytes(&qw_f32)),
+                ("q.bias", "F32", &[2], &to_f32_bytes(&qb_f32)),
+                ("k.weight", "F32", &[2, 4], &to_f32_bytes(&kw_f32)),
+                ("k.bias", "F32", &[2], &to_f32_bytes(&kb_f32)),
+            ],
+        );
+        let arc_f32 = SafetensorsArchive::open(&head_f32_path).unwrap();
+        let head_f32 = KevPointerHead::from_archive(&arc_f32, 4, Some(2)).unwrap();
+        assert!((head_f32.q_bias[0] - 0.1).abs() < 1e-5);
+
+        let head_bf16_path = tmp.join("head_bf16.safetensors");
+        make_safetensors_file(
+            &head_bf16_path,
+            &[
+                ("q.weight", "BF16", &[2, 4], &to_bf16_bytes(&qw_f32)),
+                ("q.bias", "BF16", &[2], &to_bf16_bytes(&qb_f32)),
+                ("k.weight", "BF16", &[2, 4], &to_bf16_bytes(&kw_f32)),
+                ("k.bias", "BF16", &[2], &to_bf16_bytes(&kb_f32)),
+            ],
+        );
+        let arc_bf16 = SafetensorsArchive::open(&head_bf16_path).unwrap();
+        let head_bf16 = KevPointerHead::from_archive(&arc_bf16, 4, Some(2)).unwrap();
+        assert!((head_bf16.q_bias[0] - 0.1).abs() < 1e-2);
+
+        // Test loading KevModel profile from directory containing head.safetensors
+        let cfg_kev = ModelConfig::from_json(&json!({
+            "architectures": ["KevModel"],
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "vocab_size": 100,
+            "decision_config": {"temperature": 1.25}
+        }))
+        .unwrap();
+        let prof = DecisionModelProfile::from_dir_and_config(&tmp, &cfg_kev, None).unwrap();
+        assert_eq!(prof.family_name(), "kev");
+
+        // Forward with 2 options
+        let h_decide = [1.0f32, 0.5, 0.0, 0.0];
+        let h_opts = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let logits = head.forward(&h_decide, &h_opts, 2).unwrap();
+        assert_eq!(logits.len(), 2);
+
+        // Validation error branches in forward and validate_shapes
+        assert!(head.forward(&[1.0], &h_opts, 2).is_err());
+        assert!(head.forward(&h_decide, &[1.0], 2).is_err());
+
+        let invalid_head = KevPointerHead {
+            hidden_size: 0,
+            head_dim: 2,
+            q_weight: vec![],
+            q_bias: vec![],
+            k_weight: vec![],
+            k_bias: vec![],
+        };
+        assert!(invalid_head.validate_shapes().is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validates_all_decision_bad_request_paths() {
+        let limits = CompileLimits {
+            max_choices: TEV1_MAX_OPTIONS,
+            too_wide_reason: "max 24",
+            noul_true_first: false,
+        };
+
+        // compile_systemone_request validations
+        assert!(compile_systemone_request(&json!([]), limits).is_err());
+        assert!(compile_systemone_request(&json!({}), limits).is_err());
+        assert!(compile_systemone_request(&json!({"state": "ok"}), limits).is_err());
+        assert!(
+            compile_systemone_request(&json!({"state": "ok", "questions": []}), limits).is_err()
+        );
+        assert!(
+            compile_systemone_request(&json!({"state": "ok", "questions": {}}), limits).is_err()
+        );
+        assert!(
+            compile_systemone_request(&json!({"state": "ok", "questions": {"q": 123}}), limits)
+                .is_err()
+        );
+        assert!(
+            compile_systemone_request(
+                &json!({"state": "ok", "questions": {"q": {"type": "unknown"}}}),
+                limits
+            )
+            .is_err()
+        );
+        assert!(
+            compile_systemone_request(
+                &json!({"state": "ok", "questions": {"q": {"instructions": "do it"}}}),
+                limits
+            )
+            .is_err()
+        );
+        assert!(compile_systemone_request(
+            &json!({"state": "ok", "questions": {"q": {"type": "noul", "instructions": "do it", "criteria": "not an object"}}}),
+            limits
+        )
+        .is_err());
+        assert!(compile_systemone_request(
+            &json!({"state": "ok", "questions": {"q": {"type": "noul", "instructions": "do it", "criteria": {"true": "yes", "false": "no"}, "extra_key": 123}}}),
+            limits
+        )
+        .is_err());
+        assert!(compile_systemone_request(
+            &json!({"state": "ok", "questions": {"q": {"type": "choice", "instructions": "do it", "criteria": {"a": "A"}}}}),
+            limits
+        )
+        .is_err());
+        assert!(compile_systemone_request(
+            &json!({"state": "ok", "questions": {"q": {"type": "scale", "instructions": "rate", "min": 5, "max": 2}}}),
+            limits
+        )
+        .is_err());
+
+        // normalize_decisions_adapter_request validations
+        assert!(normalize_decisions_adapter_request(&json!([])).is_err());
+        assert!(normalize_decisions_adapter_request(&json!({})).is_err());
+        assert!(
+            normalize_decisions_adapter_request(&json!({"context": "order", "decisions": []}))
+                .is_err()
+        );
+        assert!(
+            normalize_decisions_adapter_request(&json!({"context": "order", "decisions": "wrong"}))
+                .is_err()
+        );
+        assert!(
+            normalize_decisions_adapter_request(&json!({"context": "order", "decisions": [123]}))
+                .is_err()
+        );
+        assert!(
+            normalize_decisions_adapter_request(
+                &json!({"context": "order", "decisions": [{"id": "d1"}]})
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_decisions_adapter_request(&json!({
+                "context": "order",
+                "decisions": [
+                    {"id": "d1", "question": "q", "options": [123]}
+                ]
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_decisions_adapter_request(&json!({
+                "context": "order",
+                "decisions": [
+                    {"id": "d1", "question": "q1"},
+                    {"id": "d1", "question": "q2"}
+                ]
+            }))
+            .is_err()
+        );
+        assert!(
+            normalize_decisions_adapter_request(&json!({
+                "context": "order",
+                "decisions": [
+                    {"id": "d1", "type": "choice", "question": "q1", "options": ["a", "a"]}
+                ]
+            }))
+            .is_err()
+        );
+
+        // softmax_temperature validations
+        assert!(softmax_temperature(&[], 1.0).is_err());
+        assert!(softmax_temperature(&[1.0, 2.0], 0.0).is_err());
+        assert!(softmax_temperature(&[1.0, 2.0], -1.0).is_err());
+    }
+
+    #[test]
+    fn decision_choice_questions_and_normalized_entropy_confidence() {
+        let body = json!({
+            "state": "Customer feedback: great service",
+            "questions": {
+                "rating": {
+                    "type": "choice",
+                    "instructions": "Rate customer satisfaction from 1 to 5",
+                    "criteria": {
+                        "1": "poor",
+                        "2": "fair",
+                        "3": "good",
+                        "4": "great",
+                        "5": "excellent"
+                    }
+                }
+            }
+        });
+        let req = compile_systemone_request(
+            &body,
+            CompileLimits {
+                max_choices: TEV1_MAX_OPTIONS,
+                too_wide_reason: "max 24",
+                noul_true_first: false,
+            },
+        )
+        .unwrap();
+        let prompt = &build_tev1_prompts(&req).unwrap()[0];
+        assert!(prompt.contains("\"label\":\"A\"") || prompt.contains("\"label\": \"A\""));
+        assert!(prompt.contains("\"key\":\"1\"") || prompt.contains("\"key\": \"1\""));
+
+        // Test answers calculation with ConfidenceKind::NormalizedEntropy
+        let field = req.fields[0].clone();
+        let ans = answer_from_logits(
+            &field,
+            &[10.0, 0.0, 0.0, 0.0, 0.0],
+            1.0,
+            ConfidenceKind::NormalizedEntropy,
+        )
+        .unwrap();
+        assert_eq!(ans["choice"], "1");
+        assert!(ans["confidence"].as_f64().unwrap() > 0.9);
+    }
+
+    #[test]
+    fn kev_encoding_and_profile_temperature_bounds() {
+        let special = KevSpecialTokens {
+            fim_prefix_id: 100,
+            fim_middle_id: 101,
+            box_start_id: 102,
+            box_end_id: 103,
+            fim_suffix_id: 104,
+        };
+        let encoded = kev_encode_question(special, &[1, 2, 3], &[4, 5], &[vec![6, 7], vec![8, 9]]);
+        assert_eq!(encoded.shared_state_prefix_len, 5); // 100 + [1, 2, 3] + 101
+        assert_eq!(encoded.option_indices.len(), 2);
+        assert_eq!(encoded.decide_index, encoded.token_ids.len() - 1);
+
+        static COUNTER2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count2 = COUNTER2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos2 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp = std::env::temp_dir().join(format!(
+            "w34_dec_temp_{}_{}_{}",
+            std::process::id(),
+            nanos2,
+            count2
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Write head.safetensors into tmp so KevModel passes file presence check and tests temperature
+        let qw_f32 = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let qb_f32 = [0.1f32, 0.2];
+        let kw_f32 = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let kb_f32 = [0.3f32, 0.4];
+        let to_f32_bytes =
+            |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        make_safetensors_file(
+            &tmp.join("head.safetensors"),
+            &[
+                ("q.weight", "F32", &[2, 4], &to_f32_bytes(&qw_f32)),
+                ("q.bias", "F32", &[2], &to_f32_bytes(&qb_f32)),
+                ("k.weight", "F32", &[2, 4], &to_f32_bytes(&kw_f32)),
+                ("k.bias", "F32", &[2], &to_f32_bytes(&kb_f32)),
+            ],
+        );
+
+        // Kev invalid temperature (0.0 or negative)
+        let cfg_bad_kev = ModelConfig::from_json(&json!({
+            "architectures": ["KevModel"],
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "vocab_size": 100,
+            "decision_config": {"temperature": 0.0}
+        }))
+        .unwrap();
+        let err_kev =
+            DecisionModelProfile::from_dir_and_config(&tmp, &cfg_bad_kev, None).unwrap_err();
+        assert!(
+            err_kev.contains("kev_temperature"),
+            "expected kev_temperature error, got {err_kev}"
+        );
+
+        // Kev valid temperature passes
+        let cfg_ok_kev = ModelConfig::from_json(&json!({
+            "architectures": ["KevModel"],
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "vocab_size": 100,
+            "decision_config": {"temperature": 1.25}
+        }))
+        .unwrap();
+        assert!(DecisionModelProfile::from_dir_and_config(&tmp, &cfg_ok_kev, None).is_ok());
+
+        // Non-Kev models in directory without head.safetensors
+        let tmp_non_kev = tmp.join("non_kev");
+        std::fs::create_dir_all(&tmp_non_kev).unwrap();
+
+        // Xor invalid temperature
+        let cfg_bad_xor = ModelConfig::from_json(&json!({
+            "architectures": ["XorModel"],
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "vocab_size": 100,
+            "decision_config": {"temperature": -1.0}
+        }))
+        .unwrap();
+        let err_xor = DecisionModelProfile::from_dir_and_config(&tmp_non_kev, &cfg_bad_xor, None)
+            .unwrap_err();
+        assert!(err_xor.contains("XorModel/LevModel: temperature"));
+
+        // OpenJev invalid temperature
+        let cfg_bad_jev = ModelConfig::from_json(&json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "vocab_size": 100,
+            "decision_config": {"type": "openjev", "temperature": 0.0}
+        }))
+        .unwrap();
+        let err_jev = DecisionModelProfile::from_dir_and_config(&tmp_non_kev, &cfg_bad_jev, None)
+            .unwrap_err();
+        assert!(err_jev.contains("OpenJevModel: temperature"));
+
+        // Nimble missing/invalid temperature
+        let cfg_bad_nimble = ModelConfig::from_json(&json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "vocab_size": 100,
+            "nimble_temperature": 0.0
+        }))
+        .unwrap();
+        let err_nimble =
+            DecisionModelProfile::from_dir_and_config(&tmp_non_kev, &cfg_bad_nimble, None)
+                .unwrap_err();
+        assert!(err_nimble.contains("NimbleModel: nimble_temperature"));
+
+        // Tev1 invalid temperature
+        let cfg_bad_tev1 = ModelConfig::from_json(&json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "vocab_size": 100,
+            "decision_config": {"temperature": -0.5}
+        }))
+        .unwrap();
+        let err_tev1 = DecisionModelProfile::from_dir_and_config(&tmp_non_kev, &cfg_bad_tev1, None)
+            .unwrap_err();
+        assert!(err_tev1.contains("Tev1Model: decision_temperature"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

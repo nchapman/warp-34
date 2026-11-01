@@ -1802,4 +1802,363 @@ mod tests {
             6
         );
     }
+
+    #[test]
+    fn response_store_cancellation_deletion_and_lru_limits() {
+        let store = ResponseStore::with_capacity(3);
+        let flag = Arc::new(AtomicBool::new(false));
+        store.register_active("resp_active_1".into(), "tenant_x".into(), flag.clone());
+
+        // Cancel with wrong scope returns None, flag unchanged
+        assert!(store.cancel("resp_active_1", "tenant_y").is_none());
+        assert!(!flag.load(Ordering::Acquire));
+
+        // Cancel with matching scope sets flag and returns cancelled response
+        let canc = store.cancel("resp_active_1", "tenant_x").unwrap();
+        assert_eq!(canc["status"], "cancelled");
+        assert!(flag.load(Ordering::Acquire));
+
+        // Delete active/nonexistent
+        assert!(!store.delete("resp_active_1", "tenant_x"));
+
+        // Store responses with in_progress status and test cancel
+        store.insert(StoredResponse {
+            id: "resp_prog".into(),
+            owner_scope: "tenant_x".into(),
+            response: json!({"id": "resp_prog", "status": "in_progress"}),
+            history_messages: vec![json!({"role": "user", "content": "hi"})],
+        });
+        let canc_stored = store.cancel("resp_prog", "tenant_x").unwrap();
+        assert_eq!(canc_stored["status"], "cancelled");
+
+        // Delete stored response
+        assert!(store.delete("resp_prog", "tenant_x"));
+        assert!(!store.delete("resp_prog", "tenant_x"));
+
+        // LRU eviction when hitting capacity: insert 4 items
+        for i in 1..=4 {
+            store.insert(StoredResponse {
+                id: format!("resp_lru_{i}"),
+                owner_scope: "tenant_x".into(),
+                response: json!({"id": format!("resp_lru_{i}"), "status": "completed"}),
+                history_messages: Vec::new(),
+            });
+        }
+        // First item (resp_lru_1) should have been evicted
+        assert!(store.get_response("resp_lru_1", "tenant_x").is_none());
+        assert!(store.get_response("resp_lru_4", "tenant_x").is_some());
+    }
+
+    #[test]
+    fn responses_api_error_helpers_and_id_uniqueness() {
+        let e1 = ResponsesApiError::bad_request("invalid field");
+        let j1 = e1.to_openai_json();
+        assert_eq!(j1["error"]["type"], "invalid_request_error");
+        assert_eq!(j1["error"]["message"], "invalid field");
+
+        let e2 = ResponsesApiError::not_found("not found id");
+        let j2 = e2.to_openai_json();
+        assert_eq!(j2["error"]["type"], "not_found_error");
+
+        let mut ids = std::collections::HashSet::new();
+        for i in 0..20 {
+            let id = generate_unguessable_response_id(i);
+            assert!(id.starts_with("resp_"));
+            assert_eq!(id.len(), 37);
+            assert!(ids.insert(id));
+        }
+    }
+
+    #[test]
+    fn validates_all_responses_bad_request_paths() {
+        let store = ResponseStore::default();
+        // non-object root
+        assert!(translate_responses_to_chat(&json!([]), "q", &store, None, 1).is_err());
+        // missing input and previous_response_id
+        assert!(translate_responses_to_chat(&json!({"model": "q"}), "q", &store, None, 1).is_err());
+        // empty input array
+        assert!(translate_responses_to_chat(&json!({"input": []}), "q", &store, None, 1).is_err());
+        // input array with non-object
+        assert!(
+            translate_responses_to_chat(&json!({"input": [123]}), "q", &store, None, 1).is_err()
+        );
+        // message item missing role
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": [{"type": "message", "content": "hi"}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // message item missing content
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": [{"type": "message", "role": "user"}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // unsupported role
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": [{"type": "message", "role": "admin", "content": "hi"}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // content part not object
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": [{"type": "message", "role": "user", "content": [123]}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // text content part missing text
+        assert!(translate_responses_to_chat(
+            &json!({"input": [{"type": "message", "role": "user", "content": [{"type": "text"}]}]}),
+            "q",
+            &store,
+            None,
+            1
+        )
+        .is_err());
+        // input_image missing image_url
+        assert!(translate_responses_to_chat(
+            &json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_image"}]}]}),
+            "q",
+            &store,
+            None,
+            1
+        )
+        .is_err());
+        // system message cannot contain images
+        assert!(translate_responses_to_chat(
+            &json!({"input": [{"type": "message", "role": "system", "content": [{"type": "input_image", "image_url": "https://a.png"}]}]}),
+            "q",
+            &store,
+            None,
+            1
+        )
+        .is_err());
+        // unsupported content part type
+        assert!(translate_responses_to_chat(
+            &json!({"input": [{"type": "message", "role": "user", "content": [{"type": "video"}]}]}),
+            "q",
+            &store,
+            None,
+            1
+        )
+        .is_err());
+        // function_call missing name
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": [{"type": "function_call", "arguments": "{}"}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // function_call missing arguments
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": [{"type": "function_call", "name": "foo"}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // function_call arguments not valid JSON object
+        assert!(translate_responses_to_chat(
+            &json!({"input": [{"type": "function_call", "name": "foo", "arguments": "not json"}]}),
+            "q",
+            &store,
+            None,
+            1
+        )
+        .is_err());
+        // function_call_output missing output
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": [{"type": "function_call_output"}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // unsupported input item type
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": [{"type": "unsupported"}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // tools not array
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "tools": "tools"}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // tool not object
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "tools": [1]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // tool unsupported type
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "tools": [{"type": "code_interpreter"}]}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // tool_choice invalid string
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "tool_choice": "maybe"}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // tool_choice object missing name
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "tool_choice": {"type": "function"}}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // reasoning invalid effort
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "reasoning": {"effort": "extreme"}}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // text format invalid
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "text": {"format": "yaml"}}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // temperature invalid type
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "temperature": "high"}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // top_p invalid type
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "top_p": "high"}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+        // max_output_tokens 0
+        assert!(
+            translate_responses_to_chat(
+                &json!({"input": "hi", "max_output_tokens": 0}),
+                "q",
+                &store,
+                None,
+                1
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn responses_sse_fail_and_incomplete_lifecycle() {
+        let store = ResponseStore::default();
+        let req = json!({"input": "stream test"});
+        let (_, meta) = translate_responses_to_chat(&req, "qwen", &store, None, 1).unwrap();
+
+        // Failure event
+        let mut sse1 = ResponsesSseFormatter::new(meta.clone());
+        let _ = sse1.start();
+        let fail_events = sse1.fail("pipeline broken");
+        assert_eq!(fail_events.len(), 1);
+        assert_eq!(fail_events[0].0, "response.failed");
+        assert_eq!(fail_events[0].1["response"]["status"], "failed");
+        assert_eq!(
+            fail_events[0].1["response"]["error"]["message"],
+            "pipeline broken"
+        );
+
+        // Incomplete event due to length limit
+        let mut sse2 = ResponsesSseFormatter::new(meta);
+        let _ = sse2.start();
+        let turn = ParsedAssistantTurn {
+            reasoning_content: None,
+            content: Some("cut off midway".into()),
+            tool_calls: Vec::new(),
+        };
+        let (events, final_resp, _) = sse2.finish(&turn, "length", 10, 0, 5, 0);
+        assert_eq!(events.last().unwrap().0, "response.incomplete");
+        assert_eq!(final_resp["status"], "incomplete");
+        assert_eq!(
+            final_resp["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+    }
 }

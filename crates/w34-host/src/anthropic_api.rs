@@ -1251,4 +1251,356 @@ mod tests {
         assert_eq!(sync_msg["content"][2]["type"], "tool_use");
         assert_eq!(sync_msg["content"][2]["input"]["host"], "127.0.0.1");
     }
+
+    #[test]
+    fn anthropic_error_constructors_and_serialization() {
+        for (err_type, expected_str) in [
+            (AnthropicErrorType::InvalidRequest, "invalid_request_error"),
+            (AnthropicErrorType::Authentication, "authentication_error"),
+            (AnthropicErrorType::NotFound, "not_found_error"),
+            (AnthropicErrorType::Overloaded, "overloaded_error"),
+            (AnthropicErrorType::Api, "api_error"),
+        ] {
+            assert_eq!(err_type.as_str(), expected_str);
+        }
+        let e1 = AnthropicApiError::bad_request("invalid param");
+        assert_eq!(e1.to_json()["error"]["type"], "invalid_request_error");
+        assert_eq!(e1.to_json()["error"]["message"], "invalid param");
+
+        let e2 = AnthropicApiError::overloaded("high load");
+        assert_eq!(e2.to_json()["error"]["type"], "overloaded_error");
+
+        let e3 = AnthropicApiError::api_error("internal crash");
+        assert_eq!(e3.to_json()["error"]["type"], "api_error");
+
+        let (ev_name, ev_val) = AnthropicSseFormatter::error_event("fatal");
+        assert_eq!(ev_name, "error");
+        assert_eq!(ev_val["error"]["message"], "fatal");
+    }
+
+    #[test]
+    fn translates_anthropic_multimodal_and_structured_output_and_stops() {
+        // Base64 and URL image translation
+        let img_req = json!({
+            "model": "qwen-vl",
+            "max_tokens": 128,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Inspect this"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgoAAAANSUhEUg=="
+                        }
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/test.jpg"
+                        }
+                    }
+                ]
+            }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ans": {"type": "string"}},
+                        "required": ["ans"]
+                    }
+                }
+            }
+        });
+        let (chat, _) = translate_anthropic_to_chat(&img_req, "qwen-vl", 11, false).unwrap();
+        assert_eq!(chat["response_format"]["type"], "json_schema");
+        let parts = chat["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+        );
+        assert_eq!(parts[2]["type"], "image_url");
+        assert_eq!(parts[2]["image_url"]["url"], "https://example.com/test.jpg");
+
+        // output_config format must be an object with type json_schema; non-object format is rejected
+        let invalid_fmt_req = json!({
+            "model": "qwen",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"format": "json"}
+        });
+        assert!(translate_anthropic_to_chat(&invalid_fmt_req, "qwen", 12, false).is_err());
+
+        // resolve_stop_reason mapping
+        let empty_turn = ParsedAssistantTurn {
+            reasoning_content: None,
+            content: Some("hi".into()),
+            tool_calls: Vec::new(),
+        };
+        assert_eq!(
+            resolve_stop_reason(&empty_turn, "stop", None),
+            ("end_turn", Value::Null)
+        );
+        assert_eq!(
+            resolve_stop_reason(&empty_turn, "length", None),
+            ("max_tokens", Value::Null)
+        );
+        assert_eq!(
+            resolve_stop_reason(&empty_turn, "stop", Some("###")),
+            ("stop_sequence", json!("###"))
+        );
+    }
+
+    #[test]
+    fn validates_all_anthropic_bad_request_paths() {
+        assert!(translate_anthropic_to_chat(&json!([]), "q", 1, false).is_err());
+        assert!(translate_anthropic_to_chat(&json!({"model": "q"}), "q", 1, false).is_err());
+        assert!(translate_anthropic_to_chat(&json!({"messages": []}), "q", 1, false).is_err());
+        assert!(translate_anthropic_to_chat(&json!({"messages": "hi"}), "q", 1, false).is_err());
+        assert!(translate_anthropic_to_chat(&json!({"messages": [123]}), "q", 1, false).is_err());
+        assert!(
+            translate_anthropic_to_chat(&json!({"messages": [{"content": "hi"}]}), "q", 1, false)
+                .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(&json!({"messages": [{"role": "user"}]}), "q", 1, false)
+                .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"messages": [{"role": "system", "content": "hi"}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"messages": [{"role": "user", "content": []}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"messages": [{"role": "user", "content": [42]}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"messages": [{"role": "user", "content": [{}]}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"messages": [{"role": "user", "content": [{"type": "text"}]}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"messages": [{"role": "user", "content": [{"type": "audio"}]}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"messages": [{"role": "user", "content": [{"type": "image"}]}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(translate_anthropic_to_chat(
+            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "ftp"}}]}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}]}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "data": "abc"}}]}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url"}}]}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"messages": [{"role": "user", "content": [{"type": "tool_result"}]}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(translate_anthropic_to_chat(
+            &json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "text"}]}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "video"}]}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "tool_use", "name": "foo"}]}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"system": 123, "messages": [{"role": "user", "content": "hi"}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"system": [123], "messages": [{"role": "user", "content": "hi"}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(translate_anthropic_to_chat(
+            &json!({"system": [{"type": "image"}], "messages": [{"role": "user", "content": "hi"}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"system": [{"type": "text"}], "messages": [{"role": "user", "content": "hi"}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"tools": "tools", "messages": [{"role": "user", "content": "hi"}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"tools": [1], "messages": [{"role": "user", "content": "hi"}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(translate_anthropic_to_chat(
+            &json!({"tools": [{"input_schema": {}}], "messages": [{"role": "user", "content": "hi"}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"tools": [{"type": "bash_20241022", "name": "bash"}], "messages": [{"role": "user", "content": "hi"}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"tool_choice": {"type": "unknown"}, "messages": [{"role": "user", "content": "hi"}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"tool_choice": {"type": "tool"}, "messages": [{"role": "user", "content": "hi"}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(
+            translate_anthropic_to_chat(
+                &json!({"thinking": "enabled", "messages": [{"role": "user", "content": "hi"}]}),
+                "q",
+                1,
+                false
+            )
+            .is_err()
+        );
+        assert!(translate_anthropic_to_chat(
+            &json!({"thinking": {"type": "magic"}, "messages": [{"role": "user", "content": "hi"}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+        assert!(translate_anthropic_to_chat(
+            &json!({"thinking": {"type": "enabled"}, "messages": [{"role": "user", "content": "hi"}]}),
+            "q",
+            1,
+            false
+        )
+        .is_err());
+    }
 }
