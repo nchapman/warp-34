@@ -12,6 +12,48 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Production metrics and embedded dashboard
+
+- `w34 serve` now serves a warm-dark **React + TypeScript + Vite** dashboard at
+  `/`, with aggregate throughput, engine TTFT percentiles, running/queued requests,
+  token-weighted prefix reuse, and separate KV/GDN active/evictable/free capacity.
+  The read-only Connect page provides API and Prometheus setup information.
+- `/metrics` (Prometheus HELP/TYPE + seconds histograms) and `/api/metrics`
+  (`schema_version: 1`, no-store JSON) share coherent CPU telemetry. Common worker
+  lifecycle accounting replaces API-specific token counters and covers enqueue,
+  admission, prefill, committed output, completion, cancellation/backpressure,
+  shutdown, and panic. Decision-only requests do not fabricate generated tokens or
+  TTFT. Pool gauges count logical resources once across TP ranks; speculative
+  acceptance uses actual verified draft rows, not configured proposal maxima.
+- Dashboard history is bounded to five minutes in the browser, uses cumulative
+  counter/histogram deltas, resets across process restarts, pauses in hidden tabs,
+  and visibly marks disconnection. No external fonts/CDNs, prompt content, speed
+  tests, or mutation controls. The server still has **no API-key authentication**;
+  keep it private or behind an authenticated reverse proxy.
+- Node **24.21.0** and pnpm **12.10.1** are pinned in mise. Locked frontend builds
+  run before CUDA build/check/test/coverage tasks; Vite's hashed assets are embedded
+  in the executable. Docker builds assets in a separate pinned Node stage; no Node
+  runtime is shipped. Direct CUDA Cargo commands require `mise run dashboard-build`.
+  See [`METRICS.md`](METRICS.md) for metric units, timing boundaries, migration,
+  security, PromQL, and development commands.
+- Verification: `mise run check` (full release CUDA suite, both Clippy modes,
+  oracle/perf checks, and frontend checks), `mise run test-cpu`, 18 frontend tests,
+  production frontend Docker-stage build, Prometheus Python-parser validation,
+  and Chrome desktop/mobile inspection against the embedded live server passed.
+  The GDN occupancy regression first failed on unavailable occupancy, then passed
+  with authoritative state-pool free-slot accounting. Review found a missing
+  `dashboard-build` dependency on coverage tasks; fixed and task graph verified.
+- Live 4B TP=1 HTTP/SSE smoke: all 96 measured requests passed (256 output tokens,
+  8/16 clients; 24 warmup requests). With the dashboard open in both variants,
+  adding ~20 Hz scrapes of **both** `/metrics` and `/api/metrics` produced 264
+  successful scrapes, **0.53 ms p95 / 1.04 ms max**. Median aggregate throughput:
+  N=8 **1395.50 → 1395.23 tok/s**, N=16 **2218.28 → 2215.94 tok/s** without/with
+  extra scrapes. This is a short same-binary scrape-overhead check, **not** a
+  pre-instrumentation or vLLM/SGLang comparison. Raw local evidence:
+  `/tmp/w34-dashboard-load.json`; no new donor performance qualification claimed.
+
+---
+
 ## Code-quality refactor and worker error containment
 
 - Quantization and model-loading audit (`loader.rs`, `model/weights.rs`,

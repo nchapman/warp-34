@@ -15,6 +15,7 @@ use crate::{
     model::{EngineBatchSlice, PipelinedDecodeOutput, Qwen3_5Engine},
     parser::{SamplerV1, SamplingParams, StepLogprobs, TokenBitmaskConstraint},
     scheduler::{ScheduledReqSlice, SchedulerConfig, SchedulerV1},
+    telemetry::{Config as TelemetryConfig, Lifecycle, Outcome, Pool, Pools, Telemetry},
 };
 
 #[derive(Clone, Debug)]
@@ -149,6 +150,7 @@ impl DecisionReadoutTap {
 }
 
 struct Request {
+    lifecycle: Option<Lifecycle>,
     prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
     vision: Option<crate::scheduled_vision::ScheduledVision>,
@@ -164,15 +166,38 @@ struct Request {
 }
 
 impl Request {
+    fn computed(&self, tokens: usize) {
+        if let Some(life) = &self.lifecycle {
+            life.computed(tokens);
+        }
+    }
+
     fn set_terminal(&self, event: GenerationEvent) {
         // First terminal result wins; in particular, unwinding must not replace an
         // already published result while dropping request-owned resources.
-        let _ = self.terminal.set(event);
+        if self.terminal.set(event.clone()).is_ok()
+            && let Some(life) = &self.lifecycle
+        {
+            let outcome = match event {
+                GenerationEvent::Finished { .. } if self.cancelled.load(Ordering::Acquire) => {
+                    Outcome::Cancelled
+                }
+                GenerationEvent::Finished { .. } => Outcome::Completed,
+                _ => Outcome::Failed,
+            };
+            life.finish(outcome);
+        }
     }
 }
 
 impl Drop for Request {
     fn drop(&mut self) {
+        if !std::thread::panicking()
+            && self.cancelled.load(Ordering::Acquire)
+            && let Some(life) = &self.lifecycle
+        {
+            life.finish(Outcome::Cancelled);
+        }
         if std::thread::panicking() {
             // Admission and batched MTP temporarily own requests outside the registry.
             // The panic payload is only available later at the supervisor boundary.
@@ -189,6 +214,7 @@ impl Drop for Request {
 
 #[derive(Default)]
 pub struct WorkerStats {
+    pub telemetry: Arc<Telemetry>,
     pub active: AtomicU64,
     pub peak_active: AtomicU64,
     pub decode_bucket_mask: AtomicU64,
@@ -261,6 +287,24 @@ impl EngineWorker {
             .name("w34-cuda".into())
             .spawn(move || match loader() {
                 Ok(engine) => {
+                    worker_stats.telemetry.initialize(
+                        TelemetryConfig {
+                            tp_size: engine.tp_size,
+                            kv_format: kv_format_name(&engine),
+                            speculation: engine
+                                .speculative
+                                .as_ref()
+                                .map_or("none", |p| if p.is_mtp() { "mtp" } else { "dflash2" })
+                                .into(),
+                        },
+                        engine
+                            .model_dir
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                    publish_pools(&engine, &engine.radix, &worker_stats.telemetry);
                     let mut clamped_cfg = config;
                     for rank in &engine.ranks {
                         match rank.ordinary_prefill_token_capacity(clamped_cfg.max_num_seqs) {
@@ -340,6 +384,7 @@ impl EngineWorker {
     }
 
     pub fn request_shutdown(&self) {
+        self.stats.telemetry.set_status("stopping");
         self.shutdown.store(true, Ordering::Release);
         self.sender.lock().unwrap_or_else(|e| e.into_inner()).take(); // wake blocking_recv when idle
     }
@@ -363,7 +408,7 @@ impl EngineWorker {
         Ok(())
     }
 
-    fn enqueue_request(&self, req: Request) -> Result<(), WorkerError> {
+    fn enqueue_request(&self, mut req: Request) -> Result<(), WorkerError> {
         if self.is_panicked() {
             return Err(self.panic_worker_error());
         }
@@ -375,7 +420,7 @@ impl EngineWorker {
                 Err(WorkerError::worker_stopped("engine worker stopped"))
             };
         };
-        sender.try_send(req).map_err(|err| match err {
+        let permit = sender.try_reserve().map_err(|err| match err {
             mpsc::error::TrySendError::Full(_) => {
                 WorkerError::overload("engine ingress queue full")
             }
@@ -386,7 +431,12 @@ impl EngineWorker {
                     WorkerError::worker_stopped("engine worker stopped")
                 }
             }
-        })
+        })?;
+        // Reserve first: rejected ingress is HTTP admission, not a submitted engine request.
+        // Count before publishing to avoid a worker dequeue racing the waiting increment.
+        req.lifecycle = Some(self.stats.telemetry.request(req.prompt.len()));
+        permit.send(req);
+        Ok(())
     }
 
     pub fn submit(
@@ -416,6 +466,7 @@ impl EngineWorker {
         let cancelled = Arc::new(AtomicBool::new(false));
         let sampler = SamplerV1::new(params, &prompt, constraint);
         self.enqueue_request(Request {
+            lifecycle: None,
             prompt,
             images,
             vision: None,
@@ -585,6 +636,7 @@ impl EngineWorker {
         };
         let sampler = SamplerV1::new(params, &prompt, None);
         self.enqueue_request(Request {
+            lifecycle: None,
             prompt,
             images,
             vision: None,
@@ -610,6 +662,58 @@ impl Drop for EngineWorker {
         self.request_shutdown();
         // Normal server shutdown awaits shutdown(); Drop must not block an async executor.
     }
+}
+
+fn kv_format_name(engine: &Qwen3_5Engine) -> String {
+    use w34_kernels::ffi::{
+        W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4,
+    };
+    let layers = &engine.ranks[0].kv_pool.layers;
+    let all = |format| {
+        layers
+            .iter()
+            .all(|l| l.layout.k_format == format && l.layout.v_format == format)
+    };
+    if layers.is_empty() {
+        "unknown"
+    } else if all(W34_KV_FORMAT_FP16) {
+        "fp16"
+    } else if all(W34_KV_FORMAT_BF16) {
+        "bf16"
+    } else if all(W34_KV_FORMAT_Q8_0) {
+        "q8_0"
+    } else if all(W34_KV_FORMAT_TQ4) {
+        "tq4_all"
+    } else if layers.iter().all(|l| {
+        [W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4].contains(&l.layout.k_format)
+            && l.layout.k_format == l.layout.v_format
+    }) {
+        "tq4"
+    } else {
+        "mixed"
+    }
+    .into()
+}
+
+fn publish_pools(
+    engine: &Qwen3_5Engine,
+    radix: &crate::radix::MambaRadixCache,
+    telemetry: &Telemetry,
+) {
+    // Logical allocation is replicated across ranks; summing TP would double count.
+    let rank = &engine.ranks[0];
+    telemetry.publish_pools(Pools {
+        kv: Pool::known(
+            rank.kv_pool.num_pages,
+            rank.kv_pool.free_count(),
+            radix.full_evictable_pages(),
+        ),
+        gdn: Pool::known(
+            rank.state_pool.total_slots,
+            rank.state_pool.free_count(),
+            radix.mamba_evictable_slots(),
+        ),
+    });
 }
 
 fn release(engine: &mut Qwen3_5Engine, donation: Option<crate::radix::RadixDonationOutcome>) {
@@ -732,10 +836,12 @@ fn run_supervised_loop(
         eprintln!("[w34-cuda] FATAL: engine worker thread panicked: {reason}");
         *panic_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.clone());
         panicked.store(true, Ordering::Release);
+        stats.telemetry.set_status("unhealthy");
         WorkerError::worker_panicked(reason)
     } else {
         WorkerError::worker_stopped("engine worker stopped")
     };
+    stats.telemetry.set_status("stopping");
     stats.active.store(0, Ordering::Relaxed);
     receiver.close();
     for (_, r) in requests.drain() {
@@ -840,6 +946,7 @@ fn run_loop(
         );
         admit_requests(engine, &mut sched, requests, &mut speculation);
         reserve_request_capacity(engine, &mut sched, requests, &mut speculation, stats);
+        publish_pools(engine, &sched.radix, &stats.telemetry);
 
         let result = if let Some(id) = speculation.speculative_id {
             let Some(result) =
@@ -865,6 +972,7 @@ fn run_loop(
             abort_active_batch(engine, &mut sched, requests, &mut speculation, error);
         }
         complete_tick(engine, &mut sched, requests, stats);
+        publish_pools(engine, &sched.radix, &stats.telemetry);
         std::mem::swap(&mut engine.radix, &mut sched.radix);
     }
     std::mem::swap(&mut engine.radix, &mut sched.radix);
@@ -876,6 +984,7 @@ fn run_loop(
         p.abort_scheduled();
     }
     std::mem::swap(&mut engine.radix, &mut sched.radix);
+    publish_pools(engine, &engine.radix, &stats.telemetry);
 }
 
 // When waking from idle, briefly coalesce concurrent HTTP burst peers that are
@@ -1121,6 +1230,7 @@ fn extend_or_yield_mtp_batch(
                     |r| engine.alloc_three_state_slots_from(r),
                     |_, _, matched| matched == 0,
                 );
+                record_admissions(sched, requests);
                 if sched.active.len() == before {
                     break;
                 }
@@ -1191,6 +1301,7 @@ fn admit_requests(
                     |_, prompt, matched| proposer.can_restore_prefix(&prompt[..matched]),
                 );
                 sched.cfg.max_num_seqs = saved_max;
+                record_admissions(sched, requests);
                 if let Some(seq) = sched.active.first_mut() {
                     match proposer
                         .restore_prefix(engine, &seq.prompt_tokens[..seq.cached_prefix_tokens])
@@ -1248,6 +1359,7 @@ fn admit_requests(
                         |r| engine.alloc_three_state_slots_from(r),
                         |_, _, matched| matched == 0,
                     );
+                    record_admissions(sched, requests);
                     if sched.active.len() == before {
                         break;
                     }
@@ -1284,12 +1396,21 @@ fn admit_requests(
                 // considering the next. Existing requests can never lose capacity.
                 sched.cfg.max_num_seqs = before + 1;
                 sched.admit_waiting(|r| engine.alloc_three_state_slots_from(r));
+                record_admissions(sched, requests);
                 sched.cfg.max_num_seqs = limit;
                 if sched.active.len() == before {
                     break;
                 }
                 reserved += pages;
             }
+        }
+    }
+}
+
+fn record_admissions(sched: &SchedulerV1, requests: &HashMap<u64, Request>) {
+    for seq in &sched.active {
+        if let Some(life) = &requests[&seq.req_id].lifecycle {
+            life.scheduled(seq.cached_prefix_tokens);
         }
     }
 }
@@ -1391,6 +1512,7 @@ fn step_single_speculation(
         pending_ingest.clear();
         return None;
     }
+    let prefilled_before = seq.prefilled_tokens;
     let result = if !seq.is_prefill_complete() {
         proposer
             .step_scheduled_prefill_chunk(
@@ -1413,6 +1535,11 @@ fn step_single_speculation(
                 gpu,
             )
             .map(|(tokens, lps)| {
+                stats.telemetry.speculation(
+                    1,
+                    proposer.last_verified_draft_tokens as u64,
+                    proposer.last_accepted.last().copied().unwrap_or(0) as u64,
+                );
                 stats.verify_rounds.fetch_add(1, Ordering::Relaxed);
                 stats.accepted_drafts.fetch_add(
                     proposer.last_accepted.last().copied().unwrap_or(0) as u64,
@@ -1425,6 +1552,7 @@ fn step_single_speculation(
                     .collect()
             })
     };
+    r.computed(seq.prefilled_tokens - prefilled_before);
     let result = result.and_then(|tokens| {
         for (token, lp) in tokens {
             emit(r, token, lp);
@@ -1467,6 +1595,7 @@ fn step_mtp_batch(
             .sampler
             .params
             .is_plain_greedy(r.sampler.constraint.is_some());
+        let prefilled_before = seq.prefilled_tokens;
         let step = proposer
             .select_mtp_batch_slot(slot_idx)
             .and_then(|()| {
@@ -1480,6 +1609,7 @@ fn step_mtp_batch(
                 )
             })
             .map_err(WorkerError::Cuda);
+        r.computed(seq.prefilled_tokens - prefilled_before);
         match step {
             Ok(token) => {
                 if let Some((tok, lp)) = token {
@@ -1540,6 +1670,11 @@ fn step_mtp_batch(
                 let n = all_emitted.len();
                 stats.verify_rounds.fetch_add(n as u64, Ordering::Relaxed);
                 let acc_sum: usize = proposer.last_accepted.iter().rev().take(n).copied().sum();
+                stats.telemetry.speculation(
+                    n as u64,
+                    proposer.last_verified_draft_tokens as u64,
+                    acc_sum as u64,
+                );
                 stats
                     .accepted_drafts
                     .fetch_add(acc_sum as u64, Ordering::Relaxed);
@@ -1628,6 +1763,9 @@ fn complete_tick(
             .decode_bucket_mask
             .fetch_or(1 << bucket.trailing_zeros(), Ordering::Relaxed);
     }
+    stats
+        .telemetry
+        .publish_decode_bucket_mask(stats.decode_bucket_mask.load(Ordering::Relaxed));
     stats.active.store(
         sched.active.iter().filter(|s| !s.finished).count() as u64,
         Ordering::Relaxed,
@@ -1647,6 +1785,10 @@ fn complete_tick(
 }
 
 fn emit(request: &Request, id: i32, logprobs: Option<StepLogprobs>) {
+    // Engine output exists even if the bounded delivery channel rejects it.
+    if let Some(life) = &request.lifecycle {
+        life.token();
+    }
     if request
         .output
         .try_send(GenerationEvent::Token { id, logprobs })
@@ -1798,7 +1940,18 @@ fn capture_decision_tap(
         }
     }
     if let Some((tx, res)) = tap_done {
+        if let Err(error) = &res {
+            req.set_terminal(GenerationEvent::Error(error.clone()));
+        }
         let _ = tx.send(res);
+    }
+}
+
+fn record_computed_prefill(slices: &[ScheduledReqSlice], requests: &HashMap<u64, Request>) {
+    for s in slices {
+        if s.is_prefill_chunk {
+            requests[&s.req_id].computed(s.query_tokens.len());
+        }
     }
 }
 
@@ -1829,6 +1982,7 @@ fn step_plain(
             seq,
             sched.cfg.chunk_prefill_size,
         )?;
+        request.computed(slice.query_tokens.len());
         //ScheduledVision::step_prefill executes forward_selected_rows on a 1-request slice
         // with selected_rows = [q_len - 1] (selected_row index 0 on every chunk).
         capture_decision_tap(
@@ -1965,6 +2119,7 @@ fn step_plain(
         Some(&emit_mask),
         needs_gpu,
     )?;
+    record_computed_prefill(&slices, requests);
     {
         let mut batch_tok_offset = 0usize;
         let mut selected_row_idx = 0usize;
@@ -2523,6 +2678,7 @@ mod full_hidden_tap_tests {
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let request = Request {
+            lifecycle: Some(Arc::new(Telemetry::default()).request(1)),
             prompt: vec![1],
             images: Vec::new(),
             vision: None,
@@ -2548,6 +2704,25 @@ mod full_hidden_tap_tests {
             },
             rx,
         )
+    }
+
+    #[test]
+    fn telemetry_counts_engine_output_even_when_delivery_is_full() {
+        let (mut request, _stream, _tap) = terminal_test_request();
+        let telemetry = Arc::new(Telemetry::default());
+        request.lifecycle = Some(telemetry.request(1));
+        request.lifecycle.as_ref().unwrap().scheduled(0);
+        for id in 0..3 {
+            emit(&request, id, None);
+        }
+        assert_eq!(telemetry.snapshot().tokens.generated, 3);
+        assert!(request.cancelled.load(Ordering::Acquire));
+        drop(request);
+        let s = telemetry.snapshot();
+        assert_eq!(s.requests.cancelled, 1);
+        assert_eq!(s.requests.failed, 0);
+        assert_eq!(s.requests.running, 0);
+        assert_eq!(s.latency.ttft.count, 1);
     }
 
     #[tokio::test]
@@ -2719,7 +2894,9 @@ mod full_hidden_tap_tests {
     }
 
     async fn check_locally_owned_panic(pulled_batch: bool) {
-        let (request, mut stream, tap) = terminal_test_request();
+        let (mut request, mut stream, tap) = terminal_test_request();
+        let telemetry = Arc::new(Telemetry::default());
+        request.lifecycle = Some(telemetry.request(1));
         let (sender, mut receiver) = mpsc::channel(2);
         let mut requests = HashMap::new();
         if pulled_batch {
@@ -2749,6 +2926,10 @@ mod full_hidden_tap_tests {
             Some(GenerationEvent::Error(WorkerError::WorkerPanicked(msg))) if !msg.is_empty()));
         assert!(matches!(tap.await, Ok(Err(WorkerError::WorkerPanicked(msg))) if !msg.is_empty()));
         assert!(stream.events.recv().await.is_none());
+        let s = telemetry.snapshot();
+        assert_eq!(s.requests.failed, 1);
+        assert_eq!(s.requests.waiting + s.requests.running, 0);
+        assert_eq!(s.latency.e2e.count, 1);
     }
 
     #[tokio::test]
@@ -2854,6 +3035,13 @@ mod full_hidden_tap_tests {
 
             assert!(worker.is_panicked());
             assert_eq!(worker.stats.active.load(Ordering::Relaxed), 0);
+            let metrics = worker.stats.telemetry.snapshot();
+            assert_eq!(metrics.requests.submitted, 2);
+            assert_eq!(metrics.requests.failed, 2);
+            assert_eq!(metrics.requests.waiting + metrics.requests.running, 0);
+            assert_eq!(metrics.latency.e2e.count, 2);
+            assert_eq!(metrics.latency.ttft.count, 0);
+            assert_eq!(metrics.status, "unhealthy");
 
             // Future submits must report WorkerPanicked (HTTP 500), never Overload/503.
             let post_panic = worker.submit(vec![1, 2], SamplingParams::default(), None);

@@ -62,6 +62,39 @@ fn exercise_tool_choices(state: &Arc<OpenAiServerState>, kind: SpeculativeKind, 
     }
 }
 
+fn verify_speculative_telemetry(state: &OpenAiServerState, kind: SpeculativeKind, accepted: u64) {
+    let telemetry = state.metrics.snapshot();
+    assert_eq!(telemetry.speculation.accepted_tokens, accepted);
+    let drafts = telemetry
+        .speculation
+        .draft_tokens
+        .expect("actual verified drafts");
+    assert!(drafts >= accepted);
+    assert!(
+        drafts > 0,
+        "speculation must publish the actual proposal denominator"
+    );
+    assert_eq!(
+        telemetry.speculation.rounds,
+        state.worker.stats.verify_rounds.load(Ordering::Relaxed)
+    );
+    assert_eq!(telemetry.requests.submitted, 1);
+    assert_eq!(telemetry.latency.ttft.count, 1);
+    assert_eq!(
+        telemetry.latency.time_per_output_token.count, 1,
+        "one request-level observation, not speculative token drains"
+    );
+    assert!(telemetry.tokens.generated > 0);
+    assert_eq!(
+        telemetry.config.speculation,
+        if kind == SpeculativeKind::Mtp {
+            "mtp"
+        } else {
+            "dflash2"
+        }
+    );
+}
+
 fn exercise(kind: SpeculativeKind) {
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
@@ -103,6 +136,7 @@ fn exercise(kind: SpeculativeKind) {
         "speculative verifier did not run"
     );
     let accepted = state.worker.stats.accepted_drafts.load(Ordering::Relaxed);
+    verify_speculative_telemetry(&state, kind, accepted);
     println!("{kind:?}: strict JSON schema enforced (accepted drafts={accepted})");
 
     let tools = json!([

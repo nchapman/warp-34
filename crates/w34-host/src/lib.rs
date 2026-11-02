@@ -8,6 +8,8 @@ pub mod constraints;
 #[cfg(feature = "cuda")]
 mod coordinated;
 pub mod cuda;
+#[cfg(feature = "cuda")]
+pub mod dashboard;
 pub mod decision;
 #[cfg(feature = "cuda")]
 pub mod dflash;
@@ -31,6 +33,7 @@ mod scheduled_vision;
 pub mod scheduler;
 pub mod server;
 pub mod speculative;
+pub mod telemetry;
 pub mod tool_constraints;
 pub mod vision;
 

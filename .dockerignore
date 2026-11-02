@@ -4,6 +4,10 @@
 **
 !Cargo.toml
 !Cargo.lock
+!dashboard/
+!dashboard/**
+dashboard/node_modules/
+dashboard/dist/
 !.cargo/
 !.cargo/config.toml
 !crates/

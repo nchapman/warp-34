@@ -1,5 +1,15 @@
 # syntax=docker/dockerfile:1
 
+# The frontend tool versions match .mise.toml. Only dist crosses into Rust;
+# neither Node nor pnpm is present in the runtime image.
+FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS dashboard
+RUN npm install --global pnpm@12.10.1
+WORKDIR /dashboard
+COPY dashboard/package.json dashboard/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY dashboard/ ./
+RUN pnpm build
+
 # Keep the toolkit/cuBLAS version aligned with the proven warp3090 image.
 FROM nvidia/cuda:13.4.1-devel-ubuntu24.04@sha256:a3f014424ccc86cf66c84d700d2896491424205dd9457e3116ed4f0e96381311 AS build
 ENV CUDA_HOME=/usr/local/cuda \
@@ -12,6 +22,7 @@ RUN apt-get update \
     && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
 WORKDIR /src
 COPY . .
+COPY --from=dashboard /dashboard/dist ./dashboard/dist
 # Bound nvcc parallelism on smaller build hosts; kernels still target sm_86.
 ARG W34_NVCC_JOBS=4
 RUN --mount=type=cache,target=/root/.cargo/registry \

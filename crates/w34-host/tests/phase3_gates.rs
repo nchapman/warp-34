@@ -465,5 +465,152 @@ fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
         "unexpected chat_sse_resp: {chat_sse_resp}"
     );
 
+    verify_shared_live_telemetry(&state);
     common::shutdown(&state);
+}
+
+#[cfg(feature = "cuda")]
+fn collect_engine_tokens(
+    runtime: tokio::runtime::Runtime,
+    mut generation: w34_host::engine_worker::GenerationStream,
+) -> usize {
+    use w34_host::engine_worker::GenerationEvent;
+    runtime.block_on(async {
+        let mut tokens = 0;
+        while let Some(event) = generation.events.recv().await {
+            match event {
+                GenerationEvent::Token { .. } => tokens += 1,
+                GenerationEvent::Error(e) => panic!("generation failed: {e}"),
+                GenerationEvent::Finished { .. } => {}
+            }
+        }
+        tokens
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn verify_shared_live_telemetry(state: &std::sync::Arc<OpenAiServerState>) {
+    use serde_json::{Value, json};
+    let before = state.metrics.snapshot();
+    assert_eq!(
+        before.requests.submitted, 2,
+        "both JSON and SSE enter the common worker lifecycle"
+    );
+    assert_eq!(before.requests.completed + before.requests.cancelled, 2);
+    assert!(before.tokens.generated > 0);
+    assert_eq!(before.latency.ttft.count, 2);
+    assert_eq!(before.http_responses.success, 2);
+
+    // Validation failures are HTTP responses, not fictitious engine requests.
+    let (head, _) = common::request(state, "POST", "/v1/chat/completions", json!({}));
+    assert!(head.contains("400 Bad Request"));
+    assert_eq!(state.metrics.snapshot().requests.submitted, 2);
+    assert_eq!(state.metrics.snapshot().http_responses.client_error, 1);
+
+    let (head, snapshot) = common::request(state, "GET", "/api/metrics", Value::Null);
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("cache-control: no-store")
+    );
+    assert_eq!(snapshot["schema_version"], 1);
+    for name in ["kv", "gdn"] {
+        let pool = &snapshot["pools"][name];
+        let used = pool["active"].as_u64().expect("known active occupancy");
+        let free = pool["free"].as_u64().expect("known free occupancy");
+        assert_eq!(
+            used + free + pool["cached"].as_u64().unwrap(),
+            pool["capacity"].as_u64().unwrap()
+        );
+    }
+    assert_eq!(snapshot["tokens"]["generated"], before.tokens.generated);
+    let scrape = common::raw_request(state, "GET", "/metrics", None);
+    assert!(scrape.contains(&format!(
+        "w34_tokens_generated_total {}\n",
+        before.tokens.generated
+    )));
+    assert!(scrape.contains("# TYPE w34_ttft_seconds histogram"));
+    assert_eq!(
+        state.metrics.snapshot().http_responses.success,
+        2,
+        "scrapes are not inference responses"
+    );
+
+    verify_metrics_while_generating(state, before, snapshot);
+}
+
+#[cfg(feature = "cuda")]
+fn verify_metrics_while_generating(
+    state: &std::sync::Arc<OpenAiServerState>,
+    before: w34_host::telemetry::Snapshot,
+    snapshot: serde_json::Value,
+) {
+    use serde_json::Value;
+    use std::time::{Duration, Instant};
+    use w34_host::parser::SamplingParams;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Decision readout is prefill-only: contributes queue/e2e/prompt, never TTFT/output.
+    let (decision_stream, decision) = state
+        .worker
+        .submit_decision_candidate_logits(vec![1200; 65], vec![1201], None)
+        .unwrap();
+    runtime.block_on(async {
+        decision.await.unwrap().unwrap();
+    });
+    drop(decision_stream);
+
+    let generation = state
+        .worker
+        .submit(
+            vec![1300; 128],
+            SamplingParams {
+                max_tokens: 256,
+                min_tokens: 256,
+                ignore_eos: true,
+                temperature: 0.,
+                top_k: 1,
+                ..SamplingParams::default()
+            },
+            None,
+        )
+        .unwrap();
+    let consumer = std::thread::spawn(move || collect_engine_tokens(runtime, generation));
+    let mut saw_inflight = false;
+    for _ in 0..3 {
+        let start = Instant::now();
+        let (head, live) = common::request(state, "GET", "/api/metrics", Value::Null);
+        assert!(head.contains("200 OK"));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "scrape waited on engine work"
+        );
+        assert_eq!(live["instance_id"], snapshot["instance_id"]);
+        let requests = &live["requests"];
+        saw_inflight |=
+            requests["running"].as_u64().unwrap() + requests["waiting"].as_u64().unwrap() > 0;
+        assert_eq!(
+            requests["submitted"].as_u64().unwrap(),
+            ["waiting", "running", "completed", "failed", "cancelled"]
+                .iter()
+                .map(|k| requests[k].as_u64().unwrap())
+                .sum::<u64>()
+        );
+    }
+    assert!(
+        saw_inflight,
+        "must scrape while engine work is actually in flight"
+    );
+    assert_eq!(consumer.join().unwrap(), 256);
+    let after = state.metrics.snapshot();
+    assert_eq!(after.tokens.generated - before.tokens.generated, 256);
+    assert_eq!(after.latency.ttft.count - before.latency.ttft.count, 1);
+    assert_eq!(after.requests.waiting + after.requests.running, 0);
+    assert_eq!(after.requests.failed, 0);
+    let kv = &after.pools.kv;
+    assert_eq!(
+        kv.capacity,
+        kv.active.unwrap() + kv.cached + kv.free.unwrap()
+    );
 }

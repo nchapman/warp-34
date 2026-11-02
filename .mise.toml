@@ -1,4 +1,6 @@
 [tools]
+node = "24.21.0"
+pnpm = "12.10.1"
 "cargo:cargo-llvm-cov" = "0.8.3"
 rust = "1.99.0"
 python = "3.12.12"
@@ -6,8 +8,28 @@ python = "3.12.12"
 [env]
 _.file = { path = ".env", ignored_if_missing = true }
 
+[tasks."dashboard-install"]
+description = "Install locked dashboard dependencies"
+run = "pnpm --dir dashboard install --frozen-lockfile"
+
+[tasks."dashboard-build"]
+description = "Build React/Vite assets for embedding in w34"
+depends = ["dashboard-install"]
+run = "pnpm --dir dashboard build"
+
+[tasks."dashboard-check"]
+description = "Typecheck, format-check, and test the dashboard"
+depends = ["dashboard-install"]
+run = "pnpm --dir dashboard check"
+
+[tasks."dashboard-dev"]
+description = "Vite dev server; proxies metrics to w34 on localhost:8000"
+depends = ["dashboard-install"]
+run = "pnpm --dir dashboard dev"
+
 [tasks.build]
-description = "Build release binary with CUDA kernels"
+description = "Build release binary with CUDA kernels and embedded dashboard"
+depends = ["dashboard-build"]
 run = "cargo build --release --features cuda"
 
 [tasks.fmt]
@@ -20,10 +42,12 @@ run = "cargo fmt --check"
 
 [tasks.clippy]
 description = "Clippy with CUDA feature enabled"
+depends = ["dashboard-build"]
 run = "cargo clippy --features cuda --all-targets -- -D warnings"
 
 [tasks."clippy-cpu"]
 description = "Clippy without CUDA feature"
+depends = ["dashboard-build"]
 run = "cargo clippy --all-targets -- -D warnings"
 
 [tasks."check-quick"]
@@ -32,10 +56,12 @@ depends = ["fmt-check", "clippy", "clippy-cpu"]
 
 [tasks."test-quick"]
 description = "Unit tests only (lib target with CUDA)"
+depends = ["dashboard-build"]
 run = "cargo test --release --features cuda --lib"
 
 [tasks."test-cpu"]
 description = "Fast CPU-only suite: unit tests plus CPU-runnable integration tests"
+depends = ["dashboard-build"]
 run = "cargo test --lib --tests"
 
 [tasks."doc-test"]
@@ -44,19 +70,22 @@ run = "cargo test --doc"
 
 [tasks.coverage]
 description = "Fast library code coverage report with CUDA"
+depends = ["dashboard-build"]
 run = "cargo llvm-cov --features cuda --lib --summary-only"
 
 [tasks."coverage-html"]
 description = "Generate HTML coverage report for lib with CUDA"
+depends = ["dashboard-build"]
 run = "cargo llvm-cov --features cuda --lib --html"
 
 [tasks.test]
 description = "Full release test suite with CUDA"
+depends = ["dashboard-build"]
 run = "cargo test --release --features cuda"
 
 [tasks.check]
 description = "Format check, clippy (both states), and full release test suite"
-depends = ["fmt-check", "clippy", "clippy-cpu", "test", "oracle-check", "perf-check"]
+depends = ["fmt-check", "clippy", "clippy-cpu", "test", "oracle-check", "perf-check", "dashboard-check"]
 
 [tasks."perf-check"]
 description = "CPU-only tests and manifest validation for the independent performance suite"

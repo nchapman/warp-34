@@ -23,6 +23,7 @@ one.
 crates/
   w34-kernels/   CUDA kernels + C/Rust FFI seam (built incrementally via nvcc)
   w34-host/      Rust runtime, safetensors loader, scheduler, CLI, and server
+dashboard/      React + TypeScript + Vite frontend (pnpm; embedded in w34)
 docs/
   ROADMAP.md     Phased engineering roadmap & vLLM / SGLang / warp3090 source map
 ```
@@ -31,10 +32,30 @@ docs/
 
 ```sh
 export PATH="/opt/cuda/bin:$PATH"
-mise run build          # cargo build --release --features cuda
+mise install            # pinned Rust, Python, Node, and pnpm tooling
+mise run build          # build dashboard, then cargo build --release --features cuda
 mise run check-quick    # fmt --check + clippy (with and without cuda)
 mise run check          # fmt + clippy + release test suite
 ```
+
+## Live dashboard and metrics
+
+Open **`http://127.0.0.1:8000/`** while `w34 serve` is running for the built-in,
+read-only dashboard: live generation throughput, engine TTFT, request load, prefix
+reuse, and separate KV/GDN capacity. A warm-dark React interface is embedded in the
+binary—no Node runtime, external assets, or Prometheus installation required.
+
+**`/metrics`** exposes Prometheus counters, gauges, and latency histograms;
+**`/api/metrics`** exposes the same measurements as versioned JSON. The dashboard
+keeps five minutes of local history; use an external collector for persistence.
+See [metrics semantics, deployment security, and development commands](docs/METRICS.md).
+The server does not enforce authentication: keep it private or behind an authenticated
+reverse proxy.
+
+For frontend development, `mise run dashboard-dev` runs Vite with a proxy to the
+server on port 8000. `mise run dashboard-check` runs frontend checks and tests.
+Direct Cargo builds with CUDA need `mise run dashboard-build` first; `mise run build`
+and the standard check/test tasks do this automatically.
 
 ## Standalone performance comparisons
 
@@ -67,7 +88,8 @@ docker build -t warp-34:local .
 docker run --rm warp-34:local  # print CLI usage
 ```
 
-The multi-stage build uses pinned CUDA 13.4.1 + Rust 1.99.0, then copies only
+The multi-stage build compiles the locked React/Vite dashboard with the same Node
+and pnpm versions pinned in mise, then uses pinned CUDA 13.4.1 + Rust 1.99.0 and copies only
 `w34`, `libcudart`, `libcublas`, and `libcublasLt` into Ubuntu 24.04. No toolkit,
 Python, model weights, or NVIDIA driver is bundled in the runtime image.
 The locally verified image reports approximately **1.22 GB** via Docker image

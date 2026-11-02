@@ -1,4 +1,6 @@
 /target/
+/dashboard/node_modules/
+/dashboard/dist/
 /target-cov/
 /vendor/
 /models/
@@ -8,3 +10,4 @@
 __pycache__/
 *.pyc
 /.pi/
+/.playwright-mcp/

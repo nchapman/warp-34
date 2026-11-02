@@ -184,7 +184,8 @@ Every milestone must pass three automated checks before merging:
     - `HybridReqToTokenPool` uses 2-slot ping-pong track buffers (`checkpoint_dst_indices`) to snapshot GDN state at chunk boundaries (`C`) and donate only **committed** checkpoints into the radix tree.
     - Verified in Phase 3 against a **synthetic speculative proposer** forcing partial rejections across chunk boundaries (**Decisive Gate Test #5**).
 - **3.3 OpenAI HTTP/SSE Server & CLI (`w34 serve`, `w34 chat`):**
-  - Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize`, `/detokenize`, `/health`, `/metrics` (Prometheus TTFT, ITL, KV pool utilization, radix KV & GDN hit rates).
+  - Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize`, `/detokenize`, `/health`, `/metrics` (Prometheus engine latency histograms, request/token counters, KV/GDN occupancy, and hybrid prefix-token reuse).
+  - **Production observability:** embedded React/Vite dashboard at `/` plus versioned `/api/metrics` JSON from the same telemetry as Prometheus. Distinguish active/evictable/free target resources, enqueued/running requests, and engine timing from HTTP timing. Use request-average time per output token rather than misleading speculative SSE-drain ITL. See [`METRICS.md`](METRICS.md) for the implemented contract and intentionally deferred features.
   - **Qwen3 Unified Reasoning & Tool Parser (`vllm/parser/qwen3.py` parity):**
     - `chat_template_kwargs: {"enable_thinking": bool}`, streaming `delta.reasoning_content` (`<think>...</think>`) vs `delta.content`, implicit `</think>` on `<tool_call>`, and both **Qwen3-XML** (`<function=...><parameter=...>`) and **Hermes JSON** `<tool_call>` extraction.
   - **Structured Outputs (`response_format` / `json_schema` / Regex / GBNF):**

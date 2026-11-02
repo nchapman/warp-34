@@ -57,6 +57,9 @@ pub struct NativeProposer {
     mtp_batch_active_slot: usize,
     mtp_batch_slots: Vec<MtpBatchSlot>,
     pub last_accepted: Vec<usize>,
+    /// Draft rows actually included in the last successful scheduled verify call
+    /// (summed across requests for batched MTP), after budget/grammar/stop trimming.
+    pub(crate) last_verified_draft_tokens: usize,
     pub last_restored_tokens: usize,
 }
 const MEMO_BUDGET: usize = 64 * 1024 * 1024;
@@ -188,6 +191,7 @@ impl NativeProposer {
             mtp_batch_active_slot: 0,
             mtp_batch_slots,
             last_accepted: vec![],
+            last_verified_draft_tokens: 0,
             last_restored_tokens: 0,
         })
     }
@@ -1411,6 +1415,7 @@ impl NativeProposer {
             }
         }
         let lp_len = round_lps.len().min(pushed);
+        self.last_verified_draft_tokens = k;
         Ok((emitted[..pushed].to_vec(), round_lps[..lp_len].to_vec()))
     }
 
@@ -1592,6 +1597,7 @@ impl NativeProposer {
             &mut SamplerV1,
         )],
     ) -> Result<Vec<Vec<i32>>> {
+        self.last_verified_draft_tokens = 0;
         if items.is_empty() {
             return Ok(vec![]);
         }
@@ -1821,6 +1827,9 @@ impl NativeProposer {
             Ok(all_emitted)
         })();
 
+        if res.is_ok() {
+            self.last_verified_draft_tokens = prepared.iter().map(|prep| prep.drafts.len()).sum();
+        }
         if res.is_err() {
             for ((_, seq, _, _), prep) in items.iter_mut().zip(&mut prepared) {
                 if !prep.tx.spec_slots.is_empty() {

@@ -486,6 +486,10 @@ impl StateBundlePool {
         })
     }
 
+    pub fn free_count(&self) -> usize {
+        self.free_slots.len()
+    }
+
     pub fn alloc_slot(&mut self) -> Option<i32> {
         self.free_slots.pop()
     }

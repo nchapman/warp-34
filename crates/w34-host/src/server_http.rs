@@ -23,7 +23,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::{Stream, StreamExt};
@@ -31,20 +31,11 @@ use tokio_stream::{Stream, StreamExt};
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Default)]
-pub struct ServerMetrics {
-    pub requests_total: AtomicU64,
-    pub tokens_generated_total: AtomicU64,
-    pub prompt_tokens_total: AtomicU64,
-    pub cached_prompt_tokens_total: AtomicU64,
-    pub last_ttft_us: AtomicU64,
-    pub last_itl_us: AtomicU64,
-}
-
 pub struct OpenAiServerState {
     pub model_name: String,
     pub worker: EngineWorker,
-    pub metrics: ServerMetrics,
+    pub metrics: Arc<crate::telemetry::Telemetry>,
+    next_request_id: AtomicU64,
     pub allow_remote_images: bool,
     pub response_store: crate::responses_api::ResponseStore,
     constraint_factory: Option<crate::constraints::ConstraintFactory>,
@@ -94,6 +85,8 @@ impl OpenAiServerState {
         } else {
             Vec::new()
         };
+        let metrics = worker.stats.telemetry.clone();
+        metrics.set_model(model_name.clone());
         Arc::new(Self {
             model_name,
             worker,
@@ -101,7 +94,8 @@ impl OpenAiServerState {
             response_store: crate::responses_api::ResponseStore::default(),
             constraint_factory,
             decoded_vocab,
-            metrics: ServerMetrics::default(),
+            metrics,
+            next_request_id: AtomicU64::new(0),
             preprocessing: Arc::new(Semaphore::new(32)),
             admission: Arc::new(Semaphore::new(32)),
         })
@@ -169,6 +163,7 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/metrics", get(metrics))
+        .route("/api/metrics", get(metrics_json))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/v1/chat/completions", post(chat))
@@ -189,6 +184,11 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         .route("/systemone", post(systemone_decide))
         .route("/v1/decisions", post(decisions_adapter))
         .route("/decisions", post(decisions_adapter))
+        .merge(crate::dashboard::router())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            count_inference_responses,
+        ))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "not found") })
         .with_state(state)
 }
@@ -198,30 +198,45 @@ async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
     )
 }
 async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
-    let m = &s.metrics;
-    let load = |n: &AtomicU64| n.load(Ordering::Relaxed);
-    let prompts = load(&m.prompt_tokens_total);
-    let cached = load(&m.cached_prompt_tokens_total);
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        format!(
-            "w34_requests_total {}\nw34_tokens_generated_total {}\nw34_prompt_tokens_total {}\nw34_cached_prompt_tokens_total {}\nw34_radix_cache_hit_rate {}\nw34_last_ttft_ms {}\nw34_last_itl_ms {}\nw34_active_requests {}\nw34_cancelled_requests_total {}\nw34_peak_active_requests {}\nw34_decode_bucket_mask {}\n",
-            load(&m.requests_total),
-            load(&m.tokens_generated_total),
-            prompts,
-            cached,
-            cached as f64 / prompts.max(1) as f64,
-            load(&m.last_ttft_us) as f64 / 1000.0,
-            load(&m.last_itl_us) as f64 / 1000.0,
-            load(&s.worker.stats.active),
-            load(&s.worker.stats.cancelled),
-            load(&s.worker.stats.peak_active),
-            load(&s.worker.stats.decode_bucket_mask)
-        ),
+        s.metrics.snapshot().prometheus(),
     )
+}
+async fn metrics_json(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(s.metrics.snapshot()),
+    )
+}
+fn is_inference_endpoint(method: &axum::http::Method, path: &str) -> bool {
+    *method == axum::http::Method::POST
+        && matches!(
+            path,
+            "/v1/chat/completions"
+                | "/v1/completions"
+                | "/v1/responses"
+                | "/v1/messages"
+                | "/v1/systemone"
+                | "/systemone"
+                | "/v1/decisions"
+                | "/decisions"
+        )
+}
+async fn count_inference_responses(
+    State(s): State<Arc<OpenAiServerState>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let count = is_inference_endpoint(request.method(), request.uri().path());
+    let response = next.run(request).await;
+    if count {
+        s.metrics.http_response(response.status().as_u16());
+    }
+    response
 }
 async fn read_json(state: &OpenAiServerState, req: Request) -> Result<Value, ApiError> {
     read_json_with_len(state, req).await.map(|(v, _)| v)
@@ -474,7 +489,6 @@ async fn generate(
         .clone()
         .try_acquire_owned()
         .map_err(admission_error)?;
-    let start = Instant::now();
     let (json, body_len) = read_json_with_len(&s, request).await?;
     let prep_state = s.clone();
     let inline_fast = !chat
@@ -505,10 +519,7 @@ async fn generate(
         .map_err(worker_api_err)?;
     let stream = prepared.stream;
     let include_usage = prepared.include_usage;
-    let request_id = s.metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
-    s.metrics
-        .prompt_tokens_total
-        .fetch_add(prompt_len as u64, Ordering::Relaxed);
+    let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let output = output_stream(
         s,
         generation,
@@ -517,7 +528,6 @@ async fn generate(
         chat,
         prompt_len,
         request_id,
-        start,
         admission,
     );
     if stream {
@@ -667,7 +677,6 @@ fn output_stream(
     chat: bool,
     prompt_len: usize,
     request_id: u64,
-    start: Instant,
     admission: OwnedSemaphorePermit,
 ) -> impl Stream<Item = Output> + Send {
     async_stream::stream! {
@@ -685,7 +694,6 @@ fn output_stream(
         let mut legacy_offset = 0;
         let mut decoded_offset = 0;
         let mut tool_index = 0;
-        let mut last_token = Instant::now();
         let id = format!("{}-{request_id}",if chat { "chatcmpl" } else { "cmpl" });
         let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let chunk = |delta: Value, lp: Value| {
@@ -698,10 +706,6 @@ fn output_stream(
             match event {
                 GenerationEvent::Token { id, logprobs } => {
                     count += 1;
-                    s.metrics.tokens_generated_total.fetch_add(1,Ordering::Relaxed);
-                    if count == 1 { s.metrics.last_ttft_us.store(start.elapsed().as_micros() as u64,Ordering::Relaxed); }
-                    else { s.metrics.last_itl_us.store(last_token.elapsed().as_micros() as u64,Ordering::Relaxed); }
-                    last_token = Instant::now();
                     let mut lp = logprobs.as_ref().map(|lp| logprob_value(lp, tokenizer, &s.decoded_vocab));
                     if chat && let Some(lp) = &lp { logs.push(lp.clone()); }
                     if count >= params.min_tokens && params.is_stop_or_eos(id,&s.worker.eos_token_ids) {
@@ -755,7 +759,6 @@ fn output_stream(
         let delta = delta_value(tail,&mut tool_index);
         if chat && delta.as_object().is_some_and(|o| !o.is_empty()) { yield Output::Delta(chunk(delta,Value::Null)); }
         let finish = if chat && !turn.tool_calls.is_empty() { "tool_calls" } else if !stopped && count >= params.max_tokens { "length" } else { "stop" };
-        s.metrics.cached_prompt_tokens_total.fetch_add(cached as u64,Ordering::Relaxed);
         let lp = if !params.logprobs { Value::Null } else if chat { json!({"content":logs}) } else { super::completion_logprobs(&logs, &mut 0) };
         let choice = if chat { json!({"index":0,"message":{"role":"assistant","content":turn.content,"reasoning_content":turn.reasoning_content,"tool_calls":turn.tool_calls},"finish_reason":finish,"logprobs":lp}) }
             else { json!({"index":0,"text":text,"finish_reason":finish,"logprobs":lp}) };
@@ -990,10 +993,9 @@ async fn responses_create(
         .clone()
         .try_acquire_owned()
         .map_err(admission_error)?;
-    let start = Instant::now();
     let caller_scope = responses_caller_scope(&s, request.headers());
     let body = read_json(&s, request).await?;
-    let request_id = s.metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
+    let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, meta) = crate::responses_api::translate_responses_to_chat(
         &body,
         &s.model_name,
@@ -1025,9 +1027,6 @@ async fn responses_create(
         state: s.clone(),
         id: meta.response_id.clone(),
     };
-    s.metrics
-        .prompt_tokens_total
-        .fetch_add(prompt_len as u64, Ordering::Relaxed);
 
     if meta.stream {
         let params = prepared.params;
@@ -1045,7 +1044,6 @@ async fn responses_create(
             let mut cached = 0usize;
             let mut done = false;
             let mut stopped = false;
-            let mut last_token = Instant::now();
 
             for (ev_name, payload) in sse.start() {
                 yield Ok::<_, Infallible>(Event::default().event(ev_name).data(payload.to_string()));
@@ -1055,13 +1053,6 @@ async fn responses_create(
                 match event {
                     GenerationEvent::Token { id, .. } => {
                         count += 1;
-                        s.metrics.tokens_generated_total.fetch_add(1, Ordering::Relaxed);
-                        if count == 1 {
-                            s.metrics.last_ttft_us.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-                        } else {
-                            s.metrics.last_itl_us.store(last_token.elapsed().as_micros() as u64, Ordering::Relaxed);
-                        }
-                        last_token = Instant::now();
                         if count >= params.min_tokens && params.is_stop_or_eos(id, &s.worker.eos_token_ids) {
                             stopped = true;
                             continue;
@@ -1126,7 +1117,6 @@ async fn responses_create(
             } else {
                 "stop"
             };
-            s.metrics.cached_prompt_tokens_total.fetch_add(cached as u64, Ordering::Relaxed);
             let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
             let (end_frames, final_resp, history) =
                 sse.finish(&turn, finish, prompt_len, cached, count, reasoning_tokens);
@@ -1159,25 +1149,11 @@ async fn responses_create(
         let mut cached = 0usize;
         let mut done = false;
         let mut stopped = false;
-        let mut last_token = Instant::now();
 
         while let Some(event) = generation.events.recv().await {
             match event {
                 GenerationEvent::Token { id, .. } => {
                     count += 1;
-                    s.metrics
-                        .tokens_generated_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    if count == 1 {
-                        s.metrics
-                            .last_ttft_us
-                            .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    } else {
-                        s.metrics
-                            .last_itl_us
-                            .store(last_token.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    }
-                    last_token = Instant::now();
                     if count >= prepared.params.min_tokens
                         && prepared.params.is_stop_or_eos(id, &s.worker.eos_token_ids)
                     {
@@ -1232,9 +1208,6 @@ async fn responses_create(
         } else {
             "stop"
         };
-        s.metrics
-            .cached_prompt_tokens_total
-            .fetch_add(cached as u64, Ordering::Relaxed);
         let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
         let (resp, history) = crate::responses_api::build_response_object(
             &meta,
@@ -1269,9 +1242,8 @@ async fn anthropic_messages(
         .clone()
         .try_acquire_owned()
         .map_err(|err| to_anthropic_err(admission_error(err)))?;
-    let start = Instant::now();
     let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
-    let request_id = s.metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
+    let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
     let (chat_req, meta) =
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
             .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
@@ -1289,9 +1261,6 @@ async fn anthropic_messages(
             prepared.constraint,
         )
         .map_err(|e| to_anthropic_err(worker_api_err(e)))?;
-    s.metrics
-        .prompt_tokens_total
-        .fetch_add(prompt_len as u64, Ordering::Relaxed);
 
     if meta.stream {
         let params = prepared.params;
@@ -1309,19 +1278,11 @@ async fn anthropic_messages(
             let mut done = false;
             let mut stopped = false;
             let mut matched_stop: Option<String> = None;
-            let mut last_token = Instant::now();
 
             while let Some(event) = generation.events.recv().await {
                 match event {
                     GenerationEvent::Token { id, .. } => {
                         count += 1;
-                        s.metrics.tokens_generated_total.fetch_add(1, Ordering::Relaxed);
-                        if count == 1 {
-                            s.metrics.last_ttft_us.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-                        } else {
-                            s.metrics.last_itl_us.store(last_token.elapsed().as_micros() as u64, Ordering::Relaxed);
-                        }
-                        last_token = Instant::now();
                         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
                         for (ev_name, payload) in sse.ensure_started(cached) {
                             yield Ok::<_, Infallible>(Event::default().event(ev_name).data(payload.to_string()));
@@ -1390,7 +1351,6 @@ async fn anthropic_messages(
             } else {
                 "stop"
             };
-            s.metrics.cached_prompt_tokens_total.fetch_add(cached as u64, Ordering::Relaxed);
             for (ev_name, payload) in sse.finish(&turn, finish, matched_stop.as_deref(), cached, count) {
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
@@ -1410,25 +1370,11 @@ async fn anthropic_messages(
         let mut done = false;
         let mut stopped = false;
         let mut matched_stop: Option<String> = None;
-        let mut last_token = Instant::now();
 
         while let Some(event) = generation.events.recv().await {
             match event {
                 GenerationEvent::Token { id, .. } => {
                     count += 1;
-                    s.metrics
-                        .tokens_generated_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    if count == 1 {
-                        s.metrics
-                            .last_ttft_us
-                            .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    } else {
-                        s.metrics
-                            .last_itl_us
-                            .store(last_token.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    }
-                    last_token = Instant::now();
                     if count >= prepared.params.min_tokens
                         && prepared.params.is_stop_or_eos(id, &s.worker.eos_token_ids)
                     {
@@ -1491,9 +1437,6 @@ async fn anthropic_messages(
         } else {
             "stop"
         };
-        s.metrics
-            .cached_prompt_tokens_total
-            .fetch_add(cached as u64, Ordering::Relaxed);
         let msg = crate::anthropic_api::build_anthropic_message(
             &meta,
             &turn,
@@ -1736,7 +1679,6 @@ async fn execute_systemone_json(
     })
     .await??;
 
-    s.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let mut answers = serde_json::Map::new();
     let mut input_tokens = 0usize;
     let mut cached_tokens = 0usize;
@@ -1892,13 +1834,6 @@ async fn execute_systemone_json(
         }
     }
 
-    s.metrics
-        .prompt_tokens_total
-        .fetch_add(input_tokens as u64, Ordering::Relaxed);
-    s.metrics
-        .cached_prompt_tokens_total
-        .fetch_add(cached_tokens as u64, Ordering::Relaxed);
-
     Ok(json!({
         "model": req_model.unwrap_or_else(|| s.model_name.clone()),
         "answers": Value::Object(answers),
@@ -1963,6 +1898,7 @@ pub async fn serve(
     let result = tokio::select! {
         result = &mut serving => result,
         _ = shutdown => {
+            state.metrics.set_status("stopping");
             state.admission.close();
             state.preprocessing.close();
             // Existing generations can complete while HTTP drains. shutdown() below
@@ -2033,6 +1969,38 @@ mod tests {
                 assert!(done);
             }
             assert_eq!(visible, "hello ");
+        }
+    }
+
+    #[test]
+    fn telemetry_http_filter_excludes_scrapes_status_static_and_token_counts() {
+        use axum::http::Method;
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/systemone",
+            "/v1/systemone",
+            "/decisions",
+            "/v1/decisions",
+        ] {
+            assert!(super::is_inference_endpoint(&Method::POST, path));
+            assert!(!super::is_inference_endpoint(&Method::GET, path));
+        }
+        for path in [
+            "/",
+            "/metrics",
+            "/api/metrics",
+            "/health",
+            "/assets/app.js",
+            "/tokenize",
+            "/v1/messages/count_tokens",
+            "/v1/responses/input_tokens",
+            "/v1/responses/123/cancel",
+        ] {
+            assert!(!super::is_inference_endpoint(&Method::POST, path));
+            assert!(!super::is_inference_endpoint(&Method::GET, path));
         }
     }
 
