@@ -522,10 +522,7 @@ pub fn resolve_hf_model_dir(model_spec: &str) -> io::Result<PathBuf> {
     if direct.exists() {
         return Ok(direct.to_path_buf());
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/nchapman".to_string());
-    let hub_root = std::env::var("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| Path::new(&home).join(".cache/huggingface/hub"));
+    let hub_root = crate::hub::cache_dir();
 
     let folder_name = if model_spec.starts_with("models--") {
         model_spec.to_string()

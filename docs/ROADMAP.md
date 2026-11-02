@@ -117,7 +117,7 @@ Every milestone must pass three automated checks before merging:
   - Per-device context (`CudaDevice`), stream pool (compute, async D2H copy, sysmem comm), event pool, cuBLAS handle, and preallocated `DeviceArena`.
   - `CapacityPlanner` computing exact VRAM budgets for weights + KV pages + active/speculative/ping-pong/radix GDN `StateBundle`s (`72 MiB/rank` per 27B `TP=2` snapshot) + proposer draft-context KV + graph workspaces.
 - **0.4 Unified Safetensors & HF Hub Loader (`w34-host::loader`):**
-  - Resolves local paths or HuggingFace Hub repo IDs (`~/.cache/huggingface/hub/`).
+  - Resolves local paths or HuggingFace Hub repo IDs with native download-on-first-use, a shared standard cache, pinned revisions, explicit offline mode, and standard token credentials. Target/draft revisions are independent; no remote model code executes. See [`MODELS.md`](MODELS.md).
   - Parses `config.json` (`qwen3_5`, `qwen3_5_moe`, `qwen3`, `dflash2`) and `quantization_config`:
     - `compressed-tensors` (`pack-quantized` W4A16 g128, static/group `actorder`, `ignore` regexes)
     - `gptq` (`bits=4, group_size=128, sym=true, desc_act`)

@@ -8,6 +8,8 @@ use std::process::ExitCode;
 #[cfg(feature = "cuda")]
 use w34_host::cache::KvFormatPolicy;
 #[cfg(feature = "cuda")]
+use w34_host::hub::{HubOptions, ModelRole};
+#[cfg(feature = "cuda")]
 use w34_host::model::Qwen3_5Engine;
 
 #[cfg(feature = "cuda")]
@@ -35,6 +37,7 @@ fn print_usage() {
            profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
            serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
            chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--no-thinking]\n\
+         Hub options: --revision <ref> [--offline]; --draft-revision <ref> requires --draft-model.\n\
          Image options: --allow-remote-images enables public HTTP(S) fetch (16 MiB, 10 s, no redirects).\n\
          Speculative options (generate/bench/greedy-diff/dump-diff/profile-diff/serve/chat):\n\
            --speculative mtp|dflash2 [--draft-model <id|path>] [--mtp-k 1..3] [--kv-pages <n>]\n\
@@ -121,6 +124,11 @@ fn tensor_diff_metrics(a: &[f32], b: &[f32]) -> (f32, f64, f64) {
 #[cfg(feature = "cuda")]
 struct CudaCliOptions {
     model: String,
+    // Populated centrally after validation; never used as the public model name.
+    resolved_model: String,
+    revision: Option<String>,
+    draft_revision: Option<String>,
+    offline: bool,
     tp: usize,
     prompt: String,
     max_tokens: usize,
@@ -152,10 +160,23 @@ struct CudaCliOptions {
     allow_remote_images: bool,
 }
 
+#[cfg(feature = "cuda")]
+fn revision_value(args: &[String], index: &mut usize) -> Result<String, String> {
+    let flag = &args[*index];
+    *index += 1;
+    args.get(*index)
+        .filter(|value| !value.trim().is_empty() && !value.starts_with('-'))
+        .cloned()
+        .ok_or_else(|| format!("missing {flag} value"))
+}
+
 // None means help was requested; stop parsing immediately, before validation.
 #[cfg(feature = "cuda")]
 fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String> {
     let mut model = "nchapman/Qwen3.5-4B-W4A16-GPTQ".to_string();
+    let mut revision = None;
+    let mut draft_revision = None;
+    let mut offline = false;
     let mut tp = 1usize;
     let mut prompt =
         "Explain the difference between a mutex and a semaphore in two sentences.".to_string();
@@ -190,6 +211,9 @@ fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String>
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--revision" => revision = Some(revision_value(args, &mut i)?),
+            "--draft-revision" => draft_revision = Some(revision_value(args, &mut i)?),
+            "--offline" => offline = true,
             "--speculative" => {
                 i += 1;
                 speculative_kind = Some(match args.get(i).map(String::as_str) {
@@ -366,6 +390,10 @@ fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String>
 
     Ok(Some(CudaCliOptions {
         model,
+        resolved_model: String::new(),
+        revision,
+        draft_revision,
+        offline,
         tp,
         prompt,
         max_tokens,
@@ -396,6 +424,29 @@ fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String>
         image_urls,
         allow_remote_images,
     }))
+}
+
+#[cfg(feature = "cuda")]
+fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Result<(), String> {
+    if !matches!(
+        sub,
+        "generate" | "bench" | "greedy-diff" | "dump-diff" | "profile-diff" | "serve" | "chat"
+    ) {
+        if options.speculative_kind.is_some() {
+            return Err("speculation is supported by generate, bench, greedy-diff, dump-diff, profile-diff, serve and chat".into());
+        }
+        return Err(format!("unknown subcommand: {sub}"));
+    }
+    if !matches!(options.tp, 1 | 2) {
+        return Err("--tp must be 1 or 2".into());
+    }
+    if sub == "greedy-diff" && options.golden_path.is_none() {
+        return Err("--golden <dir-or-json> is required".into());
+    }
+    if options.draft_revision.is_some() && options.draft_model.is_none() {
+        return Err("--draft-revision requires --draft-model".into());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -431,16 +482,7 @@ fn validate_cuda_options(options: &CudaCliOptions, sub: &str) -> Result<KvFormat
     if *verify_lossless && speculative_kind.is_none() {
         return Err("--verify-lossless requires --speculative".into());
     }
-    if speculative_kind.is_some()
-        && !matches!(
-            sub,
-            "generate" | "bench" | "greedy-diff" | "dump-diff" | "profile-diff" | "serve" | "chat"
-        )
-    {
-        return Err(
-            "speculation is supported by generate, bench, greedy-diff, dump-diff, profile-diff, serve and chat".into(),
-        );
-    }
+    validate_cuda_command(options, sub)?;
     Ok(policy)
 }
 
@@ -464,24 +506,100 @@ fn load_cli_engine(
 }
 
 #[cfg(feature = "cuda")]
-fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
-    if args.is_empty() {
+struct PreparedCudaCli {
+    options: CudaCliOptions,
+    policy: KvFormatPolicy,
+    spec_config: Option<w34_host::proposer::SpeculativeConfig>,
+}
+
+#[cfg(feature = "cuda")]
+fn engine_path(path: std::path::PathBuf) -> Result<String, String> {
+    path.into_os_string()
+        .into_string()
+        .map_err(|path| format!("resolved model path is not valid UTF-8: {path:?}"))
+}
+
+// Keep validation and resolution together so no command can download before
+// argument checks, or initialize a GPU before all model paths are available.
+#[cfg(feature = "cuda")]
+fn prepare_cuda_cli(
+    args: &[String],
+    mut resolve: impl FnMut(&str, &HubOptions, ModelRole) -> std::io::Result<std::path::PathBuf>,
+) -> Result<Option<PreparedCudaCli>, String> {
+    let Some(sub) = args.first().map(String::as_str) else {
         print_usage();
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
+    };
+    if matches!(sub, "--help" | "-h") {
+        print_usage();
+        return Ok(None);
     }
-    let sub = args[0].as_str();
-    let Some(options) = parse_cuda_options(args)? else {
-        return Ok(ExitCode::SUCCESS);
+    let Some(mut options) = parse_cuda_options(args)? else {
+        return Ok(None);
     };
     let policy = validate_cuda_options(&options, sub)?;
+    // Comparison is local. Live profiling resolves in the nested bench command,
+    // not here (and --w34 takes precedence over --live).
+    if sub == "profile-diff" {
+        return Ok(Some(PreparedCudaCli {
+            options,
+            policy,
+            spec_config: None,
+        }));
+    }
+    options.resolved_model = engine_path(
+        resolve(
+            &options.model,
+            &HubOptions {
+                revision: options.revision.clone(),
+                offline: options.offline,
+            },
+            ModelRole::Target,
+        )
+        .map_err(|e| e.to_string())?,
+    )?;
+    let draft_model = options
+        .draft_model
+        .as_ref()
+        .map(|model| {
+            engine_path(
+                resolve(
+                    model,
+                    &HubOptions {
+                        revision: options.draft_revision.clone(),
+                        offline: options.offline,
+                    },
+                    ModelRole::Draft,
+                )
+                .map_err(|e| e.to_string())?,
+            )
+        })
+        .transpose()?;
     let spec_config = options
         .speculative_kind
         .map(|kind| w34_host::proposer::SpeculativeConfig {
             kind,
-            draft_model: options.draft_model.clone(),
+            draft_model,
             mtp_k: options.mtp_k,
         });
-    match sub {
+    Ok(Some(PreparedCudaCli {
+        options,
+        policy,
+        spec_config,
+    }))
+}
+
+#[cfg(feature = "cuda")]
+fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
+    let Some(PreparedCudaCli {
+        options,
+        policy,
+        spec_config,
+    }) = prepare_cuda_cli(args, w34_host::hub::resolve_model)?
+    else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    match args[0].as_str() {
         "generate" => run_generate(options, policy, spec_config),
         "bench" => run_bench(options, policy, spec_config),
         "greedy-diff" => run_greedy_diff(options, policy, spec_config),
@@ -501,6 +619,7 @@ fn run_generate(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
+        resolved_model,
         tp,
         prompt,
         image_urls,
@@ -511,8 +630,15 @@ fn run_generate(
         use_cuda_graph,
         ..
     } = options;
-    let mut engine = load_cli_engine(&model, tp, policy, kv_pages, use_cuda_graph, &spec_config)
-        .map_err(|e| e.to_string())?;
+    let mut engine = load_cli_engine(
+        &resolved_model,
+        tp,
+        policy,
+        kv_pages,
+        use_cuda_graph,
+        &spec_config,
+    )
+    .map_err(|e| e.to_string())?;
     let (expanded_prompt, mm_images) = prepare_multimodal_prompt_and_images(
         &engine.cfg,
         &prompt,
@@ -568,6 +694,7 @@ fn run_bench(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
+        resolved_model,
         tp,
         prompt_len,
         gen_len,
@@ -582,8 +709,15 @@ fn run_bench(
         use_cuda_graph,
         ..
     } = options;
-    let mut engine = load_cli_engine(&model, tp, policy, kv_pages, use_cuda_graph, &spec_config)
-        .map_err(|e| e.to_string())?;
+    let mut engine = load_cli_engine(
+        &resolved_model,
+        tp,
+        policy,
+        kv_pages,
+        use_cuda_graph,
+        &spec_config,
+    )
+    .map_err(|e| e.to_string())?;
     let base_ids = engine
         .encode("The quick brown fox jumps over the lazy dog. ")
         .map_err(|e| e.to_string())?;
@@ -1006,6 +1140,7 @@ fn run_greedy_diff(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
+        resolved_model,
         tp,
         golden_path,
         max_prompts,
@@ -1018,8 +1153,15 @@ fn run_greedy_diff(
         ..
     } = options;
     let golden_arg = golden_path.ok_or("--golden <dir-or-json> is required")?;
-    let mut engine = load_cli_engine(&model, tp, policy, kv_pages, use_cuda_graph, &spec_config)
-        .map_err(|e| e.to_string())?;
+    let mut engine = load_cli_engine(
+        &resolved_model,
+        tp,
+        policy,
+        kv_pages,
+        use_cuda_graph,
+        &spec_config,
+    )
+    .map_err(|e| e.to_string())?;
     let cases = load_greedy_cases(&engine, &golden_arg)?;
 
     let mut total_tokens_compared = 0usize;
@@ -1210,6 +1352,7 @@ fn run_dump_diff(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
+        resolved_model,
         tp,
         prompt,
         image_urls,
@@ -1221,8 +1364,15 @@ fn run_dump_diff(
         use_cuda_graph,
         ..
     } = options;
-    let mut engine = load_cli_engine(&model, tp, policy, kv_pages, use_cuda_graph, &spec_config)
-        .map_err(|e| e.to_string())?;
+    let mut engine = load_cli_engine(
+        &resolved_model,
+        tp,
+        policy,
+        kv_pages,
+        use_cuda_graph,
+        &spec_config,
+    )
+    .map_err(|e| e.to_string())?;
     let (expanded_prompt, mm_images) = prepare_multimodal_prompt_and_images(
         &engine.cfg,
         &prompt,
@@ -1262,8 +1412,8 @@ fn run_dump_diff(
     if compare_tp2 {
         drop(engine);
         let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
-        let mut engine_tp2 =
-            Qwen3_5Engine::load(&model, 2, policy, pages, false).map_err(|e| e.to_string())?;
+        let mut engine_tp2 = Qwen3_5Engine::load(&resolved_model, 2, policy, pages, false)
+            .map_err(|e| e.to_string())?;
         if let Some(config) = &spec_config {
             engine_tp2
                 .enable_speculative(config)
@@ -1376,23 +1526,63 @@ fn run_dump_diff(
 }
 
 #[cfg(feature = "cuda")]
+fn profile_bench_args(options: &CudaCliOptions, exe: &Path) -> Vec<String> {
+    let mut args = vec![
+        exe.display().to_string(),
+        "bench".to_string(),
+        "--model".to_string(),
+        options.model.clone(),
+        "--tp".to_string(),
+        options.tp.to_string(),
+        "--prompt-len".to_string(),
+        options.prompt_len.to_string(),
+        "--gen-len".to_string(),
+        options.gen_len.to_string(),
+        "--kv-format".to_string(),
+        options.kv_format.clone(),
+    ];
+    if let Some(kind) = options.speculative_kind {
+        args.push("--speculative".to_string());
+        match kind {
+            w34_host::proposer::SpeculativeKind::Mtp => {
+                args.push("mtp".to_string());
+                args.push("--mtp-k".to_string());
+                args.push(options.mtp_k.to_string());
+            }
+            w34_host::proposer::SpeculativeKind::DFlash2 => {
+                args.push("dflash2".to_string());
+            }
+        }
+    }
+    for (flag, value) in [
+        ("--draft-model", &options.draft_model),
+        ("--revision", &options.revision),
+        ("--draft-revision", &options.draft_revision),
+    ] {
+        if let Some(value) = value {
+            args.push(flag.to_string());
+            args.push(value.clone());
+        }
+    }
+    if options.offline {
+        args.push("--offline".to_string());
+    }
+    if let Some(pages) = options.kv_pages {
+        args.push("--kv-pages".to_string());
+        args.push(pages.to_string());
+    }
+    args
+}
+
+#[cfg(feature = "cuda")]
 fn run_profile_diff(options: CudaCliOptions) -> Result<ExitCode, String> {
     let CudaCliOptions {
-        model,
-        tp,
-        prompt_len,
-        gen_len,
-        kv_format,
-        oracle_path,
-        preset_key,
-        w34_prof_path,
+        ref oracle_path,
+        ref preset_key,
+        ref w34_prof_path,
         prof_rounds,
         live_profile,
-        speculative_kind,
-        mtp_k,
-        draft_model,
-        kv_pages,
-        out_json,
+        ref out_json,
         ..
     } = options;
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -1405,6 +1595,7 @@ fn run_profile_diff(options: CudaCliOptions) -> Result<ExitCode, String> {
         }
     };
     let oracle = oracle_path
+        .clone()
         .unwrap_or_else(|| resolve_repo_file("tools/oracle/goldens/oracle_baselines.json"));
     let script = resolve_repo_file("tools/oracle/profile_diff.py");
     let mut cmd = std::process::Command::new("python3");
@@ -1414,52 +1605,18 @@ fn run_profile_diff(options: CudaCliOptions) -> Result<ExitCode, String> {
         .arg(&oracle)
         .arg("--rounds")
         .arg(prof_rounds.to_string());
-    if let Some(p) = &preset_key {
+    if let Some(p) = preset_key {
         cmd.arg("--preset").arg(p);
     }
-    if let Some(w) = &w34_prof_path {
+    if let Some(w) = w34_prof_path {
         cmd.arg("--w34").arg(w);
     } else if live_profile {
         let exe = env::current_exe().map_err(|e| e.to_string())?;
-        let mut bench_args = vec![
-            exe.display().to_string(),
-            "bench".to_string(),
-            "--model".to_string(),
-            model.clone(),
-            "--tp".to_string(),
-            tp.to_string(),
-            "--prompt-len".to_string(),
-            prompt_len.to_string(),
-            "--gen-len".to_string(),
-            gen_len.to_string(),
-            "--kv-format".to_string(),
-            kv_format.clone(),
-        ];
-        if let Some(kind) = speculative_kind {
-            bench_args.push("--speculative".to_string());
-            match kind {
-                w34_host::proposer::SpeculativeKind::Mtp => {
-                    bench_args.push("mtp".to_string());
-                    bench_args.push("--mtp-k".to_string());
-                    bench_args.push(mtp_k.to_string());
-                }
-                w34_host::proposer::SpeculativeKind::DFlash2 => {
-                    bench_args.push("dflash2".to_string());
-                }
-            }
-        }
-        if let Some(dm) = &draft_model {
-            bench_args.push("--draft-model".to_string());
-            bench_args.push(dm.clone());
-        }
-        if let Some(kp) = kv_pages {
-            bench_args.push("--kv-pages".to_string());
-            bench_args.push(kp.to_string());
-        }
+        let bench_args = profile_bench_args(&options, &exe);
         cmd.arg("--live-cmd")
             .arg(serde_json::to_string(&bench_args).unwrap());
     }
-    if let Some(o) = &out_json {
+    if let Some(o) = out_json {
         cmd.arg("--json-out").arg(o);
     }
     let status = cmd
@@ -1480,6 +1637,7 @@ fn run_serve(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
+        resolved_model,
         tp,
         host,
         port,
@@ -1490,7 +1648,7 @@ fn run_serve(
     } = options;
     let bind_addr = format!("{host}:{port}");
     println!("[w34 serve] loading model={model} tp={tp} for http://{bind_addr}");
-    let worker_model = model.clone();
+    let worker_model = resolved_model;
     let state =
         w34_host::server::OpenAiServerState::from_loader(model, allow_remote_images, move || {
             let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
@@ -1523,6 +1681,7 @@ fn run_chat(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
+        resolved_model,
         tp,
         prompt,
         image_urls,
@@ -1534,8 +1693,15 @@ fn run_chat(
         use_cuda_graph,
         ..
     } = options;
-    let mut engine = load_cli_engine(&model, tp, policy, kv_pages, use_cuda_graph, &spec_config)
-        .map_err(|e| e.to_string())?;
+    let mut engine = load_cli_engine(
+        &resolved_model,
+        tp,
+        policy,
+        kv_pages,
+        use_cuda_graph,
+        &spec_config,
+    )
+    .map_err(|e| e.to_string())?;
     let (expanded_prompt, mm_images) = prepare_multimodal_prompt_and_images(
         &engine.cfg,
         &prompt,
@@ -1589,6 +1755,287 @@ fn run_chat(
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn parse(values: &[&str]) -> CudaCliOptions {
+        parse_cuda_options(&args(values)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn hub_options_default_and_parse_independently() {
+        let defaults = parse(&["generate"]);
+        assert!(defaults.revision.is_none());
+        assert!(defaults.draft_revision.is_none());
+        assert!(!defaults.offline);
+        assert!(defaults.resolved_model.is_empty());
+
+        let options = parse(&[
+            "bench",
+            "--revision",
+            "refs/pr/12",
+            "--draft-revision",
+            "draft-commit",
+            "--offline",
+        ]);
+        assert_eq!(options.revision.as_deref(), Some("refs/pr/12"));
+        assert_eq!(options.draft_revision.as_deref(), Some("draft-commit"));
+        assert!(options.offline);
+        let target_only = parse(&["generate", "--revision", "target-commit"]);
+        assert!(target_only.draft_revision.is_none());
+    }
+
+    #[test]
+    fn revision_values_must_be_nonempty_and_not_options() {
+        for flag in ["--revision", "--draft-revision"] {
+            assert!(parse_cuda_options(&args(&["generate", flag])).is_err());
+            for value in ["", "  ", "--offline", "--model", "-h"] {
+                let error = parse_cuda_options(&args(&["generate", flag, value]))
+                    .err()
+                    .unwrap();
+                assert_eq!(error, format!("missing {flag} value"));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_commands_and_options_never_resolve() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["unknown"], "unknown subcommand"),
+            (&["generate", "--unknown"], "unknown argument"),
+            (&["generate", "--tp", "0"], "--tp must be 1 or 2"),
+            (&["generate", "--tp", "3"], "--tp must be 1 or 2"),
+            (&["greedy-diff"], "--golden"),
+            (&["bench", "--batch-size", "0"], "--batch-size"),
+            (&["generate", "--kv-format", "unknown"], "--kv-format"),
+            (
+                &["generate", "--revision", "--offline"],
+                "missing --revision",
+            ),
+            (
+                &["generate", "--draft-revision", "draft-ref"],
+                "--draft-revision requires --draft-model",
+            ),
+            (
+                &[
+                    "generate",
+                    "--draft-revision",
+                    "draft-ref",
+                    "--draft-model",
+                    "org/draft",
+                ],
+                "--draft-model requires --speculative dflash2",
+            ),
+            (
+                &["generate", "--speculative", "dflash2"],
+                "requires --draft-model",
+            ),
+        ];
+        for (values, message) in cases {
+            let result = prepare_cuda_cli(&args(values), |_, _, _| {
+                panic!("invalid arguments must not resolve models: {values:?}")
+            });
+            assert!(result.err().unwrap().contains(message), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn help_never_resolves() {
+        for values in [
+            vec![],
+            vec!["--help"],
+            vec!["-h"],
+            vec!["generate", "--help"],
+            vec!["greedy-diff", "--tp", "3", "--help"],
+        ] {
+            let result = prepare_cuda_cli(&args(&values), |_, _, _| {
+                panic!("help must not resolve models")
+            });
+            assert!(result.unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn engine_commands_resolve_target_but_preserve_model_id() {
+        for sub in [
+            "generate",
+            "bench",
+            "greedy-diff",
+            "dump-diff",
+            "serve",
+            "chat",
+        ] {
+            let mut calls = 0;
+            let prepared = prepare_cuda_cli(
+                &args(&[
+                    sub,
+                    "--model",
+                    "org/target",
+                    "--golden",
+                    "golden.json",
+                    "--tp",
+                    "2",
+                ]),
+                |spec, options, role| {
+                    calls += 1;
+                    assert_eq!(spec, "org/target");
+                    assert!(options.revision.is_none());
+                    assert!(!options.offline);
+                    assert!(matches!(role, ModelRole::Target));
+                    Ok("/cache/target".into())
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(prepared.options.model, "org/target");
+            assert_eq!(prepared.options.resolved_model, "/cache/target");
+            assert!(prepared.spec_config.is_none());
+        }
+    }
+
+    #[test]
+    fn draft_resolution_uses_its_own_revision_and_preserves_original_id() {
+        for draft_revision in [None, Some("draft-ref")] {
+            let mut values = args(&[
+                "generate",
+                "--model",
+                "org/target",
+                "--revision",
+                "target-ref",
+                "--speculative",
+                "dflash2",
+                "--draft-model",
+                "org/draft",
+                "--offline",
+            ]);
+            if let Some(revision) = draft_revision {
+                values.extend(args(&["--draft-revision", revision]));
+            }
+            let mut calls = Vec::new();
+            let prepared = prepare_cuda_cli(&values, |spec, options, role| {
+                assert!(options.offline);
+                let path = match role {
+                    ModelRole::Target => {
+                        assert_eq!(spec, "org/target");
+                        assert_eq!(options.revision.as_deref(), Some("target-ref"));
+                        "/cache/target"
+                    }
+                    ModelRole::Draft => {
+                        assert_eq!(spec, "org/draft");
+                        assert_eq!(options.revision.as_deref(), draft_revision);
+                        "/cache/draft"
+                    }
+                };
+                calls.push(spec.to_string());
+                Ok(path.into())
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(calls, ["org/target", "org/draft"]);
+            assert_eq!(prepared.options.model, "org/target");
+            assert_eq!(prepared.options.draft_model.as_deref(), Some("org/draft"));
+            assert_eq!(prepared.options.resolved_model, "/cache/target");
+            assert_eq!(
+                prepared.spec_config.unwrap().draft_model.as_deref(),
+                Some("/cache/draft")
+            );
+        }
+    }
+
+    #[test]
+    fn profile_comparison_and_live_parent_never_resolve() {
+        for extra in [
+            vec![],
+            vec!["--live"],
+            vec!["--w34", "profile.json"],
+            vec!["--w34", "profile.json", "--live"],
+        ] {
+            let mut values = args(&[
+                "profile-diff",
+                "--revision",
+                "target-ref",
+                "--speculative",
+                "dflash2",
+                "--draft-model",
+                "org/draft",
+                "--draft-revision",
+                "draft-ref",
+                "--offline",
+            ]);
+            values.extend(args(&extra));
+            let prepared = prepare_cuda_cli(&values, |_, _, _| {
+                panic!("profile-diff must defer resolution to a nested live bench")
+            })
+            .unwrap()
+            .unwrap();
+            assert!(prepared.options.resolved_model.is_empty());
+            assert!(prepared.spec_config.is_none());
+        }
+    }
+
+    #[test]
+    fn live_bench_forwards_hub_options_and_original_ids() {
+        let options = parse(&[
+            "profile-diff",
+            "--live",
+            "--model",
+            "org/target",
+            "--revision",
+            "target-ref",
+            "--speculative",
+            "dflash2",
+            "--draft-model",
+            "org/draft",
+            "--draft-revision",
+            "draft-ref",
+            "--offline",
+            "--kv-pages",
+            "128",
+        ]);
+        let forwarded = profile_bench_args(&options, Path::new("/bin/w34"));
+        assert_eq!(&forwarded[..2], &["/bin/w34", "bench"]);
+        let nested = parse_cuda_options(&forwarded[1..]).unwrap().unwrap();
+        assert!(validate_cuda_options(&nested, "bench").is_ok());
+        assert_eq!(nested.model, "org/target");
+        assert_eq!(nested.draft_model.as_deref(), Some("org/draft"));
+        assert_eq!(nested.revision.as_deref(), Some("target-ref"));
+        assert_eq!(nested.draft_revision.as_deref(), Some("draft-ref"));
+        assert!(nested.offline);
+        assert_eq!(nested.kv_pages, Some(128));
+
+        let defaults = profile_bench_args(&parse(&["profile-diff", "--live"]), Path::new("w34"));
+        assert!(!defaults.iter().any(|arg| matches!(
+            arg.as_str(),
+            "--revision" | "--draft-revision" | "--offline"
+        )));
+    }
+
+    #[test]
+    fn resolution_errors_propagate_before_dispatch() {
+        let result = prepare_cuda_cli(&args(&["generate"]), |_, _, _| {
+            Err(std::io::Error::other("offline cache miss"))
+        });
+        assert_eq!(result.err().unwrap(), "offline cache miss");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_resolved_paths_are_rejected() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::ffi::OsString::from_vec(vec![b'/', 0xff]);
+        let result = prepare_cuda_cli(&args(&["generate"]), |_, _, _| {
+            Ok(std::path::PathBuf::from(path.clone()))
+        });
+        assert!(result.err().unwrap().contains("not valid UTF-8"));
+    }
 }
 
 fn main() -> ExitCode {

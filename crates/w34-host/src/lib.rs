@@ -15,6 +15,7 @@ pub mod decision;
 pub mod dflash;
 #[cfg(feature = "cuda")]
 pub mod engine_worker;
+pub mod hub;
 pub mod loader;
 #[cfg(feature = "cuda")]
 pub mod model;

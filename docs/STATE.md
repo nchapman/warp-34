@@ -12,6 +12,56 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Native Hugging Face model acquisition
+
+- CLI model-loading commands now accept Hub IDs with **download-on-first-use** via
+  the pinned native Rust `hf-hub 1.0.0` client, including native Xet transfers.
+  Metadata and selected Safetensors weights are pinned to one commit before
+  loading; local paths remain local and no repository Python code is executed.
+- `--revision`, independent `--draft-revision`, and `--offline` are wired through
+  generate/bench/greedy-diff/dump-diff/serve/chat and nested live profiling.
+  Saved-profile comparison never downloads. Original model IDs remain API/report
+  names; acquisition and argument validation precede CUDA initialization.
+- The released SDK owns HF cache/home/token/endpoint settings, saved login,
+  credential opt-out, HTTP transport, redirects, retries, and Xet transfers.
+  No duplicate credential lookup, custom plaintext-endpoint guard, injected HTTP
+  client, or upstream Git dependency. This is an explicit scope decision: rely
+  on the library rather than impose a second authentication/transport policy.
+  Online startup checks Hub metadata and needs a writable cache. Offline startup
+  uses the SDK's `local_files_only` snapshot lookup and then validates required
+  files; it makes no network requests. Library/fixture lookup remains cache-only
+  and uses the SDK's cache-root resolver.
+- Required-file manifests live in repository `.w34/`, alongside the standard Hub
+  layout. Missing indexed shards, skipped file 404s, unsupported architectures,
+  denied/gated access, and unsafe shard paths fail clearly. Asset selection keeps
+  tokenizer/templates, processor metadata, and decision heads, without fetching
+  alternate weight formats. See [`MODELS.md`](MODELS.md) for the full contract.
+- Live qualification: downloaded the **1,324,107,408-byte** native 4B DFlash2
+  checkpoint into a fresh temporary Hub cache through Xet, then generated 32
+  tokens with the existing 4B target. Snapshot:
+  `nchapman/Qwen3.5-4B-DFlash2@8d8bb62873a4fe6165e644163e9ff76e06ab78ba`.
+  Repeated after SDK simplification with another empty cache: online and offline
+  32-token outputs matched byte-for-byte, including with an unreachable endpoint
+  and unreadable token path offline. A pinned target cache hit transferred no
+  payload bytes and generated successfully. Local evidence:
+  `/tmp/w34-hub-sdk-{online,offline,pinned}.log` and matching output files.
+- Verification: `mise run check` (full release CUDA suite, CPU/CUDA Clippy,
+  frontend checks, oracle/perf checks), `mise run test-cpu`, and `mise run build`
+  passed. Fifteen Hub tests include child-process tests of the real production
+  resolver with saved login, explicit token, token-file override, credential
+  opt-out, endpoint override, HOME-less explicit cache, XDG cache, and offline
+  reuse. Review's suggested extra authentication/transport policies were declined
+  per the explicit SDK-delegation decision; SDK limitations are documented.
+  Strengthened the offline test to prove that a reachable Hub receives no requests.
+  Final post-review `mise run check` and `mise run test-cpu` also passed.
+- Qualification note: an earlier live test refreshed cached `main` from
+  `d5874365...` to newer weights `db853835...`, causing a DFlash oracle mismatch.
+  Restored only that test-created ref change; the oracle and full suite then
+  passed. Both snapshots remain cached. Subsequent live checks pin revisions so
+  qualification refs do not change.
+
+---
+
 ## Production metrics and embedded dashboard
 
 - `w34 serve` now serves a warm-dark **React + TypeScript + Vite** dashboard at

@@ -38,6 +38,23 @@ mise run check-quick    # fmt --check + clippy (with and without cuda)
 mise run check          # fmt + clippy + release test suite
 ```
 
+## Models: download on first use
+
+```sh
+./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ
+# Pin a revision, or require an already complete local cache:
+./target/release/w34 serve --model username/modelname --revision <commit-sha>
+./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline
+```
+
+Hub IDs automatically download the required checkpoint assets using Hugging
+Face's native Rust client, then reuse the standard Hub cache. No Python or `hf`
+CLI is required. Local model-directory paths still work without network access.
+`HF_HOME`, `HF_HUB_CACHE`, `HF_TOKEN`, saved `hf auth login` credentials, and
+`HF_HUB_OFFLINE` are supported. DFlash2 has an independent `--draft-revision`.
+Only supported Safetensors architectures are loaded; repository Python code is
+never executed. See [model downloads, authentication, and offline behavior](docs/MODELS.md).
+
 ## Live dashboard and metrics
 
 Open **`http://127.0.0.1:8000/`** while `w34 serve` is running for the built-in,
@@ -99,16 +116,15 @@ image only; there is no CI or registry publishing setup.
 
 ### Serve a cached model
 
-Models must already exist locally: **the current loader does not download from
-Hugging Face**. Mount the whole Hub cache (including `blobs`, `refs`, and
-`snapshots`, so relative symlinks resolve), read-only:
+For an offline deployment, mount the whole Hub cache (including `blobs`, `refs`,
+and `snapshots`, so relative symlinks resolve), read-only, and pass `--offline`:
 
 ```sh
 docker run --rm --name w34-local --gpus '"device=0"' \
   -p 127.0.0.1:8000:8000 \
   --mount type=bind,src="$HOME/.cache/huggingface/hub",dst=/home/w34/.cache/huggingface/hub,readonly \
   warp-34:local serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --host 0.0.0.0
+  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline --host 0.0.0.0
 ```
 
 In another terminal:
@@ -126,6 +142,13 @@ directories traversable. If your cache is private to your host user, add
 `--user "$(id -u):$(id -g)"` before the image name; `HF_HUB_CACHE` still points
 to the mounted path. To use an unpacked model directory instead, mount it at
 `/models/model` and pass `--model /models/model`.
+
+For download-on-first-use, remove `readonly` from the cache mount and omit
+`--offline`. Ensure the container user can write the cache (use the host UID/GID
+as above when appropriate). For private/gated repositories, pass `-e HF_TOKEN`
+before the image name to forward an already-exported token; do not put its value
+in command-line arguments. Online startup checks Hub metadata even for cached
+weights. A read-only cache therefore requires `--offline` or a direct local path.
 
 For two GPUs, replace `--gpus '"device=0"'` with `--gpus '"device=0,1"'` and add
 `--tp 2`. Container-visible device indices are local to the selected GPUs.
