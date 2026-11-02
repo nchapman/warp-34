@@ -426,10 +426,11 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         (prob_m <= 16) &&
         (((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
          ((prob_n >= 512) && (prob_n <= 2048) && (prob_k >= 1024) && (prob_k <= 2048)));
-    // On 30-series (<= 6 MiB L2), cap M-parallelism to 16 (M <= 1024, 8 MiB A) when N > 4096
-    // so activations stay resident in L2 across wide N tiles. On 40-series (>= 32 MiB L2,
-    // 72 MiB on RTX 4090), raise the wide-N cap to 64 (M <= 4096) to avoid re-reading weights.
-    const int wide_n_max_par = (dev_props.l2_cache_bytes >= 32 * 1024 * 1024) ? 64 : 16;
+    // Scale wide-N (N > 4096) M-parallelism directly from the card's reported L2 cache size:
+    // 16 (= 1024 M-rows) per 6 MiB of L2 cache so activations stay L2-resident across wide N
+    // tiles (e.g. 3 MiB -> 8, 6 MiB -> 16, 24 MiB -> 64, 72 MiB -> 128).
+    const int wide_n_max_par =
+        std::min(128, std::max(8, dev_props.l2_cache_bytes / (384 * 1024)));
     int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : wide_n_max_par);
     int rest_m = prob_m;
 

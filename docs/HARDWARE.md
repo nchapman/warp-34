@@ -418,8 +418,8 @@ for t in sm_86 sm_90; do sed "s/^.target .*/.target $t/" tools/hw/feat.ptx > /tm
    - **Dynamic runtime adaptation:**
      - `w34_get_current_device_props` / `CudaDeviceProps` caches `compute_major`, `compute_minor`, `multi_processor_count`, `max_shared_mem_per_block_optin`, and `l2_cache_bytes` per device.
      - `op_collectives.cu` sizes `Signal` for `kMaxBlocks = 144` and clamps `tp2_block_cap` to `min(peer_sm_cap, cap)` so GPUs with `< 84` SMs (e.g. 82-SM RTX 3090, 80-SM RTX 4080 Super, 24-SM RTX 4060) never launch more spin-waiting CTAs than physical SMs, while 128-SM RTX 4090 and 142-SM L40S scale up to full SM count on large reductions.
-     - `op_marlin.cu` and `model/rank.rs` size the Marlin tile-lock workspace to `max(sm_count, 144) * 64` ints and query the active device (`cudaGetDevice`) rather than hardcoded device `0`.
-     - `op_gdn.cu` selects single-wave `ROWS` tiling based on `sm_count` (`>= 112` SMs vs `< 112` SMs).
+     - `op_marlin.cu` and `model/rank.rs` size the Marlin tile-lock workspace to `sm_count * 64` ints, query the active device (`cudaGetDevice`), and scale wide-`N` `max_par` continuously from `l2_cache_bytes / (384 KiB)` (`[8, 128]`).
+     - `op_gdn.cu` selects single-request recurrent prefill `ROWS` in `{4, 7, 8, 11}` by minimizing wave-quantized work `ceil(nh * v_tiles / sm_count) * ROWS` directly from the card's reported `sm_count`.
 
 ---
 

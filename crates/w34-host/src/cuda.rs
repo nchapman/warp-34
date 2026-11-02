@@ -324,14 +324,10 @@ pub enum CudaArchFamily {
 }
 
 /// Minimum opt-in dynamic shared memory per block required by `W34PagedD256` (`98,304 B`).
-/// All 30-series (`sm_86`) and 40-series (`sm_89`) GPUs provide `101,376 B` (`99 KiB`).
+/// Detected from `cudaDeviceProp::sharedMemPerBlockOptin` (`101,376 B` on all 30/40-series GPUs).
 pub const MIN_REQUIRED_OPTIN_SMEM_BYTES: usize = 98_304;
 
-/// Minimum SM-lock capacity floor for Marlin workspace allocations (covers up to 144 SMs,
-/// including RTX 3090 Ti 84 SMs, RTX 4090 128 SMs, and RTX 6000 Ada / L40S 142 SMs).
-pub const MIN_MARLIN_LOCK_SMS: usize = 144;
-
-/// Immutable hardware properties queried once per GPU rank.
+/// Immutable hardware properties queried once per GPU rank from `cudaGetDeviceProperties`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CudaDeviceProps {
     pub device_id: i32,
@@ -400,9 +396,7 @@ impl CudaDeviceProps {
 
     #[inline]
     pub fn marlin_workspace_ints(&self) -> usize {
-        (self.multi_processor_count.max(0) as usize)
-            .max(MIN_MARLIN_LOCK_SMS)
-            .saturating_mul(64)
+        (self.multi_processor_count.max(1) as usize).saturating_mul(64)
     }
 
     #[inline]
@@ -3675,8 +3669,8 @@ mod tests {
                 props.validate_supported().unwrap(),
                 CudaArchFamily::AmpereSm86
             );
-            assert_eq!(props.marlin_workspace_ints(), MIN_MARLIN_LOCK_SMS * 64);
-            assert_eq!(props.marlin_workspace_bytes(), MIN_MARLIN_LOCK_SMS * 64 * 4);
+            assert_eq!(props.marlin_workspace_ints(), (sms as usize) * 64);
+            assert_eq!(props.marlin_workspace_bytes(), (sms as usize) * 64 * 4);
         }
 
         // 40-series lineup: RTX 4060 (24 SMs, 24 MiB L2) -> RTX 4090 (128 SMs, 72 MiB L2) -> L40S (142 SMs, 96 MiB L2)
@@ -3699,8 +3693,8 @@ mod tests {
             };
             assert_eq!(props.sm_tag(), "sm_89");
             assert_eq!(props.validate_supported().unwrap(), CudaArchFamily::AdaSm89);
-            assert!(props.marlin_workspace_ints() >= (sms as usize) * 64);
-            assert_eq!(props.marlin_workspace_bytes(), MIN_MARLIN_LOCK_SMS * 64 * 4);
+            assert_eq!(props.marlin_workspace_ints(), (sms as usize) * 64);
+            assert_eq!(props.marlin_workspace_bytes(), (sms as usize) * 64 * 4);
         }
 
         // Future / larger-SM GPU (> 144 SMs) scales marlin workspace automatically.

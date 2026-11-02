@@ -139,6 +139,9 @@ fn main() {
 }
 
 fn build_gencode_flags(arch_spec: &str) -> String {
+    if arch_spec.trim() == "native" {
+        return "-arch=native".to_string();
+    }
     let mut ccs: Vec<&str> = Vec::new();
     for raw in arch_spec.split([',', ';', ' ']) {
         let token = raw.trim();

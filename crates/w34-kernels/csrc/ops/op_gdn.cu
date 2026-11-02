@@ -2906,136 +2906,61 @@ extern "C" int w34_gdn_recurrent_strided_f16(
                         ba_row_stride,
                         total_state_slots);
             }
-        } else if (head_v_dim == 128 && nh == 32 && sm_count < 112) {
-            // 9B / 4B TP=1 single-request prefill on <=84-SM GPUs: 5 * 32 = 160 CTAs across 84 SMs
-            // (95.2% full 2-CTA/SM wave, 56 max V-rows/SM vs 64 with ROWS=8).
-            // On >=112-SM GPUs (e.g. RTX 4090 with 128 SMs), fall through to ROWS=8 (4 * 32 = 128
-            // CTAs = exact single wave).
-            constexpr int ROWS = 7;
-            constexpr int BV = ROWS * 4;
-            const int v_tiles = (head_v_dim + BV - 1) / BV;
-            dim3 grid((unsigned)v_tiles, (unsigned)nh);
-            w34_gdn::gdn_recurrent_prefill_f16_kernel<ROWS, 5>
-                <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-                    *batch,
-                    (const __half*)qkv_conv_out,
-                    (const __half*)q_in,
-                    (const __half*)k_in,
-                    (const __half*)v_in,
-                    (const __half*)b_in,
-                    (const __half*)a_in,
-                    a_log,
-                    dt_bias,
-                    ssm_state_pool,
-                    (__half*)out_f16,
-                    num_k_heads,
-                    head_k_dim,
-                    num_v_heads,
-                    head_v_dim,
-                    ba_row_stride,
-                    total_state_slots);
-        } else if (head_v_dim == 128 && nh == 24) {
-            if (sm_count >= 112) {
-                // 27B TP=2 single-request prefill on >=112-SM GPUs (RTX 4090 128 SMs):
-                // 5 * 24 = 120 CTAs in a single wave (28 V-rows/CTA vs 44 with ROWS=11).
-                constexpr int ROWS = 7;
-                constexpr int BV = ROWS * 4;
-                const int v_tiles = (head_v_dim + BV - 1) / BV;
-                dim3 grid((unsigned)v_tiles, (unsigned)nh);
-                w34_gdn::gdn_recurrent_prefill_f16_kernel<ROWS, 5>
-                    <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-                        *batch,
-                        (const __half*)qkv_conv_out,
-                        (const __half*)q_in,
-                        (const __half*)k_in,
-                        (const __half*)v_in,
-                        (const __half*)b_in,
-                        (const __half*)a_in,
-                        a_log,
-                        dt_bias,
-                        ssm_state_pool,
-                        (__half*)out_f16,
-                        num_k_heads,
-                        head_k_dim,
-                        num_v_heads,
-                        head_v_dim,
-                        ba_row_stride,
-                        total_state_slots);
-            } else {
-                // 27B TP=2 single-request prefill on <=84-SM GPUs: 3 * 24 = 72 CTAs across 84 SMs
-                // (single-wave, 44 max V-rows/SM vs 64 with ROWS=8).
-                constexpr int ROWS = 11;
-                constexpr int BV = ROWS * 4;
-                const int v_tiles = (head_v_dim + BV - 1) / BV;
-                dim3 grid((unsigned)v_tiles, (unsigned)nh);
-                w34_gdn::gdn_recurrent_prefill_f16_kernel<ROWS, 3>
-                    <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-                        *batch,
-                        (const __half*)qkv_conv_out,
-                        (const __half*)q_in,
-                        (const __half*)k_in,
-                        (const __half*)v_in,
-                        (const __half*)b_in,
-                        (const __half*)a_in,
-                        a_log,
-                        dt_bias,
-                        ssm_state_pool,
-                        (__half*)out_f16,
-                        num_k_heads,
-                        head_k_dim,
-                        num_v_heads,
-                        head_v_dim,
-                        ba_row_stride,
-                        total_state_slots);
-            }
-        } else if (head_v_dim >= 32 && nh * ((head_v_dim + 31) / 32) >= sm_count) {
-            constexpr int ROWS = 8;
-            constexpr int BV = ROWS * 4;
-            const int v_tiles = (head_v_dim + BV - 1) / BV;
-            dim3 grid((unsigned)v_tiles, (unsigned)nh);
-            w34_gdn::gdn_recurrent_prefill_f16_kernel<ROWS, 5>
-                <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-                    *batch,
-                    (const __half*)qkv_conv_out,
-                    (const __half*)q_in,
-                    (const __half*)k_in,
-                    (const __half*)v_in,
-                    (const __half*)b_in,
-                    (const __half*)a_in,
-                    a_log,
-                    dt_bias,
-                    ssm_state_pool,
-                    (__half*)out_f16,
-                    num_k_heads,
-                    head_k_dim,
-                    num_v_heads,
-                    head_v_dim,
-                    ba_row_stride,
-                    total_state_slots);
         } else {
-            constexpr int ROWS = 4;
-            constexpr int BV = ROWS * 4;
-            const int v_tiles = (head_v_dim + BV - 1) / BV;
+            // Select ROWS in {4, 7, 8, 11} by minimizing wave-quantized work
+            // `waves * ROWS = ceil(nh * v_tiles / sm_count) * ROWS` using the GPU's
+            // reported `sm_count` (breaking ties toward fewer waves).
+            int best_rows = 4;
+            int best_cost = INT32_MAX;
+            int best_waves = INT32_MAX;
+            for (int cand_rows : {4, 7, 8, 11}) {
+                const int bv = cand_rows * 4;
+                if (head_v_dim < bv && cand_rows != 4) continue;
+                const int v_tiles = (head_v_dim + bv - 1) / bv;
+                const int ctas = nh * v_tiles;
+                const int waves = (ctas + sm_count - 1) / sm_count;
+                const int cost = waves * cand_rows;
+                if (cost < best_cost || (cost == best_cost && waves < best_waves)) {
+                    best_cost = cost;
+                    best_waves = waves;
+                    best_rows = cand_rows;
+                }
+            }
+            const int bv = best_rows * 4;
+            const int v_tiles = (head_v_dim + bv - 1) / bv;
             dim3 grid((unsigned)v_tiles, (unsigned)nh);
-            w34_gdn::gdn_recurrent_prefill_f16_kernel<ROWS, 5>
-                <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-                    *batch,
-                    (const __half*)qkv_conv_out,
-                    (const __half*)q_in,
-                    (const __half*)k_in,
-                    (const __half*)v_in,
-                    (const __half*)b_in,
-                    (const __half*)a_in,
-                    a_log,
-                    dt_bias,
-                    ssm_state_pool,
-                    (__half*)out_f16,
-                    num_k_heads,
-                    head_k_dim,
-                    num_v_heads,
-                    head_v_dim,
-                    ba_row_stride,
-                    total_state_slots);
+            auto launch_recurrent = [&](auto rows_tag, auto min_blocks_tag) {
+                constexpr int ROWS = decltype(rows_tag)::value;
+                constexpr int MIN_BLOCKS = decltype(min_blocks_tag)::value;
+                w34_gdn::gdn_recurrent_prefill_f16_kernel<ROWS, MIN_BLOCKS>
+                    <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                        *batch,
+                        (const __half*)qkv_conv_out,
+                        (const __half*)q_in,
+                        (const __half*)k_in,
+                        (const __half*)v_in,
+                        (const __half*)b_in,
+                        (const __half*)a_in,
+                        a_log,
+                        dt_bias,
+                        ssm_state_pool,
+                        (__half*)out_f16,
+                        num_k_heads,
+                        head_k_dim,
+                        num_v_heads,
+                        head_v_dim,
+                        ba_row_stride,
+                        total_state_slots);
+            };
+            if (best_rows == 11) {
+                launch_recurrent(std::integral_constant<int, 11>{}, std::integral_constant<int, 3>{});
+            } else if (best_rows == 8) {
+                launch_recurrent(std::integral_constant<int, 8>{}, std::integral_constant<int, 5>{});
+            } else if (best_rows == 7) {
+                launch_recurrent(std::integral_constant<int, 7>{}, std::integral_constant<int, 5>{});
+            } else {
+                launch_recurrent(std::integral_constant<int, 4>{}, std::integral_constant<int, 5>{});
+            }
         }
     }
     return (int)cudaGetLastError();

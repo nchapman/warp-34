@@ -185,17 +185,16 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
     `prepare_execution_plan` and `ModelRank::load`.
   - Replaced hardcoded device `0` `cudaDeviceGetAttribute` calls and `84`-SM
     constants in `op_marlin.cu` and `model/rank.rs` with cached active-device
-    properties (`max(sm_count, 144) * 64` lock ints) and L2-aware wide-`N`
-    `max_par` scaling (`max_par = 64` when `l2_cache_bytes >= 32 MiB`, e.g.
-    RTX 4090's 72 MiB L2, vs `16` on 30-series 3–6 MiB L2).
+    properties (`sm_count * 64` lock ints) and continuous L2-proportional
+    wide-`N` `max_par` scaling (`clamp(l2_cache_bytes / 384 KiB, 8, 128)`).
   - Raised `w34_comm::Signal::kMaxBlocks` in `op_collectives.cu` from `84` to
-    `144` (covering up to 128 SMs on RTX 4090 and 142 SMs on L40S / RTX 6000
-    Ada) while clamping launched blocks via `tp2_block_cap` to the minimum SM
-    count across TP peers so `< 84`-SM GPUs (e.g. 82-SM RTX 3090, 80-SM RTX
-    4080 Super, 24-SM RTX 4060) never launch more spin-waiting CTAs than SMs.
-  - Parameterized `op_gdn.cu` single-request recurrent prefill `ROWS` wave
-    packing by `sm_count` (`>= 112` SMs vs `< 112` SMs) and warmed all `nh`
-    variants in `prepare_execution_plan`.
+    `144` (compile-time struct array ceiling covering full AD102) while clamping
+    launched blocks via `tp2_block_cap` to the live minimum SM count across TP
+    peers so `< 84`-SM GPUs never launch more spin-waiting CTAs than SMs.
+  - Replaced hardcoded `nh == 32` / `nh == 24` branches in `op_gdn.cu`
+    single-request recurrent prefill with direct wave-cost minimization
+    (`ceil(nh * v_tiles / sm_count) * ROWS`) over `ROWS` in `{4, 7, 8, 11}`
+    using the card's reported `sm_count`.
   - Updated `phase4_dflash.rs` `actual_sglang_full_model_hidden_parity` to
     enforce 0-ULP on the provenance capture GPU (`RTX 3090 Ti`) and
     `relL2 < 1e-4` when `cuBLAS` runs on a different 30/40-series GPU.
