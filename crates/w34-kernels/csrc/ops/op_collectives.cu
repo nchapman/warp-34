@@ -101,7 +101,9 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* s_warp) {
         }
     }
     __syncthreads();
-    return s_warp[0];
+    const float total = s_warp[0];
+    __syncthreads();
+    return total;
 }
 
 __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(

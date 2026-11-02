@@ -2858,38 +2858,24 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_embedding_splice_f16",
     )?;
-    check_rc(
-        unsafe {
-            ffi::w34_moe_topk_router_f16(
-                &ex,
-                buf_a as *const c_void,
-                buf_b as *mut f32,
-                reject_ids as *mut i32,
-                1,
-                8,
-                2,
-                1,
-                0,
-            )
-        },
-        "warmup w34_moe_topk_router_f16 (warp256)",
-    )?;
-    check_rc(
-        unsafe {
-            ffi::w34_moe_topk_router_f16(
-                &ex,
-                buf_a as *const c_void,
-                buf_b as *mut f32,
-                reject_ids as *mut i32,
-                1,
-                512,
-                2,
-                1,
-                0,
-            )
-        },
-        "warmup w34_moe_topk_router_f16 (cta128)",
-    )?;
+    for (n_exp, top_k) in [(8i32, 2i32), (256, 8), (512, 2)] {
+        check_rc(
+            unsafe {
+                ffi::w34_moe_topk_router_f16(
+                    &ex,
+                    buf_a as *const c_void,
+                    buf_b as *mut f32,
+                    buf_d as *mut i32,
+                    1,
+                    n_exp,
+                    top_k,
+                    1,
+                    0,
+                )
+            },
+            "warmup w34_moe_topk_router_f16",
+        )?;
+    }
     check_rc(
         unsafe {
             ffi::w34_moe_w4a16_gate_up_silu_f16(
@@ -2909,28 +2895,30 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_moe_w4a16_gate_up_silu_f16",
     )?;
-    check_rc(
-        unsafe {
-            ffi::w34_moe_w4a16_down_accum_f16(
-                &ex,
-                buf_c as *const c_void,
-                buf_b as *const u32,
-                buf_a as *const c_void,
-                reject_ids as *const i32,
-                reject_probs as *const f32,
-                buf_a as *const c_void,
-                buf_a as *const c_void,
-                buf_c as *mut c_void,
-                1,
-                1,
-                2,
-                64,
-                64,
-                64,
-            )
-        },
-        "warmup w34_moe_w4a16_down_accum_f16",
-    )?;
+    for (top_k, n_interm) in [(1i32, 64i32), (8, 256), (8, 512)] {
+        check_rc(
+            unsafe {
+                ffi::w34_moe_w4a16_down_accum_f16(
+                    &ex,
+                    buf_c as *const c_void,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    zero_i32 as *const i32,
+                    buf_a as *const f32,
+                    buf_a as *const c_void,
+                    buf_a as *const c_void,
+                    buf_c as *mut c_void,
+                    1,
+                    top_k,
+                    2,
+                    64,
+                    n_interm,
+                    64,
+                )
+            },
+            "warmup w34_moe_w4a16_down_accum_f16",
+        )?;
+    }
     let moe_ids_m4 = arena.upload_slice(&[0i32, 1, 0, 1], &stream)?;
     let moe_w_m4 = arena.upload_slice(&[1.0f32; 4], &stream)?;
     let moe_ws = arena.alloc_aligned(64 * 1024)?;

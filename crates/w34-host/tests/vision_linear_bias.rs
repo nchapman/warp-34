@@ -304,10 +304,15 @@ fn linear_bias_patch_shape_strict_reduction() {
         // On other GPUs (e.g. 128-SM RTX 4090), cuBLAS may choose a different FP32 split-K
         // tile where partial sums retain the 1536 * 2^-20 ~= 0.001465 term, whereas broken
         // reduced-precision FP16 reduction produces 0.5 (0x3800).
-        let max_abs = out
-            .iter()
-            .map(|&bits| w34_host::cuda::f16_to_f32(bits).abs())
-            .fold(0.0f32, f32::max);
+        let mut max_abs = 0.0f32;
+        for &bits in &out {
+            let val = w34_host::cuda::f16_to_f32(bits);
+            assert!(
+                val.is_finite(),
+                "non-finite GEMM output on {gpu_name}: bits={bits:#06x}"
+            );
+            max_abs = max_abs.max(val.abs());
+        }
         assert!(
             max_abs < 0.005,
             "FP32 reduction check failed on {gpu_name}: max_abs={max_abs} (first bits: {:#06x})",
