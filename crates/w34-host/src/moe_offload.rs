@@ -69,6 +69,194 @@ impl ExpertPackLayout {
             stride,
         })
     }
+
+    /// Packs a single expert's N-major `U4B8` weights and `FP16` scales into a `stride`-byte slot.
+    pub fn write_pack(
+        &self,
+        gate_up_packed: &[u32],
+        gate_up_scales: &[u16],
+        down_packed: &[u32],
+        down_scales: &[u16],
+        dst_pack: &mut [u8],
+    ) -> io::Result<()> {
+        if dst_pack.len() != self.stride
+            || gate_up_packed.len() * 4 != self.gate_up_packed.len()
+            || gate_up_scales.len() * 2 != self.gate_up_scales.len()
+            || down_packed.len() * 4 != self.down_packed.len()
+            || down_scales.len() * 2 != self.down_scales.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid expert slice lengths for write_pack",
+            ));
+        }
+        dst_pack.fill(0);
+        for (dst, &w) in dst_pack[self.gate_up_packed.clone()]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(gate_up_packed)
+        {
+            dst.copy_from_slice(&w.to_le_bytes());
+        }
+        for (dst, &s) in dst_pack[self.gate_up_scales.clone()]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(gate_up_scales)
+        {
+            dst.copy_from_slice(&s.to_le_bytes());
+        }
+        for (dst, &w) in dst_pack[self.down_packed.clone()]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(down_packed)
+        {
+            dst.copy_from_slice(&w.to_le_bytes());
+        }
+        for (dst, &s) in dst_pack[self.down_scales.clone()]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(down_scales)
+        {
+            dst.copy_from_slice(&s.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Evaluates one packed `U4B8` expert on CPU matching `op_moe.cu` (`marlin_silu_and_mul_f16`
+    /// and FP16-rounded `U4B8` dequantization) and accumulates into `out_accum_f32: [hidden]`.
+    pub fn eval_expert_u4b8_cpu(
+        &self,
+        pack: &[u8],
+        x_f16: &[u16],
+        topk_weight: f32,
+        out_accum_f32: &mut [f32],
+    ) {
+        use crate::cuda::{f16_to_f32, f32_to_f16};
+        assert_eq!(pack.len(), self.stride);
+        assert_eq!(x_f16.len(), self.hidden);
+        assert_eq!(out_accum_f32.len(), self.hidden);
+
+        let gu_packed_bytes = &pack[self.gate_up_packed.clone()];
+        let gu_scales_bytes = &pack[self.gate_up_scales.clone()];
+        let dn_packed_bytes = &pack[self.down_packed.clone()];
+        let dn_scales_bytes = &pack[self.down_scales.clone()];
+
+        let words_per_k = self.hidden / 8;
+        let groups_per_k = self.hidden / self.group_size;
+        let words_per_group_k = self.group_size / 8;
+
+        // 1. Gate + Up projection + donor vLLM SiluAndMul (FP16 intermediate)
+        let mut interm_f16 = vec![0u16; self.intermediate];
+        for (n, dst_interm) in interm_f16.iter_mut().enumerate() {
+            let mut gate_acc = 0.0f32;
+            let mut up_acc = 0.0f32;
+            let gate_row_w = n * words_per_k;
+            let up_row_w = (self.intermediate + n) * words_per_k;
+            let gate_row_s = n * groups_per_k;
+            let up_row_s = (self.intermediate + n) * groups_per_k;
+
+            for g in 0..groups_per_k {
+                let gs_off = (gate_row_s + g) * 2;
+                let us_off = (up_row_s + g) * 2;
+                let gs = f16_to_f32(u16::from_le_bytes([
+                    gu_scales_bytes[gs_off],
+                    gu_scales_bytes[gs_off + 1],
+                ]));
+                let us = f16_to_f32(u16::from_le_bytes([
+                    gu_scales_bytes[us_off],
+                    gu_scales_bytes[us_off + 1],
+                ]));
+                for w in 0..words_per_group_k {
+                    let w_idx = g * words_per_group_k + w;
+                    let gw_off = (gate_row_w + w_idx) * 4;
+                    let uw_off = (up_row_w + w_idx) * 4;
+                    let gw = u32::from_le_bytes([
+                        gu_packed_bytes[gw_off],
+                        gu_packed_bytes[gw_off + 1],
+                        gu_packed_bytes[gw_off + 2],
+                        gu_packed_bytes[gw_off + 3],
+                    ]);
+                    let uw = u32::from_le_bytes([
+                        gu_packed_bytes[uw_off],
+                        gu_packed_bytes[uw_off + 1],
+                        gu_packed_bytes[uw_off + 2],
+                        gu_packed_bytes[uw_off + 3],
+                    ]);
+                    let k_base = w_idx * 8;
+                    for b in 0..8 {
+                        let x_val = f16_to_f32(x_f16[k_base + b]);
+                        let gnib = ((gw >> (b * 4)) & 0xF) as i32 - 8;
+                        let unib = ((uw >> (b * 4)) & 0xF) as i32 - 8;
+                        let gw_h = f16_to_f32(f32_to_f16((gnib as f32) * gs));
+                        let uw_h = f16_to_f32(f32_to_f16((unib as f32) * us));
+                        gate_acc += gw_h * x_val;
+                        up_acc += uw_h * x_val;
+                    }
+                }
+            }
+            let gate_h = f16_to_f32(f32_to_f16(gate_acc));
+            let up_h = f16_to_f32(f32_to_f16(up_acc));
+            let silu_h = f16_to_f32(f32_to_f16(gate_h / (1.0f32 + (-gate_h).exp())));
+            *dst_interm = f32_to_f16(silu_h * up_h);
+        }
+
+        // 2. Down projection + Top-K weight scaling
+        let words_per_interm = self.intermediate / 8;
+        let groups_per_interm = self.intermediate / self.group_size;
+        let tw_h = f16_to_f32(f32_to_f16(topk_weight));
+        for (h, dst_out) in out_accum_f32.iter_mut().enumerate() {
+            let mut down_acc = 0.0f32;
+            let row_w = h * words_per_interm;
+            let row_s = h * groups_per_interm;
+            for g in 0..groups_per_interm {
+                let ds_off = (row_s + g) * 2;
+                let ds = f16_to_f32(u16::from_le_bytes([
+                    dn_scales_bytes[ds_off],
+                    dn_scales_bytes[ds_off + 1],
+                ]));
+                for w in 0..words_per_group_k {
+                    let w_idx = g * words_per_group_k + w;
+                    let dw_off = (row_w + w_idx) * 4;
+                    let dw = u32::from_le_bytes([
+                        dn_packed_bytes[dw_off],
+                        dn_packed_bytes[dw_off + 1],
+                        dn_packed_bytes[dw_off + 2],
+                        dn_packed_bytes[dw_off + 3],
+                    ]);
+                    let k_base = w_idx * 8;
+                    for b in 0..8 {
+                        let x_val = f16_to_f32(interm_f16[k_base + b]);
+                        let dnib = ((dw >> (b * 4)) & 0xF) as i32 - 8;
+                        let dw_h = f16_to_f32(f32_to_f16((dnib as f32) * ds));
+                        down_acc += dw_h * x_val;
+                    }
+                }
+            }
+            let prod_h = f16_to_f32(f32_to_f16(down_acc)) * tw_h;
+            *dst_out += f16_to_f32(f32_to_f16(prod_h));
+        }
+    }
+}
+
+/// Execution policy for tiered 512-expert MoE layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeOffloadMode {
+    /// Automatically selects `GpuLru` when unique active local experts fit in `K_hot`,
+    /// or `StreamedPrefill` when active local experts exceed `K_hot`.
+    Auto,
+    /// Dynamic GPU LRU slot replacement via single-DMA H2D transfer + device unpack.
+    /// Automatically falls back to `StreamedPrefill` if a batch activates `> K_hot` unique local experts.
+    GpuLru,
+    /// Evaluates hot-cache hits (plus up to `gpu_pcie_budget` cold experts via DMA) on the GPU
+    /// while co-executing remaining cold experts in parallel on the CPU thread pool.
+    CpuHybrid { gpu_pcie_budget: usize },
+    /// Executes hot experts in Pass 0 and streams cold experts through double-buffered
+    /// H2D + compute staging arenas (`stage_buf[0..2]`).
+    StreamedPrefill,
 }
 
 #[cfg(feature = "cuda")]
@@ -243,6 +431,47 @@ mod host_store {
             })
         }
 
+        /// Constructs a `HostExpertStore` directly from pre-packed contiguous expert slots.
+        pub fn from_raw_packs(
+            layout: ExpertPackLayout,
+            expert_ids: Range<usize>,
+            raw_packs: &[u8],
+            max_pinned_bytes: usize,
+        ) -> Result<Self> {
+            require(
+                layout
+                    == ExpertPackLayout::new(
+                        layout.intermediate,
+                        layout.hidden,
+                        layout.group_size,
+                    )?,
+                "inconsistent expert pack layout",
+            )?;
+            let count = expert_ids.len();
+            let bytes = layout
+                .stride
+                .checked_mul(count)
+                .ok_or_else(|| io::Error::other("expert store size overflow"))?;
+            require(
+                count > 0 && raw_packs.len() == bytes,
+                "invalid raw_packs length for HostExpertStore::from_raw_packs",
+            )?;
+            require(
+                bytes <= max_pinned_bytes,
+                format!("expert store needs {bytes} pinned bytes, budget is {max_pinned_bytes}"),
+            )?;
+            let storage = MappedHostBuffer::alloc(bytes).map_err(io::Error::other)?;
+            // SAFETY: newly allocated storage is exclusively owned and has no GPU readers.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(storage.host_ptr.cast::<u8>(), bytes) };
+            dst.copy_from_slice(raw_packs);
+            Ok(Self {
+                storage,
+                layout,
+                expert_ids,
+            })
+        }
+
         pub fn layout(&self) -> &ExpertPackLayout {
             &self.layout
         }
@@ -267,11 +496,865 @@ mod host_store {
                 )
             })
         }
+
+        /// Evaluates a single locally owned expert on CPU and accumulates into `out_accum_f32`.
+        pub fn eval_expert_u4b8_cpu(
+            &self,
+            global_id: usize,
+            x_f16: &[u16],
+            topk_weight: f32,
+            out_accum_f32: &mut [f32],
+        ) -> bool {
+            let Some(pack) = self.expert_pack(global_id) else {
+                return false;
+            };
+            self.layout
+                .eval_expert_u4b8_cpu(pack, x_f16, topk_weight, out_accum_f32);
+            true
+        }
+
+        /// Evaluates a batch of cold `(token_idx, global_expert_id, topk_weight)` tasks in parallel
+        /// across CPU threads and returns `FP16` per-token partial sums `[num_tokens, hidden]`.
+        pub fn eval_cold_tasks_cpu(
+            &self,
+            x_f16: &[u16],
+            num_tokens: usize,
+            tasks: &[(usize, usize, f32)],
+        ) -> Vec<u16> {
+            use crate::cuda::f32_to_f16;
+            let h = self.layout.hidden;
+            assert_eq!(x_f16.len(), num_tokens * h);
+            if tasks.is_empty() || num_tokens == 0 {
+                return vec![0u16; num_tokens * h];
+            }
+
+            let per_task_out: Vec<Vec<f32>> = if tasks.len() == 1 {
+                let (tok, ge, weight) = tasks[0];
+                let mut acc = vec![0.0f32; h];
+                self.eval_expert_u4b8_cpu(ge, &x_f16[tok * h..(tok + 1) * h], weight, &mut acc);
+                vec![acc]
+            } else {
+                let max_workers = std::thread::available_parallelism()
+                    .map(|n| n.get().min(16))
+                    .unwrap_or(4)
+                    .min(tasks.len());
+                let chunk_len = tasks.len().div_ceil(max_workers);
+                let mut out_vecs = vec![Vec::new(); tasks.len()];
+                std::thread::scope(|s| {
+                    let mut handles = Vec::new();
+                    for (chunk_idx, task_chunk) in tasks.chunks(chunk_len).enumerate() {
+                        handles.push((
+                            chunk_idx,
+                            s.spawn(move || {
+                                let mut chunk_res = Vec::with_capacity(task_chunk.len());
+                                for &(tok, ge, weight) in task_chunk {
+                                    let mut acc = vec![0.0f32; h];
+                                    self.eval_expert_u4b8_cpu(
+                                        ge,
+                                        &x_f16[tok * h..(tok + 1) * h],
+                                        weight,
+                                        &mut acc,
+                                    );
+                                    chunk_res.push(acc);
+                                }
+                                chunk_res
+                            }),
+                        ));
+                    }
+                    for (chunk_idx, handle) in handles {
+                        let chunk_res = handle.join().expect("CPU cold expert worker panicked");
+                        let base = chunk_idx * chunk_len;
+                        for (i, acc) in chunk_res.into_iter().enumerate() {
+                            out_vecs[base + i] = acc;
+                        }
+                    }
+                });
+                out_vecs
+            };
+
+            let mut tok_accum = vec![0.0f32; num_tokens * h];
+            for (&(tok, _, _), task_vec) in tasks.iter().zip(&per_task_out) {
+                let dst = &mut tok_accum[tok * h..(tok + 1) * h];
+                for (d, &v) in dst.iter_mut().zip(task_vec) {
+                    *d += v;
+                }
+            }
+            tok_accum.into_iter().map(f32_to_f16).collect()
+        }
+    }
+
+    /// Device-resident table of `capacity` expert slots in VRAM (`U4B8` N-major layout).
+    pub struct DeviceExpertSlotTable {
+        pub device_id: i32,
+        pub capacity: usize,
+        pub layout: ExpertPackLayout,
+        pub gate_up_packed: crate::cuda::DeviceBuffer,
+        pub gate_up_scales: crate::cuda::DeviceBuffer,
+        pub down_packed: crate::cuda::DeviceBuffer,
+        pub down_scales: crate::cuda::DeviceBuffer,
+    }
+
+    impl DeviceExpertSlotTable {
+        pub fn alloc(
+            device_id: i32,
+            capacity: usize,
+            layout: ExpertPackLayout,
+        ) -> crate::cuda::Result<Self> {
+            use crate::cuda::{CudaError, DeviceBuffer};
+            if capacity == 0 || capacity > 65535 {
+                return Err(CudaError::new(-1, "invalid DeviceExpertSlotTable capacity"));
+            }
+            let gate_up_packed =
+                DeviceBuffer::alloc(device_id, capacity * layout.gate_up_packed.len())?;
+            let gate_up_scales =
+                DeviceBuffer::alloc(device_id, capacity * layout.gate_up_scales.len())?;
+            let down_packed = DeviceBuffer::alloc(device_id, capacity * layout.down_packed.len())?;
+            let down_scales = DeviceBuffer::alloc(device_id, capacity * layout.down_scales.len())?;
+            Ok(Self {
+                device_id,
+                capacity,
+                layout,
+                gate_up_packed,
+                gate_up_scales,
+                down_packed,
+                down_scales,
+            })
+        }
+
+        /// Unpacks `num_staged` contiguous expert packs on `stream` into `dst_slots_dev`.
+        pub fn unpack_staged(
+            &self,
+            stream: &crate::cuda::CudaStream,
+            staged_packs_addr: u64,
+            dst_slots_addr: u64,
+            num_staged: usize,
+        ) -> crate::cuda::Result<()> {
+            if num_staged == 0 {
+                return Ok(());
+            }
+            let ex = stream.exec(0, 0);
+            crate::cuda::check_rc(
+                // SAFETY: device pointers and capacities are owned and validated by `self` and caller.
+                unsafe {
+                    w34_kernels::ffi::w34_moe_unpack_staged_experts(
+                        &ex,
+                        staged_packs_addr as *const core::ffi::c_void,
+                        dst_slots_addr as *const i32,
+                        self.gate_up_packed.addr() as *mut u32,
+                        self.gate_up_scales.addr() as *mut core::ffi::c_void,
+                        self.down_packed.addr() as *mut u32,
+                        self.down_scales.addr() as *mut core::ffi::c_void,
+                        num_staged as i32,
+                        self.capacity as i32,
+                        self.layout.stride,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                    )
+                },
+                "w34_moe_unpack_staged_experts",
+            )
+        }
+
+        /// Launches `w34_moe_w4a16_mlp_f16` against this slot table.
+        #[allow(clippy::too_many_arguments)]
+        pub fn launch_moe_w4a16(
+            &self,
+            ex: &w34_kernels::ffi::W34Exec,
+            x_addr: u64,
+            remapped_topk_ids_addr: u64,
+            topk_weights_addr: u64,
+            shared_expert_out_addr: u64,
+            shared_expert_gate_addr: u64,
+            interm_buf_addr: u64,
+            out_addr: u64,
+            num_tokens: usize,
+            top_k: usize,
+        ) -> crate::cuda::Result<()> {
+            crate::cuda::check_rc(
+                // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
+                unsafe {
+                    w34_kernels::ffi::w34_moe_w4a16_mlp_f16(
+                        ex,
+                        x_addr as *const core::ffi::c_void,
+                        self.gate_up_packed.addr() as *const u32,
+                        self.gate_up_scales.addr() as *const core::ffi::c_void,
+                        self.down_packed.addr() as *const u32,
+                        self.down_scales.addr() as *const core::ffi::c_void,
+                        remapped_topk_ids_addr as *const i32,
+                        topk_weights_addr as *const f32,
+                        shared_expert_out_addr as *const core::ffi::c_void,
+                        shared_expert_gate_addr as *const core::ffi::c_void,
+                        interm_buf_addr as *mut core::ffi::c_void,
+                        out_addr as *mut core::ffi::c_void,
+                        num_tokens as i32,
+                        top_k as i32,
+                        self.capacity as i32,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                    )
+                },
+                "w34_moe_w4a16_mlp_f16 (tiered)",
+            )
+        }
+    }
+
+    /// Per-layer VRAM hot expert cache (`K_hot` slots) with LRU eviction tracking and telemetry.
+    pub struct HotExpertCache {
+        pub slots: DeviceExpertSlotTable,
+        pub expert_ids: Range<usize>,
+        pub expert_to_slot: Vec<i32>,
+        pub slot_to_expert: Vec<usize>,
+        pub slot_last_used: Vec<u64>,
+        pub d_expert_to_slot: crate::cuda::DeviceBuffer,
+        pub step_clock: u64,
+        pub hits: u64,
+        pub misses: u64,
+        pub evictions: u64,
+        pub dma_experts_loaded: u64,
+        pub cpu_cold_evals: u64,
+    }
+
+    impl HotExpertCache {
+        pub fn new(
+            device_id: i32,
+            k_hot: usize,
+            expert_ids: Range<usize>,
+            layout: ExpertPackLayout,
+        ) -> crate::cuda::Result<Self> {
+            let local_count = expert_ids.len();
+            if k_hot == 0 || k_hot > local_count {
+                return Err(crate::cuda::CudaError::new(
+                    -1,
+                    "invalid HotExpertCache k_hot",
+                ));
+            }
+            let slots = DeviceExpertSlotTable::alloc(device_id, k_hot, layout)?;
+            let d_expert_to_slot = crate::cuda::DeviceBuffer::alloc(
+                device_id,
+                local_count * core::mem::size_of::<i32>(),
+            )?;
+            Ok(Self {
+                slots,
+                expert_ids,
+                expert_to_slot: vec![-1; local_count],
+                slot_to_expert: vec![usize::MAX; k_hot],
+                slot_last_used: vec![0; k_hot],
+                d_expert_to_slot,
+                step_clock: 1,
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+                dma_experts_loaded: 0,
+                cpu_cold_evals: 0,
+            })
+        }
+
+        /// Populates the `K_hot` VRAM slots with `initial_experts` (or the first `K_hot` local experts).
+        pub fn populate_initial(
+            &mut self,
+            store: &HostExpertStore,
+            initial_experts: Option<&[usize]>,
+            ws: &mut TieredMoeWorkspace,
+            stream: &crate::cuda::CudaStream,
+        ) -> crate::cuda::Result<()> {
+            let k_hot = self.slots.capacity;
+            let chosen: Vec<usize> = match initial_experts {
+                Some(ids) => {
+                    if ids.len() != k_hot || ids.iter().any(|id| !self.expert_ids.contains(id)) {
+                        return Err(crate::cuda::CudaError::new(
+                            -1,
+                            "invalid initial_experts for HotExpertCache",
+                        ));
+                    }
+                    ids.to_vec()
+                }
+                None => self.expert_ids.clone().take(k_hot).collect(),
+            };
+            self.expert_to_slot.fill(-1);
+            for (slot, &ge) in chosen.iter().enumerate() {
+                let le = ge - self.expert_ids.start;
+                self.expert_to_slot[le] = slot as i32;
+                self.slot_to_expert[slot] = ge;
+                self.slot_last_used[slot] = self.step_clock;
+            }
+            self.step_clock += 1;
+
+            // Upload in chunks of `ws.stage_capacity`.
+            let chunk_cap = ws.stage_capacity;
+            for chunk_start in (0..k_hot).step_by(chunk_cap) {
+                let chunk_end = (chunk_start + chunk_cap).min(k_hot);
+                let num_staged = chunk_end - chunk_start;
+                ws.stage_experts_to_slots(
+                    0,
+                    store,
+                    &chosen[chunk_start..chunk_end],
+                    &(chunk_start as i32..chunk_end as i32).collect::<Vec<_>>(),
+                    &self.slots,
+                    stream,
+                )?;
+                let _ = num_staged;
+            }
+            self.d_expert_to_slot
+                .copy_from_host(&self.expert_to_slot, stream)?;
+            stream.synchronize()
+        }
+
+        #[inline]
+        pub fn slot_of(&self, global_id: usize) -> Option<i32> {
+            if !self.expert_ids.contains(&global_id) {
+                return None;
+            }
+            let slot = self.expert_to_slot[global_id - self.expert_ids.start];
+            (slot >= 0).then_some(slot)
+        }
+    }
+
+    /// Reusable double-buffered staging & scratch workspace for `TieredMoeEngine`.
+    pub struct TieredMoeWorkspace {
+        pub device_id: i32,
+        pub layout: ExpertPackLayout,
+        pub stage_capacity: usize,
+        pub max_tokens: usize,
+        pub top_k: usize,
+        pub h_stage_packs: [MappedHostBuffer; 2],
+        pub d_stage_packs: [crate::cuda::DeviceBuffer; 2],
+        pub d_stage_slots: [crate::cuda::DeviceBuffer; 2],
+        pub stage_tables: [DeviceExpertSlotTable; 2],
+        pub h2d_stream: crate::cuda::CudaStream,
+        pub h2d_done_events: [crate::cuda::CudaEvent; 2],
+        pub compute_done_events: [crate::cuda::CudaEvent; 2],
+        pub d_remapped_topk_ids: [crate::cuda::DeviceBuffer; 2],
+        pub d_interm_buf: crate::cuda::DeviceBuffer,
+        pub d_chunk_out: crate::cuda::DeviceBuffer,
+        pub d_scratch: crate::cuda::DeviceBuffer,
+    }
+
+    impl TieredMoeWorkspace {
+        pub fn new(
+            device_id: i32,
+            layout: ExpertPackLayout,
+            stage_capacity: usize,
+            max_tokens: usize,
+            top_k: usize,
+        ) -> crate::cuda::Result<Self> {
+            use crate::cuda::{CudaEvent, CudaStream, DeviceBuffer};
+            let stage_cap = stage_capacity.max(1);
+            let stage_bytes = stage_cap * layout.stride;
+            let pairs = (max_tokens * top_k).max(1);
+            let h_stage_packs = [
+                MappedHostBuffer::alloc(stage_bytes)?,
+                MappedHostBuffer::alloc(stage_bytes)?,
+            ];
+            let d_stage_packs = [
+                DeviceBuffer::alloc(device_id, stage_bytes)?,
+                DeviceBuffer::alloc(device_id, stage_bytes)?,
+            ];
+            let d_stage_slots = [
+                DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
+                DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
+            ];
+            let stage_tables = [
+                DeviceExpertSlotTable::alloc(device_id, stage_cap, layout.clone())?,
+                DeviceExpertSlotTable::alloc(device_id, stage_cap, layout.clone())?,
+            ];
+            let h2d_stream = CudaStream::new(device_id)?;
+            let h2d_done_events = [
+                CudaEvent::new(device_id, false)?,
+                CudaEvent::new(device_id, false)?,
+            ];
+            let compute_done_events = [
+                CudaEvent::new(device_id, false)?,
+                CudaEvent::new(device_id, false)?,
+            ];
+            // Record initial compute_done_events so the first wait_event is immediately satisfied.
+            compute_done_events[0].record(&h2d_stream)?;
+            compute_done_events[1].record(&h2d_stream)?;
+
+            let d_remapped_topk_ids = [
+                DeviceBuffer::alloc(device_id, pairs * core::mem::size_of::<i32>())?,
+                DeviceBuffer::alloc(device_id, pairs * core::mem::size_of::<i32>())?,
+            ];
+            let d_interm_buf = DeviceBuffer::alloc(
+                device_id,
+                pairs * layout.intermediate * core::mem::size_of::<u16>(),
+            )?;
+            let d_chunk_out = DeviceBuffer::alloc(
+                device_id,
+                max_tokens.max(1) * layout.hidden * core::mem::size_of::<u16>(),
+            )?;
+            // Scratch for grouped-MMA token-expert sorting inside `w34_moe_w4a16_mlp_f16`.
+            let d_scratch = DeviceBuffer::alloc(device_id, 16 * 1024 * 1024)?;
+
+            Ok(Self {
+                device_id,
+                layout,
+                stage_capacity: stage_cap,
+                max_tokens,
+                top_k,
+                h_stage_packs,
+                d_stage_packs,
+                d_stage_slots,
+                stage_tables,
+                h2d_stream,
+                h2d_done_events,
+                compute_done_events,
+                d_remapped_topk_ids,
+                d_interm_buf,
+                d_chunk_out,
+                d_scratch,
+            })
+        }
+
+        /// Copies `global_expert_ids` into pinned `h_stage_packs[buf_idx]`, DMAs them to
+        /// `d_stage_packs[buf_idx]`, and scatters them into `dst_table` at `dst_slots`.
+        pub fn stage_experts_to_slots(
+            &self,
+            buf_idx: usize,
+            store: &HostExpertStore,
+            global_expert_ids: &[usize],
+            dst_slots: &[i32],
+            dst_table: &DeviceExpertSlotTable,
+            stream: &crate::cuda::CudaStream,
+        ) -> crate::cuda::Result<()> {
+            let n = global_expert_ids.len();
+            if n == 0 {
+                return Ok(());
+            }
+            assert_eq!(n, dst_slots.len());
+            assert!(n <= self.stage_capacity);
+            let stride = self.layout.stride;
+            let total_bytes = n * stride;
+            // SAFETY: caller ensures previous DMA from `h_stage_packs[buf_idx]` has completed.
+            let pinned_dst = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.h_stage_packs[buf_idx].host_ptr.cast::<u8>(),
+                    total_bytes,
+                )
+            };
+            for (i, &ge) in global_expert_ids.iter().enumerate() {
+                let src = store
+                    .expert_pack(ge)
+                    .expect("expert not owned by local HostExpertStore");
+                pinned_dst[i * stride..(i + 1) * stride].copy_from_slice(src);
+            }
+            self.d_stage_packs[buf_idx].copy_from_host(pinned_dst, stream)?;
+            self.d_stage_slots[buf_idx].copy_from_host(dst_slots, stream)?;
+            dst_table.unpack_staged(
+                stream,
+                self.d_stage_packs[buf_idx].addr(),
+                self.d_stage_slots[buf_idx].addr(),
+                n,
+            )
+        }
+    }
+
+    /// Executes a tiered 512-expert MoE layer across `TP=1` or `TP=2 / EP=2` in `GpuLru`,
+    /// `CpuHybrid`, or double-buffered `StreamedPrefill` mode.
+    pub struct TieredMoeEngine;
+
+    impl TieredMoeEngine {
+        #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+        pub fn execute_layer(
+            mode: MoeOffloadMode,
+            store: &HostExpertStore,
+            cache: &mut HotExpertCache,
+            ws: &mut TieredMoeWorkspace,
+            compute_stream: &crate::cuda::CudaStream,
+            x_addr: u64,
+            d_topk_ids_addr: u64,
+            d_topk_weights_addr: u64,
+            h_topk_ids: &[i32],
+            h_topk_weights: &[f32],
+            shared_expert_out_addr: u64,
+            shared_expert_gate_addr: u64,
+            out_addr: u64,
+            num_tokens: usize,
+            top_k: usize,
+        ) -> crate::cuda::Result<()> {
+            if num_tokens == 0 {
+                return Ok(());
+            }
+            assert_eq!(h_topk_ids.len(), num_tokens * top_k);
+            assert_eq!(h_topk_weights.len(), num_tokens * top_k);
+
+            // Identify unique active local experts and count cache hits/misses.
+            let mut active_local: Vec<usize> = Vec::new();
+            let mut hits_in_step: Vec<usize> = Vec::new();
+            let mut misses_in_step: Vec<usize> = Vec::new();
+
+            for &raw_id in h_topk_ids {
+                if raw_id < 0 {
+                    continue;
+                }
+                let ge = raw_id as usize;
+                if !cache.expert_ids.contains(&ge) {
+                    continue;
+                }
+                if !active_local.contains(&ge) {
+                    active_local.push(ge);
+                }
+                if cache.slot_of(ge).is_some() {
+                    cache.hits += 1;
+                    if !hits_in_step.contains(&ge) {
+                        hits_in_step.push(ge);
+                    }
+                } else {
+                    cache.misses += 1;
+                    if !misses_in_step.contains(&ge) {
+                        misses_in_step.push(ge);
+                    }
+                }
+            }
+
+            // Touch LRU timestamps on all hit slots first so they cannot be evicted this step.
+            let step = cache.step_clock;
+            cache.step_clock += 1;
+            for &ge in &hits_in_step {
+                let slot = cache.slot_of(ge).unwrap() as usize;
+                cache.slot_last_used[slot] = step;
+            }
+
+            let effective_mode = match mode {
+                MoeOffloadMode::Auto => {
+                    if active_local.len() <= cache.slots.capacity
+                        && misses_in_step.len() <= ws.stage_capacity
+                    {
+                        MoeOffloadMode::GpuLru
+                    } else {
+                        MoeOffloadMode::StreamedPrefill
+                    }
+                }
+                MoeOffloadMode::GpuLru => {
+                    if active_local.len() <= cache.slots.capacity
+                        && misses_in_step.len() <= ws.stage_capacity
+                    {
+                        MoeOffloadMode::GpuLru
+                    } else {
+                        MoeOffloadMode::StreamedPrefill
+                    }
+                }
+                other => other,
+            };
+
+            let ex = compute_stream.exec(ws.d_scratch.addr(), ws.d_scratch.len_bytes);
+
+            match effective_mode {
+                MoeOffloadMode::GpuLru => {
+                    if !misses_in_step.is_empty() {
+                        let mut victim_slots = Vec::with_capacity(misses_in_step.len());
+                        for &ge in &misses_in_step {
+                            // Choose the slot with the smallest `slot_last_used` timestamp.
+                            let (victim_slot, _) = cache
+                                .slot_last_used
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|&(_, &ts)| ts)
+                                .unwrap();
+                            let old_ge = cache.slot_to_expert[victim_slot];
+                            if old_ge < usize::MAX {
+                                cache.expert_to_slot[old_ge - cache.expert_ids.start] = -1;
+                                cache.evictions += 1;
+                            }
+                            cache.expert_to_slot[ge - cache.expert_ids.start] = victim_slot as i32;
+                            cache.slot_to_expert[victim_slot] = ge;
+                            cache.slot_last_used[victim_slot] = step;
+                            victim_slots.push(victim_slot as i32);
+                        }
+                        cache.dma_experts_loaded += misses_in_step.len() as u64;
+                        ws.stage_experts_to_slots(
+                            0,
+                            store,
+                            &misses_in_step,
+                            &victim_slots,
+                            &cache.slots,
+                            compute_stream,
+                        )?;
+                        cache
+                            .d_expert_to_slot
+                            .copy_from_host(&cache.expert_to_slot, compute_stream)?;
+                    }
+                    // Remap global `d_topk_ids_addr` on GPU using `cache.d_expert_to_slot`.
+                    crate::cuda::check_rc(
+                        // SAFETY: pointers and counts match allocated device buffers.
+                        unsafe {
+                            w34_kernels::ffi::w34_moe_remap_topk_ids_i32(
+                                &ex,
+                                d_topk_ids_addr as *const i32,
+                                cache.d_expert_to_slot.addr() as *const i32,
+                                ws.d_remapped_topk_ids[0].addr() as *mut i32,
+                                (num_tokens * top_k) as i32,
+                                cache.expert_ids.start as i32,
+                                cache.expert_ids.len() as i32,
+                            )
+                        },
+                        "w34_moe_remap_topk_ids_i32",
+                    )?;
+                    cache.slots.launch_moe_w4a16(
+                        &ex,
+                        x_addr,
+                        ws.d_remapped_topk_ids[0].addr(),
+                        d_topk_weights_addr,
+                        shared_expert_out_addr,
+                        shared_expert_gate_addr,
+                        ws.d_interm_buf.addr(),
+                        out_addr,
+                        num_tokens,
+                        top_k,
+                    )
+                }
+
+                MoeOffloadMode::CpuHybrid { gpu_pcie_budget } => {
+                    // Optionally promote up to `gpu_pcie_budget` cold misses into GPU LRU slots.
+                    let gpu_promote = gpu_pcie_budget
+                        .min(misses_in_step.len())
+                        .min(ws.stage_capacity)
+                        .min(cache.slots.capacity.saturating_sub(hits_in_step.len()));
+                    if gpu_promote > 0 {
+                        let promoted = &misses_in_step[..gpu_promote];
+                        let mut victim_slots = Vec::with_capacity(gpu_promote);
+                        for &ge in promoted {
+                            let (victim_slot, _) = cache
+                                .slot_last_used
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|&(_, &ts)| ts)
+                                .unwrap();
+                            let old_ge = cache.slot_to_expert[victim_slot];
+                            if old_ge < usize::MAX {
+                                cache.expert_to_slot[old_ge - cache.expert_ids.start] = -1;
+                                cache.evictions += 1;
+                            }
+                            cache.expert_to_slot[ge - cache.expert_ids.start] = victim_slot as i32;
+                            cache.slot_to_expert[victim_slot] = ge;
+                            cache.slot_last_used[victim_slot] = step;
+                            victim_slots.push(victim_slot as i32);
+                        }
+                        cache.dma_experts_loaded += gpu_promote as u64;
+                        ws.stage_experts_to_slots(
+                            0,
+                            store,
+                            promoted,
+                            &victim_slots,
+                            &cache.slots,
+                            compute_stream,
+                        )?;
+                        cache
+                            .d_expert_to_slot
+                            .copy_from_host(&cache.expert_to_slot, compute_stream)?;
+                    }
+
+                    // Partition pairs into GPU hot/promoted slots vs CPU cold tasks.
+                    let mut remapped_hot = vec![-1i32; num_tokens * top_k];
+                    let mut cold_tasks = Vec::new();
+                    for tok in 0..num_tokens {
+                        for k in 0..top_k {
+                            let idx = tok * top_k + k;
+                            let raw_id = h_topk_ids[idx];
+                            if raw_id < 0 {
+                                continue;
+                            }
+                            let ge = raw_id as usize;
+                            if !cache.expert_ids.contains(&ge) {
+                                continue;
+                            }
+                            if let Some(slot) = cache.slot_of(ge) {
+                                remapped_hot[idx] = slot;
+                            } else {
+                                cold_tasks.push((tok, ge, h_topk_weights[idx]));
+                            }
+                        }
+                    }
+
+                    ws.d_remapped_topk_ids[0].copy_from_host(&remapped_hot, compute_stream)?;
+
+                    // Download `x` to host if there are cold CPU tasks, then launch GPU hot MoE
+                    // concurrently while the CPU thread pool evaluates cold experts!
+                    let mut h_x = vec![
+                        0u16;
+                        if cold_tasks.is_empty() {
+                            0
+                        } else {
+                            num_tokens * ws.layout.hidden
+                        }
+                    ];
+                    if !cold_tasks.is_empty() {
+                        crate::cuda::check_rc(
+                            // SAFETY: `h_x` and `x_addr` cover `num_tokens * hidden` FP16 elements.
+                            unsafe {
+                                w34_kernels::ffi::w34_memcpy_d2h_async(
+                                    h_x.as_mut_ptr().cast::<core::ffi::c_void>(),
+                                    x_addr as *const core::ffi::c_void,
+                                    core::mem::size_of_val(h_x.as_slice()),
+                                    compute_stream.handle,
+                                )
+                            },
+                            "w34_memcpy_d2h_async (CpuHybrid x)",
+                        )?;
+                        compute_stream.synchronize()?;
+                    }
+
+                    cache.slots.launch_moe_w4a16(
+                        &ex,
+                        x_addr,
+                        ws.d_remapped_topk_ids[0].addr(),
+                        d_topk_weights_addr,
+                        shared_expert_out_addr,
+                        shared_expert_gate_addr,
+                        ws.d_interm_buf.addr(),
+                        out_addr,
+                        num_tokens,
+                        top_k,
+                    )?;
+
+                    if !cold_tasks.is_empty() {
+                        cache.cpu_cold_evals += cold_tasks.len() as u64;
+                        let h_cold_out = store.eval_cold_tasks_cpu(&h_x, num_tokens, &cold_tasks);
+                        ws.d_chunk_out.copy_from_host(&h_cold_out, compute_stream)?;
+                        crate::cuda::check_rc(
+                            // SAFETY: `out_addr` and `ws.d_chunk_out` are disjoint 4-byte-aligned FP16 buffers.
+                            unsafe {
+                                w34_kernels::ffi::w34_add_inplace_f16(
+                                    &ex,
+                                    out_addr as *mut core::ffi::c_void,
+                                    ws.d_chunk_out.addr() as *const core::ffi::c_void,
+                                    (num_tokens * ws.layout.hidden) as i64,
+                                )
+                            },
+                            "w34_add_inplace_f16 (CpuHybrid)",
+                        )?;
+                    }
+                    Ok(())
+                }
+
+                MoeOffloadMode::StreamedPrefill => {
+                    // Pass 0: Execute all hot-cache hits on `compute_stream` (plus shared expert).
+                    crate::cuda::check_rc(
+                        // SAFETY: pointers and counts match allocated device buffers.
+                        unsafe {
+                            w34_kernels::ffi::w34_moe_remap_topk_ids_i32(
+                                &ex,
+                                d_topk_ids_addr as *const i32,
+                                cache.d_expert_to_slot.addr() as *const i32,
+                                ws.d_remapped_topk_ids[0].addr() as *mut i32,
+                                (num_tokens * top_k) as i32,
+                                cache.expert_ids.start as i32,
+                                cache.expert_ids.len() as i32,
+                            )
+                        },
+                        "w34_moe_remap_topk_ids_i32 (Pass 0)",
+                    )?;
+
+                    // Before launching Pass 0 on `compute_stream`, kick off Chunk 0 H2D on `ws.h2d_stream`
+                    // so PCIe DMA overlaps with Pass 0 GPU compute!
+                    let chunks: Vec<&[usize]> = misses_in_step.chunks(ws.stage_capacity).collect();
+                    if !chunks.is_empty() {
+                        let c0 = chunks[0];
+                        let dst_slots: Vec<i32> = (0..c0.len() as i32).collect();
+                        ws.h2d_stream.wait_event(&ws.compute_done_events[0])?;
+                        ws.stage_experts_to_slots(
+                            0,
+                            store,
+                            c0,
+                            &dst_slots,
+                            &ws.stage_tables[0],
+                            &ws.h2d_stream,
+                        )?;
+                        cache.dma_experts_loaded += c0.len() as u64;
+                        ws.h2d_done_events[0].record(&ws.h2d_stream)?;
+                    }
+
+                    cache.slots.launch_moe_w4a16(
+                        &ex,
+                        x_addr,
+                        ws.d_remapped_topk_ids[0].addr(),
+                        d_topk_weights_addr,
+                        shared_expert_out_addr,
+                        shared_expert_gate_addr,
+                        ws.d_interm_buf.addr(),
+                        out_addr,
+                        num_tokens,
+                        top_k,
+                    )?;
+
+                    // Passes 1..=chunks.len(): Double-buffered H2D + Grouped-MMA streaming.
+                    for (c_idx, chunk) in chunks.iter().enumerate() {
+                        let buf_idx = c_idx & 1;
+                        // Enqueue H2D for `c_idx + 1` on `ws.h2d_stream` into `1 - buf_idx`
+                        // before launching compute for `c_idx` on `compute_stream`!
+                        if c_idx + 1 < chunks.len() {
+                            let next_buf = 1 - buf_idx;
+                            let next_chunk = chunks[c_idx + 1];
+                            let dst_slots: Vec<i32> = (0..next_chunk.len() as i32).collect();
+                            ws.h2d_stream
+                                .wait_event(&ws.compute_done_events[next_buf])?;
+                            ws.stage_experts_to_slots(
+                                next_buf,
+                                store,
+                                next_chunk,
+                                &dst_slots,
+                                &ws.stage_tables[next_buf],
+                                &ws.h2d_stream,
+                            )?;
+                            cache.dma_experts_loaded += next_chunk.len() as u64;
+                            ws.h2d_done_events[next_buf].record(&ws.h2d_stream)?;
+                        }
+
+                        // Build per-pair remapped IDs for `chunk`.
+                        let mut chunk_remap = vec![-1i32; num_tokens * top_k];
+                        for (pair_idx, &raw_id) in h_topk_ids.iter().enumerate() {
+                            if raw_id < 0 {
+                                continue;
+                            }
+                            let ge = raw_id as usize;
+                            if let Some(pos) = chunk.iter().position(|&e| e == ge) {
+                                chunk_remap[pair_idx] = pos as i32;
+                            }
+                        }
+
+                        compute_stream.wait_event(&ws.h2d_done_events[buf_idx])?;
+                        ws.d_remapped_topk_ids[buf_idx]
+                            .copy_from_host(&chunk_remap, compute_stream)?;
+                        ws.stage_tables[buf_idx].launch_moe_w4a16(
+                            &ex,
+                            x_addr,
+                            ws.d_remapped_topk_ids[buf_idx].addr(),
+                            d_topk_weights_addr,
+                            0,
+                            0,
+                            ws.d_interm_buf.addr(),
+                            ws.d_chunk_out.addr(),
+                            num_tokens,
+                            top_k,
+                        )?;
+                        crate::cuda::check_rc(
+                            // SAFETY: `out_addr` and `ws.d_chunk_out` are disjoint 4-byte-aligned FP16 buffers.
+                            unsafe {
+                                w34_kernels::ffi::w34_add_inplace_f16(
+                                    &ex,
+                                    out_addr as *mut core::ffi::c_void,
+                                    ws.d_chunk_out.addr() as *const core::ffi::c_void,
+                                    (num_tokens * ws.layout.hidden) as i64,
+                                )
+                            },
+                            "w34_add_inplace_f16 (StreamedPrefill)",
+                        )?;
+                        ws.compute_done_events[buf_idx].record(compute_stream)?;
+                    }
+                    Ok(())
+                }
+
+                MoeOffloadMode::Auto => unreachable!(),
+            }
+        }
     }
 }
 
 #[cfg(feature = "cuda")]
-pub use host_store::HostExpertStore;
+pub use host_store::{
+    DeviceExpertSlotTable, HostExpertStore, HotExpertCache, TieredMoeEngine, TieredMoeWorkspace,
+};
 
 #[cfg(test)]
 mod layout_tests {
@@ -515,5 +1598,372 @@ mod tests {
             );
         }
         stream.synchronize().unwrap();
+    }
+
+    #[test]
+    fn tiered_moe_gpu_lru_cpu_hybrid_and_streamed_prefill_parity_tp1_and_ep2() {
+        use super::{
+            DeviceExpertSlotTable, ExpertPackLayout, HostExpertStore, HotExpertCache,
+            MoeOffloadMode, TieredMoeEngine, TieredMoeWorkspace,
+        };
+        use crate::cuda::{f16_to_f32, f32_to_f16};
+
+        let _device = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+
+        let num_experts = 16usize;
+        let n_interm = 128usize;
+        let k_hidden = 128usize;
+        let group_size = 128usize;
+        let top_k = 4usize;
+        let num_tokens = 6usize;
+        let layout = ExpertPackLayout::new(n_interm, k_hidden, group_size).unwrap();
+
+        // Build deterministic synthetic U4B8 weights and scales for 16 experts.
+        let gu_words_per_exp = (2 * n_interm) * (k_hidden / 8);
+        let gu_scales_per_exp = (2 * n_interm) * (k_hidden / group_size);
+        let dn_words_per_exp = k_hidden * (n_interm / 8);
+        let dn_scales_per_exp = k_hidden * (n_interm / group_size);
+
+        let mut raw_packs = vec![0u8; num_experts * layout.stride];
+        for e in 0..num_experts {
+            let gu_p: Vec<u32> = (0..gu_words_per_exp)
+                .map(|i| {
+                    let mut w = 0u32;
+                    for b in 0..8 {
+                        let nib = (((e * 13 + i * 7 + b * 3) % 15) as u32) & 0xF;
+                        w |= nib << (b * 4);
+                    }
+                    w
+                })
+                .collect();
+            let gu_s: Vec<u16> = (0..gu_scales_per_exp)
+                .map(|i| f32_to_f16(0.015 + 0.002 * (((e * 5 + i) % 9) as f32)))
+                .collect();
+            let dn_p: Vec<u32> = (0..dn_words_per_exp)
+                .map(|i| {
+                    let mut w = 0u32;
+                    for b in 0..8 {
+                        let nib = (((e * 11 + i * 5 + b * 7) % 15) as u32) & 0xF;
+                        w |= nib << (b * 4);
+                    }
+                    w
+                })
+                .collect();
+            let dn_s: Vec<u16> = (0..dn_scales_per_exp)
+                .map(|i| f32_to_f16(0.012 + 0.0015 * (((e * 3 + i) % 11) as f32)))
+                .collect();
+            layout
+                .write_pack(
+                    &gu_p,
+                    &gu_s,
+                    &dn_p,
+                    &dn_s,
+                    &mut raw_packs[e * layout.stride..(e + 1) * layout.stride],
+                )
+                .unwrap();
+        }
+
+        let h_x: Vec<u16> = (0..num_tokens * k_hidden)
+            .map(|i| f32_to_f16(((i as f32 * 0.13).sin()) * 0.4))
+            .collect();
+        let h_shared_out: Vec<u16> = (0..num_tokens * k_hidden)
+            .map(|i| f32_to_f16(((i as f32 * 0.07).cos()) * 0.25))
+            .collect();
+        // Split `shared_out` into two additive partial sums to verify TP=2 shared expert fusion!
+        let h_shared_out_r0: Vec<u16> = h_shared_out
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| f32_to_f16(f16_to_f32(v) * if i % 2 == 0 { 0.6 } else { 0.35 }))
+            .collect();
+        let h_shared_out_r1: Vec<u16> = h_shared_out
+            .iter()
+            .zip(&h_shared_out_r0)
+            .map(|(&full, &r0)| f32_to_f16(f16_to_f32(full) - f16_to_f32(r0)))
+            .collect();
+        let h_shared_gate: Vec<u16> = (0..num_tokens)
+            .map(|t| f32_to_f16(-0.3 + 0.25 * (t as f32)))
+            .collect();
+
+        // Route 6 tokens x top_k=4 across 10 distinct experts (`0, 1, 4, 5, 8, 9, 10, 11, 12, 14`),
+        // leaving `2, 3, 6, 7, 13, 15` inactive in this batch so LRU eviction of inactive slots is exercised.
+        let h_topk_ids: Vec<i32> = vec![
+            0, 4, 8, 11, // tok 0
+            1, 4, 9, 14, // tok 1
+            0, 5, 10, 12, // tok 2
+            1, 5, 8, 12, // tok 3
+            0, 4, 11, 14, // tok 4
+            4, 5, 9, 10, // tok 5
+        ];
+        let h_topk_weights: Vec<f32> = (0..num_tokens * top_k)
+            .map(|i| 0.1 + 0.05 * ((i % 4) as f32))
+            .collect();
+
+        let d_x = upload(&h_x, &stream);
+        let d_shared_out = upload(&h_shared_out, &stream);
+        let d_shared_out_r0 = upload(&h_shared_out_r0, &stream);
+        let d_shared_out_r1 = upload(&h_shared_out_r1, &stream);
+        let d_shared_gate = upload(&h_shared_gate, &stream);
+        let d_topk_ids = upload(&h_topk_ids, &stream);
+        let d_topk_weights = upload(&h_topk_weights, &stream);
+
+        // 1. Compute full-resident GPU oracle output (`K_hot = 16` all resident).
+        let full_store = HostExpertStore::from_raw_packs(
+            layout.clone(),
+            0..num_experts,
+            &raw_packs,
+            num_experts * layout.stride,
+        )
+        .unwrap();
+        let mut ws_oracle =
+            TieredMoeWorkspace::new(0, layout.clone(), 8, num_tokens, top_k).unwrap();
+        let mut full_cache =
+            HotExpertCache::new(0, num_experts, 0..num_experts, layout.clone()).unwrap();
+        full_cache
+            .populate_initial(&full_store, None, &mut ws_oracle, &stream)
+            .unwrap();
+        let d_oracle_out =
+            DeviceBuffer::alloc(0, num_tokens * k_hidden * std::mem::size_of::<u16>()).unwrap();
+        TieredMoeEngine::execute_layer(
+            MoeOffloadMode::GpuLru,
+            &full_store,
+            &mut full_cache,
+            &mut ws_oracle,
+            &stream,
+            d_x.addr(),
+            d_topk_ids.addr(),
+            d_topk_weights.addr(),
+            &h_topk_ids,
+            &h_topk_weights,
+            d_shared_out.addr(),
+            d_shared_gate.addr(),
+            d_oracle_out.addr(),
+            num_tokens,
+            top_k,
+        )
+        .unwrap();
+        let mut h_oracle = vec![0u16; num_tokens * k_hidden];
+        d_oracle_out.copy_to_host(&mut h_oracle, &stream).unwrap();
+
+        let assert_close_f16 = |actual: &[u16], label: &str| {
+            let max_diff = actual
+                .iter()
+                .zip(&h_oracle)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 8e-3,
+                "{label} max_abs_diff={max_diff} exceeds 8e-3 (<= 4 FP16 ULPs)"
+            );
+        };
+
+        // 2. Verify TP=1 `CpuHybrid { gpu_pcie_budget: 0 }` and `CpuHybrid { gpu_pcie_budget: 2 }`
+        //    with only `k_hot = 4` experts initially cached in VRAM!
+        for budget in [0usize, 2usize] {
+            let mut cache = HotExpertCache::new(0, 4, 0..num_experts, layout.clone()).unwrap();
+            let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 3, num_tokens, top_k).unwrap();
+            cache
+                .populate_initial(&full_store, Some(&[0, 1, 2, 3]), &mut ws, &stream)
+                .unwrap();
+            let d_out =
+                DeviceBuffer::alloc(0, num_tokens * k_hidden * std::mem::size_of::<u16>()).unwrap();
+            TieredMoeEngine::execute_layer(
+                MoeOffloadMode::CpuHybrid {
+                    gpu_pcie_budget: budget,
+                },
+                &full_store,
+                &mut cache,
+                &mut ws,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids,
+                &h_topk_weights,
+                d_shared_out.addr(),
+                d_shared_gate.addr(),
+                d_out.addr(),
+                num_tokens,
+                top_k,
+            )
+            .unwrap();
+            let mut h_out = vec![0u16; num_tokens * k_hidden];
+            d_out.copy_to_host(&mut h_out, &stream).unwrap();
+            assert!(cache.cpu_cold_evals > 0);
+            assert_eq!(cache.dma_experts_loaded, budget as u64);
+            assert_close_f16(&h_out, &format!("TP=1 CpuHybrid(budget={budget})"));
+        }
+
+        // 3. Verify TP=1 `StreamedPrefill` with `k_hot = 4` and `stage_capacity = 3` (forces 4 cold chunks
+        //    through the double-buffered `stage_tables[0..2]` pipeline!).
+        {
+            let mut cache = HotExpertCache::new(0, 4, 0..num_experts, layout.clone()).unwrap();
+            let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 3, num_tokens, top_k).unwrap();
+            cache
+                .populate_initial(&full_store, Some(&[0, 1, 2, 3]), &mut ws, &stream)
+                .unwrap();
+            let d_out =
+                DeviceBuffer::alloc(0, num_tokens * k_hidden * std::mem::size_of::<u16>()).unwrap();
+            TieredMoeEngine::execute_layer(
+                MoeOffloadMode::StreamedPrefill,
+                &full_store,
+                &mut cache,
+                &mut ws,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids,
+                &h_topk_weights,
+                d_shared_out.addr(),
+                d_shared_gate.addr(),
+                d_out.addr(),
+                num_tokens,
+                top_k,
+            )
+            .unwrap();
+            let mut h_out = vec![0u16; num_tokens * k_hidden];
+            d_out.copy_to_host(&mut h_out, &stream).unwrap();
+            assert_eq!(cache.dma_experts_loaded, 8);
+            assert_close_f16(&h_out, "TP=1 StreamedPrefill(stage_cap=3)");
+        }
+
+        // 4. Verify TP=1 `GpuLru` with `k_hot = 12` and `stage_capacity = 12` (8 hits + 2 misses -> 2 LRU evictions + 2 DMA loads).
+        {
+            let mut cache = HotExpertCache::new(0, 12, 0..num_experts, layout.clone()).unwrap();
+            let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 12, num_tokens, top_k).unwrap();
+            cache
+                .populate_initial(&full_store, None, &mut ws, &stream)
+                .unwrap();
+            let d_out =
+                DeviceBuffer::alloc(0, num_tokens * k_hidden * std::mem::size_of::<u16>()).unwrap();
+            TieredMoeEngine::execute_layer(
+                MoeOffloadMode::GpuLru,
+                &full_store,
+                &mut cache,
+                &mut ws,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids,
+                &h_topk_weights,
+                d_shared_out.addr(),
+                d_shared_gate.addr(),
+                d_out.addr(),
+                num_tokens,
+                top_k,
+            )
+            .unwrap();
+            let mut h_out = vec![0u16; num_tokens * k_hidden];
+            d_out.copy_to_host(&mut h_out, &stream).unwrap();
+            assert_eq!(cache.dma_experts_loaded, 2);
+            assert_eq!(cache.evictions, 2);
+            assert_close_f16(&h_out, "TP=1 GpuLru(k_hot=12)");
+        }
+
+        // 5. Verify TP=2 / EP=2 (`Rank 0: 0..8`, `Rank 1: 8..16`) across `GpuLru`, `CpuHybrid`, and `StreamedPrefill`,
+        //    including single-AllReduce fusion of EP=2 routed experts + TP=2 sharded shared_expert!
+        let store_r0 = HostExpertStore::from_raw_packs(
+            layout.clone(),
+            0..8,
+            &raw_packs[0..8 * layout.stride],
+            8 * layout.stride,
+        )
+        .unwrap();
+        let store_r1 = HostExpertStore::from_raw_packs(
+            layout.clone(),
+            8..16,
+            &raw_packs[8 * layout.stride..16 * layout.stride],
+            8 * layout.stride,
+        )
+        .unwrap();
+
+        for mode in [
+            MoeOffloadMode::GpuLru,
+            MoeOffloadMode::CpuHybrid { gpu_pcie_budget: 1 },
+            MoeOffloadMode::StreamedPrefill,
+        ] {
+            let k_hot_ep = if matches!(mode, MoeOffloadMode::GpuLru) {
+                8
+            } else {
+                3
+            };
+            let mut cache_r0 = HotExpertCache::new(0, k_hot_ep, 0..8, layout.clone()).unwrap();
+            let mut cache_r1 = HotExpertCache::new(0, k_hot_ep, 8..16, layout.clone()).unwrap();
+            let mut ws_r0 =
+                TieredMoeWorkspace::new(0, layout.clone(), 4, num_tokens, top_k).unwrap();
+            let mut ws_r1 =
+                TieredMoeWorkspace::new(0, layout.clone(), 4, num_tokens, top_k).unwrap();
+            cache_r0
+                .populate_initial(&store_r0, None, &mut ws_r0, &stream)
+                .unwrap();
+            cache_r1
+                .populate_initial(&store_r1, None, &mut ws_r1, &stream)
+                .unwrap();
+
+            let d_out_r0 =
+                DeviceBuffer::alloc(0, num_tokens * k_hidden * std::mem::size_of::<u16>()).unwrap();
+            let d_out_r1 =
+                DeviceBuffer::alloc(0, num_tokens * k_hidden * std::mem::size_of::<u16>()).unwrap();
+
+            TieredMoeEngine::execute_layer(
+                mode,
+                &store_r0,
+                &mut cache_r0,
+                &mut ws_r0,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids,
+                &h_topk_weights,
+                d_shared_out_r0.addr(),
+                d_shared_gate.addr(),
+                d_out_r0.addr(),
+                num_tokens,
+                top_k,
+            )
+            .unwrap();
+            TieredMoeEngine::execute_layer(
+                mode,
+                &store_r1,
+                &mut cache_r1,
+                &mut ws_r1,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids,
+                &h_topk_weights,
+                d_shared_out_r1.addr(),
+                d_shared_gate.addr(),
+                d_out_r1.addr(),
+                num_tokens,
+                top_k,
+            )
+            .unwrap();
+
+            // Simulate the post-MoE TP=2 AllReduce (`out_r0 += out_r1`).
+            let ex = stream.exec(0, 0);
+            crate::cuda::check_rc(
+                // SAFETY: `d_out_r0` and `d_out_r1` are disjoint 4-byte-aligned FP16 buffers.
+                unsafe {
+                    ffi::w34_add_inplace_f16(
+                        &ex,
+                        d_out_r0.addr() as *mut _,
+                        d_out_r1.addr() as *const _,
+                        (num_tokens * k_hidden) as i64,
+                    )
+                },
+                "w34_add_inplace_f16 (EP=2 sum)",
+            )
+            .unwrap();
+
+            let mut h_ep2 = vec![0u16; num_tokens * k_hidden];
+            d_out_r0.copy_to_host(&mut h_ep2, &stream).unwrap();
+            assert_close_f16(&h_ep2, &format!("TP=2/EP=2 {mode:?}"));
+        }
+        let _ = DeviceExpertSlotTable::alloc;
     }
 }
