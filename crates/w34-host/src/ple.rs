@@ -794,6 +794,395 @@ impl QwenFlashNextCapacityPlan {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub mod gpu_ops {
+    use core::ffi::c_void;
+    use w34_kernels::ffi::{self, W34AttentionBatch, W34Exec, W34GdnBatch, W34KvLayerLayout};
+
+    use crate::cuda::{CudaError, Result};
+
+    #[inline]
+    fn check(rc: i32, op: &'static str) -> Result<()> {
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(CudaError::new(rc, op))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_init_streams_f16(
+        ex: &W34Exec,
+        embed_in: u64,
+        residual_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller and sized for `num_tokens`.
+        let rc = unsafe {
+            ffi::w34_hc_init_streams_f16(
+                ex,
+                embed_in as usize as *const c_void,
+                residual_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                hidden_size as i32,
+            )
+        };
+        check(rc, "w34_hc_init_streams_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_rmsnorm_f16(
+        ex: &W34Exec,
+        residual_in: u64,
+        norm_weight: u64,
+        normed_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller and sized for `num_tokens * hc_count * hidden_size`.
+        let rc = unsafe {
+            ffi::w34_hc_rmsnorm_f16(
+                ex,
+                residual_in as usize as *const c_void,
+                norm_weight as usize as *const c_void,
+                normed_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                hidden_size as i32,
+                eps,
+            )
+        };
+        check(rc, "w34_hc_rmsnorm_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_down_silu_inject_f16(
+        ex: &W34Exec,
+        down_in: u64,
+        down_out: u64,
+        inj_in: u64,
+        inject_weights_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_rank_dim: usize,
+        hc_count: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_hc_down_silu_inject_f16(
+                ex,
+                down_in as usize as *const c_void,
+                down_out as usize as *mut c_void,
+                inj_in as usize as *const c_void,
+                inject_weights_out as usize as *mut f32,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_rank_dim as i32,
+                hc_count as i32,
+            )
+        };
+        check(rc, "w34_hc_down_silu_inject_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_mix_streams_f16(
+        ex: &W34Exec,
+        residual_in: u64,
+        up_raw_in: u64,
+        mixed_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_hc_mix_streams_f16(
+                ex,
+                residual_in as usize as *const c_void,
+                up_raw_in as usize as *const c_void,
+                mixed_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                hidden_size as i32,
+            )
+        };
+        check(rc, "w34_hc_mix_streams_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_combine_f16(
+        ex: &W34Exec,
+        residual_in: u64,
+        block_out: u64,
+        inject_weights: u64,
+        ple_delta: u64,
+        residual_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_hc_combine_f16(
+                ex,
+                residual_in as usize as *const c_void,
+                block_out as usize as *const c_void,
+                inject_weights as usize as *const f32,
+                ple_delta as usize as *const c_void,
+                residual_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                hidden_size as i32,
+            )
+        };
+        check(rc, "w34_hc_combine_f16")
+    }
+
+    pub fn ple_dequant_f8_to_f16(
+        ex: &W34Exec,
+        f8_in: u64,
+        f16_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        embed_dim: usize,
+        weight_scale: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dequant_f8_to_f16(
+                ex,
+                f8_in as usize as *const u8,
+                f16_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                embed_dim as i32,
+                weight_scale,
+            )
+        };
+        check(rc, "w34_ple_dequant_f8_to_f16")
+    }
+
+    pub fn ple_dilated_conv1d_f16(
+        ex: &W34Exec,
+        key_in: u64,
+        conv_weight: u64,
+        conv_state_pool: u64,
+        key_out: u64,
+        batch: &W34GdnBatch,
+        conv_dim: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers and `batch` metadata are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dilated_conv1d_f16(
+                ex,
+                key_in as usize as *const c_void,
+                conv_weight as usize as *const c_void,
+                conv_state_pool as usize as *mut c_void,
+                key_out as usize as *mut c_void,
+                batch,
+                conv_dim as i32,
+            )
+        };
+        check(rc, "w34_ple_dilated_conv1d_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_signed_sqrt_gate_f16(
+        ex: &W34Exec,
+        norm_query: u64,
+        norm_key: u64,
+        value_in: u64,
+        ple_delta_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        embed_dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_signed_sqrt_gate_f16(
+                ex,
+                norm_query as usize as *const c_void,
+                norm_key as usize as *const c_void,
+                value_in as usize as *const c_void,
+                ple_delta_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                embed_dim as i32,
+                eps,
+            )
+        };
+        check(rc, "w34_ple_signed_sqrt_gate_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_indexer_norm_rope_f16(
+        ex: &W34Exec,
+        qk_in: u64,
+        q_norm_weight: u64,
+        k_norm_weight: u64,
+        positions: u64,
+        q_out: u64,
+        k_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        eps: f32,
+        mrope_s1: usize,
+        mrope_s2: usize,
+        pos_plane_stride: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_qsa_indexer_norm_rope_f16(
+                ex,
+                qk_in as usize as *const c_void,
+                q_norm_weight as usize as *const c_void,
+                k_norm_weight as usize as *const c_void,
+                positions as usize as *const i32,
+                q_out as usize as *mut c_void,
+                k_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                q_heads as i32,
+                kv_heads as i32,
+                head_dim as i32,
+                rotary_dim as i32,
+                rope_theta,
+                eps,
+                mrope_s1 as i32,
+                mrope_s2 as i32,
+                pos_plane_stride as i32,
+            )
+        };
+        check(rc, "w34_qsa_indexer_norm_rope_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_indexer_cache_update_f16(
+        ex: &W34Exec,
+        k_in: u64,
+        raw_k_cache: u64,
+        comp_k_cache: u64,
+        write_slot_mapping: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_qsa_indexer_cache_update_f16(
+                ex,
+                k_in as usize as *const c_void,
+                raw_k_cache as usize as *mut c_void,
+                comp_k_cache as usize as *mut c_void,
+                write_slot_mapping as usize as *const i32,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                head_dim as i32,
+            )
+        };
+        check(rc, "w34_qsa_indexer_cache_update_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_select_blocks_f16(
+        ex: &W34Exec,
+        q_indexer: u64,
+        comp_k_cache: u64,
+        batch: &W34AttentionBatch,
+        out_selected_phys_blocks: u64,
+        out_selected_logical_blocks: u64,
+        out_num_selected_blocks: u64,
+        out_token_seq_pos: u64,
+        q_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        select_k_blocks: usize,
+        sink_blocks: usize,
+        recent_blocks: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers and `batch` metadata are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_qsa_select_blocks_f16(
+                ex,
+                q_indexer as usize as *const c_void,
+                comp_k_cache as usize as *const c_void,
+                batch,
+                out_selected_phys_blocks as usize as *mut i32,
+                out_selected_logical_blocks as usize as *mut i32,
+                out_num_selected_blocks as usize as *mut i32,
+                out_token_seq_pos as usize as *mut i32,
+                q_heads as i32,
+                head_dim as i32,
+                block_size as i32,
+                select_k_blocks as i32,
+                sink_blocks as i32,
+                recent_blocks as i32,
+            )
+        };
+        check(rc, "w34_qsa_select_blocks_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_sparse_paged_attn_f16(
+        ex: &W34Exec,
+        q: u64,
+        gate: u64,
+        kv_layout: &W34KvLayerLayout,
+        selected_phys_blocks: u64,
+        selected_logical_blocks: u64,
+        num_selected_blocks: u64,
+        token_seq_pos: u64,
+        valid_token_mask: u64,
+        out: u64,
+        num_tokens: usize,
+        local_q_heads: usize,
+        select_k_blocks: usize,
+        sm_scale: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers and `kv_layout` are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_qsa_sparse_paged_attn_f16(
+                ex,
+                q as usize as *const c_void,
+                gate as usize as *const c_void,
+                kv_layout,
+                selected_phys_blocks as usize as *const i32,
+                selected_logical_blocks as usize as *const i32,
+                num_selected_blocks as usize as *const i32,
+                token_seq_pos as usize as *const i32,
+                valid_token_mask as usize as *const u8,
+                out as usize as *mut c_void,
+                num_tokens as i32,
+                local_q_heads as i32,
+                select_k_blocks as i32,
+                sm_scale,
+            )
+        };
+        check(rc, "w34_qsa_sparse_paged_attn_f16")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,5 +1359,515 @@ mod tests {
         table.gather_dequant_f32(&ids, &mut out_f32);
         assert!(out_f32.iter().all(|v| v.is_finite()));
         assert!(out_f32.iter().any(|&v| v != 0.0));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_gpu_hc_ple_qsa_kernels_parity() {
+        use crate::cuda::{CudaDevice, CudaStream, DeviceBuffer, f16_to_f32};
+        use w34_kernels::ffi::{
+            W34_ATTN_MASK_CAUSAL, W34_KV_FORMAT_FP16, W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+            W34_KV_TRANSFORM_IDENTITY, W34AttentionBatch, W34GdnBatch, W34KvLayerLayout,
+        };
+
+        fn dev_from_slice<T: Copy>(src: &[T], stream: &CudaStream) -> DeviceBuffer {
+            let buf = DeviceBuffer::alloc(0, core::mem::size_of_val(src)).unwrap();
+            buf.copy_from_host(src, stream).unwrap();
+            stream.synchronize().unwrap();
+            buf
+        }
+
+        fn dev_to_vec<T: Copy + Default>(
+            buf: &DeviceBuffer,
+            len: usize,
+            stream: &CudaStream,
+        ) -> Vec<T> {
+            let mut out = vec![T::default(); len];
+            buf.copy_to_host(&mut out, stream).unwrap();
+            out
+        }
+
+        let _dev = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let ex = stream.exec(0, 0);
+
+        // 1. Verify HyperConnection (GatedResidual) kernels:
+        //    hc_init_streams_f16 -> hc_rmsnorm_f16 -> hc_down_silu_inject_f16 -> hc_mix_streams_f16 -> hc_combine_f16
+        let m = 3usize;
+        let hc_count = 4usize;
+        let hidden = 2560usize;
+        let rank_dim = 320usize;
+        let eps = 1e-6f32;
+
+        let embed_f32: Vec<f32> = (0..m * hidden)
+            .map(|i| (((i * 17 + 5) % 97) as f32 - 48.0) * 0.02)
+            .collect();
+        let embed_f16: Vec<u16> = embed_f32.iter().map(|&v| f32_to_f16(v)).collect();
+        let norm_w_f32: Vec<f32> = (0..hc_count * hidden)
+            .map(|i| (((i * 13 + 3) % 53) as f32 - 26.0) * 0.01)
+            .collect();
+        let norm_w_f16: Vec<u16> = norm_w_f32.iter().map(|&v| f32_to_f16(v)).collect();
+        let down_in_f32: Vec<f32> = (0..m * rank_dim)
+            .map(|i| (((i * 23 + 7) % 89) as f32 - 44.0) * 0.1)
+            .collect();
+        let down_in_f16: Vec<u16> = down_in_f32.iter().map(|&v| f32_to_f16(v)).collect();
+        let inj_in_f32: Vec<f32> = (0..m * hc_count)
+            .map(|i| ((i as f32) - 5.5) * 0.8)
+            .collect();
+        let inj_in_f16: Vec<u16> = inj_in_f32.iter().map(|&v| f32_to_f16(v)).collect();
+        let up_in_f32: Vec<f32> = (0..m * hc_count * hidden)
+            .map(|i| (((i * 7 + 11) % 71) as f32 - 35.0) * 0.05)
+            .collect();
+        let up_in_f16: Vec<u16> = up_in_f32.iter().map(|&v| f32_to_f16(v)).collect();
+        let blk_out_f32: Vec<f32> = (0..m * hidden)
+            .map(|i| (((i * 19 + 1) % 67) as f32 - 33.0) * 0.03)
+            .collect();
+        let blk_out_f16: Vec<u16> = blk_out_f32.iter().map(|&v| f32_to_f16(v)).collect();
+        let ple_delta_f32: Vec<f32> = (0..m * hc_count * hidden)
+            .map(|i| (((i * 31 + 2) % 61) as f32 - 30.0) * 0.01)
+            .collect();
+        let ple_delta_f16: Vec<u16> = ple_delta_f32.iter().map(|&v| f32_to_f16(v)).collect();
+
+        let d_embed = dev_from_slice(&embed_f16, &stream);
+        let d_res = DeviceBuffer::alloc(0, m * hc_count * hidden * 2).unwrap();
+        let d_norm_w = dev_from_slice(&norm_w_f16, &stream);
+        let d_normed = DeviceBuffer::alloc(0, m * hc_count * hidden * 2).unwrap();
+        let d_down_in = dev_from_slice(&down_in_f16, &stream);
+        let d_down_out = DeviceBuffer::alloc(0, m * rank_dim * 2).unwrap();
+        let d_inj_in = dev_from_slice(&inj_in_f16, &stream);
+        let d_inj_w = DeviceBuffer::alloc(0, m * hc_count * 4).unwrap();
+        let d_up_in = dev_from_slice(&up_in_f16, &stream);
+        let d_mixed = DeviceBuffer::alloc(0, m * hidden * 2).unwrap();
+        let d_blk_out = dev_from_slice(&blk_out_f16, &stream);
+        let d_ple_delta = dev_from_slice(&ple_delta_f16, &stream);
+        let d_res_out = DeviceBuffer::alloc(0, m * hc_count * hidden * 2).unwrap();
+
+        gpu_ops::hc_init_streams_f16(&ex, d_embed.addr(), d_res.addr(), 0, m, hc_count, hidden)
+            .unwrap();
+        gpu_ops::hc_rmsnorm_f16(
+            &ex,
+            d_res.addr(),
+            d_norm_w.addr(),
+            d_normed.addr(),
+            0,
+            m,
+            hc_count,
+            hidden,
+            eps,
+        )
+        .unwrap();
+        gpu_ops::hc_down_silu_inject_f16(
+            &ex,
+            d_down_in.addr(),
+            d_down_out.addr(),
+            d_inj_in.addr(),
+            d_inj_w.addr(),
+            0,
+            m,
+            rank_dim,
+            hc_count,
+        )
+        .unwrap();
+        gpu_ops::hc_mix_streams_f16(
+            &ex,
+            d_res.addr(),
+            d_up_in.addr(),
+            d_mixed.addr(),
+            0,
+            m,
+            hc_count,
+            hidden,
+        )
+        .unwrap();
+        gpu_ops::hc_combine_f16(
+            &ex,
+            d_res.addr(),
+            d_blk_out.addr(),
+            d_inj_w.addr(),
+            d_ple_delta.addr(),
+            d_res_out.addr(),
+            0,
+            m,
+            hc_count,
+            hidden,
+        )
+        .unwrap();
+
+        let h_down_out: Vec<u16> = dev_to_vec(&d_down_out, m * rank_dim, &stream);
+        let h_inj_w: Vec<f32> = dev_to_vec(&d_inj_w, m * hc_count, &stream);
+        let h_mixed: Vec<u16> = dev_to_vec(&d_mixed, m * hidden, &stream);
+        let h_res_out: Vec<u16> = dev_to_vec(&d_res_out, m * hc_count * hidden, &stream);
+
+        for i in 0..m * rank_dim {
+            let x = f16_to_f32(down_in_f16[i]) * 0.25;
+            let ref_silu = x / (1.0 + (-x).exp());
+            let got = f16_to_f32(h_down_out[i]);
+            assert!((got - ref_silu).abs() < 2e-3, "down silu mismatch at {i}");
+        }
+        for i in 0..m * hc_count {
+            let x = f16_to_f32(inj_in_f16[i]) * 0.25;
+            let ref_inj = 2.0 / (1.0 + (-x).exp());
+            assert!((h_inj_w[i] - ref_inj).abs() < 1e-5, "inj mismatch at {i}");
+        }
+        for tok in 0..m {
+            for d in 0..hidden {
+                let r = f16_to_f32(embed_f16[tok * hidden + d]);
+                let mut acc = 0.0f32;
+                for s in 0..hc_count {
+                    let u = f16_to_f32(up_in_f16[(tok * hc_count + s) * hidden + d]);
+                    acc += (0.25 / (1.0 + (-u).exp())) * r;
+                }
+                let got_mix = f16_to_f32(h_mixed[tok * hidden + d]);
+                assert!((got_mix - acc).abs() < 2e-3);
+
+                let y = f16_to_f32(blk_out_f16[tok * hidden + d]);
+                for s in 0..hc_count {
+                    let idx = (tok * hc_count + s) * hidden + d;
+                    let p = f16_to_f32(ple_delta_f16[idx]);
+                    let ref_comb = r + h_inj_w[tok * hc_count + s] * y + p;
+                    let got_comb = f16_to_f32(h_res_out[idx]);
+                    assert!((got_comb - ref_comb).abs() < 3e-3);
+                }
+            }
+        }
+
+        // 2. Verify PLE kernels:
+        //    ple_dequant_f8_to_f16, ple_dilated_conv1d_f16 (prefill + continuation step), ple_signed_sqrt_gate_f16
+        let f8_bytes: Vec<u8> = (0..m * hidden)
+            .map(|i| ((i * 29 + 3) % 120) as u8)
+            .collect();
+        let scale = 0.00019931793f32;
+        let lut = F8E4m3ScaleLut::new(scale);
+        let d_f8 = dev_from_slice(&f8_bytes, &stream);
+        let d_ple_emb = DeviceBuffer::alloc(0, m * hidden * 2).unwrap();
+        gpu_ops::ple_dequant_f8_to_f16(&ex, d_f8.addr(), d_ple_emb.addr(), 0, m, hidden, scale)
+            .unwrap();
+        let h_ple_emb: Vec<u16> = dev_to_vec(&d_ple_emb, m * hidden, &stream);
+        for (i, &b) in f8_bytes.iter().enumerate() {
+            assert_eq!(h_ple_emb[i], lut.f16_lut[b as usize]);
+        }
+
+        // Verify PLE signed-sqrt sigmoid gate (including exact 0.0 sign preservation):
+        let query_vals: Vec<f32> = (0..m * hc_count * hidden)
+            .map(|i| {
+                if i % 16 == 0 {
+                    0.0
+                } else {
+                    (((i * 19 + 5) % 83) as f32 - 41.0) * 0.2
+                }
+            })
+            .collect();
+        let query_f16: Vec<u16> = query_vals.iter().map(|&v| f32_to_f16(v)).collect();
+        let key_f16: Vec<u16> = (0..m * hc_count * hidden)
+            .map(|i| f32_to_f16((((i * 7 + 3) % 59) as f32 - 29.0) * 0.1))
+            .collect();
+        let val_f16: Vec<u16> = (0..m * hidden)
+            .map(|i| f32_to_f16((((i * 13 + 1) % 47) as f32 - 23.0) * 0.15))
+            .collect();
+        let d_qg = dev_from_slice(&query_f16, &stream);
+        let d_kg = dev_from_slice(&key_f16, &stream);
+        let d_vg = dev_from_slice(&val_f16, &stream);
+        let d_gout = DeviceBuffer::alloc(0, m * hc_count * hidden * 2).unwrap();
+        gpu_ops::ple_signed_sqrt_gate_f16(
+            &ex,
+            d_qg.addr(),
+            d_kg.addr(),
+            d_vg.addr(),
+            d_gout.addr(),
+            0,
+            m,
+            hc_count,
+            hidden,
+            1e-6,
+        )
+        .unwrap();
+        let h_gout: Vec<u16> = dev_to_vec(&d_gout, m * hc_count * hidden, &stream);
+        for tok in 0..m {
+            for d in 0..hidden {
+                let v = f16_to_f32(val_f16[tok * hidden + d]);
+                for s in 0..hc_count {
+                    let idx = (tok * hc_count + s) * hidden + d;
+                    let q = f16_to_f32(query_f16[idx]);
+                    let k = f16_to_f32(key_f16[idx]);
+                    let prod = q * k;
+                    let sgn = if prod > 0.0 {
+                        1.0
+                    } else if prod < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    let logit = sgn * (prod.abs() + 1e-6).sqrt();
+                    let g = 1.0 / (1.0 + (-logit).exp());
+                    let ref_out = g * v;
+                    let got = f16_to_f32(h_gout[idx]);
+                    assert!((got - ref_out).abs() < 3e-3, "gate mismatch at {idx}");
+                }
+            }
+        }
+
+        // Verify PLE stateful dilated conv1d (kernel=4, dilation=3, span=9):
+        // Run 12 tokens in one prefill vs 10 tokens prefill + 2 tokens decode continuation!
+        let conv_dim = 64usize;
+        let seq_total = 12usize;
+        let key_seq_f16: Vec<u16> = (0..seq_total * conv_dim)
+            .map(|i| f32_to_f16((((i * 11 + 5) % 43) as f32 - 21.0) * 0.05))
+            .collect();
+        let conv_w_f16: Vec<u16> = (0..conv_dim * 4)
+            .map(|i| f32_to_f16((((i * 7 + 1) % 19) as f32 - 9.0) * 0.1))
+            .collect();
+        let d_conv_w = dev_from_slice(&conv_w_f16, &stream);
+
+        let d_key_full = dev_from_slice(&key_seq_f16, &stream);
+        let d_out_full = DeviceBuffer::alloc(0, seq_total * conv_dim * 2).unwrap();
+        let d_state_full = DeviceBuffer::alloc(0, 2 * conv_dim * 9 * 2).unwrap();
+        let d_qsl_full = dev_from_slice(&[0i32, seq_total as i32], &stream);
+        let d_slot0 = dev_from_slice(&[0i32], &stream);
+        let d_has0 = dev_from_slice(&[0u8], &stream);
+        let batch_full = W34GdnBatch {
+            query_start_loc: d_qsl_full.addr() as usize as *const i32,
+            state_in_indices: d_slot0.addr() as usize as *const i32,
+            state_out_indices: d_slot0.addr() as usize as *const i32,
+            spec_state_indices: core::ptr::null(),
+            checkpoint_dst_indices: core::ptr::null(),
+            checkpoint_token_offsets: core::ptr::null(),
+            has_initial_state: d_has0.addr() as usize as *const u8,
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: seq_total as i32,
+            max_verify_tokens: 0,
+            max_checkpoints_per_req: 0,
+        };
+        gpu_ops::ple_dilated_conv1d_f16(
+            &ex,
+            d_key_full.addr(),
+            d_conv_w.addr(),
+            d_state_full.addr(),
+            d_out_full.addr(),
+            &batch_full,
+            conv_dim,
+        )
+        .unwrap();
+
+        // Now run 10 tokens + 2 tokens continuation using state slot 1:
+        let split = 10usize;
+        let d_key_p1 = dev_from_slice(&key_seq_f16[..split * conv_dim], &stream);
+        let d_out_p1 = DeviceBuffer::alloc(0, split * conv_dim * 2).unwrap();
+        let d_qsl_p1 = dev_from_slice(&[0i32, split as i32], &stream);
+        let d_slot1 = dev_from_slice(&[1i32], &stream);
+        let batch_p1 = W34GdnBatch {
+            query_start_loc: d_qsl_p1.addr() as usize as *const i32,
+            state_in_indices: d_slot1.addr() as usize as *const i32,
+            state_out_indices: d_slot1.addr() as usize as *const i32,
+            total_tokens: split as i32,
+            ..batch_full
+        };
+        gpu_ops::ple_dilated_conv1d_f16(
+            &ex,
+            d_key_p1.addr(),
+            d_conv_w.addr(),
+            d_state_full.addr(),
+            d_out_p1.addr(),
+            &batch_p1,
+            conv_dim,
+        )
+        .unwrap();
+
+        let rem = seq_total - split;
+        let d_key_p2 = dev_from_slice(&key_seq_f16[split * conv_dim..], &stream);
+        let d_out_p2 = DeviceBuffer::alloc(0, rem * conv_dim * 2).unwrap();
+        let d_qsl_p2 = dev_from_slice(&[0i32, rem as i32], &stream);
+        let d_has1 = dev_from_slice(&[1u8], &stream);
+        let batch_p2 = W34GdnBatch {
+            query_start_loc: d_qsl_p2.addr() as usize as *const i32,
+            state_in_indices: d_slot1.addr() as usize as *const i32,
+            state_out_indices: d_slot1.addr() as usize as *const i32,
+            has_initial_state: d_has1.addr() as usize as *const u8,
+            total_tokens: rem as i32,
+            ..batch_full
+        };
+        gpu_ops::ple_dilated_conv1d_f16(
+            &ex,
+            d_key_p2.addr(),
+            d_conv_w.addr(),
+            d_state_full.addr(),
+            d_out_p2.addr(),
+            &batch_p2,
+            conv_dim,
+        )
+        .unwrap();
+
+        let h_out_full: Vec<u16> = dev_to_vec(&d_out_full, seq_total * conv_dim, &stream);
+        let mut h_out_split: Vec<u16> = dev_to_vec(&d_out_p1, split * conv_dim, &stream);
+        h_out_split.extend(dev_to_vec::<u16>(&d_out_p2, rem * conv_dim, &stream));
+        assert_eq!(h_out_full, h_out_split);
+
+        // 3. Verify QSA Indexer + Block Selector + Sparse Paged GQA kernels:
+        let qsa_tokens = 2usize;
+        let q_heads = 12usize;
+        let kv_heads = 1usize;
+        let head_dim = 256usize;
+        let block_size = 16usize;
+        let num_pages = 4usize;
+        let select_k = 64usize;
+
+        let d_k_cache = dev_from_slice(
+            &vec![f32_to_f16(0.1); num_pages * kv_heads * block_size * head_dim],
+            &stream,
+        );
+        let d_v_cache = dev_from_slice(
+            &vec![f32_to_f16(0.25); num_pages * kv_heads * block_size * head_dim],
+            &stream,
+        );
+        let kv_layout = W34KvLayerLayout {
+            k_base: d_k_cache.addr(),
+            v_base: d_v_cache.addr(),
+            k_page_stride_bytes: (kv_heads * block_size * head_dim * 2) as u64,
+            k_head_stride_bytes: (block_size * head_dim * 2) as u64,
+            k_token_stride_bytes: (head_dim * 2) as u64,
+            v_page_stride_bytes: (kv_heads * block_size * head_dim * 2) as u64,
+            v_head_stride_bytes: (block_size * head_dim * 2) as u64,
+            v_token_stride_bytes: (head_dim * 2) as u64,
+            namespace_id: W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+            layer_id: 3,
+            local_kv_heads: kv_heads as i32,
+            head_dim: head_dim as i32,
+            block_size: block_size as i32,
+            k_format: W34_KV_FORMAT_FP16,
+            v_format: W34_KV_FORMAT_FP16,
+            k_transform: W34_KV_TRANSFORM_IDENTITY,
+            v_transform: W34_KV_TRANSFORM_IDENTITY,
+            reserved: 0,
+        };
+
+        let d_qk_idx_in = dev_from_slice(&vec![f32_to_f16(0.1); qsa_tokens * 5 * 128], &stream);
+        let d_q_idx = dev_from_slice(&vec![f32_to_f16(0.1); qsa_tokens * 4 * 128], &stream);
+        let d_k_idx = dev_from_slice(&vec![f32_to_f16(0.1); qsa_tokens * 128], &stream);
+        let d_idx_norm_w = dev_from_slice(&vec![f32_to_f16(0.0); 128], &stream);
+        let d_pos_ids = dev_from_slice(&[20i32, 21, 20, 21, 20, 21], &stream);
+        gpu_ops::qsa_indexer_norm_rope_f16(
+            &ex,
+            d_qk_idx_in.addr(),
+            d_idx_norm_w.addr(),
+            d_idx_norm_w.addr(),
+            d_pos_ids.addr(),
+            d_q_idx.addr(),
+            d_k_idx.addr(),
+            0,
+            qsa_tokens,
+            4,
+            1,
+            128,
+            32,
+            10_000_000.0,
+            1e-6,
+            6,
+            11,
+            qsa_tokens,
+        )
+        .unwrap();
+
+        let d_raw_k = dev_from_slice(&vec![f32_to_f16(0.1); num_pages * 16 * 128], &stream);
+        let d_comp_k = dev_from_slice(&vec![f32_to_f16(0.1); num_pages * 4 * 128], &stream);
+        let d_qsl_attn = dev_from_slice(&[0, qsa_tokens as i32], &stream);
+        let d_ctx_before = dev_from_slice(&[20], &stream);
+        let d_seq_after = dev_from_slice(&[22], &stream);
+        let d_blk_tbl = dev_from_slice(&[2, 1, -1, -1], &stream);
+        let d_slot_map = dev_from_slice(&[16 + 4, 16 + 5], &stream);
+        gpu_ops::qsa_indexer_cache_update_f16(
+            &ex,
+            d_k_idx.addr(),
+            d_raw_k.addr(),
+            d_comp_k.addr(),
+            d_slot_map.addr(),
+            0,
+            qsa_tokens,
+            128,
+        )
+        .unwrap();
+        let attn_batch = W34AttentionBatch {
+            query_start_loc: d_qsl_attn.addr() as usize as *const i32,
+            context_lens_before: d_ctx_before.addr() as usize as *const i32,
+            seq_lens_after: d_seq_after.addr() as usize as *const i32,
+            block_tables: d_blk_tbl.addr() as usize as *const i32,
+            write_slot_mapping: d_slot_map.addr() as usize as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: qsa_tokens as i32,
+            max_blocks_per_req: 4,
+            max_q_len: qsa_tokens as i32,
+            max_seq_len: 22,
+            mask_mode: W34_ATTN_MASK_CAUSAL,
+            sliding_window: -1,
+            sm_scale: (head_dim as f32).powf(-0.5),
+            reserved: 0,
+        };
+
+        let d_sel_phys = DeviceBuffer::alloc(0, qsa_tokens * select_k * 4).unwrap();
+        let d_sel_log = DeviceBuffer::alloc(0, qsa_tokens * select_k * 4).unwrap();
+        let d_num_sel = DeviceBuffer::alloc(0, qsa_tokens * 4).unwrap();
+        let d_seq_pos = DeviceBuffer::alloc(0, qsa_tokens * 4).unwrap();
+
+        gpu_ops::qsa_select_blocks_f16(
+            &ex,
+            d_q_idx.addr(),
+            d_comp_k.addr(),
+            &attn_batch,
+            d_sel_phys.addr(),
+            d_sel_log.addr(),
+            d_num_sel.addr(),
+            d_seq_pos.addr(),
+            4,
+            128,
+            block_size,
+            select_k,
+            8,
+            16,
+        )
+        .unwrap();
+
+        let h_num_sel: Vec<i32> = dev_to_vec(&d_num_sel, qsa_tokens, &stream);
+        let h_seq_pos: Vec<i32> = dev_to_vec(&d_seq_pos, qsa_tokens, &stream);
+        let h_sel_phys: Vec<i32> = dev_to_vec(&d_sel_phys, qsa_tokens * select_k, &stream);
+        assert_eq!(h_num_sel, vec![2, 2]);
+        assert_eq!(h_seq_pos, vec![20, 21]);
+        assert_eq!(&h_sel_phys[0..2], &[2, 1]);
+
+        let d_q_main = dev_from_slice(
+            &vec![f32_to_f16(0.1); qsa_tokens * q_heads * head_dim],
+            &stream,
+        );
+        let d_gate = dev_from_slice(
+            &vec![f32_to_f16(0.0); qsa_tokens * q_heads * head_dim],
+            &stream,
+        );
+        let d_attn_out = DeviceBuffer::alloc(0, qsa_tokens * q_heads * head_dim * 2).unwrap();
+
+        gpu_ops::qsa_sparse_paged_attn_f16(
+            &ex,
+            d_q_main.addr(),
+            d_gate.addr(),
+            &kv_layout,
+            d_sel_phys.addr(),
+            d_sel_log.addr(),
+            d_num_sel.addr(),
+            d_seq_pos.addr(),
+            0,
+            d_attn_out.addr(),
+            qsa_tokens,
+            q_heads,
+            select_k,
+            attn_batch.sm_scale,
+        )
+        .unwrap();
+
+        let h_attn_out: Vec<u16> =
+            dev_to_vec(&d_attn_out, qsa_tokens * q_heads * head_dim, &stream);
+        // Since V = 0.25 everywhere and sigmoid(0.0) = 0.5, gated attention output must equal 0.125!
+        for &v in &h_attn_out {
+            let vf = f16_to_f32(v);
+            assert!((vf - 0.125).abs() < 1e-3, "expected 0.125, got {vf}");
+        }
     }
 }

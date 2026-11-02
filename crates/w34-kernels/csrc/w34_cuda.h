@@ -645,6 +645,66 @@ int w34_clef_build_residual_features_f16(const w34_exec* ex, const void* fields_
                                          const int32_t* opt_q_idx, void* out_features_f16,
                                          int total_opts, int num_q, int width);
 
+// --- Qwen3.8-Flash-Next (qwen4_exp): HyperConnection, PLE, and QSA Kernels ---
+int w34_hc_init_streams_f16(const w34_exec* ex, const void* embed_in, void* residual_out,
+                            const uint8_t* valid_token_mask, int num_tokens,
+                            int hc_count, int hidden_size);
+int w34_hc_rmsnorm_f16(const w34_exec* ex, const void* residual_in, const void* norm_weight,
+                       void* normed_out, const uint8_t* valid_token_mask,
+                       int num_tokens, int hc_count, int hidden_size, float eps);
+int w34_hc_down_silu_inject_f16(const w34_exec* ex, const void* down_in, void* down_out,
+                                const void* inj_in, float* inject_weights_out,
+                                const uint8_t* valid_token_mask, int num_tokens,
+                                int hc_rank_dim, int hc_count);
+int w34_hc_mix_streams_f16(const w34_exec* ex, const void* residual_in, const void* up_raw_in,
+                           void* mixed_out, const uint8_t* valid_token_mask,
+                           int num_tokens, int hc_count, int hidden_size);
+int w34_hc_combine_f16(const w34_exec* ex, const void* residual_in, const void* block_out,
+                       const float* inject_weights, const void* ple_delta,
+                       void* residual_out, const uint8_t* valid_token_mask,
+                       int num_tokens, int hc_count, int hidden_size);
+
+int w34_ple_dequant_f8_to_f16(const w34_exec* ex, const uint8_t* f8_in, void* f16_out,
+                              const uint8_t* valid_token_mask, int num_tokens,
+                              int embed_dim, float weight_scale);
+int w34_ple_dilated_conv1d_f16(const w34_exec* ex, const void* key_in, const void* conv_weight,
+                               void* conv_state_pool, void* key_out,
+                               const w34_gdn_batch* batch, int conv_dim);
+int w34_ple_signed_sqrt_gate_f16(const w34_exec* ex, const void* norm_query,
+                                 const void* norm_key, const void* value_in,
+                                 void* ple_delta_out, const uint8_t* valid_token_mask,
+                                 int num_tokens, int hc_count, int embed_dim, float eps);
+
+int w34_qsa_indexer_norm_rope_f16(const w34_exec* ex, const void* qk_in,
+                                  const void* q_norm_weight, const void* k_norm_weight,
+                                  const int32_t* positions, void* q_out, void* k_out,
+                                  const uint8_t* valid_token_mask, int num_tokens,
+                                  int q_heads, int kv_heads, int head_dim, int rotary_dim,
+                                  float rope_theta, float eps, int mrope_s1, int mrope_s2,
+                                  int pos_plane_stride);
+int w34_qsa_indexer_cache_update_f16(const w34_exec* ex, const void* k_in,
+                                     void* raw_k_cache, void* comp_k_cache,
+                                     const int32_t* write_slot_mapping,
+                                     const uint8_t* valid_token_mask,
+                                     int num_tokens, int head_dim);
+int w34_qsa_select_blocks_f16(const w34_exec* ex, const void* q_indexer,
+                              const void* comp_k_cache, const w34_attention_batch* batch,
+                              int32_t* out_selected_phys_blocks,
+                              int32_t* out_selected_logical_blocks,
+                              int32_t* out_num_selected_blocks,
+                              int32_t* out_token_seq_pos,
+                              int q_heads, int head_dim, int block_size,
+                              int select_k_blocks, int sink_blocks, int recent_blocks);
+int w34_qsa_sparse_paged_attn_f16(const w34_exec* ex, const void* q, const void* gate,
+                                  const w34_kv_layer_layout* kv_layout,
+                                  const int32_t* selected_phys_blocks,
+                                  const int32_t* selected_logical_blocks,
+                                  const int32_t* num_selected_blocks,
+                                  const int32_t* token_seq_pos,
+                                  const uint8_t* valid_token_mask,
+                                  void* out, int num_tokens, int local_q_heads,
+                                  int select_k_blocks, float sm_scale);
+
 #ifdef __cplusplus
 }
 #endif
