@@ -22,6 +22,13 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
     - `TP=1` (1× RTX 3090 Ti): `26.9–30.1 tok/s` decode (`" Paris, which is also the largest city in the country..."`), `MambaRadixCache` 64-token prefix reuse bit-identical (`1543.00 ms -> 347.32 ms` TTFT).
     - `TP=2 / EP=2` (2× RTX 3090 Ti): `41.95–42.31 tok/s` decode (`20.81 ms` TTFT), `MambaRadixCache` 64-token prefix reuse bit-identical (`654.10 ms -> 21.49 ms` TTFT, matching `TP=1` token-for-token `ids=[760, 6511, 314, 9338, 369, 760, 6511, 314]`).
   - **`QF-4` (Native `Qwen4` `MTP` Speculative Decoding)**: Implemented `Qwen4MtpSubsystems` and `forward_qwen4_inner` in `crates/w34-host/src/mtp.rs` with dual-stream `residual_linear_shared` (`pre_fc_norm_embedding` + `fc_embedding` + `pre_fc_norm_hidden` `[hc_count * H]` + `fc_hidden` + `w34_qwen4_mtp_broadcast_add_f16`), 1-layer `HC + QSA + MoE + final_hc_mixer`, and QSA step-0 top-k block index reuse (`skip_topk = step > 0`), verified losslessly on `TP=1` and `TP=2 / EP=2` in `crates/w34-host/tests/qwen4_flash_next.rs`.
+  - **`QF-5` (Next Performance Milestones vs. Reference Headline Numbers — documented in [`QWEN_FLASH_NEXT.md` §5](QWEN_FLASH_NEXT.md#5-current-baseline-vs-reference-headline-numbers--next-performance-milestones-qf-5))**:
+    - Current real-checkpoint measurements (`26.9–30.1 tok/s` on `TP=1`, `41.95–42.31 tok/s` on `TP=2 / EP=2`) reflect cold, un-speculated (`M=1` target-only) 16-token runs, matching the reference un-speculated cold/static hillclimb (`34.7–49.8 tok/s`).
+    - To reach and beat the reference `MTP-3` + warm-cache headline numbers (`43–51 tok/s` on `1× 3090`, `84–111.5 tok/s` on `2× 3090`):
+      1. Auto-discover and load `<snapshot>/runtime/mtp-int4-g32` (`compressed-tensors` `INT4 group_size=32` routed experts, `3.85 GiB`) in `Qwen3_5MtpRank::load_from_dir` so `MTP-3` runs on the real `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` checkpoint.
+      2. Pre-seed `HotExpertCache` at startup from `<snapshot>/runtime/static_hot_cache_rankings.json` (`hot32` on `TP=1`, `hot84–104` on `TP=2 / EP=2`).
+      3. Shard `HostPackStorage::Mapped` into per-layer / 2-GiB `PinnedHostBuffer` slabs (avoiding the 32-GiB single-allocation limit on `TP=1`'s `58.5 GiB` expert store) and wire the multi-core AVX2/AVX-512 cold-expert worker pool for `TP=1` decode.
+      4. Add optional `MTP` draft `lm_head` active-vocabulary range filtering (`[[0, 65536], [248044, 248320]]`).
 
 ---
 
