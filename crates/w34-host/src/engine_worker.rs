@@ -225,6 +225,15 @@ pub struct WorkerStats {
     pub cached_tokens: AtomicU64,
 }
 
+fn validate_request_length(prompt: usize, output: usize, limit: usize) -> Result<(), WorkerError> {
+    if prompt.checked_add(output).is_none_or(|total| total > limit) {
+        return Err(WorkerError::invalid_request(format!(
+            "prompt ({prompt}) + output budget ({output}) exceeds serving context limit ({limit} tokens)"
+        )));
+    }
+    Ok(())
+}
+
 pub struct EngineWorker {
     sender: Mutex<Option<Sender<Request>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -240,6 +249,7 @@ pub struct EngineWorker {
     pub vision_config: Option<crate::vision::VisionConfig>,
     pub has_vision_weights: bool,
     pub kv_token_capacity: usize,
+    max_model_len: Option<usize>,
 }
 impl EngineWorker {
     pub fn start(engine: Qwen3_5Engine, config: SchedulerConfig) -> Self {
@@ -380,7 +390,25 @@ impl EngineWorker {
             vision_config,
             has_vision_weights,
             kv_token_capacity,
+            max_model_len: None,
         })
+    }
+
+    /// Set a deployment admission ceiling before sharing the worker with callers.
+    /// This does not resize KV pools or extend a model's supported context window.
+    pub fn set_max_model_len(&mut self, limit: Option<usize>) -> Result<(), String> {
+        if limit.is_some_and(|n| n == 0 || n > self.kv_token_capacity) {
+            return Err(format!(
+                "--max-model-len must be positive and no greater than the allocated KV capacity ({} tokens); increase --kv-pages if needed",
+                self.kv_token_capacity
+            ));
+        }
+        self.max_model_len = limit;
+        Ok(())
+    }
+
+    pub fn max_model_len(&self) -> usize {
+        self.max_model_len.unwrap_or(self.kv_token_capacity)
     }
 
     pub fn request_shutdown(&self) {
@@ -412,6 +440,11 @@ impl EngineWorker {
         if self.is_panicked() {
             return Err(self.panic_worker_error());
         }
+        validate_request_length(
+            req.prompt.len(),
+            req.sampler.params.max_tokens,
+            self.max_model_len(),
+        )?;
         let guard = self.sender.lock().unwrap_or_else(|e| e.into_inner());
         let Some(sender) = guard.as_ref() else {
             return if self.is_panicked() {
@@ -2943,6 +2976,17 @@ mod full_hidden_tap_tests {
     }
 
     #[test]
+    fn request_length_limit_includes_output_and_handles_overflow() {
+        assert!(validate_request_length(8, 2, 10).is_ok());
+        assert!(validate_request_length(10, 0, 10).is_ok()); // Decision-only prefill.
+        for (prompt, output) in [(9, 2), (11, 0), (usize::MAX, 1)] {
+            let err = validate_request_length(prompt, output, 10).unwrap_err();
+            assert_eq!(err.http_status(), axum::http::StatusCode::BAD_REQUEST);
+            assert!(err.to_string().contains("context limit"));
+        }
+    }
+
+    #[test]
     fn worker_panic_containment_drains_in_flight_and_queued_and_poisons_future_submits() {
         let (sender, mut receiver) = mpsc::channel(32);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2993,6 +3037,7 @@ mod full_hidden_tap_tests {
             vision_config: None,
             has_vision_weights: false,
             kv_token_capacity: 4096,
+            max_model_len: None,
         };
 
         let mut active_stream = worker

@@ -462,9 +462,11 @@ function ConnectionGuide() {
       <section className="guide-security">
         <h2>Keep your endpoint private.</h2>
         <p>
-          The server does not enforce API-key authentication. Bind locally or
-          place it behind an authenticated reverse proxy before exposing it to a
-          network. The dashboard is read-only and contains no prompt or response
+          API-key authentication is optional. When enabled, configure your
+          client with the deployment’s key (Bearer authorization or x-api-key).
+          The dashboard, metrics, and health endpoints remain public. Bind
+          locally or use an authenticated TLS reverse proxy to protect the whole
+          service. The dashboard is read-only and contains no prompt or response
           content.
         </p>
       </section>

@@ -33,6 +33,7 @@ const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct OpenAiServerState {
     pub model_name: String,
+    api_key: Option<crate::api_auth::ApiKey>,
     pub worker: EngineWorker,
     pub metrics: Arc<crate::telemetry::Telemetry>,
     next_request_id: AtomicU64,
@@ -63,11 +64,32 @@ impl OpenAiServerState {
         allow_remote_images: bool,
         loader: impl FnOnce() -> Result<Qwen3_5Engine, String> + Send + 'static,
     ) -> Result<Arc<Self>, String> {
-        Ok(Self::with_worker(
+        Self::from_loader_with_options(
             model_name,
-            EngineWorker::from_loader(loader, SchedulerConfig::default())?,
             allow_remote_images,
-        ))
+            super::ServeOptions::default(),
+            loader,
+        )
+    }
+    pub fn from_loader_with_options(
+        model_name: String,
+        allow_remote_images: bool,
+        options: super::ServeOptions,
+        loader: impl FnOnce() -> Result<Qwen3_5Engine, String> + Send + 'static,
+    ) -> Result<Arc<Self>, String> {
+        options.validate()?;
+        let config = SchedulerConfig {
+            max_num_seqs: options.max_num_seqs,
+            ..SchedulerConfig::default()
+        };
+        let mut worker = EngineWorker::from_loader(loader, config)?;
+        worker.set_max_model_len(options.max_model_len)?;
+        let mut state = Self::with_worker(model_name, worker, allow_remote_images);
+        // This newly created state has not been shared with any request handler.
+        Arc::get_mut(&mut state)
+            .expect("unshared server state")
+            .api_key = options.api_key;
+        Ok(state)
     }
     fn with_worker(
         model_name: String,
@@ -89,6 +111,7 @@ impl OpenAiServerState {
         metrics.set_model(model_name.clone());
         Arc::new(Self {
             model_name,
+            api_key: None,
             worker,
             allow_remote_images,
             response_store: crate::responses_api::ResponseStore::default(),
@@ -160,10 +183,7 @@ async fn health(State(s): State<Arc<OpenAiServerState>>) -> Response {
 
 pub fn router(state: Arc<OpenAiServerState>) -> Router {
     Router::new()
-        .route("/health", get(health))
         .route("/v1/models", get(models))
-        .route("/metrics", get(metrics))
-        .route("/api/metrics", get(metrics_json))
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/v1/chat/completions", post(chat))
@@ -184,6 +204,15 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         .route("/systemone", post(systemone_decide))
         .route("/v1/decisions", post(decisions_adapter))
         .route("/decisions", post(decisions_adapter))
+        // Protect every inference, tokenization, model, and stored-response route,
+        // including unversioned aliases, before reading bodies or fetching media.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.api_key.clone(),
+            crate::api_auth::authenticate,
+        ))
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .route("/api/metrics", get(metrics_json))
         .merge(crate::dashboard::router())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

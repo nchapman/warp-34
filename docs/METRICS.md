@@ -22,10 +22,13 @@ at tick boundaries. No prompt/response content, request IDs, user labels, or cre
 are included. The configured model name is operational metadata; if you use a local
 path as the served model name, that name is visible too.
 
-**Exposure:** the server does not enforce API-key authentication. Bind to loopback,
-use a trusted private network, or protect the entire service with an authenticated
-reverse proxy. Authorization headers used to scope stored Responses are not access
-control. The dashboard adds no generation, benchmarking, or administrative actions.
+**Exposure:** [optional API-key authentication](SERVING.md) protects inference,
+model-list, tokenization, and stored-Responses APIs. The dashboard, `/health`,
+`/metrics`, and `/api/metrics` remain **unauthenticated**, even when a key is enabled.
+Bind to loopback, use a trusted private network, or protect the entire service with
+an authenticated TLS reverse proxy. Without `--api-key` or `--api-key-env`,
+credentials used to scope stored Responses do not enforce access control.
+The dashboard adds no generation, benchmarking, or administrative actions.
 Its production CSP restricts scripts and connections to the same origin, and assets
 are served from an embedded allowlist, never the filesystem.
 

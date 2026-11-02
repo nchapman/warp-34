@@ -9,6 +9,39 @@ mod http;
 #[cfg(feature = "cuda")]
 pub use http::*;
 
+/// Deployment controls shared by the CLI, HTTP server, and engine ingress.
+/// Authentication is opt-in; secrets deliberately have no Debug implementation.
+#[derive(Clone)]
+pub struct ServeOptions {
+    pub api_key: Option<crate::api_auth::ApiKey>,
+    pub max_num_seqs: usize,
+    /// Optional total prompt + output admission ceiling, not a KV allocation size.
+    pub max_model_len: Option<usize>,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            max_num_seqs: crate::scheduler::SchedulerConfig::default().max_num_seqs,
+            max_model_len: None,
+        }
+    }
+}
+
+impl ServeOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        // The current decode graph IO and capture buckets support at most 16 requests.
+        if !(1..=16).contains(&self.max_num_seqs) {
+            return Err("--max-num-seqs must be 1..16".into());
+        }
+        if self.max_model_len == Some(0) {
+            return Err("--max-model-len must be positive".into());
+        }
+        Ok(())
+    }
+}
+
 /// Typed error seam between the engine worker thread and HTTP handlers.
 ///
 /// Preserves failure categories from the producer so handlers return accurate

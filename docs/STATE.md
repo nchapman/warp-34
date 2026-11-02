@@ -12,6 +12,56 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Production serving controls after oracle option audit
+
+- Compared the pinned vLLM 0.31.0 and SGLang v0.5.19 CLI surfaces, then selected
+  deployment controls rather than copying engine/backend tuning flags. Full
+  contract and deferred scope: [`SERVING.md`](SERVING.md).
+- **Optional** `--api-key` / `--api-key-env NAME`: no authentication by default.
+  Bearer or `x-api-key` authentication covers inference, model-list, tokenization,
+  token-count, and stored-Responses APIs, including unversioned aliases, before
+  request preprocessing. Fixed-size SHA-256 digest comparison uses `subtle`;
+  keys are not logged. Dashboard/assets, health, and metrics remain public by
+  explicit policy; protect the whole listener with a proxy/firewall when needed.
+- `--served-model-name` advertises a stable public alias without changing model
+  acquisition. Without it the original model ID/path remains public (not the
+  resolved Hub snapshot path). Request model-name routing remains permissive.
+- `--max-num-seqs` is bounded to **1–16**, matching fixed decode graph IO, and
+  reaches both GDN pool planning and worker scheduling. `--max-model-len` is an
+  optional prompt + output admission ceiling, checked for all worker requests,
+  including decisions, before enqueue. It does not allocate KV or extend model
+  context; it cannot exceed actual allocated KV capacity. Defaults are unchanged.
+- Serve-only options are rejected on other commands. `serve` now rejects unused
+  generation/benchmark/oracle flags, especially `--batch-size` (use
+  `--max-num-seqs`). Its regression test first failed by reaching model resolution,
+  then passed after validation was added.
+- Corrections to the initial audit: our KV formats are not a blanket superset of
+  donor formats; a shared KV pool capacity is not a model context guarantee;
+  remote-image enablement is not a domain allowlist. TLS/CORS can live at a proxy,
+  but logging, watchdogs, and drain policy remain separate operational work.
+  Retained FP16 target precision, SDK-owned Hub policy, automatic quantization,
+  existing scheduler tuning, per-request seed, and `n=1` rather than adding knobs
+  without a demonstrated product need.
+- Verification: final `CUDA_VISIBLE_DEVICES=0,1 mise run check` passed (378.87 s;
+  340 Rust tests/doctests passed, 3 existing opt-in tests ignored; 69 oracle,
+  51 perf-suite, and 18 frontend tests; CPU/CUDA Clippy and formatting). Separate
+  `mise run test-cpu` passed (191 tests, 1 ignored), as did `mise run build`,
+  relative documentation-link checks, and `git diff --check`. Initial Prettier
+  and two Clippy style failures were fixed before the successful full rerun.
+- Live GPU integration covers protected/public routes, aliases, context rejection
+  across four APIs (JSON and SSE), decision prefill rejection, and two-active
+  concurrency. The release CLI also passed env-key-enabled and unauthenticated
+  SSE smoke tests, alias/health/metrics checks, graceful SIGTERM shutdown, and
+  rejection of a context cap larger than its allocated KV pool. GPUs are clear.
+  Local logs: `/tmp/w34-serving-{check,cpu,build}.log`; CLI smoke script:
+  `/tmp/w34-serving-cli-smoke.py`. No new kernel-performance or donor-speed claim.
+- Review found no actionable issues introduced here. Two repeated pre-existing
+  Hub suggestions were left out of scope: transport timeouts remain delegated
+  to the SDK per the prior explicit decision; the progress-thread clock-subtraction
+  edge case is unrelated to serving controls. No follow-up review was needed.
+
+---
+
 ## Native Hugging Face model acquisition
 
 - CLI model-loading commands now accept Hub IDs with **download-on-first-use** via
@@ -78,8 +128,9 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 - Dashboard history is bounded to five minutes in the browser, uses cumulative
   counter/histogram deltas, resets across process restarts, pauses in hidden tabs,
   and visibly marks disconnection. No external fonts/CDNs, prompt content, speed
-  tests, or mutation controls. The server still has **no API-key authentication**;
-  keep it private or behind an authenticated reverse proxy.
+  tests, or mutation controls. Optional API-key authentication is now available
+  (see above); dashboard/metrics remain public, so keep the listener private or
+  behind an authenticated reverse proxy.
 - Node **24.21.0** and pnpm **12.10.1** are pinned in mise. Locked frontend builds
   run before CUDA build/check/test/coverage tasks; Vite's hashed assets are embedded
   in the executable. Docker builds assets in a separate pinned Node stage; no Node

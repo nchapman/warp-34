@@ -37,6 +37,11 @@ fn print_usage() {
            profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
            serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
            chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--no-thinking]\n\
+         Serve-only: --api-key <value> OR --api-key-env <name> (explicit lookup; no ambient default).\n\
+           Protects API routes; dashboard, metrics and health remain public. Default: no authentication.\n\
+           --served-model-name <name> advertises an alias (default: original model ID).\n\
+           --max-num-seqs <1..16> (default 16; fixed graph limit).\n\
+           --max-model-len <positive integer> caps total prompt + output admission only (default: engine capacity); does not size VRAM.\n\
          Hub options: --revision <ref> [--offline]; --draft-revision <ref> requires --draft-model.\n\
          Image options: --allow-remote-images enables public HTTP(S) fetch (16 MiB, 10 s, no redirects).\n\
          Speculative options (generate/bench/greedy-diff/dump-diff/profile-diff/serve/chat):\n\
@@ -122,7 +127,127 @@ fn tensor_diff_metrics(a: &[f32], b: &[f32]) -> (f32, f64, f64) {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Default)]
+struct ServeCliConfig {
+    options: w34_host::server::ServeOptions,
+    model_name: Option<String>,
+    api_key: Option<String>,
+    api_key_env: Option<String>,
+    used: bool,
+    rejected: Option<String>,
+}
+
+#[cfg(feature = "cuda")]
+impl ServeCliConfig {
+    fn parse(&mut self, args: &[String], i: &mut usize) -> Result<bool, String> {
+        let flag = args[*i].as_str();
+        if !matches!(
+            flag,
+            "--api-key"
+                | "--api-key-env"
+                | "--served-model-name"
+                | "--max-num-seqs"
+                | "--max-model-len"
+        ) {
+            if matches!(
+                flag,
+                "--batch-size"
+                    | "--prompt"
+                    | "-p"
+                    | "--image"
+                    | "--max-tokens"
+                    | "-n"
+                    | "--no-thinking"
+                    | "--prompt-len"
+                    | "--gen-len"
+                    | "--stage"
+                    | "--golden"
+                    | "--out"
+                    | "--max-prompts"
+                    | "--compare-tp2"
+                    | "--oracle"
+                    | "--preset"
+                    | "--w34"
+                    | "--rounds"
+                    | "--verify-lossless"
+                    | "--verify-radix-warm"
+                    | "--live"
+            ) {
+                self.rejected.get_or_insert_with(|| flag.to_string());
+            }
+            return Ok(false);
+        }
+        self.used = true;
+        let value = revision_value(args, i)?;
+        match flag {
+            "--api-key" => self.api_key = Some(value),
+            "--api-key-env" => self.api_key_env = Some(value),
+            "--served-model-name" => self.model_name = Some(value),
+            "--max-num-seqs" => {
+                self.options.max_num_seqs = value.parse().map_err(|_| "invalid --max-num-seqs")?
+            }
+            "--max-model-len" => {
+                self.options.max_model_len =
+                    Some(value.parse().map_err(|_| "invalid --max-model-len")?)
+            }
+            _ => unreachable!(),
+        }
+        Ok(true)
+    }
+
+    fn validate(&self, sub: &str) -> Result<(), String> {
+        if sub != "serve" && self.used {
+            return Err("API key, served model name and admission options require serve".into());
+        }
+        if sub == "serve"
+            && let Some(flag) = &self.rejected
+        {
+            return Err(if flag == "--batch-size" {
+                "--batch-size is not supported by serve; use --max-num-seqs".into()
+            } else {
+                format!("{flag} is not supported by serve")
+            });
+        }
+        if self.api_key.is_some() && self.api_key_env.is_some() {
+            return Err("--api-key and --api-key-env are mutually exclusive".into());
+        }
+        if let Some(name) = &self.model_name
+            && (name.trim().is_empty() || name.chars().any(char::is_control))
+        {
+            return Err(
+                "--served-model-name must be nonempty and contain no control characters".into(),
+            );
+        }
+        self.options.validate()
+    }
+
+    fn resolve_key(
+        &mut self,
+        mut lookup: impl FnMut(&str) -> Result<String, env::VarError>,
+    ) -> Result<(), String> {
+        let value = match self.api_key.take() {
+            Some(value) => Some(value),
+            None => self
+                .api_key_env
+                .take()
+                .map(|name| {
+                    lookup(&name).map_err(|_| {
+                        "--api-key-env must name a set Unicode environment variable".to_string()
+                    })
+                })
+                .transpose()?,
+        };
+        self.options.api_key = value
+            .map(w34_host::api_auth::ApiKey::new)
+            .transpose()
+            .map_err(|_| "invalid API key".to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
 struct CudaCliOptions {
+    serve: ServeCliConfig,
     model: String,
     // Populated centrally after validation; never used as the public model name.
     resolved_model: String,
@@ -173,6 +298,7 @@ fn revision_value(args: &[String], index: &mut usize) -> Result<String, String> 
 // None means help was requested; stop parsing immediately, before validation.
 #[cfg(feature = "cuda")]
 fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String> {
+    let mut serve = ServeCliConfig::default();
     let mut model = "nchapman/Qwen3.5-4B-W4A16-GPTQ".to_string();
     let mut revision = None;
     let mut draft_revision = None;
@@ -210,6 +336,10 @@ fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String>
 
     let mut i = 1;
     while i < args.len() {
+        if serve.parse(args, &mut i)? {
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "--revision" => revision = Some(revision_value(args, &mut i)?),
             "--draft-revision" => draft_revision = Some(revision_value(args, &mut i)?),
@@ -389,6 +519,7 @@ fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String>
     }
 
     Ok(Some(CudaCliOptions {
+        serve,
         model,
         resolved_model: String::new(),
         revision,
@@ -460,6 +591,7 @@ fn validate_cuda_options(options: &CudaCliOptions, sub: &str) -> Result<KvFormat
         verify_lossless,
         ..
     } = options;
+    options.serve.validate(sub)?;
     let policy = parse_kv_policy(kv_format)?;
     if *kv_pages == Some(0) {
         return Err("--kv-pages must be positive".into());
@@ -524,7 +656,16 @@ fn engine_path(path: std::path::PathBuf) -> Result<String, String> {
 #[cfg(feature = "cuda")]
 fn prepare_cuda_cli(
     args: &[String],
+    resolve: impl FnMut(&str, &HubOptions, ModelRole) -> std::io::Result<std::path::PathBuf>,
+) -> Result<Option<PreparedCudaCli>, String> {
+    prepare_cuda_cli_with_env(args, resolve, |name| env::var(name))
+}
+
+#[cfg(feature = "cuda")]
+fn prepare_cuda_cli_with_env(
+    args: &[String],
     mut resolve: impl FnMut(&str, &HubOptions, ModelRole) -> std::io::Result<std::path::PathBuf>,
+    lookup: impl FnMut(&str) -> Result<String, env::VarError>,
 ) -> Result<Option<PreparedCudaCli>, String> {
     let Some(sub) = args.first().map(String::as_str) else {
         print_usage();
@@ -538,6 +679,7 @@ fn prepare_cuda_cli(
         return Ok(None);
     };
     let policy = validate_cuda_options(&options, sub)?;
+    options.serve.resolve_key(lookup)?;
     // Comparison is local. Live profiling resolves in the nested bench command,
     // not here (and --w34 takes precedence over --live).
     if sub == "profile-diff" {
@@ -1637,6 +1779,7 @@ fn run_serve(
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
+        serve,
         resolved_model,
         tp,
         host,
@@ -1646,11 +1789,20 @@ fn run_serve(
         use_cuda_graph,
         ..
     } = options;
+    let model = serve
+        .model_name
+        .map(|name| name.trim().to_string())
+        .unwrap_or(model);
+    let max_num_seqs = serve.options.max_num_seqs;
+    let auth_enabled = serve.options.api_key.is_some();
     let bind_addr = format!("{host}:{port}");
     println!("[w34 serve] loading model={model} tp={tp} for http://{bind_addr}");
     let worker_model = resolved_model;
-    let state =
-        w34_host::server::OpenAiServerState::from_loader(model, allow_remote_images, move || {
+    let state = w34_host::server::OpenAiServerState::from_loader_with_options(
+        model,
+        allow_remote_images,
+        serve.options,
+        move || {
             let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
             let mut engine = Qwen3_5Engine::load_for_serving(
                 &worker_model,
@@ -1658,7 +1810,7 @@ fn run_serve(
                 policy,
                 pages,
                 use_cuda_graph,
-                w34_host::scheduler::SchedulerConfig::default().max_num_seqs,
+                max_num_seqs,
             )
             .map_err(|e| e.to_string())?;
             if let Some(config) = &spec_config {
@@ -1667,7 +1819,13 @@ fn run_serve(
                     .map_err(|e| e.to_string())?;
             }
             Ok(engine)
-        })?;
+        },
+    )?;
+    println!(
+        "[w34 serve] api_auth={} max_num_seqs={max_num_seqs} context_limit={} tokens (dashboard/metrics/health are public)",
+        if auth_enabled { "enabled" } else { "disabled" },
+        state.worker.max_model_len(),
+    );
     w34_host::server::run_blocking_server(&bind_addr, state)
         .map_err(|e| format!("server error: {e}"))?;
     Ok(ExitCode::SUCCESS)
@@ -1767,6 +1925,200 @@ mod tests {
 
     fn parse(values: &[&str]) -> CudaCliOptions {
         parse_cuda_options(&args(values)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn serve_defaults_limits_and_alias() {
+        let defaults = parse(&["serve"]);
+        assert_eq!(defaults.serve.options.max_num_seqs, 16);
+        assert!(defaults.serve.options.max_model_len.is_none());
+        assert!(defaults.serve.options.api_key.is_none());
+        for limit in ["1", "16"] {
+            let prepared = prepare_cuda_cli_with_env(
+                &args(&[
+                    "serve",
+                    "--model",
+                    "original",
+                    "--served-model-name",
+                    " alias ",
+                    "--max-num-seqs",
+                    limit,
+                    "--max-model-len",
+                    "123",
+                ]),
+                |model, _, _| {
+                    assert_eq!(model, "original");
+                    Ok("/cache/model".into())
+                },
+                |_| panic!("no ambient environment lookup"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                prepared.options.serve.options.max_num_seqs.to_string(),
+                limit
+            );
+            assert_eq!(prepared.options.serve.options.max_model_len, Some(123));
+        }
+    }
+
+    #[test]
+    fn serve_invalid_controls_never_resolve_or_read_environment() {
+        for values in [
+            vec!["--max-num-seqs", "0"],
+            vec!["--max-num-seqs", "17"],
+            vec!["--max-num-seqs", "x"],
+            vec!["--max-model-len", "0"],
+            vec!["--max-model-len", "-1"],
+            vec!["--max-model-len", "x"],
+            vec!["--served-model-name", "  "],
+            vec!["--served-model-name", "a\nb"],
+            vec!["--api-key", "secret", "--api-key-env", "KEY"],
+        ] {
+            let mut argv = args(&["serve"]);
+            argv.extend(args(&values));
+            assert!(
+                prepare_cuda_cli_with_env(
+                    &argv,
+                    |_, _, _| panic!("download"),
+                    |_| panic!("environment")
+                )
+                .is_err()
+            );
+        }
+        for flag in [
+            "--api-key",
+            "--api-key-env",
+            "--served-model-name",
+            "--max-num-seqs",
+            "--max-model-len",
+        ] {
+            assert!(
+                prepare_cuda_cli(&args(&["serve", flag]), |_, _, _| panic!("download")).is_err()
+            );
+            let value = if flag.starts_with("--max-") {
+                "1"
+            } else {
+                "value"
+            };
+            for sub in [
+                "generate",
+                "bench",
+                "chat",
+                "dump-diff",
+                "profile-diff",
+                "greedy-diff",
+            ] {
+                assert!(
+                    prepare_cuda_cli_with_env(
+                        &args(&[sub, flag, value]),
+                        |_, _, _| panic!("download"),
+                        |_| panic!("environment")
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn serve_ignored_flags_are_rejected_before_download() {
+        for (flag, value) in [
+            ("--batch-size", Some("4")),
+            ("--prompt", Some("text")),
+            ("-p", Some("text")),
+            ("--image", Some("image.png")),
+            ("--max-tokens", Some("4")),
+            ("-n", Some("4")),
+            ("--no-thinking", None),
+            ("--prompt-len", Some("4")),
+            ("--gen-len", Some("4")),
+            ("--stage", Some("decode")),
+            ("--golden", Some("file")),
+            ("--out", Some("file")),
+            ("--max-prompts", Some("4")),
+            ("--compare-tp2", None),
+            ("--oracle", Some("file")),
+            ("--preset", Some("key")),
+            ("--w34", Some("file")),
+            ("--rounds", Some("4")),
+            ("--verify-lossless", None),
+            ("--verify-radix-warm", None),
+            ("--live", None),
+        ] {
+            let mut argv = args(&["serve", flag]);
+            argv.extend(value.map(str::to_string));
+            let error = prepare_cuda_cli(&argv, |_, _, _| panic!("download for {flag}"))
+                .err()
+                .unwrap();
+            assert!(error.contains(flag), "{error}");
+        }
+    }
+
+    #[test]
+    fn serve_secret_lookup_is_explicit_once_and_after_validation() {
+        let mut calls = 0;
+        let prepared = prepare_cuda_cli_with_env(
+            &args(&["serve", "--api-key-env", "KEY"]),
+            |_, _, _| Ok("/cache/model".into()),
+            |name| {
+                calls += 1;
+                assert_eq!(name, "KEY");
+                Ok("secret-value".into())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(prepared.options.serve.options.api_key.is_some());
+        for value in [
+            Ok(String::new()),
+            Ok("bad\nsecret".into()),
+            Err(env::VarError::NotPresent),
+            Err(env::VarError::NotUnicode(std::ffi::OsString::from(
+                "secret-value",
+            ))),
+        ] {
+            let error = prepare_cuda_cli_with_env(
+                &args(&["serve", "--api-key-env", "KEY"]),
+                |_, _, _| panic!("download"),
+                |_| value.clone(),
+            )
+            .err()
+            .unwrap();
+            assert!(!error.contains("secret"));
+        }
+        for argv in [
+            vec!["serve", "--api-key-env", "KEY", "--help"],
+            vec!["serve", "--api-key", "secret", "--api-key-env", "KEY", "-h"],
+            vec!["serve", "--batch-size", "4", "--help"],
+        ] {
+            assert!(
+                prepare_cuda_cli_with_env(
+                    &args(&argv),
+                    |_, _, _| panic!("download"),
+                    |_| panic!("environment")
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        for value in ["", "bad\nsecret"] {
+            let error = prepare_cuda_cli(&args(&["serve", "--api-key", value]), |_, _, _| {
+                panic!("download")
+            })
+            .err()
+            .unwrap();
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn serve_batch_size_rejected_before_download() {
+        let result = prepare_cuda_cli(&args(&["serve", "--batch-size", "4"]), |_, _, _| {
+            panic!("serve --batch-size must not download")
+        });
+        assert!(result.err().unwrap().contains("--max-num-seqs"));
     }
 
     #[test]
@@ -1873,25 +2225,18 @@ mod tests {
             "chat",
         ] {
             let mut calls = 0;
-            let prepared = prepare_cuda_cli(
-                &args(&[
-                    sub,
-                    "--model",
-                    "org/target",
-                    "--golden",
-                    "golden.json",
-                    "--tp",
-                    "2",
-                ]),
-                |spec, options, role| {
-                    calls += 1;
-                    assert_eq!(spec, "org/target");
-                    assert!(options.revision.is_none());
-                    assert!(!options.offline);
-                    assert!(matches!(role, ModelRole::Target));
-                    Ok("/cache/target".into())
-                },
-            )
+            let mut values = args(&[sub, "--model", "org/target", "--tp", "2"]);
+            if sub == "greedy-diff" {
+                values.extend(args(&["--golden", "golden.json"]));
+            }
+            let prepared = prepare_cuda_cli(&values, |spec, options, role| {
+                calls += 1;
+                assert_eq!(spec, "org/target");
+                assert!(options.revision.is_none());
+                assert!(!options.offline);
+                assert!(matches!(role, ModelRole::Target));
+                Ok("/cache/target".into())
+            })
             .unwrap()
             .unwrap();
             assert_eq!(calls, 1);

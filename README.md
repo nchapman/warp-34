@@ -55,6 +55,23 @@ CLI is required. Local model-directory paths still work without network access.
 Only supported Safetensors architectures are loaded; repository Python code is
 never executed. See [model downloads, authentication, and offline behavior](docs/MODELS.md).
 
+## Serving controls
+
+Authentication is **optional**; local use remains unauthenticated by default.
+For a deployment, export your key through a secret manager, then use:
+
+```sh
+./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ \
+  --api-key-env W34_API_KEY --served-model-name coding-model \
+  --max-num-seqs 4 --kv-pages 512 --max-model-len 8192
+```
+
+`--api-key VALUE` is also supported, but an environment variable avoids putting
+secrets in process arguments. API clients use Bearer authorization or `x-api-key`.
+`--max-num-seqs` (1–16, default 16) controls active concurrency and GDN state planning;
+`--max-model-len` optionally caps prompt + output tokens without changing KV allocation.
+See [serving controls, authentication scope, and limits](docs/SERVING.md).
+
 ## Live dashboard and metrics
 
 Open **`http://127.0.0.1:8000/`** while `w34 serve` is running for the built-in,
@@ -66,7 +83,8 @@ binary—no Node runtime, external assets, or Prometheus installation required.
 **`/api/metrics`** exposes the same measurements as versioned JSON. The dashboard
 keeps five minutes of local history; use an external collector for persistence.
 See [metrics semantics, deployment security, and development commands](docs/METRICS.md).
-The server does not enforce authentication: keep it private or behind an authenticated
+Dashboard, metrics, and health remain public even with API authentication enabled:
+keep the listener private or protect the entire service with an authenticated TLS
 reverse proxy.
 
 For frontend development, `mise run dashboard-dev` runs Vite with a proxy to the

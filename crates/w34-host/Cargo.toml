@@ -21,6 +21,8 @@ w34-kernels = { path = "../w34-kernels" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 axum = "0.8"
+sha2 = "0.10"
+subtle = "2"
 include_dir = "0.7.4"
 hf-hub = { version = "=1.0.0", features = ["blocking", "rustls-tls"] }
 tempfile = "3"
@@ -38,5 +40,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 turbojpeg-sys = { version = "=1.2.0", default-features = false, features = ["cmake"] }
 
 [dev-dependencies]
-sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

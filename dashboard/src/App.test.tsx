@@ -86,7 +86,7 @@ describe("dashboard states", () => {
       screen.getByRole("heading", { name: "Bring your coding agent." }),
     ).toBeVisible();
     expect(
-      screen.getByText(/does not enforce API-key authentication/),
+      screen.getByText(/API-key authentication is optional/),
     ).toBeVisible();
     expect(screen.getByRole("link", { name: "/api/metrics" })).toHaveAttribute(
       "href",
