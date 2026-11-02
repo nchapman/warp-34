@@ -28,6 +28,22 @@ docs/
   ROADMAP.md     Phased engineering roadmap & vLLM / SGLang / warp3090 source map
 ```
 
+## Clone and large test fixtures
+
+Install [Git LFS](https://git-lfs.com/) before cloning so oracle Safetensors
+fixtures are downloaded rather than left as pointer files:
+
+```sh
+git lfs install
+git clone https://github.com/nchapman/warp-34.git
+cd warp-34
+# For an existing clone, or a clone made without Git LFS:
+git lfs pull
+```
+
+All tracked `*.safetensors` use LFS. Model checkpoints downloaded at runtime stay
+in the Hugging Face cache and are not committed to this repository.
+
 ## Quick Commands
 
 ```sh

@@ -12,6 +12,20 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Public GitHub publication and Git LFS
+
+- Public repository: https://github.com/nchapman/warp-34 (`origin`, `main`).
+- Migrated tracked `*.safetensors` history to Git LFS, including historical
+  fixtures exceeding GitHub's 100 MB regular-file limit. Commit IDs changed;
+  the serving-controls commit is now `d2890e3` (formerly `a7da87a`).
+- Uploaded all 17 LFS objects reachable from `main` (~300 MB). `git lfs fsck`
+  passes, all 521 pre-existing tracked working files are byte-identical after
+  checkout, and no regular blob >=10 MB remains in any local branch history.
+  The detached historical benchmark worktree was left unchanged.
+- Local pre-migration recovery bundle: `/tmp/warp-34-pre-lfs-a7da87a.bundle`.
+  See README for clone/setup instructions. No runtime code or fixture bytes changed;
+  the preceding full-suite verification remains applicable.
+
 ## Production serving controls after oracle option audit
 
 - Compared the pinned vLLM 0.31.0 and SGLang v0.5.19 CLI surfaces, then selected
