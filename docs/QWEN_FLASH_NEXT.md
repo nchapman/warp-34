@@ -143,11 +143,11 @@ Each of the 48 decoder layers wraps its token mixer (`GDN` or `QSA`) and its `Mo
 - **Checkpoint Weight Mapping:** At load time, `loader.rs` concatenates `hyper_connection.input_mix_weight_down.weight` (`[320, 10240]`) and `hyper_connection.block_inject_weight.weight` (`[4, 10240]`) into a single 16-row-aligned projection `[336, 10240]` (zero-padded in rows `324..336` for Tensor Core alignment).
 - **Fused Kernel Pipeline (`combine_and_mix`):**
   1. **`w34_hc_combine_and_grouped_gemma_rmsnorm`:** For each token `t` and branch `b ∈ 0..4`:
-     - If a pending `(prev_block_output: [T, 2560], prev_injection: [T, 4])` exists from the preceding sub-block, fuses `hidden_states[t, b, :] += prev_injection[t, b] * prev_block_output[t, :]`.
-     - Computes independent `FP32` RMS variance per branch `b` over `2560` elements and writes normalized output `normed[t, b, i] = hidden_states[t, b, i] * rrms * (1.0f + weight[b, i])`.
-  2. **Low-Rank Down + Inject GEMM:** Skinny GEMM (`[T, 10240] × [10240, 336] → [T, 336]`), splitting `down: [T, 320]` and raw `inject_logits: [T, 4]`.
-  3. **`w34_hc_silu` + Up Projection + `w34_hc_gate_mix`:** Applies `SiLU(down)`, multiplies by `input_mix_weight_up` (`[320, 4]`), applies `sigmoid` read gates to the 4 streams, and collapses `hidden_states: [T, 4, 2560]` into `block_input: [T, 2560]` while storing `injection = sigmoid(inject_logits): [T, 4]`.
-- **Final Layer Mixer:** Before the final `GemmaRMSNorm` and `lm_head`, a combine-free `final_hyper_connection` (`use_combine = false`) collapses `[T, 4, 2560] → [T, 2560]`, while retaining the pre-final `[T, 4, 2560]` tensor as a `TapPlan` output for `Qwen4` `MTP`.
+     - If a pending `(prev_block_output: [T, 2560], prev_injection: [T, 4])` exists from the preceding sub-block, fuses `hidden_states[t, b, :] += (2.0 * sigmoid(prev_injection[t, b] / 4.0)) * prev_block_output[t, :]` (rounding to activation dtype before norm reduction).
+     - Computes independent `FP32` RMS variance per branch `b` over `2560` elements and writes normalized output `xn[t, b, i] = hidden_states[t, b, i] * rrms * (1.0f + weight[b, i])`.
+  2. **Low-Rank Down + Inject GEMM:** Skinny GEMM (`xn: [T, 10240] × W_down_inj^T: [10240, 336] → [T, 336]`), splitting `down: [T, 320]` and raw `inject_logits: [T, 4]`.
+  3. **`w34_hc_silu` + `w34_hc_gate_mix`:** Computes `lora = SiLU(down / 4.0)`, multiplies by `input_mix_weight_up^T` (`[320, 10240]`), applies `sigmoid(gate) / 4.0` element-wise read gates to the normalized streams `xn: [T, 4, 2560]`, and sums over the 4 branches into `block_input: [T, 2560]` while returning `inject_logits: [T, 4]`.
+- **Final Layer Mixer:** Before `lm_head` (no separate `model.language_model.norm` exists in `qwen4_exp`), `model.language_model.hyper_connection_mixer` (`use_combine = false`) runs `combine_and_mix` to materialize the last layer's combine into `multi_hidden: [T, 10240]` (retained as a `TapPlan` output for `Qwen4` `MTP`) and collapse it into `sample_hidden_states: [T, 2560]`.
 
 ---
 

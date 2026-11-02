@@ -23,6 +23,7 @@ pub mod model;
 #[cfg(feature = "cuda")]
 pub mod mtp;
 pub mod parser;
+pub mod ple;
 pub mod profiling;
 #[cfg(feature = "cuda")]
 pub mod proposer;
