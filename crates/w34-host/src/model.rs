@@ -37,7 +37,7 @@ mod graph_io;
 mod graphs;
 mod rank;
 mod sampling;
-mod weights;
+pub(crate) mod weights;
 
 pub use engine::*;
 pub use graph_io::*;

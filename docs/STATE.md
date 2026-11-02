@@ -76,6 +76,37 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Qwen3.8-Flash-Next branch (`qwen-flash-next`)
+
+- QF-0 config/Hub parsing, zero-copy PLE mmap storage and TP=1/TP=2 capacity
+  planning are committed in `8786fb1`; QF-1 HC/PLE/QSA primitives and local
+  math-parity tests are committed in `71fb030`. These do **not** establish
+  end-to-end Qwen4Exp generation or reference-dump parity for the assembled model.
+- QF-2 is in progress. `moe_offload.rs` now defines a checked, page-aligned
+  N-major U4B8 expert pack and budget-bounded immutable pinned `HostExpertStore`.
+  It reuses `RawLinearHost` quantized loading, validates symmetric zero points
+  and static group indices, and partitions whole experts for EP=1/EP=2.
+- New CUDA helpers scatter staged packs into bounded cache slots and remap
+  global routed IDs to local slots; HC/PLE/QSA and offload helpers are registered
+  in cold-start warmup. The staging geometry regression was reproduced before
+  fixing incomplete-group acceptance; scatter/remap GPU tests passed afterward.
+- Checkpoint qualification loads two actual experts from the pinned albucino
+  snapshot and compares TP=1 and EP=2 pack bytes against checkpoint words.
+  After Clippy fixes and review-requested destination bounds/alignment checks,
+  `CUDA_VISIBLE_DEVICES=0 cargo test --release --features cuda --lib moe_offload
+  -- --include-ignored --test-threads=1` passed **5/5**, including the explicit
+  checkpoint qualification. The subsequent `mise run check` passed (exit 0),
+  including CPU/CUDA Clippy, frontend/oracle/performance checks and the release
+  CUDA suite. Host library results: **163 passed, 3 ignored**; the checkpoint
+  qualification was run explicitly above rather than inferred from that suite.
+  Evidence: session task `t-mvznr165.log`. No QF-2 completion claim yet.
+- Still required: GPU hot-cache/LRU lifecycle, CPU-hybrid workers, FP32 partial
+  accumulation and double-buffered streaming, followed by QF-3 model/cache/state/
+  graph integration and QF-4 Qwen4 MTP plus single-/dual-card end-to-end oracles
+  and benchmarks. The host store is not yet wired into model execution.
+
+---
+
 ## Native Hugging Face model acquisition
 
 - CLI model-loading commands now accept Hub IDs with **download-on-first-use** via

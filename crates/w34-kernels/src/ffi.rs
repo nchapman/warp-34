@@ -1469,6 +1469,39 @@ unsafe extern "C" {
         select_k_blocks: i32,
         sm_scale: f32,
     ) -> i32;
+
+    pub fn w34_moe_unpack_staged_experts(
+        ex: *const W34Exec,
+        staged_packs: *const c_void,
+        dst_slots: *const i32,
+        gate_up_packed_base: *mut u32,
+        gate_up_scales_base: *mut c_void,
+        down_packed_base: *mut u32,
+        down_scales_base: *mut c_void,
+        num_staged: i32,
+        dst_capacity: i32,
+        pack_stride_bytes: usize,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+    ) -> i32;
+
+    pub fn w34_moe_remap_topk_ids_i32(
+        ex: *const W34Exec,
+        global_topk_ids: *const i32,
+        expert_to_slot: *const i32,
+        remapped_topk_ids: *mut i32,
+        total_pairs: i32,
+        global_expert_offset: i32,
+        local_num_experts: i32,
+    ) -> i32;
+
+    pub fn w34_add_inplace_f16(
+        ex: *const W34Exec,
+        dst_f16: *mut c_void,
+        src_f16: *const c_void,
+        num_elems: i64,
+    ) -> i32;
 }
 
 /// Returns the linked cuBLAS runtime version (`major * 10000 + minor * 100 + patch`).

@@ -705,6 +705,23 @@ int w34_qsa_sparse_paged_attn_f16(const w34_exec* ex, const void* q, const void*
                                   void* out, int num_tokens, int local_q_heads,
                                   int select_k_blocks, float sm_scale);
 
+// Pack and destination bases must be 16-byte aligned. Four destinations each
+// contain dst_capacity expert regions; nonnegative dst_slots must be unique.
+// Slots outside [0,dst_capacity) are skipped. Source packs use pack_stride_bytes.
+int w34_moe_unpack_staged_experts(const w34_exec* ex, const void* staged_packs,
+                                  const int32_t* dst_slots, uint32_t* gate_up_packed_base,
+                                  void* gate_up_scales_base, uint32_t* down_packed_base,
+                                  void* down_scales_base, int num_staged, int dst_capacity,
+                                  size_t pack_stride_bytes, int n_interm, int k_hidden,
+                                  int group_size);
+int w34_moe_remap_topk_ids_i32(const w34_exec* ex, const int32_t* global_topk_ids,
+                               const int32_t* expert_to_slot, int32_t* remapped_topk_ids,
+                               int total_pairs, int global_expert_offset,
+                               int local_num_experts);
+// Source and destination must be disjoint and 4-byte aligned (half2).
+int w34_add_inplace_f16(const w34_exec* ex, void* dst_f16, const void* src_f16,
+                        int64_t num_elems);
+
 #ifdef __cplusplus
 }
 #endif
