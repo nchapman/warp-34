@@ -1,6 +1,6 @@
 # warp-34 — Project Agent Guide
 
-> **Posture: beat `vLLM` and `SGLang` on 1–2× RTX 3090 Ti (`sm_86`).** Clean-room Rust + CUDA inference engine for Qwen 3.5 / 3.6 / 3.8 hybrid models (GDN + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4 KV).
+> **Posture: beat `vLLM` and `SGLang` on 1–2× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs (primary reference targets: RTX 3090 / 3090 Ti and RTX 4090).** Clean-room Rust + CUDA inference engine for Qwen 3.5 / 3.6 / 3.8 hybrid models (GDN + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4 KV).
 
 ## Project
 
@@ -10,7 +10,7 @@
   - **`vllm.cpp` (`50d425bec`)**: `/home/nchapman/Code/warp3090/vendor/vllm.cpp`. Donor for native CUDA C++ GDN kernels (`src/vt/cuda/cuda_gdn.cu`), verified against `vLLM` FLA golden dumps.
   - **`SGLang v0.5.19` (`0bcd822377`)**: `/home/nchapman/Code/warp3090-dflash/vendor/sglang` & Docker `lmsysorg/sglang:v0.5.19`. Donor for `MambaRadixCache` + `HybridReqToTokenPool` (`extra_buffer` ping-pong GDN checkpoint donation) and `DFlashWorkerV2` (`M=8` verify on 27B, `M=16` on 4B).
   - **`warp3090` (`/home/nchapman/Code/warp3090`)**: Donor for TurboQuant 4-bit KV (`TQ4`: `block_tq4_0` 132B/row, Rademacher+WHT-256, Beta(256) codebook, `FirstLast2` `2.52×` `f16b`, `fattn_vec_tq` + `fattn_mma_tq`) and pinned-sysmem `TP=2` collectives (`op_all_reduce.cu`).
-- **Key Docs:** `docs/STATE.md` (current status & Phase 0 entry point), `docs/ROADMAP.md` (phased plan, seam contracts, & 5 Decisive Pre-Freeze Gate Tests), `docs/HARDWARE.md` (3090 Ti `sm_86` roofline & ISA traps).
+- **Key Docs:** `docs/STATE.md` (current status & Phase 0 entry point), `docs/ROADMAP.md` (phased plan, seam contracts, & 5 Decisive Pre-Freeze Gate Tests), `docs/HARDWARE.md` (30-series `sm_86` & 40-series `sm_89` rooflines & ISA traps).
 
 ## Commands
 
@@ -31,7 +31,7 @@ for p in $(pgrep -x w34); do kill "$p"; done                              # stop
 ## Conventions
 
 - **Session ritual:** At start, read `docs/STATE.md` and `docs/ROADMAP.md`, check `git status -sb` / `git log --oneline -5`, and check `nvidia-smi` for GPU squatters. At end, update `docs/STATE.md`.
-- **Hardware traps (`docs/HARDWARE.md`):** Target is **2× RTX 3090 Ti (`sm_86`, 84 SMs, 1008 GB/s, 450 W), not RTX 3090** — no NVLink, PCIe Gen4 x8 (`topo PHB`, P2P disabled; cross-GPU uses pinned-sysmem two-hop with system-scope fences). GeForce FP32-accumulate tensor math is half-rate (F16-mma FP32-acc = 80 TF vs 160 FP16-acc; INT8 IMMA = 320 TOPS); INT32 is half-rate and shares issue with FP32. `sm_86` ceiling: `cp.async`, `ldmatrix`, dense `mma.sync`, `mbarrier`; no TMA, `wgmma`, `stmatrix`, clusters, FP8, or `mma.sp` (CUDA 13.4 `ptxas` rejects `sm_86a`).
+- **Hardware traps (`docs/HARDWARE.md`):** Kernels build as a multi-arch fatbinary (`sm_86,sm_89` + PTX by default; override via `W34_ARCH`) and query cached per-device properties (`CudaDeviceProps` / `w34_device_props`) at runtime so all 30-series (`28–84` SMs, `3–6 MiB` L2) and 40-series (`24–142` SMs, `24–96 MiB` L2) GPUs work without hardcoded `84`-SM or device-`0` assumptions. Primary targets are **1–2× RTX 3090 / 3090 Ti (`sm_86`, 82–84 SMs, 6 MB L2, 936–1008 GB/s)** and **1–2× RTX 4090 (`sm_89`, 128 SMs, 72 MB L2, 1008 GB/s, 165 TF F16-mma FP32-acc / 330 TF FP16-acc / 661 TOPS INT8 IMMA)**. Cross-GPU `TP=2` uses pinned-sysmem two-hop with system-scope fences (`kMaxBlocks = 144`, clamped to `min(peer_sm_cap, cap)`). GeForce FP32-accumulate tensor math is half-rate; INT32 is half-rate and shares issue with FP32. Shared `sm_86`/`sm_89` ceiling: `cp.async`, `ldmatrix`, dense `mma.sync`, `mbarrier`; no TMA, `wgmma`, `stmatrix`, clusters, or `mma.sp` (CUDA 13.4 `ptxas` rejects `sm_86a`).
 - **Foundational Seam Invariants (`docs/ROADMAP.md` §1.5):**
   - **Precision policy:** Target model spine is end-to-end `FP16` (`__half`); `DFlash2` drafters preserve native `BF16` (`__nv_bfloat16`) where required (4B drafter overflows `FP16`); persistent GDN `ssm_state` (`72 MiB/rank` per 27B `TP=2` snapshot) and reductions are `FP32` in global memory.
   - **KV addressing:** Logical `page_id`s are decoupled from physical storage via per-layer `KvLayerLayout` descriptors (`fp16`, `q8_0` `272 B` rows, `tq4` `3.07×` rotated `Q8_0` boundaries + `132 B` LSQ `TQ4` interior, `tq4_all` `3.88×`, and `DFlashDraftContext` namespaces).

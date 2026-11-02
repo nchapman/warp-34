@@ -23,11 +23,12 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 COPY --from=dashboard /dashboard/dist ./dashboard/dist
-# Bound nvcc parallelism on smaller build hosts; kernels still target sm_86.
+# Bound nvcc parallelism on smaller build hosts; kernels build as an sm_86 + sm_89 fatbinary by default.
 ARG W34_NVCC_JOBS=4
+ARG W34_ARCH=sm_86,sm_89
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/target \
-    W34_NVCC_JOBS=${W34_NVCC_JOBS} cargo build --locked --release --features cuda --bin w34 \
+    W34_ARCH=${W34_ARCH} W34_NVCC_JOBS=${W34_NVCC_JOBS} cargo build --locked --release --features cuda --bin w34 \
     && cp target/release/w34 /w34
 
 # Do not ship the multi-GB CUDA runtime image, toolkit, or driver stubs.

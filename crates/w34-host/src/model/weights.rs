@@ -775,7 +775,7 @@ impl RawLinearHost {
                         .is_some()
                 {
                     loader_err_msg(format!(
-                        "unsupported MXFP4/NVFP4 block-quantized tensor at '{base_prefix}' (sm_86 supports W4A16/W8A16 integer Marlin or FP16/BF16)"
+                        "unsupported MXFP4/NVFP4 block-quantized tensor at '{base_prefix}' (sm_86/sm_89 supports W4A16/W8A16 integer Marlin or FP16/BF16)"
                     ))
                 } else {
                     loader_err_msg(format!(
@@ -794,7 +794,7 @@ impl RawLinearHost {
                 .is_some()
         {
             return Err(loader_err_msg(format!(
-                "unsupported FP8/float-quantized tensor '{weight_key}' (accompanied by weight_scale/weight_scale_inv; RTX 3090 Ti sm_86 lacks native FP8 tensor cores)"
+                "unsupported FP8/float-quantized tensor '{weight_key}' (accompanied by weight_scale/weight_scale_inv; warp-34 sm_86/sm_89 spine requires W4A16/W8A16 or FP16/BF16)"
             )));
         }
         let w_info = archive
@@ -1875,7 +1875,7 @@ pub(crate) fn load_moe_layer_weights(
                 .is_some()
         {
             return Err(loader_err_msg(format!(
-                "unsupported FP8 fused MoE expert tensor '{gu_key}' (RTX 3090 Ti sm_86 lacks native FP8; use W4A16 or BF16/FP16 MoE)"
+                "unsupported FP8 fused MoE expert tensor '{gu_key}' (warp-34 sm_86/sm_89 spine requires W4A16 or BF16/FP16 MoE)"
             )));
         }
         let gu_info = archive
@@ -2151,7 +2151,7 @@ pub(crate) fn load_moe_layer_weights(
             }
             RawLinearHost::U8B128NMajor { .. } => {
                 return Err(loader_err_msg(format!(
-                    "unsupported 8-bit W8A16 routed MoE experts at '{pfx}' (sm_86 MoE supports 4-bit W4A16 or FP16/BF16 experts)"
+                    "unsupported 8-bit W8A16 routed MoE experts at '{pfx}' (sm_86/sm_89 MoE supports 4-bit W4A16 or FP16/BF16 experts)"
                 )));
             }
             RawLinearHost::DenseF16 { .. } => {

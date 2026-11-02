@@ -312,6 +312,106 @@ impl CapacityPlanner {
     }
 }
 
+/// Architecture family for 30-series (`sm_86`) and 40-series (`sm_89`) GPUs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudaArchFamily {
+    /// NVIDIA Ampere 30-series / workstation (`sm_86`: RTX 3060..3090 Ti, A4000..A6000, A40).
+    AmpereSm86,
+    /// NVIDIA Ada Lovelace 40-series / workstation (`sm_89`: RTX 4060..4090, RTX 6000 Ada, L40S).
+    AdaSm89,
+    /// Other Ampere-or-newer architecture (`>= 8.0`, e.g. `sm_80`, `sm_87`, `sm_90`).
+    OtherAmpereOrNewer { major: i32, minor: i32 },
+}
+
+/// Minimum opt-in dynamic shared memory per block required by `W34PagedD256` (`98,304 B`).
+/// All 30-series (`sm_86`) and 40-series (`sm_89`) GPUs provide `101,376 B` (`99 KiB`).
+pub const MIN_REQUIRED_OPTIN_SMEM_BYTES: usize = 98_304;
+
+/// Minimum SM-lock capacity floor for Marlin workspace allocations (covers up to 144 SMs,
+/// including RTX 3090 Ti 84 SMs, RTX 4090 128 SMs, and RTX 6000 Ada / L40S 142 SMs).
+pub const MIN_MARLIN_LOCK_SMS: usize = 144;
+
+/// Immutable hardware properties queried once per GPU rank.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CudaDeviceProps {
+    pub device_id: i32,
+    pub compute_major: i32,
+    pub compute_minor: i32,
+    pub multi_processor_count: i32,
+    pub max_shared_mem_per_block_optin: usize,
+    pub max_shared_mem_per_multiprocessor: usize,
+    pub l2_cache_bytes: usize,
+    pub persisting_l2_max_bytes: usize,
+    pub name: String,
+}
+
+impl CudaDeviceProps {
+    #[inline]
+    pub fn sm_tag(&self) -> String {
+        format!("sm_{}{}", self.compute_major, self.compute_minor)
+    }
+
+    pub fn arch_family(&self) -> Result<CudaArchFamily> {
+        match (self.compute_major, self.compute_minor) {
+            (8, 6) => Ok(CudaArchFamily::AmpereSm86),
+            (8, 9) => Ok(CudaArchFamily::AdaSm89),
+            (major, minor) if (major > 8 && minor >= 0) || (major == 8 && minor >= 6) => {
+                Ok(CudaArchFamily::OtherAmpereOrNewer { major, minor })
+            }
+            (major, minor) => Err(CudaError::with_detail(
+                -20,
+                "unsupported GPU compute capability",
+                format!(
+                    "GPU {} ({}) has compute capability {}.{} (sm_{}{}); warp-34 requires 30-series (sm_86) or 40-series (sm_89) (>= 8.6)",
+                    self.device_id, self.name, major, minor, major, minor
+                ),
+            )),
+        }
+    }
+
+    pub fn validate_supported(&self) -> Result<CudaArchFamily> {
+        let family = self.arch_family()?;
+        if self.multi_processor_count <= 0 {
+            return Err(CudaError::with_detail(
+                -21,
+                "invalid GPU multiProcessorCount",
+                format!(
+                    "GPU {} ({}) reported multi_processor_count={}",
+                    self.device_id, self.name, self.multi_processor_count
+                ),
+            ));
+        }
+        if self.max_shared_mem_per_block_optin < MIN_REQUIRED_OPTIN_SMEM_BYTES {
+            return Err(CudaError::with_detail(
+                -22,
+                "insufficient GPU opt-in shared memory",
+                format!(
+                    "GPU {} ({}, {}) provides {} B opt-in shared memory per block, need >= {} B",
+                    self.device_id,
+                    self.name,
+                    self.sm_tag(),
+                    self.max_shared_mem_per_block_optin,
+                    MIN_REQUIRED_OPTIN_SMEM_BYTES
+                ),
+            ));
+        }
+        Ok(family)
+    }
+
+    #[inline]
+    pub fn marlin_workspace_ints(&self) -> usize {
+        (self.multi_processor_count.max(0) as usize)
+            .max(MIN_MARLIN_LOCK_SMS)
+            .saturating_mul(64)
+    }
+
+    #[inline]
+    pub fn marlin_workspace_bytes(&self) -> usize {
+        self.marlin_workspace_ints()
+            .saturating_mul(core::mem::size_of::<i32>())
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct CudaDevice {
     pub device_id: i32,
@@ -327,6 +427,38 @@ impl CudaDevice {
             "w34_get_device_count",
         )?;
         Ok(count)
+    }
+
+    pub fn props_for(device_id: i32) -> Result<CudaDeviceProps> {
+        let mut raw_props = ffi::W34DeviceProps::default();
+        check_rc(
+            // SAFETY: `raw_props` is a valid initialized stack `W34DeviceProps` out-parameter.
+            unsafe { ffi::w34_get_device_props(device_id, &raw mut raw_props) },
+            "w34_get_device_props",
+        )?;
+        let nul_pos = raw_props
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(raw_props.name.len());
+        let name = String::from_utf8_lossy(&raw_props.name[..nul_pos]).into_owned();
+        Ok(CudaDeviceProps {
+            device_id: raw_props.device_id,
+            compute_major: raw_props.compute_major,
+            compute_minor: raw_props.compute_minor,
+            multi_processor_count: raw_props.multi_processor_count,
+            max_shared_mem_per_block_optin: raw_props.max_shared_mem_per_block_optin.max(0)
+                as usize,
+            max_shared_mem_per_multiprocessor: raw_props.max_shared_mem_per_multiprocessor.max(0)
+                as usize,
+            l2_cache_bytes: raw_props.l2_cache_bytes.max(0) as usize,
+            persisting_l2_max_bytes: raw_props.persisting_l2_max_bytes.max(0) as usize,
+            name,
+        })
+    }
+
+    pub fn props(&self) -> Result<CudaDeviceProps> {
+        Self::props_for(self.device_id)
     }
 
     pub fn set_current(device_id: i32) -> Result<Self> {
@@ -1292,6 +1424,9 @@ impl Tp2Collectives {
 #[allow(clippy::undocumented_unsafe_blocks)]
 pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let dev = CudaDevice::set_current(device_id)?;
+    let dev_props = dev.props()?;
+    dev_props.validate_supported()?;
+    let marlin_ws_ints = dev_props.marlin_workspace_ints() as i64;
     let stream = CudaStream::new(device_id)?;
     let cublas = CublasHandle::new(&stream)?;
     let mut arena = DeviceArena::new(device_id, 16 * 1024 * 1024)?;
@@ -1301,7 +1436,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let buf_b = arena.alloc_aligned(64 * 1024)?;
     let buf_c = arena.alloc_aligned(64 * 1024)?;
     let buf_d = arena.alloc_aligned(64 * 1024)?;
-    let buf_ws = arena.alloc_aligned(64 * 1024)?;
+    let buf_ws = arena.alloc_aligned((64 * 1024).max(dev_props.marlin_workspace_bytes()))?;
 
     // 1. Norms, RoPE, activations
     check_rc(
@@ -1456,7 +1591,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                         m_warm,
                         64,
                         128,
-                        2048,
+                        marlin_ws_ints,
                         group_blocks,
                     )
                 },
@@ -1475,7 +1610,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                         m_warm,
                         64,
                         128,
-                        2048,
+                        marlin_ws_ints,
                         group_blocks,
                     )
                 },
@@ -1495,7 +1630,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                         m_warm,
                         64,
                         128,
-                        2048,
+                        marlin_ws_ints,
                         group_blocks,
                     )
                 },
@@ -2002,30 +2137,32 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         total_tokens: 3,
         ..gdn_batch
     };
-    check_rc(
-        unsafe {
-            ffi::w34_gdn_recurrent_f16(
-                &ex,
-                &gdn_batch_prefill,
-                buf_d as *const c_void,
-                core::ptr::null(),
-                core::ptr::null(),
-                core::ptr::null(),
-                buf_a as *const c_void,
-                buf_a as *const c_void,
-                buf_b as *const f32,
-                buf_b as *const f32,
-                buf_ws as *mut f32,
-                buf_c as *mut c_void,
-                1,
-                128,
-                1,
-                128,
-                1,
-            )
-        },
-        "warmup w34_gdn_recurrent_f16 prefill",
-    )?;
+    for num_v_heads in [1i32, 24, 32] {
+        check_rc(
+            unsafe {
+                ffi::w34_gdn_recurrent_f16(
+                    &ex,
+                    &gdn_batch_prefill,
+                    gdn_ws_wide as *const c_void,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    buf_a as *const c_void,
+                    buf_a as *const c_void,
+                    buf_b as *const f32,
+                    buf_b as *const f32,
+                    gdn_ws_wide as *mut f32,
+                    buf_c as *mut c_void,
+                    1,
+                    128,
+                    num_v_heads,
+                    128,
+                    1,
+                )
+            },
+            "warmup w34_gdn_recurrent_f16 prefill",
+        )?;
+    }
     let q_start_wy = arena.upload_slice(&[0i32, 256], &stream)?;
     let gdn_batch_wy = W34GdnBatch {
         query_start_loc: q_start_wy as *const i32,
@@ -3512,5 +3649,138 @@ mod tests {
                 "CUDA error 2 (out of memory) in w34_malloc"
             );
         }
+    }
+
+    #[test]
+    fn test_device_props_validation_across_30_and_40_series_lineup() {
+        // 30-series lineup: RTX 3060 (28 SMs, 3 MiB L2) -> RTX 3090 Ti (84 SMs, 6 MiB L2)
+        for (name, sms, l2_mib) in [
+            ("NVIDIA GeForce RTX 3060", 28, 3),
+            ("NVIDIA GeForce RTX 3090", 82, 6),
+            ("NVIDIA GeForce RTX 3090 Ti", 84, 6),
+        ] {
+            let props = CudaDeviceProps {
+                device_id: 0,
+                compute_major: 8,
+                compute_minor: 6,
+                multi_processor_count: sms,
+                max_shared_mem_per_block_optin: 101_376,
+                max_shared_mem_per_multiprocessor: 102_400,
+                l2_cache_bytes: l2_mib * 1024 * 1024,
+                persisting_l2_max_bytes: (l2_mib * 3 / 4) * 1024 * 1024,
+                name: name.to_string(),
+            };
+            assert_eq!(props.sm_tag(), "sm_86");
+            assert_eq!(
+                props.validate_supported().unwrap(),
+                CudaArchFamily::AmpereSm86
+            );
+            assert_eq!(props.marlin_workspace_ints(), MIN_MARLIN_LOCK_SMS * 64);
+            assert_eq!(props.marlin_workspace_bytes(), MIN_MARLIN_LOCK_SMS * 64 * 4);
+        }
+
+        // 40-series lineup: RTX 4060 (24 SMs, 24 MiB L2) -> RTX 4090 (128 SMs, 72 MiB L2) -> L40S (142 SMs, 96 MiB L2)
+        for (name, sms, l2_mib) in [
+            ("NVIDIA GeForce RTX 4060", 24, 24),
+            ("NVIDIA GeForce RTX 4080 SUPER", 80, 64),
+            ("NVIDIA GeForce RTX 4090", 128, 72),
+            ("NVIDIA L40S", 142, 96),
+        ] {
+            let props = CudaDeviceProps {
+                device_id: 0,
+                compute_major: 8,
+                compute_minor: 9,
+                multi_processor_count: sms,
+                max_shared_mem_per_block_optin: 101_376,
+                max_shared_mem_per_multiprocessor: 102_400,
+                l2_cache_bytes: l2_mib * 1024 * 1024,
+                persisting_l2_max_bytes: 50 * 1024 * 1024,
+                name: name.to_string(),
+            };
+            assert_eq!(props.sm_tag(), "sm_89");
+            assert_eq!(props.validate_supported().unwrap(), CudaArchFamily::AdaSm89);
+            assert!(props.marlin_workspace_ints() >= (sms as usize) * 64);
+            assert_eq!(props.marlin_workspace_bytes(), MIN_MARLIN_LOCK_SMS * 64 * 4);
+        }
+
+        // Future / larger-SM GPU (> 144 SMs) scales marlin workspace automatically.
+        let large_sm_props = CudaDeviceProps {
+            device_id: 0,
+            compute_major: 9,
+            compute_minor: 0,
+            multi_processor_count: 160,
+            max_shared_mem_per_block_optin: 232_448,
+            max_shared_mem_per_multiprocessor: 233_472,
+            l2_cache_bytes: 50 * 1024 * 1024,
+            persisting_l2_max_bytes: 36 * 1024 * 1024,
+            name: "NVIDIA H200".to_string(),
+        };
+        assert_eq!(
+            large_sm_props.validate_supported().unwrap(),
+            CudaArchFamily::OtherAmpereOrNewer { major: 9, minor: 0 }
+        );
+        assert_eq!(large_sm_props.marlin_workspace_ints(), 160 * 64);
+        assert_eq!(large_sm_props.marlin_workspace_bytes(), 160 * 64 * 4);
+
+        // Pre-sm_86 (< 8.6, e.g. Turing sm_75 or sm_80 without sm_80 SASS in the default fatbinary) is rejected.
+        for (major, minor, name) in [
+            (7, 5, "NVIDIA GeForce RTX 2080 Ti"),
+            (8, 0, "NVIDIA A100-SXM4-80GB"),
+        ] {
+            let unsupported = CudaDeviceProps {
+                compute_major: major,
+                compute_minor: minor,
+                name: name.to_string(),
+                ..large_sm_props.clone()
+            };
+            assert!(unsupported.validate_supported().is_err());
+        }
+
+        // Insufficient opt-in shared memory is rejected.
+        let small_smem = CudaDeviceProps {
+            max_shared_mem_per_block_optin: 49_152,
+            ..large_sm_props
+        };
+        assert!(small_smem.validate_supported().is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_runtime_gpu_device_props_and_tp2_sm_cap() {
+        let count = CudaDevice::count().unwrap();
+        assert!(count >= 1);
+        let dev = CudaDevice::set_current(0).unwrap();
+        let props = dev.props().unwrap();
+        assert_eq!(props.device_id, 0);
+        assert!(props.compute_major >= 8);
+        assert!(props.multi_processor_count >= 24);
+        assert!(props.max_shared_mem_per_block_optin >= MIN_REQUIRED_OPTIN_SMEM_BYTES);
+        assert!(props.l2_cache_bytes >= 2 * 1024 * 1024);
+        assert!(!props.name.is_empty());
+        let family = props.validate_supported().unwrap();
+        assert!(matches!(
+            family,
+            CudaArchFamily::AmpereSm86
+                | CudaArchFamily::AdaSm89
+                | CudaArchFamily::OtherAmpereOrNewer { .. }
+        ));
+
+        let mut cur_raw = ffi::W34DeviceProps::default();
+        check_rc(
+            // SAFETY: `cur_raw` is a valid initialized stack `W34DeviceProps`.
+            unsafe { ffi::w34_get_current_device_props(&raw mut cur_raw) },
+            "w34_get_current_device_props",
+        )
+        .unwrap();
+        assert_eq!(cur_raw.multi_processor_count, props.multi_processor_count);
+
+        let mut min_sms = 0i32;
+        check_rc(
+            // SAFETY: `min_sms` is a valid initialized stack `i32`.
+            unsafe { ffi::w34_get_tp2_min_sm_count(&raw mut min_sms) },
+            "w34_get_tp2_min_sm_count",
+        )
+        .unwrap();
+        assert!(min_sms >= 24 && min_sms <= props.multi_processor_count);
     }
 }

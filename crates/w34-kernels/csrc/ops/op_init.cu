@@ -3,11 +3,17 @@
 
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <new>
 
 namespace {
+constexpr int kMaxCachedDevices = 32;
+std::mutex g_device_props_mutex;
+std::atomic<uint32_t> g_device_props_mask{0u};
+w34_device_props g_device_props[kMaxCachedDevices] = {};
+std::atomic<int> g_tp2_min_sms{0};
 constexpr size_t vision_workspace_bytes = 1024 * 1024;
 constexpr int vision_plan_limit = 256;
 struct VisionPlan {
@@ -83,6 +89,83 @@ extern "C" int w34_cublas_runtime_version(int* out_version) {
 extern "C" int w34_get_device_count(int* out_count) {
     if (out_count == nullptr) return (int)cudaErrorInvalidValue;
     return (int)cudaGetDeviceCount(out_count);
+}
+
+extern "C" int w34_get_device_props(int device_id, w34_device_props* out_props) {
+    if (out_props == nullptr) return (int)cudaErrorInvalidValue;
+    if (device_id < 0 || device_id >= kMaxCachedDevices) {
+        return (int)cudaErrorInvalidDevice;
+    }
+    const uint32_t bit = 1u << device_id;
+    if ((g_device_props_mask.load(std::memory_order_acquire) & bit) != 0u) {
+        *out_props = g_device_props[device_id];
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_device_props_mutex);
+    if ((g_device_props_mask.load(std::memory_order_relaxed) & bit) != 0u) {
+        *out_props = g_device_props[device_id];
+        return 0;
+    }
+    cudaDeviceProp prop{};
+    cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
+    if (err != cudaSuccess) return (int)err;
+    int max_smem_optin = (int)prop.sharedMemPerBlockOptin;
+    if (max_smem_optin <= 0) {
+        err = cudaDeviceGetAttribute(
+            &max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id);
+        if (err != cudaSuccess) return (int)err;
+    }
+    w34_device_props p{};
+    p.device_id = device_id;
+    p.compute_major = prop.major;
+    p.compute_minor = prop.minor;
+    p.multi_processor_count = prop.multiProcessorCount;
+    p.max_shared_mem_per_block_optin = max_smem_optin;
+    p.max_shared_mem_per_multiprocessor = (int)prop.sharedMemPerMultiprocessor;
+    p.l2_cache_bytes = prop.l2CacheSize;
+    p.persisting_l2_max_bytes = prop.persistingL2CacheMaxSize;
+    std::strncpy(p.name, prop.name, sizeof(p.name) - 1);
+    p.name[sizeof(p.name) - 1] = '\0';
+    g_device_props[device_id] = p;
+    g_device_props_mask.fetch_or(bit, std::memory_order_release);
+    *out_props = p;
+    return 0;
+}
+
+extern "C" int w34_get_current_device_props(w34_device_props* out_props) {
+    if (out_props == nullptr) return (int)cudaErrorInvalidValue;
+    int dev_id = 0;
+    cudaError_t err = cudaGetDevice(&dev_id);
+    if (err != cudaSuccess) return (int)err;
+    return w34_get_device_props(dev_id, out_props);
+}
+
+extern "C" int w34_get_tp2_min_sm_count(int* out_min_sms) {
+    if (out_min_sms == nullptr) return (int)cudaErrorInvalidValue;
+    int cached = g_tp2_min_sms.load(std::memory_order_acquire);
+    if (cached > 0) {
+        *out_min_sms = cached;
+        return 0;
+    }
+    int count = 0;
+    cudaError_t err = cudaGetDeviceCount(&count);
+    if (err != cudaSuccess) return (int)err;
+    if (count <= 0) return (int)cudaErrorNoDevice;
+    w34_device_props p0{};
+    int rc = w34_get_device_props(0, &p0);
+    if (rc != 0) return rc;
+    int min_sms = p0.multi_processor_count;
+    if (count >= 2) {
+        w34_device_props p1{};
+        rc = w34_get_device_props(1, &p1);
+        if (rc != 0) return rc;
+        if (p1.multi_processor_count < min_sms) {
+            min_sms = p1.multi_processor_count;
+        }
+    }
+    g_tp2_min_sms.store(min_sms, std::memory_order_release);
+    *out_min_sms = min_sms;
+    return 0;
 }
 
 extern "C" int w34_set_device(int device_id) {

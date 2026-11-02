@@ -104,6 +104,38 @@ pub struct W34GdnBatch {
 
 const _: [(); 80] = [(); core::mem::size_of::<W34GdnBatch>()];
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct W34DeviceProps {
+    pub device_id: i32,
+    pub compute_major: i32,
+    pub compute_minor: i32,
+    pub multi_processor_count: i32,
+    pub max_shared_mem_per_block_optin: i32,
+    pub max_shared_mem_per_multiprocessor: i32,
+    pub l2_cache_bytes: i32,
+    pub persisting_l2_max_bytes: i32,
+    pub name: [u8; 64],
+}
+
+impl Default for W34DeviceProps {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            compute_major: 0,
+            compute_minor: 0,
+            multi_processor_count: 0,
+            max_shared_mem_per_block_optin: 0,
+            max_shared_mem_per_multiprocessor: 0,
+            l2_cache_bytes: 0,
+            persisting_l2_max_bytes: 0,
+            name: [0u8; 64],
+        }
+    }
+}
+
+const _: [(); 96] = [(); core::mem::size_of::<W34DeviceProps>()];
+
 pub const W34_MAX_TOP_LOGPROBS: usize = 20;
 
 #[repr(C)]
@@ -174,6 +206,9 @@ unsafe extern "C" {
     pub fn w34_cuda_error_string(code: i32) -> *const core::ffi::c_char;
     pub fn w34_cublas_runtime_version(out_version: *mut i32) -> i32;
     pub fn w34_get_device_count(out_count: *mut i32) -> i32;
+    pub fn w34_get_device_props(device_id: i32, out_props: *mut W34DeviceProps) -> i32;
+    pub fn w34_get_current_device_props(out_props: *mut W34DeviceProps) -> i32;
+    pub fn w34_get_tp2_min_sm_count(out_min_sms: *mut i32) -> i32;
     pub fn w34_set_device(device_id: i32) -> i32;
     pub fn w34_device_synchronize() -> i32;
     pub fn w34_get_mem_info(out_free: *mut usize, out_total: *mut usize) -> i32;

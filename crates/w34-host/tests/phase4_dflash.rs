@@ -166,11 +166,22 @@ fn run_4b(strict_parity: bool) {
             max_abs = max_abs.max((x - y).abs());
         }
         let rel = (error / energy).sqrt();
-        eprintln!("actual SGLang final hidden relL2={rel}, maxabs={max_abs}");
-        assert_eq!(
-            error, 0.0,
-            "BF16 drafter must retain 0-ULP donor parity: relL2={rel}, maxabs={max_abs}"
+        let active_gpu = target.device.props().unwrap().name;
+        let provenance_gpu = provenance["gpu"].as_str().unwrap_or("");
+        eprintln!(
+            "actual SGLang final hidden on {active_gpu} (provenance {provenance_gpu}): relL2={rel}, maxabs={max_abs}"
         );
+        if active_gpu == provenance_gpu {
+            assert_eq!(
+                error, 0.0,
+                "BF16 drafter must retain 0-ULP donor parity on provenance GPU {provenance_gpu}: relL2={rel}, maxabs={max_abs}"
+            );
+        } else {
+            assert!(
+                rel < 1e-4,
+                "BF16 drafter cross-GPU cuBLAS parity exceeded relL2 < 1e-4 on {active_gpu} vs {provenance_gpu}: relL2={rel}, maxabs={max_abs}"
+            );
+        }
     }
 
     let merged = DraftCandidates::merge(&[candidates]).unwrap();

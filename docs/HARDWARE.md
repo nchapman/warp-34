@@ -1,6 +1,14 @@
-# RTX 3090 Ti (GA102, sm_86) — Hardware Reference
+# RTX 30-Series (`sm_86`) & RTX 40-Series (`sm_89`) — Hardware Reference
 
 Every number an optimization decision might depend on, each with its source.
+`warp-34` builds a multi-architecture fatbinary (`sm_86` + `sm_89` + PTX) by
+default and queries per-device hardware properties (`CudaDeviceProps` /
+`w34_device_props`) at startup so every GeForce RTX 30-series (`sm_86`,
+28–84 SMs, 3–6 MiB L2) and RTX 40-series (`sm_89`, 24–142 SMs, 24–96 MiB L2)
+GPU runs natively without hardcoded SM or L2 constants. Primary optimization
+references are **1–2× RTX 3090 / 3090 Ti (`sm_86`)** and **1–2× RTX 4090
+(`sm_89`)**.
+
 Sources are tagged inline:
 
 - **[BOX]** queried on this machine (2× RTX 3090 Ti, driver 615.71.09, CUDA 13.4)
@@ -370,6 +378,48 @@ nvidia-smi --query-gpu=index,name,power.limit,power.default_limit,clocks.sm,cloc
 nvcc -o /tmp/devprops tools/hw/devprops.cu && /tmp/devprops   # cudaDeviceProp dump
 for t in sm_86 sm_90; do sed "s/^.target .*/.target $t/" tools/hw/feat.ptx > /tmp/feat_$t.ptx; ptxas -arch=$t /tmp/feat_$t.ptx -o /dev/null; done  # feature-gate probes
 ```
+
+---
+
+## 12. RTX 4090 (`AD102-300`, `sm_89`) & Full 30/40-Series Lineup
+
+### 12.1 Primary Reference Comparison: RTX 3090 Ti (`sm_86`) vs RTX 4090 (`sm_89`)
+
+| Property | RTX 3090 (`GA102-300`) | RTX 3090 Ti (`GA102-350`) | RTX 4090 (`AD102-300`) | Ratio (`4090 / 3090 Ti`) |
+|---|---|---|---|---|
+| Compute capability | `8.6` (`sm_86`) | `8.6` (`sm_86`) | `8.9` (`sm_89`) | — |
+| SMs | **82** | **84** | **128** (of 144 on full AD102) | **1.524×** |
+| CUDA (FP32) cores | 10,496 (128/SM) | 10,752 (128/SM) | 16,384 (128/SM) | 1.524× |
+| Tensor cores | 328 (3rd gen, 4/SM) | 336 (3rd gen, 4/SM) | 512 (4th gen, 4/SM) | 1.524× |
+| Base / boost clock | 1395 / 1695 MHz | 1560 / **1860 MHz** | 2235 / **2520 MHz** | **1.355×** |
+| Memory | 24 GB GDDR6X, 19.5 Gbps | 24 GB GDDR6X, 21 Gbps | 24 GB GDDR6X, 21 Gbps | 1.00× |
+| Theoretical DRAM BW | **936 GB/s** | **1008 GB/s** | **1008 GB/s** | **1.00×** |
+| **L2 cache** | **6 MB** | **6 MB** (`6,291,456 B`) | **72 MB** (`75,497,472 B`) | **12.0×** |
+| L1 / shared per SM | 128 KB unified | 128 KB unified | 128 KB unified | 1.00× |
+| Max opt-in shared/block | 99 KB (`101,376 B`) | 99 KB (`101,376 B`) | 99 KB (`101,376 B`) | 1.00× |
+| Register file per SM | 64K × 32-bit (256 KB) | 64K × 32-bit (256 KB) | 64K × 32-bit (256 KB) | 1.00× |
+| Dense FP32 TFLOPS | 35.6 TF | 40.0 TF | **82.6 TF** | **2.065×** |
+| Dense Tensor FP16/BF16 (FP32-acc) | 71.2 TF | **80.0 TF** | **165.2 TF** | **2.065×** |
+| Dense Tensor FP16 (FP16-acc) | 142.4 TF | **160.0 TF** | **330.3 TF** | **2.065×** |
+| Dense Tensor INT8 (`IMMA`) | 284.7 TOPS | **320.0 TOPS** | **660.6 TOPS** | **2.065×** |
+| TDP | 350 W | 450 W | 450 W | 1.00× |
+
+### 12.2 Architectural Implications of `sm_89` vs `sm_86`
+
+1. **Identical HBM bandwidth (1008 GB/s), 2.065× compute & 12× L2 cache:**
+   - Single-request `M=1` weight-streaming decode is HBM-bound on both 3090 Ti and 4090 (~1008 GB/s), but **prefill (`M >= 16`), multi-token verify (`M = 8..16` for `MTP` / `DFlash2`), batched serving (`N = 8..32`), and L2-resident operations** benefit directly from 4090's **2.065× tensor/ALU throughput** and **72 MB L2 cache**.
+   - On 4090 (`l2_cache_bytes >= 32 MiB`), `op_marlin.cu` raises the wide-`N` (`N > 4096`) `M`-parallelism cap from `max_par = 16` (`M <= 1024`) to `max_par = 64` (`M <= 4096`) because the activation matrix `A` stays resident in the 72 MB L2 cache across all `N` tiles without re-reading `B` weights from HBM.
+2. **Per-SM limits are identical between `sm_86` and `sm_89`:**
+   - Both architectures have `128 KB` unified L1/shared per SM, `101,376 B` (`99 KB`) max opt-in dynamic shared memory per block, `65,536` 32-bit registers per SM (`255` max per thread), `48` max warps (`1536` threads) per SM, and `16` max blocks per SM.
+   - All `sm_80+` PTX instructions used in `warp-34` (`cp.async`, `ldmatrix`, `mma.sync.aligned.m16n8k16`, `redux.sync`, `mbarrier`) assemble natively to both `sm_86` and `sm_89` with `0` register spills (`0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`).
+3. **Full 30-Series & 40-Series Lineup (Runtime `CudaDeviceProps` Scaling):**
+   - **30-Series (`sm_86`):** RTX 3060 (28 SMs, 3 MB L2), RTX 3060 Ti (38 SMs, 4 MB L2), RTX 3070 / 3070 Ti (46–48 SMs, 4 MB L2), RTX 3080 / 3080 Ti (68–80 SMs, 5–6 MB L2), RTX 3090 (82 SMs, 6 MB L2), RTX 3090 Ti / RTX A6000 (84 SMs, 6 MB L2).
+   - **40-Series (`sm_89`):** RTX 4060 / 4060 Ti (24–34 SMs, 24–32 MB L2), RTX 4070 / Super / Ti / Ti Super (46–66 SMs, 36–48 MB L2), RTX 4080 / Super (76–80 SMs, 64 MB L2), RTX 4090 D (114 SMs, 72 MB L2), RTX 4090 (128 SMs, 72 MB L2), RTX 6000 Ada / L40S (142 SMs, 96 MB L2).
+   - **Dynamic runtime adaptation:**
+     - `w34_get_current_device_props` / `CudaDeviceProps` caches `compute_major`, `compute_minor`, `multi_processor_count`, `max_shared_mem_per_block_optin`, and `l2_cache_bytes` per device.
+     - `op_collectives.cu` sizes `Signal` for `kMaxBlocks = 144` and clamps `tp2_block_cap` to `min(peer_sm_cap, cap)` so GPUs with `< 84` SMs (e.g. 82-SM RTX 3090, 80-SM RTX 4080 Super, 24-SM RTX 4060) never launch more spin-waiting CTAs than physical SMs, while 128-SM RTX 4090 and 142-SM L40S scale up to full SM count on large reductions.
+     - `op_marlin.cu` and `model/rank.rs` size the Marlin tile-lock workspace to `max(sm_count, 144) * 64` ints and query the active device (`cudaGetDevice`) rather than hardcoded device `0`.
+     - `op_gdn.cu` selects single-wave `ROWS` tiling based on `sm_count` (`>= 112` SMs vs `< 112` SMs).
 
 ---
 

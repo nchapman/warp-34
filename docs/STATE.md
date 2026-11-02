@@ -171,6 +171,34 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Code-quality refactor and worker error containment
 
+- Multi-architecture 30-series (`sm_86`) & 40-series (`sm_89`) GPU support
+  (`crates/w34-kernels/build.rs`, `Dockerfile`, `csrc/w34_cuda.h`,
+  `csrc/ops/op_init.cu`, `csrc/ops/op_marlin.cu`, `csrc/ops/op_collectives.cu`,
+  `csrc/ops/op_gdn.cu`, `src/ffi.rs`, `src/cuda.rs`, `src/model/rank.rs`,
+  `tests/phase4_dflash.rs`, `docs/HARDWARE.md`):
+  - Default `w34-kernels` and Docker builds now emit a multi-architecture
+    fatbinary covering both `sm_86` (all RTX 30-series / Ampere GA10x) and
+    `sm_89` (all RTX 40-series / Ada AD10x) plus PTX forward-compatibility,
+    while supporting single- or multi-arch `W34_ARCH` overrides.
+  - Added `w34_device_props` / `CudaDeviceProps` + `CudaArchFamily` with
+    lock-free per-device caching in `op_init.cu` and startup validation in
+    `prepare_execution_plan` and `ModelRank::load`.
+  - Replaced hardcoded device `0` `cudaDeviceGetAttribute` calls and `84`-SM
+    constants in `op_marlin.cu` and `model/rank.rs` with cached active-device
+    properties (`max(sm_count, 144) * 64` lock ints) and L2-aware wide-`N`
+    `max_par` scaling (`max_par = 64` when `l2_cache_bytes >= 32 MiB`, e.g.
+    RTX 4090's 72 MiB L2, vs `16` on 30-series 3–6 MiB L2).
+  - Raised `w34_comm::Signal::kMaxBlocks` in `op_collectives.cu` from `84` to
+    `144` (covering up to 128 SMs on RTX 4090 and 142 SMs on L40S / RTX 6000
+    Ada) while clamping launched blocks via `tp2_block_cap` to the minimum SM
+    count across TP peers so `< 84`-SM GPUs (e.g. 82-SM RTX 3090, 80-SM RTX
+    4080 Super, 24-SM RTX 4060) never launch more spin-waiting CTAs than SMs.
+  - Parameterized `op_gdn.cu` single-request recurrent prefill `ROWS` wave
+    packing by `sm_count` (`>= 112` SMs vs `< 112` SMs) and warmed all `nh`
+    variants in `prepare_execution_plan`.
+  - Updated `phase4_dflash.rs` `actual_sglang_full_model_hidden_parity` to
+    enforce 0-ULP on the provenance capture GPU (`RTX 3090 Ti`) and
+    `relL2 < 1e-4` when `cuBLAS` runs on a different 30/40-series GPU.
 - Quantization and model-loading audit (`loader.rs`, `model/weights.rs`,
   `model/rank.rs`, `mtp.rs`, `dflash.rs`, `tests/quant_formats.rs`):
   - Fixed `marlin_permute_scales_k_by_n` and `RawLinearHost::upload` when

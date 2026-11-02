@@ -16,7 +16,8 @@
 
 namespace w34_comm {
 
-constexpr int kMaxBlocks = 84;
+// Sized for up to 144 SMs (covering all 30-series 28..84 SMs and 40-series 24..142 SMs).
+constexpr int kMaxBlocks = 144;
 constexpr int kSmallMaxBlocks = 36;
 constexpr int kRanks = 16;
 
@@ -25,7 +26,18 @@ struct Signal {
     alignas(128) uint32_t end[kMaxBlocks][kRanks];
     alignas(128) uint32_t flag[kMaxBlocks];
 };
-static_assert(sizeof(Signal) == 11136, "Signal ABI size mismatch");
+static_assert(sizeof(Signal) == 19072, "Signal ABI size mismatch");
+
+inline int tp2_block_cap(bool is_small) {
+    int min_sms = 84;
+    if (w34_get_tp2_min_sm_count(&min_sms) != 0 || min_sms < 1) {
+        min_sms = 1;
+    }
+    int cap = is_small ? kSmallMaxBlocks : kMaxBlocks;
+    if (cap > min_sms) cap = min_sms;
+    if (cap < 1) cap = 1;
+    return cap;
+}
 
 __device__ __forceinline__ void st_flag_release(uint32_t* addr, uint32_t val) {
     asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(val), "l"(addr) : "memory");
@@ -578,7 +590,7 @@ extern "C" int w34_tp2_all_reduce_f16(const w34_exec* ex, const void* local_in, 
         return (int)cudaErrorInvalidValue;
     }
     int blocks = (num_elems + 511) / 512;
-    const int cap = (num_elems <= 36 * 5120) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -621,7 +633,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
     }
     if (num_tokens == 0) return 0;
     int blocks = num_tokens;
-    const int cap = (num_tokens <= 36) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    const int cap = w34_comm::tp2_block_cap(num_tokens <= 36);
     if (blocks > cap) blocks = cap;
     if (hidden_size <= 2560) {
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<10>
@@ -668,7 +680,7 @@ extern "C" int w34_tp2_all_reduce_bf16(const w34_exec* ex, const void* local_in,
         return (int)cudaErrorInvalidValue;
     }
     int blocks = (num_elems + 511) / 512;
-    const int cap = (num_elems <= 36 * 5120) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_bf16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -688,7 +700,7 @@ extern "C" int w34_tp2_all_reduce_f32(const w34_exec* ex, const float* local_in,
         return (int)cudaErrorInvalidValue;
     }
     int blocks = (num_elems + 511) / 512;
-    const int cap = (num_elems <= 36 * 5120) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_f32_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -759,7 +771,7 @@ extern "C" int w34_tp2_gather_vocab_f16(
     }
     const int num_elems = num_rows * local_vocab_size;
     int blocks = (num_elems + 511) / 512;
-    const int cap = (num_elems <= 36 * 5120) ? w34_comm::kSmallMaxBlocks : w34_comm::kMaxBlocks;
+    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(

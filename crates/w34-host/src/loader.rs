@@ -1247,7 +1247,7 @@ impl ModelConfig {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "unsupported {method} 4-bit group_size={} (supported on sm_86 Marlin: 32, 64, 128)",
+                            "unsupported {method} 4-bit group_size={} (supported on sm_86/sm_89 Marlin: 32, 64, 128)",
                             if group_size == 0 {
                                 -1
                             } else {
@@ -1265,7 +1265,7 @@ impl ModelConfig {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "unsupported {method} 8-bit group_size={} (supported on sm_86 Marlin: 32, 64, 128{})",
+                            "unsupported {method} 8-bit group_size={} (supported on sm_86/sm_89 Marlin: 32, 64, 128{})",
                             if group_size == 0 {
                                 -1
                             } else {
@@ -1284,7 +1284,7 @@ impl ModelConfig {
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported {method} bit-width bits={bits} (supported on sm_86: 4-bit W4A16 or 8-bit W8A16)"
+                    "unsupported {method} bit-width bits={bits} (supported on sm_86/sm_89: 4-bit W4A16 or 8-bit W8A16)"
                 ),
             )),
         }
@@ -1311,7 +1311,7 @@ impl ModelConfig {
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported quantization method '{}' (RTX 3090 Ti sm_86 supports: unquantized FP16/BF16/FP32, compressed-tensors pack-quantized W4A16/W8A16, gptq/auto-round symmetric W4A16/W8A16, and awq gemm W4A16)",
+                    "unsupported quantization method '{}' (warp-34 sm_86/sm_89 supports: unquantized FP16/BF16/FP32, compressed-tensors pack-quantized W4A16/W8A16, gptq/auto-round symmetric W4A16/W8A16, and awq gemm W4A16)",
                     if raw_method.is_empty() {
                         "<missing quant_method>".to_string()
                     } else {
@@ -1329,7 +1329,7 @@ impl ModelConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported compressed-tensors format '{fmt}' (RTX 3090 Ti sm_86 requires weight-only 'pack-quantized' W4A16/W8A16; FP8/NVFP4/W8A8 are not supported)"
+                    "unsupported compressed-tensors format '{fmt}' (warp-34 sm_86/sm_89 requires weight-only 'pack-quantized' W4A16/W8A16; FP8/NVFP4/W8A8 are not supported)"
                 ),
             ));
         }
@@ -1343,7 +1343,7 @@ impl ModelConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported compressed-tensors sparsity format '{sp_fmt}' (sm_86 dense Marlin only)"
+                    "unsupported compressed-tensors sparsity format '{sp_fmt}' (sm_86/sm_89 dense Marlin only)"
                 ),
             ));
         }
@@ -1435,7 +1435,7 @@ impl ModelConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported compressed-tensors activation quantization in '{}' (sm_86 engine supports weight-only W4A16/W8A16)",
+                    "unsupported compressed-tensors activation quantization in '{}' (sm_86/sm_89 engine supports weight-only W4A16/W8A16)",
                     sanitize_diag(gk)
                 ),
             ));
@@ -1455,7 +1455,7 @@ impl ModelConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported compressed-tensors weights.type='{}' in '{}' (expected 'int'; FP8/FP4 are not native on sm_86)",
+                    "unsupported compressed-tensors weights.type='{}' in '{}' (expected 'int'; FP8/FP4 are not enabled on sm_86/sm_89)",
                     sanitize_diag(wtype),
                     sanitize_diag(gk)
                 ),
@@ -1650,7 +1650,7 @@ impl ModelConfig {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported auto-round act_bits={act_b} (sm_86 engine requires weight-only W4A16/W8A16 with act_bits >= 16)"
+                    "unsupported auto-round act_bits={act_b} (sm_86/sm_89 engine requires weight-only W4A16/W8A16 with act_bits >= 16)"
                 ),
             ));
         }
