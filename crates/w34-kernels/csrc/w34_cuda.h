@@ -147,6 +147,7 @@ int w34_memset_async(void* dst, int value, size_t bytes, uintptr_t stream);
 int w34_stream_create(uintptr_t* out_stream);
 int w34_stream_destroy(uintptr_t stream);
 int w34_stream_synchronize(uintptr_t stream);
+int w34_stream_set_persisting_l2_window(uintptr_t stream, const void* base_ptr, size_t num_bytes);
 
 int w34_event_create(uintptr_t* out_event, int enable_timing);
 int w34_event_destroy(uintptr_t event);

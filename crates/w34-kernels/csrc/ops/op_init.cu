@@ -250,6 +250,60 @@ extern "C" int w34_stream_synchronize(uintptr_t stream) {
     return (int)cudaStreamSynchronize((cudaStream_t)stream);
 }
 
+extern "C" int w34_stream_set_persisting_l2_window(
+    uintptr_t stream,
+    const void* base_ptr,
+    size_t num_bytes) {
+    if (stream == 0) return (int)cudaErrorInvalidValue;
+    if (base_ptr == nullptr || num_bytes == 0) {
+        cudaStreamAttrValue attr{};
+        attr.accessPolicyWindow.base_ptr = nullptr;
+        attr.accessPolicyWindow.num_bytes = 0;
+        attr.accessPolicyWindow.hitRatio = 0.0f;
+        attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+        attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+        (void)cudaStreamSetAttribute(
+            (cudaStream_t)stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+        (void)cudaGetLastError();
+        return 0;
+    }
+    w34_device_props props{};
+    int rc = w34_get_current_device_props(&props);
+    if (rc != 0) return rc;
+    // Only pin a persisting L2 window on architectures with >= 16 MiB persisting L2
+    // capacity (e.g. RTX 4090 sm_89 with 49.5 MiB persisting / 72 MiB total L2), leaving
+    // smaller L2 caches (e.g. RTX 3090 Ti sm_86 with 6 MiB L2) 100% available for streaming.
+    if (props.persisting_l2_max_bytes < 16 * 1024 * 1024) {
+        return 0;
+    }
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    int max_window_bytes = 0;
+    (void)cudaDeviceGetAttribute(&max_window_bytes, cudaDevAttrMaxAccessPolicyWindowSize, dev);
+    size_t limit_bytes = 16ULL * 1024ULL * 1024ULL;
+    if (max_window_bytes > 0 && (size_t)max_window_bytes < limit_bytes) {
+        limit_bytes = (size_t)max_window_bytes;
+    }
+    cudaError_t err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, limit_bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    size_t window_bytes = num_bytes < limit_bytes ? num_bytes : limit_bytes;
+    cudaStreamAttrValue attr{};
+    attr.accessPolicyWindow.base_ptr = const_cast<void*>(base_ptr);
+    attr.accessPolicyWindow.num_bytes = window_bytes;
+    attr.accessPolicyWindow.hitRatio = 1.0f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+    err = cudaStreamSetAttribute(
+        (cudaStream_t)stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+    }
+    return 0;
+}
+
 extern "C" int w34_event_create(uintptr_t* out_event, int enable_timing) {
     if (out_event == nullptr) return (int)cudaErrorInvalidValue;
     cudaEvent_t ev = nullptr;

@@ -415,16 +415,18 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     const int num_groups = (group_blocks == -1) ? 1 : (prob_k / groupsize);
 
     constexpr int stages = 4;
-    // When `(prob_n / 64) * 2 <= sms` and `prob_k >= 1024` (e.g. 4B `down_proj` [9728 -> 2560]
-    // and 35B-A3B MoE projections [2048..4096 -> 512..2048]), `mn_tiles <= 42` leaves 50-90% of
-    // the 84 SMs idle. Force `max_par = 1` + deterministic 2..4-slice Split-K across ALL
-    // `M = 1..16` with lock-based sequential reduction (no atomicAdd) so `M = 1..16` stay
-    // 0-ULP M-invariant!
-    // For wider `N` where `(prob_n / 64) * 2 > sms` (e.g. 27B `N = 5120 -> 80` tiles), 1-slice
-    // `cfg128 = {128, 64, 128}` already fills 80/84 SMs without Split-K reduction overhead.
+    // When `(prob_n / 64) * 2 <= sms` and `prob_k >= 1024`, `mn_tiles <= sms / 2` leaves
+    // 50-90% of the SMs idle. Force `max_par = 1` + deterministic 2..4-slice Split-K across
+    // ALL `M = 1..16` with lock-based sequential reduction (no atomicAdd) so `M = 1..16` stay
+    // 0-ULP M-invariant.
+    // Keep `N = 2560, K <= 4096` on 1-slice `{128, 64, 128}` so 4B golden parity is preserved
+    // across 84-SM (3090 Ti) and 128-SM (4090) GPUs while unlocking `N = 3072, K >= 2560`
+    // (e.g. 9B TP=2 `qkv` / `in_z` on 128 SMs).
+    const bool keep_2560_1slice = (prob_n == 2560 && prob_k <= 4096);
     const bool enable_m_invariant_split_k =
-        (prob_m <= 16) &&
+        (prob_m <= 16) && !keep_2560_1slice &&
         (((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
+         ((prob_n == 3072) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 2560)) ||
          ((prob_n >= 512) && (prob_n <= 2048) && (prob_k >= 1024) && (prob_k <= 2048)));
     // Scale wide-N (N > 4096) M-parallelism directly from the card's reported L2 cache size:
     // 16 (= 1024 M-rows) per 6 MiB of L2 cache so activations stay L2-resident across wide N

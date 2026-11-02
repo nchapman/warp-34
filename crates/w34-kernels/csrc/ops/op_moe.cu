@@ -95,6 +95,115 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
     return v;
 }
 
+// Specialized 1-warp (32-thread) register-only router for num_experts == 256 and top_k == 8
+// with 16-byte aligned uint4 load (1 transaction per thread) and winner-only rescan.
+__global__ void __launch_bounds__(32) moe_topk_router_256_k8_f16_kernel(
+    const __half* __restrict__ router_logits,
+    float* __restrict__ topk_weights,
+    int32_t* __restrict__ topk_ids,
+    int num_tokens,
+    int norm_topk_prob,
+    int scoring_func) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+
+    const int lane = threadIdx.x & 31;
+    const uint4* row_v4 = reinterpret_cast<const uint4*>(router_logits + (size_t)tok * 256);
+    const uint4 v = __ldg(&row_v4[lane]);
+    const __half* h = reinterpret_cast<const __half*>(&v);
+    const int base_e = lane * 8;
+
+    float p[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        p[i] = __half2float(h[i]);
+    }
+
+    if (scoring_func == 1) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            p[i] = 1.0f / (1.0f + expf(-p[i]));
+        }
+    } else {
+        float local_max = p[0];
+#pragma unroll
+        for (int i = 1; i < 8; ++i) {
+            local_max = fmaxf(local_max, p[i]);
+        }
+        const float max_val = warp_reduce_max(local_max);
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float ev = expf(p[i] - max_val);
+            p[i] = ev;
+            local_sum += ev;
+        }
+        const float sum_val = warp_reduce_sum(local_sum);
+        const float inv_sum = (sum_val > 0.0f) ? (1.0f / sum_val) : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            p[i] *= inv_sum;
+        }
+    }
+
+    float best_v = p[0];
+    int best_e = base_e;
+#pragma unroll
+    for (int i = 1; i < 8; ++i) {
+        if (p[i] > best_v) {
+            best_v = p[i];
+            best_e = base_e + i;
+        }
+    }
+
+    float w_sum = 0.0f;
+    float my_w = 0.0f;
+    int32_t my_id = 0;
+
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        float cur_v = best_v;
+        int cur_e = best_e;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, cur_v, off);
+            const int oe = __shfl_xor_sync(0xffffffffu, cur_e, off);
+            if (ov > cur_v || (ov == cur_v && oe < cur_e)) {
+                cur_v = ov;
+                cur_e = oe;
+            }
+        }
+        const float win_v = __shfl_sync(0xffffffffu, cur_v, 0);
+        const int win_e = __shfl_sync(0xffffffffu, cur_e, 0);
+        w_sum += win_v;
+        if (lane == k) {
+            my_w = win_v;
+            my_id = win_e;
+        }
+        if ((win_e >> 3) == lane && k < 7) {
+            best_v = -1.0f;
+            best_e = 256;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (base_e + i == win_e) {
+                    p[i] = -2.0f;
+                }
+                if (p[i] > best_v) {
+                    best_v = p[i];
+                    best_e = base_e + i;
+                }
+            }
+        }
+    }
+
+    if (lane < 8) {
+        const float scale = (norm_topk_prob != 0 && w_sum > 1e-12f) ? (1.0f / w_sum) : 1.0f;
+        topk_weights[(size_t)tok * 8 + lane] = my_w * scale;
+        topk_ids[(size_t)tok * 8 + lane] = my_id;
+    }
+}
+
 // Fast 1-warp (32-thread) register-only router for num_experts <= 256 and top_k <= 32.
 // Eliminates all shared memory and CTA barriers.
 __global__ void moe_topk_router_warp256_f16_kernel(
@@ -330,7 +439,7 @@ __global__ void moe_topk_router_f16_kernel(
 // gate_up_qzeros: [num_experts, (2 * n_interm) / 8, k_hidden / group_size] uint32_t (when HAS_ZP)
 // Grid: ((n_interm + 3) / 4, num_tokens * top_k), Block: 128 threads (4 warps).
 template <bool HAS_ZP = false>
-__global__ void moe_w4a16_gate_up_silu_f16_kernel(
+__global__ void __launch_bounds__(128, 8) moe_w4a16_gate_up_silu_f16_kernel(
     const __half* __restrict__ x,
     const uint32_t* __restrict__ gate_up_packed,
     const __half* __restrict__ gate_up_scales,
@@ -346,7 +455,7 @@ __global__ void moe_w4a16_gate_up_silu_f16_kernel(
     const int pair_idx = blockIdx.y;
     if (pair_idx >= num_tokens * top_k) return;
     const int tok = pair_idx / top_k;
-    const int expert_id = topk_ids[pair_idx];
+    const int expert_id = __ldg(&topk_ids[pair_idx]);
     if (expert_id < 0 || expert_id >= num_experts) return;
 
     const int lane = threadIdx.x & 31;
@@ -354,9 +463,12 @@ __global__ void moe_w4a16_gate_up_silu_f16_kernel(
     const int col = blockIdx.x * 4 + wid;
     if (col >= n_interm) return;
 
-    const int words_per_row = k_hidden / 8;
+    const int words_per_row = k_hidden >> 3;
+    const int words_per_group = group_size >> 3;
+    const int group_shift = ((words_per_group & (words_per_group - 1)) == 0)
+        ? (__ffs(words_per_group) - 1)
+        : -1;
     const int groups_per_row = (k_hidden + group_size - 1) / group_size;
-    const int words_per_group = group_size / 8;
     const int n_gate_up = 2 * n_interm;
 
     const __half* x_row = x + (size_t)tok * k_hidden;
@@ -374,12 +486,13 @@ __global__ void moe_w4a16_gate_up_silu_f16_kernel(
     float gate_acc = 0.0f;
     float up_acc = 0.0f;
 
+#pragma unroll 4
     for (int w = lane; w < words_per_row; w += 32) {
         const uint4 xv = __ldg(&x_vec4[w]);
         const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
         const uint32_t gw = __ldg(&gate_w[w]);
         const uint32_t uw = __ldg(&up_w[w]);
-        const int g_idx = w / words_per_group;
+        const int g_idx = (group_shift >= 0) ? (w >> group_shift) : (w / words_per_group);
         const __half2 gs_h2 = __half2half2(__ldg(&gate_s[g_idx]));
         const __half2 us_h2 = __half2half2(__ldg(&up_s[g_idx]));
         uint32_t g_zp = 8u;
@@ -423,8 +536,8 @@ __global__ void moe_w4a16_gate_up_silu_f16_kernel(
 // down_scales: [num_experts, k_hidden, n_interm / group_size] __half
 // down_qzeros: [num_experts, k_hidden / 8, n_interm / group_size] uint32_t (when HAS_ZP)
 // Grid: ((k_hidden + 3) / 4, num_tokens), Block: 128 threads (4 warps).
-template <bool HAS_ZP = false>
-__global__ void moe_w4a16_down_accum_f16_kernel(
+template <bool HAS_ZP = false, int FIXED_WORDS_PER_ROW = 0, int FIXED_TOP_K = 0>
+__global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
     const __half* __restrict__ interm_in,
     const uint32_t* __restrict__ down_packed,
     const __half* __restrict__ down_scales,
@@ -448,50 +561,98 @@ __global__ void moe_w4a16_down_accum_f16_kernel(
     const int out_col = blockIdx.x * 4 + wid;
     if (out_col >= k_hidden) return;
 
-    const int words_per_row = n_interm / 8;
+    const int words_per_row = (FIXED_WORDS_PER_ROW > 0) ? FIXED_WORDS_PER_ROW : (n_interm >> 3);
+    const int words_per_group = group_size >> 3;
+    const int group_shift = ((words_per_group & (words_per_group - 1)) == 0)
+        ? (__ffs(words_per_group) - 1)
+        : -1;
     const int groups_per_row = (n_interm + group_size - 1) / group_size;
-    const int words_per_group = group_size / 8;
 
     float total_sum = 0.0f;
 
-    for (int slot = 0; slot < top_k; ++slot) {
-        const int pair_idx = tok * top_k + slot;
-        const int expert_id = topk_ids[pair_idx];
-        if (expert_id < 0 || expert_id >= num_experts) continue;
-        const __half tw_h = __float2half_rn(topk_weights[pair_idx]);
+    if constexpr (FIXED_WORDS_PER_ROW > 0 && FIXED_TOP_K > 0) {
+#pragma unroll
+        for (int slot = 0; slot < FIXED_TOP_K; ++slot) {
+            const int pair_idx = tok * FIXED_TOP_K + slot;
+            const int expert_id = __ldg(&topk_ids[pair_idx]);
+            if (expert_id < 0 || expert_id >= num_experts) continue;
+            const __half tw_h = __float2half_rn(__ldg(&topk_weights[pair_idx]));
 
-        const uint4* x_vec4 = (const uint4*)(interm_in + (size_t)pair_idx * n_interm);
-        const size_t row_idx = (size_t)expert_id * k_hidden + out_col;
-        const uint32_t* dw_ptr = down_packed + row_idx * words_per_row;
-        const __half* ds_ptr = down_scales + row_idx * groups_per_row;
-        const uint32_t* zp_exp = HAS_ZP
-            ? (down_qzeros + (size_t)expert_id * (k_hidden >> 3) * groups_per_row)
-            : nullptr;
+            const uint4* x_vec4 = (const uint4*)(interm_in + (size_t)pair_idx * n_interm);
+            const size_t row_idx = (size_t)expert_id * k_hidden + out_col;
+            const uint32_t* dw_ptr = down_packed + row_idx * FIXED_WORDS_PER_ROW;
+            const __half* ds_ptr = down_scales + row_idx * groups_per_row;
+            const uint32_t* zp_exp = HAS_ZP
+                ? (down_qzeros + (size_t)expert_id * (k_hidden >> 3) * groups_per_row)
+                : nullptr;
 
-        float dot = 0.0f;
-        for (int w = lane; w < words_per_row; w += 32) {
-            const uint4 xv = __ldg(&x_vec4[w]);
-            const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
-            const uint32_t dw = __ldg(&dw_ptr[w]);
-            const int g_idx = w / words_per_group;
-            const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
-            uint32_t d_zp = 8u;
-            if constexpr (HAS_ZP) {
-                d_zp = load_zp_nibble(zp_exp, out_col, groups_per_row, g_idx);
-            }
+            float dot = 0.0f;
+#pragma unroll
+            for (int iter = 0; iter < (FIXED_WORDS_PER_ROW / 32); ++iter) {
+                const int w = lane + iter * 32;
+                const uint4 xv = __ldg(&x_vec4[w]);
+                const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
+                const uint32_t dw = __ldg(&dw_ptr[w]);
+                const int g_idx = (group_shift >= 0) ? (w >> group_shift) : (w / words_per_group);
+                const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
+                uint32_t d_zp = 8u;
+                if constexpr (HAS_ZP) {
+                    d_zp = load_zp_nibble(zp_exp, out_col, groups_per_row, g_idx);
+                }
 
 #pragma unroll
-            for (int p = 0; p < 4; ++p) {
-                const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
-                const __half2 dwh2 = HAS_ZP
-                    ? unpack_u4_zp_pair_scaled_h2(dw, p, d_zp, ds_h2)
-                    : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
-                dot += __low2float(dwh2) * __low2float(xh2);
-                dot += __high2float(dwh2) * __high2float(xh2);
+                for (int p = 0; p < 4; ++p) {
+                    const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
+                    const __half2 dwh2 = HAS_ZP
+                        ? unpack_u4_zp_pair_scaled_h2(dw, p, d_zp, ds_h2)
+                        : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
+                    dot += __low2float(dwh2) * __low2float(xh2);
+                    dot += __high2float(dwh2) * __high2float(xh2);
+                }
             }
+            dot = warp_reduce_sum(dot);
+            total_sum += __half2float(__hmul(__float2half_rn(dot), tw_h));
         }
-        dot = warp_reduce_sum(dot);
-        total_sum += __half2float(__hmul(__float2half_rn(dot), tw_h));
+    } else {
+        for (int slot = 0; slot < top_k; ++slot) {
+            const int pair_idx = tok * top_k + slot;
+            const int expert_id = __ldg(&topk_ids[pair_idx]);
+            if (expert_id < 0 || expert_id >= num_experts) continue;
+            const __half tw_h = __float2half_rn(__ldg(&topk_weights[pair_idx]));
+
+            const uint4* x_vec4 = (const uint4*)(interm_in + (size_t)pair_idx * n_interm);
+            const size_t row_idx = (size_t)expert_id * k_hidden + out_col;
+            const uint32_t* dw_ptr = down_packed + row_idx * words_per_row;
+            const __half* ds_ptr = down_scales + row_idx * groups_per_row;
+            const uint32_t* zp_exp = HAS_ZP
+                ? (down_qzeros + (size_t)expert_id * (k_hidden >> 3) * groups_per_row)
+                : nullptr;
+
+            float dot = 0.0f;
+            for (int w = lane; w < words_per_row; w += 32) {
+                const uint4 xv = __ldg(&x_vec4[w]);
+                const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
+                const uint32_t dw = __ldg(&dw_ptr[w]);
+                const int g_idx = (group_shift >= 0) ? (w >> group_shift) : (w / words_per_group);
+                const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
+                uint32_t d_zp = 8u;
+                if constexpr (HAS_ZP) {
+                    d_zp = load_zp_nibble(zp_exp, out_col, groups_per_row, g_idx);
+                }
+
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
+                    const __half2 dwh2 = HAS_ZP
+                        ? unpack_u4_zp_pair_scaled_h2(dw, p, d_zp, ds_h2)
+                        : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
+                    dot += __low2float(dwh2) * __low2float(xh2);
+                    dot += __high2float(dwh2) * __high2float(xh2);
+                }
+            }
+            dot = warp_reduce_sum(dot);
+            total_sum += __half2float(__hmul(__float2half_rn(dot), tw_h));
+        }
     }
 
     if (lane == 0) {
@@ -1545,7 +1706,10 @@ extern "C" int w34_moe_topk_router_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens == 0) return 0;
-    if (num_experts <= 256) {
+    if (num_experts == 256 && top_k == 8 && (((uintptr_t)router_logits & 15u) == 0u)) {
+        w34_moe::moe_topk_router_256_k8_f16_kernel<<<(unsigned)num_tokens, 32, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)router_logits, topk_weights, topk_ids, num_tokens, norm_topk_prob, scoring_func);
+    } else if (num_experts <= 256) {
         w34_moe::moe_topk_router_warp256_f16_kernel<<<(unsigned)num_tokens, 32, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)router_logits, topk_weights, topk_ids, num_tokens, num_experts, top_k,
             norm_topk_prob, scoring_func);
@@ -1673,10 +1837,22 @@ extern "C" int w34_moe_w4a16_down_accum_f16(
         return (int)cudaGetLastError();
     }
     dim3 grid((unsigned)((k_hidden + 3) / 4), (unsigned)num_tokens);
-    w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-        (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-        num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    if (n_interm == 256 && top_k == 8) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 32, 8><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else if (n_interm == 512 && top_k == 8) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 64, 8><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    }
     return (int)cudaGetLastError();
 }
 
@@ -1926,10 +2102,22 @@ extern "C" int w34_moe_w4a16_mlp_f16(
         (const __half*)x, gate_up_packed, (const __half*)gate_up_scales, nullptr, topk_ids,
         (__half*)interm_buf, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
     dim3 g2((unsigned)((k_hidden + 3) / 4), (unsigned)num_tokens);
-    w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<g2, 128, 0, st>>>(
-        (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-        (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-        num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    if (n_interm == 256 && top_k == 8) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 32, 8><<<g2, 128, 0, st>>>(
+            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else if (n_interm == 512 && top_k == 8) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 64, 8><<<g2, 128, 0, st>>>(
+            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<g2, 128, 0, st>>>(
+            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    }
     return (int)cudaGetLastError();
 }
 

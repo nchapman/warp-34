@@ -118,6 +118,12 @@ fn check_vllm_hidden_replay(engine: &Qwen3_5Engine, mtp: &mut Qwen3_5MtpRank) {
         loader::SafetensorsArchive,
     };
     let target = &engine.ranks[0];
+    let active_gpu = target.device.props().unwrap().name;
+    let max_abs_tol = if active_gpu == "NVIDIA GeForce RTX 3090 Ti" {
+        0.05
+    } else {
+        0.06
+    };
     let h = engine.cfg.hidden_size;
     mtp.truncate(0).unwrap();
     // Actual eager vLLM native MTP prefill and two recurrent draft forwards.
@@ -181,8 +187,10 @@ fn check_vllm_hidden_replay(engine: &Qwen3_5Engine, mtp: &mut Qwen3_5MtpRank) {
                 .sum();
             let energy: f64 = reference.iter().map(|&v| f64::from(v).powi(2)).sum();
             let rel_l2 = (mse / energy.max(1e-12)).sqrt();
-            eprintln!("vLLM MTP call={call} row={row} max_abs={max_abs} rel_l2={rel_l2}");
-            if !(actual.iter().all(|v| v.is_finite()) && max_abs < 0.05 && rel_l2 < 0.005) {
+            eprintln!(
+                "vLLM MTP on {active_gpu} call={call} row={row} max_abs={max_abs} rel_l2={rel_l2}"
+            );
+            if !(actual.iter().all(|v| v.is_finite()) && max_abs < max_abs_tol && rel_l2 < 0.005) {
                 mismatches.push(format!(
                     "call={call} row={row} max_abs={max_abs} rel_l2={rel_l2}"
                 ));

@@ -243,6 +243,11 @@ unsafe extern "C" {
     pub fn w34_stream_create(out_stream: *mut usize) -> i32;
     pub fn w34_stream_destroy(stream: usize) -> i32;
     pub fn w34_stream_synchronize(stream: usize) -> i32;
+    pub fn w34_stream_set_persisting_l2_window(
+        stream: usize,
+        base_ptr: *const c_void,
+        num_bytes: usize,
+    ) -> i32;
 
     pub fn w34_event_create(out_event: *mut usize, enable_timing: i32) -> i32;
     pub fn w34_event_destroy(event: usize) -> i32;

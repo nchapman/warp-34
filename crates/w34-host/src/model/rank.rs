@@ -458,6 +458,8 @@ impl Qwen3_5ModelRank {
 
         let mut weight_arena = DeviceArena::new(device_id, est_weight_bytes)?;
         let scratch_arena = DeviceArena::new(device_id, scratch_bytes)?;
+        let _ = stream
+            .set_persisting_l2_window(scratch_arena.allocation_base(), scratch_arena.capacity());
         let batch_meta_arena = DeviceArena::new(device_id, 16 * 1024 * 1024)?;
         let marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
         let repack_staging = DeviceBuffer::alloc(device_id, staging_bytes)?;

@@ -420,6 +420,36 @@ for t in sm_86 sm_90; do sed "s/^.target .*/.target $t/" tools/hw/feat.ptx > /tm
      - `op_collectives.cu` sizes `Signal` for `kMaxBlocks = 144` and clamps `tp2_block_cap` to `min(peer_sm_cap, cap)` so GPUs with `< 84` SMs (e.g. 82-SM RTX 3090, 80-SM RTX 4080 Super, 24-SM RTX 4060) never launch more spin-waiting CTAs than physical SMs, while 128-SM RTX 4090 and 142-SM L40S scale up to full SM count on large reductions.
      - `op_marlin.cu` and `model/rank.rs` size the Marlin tile-lock workspace to `sm_count * 64` ints, query the active device (`cudaGetDevice`), and scale wide-`N` `max_par` continuously from `l2_cache_bytes / (384 KiB)` (`[8, 128]`).
      - `op_gdn.cu` selects single-request recurrent prefill `ROWS` in `{4, 7, 8, 11}` by minimizing wave-quantized work `ceil(nh * v_tiles / sm_count) * ROWS` directly from the card's reported `sm_count`.
+4. **Live 2× RTX 4090 (`sm_89`) Empirical Findings & Kernel Tuning (`Passes 1–5`):**
+   - **Cold-DRAM vs L2-Resident Marlin Trap (`op_marlin.cu`):**
+     - Single-layer Marlin microbenchmarks (`<= 64 MiB` weight footprint) fit entirely inside the 4090's **`72 MiB` L2 cache** (`~2.8 TB/s` L2 BW), making 128-CTA `{128, 128, 256}` Split-K appear `28–38%` faster on wide shapes (`N = 5120`).
+     - In full-model inference (`4B` = `2.6 GB`, `9B` = `5.4 GB`, `27B` = `14.5 GB`), weights stream cold from GDDR6X (`1,008 GB/s`), where `80` CTAs of 1-slice `{128, 64, 128}` already saturate DRAM controllers without paying Split-K's global-memory partial-sum write/read traffic or spin-lock serialization.
+     - Conversely, for narrow `N` (`N <= 3072`, where `mn_tiles = N / 64 <= 48` CTAs cannot saturate DRAM with 1 slice), 2-slice `enable_m_invariant_split_k` (`80..96` CTAs) genuinely increases achieved DRAM bandwidth and speeds up real inference (`9B TP=2` decode `219.6 -> 230.0 tok/s`, `+4.7%`). Keeping `N = 2560, K <= 4096` on 1-slice preserves `128/128 (100.0%)` exact `4B` golden token parity across 3090 Ti (`84` SMs) and 4090 (`128` SMs).
+   - **Multi-CTA PCIe Pinned-Sysmem Collectives (`op_collectives.cu`):**
+     - Replacing thread-0-only peer flag polling with single-writer `barrier_epoch_release` + multi-warp read, buffering `v_reg` in registers instead of `24.7 KiB` shared memory (`SHARED: 128B`, `STACK:0 LOCAL:0`), launching `512` threads for `H >= 4096`, software-pipelining `tx_stage(stage + 1)` before `wait_stage(stage)`, and raising `tp2_block_cap` to `<= 16` CTAs cut `TP=2` collective latency by `-9%` to `-14%` across `H = 2048..5120` (`M = 1..16`) on both 2× 4090 (`5.75 -> 5.20 us` at `M=1, H=5120`; `24.48 -> 21.84 us` at `M=16, H=5120`) and 2× 3090 Ti (`3090 Ti` `35B-A3B TP=2` decode `268.2 -> 287.2 tok/s`, `+7.1%`; `27B TP=2` decode `89.3 -> 90.8 tok/s`, `+1.7%`).
+   - **35B-A3B Sparse MoE `M=1` Decode (`op_moe.cu`):**
+     - Adding `moe_topk_router_256_k8_f16_kernel` (`8` warps × `32` lanes = `256` experts in registers with warp-shuffle top-8 reduction, `1.73 us` vs `vLLM`'s `16.2 us` 2-stage router), plus `__launch_bounds__(128, 8)` (`64` regs/thread -> `8` blocks/SM = `32` warps/SM occupancy, `STACK:0 LOCAL:0`) and bitshift `w >> group_shift` in `moe_w4a16_gate_up_silu_f16_kernel` and `moe_w4a16_down_accum_f16_kernel<false, 32|64, 8>`, reduced 4090 `nsys` per-step MoE time by **`-11.4%`** on `35B TP=1` (`970.4 -> 859.5 us/step`) and **`-21.5%`** on `35B TP=2` (`719.2 -> 564.3 us/step`), lifting 4090 `35B-A3B` decode to **`242.4 tok/s`** (`TP=1`, `+6.1%`), **`308.4 tok/s`** (`TP=2`, `+9.7%`), and **`507.1 tok/s`** (`TP=2 MTP k=2`, `+6.5%`), and 3090 Ti `35B-A3B` decode to **`213.6 tok/s`** (`TP=1`, `+4.9%`), **`287.2 tok/s`** (`TP=2`, `+7.1%`), and **`466.4 tok/s`** (`TP=2 MTP k=2`).
+   - **Persisting L2 Cache Window (`op_init.cu`, `model/rank.rs`):**
+     - On GPUs with `persisting_l2_max_bytes >= 16 MiB` (RTX 4090 reports `51,904,512 B` = `49.5 MiB`; RTX 3090 Ti reports `4,718,592 B` = `4.5 MiB`), `w34_stream_set_persisting_l2_window` pins a `16 MiB` persisting L2 window (`hitRatio = 1.0`, `hitProp = cudaAccessPropertyPersisting`, `missProp = cudaAccessPropertyNormal`) on `scratch_arena` so hot decode/verify ping-pong hidden states and QKV/MoE scratch buffers remain L2-resident across weight-streaming GEMMs without thrashing `M=512` prefill activations (`missProp = Streaming` with `36 MiB` degraded `35B` prefill `4706 -> 4417 tok/s`; `missProp = Normal` with `16 MiB` keeps `35B TP=2` prefill at `4868 tok/s`).
+
+### 12.3 Measured 2× RTX 4090 (`sm_89`) vs 2× RTX 3090 Ti (`sm_86`) & `vLLM 0.31.0` / `SGLang v0.5.19` Oracles
+
+| Model & Config | `vLLM 0.31.0` / `SGLang v0.5.19` Oracle (`3090 Ti`) | `warp-34` `3090 Ti` (`sm_86`) Decode (`tok/s`) | `warp-34` `4090` (`sm_89`) Before (`tok/s`) | `warp-34` `4090` (`sm_89`) After (`tok/s`) | `warp-34` `4090` Prefill (`tok/s`) |
+|---|---:|---:|---:|---:|---:|
+| `Qwen3.5-4B` (`TP=1`) | `169.3` (`vLLM`) | `223.9` | `224.8` | **`226.4`** | **`11,291.0`** |
+| `Qwen3.5-4B` (`TP=1`, `MTP k=2`) | — | `344.2` | `353.3` | **`356.7`** | `5,152.3` |
+| `Qwen3.5-4B` (`TP=1`, `DFlash2 M=16`) | `462.6` (`SGLang`) | `647.5` | `805.2` | **`817.6`** | `9,340.7` |
+| `Qwen3.5-9B` (`TP=1`) | `102.7` (`vLLM`) | `134.9` | `136.4` | **`138.3`** | **`6,496.5`** |
+| `Qwen3.5-9B` (`TP=2`) | `120.2` (`vLLM`) | `211.7` | `219.6` | **`230.0`** | **`5,771.0`** |
+| `Qwen3.5-9B` (`TP=2`, `MTP k=2`) | — | `370.1` | `383.6` | **`400.7`** | `4,295.0` |
+| `Qwen3.8-27B` (`TP=1`) | OOM (`vLLM` FP16 KV) | `54.5` | `55.0` | **`55.1`** | **`2,608.0`** |
+| `Qwen3.8-27B` (`TP=1`, `MTP k=2`) | — | `88.7` | `93.8` | **`94.1`** | `1,510.7` |
+| `Qwen3.8-27B` (`TP=2`) | `57.2` (`vLLM`) | `90.8` | `91.2` | **`91.9`** | **`2,226.5`** |
+| `Qwen3.8-27B` (`TP=2`, `MTP k=2`) | — | `149.2` | `158.9` | **`159.9`** | `1,353.5` |
+| `Qwen3.8-27B` (`TP=2`, `DFlash2 M=8`) | `124.8` (`SGLang`) | `164.6` | `180.4` | **`182.0`** | `1,720.1` |
+| `Qwen3.6-35B-A3B MoE` (`TP=1`) | OOM (`vLLM` 1×24GB) | `213.6` | `228.5` | **`242.4`** | **`3,538.9`** |
+| `Qwen3.6-35B-A3B MoE` (`TP=2`) | `158.4` (`vLLM`) | `287.2` | `281.2` | **`308.4`** | **`4,868.4`** |
+| `Qwen3.6-35B-A3B MoE` (`TP=2`, `MTP k=2`) | `241.0` (`vLLM MTP`) | `466.4` | `476.3` | **`507.1`** | `2,713.6` |
 
 ---
 

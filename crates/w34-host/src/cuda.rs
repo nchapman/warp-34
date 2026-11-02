@@ -539,6 +539,26 @@ impl CudaStream {
             "w34_stream_wait_event",
         )
     }
+
+    pub fn set_persisting_l2_window(&self, base_ptr: u64, num_bytes: usize) -> Result<()> {
+        check_rc(
+            // SAFETY: selects the stream's owning device on the calling thread.
+            unsafe { ffi::w34_set_device(self.device_id) },
+            "w34_set_device",
+        )?;
+        check_rc(
+            // SAFETY: `self.handle` is a live `cudaStream_t` and `base_ptr` is a device allocation
+            // of at least `num_bytes` on `self.device_id` (or null when `num_bytes == 0`).
+            unsafe {
+                ffi::w34_stream_set_persisting_l2_window(
+                    self.handle,
+                    base_ptr as usize as *const c_void,
+                    num_bytes,
+                )
+            },
+            "w34_stream_set_persisting_l2_window",
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -548,6 +568,7 @@ impl Drop for CudaStream {
             // SAFETY: `self.handle` is non-zero and uniquely owned by `self`; device context is set first.
             unsafe {
                 let _ = ffi::w34_set_device(self.device_id);
+                let _ = ffi::w34_stream_set_persisting_l2_window(self.handle, std::ptr::null(), 0);
                 let _ = ffi::w34_stream_destroy(self.handle);
             }
         }

@@ -2495,11 +2495,15 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
         if ((short_split || (batch->total_tokens <= 32 && batch->max_seq_len > 1024 &&
             batch->max_blocks_per_req > 64)) &&
             ex->scratch_ptr != 0 && (ex->scratch_ptr & 15u) == 0u) {
+            const int max_short_splits = (batch->total_tokens <= 4) ? 8 : 4;
             int cand_splits =
-                short_split ? ((batch->max_seq_len <= 256) ? (batch->max_seq_len + 63) / 64 : 4) :
-                ((batch->max_blocks_per_req > 2048 && batch->total_tokens <= 2) ? 64 :
-                 (batch->max_blocks_per_req > 1024 && batch->total_tokens <= 4) ? 32 :
-                 (batch->total_tokens <= 8 ? 16 : (batch->total_tokens <= 16 ? 8 : 4)));
+                short_split
+                    ? (((batch->max_seq_len + 63) / 64 < max_short_splits)
+                           ? ((batch->max_seq_len + 63) / 64)
+                           : max_short_splits)
+                    : ((batch->max_blocks_per_req > 2048 && batch->total_tokens <= 2) ? 64 :
+                       (batch->max_blocks_per_req > 1024 && batch->total_tokens <= 4) ? 32 :
+                       (batch->total_tokens <= 8 ? 16 : (batch->total_tokens <= 16 ? 8 : 4)));
             if (short_split && batch->max_q_len == 1 && batch->total_tokens >= 6 &&
                 cand_splits > 2) {
                 cand_splits = 2;

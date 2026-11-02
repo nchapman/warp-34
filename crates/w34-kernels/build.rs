@@ -15,12 +15,23 @@ fn main() {
 
     let out = PathBuf::from(var("OUT_DIR").expect("OUT_DIR"));
     let cuda_home = var_os("CUDA_HOME")
+        .or_else(|| var_os("CUDA_PATH"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/opt/cuda".into());
+        .unwrap_or_else(|| {
+            let opt_cuda = PathBuf::from("/opt/cuda");
+            let usr_local_cuda = PathBuf::from("/usr/local/cuda");
+            if opt_cuda.join("bin/nvcc").exists() {
+                opt_cuda
+            } else if usr_local_cuda.join("bin/nvcc").exists() {
+                usr_local_cuda
+            } else {
+                opt_cuda
+            }
+        });
     let nvcc = cuda_home.join("bin/nvcc");
     assert!(
         nvcc.exists(),
-        "nvcc not found at {} (set CUDA_HOME or add /opt/cuda/bin to PATH)",
+        "nvcc not found at {} (set CUDA_HOME or install CUDA under /opt/cuda or /usr/local/cuda)",
         nvcc.display()
     );
 
@@ -133,6 +144,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=W34_ARCH");
     println!("cargo:rerun-if-env-changed=W34_NVCC_JOBS");
     println!("cargo:rerun-if-env-changed=W34_NVCC_EXTRA");

@@ -57,19 +57,21 @@ __device__ __forceinline__ void barrier_epoch_release(
     uint32_t* out_epoch) {
     __syncthreads();
     uint32_t epoch = self_sg->flag[blockIdx.x] + 1;
-    if (threadIdx.x < 2) {
-        Signal* target_sg = (threadIdx.x == 0) ? sig0 : sig1;
-        uint32_t* peer_counter = &target_sg->start[blockIdx.x][rank];
-        uint32_t* self_counter = &self_sg->start[blockIdx.x][threadIdx.x];
+    if (threadIdx.x == 0) {
+        // Only write to peer's Signal struct (`peer_sg->start[blockIdx.x][rank]`) and poll
+        // our own slot written by the peer (`self_sg->start[blockIdx.x][1 - rank]`).
+        // Writing to `self_sg->start[blockIdx.x][rank]` would dirty the same 128-byte host
+        // cache line that the peer GPU's PCIe Posted Write updates, causing a coherence
+        // bounce across the CPU root complex on every barrier.
+        Signal* peer_sg = (rank == 0) ? sig1 : sig0;
+        uint32_t* peer_counter = &peer_sg->start[blockIdx.x][rank];
+        uint32_t* self_counter = &self_sg->start[blockIdx.x][1 - rank];
         st_flag_release(peer_counter, epoch);
         while (static_cast<int32_t>(ld_flag_acquire(self_counter) - epoch) < 0) {
-            __nanosleep(128);
         }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
         self_sg->flag[blockIdx.x] = epoch;
     }
+    __syncthreads();
     *out_epoch = epoch;
 }
 
@@ -81,7 +83,9 @@ __device__ __forceinline__ float warp_reduce_sum_f32(float val) {
     return val;
 }
 
-__device__ __forceinline__ float block_reduce_sum_256(float val, float* s_warp) {
+template <int THREADS = 256>
+__device__ __forceinline__ float block_reduce_sum(float val, float* s_warp) {
+    constexpr int NUM_WARPS = THREADS / 32;
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     val = warp_reduce_sum_f32(val);
@@ -89,7 +93,7 @@ __device__ __forceinline__ float block_reduce_sum_256(float val, float* s_warp) 
         s_warp[wid] = val;
     }
     __syncthreads();
-    val = (threadIdx.x < 8) ? s_warp[lane] : 0.0f;
+    val = (threadIdx.x < NUM_WARPS) ? s_warp[lane] : 0.0f;
     if (wid == 0) {
         val = warp_reduce_sum_f32(val);
         if (lane == 0) {
@@ -165,8 +169,8 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
     }
 }
 
-template <int MAX_ITERS>
-__global__ void __launch_bounds__(256, 2) tp2_all_reduce_residual_gemma_rms_norm_f16_kernel(
+template <int THREADS, int MAX_ITERS>
+__global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_norm_f16_kernel(
     const __half* local_in,
     __half* ar_out,
     __half* __restrict__ residual,
@@ -207,38 +211,51 @@ __global__ void __launch_bounds__(256, 2) tp2_all_reduce_residual_gemma_rms_norm
     const int stage_rows = (num_tokens + num_stages - 1) / num_stages;
 
     __shared__ float s_warp[32];
-    __shared__ float s_v[MAX_ITERS * 256];
 
-    for (int stage = 0; stage < num_stages; ++stage) {
-        const int row_begin = stage * stage_rows;
-        int row_end = row_begin + stage_rows;
-        if (row_end > num_tokens) row_end = num_tokens;
-
+    auto tx_stage = [&](int st) {
+        const int rb = st * stage_rows;
+        int re = rb + stage_rows;
+        if (re > num_tokens) re = num_tokens;
         if (vec8) {
             const int vec_cols = hidden_size >> 3;
-            for (int row = row_begin + (int)blockIdx.x; row < row_end; row += (int)gridDim.x) {
+            for (int row = rb + (int)blockIdx.x; row < re; row += (int)gridDim.x) {
                 const uint4* src_v = reinterpret_cast<const uint4*>(local_in + (size_t)row * hidden_size);
                 uint4* dst_v = reinterpret_cast<uint4*>(my_s + (size_t)row * hidden_size);
 #pragma unroll
                 for (int k = 0; k < VEC_ITERS; ++k) {
-                    const int c = threadIdx.x + k * 256;
+                    const int c = threadIdx.x + k * THREADS;
                     if (c < vec_cols) {
                         dst_v[c] = src_v[c];
                     }
                 }
             }
         } else {
-            for (int row = row_begin + (int)blockIdx.x; row < row_end; row += (int)gridDim.x) {
+            for (int row = rb + (int)blockIdx.x; row < re; row += (int)gridDim.x) {
                 const __half* src_r = local_in + (size_t)row * hidden_size;
                 __half* dst_r = my_s + (size_t)row * hidden_size;
-                for (int c = threadIdx.x; c < hidden_size; c += 256) {
+                for (int c = threadIdx.x; c < hidden_size; c += THREADS) {
                     dst_r[c] = src_r[c];
                 }
             }
         }
+    };
+
+    tx_stage(0);
+
+    for (int stage = 0; stage < num_stages; ++stage) {
+        const int row_begin = stage * stage_rows;
+        int row_end = row_begin + stage_rows;
+        if (row_end > num_tokens) row_end = num_tokens;
 
         uint32_t epoch = 0;
         barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+
+        // Software-pipeline TX of `stage + 1` onto PCIe Posted Write queues immediately
+        // after `stage` barrier release so TX(stage + 1) overlaps in full duplex with
+        // RX(stage) non-posted reads across PCIe.
+        if (stage + 1 < num_stages) {
+            tx_stage(stage + 1);
+        }
 
         if (vec8) {
             const int vec_cols = hidden_size >> 3;
@@ -255,10 +272,11 @@ __global__ void __launch_bounds__(256, 2) tp2_all_reduce_residual_gemma_rms_norm
                     ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
                     : nullptr;
 
+                float v_reg[VEC_ITERS][8];
                 float sum_sq = 0.0f;
 #pragma unroll
                 for (int k = 0; k < VEC_ITERS; ++k) {
-                    const int c = threadIdx.x + k * 256;
+                    const int c = threadIdx.x + k * THREADS;
                     if (c < vec_cols) {
                         const uint4 lv = local_v[c];
                         const uint4 pv = peer_v[c];
@@ -285,7 +303,7 @@ __global__ void __launch_bounds__(256, 2) tp2_all_reduce_residual_gemma_rms_norm
                             }
                             sh[d] = __hadd(ar_h, res_old);
                             const float v = ar_hf + res_hf;
-                            s_v[base_i + d] = v;
+                            v_reg[k][d] = v;
                             sum_sq += v * v;
                         }
                         if (ar_v != nullptr) {
@@ -294,28 +312,26 @@ __global__ void __launch_bounds__(256, 2) tp2_all_reduce_residual_gemma_rms_norm
                         res_v[c] = sumv;
                     }
                 }
-                sum_sq = block_reduce_sum_256(sum_sq, s_warp);
+                sum_sq = block_reduce_sum<THREADS>(sum_sq, s_warp);
                 const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
 
 #pragma unroll
                 for (int k = 0; k < VEC_ITERS; ++k) {
-                    const int c = threadIdx.x + k * 256;
+                    const int c = threadIdx.x + k * THREADS;
                     if (c < vec_cols) {
                         const uint4 wv = weight_v[c];
                         const __half* wh = reinterpret_cast<const __half*>(&wv);
                         uint4 ov;
                         __half* oh = reinterpret_cast<__half*>(&ov);
-                        const int base_i = c << 3;
 #pragma unroll
                         for (int d = 0; d < 8; ++d) {
-                            const float v = s_v[base_i + d] * inv_rms;
+                            const float v = v_reg[k][d] * inv_rms;
                             const float w = 1.0f + __half2float(wh[d]);
                             oh[d] = __float2half(v * w);
                         }
                         out_v[c] = ov;
                     }
                 }
-                __syncthreads();
             }
         } else {
             for (int row = row_begin + (int)blockIdx.x; row < row_end; row += (int)gridDim.x) {
@@ -328,10 +344,11 @@ __global__ void __launch_bounds__(256, 2) tp2_all_reduce_residual_gemma_rms_norm
                     ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
                     : nullptr;
 
+                float v_scalar[MAX_ITERS];
                 float sum_sq = 0.0f;
 #pragma unroll
                 for (int k = 0; k < MAX_ITERS; k++) {
-                    const int i = threadIdx.x + k * 256;
+                    const int i = threadIdx.x + k * THREADS;
                     if (i < hidden_size) {
                         const float local_f = __half2float(local_row[i]);
                         const float peer_f = __half2float(peer_row[i]);
@@ -347,23 +364,22 @@ __global__ void __launch_bounds__(256, 2) tp2_all_reduce_residual_gemma_rms_norm
                         const __half sum_h = __hadd(ar_h, res_old);
                         res_row[i] = sum_h;
                         const float v = __half2float(ar_h) + __half2float(res_old);
-                        s_v[i] = v;
+                        v_scalar[k] = v;
                         sum_sq += v * v;
                     }
                 }
-                sum_sq = block_reduce_sum_256(sum_sq, s_warp);
+                sum_sq = block_reduce_sum<THREADS>(sum_sq, s_warp);
                 const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
 
 #pragma unroll
                 for (int k = 0; k < MAX_ITERS; k++) {
-                    const int i = threadIdx.x + k * 256;
+                    const int i = threadIdx.x + k * THREADS;
                     if (i < hidden_size) {
-                        const float v = s_v[i] * inv_rms;
+                        const float v = v_scalar[k] * inv_rms;
                         const float w = 1.0f + __half2float(weight[i]);
                         out_row[i] = __float2half(v * w);
                     }
                 }
-                __syncthreads();
             }
         }
     }
@@ -633,10 +649,13 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
     }
     if (num_tokens == 0) return 0;
     int blocks = num_tokens;
-    const int cap = w34_comm::tp2_block_cap(num_tokens <= 36);
+    // Cap blocks at 16 (`16 * 512 = 8192` threads across 16 CTAs easily saturates PCIe Gen4
+    // x4/x8 while avoiding 36..128-CTA host cache-line polling storms across the root complex).
+    int cap = w34_comm::tp2_block_cap(true);
+    if (cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (hidden_size <= 2560) {
-        w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<10>
+        w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>
             <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)local_in, (__half*)ar_out, (__half*)residual,
                 (const __half*)weight, (__half*)out,
@@ -644,7 +663,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
                 rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
     } else if (hidden_size <= 4096) {
-        w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<16>
+        w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>
             <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)local_in, (__half*)ar_out, (__half*)residual,
                 (const __half*)weight, (__half*)out,
@@ -652,16 +671,16 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
                 rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
     } else if (hidden_size <= 5120) {
-        w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<20>
-            <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+        w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>
+            <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)local_in, (__half*)ar_out, (__half*)residual,
                 (const __half*)weight, (__half*)out,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
                 rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
     } else {
-        w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<24>
-            <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+        w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>
+            <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)local_in, (__half*)ar_out, (__half*)residual,
                 (const __half*)weight, (__half*)out,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
@@ -789,6 +808,18 @@ extern "C" int w34_tp2_gather_vocab_f16(
 extern "C" int w34_tp2_warmup(void) {
     cudaFuncAttributes attr;
     cudaError_t err = cudaFuncGetAttributes(&attr, w34_comm::tp2_all_reduce_f16_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(
+        &attr, w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(
+        &attr, w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(
+        &attr, w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(
+        &attr, w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>);
     if (err != cudaSuccess) return (int)err;
     err = cudaFuncGetAttributes(&attr, w34_comm::tp2_all_gather_top1_f32_i32_kernel);
     if (err != cudaSuccess) return (int)err;
