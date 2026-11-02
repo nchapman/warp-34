@@ -451,6 +451,31 @@ for t in sm_86 sm_90; do sed "s/^.target .*/.target $t/" tools/hw/feat.ptx > /tm
 | `Qwen3.6-35B-A3B MoE` (`TP=2`) | `158.4` (`vLLM`) | `287.2` | `281.2` | **`308.4`** | **`4,868.4`** |
 | `Qwen3.6-35B-A3B MoE` (`TP=2`, `MTP k=2`) | `241.0` (`vLLM MTP`) | `466.4` | `476.3` | **`507.1`** | `2,713.6` |
 
+### 12.4 Live 2× RTX 4090 `nsys` Per-Step Category Breakdown (`µs/step`, 64 Decode Steps)
+
+| Config (`2× RTX 4090`, Rank 0 `µs/step`) | Marlin | MoE | Collectives (`TP=2`) | GEMV (`in_proj_ba` / `lm_head`) | GDN | Paged Attn (`TQ4`) | Norm / RoPE / SiLU | DFlash / `cuBLAS` | Total GPU `µs/step` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `4B TP=1` | `1,942.5` | — | — | `272.6` | `414.5` | `94.7` | `270.4` | — | `3,004.7` |
+| `4B TP=1 DFlash2 (M=16)` | `2,052.1` | — | — | `266.8` | `645.7` | `156.9` | `395.9` | `2,798.7` | `6,343.6` (`/round`) |
+| `9B TP=1` | `3,855.7` | — | — | `303.6` | `471.7` | `115.6` | `293.0` | — | `5,050.2` |
+| `9B TP=2` | `1,882.2` | — | `437.4` | `283.7` | `316.9` | `97.0` | `227.6` | — | `3,254.2` |
+| `27B TP=1` | `9,114.2` | — | — | `584.7` | `1,151.1` | `317.7` | `529.3` | — | `11,717.0` |
+| `27B TP=2` | `5,505.8` | — | `911.0` | `575.4` | `679.7` | `227.5` | `442.7` | — | `8,359.7` |
+| `35B-A3B TP=1` (Before → After) | `903.4` → **`891.5`** | `970.4` → **`859.5`** (`-11.4%`) | — | `384.6` → **`377.4`** | `460.0` → **`452.9`** | `113.0` → **`110.5`** | `268.2` → **`264.6`** | — | `3,109.7` → **`2,966.1`** |
+| `35B-A3B TP=2` (Before → After) | `488.3` → **`477.1`** | `719.2` → **`564.3`** (`-21.5%`) | `536.2` → **`509.1`** (`-5.1%`) | `376.4` → **`368.1`** | `331.4` → **`319.9`** | `95.6` → **`92.9`** | `238.9` → **`232.9`** | — | `2,794.7` → **`2,572.9`** |
+| `35B-A3B TP=2 MTP (k=2)` (Before → After) | `541.5` → **`537.5`** | `1,358.2` → **`1,236.2`** (`-9.0%`) | `572.1` → **`546.8`** (`-4.4%`) | `395.9` → **`383.8`** | `512.0` → **`507.6`** | `124.2` → **`111.7`** | `289.2` → **`283.1`** | — | `3,803.6` → **`3,617.0`** (`/round`) |
+
+### 12.5 Roofline Assessment & Future `sm_89`-Specific Opportunities
+
+1. **Dense `M=1` Decode Is at the `1,008 GB/s` GDDR6X Roofline:**
+   - Because RTX 4090 and RTX 3090 Ti share the exact same `384-bit @ 21 Gbps` (`1,008 GB/s`) GDDR6X memory bus, single-request `M=1` dense decode (`27B TP=1` at `55.1 tok/s` streaming `14.5 GB`/token, `9B TP=1` at `138.3 tok/s` streaming `5.4 GB`/token, `4B TP=1` at `226.4 tok/s` streaming `2.6 GB`/token) already achieves `~85–90%` of effective DRAM bandwidth (`~930 GB/s` inside the Marlin GEMMs).
+   - Where 4090 pulls ahead by `1.26×–1.72×` over 3090 Ti is whenever work becomes compute-bound, L2-resident, or multi-CTA occupancy-sensitive: **prefill (`M=512`)** (`11,291 tok/s` on `4B`, `6,496 tok/s` on `9B`, `4,868 tok/s` on `35B TP=2`), **speculative verification (`M=3..16`)** (`817.6 tok/s` on `4B DFlash2`, `507.1 tok/s` on `35B TP=2 MTP`, `400.7 tok/s` on `9B TP=2 MTP`, `182.0 tok/s` on `27B TP=2 DFlash2`), and **sparse MoE decode** (`308.4 tok/s` on `35B TP=2`, `242.4 tok/s` on `35B TP=1`).
+2. **Untapped `sm_89`-Only Hardware Opportunities (Future Passes):**
+   - **Native Ada `FP8` (`e4m3` / `e5m2`) Tensor Core MMA (`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` — `330.3 TFLOPS` FP32-acc on 4090):**
+     - `sm_86` lacks hardware `FP8`, whereas `sm_89` provides `2×` Tensor Core throughput (`330.3 TF` vs `165.2 TF` FP16/BF16) and `0.5×` weight bandwidth in `FP8`. Quantizing the 5-layer `DFlash2` drafter from `BF16` (`cuBLAS`, `2,798.7 µs/round` on `4B`) to `FP8` (`W8A8-FP8` or `W4A8-FP8`) on `sm_89` would cut drafter latency in half, pushing `4B DFlash2` past `~950+ tok/s` and `27B DFlash2` past `~200+ tok/s`, and accelerating `M >= 64` prefill.
+   - **Multi-Token `m_e in {2, 3}` Register-Broadcast Sparse MoE GEMV (`op_moe.cu`):**
+     - During `35B-A3B` speculative verify (`M=3` for `MTP k=2`), `MoE` takes `1,236.2 µs/round` (vs `564.3 µs/step` at `M=1`) because with `M=3 × top-8 = 24` expert assignments across `256` experts, most active experts receive `m_e = 1` or `2` tokens (falling below the `m_e >= 4` `mma.sync` tile threshold and streaming weights per token row). A specialized `m_e in {2, 3}` warp-per-expert GEMV that loads each expert's packed `int32` weight once into registers and multiplies against `2` or `3` token activation vectors simultaneously would save `~200–250 µs/round` on `35B-A3B MTP` (`507 -> ~550+ tok/s`).
+
 ---
 
 ## Source index
