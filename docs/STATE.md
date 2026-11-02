@@ -195,9 +195,15 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
     single-request recurrent prefill with direct wave-cost minimization
     (`ceil(nh * v_tiles / sm_count) * ROWS`) over `ROWS` in `{4, 7, 8, 11}`
     using the card's reported `sm_count`.
-  - Updated `phase4_dflash.rs` `actual_sglang_full_model_hidden_parity` to
-    enforce 0-ULP on the provenance capture GPU (`RTX 3090 Ti`) and
-    `relL2 < 1e-4` when `cuBLAS` runs on a different 30/40-series GPU.
+  - Updated `phase4_dflash.rs` `actual_sglang_full_model_hidden_parity` and
+    `vision_linear_bias.rs` `linear_bias_patch_shape_strict_reduction` to
+    enforce 0-ULP on the provenance capture GPU (`RTX 3090 Ti`) and strict
+    floating-point bounds (`relL2 < 1e-4` / `max_abs < 0.005`) when `cuBLAS`
+    executes on a different 30/40-series GPU; updated `prepare_execution_plan`
+    to warm all 4 GDN `ROWS` templates (`{4, 7, 8, 11}`) via
+    `sms / {3, 4, 5}` plus `_strided` GDN/norm entrypoints, and updated
+    `tools/oracle/vision_norm_probe.py` + `build_vision_fa2_probe.sh` to build
+    `sm_86 + sm_89` fatbinaries.
 - Quantization and model-loading audit (`loader.rs`, `model/weights.rs`,
   `model/rank.rs`, `mtp.rs`, `dflash.rs`, `tests/quant_formats.rs`):
   - Fixed `marlin_permute_scales_k_by_n` and `RawLinearHost::upload` when

@@ -1502,6 +1502,24 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
     check_rc(
         unsafe {
+            ffi::w34_rms_norm_gated_silu_strided_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                core::ptr::null(),
+                1,
+                2,
+                128,
+                256,
+                1e-6,
+            )
+        },
+        "warmup w34_rms_norm_gated_silu_strided_f16",
+    )?;
+    check_rc(
+        unsafe {
             ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
                 &ex,
                 buf_a as *const c_void,
@@ -2078,6 +2096,25 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
     check_rc(
         unsafe {
+            ffi::w34_gdn_causal_conv1d_strided_f16(
+                &ex,
+                &gdn_batch,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                core::ptr::null(),
+                buf_c as *mut c_void,
+                buf_d as *mut c_void,
+                384,
+                384,
+                4,
+                1,
+                1,
+            )
+        },
+        "warmup w34_gdn_causal_conv1d_strided_f16",
+    )?;
+    check_rc(
+        unsafe {
             ffi::w34_gdn_recurrent_f16(
                 &ex,
                 &gdn_batch,
@@ -2100,7 +2137,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_gdn_recurrent_f16 decode",
     )?;
-    let gdn_ws_wide = arena.alloc_aligned(2 * 1024 * 1024)?;
+    let gdn_ws_wide = arena.alloc_aligned(4 * 1024 * 1024)?;
     check_rc(
         unsafe {
             ffi::w34_gdn_recurrent_f16(
@@ -2131,10 +2168,19 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         total_tokens: 3,
         ..gdn_batch
     };
-    for num_v_heads in [1i32, 24, 32] {
+    let sms = dev_props.multi_processor_count.max(1);
+    for num_v_heads in [
+        1i32,
+        (sms / 5).clamp(1, 48),
+        (sms / 4).clamp(1, 48),
+        (sms / 3).clamp(1, 48),
+        16,
+        24,
+        32,
+    ] {
         check_rc(
             unsafe {
-                ffi::w34_gdn_recurrent_f16(
+                ffi::w34_gdn_recurrent_strided_f16(
                     &ex,
                     &gdn_batch_prefill,
                     gdn_ws_wide as *const c_void,
@@ -2151,10 +2197,11 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                     128,
                     num_v_heads,
                     128,
+                    num_v_heads,
                     1,
                 )
             },
-            "warmup w34_gdn_recurrent_f16 prefill",
+            "warmup w34_gdn_recurrent_strided_f16 prefill",
         )?;
     }
     let q_start_wy = arena.upload_slice(&[0i32, 256], &stream)?;

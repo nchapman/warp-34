@@ -271,10 +271,26 @@ fn linear_bias_patch_shape_strict_reduction() {
     let mut out = vec![0u16; 1200 * 1152];
     c.copy_to_host(&mut out, &stream).unwrap();
     stream.synchronize().unwrap();
-    assert_eq!(
-        out.iter().filter(|&&bits| bits != 0).count(),
-        0,
-        "all outputs must exactly match native F.linear (+0); first bits: {:#06x}",
-        out[0]
-    );
+    let gpu_name = dev.props().unwrap().name;
+    if gpu_name == "NVIDIA GeForce RTX 3090 Ti" {
+        assert_eq!(
+            out.iter().filter(|&&bits| bits != 0).count(),
+            0,
+            "all outputs must exactly match native F.linear (+0) on 3090 Ti; first bits: {:#06x}",
+            out[0]
+        );
+    } else {
+        // On other GPUs (e.g. 128-SM RTX 4090), cuBLAS may choose a different FP32 split-K
+        // tile where partial sums retain the 1536 * 2^-20 ~= 0.001465 term, whereas broken
+        // reduced-precision FP16 reduction produces 0.5 (0x3800).
+        let max_abs = out
+            .iter()
+            .map(|&bits| w34_host::cuda::f16_to_f32(bits).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 0.005,
+            "FP32 reduction check failed on {gpu_name}: max_abs={max_abs} (first bits: {:#06x})",
+            out[0]
+        );
+    }
 }
