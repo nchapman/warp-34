@@ -56,7 +56,7 @@ pub use weights::*;
 #[path = "model_scratch.rs"]
 mod model_scratch;
 
-type LayerScratchAddrs = ([u64; 6], [u64; 5], [u64; 10], u64);
+type LayerScratchAddrs = ([u64; 6], [u64; 5], [u64; 10], [u64; 3], [u64; 7], u64);
 
 /// Reserve one high-water region; all offsets within a phase remain disjoint.
 /// Main-stream ordering separates FA/GDN from FFN and subsequent layers. GDN's
@@ -69,7 +69,8 @@ fn alloc_layer_scratch(
     tp: usize,
     tokens: usize,
 ) -> Result<LayerScratchAddrs> {
-    let (bytes, fa_offsets, gdn_offsets, ffn_offsets) = layer_scratch_layout(cfg, tp, tokens)?;
+    let (bytes, fa_offsets, gdn_offsets, ffn_offsets, ple_hc_offsets, qsa_offsets) =
+        layer_scratch_layout(cfg, tp, tokens)?;
     let base = arena.alloc_aligned(bytes)?;
     let overlay_end = base
         .checked_add(bytes as u64)
@@ -78,6 +79,8 @@ fn alloc_layer_scratch(
         fa_offsets.map(|o| base + o as u64),
         gdn_offsets.map(|o| base + o as u64),
         ffn_offsets.map(|o| o.map_or(0, |o| base + o as u64)),
+        ple_hc_offsets.map(|o| base + o as u64),
+        qsa_offsets.map(|o| base + o as u64),
         overlay_end,
     ))
 }
@@ -93,6 +96,11 @@ fn layer_scratch_layout(
     }
     let overflow = || loader_err("layer scratch layout overflow");
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
+    let moe = if cfg.is_qwen4_exp() {
+        cfg.moe_intermediate_size
+    } else {
+        cfg.moe_intermediate_size / tp
+    };
     model_scratch::layer_layout(
         model_scratch::Dimensions {
             q: mul(cfg.num_attention_heads / tp, cfg.head_dim)?,
@@ -103,9 +111,11 @@ fn layer_scratch_layout(
             interm: cfg.intermediate_size / tp,
             experts: cfg.num_experts,
             top_k: cfg.num_experts_per_tok,
-            moe: cfg.moe_intermediate_size / tp,
+            moe,
             shared: cfg.shared_expert_intermediate_size / tp,
             hidden: cfg.hidden_size,
+            hc_count: cfg.hc_count,
+            indexer_head_dim: cfg.indexer_head_dim,
         },
         tokens,
     )

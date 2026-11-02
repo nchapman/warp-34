@@ -69,6 +69,7 @@ impl Qwen3_5ModelRank {
             unsafe { ffi::w34_graph_begin_capture(stream_handle) },
             "w34_graph_begin_capture",
         )?;
+        self.is_capturing_graph = true;
         let res = self.forward_device_batches(
             tok_ptr,
             pos_ptr,
@@ -81,6 +82,7 @@ impl Qwen3_5ModelRank {
             0,
             None,
         );
+        self.is_capturing_graph = false;
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
         // SAFETY: pair the successful begin with end even if the forward returned
@@ -176,6 +178,7 @@ impl Qwen3_5ModelRank {
             unsafe { ffi::w34_graph_begin_capture(stream_handle) },
             "w34_graph_begin_capture (spec_verify)",
         )?;
+        self.is_capturing_graph = true;
         let res = self.forward_selected_rows_device(
             tok_ptr,
             pos_ptr,
@@ -187,6 +190,7 @@ impl Qwen3_5ModelRank {
             Some(out_ids_ptr),
             true,
         );
+        self.is_capturing_graph = false;
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
         // SAFETY: pair the successful begin with end even if the forward returned
@@ -288,6 +292,7 @@ impl Qwen3_5ModelRank {
             unsafe { ffi::w34_graph_begin_capture(stream_handle) },
             "w34_graph_begin_capture (batched_decode)",
         )?;
+        self.is_capturing_graph = true;
         let emit_device_greedy = sample_mode == DecodeGraphSampleMode::PlainGreedy;
         let res = self
             .forward_selected_rows_device(
@@ -332,6 +337,7 @@ impl Qwen3_5ModelRank {
                 }
                 Ok(v)
             });
+        self.is_capturing_graph = false;
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
         // SAFETY: pair the successful begin with end even if the forward returned

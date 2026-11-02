@@ -256,74 +256,14 @@ __global__ void qsa_select_blocks_f16_kernel(
 
     const float scale = rsqrtf((float)head_dim);
     // Compressed length ends at the last completed 4-token group before or at token_pos.
-    const int num_comp_groups = token_pos / 4;
+    const int num_comp_groups = (token_pos + 1) / 4;
     const int num_full_comp_blocks = num_comp_groups / 4;
     const int rem_comp_groups = num_comp_groups % 4;
 
-    // Pass 1: Compute per-head log-sum-exp over all valid compressed groups 0..num_comp_groups.
-    // Warp 0..3 handles blocks in parallel (4 warps in blockDim=128).
     const int wid = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int num_warps = blockDim.x >> 5;
-
-    float m_h[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
-    float d_h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-
     const int total_comp_blocks = num_full_comp_blocks + ((rem_comp_groups > 0) ? 1 : 0);
-    for (int b = wid; b < total_comp_blocks; b += num_warps) {
-        const int32_t phys_page = req_block_table[b];
-        if (phys_page < 0) continue;
-        const int c_limit = (b < num_full_comp_blocks) ? 4 : rem_comp_groups;
-        for (int c = 0; c < c_limit; ++c) {
-            const __half* ck = comp_k_cache + ((size_t)phys_page * 4 + c) * head_dim;
-            float dot_h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const int col = lane + i * 32;
-                const float kv = __half2float(ck[col]);
-                dot_h[0] += s_q[0][col] * kv;
-                dot_h[1] += s_q[1][col] * kv;
-                dot_h[2] += s_q[2][col] * kv;
-                dot_h[3] += s_q[3][col] * kv;
-            }
-#pragma unroll
-            for (int h = 0; h < 4; ++h) {
-                const float logit = qsa_warp_reduce_sum(dot_h[h]) * scale;
-                const float m_new = fmaxf(m_h[h], logit);
-                d_h[h] = d_h[h] * expf(m_h[h] - m_new) + expf(logit - m_new);
-                m_h[h] = m_new;
-            }
-        }
-    }
-
-    __shared__ float s_m[8][4];
-    __shared__ float s_d[8][4];
-    __shared__ float s_lse[4];
-    if (lane == 0) {
-#pragma unroll
-        for (int h = 0; h < 4; ++h) {
-            s_m[wid][h] = m_h[h];
-            s_d[wid][h] = d_h[h];
-        }
-    }
-    __syncthreads();
-
-    if (threadIdx.x < 4) {
-        const int h = threadIdx.x;
-        float m_all = -FLT_MAX;
-        float d_all = 0.0f;
-        for (int w = 0; w < num_warps; ++w) {
-            const float mw = s_m[w][h];
-            const float dw = s_d[w][h];
-            if (dw > 0.0f) {
-                const float m_new = fmaxf(m_all, mw);
-                d_all = d_all * expf(m_all - m_new) + dw * expf(mw - m_new);
-                m_all = m_new;
-            }
-        }
-        s_lse[h] = (d_all > 0.0f) ? (m_all + logf(d_all)) : 0.0f;
-    }
-    __syncthreads();
 
     // Candidate middle blocks are in [mid_start, mid_end).
     const int mid_start = (sink_blocks < num_valid_blocks) ? sink_blocks : num_valid_blocks;
@@ -352,7 +292,6 @@ __global__ void qsa_select_blocks_f16_kernel(
             const int32_t phys_page = req_block_table[b];
             const int c_limit = (b < num_full_comp_blocks) ? 4 : rem_comp_groups;
             if (phys_page >= 0 && c_limit > 0) {
-                float max_logit[4] = {-FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
                 for (int c = 0; c < c_limit; ++c) {
                     const __half* ck = comp_k_cache + ((size_t)phys_page * 4 + c) * head_dim;
                     float dot_h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -365,14 +304,15 @@ __global__ void qsa_select_blocks_f16_kernel(
                         dot_h[2] += s_q[2][col] * kv;
                         dot_h[3] += s_q[3][col] * kv;
                     }
+                    float group_score = 0.0f;
 #pragma unroll
                     for (int h = 0; h < 4; ++h) {
-                        const float logit = qsa_warp_reduce_sum(dot_h[h]) * scale;
-                        max_logit[h] = fmaxf(max_logit[h], logit);
+                        const float logit = qsa_warp_reduce_sum(dot_h[h]);
+                        group_score += fmaxf(logit, 0.0f);
                     }
+                    group_score *= scale;
+                    blk_score = fmaxf(blk_score, group_score);
                 }
-                blk_score = expf(max_logit[0] - s_lse[0]) + expf(max_logit[1] - s_lse[1]) +
-                            expf(max_logit[2] - s_lse[2]) + expf(max_logit[3] - s_lse[3]);
             }
         }
         if (lane == 0) {

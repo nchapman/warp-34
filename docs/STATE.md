@@ -12,6 +12,19 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## `Qwen/Qwen3.8-Flash-Next` (`qwen4_exp` / `Qwen4ExpForConditionalGeneration`) on 1× and 2× RTX 3090 Ti
+
+- Implemented end-to-end native support for `Qwen/Qwen3.8-Flash-Next` (`model_type: "qwen4_exp"`, `Qwen4ExpForConditionalGeneration`) across 1× RTX 3090 Ti (`TP=1`) and 2× RTX 3090 Ti (`TP=2 / EP=2`), documented in [`QWEN_FLASH_NEXT.md`](QWEN_FLASH_NEXT.md):
+  - **`QF-0` (Config, Hub, `PleMmapTable`, `CapacityPlanner`)**: Extended `ModelConfig` and `hub::files` for `qwen4_exp`, AutoRound + FP8 `PLE` hybrid checkpoints (`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`), zero-copy 128-shard `PleMmapTable` (`49.68 GiB` `F8_E4M3` mmap + prime-modulo `splitmix64` bigram/trigram hashing), and `QwenFlashNextCapacityPlan` for `TP=1` and `TP=2 / EP=2`.
+  - **`QF-1` (`HyperConnection`, `PLE`, `QSA` CUDA Kernels)**: Added `op_hc.cu` (`w34_hc_expand_streams_f16`, `w34_hc_rmsnorm_f16`, `w34_hc_down_silu_inject_f16`, `w34_hc_mix_streams_f16`, `w34_hc_combine_streams_f16`, `w34_qwen4_mtp_broadcast_add_f16`), `op_ple.cu` (`w34_ple_dequant_fp8_to_f16`, `w34_ple_grouped_gemma_rmsnorm_f16`, `w34_ple_gate_scale_f16`, `w34_ple_short_conv_f16`), and `op_qsa.cu` (`w34_qsa_pre_index_norm_rope_f16`, `w34_qsa_update_index_k_cache_f16`, `w34_qsa_select_blocks_f16`, `w34_qsa_paged_attention_f16`).
+  - **`QF-2` (Tiered 512-Expert MoE Offloading)**: Added `op_moe.cu` and `crates/w34-host/src/moe_offload.rs` supporting 512 routed + 1 shared expert per layer across 48 layers (`HostExpertStore` with parallel in-place `[K/8, N] -> [N, K/8]` transpose and `HostPackStorage::Mapped`/`Heap`, `HotExpertCache` VRAM slots, device-side `w34_moe_lru_resolve` + zero-copy PCIe UVA fallback decode, CPU/PCIe hybrid decode, and double-buffered async H2D streamed prefill across `TP=1` and `TP=2 / EP=2`).
+  - **`QF-3` (48-Layer `Qwen4Exp` Spine, `StateBundlePool`, `KvPool`, `MambaRadixCache`, `CUDAGraphRunner`)**: Assembled the 48-layer `3:1` `GDN:QSA` spine with `PLE` (`ple_conv_state_buf` + `ple_history_tokens` in `StateBundlePool`, `qsa_raw_k_buf` + `qsa_comp_k_buf` in `KvPool`), `MambaRadixCache` prefix reuse, and CUDA Graph capture/replay. Verified on `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`:
+    - `TP=1` (1× RTX 3090 Ti): `26.9–30.1 tok/s` decode (`" Paris, which is also the largest city in the country..."`), `MambaRadixCache` 64-token prefix reuse bit-identical (`1543.00 ms -> 347.32 ms` TTFT).
+    - `TP=2 / EP=2` (2× RTX 3090 Ti): `41.95–42.31 tok/s` decode (`20.81 ms` TTFT), `MambaRadixCache` 64-token prefix reuse bit-identical (`654.10 ms -> 21.49 ms` TTFT, matching `TP=1` token-for-token `ids=[760, 6511, 314, 9338, 369, 760, 6511, 314]`).
+  - **`QF-4` (Native `Qwen4` `MTP` Speculative Decoding)**: Implemented `Qwen4MtpSubsystems` and `forward_qwen4_inner` in `crates/w34-host/src/mtp.rs` with dual-stream `residual_linear_shared` (`pre_fc_norm_embedding` + `fc_embedding` + `pre_fc_norm_hidden` `[hc_count * H]` + `fc_hidden` + `w34_qwen4_mtp_broadcast_add_f16`), 1-layer `HC + QSA + MoE + final_hc_mixer`, and QSA step-0 top-k block index reuse (`skip_topk = step > 0`), verified losslessly on `TP=1` and `TP=2 / EP=2` in `crates/w34-host/tests/qwen4_flash_next.rs`.
+
+---
+
 ## Public GitHub publication and Git LFS
 
 - Public repository: https://github.com/nchapman/warp-34 (`origin`, `main`).

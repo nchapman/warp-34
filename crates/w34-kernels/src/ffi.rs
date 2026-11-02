@@ -381,6 +381,20 @@ unsafe extern "C" {
         eps: f32,
     ) -> i32;
 
+    pub fn w34_rms_norm_gated_sigmoid_strided_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        z: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        num_v_heads: i32,
+        head_dim: i32,
+        z_token_stride: i32,
+        eps: f32,
+    ) -> i32;
+
     pub fn w34_fused_qk_rmsnorm_rope_gate_f16(
         ex: *const W34Exec,
         q_gate_in: *const c_void,
@@ -1371,6 +1385,16 @@ unsafe extern "C" {
         hidden_size: i32,
     ) -> i32;
 
+    pub fn w34_qwen4_mtp_broadcast_add_f16(
+        ex: *const W34Exec,
+        fc_embed: *const c_void,
+        fc_hidden: *const c_void,
+        out_multi_hidden: *mut c_void,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+    ) -> i32;
+
     pub fn w34_ple_dequant_f8_to_f16(
         ex: *const W34Exec,
         f8_in: *const u8,
@@ -1501,6 +1525,33 @@ unsafe extern "C" {
         dst_f16: *mut c_void,
         src_f16: *const c_void,
         num_elems: i64,
+    ) -> i32;
+
+    pub fn w34_moe_gpu_lru_update_and_pull(
+        ex: *const W34Exec,
+        global_topk_ids: *const i32,
+        expert_to_slot: *mut i32,
+        slot_to_expert: *mut i32,
+        slot_last_used: *mut u64,
+        step_counter: *mut u64,
+        remapped_topk_ids: *mut i32,
+        miss_local_experts: *mut i32,
+        miss_victim_slots: *mut i32,
+        num_misses_buf: *mut i32,
+        mapped_host_packs: *const c_void,
+        gate_up_packed_base: *mut u32,
+        gate_up_scales_base: *mut c_void,
+        down_packed_base: *mut u32,
+        down_scales_base: *mut c_void,
+        total_pairs: i32,
+        global_expert_offset: i32,
+        local_num_experts: i32,
+        k_hot: i32,
+        max_misses: i32,
+        pack_stride_bytes: usize,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
     ) -> i32;
 }
 

@@ -206,6 +206,11 @@ int w34_rms_norm_gated_silu_strided_f16(const w34_exec* ex, const void* x, const
                                         const uint8_t* valid_token_mask,
                                         int num_tokens, int num_v_heads, int head_dim,
                                         int z_token_stride, float eps);
+int w34_rms_norm_gated_sigmoid_strided_f16(const w34_exec* ex, const void* x, const void* z,
+                                           const void* weight, void* out,
+                                           const uint8_t* valid_token_mask,
+                                           int num_tokens, int num_v_heads, int head_dim,
+                                           int z_token_stride, float eps);
 
 int w34_fused_qk_rmsnorm_rope_gate_f16(
     const w34_exec* ex,
@@ -663,6 +668,9 @@ int w34_hc_combine_f16(const w34_exec* ex, const void* residual_in, const void* 
                        const float* inject_weights, const void* ple_delta,
                        void* residual_out, const uint8_t* valid_token_mask,
                        int num_tokens, int hc_count, int hidden_size);
+int w34_qwen4_mtp_broadcast_add_f16(const w34_exec* ex, const void* fc_embed,
+                                    const void* fc_hidden, void* out_multi_hidden,
+                                    int num_tokens, int hc_count, int hidden_size);
 
 int w34_ple_dequant_f8_to_f16(const w34_exec* ex, const uint8_t* f8_in, void* f16_out,
                               const uint8_t* valid_token_mask, int num_tokens,
@@ -721,6 +729,16 @@ int w34_moe_remap_topk_ids_i32(const w34_exec* ex, const int32_t* global_topk_id
 // Source and destination must be disjoint and 4-byte aligned (half2).
 int w34_add_inplace_f16(const w34_exec* ex, void* dst_f16, const void* src_f16,
                         int64_t num_elems);
+int w34_moe_gpu_lru_update_and_pull(
+    const w34_exec* ex, const int32_t* global_topk_ids, int32_t* expert_to_slot,
+    int32_t* slot_to_expert, uint64_t* slot_last_used, uint64_t* step_counter,
+    int32_t* remapped_topk_ids, int32_t* miss_local_experts,
+    int32_t* miss_victim_slots, int32_t* num_misses_buf,
+    const void* mapped_host_packs, uint32_t* gate_up_packed_base,
+    void* gate_up_scales_base, uint32_t* down_packed_base,
+    void* down_scales_base, int total_pairs, int global_expert_offset,
+    int local_num_experts, int k_hot, int max_misses,
+    size_t pack_stride_bytes, int n_interm, int k_hidden, int group_size);
 
 #ifdef __cplusplus
 }

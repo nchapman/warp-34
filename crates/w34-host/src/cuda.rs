@@ -1541,6 +1541,24 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
     check_rc(
         unsafe {
+            ffi::w34_rms_norm_gated_sigmoid_strided_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                core::ptr::null(),
+                1,
+                2,
+                128,
+                256,
+                1e-6,
+            )
+        },
+        "warmup w34_rms_norm_gated_sigmoid_strided_f16",
+    )?;
+    check_rc(
+        unsafe {
             ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
                 &ex,
                 buf_a as *const c_void,
@@ -3231,6 +3249,20 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
     check_rc(
         unsafe {
+            ffi::w34_qwen4_mtp_broadcast_add_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                4,
+                128,
+            )
+        },
+        "warmup w34_qwen4_mtp_broadcast_add_f16",
+    )?;
+    check_rc(
+        unsafe {
             ffi::w34_ple_dequant_f8_to_f16(
                 &ex,
                 buf_a as *const u8,
@@ -3393,6 +3425,37 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     check_rc(
         unsafe { ffi::w34_add_inplace_f16(&ex, buf_c as *mut c_void, buf_a as *const c_void, 128) },
         "warmup w34_add_inplace_f16",
+    )?;
+    check_rc(
+        unsafe {
+            ffi::w34_moe_gpu_lru_update_and_pull(
+                &ex,
+                zero_i32 as *const i32,
+                buf_c as *mut i32,
+                (buf_c + 256) as *mut i32,
+                (buf_c + 512) as *mut u64,
+                (buf_c + 1024) as *mut u64,
+                (buf_c + 1280) as *mut i32,
+                (buf_c + 1536) as *mut i32,
+                (buf_c + 1792) as *mut i32,
+                (buf_c + 2048) as *mut i32,
+                buf_a as *const c_void,
+                buf_b as *mut u32,
+                (buf_b + 16384) as *mut c_void,
+                (buf_b + 32768) as *mut u32,
+                (buf_b + 49152) as *mut c_void,
+                1,
+                0,
+                16,
+                8,
+                1,
+                28672,
+                128,
+                128,
+                128,
+            )
+        },
+        "warmup w34_moe_gpu_lru_update_and_pull",
     )?;
 
     dev.synchronize()

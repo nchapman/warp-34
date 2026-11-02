@@ -35,6 +35,9 @@ impl Qwen3_5Engine {
                 st.conv_state.zero_async(&r.stream)?;
                 st.ssm_state.zero_async(&r.stream)?;
             }
+            if let Some(ple_st) = &r.state_pool.ple_conv_state {
+                ple_st.zero_async(&r.stream)?;
+            }
             r.stream.synchronize()?;
         }
         Ok(())
@@ -176,6 +179,20 @@ impl Qwen3_5Engine {
         if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
             r0.device.make_current()?;
+            if r0.cfg.is_qwen4_exp() {
+                r0.stage_ple_f8_for_batch(
+                    tokens,
+                    &q_start,
+                    &st_in_arr,
+                    &st_out_arr,
+                    &has_init_arr,
+                    &[],
+                    0,
+                    &[],
+                    &[],
+                    0,
+                )?;
+            }
             let tok_dev = DeviceBuffer::alloc(r0.device.device_id, num_tokens * 4)?;
             let pos_dev = DeviceBuffer::alloc(r0.device.device_id, pos_host.len() * 4)?;
             let q_start_dev = DeviceBuffer::alloc(r0.device.device_id, 8)?;
@@ -282,6 +299,20 @@ impl Qwen3_5Engine {
                 let d0_ref = &mut dump0;
                 let h0 = sc.spawn(move || -> Result<(i32, f32, [i32; 5], [f32; 5])> {
                     r0.device.make_current()?;
+                    if r0.cfg.is_qwen4_exp() {
+                        r0.stage_ple_f8_for_batch(
+                            tokens,
+                            &q_start,
+                            &st_in_arr,
+                            &st_out_arr,
+                            &has_init_arr,
+                            &[],
+                            0,
+                            &[],
+                            &[],
+                            0,
+                        )?;
+                    }
                     let tok_dev = DeviceBuffer::alloc(r0.device.device_id, num_tokens * 4)?;
                     let pos_dev = DeviceBuffer::alloc(r0.device.device_id, pos_slice.len() * 4)?;
                     let q_start_dev = DeviceBuffer::alloc(r0.device.device_id, 8)?;
@@ -374,6 +405,20 @@ impl Qwen3_5Engine {
                 let c1 = comm.clone();
                 let h1 = sc.spawn(move || -> Result<(f32, [i32; 5], [f32; 5])> {
                     r1.device.make_current()?;
+                    if r1.cfg.is_qwen4_exp() {
+                        r1.stage_ple_f8_for_batch(
+                            tokens,
+                            &q_start,
+                            &st_in_arr,
+                            &st_out_arr,
+                            &has_init_arr,
+                            &[],
+                            0,
+                            &[],
+                            &[],
+                            0,
+                        )?;
+                    }
                     let tok_dev = DeviceBuffer::alloc(r1.device.device_id, num_tokens * 4)?;
                     let pos_dev = DeviceBuffer::alloc(r1.device.device_id, pos_slice.len() * 4)?;
                     let q_start_dev = DeviceBuffer::alloc(r1.device.device_id, 8)?;
@@ -516,6 +561,22 @@ impl Qwen3_5Engine {
         let seq_arr = [seq_after as i32];
         let slot_arr = [write_slot];
         let st_arr = [state_slot];
+        if self.cfg.is_qwen4_exp() {
+            for r in &mut self.ranks {
+                r.stage_ple_f8_for_batch(
+                    &tok_arr,
+                    &[0, 1],
+                    &st_arr,
+                    &st_arr,
+                    &[1u8],
+                    &[],
+                    0,
+                    &[],
+                    &[],
+                    0,
+                )?;
+            }
+        }
 
         if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];

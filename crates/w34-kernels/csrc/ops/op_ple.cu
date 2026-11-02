@@ -107,7 +107,8 @@ __global__ void ple_dilated_conv1d_f16_kernel(
             : hist[SPAN + t - 9];
 
         const float acc = w0 * v_lag9 + w1 * v_lag6 + w2 * v_lag3 + w3 * v_lag0;
-        key_out[(size_t)(q_start + t) * conv_dim + d] = __float2half(acc);
+        const float silu_acc = acc / (1.0f + expf(-acc));
+        key_out[(size_t)(q_start + t) * conv_dim + d] = __float2half(silu_acc);
 
         if (batch.spec_state_indices != nullptr && batch.max_verify_tokens > 0 &&
             t < batch.max_verify_tokens && conv_state_pool != nullptr) {
@@ -121,6 +122,29 @@ __global__ void ple_dilated_conv1d_f16_kernel(
                         ? __half2float(key_in[(size_t)(q_start + pos) * conv_dim + d])
                         : hist[SPAN + pos];
                     dst_state[s] = __float2half(sv);
+                }
+            }
+        }
+        if (batch.checkpoint_dst_indices != nullptr && batch.checkpoint_token_offsets != nullptr &&
+            batch.max_checkpoints_per_req > 0 && conv_state_pool != nullptr) {
+            for (int e = 0; e < batch.max_checkpoints_per_req; ++e) {
+                const int trig_off =
+                    batch.checkpoint_token_offsets[req * batch.max_checkpoints_per_req + e];
+                if (trig_off == t + 1) {
+                    const int chk_slot =
+                        batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
+                    if (chk_slot >= 0) {
+                        __half* dst_state =
+                            conv_state_pool + ((size_t)chk_slot * conv_dim + d) * SPAN;
+#pragma unroll
+                        for (int s = 0; s < SPAN; ++s) {
+                            const int pos = (t + 1) - SPAN + s;
+                            const float sv = (pos >= 0)
+                                ? __half2float(key_in[(size_t)(q_start + pos) * conv_dim + d])
+                                : hist[SPAN + pos];
+                            dst_state[s] = __float2half(sv);
+                        }
+                    }
                 }
             }
         }
@@ -140,9 +164,9 @@ __global__ void ple_dilated_conv1d_f16_kernel(
 }
 
 // Signed-sqrt sigmoid gating over [num_tokens, hc_count, embed_dim]:
-//   prod = norm_query[tok, s, d] * norm_key[tok, s, d]
-//   gate = sigmoid(sign(prod) * sqrt(|prod| + 1e-6))
-//   ple_delta[tok, s, d] = gate * value[tok, d]
+//   dot[tok, s] = sum_{d=0..embed_dim-1} (norm_query[tok, s, d] * norm_key[tok, s, d]) / sqrt(embed_dim)
+//   gate[tok, s] = sigmoid(sign(dot[tok, s]) * sqrt(max(|dot[tok, s]|, eps)))
+//   ple_delta[tok, s, d] = gate[tok, s] * value[tok, d]
 __global__ void ple_signed_sqrt_gate_f16_kernel(
     const __half* __restrict__ norm_query,
     const __half* __restrict__ norm_key,
@@ -169,19 +193,61 @@ __global__ void ple_signed_sqrt_gate_f16_kernel(
     const __half* k_tok = norm_key + stream_base;
     const __half* v_tok = value_in + (size_t)tok * embed_dim;
 
+    float dot_s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            if (s < hc_count) {
+                const size_t idx = (size_t)s * embed_dim + d;
+                dot_s[s] += __half2float(q_tok[idx]) * __half2float(k_tok[idx]);
+            }
+        }
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int num_warps = blockDim.x >> 5;
+    __shared__ float s_warp[8][4];
+    __shared__ float s_gate[4];
+
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        float v = dot_s[s];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, offset);
+        }
+        if (lane == 0) {
+            s_warp[wid][s] = v;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 4) {
+        const int s = threadIdx.x;
+        if (s < hc_count) {
+            float sum = 0.0f;
+            for (int w = 0; w < num_warps; ++w) {
+                sum += s_warp[w][s];
+            }
+            const float dot = sum * rsqrtf((float)embed_dim);
+            const float sign_d = (dot > 0.0f) ? 1.0f : ((dot < 0.0f) ? -1.0f : 0.0f);
+            const float clamped = fmaxf(fabsf(dot), eps);
+            const float logit = sign_d * sqrtf(clamped);
+            s_gate[s] = 1.0f / (1.0f + expf(-logit));
+        } else {
+            s_gate[s] = 0.0f;
+        }
+    }
+    __syncthreads();
+
     for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
         const float val = __half2float(v_tok[d]);
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
             if (s < hc_count) {
                 const size_t idx = (size_t)s * embed_dim + d;
-                const float q = __half2float(q_tok[idx]);
-                const float k = __half2float(k_tok[idx]);
-                const float prod = q * k;
-                const float sign_p = (prod > 0.0f) ? 1.0f : ((prod < 0.0f) ? -1.0f : 0.0f);
-                const float logit = sign_p * sqrtf(fabsf(prod) + eps);
-                const float gate = 1.0f / (1.0f + expf(-logit));
-                dst_tok[idx] = __float2half(gate * val);
+                dst_tok[idx] = __float2half(s_gate[s] * val);
             }
         }
     }

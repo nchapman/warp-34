@@ -815,6 +815,7 @@ pub struct ModelConfig {
     pub indexer_head_dim: usize,
     pub indexer_budget: usize,
     pub indexer_compress_ratio: usize,
+    pub output_gate_type: String,
 }
 
 impl ModelConfig {
@@ -1383,6 +1384,13 @@ impl ModelConfig {
             decision_temperature: get_f64("decision_temperature").or_else(|| dc_f64("temperature")),
         };
 
+        let output_gate_type = tc
+            .get("output_gate_type")
+            .or_else(|| root.get("output_gate_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("silu")
+            .to_string();
+
         Ok(Self {
             architectures,
             model_type,
@@ -1437,6 +1445,7 @@ impl ModelConfig {
             indexer_head_dim,
             indexer_budget,
             indexer_compress_ratio,
+            output_gate_type,
         })
     }
 

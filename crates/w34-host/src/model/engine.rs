@@ -176,9 +176,25 @@ impl Qwen3_5Engine {
                 .saturating_add(crate::clef::ClefJointHeadGpu::reserved_rank0_headroom_bytes(head));
         }
 
+        let qwen4_shared = if cfg.is_qwen4_exp() {
+            let ple_abs_id = cfg.ple_layer_ids.first().copied().unwrap_or(2);
+            let ple_layer_idx = ple_abs_id.saturating_sub(1);
+            let ple_hasher = Arc::new(
+                crate::ple::PleNgramHasher::from_archive(&archive, &cfg, ple_layer_idx, 0)
+                    .map_err(|e| loader_err_ctx("PleNgramHasher::from_archive", e.to_string()))?,
+            );
+            let ple_mmap_table = Arc::new(
+                crate::ple::PleMmapTable::open(&archive, &cfg, ple_layer_idx)
+                    .map_err(|e| loader_err_ctx("PleMmapTable::open", e.to_string()))?,
+            );
+            Some((ple_hasher, ple_mmap_table))
+        } else {
+            None
+        };
+
         let mut ranks = Vec::with_capacity(tp_size);
         for r in 0..tp_size {
-            let rank_model = Qwen3_5ModelRank::load_rank_with_capacity(
+            let mut rank_model = Qwen3_5ModelRank::load_rank_with_capacity(
                 &archive,
                 &cfg,
                 r,
@@ -187,6 +203,9 @@ impl Qwen3_5Engine {
                 kv_policy,
                 rank_capacity,
             )?;
+            if let Some((ref hasher, ref table)) = qwen4_shared {
+                rank_model.init_qwen4_subsystems(&archive, hasher.clone(), table.clone())?;
+            }
             ranks.push(rank_model);
         }
         if ranks.len() > 1 {

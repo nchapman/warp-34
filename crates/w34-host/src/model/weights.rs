@@ -1419,6 +1419,13 @@ impl RawLinearHost {
 }
 
 #[cfg(feature = "cuda")]
+pub struct QsaIndexerWeights {
+    pub index_qk_proj: LinearProj,
+    pub q_layernorm_ptr: u64,
+    pub k_layernorm_ptr: u64,
+}
+
+#[cfg(feature = "cuda")]
 pub struct FullAttentionLayerWeights {
     pub layer_id: usize,
     pub kv_layer_ordinal: usize,
@@ -1426,6 +1433,264 @@ pub struct FullAttentionLayerWeights {
     pub o_proj: LinearProj,
     pub q_norm_ptr: u64,
     pub k_norm_ptr: u64,
+    pub qsa_indexer: Option<QsaIndexerWeights>,
+}
+
+#[cfg(feature = "cuda")]
+pub struct HcBlockWeights {
+    pub hc_norm_ptr: u64,
+    pub input_mix_weight_down: LinearProj,
+    pub input_mix_weight_up: LinearProj,
+    pub block_inject_weight: Option<LinearProj>,
+}
+
+#[cfg(feature = "cuda")]
+impl HcBlockWeights {
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_mix(
+        &self,
+        ex: &W34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        hc_residual_buf: u64,
+        out_mixed_buf: u64,
+        hc_inj_weights_buf: u64,
+        ple_buf_a: u64,
+        ple_buf_b: u64,
+        ple_val_buf: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        hc_lowrank: usize,
+        h_dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let low_dim = hc_lowrank;
+        let hc_down_buf = ple_val_buf;
+        let hc_inj_raw_buf = ple_val_buf + (num_tokens * low_dim * 2) as u64;
+        crate::ple::gpu_ops::hc_rmsnorm_f16(
+            ex,
+            hc_residual_buf,
+            self.hc_norm_ptr,
+            ple_buf_a,
+            0,
+            num_tokens,
+            hc_count,
+            h_dim,
+            eps,
+        )?;
+        self.input_mix_weight_down.forward(
+            ex,
+            cublas,
+            marlin_ws_ptr,
+            marlin_ws_ints,
+            ple_buf_a,
+            hc_down_buf,
+            num_tokens,
+        )?;
+        let (inj_raw_ptr, inj_w_ptr) = if let Some(inj_proj) = &self.block_inject_weight {
+            inj_proj.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_buf_a,
+                hc_inj_raw_buf,
+                num_tokens,
+            )?;
+            (hc_inj_raw_buf, hc_inj_weights_buf)
+        } else {
+            (0, 0)
+        };
+        crate::ple::gpu_ops::hc_down_silu_inject_f16(
+            ex,
+            hc_down_buf,
+            hc_down_buf,
+            inj_raw_ptr,
+            inj_w_ptr,
+            0,
+            num_tokens,
+            low_dim,
+            hc_count,
+        )?;
+        self.input_mix_weight_up.forward(
+            ex,
+            cublas,
+            marlin_ws_ptr,
+            marlin_ws_ints,
+            hc_down_buf,
+            ple_buf_b,
+            num_tokens,
+        )?;
+        crate::ple::gpu_ops::hc_mix_streams_f16(
+            ex,
+            ple_buf_a,
+            ple_buf_b,
+            out_mixed_buf,
+            0,
+            num_tokens,
+            hc_count,
+            h_dim,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_combine(
+        &self,
+        ex: &W34Exec,
+        block_out_buf: u64,
+        hc_inj_weights_buf: u64,
+        hc_residual_buf: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        h_dim: usize,
+    ) -> Result<()> {
+        crate::ple::gpu_ops::hc_combine_f16(
+            ex,
+            hc_residual_buf,
+            block_out_buf,
+            hc_inj_weights_buf,
+            0,
+            hc_residual_buf,
+            0,
+            num_tokens,
+            hc_count,
+            h_dim,
+        )
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct PleLayerWeights {
+    pub key_proj: LinearProj,
+    pub value_proj: LinearProj,
+    pub norm_key_ptr: u64,
+    pub norm_query_ptr: u64,
+    pub norm_conv_ptr: u64,
+    pub conv1d_weight_ptr: u64,
+    pub weight_scale: f32,
+}
+
+#[cfg(feature = "cuda")]
+impl PleLayerWeights {
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        ex: &W34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        ple_f8_staging_ptr: u64,
+        hc_residual_buf: u64,
+        normed_buf: u64,
+        ple_buf_a: u64,
+        ple_buf_b: u64,
+        ple_val_buf: u64,
+        ple_conv_state_ptr: u64,
+        gdn_batch: &ffi::W34GdnBatch,
+        num_tokens: usize,
+        hc_count: usize,
+        h_dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        let total_dim = hc_count * h_dim;
+        crate::ple::gpu_ops::ple_dequant_f8_to_f16(
+            ex,
+            ple_f8_staging_ptr,
+            ple_val_buf,
+            0,
+            num_tokens,
+            h_dim,
+            self.weight_scale,
+        )?;
+        self.key_proj.forward(
+            ex,
+            cublas,
+            marlin_ws_ptr,
+            marlin_ws_ints,
+            ple_val_buf,
+            ple_buf_a,
+            num_tokens,
+        )?;
+        self.value_proj.forward(
+            ex,
+            cublas,
+            marlin_ws_ptr,
+            marlin_ws_ints,
+            ple_val_buf,
+            normed_buf,
+            num_tokens,
+        )?;
+        crate::ple::gpu_ops::hc_rmsnorm_f16(
+            ex,
+            ple_buf_a,
+            self.norm_key_ptr,
+            ple_buf_a,
+            0,
+            num_tokens,
+            hc_count,
+            h_dim,
+            eps,
+        )?;
+        crate::ple::gpu_ops::hc_rmsnorm_f16(
+            ex,
+            hc_residual_buf,
+            self.norm_query_ptr,
+            ple_buf_b,
+            0,
+            num_tokens,
+            hc_count,
+            h_dim,
+            eps,
+        )?;
+        crate::ple::gpu_ops::ple_signed_sqrt_gate_f16(
+            ex, ple_buf_b, ple_buf_a, normed_buf, ple_buf_a, 0, num_tokens, hc_count, h_dim, 1e-6,
+        )?;
+        check_rc(
+            // SAFETY: hc_residual_buf and ple_buf_a each hold num_tokens * total_dim FP16 elements.
+            unsafe {
+                ffi::w34_add_inplace_f16(
+                    ex,
+                    hc_residual_buf as *mut c_void,
+                    ple_buf_a as *const c_void,
+                    (num_tokens * total_dim) as i64,
+                )
+            },
+            "w34_add_inplace_f16 (ple gated_value)",
+        )?;
+        crate::ple::gpu_ops::hc_rmsnorm_f16(
+            ex,
+            ple_buf_a,
+            self.norm_conv_ptr,
+            ple_buf_b,
+            0,
+            num_tokens,
+            hc_count,
+            h_dim,
+            eps,
+        )?;
+        crate::ple::gpu_ops::ple_dilated_conv1d_f16(
+            ex,
+            ple_buf_b,
+            self.conv1d_weight_ptr,
+            ple_conv_state_ptr,
+            ple_buf_a,
+            gdn_batch,
+            total_dim,
+        )?;
+        check_rc(
+            // SAFETY: hc_residual_buf and ple_buf_a each hold num_tokens * total_dim FP16 elements.
+            unsafe {
+                ffi::w34_add_inplace_f16(
+                    ex,
+                    hc_residual_buf as *mut c_void,
+                    ple_buf_a as *const c_void,
+                    (num_tokens * total_dim) as i64,
+                )
+            },
+            "w34_add_inplace_f16 (ple conv_out)",
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1487,12 +1752,27 @@ pub struct MoeLayerWeights {
 }
 
 #[cfg(feature = "cuda")]
+pub struct TieredMoeLayerWeights {
+    pub layer_id: usize,
+    pub router_gate: LinearProj,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub norm_topk_prob: bool,
+    pub scoring_func: i32,
+    pub shared_gate_up_proj: Option<LinearProj>,
+    pub shared_down_proj: Option<LinearProj>,
+    pub shared_expert_gate: Option<LinearProj>,
+    pub local_shared_interm: usize,
+}
+
+#[cfg(feature = "cuda")]
 pub enum FfnBlockWeights {
     Dense {
         gate_up_proj: LinearProj,
         down_proj: LinearProj,
     },
     Moe(Box<MoeLayerWeights>),
+    TieredMoe(Box<TieredMoeLayerWeights>),
 }
 
 #[cfg(feature = "cuda")]
@@ -1823,6 +2103,82 @@ impl FfnBlockWeights {
                         )
                     }
                 }
+            }
+            Self::TieredMoe(tmoe) => {
+                tmoe.router_gate.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    normed_buf,
+                    moe_router_logits_buf,
+                    num_tokens,
+                )?;
+                check_rc(
+                    // SAFETY: router projection precedes this on ex.stream.
+                    unsafe {
+                        ffi::w34_moe_topk_router_f16(
+                            ex,
+                            moe_router_logits_buf as *const c_void,
+                            moe_topk_weights_buf as *mut f32,
+                            moe_topk_ids_buf as *mut i32,
+                            num_tokens as i32,
+                            tmoe.num_experts as i32,
+                            tmoe.top_k as i32,
+                            i32::from(tmoe.norm_topk_prob),
+                            tmoe.scoring_func,
+                        )
+                    },
+                    "w34_moe_topk_router_f16 (tiered)",
+                )?;
+                if let (Some(sh_gu), Some(sh_dn)) =
+                    (&tmoe.shared_gate_up_proj, &tmoe.shared_down_proj)
+                {
+                    sh_gu.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        moe_sh_gu_buf,
+                        num_tokens,
+                    )?;
+                    check_rc(
+                        // SAFETY: shared gate_up produced [M, 2*shared] FP16.
+                        unsafe {
+                            ffi::w34_silu_and_mul_f16(
+                                ex,
+                                moe_sh_gu_buf as *const c_void,
+                                moe_sh_act_buf as *mut c_void,
+                                core::ptr::null(),
+                                num_tokens as i32,
+                                tmoe.local_shared_interm as i32,
+                            )
+                        },
+                        "w34_silu_and_mul_f16 (tiered shared_expert)",
+                    )?;
+                    sh_dn.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        moe_sh_act_buf,
+                        moe_sh_out_buf,
+                        num_tokens,
+                    )?;
+                    if let Some(sh_gate) = &tmoe.shared_expert_gate {
+                        sh_gate.forward(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            normed_buf,
+                            moe_sh_gate_buf,
+                            num_tokens,
+                        )?;
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -2285,10 +2641,312 @@ pub(crate) fn load_moe_layer_weights(
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn load_hc_block_weights(
+    archive: &SafetensorsArchive,
+    cfg: &ModelConfig,
+    hc_pfx: &str,
+    has_inject: bool,
+    weight_arena: &mut DeviceArena,
+    stream: &CudaStream,
+    repack_staging: &DeviceBuffer,
+) -> Result<HcBlockWeights> {
+    let total_dim = cfg.hc_count * cfg.hidden_size;
+    let low_dim = cfg.hc_lowrank;
+    let hc_norm_key = archive
+        .resolve_name(&format!("{hc_pfx}.hc_norm.weight"))
+        .ok_or_else(|| loader_err_msg(format!("missing '{hc_pfx}.hc_norm.weight'")))?;
+    let hc_norm_bits = archive
+        .read_f16_bits(&hc_norm_key)
+        .map_err(|e| loader_err_msg(format!("read '{hc_norm_key}': {e}")))?;
+    if hc_norm_bits.len() != total_dim {
+        return Err(loader_err_msg(format!(
+            "'{hc_norm_key}' length {} != expected {total_dim}",
+            hc_norm_bits.len()
+        )));
+    }
+    let hc_norm_ptr = weight_arena.upload_slice(&hc_norm_bits, stream)?;
+
+    let raw_down = RawLinearHost::load(
+        archive,
+        &format!("{hc_pfx}.input_mix_weight_down"),
+        &cfg.quant,
+    )?;
+    if raw_down.dims() != (low_dim, total_dim) {
+        return Err(loader_err_msg(format!(
+            "'{hc_pfx}.input_mix_weight_down' dims {:?} != ({low_dim}, {total_dim})",
+            raw_down.dims()
+        )));
+    }
+    let input_mix_weight_down = raw_down.upload(weight_arena, stream, repack_staging)?;
+
+    let raw_up = RawLinearHost::load(
+        archive,
+        &format!("{hc_pfx}.input_mix_weight_up"),
+        &cfg.quant,
+    )?;
+    if raw_up.dims() != (total_dim, low_dim) {
+        return Err(loader_err_msg(format!(
+            "'{hc_pfx}.input_mix_weight_up' dims {:?} != ({total_dim}, {low_dim})",
+            raw_up.dims()
+        )));
+    }
+    let input_mix_weight_up = raw_up.upload(weight_arena, stream, repack_staging)?;
+
+    let block_inject_weight = if has_inject {
+        let raw_inj = RawLinearHost::load(
+            archive,
+            &format!("{hc_pfx}.block_inject_weight"),
+            &cfg.quant,
+        )?;
+        if raw_inj.dims() != (cfg.hc_count, total_dim) {
+            return Err(loader_err_msg(format!(
+                "'{hc_pfx}.block_inject_weight' dims {:?} != ({}, {total_dim})",
+                raw_inj.dims(),
+                cfg.hc_count
+            )));
+        }
+        Some(raw_inj.upload(weight_arena, stream, repack_staging)?)
+    } else {
+        None
+    };
+
+    Ok(HcBlockWeights {
+        hc_norm_ptr,
+        input_mix_weight_down,
+        input_mix_weight_up,
+        block_inject_weight,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn load_qsa_indexer_weights(
+    archive: &SafetensorsArchive,
+    cfg: &ModelConfig,
+    pfx: &str,
+    weight_arena: &mut DeviceArena,
+    stream: &CudaStream,
+    repack_staging: &DeviceBuffer,
+) -> Result<QsaIndexerWeights> {
+    let idx_pfx = format!("{pfx}.self_attn.indexer");
+    let expected_n = (cfg.indexer_n_heads + cfg.indexer_kv_heads) * cfg.indexer_head_dim;
+    let raw_qk = RawLinearHost::load(archive, &format!("{idx_pfx}.index_qk_proj"), &cfg.quant)?;
+    if raw_qk.dims() != (expected_n, cfg.hidden_size) {
+        return Err(loader_err_msg(format!(
+            "'{idx_pfx}.index_qk_proj' dims {:?} != ({expected_n}, {})",
+            raw_qk.dims(),
+            cfg.hidden_size
+        )));
+    }
+    let index_qk_proj = raw_qk.upload(weight_arena, stream, repack_staging)?;
+
+    let q_ln_key = archive
+        .resolve_name(&format!("{idx_pfx}.q_layernorm.weight"))
+        .ok_or_else(|| loader_err_msg(format!("missing '{idx_pfx}.q_layernorm.weight'")))?;
+    let q_ln_bits = archive
+        .read_f16_bits(&q_ln_key)
+        .map_err(|e| loader_err_msg(format!("read '{q_ln_key}': {e}")))?;
+    if q_ln_bits.len() != cfg.indexer_head_dim {
+        return Err(loader_err_msg(format!(
+            "'{q_ln_key}' len {} != {}",
+            q_ln_bits.len(),
+            cfg.indexer_head_dim
+        )));
+    }
+    let q_layernorm_ptr = weight_arena.upload_slice(&q_ln_bits, stream)?;
+
+    let k_ln_key = archive
+        .resolve_name(&format!("{idx_pfx}.k_layernorm.weight"))
+        .ok_or_else(|| loader_err_msg(format!("missing '{idx_pfx}.k_layernorm.weight'")))?;
+    let k_ln_bits = archive
+        .read_f16_bits(&k_ln_key)
+        .map_err(|e| loader_err_msg(format!("read '{k_ln_key}': {e}")))?;
+    if k_ln_bits.len() != cfg.indexer_head_dim {
+        return Err(loader_err_msg(format!(
+            "'{k_ln_key}' len {} != {}",
+            k_ln_bits.len(),
+            cfg.indexer_head_dim
+        )));
+    }
+    let k_layernorm_ptr = weight_arena.upload_slice(&k_ln_bits, stream)?;
+
+    Ok(QsaIndexerWeights {
+        index_qk_proj,
+        q_layernorm_ptr,
+        k_layernorm_ptr,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn load_ple_layer_weights(
+    archive: &SafetensorsArchive,
+    cfg: &ModelConfig,
+    pfx: &str,
+    weight_arena: &mut DeviceArena,
+    stream: &CudaStream,
+    repack_staging: &DeviceBuffer,
+) -> Result<PleLayerWeights> {
+    let ple_pfx = format!("{pfx}.ple");
+    let total_dim = cfg.hc_count * cfg.hidden_size;
+    let raw_key = RawLinearHost::load(archive, &format!("{ple_pfx}.key_proj"), &cfg.quant)?;
+    if raw_key.dims() != (total_dim, cfg.ple_embed_dim) {
+        return Err(loader_err_msg(format!(
+            "'{ple_pfx}.key_proj' dims {:?} != ({total_dim}, {})",
+            raw_key.dims(),
+            cfg.ple_embed_dim
+        )));
+    }
+    let key_proj = raw_key.upload(weight_arena, stream, repack_staging)?;
+
+    let raw_val = RawLinearHost::load(archive, &format!("{ple_pfx}.value_proj"), &cfg.quant)?;
+    if raw_val.dims() != (cfg.hidden_size, cfg.ple_embed_dim) {
+        return Err(loader_err_msg(format!(
+            "'{ple_pfx}.value_proj' dims {:?} != ({}, {})",
+            raw_val.dims(),
+            cfg.hidden_size,
+            cfg.ple_embed_dim
+        )));
+    }
+    let value_proj = raw_val.upload(weight_arena, stream, repack_staging)?;
+
+    let load_norm = |suffix: &str, arena: &mut DeviceArena| -> Result<u64> {
+        let key = archive
+            .resolve_name(&format!("{ple_pfx}.{suffix}"))
+            .ok_or_else(|| loader_err_msg(format!("missing '{ple_pfx}.{suffix}'")))?;
+        let bits = archive
+            .read_f16_bits(&key)
+            .map_err(|e| loader_err_msg(format!("read '{key}': {e}")))?;
+        if bits.len() != total_dim {
+            return Err(loader_err_msg(format!(
+                "'{key}' len {} != {total_dim}",
+                bits.len()
+            )));
+        }
+        arena.upload_slice(&bits, stream)
+    };
+    let norm_key_ptr = load_norm("norm_key.weight", weight_arena)?;
+    let norm_query_ptr = load_norm("norm_query.weight", weight_arena)?;
+    let norm_conv_ptr = load_norm("norm_conv.weight", weight_arena)?;
+
+    let conv_key = archive
+        .resolve_name(&format!("{ple_pfx}.conv1d.weight"))
+        .ok_or_else(|| loader_err_msg(format!("missing '{ple_pfx}.conv1d.weight'")))?;
+    let conv_bits = archive
+        .read_f16_bits(&conv_key)
+        .map_err(|e| loader_err_msg(format!("read '{conv_key}': {e}")))?;
+    if conv_bits.len() != total_dim * cfg.ple_conv_kernel_size {
+        return Err(loader_err_msg(format!(
+            "'{conv_key}' len {} != {}",
+            conv_bits.len(),
+            total_dim * cfg.ple_conv_kernel_size
+        )));
+    }
+    let conv1d_weight_ptr = weight_arena.upload_slice(&conv_bits, stream)?;
+
+    let scale_key = archive
+        .resolve_name(&format!(
+            "{ple_pfx}.ple_embedding.ngram_embedding.weight_scale"
+        ))
+        .ok_or_else(|| {
+            loader_err_msg(format!(
+                "missing '{ple_pfx}.ple_embedding.ngram_embedding.weight_scale'"
+            ))
+        })?;
+    let scale_vals = archive
+        .read_f32(&scale_key)
+        .map_err(|e| loader_err_msg(format!("read '{scale_key}': {e}")))?;
+    let weight_scale = *scale_vals
+        .first()
+        .ok_or_else(|| loader_err_msg(format!("empty '{scale_key}'")))?;
+
+    Ok(PleLayerWeights {
+        key_proj,
+        value_proj,
+        norm_key_ptr,
+        norm_query_ptr,
+        norm_conv_ptr,
+        conv1d_weight_ptr,
+        weight_scale,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_tiered_moe_layer_weights(
+    archive: &SafetensorsArchive,
+    cfg: &ModelConfig,
+    layer_id: usize,
+    pfx: &str,
+    rank: usize,
+    tp_size: usize,
+    weight_arena: &mut DeviceArena,
+    stream: &CudaStream,
+    repack_staging: &DeviceBuffer,
+) -> Result<TieredMoeLayerWeights> {
+    let raw_router = RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), &cfg.quant)?;
+    let router_gate = raw_router.upload(weight_arena, stream, repack_staging)?;
+    let h = cfg.hidden_size;
+    let full_shared_interm = cfg.shared_expert_intermediate_size;
+    let local_shared_interm = full_shared_interm / tp_size;
+    let s_gate_full = RawLinearHost::load(
+        archive,
+        &format!("{pfx}.mlp.shared_expert.gate_proj"),
+        &cfg.quant,
+    )?;
+    let s_gate =
+        s_gate_full.slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+    let s_up_full = RawLinearHost::load(
+        archive,
+        &format!("{pfx}.mlp.shared_expert.up_proj"),
+        &cfg.quant,
+    )?;
+    let s_up = s_up_full.slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+    let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up])?.upload(
+        weight_arena,
+        stream,
+        repack_staging,
+    )?;
+    let s_dn_full = RawLinearHost::load(
+        archive,
+        &format!("{pfx}.mlp.shared_expert.down_proj"),
+        &cfg.quant,
+    )?;
+    let s_dn = s_dn_full
+        .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
+        .upload(weight_arena, stream, repack_staging)?;
+    let raw_eg = RawLinearHost::load(
+        archive,
+        &format!("{pfx}.mlp.shared_expert_gate"),
+        &cfg.quant,
+    )?;
+    if raw_eg.dims() != (1, h) {
+        return Err(loader_err_msg(format!(
+            "shared_expert_gate dims {:?} at '{pfx}' != (1, {h})",
+            raw_eg.dims()
+        )));
+    }
+    let s_eg = raw_eg.upload(weight_arena, stream, repack_staging)?;
+    Ok(TieredMoeLayerWeights {
+        layer_id,
+        router_gate,
+        num_experts: cfg.num_experts,
+        top_k: cfg.num_experts_per_tok.max(1),
+        norm_topk_prob: cfg.norm_topk_prob,
+        scoring_func: i32::from(cfg.scoring_func.eq_ignore_ascii_case("sigmoid")),
+        shared_gate_up_proj: Some(s_gu),
+        shared_down_proj: Some(s_dn),
+        shared_expert_gate: Some(s_eg),
+        local_shared_interm,
+    })
+}
+
+#[cfg(feature = "cuda")]
 pub struct DecoderLayerWeights {
     pub layer_id: usize,
     pub input_layernorm_ptr: u64,
     pub post_attention_layernorm_ptr: u64,
+    pub attn_hc: Option<HcBlockWeights>,
+    pub mlp_hc: Option<HcBlockWeights>,
+    pub ple: Option<PleLayerWeights>,
     pub block: LayerBlockWeights,
     pub ffn: FfnBlockWeights,
 }

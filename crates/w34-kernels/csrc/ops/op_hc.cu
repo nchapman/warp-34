@@ -373,4 +373,48 @@ int w34_hc_combine_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
 }
 
+__global__ void qwen4_mtp_broadcast_add_f16_kernel(
+    const __half* __restrict__ fc_embed,
+    const __half* __restrict__ fc_hidden,
+    __half* __restrict__ out_multi_hidden,
+    int num_tokens,
+    int hc_count,
+    int hidden_size) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+    const __half* emb_row = fc_embed + static_cast<size_t>(tok) * hidden_size;
+    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        const __half e = emb_row[d];
+        for (int b = 0; b < hc_count; ++b) {
+            const size_t idx =
+                (static_cast<size_t>(tok) * hc_count + b) * hidden_size + d;
+            out_multi_hidden[idx] = __hadd(e, fc_hidden[idx]);
+        }
+    }
+}
+
+int w34_qwen4_mtp_broadcast_add_f16(
+    const w34_exec* ex,
+    const void* fc_embed,
+    const void* fc_hidden,
+    void* out_multi_hidden,
+    int num_tokens,
+    int hc_count,
+    int hidden_size) {
+    if (!ex || !fc_embed || !fc_hidden || !out_multi_hidden || num_tokens < 0 ||
+        hc_count <= 0 || hidden_size <= 0 || hc_count > 4) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    qwen4_mtp_broadcast_add_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+        static_cast<const __half*>(fc_embed),
+        static_cast<const __half*>(fc_hidden),
+        static_cast<__half*>(out_multi_hidden),
+        num_tokens,
+        hc_count,
+        hidden_size);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
 } // extern "C"

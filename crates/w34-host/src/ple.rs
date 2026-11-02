@@ -320,8 +320,8 @@ impl PleNgramHasher {
                     w_prev2.max(0) as i64
                 };
 
-                let bigram_hash = s0.wrapping_mul(m0).wrapping_add(s1.wrapping_mul(m1));
-                let trigram_hash = bigram_hash.wrapping_add(s2.wrapping_mul(m2));
+                let bigram_hash = s0.wrapping_mul(m0) ^ s1.wrapping_mul(m1);
+                let trigram_hash = bigram_hash ^ s2.wrapping_mul(m2);
                 let row_out = &mut out_ids[(start + tok_pos) * self.ngram_heads
                     ..(start + tok_pos + 1) * self.ngram_heads];
 
@@ -344,6 +344,111 @@ impl PleNgramHasher {
             }
 
             ngram_context[req_idx] = [w_prev2, w_prev1];
+        }
+    }
+
+    /// Computes `[num_tokens, ngram_heads]` global row IDs while reading and updating per-slot
+    /// `slot_contexts` (`StateBundlePool::ple_ngram_context`) across `state_in`, `state_out`,
+    /// `spec_state_indices`, and `MambaRadixCache` `checkpoint_dst_indices`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_ngram_ids_for_slots(
+        &self,
+        input_ids: &[i32],
+        query_start_loc: &[i32],
+        state_in_indices: &[i32],
+        state_out_indices: &[i32],
+        has_initial_state: &[u8],
+        spec_state_indices: &[i32],
+        max_verify_tokens: usize,
+        checkpoint_dst_indices: &[i32],
+        checkpoint_token_offsets: &[i32],
+        max_checkpoints_per_req: usize,
+        slot_contexts: &mut [[i32; 2]],
+        out_ids: &mut [i64],
+    ) {
+        let num_reqs = query_start_loc.len().saturating_sub(1);
+        assert_eq!(out_ids.len(), input_ids.len() * self.ngram_heads);
+        let m0 = self.layer_multipliers[0];
+        let m1 = self.layer_multipliers.get(1).copied().unwrap_or(0);
+        let m2 = self.layer_multipliers.get(2).copied().unwrap_or(0);
+        let eos = self.eos_token_id;
+
+        for req_idx in 0..num_reqs {
+            let start = query_start_loc[req_idx].max(0) as usize;
+            let end = (query_start_loc[req_idx + 1].max(0) as usize).min(input_ids.len());
+            if start >= end {
+                continue;
+            }
+            let in_slot = state_in_indices.get(req_idx).copied().unwrap_or(-1);
+            let has_init = has_initial_state.get(req_idx).copied().unwrap_or(0) != 0;
+            let [mut w_prev2, mut w_prev1] =
+                if has_init && in_slot >= 0 && (in_slot as usize) < slot_contexts.len() {
+                    slot_contexts[in_slot as usize]
+                } else {
+                    [eos, eos]
+                };
+
+            for (tok_pos, &raw_tok) in input_ids[start..end].iter().enumerate() {
+                let tok = raw_tok.max(0);
+                let s0 = tok as i64;
+                let s1 = w_prev1.max(0) as i64;
+                let s2 = if w_prev1 == eos {
+                    eos as i64
+                } else {
+                    w_prev2.max(0) as i64
+                };
+
+                let bigram_hash = s0.wrapping_mul(m0) ^ s1.wrapping_mul(m1);
+                let trigram_hash = bigram_hash ^ s2.wrapping_mul(m2);
+                let row_out = &mut out_ids[(start + tok_pos) * self.ngram_heads
+                    ..(start + tok_pos + 1) * self.ngram_heads];
+
+                for (h, slot) in row_out.iter_mut().enumerate().take(self.bigram_heads) {
+                    let mod_p = self.ngram_heads_vocab_sizes[h];
+                    *slot = bigram_hash.rem_euclid(mod_p) + self.ngram_heads_offsets[h];
+                }
+                for (h, slot) in row_out
+                    .iter_mut()
+                    .enumerate()
+                    .take(self.ngram_heads)
+                    .skip(self.bigram_heads)
+                {
+                    let mod_p = self.ngram_heads_vocab_sizes[h];
+                    *slot = trigram_hash.rem_euclid(mod_p) + self.ngram_heads_offsets[h];
+                }
+
+                w_prev2 = if tok == eos { eos } else { w_prev1 };
+                w_prev1 = tok;
+
+                if max_verify_tokens > 0 && tok_pos < max_verify_tokens {
+                    let idx = req_idx * max_verify_tokens + tok_pos;
+                    if let Some(&spec_slot) = spec_state_indices.get(idx)
+                        && spec_slot >= 0
+                        && (spec_slot as usize) < slot_contexts.len()
+                    {
+                        slot_contexts[spec_slot as usize] = [w_prev2, w_prev1];
+                    }
+                }
+                if max_checkpoints_per_req > 0 {
+                    for e in 0..max_checkpoints_per_req {
+                        let idx = req_idx * max_checkpoints_per_req + e;
+                        if checkpoint_token_offsets.get(idx).copied() == Some((tok_pos + 1) as i32)
+                            && let Some(&chk_slot) = checkpoint_dst_indices.get(idx)
+                            && chk_slot >= 0
+                            && (chk_slot as usize) < slot_contexts.len()
+                        {
+                            slot_contexts[chk_slot as usize] = [w_prev2, w_prev1];
+                        }
+                    }
+                }
+            }
+
+            if max_verify_tokens == 0 {
+                let out_slot = state_out_indices.get(req_idx).copied().unwrap_or(in_slot);
+                if out_slot >= 0 && (out_slot as usize) < slot_contexts.len() {
+                    slot_contexts[out_slot as usize] = [w_prev2, w_prev1];
+                }
+            }
         }
     }
 }
@@ -1363,6 +1468,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn test_gpu_hc_ple_qsa_kernels_parity() {
         use crate::cuda::{CudaDevice, CudaStream, DeviceBuffer, f16_to_f32};
         use w34_kernels::ffi::{
@@ -1583,22 +1689,25 @@ mod tests {
         .unwrap();
         let h_gout: Vec<u16> = dev_to_vec(&d_gout, m * hc_count * hidden, &stream);
         for tok in 0..m {
-            for d in 0..hidden {
-                let v = f16_to_f32(val_f16[tok * hidden + d]);
-                for s in 0..hc_count {
+            for s in 0..hc_count {
+                let mut dot = 0.0f32;
+                for d in 0..hidden {
                     let idx = (tok * hc_count + s) * hidden + d;
-                    let q = f16_to_f32(query_f16[idx]);
-                    let k = f16_to_f32(key_f16[idx]);
-                    let prod = q * k;
-                    let sgn = if prod > 0.0 {
-                        1.0
-                    } else if prod < 0.0 {
-                        -1.0
-                    } else {
-                        0.0
-                    };
-                    let logit = sgn * (prod.abs() + 1e-6).sqrt();
-                    let g = 1.0 / (1.0 + (-logit).exp());
+                    dot += f16_to_f32(query_f16[idx]) * f16_to_f32(key_f16[idx]);
+                }
+                dot /= (hidden as f32).sqrt();
+                let sgn = if dot > 0.0 {
+                    1.0
+                } else if dot < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                let logit = sgn * dot.abs().max(1e-6).sqrt();
+                let g = 1.0 / (1.0 + (-logit).exp());
+                for d in 0..hidden {
+                    let v = f16_to_f32(val_f16[tok * hidden + d]);
+                    let idx = (tok * hc_count + s) * hidden + d;
                     let ref_out = g * v;
                     let got = f16_to_f32(h_gout[idx]);
                     assert!((got - ref_out).abs() < 3e-3, "gate mismatch at {idx}");
@@ -1758,10 +1867,10 @@ mod tests {
             4,
             1,
             128,
-            32,
+            64,
             10_000_000.0,
             1e-6,
-            6,
+            11,
             11,
             qsa_tokens,
         )

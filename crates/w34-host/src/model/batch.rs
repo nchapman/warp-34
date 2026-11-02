@@ -166,6 +166,26 @@ impl Qwen3_5Engine {
             r.device.make_current()?;
             match phase {
                 ReplayPhase::Upload => {
+                    if r.cfg.is_qwen4_exp() {
+                        let mut ckpt_dst = Vec::with_capacity(s.checkpoints.len());
+                        let mut ckpt_off = Vec::with_capacity(s.checkpoints.len());
+                        for &(trig_off, dst_slot) in s.checkpoints {
+                            ckpt_off.push(trig_off);
+                            ckpt_dst.push(dst_slot);
+                        }
+                        r.stage_ple_f8_for_batch(
+                            s.tokens,
+                            &[0, q_len as i32],
+                            &[s.state_in_slot],
+                            &[s.state_out_slot],
+                            &[u8::from(s.has_initial_state)],
+                            s.spec_slots,
+                            s.spec_slots.len(),
+                            &ckpt_dst,
+                            &ckpt_off,
+                            s.checkpoints.len(),
+                        )?;
+                    }
                     r.spec_verify_io
                         .meta_i32
                         .copy_from_host(&host_meta, &r.stream)?;
@@ -250,6 +270,9 @@ impl Qwen3_5Engine {
             r.device.make_current()?;
             match phase {
                 ReplayPhase::Upload => {
+                    if r.cfg.is_qwen4_exp() {
+                        r.stage_ple_f8_for_decode_slices(slices)?;
+                    }
                     r.batched_decode_io
                         .upload_inputs(&host_meta, &host_masks, slices, &r.stream)
                 }
@@ -369,6 +392,9 @@ impl Qwen3_5Engine {
             ));
         }
         r0.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, None)?;
+        if r0.cfg.is_qwen4_exp() {
+            r0.stage_ple_f8_for_decode_slices(slices)?;
+        }
         r0.batched_decode_io.upload_inputs_slot(
             slot,
             &host_meta,
@@ -654,6 +680,15 @@ impl Qwen3_5Engine {
                 && s.spec_slots.len() == q_len
                 && s.checkpoints.len() <= MAX_SPEC_VERIFY_CHECKPOINTS
                 && s.block_table.len() <= self.ranks[0].spec_verify_io.max_blocks_per_req
+                && (!self.cfg.is_qwen4_exp()
+                    || self.ranks.iter().all(|r| {
+                        r.tiered_moe.as_ref().is_some_and(|tm| {
+                            (0..r.layers.len()).all(|li| {
+                                q_len * self.cfg.num_experts_per_tok.max(1) <= tm.layer_hot_k(li)
+                                    && tm.layer_has_mapped_store(li)
+                            })
+                        })
+                    }))
                 && self.ranks.iter().all(|r| {
                     let expected_m = r
                         .speculative_logits
