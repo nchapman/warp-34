@@ -450,6 +450,67 @@ impl SafetensorsArchive {
             )),
         }
     }
+
+    /// Reads a 2-element `I64` or `I32` `.weight_shape` tensor (`[N, K]`).
+    pub fn read_weight_shape_2d(&self, name: &str) -> io::Result<[usize; 2]> {
+        let info = self.tensor_info(name)?;
+        if info.num_elems() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected 2 elements in '{name}', got shape {:?}",
+                    info.shape
+                ),
+            ));
+        }
+        let expected_bytes: u64 = match info.dtype.as_str() {
+            "I64" | "U64" => 16,
+            "I32" | "U32" => 8,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported dtype {other} for read_weight_shape_2d({name})"),
+                ));
+            }
+        };
+        if info.len_bytes != expected_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected {expected_bytes} bytes in '{name}' ({}), got {}",
+                    info.dtype, info.len_bytes
+                ),
+            ));
+        }
+        let bytes = self.read_bytes(name)?;
+        if bytes.len() as u64 != expected_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "short read on '{name}': expected {expected_bytes} bytes, got {}",
+                    bytes.len()
+                ),
+            ));
+        }
+        let vals: [i64; 2] = match info.dtype.as_str() {
+            "I64" | "U64" => [
+                i64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                i64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            ],
+            "I32" | "U32" => [
+                i32::from_le_bytes(bytes[0..4].try_into().unwrap()) as i64,
+                i32::from_le_bytes(bytes[4..8].try_into().unwrap()) as i64,
+            ],
+            _ => unreachable!(),
+        };
+        if vals[0] <= 0 || vals[1] <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("non-positive dimensions {:?} in '{name}'", vals),
+            ));
+        }
+        Ok([vals[0] as usize, vals[1] as usize])
+    }
 }
 
 /// Resolves a model path or `<org>/<repo>` HuggingFace Hub identifier to a local snapshot directory.
@@ -685,36 +746,42 @@ impl ModelConfig {
         let tc = root.get("text_config").unwrap_or(&root);
         if root.get("quantization_config").is_none_or(Json::is_null)
             && tc.get("quantization_config").is_none_or(Json::is_null)
+            && let Some(standalone_qcfg) = [
+                "quantize_config.json",
+                "quant_config.json",
+                "quantization_config.json",
+            ]
+            .into_iter()
+            .map(|name| dir.join(name))
+            .find(|p| p.exists())
         {
-            let standalone_qcfg = dir.join("quantize_config.json");
-            if standalone_qcfg.exists() {
-                let qtext = fs::read_to_string(&standalone_qcfg).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("read {}: {e}", standalone_qcfg.display()),
-                    )
-                })?;
-                let mut qjson: Json = serde_json::from_str(&qtext).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("bad {}: {e}", standalone_qcfg.display()),
-                    )
-                })?;
-                if qjson.get("quant_method").is_none()
-                    && let Some(obj) = qjson.as_object_mut()
+            let qtext = fs::read_to_string(&standalone_qcfg).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("read {}: {e}", standalone_qcfg.display()),
+                )
+            })?;
+            let mut qjson: Json = serde_json::from_str(&qtext).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bad {}: {e}", standalone_qcfg.display()),
+                )
+            })?;
+            if let Some(obj) = qjson.as_object_mut() {
+                if !obj.contains_key("bits")
+                    && let Some(b) = obj.get("w_bit").cloned()
                 {
-                    if let Some(b) = obj.get("w_bit").cloned() {
-                        obj.insert("bits".to_string(), b);
-                    }
-                    if let Some(g) = obj.get("q_group_size").cloned() {
-                        obj.insert("group_size".to_string(), g);
-                    }
+                    obj.insert("bits".to_string(), b);
+                }
+                if !obj.contains_key("group_size")
+                    && let Some(g) = obj.get("q_group_size").cloned()
+                {
+                    obj.insert("group_size".to_string(), g);
+                }
+                if !obj.contains_key("quant_method") {
                     if obj.contains_key("zero_point") {
                         obj.insert("quant_method".to_string(), Json::String("awq".into()));
-                    } else if obj.contains_key("bits")
-                        || obj.contains_key("w_bit")
-                        || obj.contains_key("group_size")
-                    {
+                    } else if obj.contains_key("bits") || obj.contains_key("group_size") {
                         obj.insert("quant_method".to_string(), Json::String("gptq".into()));
                     } else {
                         return Err(io::Error::new(
@@ -726,8 +793,8 @@ impl ModelConfig {
                         ));
                     }
                 }
-                cfg.quant = Self::parse_quant(Some(&qjson))?;
             }
+            cfg.quant = Self::parse_quant(Some(&qjson))?;
         }
         Ok(cfg)
     }
@@ -1240,391 +1307,10 @@ impl ModelConfig {
             .trim();
         let method_lc = raw_method.to_ascii_lowercase();
         match method_lc.as_str() {
-            "compressed-tensors" | "compressed_tensors" => {
-                if let Some(fmt) = q.get("format").and_then(|v| v.as_str())
-                    && fmt != "pack-quantized"
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported compressed-tensors format '{fmt}' (RTX 3090 Ti sm_86 requires weight-only 'pack-quantized' W4A16/W8A16; FP8/NVFP4/W8A8 are not supported)"
-                        ),
-                    ));
-                }
-                if let Some(sp_fmt) = q
-                    .get("sparsity_config")
-                    .and_then(|sc| sc.get("format"))
-                    .and_then(|v| v.as_str())
-                    && !sp_fmt.is_empty()
-                    && sp_fmt != "dense"
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported compressed-tensors sparsity format '{sp_fmt}' (sm_86 dense Marlin only)"
-                        ),
-                    ));
-                }
-                let groups_obj = q
-                    .get("config_groups")
-                    .and_then(|cg| cg.as_object())
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "compressed-tensors quantization_config is missing config_groups",
-                        )
-                    })?;
-                if groups_obj.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "compressed-tensors config_groups is empty",
-                    ));
-                }
-
-                let mut chosen_linear: Option<(usize, usize, bool)> = None;
-                let mut fallback_group: Option<(usize, usize, bool)> = None;
-                let mut group_keys: Vec<&String> = groups_obj.keys().collect();
-                group_keys.sort();
-                for gk in group_keys {
-                    let grp = &groups_obj[gk];
-                    if let Some(gfmt) = grp.get("format").and_then(|v| v.as_str())
-                        && gfmt != "pack-quantized"
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "unsupported compressed-tensors group '{}' format '{}' (expected 'pack-quantized')",
-                                sanitize_diag(gk),
-                                sanitize_diag(gfmt)
-                            ),
-                        ));
-                    }
-                    if grp.get("input_activations").is_some_and(|v| !v.is_null())
-                        || grp.get("output_activations").is_some_and(|v| !v.is_null())
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "unsupported compressed-tensors activation quantization in '{}' (sm_86 engine supports weight-only W4A16/W8A16)",
-                                sanitize_diag(gk)
-                            ),
-                        ));
-                    }
-                    let weights = grp.get("weights").filter(|v| !v.is_null()).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "compressed-tensors group '{}' is missing weights descriptor",
-                                sanitize_diag(gk)
-                            ),
-                        )
-                    })?;
-                    if let Some(wtype) = weights.get("type").and_then(|v| v.as_str())
-                        && wtype != "int"
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "unsupported compressed-tensors weights.type='{}' in '{}' (expected 'int'; FP8/FP4 are not native on sm_86)",
-                                sanitize_diag(wtype),
-                                sanitize_diag(gk)
-                            ),
-                        ));
-                    }
-                    if let Some(ao) = weights.get("actorder") {
-                        let dynamic_ao = match ao {
-                            Json::Null | Json::Bool(false) => false,
-                            Json::Bool(true) => true,
-                            Json::String(s) => {
-                                !matches!(s.as_str(), "none" | "static" | "false" | "")
-                            }
-                            _ => true,
-                        };
-                        if dynamic_ao {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "unsupported compressed-tensors weights.actorder={} in '{}' (channel-permuted actorder is not supported)",
-                                    sanitize_diag(&ao.to_string()),
-                                    sanitize_diag(gk)
-                                ),
-                            ));
-                        }
-                    }
-                    let num_bits = weights
-                        .get("num_bits")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(4) as usize;
-                    let strategy = weights
-                        .get("strategy")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("group");
-                    let group_size = match strategy {
-                        "channel" => 0,
-                        "group" => Self::parse_group_size_i64(weights.get("group_size"), 32)?,
-                        other => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "unsupported compressed-tensors weights.strategy='{}' in '{}' (expected 'group' or 8-bit 'channel')",
-                                    sanitize_diag(other),
-                                    sanitize_diag(gk)
-                                ),
-                            ));
-                        }
-                    };
-                    let symmetric = weights
-                        .get("symmetric")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    if num_bits == 8 && !symmetric {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "unsupported compressed-tensors asymmetric 8-bit weights in '{}' (8-bit W8A16 requires symmetric=true)",
-                                sanitize_diag(gk)
-                            ),
-                        ));
-                    }
-                    Self::validate_bits_and_group_size(
-                        "compressed-tensors",
-                        num_bits,
-                        group_size,
-                        true,
-                    )?;
-                    let is_embedding_only = grp
-                        .get("targets")
-                        .and_then(|v| v.as_array())
-                        .is_some_and(|arr| {
-                            !arr.is_empty()
-                                && arr
-                                    .iter()
-                                    .filter_map(|x| x.as_str())
-                                    .all(|t| t == "Embedding" || t.contains("embed"))
-                        });
-                    if !is_embedding_only {
-                        if let Some((prev_b, prev_g, prev_s)) = chosen_linear {
-                            if (prev_b, prev_g, prev_s) != (num_bits, group_size, symmetric) {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "conflicting compressed-tensors quantization in '{}': ({num_bits}-bit, group_size={group_size}, symmetric={symmetric}) vs previous ({prev_b}-bit, group_size={prev_g}, symmetric={prev_s})",
-                                        sanitize_diag(gk)
-                                    ),
-                                ));
-                            }
-                        } else {
-                            chosen_linear = Some((num_bits, group_size, symmetric));
-                        }
-                    } else if fallback_group.is_none() {
-                        fallback_group = Some((num_bits, group_size, symmetric));
-                    }
-                }
-                let (num_bits, group_size, symmetric) = chosen_linear
-                    .or(fallback_group)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "compressed-tensors config_groups did not define any valid quantization group",
-                        )
-                    })?;
-                let ignore = q
-                    .get("ignore")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(QuantScheme::CompressedTensors {
-                    num_bits,
-                    group_size,
-                    symmetric,
-                    ignore,
-                })
-            }
-            "gptq" | "gptq_marlin" => {
-                let bits = q.get("bits").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
-                let group_size = Self::parse_group_size_i64(q.get("group_size"), 128)?;
-                let sym = q.get("sym").and_then(|v| v.as_bool()).unwrap_or(true);
-                let desc_act = q.get("desc_act").and_then(|v| v.as_bool()).unwrap_or(false);
-                if !sym {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unsupported GPTQ config: sym=false (asymmetric GPTQ is not supported; use sym=true GPTQ/AutoRound or AWQ)",
-                    ));
-                }
-                if desc_act && group_size != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unsupported GPTQ config: desc_act=true (activation-order channel permutation is not supported; use desc_act=false)",
-                    ));
-                }
-                Self::validate_bits_and_group_size("gptq", bits, group_size, true)?;
-                if let Some(dyn_obj) = q.get("dynamic").and_then(|v| v.as_object()) {
-                    for (pat, rule) in dyn_obj {
-                        if pat.trim_start().starts_with("-:") {
-                            continue;
-                        }
-                        if let Some(ro) = rule.as_object() {
-                            let r_bits = ro
-                                .get("bits")
-                                .and_then(|v| v.as_u64())
-                                .map(|x| x as usize)
-                                .unwrap_or(bits);
-                            let r_gs = if ro.contains_key("group_size") {
-                                Self::parse_group_size_i64(ro.get("group_size"), 128)?
-                            } else {
-                                group_size
-                            };
-                            let r_sym = ro.get("sym").and_then(|v| v.as_bool()).unwrap_or(sym);
-                            let r_desc = ro
-                                .get("desc_act")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(desc_act);
-                            if !r_sym {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("unsupported GPTQ dynamic rule '{pat}': sym=false"),
-                                ));
-                            }
-                            if r_desc && r_gs != 0 {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("unsupported GPTQ dynamic rule '{pat}': desc_act=true"),
-                                ));
-                            }
-                            if r_bits != bits || r_gs != group_size {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "unsupported GPTQ mixed bit/group dynamic override '{pat}' (bits={r_bits}, group_size={r_gs}; only '-:' FP16/BF16 skip rules are supported)"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                }
-                Ok(QuantScheme::Gptq {
-                    bits,
-                    group_size,
-                    sym,
-                    desc_act,
-                })
-            }
-            "awq" | "awq_marlin" => {
-                let bits = q.get("bits").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
-                let group_size = Self::parse_group_size_i64(q.get("group_size"), 128)?;
-                let zero_point = q
-                    .get("zero_point")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let version = q
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("gemm")
-                    .to_ascii_lowercase();
-                if !matches!(version.as_str(), "gemm" | "marlin") {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported AWQ version '{version}' (expected 'gemm' or 'marlin')"
-                        ),
-                    ));
-                }
-                Self::validate_bits_and_group_size("awq", bits, group_size, false)?;
-                if bits != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unsupported AWQ bits={bits} (expected 4-bit AWQ)"),
-                    ));
-                }
-                Ok(QuantScheme::Awq {
-                    bits,
-                    group_size,
-                    zero_point,
-                })
-            }
-            "auto-round" | "autoround" | "auto_round" => {
-                if let Some(dt) = q.get("data_type").and_then(|v| v.as_str())
-                    && !dt.to_ascii_lowercase().starts_with("int")
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported auto-round data_type='{dt}' (expected integer W4A16/W8A16)"
-                        ),
-                    ));
-                }
-                let packing_fmt = q
-                    .get("packing_format")
-                    .or_else(|| q.get("backend"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("auto_round:auto_gptq")
-                    .to_ascii_lowercase();
-                if packing_fmt.contains("fp8")
-                    || packing_fmt.contains("mxfp")
-                    || packing_fmt.contains("nvfp")
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unsupported auto-round packing_format='{packing_fmt}'"),
-                    ));
-                }
-                let awq_packing = packing_fmt.contains("awq");
-                let bits = q.get("bits").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
-                if awq_packing && bits != 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "unsupported auto-round AWQ packing with bits={bits} (AWQ packing requires 4-bit)"
-                        ),
-                    ));
-                }
-                if let Some(ec) = q
-                    .get("extra_config")
-                    .or_else(|| q.get("layer_config"))
-                    .and_then(|v| v.as_object())
-                {
-                    for (k, v) in ec {
-                        if let Some(b) = v.get("bits").and_then(|x| x.as_u64())
-                            && b as usize != bits
-                            && b != 16
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "unsupported mixed-bit AutoRound override in '{}': {b}-bit (model base is {bits}-bit)",
-                                    sanitize_diag(k)
-                                ),
-                            ));
-                        }
-                    }
-                }
-                let group_size = Self::parse_group_size_i64(q.get("group_size"), 128)?;
-                let sym = q.get("sym").and_then(|v| v.as_bool()).unwrap_or(true);
-                let desc_act = q.get("desc_act").and_then(|v| v.as_bool()).unwrap_or(false);
-                if desc_act && group_size != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unsupported auto-round config: desc_act=true",
-                    ));
-                }
-                if !sym && !(awq_packing && bits == 4) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unsupported auto-round config: sym=false with GPTQ packing (requires sym=true or AWQ packing)",
-                    ));
-                }
-                Self::validate_bits_and_group_size("auto-round", bits, group_size, !awq_packing)?;
-                Ok(QuantScheme::AutoRound {
-                    bits,
-                    group_size,
-                    sym,
-                    awq_packing,
-                })
-            }
+            "compressed-tensors" | "compressed_tensors" => Self::parse_quant_compressed_tensors(q),
+            "gptq" | "gptq_marlin" => Self::parse_quant_gptq(q),
+            "awq" | "awq_marlin" => Self::parse_quant_awq(q),
+            "auto-round" | "autoround" | "auto_round" => Self::parse_quant_auto_round(q),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1637,6 +1323,463 @@ impl ModelConfig {
                 ),
             )),
         }
+    }
+
+    fn parse_quant_compressed_tensors(q: &Json) -> io::Result<QuantScheme> {
+        if let Some(fmt) = q.get("format").and_then(|v| v.as_str())
+            && fmt != "pack-quantized"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported compressed-tensors format '{fmt}' (RTX 3090 Ti sm_86 requires weight-only 'pack-quantized' W4A16/W8A16; FP8/NVFP4/W8A8 are not supported)"
+                ),
+            ));
+        }
+        if let Some(sp_fmt) = q
+            .get("sparsity_config")
+            .and_then(|sc| sc.get("format"))
+            .and_then(|v| v.as_str())
+            && !sp_fmt.is_empty()
+            && sp_fmt != "dense"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported compressed-tensors sparsity format '{sp_fmt}' (sm_86 dense Marlin only)"
+                ),
+            ));
+        }
+        let groups_obj = q
+            .get("config_groups")
+            .and_then(|cg| cg.as_object())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed-tensors quantization_config is missing config_groups",
+                )
+            })?;
+        if groups_obj.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compressed-tensors config_groups is empty",
+            ));
+        }
+
+        let mut chosen_linear: Option<(usize, usize, bool)> = None;
+        let mut fallback_group: Option<(usize, usize, bool)> = None;
+        let mut group_keys: Vec<&String> = groups_obj.keys().collect();
+        group_keys.sort();
+        for gk in group_keys {
+            let grp = &groups_obj[gk];
+            let (num_bits, group_size, symmetric, is_embedding_only) =
+                Self::parse_compressed_tensors_group(gk, grp)?;
+            if !is_embedding_only {
+                if let Some((prev_b, prev_g, prev_s)) = chosen_linear {
+                    if (prev_b, prev_g, prev_s) != (num_bits, group_size, symmetric) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "conflicting compressed-tensors quantization in '{}': ({num_bits}-bit, group_size={group_size}, symmetric={symmetric}) vs previous ({prev_b}-bit, group_size={prev_g}, symmetric={prev_s})",
+                                sanitize_diag(gk)
+                            ),
+                        ));
+                    }
+                } else {
+                    chosen_linear = Some((num_bits, group_size, symmetric));
+                }
+            } else if fallback_group.is_none() {
+                fallback_group = Some((num_bits, group_size, symmetric));
+            }
+        }
+        let (num_bits, group_size, symmetric) =
+            chosen_linear.or(fallback_group).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "compressed-tensors config_groups did not define any valid quantization group",
+                )
+            })?;
+        let ignore = q
+            .get("ignore")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(QuantScheme::CompressedTensors {
+            num_bits,
+            group_size,
+            symmetric,
+            ignore,
+        })
+    }
+
+    fn parse_compressed_tensors_group(
+        gk: &str,
+        grp: &Json,
+    ) -> io::Result<(usize, usize, bool, bool)> {
+        if let Some(gfmt) = grp.get("format").and_then(|v| v.as_str())
+            && gfmt != "pack-quantized"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported compressed-tensors group '{}' format '{}' (expected 'pack-quantized')",
+                    sanitize_diag(gk),
+                    sanitize_diag(gfmt)
+                ),
+            ));
+        }
+        if grp.get("input_activations").is_some_and(|v| !v.is_null())
+            || grp.get("output_activations").is_some_and(|v| !v.is_null())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported compressed-tensors activation quantization in '{}' (sm_86 engine supports weight-only W4A16/W8A16)",
+                    sanitize_diag(gk)
+                ),
+            ));
+        }
+        let weights = grp.get("weights").filter(|v| !v.is_null()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "compressed-tensors group '{}' is missing weights descriptor",
+                    sanitize_diag(gk)
+                ),
+            )
+        })?;
+        if let Some(wtype) = weights.get("type").and_then(|v| v.as_str())
+            && wtype != "int"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported compressed-tensors weights.type='{}' in '{}' (expected 'int'; FP8/FP4 are not native on sm_86)",
+                    sanitize_diag(wtype),
+                    sanitize_diag(gk)
+                ),
+            ));
+        }
+        if let Some(ao) = weights.get("actorder") {
+            let dynamic_ao = match ao {
+                Json::Null | Json::Bool(false) => false,
+                Json::Bool(true) => true,
+                Json::String(s) => !matches!(s.as_str(), "none" | "static" | "false" | ""),
+                _ => true,
+            };
+            if dynamic_ao {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported compressed-tensors weights.actorder={} in '{}' (channel-permuted actorder is not supported)",
+                        sanitize_diag(&ao.to_string()),
+                        sanitize_diag(gk)
+                    ),
+                ));
+            }
+        }
+        let num_bits = weights
+            .get("num_bits")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4) as usize;
+        let strategy = weights
+            .get("strategy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("group");
+        let group_size = match strategy {
+            "channel" => 0,
+            "group" => Self::parse_group_size_i64(weights.get("group_size"), 32)?,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported compressed-tensors weights.strategy='{}' in '{}' (expected 'group' or 8-bit 'channel')",
+                        sanitize_diag(other),
+                        sanitize_diag(gk)
+                    ),
+                ));
+            }
+        };
+        let symmetric = weights
+            .get("symmetric")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if num_bits == 8 && !symmetric {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported compressed-tensors asymmetric 8-bit weights in '{}' (8-bit W8A16 requires symmetric=true)",
+                    sanitize_diag(gk)
+                ),
+            ));
+        }
+        Self::validate_bits_and_group_size("compressed-tensors", num_bits, group_size, true)?;
+        let is_embedding_only = grp
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                !arr.is_empty()
+                    && arr
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .all(|t| t == "Embedding" || t.contains("embed"))
+            });
+        Ok((num_bits, group_size, symmetric, is_embedding_only))
+    }
+
+    fn parse_quant_gptq(q: &Json) -> io::Result<QuantScheme> {
+        let bits = q.get("bits").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+        let group_size = Self::parse_group_size_i64(q.get("group_size"), 128)?;
+        let sym = q.get("sym").and_then(|v| v.as_bool()).unwrap_or(true);
+        let desc_act = q.get("desc_act").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !sym {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported GPTQ config: sym=false (asymmetric GPTQ is not supported; use sym=true GPTQ/AutoRound or AWQ)",
+            ));
+        }
+        if desc_act && group_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported GPTQ config: desc_act=true (activation-order channel permutation is not supported; use desc_act=false)",
+            ));
+        }
+        Self::validate_bits_and_group_size("gptq", bits, group_size, true)?;
+        if let Some(dyn_obj) = q.get("dynamic").and_then(|v| v.as_object()) {
+            for (pat, rule) in dyn_obj {
+                if pat.trim_start().starts_with("-:") {
+                    continue;
+                }
+                if let Some(ro) = rule.as_object() {
+                    let r_bits = ro
+                        .get("bits")
+                        .and_then(|v| v.as_u64())
+                        .map(|x| x as usize)
+                        .unwrap_or(bits);
+                    let r_gs = if ro.contains_key("group_size") {
+                        Self::parse_group_size_i64(ro.get("group_size"), 128)?
+                    } else {
+                        group_size
+                    };
+                    let r_sym = ro.get("sym").and_then(|v| v.as_bool()).unwrap_or(sym);
+                    let r_desc = ro
+                        .get("desc_act")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(desc_act);
+                    if !r_sym {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported GPTQ dynamic rule '{pat}': sym=false"),
+                        ));
+                    }
+                    if r_desc && r_gs != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported GPTQ dynamic rule '{pat}': desc_act=true"),
+                        ));
+                    }
+                    if r_bits != bits || r_gs != group_size {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "unsupported GPTQ mixed bit/group dynamic override '{pat}' (bits={r_bits}, group_size={r_gs}; only '-:' FP16/BF16 skip rules are supported)"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(QuantScheme::Gptq {
+            bits,
+            group_size,
+            sym,
+            desc_act,
+        })
+    }
+
+    fn parse_quant_awq(q: &Json) -> io::Result<QuantScheme> {
+        let bits = q
+            .get("bits")
+            .or_else(|| q.get("w_bit"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4) as usize;
+        let group_size =
+            Self::parse_group_size_i64(q.get("group_size").or_else(|| q.get("q_group_size")), 128)?;
+        let zero_point = q
+            .get("zero_point")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let version = q
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gemm")
+            .to_ascii_lowercase();
+        if !matches!(version.as_str(), "gemm" | "marlin") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported AWQ version '{version}' (expected 'gemm' or 'marlin')"),
+            ));
+        }
+        Self::validate_bits_and_group_size("awq", bits, group_size, false)?;
+        if bits != 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported AWQ bits={bits} (expected 4-bit AWQ)"),
+            ));
+        }
+        Ok(QuantScheme::Awq {
+            bits,
+            group_size,
+            zero_point,
+        })
+    }
+
+    fn parse_quant_auto_round(q: &Json) -> io::Result<QuantScheme> {
+        if let Some(dt) = q.get("data_type").and_then(|v| v.as_str())
+            && !dt.to_ascii_lowercase().starts_with("int")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported auto-round data_type='{dt}' (expected integer W4A16/W8A16)"),
+            ));
+        }
+        if let Some(act_b) = q.get("act_bits").and_then(|v| v.as_u64())
+            && act_b < 16
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported auto-round act_bits={act_b} (sm_86 engine requires weight-only W4A16/W8A16 with act_bits >= 16)"
+                ),
+            ));
+        }
+        let packing_fmt = q
+            .get("packing_format")
+            .or_else(|| q.get("backend"))
+            .or_else(|| q.get("vllm_backend"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto_round:auto_gptq")
+            .trim()
+            .to_ascii_lowercase();
+        if packing_fmt.contains("fp8")
+            || packing_fmt.contains("mxfp")
+            || packing_fmt.contains("nvfp")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported auto-round packing_format='{packing_fmt}'"),
+            ));
+        }
+        let awq_packing = packing_fmt.contains("awq");
+        let bits = q.get("bits").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+        if awq_packing && bits != 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported auto-round AWQ packing with bits={bits} (AWQ packing requires 4-bit)"
+                ),
+            ));
+        }
+        let group_size = Self::parse_group_size_i64(q.get("group_size"), 128)?;
+        let sym = q.get("sym").and_then(|v| v.as_bool()).unwrap_or(true);
+        let desc_act = q.get("desc_act").and_then(|v| v.as_bool()).unwrap_or(false);
+        if desc_act && group_size != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported auto-round config: desc_act=true",
+            ));
+        }
+        if !sym && !(awq_packing && bits == 4) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported auto-round config: sym=false with GPTQ packing (requires sym=true or AWQ packing)",
+            ));
+        }
+        Self::validate_bits_and_group_size("auto-round", bits, group_size, !awq_packing)?;
+        if let Some(ec) = q
+            .get("extra_config")
+            .or_else(|| q.get("layer_config"))
+            .and_then(|v| v.as_object())
+        {
+            Self::validate_auto_round_extra_config(ec, bits, group_size, sym, awq_packing)?;
+        }
+        Ok(QuantScheme::AutoRound {
+            bits,
+            group_size,
+            sym,
+            awq_packing,
+        })
+    }
+
+    fn validate_auto_round_extra_config(
+        ec: &serde_json::Map<String, Json>,
+        bits: usize,
+        group_size: usize,
+        sym: bool,
+        awq_packing: bool,
+    ) -> io::Result<()> {
+        for (k, v) in ec {
+            let layer_bits = v
+                .get("bits")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(bits);
+            if layer_bits >= 16 {
+                continue;
+            }
+            if layer_bits != bits {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported mixed-bit AutoRound override in '{}': {layer_bits}-bit (model base is {bits}-bit)",
+                        sanitize_diag(k)
+                    ),
+                ));
+            }
+            if let Some(dt) = v.get("data_type").and_then(|x| x.as_str())
+                && !dt.to_ascii_lowercase().starts_with("int")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported auto-round data_type='{dt}' in '{}' (expected integer W4A16/W8A16)",
+                        sanitize_diag(k)
+                    ),
+                ));
+            }
+            if let Some(act_b) = v.get("act_bits").and_then(|x| x.as_u64())
+                && act_b < 16
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported auto-round act_bits={act_b} in '{}'",
+                        sanitize_diag(k)
+                    ),
+                ));
+            }
+            let layer_gs = if v.get("group_size").is_some() {
+                Self::parse_group_size_i64(v.get("group_size"), group_size as i64)?
+            } else {
+                group_size
+            };
+            Self::validate_bits_and_group_size("auto-round", layer_bits, layer_gs, !awq_packing)?;
+            let layer_sym = v.get("sym").and_then(|x| x.as_bool()).unwrap_or(sym);
+            if !layer_sym && !(awq_packing && layer_bits == 4) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported auto-round sym=false override in '{}' with GPTQ packing",
+                        sanitize_diag(k)
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn num_full_attention_layers(&self) -> usize {
@@ -1655,16 +1798,24 @@ impl ModelConfig {
 }
 
 /// Permutes a `[K / group_size, N]` FP16 scale matrix into `vLLM` Marlin scale layout.
+///
+/// When `group_size > 0 && group_size <= 128` (`group_blocks > 0`), applies the 64-element
+/// 8x8 tile transpose expected by `Marlin<..., group_blocks > 0>` (`s_sh_rd = 8 * warp_col + lane / 4`),
+/// even when `size_k == group_size` (e.g. `size_k = 128, group_size = 128, group_blocks = 8`).
+/// When `group_size == 0` or `group_size > 128` (`group_blocks == -1`, channelwise W8A16),
+/// applies the 32-element post-MMA column permutation (`scale_perm_single`).
 pub fn marlin_permute_scales_k_by_n(
     scales_k_by_n: &[u16],
     size_k: usize,
     size_n: usize,
     group_size: usize,
 ) -> Vec<u16> {
-    let num_groups = size_k / group_size;
+    let eff_gs = if group_size == 0 { size_k } else { group_size };
+    let num_groups = size_k / eff_gs;
     assert_eq!(scales_k_by_n.len(), num_groups * size_n);
     let mut out = vec![0u16; scales_k_by_n.len()];
-    if group_size < size_k {
+    let is_grouped_marlin = group_size > 0 && group_size <= 128;
+    if is_grouped_marlin {
         let mut scale_perm = [0usize; 64];
         for i in 0..8 {
             for j in 0..8 {
@@ -1703,7 +1854,8 @@ pub fn marlin_permute_scales_from_n_major(
     size_n: usize,
     group_size: usize,
 ) -> Vec<u16> {
-    let num_groups = size_k / group_size;
+    let eff_gs = if group_size == 0 { size_k } else { group_size };
+    let num_groups = size_k / eff_gs;
     assert_eq!(scales_n_by_kg.len(), size_n * num_groups);
     let mut k_by_n = vec![0u16; num_groups * size_n];
     for n in 0..size_n {
@@ -1929,8 +2081,9 @@ pub fn dequant_u8b128_n_major_to_f16(
     size_k: usize,
     group_size: usize,
 ) -> Vec<u16> {
+    let eff_gs = if group_size == 0 { size_k } else { group_size };
     let words_per_row = size_k / 4;
-    let groups_per_row = size_k / group_size;
+    let groups_per_row = size_k / eff_gs;
     assert_eq!(packed_n_by_k4.len(), size_n * words_per_row);
     assert_eq!(scales_n_by_kg.len(), size_n * groups_per_row);
     let mut out = vec![0u16; size_n * size_k];
@@ -1940,7 +2093,7 @@ pub fn dequant_u8b128_n_major_to_f16(
             for b in 0..4 {
                 let k = w_idx * 4 + b;
                 let q = ((word >> (b * 8)) & 0xFF) as i32 - 128;
-                let scale = f16_to_f32(scales_n_by_kg[n * groups_per_row + (k / group_size)]);
+                let scale = f16_to_f32(scales_n_by_kg[n * groups_per_row + (k / eff_gs)]);
                 out[n * size_k + k] = f32_to_f16((q as f32) * scale);
             }
         }
@@ -2650,5 +2803,101 @@ mod tests {
         let mut drafter_swa = bad_swa.clone();
         drafter_swa["use_sliding_window"] = serde_json::json!(true);
         assert!(ModelConfig::from_drafter_json(&drafter_swa).is_ok());
+    }
+
+    #[test]
+    fn test_awq_key_aliases_and_auto_round_extra_config_validation() {
+        let base = serde_json::json!({
+            "hidden_size": 2560,
+            "intermediate_size": 6912,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 28,
+            "vocab_size": 152064
+        });
+
+        let mut awq_alias = base.clone();
+        awq_alias["quantization_config"] = serde_json::json!({
+            "quant_method": "awq",
+            "w_bit": 4,
+            "q_group_size": 64,
+            "zero_point": false,
+            "version": "gemm"
+        });
+        let cfg = ModelConfig::from_json(&awq_alias).unwrap();
+        assert_eq!(
+            cfg.quant,
+            QuantScheme::Awq {
+                bits: 4,
+                group_size: 64,
+                zero_point: false,
+            }
+        );
+
+        let mut awq_bad_bits = base.clone();
+        awq_bad_bits["quantization_config"] = serde_json::json!({
+            "quant_method": "awq",
+            "w_bit": 8,
+            "q_group_size": 128,
+            "zero_point": true
+        });
+        assert!(ModelConfig::from_json(&awq_bad_bits).is_err());
+
+        let mut ar_backend = base.clone();
+        ar_backend["quantization_config"] = serde_json::json!({
+            "quant_method": "auto-round",
+            "bits": 4,
+            "group_size": 64,
+            "sym": false,
+            "backend": "awq:marlin",
+            "extra_config": {
+                "lm_head": { "bits": 16, "data_type": "fp", "group_size": 0 },
+                "model.layers.0.mlp.gate": { "bits": 32, "data_type": "float" }
+            }
+        });
+        let cfg = ModelConfig::from_json(&ar_backend).unwrap();
+        assert_eq!(
+            cfg.quant,
+            QuantScheme::AutoRound {
+                bits: 4,
+                group_size: 64,
+                sym: false,
+                awq_packing: true,
+            }
+        );
+
+        for bad_ec in [
+            serde_json::json!({ "model.layers.0.self_attn.q_proj": { "bits": 4, "group_size": 16 } }),
+            serde_json::json!({ "model.layers.0.self_attn.q_proj": { "bits": 4, "sym": false } }),
+            serde_json::json!({ "model.layers.0.self_attn.q_proj": { "bits": 4, "data_type": "fp8" } }),
+            serde_json::json!({ "model.layers.0.self_attn.q_proj": { "bits": 4, "act_bits": 8 } }),
+        ] {
+            let mut ar_bad = base.clone();
+            ar_bad["quantization_config"] = serde_json::json!({
+                "quant_method": "auto-round",
+                "bits": 4,
+                "group_size": 128,
+                "sym": true,
+                "packing_format": "auto_round:auto_gptq",
+                "extra_config": bad_ec
+            });
+            assert!(
+                ModelConfig::from_json(&ar_bad).is_err(),
+                "expected error for {bad_ec}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_marlin_permute_scales_k_equals_group_size_128_uses_grouped_transpose() {
+        let size_k = 128usize;
+        let size_n = 64usize;
+        let scales: Vec<u16> = (0..size_n as u16).collect();
+        let grouped = marlin_permute_scales_k_by_n(&scales, size_k, size_n, 128);
+        let channelwise = marlin_permute_scales_k_by_n(&scales, size_k, size_n, 0);
+        // For 8x8 transpose (`scale_perm`), index 1 is `0 + 8 * 1 = 8`.
+        // For `scale_perm_single`, index 1 is `1`.
+        assert_eq!(grouped[1], 8);
+        assert_eq!(channelwise[1], 1);
     }
 }

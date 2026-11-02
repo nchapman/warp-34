@@ -162,8 +162,9 @@ fn marlin_w4_symmetric_asymmetric_and_w8_match_scalar_reference() {
             let w = weights(n, k, group, bits, asymmetric, 1);
             let packed = upload(&w.packed, &stream);
             let repacked = DeviceBuffer::alloc(0, w.packed.len() * 4).unwrap();
+            let perm_group = if group == k && group > 128 { 0 } else { group };
             let scales = upload(
-                &marlin_permute_scales_from_n_major(&w.scales, k, n, group),
+                &marlin_permute_scales_from_n_major(&w.scales, k, n, perm_group),
                 &stream,
             );
             let zeros = upload(
@@ -260,6 +261,123 @@ fn marlin_w4_symmetric_asymmetric_and_w8_match_scalar_reference() {
                 output.copy_to_host(&mut got, &stream).unwrap();
                 assert_close(&got, &reference, &label);
             }
+        }
+    }
+}
+
+#[test]
+fn marlin_gemm_k_128_group_128_and_channelwise_match_reference() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let (n, k) = (128usize, 128usize);
+    let workspace = DeviceBuffer::alloc(0, (n / 64) * 16 * 4).unwrap();
+    for (bits, asymmetric, perm_gs, gb) in [
+        (4usize, false, 128usize, 8i32),
+        (4usize, true, 128usize, 8i32),
+        (8usize, false, 128usize, 8i32),
+        (8usize, false, 0usize, -1i32),
+    ] {
+        let w = weights(n, k, 128, bits, asymmetric, 3);
+        let packed = upload(&w.packed, &stream);
+        let repacked = DeviceBuffer::alloc(0, w.packed.len() * 4).unwrap();
+        let scales = upload(
+            &marlin_permute_scales_from_n_major(&w.scales, k, n, perm_gs),
+            &stream,
+        );
+        let zeros = upload(
+            &marlin_permute_zero_points_from_n_major(&w.zeros, k, n, 128),
+            &stream,
+        );
+        // SAFETY: packed and repacked buffers are allocated on the active GPU device with correct element counts.
+        let rc = unsafe {
+            if bits == 8 {
+                ffi::w34_marlin_repack_int8(
+                    &ex,
+                    packed.addr() as *const u32,
+                    repacked.addr() as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
+            } else {
+                ffi::w34_marlin_repack_int4(
+                    &ex,
+                    packed.addr() as *const u32,
+                    repacked.addr() as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
+            }
+        };
+        assert_eq!(rc, 0);
+        for m in [1usize, 8, 16, 65] {
+            let label = format!("k=128 W{bits} asym={asymmetric} gb={gb} M={m}");
+            let a: Vec<u16> = (0..m * k)
+                .map(|i| f32_to_f16(((i * 19 + i / k * 5) % 43) as f32 / 64.0 - 0.328125))
+                .collect();
+            let mut reference = vec![0.0; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    reference[row * n + col] = (0..k)
+                        .map(|j| f16_to_f32(a[row * k + j]) * w.dense[col * k + j])
+                        .sum();
+                }
+            }
+            let input = upload(&a, &stream);
+            let output = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+            workspace.zero_async(&stream).unwrap();
+            // SAFETY: all tensor inputs, outputs, scales, and zero-point pointers are valid device allocations matching matrix dimensions.
+            let rc = unsafe {
+                if asymmetric {
+                    ffi::w34_marlin_gemm_f16u4_zp(
+                        &ex,
+                        input.addr() as *const c_void,
+                        repacked.addr() as *const c_void,
+                        scales.addr() as *const c_void,
+                        zeros.addr() as *const c_void,
+                        output.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        gb,
+                    )
+                } else if bits == 8 {
+                    ffi::w34_marlin_gemm_f16u8(
+                        &ex,
+                        input.addr() as *const c_void,
+                        repacked.addr() as *const c_void,
+                        scales.addr() as *const c_void,
+                        output.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        gb,
+                    )
+                } else {
+                    ffi::w34_marlin_gemm_f16u4(
+                        &ex,
+                        input.addr() as *const c_void,
+                        repacked.addr() as *const c_void,
+                        scales.addr() as *const c_void,
+                        output.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        gb,
+                    )
+                }
+            };
+            assert_eq!(rc, 0, "{label}");
+            let mut got = vec![0; m * n];
+            output.copy_to_host(&mut got, &stream).unwrap();
+            assert_close(&got, &reference, &label);
         }
     }
 }

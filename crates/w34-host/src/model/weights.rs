@@ -341,13 +341,53 @@ impl RawLinearHost {
                     s_info.dtype
                 )));
             }
-            let bits = match quant.bits() {
-                8 => 8usize,
-                4 | 0 => 4usize,
-                other => {
+            let shape_override = archive
+                .resolve_name(&format!("{base_prefix}.weight_shape"))
+                .map(|sk| {
+                    archive.read_weight_shape_2d(&sk).map_err(|e| {
+                        loader_err_msg(format!("read_weight_shape_2d('{sk}') failed: {e}"))
+                    })
+                })
+                .transpose()?;
+            let bits = if let Some([shape_n, shape_k]) = shape_override {
+                if shape_n != p_info.shape[0]
+                    || p_info.shape[1] == 0
+                    || !shape_k.is_multiple_of(p_info.shape[1])
+                {
                     return Err(loader_err_msg(format!(
-                        "unsupported compressed-tensors bit-width {other} on '{base_prefix}'"
+                        "mismatched compressed-tensors weight_shape [{shape_n}, {shape_k}] vs weight_packed {:?} on '{base_prefix}'",
+                        p_info.shape
                     )));
+                }
+                let pf = shape_k / p_info.shape[1];
+                let inferred = match pf {
+                    8 => 4usize,
+                    4 => 8usize,
+                    _ => {
+                        return Err(loader_err_msg(format!(
+                            "unsupported compressed-tensors pack_factor={pf} from weight_shape [{shape_n}, {shape_k}] on '{base_prefix}'",
+                        )));
+                    }
+                };
+                if quant.bits() != 0
+                    && quant.bits() != inferred
+                    && !base_prefix.ends_with("embed_tokens")
+                {
+                    return Err(loader_err_msg(format!(
+                        "compressed-tensors weight_shape implies {inferred}-bit on '{base_prefix}', but config specifies {}-bit",
+                        quant.bits()
+                    )));
+                }
+                inferred
+            } else {
+                match quant.bits() {
+                    8 => 8usize,
+                    4 | 0 => 4usize,
+                    other => {
+                        return Err(loader_err_msg(format!(
+                            "unsupported compressed-tensors bit-width {other} on '{base_prefix}'"
+                        )));
+                    }
                 }
             };
             let pack_factor = 32 / bits;
@@ -368,7 +408,7 @@ impl RawLinearHost {
                 )));
             }
             let group_size = k / num_groups;
-            let channelwise = num_groups == 1 && k > 128;
+            let channelwise = num_groups == 1 && (quant.is_channelwise() || k > 128);
             if let Some(g_idx_key) = archive
                 .resolve_name(&format!("{base_prefix}.weight_g_idx"))
                 .or_else(|| archive.resolve_name(&format!("{base_prefix}.g_idx")))
@@ -456,7 +496,7 @@ impl RawLinearHost {
                     group_size,
                 });
             }
-            if quant.expects_zero_points() {
+            if quant.expects_zero_points() && !base_prefix.ends_with("embed_tokens") {
                 return Err(loader_err_msg(format!(
                     "missing '{base_prefix}.weight_zero_point' required by asymmetric compressed-tensors config"
                 )));
@@ -637,7 +677,7 @@ impl RawLinearHost {
                 )));
             }
             let group_size = k.checked_div(num_groups).unwrap_or(quant.group_size_or(k));
-            let channelwise = num_groups == 1 && k > 128;
+            let channelwise = num_groups == 1 && (quant.is_channelwise() || k > 128);
             if let Some(g_idx_key) = archive.resolve_name(&format!("{base_prefix}.g_idx")) {
                 let g_idx = archive
                     .read_u32(&g_idx_key)
@@ -1311,6 +1351,7 @@ impl RawLinearHost {
                 channelwise,
             } => {
                 let gs_ok = *channelwise || matches!(*group_size, 32 | 64 | 128);
+                let eff_gs = if *channelwise { *k } else { *group_size };
                 if marlin_geom_ok(*n, *k) && gs_ok {
                     let b_q_weight_ptr = Self::repack_with_staging(
                         packed,
@@ -1321,8 +1362,8 @@ impl RawLinearHost {
                         stream,
                         repack_staging,
                     )?;
-                    let eff_gs = if *channelwise { *k } else { *group_size };
-                    let perm_scales = marlin_permute_scales_from_n_major(scales, *k, *n, eff_gs);
+                    let perm_gs = if *channelwise { 0 } else { *group_size };
+                    let perm_scales = marlin_permute_scales_from_n_major(scales, *k, *n, perm_gs);
                     let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
                     let group_blocks = if *channelwise {
                         -1
@@ -1337,7 +1378,7 @@ impl RawLinearHost {
                         group_blocks,
                     })
                 } else {
-                    let f16_w = dequant_u8b128_n_major_to_f16(packed, scales, *n, *k, *group_size);
+                    let f16_w = dequant_u8b128_n_major_to_f16(packed, scales, *n, *k, eff_gs);
                     let weight_ptr = arena.upload_slice(&f16_w, stream)?;
                     Ok(LinearProj::DenseF16 {
                         weight_ptr,
@@ -1904,6 +1945,36 @@ pub(crate) fn load_moe_layer_weights(
                 "unsupported fused 3D quantized MoE expert layout on '{pfx}' (expected per-expert W4A16 or 3D BF16/FP16)"
             )));
         }
+        let load_expert_parts = |e: usize| -> Result<(RawLinearHost, RawLinearHost)> {
+            let epfx = format!("{pfx}.mlp.experts.{e}");
+            let rg_full = RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?;
+            if rg_full.dims() != (full_interm, h) {
+                return Err(loader_err_msg(format!(
+                    "MoE gate_proj dims {:?} at '{epfx}' do not match expected ({full_interm}, {h})",
+                    rg_full.dims()
+                )));
+            }
+            let ru_full = RawLinearHost::load(archive, &format!("{epfx}.up_proj"), &cfg.quant)?;
+            if ru_full.dims() != (full_interm, h) {
+                return Err(loader_err_msg(format!(
+                    "MoE up_proj dims {:?} at '{epfx}' do not match expected ({full_interm}, {h})",
+                    ru_full.dims()
+                )));
+            }
+            let rd_full = RawLinearHost::load(archive, &format!("{epfx}.down_proj"), &cfg.quant)?;
+            if rd_full.dims() != (h, full_interm) {
+                return Err(loader_err_msg(format!(
+                    "MoE down_proj dims {:?} at '{epfx}' do not match expected ({h}, {full_interm})",
+                    rd_full.dims()
+                )));
+            }
+            let rg = rg_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+            let ru = ru_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+            let gu = RawLinearHost::concat_rows(&[rg, ru])?;
+            let rd = rd_full.slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+            Ok((gu, rd))
+        };
+
         // Probe expert 0 to determine W4A16 vs W4A16Zp vs DenseF16 storage
         let exp0_gate = RawLinearHost::load(
             archive,
@@ -1912,15 +1983,19 @@ pub(crate) fn load_moe_layer_weights(
         )?;
         match exp0_gate {
             RawLinearHost::U4B8NMajor { group_size, .. } => {
-                if !h.is_multiple_of(8) || !local_moe_interm.is_multiple_of(8) {
+                if !h.is_multiple_of(8)
+                    || !local_moe_interm.is_multiple_of(8)
+                    || !h.is_multiple_of(group_size)
+                    || !local_moe_interm.is_multiple_of(group_size)
+                {
                     return Err(loader_err_msg(format!(
-                        "W4A16 MoE requires hidden_size ({h}) and local_moe_interm ({local_moe_interm}) divisible by 8"
+                        "W4A16 MoE requires hidden_size ({h}) and local_moe_interm ({local_moe_interm}) divisible by 8 and group_size ({group_size})"
                     )));
                 }
                 let gu_words_per_exp = (2 * local_moe_interm) * (h / 8);
-                let gu_scales_per_exp = (2 * local_moe_interm) * h.div_ceil(group_size);
+                let gu_scales_per_exp = (2 * local_moe_interm) * (h / group_size);
                 let dn_words_per_exp = h * (local_moe_interm / 8);
-                let dn_scales_per_exp = h * local_moe_interm.div_ceil(group_size);
+                let dn_scales_per_exp = h * (local_moe_interm / group_size);
 
                 let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
                 let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
@@ -1929,29 +2004,35 @@ pub(crate) fn load_moe_layer_weights(
 
                 for e in 0..num_exp {
                     let epfx = format!("{pfx}.mlp.experts.{e}");
-                    let rg =
-                        RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?
-                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                    let ru = RawLinearHost::load(archive, &format!("{epfx}.up_proj"), &cfg.quant)?
-                        .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                    let gu = RawLinearHost::concat_rows(&[rg, ru])?;
-                    if let RawLinearHost::U4B8NMajor { packed, scales, .. } = gu {
+                    let (gu, rd) = load_expert_parts(e)?;
+                    if let RawLinearHost::U4B8NMajor {
+                        packed,
+                        scales,
+                        group_size: gs,
+                        ..
+                    } = gu
+                        && gs == group_size
+                    {
                         all_gu_packed.extend_from_slice(&packed);
                         all_gu_scales.extend_from_slice(&scales);
                     } else {
                         return Err(loader_err_msg(format!(
-                            "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W4A16)"
+                            "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W4A16 group_size={group_size})"
                         )));
                     }
-                    let rd =
-                        RawLinearHost::load(archive, &format!("{epfx}.down_proj"), &cfg.quant)?
-                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                    if let RawLinearHost::U4B8NMajor { packed, scales, .. } = rd {
+                    if let RawLinearHost::U4B8NMajor {
+                        packed,
+                        scales,
+                        group_size: gs,
+                        ..
+                    } = rd
+                        && gs == group_size
+                    {
                         all_dn_packed.extend_from_slice(&packed);
                         all_dn_scales.extend_from_slice(&scales);
                     } else {
                         return Err(loader_err_msg(format!(
-                            "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W4A16)"
+                            "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W4A16 group_size={group_size})"
                         )));
                     }
                 }
@@ -1969,13 +2050,17 @@ pub(crate) fn load_moe_layer_weights(
                 }
             }
             RawLinearHost::U4ZpNMajor { group_size, .. } => {
-                if !h.is_multiple_of(8) || !local_moe_interm.is_multiple_of(8) {
+                if !h.is_multiple_of(8)
+                    || !local_moe_interm.is_multiple_of(8)
+                    || !h.is_multiple_of(group_size)
+                    || !local_moe_interm.is_multiple_of(group_size)
+                {
                     return Err(loader_err_msg(format!(
-                        "W4A16 asymmetric MoE requires hidden_size ({h}) and local_moe_interm ({local_moe_interm}) divisible by 8"
+                        "W4A16 asymmetric MoE requires hidden_size ({h}) and local_moe_interm ({local_moe_interm}) divisible by 8 and group_size ({group_size})"
                     )));
                 }
-                let gu_groups = h.div_ceil(group_size);
-                let dn_groups = local_moe_interm.div_ceil(group_size);
+                let gu_groups = h / group_size;
+                let dn_groups = local_moe_interm / group_size;
                 let gu_words_per_exp = (2 * local_moe_interm) * (h / 8);
                 let gu_scales_per_exp = (2 * local_moe_interm) * gu_groups;
                 let gu_qzeros_per_exp = ((2 * local_moe_interm) / 8) * gu_groups;
@@ -1992,43 +2077,39 @@ pub(crate) fn load_moe_layer_weights(
 
                 for e in 0..num_exp {
                     let epfx = format!("{pfx}.mlp.experts.{e}");
-                    let rg =
-                        RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?
-                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                    let ru = RawLinearHost::load(archive, &format!("{epfx}.up_proj"), &cfg.quant)?
-                        .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                    let gu = RawLinearHost::concat_rows(&[rg, ru])?;
+                    let (gu, rd) = load_expert_parts(e)?;
                     if let RawLinearHost::U4ZpNMajor {
                         packed,
                         scales,
                         qzeros,
+                        group_size: gs,
                         ..
                     } = gu
+                        && gs == group_size
                     {
                         all_gu_packed.extend_from_slice(&packed);
                         all_gu_scales.extend_from_slice(&scales);
                         all_gu_qzeros.extend_from_slice(&qzeros);
                     } else {
                         return Err(loader_err_msg(format!(
-                            "inconsistent MoE expert quantization at '{epfx}' (expected asymmetric W4A16)"
+                            "inconsistent MoE expert quantization at '{epfx}' (expected asymmetric W4A16 group_size={group_size})"
                         )));
                     }
-                    let rd =
-                        RawLinearHost::load(archive, &format!("{epfx}.down_proj"), &cfg.quant)?
-                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
                     if let RawLinearHost::U4ZpNMajor {
                         packed,
                         scales,
                         qzeros,
+                        group_size: gs,
                         ..
                     } = rd
+                        && gs == group_size
                     {
                         all_dn_packed.extend_from_slice(&packed);
                         all_dn_scales.extend_from_slice(&scales);
                         all_dn_qzeros.extend_from_slice(&qzeros);
                     } else {
                         return Err(loader_err_msg(format!(
-                            "inconsistent MoE down_proj quantization at '{epfx}' (expected asymmetric W4A16)"
+                            "inconsistent MoE down_proj quantization at '{epfx}' (expected asymmetric W4A16 group_size={group_size})"
                         )));
                     }
                 }
@@ -2059,20 +2140,20 @@ pub(crate) fn load_moe_layer_weights(
                 let mut all_dn_f16 = Vec::with_capacity(num_exp * h * local_moe_interm);
                 for e in 0..num_exp {
                     let epfx = format!("{pfx}.mlp.experts.{e}");
-                    let rg =
-                        RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?
-                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                    let ru = RawLinearHost::load(archive, &format!("{epfx}.up_proj"), &cfg.quant)?
-                        .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-                    let gu = RawLinearHost::concat_rows(&[rg, ru])?;
+                    let (gu, rd) = load_expert_parts(e)?;
                     if let RawLinearHost::DenseF16 { weight, .. } = gu {
                         all_gu_f16.extend_from_slice(&weight);
+                    } else {
+                        return Err(loader_err_msg(format!(
+                            "inconsistent MoE expert quantization at '{epfx}' (expected DenseF16)"
+                        )));
                     }
-                    let rd =
-                        RawLinearHost::load(archive, &format!("{epfx}.down_proj"), &cfg.quant)?
-                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
                     if let RawLinearHost::DenseF16 { weight, .. } = rd {
                         all_dn_f16.extend_from_slice(&weight);
+                    } else {
+                        return Err(loader_err_msg(format!(
+                            "inconsistent MoE down_proj quantization at '{epfx}' (expected DenseF16)"
+                        )));
                     }
                 }
                 let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
@@ -2085,7 +2166,8 @@ pub(crate) fn load_moe_layer_weights(
         }
     };
 
-    let local_shared_interm = cfg.shared_expert_intermediate_size / tp_size;
+    let full_shared_interm = cfg.shared_expert_intermediate_size;
+    let local_shared_interm = full_shared_interm / tp_size;
     let (shared_gate_up_proj, shared_down_proj, shared_expert_gate) = if local_shared_interm > 0
         && archive
             .resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))
@@ -2095,42 +2177,71 @@ pub(crate) fn load_moe_layer_weights(
             })
             .is_some()
     {
-        let s_gate = RawLinearHost::load(
+        let s_gate_full = RawLinearHost::load(
             archive,
             &format!("{pfx}.mlp.shared_expert.gate_proj"),
             &cfg.quant,
-        )?
-        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
-        let s_up = RawLinearHost::load(
+        )?;
+        if s_gate_full.dims() != (full_shared_interm, h) {
+            return Err(loader_err_msg(format!(
+                "shared_expert.gate_proj dims {:?} at '{pfx}' do not match expected ({full_shared_interm}, {h})",
+                s_gate_full.dims()
+            )));
+        }
+        let s_gate =
+            s_gate_full.slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+        let s_up_full = RawLinearHost::load(
             archive,
             &format!("{pfx}.mlp.shared_expert.up_proj"),
             &cfg.quant,
-        )?
-        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+        )?;
+        if s_up_full.dims() != (full_shared_interm, h) {
+            return Err(loader_err_msg(format!(
+                "shared_expert.up_proj dims {:?} at '{pfx}' do not match expected ({full_shared_interm}, {h})",
+                s_up_full.dims()
+            )));
+        }
+        let s_up =
+            s_up_full.slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
         let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up])?.upload(
             weight_arena,
             stream,
             repack_staging,
         )?;
-        let s_dn = RawLinearHost::load(
+        let s_dn_full = RawLinearHost::load(
             archive,
             &format!("{pfx}.mlp.shared_expert.down_proj"),
             &cfg.quant,
-        )?
-        .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
-        .upload(weight_arena, stream, repack_staging)?;
+        )?;
+        if s_dn_full.dims() != (h, full_shared_interm) {
+            return Err(loader_err_msg(format!(
+                "shared_expert.down_proj dims {:?} at '{pfx}' do not match expected ({h}, {full_shared_interm})",
+                s_dn_full.dims()
+            )));
+        }
+        let s_dn = s_dn_full
+            .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
+            .upload(weight_arena, stream, repack_staging)?;
         let s_eg = if archive
             .resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight"))
+            .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.shared_expert_gate.qweight")))
+            .or_else(|| {
+                archive.resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight_packed"))
+            })
             .is_some()
         {
-            Some(
-                RawLinearHost::load(
-                    archive,
-                    &format!("{pfx}.mlp.shared_expert_gate"),
-                    &cfg.quant,
-                )?
-                .upload(weight_arena, stream, repack_staging)?,
-            )
+            let raw_eg = RawLinearHost::load(
+                archive,
+                &format!("{pfx}.mlp.shared_expert_gate"),
+                &cfg.quant,
+            )?;
+            if raw_eg.dims() != (1, h) {
+                return Err(loader_err_msg(format!(
+                    "shared_expert_gate dims {:?} at '{pfx}' do not match expected (1, {h})",
+                    raw_eg.dims()
+                )));
+            }
+            Some(raw_eg.upload(weight_arena, stream, repack_staging)?)
         } else {
             None
         };

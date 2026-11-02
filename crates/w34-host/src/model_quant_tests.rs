@@ -220,3 +220,71 @@ fn unquantized_f16_bf16_f32_load_to_the_same_fp16_spine() {
         assert_eq!(loaded.to_f16_vec(), expected, "{dtype}");
     }
 }
+
+#[test]
+fn compressed_tensors_weight_shape_validates_and_resolves_embed_tokens_bits() {
+    let (n, k) = (8usize, 128usize);
+    let packed_u8 = vec![0x82828282u32; n * (k / 4)];
+    let scales = vec![f32_to_f16(0.25); n];
+    let shape_i64: Vec<u8> = [n as i64, k as i64]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    // 8-bit embed_tokens in a model whose linear scheme is 4-bit asymmetric
+    let fixture = Fixture::new(vec![
+        (
+            "model.embed_tokens.weight_packed",
+            "I32",
+            vec![n, k / 4],
+            words(&packed_u8),
+        ),
+        (
+            "model.embed_tokens.weight_scale",
+            "F16",
+            vec![n, 1],
+            halves(&scales),
+        ),
+        (
+            "model.embed_tokens.weight_shape",
+            "I64",
+            vec![2],
+            shape_i64.clone(),
+        ),
+    ]);
+    let loaded =
+        RawLinearHost::load(&fixture.archive(), "model.embed_tokens", &ct(4, 128, false)).unwrap();
+    assert_eq!(loaded.dims(), (n, k));
+    assert_eq!(loaded.to_f16_vec(), vec![f32_to_f16(0.5); n * k]);
+
+    // Non-embedding layer with conflicting weight_shape (8-bit tensor vs 4-bit config) fails fast
+    let bad_fixture = Fixture::new(vec![
+        (
+            "proj.weight_packed",
+            "I32",
+            vec![n, k / 4],
+            words(&packed_u8),
+        ),
+        ("proj.weight_scale", "F16", vec![n, 1], halves(&scales)),
+        ("proj.weight_shape", "I64", vec![2], shape_i64),
+    ]);
+    let err = RawLinearHost::load(&bad_fixture.archive(), "proj", &ct(4, 128, true))
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("weight_shape"), "{err}");
+
+    // Truncated weight_shape (e.g. 8 bytes declared for I64 [2]) returns an error instead of panicking
+    let short_fixture = Fixture::new(vec![
+        (
+            "proj.weight_packed",
+            "I32",
+            vec![n, k / 4],
+            words(&packed_u8),
+        ),
+        ("proj.weight_scale", "F16", vec![n, 1], halves(&scales)),
+        ("proj.weight_shape", "I64", vec![2], vec![0u8; 8]),
+    ]);
+    let err = RawLinearHost::load(&short_fixture.archive(), "proj", &ct(8, 128, true))
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("expected 16 bytes"), "{err}");
+}

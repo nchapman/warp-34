@@ -33,7 +33,15 @@ impl DFlash2Config {
         let body = root.get("transformer_layer_config").unwrap_or(&root);
         let model = ModelConfig::from_drafter_json(body)
             .map_err(|e| loader_err_ctx("DFlash model config", e.to_string()))?;
+        let has_standalone_qcfg = [
+            "quantize_config.json",
+            "quant_config.json",
+            "quantization_config.json",
+        ]
+        .iter()
+        .any(|name| dir.join(name).exists());
         if model.quant != QuantScheme::Unquantized
+            || has_standalone_qcfg
             || root
                 .get("quantization_config")
                 .is_some_and(|v| !v.is_null())

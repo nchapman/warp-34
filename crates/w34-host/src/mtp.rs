@@ -133,12 +133,13 @@ impl Qwen3_5MtpRank {
         let ffn_weight_bytes = if is_moe_mtp {
             let local_moe_i = c.moe_intermediate_size / tp;
             let local_sh_i = c.shared_expert_intermediate_size / tp;
-            let experts_are_w4 = archive
-                .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.qweight")
-                .is_some()
-                || archive
-                    .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_packed")
-                    .is_some();
+            let experts_are_w4 = c.quant.bits() == 4
+                && (archive
+                    .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.qweight")
+                    .is_some()
+                    || archive
+                        .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_packed")
+                        .is_some());
             let expert_elem_bytes = if experts_are_w4 { 1usize } else { 2usize };
             c.num_experts * 3 * h * local_moe_i * expert_elem_bytes
                 + 2 * (c.num_experts * h + 3 * h * local_sh_i + h)

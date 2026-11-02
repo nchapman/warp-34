@@ -228,9 +228,23 @@ impl Qwen3_5ModelRank {
                 || name.contains("embed_tokens.")
                 || name.ends_with(".g_idx")
                 || name.ends_with(".weight_g_idx")
+                || name.ends_with(".weight_shape")
+                || (name.ends_with(".qzeros") && !cfg.quant.expects_zero_points())
             {
                 continue;
             }
+            let is_replicated = name.contains("norm.")
+                || name.ends_with(".mlp.gate.weight")
+                || name.ends_with(".mlp.gate.weight_packed")
+                || name.ends_with(".mlp.gate.weight_scale")
+                || name.ends_with(".mlp.gate.weight_zero_point")
+                || name.ends_with(".mlp.gate.qweight")
+                || name.ends_with(".mlp.gate.scales")
+                || name.ends_with(".mlp.gate.qzeros")
+                || name.contains(".shared_expert_gate.");
+            let is_col_sharded = name.contains(".o_proj.")
+                || name.contains(".out_proj.")
+                || name.contains(".down_proj.");
             let raw_gpu_bytes = match info.dtype.as_str() {
                 "F16" | "BF16" => info.num_elems().saturating_mul(2),
                 "F32" => {
@@ -253,12 +267,19 @@ impl Qwen3_5ModelRank {
                         } else {
                             (info.shape[0], info.shape[1] * pack_factor)
                         };
-                        let local_n = n.div_ceil(tp_size);
-                        let marlin_ok = (local_n % 64 == 0 && k % 128 == 0)
-                            || (local_n % 128 == 0 && k % 64 == 0);
-                        let gs = cfg.quant.group_size_or(k);
-                        let gs_ok = (cfg.quant.is_channelwise() && cfg.quant.bits() == 8)
-                            || matches!(gs, 32 | 64 | 128);
+                        let (local_n, local_k) = if is_replicated {
+                            (n, k)
+                        } else if is_col_sharded {
+                            (n, k.div_ceil(tp_size))
+                        } else {
+                            (n.div_ceil(tp_size), k)
+                        };
+                        let marlin_ok = (local_n % 64 == 0 && local_k % 128 == 0)
+                            || (local_n % 128 == 0 && local_k % 64 == 0);
+                        let gs = cfg.quant.group_size_or(local_k);
+                        let gs_ok = ((cfg.quant.is_channelwise() && cfg.quant.bits() == 8)
+                            || matches!(gs, 32 | 64 | 128))
+                            && (gs == 0 || local_k.is_multiple_of(gs));
                         if !marlin_ok || !gs_ok {
                             Some(n * k * 2)
                         } else {
@@ -271,15 +292,6 @@ impl Qwen3_5ModelRank {
                 }
                 _ => info.len_bytes as usize,
             };
-            let is_replicated = name.contains("norm.")
-                || name.ends_with(".mlp.gate.weight")
-                || name.ends_with(".mlp.gate.weight_packed")
-                || name.ends_with(".mlp.gate.weight_scale")
-                || name.ends_with(".mlp.gate.weight_zero_point")
-                || name.ends_with(".mlp.gate.qweight")
-                || name.ends_with(".mlp.gate.scales")
-                || name.ends_with(".mlp.gate.qzeros")
-                || name.contains(".shared_expert_gate.");
             if is_replicated {
                 let aligned = raw_gpu_bytes.saturating_add(255) & !255;
                 replicated_bytes = replicated_bytes.saturating_add(aligned);
@@ -340,7 +352,32 @@ impl Qwen3_5ModelRank {
             .is_some()
             || archive.resolve_name("model.embed_tokens.qweight").is_some()
         {
-            let raw_embed = RawLinearHost::load(archive, "model.embed_tokens", &cfg.quant)?;
+            let mut embed_quant = cfg.quant.clone();
+            if let Some(pk) = archive.resolve_name("model.embed_tokens.weight_packed")
+                && let Ok(p_info) = archive.tensor_info(&pk)
+                && p_info.shape.len() == 2
+                && p_info.shape[0] == cfg.vocab_size
+            {
+                let has_zp = archive
+                    .resolve_name("model.embed_tokens.weight_zero_point")
+                    .is_some();
+                if p_info.shape[1].saturating_mul(4) == cfg.hidden_size {
+                    embed_quant = crate::loader::QuantScheme::CompressedTensors {
+                        num_bits: 8,
+                        group_size: cfg.quant.raw_group_size(),
+                        symmetric: true,
+                        ignore: Vec::new(),
+                    };
+                } else if p_info.shape[1].saturating_mul(8) == cfg.hidden_size {
+                    embed_quant = crate::loader::QuantScheme::CompressedTensors {
+                        num_bits: 4,
+                        group_size: cfg.quant.raw_group_size(),
+                        symmetric: !has_zp,
+                        ignore: Vec::new(),
+                    };
+                }
+            }
+            let raw_embed = RawLinearHost::load(archive, "model.embed_tokens", &embed_quant)?;
             if raw_embed.dims() != (cfg.vocab_size, cfg.hidden_size) {
                 return Err(loader_err_msg(format!(
                     "quantized embed_tokens dims {:?} do not match ({}, {})",

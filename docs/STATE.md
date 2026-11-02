@@ -14,6 +14,26 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Code-quality refactor and worker error containment
 
+- Quantization and model-loading audit (`loader.rs`, `model/weights.rs`,
+  `model/rank.rs`, `mtp.rs`, `dflash.rs`, `tests/quant_formats.rs`):
+  - Fixed `marlin_permute_scales_k_by_n` and `RawLinearHost::upload` when
+    `size_k == group_size` (e.g. `K = 128, group_size = 128`) so grouped Marlin
+    layers (`group_blocks > 0`) always use the 64-element 8×8 `scale_perm`
+    transpose while channelwise W8A16 layers (`group_blocks == -1`,
+    `group_size == 0` or `group_size > 128`) use `scale_perm_single`.
+  - Added AWQ `w_bit` / `q_group_size` key-alias support in `parse_quant_awq`
+    and standalone `quant_config.json` / `quantization_config.json` discovery in
+    `ModelConfig::from_dir` and `DFlash2Config::load`; tightened `auto-round`
+    `extra_config` validation (`group_size`, `sym`, `data_type`, `act_bits` on
+    quantized overrides while allowing `bits >= 16` float skip rules) and
+    `vllm_backend` resolution.
+  - Added `.weight_shape` (`read_weight_shape_2d` with strict byte-length checks)
+    and `embed_tokens` bit-width/symmetry resolution for `compressed-tensors`
+    checkpoints, per-expert and shared-expert dimension and `group_size`
+    validation in `load_moe_layer_weights`, accurate column-sharded/replicated
+    `estimate_weight_arena_bytes` accounting (skipping unused `.qzeros` and
+    `.weight_shape`), and 4-bit-only `experts_are_w4` MTP arena sizing.
+  - Verified with `mise run check`, `mise run test-cpu`, and `review`.
 - Workspace Clippy now enables `cognitive_complexity` with threshold **25** in
   `clippy.toml`, enforced by the existing CPU/CUDA all-target checks with
   `-D warnings`. No function-length or nesting limits are enabled, and no
