@@ -57,7 +57,8 @@ fn linear_bias_materialization() {
         .unwrap();
     c.copy_to_host(&mut out, &stream).unwrap();
     stream.synchronize().unwrap();
-    if dev.props().unwrap().name == "NVIDIA GeForce RTX 3090 Ti" {
+    let arch_family = dev.props().unwrap().arch_family().unwrap();
+    if arch_family == w34_host::cuda::CudaArchFamily::AmpereSm86 {
         assert_eq!(out[0], f32_to_f16(1.0));
     } else {
         assert!(out[0] == f32_to_f16(1.0) || out[0] == f32_to_f16(0.99951171875));
@@ -75,11 +76,11 @@ fn linear_bias_materialization() {
         stream.synchronize().unwrap();
         let tiny_half_acc = [0.99951171875, -0.99951171875, 2., -2., -1., 1.].map(f32_to_f16);
         let exact_fp32_epilogue = [1.0, -1.0, 2., -2., -1.0009765625, 1.0009765625].map(f32_to_f16);
-        if dev.props().unwrap().name == "NVIDIA GeForce RTX 3090 Ti" {
+        if arch_family == w34_host::cuda::CudaArchFamily::AmpereSm86 {
             assert_eq!(
                 out,
                 // Native Lt's tiny-shape algorithm is not an exact-sum CPU oracle.
-                // torch F.linear on these same FP16 tensors gives these bits on 3090 Ti.
+                // torch F.linear on these same FP16 tensors gives these bits on sm_86.
                 tiny_half_acc
             );
         } else {
@@ -292,12 +293,15 @@ fn linear_bias_patch_shape_strict_reduction() {
     let mut out = vec![0u16; 1200 * 1152];
     c.copy_to_host(&mut out, &stream).unwrap();
     stream.synchronize().unwrap();
-    let gpu_name = dev.props().unwrap().name;
-    if gpu_name == "NVIDIA GeForce RTX 3090 Ti" {
+    let props = dev.props().unwrap();
+    let gpu_name = &props.name;
+    if props.arch_family().unwrap() == w34_host::cuda::CudaArchFamily::AmpereSm86
+        && props.multi_processor_count == 84
+    {
         assert_eq!(
             out.iter().filter(|&&bits| bits != 0).count(),
             0,
-            "all outputs must exactly match native F.linear (+0) on 3090 Ti; first bits: {:#06x}",
+            "all outputs must exactly match native F.linear (+0) on 84-SM sm_86; first bits: {:#06x}",
             out[0]
         );
     } else {

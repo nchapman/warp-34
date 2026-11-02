@@ -118,8 +118,11 @@ fn check_vllm_hidden_replay(engine: &Qwen3_5Engine, mtp: &mut Qwen3_5MtpRank) {
         loader::SafetensorsArchive,
     };
     let target = &engine.ranks[0];
-    let active_gpu = target.device.props().unwrap().name;
-    let max_abs_tol = if active_gpu == "NVIDIA GeForce RTX 3090 Ti" {
+    let props = target.device.props().unwrap();
+    let active_gpu = &props.name;
+    let max_abs_tol = if props.arch_family().unwrap() == w34_host::cuda::CudaArchFamily::AmpereSm86
+        && props.multi_processor_count == 84
+    {
         0.05
     } else {
         0.06
