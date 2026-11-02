@@ -23,6 +23,45 @@ fn request(state: &Arc<OpenAiServerState>, body: Value) -> (String, Value) {
     request_endpoint(state, "/v1/chat/completions", body)
 }
 
+fn exercise_tool_choices(state: &Arc<OpenAiServerState>, kind: SpeculativeKind, tools: &Value) {
+    for choice in [
+        json!("required"),
+        json!({"type":"function","function":{"name":"report"}}),
+        json!("auto"),
+        json!("none"),
+    ] {
+        let (head, body) = request(
+            state,
+            json!({"messages":[{"role":"user","content":"Call report for Oslo."}],
+            "tools":tools, "tool_choice":choice, "max_tokens":192, "chat_template_kwargs":{"enable_thinking":false}}),
+        );
+        assert!(head.contains("200 OK"), "{choice}: {head} {body}");
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        if choice == "none" {
+            assert!(calls.is_empty(), "{body}");
+        }
+        if choice == "required" || choice.is_object() {
+            assert!(!calls.is_empty(), "{body}");
+        }
+        for call in calls {
+            let name = call["function"]["name"].as_str().unwrap();
+            let args: Value =
+                serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+            match name {
+                "report" => assert_eq!(args, json!({"city":"Oslo"})),
+                "noop" if !choice.is_object() => assert_eq!(args, json!({})),
+                _ => panic!("unexpected tool {call}"),
+            }
+        }
+        println!(
+            "{kind:?}: tool_choice={choice}, schema-valid calls={}",
+            calls.len()
+        );
+    }
+}
+
 fn exercise(kind: SpeculativeKind) {
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
@@ -70,42 +109,7 @@ fn exercise(kind: SpeculativeKind) {
         {"type":"function","function":{"name":"report","parameters":{"type":"object","properties":{"city":{"const":"Oslo"}},"required":["city"],"additionalProperties":false}}},
         {"type":"function","function":{"name":"noop","parameters":{"type":"object","properties":{},"additionalProperties":false}}}
     ]);
-    for choice in [
-        json!("required"),
-        json!({"type":"function","function":{"name":"report"}}),
-        json!("auto"),
-        json!("none"),
-    ] {
-        let (head, body) = request(
-            &state,
-            json!({"messages":[{"role":"user","content":"Call report for Oslo."}],
-            "tools":tools, "tool_choice":choice, "max_tokens":192, "chat_template_kwargs":{"enable_thinking":false}}),
-        );
-        assert!(head.contains("200 OK"), "{choice}: {head} {body}");
-        let calls = body["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .unwrap();
-        if choice == "none" {
-            assert!(calls.is_empty(), "{body}");
-        }
-        if choice == "required" || choice.is_object() {
-            assert!(!calls.is_empty(), "{body}");
-        }
-        for call in calls {
-            let name = call["function"]["name"].as_str().unwrap();
-            let args: Value =
-                serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
-            match name {
-                "report" => assert_eq!(args, json!({"city":"Oslo"})),
-                "noop" if !choice.is_object() => assert_eq!(args, json!({})),
-                _ => panic!("unexpected tool {call}"),
-            }
-        }
-        println!(
-            "{kind:?}: tool_choice={choice}, schema-valid calls={}",
-            calls.len()
-        );
-    }
+    exercise_tool_choices(&state, kind, &tools);
     let (head, body) = request(
         &state,
         json!({

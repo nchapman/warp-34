@@ -3679,15 +3679,19 @@ mod tests {
         // Template contains exactly 3 `<|im_start|>`, 2 `<|im_end|>`, 1 `<think>`, 1 `</think>`,
         // and 0 `<|endoftext|>`, `<tool_call>`, `</tool_call>`, `<tool_response>`, `@@SECRET_ADDED@@`.
         let count_id = |target: i32| enc_txt.input_ids.iter().filter(|&&x| x == target).count();
-        assert_eq!(count_id(im_start_id), 3);
-        assert_eq!(count_id(im_end_id), 2);
-        assert_eq!(count_id(think_open_id), 1);
-        assert_eq!(count_id(think_close_id), 1);
-        assert_eq!(count_id(eot_id), 0);
-        assert_eq!(count_id(tool_call_id), 0);
-        assert_eq!(count_id(tool_close_id), 0);
-        assert_eq!(count_id(tool_resp_id), 0);
-        assert_eq!(count_id(secret_added_id), 0);
+        for (target_id, expected_count) in [
+            (im_start_id, 3),
+            (im_end_id, 2),
+            (think_open_id, 1),
+            (think_close_id, 1),
+            (eot_id, 0),
+            (tool_call_id, 0),
+            (tool_close_id, 0),
+            (tool_resp_id, 0),
+            (secret_added_id, 0),
+        ] {
+            assert_eq!(count_id(target_id), expected_count);
+        }
 
         // Multimodal record shifts every question and option span by `1 + 12 + 1 + 1 = 15` tokens
         // (start + 12 image_pad + end + '\n') and places the media block right after `STATE:\n`.

@@ -99,13 +99,15 @@ fn test_phase5_1_wht256_outlier_protection_and_long_context_needle() {
         let pool = KvPool::new(0, 0, &layer_ids, 2, 256, 16, 16, policy).expect("KvPool");
         // Test interior layer (ordinal 2 -> Q8_0 or rotated TQ4)
         let layout = pool.layers[2].layout;
-        if policy == KvFormatPolicy::Q8_0 {
-            assert_eq!(layout.k_transform, W34_KV_TRANSFORM_IDENTITY);
-            assert_eq!(layout.v_transform, W34_KV_TRANSFORM_IDENTITY);
+        let expected_transform = if policy == KvFormatPolicy::Q8_0 {
+            W34_KV_TRANSFORM_IDENTITY
         } else {
-            assert_eq!(layout.k_transform, W34_KV_TRANSFORM_RADEMACHER_WHT256);
-            assert_eq!(layout.v_transform, W34_KV_TRANSFORM_RADEMACHER_WHT256);
-        }
+            W34_KV_TRANSFORM_RADEMACHER_WHT256
+        };
+        assert_eq!(
+            (layout.k_transform, layout.v_transform),
+            (expected_transform, expected_transform)
+        );
 
         let seq_len = 48usize; // 3 full pages
         let q_len = 8usize; // multi-token verify batch (t <= 16)
@@ -365,6 +367,30 @@ fn test_phase5_1_wht256_outlier_protection_and_long_context_needle() {
     }
 }
 
+fn encode_base64_for_test(data: &[u8]) -> String {
+    const LUT: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let v = (b0 << 16) | (b1 << 8) | b2;
+        out.push(LUT[((v >> 18) & 63) as usize] as char);
+        out.push(LUT[((v >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            LUT[((v >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            LUT[(v & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[test]
 fn phase5_2_vision_smart_resize_mrope_and_multimodal_radix_key() {
     use w34_host::server::parse_openai_messages_multimodal;
@@ -429,43 +455,24 @@ fn phase5_2_vision_smart_resize_mrope_and_multimodal_radix_key() {
     assert!(content_str.starts_with("<|vision_start|><|image_pad|>"));
     assert!(content_str.ends_with("<|vision_end|>What is in this image?"));
 
-    // 6. Security: reject local `file://` URLs, bare paths over HTTP, empty base64, and corrupt PNG/JPEG.
-    assert!(w34_host::vision::parse_image_url_to_rgb("file:///etc/passwd").is_err());
-    assert!(w34_host::vision::parse_image_url_to_rgb("/etc/passwd").is_err());
-    assert!(w34_host::vision::parse_image_url_to_rgb("data:image/png;base64,").is_err());
-    assert!(
-        w34_host::vision::parse_image_url_to_rgb("data:image/png;base64,bm90LWEtcG5n").is_err()
-    );
-    assert!(
-        w34_host::vision::parse_image_url_to_rgb("data:image/jpeg;base64,bm90LWEtanBlZw==")
-            .is_err()
-    );
-    assert!(w34_host::vision::parse_image_url_to_rgb("data:image/webp;base64,UklGRg==").is_err());
+    check_image_decoding_and_url_policy();
+}
+
+fn check_image_decoding_and_url_policy() {
+    // Reject local `file://` URLs, bare paths over HTTP, empty base64, and corrupt PNG/JPEG.
+    for bad_url in [
+        "file:///etc/passwd",
+        "/etc/passwd",
+        "data:image/png;base64,",
+        "data:image/png;base64,bm90LWEtcG5n",
+        "data:image/jpeg;base64,bm90LWEtanBlZw==",
+        "data:image/webp;base64,UklGRg==",
+    ] {
+        assert!(w34_host::vision::parse_image_url_to_rgb(bad_url).is_err());
+    }
 
     // 7. PNG (RGBA8 -> RGB8) and JPEG decoding via both `data:image/...;base64,...` and local CLI files.
-    let encode_b64 = |data: &[u8]| -> String {
-        const LUT: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-        for chunk in data.chunks(3) {
-            let b0 = chunk[0] as u32;
-            let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-            let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-            let v = (b0 << 16) | (b1 << 8) | b2;
-            out.push(LUT[((v >> 18) & 63) as usize] as char);
-            out.push(LUT[((v >> 12) & 63) as usize] as char);
-            out.push(if chunk.len() > 1 {
-                LUT[((v >> 6) & 63) as usize] as char
-            } else {
-                '='
-            });
-            out.push(if chunk.len() > 2 {
-                LUT[(v & 63) as usize] as char
-            } else {
-                '='
-            });
-        }
-        out
-    };
+    let encode_b64 = encode_base64_for_test;
 
     let (w, h) = (36u32, 24u32);
     let mut rgba_img = image::RgbaImage::new(w, h);

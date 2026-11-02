@@ -12,6 +12,7 @@ unsafe_code = "allow"
 
 [workspace.lints.clippy]
 all = { level = "warn" }
+cognitive_complexity = "warn"
 undocumented_unsafe_blocks = "warn"
 missing_safety_doc = "warn"
 

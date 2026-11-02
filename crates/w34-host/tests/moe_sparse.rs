@@ -234,11 +234,19 @@ fn cpu_marlin_moe_ref(
     out
 }
 
-fn check_sparse(shape: SparseShape) {
-    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _dev = CudaDevice::set_current(0).unwrap();
-    let stream = CudaStream::new(0).unwrap();
+struct SparseHostFixture {
+    gu_packed: Vec<u32>,
+    gu_scales: Vec<u16>,
+    dn_packed: Vec<u32>,
+    dn_scales: Vec<u16>,
+    x_host: Vec<u16>,
+    sh_out_host: Vec<u16>,
+    sh_gate_host: Vec<u16>,
+    topk_ids: Vec<i32>,
+    topk_weights: Vec<f32>,
+}
 
+fn build_sparse_host_fixture(shape: &SparseShape) -> SparseHostFixture {
     let SparseShape {
         num_tokens,
         top_k,
@@ -247,10 +255,8 @@ fn check_sparse(shape: SparseShape) {
         interm,
         group_size,
         concentrated,
-        ws_cap,
-        expected_regime,
-        check_tp2_partition,
-    } = shape;
+        ..
+    } = *shape;
 
     let gu_words = num_experts * (2 * interm) * (hidden / 8);
     let gu_scales_len = num_experts * (2 * interm) * (hidden / group_size);
@@ -315,6 +321,48 @@ fn check_sparse(shape: SparseShape) {
     // Invalid routes must not leave observable uninitialized stage2 values.
     topk_ids[0] = -1;
     topk_ids[1] = num_experts as i32;
+
+    SparseHostFixture {
+        gu_packed,
+        gu_scales,
+        dn_packed,
+        dn_scales,
+        x_host,
+        sh_out_host,
+        sh_gate_host,
+        topk_ids,
+        topk_weights,
+    }
+}
+
+fn check_sparse(shape: SparseShape) {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+
+    let SparseShape {
+        num_tokens,
+        top_k,
+        num_experts,
+        hidden,
+        interm,
+        group_size,
+        concentrated: _,
+        ws_cap,
+        expected_regime,
+        check_tp2_partition,
+    } = shape;
+    let SparseHostFixture {
+        gu_packed,
+        gu_scales,
+        dn_packed,
+        dn_scales,
+        x_host,
+        sh_out_host,
+        sh_gate_host,
+        topk_ids,
+        topk_weights,
+    } = build_sparse_host_fixture(&shape);
 
     let d_x = DeviceBuffer::alloc(0, x_host.len() * 2).unwrap();
     let d_gu_w = DeviceBuffer::alloc(0, gu_packed.len() * 4).unwrap();
@@ -478,10 +526,22 @@ fn check_sparse(shape: SparseShape) {
 
     // Sequential single-GPU TP intermediate partition check; no collectives.
     let half_interm = interm / 2;
-    let mut gu_w_r = [vec![0u32; gu_words / 2], vec![0u32; gu_words / 2]];
-    let mut gu_s_r = [vec![0u16; gu_scales_len / 2], vec![0u16; gu_scales_len / 2]];
-    let mut dn_w_r = [vec![0u32; dn_words / 2], vec![0u32; dn_words / 2]];
-    let mut dn_s_r = [vec![0u16; dn_scales_len / 2], vec![0u16; dn_scales_len / 2]];
+    let mut gu_w_r = [
+        vec![0u32; gu_packed.len() / 2],
+        vec![0u32; gu_packed.len() / 2],
+    ];
+    let mut gu_s_r = [
+        vec![0u16; gu_scales.len() / 2],
+        vec![0u16; gu_scales.len() / 2],
+    ];
+    let mut dn_w_r = [
+        vec![0u32; dn_packed.len() / 2],
+        vec![0u32; dn_packed.len() / 2],
+    ];
+    let mut dn_s_r = [
+        vec![0u16; dn_scales.len() / 2],
+        vec![0u16; dn_scales.len() / 2],
+    ];
     let w_row = hidden / 8;
     let g_row = hidden / group_size;
     let dw_half = half_interm / 8;

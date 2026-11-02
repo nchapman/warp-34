@@ -1360,247 +1360,49 @@ mod tests {
 
     #[test]
     fn validates_all_anthropic_bad_request_paths() {
-        assert!(translate_anthropic_to_chat(&json!([]), "q", 1, false).is_err());
-        assert!(translate_anthropic_to_chat(&json!({"model": "q"}), "q", 1, false).is_err());
-        assert!(translate_anthropic_to_chat(&json!({"messages": []}), "q", 1, false).is_err());
-        assert!(translate_anthropic_to_chat(&json!({"messages": "hi"}), "q", 1, false).is_err());
-        assert!(translate_anthropic_to_chat(&json!({"messages": [123]}), "q", 1, false).is_err());
-        assert!(
-            translate_anthropic_to_chat(&json!({"messages": [{"content": "hi"}]}), "q", 1, false)
-                .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(&json!({"messages": [{"role": "user"}]}), "q", 1, false)
-                .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"messages": [{"role": "system", "content": "hi"}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"messages": [{"role": "user", "content": []}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"messages": [{"role": "user", "content": [42]}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"messages": [{"role": "user", "content": [{}]}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"messages": [{"role": "user", "content": [{"type": "text"}]}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"messages": [{"role": "user", "content": [{"type": "audio"}]}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"messages": [{"role": "user", "content": [{"type": "image"}]}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(translate_anthropic_to_chat(
-            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "ftp"}}]}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}]}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "data": "abc"}}]}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url"}}]}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"messages": [{"role": "user", "content": [{"type": "tool_result"}]}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(translate_anthropic_to_chat(
-            &json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "text"}]}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "video"}]}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "tool_use", "name": "foo"}]}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"system": 123, "messages": [{"role": "user", "content": "hi"}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"system": [123], "messages": [{"role": "user", "content": "hi"}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(translate_anthropic_to_chat(
-            &json!({"system": [{"type": "image"}], "messages": [{"role": "user", "content": "hi"}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"system": [{"type": "text"}], "messages": [{"role": "user", "content": "hi"}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"tools": "tools", "messages": [{"role": "user", "content": "hi"}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"tools": [1], "messages": [{"role": "user", "content": "hi"}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(translate_anthropic_to_chat(
-            &json!({"tools": [{"input_schema": {}}], "messages": [{"role": "user", "content": "hi"}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"tools": [{"type": "bash_20241022", "name": "bash"}], "messages": [{"role": "user", "content": "hi"}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"tool_choice": {"type": "unknown"}, "messages": [{"role": "user", "content": "hi"}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"tool_choice": {"type": "tool"}, "messages": [{"role": "user", "content": "hi"}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(
-            translate_anthropic_to_chat(
-                &json!({"thinking": "enabled", "messages": [{"role": "user", "content": "hi"}]}),
-                "q",
-                1,
-                false
-            )
-            .is_err()
-        );
-        assert!(translate_anthropic_to_chat(
-            &json!({"thinking": {"type": "magic"}, "messages": [{"role": "user", "content": "hi"}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
-        assert!(translate_anthropic_to_chat(
-            &json!({"thinking": {"type": "enabled"}, "messages": [{"role": "user", "content": "hi"}]}),
-            "q",
-            1,
-            false
-        )
-        .is_err());
+        let bad_cases = [
+            json!([]),
+            json!({"model": "q"}),
+            json!({"messages": []}),
+            json!({"messages": "hi"}),
+            json!({"messages": [123]}),
+            json!({"messages": [{"content": "hi"}]}),
+            json!({"messages": [{"role": "user"}]}),
+            json!({"messages": [{"role": "system", "content": "hi"}]}),
+            json!({"messages": [{"role": "user", "content": []}]}),
+            json!({"messages": [{"role": "user", "content": [42]}]}),
+            json!({"messages": [{"role": "user", "content": [{}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "text"}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "audio"}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "image"}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "ftp"}}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "data": "abc"}}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url"}}]}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "tool_result"}]}]}),
+            json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "text"}]}]}),
+            json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "video"}]}]}),
+            json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": [{"type": "tool_use", "name": "foo"}]}]}),
+            json!({"system": 123, "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"system": [123], "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"system": [{"type": "image"}], "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"system": [{"type": "text"}], "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"tools": "tools", "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"tools": [1], "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"tools": [{"input_schema": {}}], "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"tools": [{"type": "bash_20241022", "name": "bash"}], "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"tool_choice": {"type": "unknown"}, "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"tool_choice": {"type": "tool"}, "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"thinking": "enabled", "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"thinking": {"type": "magic"}, "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"thinking": {"type": "enabled"}, "messages": [{"role": "user", "content": "hi"}]}),
+        ];
+        for case in &bad_cases {
+            assert!(
+                translate_anthropic_to_chat(case, "q", 1, false).is_err(),
+                "expected bad-request error for payload: {case}"
+            );
+        }
     }
 }

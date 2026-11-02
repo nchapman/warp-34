@@ -3066,6 +3066,81 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_prefill_tile_benchmark(
+        ex: &W34Exec,
+        stream: &CudaStream,
+        arena: &mut DeviceArena,
+        layout: &W34KvLayerLayout,
+        write_batch: &W34AttentionBatch,
+        block_table_host: &[i32],
+        num_pages: usize,
+        q_dev: u64,
+        out_128q_addr: u64,
+        fmt: i32,
+    ) {
+        // Repeated physical pages isolate tile compute/dequant costs without a model.
+        // End-to-end cold-prefill benchmarks separately measure real HBM working sets.
+        let table: Vec<i32> = (0..4096).map(|i| block_table_host[i % num_pages]).collect();
+        let pages = arena.upload_slice(&table, stream).unwrap();
+        for heads in [16, 24] {
+            for (queries, context) in [(256, 8192), (1024, 8192), (1024, 64512)] {
+                let starts = arena.upload_slice(&[0i32, queries], stream).unwrap();
+                let ctx = arena.upload_slice(&[context], stream).unwrap();
+                let seq = arena.upload_slice(&[context + queries], stream).unwrap();
+                let batch = W34AttentionBatch {
+                    query_start_loc: starts as *const i32,
+                    context_lens_before: ctx as *const i32,
+                    seq_lens_after: seq as *const i32,
+                    block_tables: pages as *const i32,
+                    write_slot_mapping: core::ptr::null(),
+                    total_tokens: queries,
+                    max_blocks_per_req: 4096,
+                    max_q_len: queries,
+                    max_seq_len: context + queries,
+                    ..*write_batch
+                };
+                for variant in [1, 2] {
+                    let invoke = || {
+                        check_rc(
+                            // SAFETY: `q_dev`, `out_128q_addr`, `layout`, and `batch` pointers
+                            // live in `arena`/`k_pool`/`v_pool` for the duration of the test.
+                            unsafe {
+                                ffi::w34_paged_attention_f16_force_kernel_for_test(
+                                    ex,
+                                    layout,
+                                    &batch,
+                                    q_dev as *const c_void,
+                                    out_128q_addr as *mut c_void,
+                                    heads,
+                                    variant,
+                                )
+                            },
+                            "prefill tile benchmark",
+                        )
+                        .unwrap()
+                    };
+                    invoke();
+                    stream.synchronize().unwrap();
+                    let start = CudaEvent::new(0, true).unwrap();
+                    let end = CudaEvent::new(0, true).unwrap();
+                    start.record(stream).unwrap();
+                    for _ in 0..5 {
+                        invoke();
+                    }
+                    end.record(stream).unwrap();
+                    stream.synchronize().unwrap();
+                    eprintln!(
+                        "tile_bench fmt={fmt} heads={heads} q={queries} ctx={context} rows={} ms={:.4}",
+                        if variant == 1 { 64 } else { 128 },
+                        start.elapsed_ms(&end).unwrap() / 5.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     fn prefill_variant_fixture(benchmark: bool) {
         let _dev = CudaDevice::set_current(0).unwrap();
         let stream = CudaStream::new(0).unwrap();
@@ -3199,65 +3274,18 @@ mod tests {
             .unwrap();
 
             if benchmark {
-                // Repeated physical pages isolate tile compute/dequant costs without a model.
-                // End-to-end cold-prefill benchmarks separately measure real HBM working sets.
-                let table: Vec<i32> = (0..4096).map(|i| block_table_host[i % num_pages]).collect();
-                let pages = arena.upload_slice(&table, &stream).unwrap();
-                for heads in [16, 24] {
-                    for (queries, context) in [(256, 8192), (1024, 8192), (1024, 64512)] {
-                        let starts = arena.upload_slice(&[0i32, queries], &stream).unwrap();
-                        let ctx = arena.upload_slice(&[context], &stream).unwrap();
-                        let seq = arena.upload_slice(&[context + queries], &stream).unwrap();
-                        let batch = W34AttentionBatch {
-                            query_start_loc: starts as *const i32,
-                            context_lens_before: ctx as *const i32,
-                            seq_lens_after: seq as *const i32,
-                            block_tables: pages as *const i32,
-                            write_slot_mapping: core::ptr::null(),
-                            total_tokens: queries,
-                            max_blocks_per_req: 4096,
-                            max_q_len: queries,
-                            max_seq_len: context + queries,
-                            ..write_batch
-                        };
-                        for variant in [1, 2] {
-                            let invoke = || {
-                                check_rc(
-                                    // SAFETY: `q_dev`, `out_128q`, `layout`, and `batch` pointers
-                                    // live in `arena`/`k_pool`/`v_pool` for the duration of the test.
-                                    unsafe {
-                                        ffi::w34_paged_attention_f16_force_kernel_for_test(
-                                            &ex,
-                                            &layout,
-                                            &batch,
-                                            q_dev as *const c_void,
-                                            out_128q.addr() as *mut c_void,
-                                            heads,
-                                            variant,
-                                        )
-                                    },
-                                    "prefill tile benchmark",
-                                )
-                                .unwrap()
-                            };
-                            invoke();
-                            stream.synchronize().unwrap();
-                            let start = CudaEvent::new(0, true).unwrap();
-                            let end = CudaEvent::new(0, true).unwrap();
-                            start.record(&stream).unwrap();
-                            for _ in 0..5 {
-                                invoke();
-                            }
-                            end.record(&stream).unwrap();
-                            stream.synchronize().unwrap();
-                            eprintln!(
-                                "tile_bench fmt={fmt} heads={heads} q={queries} ctx={context} rows={} ms={:.4}",
-                                if variant == 1 { 64 } else { 128 },
-                                start.elapsed_ms(&end).unwrap() / 5.0
-                            );
-                        }
-                    }
-                }
+                run_prefill_tile_benchmark(
+                    &ex,
+                    &stream,
+                    &mut arena,
+                    &layout,
+                    &write_batch,
+                    &block_table_host,
+                    num_pages,
+                    q_dev,
+                    out_128q.addr(),
+                    fmt,
+                );
                 continue;
             }
 

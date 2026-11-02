@@ -1051,32 +1051,15 @@ impl Qwen3VisionEncoder {
     ) -> Result<DeviceBuffer> {
         macro_rules! sample {
             ($name:expr, $buf:expr, $rows:expr, $cols:expr) => {
-                if let Some(ref mut trace) = trace {
-                    let rows: usize = $rows;
-                    let cols: usize = $cols;
-                    let key = format!("vision_trace.{}", $name);
-                    if rows > 0 && !trace.contains_key(&key) {
-                        let mut data = Vec::with_capacity(3 * cols);
-                        for row in [0, rows / 2, rows - 1] {
-                            let mut host = vec![0u16; cols];
-                            check_rc(
-                                // SAFETY: host is allocated for `cols` half elements (`cols * 2` bytes),
-                                // device address is within the source device buffer, and stream is synchronized before read.
-                                unsafe {
-                                    ffi::w34_memcpy_d2h_async(
-                                        host.as_mut_ptr() as *mut c_void,
-                                        ($buf.addr() + (row * cols * 2) as u64) as *const c_void,
-                                        cols * 2,
-                                        stream.handle,
-                                    )
-                                },
-                                "vision trace row",
-                            )?;
-                            stream.synchronize()?;
-                            data.extend(host.into_iter().map(f16_to_f32));
-                        }
-                        trace.insert(key, (vec![3, cols], data));
-                    }
+                if let Some(trace_out) = trace.as_deref_mut() {
+                    Self::record_vision_trace_sample(
+                        trace_out,
+                        stream,
+                        &format!("vision_trace.{}", $name),
+                        &$buf,
+                        $rows,
+                        $cols,
+                    )?;
                 }
             };
         }
@@ -1428,6 +1411,40 @@ impl Qwen3VisionEncoder {
 
         sample!("merger.output", d_visual_out, total_merged, out_hidden);
         Ok(d_visual_out)
+    }
+
+    fn record_vision_trace_sample(
+        trace: &mut VisionTrace,
+        stream: &CudaStream,
+        key: &str,
+        buf: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+    ) -> Result<()> {
+        if rows == 0 || trace.contains_key(key) {
+            return Ok(());
+        }
+        let mut data = Vec::with_capacity(3 * cols);
+        for row in [0, rows / 2, rows - 1] {
+            let mut host = vec![0u16; cols];
+            check_rc(
+                // SAFETY: host is allocated for `cols` half elements (`cols * 2` bytes),
+                // device address is within the source device buffer, and stream is synchronized before read.
+                unsafe {
+                    ffi::w34_memcpy_d2h_async(
+                        host.as_mut_ptr() as *mut c_void,
+                        (buf.addr() + (row * cols * 2) as u64) as *const c_void,
+                        cols * 2,
+                        stream.handle,
+                    )
+                },
+                "vision trace row",
+            )?;
+            stream.synchronize()?;
+            data.extend(host.into_iter().map(f16_to_f32));
+        }
+        trace.insert(key.to_string(), (vec![3, cols], data));
+        Ok(())
     }
 }
 

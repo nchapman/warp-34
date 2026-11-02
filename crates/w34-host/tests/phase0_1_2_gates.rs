@@ -108,6 +108,14 @@ fn test_phase0_loader_all_five_cached_checkpoints() {
 }
 
 #[cfg(feature = "cuda")]
+fn assert_f16_within_tol(got: &[u16], expected: &[f32], tol: f32) {
+    for (&g, &r) in got.iter().zip(expected.iter()) {
+        let diff = (f16_to_f32(g) - r).abs();
+        assert!(diff <= tol, "diff={diff} > tol={tol}");
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[test]
 fn test_phase1_op_fixtures_dump_diff() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -149,10 +157,7 @@ fn test_phase1_op_fixtures_dump_diff() {
         assert_eq!(rc, 0);
         let mut got_u16 = vec![0u16; x.len()];
         d_out.copy_to_host(&mut got_u16, &stream).unwrap();
-        for (&g, &r) in got_u16.iter().zip(ref_out.iter()) {
-            let diff = (f16_to_f32(g) - r).abs();
-            assert!(diff <= 2e-3, "gemma_rms_norm diff={diff}");
-        }
+        assert_f16_within_tol(&got_u16, &ref_out, 2e-3);
 
         let res_in = archive
             .read_f16_bits("fused_add_gemma_rms_norm.res_in")
@@ -180,12 +185,8 @@ fn test_phase1_op_fixtures_dump_diff() {
         let mut got_res = vec![0u16; res_in.len()];
         d_res.copy_to_host(&mut got_res, &stream).unwrap();
         d_out.copy_to_host(&mut got_u16, &stream).unwrap();
-        for (&g, &r) in got_res.iter().zip(ref_res_out.iter()) {
-            assert!((f16_to_f32(g) - r).abs() <= 2e-3);
-        }
-        for (&g, &r) in got_u16.iter().zip(ref_f_out.iter()) {
-            assert!((f16_to_f32(g) - r).abs() <= 2e-3);
-        }
+        assert_f16_within_tol(&got_res, &ref_res_out, 2e-3);
+        assert_f16_within_tol(&got_u16, &ref_f_out, 2e-3);
     }
 
     // 2. silu_and_mul & rms_norm_gated_silu
@@ -208,9 +209,7 @@ fn test_phase1_op_fixtures_dump_diff() {
         assert_eq!(rc, 0);
         let mut got = vec![0u16; ref_out.len()];
         d_out.copy_to_host(&mut got, &stream).unwrap();
-        for (&g, &r) in got.iter().zip(ref_out.iter()) {
-            assert!((f16_to_f32(g) - r).abs() <= 2e-3);
-        }
+        assert_f16_within_tol(&got, &ref_out, 2e-3);
 
         let gx = archive.read_f16_bits("rms_norm_gated.x").unwrap();
         let gz = archive.read_f16_bits("rms_norm_gated.z").unwrap();
@@ -240,9 +239,7 @@ fn test_phase1_op_fixtures_dump_diff() {
         assert_eq!(rc, 0);
         let mut got_g = vec![0u16; gref.len()];
         d_go.copy_to_host(&mut got_g, &stream).unwrap();
-        for (&g, &r) in got_g.iter().zip(gref.iter()) {
-            assert!((f16_to_f32(g) - r).abs() <= 3e-3);
-        }
+        assert_f16_within_tol(&got_g, &gref, 3e-3);
     }
 
     // 3. fused_qk_rmsnorm_rope_gate
@@ -303,15 +300,9 @@ fn test_phase1_op_fixtures_dump_diff() {
         d_qo.copy_to_host(&mut got_q, &stream).unwrap();
         d_ko.copy_to_host(&mut got_k, &stream).unwrap();
         d_go.copy_to_host(&mut got_g, &stream).unwrap();
-        for (&g, &r) in got_q.iter().zip(ref_q.iter()) {
-            assert!((f16_to_f32(g) - r).abs() <= 3e-3);
-        }
-        for (&g, &r) in got_k.iter().zip(ref_k.iter()) {
-            assert!((f16_to_f32(g) - r).abs() <= 3e-3);
-        }
-        for (&g, &r) in got_g.iter().zip(ref_gate.iter()) {
-            assert_eq!(f16_to_f32(g), r);
-        }
+        assert_f16_within_tol(&got_q, &ref_q, 3e-3);
+        assert_f16_within_tol(&got_k, &ref_k, 3e-3);
+        assert_f16_within_tol(&got_g, &ref_gate, 0.0);
     }
 
     // 4. Marlin W4A16 repack (0 ULP bit-exact) + GEMM (M=1 and M=16)

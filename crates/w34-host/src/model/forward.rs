@@ -4,6 +4,94 @@ use super::*;
 
 #[cfg(feature = "cuda")]
 impl Qwen3_5ModelRank {
+    #[inline]
+    fn layer_tap_target(
+        &self,
+        layer_idx: usize,
+        num_tokens: usize,
+        h_dim: usize,
+    ) -> (u64, i32, i32) {
+        if num_tokens <= self.max_tap_rows
+            && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
+            && let Some(tap_buf) = &self.tap_aux_bf16
+        {
+            let num_taps = self.tap_layer_ids.len();
+            (
+                tap_buf.addr(),
+                (num_taps * h_dim) as i32,
+                (tap_slot * h_dim) as i32,
+            )
+        } else {
+            (0, 0, 0)
+        }
+    }
+
+    fn record_final_forward_dump(
+        &self,
+        residual_buf: u64,
+        final_norm_out_buf: u64,
+        num_tokens: usize,
+        h_dim: usize,
+        dump: &mut ForwardDump,
+    ) -> Result<()> {
+        Self::record_dump_f16(
+            &self.stream,
+            residual_buf,
+            vec![num_tokens, h_dim],
+            &format!("layer_{}_hidden_after", self.layers.len() - 1),
+            dump,
+        )?;
+        Self::record_dump_f16(
+            &self.stream,
+            final_norm_out_buf,
+            vec![num_tokens, h_dim],
+            "final_norm",
+            dump,
+        )?;
+        if num_tokens <= self.max_tap_rows {
+            if let Some(tap_buf) = &self.tap_aux_bf16
+                && !self.tap_layer_ids.is_empty()
+            {
+                let tap_cols = self.tap_layer_ids.len() * h_dim;
+                let count = num_tokens * tap_cols;
+                let mut host_u16 = vec![0u16; count];
+                check_rc(
+                    // SAFETY: count is bounded by max_tap_rows and configured
+                    // tap columns. The host vector has count u16 elements and
+                    // is kept alive until the stream synchronization below.
+                    unsafe {
+                        ffi::w34_memcpy_d2h_async(
+                            host_u16.as_mut_ptr() as *mut c_void,
+                            tap_buf.addr() as *const c_void,
+                            count * 2,
+                            self.stream.handle,
+                        )
+                    },
+                    "record_dump_bf16 d2h",
+                )?;
+                self.stream.synchronize()?;
+                let vals_f32: Vec<f32> = host_u16
+                    .into_iter()
+                    .map(|b| f32::from_bits((b as u32) << 16))
+                    .collect();
+                dump.tensors_f32.insert(
+                    "tap_aux_bf16".to_string(),
+                    (vec![num_tokens, tap_cols], vals_f32),
+                );
+            }
+            if let Some(final_h_buf) = &self.last_final_hidden_f16 {
+                Self::record_dump_f16(
+                    &self.stream,
+                    final_h_buf.addr(),
+                    vec![num_tokens, h_dim],
+                    "last_final_hidden_f16",
+                    dump,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Executes the full model spine for `num_tokens` tokens on this rank.
     ///
     /// Raw-address seam: the engine supplies live device token/position buffers,
@@ -519,19 +607,8 @@ impl Qwen3_5ModelRank {
             } else {
                 (self.final_norm_ptr, final_norm_out_buf)
             };
-            let (tap_dst, tap_stride, tap_offset) = if num_tokens <= self.max_tap_rows
-                && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
-                && let Some(tap_buf) = &self.tap_aux_bf16
-            {
-                let num_taps = self.tap_layer_ids.len();
-                (
-                    tap_buf.addr(),
-                    (num_taps * h_dim) as i32,
-                    (tap_slot * h_dim) as i32,
-                )
-            } else {
-                (0, 0, 0)
-            };
+            let (tap_dst, tap_stride, tap_offset) =
+                self.layer_tap_target(layer_idx, num_tokens, h_dim);
             if let Some(comm) = tp2 {
                 comm.all_reduce_residual_gemma_rms_norm_f16(
                     &ex,
@@ -589,61 +666,13 @@ impl Qwen3_5ModelRank {
         if let Some(dump) = dump_out.as_deref_mut()
             && self.rank == 0
         {
-            Self::record_dump_f16(
-                &self.stream,
+            self.record_final_forward_dump(
                 residual_buf,
-                vec![num_tokens, h_dim],
-                &format!("layer_{}_hidden_after", self.layers.len() - 1),
-                dump,
-            )?;
-            Self::record_dump_f16(
-                &self.stream,
                 final_norm_out_buf,
-                vec![num_tokens, h_dim],
-                "final_norm",
+                num_tokens,
+                h_dim,
                 dump,
             )?;
-            if num_tokens <= self.max_tap_rows {
-                if let Some(tap_buf) = &self.tap_aux_bf16
-                    && !self.tap_layer_ids.is_empty()
-                {
-                    let tap_cols = self.tap_layer_ids.len() * h_dim;
-                    let count = num_tokens * tap_cols;
-                    let mut host_u16 = vec![0u16; count];
-                    check_rc(
-                        // SAFETY: count is bounded by max_tap_rows and configured
-                        // tap columns. The host vector has count u16 elements and
-                        // is kept alive until the stream synchronization below.
-                        unsafe {
-                            ffi::w34_memcpy_d2h_async(
-                                host_u16.as_mut_ptr() as *mut c_void,
-                                tap_buf.addr() as *const c_void,
-                                count * 2,
-                                self.stream.handle,
-                            )
-                        },
-                        "record_dump_bf16 d2h",
-                    )?;
-                    self.stream.synchronize()?;
-                    let vals_f32: Vec<f32> = host_u16
-                        .into_iter()
-                        .map(|b| f32::from_bits((b as u32) << 16))
-                        .collect();
-                    dump.tensors_f32.insert(
-                        "tap_aux_bf16".to_string(),
-                        (vec![num_tokens, tap_cols], vals_f32),
-                    );
-                }
-                if let Some(final_h_buf) = &self.last_final_hidden_f16 {
-                    Self::record_dump_f16(
-                        &self.stream,
-                        final_h_buf.addr(),
-                        vec![num_tokens, h_dim],
-                        "last_final_hidden_f16",
-                        dump,
-                    )?;
-                }
-            }
         }
 
         // 4. LM Head on last token row `[1, h_dim]`
@@ -1328,19 +1357,8 @@ impl Qwen3_5ModelRank {
             } else {
                 (self.final_norm_ptr, final_norm_out_buf)
             };
-            let (tap_dst, tap_stride, tap_offset) = if num_tokens <= self.max_tap_rows
-                && let Some(tap_slot) = self.tap_layer_ids.iter().position(|&id| id == layer_idx)
-                && let Some(tap_buf) = &self.tap_aux_bf16
-            {
-                let num_taps = self.tap_layer_ids.len();
-                (
-                    tap_buf.addr(),
-                    (num_taps * h_dim) as i32,
-                    (tap_slot * h_dim) as i32,
-                )
-            } else {
-                (0, 0, 0)
-            };
+            let (tap_dst, tap_stride, tap_offset) =
+                self.layer_tap_target(layer_idx, num_tokens, h_dim);
             if let Some(comm) = tp2 {
                 comm.all_reduce_residual_gemma_rms_norm_f16(
                     &ex,

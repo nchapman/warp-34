@@ -57,10 +57,14 @@ fn cached_4b_mtp_k123() {
     let mut bad = engine.cfg.clone();
     bad.num_key_value_heads = 1;
     assert!(validate_geometry(&bad, 0, 2).is_err());
-    assert!(mtp.ingest(target, &[anchor; 65], hidden, None).is_err());
-    assert!(mtp.ingest(target, &[-1], hidden, None).is_err());
-    assert!(mtp.ingest(target, &[anchor], 0, None).is_err());
-    assert!(mtp.ingest(target, &[anchor], u64::MAX - 1, None).is_err());
+    for (bad_tokens, bad_hidden) in [
+        (&[anchor; 65][..], hidden),
+        (&[-1][..], hidden),
+        (&[anchor][..], 0),
+        (&[anchor][..], u64::MAX - 1),
+    ] {
+        assert!(mtp.ingest(target, bad_tokens, bad_hidden, None).is_err());
+    }
     assert!(mtp.is_empty());
     mtp.ingest(target, &[], 0, None).unwrap();
     mtp.ingest(target, &tokens[1..], hidden, None).unwrap();

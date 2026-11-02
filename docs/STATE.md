@@ -14,6 +14,18 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ## Code-quality refactor and worker error containment
 
+- Workspace Clippy now enables `cognitive_complexity` with threshold **25** in
+  `clippy.toml`, enforced by the existing CPU/CUDA all-target checks with
+  `-D warnings`. No function-length or nesting limits are enabled, and no
+  cognitive-complexity suppressions were added. Split worker scheduling and CLI
+  parsing/command dispatch into focused helpers, extracted forward/vision
+  diagnostics, and decomposed test fixtures/assertions while retaining coverage.
+  Added CLI missing-value and help short-circuit regression coverage.
+  Verification for this follow-up: `mise run check` (including the full release
+  CUDA suite, oracle/perf checks, and both Clippy configurations) and
+  `mise run test-cpu` pass; the diff review found no actionable issues. Explicitly
+  ignored qualification tests remain ignored; no new standalone performance or
+  donor parity runs were performed for this structural refactor.
 - Split the 10,433-line `src/model.rs` into a 176-line public facade and focused
   `src/model/` modules for weights, ranks, forward execution, generation, graph
   IO/capture/replay, sampling, decisions, and diagnostics. Existing `crate::model`

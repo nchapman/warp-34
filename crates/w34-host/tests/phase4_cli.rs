@@ -76,6 +76,62 @@ fn speculative_cli_validation_without_a_visible_gpu() {
 }
 
 #[test]
+fn cli_option_parsing_preserves_errors_and_help_short_circuit() {
+    for (flag, error) in [
+        ("--draft-model", "missing --draft-model"),
+        ("--mtp-k", "missing --mtp-k"),
+        ("--kv-pages", "missing --kv-pages"),
+        ("--model", "missing --model value"),
+        ("-m", "missing --model value"),
+        ("--tp", "missing --tp value"),
+        ("--prompt", "missing --prompt value"),
+        ("-p", "missing --prompt value"),
+        ("--max-tokens", "missing --max-tokens"),
+        ("-n", "missing --max-tokens"),
+        ("--prompt-len", "missing --prompt-len"),
+        ("--gen-len", "missing --gen-len"),
+        ("--kv-format", "missing --kv-format"),
+        ("--golden", "missing --golden"),
+        ("--out", "missing --out"),
+        ("--max-prompts", "missing --max-prompts"),
+        ("--oracle", "missing --oracle"),
+        ("--preset", "missing --preset"),
+        ("--w34", "missing --w34"),
+        ("--rounds", "missing --rounds"),
+        ("--host", "missing --host"),
+        ("--port", "missing --port"),
+        ("--stage", "missing --stage value"),
+        ("--image", "missing --image value"),
+        ("--batch-size", "missing --batch-size"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_w34"))
+            .env("CUDA_VISIBLE_DEVICES", "")
+            .args(["generate", flag])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(error),
+            "{flag}: {out:?}"
+        );
+    }
+    // Help is handled during parsing, before cross-option validation or loading.
+    for args in [
+        vec![],
+        vec!["generate", "--mtp-k", "4", "--help"],
+        vec!["generate", "--speculative", "dflash2", "-h"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_w34"))
+            .env("CUDA_VISIBLE_DEVICES", "")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--speculative mtp|dflash2"));
+    }
+}
+
+#[test]
 fn profile_diff_presets_and_spec_classification() {
     for preset in [
         "vllm_4b_tp1_decode",

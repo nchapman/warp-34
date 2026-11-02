@@ -407,15 +407,51 @@ fn tp1_and_tp2_gpu_sampler_and_bitmask_parity_plain_and_speculative() {
     assert_eq!(g_json1, g_json2);
 }
 
-#[test]
-fn fast_greedy_sampler_matches_full_sampler_and_rejects_ineligible_rows() {
-    let _guard = GPU_LOCK.lock().unwrap();
-    let dev = CudaDevice::set_current(0).unwrap();
-    let stream = CudaStream::new(dev.device_id).unwrap();
+fn assert_sample_matches(
+    actual: &W34SamplerRowOut,
+    expected: &W34SamplerRowOut,
+    row: usize,
+    path: &str,
+) {
+    assert_eq!(
+        actual.sampled_id, expected.sampled_id,
+        "row {row} {path} id"
+    );
+    assert!(
+        (actual.sampled_logprob - expected.sampled_logprob).abs() < 1e-4,
+        "row {row} {path} logprob={} vs ref={}",
+        actual.sampled_logprob,
+        expected.sampled_logprob,
+    );
+}
 
-    // Vocab size matches Qwen3.5 (`248320`, >= 1024 fast-greedy threshold).
-    let vocab_size = 248_320usize;
-    let num_rows = 8usize;
+fn copy_sampler_rows_d2h(
+    stream: &CudaStream,
+    dev_addr: u64,
+    num_rows: usize,
+) -> Vec<W34SamplerRowOut> {
+    let out_bytes = num_rows * core::mem::size_of::<W34SamplerRowOut>();
+    let mut host = vec![W34SamplerRowOut::default(); num_rows];
+    // SAFETY: `host` and `dev_addr` are sized for `out_bytes` and synchronized before returning.
+    unsafe {
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                host.as_mut_ptr() as *mut c_void,
+                dev_addr as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+    host
+}
+
+fn build_fast_greedy_test_fixture(
+    num_rows: usize,
+    vocab_size: usize,
+) -> (Vec<u16>, Vec<W34SamplerRowCfg>, Vec<W34SamplerSparseEntry>) {
     let mut logits_f16 = vec![0u16; num_rows * vocab_size];
     for r in 0..num_rows {
         for v in 0..vocab_size {
@@ -473,6 +509,19 @@ fn fast_greedy_sampler_matches_full_sampler_and_rejects_ineligible_rows() {
             use_token_id_cdf: 0,
         });
     }
+    (logits_f16, row_cfgs, sparse)
+}
+
+#[test]
+fn fast_greedy_sampler_matches_full_sampler_and_rejects_ineligible_rows() {
+    let _guard = GPU_LOCK.lock().unwrap();
+    let dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(dev.device_id).unwrap();
+
+    // Vocab size matches Qwen3.5 (`248320`, >= 1024 fast-greedy threshold).
+    let vocab_size = 248_320usize;
+    let num_rows = 8usize;
+    let (logits_f16, row_cfgs, sparse) = build_fast_greedy_test_fixture(num_rows, vocab_size);
 
     let mut arena = DeviceArena::new(dev.device_id, 256 * 1024 * 1024).unwrap();
     let d_logits = arena.upload_slice(&logits_f16, &stream).unwrap();
@@ -573,70 +622,14 @@ fn fast_greedy_sampler_matches_full_sampler_and_rejects_ineligible_rows() {
     };
     assert_eq!(rc_nosparse_ref, 0);
 
-    let zero_out = W34SamplerRowOut::default();
-    let mut got_fast = vec![zero_out; num_rows];
-    let mut got_auto = vec![zero_out; num_rows];
-    let mut got_ref = vec![zero_out; num_rows];
-    let mut got_nosparse_ref = vec![zero_out; num_rows];
-    // SAFETY: each host Vec and device buffer has exact length `out_bytes` and outlives `stream.synchronize()`.
-    unsafe {
-        assert_eq!(
-            ffi::w34_memcpy_d2h_async(
-                got_fast.as_mut_ptr() as *mut c_void,
-                d_out_fast as *const c_void,
-                out_bytes,
-                stream.handle,
-            ),
-            0
-        );
-        assert_eq!(
-            ffi::w34_memcpy_d2h_async(
-                got_auto.as_mut_ptr() as *mut c_void,
-                d_out_auto as *const c_void,
-                out_bytes,
-                stream.handle,
-            ),
-            0
-        );
-        assert_eq!(
-            ffi::w34_memcpy_d2h_async(
-                got_ref.as_mut_ptr() as *mut c_void,
-                d_out_ref as *const c_void,
-                out_bytes,
-                stream.handle,
-            ),
-            0
-        );
-        assert_eq!(
-            ffi::w34_memcpy_d2h_async(
-                got_nosparse_ref.as_mut_ptr() as *mut c_void,
-                d_out_nosparse_ref as *const c_void,
-                out_bytes,
-                stream.handle,
-            ),
-            0
-        );
-    }
-    stream.synchronize().unwrap();
+    let got_fast = copy_sampler_rows_d2h(&stream, d_out_fast, num_rows);
+    let got_auto = copy_sampler_rows_d2h(&stream, d_out_auto, num_rows);
+    let got_ref = copy_sampler_rows_d2h(&stream, d_out_ref, num_rows);
+    let got_nosparse_ref = copy_sampler_rows_d2h(&stream, d_out_nosparse_ref, num_rows);
 
     for r in 0..num_rows {
-        assert_eq!(got_fast[r].sampled_id, got_ref[r].sampled_id, "row {r} id");
-        assert_eq!(
-            got_auto[r].sampled_id, got_nosparse_ref[r].sampled_id,
-            "row {r} auto id"
-        );
-        assert!(
-            (got_fast[r].sampled_logprob - got_ref[r].sampled_logprob).abs() < 1e-4,
-            "row {r} logprob fast={} vs ref={}",
-            got_fast[r].sampled_logprob,
-            got_ref[r].sampled_logprob
-        );
-        assert!(
-            (got_auto[r].sampled_logprob - got_nosparse_ref[r].sampled_logprob).abs() < 1e-4,
-            "row {r} auto logprob={} vs ref={}",
-            got_auto[r].sampled_logprob,
-            got_nosparse_ref[r].sampled_logprob
-        );
+        assert_sample_matches(&got_fast[r], &got_ref[r], r, "fast");
+        assert_sample_matches(&got_auto[r], &got_nosparse_ref[r], r, "auto");
     }
 
     // Direct `w34_sampler_step_fast_greedy_f16` rejects `vocab_size < 1024` (`cudaErrorInvalidValue == 1`),
@@ -904,62 +897,48 @@ fn test_fast_greedy_masked_matches_full_sampler_and_edges() {
     };
     assert_eq!(rc_ref, 0);
 
-    let mut got_fast = vec![W34SamplerRowOut::default(); num_rows];
-    let mut got_ref = vec![W34SamplerRowOut::default(); num_rows];
-    // SAFETY: host and device buffers are `out_bytes` bytes on `stream`.
-    unsafe {
+    let got_fast = copy_sampler_rows_d2h(&stream, d_out_fast, num_rows);
+    let got_ref = copy_sampler_rows_d2h(&stream, d_out_ref, num_rows);
+
+    for (r, expected_status, expected_id) in [
+        (0usize, 0, allowed_win_r0 as i32),
+        (1, 0, 501),
+        (2, 0, 88_889),
+        (3, 0, 140_001),
+        (4, 1, -1),
+        (5, 2, -1),
+    ] {
         assert_eq!(
-            ffi::w34_memcpy_d2h_async(
-                got_fast.as_mut_ptr() as *mut c_void,
-                d_out_fast as *const c_void,
-                out_bytes,
-                stream.handle,
-            ),
-            0
-        );
-        assert_eq!(
-            ffi::w34_memcpy_d2h_async(
-                got_ref.as_mut_ptr() as *mut c_void,
-                d_out_ref as *const c_void,
-                out_bytes,
-                stream.handle,
-            ),
-            0
+            (got_fast[r].status, got_fast[r].sampled_id),
+            (expected_status, expected_id),
+            "row {r}"
         );
     }
-    stream.synchronize().unwrap();
-
-    assert_eq!(got_fast[0].status, 0);
-    assert_eq!(got_fast[0].sampled_id, allowed_win_r0 as i32);
-    assert_eq!(got_fast[1].status, 0);
-    assert_eq!(got_fast[1].sampled_id, 501);
-    assert_eq!(got_fast[2].status, 0);
-    assert_eq!(got_fast[2].sampled_id, 88_889);
-    assert_eq!(got_fast[2].draft_accepted, 1);
-    assert_eq!(got_fast[2].draft_prob, 1.0);
-    assert_eq!(got_fast[3].status, 0);
-    assert_eq!(got_fast[3].sampled_id, 140_001);
-    assert_eq!(got_fast[3].draft_accepted, 0);
-    assert_eq!(got_fast[3].draft_prob, 0.0);
-    assert_eq!(got_fast[4].status, 1);
-    assert_eq!(got_fast[4].sampled_id, -1);
-    assert_eq!(got_fast[5].status, 2);
-    assert_eq!(got_fast[5].sampled_id, -1);
+    assert_eq!(
+        (
+            got_fast[2].draft_accepted,
+            got_fast[2].draft_prob,
+            got_fast[3].draft_accepted,
+            got_fast[3].draft_prob,
+        ),
+        (1, 1.0, 0, 0.0)
+    );
 
     for r in 0..num_rows {
-        assert_eq!(got_fast[r].status, got_ref[r].status, "row {r} status");
         assert_eq!(
-            got_fast[r].sampled_id, got_ref[r].sampled_id,
-            "row {r} sampled_id"
-        );
-        assert_eq!(
-            got_fast[r].draft_accepted, got_ref[r].draft_accepted,
-            "row {r} draft_accepted"
-        );
-        assert_eq!(
-            got_fast[r].draft_prob.to_bits(),
-            got_ref[r].draft_prob.to_bits(),
-            "row {r} draft_prob"
+            (
+                got_fast[r].status,
+                got_fast[r].sampled_id,
+                got_fast[r].draft_accepted,
+                got_fast[r].draft_prob.to_bits(),
+            ),
+            (
+                got_ref[r].status,
+                got_ref[r].sampled_id,
+                got_ref[r].draft_accepted,
+                got_ref[r].draft_prob.to_bits(),
+            ),
+            "row {r}"
         );
     }
 

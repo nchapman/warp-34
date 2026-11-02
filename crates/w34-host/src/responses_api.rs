@@ -1660,11 +1660,22 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(chat1["messages"][0]["role"], "system");
-        assert_eq!(chat1["messages"][0]["content"], "Be concise.");
-        assert_eq!(chat1["messages"][1]["role"], "user");
-        assert_eq!(chat1["messages"][1]["content"], "Read Cargo.toml");
-        assert_eq!(chat1["tool_choice"], "none");
+        assert_eq!(
+            (
+                chat1["messages"][0]["role"].as_str(),
+                chat1["messages"][0]["content"].as_str(),
+                chat1["messages"][1]["role"].as_str(),
+                chat1["messages"][1]["content"].as_str(),
+                chat1["tool_choice"].as_str(),
+            ),
+            (
+                Some("system"),
+                Some("Be concise."),
+                Some("user"),
+                Some("Read Cargo.toml"),
+                Some("none"),
+            )
+        );
 
         // Verify stateful tool_choice="none" bitmask constraint parses identically to Chat API
         let constraint = RequestConstraint::parse(&chat1).unwrap().unwrap();
@@ -1872,259 +1883,41 @@ mod tests {
     #[test]
     fn validates_all_responses_bad_request_paths() {
         let store = ResponseStore::default();
-        // non-object root
-        assert!(translate_responses_to_chat(&json!([]), "q", &store, None, 1).is_err());
-        // missing input and previous_response_id
-        assert!(translate_responses_to_chat(&json!({"model": "q"}), "q", &store, None, 1).is_err());
-        // empty input array
-        assert!(translate_responses_to_chat(&json!({"input": []}), "q", &store, None, 1).is_err());
-        // input array with non-object
-        assert!(
-            translate_responses_to_chat(&json!({"input": [123]}), "q", &store, None, 1).is_err()
-        );
-        // message item missing role
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": [{"type": "message", "content": "hi"}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // message item missing content
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": [{"type": "message", "role": "user"}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // unsupported role
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": [{"type": "message", "role": "admin", "content": "hi"}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // content part not object
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": [{"type": "message", "role": "user", "content": [123]}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // text content part missing text
-        assert!(translate_responses_to_chat(
-            &json!({"input": [{"type": "message", "role": "user", "content": [{"type": "text"}]}]}),
-            "q",
-            &store,
-            None,
-            1
-        )
-        .is_err());
-        // input_image missing image_url
-        assert!(translate_responses_to_chat(
-            &json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_image"}]}]}),
-            "q",
-            &store,
-            None,
-            1
-        )
-        .is_err());
-        // system message cannot contain images
-        assert!(translate_responses_to_chat(
-            &json!({"input": [{"type": "message", "role": "system", "content": [{"type": "input_image", "image_url": "https://a.png"}]}]}),
-            "q",
-            &store,
-            None,
-            1
-        )
-        .is_err());
-        // unsupported content part type
-        assert!(translate_responses_to_chat(
-            &json!({"input": [{"type": "message", "role": "user", "content": [{"type": "video"}]}]}),
-            "q",
-            &store,
-            None,
-            1
-        )
-        .is_err());
-        // function_call missing name
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": [{"type": "function_call", "arguments": "{}"}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // function_call missing arguments
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": [{"type": "function_call", "name": "foo"}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // function_call arguments not valid JSON object
-        assert!(translate_responses_to_chat(
-            &json!({"input": [{"type": "function_call", "name": "foo", "arguments": "not json"}]}),
-            "q",
-            &store,
-            None,
-            1
-        )
-        .is_err());
-        // function_call_output missing output
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": [{"type": "function_call_output"}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // unsupported input item type
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": [{"type": "unsupported"}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // tools not array
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "tools": "tools"}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // tool not object
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "tools": [1]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // tool unsupported type
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "tools": [{"type": "code_interpreter"}]}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // tool_choice invalid string
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "tool_choice": "maybe"}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // tool_choice object missing name
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "tool_choice": {"type": "function"}}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // reasoning invalid effort
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "reasoning": {"effort": "extreme"}}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // text format invalid
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "text": {"format": "yaml"}}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // temperature invalid type
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "temperature": "high"}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // top_p invalid type
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "top_p": "high"}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        // max_output_tokens 0
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "max_output_tokens": 0}),
-                "q",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
+        let bad_cases = [
+            json!([]),
+            json!({"model": "q"}),
+            json!({"input": []}),
+            json!({"input": [123]}),
+            json!({"input": [{"type": "message", "content": "hi"}]}),
+            json!({"input": [{"type": "message", "role": "user"}]}),
+            json!({"input": [{"type": "message", "role": "admin", "content": "hi"}]}),
+            json!({"input": [{"type": "message", "role": "user", "content": [123]}]}),
+            json!({"input": [{"type": "message", "role": "user", "content": [{"type": "text"}]}]}),
+            json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_image"}]}]}),
+            json!({"input": [{"type": "message", "role": "system", "content": [{"type": "input_image", "image_url": "https://a.png"}]}]}),
+            json!({"input": [{"type": "message", "role": "user", "content": [{"type": "video"}]}]}),
+            json!({"input": [{"type": "function_call", "arguments": "{}"}]}),
+            json!({"input": [{"type": "function_call", "name": "foo"}]}),
+            json!({"input": [{"type": "function_call", "name": "foo", "arguments": "not json"}]}),
+            json!({"input": [{"type": "function_call_output"}]}),
+            json!({"input": [{"type": "unsupported"}]}),
+            json!({"input": "hi", "tools": "tools"}),
+            json!({"input": "hi", "tools": [1]}),
+            json!({"input": "hi", "tools": [{"type": "code_interpreter"}]}),
+            json!({"input": "hi", "tool_choice": "maybe"}),
+            json!({"input": "hi", "tool_choice": {"type": "function"}}),
+            json!({"input": "hi", "reasoning": {"effort": "extreme"}}),
+            json!({"input": "hi", "text": {"format": "yaml"}}),
+            json!({"input": "hi", "temperature": "high"}),
+            json!({"input": "hi", "top_p": "high"}),
+            json!({"input": "hi", "max_output_tokens": 0}),
+        ];
+        for case in &bad_cases {
+            assert!(
+                translate_responses_to_chat(case, "q", &store, None, 1).is_err(),
+                "expected bad-request error for payload: {case}"
+            );
+        }
     }
 
     #[test]
