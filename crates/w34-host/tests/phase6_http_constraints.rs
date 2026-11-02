@@ -382,8 +382,12 @@ fn dflash_http_strict_schema_is_enforced() {
 fn qwen3_6_moe_mtp_http_tool_and_schema_adherence() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let model = "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4";
-    if w34_host::cuda::CudaDevice::count().unwrap_or(0) < 2
-        || w34_host::loader::resolve_hf_model_dir(model).is_err()
+    if !common::require_or_skip_gpus(2, "qwen3_6_moe_mtp_http_tool_and_schema_adherence")
+        || common::require_or_skip_cached_model(
+            model,
+            "qwen3_6_moe_mtp_http_tool_and_schema_adherence",
+        )
+        .is_none()
     {
         return;
     }

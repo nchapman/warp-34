@@ -3,6 +3,7 @@
 
 #include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cstring>
 #include <mutex>
 #include <new>
 
@@ -50,6 +51,15 @@ uint32_t vision_alignment(const void* p) {
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+extern "C" const char* w34_cuda_error_string(int code) {
+    if (code < 0) return nullptr;
+    const char* msg = cudaGetErrorString((cudaError_t)code);
+    if (msg == nullptr || std::strcmp(msg, "unrecognized error code") == 0) {
+        return nullptr;
+    }
+    return msg;
+}
 
 extern "C" int w34_cublas_runtime_version(int* out_version) {
     if (out_version == nullptr) {

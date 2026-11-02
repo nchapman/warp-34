@@ -112,6 +112,7 @@ typedef struct {
 static_assert(sizeof(w34_gdn_batch) == 80, "w34_gdn_batch ABI size mismatch");
 
 // --- Runtime, Stream, Event, Graph, & cuBLAS primitives (op_init.cu) ---
+const char* w34_cuda_error_string(int code);
 int w34_cublas_runtime_version(int* out_version);
 int w34_get_device_count(int* out_count);
 int w34_set_device(int device_id);
@@ -419,6 +420,10 @@ typedef struct w34_sampler_row_out {
     int32_t  top_ids[W34_MAX_TOP_LOGPROBS];
     float    top_logprobs[W34_MAX_TOP_LOGPROBS];
 } w34_sampler_row_out;
+
+static_assert(sizeof(w34_sampler_row_cfg) == 64, "w34_sampler_row_cfg ABI size mismatch");
+static_assert(sizeof(w34_sampler_sparse_entry) == 16, "w34_sampler_sparse_entry ABI size mismatch");
+static_assert(sizeof(w34_sampler_row_out) == 184, "w34_sampler_row_out ABI size mismatch");
 
 int w34_sampler_greedy_top5_f16(const w34_exec* ex,
                                 const void* logits_f16,     // [num_rows, local_vocab_size]

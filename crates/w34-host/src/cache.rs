@@ -401,7 +401,7 @@ impl StateTx {
 
     /// Commits or rolls back a speculative verification round of `1 + k` tokens where
     /// `accepted_len` in `1..=1 + k` tokens were accepted (`1` = bonus token only, all drafts rejected).
-    /// Returns the freed slots to return to [`StateBundlePool`].
+    /// Returns the freed slots to return to the CUDA `StateBundlePool`.
     pub fn resolve_spec_verify(&mut self, accepted_len: usize) -> Vec<i32> {
         assert!(accepted_len >= 1 && accepted_len <= 1 + self.spec_slots.len());
         let schedule = self.verify_slot_schedule();

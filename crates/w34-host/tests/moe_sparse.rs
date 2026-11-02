@@ -1,11 +1,13 @@
 //! Sparse MoE parity, real-weight M4/M8/M16/M306 validation, shared expert, invalid routes, and TP1/TP2 execution.
 #![cfg(feature = "cuda")]
 #![allow(clippy::undocumented_unsafe_blocks)]
+
+mod common;
+
 use std::{ffi::c_void, sync::Mutex};
 use w34_host::{
     cache::KvFormatPolicy,
     cuda::{CublasHandle, CudaDevice, CudaStream, DeviceBuffer, f16_to_f32, f32_to_f16},
-    loader::resolve_hf_model_dir,
     model::{FfnBlockWeights, Qwen3_5Engine},
 };
 use w34_kernels::ffi;
@@ -609,7 +611,12 @@ fn check_sparse(shape: SparseShape) {
 fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let model = "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4";
-    if resolve_hf_model_dir(model).is_err() {
+    if common::require_or_skip_cached_model(
+        model,
+        "real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2",
+    )
+    .is_none()
+    {
         return;
     }
 
@@ -782,7 +789,10 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
             );
         }
 
-        if CudaDevice::count().unwrap_or(0) < 2 {
+        if !common::require_or_skip_gpus(
+            2,
+            "real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2::tp2",
+        ) {
             return;
         }
         for p in &prompts_tp1 {

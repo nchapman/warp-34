@@ -1,10 +1,126 @@
 //! OpenAI request validation and Axum HTTP/SSE serving.
+use axum::http::StatusCode;
+use core::fmt;
+
 pub use crate::chatml::{ChatMessage, format_chatml_prompt, format_chatml_prompt_with_options};
 #[cfg(feature = "cuda")]
 #[path = "server_http.rs"]
 mod http;
 #[cfg(feature = "cuda")]
 pub use http::*;
+
+/// Typed error seam between the engine worker thread and HTTP handlers.
+///
+/// Preserves failure categories from the producer so handlers return accurate
+/// HTTP status codes (`400`, `429`, `503`, `500`) instead of flattening
+/// client validation errors, overload, and panics into a generic `500`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerError {
+    /// Client-fixable invalid request (`400 Bad Request`).
+    InvalidRequest(String),
+    /// Transient server capacity exhaustion (`429 Too Many Requests`).
+    Overload(String),
+    /// Graceful worker shutdown (`503 Service Unavailable`).
+    WorkerStopped(String),
+    /// Fatal worker thread panic caught at the scheduler loop boundary (`500 Internal Server Error`).
+    WorkerPanicked(String),
+    /// Structured CUDA / kernel failure (`500 Internal Server Error`).
+    Cuda(crate::cuda::CudaError),
+    /// Internal execution or sampling invariant failure (`500 Internal Server Error`).
+    Internal(String),
+}
+
+impl WorkerError {
+    #[inline]
+    pub fn invalid_request(msg: impl Into<String>) -> Self {
+        Self::InvalidRequest(msg.into())
+    }
+
+    #[inline]
+    pub fn overload(msg: impl Into<String>) -> Self {
+        Self::Overload(msg.into())
+    }
+
+    #[inline]
+    pub fn worker_stopped(msg: impl Into<String>) -> Self {
+        Self::WorkerStopped(msg.into())
+    }
+
+    #[inline]
+    pub fn worker_panicked(msg: impl Into<String>) -> Self {
+        Self::WorkerPanicked(msg.into())
+    }
+
+    #[inline]
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::Internal(msg.into())
+    }
+
+    /// Maps `op_sampler.cu` non-zero row statuses: `1` denotes an unsatisfiable
+    /// client bitmask (zero allowed tokens), `2` denotes non-finite logits, and
+    /// `3` denotes a row incorrectly dispatched to the fast-greedy kernel.
+    #[inline]
+    pub fn sampler_status(status: i32) -> Self {
+        if status == 1 {
+            Self::InvalidRequest("GPU sampler status 1: grammar bitmask allows zero tokens".into())
+        } else {
+            Self::Internal(format!("GPU sampler status {status}"))
+        }
+    }
+
+    #[inline]
+    pub const fn http_status(&self) -> StatusCode {
+        match self {
+            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Overload(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::WorkerStopped(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::WorkerPanicked(_) | Self::Cuda(_) | Self::Internal(_) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+
+    #[inline]
+    pub const fn openai_error_type(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest(_) => "invalid_request_error",
+            Self::Overload(_) => "rate_limit_error",
+            Self::WorkerStopped(_)
+            | Self::WorkerPanicked(_)
+            | Self::Cuda(_)
+            | Self::Internal(_) => "server_error",
+        }
+    }
+}
+
+impl fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest(m)
+            | Self::Overload(m)
+            | Self::WorkerStopped(m)
+            | Self::Internal(m) => f.write_str(m),
+            Self::WorkerPanicked(m) => write!(f, "engine worker terminated after panic: {m}"),
+            Self::Cuda(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl std::error::Error for WorkerError {}
+
+impl From<crate::cuda::CudaError> for WorkerError {
+    #[inline]
+    fn from(err: crate::cuda::CudaError) -> Self {
+        Self::Cuda(err)
+    }
+}
+
+impl From<WorkerError> for String {
+    #[inline]
+    fn from(err: WorkerError) -> Self {
+        err.to_string()
+    }
+}
 
 /// Endpoint-specific wire validation; chat retains its boolean logprobs contract.
 pub fn completion_sampling_params(
@@ -377,5 +493,41 @@ mod tests {
         assert_eq!(params.temperature, 0.8);
         assert_eq!(params.top_p, 0.95);
         assert_eq!(params.seed, 42);
+    }
+
+    #[test]
+    fn test_worker_error_http_status_and_wire_classification() {
+        let bad = WorkerError::invalid_request("invalid tokens or request exceeds KV capacity");
+        assert_eq!(bad.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(bad.openai_error_type(), "invalid_request_error");
+
+        let overload = WorkerError::overload("engine admission capacity exceeded");
+        assert_eq!(overload.http_status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(overload.openai_error_type(), "rate_limit_error");
+
+        let stopped = WorkerError::worker_stopped("engine worker stopped");
+        assert_eq!(stopped.http_status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stopped.openai_error_type(), "server_error");
+
+        let panicked = WorkerError::worker_panicked("invariant failure");
+        assert_eq!(panicked.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(panicked.openai_error_type(), "server_error");
+        assert_eq!(
+            panicked.to_string(),
+            "engine worker terminated after panic: invariant failure"
+        );
+
+        let cuda = WorkerError::from(crate::cuda::CudaError::new(-10, "kernel launch"));
+        assert_eq!(cuda.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(cuda.openai_error_type(), "server_error");
+
+        assert_eq!(
+            WorkerError::sampler_status(1).http_status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            WorkerError::sampler_status(2).http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

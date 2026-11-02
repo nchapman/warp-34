@@ -171,6 +171,7 @@ const _: [(); 184] = [(); core::mem::size_of::<W34SamplerRowOut>()];
 
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
+    pub fn w34_cuda_error_string(code: i32) -> *const core::ffi::c_char;
     pub fn w34_cublas_runtime_version(out_version: *mut i32) -> i32;
     pub fn w34_get_device_count(out_count: *mut i32) -> i32;
     pub fn w34_set_device(device_id: i32) -> i32;
@@ -226,6 +227,16 @@ unsafe extern "C" {
 
     pub fn w34_cublas_create(out_handle: *mut usize, stream: usize) -> i32;
     pub fn w34_cublas_destroy(handle: usize) -> i32;
+    pub fn w34_cublas_gemm_f16_bias(
+        handle: usize,
+        a: *const c_void,
+        b: *const c_void,
+        bias: *const c_void,
+        c: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> i32;
     pub fn w34_cublas_gemm_f16(
         handle: usize,
         a: *const c_void,

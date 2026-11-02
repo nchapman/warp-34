@@ -35,8 +35,8 @@ description = "Unit tests only (lib target with CUDA)"
 run = "cargo test --release --features cuda --lib"
 
 [tasks."test-cpu"]
-description = "Fast unit test suite without CUDA (CPU-only)"
-run = "cargo test --lib"
+description = "Fast CPU-only suite: unit tests plus CPU-runnable integration tests"
+run = "cargo test --lib --tests"
 
 [tasks."doc-test"]
 description = "Run library documentation tests"

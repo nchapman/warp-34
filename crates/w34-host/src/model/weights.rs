@@ -1,0 +1,2170 @@
+//! Host quantization, weight loading, and device linear/FFN projections.
+
+use super::*;
+
+#[cfg(feature = "cuda")]
+pub enum LinearProj {
+    MarlinW4A16 {
+        b_q_weight_ptr: u64,
+        b_scales_ptr: u64,
+        size_n: usize,
+        size_k: usize,
+        group_blocks: i32,
+    },
+    MarlinW4A16Zp {
+        b_q_weight_ptr: u64,
+        b_scales_ptr: u64,
+        b_zeros_ptr: u64,
+        size_n: usize,
+        size_k: usize,
+        group_blocks: i32,
+    },
+    MarlinW8A16 {
+        b_q_weight_ptr: u64,
+        b_scales_ptr: u64,
+        size_n: usize,
+        size_k: usize,
+        group_blocks: i32,
+    },
+    DenseF16 {
+        weight_ptr: u64,
+        size_n: usize,
+        size_k: usize,
+    },
+}
+
+#[cfg(feature = "cuda")]
+impl LinearProj {
+    pub fn size_n(&self) -> usize {
+        match self {
+            Self::MarlinW4A16 { size_n, .. }
+            | Self::MarlinW4A16Zp { size_n, .. }
+            | Self::MarlinW8A16 { size_n, .. }
+            | Self::DenseF16 { size_n, .. } => *size_n,
+        }
+    }
+
+    pub fn size_k(&self) -> usize {
+        match self {
+            Self::MarlinW4A16 { size_k, .. }
+            | Self::MarlinW4A16Zp { size_k, .. }
+            | Self::MarlinW8A16 { size_k, .. }
+            | Self::DenseF16 { size_k, .. } => *size_k,
+        }
+    }
+
+    pub fn byte_footprint(&self) -> usize {
+        match self {
+            Self::MarlinW4A16 {
+                size_n,
+                size_k,
+                group_blocks,
+                ..
+            } => {
+                let g = (*group_blocks as usize) * 16;
+                (size_n * size_k / 2) + (size_n * (size_k / g) * 2)
+            }
+            Self::MarlinW4A16Zp {
+                size_n,
+                size_k,
+                group_blocks,
+                ..
+            } => {
+                let g = (*group_blocks as usize) * 16;
+                (size_n * size_k / 2) + (size_n * (size_k / g) * 2) + ((size_n / 2) * (size_k / g))
+            }
+            Self::MarlinW8A16 {
+                size_n,
+                size_k,
+                group_blocks,
+                ..
+            } => {
+                let num_groups = if *group_blocks < 0 {
+                    1
+                } else {
+                    size_k / ((*group_blocks as usize) * 16)
+                };
+                (size_n * size_k) + (size_n * num_groups * 2)
+            }
+            Self::DenseF16 { size_n, size_k, .. } => size_n * size_k * 2,
+        }
+    }
+
+    /// Enqueue a projection using caller-managed device addresses. The model
+    /// loader supplies weights; forward supplies MxK input, MxN output, and
+    /// nonaliasing workspace on the execution stream. This legacy raw-address
+    /// API does not enforce those capacities, lifetimes, or device affinity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        ex: &W34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        x_ptr: u64,
+        out_ptr: u64,
+        m: usize,
+    ) -> Result<()> {
+        match *self {
+            Self::MarlinW4A16 {
+                b_q_weight_ptr,
+                b_scales_ptr,
+                size_n,
+                size_k,
+                group_blocks,
+            } => check_rc(
+                // SAFETY: model upload repacks U4B8 weights and permutes scales
+                // for this N/K/group geometry. X/output/workspace extents and
+                // stream ordering are supplied by the raw-address caller.
+                unsafe {
+                    ffi::w34_marlin_gemm_f16u4(
+                        ex,
+                        x_ptr as *const c_void,
+                        b_q_weight_ptr as *const c_void,
+                        b_scales_ptr as *const c_void,
+                        out_ptr as *mut c_void,
+                        marlin_ws_ptr as *mut i32,
+                        m as i64,
+                        size_n as i64,
+                        size_k as i64,
+                        marlin_ws_ints as i64,
+                        group_blocks,
+                    )
+                },
+                "w34_marlin_gemm_f16u4",
+            ),
+            Self::MarlinW4A16Zp {
+                b_q_weight_ptr,
+                b_scales_ptr,
+                b_zeros_ptr,
+                size_n,
+                size_k,
+                group_blocks,
+            } => check_rc(
+                // SAFETY: upload creates Marlin U4 tiles with correspondingly
+                // permuted scales and zero points. Caller-managed X/output and
+                // workspace must match M/N/K and remain live for this stream.
+                unsafe {
+                    ffi::w34_marlin_gemm_f16u4_zp(
+                        ex,
+                        x_ptr as *const c_void,
+                        b_q_weight_ptr as *const c_void,
+                        b_scales_ptr as *const c_void,
+                        b_zeros_ptr as *const c_void,
+                        out_ptr as *mut c_void,
+                        marlin_ws_ptr as *mut i32,
+                        m as i64,
+                        size_n as i64,
+                        size_k as i64,
+                        marlin_ws_ints as i64,
+                        group_blocks,
+                    )
+                },
+                "w34_marlin_gemm_f16u4_zp",
+            ),
+            Self::MarlinW8A16 {
+                b_q_weight_ptr,
+                b_scales_ptr,
+                size_n,
+                size_k,
+                group_blocks,
+            } => check_rc(
+                // SAFETY: upload creates U8B128 Marlin weights/scales for this
+                // geometry (including channelwise groups). The raw-address caller
+                // supplies live MxK/MxN buffers and separate Marlin workspace.
+                unsafe {
+                    ffi::w34_marlin_gemm_f16u8(
+                        ex,
+                        x_ptr as *const c_void,
+                        b_q_weight_ptr as *const c_void,
+                        b_scales_ptr as *const c_void,
+                        out_ptr as *mut c_void,
+                        marlin_ws_ptr as *mut i32,
+                        m as i64,
+                        size_n as i64,
+                        size_k as i64,
+                        marlin_ws_ints as i64,
+                        group_blocks,
+                    )
+                },
+                "w34_marlin_gemm_f16u8",
+            ),
+            Self::DenseF16 {
+                weight_ptr,
+                size_n,
+                size_k,
+            } => {
+                // Small-N projections (GDN in_proj_ba, size_n <= 256) use a single
+                // batch-size-invariant warp-reduction kernel to avoid per-row cuBLAS
+                // split-K launches and guarantee 0-ULP ssm_state parity across all M.
+                if size_n <= 256 && size_k.is_multiple_of(8) {
+                    check_rc(
+                        // SAFETY: this branch enforces the small-N and K alignment
+                        // specialization. The loaded weight is NxK FP16; input and
+                        // output extents/lifetimes still rely on the caller.
+                        unsafe {
+                            ffi::w34_small_n_gemm_f16(
+                                ex,
+                                x_ptr as *const c_void,
+                                weight_ptr as *const c_void,
+                                out_ptr as *mut c_void,
+                                m as i32,
+                                size_n as i32,
+                                size_k as i32,
+                            )
+                        },
+                        "w34_small_n_gemm_f16",
+                    )
+                } else {
+                    cublas.gemm_f16(
+                        x_ptr,
+                        weight_ptr,
+                        out_ptr,
+                        m as i32,
+                        size_n as i32,
+                        size_k as i32,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// Raw host representation of a linear weight before sharding/uploading.
+pub(crate) enum RawLinearHost {
+    U4B8NMajor {
+        packed: Vec<u32>,
+        scales: Vec<u16>,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    },
+    U4ZpNMajor {
+        packed: Vec<u32>,
+        scales: Vec<u16>,
+        /// N-major `[n / 8, k / group_size]` packed 4-bit zero-points (8 consecutive N-rows per `u32`).
+        qzeros: Vec<u32>,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    },
+    U8B128NMajor {
+        packed: Vec<u32>,
+        scales: Vec<u16>,
+        n: usize,
+        k: usize,
+        group_size: usize,
+        channelwise: bool,
+    },
+    DenseF16 {
+        weight: Vec<u16>,
+        n: usize,
+        k: usize,
+    },
+}
+
+impl RawLinearHost {
+    pub(crate) fn dims(&self) -> (usize, usize) {
+        match self {
+            Self::U4B8NMajor { n, k, .. }
+            | Self::U4ZpNMajor { n, k, .. }
+            | Self::U8B128NMajor { n, k, .. }
+            | Self::DenseF16 { n, k, .. } => (*n, *k),
+        }
+    }
+
+    pub(crate) fn to_f16_vec(&self) -> Vec<u16> {
+        match self {
+            Self::DenseF16 { weight, .. } => weight.clone(),
+            Self::U4B8NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => dequant_u4b8_n_major_to_f16(packed, scales, *n, *k, *group_size),
+            Self::U4ZpNMajor {
+                packed,
+                scales,
+                qzeros,
+                n,
+                k,
+                group_size,
+            } => dequant_u4_zp_n_major_to_f16(packed, scales, qzeros, *n, *k, *group_size),
+            Self::U8B128NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+                ..
+            } => dequant_u8b128_n_major_to_f16(packed, scales, *n, *k, *group_size),
+        }
+    }
+
+    pub(crate) fn load(
+        archive: &SafetensorsArchive,
+        base_prefix: &str,
+        quant: &QuantScheme,
+    ) -> Result<Self> {
+        // 1. compressed-tensors pack-quantized (`*.weight_packed` + `*.weight_scale` [+ `*.weight_zero_point`])
+        let packed_key = format!("{base_prefix}.weight_packed");
+        if let Some(real_packed) = archive.resolve_name(&packed_key) {
+            let scale_key = archive
+                .resolve_name(&format!("{base_prefix}.weight_scale"))
+                .ok_or_else(|| {
+                    loader_err_msg(format!(
+                        "missing '{base_prefix}.weight_scale' for packed tensor '{real_packed}'"
+                    ))
+                })?;
+            let p_info = archive
+                .tensor_info(&real_packed)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{real_packed}') failed: {e}")))?;
+            let s_info = archive
+                .tensor_info(&scale_key)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{scale_key}') failed: {e}")))?;
+            if p_info.shape.len() != 2 || s_info.shape.len() != 2 || s_info.shape[1] == 0 {
+                return Err(loader_err_msg(format!(
+                    "invalid compressed-tensors 2D shapes for '{base_prefix}': weight_packed={:?}, weight_scale={:?}",
+                    p_info.shape, s_info.shape
+                )));
+            }
+            if !matches!(p_info.dtype.as_str(), "I32" | "U32") {
+                return Err(loader_err_msg(format!(
+                    "unsupported weight_packed dtype '{}' on '{real_packed}' (expected I32/U32)",
+                    p_info.dtype
+                )));
+            }
+            if !matches!(s_info.dtype.as_str(), "F16" | "BF16" | "F32") {
+                return Err(loader_err_msg(format!(
+                    "unsupported weight_scale dtype '{}' on '{scale_key}' (expected F16/BF16/F32)",
+                    s_info.dtype
+                )));
+            }
+            let bits = match quant.bits() {
+                8 => 8usize,
+                4 | 0 => 4usize,
+                other => {
+                    return Err(loader_err_msg(format!(
+                        "unsupported compressed-tensors bit-width {other} on '{base_prefix}'"
+                    )));
+                }
+            };
+            let pack_factor = 32 / bits;
+            let n = p_info.shape[0];
+            let k = p_info.shape[1]
+                .checked_mul(pack_factor)
+                .ok_or_else(|| loader_err("overflow on packed K dimension"))?;
+            let num_groups = s_info.shape[1];
+            if n == 0
+                || k == 0
+                || num_groups == 0
+                || s_info.shape[0] != n
+                || !k.is_multiple_of(num_groups)
+            {
+                return Err(loader_err_msg(format!(
+                    "mismatched compressed-tensors scale shape {:?} against [{n}, {k}] ({bits}-bit) on '{base_prefix}'",
+                    s_info.shape
+                )));
+            }
+            let group_size = k / num_groups;
+            let channelwise = num_groups == 1 && k > 128;
+            if let Some(g_idx_key) = archive
+                .resolve_name(&format!("{base_prefix}.weight_g_idx"))
+                .or_else(|| archive.resolve_name(&format!("{base_prefix}.g_idx")))
+            {
+                let g_idx = archive
+                    .read_u32(&g_idx_key)
+                    .map_err(|e| loader_err_msg(format!("read_u32('{g_idx_key}') failed: {e}")))?;
+                validate_static_gptq_g_idx(
+                    &g_idx,
+                    k,
+                    if channelwise { 0 } else { group_size },
+                    &g_idx_key,
+                )
+                .map_err(|e| loader_err_msg(e.to_string()))?;
+            }
+            let packed = archive
+                .read_u32(&real_packed)
+                .map_err(|e| loader_err_msg(format!("read_u32('{real_packed}') failed: {e}")))?;
+            let scales = archive
+                .read_f16_bits(&scale_key)
+                .map_err(|e| loader_err_msg(format!("read_f16_bits('{scale_key}') failed: {e}")))?;
+            let expected_packed = n
+                .checked_mul(k / pack_factor)
+                .ok_or_else(|| loader_err("packed dimensions overflow"))?;
+            if packed.len() != expected_packed {
+                return Err(loader_err_msg(format!(
+                    "packed length {} does not match expected {} on '{real_packed}'",
+                    packed.len(),
+                    expected_packed
+                )));
+            }
+            let expected_scales = n
+                .checked_mul(num_groups)
+                .ok_or_else(|| loader_err("scale dimensions overflow"))?;
+            if scales.len() != expected_scales {
+                return Err(loader_err_msg(format!(
+                    "scales length {} does not match expected {} on '{scale_key}'",
+                    scales.len(),
+                    expected_scales
+                )));
+            }
+
+            if let Some(zp_key) = archive.resolve_name(&format!("{base_prefix}.weight_zero_point"))
+            {
+                if bits != 4 {
+                    return Err(loader_err_msg(format!(
+                        "unsupported {bits}-bit asymmetric weight_zero_point '{zp_key}' (only 4-bit zero-points are supported)"
+                    )));
+                }
+                let zp_info = archive
+                    .tensor_info(&zp_key)
+                    .map_err(|e| loader_err_msg(format!("tensor_info('{zp_key}') failed: {e}")))?;
+                if !matches!(zp_info.dtype.as_str(), "I32" | "U32") {
+                    return Err(loader_err_msg(format!(
+                        "unsupported weight_zero_point dtype '{}' on '{zp_key}' (expected I32/U32)",
+                        zp_info.dtype
+                    )));
+                }
+                if !n.is_multiple_of(8) || zp_info.shape.as_slice() != [n / 8, num_groups] {
+                    return Err(loader_err_msg(format!(
+                        "unexpected weight_zero_point shape {:?} on '{zp_key}' (expected [{}, {num_groups}])",
+                        zp_info.shape,
+                        n / 8
+                    )));
+                }
+                let qzeros = archive
+                    .read_u32(&zp_key)
+                    .map_err(|e| loader_err_msg(format!("read_u32('{zp_key}') failed: {e}")))?;
+                let expected_qzeros = (n / 8)
+                    .checked_mul(num_groups)
+                    .ok_or_else(|| loader_err("zero-point dimensions overflow"))?;
+                if qzeros.len() != expected_qzeros {
+                    return Err(loader_err_msg(format!(
+                        "zero-point length {} does not match expected {} on '{zp_key}'",
+                        qzeros.len(),
+                        expected_qzeros
+                    )));
+                }
+                return Ok(Self::U4ZpNMajor {
+                    packed,
+                    scales,
+                    qzeros,
+                    n,
+                    k,
+                    group_size,
+                });
+            }
+            if quant.expects_zero_points() {
+                return Err(loader_err_msg(format!(
+                    "missing '{base_prefix}.weight_zero_point' required by asymmetric compressed-tensors config"
+                )));
+            }
+            return if bits == 8 {
+                Ok(Self::U8B128NMajor {
+                    packed,
+                    scales,
+                    n,
+                    k,
+                    group_size,
+                    channelwise,
+                })
+            } else {
+                Ok(Self::U4B8NMajor {
+                    packed,
+                    scales,
+                    n,
+                    k,
+                    group_size,
+                })
+            };
+        }
+
+        // 2. GPTQ / AutoRound / AutoAWQ (`*.qweight` + `*.scales` [+ `*.qzeros` / `*.g_idx`])
+        let qweight_key = format!("{base_prefix}.qweight");
+        if let Some(real_qw) = archive.resolve_name(&qweight_key) {
+            let scale_key = archive
+                .resolve_name(&format!("{base_prefix}.scales"))
+                .ok_or_else(|| {
+                    loader_err_msg(format!(
+                        "missing '{base_prefix}.scales' for quantized tensor '{real_qw}'"
+                    ))
+                })?;
+            let qw_info = archive
+                .tensor_info(&real_qw)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{real_qw}') failed: {e}")))?;
+            let s_info = archive
+                .tensor_info(&scale_key)
+                .map_err(|e| loader_err_msg(format!("tensor_info('{scale_key}') failed: {e}")))?;
+            if qw_info.shape.len() != 2 || s_info.shape.len() != 2 || s_info.shape[0] == 0 {
+                return Err(loader_err_msg(format!(
+                    "invalid 2D qweight/scales shapes for '{base_prefix}': qweight={:?}, scales={:?}",
+                    qw_info.shape, s_info.shape
+                )));
+            }
+            if !matches!(qw_info.dtype.as_str(), "I32" | "U32") {
+                return Err(loader_err_msg(format!(
+                    "unsupported qweight dtype '{}' on '{real_qw}' (expected I32/U32)",
+                    qw_info.dtype
+                )));
+            }
+
+            if quant.is_awq_packing() {
+                let k = qw_info.shape[0];
+                let n8 = qw_info.shape[1];
+                let n = n8
+                    .checked_mul(8)
+                    .ok_or_else(|| loader_err("overflow on AWQ N dimension"))?;
+                let num_groups = s_info.shape[0];
+                if n8 == 0
+                    || k == 0
+                    || num_groups == 0
+                    || !k.is_multiple_of(8)
+                    || s_info.shape[1] != n
+                    || !k.is_multiple_of(num_groups)
+                {
+                    return Err(loader_err_msg(format!(
+                        "mismatched AWQ qweight {:?} / scales {:?} on '{base_prefix}' (expected [K, N/8] and [K/g, N])",
+                        qw_info.shape, s_info.shape
+                    )));
+                }
+                let group_size = k / num_groups;
+                let qw_k_n8 = archive
+                    .read_u32(&real_qw)
+                    .map_err(|e| loader_err_msg(format!("read_u32('{real_qw}') failed: {e}")))?;
+                let expected_qw = k
+                    .checked_mul(n8)
+                    .ok_or_else(|| loader_err("AWQ qweight dimensions overflow"))?;
+                if qw_k_n8.len() != expected_qw {
+                    return Err(loader_err_msg(format!(
+                        "AWQ qweight length {} does not match expected {} on '{real_qw}'",
+                        qw_k_n8.len(),
+                        expected_qw
+                    )));
+                }
+                let packed = unpack_awq_qweight_k_n8_to_n_major(&qw_k_n8, k, n);
+                let scales_kg_n = archive.read_f16_bits(&scale_key).map_err(|e| {
+                    loader_err_msg(format!("read_f16_bits('{scale_key}') failed: {e}"))
+                })?;
+                let expected_sc = num_groups
+                    .checked_mul(n)
+                    .ok_or_else(|| loader_err("AWQ scale dimensions overflow"))?;
+                if scales_kg_n.len() != expected_sc {
+                    return Err(loader_err_msg(format!(
+                        "AWQ scales length {} does not match expected {} on '{scale_key}'",
+                        scales_kg_n.len(),
+                        expected_sc
+                    )));
+                }
+                let mut scales_n_kg = vec![0u16; n * num_groups];
+                for g in 0..num_groups {
+                    for c in 0..n {
+                        scales_n_kg[c * num_groups + g] = scales_kg_n[g * n + c];
+                    }
+                }
+                if quant.expects_zero_points() {
+                    let qz_key = archive
+                        .resolve_name(&format!("{base_prefix}.qzeros"))
+                        .ok_or_else(|| {
+                            loader_err_msg(format!(
+                                "missing '{base_prefix}.qzeros' required by AWQ zero_point=true config"
+                            ))
+                        })?;
+                    let qz_info = archive.tensor_info(&qz_key).map_err(|e| {
+                        loader_err_msg(format!("tensor_info('{qz_key}') failed: {e}"))
+                    })?;
+                    if !matches!(qz_info.dtype.as_str(), "I32" | "U32") {
+                        return Err(loader_err_msg(format!(
+                            "unsupported qzeros dtype '{}' on '{qz_key}' (expected I32/U32)",
+                            qz_info.dtype
+                        )));
+                    }
+                    if qz_info.shape.as_slice() != [num_groups, n8] {
+                        return Err(loader_err_msg(format!(
+                            "unexpected AWQ qzeros shape {:?} on '{qz_key}' (expected [{num_groups}, {n8}])",
+                            qz_info.shape
+                        )));
+                    }
+                    let qz_kg_n8 = archive
+                        .read_u32(&qz_key)
+                        .map_err(|e| loader_err_msg(format!("read_u32('{qz_key}') failed: {e}")))?;
+                    let expected_qz = num_groups
+                        .checked_mul(n8)
+                        .ok_or_else(|| loader_err("AWQ zero-point dimensions overflow"))?;
+                    if qz_kg_n8.len() != expected_qz {
+                        return Err(loader_err_msg(format!(
+                            "AWQ qzeros length {} does not match expected {} on '{qz_key}'",
+                            qz_kg_n8.len(),
+                            expected_qz
+                        )));
+                    }
+                    let qzeros = unpack_awq_qzeros_kg_n8_to_n_major(&qz_kg_n8, k, n, group_size);
+                    return Ok(Self::U4ZpNMajor {
+                        packed,
+                        scales: scales_n_kg,
+                        qzeros,
+                        n,
+                        k,
+                        group_size,
+                    });
+                }
+                return Ok(Self::U4B8NMajor {
+                    packed,
+                    scales: scales_n_kg,
+                    n,
+                    k,
+                    group_size,
+                });
+            }
+
+            let bits = if quant.bits() == 8 { 8usize } else { 4usize };
+            let pack_factor = 32 / bits;
+            let k = qw_info.shape[0]
+                .checked_mul(pack_factor)
+                .ok_or_else(|| loader_err("overflow on GPTQ K dimension"))?;
+            let n = qw_info.shape[1];
+            let num_groups = s_info.shape[0];
+            if n == 0
+                || k == 0
+                || num_groups == 0
+                || s_info.shape[1] != n
+                || !k.is_multiple_of(num_groups)
+            {
+                return Err(loader_err_msg(format!(
+                    "mismatched GPTQ qweight {:?} / scales {:?} ({bits}-bit) on '{base_prefix}'",
+                    qw_info.shape, s_info.shape
+                )));
+            }
+            let group_size = k.checked_div(num_groups).unwrap_or(quant.group_size_or(k));
+            let channelwise = num_groups == 1 && k > 128;
+            if let Some(g_idx_key) = archive.resolve_name(&format!("{base_prefix}.g_idx")) {
+                let g_idx = archive
+                    .read_u32(&g_idx_key)
+                    .map_err(|e| loader_err_msg(format!("read_u32('{g_idx_key}') failed: {e}")))?;
+                validate_static_gptq_g_idx(
+                    &g_idx,
+                    k,
+                    if channelwise { 0 } else { group_size },
+                    &g_idx_key,
+                )
+                .map_err(|e| loader_err_msg(e.to_string()))?;
+            }
+            let qw_raw = archive
+                .read_u32(&real_qw)
+                .map_err(|e| loader_err_msg(format!("read_u32('{real_qw}') failed: {e}")))?;
+            let expected_qw = (k / pack_factor)
+                .checked_mul(n)
+                .ok_or_else(|| loader_err("GPTQ qweight dimensions overflow"))?;
+            if qw_raw.len() != expected_qw {
+                return Err(loader_err_msg(format!(
+                    "GPTQ qweight length {} does not match expected {} on '{real_qw}'",
+                    qw_raw.len(),
+                    expected_qw
+                )));
+            }
+            let packed = if bits == 8 {
+                transpose_gptq_qweight_k4_n_to_n_major(&qw_raw, k, n)
+            } else {
+                transpose_gptq_qweight_k8_n_to_n_major(&qw_raw, k, n)
+            };
+            let scales_kg_n = archive
+                .read_f16_bits(&scale_key)
+                .map_err(|e| loader_err_msg(format!("read_f16_bits('{scale_key}') failed: {e}")))?;
+            let expected_sc = num_groups
+                .checked_mul(n)
+                .ok_or_else(|| loader_err("GPTQ scale dimensions overflow"))?;
+            if scales_kg_n.len() != expected_sc {
+                return Err(loader_err_msg(format!(
+                    "GPTQ scales length {} does not match expected {} on '{scale_key}'",
+                    scales_kg_n.len(),
+                    expected_sc
+                )));
+            }
+            let mut scales_n_kg = vec![0u16; n * num_groups];
+            for g in 0..num_groups {
+                for c in 0..n {
+                    scales_n_kg[c * num_groups + g] = scales_kg_n[g * n + c];
+                }
+            }
+            return if bits == 8 {
+                Ok(Self::U8B128NMajor {
+                    packed,
+                    scales: scales_n_kg,
+                    n,
+                    k,
+                    group_size,
+                    channelwise,
+                })
+            } else {
+                Ok(Self::U4B8NMajor {
+                    packed,
+                    scales: scales_n_kg,
+                    n,
+                    k,
+                    group_size,
+                })
+            };
+        }
+
+        // 3. Unquantized FP16 / BF16 / FP32 (`*.weight`)
+        let weight_key = archive
+            .resolve_name(&format!("{base_prefix}.weight"))
+            .ok_or_else(|| {
+                if archive
+                    .resolve_name(&format!("{base_prefix}_blocks"))
+                    .is_some()
+                    || archive
+                        .resolve_name(&format!("{base_prefix}.weight_blocks"))
+                        .is_some()
+                {
+                    loader_err_msg(format!(
+                        "unsupported MXFP4/NVFP4 block-quantized tensor at '{base_prefix}' (sm_86 supports W4A16/W8A16 integer Marlin or FP16/BF16)"
+                    ))
+                } else {
+                    loader_err_msg(format!(
+                        "missing tensor '{base_prefix}.weight' (nor quantized .weight_packed / .qweight)"
+                    ))
+                }
+            })?;
+        if archive
+            .resolve_name(&format!("{base_prefix}.weight_scale"))
+            .is_some()
+            || archive
+                .resolve_name(&format!("{base_prefix}.weight_scale_inv"))
+                .is_some()
+        {
+            return Err(loader_err_msg(format!(
+                "unsupported FP8/float-quantized tensor '{weight_key}' (accompanied by weight_scale/weight_scale_inv; RTX 3090 Ti sm_86 lacks native FP8 tensor cores)"
+            )));
+        }
+        let w_info = archive
+            .tensor_info(&weight_key)
+            .map_err(|e| loader_err_msg(format!("tensor_info('{weight_key}') failed: {e}")))?;
+        if w_info.shape.len() != 2 {
+            return Err(loader_err_msg(format!(
+                "expected 2D weight tensor for '{weight_key}', found shape {:?} (dtype={})",
+                w_info.shape, w_info.dtype
+            )));
+        }
+        let n = w_info.shape[0];
+        let k = w_info.shape[1];
+        let weight = archive
+            .read_f16_bits(&weight_key)
+            .map_err(|e| loader_err_msg(format!("read_f16_bits('{weight_key}') failed: {e}")))?;
+        let expected_weight = n
+            .checked_mul(k)
+            .ok_or_else(|| loader_err("dense weight dimensions overflow"))?;
+        if weight.len() != expected_weight {
+            return Err(loader_err_msg(format!(
+                "dense weight element count {} does not match expected {} on '{weight_key}'",
+                weight.len(),
+                expected_weight
+            )));
+        }
+        Ok(Self::DenseF16 { weight, n, k })
+    }
+
+    pub(crate) fn slice_rows(&self, row_start: usize, row_end: usize) -> Self {
+        let out_n = row_end - row_start;
+        match self {
+            Self::U4B8NMajor {
+                packed,
+                scales,
+                k,
+                group_size,
+                ..
+            } => {
+                let words_per_row = k / 8;
+                let groups_per_row = k / group_size;
+                Self::U4B8NMajor {
+                    packed: packed[row_start * words_per_row..row_end * words_per_row].to_vec(),
+                    scales: scales[row_start * groups_per_row..row_end * groups_per_row].to_vec(),
+                    n: out_n,
+                    k: *k,
+                    group_size: *group_size,
+                }
+            }
+            Self::U4ZpNMajor {
+                packed,
+                scales,
+                qzeros,
+                k,
+                group_size,
+                ..
+            } => {
+                if row_start.is_multiple_of(8) && row_end.is_multiple_of(8) {
+                    let words_per_row = k / 8;
+                    let groups_per_row = k / group_size;
+                    let zp_start = (row_start / 8) * groups_per_row;
+                    let zp_end = (row_end / 8) * groups_per_row;
+                    Self::U4ZpNMajor {
+                        packed: packed[row_start * words_per_row..row_end * words_per_row].to_vec(),
+                        scales: scales[row_start * groups_per_row..row_end * groups_per_row]
+                            .to_vec(),
+                        qzeros: qzeros[zp_start..zp_end].to_vec(),
+                        n: out_n,
+                        k: *k,
+                        group_size: *group_size,
+                    }
+                } else {
+                    let f16_all = self.to_f16_vec();
+                    Self::DenseF16 {
+                        weight: f16_all[row_start * k..row_end * k].to_vec(),
+                        n: out_n,
+                        k: *k,
+                    }
+                }
+            }
+            Self::U8B128NMajor {
+                packed,
+                scales,
+                k,
+                group_size,
+                channelwise,
+                ..
+            } => {
+                let words_per_row = k / 4;
+                let groups_per_row = if *channelwise { 1 } else { k / group_size };
+                Self::U8B128NMajor {
+                    packed: packed[row_start * words_per_row..row_end * words_per_row].to_vec(),
+                    scales: scales[row_start * groups_per_row..row_end * groups_per_row].to_vec(),
+                    n: out_n,
+                    k: *k,
+                    group_size: *group_size,
+                    channelwise: *channelwise,
+                }
+            }
+            Self::DenseF16 { weight, k, .. } => Self::DenseF16 {
+                weight: weight[row_start * k..row_end * k].to_vec(),
+                n: out_n,
+                k: *k,
+            },
+        }
+    }
+
+    pub(crate) fn slice_cols(&self, col_start: usize, col_end: usize) -> Self {
+        let out_k = col_end - col_start;
+        match self {
+            Self::U4B8NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => {
+                if !col_start.is_multiple_of(8)
+                    || !out_k.is_multiple_of(8)
+                    || !col_start.is_multiple_of(*group_size)
+                    || !out_k.is_multiple_of(*group_size)
+                {
+                    let dense = self.to_f16_vec();
+                    let col_major: Vec<u16> = dense
+                        .chunks_exact(*k)
+                        .flat_map(|row| row[col_start..col_end].iter().copied())
+                        .collect();
+                    return Self::DenseF16 {
+                        weight: col_major,
+                        n: *n,
+                        k: out_k,
+                    };
+                }
+                let in_words = k / 8;
+                let out_words = out_k / 8;
+                let w_start = col_start / 8;
+                let in_groups = k / group_size;
+                let out_groups = out_k / group_size;
+                let g_start = col_start / group_size;
+                let mut new_packed = vec![0u32; n * out_words];
+                let mut new_scales = vec![0u16; n * out_groups];
+                for r in 0..*n {
+                    new_packed[r * out_words..(r + 1) * out_words].copy_from_slice(
+                        &packed[r * in_words + w_start..r * in_words + w_start + out_words],
+                    );
+                    new_scales[r * out_groups..(r + 1) * out_groups].copy_from_slice(
+                        &scales[r * in_groups + g_start..r * in_groups + g_start + out_groups],
+                    );
+                }
+                Self::U4B8NMajor {
+                    packed: new_packed,
+                    scales: new_scales,
+                    n: *n,
+                    k: out_k,
+                    group_size: *group_size,
+                }
+            }
+            Self::U4ZpNMajor {
+                packed,
+                scales,
+                qzeros,
+                n,
+                k,
+                group_size,
+            } => {
+                if !col_start.is_multiple_of(8)
+                    || !out_k.is_multiple_of(8)
+                    || !col_start.is_multiple_of(*group_size)
+                    || !out_k.is_multiple_of(*group_size)
+                {
+                    let dense = self.to_f16_vec();
+                    let col_major: Vec<u16> = dense
+                        .chunks_exact(*k)
+                        .flat_map(|row| row[col_start..col_end].iter().copied())
+                        .collect();
+                    return Self::DenseF16 {
+                        weight: col_major,
+                        n: *n,
+                        k: out_k,
+                    };
+                }
+                let in_words = k / 8;
+                let out_words = out_k / 8;
+                let w_start = col_start / 8;
+                let in_groups = k / group_size;
+                let out_groups = out_k / group_size;
+                let g_start = col_start / group_size;
+                let mut new_packed = vec![0u32; n * out_words];
+                let mut new_scales = vec![0u16; n * out_groups];
+                for r in 0..*n {
+                    new_packed[r * out_words..(r + 1) * out_words].copy_from_slice(
+                        &packed[r * in_words + w_start..r * in_words + w_start + out_words],
+                    );
+                    new_scales[r * out_groups..(r + 1) * out_groups].copy_from_slice(
+                        &scales[r * in_groups + g_start..r * in_groups + g_start + out_groups],
+                    );
+                }
+                let n8 = n / 8;
+                let mut new_qzeros = vec![0u32; n8 * out_groups];
+                for np in 0..n8 {
+                    new_qzeros[np * out_groups..(np + 1) * out_groups].copy_from_slice(
+                        &qzeros[np * in_groups + g_start..np * in_groups + g_start + out_groups],
+                    );
+                }
+                Self::U4ZpNMajor {
+                    packed: new_packed,
+                    scales: new_scales,
+                    qzeros: new_qzeros,
+                    n: *n,
+                    k: out_k,
+                    group_size: *group_size,
+                }
+            }
+            Self::U8B128NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+                channelwise,
+            } => {
+                if !col_start.is_multiple_of(4)
+                    || !out_k.is_multiple_of(4)
+                    || (!*channelwise
+                        && (!col_start.is_multiple_of(*group_size)
+                            || !out_k.is_multiple_of(*group_size)))
+                {
+                    let dense = self.to_f16_vec();
+                    let col_major: Vec<u16> = dense
+                        .chunks_exact(*k)
+                        .flat_map(|row| row[col_start..col_end].iter().copied())
+                        .collect();
+                    return Self::DenseF16 {
+                        weight: col_major,
+                        n: *n,
+                        k: out_k,
+                    };
+                }
+                let in_words = k / 4;
+                let out_words = out_k / 4;
+                let w_start = col_start / 4;
+                let mut new_packed = vec![0u32; n * out_words];
+                for r in 0..*n {
+                    new_packed[r * out_words..(r + 1) * out_words].copy_from_slice(
+                        &packed[r * in_words + w_start..r * in_words + w_start + out_words],
+                    );
+                }
+                if *channelwise {
+                    Self::U8B128NMajor {
+                        packed: new_packed,
+                        scales: scales.clone(),
+                        n: *n,
+                        k: out_k,
+                        group_size: out_k,
+                        channelwise: true,
+                    }
+                } else {
+                    let in_groups = k / group_size;
+                    let out_groups = out_k / group_size;
+                    let g_start = col_start / group_size;
+                    let mut new_scales = vec![0u16; n * out_groups];
+                    for r in 0..*n {
+                        new_scales[r * out_groups..(r + 1) * out_groups].copy_from_slice(
+                            &scales[r * in_groups + g_start..r * in_groups + g_start + out_groups],
+                        );
+                    }
+                    Self::U8B128NMajor {
+                        packed: new_packed,
+                        scales: new_scales,
+                        n: *n,
+                        k: out_k,
+                        group_size: *group_size,
+                        channelwise: false,
+                    }
+                }
+            }
+            Self::DenseF16 { weight, n, k } => {
+                let mut new_weight = vec![0u16; n * out_k];
+                for r in 0..*n {
+                    new_weight[r * out_k..(r + 1) * out_k]
+                        .copy_from_slice(&weight[r * k + col_start..r * k + col_end]);
+                }
+                Self::DenseF16 {
+                    weight: new_weight,
+                    n: *n,
+                    k: out_k,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn concat_rows(parts: &[Self]) -> Result<Self> {
+        if parts.is_empty() {
+            return Err(loader_err_msg("concat_rows called with empty parts"));
+        }
+        let k = parts[0].dims().1;
+        for (i, p) in parts.iter().enumerate() {
+            if p.dims().1 != k {
+                return Err(loader_err_msg(format!(
+                    "concat_rows K mismatch: part {i} has K={} but part 0 has K={k}",
+                    p.dims().1
+                )));
+            }
+        }
+        if let Self::U4B8NMajor {
+            group_size: gs0, ..
+        } = &parts[0]
+            && parts
+                .iter()
+                .all(|p| matches!(p, Self::U4B8NMajor { group_size, .. } if group_size == gs0))
+        {
+            let mut packed = Vec::new();
+            let mut scales = Vec::new();
+            let mut total_n = 0;
+            for p in parts {
+                if let Self::U4B8NMajor {
+                    packed: pk,
+                    scales: sc,
+                    n,
+                    ..
+                } = p
+                {
+                    packed.extend_from_slice(pk);
+                    scales.extend_from_slice(sc);
+                    total_n += *n;
+                }
+            }
+            return Ok(Self::U4B8NMajor {
+                packed,
+                scales,
+                n: total_n,
+                k,
+                group_size: *gs0,
+            });
+        }
+
+        if let Self::U4ZpNMajor {
+            group_size: gs0, ..
+        } = &parts[0]
+            && parts.iter().all(
+                |p| matches!(p, Self::U4ZpNMajor { group_size, n, .. } if group_size == gs0 && n.is_multiple_of(8)),
+            )
+        {
+            let mut packed = Vec::new();
+            let mut scales = Vec::new();
+            let mut qzeros = Vec::new();
+            let mut total_n = 0;
+            for p in parts {
+                if let Self::U4ZpNMajor {
+                    packed: pk,
+                    scales: sc,
+                    qzeros: qz,
+                    n,
+                    ..
+                } = p
+                {
+                    packed.extend_from_slice(pk);
+                    scales.extend_from_slice(sc);
+                    qzeros.extend_from_slice(qz);
+                    total_n += *n;
+                }
+            }
+            return Ok(Self::U4ZpNMajor {
+                packed,
+                scales,
+                qzeros,
+                n: total_n,
+                k,
+                group_size: *gs0,
+            });
+        }
+
+        if let Self::U8B128NMajor {
+            group_size: gs0,
+            channelwise: cw0,
+            ..
+        } = &parts[0]
+            && parts.iter().all(|p| {
+                matches!(
+                    p,
+                    Self::U8B128NMajor {
+                        group_size,
+                        channelwise,
+                        ..
+                    } if group_size == gs0 && channelwise == cw0
+                )
+            })
+        {
+            let mut packed = Vec::new();
+            let mut scales = Vec::new();
+            let mut total_n = 0;
+            for p in parts {
+                if let Self::U8B128NMajor {
+                    packed: pk,
+                    scales: sc,
+                    n,
+                    ..
+                } = p
+                {
+                    packed.extend_from_slice(pk);
+                    scales.extend_from_slice(sc);
+                    total_n += *n;
+                }
+            }
+            return Ok(Self::U8B128NMajor {
+                packed,
+                scales,
+                n: total_n,
+                k,
+                group_size: *gs0,
+                channelwise: *cw0,
+            });
+        }
+
+        let mut weight = Vec::new();
+        let mut total_n = 0;
+        for p in parts {
+            let dq = p.to_f16_vec();
+            weight.extend_from_slice(&dq);
+            total_n += p.dims().0;
+        }
+        Ok(Self::DenseF16 {
+            weight,
+            n: total_n,
+            k,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn repack_with_staging(
+        packed: &[u32],
+        n: usize,
+        k: usize,
+        bits: usize,
+        arena: &mut DeviceArena,
+        stream: &CudaStream,
+        repack_staging: &DeviceBuffer,
+    ) -> Result<u64> {
+        let bytes = packed.len() * 4;
+        let b_q_weight_ptr = arena.alloc_aligned(bytes)?;
+        let ex = stream.exec(0, 0);
+        if bytes > repack_staging.len_bytes {
+            return Err(loader_err_msg(format!(
+                "packed weight size {} exceeds repack staging buffer {}",
+                bytes, repack_staging.len_bytes
+            )));
+        }
+        repack_staging.copy_from_host(packed, stream)?;
+        // SAFETY: staging capacity is checked and the destination reserves the
+        // same packed byte count. Upload/repack are ordered on stream. The loader
+        // supplies packed length and N/K consistent with the selected bit width.
+        let rc = unsafe {
+            if bits == 8 {
+                ffi::w34_marlin_repack_int8(
+                    &ex,
+                    repack_staging.addr() as *const u32,
+                    b_q_weight_ptr as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
+            } else {
+                ffi::w34_marlin_repack_int4(
+                    &ex,
+                    repack_staging.addr() as *const u32,
+                    b_q_weight_ptr as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
+            }
+        };
+        check_rc(rc, "w34_marlin_repack")?;
+        Ok(b_q_weight_ptr)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn upload(
+        &self,
+        arena: &mut DeviceArena,
+        stream: &CudaStream,
+        repack_staging: &DeviceBuffer,
+    ) -> Result<LinearProj> {
+        let marlin_geom_ok = |n: usize, k: usize| {
+            (n.is_multiple_of(64) && k.is_multiple_of(128))
+                || (n.is_multiple_of(128) && k.is_multiple_of(64))
+        };
+        match self {
+            Self::U4B8NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => {
+                if marlin_geom_ok(*n, *k) && matches!(*group_size, 32 | 64 | 128) {
+                    let b_q_weight_ptr = Self::repack_with_staging(
+                        packed,
+                        *n,
+                        *k,
+                        4,
+                        arena,
+                        stream,
+                        repack_staging,
+                    )?;
+                    let perm_scales =
+                        marlin_permute_scales_from_n_major(scales, *k, *n, *group_size);
+                    let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
+                    Ok(LinearProj::MarlinW4A16 {
+                        b_q_weight_ptr,
+                        b_scales_ptr,
+                        size_n: *n,
+                        size_k: *k,
+                        group_blocks: (*group_size / 16) as i32,
+                    })
+                } else {
+                    let f16_w = dequant_u4b8_n_major_to_f16(packed, scales, *n, *k, *group_size);
+                    let weight_ptr = arena.upload_slice(&f16_w, stream)?;
+                    Ok(LinearProj::DenseF16 {
+                        weight_ptr,
+                        size_n: *n,
+                        size_k: *k,
+                    })
+                }
+            }
+            Self::U4ZpNMajor {
+                packed,
+                scales,
+                qzeros,
+                n,
+                k,
+                group_size,
+            } => {
+                if marlin_geom_ok(*n, *k) && matches!(*group_size, 32 | 64 | 128) {
+                    let b_q_weight_ptr = Self::repack_with_staging(
+                        packed,
+                        *n,
+                        *k,
+                        4,
+                        arena,
+                        stream,
+                        repack_staging,
+                    )?;
+                    let perm_scales =
+                        marlin_permute_scales_from_n_major(scales, *k, *n, *group_size);
+                    let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
+                    let perm_zeros =
+                        marlin_permute_zero_points_from_n_major(qzeros, *k, *n, *group_size);
+                    let b_zeros_ptr = arena.upload_slice(&perm_zeros, stream)?;
+                    Ok(LinearProj::MarlinW4A16Zp {
+                        b_q_weight_ptr,
+                        b_scales_ptr,
+                        b_zeros_ptr,
+                        size_n: *n,
+                        size_k: *k,
+                        group_blocks: (*group_size / 16) as i32,
+                    })
+                } else {
+                    let f16_w =
+                        dequant_u4_zp_n_major_to_f16(packed, scales, qzeros, *n, *k, *group_size);
+                    let weight_ptr = arena.upload_slice(&f16_w, stream)?;
+                    Ok(LinearProj::DenseF16 {
+                        weight_ptr,
+                        size_n: *n,
+                        size_k: *k,
+                    })
+                }
+            }
+            Self::U8B128NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+                channelwise,
+            } => {
+                let gs_ok = *channelwise || matches!(*group_size, 32 | 64 | 128);
+                if marlin_geom_ok(*n, *k) && gs_ok {
+                    let b_q_weight_ptr = Self::repack_with_staging(
+                        packed,
+                        *n,
+                        *k,
+                        8,
+                        arena,
+                        stream,
+                        repack_staging,
+                    )?;
+                    let eff_gs = if *channelwise { *k } else { *group_size };
+                    let perm_scales = marlin_permute_scales_from_n_major(scales, *k, *n, eff_gs);
+                    let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
+                    let group_blocks = if *channelwise {
+                        -1
+                    } else {
+                        (*group_size / 16) as i32
+                    };
+                    Ok(LinearProj::MarlinW8A16 {
+                        b_q_weight_ptr,
+                        b_scales_ptr,
+                        size_n: *n,
+                        size_k: *k,
+                        group_blocks,
+                    })
+                } else {
+                    let f16_w = dequant_u8b128_n_major_to_f16(packed, scales, *n, *k, *group_size);
+                    let weight_ptr = arena.upload_slice(&f16_w, stream)?;
+                    Ok(LinearProj::DenseF16 {
+                        weight_ptr,
+                        size_n: *n,
+                        size_k: *k,
+                    })
+                }
+            }
+            Self::DenseF16 { weight, n, k } => {
+                let weight_ptr = arena.upload_slice(weight, stream)?;
+                Ok(LinearProj::DenseF16 {
+                    weight_ptr,
+                    size_n: *n,
+                    size_k: *k,
+                })
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub struct FullAttentionLayerWeights {
+    pub layer_id: usize,
+    pub kv_layer_ordinal: usize,
+    pub qkv_proj: LinearProj,
+    pub o_proj: LinearProj,
+    pub q_norm_ptr: u64,
+    pub k_norm_ptr: u64,
+}
+
+#[cfg(feature = "cuda")]
+pub struct GdnLayerWeights {
+    pub layer_id: usize,
+    pub gdn_layer_ordinal: usize,
+    pub in_proj_qkvz: LinearProj,
+    pub in_proj_ba: LinearProj,
+    pub out_proj: LinearProj,
+    pub conv_weight_ptr: u64,
+    pub a_log_ptr: u64,
+    pub dt_bias_ptr: u64,
+    pub norm_weight_ptr: u64,
+}
+
+#[cfg(feature = "cuda")]
+pub enum LayerBlockWeights {
+    FullAttention(FullAttentionLayerWeights),
+    LinearAttention(GdnLayerWeights),
+}
+
+#[cfg(feature = "cuda")]
+pub enum MoeExpertStorage {
+    W4A16 {
+        gate_up_packed_ptr: u64,
+        gate_up_scales_ptr: u64,
+        down_packed_ptr: u64,
+        down_scales_ptr: u64,
+        group_size: usize,
+    },
+    W4A16Zp {
+        gate_up_packed_ptr: u64,
+        gate_up_scales_ptr: u64,
+        gate_up_qzeros_ptr: u64,
+        down_packed_ptr: u64,
+        down_scales_ptr: u64,
+        down_qzeros_ptr: u64,
+        group_size: usize,
+    },
+    DenseF16 {
+        gate_up_ptr: u64,
+        down_ptr: u64,
+    },
+}
+
+#[cfg(feature = "cuda")]
+pub struct MoeLayerWeights {
+    pub router_gate: LinearProj,
+    pub experts: MoeExpertStorage,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub norm_topk_prob: bool,
+    pub scoring_func: i32,
+    pub local_moe_interm: usize,
+    pub shared_gate_up_proj: Option<LinearProj>,
+    pub shared_down_proj: Option<LinearProj>,
+    pub shared_expert_gate: Option<LinearProj>,
+    pub local_shared_interm: usize,
+}
+
+#[cfg(feature = "cuda")]
+pub enum FfnBlockWeights {
+    Dense {
+        gate_up_proj: LinearProj,
+        down_proj: LinearProj,
+    },
+    Moe(Box<MoeLayerWeights>),
+}
+
+#[cfg(feature = "cuda")]
+impl FfnBlockWeights {
+    /// Enqueue the loaded FFN using the model's phase-local scratch layout.
+    /// Raw buffer extents, device affinity, and ordering are caller obligations;
+    /// accepting u64 addresses here does not validate arbitrary allocations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        ex: &W34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        num_tokens: usize,
+        h_dim: usize,
+        local_interm: usize,
+        gate_up_buf: u64,
+        act_buf: u64,
+        moe_router_logits_buf: u64,
+        moe_topk_weights_buf: u64,
+        moe_topk_ids_buf: u64,
+        moe_interm_buf: u64,
+        moe_sh_gu_buf: u64,
+        moe_sh_act_buf: u64,
+        moe_sh_out_buf: u64,
+        moe_sh_gate_buf: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Dense {
+                gate_up_proj,
+                down_proj,
+            } => {
+                gate_up_proj.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    normed_buf,
+                    gate_up_buf,
+                    num_tokens,
+                )?;
+                check_rc(
+                    // SAFETY: the model's dense FFN phase reserves [M,2*interm]
+                    // gate/up and [M,interm] activation regions. The projection
+                    // precedes this launch on ex.stream; these addresses are supplied
+                    // by the caller rather than capacity-checked by this method.
+                    unsafe {
+                        ffi::w34_silu_and_mul_f16(
+                            ex,
+                            gate_up_buf as *const c_void,
+                            act_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            local_interm as i32,
+                        )
+                    },
+                    "w34_silu_and_mul_f16",
+                )?;
+                down_proj.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    act_buf,
+                    mlp_out_buf,
+                    num_tokens,
+                )
+            }
+            Self::Moe(moe) => {
+                let fused_dual_small_n = match (
+                    &moe.router_gate,
+                    &moe.shared_expert_gate,
+                    moe.shared_gate_up_proj.is_some() && moe.shared_down_proj.is_some(),
+                ) {
+                    (
+                        LinearProj::DenseF16 {
+                            weight_ptr: w0,
+                            size_n: n0,
+                            size_k: k0,
+                        },
+                        Some(LinearProj::DenseF16 {
+                            weight_ptr: w1,
+                            size_n: n1,
+                            size_k: k1,
+                        }),
+                        true,
+                    ) if *n0 <= 256 && *n1 <= 256 && *k0 == *k1 && k0.is_multiple_of(8) => {
+                        Some((*w0, *n0, *w1, *n1, *k0))
+                    }
+                    _ => None,
+                };
+                if let Some((w0, n0, w1, n1, k)) = fused_dual_small_n {
+                    check_rc(
+                        // SAFETY: the match checked both small-N geometries and
+                        // equal K. Router/shared-gate weights come from upload;
+                        // model scratch provides separate router and gate outputs.
+                        unsafe {
+                            ffi::w34_small_n_gemm_dual_f16(
+                                ex,
+                                normed_buf as *const c_void,
+                                w0 as *const c_void,
+                                moe_router_logits_buf as *mut c_void,
+                                n0 as i32,
+                                w1 as *const c_void,
+                                moe_sh_gate_buf as *mut c_void,
+                                n1 as i32,
+                                num_tokens as i32,
+                                k as i32,
+                            )
+                        },
+                        "w34_small_n_gemm_dual_f16",
+                    )?;
+                } else {
+                    moe.router_gate.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        moe_router_logits_buf,
+                        num_tokens,
+                    )?;
+                }
+                check_rc(
+                    // SAFETY: router projection precedes this on ex.stream.
+                    // The model scratch layout reserves M*experts FP16 logits and
+                    // M*top_k FP32 weights/i32 IDs for the loaded MoE geometry.
+                    unsafe {
+                        ffi::w34_moe_topk_router_f16(
+                            ex,
+                            moe_router_logits_buf as *const c_void,
+                            moe_topk_weights_buf as *mut f32,
+                            moe_topk_ids_buf as *mut i32,
+                            num_tokens as i32,
+                            moe.num_experts as i32,
+                            moe.top_k as i32,
+                            i32::from(moe.norm_topk_prob),
+                            moe.scoring_func,
+                        )
+                    },
+                    "w34_moe_topk_router_f16",
+                )?;
+
+                let (sh_out_ptr, sh_gate_ptr) = if let (Some(sh_gu), Some(sh_dn)) =
+                    (&moe.shared_gate_up_proj, &moe.shared_down_proj)
+                {
+                    sh_gu.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        moe_sh_gu_buf,
+                        num_tokens,
+                    )?;
+                    check_rc(
+                        // SAFETY: the shared projection just produced [M,2*shared]
+                        // gate/up; model scratch reserves [M,shared] activation.
+                        // Both regions are distinct within the FFN phase.
+                        unsafe {
+                            ffi::w34_silu_and_mul_f16(
+                                ex,
+                                moe_sh_gu_buf as *const c_void,
+                                moe_sh_act_buf as *mut c_void,
+                                core::ptr::null(),
+                                num_tokens as i32,
+                                moe.local_shared_interm as i32,
+                            )
+                        },
+                        "w34_silu_and_mul_f16 (shared_expert)",
+                    )?;
+                    sh_dn.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        moe_sh_act_buf,
+                        moe_sh_out_buf,
+                        num_tokens,
+                    )?;
+                    let sg_ptr = if let Some(sh_gate) = &moe.shared_expert_gate {
+                        if fused_dual_small_n.is_none() {
+                            sh_gate.forward(
+                                ex,
+                                cublas,
+                                marlin_ws_ptr,
+                                marlin_ws_ints,
+                                normed_buf,
+                                moe_sh_gate_buf,
+                                num_tokens,
+                            )?;
+                        }
+                        moe_sh_gate_buf as *const c_void
+                    } else {
+                        core::ptr::null()
+                    };
+                    (moe_sh_out_buf as *const c_void, sg_ptr)
+                } else {
+                    (core::ptr::null(), core::ptr::null())
+                };
+
+                match &moe.experts {
+                    MoeExpertStorage::W4A16 {
+                        gate_up_packed_ptr,
+                        gate_up_scales_ptr,
+                        down_packed_ptr,
+                        down_scales_ptr,
+                        group_size,
+                    } => check_rc(
+                        // SAFETY: loader stores expert-major packed U4 weights and
+                        // FP16 scales with the loaded group size. Top-k buffers were
+                        // produced above; model scratch reserves routed intermediate
+                        // and output rows. Shared inputs are null when absent.
+                        unsafe {
+                            ffi::w34_moe_w4a16_mlp_f16(
+                                ex,
+                                normed_buf as *const c_void,
+                                *gate_up_packed_ptr as *const u32,
+                                *gate_up_scales_ptr as *const c_void,
+                                *down_packed_ptr as *const u32,
+                                *down_scales_ptr as *const c_void,
+                                moe_topk_ids_buf as *const i32,
+                                moe_topk_weights_buf as *const f32,
+                                sh_out_ptr,
+                                sh_gate_ptr,
+                                moe_interm_buf as *mut c_void,
+                                mlp_out_buf as *mut c_void,
+                                num_tokens as i32,
+                                moe.top_k as i32,
+                                moe.num_experts as i32,
+                                moe.local_moe_interm as i32,
+                                h_dim as i32,
+                                *group_size as i32,
+                            )
+                        },
+                        "w34_moe_w4a16_mlp_f16",
+                    ),
+                    MoeExpertStorage::W4A16Zp {
+                        gate_up_packed_ptr,
+                        gate_up_scales_ptr,
+                        gate_up_qzeros_ptr,
+                        down_packed_ptr,
+                        down_scales_ptr,
+                        down_qzeros_ptr,
+                        group_size,
+                    } => check_rc(
+                        // SAFETY: expert-major U4 weights/scales/zero points use
+                        // the same loaded geometry. Router outputs and shared inputs
+                        // precede this on ex.stream; model scratch supplies separate
+                        // routed intermediates/output, with null shared inputs allowed.
+                        unsafe {
+                            ffi::w34_moe_w4a16_mlp_zp_f16(
+                                ex,
+                                normed_buf as *const c_void,
+                                *gate_up_packed_ptr as *const u32,
+                                *gate_up_scales_ptr as *const c_void,
+                                *gate_up_qzeros_ptr as *const u32,
+                                *down_packed_ptr as *const u32,
+                                *down_scales_ptr as *const c_void,
+                                *down_qzeros_ptr as *const u32,
+                                moe_topk_ids_buf as *const i32,
+                                moe_topk_weights_buf as *const f32,
+                                sh_out_ptr,
+                                sh_gate_ptr,
+                                moe_interm_buf as *mut c_void,
+                                mlp_out_buf as *mut c_void,
+                                num_tokens as i32,
+                                moe.top_k as i32,
+                                moe.num_experts as i32,
+                                moe.local_moe_interm as i32,
+                                h_dim as i32,
+                                *group_size as i32,
+                            )
+                        },
+                        "w34_moe_w4a16_mlp_zp_f16",
+                    ),
+                    MoeExpertStorage::DenseF16 {
+                        gate_up_ptr,
+                        down_ptr,
+                    } => {
+                        check_rc(
+                            // SAFETY: dense expert weights are uploaded with this
+                            // expert/intermediate/hidden geometry. Router IDs select
+                            // experts; model scratch provides M*top_k*interm FP16
+                            // intermediates distinct from the normalized input.
+                            unsafe {
+                                ffi::w34_moe_f16_gate_up_silu(
+                                    ex,
+                                    normed_buf as *const c_void,
+                                    *gate_up_ptr as *const c_void,
+                                    moe_topk_ids_buf as *const i32,
+                                    moe_interm_buf as *mut c_void,
+                                    num_tokens as i32,
+                                    moe.top_k as i32,
+                                    moe.num_experts as i32,
+                                    moe.local_moe_interm as i32,
+                                    h_dim as i32,
+                                )
+                            },
+                            "w34_moe_f16_gate_up_silu",
+                        )?;
+                        check_rc(
+                            // SAFETY: gate/up above produced routed intermediates;
+                            // down weights use the matching expert geometry and
+                            // output is M*h_dim FP16 in the model scratch layout.
+                            // Same-stream ordering preserves router/shared inputs.
+                            unsafe {
+                                ffi::w34_moe_f16_down_accum(
+                                    ex,
+                                    moe_interm_buf as *const c_void,
+                                    *down_ptr as *const c_void,
+                                    moe_topk_ids_buf as *const i32,
+                                    moe_topk_weights_buf as *const f32,
+                                    sh_out_ptr,
+                                    sh_gate_ptr,
+                                    mlp_out_buf as *mut c_void,
+                                    num_tokens as i32,
+                                    moe.top_k as i32,
+                                    moe.num_experts as i32,
+                                    h_dim as i32,
+                                    moe.local_moe_interm as i32,
+                                )
+                            },
+                            "w34_moe_f16_down_accum",
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_moe_layer_weights(
+    archive: &SafetensorsArchive,
+    cfg: &ModelConfig,
+    pfx: &str,
+    rank: usize,
+    tp_size: usize,
+    weight_arena: &mut DeviceArena,
+    stream: &CudaStream,
+    repack_staging: &DeviceBuffer,
+) -> Result<MoeLayerWeights> {
+    let raw_router = RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), &cfg.quant)?;
+    let router_gate = raw_router.upload(weight_arena, stream, repack_staging)?;
+
+    let full_interm = cfg.moe_intermediate_size;
+    if !full_interm.is_multiple_of(tp_size) {
+        return Err(loader_err_msg(format!(
+            "moe_intermediate_size {} is not divisible by TP={tp_size}",
+            full_interm
+        )));
+    }
+    let local_moe_interm = full_interm / tp_size;
+    let num_exp = cfg.num_experts;
+    let top_k = cfg.num_experts_per_tok.max(1);
+    let scoring_func = i32::from(cfg.scoring_func.eq_ignore_ascii_case("sigmoid"));
+    let h = cfg.hidden_size;
+
+    let fused_gu_key = archive
+        .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj"))
+        .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj.weight")));
+    let fused_dn_key = archive
+        .resolve_name(&format!("{pfx}.mlp.experts.down_proj"))
+        .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.experts.down_proj.weight")));
+
+    let experts = if let (Some(gu_key), Some(dn_key)) = (fused_gu_key, fused_dn_key) {
+        if archive
+            .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj_scale_inv"))
+            .is_some()
+            || archive
+                .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj.weight_scale"))
+                .is_some()
+            || archive
+                .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj.weight_scale_inv"))
+                .is_some()
+        {
+            return Err(loader_err_msg(format!(
+                "unsupported FP8 fused MoE expert tensor '{gu_key}' (RTX 3090 Ti sm_86 lacks native FP8; use W4A16 or BF16/FP16 MoE)"
+            )));
+        }
+        let gu_info = archive
+            .tensor_info(&gu_key)
+            .map_err(|e| loader_err_msg(format!("tensor_info fused experts.gate_up_proj: {e}")))?;
+        let dn_info = archive
+            .tensor_info(&dn_key)
+            .map_err(|e| loader_err_msg(format!("tensor_info fused experts.down_proj: {e}")))?;
+        if gu_info.shape.as_slice() != [num_exp, 2 * full_interm, h]
+            || dn_info.shape.as_slice() != [num_exp, h, full_interm]
+        {
+            return Err(loader_err_msg(format!(
+                "unexpected fused 3D MoE expert shapes on '{pfx}': gate_up_proj={:?}, down_proj={:?}",
+                gu_info.shape, dn_info.shape
+            )));
+        }
+        let gu_all = archive
+            .read_f16_bits(&gu_key)
+            .map_err(|e| loader_err_msg(format!("read fused experts.gate_up_proj: {e}")))?;
+        let dn_all = archive
+            .read_f16_bits(&dn_key)
+            .map_err(|e| loader_err_msg(format!("read fused experts.down_proj: {e}")))?;
+
+        let expected_gu = num_exp
+            .checked_mul(2)
+            .and_then(|v| v.checked_mul(full_interm))
+            .and_then(|v| v.checked_mul(h))
+            .ok_or_else(|| loader_err("fused experts.gate_up_proj size overflow"))?;
+        let expected_dn = num_exp
+            .checked_mul(h)
+            .and_then(|v| v.checked_mul(full_interm))
+            .ok_or_else(|| loader_err("fused experts.down_proj size overflow"))?;
+        if gu_all.len() != expected_gu || dn_all.len() != expected_dn {
+            return Err(loader_err(
+                "fused MoE expert tensor element count mismatch against shape",
+            ));
+        }
+        let local_gu_cap = num_exp
+            .checked_mul(2)
+            .and_then(|v| v.checked_mul(local_moe_interm))
+            .and_then(|v| v.checked_mul(h))
+            .ok_or_else(|| loader_err("local fused gate_up capacity overflow"))?;
+        let local_dn_cap = num_exp
+            .checked_mul(h)
+            .and_then(|v| v.checked_mul(local_moe_interm))
+            .ok_or_else(|| loader_err("local fused down capacity overflow"))?;
+        let mut all_gu_f16 = Vec::with_capacity(local_gu_cap);
+        let mut all_dn_f16 = Vec::with_capacity(local_dn_cap);
+        let col_start = rank * local_moe_interm;
+        let col_end = (rank + 1) * local_moe_interm;
+
+        for e in 0..num_exp {
+            let exp_gu = &gu_all[e * 2 * full_interm * h..(e + 1) * 2 * full_interm * h];
+            all_gu_f16.extend_from_slice(&exp_gu[col_start * h..col_end * h]);
+            all_gu_f16.extend_from_slice(
+                &exp_gu[(full_interm + col_start) * h..(full_interm + col_end) * h],
+            );
+
+            let exp_dn = &dn_all[e * h * full_interm..(e + 1) * h * full_interm];
+            if tp_size == 1 {
+                all_dn_f16.extend_from_slice(exp_dn);
+            } else {
+                for row in 0..h {
+                    let row_base = row * full_interm;
+                    all_dn_f16.extend_from_slice(&exp_dn[row_base + col_start..row_base + col_end]);
+                }
+            }
+        }
+        drop(gu_all);
+        drop(dn_all);
+        let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
+        let down_ptr = weight_arena.upload_slice(&all_dn_f16, stream)?;
+        MoeExpertStorage::DenseF16 {
+            gate_up_ptr,
+            down_ptr,
+        }
+    } else {
+        if archive
+            .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj_blocks"))
+            .is_some()
+            || archive
+                .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj.weight_packed"))
+                .is_some()
+        {
+            return Err(loader_err_msg(format!(
+                "unsupported fused 3D quantized MoE expert layout on '{pfx}' (expected per-expert W4A16 or 3D BF16/FP16)"
+            )));
+        }
+        // Probe expert 0 to determine W4A16 vs W4A16Zp vs DenseF16 storage
+        let exp0_gate = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.experts.0.gate_proj"),
+            &cfg.quant,
+        )?;
+        match exp0_gate {
+            RawLinearHost::U4B8NMajor { group_size, .. } => {
+                if !h.is_multiple_of(8) || !local_moe_interm.is_multiple_of(8) {
+                    return Err(loader_err_msg(format!(
+                        "W4A16 MoE requires hidden_size ({h}) and local_moe_interm ({local_moe_interm}) divisible by 8"
+                    )));
+                }
+                let gu_words_per_exp = (2 * local_moe_interm) * (h / 8);
+                let gu_scales_per_exp = (2 * local_moe_interm) * h.div_ceil(group_size);
+                let dn_words_per_exp = h * (local_moe_interm / 8);
+                let dn_scales_per_exp = h * local_moe_interm.div_ceil(group_size);
+
+                let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
+                let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
+                let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
+                let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
+
+                for e in 0..num_exp {
+                    let epfx = format!("{pfx}.mlp.experts.{e}");
+                    let rg =
+                        RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?
+                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let ru = RawLinearHost::load(archive, &format!("{epfx}.up_proj"), &cfg.quant)?
+                        .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let gu = RawLinearHost::concat_rows(&[rg, ru])?;
+                    if let RawLinearHost::U4B8NMajor { packed, scales, .. } = gu {
+                        all_gu_packed.extend_from_slice(&packed);
+                        all_gu_scales.extend_from_slice(&scales);
+                    } else {
+                        return Err(loader_err_msg(format!(
+                            "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W4A16)"
+                        )));
+                    }
+                    let rd =
+                        RawLinearHost::load(archive, &format!("{epfx}.down_proj"), &cfg.quant)?
+                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    if let RawLinearHost::U4B8NMajor { packed, scales, .. } = rd {
+                        all_dn_packed.extend_from_slice(&packed);
+                        all_dn_scales.extend_from_slice(&scales);
+                    } else {
+                        return Err(loader_err_msg(format!(
+                            "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W4A16)"
+                        )));
+                    }
+                }
+
+                let gate_up_packed_ptr = weight_arena.upload_slice(&all_gu_packed, stream)?;
+                let gate_up_scales_ptr = weight_arena.upload_slice(&all_gu_scales, stream)?;
+                let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
+                let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
+                MoeExpertStorage::W4A16 {
+                    gate_up_packed_ptr,
+                    gate_up_scales_ptr,
+                    down_packed_ptr,
+                    down_scales_ptr,
+                    group_size,
+                }
+            }
+            RawLinearHost::U4ZpNMajor { group_size, .. } => {
+                if !h.is_multiple_of(8) || !local_moe_interm.is_multiple_of(8) {
+                    return Err(loader_err_msg(format!(
+                        "W4A16 asymmetric MoE requires hidden_size ({h}) and local_moe_interm ({local_moe_interm}) divisible by 8"
+                    )));
+                }
+                let gu_groups = h.div_ceil(group_size);
+                let dn_groups = local_moe_interm.div_ceil(group_size);
+                let gu_words_per_exp = (2 * local_moe_interm) * (h / 8);
+                let gu_scales_per_exp = (2 * local_moe_interm) * gu_groups;
+                let gu_qzeros_per_exp = ((2 * local_moe_interm) / 8) * gu_groups;
+                let dn_words_per_exp = h * (local_moe_interm / 8);
+                let dn_scales_per_exp = h * dn_groups;
+                let dn_qzeros_per_exp = (h / 8) * dn_groups;
+
+                let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
+                let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
+                let mut all_gu_qzeros = Vec::with_capacity(num_exp * gu_qzeros_per_exp);
+                let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
+                let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
+                let mut all_dn_qzeros = Vec::with_capacity(num_exp * dn_qzeros_per_exp);
+
+                for e in 0..num_exp {
+                    let epfx = format!("{pfx}.mlp.experts.{e}");
+                    let rg =
+                        RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?
+                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let ru = RawLinearHost::load(archive, &format!("{epfx}.up_proj"), &cfg.quant)?
+                        .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let gu = RawLinearHost::concat_rows(&[rg, ru])?;
+                    if let RawLinearHost::U4ZpNMajor {
+                        packed,
+                        scales,
+                        qzeros,
+                        ..
+                    } = gu
+                    {
+                        all_gu_packed.extend_from_slice(&packed);
+                        all_gu_scales.extend_from_slice(&scales);
+                        all_gu_qzeros.extend_from_slice(&qzeros);
+                    } else {
+                        return Err(loader_err_msg(format!(
+                            "inconsistent MoE expert quantization at '{epfx}' (expected asymmetric W4A16)"
+                        )));
+                    }
+                    let rd =
+                        RawLinearHost::load(archive, &format!("{epfx}.down_proj"), &cfg.quant)?
+                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    if let RawLinearHost::U4ZpNMajor {
+                        packed,
+                        scales,
+                        qzeros,
+                        ..
+                    } = rd
+                    {
+                        all_dn_packed.extend_from_slice(&packed);
+                        all_dn_scales.extend_from_slice(&scales);
+                        all_dn_qzeros.extend_from_slice(&qzeros);
+                    } else {
+                        return Err(loader_err_msg(format!(
+                            "inconsistent MoE down_proj quantization at '{epfx}' (expected asymmetric W4A16)"
+                        )));
+                    }
+                }
+
+                let gate_up_packed_ptr = weight_arena.upload_slice(&all_gu_packed, stream)?;
+                let gate_up_scales_ptr = weight_arena.upload_slice(&all_gu_scales, stream)?;
+                let gate_up_qzeros_ptr = weight_arena.upload_slice(&all_gu_qzeros, stream)?;
+                let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
+                let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
+                let down_qzeros_ptr = weight_arena.upload_slice(&all_dn_qzeros, stream)?;
+                MoeExpertStorage::W4A16Zp {
+                    gate_up_packed_ptr,
+                    gate_up_scales_ptr,
+                    gate_up_qzeros_ptr,
+                    down_packed_ptr,
+                    down_scales_ptr,
+                    down_qzeros_ptr,
+                    group_size,
+                }
+            }
+            RawLinearHost::U8B128NMajor { .. } => {
+                return Err(loader_err_msg(format!(
+                    "unsupported 8-bit W8A16 routed MoE experts at '{pfx}' (sm_86 MoE supports 4-bit W4A16 or FP16/BF16 experts)"
+                )));
+            }
+            RawLinearHost::DenseF16 { .. } => {
+                let mut all_gu_f16 = Vec::with_capacity(num_exp * 2 * local_moe_interm * h);
+                let mut all_dn_f16 = Vec::with_capacity(num_exp * h * local_moe_interm);
+                for e in 0..num_exp {
+                    let epfx = format!("{pfx}.mlp.experts.{e}");
+                    let rg =
+                        RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?
+                            .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let ru = RawLinearHost::load(archive, &format!("{epfx}.up_proj"), &cfg.quant)?
+                        .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    let gu = RawLinearHost::concat_rows(&[rg, ru])?;
+                    if let RawLinearHost::DenseF16 { weight, .. } = gu {
+                        all_gu_f16.extend_from_slice(&weight);
+                    }
+                    let rd =
+                        RawLinearHost::load(archive, &format!("{epfx}.down_proj"), &cfg.quant)?
+                            .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+                    if let RawLinearHost::DenseF16 { weight, .. } = rd {
+                        all_dn_f16.extend_from_slice(&weight);
+                    }
+                }
+                let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
+                let down_ptr = weight_arena.upload_slice(&all_dn_f16, stream)?;
+                MoeExpertStorage::DenseF16 {
+                    gate_up_ptr,
+                    down_ptr,
+                }
+            }
+        }
+    };
+
+    let local_shared_interm = cfg.shared_expert_intermediate_size / tp_size;
+    let (shared_gate_up_proj, shared_down_proj, shared_expert_gate) = if local_shared_interm > 0
+        && archive
+            .resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))
+            .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.qweight")))
+            .or_else(|| {
+                archive.resolve_name(&format!("{pfx}.mlp.shared_expert.gate_proj.weight_packed"))
+            })
+            .is_some()
+    {
+        let s_gate = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.shared_expert.gate_proj"),
+            &cfg.quant,
+        )?
+        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+        let s_up = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.shared_expert.up_proj"),
+            &cfg.quant,
+        )?
+        .slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
+        let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up])?.upload(
+            weight_arena,
+            stream,
+            repack_staging,
+        )?;
+        let s_dn = RawLinearHost::load(
+            archive,
+            &format!("{pfx}.mlp.shared_expert.down_proj"),
+            &cfg.quant,
+        )?
+        .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
+        .upload(weight_arena, stream, repack_staging)?;
+        let s_eg = if archive
+            .resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight"))
+            .is_some()
+        {
+            Some(
+                RawLinearHost::load(
+                    archive,
+                    &format!("{pfx}.mlp.shared_expert_gate"),
+                    &cfg.quant,
+                )?
+                .upload(weight_arena, stream, repack_staging)?,
+            )
+        } else {
+            None
+        };
+        (Some(s_gu), Some(s_dn), s_eg)
+    } else {
+        (None, None, None)
+    };
+
+    Ok(MoeLayerWeights {
+        router_gate,
+        experts,
+        num_experts: num_exp,
+        top_k,
+        norm_topk_prob: cfg.norm_topk_prob,
+        scoring_func,
+        local_moe_interm,
+        shared_gate_up_proj,
+        shared_down_proj,
+        shared_expert_gate,
+        local_shared_interm,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub struct DecoderLayerWeights {
+    pub layer_id: usize,
+    pub input_layernorm_ptr: u64,
+    pub post_attention_layernorm_ptr: u64,
+    pub block: LayerBlockWeights,
+    pub ffn: FfnBlockWeights,
+}
+
+impl RawLinearHost {
+    pub(super) fn size_check(&self) -> usize {
+        self.dims().0
+    }
+}

@@ -1,6 +1,8 @@
 //! Phase 6.6a GPU-resident stochastic `SamplerV1` + device grammar bitmasking gates.
 #![cfg(feature = "cuda")]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -293,7 +295,10 @@ fn gpu_sampler_matches_cpu_reference_across_full_248k_vocab_and_rejection() {
 #[test]
 fn tp1_and_tp2_gpu_sampler_and_bitmask_parity_plain_and_speculative() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if CudaDevice::count().unwrap_or(0) < 2 {
+    if !common::require_or_skip_gpus(
+        2,
+        "tp1_and_tp2_gpu_sampler_and_bitmask_parity_plain_and_speculative",
+    ) {
         return;
     }
     let model = "nchapman/Qwen3.5-4B-W4A16-GPTQ";
@@ -737,10 +742,11 @@ fn fast_greedy_sampler_matches_full_sampler_and_rejects_ineligible_rows() {
 
 #[test]
 fn test_fast_greedy_masked_matches_full_sampler_and_edges() {
-    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(dev) = CudaDevice::set_current(0) else {
+    if !common::require_or_skip_gpus(1, "test_fast_greedy_masked_matches_full_sampler_and_edges") {
         return;
-    };
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).expect("CudaDevice(0)");
     let stream = CudaStream::new(dev.device_id).unwrap();
     // Use an odd non-multiple-of-8 vocab size above 248,320 so both vectorized `uint4` and tail
     // bitmask paths are exercised across all 16 splits.

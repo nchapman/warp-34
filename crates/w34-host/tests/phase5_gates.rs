@@ -11,6 +11,8 @@
 //!   gate+up+SiLU + down+shared_expert+gate kernels, `Qwen3.6-35B-A3B` config & engine).
 #![allow(clippy::undocumented_unsafe_blocks)]
 
+mod common;
+
 use w34_host::cache::{KvFormatPolicy, kv_format_row_bytes};
 use w34_kernels::ffi::{
     W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4, W34_KV_TRANSFORM_IDENTITY,
@@ -755,11 +757,16 @@ fn phase5_3_moe_router_and_fused_w4a16_f16_kernels() {
 #[cfg(feature = "cuda")]
 #[test]
 fn phase5_2_live_qwen3_vision_encoder_and_multimodal_radix_cache() {
-    use w34_host::loader::resolve_hf_model_dir;
     use w34_host::model::Qwen3_5Engine;
     use w34_host::vision::preprocess_rgb_image;
 
-    let Ok(dir) = resolve_hf_model_dir("nchapman/Qwen3.5-4B-W4A16-GPTQ") else {
+    let test_name = "phase5_2_live_qwen3_vision_encoder_and_multimodal_radix_cache";
+    if !common::require_or_skip_gpus(1, test_name) {
+        return;
+    }
+    let Some(dir) =
+        common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-W4A16-GPTQ", test_name)
+    else {
         return;
     };
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -826,11 +833,12 @@ fn phase5_2_live_qwen3_vision_encoder_and_multimodal_radix_cache() {
 #[cfg(feature = "cuda")]
 #[test]
 fn phase5_3_moe_checkpoint_config_and_dense_f16_tp_parity() {
-    use w34_host::loader::{ModelConfig, resolve_hf_model_dir};
+    use w34_host::loader::ModelConfig;
 
     // 1. Verify Qwen3.6-35B-A3B MoE checkpoint config parsing if cached on disk
-    if let Ok(dir) = resolve_hf_model_dir(
+    if let Some(dir) = common::require_or_skip_cached_model(
         "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4",
+        "phase5_3_moe_checkpoint_config_and_dense_f16_tp_parity",
     ) {
         let cfg = ModelConfig::from_dir(&dir).expect("parse 35B-A3B MoE config");
         assert_eq!(cfg.num_hidden_layers, 40);

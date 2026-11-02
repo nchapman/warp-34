@@ -12,6 +12,44 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Code-quality refactor and worker error containment
+
+- Split the 10,433-line `src/model.rs` into a 176-line public facade and focused
+  `src/model/` modules for weights, ranks, forward execution, generation, graph
+  IO/capture/replay, sampling, decisions, and diagnostics. Existing `crate::model`
+  paths remain available. Removed model-wide lint suppressions and documented
+  local unsafe obligations; `cuda.rs` now documents its caller-owned lifetime and
+  stream-ordering contracts rather than claiming those are enforced by Rust.
+- Speculative verification and batched decode share coordinated upload-all →
+  capture-all → launch-all replay. Partial TP launches remain fatal because a
+  peer may be blocked in a collective. Single-token capture adopts returned graph
+  handles before propagating errors. Capture cleanup handles `Result` errors,
+  not panics; existing raw-address APIs still require caller discipline.
+- Typed worker errors preserve OpenAI/Anthropic envelopes while distinguishing
+  invalid input (400), overload (429), shutdown (503), and internal/CUDA/panic
+  failures (500). Worker supervision catches Rust unwinding, poisons health,
+  rejects future submissions, and drains active/queued requests. An independent
+  terminal-event slot preserves finish/error delivery under token backpressure;
+  request drop guards cover temporary admission/MTP ownership. Engine teardown
+  occurs after supervisor notification, on the dedicated OS thread. This is not
+  recovery from CUDA device faults or proof against in-flight collective hangs.
+- Added runtime CUDA error descriptions, C-side sampler ABI assertions, and a
+  unified biased-GEMM FFI declaration. CPU testing includes integration targets;
+  converted optional fixture/GPU checks log local skips and fail under `CI=true`
+  or `W34_STRICT_TESTS=1`. DFlash2 explicitly uses a window-aware parser while
+  target `ModelConfig::from_dir` remains strict regardless of architecture labels.
+- Verification: `mise run check` (`fmt-check`, `clippy`, `clippy-cpu`, full release CUDA test suite, `oracle-check`, `perf-check`), `mise run test-cpu`, and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` all pass with 0 failures.
+- Review follow-ups (pre-existing, outside this behavior-preserving refactor):
+  validate RoPE rotary geometry before kernel dispatch; merge rather than replace
+  pre-populated TP=2 diagnostic dumps; tighten DFlash root/body validation, vision
+  geometry/input validation, multi-request tap validity, and incomplete scheduled
+  batch reporting. Existing TP argument assertions and redundant loader checks
+  also remain unchanged. CUDA diagnostic origin is still inferred from code and
+  context, not represented by a distinct runtime/cuBLAS/host error-kind field.
+  These are not newly established inference guarantees.
+
+---
+
 ## Production-Hardened Quantization & Model-Loading Subsystem (sm_86 Native)
 
 `warp-34` supports common Qwen 3.5 / 3.6 / 3.8 HuggingFace quantized and unquantized checkpoints suited to 1–2× RTX 3090 Ti (`sm_86`) without silent corruption or opaque OOMs:

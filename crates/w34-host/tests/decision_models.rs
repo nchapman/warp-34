@@ -1,6 +1,8 @@
 #![cfg(feature = "cuda")]
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -15,21 +17,6 @@ use w34_host::model::Qwen3_5Engine;
 use w34_host::server::{OpenAiServerState, serve};
 
 static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn find_hf_snapshot(repo_dir_name: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let snapshots = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(repo_dir_name)
-        .join("snapshots");
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(snapshots)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.join("config.json").exists())
-        .collect();
-    entries.sort();
-    entries.pop()
-}
 
 fn write_synthetic_kev_head_safetensors(dir: &Path, d_proj: usize, hidden_size: usize) {
     let mut q_vals = vec![0.0f32; d_proj * hidden_size];
@@ -121,8 +108,10 @@ where
 #[test]
 fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
     let _gpu = GPU_LOCK.lock().unwrap();
-    let Some(dir) = find_hf_snapshot("models--nchapman--Qwen3.5-4B-W4A16-GPTQ") else {
-        eprintln!("skipping decision_models test: Qwen3.5-4B-W4A16-GPTQ not cached");
+    let Some(dir) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens",
+    ) else {
         return;
     };
 
@@ -806,7 +795,10 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
             *tp1_pair_sink.lock().unwrap() = Some((b1, b2));
         }));
 
-        if w34_host::cuda::CudaDevice::count().unwrap_or(0) >= 2 {
+        if common::require_or_skip_gpus(
+            2,
+            "decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens::clef_tp2",
+        ) {
             let (tp1_b1, tp1_b2) = tp1_pair.lock().unwrap().take().unwrap();
             let clef_profile_tp2 = clef_profile.clone();
             let state_clef_tp2 =

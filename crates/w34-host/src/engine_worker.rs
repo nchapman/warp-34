@@ -3,20 +3,21 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
+pub use crate::server::WorkerError;
 use crate::{
     model::{EngineBatchSlice, PipelinedDecodeOutput, Qwen3_5Engine},
     parser::{SamplerV1, SamplingParams, StepLogprobs, TokenBitmaskConstraint},
     scheduler::{ScheduledReqSlice, SchedulerConfig, SchedulerV1},
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum GenerationEvent {
     Token {
         id: i32,
@@ -26,11 +27,46 @@ pub enum GenerationEvent {
         cached_tokens: usize,
         generated_tokens: usize,
     },
-    Error(String),
+    Error(WorkerError),
+}
+
+/// Bounded token events followed by exactly one out-of-band terminal event.
+/// Publishing the terminal result never waits for a slow consumer to free queue space.
+/// The request owns the sole sender, so channel closure orders terminal delivery after
+/// all buffered tokens (and wakes a consumer already waiting in `recv`).
+pub struct GenerationEvents {
+    receiver: Receiver<GenerationEvent>,
+    terminal: Arc<OnceLock<GenerationEvent>>,
+    terminal_delivered: bool,
+}
+
+impl GenerationEvents {
+    pub async fn recv(&mut self) -> Option<GenerationEvent> {
+        if let Some(event) = self.receiver.recv().await {
+            return Some(event);
+        }
+        if self.terminal_delivered {
+            return None;
+        }
+        self.terminal_delivered = true;
+        self.terminal.get().cloned()
+    }
+}
+
+fn generation_channel(capacity: usize) -> (Sender<GenerationEvent>, GenerationEvents) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    (
+        sender,
+        GenerationEvents {
+            receiver,
+            terminal: Arc::new(OnceLock::new()),
+            terminal_delivered: false,
+        },
+    )
 }
 
 pub struct GenerationStream {
-    pub events: Receiver<GenerationEvent>,
+    pub events: GenerationEvents,
     pub cached_tokens: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
 }
@@ -64,22 +100,22 @@ pub enum DecisionTapOutput {
 enum DecisionReadoutTap {
     CandidateLogits {
         token_ids: Vec<i32>,
-        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
+        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, WorkerError>>,
     },
     HiddenPositions {
         positions: Vec<usize>,
         captured: Vec<Option<Vec<f32>>>,
-        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
+        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, WorkerError>>,
     },
     ClefJoint {
         record: Arc<crate::clef::ClefEncodedRecord>,
         gpu_state: Option<crate::clef::ClefDeviceRequestState>,
-        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, String>>,
+        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, WorkerError>>,
     },
 }
 
 impl DecisionReadoutTap {
-    fn fail(self, error: String) {
+    fn fail(self, error: WorkerError) {
         match self {
             Self::CandidateLogits { tx, .. }
             | Self::HiddenPositions { tx, .. }
@@ -99,7 +135,7 @@ impl DecisionReadoutTap {
         }
     }
 
-    fn fail_and_recycle(self, engine: &mut Qwen3_5Engine, error: String) {
+    fn fail_and_recycle(self, engine: &mut Qwen3_5Engine, error: WorkerError) {
         match self {
             Self::ClefJoint { gpu_state, tx, .. } => {
                 if let Some(st) = gpu_state {
@@ -120,10 +156,35 @@ struct Request {
     cached_tokens: Arc<AtomicU64>,
     sampler: SamplerV1,
     output: Sender<GenerationEvent>,
+    terminal: Arc<OnceLock<GenerationEvent>>,
     cancelled: Arc<AtomicBool>,
     max_prefix_lookup_len: Option<usize>,
     mamba_branching_seqlen: Option<usize>,
     decision_tap: Option<DecisionReadoutTap>,
+}
+
+impl Request {
+    fn set_terminal(&self, event: GenerationEvent) {
+        // First terminal result wins; in particular, unwinding must not replace an
+        // already published result while dropping request-owned resources.
+        let _ = self.terminal.set(event);
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Admission and batched MTP temporarily own requests outside the registry.
+            // The panic payload is only available later at the supervisor boundary.
+            let error = WorkerError::worker_panicked(
+                "engine worker panicked while processing a locally owned request (unwinding)",
+            );
+            self.set_terminal(GenerationEvent::Error(error.clone()));
+            if let Some(tap) = self.decision_tap.take() {
+                tap.fail(error);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -142,6 +203,8 @@ pub struct EngineWorker {
     sender: Mutex<Option<Sender<Request>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     shutdown: Arc<AtomicBool>,
+    panicked: Arc<AtomicBool>,
+    panic_reason: Arc<Mutex<Option<String>>>,
     pub stats: Arc<WorkerStats>,
     pub tokenizer: Option<tokenizers::Tokenizer>,
     pub eos_token_ids: Vec<i32>,
@@ -157,6 +220,27 @@ impl EngineWorker {
         Self::from_loader(move || Ok(engine), config).expect("infallible engine transfer")
     }
 
+    /// Returns whether the background `w34-cuda` worker thread terminated due to a panic.
+    #[inline]
+    pub fn is_panicked(&self) -> bool {
+        self.panicked.load(Ordering::Acquire)
+    }
+
+    /// Returns the captured panic message if the worker thread panicked.
+    pub fn panic_reason(&self) -> Option<String> {
+        self.panic_reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn panic_worker_error(&self) -> WorkerError {
+        WorkerError::worker_panicked(
+            self.panic_reason()
+                .unwrap_or_else(|| "unknown panic payload".into()),
+        )
+    }
+
     /// Called before starting the async runtime. Initialization, inference, and destruction
     /// all take place on this named OS thread, never on a Tokio worker or blocking pool.
     pub fn from_loader(
@@ -167,6 +251,10 @@ impl EngineWorker {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
+        let panicked = Arc::new(AtomicBool::new(false));
+        let worker_panicked = panicked.clone();
+        let panic_reason = Arc::new(Mutex::new(None));
+        let worker_panic_reason = panic_reason.clone();
         let stats = Arc::new(WorkerStats::default());
         let worker_stats = stats.clone();
         let thread = std::thread::Builder::new()
@@ -197,7 +285,15 @@ impl EngineWorker {
                         kv_token_capacity,
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
-                        run(engine, clamped_cfg, receiver, stop, worker_stats);
+                        run(
+                            engine,
+                            clamped_cfg,
+                            receiver,
+                            stop,
+                            worker_stats,
+                            worker_panicked,
+                            worker_panic_reason,
+                        );
                     }
                 }
                 Err(e) => {
@@ -229,6 +325,8 @@ impl EngineWorker {
             sender: Mutex::new(Some(sender)),
             thread: Mutex::new(Some(thread)),
             shutdown,
+            panicked,
+            panic_reason,
             stats,
             tokenizer,
             eos_token_ids,
@@ -243,12 +341,12 @@ impl EngineWorker {
 
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.sender.lock().unwrap().take(); // wake blocking_recv when idle
+        self.sender.lock().unwrap_or_else(|e| e.into_inner()).take(); // wake blocking_recv when idle
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
         self.request_shutdown();
-        let thread = self.thread.lock().unwrap().take();
+        let thread = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(thread) = thread {
             // Only joining is offloaded; no CUDA state ever enters spawn_blocking.
             tokio::task::spawn_blocking(move || thread.join())
@@ -256,7 +354,39 @@ impl EngineWorker {
                 .map_err(|e| e.to_string())?
                 .map_err(|_| "CUDA worker panicked".to_string())?;
         }
+        if self.is_panicked() {
+            let reason = self
+                .panic_reason()
+                .unwrap_or_else(|| "unknown panic payload".into());
+            return Err(format!("CUDA worker panicked: {reason}"));
+        }
         Ok(())
+    }
+
+    fn enqueue_request(&self, req: Request) -> Result<(), WorkerError> {
+        if self.is_panicked() {
+            return Err(self.panic_worker_error());
+        }
+        let guard = self.sender.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sender) = guard.as_ref() else {
+            return if self.is_panicked() {
+                Err(self.panic_worker_error())
+            } else {
+                Err(WorkerError::worker_stopped("engine worker stopped"))
+            };
+        };
+        sender.try_send(req).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => {
+                WorkerError::overload("engine ingress queue full")
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                if self.is_panicked() {
+                    self.panic_worker_error()
+                } else {
+                    WorkerError::worker_stopped("engine worker stopped")
+                }
+            }
+        })
     }
 
     pub fn submit(
@@ -264,7 +394,7 @@ impl EngineWorker {
         prompt: Vec<i32>,
         params: SamplingParams,
         constraint: Option<TokenBitmaskConstraint>,
-    ) -> Result<GenerationStream, String> {
+    ) -> Result<GenerationStream, WorkerError> {
         self.submit_with_images(prompt, Vec::new(), params, constraint)
     }
 
@@ -274,34 +404,31 @@ impl EngineWorker {
         images: Vec<crate::vision::PreprocessedImage>,
         params: SamplingParams,
         constraint: Option<TokenBitmaskConstraint>,
-    ) -> Result<GenerationStream, String> {
-        params.validate()?;
+    ) -> Result<GenerationStream, WorkerError> {
+        params.validate().map_err(WorkerError::invalid_request)?;
         if prompt.is_empty() || params.max_tokens == 0 {
-            return Err("prompt and output budget must be nonempty".into());
+            return Err(WorkerError::invalid_request(
+                "prompt and output budget must be nonempty",
+            ));
         }
-        let (output, events) = mpsc::channel(64);
+        let (output, events) = generation_channel(64);
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let sampler = SamplerV1::new(params, &prompt, constraint);
-        self.sender
-            .lock()
-            .unwrap()
-            .as_ref()
-            .ok_or("engine worker stopped")?
-            .try_send(Request {
-                prompt,
-                images,
-                vision: None,
-                reserved_pages: 0,
-                cached_tokens: cached_tokens.clone(),
-                sampler,
-                output,
-                cancelled: cancelled.clone(),
-                max_prefix_lookup_len: None,
-                mamba_branching_seqlen: None,
-                decision_tap: None,
-            })
-            .map_err(|_| "engine queue unavailable or full")?;
+        self.enqueue_request(Request {
+            prompt,
+            images,
+            vision: None,
+            reserved_pages: 0,
+            cached_tokens: cached_tokens.clone(),
+            sampler,
+            output,
+            terminal: events.terminal.clone(),
+            cancelled: cancelled.clone(),
+            max_prefix_lookup_len: None,
+            mamba_branching_seqlen: None,
+            decision_tap: None,
+        })?;
         Ok(GenerationStream {
             events,
             cancelled,
@@ -317,9 +444,9 @@ impl EngineWorker {
     ) -> Result<
         (
             GenerationStream,
-            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
         ),
-        String,
+        WorkerError,
     > {
         self.submit_decision_candidate_logits_with_images(
             prompt,
@@ -338,9 +465,9 @@ impl EngineWorker {
     ) -> Result<
         (
             GenerationStream,
-            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
         ),
-        String,
+        WorkerError,
     > {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let stream = self.submit_decision_internal(
@@ -362,9 +489,9 @@ impl EngineWorker {
     ) -> Result<
         (
             GenerationStream,
-            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
         ),
-        String,
+        WorkerError,
     > {
         self.submit_decision_hidden_positions_with_images(
             prompt,
@@ -385,9 +512,9 @@ impl EngineWorker {
     ) -> Result<
         (
             GenerationStream,
-            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
         ),
-        String,
+        WorkerError,
     > {
         let captured = vec![None; positions.len()];
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -412,9 +539,9 @@ impl EngineWorker {
     ) -> Result<
         (
             GenerationStream,
-            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, String>>,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
         ),
-        String,
+        WorkerError,
     > {
         let prompt = record.input_ids.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -441,11 +568,13 @@ impl EngineWorker {
         max_prefix_lookup_len: Option<usize>,
         mamba_branching_seqlen: Option<usize>,
         tap: DecisionReadoutTap,
-    ) -> Result<GenerationStream, String> {
+    ) -> Result<GenerationStream, WorkerError> {
         if prompt.is_empty() {
-            return Err("decision prompt must be nonempty".into());
+            return Err(WorkerError::invalid_request(
+                "decision prompt must be nonempty",
+            ));
         }
-        let (output, events) = mpsc::channel(8);
+        let (output, events) = generation_channel(8);
         let cached_tokens = Arc::new(AtomicU64::new(0));
         let cancelled = Arc::new(AtomicBool::new(false));
         let params = SamplingParams {
@@ -455,25 +584,20 @@ impl EngineWorker {
             ..SamplingParams::default()
         };
         let sampler = SamplerV1::new(params, &prompt, None);
-        self.sender
-            .lock()
-            .unwrap()
-            .as_ref()
-            .ok_or("engine worker stopped")?
-            .try_send(Request {
-                prompt,
-                images,
-                vision: None,
-                reserved_pages: 0,
-                cached_tokens: cached_tokens.clone(),
-                sampler,
-                output,
-                cancelled: cancelled.clone(),
-                max_prefix_lookup_len,
-                mamba_branching_seqlen,
-                decision_tap: Some(tap),
-            })
-            .map_err(|_| "engine queue unavailable or full")?;
+        self.enqueue_request(Request {
+            prompt,
+            images,
+            vision: None,
+            reserved_pages: 0,
+            cached_tokens: cached_tokens.clone(),
+            sampler,
+            output,
+            terminal: events.terminal.clone(),
+            cancelled: cancelled.clone(),
+            max_prefix_lookup_len,
+            mamba_branching_seqlen,
+            decision_tap: Some(tap),
+        })?;
         Ok(GenerationStream {
             events,
             cancelled,
@@ -502,11 +626,11 @@ fn enqueue(
     mut request: Request,
 ) {
     if requests.len() >= 32 {
-        let msg = "engine admission capacity exceeded".to_string();
+        let err = WorkerError::overload("engine admission capacity exceeded");
         if let Some(tap) = request.decision_tap.take() {
-            tap.fail(msg.clone());
+            tap.fail(err.clone());
         }
-        let _ = request.output.try_send(GenerationEvent::Error(msg));
+        request.set_terminal(GenerationEvent::Error(err));
         return;
     }
     let vocab = engine.cfg.vocab_size;
@@ -526,11 +650,11 @@ fn enqueue(
             .checked_add(p.max_tokens)
             .is_some_and(|n| n.div_ceil(16) <= engine.ranks[0].kv_pool.num_pages);
     if !valid {
-        let msg = "invalid tokens or request exceeds KV capacity".to_string();
+        let err = WorkerError::invalid_request("invalid tokens or request exceeds KV capacity");
         if let Some(tap) = request.decision_tap.take() {
-            tap.fail(msg.clone());
+            tap.fail(err.clone());
         }
-        let _ = request.output.try_send(GenerationEvent::Error(msg));
+        request.set_terminal(GenerationEvent::Error(err));
         return;
     }
     request.reserved_pages = (request.prompt.len() + p.max_tokens).div_ceil(16);
@@ -543,10 +667,11 @@ fn enqueue(
         ) {
             Ok(vision) => request.vision = Some(vision),
             Err(error) => {
+                let err = WorkerError::invalid_request(error);
                 if let Some(tap) = request.decision_tap.take() {
-                    tap.fail(error.clone());
+                    tap.fail(err.clone());
                 }
-                let _ = request.output.try_send(GenerationEvent::Error(error));
+                request.set_terminal(GenerationEvent::Error(err));
                 return;
             }
         }
@@ -570,15 +695,90 @@ fn enqueue(
     requests.insert(id, request);
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&'static str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn notify_request_error(mut r: Request, err: WorkerError) {
+    r.set_terminal(GenerationEvent::Error(err.clone()));
+    if let Some(tap) = r.decision_tap.take() {
+        tap.fail(err);
+    }
+}
+
+/// On any exit, closes ingress and terminates active and queued requests. A panic
+/// first publishes dead health and its actual diagnostic; normal return reports
+/// [`WorkerError::WorkerStopped`]. CUDA engine ownership must stay outside `body`
+/// so engine teardown cannot delay publication of poisoned health.
+fn run_supervised_loop(
+    receiver: &mut Receiver<Request>,
+    requests: &mut HashMap<u64, Request>,
+    stats: &WorkerStats,
+    panicked: &AtomicBool,
+    panic_reason: &Mutex<Option<String>>,
+    body: impl FnOnce(&mut Receiver<Request>, &mut HashMap<u64, Request>),
+) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        body(receiver, requests);
+    }));
+    let err = if let Err(payload) = outcome {
+        let reason = panic_payload_message(&*payload);
+        eprintln!("[w34-cuda] FATAL: engine worker thread panicked: {reason}");
+        *panic_reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.clone());
+        panicked.store(true, Ordering::Release);
+        WorkerError::worker_panicked(reason)
+    } else {
+        WorkerError::worker_stopped("engine worker stopped")
+    };
+    stats.active.store(0, Ordering::Relaxed);
+    receiver.close();
+    for (_, r) in requests.drain() {
+        notify_request_error(r, err.clone());
+    }
+    while let Ok(r) = receiver.try_recv() {
+        notify_request_error(r, err.clone());
+    }
+}
+
 fn run(
     mut engine: Qwen3_5Engine,
     config: SchedulerConfig,
     mut receiver: Receiver<Request>,
     shutdown: Arc<AtomicBool>,
     stats: Arc<WorkerStats>,
+    panicked: Arc<AtomicBool>,
+    panic_reason: Arc<Mutex<Option<String>>>,
+) {
+    let mut requests = HashMap::new();
+    run_supervised_loop(
+        &mut receiver,
+        &mut requests,
+        &stats,
+        &panicked,
+        &panic_reason,
+        |receiver, requests| {
+            // Borrow only: CUDA destruction (which may synchronize) must happen after
+            // the supervisor publishes poisoned health and notifies retained callers.
+            run_loop(&mut engine, config, receiver, requests, &shutdown, &stats);
+        },
+    );
+}
+
+fn run_loop(
+    engine: &mut Qwen3_5Engine,
+    config: SchedulerConfig,
+    receiver: &mut Receiver<Request>,
+    requests: &mut HashMap<u64, Request>,
+    shutdown: &AtomicBool,
+    stats: &WorkerStats,
 ) {
     let mut sched = SchedulerV1::new(config);
-    let mut requests = HashMap::new();
     let mut speculative_id = None;
     let mut pending_ingest = Vec::new();
     let mut mtp_batch_slots: [Option<(u64, Vec<i32>)>; crate::mtp::MAX_MTP_BATCH_SLOTS] =
@@ -600,12 +800,12 @@ fn run(
         // The engine retains the canonical radix between ticks (including diagnostics).
         std::mem::swap(&mut engine.radix, &mut sched.radix);
         if let Some(r) = first {
-            enqueue(&engine, &mut sched, &mut requests, r);
+            enqueue(engine, &mut sched, requests, r);
         }
         // Bound queue draining even if producers keep replenishing it.
         for _ in 0..32 {
             match receiver.try_recv() {
-                Ok(r) => enqueue(&engine, &mut sched, &mut requests, r),
+                Ok(r) => enqueue(engine, &mut sched, requests, r),
                 Err(_) => break,
             }
         }
@@ -631,7 +831,7 @@ fn run(
                 }
                 match receiver.try_recv() {
                     Ok(r) => {
-                        enqueue(&engine, &mut sched, &mut requests, r);
+                        enqueue(engine, &mut sched, requests, r);
                         last_arrival = std::time::Instant::now();
                     }
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -685,11 +885,11 @@ fn run(
             {
                 let _ = p.set_mtp_batch_mode(false);
             }
-            release(&mut engine, sched.cancel_request(id));
+            release(engine, sched.cancel_request(id));
             if let Some(mut r) = requests.remove(&id)
                 && let Some(tap) = r.decision_tap.take()
             {
-                tap.recycle_into(&mut engine);
+                tap.recycle_into(engine);
             }
         }
 
@@ -747,7 +947,7 @@ fn run(
             let promoted = if can_promote_to_mtp_batch {
                 let mut proposer = engine.speculative.take().unwrap();
                 let ok = proposer
-                    .promote_single_to_mtp_batch_slot0(&engine, pending_ingest.len())
+                    .promote_single_to_mtp_batch_slot0(engine, pending_ingest.len())
                     .is_ok();
                 engine.speculative = Some(proposer);
                 ok
@@ -880,18 +1080,17 @@ fn run(
                     );
                     sched.cfg.max_num_seqs = saved_max;
                     if let Some(seq) = sched.active.first_mut() {
-                        match proposer.restore_prefix(
-                            &mut engine,
-                            &seq.prompt_tokens[..seq.cached_prefix_tokens],
-                        ) {
+                        match proposer
+                            .restore_prefix(engine, &seq.prompt_tokens[..seq.cached_prefix_tokens])
+                        {
                             Ok(()) => {
                                 speculative_id = Some(id);
                                 seq.custom_prefill = true;
                             }
                             Err(e) => {
                                 let r = requests.remove(&id).unwrap();
-                                let _ = r.output.try_send(GenerationEvent::Error(e.to_string()));
-                                release(&mut engine, sched.cancel_request(id));
+                                notify_request_error(r, WorkerError::Cuda(e));
+                                release(engine, sched.cancel_request(id));
                                 proposer.abort_scheduled();
                             }
                         }
@@ -989,12 +1188,8 @@ fn run(
             let ids: Vec<_> = sched.waiting.iter().map(|w| w.req_id).collect();
             for id in ids {
                 sched.cancel_request(id);
-                if let Some(mut r) = requests.remove(&id) {
-                    let msg = "state pool exhausted".to_string();
-                    if let Some(tap) = r.decision_tap.take() {
-                        tap.fail(msg.clone());
-                    }
-                    let _ = r.output.try_send(GenerationEvent::Error(msg));
+                if let Some(r) = requests.remove(&id) {
+                    notify_request_error(r, WorkerError::overload("state pool exhausted"));
                 }
             }
         }
@@ -1012,17 +1207,14 @@ fn run(
                 &mut seq.radix_state.kv_pages,
                 needed,
             ) {
-                failed.push((seq.req_id, "KV pool exhausted".to_string()));
+                failed.push((seq.req_id, WorkerError::overload("KV pool exhausted")));
             }
         }
         for (id, error) in failed {
-            if let Some(mut r) = requests.remove(&id) {
-                if let Some(tap) = r.decision_tap.take() {
-                    tap.fail(error.clone());
-                }
-                let _ = r.output.try_send(GenerationEvent::Error(error));
+            if let Some(r) = requests.remove(&id) {
+                notify_request_error(r, error);
             }
-            release(&mut engine, sched.cancel_request(id));
+            release(engine, sched.cancel_request(id));
             if speculative_id == Some(id) {
                 engine.speculative.as_mut().unwrap().abort_scheduled();
                 speculative_id = None;
@@ -1054,7 +1246,13 @@ fn run(
                 .is_plain_greedy(r.sampler.constraint.is_some());
             if let Err(err) = r.sampler.materialize_pending_constraint() {
                 engine.speculative = Some(proposer);
-                fail_request(&mut engine, &mut sched, &mut requests, id, err);
+                fail_request(
+                    engine,
+                    &mut sched,
+                    requests,
+                    id,
+                    WorkerError::invalid_request(err),
+                );
                 speculative_id = None;
                 pending_ingest.clear();
                 std::mem::swap(&mut engine.radix, &mut sched.radix);
@@ -1063,7 +1261,7 @@ fn run(
             let result = if !seq.is_prefill_complete() {
                 proposer
                     .step_scheduled_prefill_chunk(
-                        &mut engine,
+                        engine,
                         &mut sched.radix,
                         seq,
                         &mut r.sampler,
@@ -1074,7 +1272,7 @@ fn run(
             } else {
                 proposer
                     .step_scheduled_verify_round(
-                        &mut engine,
+                        engine,
                         &mut sched.radix,
                         seq,
                         &mut pending_ingest,
@@ -1099,16 +1297,16 @@ fn run(
                     emit(r, token, lp);
                 }
                 if seq.finished {
-                    proposer.finish_scheduled(&mut engine, &mut pending_ingest)?;
+                    proposer.finish_scheduled(engine, &mut pending_ingest)?;
                 }
                 Ok(())
             });
             engine.speculative = Some(proposer);
             if seq.finished {
-                release(&mut engine, sched.finish_request_early(id));
+                release(engine, sched.finish_request_early(id));
                 speculative_id = None;
             }
-            result.map_err(|e| e.to_string())
+            result.map_err(WorkerError::Cuda)
         } else if mtp_batch_slots.iter().any(|s| s.is_some()) {
             let mut proposer = engine.speculative.take().unwrap();
             let prefill_target = mtp_batch_slots
@@ -1121,7 +1319,8 @@ fn run(
                         .iter()
                         .any(|s| s.req_id == *id && !s.is_prefill_complete())
                 });
-            let res: std::result::Result<(), String> = if let Some((slot_idx, id)) = prefill_target
+            let res: std::result::Result<(), WorkerError> = if let Some((slot_idx, id)) =
+                prefill_target
             {
                 let seq = sched.active.iter_mut().find(|s| s.req_id == id).unwrap();
                 let r = requests.get_mut(&id).unwrap();
@@ -1133,7 +1332,7 @@ fn run(
                     .select_mtp_batch_slot(slot_idx)
                     .and_then(|()| {
                         proposer.step_scheduled_prefill_chunk(
-                            &mut engine,
+                            engine,
                             &mut sched.radix,
                             seq,
                             &mut r.sampler,
@@ -1141,7 +1340,7 @@ fn run(
                             config.chunk_prefill_size,
                         )
                     })
-                    .map_err(|e| e.to_string());
+                    .map_err(WorkerError::Cuda);
                 match step {
                     Ok(token) => {
                         if let Some((tok, lp)) = token {
@@ -1150,7 +1349,7 @@ fn run(
                         if seq.finished {
                             let _ = proposer.reset_mtp_batch_slot(slot_idx);
                             mtp_batch_slots[slot_idx] = None;
-                            release(&mut engine, sched.finish_request_early(id));
+                            release(engine, sched.finish_request_early(id));
                             if mtp_batch_slots.iter().all(|s| s.is_none()) {
                                 let _ = proposer.set_mtp_batch_mode(false);
                             }
@@ -1197,7 +1396,7 @@ fn run(
                         })
                         .collect();
                     proposer.step_scheduled_batched_mtp_verify_round(
-                        &mut engine,
+                        engine,
                         &mut sched.radix,
                         &mut items,
                     )
@@ -1233,7 +1432,7 @@ fn run(
                             }
                         }
                         for id in finished_ids {
-                            release(&mut engine, sched.finish_request_early(id));
+                            release(engine, sched.finish_request_early(id));
                         }
                         if mtp_batch_slots.iter().all(|s| s.is_none()) {
                             let _ = proposer.set_mtp_batch_mode(false);
@@ -1245,14 +1444,14 @@ fn run(
                             requests.insert(id, req);
                             mtp_batch_slots[slot_idx] = Some((id, pending_vec));
                         }
-                        Err(e.to_string())
+                        Err(WorkerError::Cuda(e))
                     }
                 }
             };
             engine.speculative = Some(proposer);
             res
         } else {
-            step_plain(&mut engine, &mut sched, &mut requests, &receiver, &shutdown)
+            step_plain(engine, &mut sched, requests, receiver, shutdown)
         };
         if let Err(error) = result {
             // GPU errors invalidate this batch; abort private state rather than publishing it.
@@ -1262,9 +1461,9 @@ fn run(
                     if let Some(tap) = r.decision_tap.take() {
                         tap.fail(error.clone());
                     }
-                    let _ = r.output.try_send(GenerationEvent::Error(error.clone()));
+                    r.set_terminal(GenerationEvent::Error(error.clone()));
                 }
-                release(&mut engine, sched.cancel_request(id));
+                release(engine, sched.cancel_request(id));
             }
             if let Some(p) = &mut engine.speculative {
                 p.abort_scheduled();
@@ -1289,7 +1488,7 @@ fn run(
                 .cached_tokens
                 .fetch_add(seq.cached_prefix_tokens as u64, Ordering::Relaxed);
             if let Some(r) = requests.remove(&seq.req_id) {
-                let _ = r.output.try_send(GenerationEvent::Finished {
+                r.set_terminal(GenerationEvent::Finished {
                     cached_tokens: seq.cached_prefix_tokens,
                     generated_tokens: seq.generated_tokens.len(),
                 });
@@ -1300,7 +1499,7 @@ fn run(
     std::mem::swap(&mut engine.radix, &mut sched.radix);
     let ids: Vec<_> = requests.keys().copied().collect();
     for id in ids {
-        release(&mut engine, sched.cancel_request(id));
+        release(engine, sched.cancel_request(id));
     }
     if let Some(p) = &mut engine.speculative {
         p.abort_scheduled();
@@ -1323,13 +1522,13 @@ fn fail_request(
     sched: &mut SchedulerV1,
     requests: &mut HashMap<u64, Request>,
     id: u64,
-    error: String,
+    error: WorkerError,
 ) {
     if let Some(mut r) = requests.remove(&id) {
         if let Some(tap) = r.decision_tap.take() {
             tap.fail_and_recycle(engine, error.clone());
         }
-        let _ = r.output.try_send(GenerationEvent::Error(error));
+        r.set_terminal(GenerationEvent::Error(error));
     }
     release(engine, sched.cancel_request(id));
 }
@@ -1354,7 +1553,7 @@ fn capture_decision_tap(
                         logits,
                         cached_tokens: cached_toks,
                     })
-                    .map_err(|e| e.to_string());
+                    .map_err(WorkerError::Cuda);
                 if let Some(DecisionReadoutTap::CandidateLogits { tx, .. }) =
                     req.decision_tap.take()
                 {
@@ -1375,7 +1574,7 @@ fn capture_decision_tap(
                     match engine.read_norm_hidden_row_f32(tok_off + (pos - chunk_start)) {
                         Ok(row) => captured[p_idx] = Some(row),
                         Err(e) => {
-                            read_err = Some(e.to_string());
+                            read_err = Some(WorkerError::Cuda(e));
                             break;
                         }
                     }
@@ -1394,7 +1593,9 @@ fn capture_decision_tap(
                         cached_tokens: cached_toks,
                     })
                 } else {
-                    Err("kev: missing hidden position after final prefill chunk".into())
+                    Err(WorkerError::internal(
+                        "kev: missing hidden position after final prefill chunk",
+                    ))
                 };
                 tap_done = Some((tx, res));
             }
@@ -1411,7 +1612,7 @@ fn capture_decision_tap(
                         *gpu_state = Some(st);
                         None
                     }
-                    Err(e) => Some(e),
+                    Err(e) => Some(WorkerError::internal(e)),
                 }
             } else {
                 None
@@ -1428,6 +1629,7 @@ fn capture_decision_tap(
                         )
                     })
                     .err()
+                    .map(WorkerError::internal)
             });
             if (read_err.is_some() || s.is_final_prefill_chunk)
                 && let Some(DecisionReadoutTap::ClefJoint {
@@ -1448,8 +1650,9 @@ fn capture_decision_tap(
                             logits,
                             cached_tokens: cached_toks,
                         })
+                        .map_err(WorkerError::internal)
                 } else {
-                    Err("clef gpu request state missing".into())
+                    Err(WorkerError::internal("clef gpu request state missing"))
                 };
                 tap_done = Some((tx, res));
             }
@@ -1466,7 +1669,7 @@ fn step_plain(
     requests: &mut HashMap<u64, Request>,
     receiver: &Receiver<Request>,
     shutdown: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<(), WorkerError> {
     let _batch_range = crate::profiling::Range::new(c"w34.serve.batch");
     // Vision prefill uses the same scheduler commit seam, but its 3-plane embedding
     // splice cannot share an ordinary text prefill batch. Decode can share batches.
@@ -1482,12 +1685,11 @@ fn step_plain(
         let seq = sched.active.iter().find(|seq| seq.req_id == id).unwrap();
         let cached_toks = seq.cached_prefix_tokens;
         let request = requests.get_mut(&id).unwrap();
-        let (greedy, slice) = request
-            .vision
-            .as_mut()
-            .unwrap()
-            .step_prefill(engine, seq, sched.cfg.chunk_prefill_size)
-            .map_err(|e| e.to_string())?;
+        let (greedy, slice) = request.vision.as_mut().unwrap().step_prefill(
+            engine,
+            seq,
+            sched.cfg.chunk_prefill_size,
+        )?;
         //ScheduledVision::step_prefill executes forward_selected_rows on a 1-request slice
         // with selected_rows = [q_len - 1] (selected_row index 0 on every chunk).
         capture_decision_tap(
@@ -1509,10 +1711,11 @@ fn step_plain(
                         .sampler
                         .try_commit_token(greedy)
                         .map(|()| (greedy, None))
+                        .map_err(WorkerError::internal)
                 } else {
                     engine
                         .sample_single_gpu_step(&mut request.sampler)
-                        .map_err(|e| e.to_string())
+                        .map_err(WorkerError::Cuda)
                 };
                 let (token, lp) = match sample {
                     Ok(value) => value,
@@ -1617,9 +1820,12 @@ fn step_plain(
         );
     }
 
-    let greedy = engine
-        .step_batch_slices_for_sampler_filtered(&batch, Some(&deltas), Some(&emit_mask), needs_gpu)
-        .map_err(|e| e.to_string())?;
+    let greedy = engine.step_batch_slices_for_sampler_filtered(
+        &batch,
+        Some(&deltas),
+        Some(&emit_mask),
+        needs_gpu,
+    )?;
     {
         let mut batch_tok_offset = 0usize;
         let mut selected_row_idx = 0usize;
@@ -1651,7 +1857,7 @@ fn step_plain(
             );
         }
     }
-    let mut pending_errors: Vec<Option<String>> = vec![None; slices.len()];
+    let mut pending_errors: Vec<Option<WorkerError>> = vec![None; slices.len()];
     let sampled = if needs_gpu {
         let _sampler_range = crate::profiling::Range::new(c"w34.serve.sampler");
         let mut masks = Vec::new();
@@ -1663,7 +1869,7 @@ fn step_plain(
             }
             let r = requests.get_mut(&s.req_id).unwrap();
             if let Err(err) = r.sampler.materialize_pending_constraint() {
-                pending_errors[i] = Some(err);
+                pending_errors[i] = Some(WorkerError::invalid_request(err));
                 rows.push(w34_kernels::ffi::W34SamplerRowCfg {
                     temperature: 0.0,
                     top_k: 1,
@@ -1690,22 +1896,22 @@ fn step_plain(
             } else {
                 SamplerV1::uniform_f32(sampler.params.seed, sampler.output_history.len())
             };
-            rows.push(sampler.append_gpu_row(
-                engine.cfg.vocab_size,
-                &engine.cfg.eos_token_ids,
-                u1,
-                0.0,
-                -1,
-                false,
-                &mut masks,
-                &mut sparse,
-            )?);
+            rows.push(
+                sampler
+                    .append_gpu_row(
+                        engine.cfg.vocab_size,
+                        &engine.cfg.eos_token_ids,
+                        u1,
+                        0.0,
+                        -1,
+                        false,
+                        &mut masks,
+                        &mut sparse,
+                    )
+                    .map_err(WorkerError::internal)?,
+            );
         }
-        Some(
-            engine
-                .run_gpu_sampler_rows(&rows, &masks, &sparse)
-                .map_err(|e| e.to_string())?,
-        )
+        Some(engine.run_gpu_sampler_rows(&rows, &masks, &sparse)?)
     } else {
         None
     };
@@ -1727,7 +1933,7 @@ fn step_plain(
                         sched,
                         requests,
                         s.req_id,
-                        format!("GPU sampler status {}", out.status),
+                        WorkerError::sampler_status(out.status),
                     );
                     continue;
                 }
@@ -1746,7 +1952,13 @@ fn step_plain(
             };
             if r.sampler.params.max_tokens > 0 {
                 if let Err(error) = r.sampler.try_commit_token_deferred(id) {
-                    fail_request(engine, sched, requests, s.req_id, error);
+                    fail_request(
+                        engine,
+                        sched,
+                        requests,
+                        s.req_id,
+                        WorkerError::internal(error),
+                    );
                     continue;
                 }
                 emit(r, id, lp);
@@ -1778,23 +1990,27 @@ fn run_pipelined_decode_burst(
     initial_slices: Vec<ScheduledReqSlice>,
     deltas: &[i32],
     needs_gpu: bool,
-) -> Result<(), String> {
+) -> Result<(), WorkerError> {
     let fg_storage = if needs_gpu {
         let mut masks = Vec::new();
         let mut sparse = Vec::new();
         let mut rows = Vec::new();
         for s in &initial_slices {
             let sampler = &requests[&s.req_id].sampler;
-            rows.push(sampler.append_gpu_row(
-                engine.cfg.vocab_size,
-                &engine.cfg.eos_token_ids,
-                0.0,
-                0.0,
-                -1,
-                false,
-                &mut masks,
-                &mut sparse,
-            )?);
+            rows.push(
+                sampler
+                    .append_gpu_row(
+                        engine.cfg.vocab_size,
+                        &engine.cfg.eos_token_ids,
+                        0.0,
+                        0.0,
+                        -1,
+                        false,
+                        &mut masks,
+                        &mut sparse,
+                    )
+                    .map_err(WorkerError::internal)?,
+            );
         }
         debug_assert!(masks.is_empty());
         Some((rows, sparse))
@@ -1843,7 +2059,7 @@ fn run_pipelined_decode_burst(
             .enqueue_pipelined_decode_step(cur_slot, &batch_cur, Some(deltas), false, true, fg_ref)
             .map_err(|e| {
                 engine.abort_pipelined_decode();
-                e.to_string()
+                WorkerError::Cuda(e)
             })?
     };
 
@@ -1885,7 +2101,7 @@ fn run_pipelined_decode_burst(
         if !can_overlap_next {
             let out_cur = engine.wait_pipelined_decode_step(ticket_cur).map_err(|e| {
                 engine.abort_pipelined_decode();
-                e.to_string()
+                WorkerError::Cuda(e)
             })?;
             commit_pipelined_step(engine, sched, requests, &slices_cur, &out_cur, None);
             return Ok(());
@@ -1947,13 +2163,13 @@ fn run_pipelined_decode_burst(
                 )
                 .map_err(|e| {
                     engine.abort_pipelined_decode();
-                    e.to_string()
+                    WorkerError::Cuda(e)
                 })?
         };
 
         let out_cur = engine.wait_pipelined_decode_step(ticket_cur).map_err(|e| {
             engine.abort_pipelined_decode();
-            e.to_string()
+            WorkerError::Cuda(e)
         })?;
 
         let mut deferred_releases = Vec::new();
@@ -1967,7 +2183,7 @@ fn run_pipelined_decode_burst(
                 PipelinedDecodeOutput::FastGreedy(rows) => {
                     let out = &rows[i];
                     if out.status != 0 {
-                        Err(format!("GPU sampler status {}", out.status))
+                        Err(WorkerError::sampler_status(out.status))
                     } else {
                         Ok((
                             out.sampled_id,
@@ -1992,7 +2208,7 @@ fn run_pipelined_decode_burst(
                 }
             };
             if let Err(err) = r.sampler.try_commit_token(id) {
-                deferred_failures.push((s.req_id, err));
+                deferred_failures.push((s.req_id, WorkerError::internal(err)));
                 any_stopped = true;
                 continue;
             }
@@ -2010,7 +2226,7 @@ fn run_pipelined_decode_burst(
                 .wait_pipelined_decode_step(ticket_next)
                 .map_err(|e| {
                     engine.abort_pipelined_decode();
-                    e.to_string()
+                    WorkerError::Cuda(e)
                 })?;
             for outcome in deferred_releases {
                 release(engine, outcome);
@@ -2074,7 +2290,7 @@ fn commit_pipelined_step(
             PipelinedDecodeOutput::FastGreedy(rows) => {
                 let row = &rows[i];
                 if row.status != 0 {
-                    Err(format!("GPU sampler status {}", row.status))
+                    Err(WorkerError::sampler_status(row.status))
                 } else {
                     Ok((
                         row.sampled_id,
@@ -2098,7 +2314,13 @@ fn commit_pipelined_step(
             }
         };
         if let Err(err) = r.sampler.try_commit_token(id) {
-            fail_request(engine, sched, requests, s.req_id, err);
+            fail_request(
+                engine,
+                sched,
+                requests,
+                s.req_id,
+                WorkerError::internal(err),
+            );
             continue;
         }
         emit(r, id, lp);
@@ -2150,5 +2372,371 @@ mod full_hidden_tap_tests {
             short_err.contains("captured 380 hidden rows after final prefill chunk, expected 404"),
             "{short_err}"
         );
+    }
+
+    fn terminal_test_request() -> (
+        Request,
+        GenerationStream,
+        tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
+    ) {
+        let (output, events) = generation_channel(2);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cached_tokens = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let request = Request {
+            prompt: vec![1],
+            images: Vec::new(),
+            vision: None,
+            reserved_pages: 0,
+            cached_tokens: cached_tokens.clone(),
+            sampler: SamplerV1::new(SamplingParams::default(), &[1], None),
+            output,
+            terminal: events.terminal.clone(),
+            cancelled: cancelled.clone(),
+            max_prefix_lookup_len: None,
+            mamba_branching_seqlen: None,
+            decision_tap: Some(DecisionReadoutTap::CandidateLogits {
+                token_ids: vec![1],
+                tx,
+            }),
+        };
+        (
+            request,
+            GenerationStream {
+                events,
+                cached_tokens,
+                cancelled,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn terminal_finished_survives_full_queue_and_is_delivered_once() {
+        let (request, mut stream, _tap) = terminal_test_request();
+        for id in 0..2 {
+            emit(&request, id, None);
+        }
+        request.set_terminal(GenerationEvent::Finished {
+            cached_tokens: 3,
+            generated_tokens: 2,
+        });
+        // A later cleanup must not overwrite the already committed terminal result.
+        notify_request_error(request, WorkerError::worker_stopped("late stop"));
+        for id in 0..2 {
+            assert!(matches!(stream.events.recv().await,
+                Some(GenerationEvent::Token { id: actual, .. }) if actual == id));
+        }
+        assert!(matches!(
+            stream.events.recv().await,
+            Some(GenerationEvent::Finished {
+                cached_tokens: 3,
+                generated_tokens: 2,
+            })
+        ));
+        assert!(stream.events.recv().await.is_none());
+        assert!(stream.events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_wakes_a_waiting_receiver() {
+        let (request, mut stream, _tap) = terminal_test_request();
+        let receive = stream.events.recv();
+        tokio::pin!(receive);
+        // Poll recv while the channel is empty but still open, then terminate it.
+        assert!(
+            std::future::poll_fn(|cx| {
+                assert!(receive.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(true)
+            })
+            .await
+        );
+        notify_request_error(request, WorkerError::worker_stopped("stop while waiting"));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), receive).await,
+            Ok(Some(GenerationEvent::Error(WorkerError::WorkerStopped(_))))
+        ));
+    }
+
+    #[test]
+    fn supervisor_publishes_poison_before_borrowed_state_teardown() {
+        struct TeardownProbe<'a> {
+            panicked: &'a AtomicBool,
+            reason: &'a Mutex<Option<String>>,
+            touched: bool,
+        }
+        impl Drop for TeardownProbe<'_> {
+            fn drop(&mut self) {
+                assert!(self.touched);
+                assert!(!std::thread::panicking());
+                assert!(self.panicked.load(Ordering::Acquire));
+                assert_eq!(
+                    self.reason.lock().unwrap().as_deref(),
+                    Some("borrowed state panic")
+                );
+            }
+        }
+        let panicked = AtomicBool::new(false);
+        let reason = Mutex::new(None);
+        let mut engine = TeardownProbe {
+            panicked: &panicked,
+            reason: &reason,
+            touched: false,
+        };
+        let (_sender, mut receiver) = mpsc::channel(2);
+        let mut requests = HashMap::new();
+        // Mirror run(): borrow state across the caught closure, never move it in.
+        run_supervised_loop(
+            &mut receiver,
+            &mut requests,
+            &WorkerStats::default(),
+            &panicked,
+            &reason,
+            |_, _| {
+                let borrowed = &mut engine;
+                borrowed.touched = true;
+                panic!("borrowed state panic");
+            },
+        );
+        drop(engine);
+    }
+
+    #[tokio::test]
+    async fn terminal_panic_survives_full_token_queue() {
+        let (request, mut stream, tap) = terminal_test_request();
+        for id in 0..2 {
+            request
+                .output
+                .try_send(GenerationEvent::Token { id, logprobs: None })
+                .unwrap();
+        }
+        let (_sender, mut receiver) = mpsc::channel(2);
+        let mut requests = HashMap::from([(1, request)]);
+        run_supervised_loop(
+            &mut receiver,
+            &mut requests,
+            &WorkerStats::default(),
+            &AtomicBool::new(false),
+            &Mutex::new(None),
+            |_, _| panic!("full queue panic"),
+        );
+        for id in 0..2 {
+            assert!(
+                matches!(stream.events.recv().await, Some(GenerationEvent::Token { id: actual, .. }) if actual == id)
+            );
+        }
+        assert!(matches!(stream.events.recv().await,
+            Some(GenerationEvent::Error(WorkerError::WorkerPanicked(msg))) if msg == "full queue panic"));
+        assert!(
+            matches!(tap.await, Ok(Err(WorkerError::WorkerPanicked(msg))) if msg == "full queue panic")
+        );
+        assert!(stream.events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_normal_stop_drains_active_and_queued_decisions() {
+        let (active, mut active_stream, active_tap) = terminal_test_request();
+        for id in 0..2 {
+            emit(&active, id, None);
+        }
+        let (queued, mut queued_stream, queued_tap) = terminal_test_request();
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert!(sender.try_send(queued).is_ok());
+        let mut requests = HashMap::from([(1, active)]);
+        let stats = WorkerStats::default();
+        stats.active.store(1, Ordering::Relaxed);
+        let panicked = AtomicBool::new(false);
+        let reason = Mutex::new(None);
+        run_supervised_loop(
+            &mut receiver,
+            &mut requests,
+            &stats,
+            &panicked,
+            &reason,
+            |_, _| {},
+        );
+        assert!(sender.is_closed(), "normal stop must close ingress");
+        assert!(requests.is_empty());
+        assert_eq!(stats.active.load(Ordering::Relaxed), 0);
+        assert!(!panicked.load(Ordering::Acquire));
+        assert!(reason.lock().unwrap().is_none());
+        for id in 0..2 {
+            assert!(matches!(active_stream.events.recv().await,
+                Some(GenerationEvent::Token { id: actual, .. }) if actual == id));
+        }
+        for stream in [&mut active_stream, &mut queued_stream] {
+            match stream.events.recv().await {
+                Some(GenerationEvent::Error(err @ WorkerError::WorkerStopped(_))) => assert_eq!(
+                    err.http_status(),
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                ),
+                other => panic!("expected WorkerStopped, got {other:?}"),
+            }
+            assert!(stream.events.recv().await.is_none());
+        }
+        for tap in [active_tap, queued_tap] {
+            assert!(matches!(tap.await, Ok(Err(WorkerError::WorkerStopped(_)))));
+        }
+    }
+
+    async fn check_locally_owned_panic(pulled_batch: bool) {
+        let (request, mut stream, tap) = terminal_test_request();
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut requests = HashMap::new();
+        if pulled_batch {
+            requests.insert(1, request);
+        } else {
+            assert!(sender.try_send(request).is_ok());
+        }
+        run_supervised_loop(
+            &mut receiver,
+            &mut requests,
+            &WorkerStats::default(),
+            &AtomicBool::new(false),
+            &Mutex::new(None),
+            |rx, reqs| {
+                if pulled_batch {
+                    // Exercise the heap-owned batch shape used by MTP verification.
+                    #[allow(clippy::useless_vec)]
+                    let _pulled = vec![(0, 1, Vec::<i32>::new(), reqs.remove(&1).unwrap())];
+                    panic!("panic while MTP owns pulled requests");
+                } else {
+                    let _admitting = rx.try_recv().unwrap();
+                    panic!("panic during admission before registry insert");
+                }
+            },
+        );
+        assert!(matches!(stream.events.recv().await,
+            Some(GenerationEvent::Error(WorkerError::WorkerPanicked(msg))) if !msg.is_empty()));
+        assert!(matches!(tap.await, Ok(Err(WorkerError::WorkerPanicked(msg))) if !msg.is_empty()));
+        assert!(stream.events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_panic_during_admission() {
+        check_locally_owned_panic(false).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_panic_while_mtp_requests_are_pulled() {
+        check_locally_owned_panic(true).await;
+    }
+
+    #[test]
+    fn worker_panic_containment_drains_in_flight_and_queued_and_poisons_future_submits() {
+        let (sender, mut receiver) = mpsc::channel(32);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let panicked = Arc::new(AtomicBool::new(false));
+        let panic_reason = Arc::new(Mutex::new(None));
+        let stats = Arc::new(WorkerStats::default());
+        stats.active.store(2, Ordering::Relaxed);
+
+        let worker_panicked = panicked.clone();
+        let worker_panic_reason = panic_reason.clone();
+        let worker_stats = stats.clone();
+        let (ingested_tx, ingested_rx) = std::sync::mpsc::sync_channel(1);
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::sync_channel(1);
+
+        let thread = std::thread::Builder::new()
+            .name("w34-cuda-test".into())
+            .spawn(move || {
+                let mut requests = HashMap::new();
+                run_supervised_loop(
+                    &mut receiver,
+                    &mut requests,
+                    &worker_stats,
+                    &worker_panicked,
+                    &worker_panic_reason,
+                    |rx, reqs| {
+                        let first = rx.blocking_recv().expect("first request");
+                        reqs.insert(1, first);
+                        ingested_tx.send(()).unwrap();
+                        unblock_rx.recv().unwrap();
+                        panic!("simulated scheduler invariant breach");
+                    },
+                );
+            })
+            .unwrap();
+
+        let worker = EngineWorker {
+            sender: Mutex::new(Some(sender)),
+            thread: Mutex::new(Some(thread)),
+            shutdown,
+            panicked,
+            panic_reason,
+            stats,
+            tokenizer: None,
+            eos_token_ids: vec![2],
+            vocab_size: 1024,
+            default_preserve_thinking: false,
+            decision_profile: crate::decision::DecisionModelProfile::Tev1 { temperature: 1.0 },
+            vision_config: None,
+            has_vision_weights: false,
+            kv_token_capacity: 4096,
+        };
+
+        let mut active_stream = worker
+            .submit(vec![10, 20], SamplingParams::default(), None)
+            .expect("submit active request");
+        ingested_rx.recv().unwrap();
+
+        // Enqueue a second request with a decision tap sitting in `receiver` (not yet dequeued).
+        let (mut queued_stream, queued_tap_rx) = worker
+            .submit_decision_candidate_logits(vec![30, 40], vec![1, 2], None)
+            .expect("submit queued decision request");
+
+        unblock_tx.send(()).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            match active_stream.events.recv().await {
+                Some(GenerationEvent::Error(WorkerError::WorkerPanicked(msg))) => {
+                    assert_eq!(msg, "simulated scheduler invariant breach");
+                }
+                other => panic!("expected WorkerPanicked on active stream, got {other:?}"),
+            }
+
+            match queued_stream.events.recv().await {
+                Some(GenerationEvent::Error(WorkerError::WorkerPanicked(msg))) => {
+                    assert_eq!(msg, "simulated scheduler invariant breach");
+                }
+                other => panic!("expected WorkerPanicked on queued stream, got {other:?}"),
+            }
+
+            match queued_tap_rx.await {
+                Ok(Err(WorkerError::WorkerPanicked(msg))) => {
+                    assert_eq!(msg, "simulated scheduler invariant breach");
+                }
+                other => panic!("expected WorkerPanicked on decision tap, got {other:?}"),
+            }
+
+            assert!(worker.is_panicked());
+            assert_eq!(worker.stats.active.load(Ordering::Relaxed), 0);
+
+            // Future submits must report WorkerPanicked (HTTP 500), never Overload/503.
+            let post_panic = worker.submit(vec![1, 2], SamplingParams::default(), None);
+            match post_panic {
+                Err(err @ WorkerError::WorkerPanicked(_)) => {
+                    assert_eq!(
+                        err.http_status(),
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    );
+                }
+                Ok(_) => panic!("expected submit after panic to fail"),
+                Err(other) => panic!("expected WorkerPanicked on post-panic submit, got {other:?}"),
+            }
+
+            let shutdown_err = worker
+                .shutdown()
+                .await
+                .expect_err("shutdown must surface worker panic");
+            assert!(
+                shutdown_err.contains("simulated scheduler invariant breach"),
+                "{shutdown_err}"
+            );
+        });
     }
 }

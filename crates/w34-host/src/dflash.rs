@@ -31,7 +31,7 @@ impl DFlash2Config {
         let root: Value = serde_json::from_str(&text)
             .map_err(|e| loader_err_ctx("parse DFlash config", e.to_string()))?;
         let body = root.get("transformer_layer_config").unwrap_or(&root);
-        let model = ModelConfig::from_json(body)
+        let model = ModelConfig::from_drafter_json(body)
             .map_err(|e| loader_err_ctx("DFlash model config", e.to_string()))?;
         if model.quant != QuantScheme::Unquantized
             || root

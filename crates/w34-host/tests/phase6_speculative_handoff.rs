@@ -64,7 +64,7 @@ async fn collect(stream: &mut GenerationStream, mut tokens: Vec<i32>) -> Result<
                 }
                 return Ok(tokens);
             }
-            GenerationEvent::Error(e) => return Err(e),
+            GenerationEvent::Error(e) => return Err(e.to_string()),
         }
     }
     Err("stream closed without Finished".into())

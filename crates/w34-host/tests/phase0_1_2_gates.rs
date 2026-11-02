@@ -50,8 +50,17 @@ fn test_phase0_loader_all_five_cached_checkpoints() {
     for (repo_id, expected_layers, expected_hidden, tp) in models {
         let dir = resolve_hf_model_dir(repo_id)
             .unwrap_or_else(|e| panic!("failed to resolve {repo_id}: {e}"));
-        let cfg = ModelConfig::from_dir(&dir)
-            .unwrap_or_else(|e| panic!("failed to parse config for {repo_id}: {e}"));
+        // This fixture is a drafter, not a target engine: select the windowed
+        // parser explicitly rather than weakening target-model validation.
+        let cfg = if repo_id == "incoai/Qwen3.8-27B-DFlash2" {
+            let root: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                    .unwrap();
+            ModelConfig::from_drafter_json(root.get("transformer_layer_config").unwrap_or(&root))
+        } else {
+            ModelConfig::from_dir(&dir)
+        }
+        .unwrap_or_else(|e| panic!("failed to parse config for {repo_id}: {e}"));
         assert_eq!(cfg.num_hidden_layers, expected_layers, "{repo_id} layers");
         assert_eq!(cfg.hidden_size, expected_hidden, "{repo_id} hidden_size");
 

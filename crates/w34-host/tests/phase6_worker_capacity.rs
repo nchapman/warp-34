@@ -59,7 +59,7 @@ fn serving_sixteen_requests_reach_b16() {
                                 finished = true;
                                 break;
                             }
-                            GenerationEvent::Error(e) => return Err(e),
+                            GenerationEvent::Error(e) => return Err(e.to_string()),
                         }
                     }
                     if !finished || tokens != 8 {

@@ -93,7 +93,7 @@ fn invalid_vision_request_does_not_abort_text_peer() {
                     match event {
                         GenerationEvent::Token { .. } => count += 1,
                         GenerationEvent::Finished { .. } => return (rejected, Ok(count)),
-                        GenerationEvent::Error(e) => return (rejected, Err(e)),
+                        GenerationEvent::Error(e) => return (rejected, Err(e.to_string())),
                     }
                 }
                 (rejected, Err("unexpected EOF".to_string()))
@@ -150,7 +150,7 @@ fn kv_pressure_queues_newcomers_without_failing_running_requests() {
                     match event {
                         GenerationEvent::Token { .. } => count += 1,
                         GenerationEvent::Finished { .. } => return Ok(count),
-                        GenerationEvent::Error(e) => return Err(e),
+                        GenerationEvent::Error(e) => return Err(e.to_string()),
                     }
                 }
                 Err("unexpected worker EOF".into())

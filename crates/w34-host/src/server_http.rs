@@ -1,6 +1,6 @@
 //! Axum owns transport; only EngineWorker's OS thread owns CUDA objects.
 use crate::{
-    engine_worker::{EngineWorker, GenerationEvent, GenerationStream},
+    engine_worker::{EngineWorker, GenerationEvent, GenerationStream, WorkerError},
     model::Qwen3_5Engine,
     parser::{Qwen3Parser, SamplingParams, StepLogprobs, StreamParseDelta},
     scheduler::SchedulerConfig,
@@ -110,9 +110,22 @@ impl OpenAiServerState {
 
 type ApiError = (StatusCode, Json<Value>);
 fn error(status: StatusCode, message: impl ToString) -> ApiError {
+    let err_type = if status == StatusCode::TOO_MANY_REQUESTS {
+        "rate_limit_error"
+    } else if status.is_server_error() {
+        "server_error"
+    } else {
+        "invalid_request_error"
+    };
     (
         status,
-        Json(json!({"error":{"message":message.to_string(),"type":"invalid_request_error"}})),
+        Json(json!({"error":{"message":message.to_string(),"type":err_type}})),
+    )
+}
+fn worker_api_err(err: WorkerError) -> ApiError {
+    (
+        err.http_status(),
+        Json(json!({"error":{"message":err.to_string(),"type":err.openai_error_type()}})),
     )
 }
 fn bad(message: impl ToString) -> ApiError {
@@ -125,9 +138,35 @@ fn busy() -> ApiError {
     )
 }
 
+fn admission_error(err: tokio::sync::TryAcquireError) -> ApiError {
+    match err {
+        tokio::sync::TryAcquireError::NoPermits => {
+            worker_api_err(WorkerError::overload("server admission capacity exceeded"))
+        }
+        tokio::sync::TryAcquireError::Closed => {
+            worker_api_err(WorkerError::worker_stopped("server shutting down"))
+        }
+    }
+}
+
+async fn health(State(s): State<Arc<OpenAiServerState>>) -> Response {
+    if s.worker.is_panicked() {
+        let detail = s
+            .worker
+            .panic_reason()
+            .unwrap_or_else(|| "engine worker panicked".into());
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status":"error","error":format!("engine worker terminated after panic: {detail}")})),
+        )
+            .into_response();
+    }
+    Json(json!({"status":"ok"})).into_response()
+}
+
 pub fn router(state: Arc<OpenAiServerState>) -> Router {
     Router::new()
-        .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
+        .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/metrics", get(metrics))
         .route("/tokenize", post(tokenize))
@@ -239,7 +278,7 @@ async fn tokenize(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| busy())?;
+        .map_err(admission_error)?;
     let body = read_json(&s, req).await?;
     if s.worker.tokenizer.is_none() {
         return Err(bad("tokenizer unavailable"));
@@ -271,7 +310,7 @@ async fn detokenize(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| busy())?;
+        .map_err(admission_error)?;
     let body = read_json(&s, req).await?;
     if s.worker.tokenizer.is_none() {
         return Err(bad("tokenizer unavailable"));
@@ -434,7 +473,7 @@ async fn generate(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| busy())?;
+        .map_err(admission_error)?;
     let start = Instant::now();
     let (json, body_len) = read_json_with_len(&s, request).await?;
     let prep_state = s.clone();
@@ -463,7 +502,7 @@ async fn generate(
             prepared.params.clone(),
             prepared.constraint,
         )
-        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(worker_api_err)?;
     let stream = prepared.stream;
     let include_usage = prepared.include_usage;
     let request_id = s.metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
@@ -497,9 +536,9 @@ async fn generate(
                         yield Ok(Event::default().data(final_chunk.to_string()));
                         if include_usage { final_chunk["choices"] = json!([]); final_chunk["usage"] = value["usage"].clone(); yield Ok(Event::default().data(final_chunk.to_string())); }
                     }
-                    Output::Error(message) => {
+                    Output::Error(err) => {
                         yield Ok(Event::default().data(
-                            json!({"error":{"message":message,"type":"server_error"}}).to_string(),
+                            json!({"error":{"message":err.to_string(),"type":err.openai_error_type()}}).to_string(),
                         ));
                     }
                 }
@@ -514,8 +553,8 @@ async fn generate(
         while let Some(item) = output.next().await {
             match item {
                 Output::Complete(value) => return Ok(Json(value).into_response()),
-                Output::Error(message) => {
-                    return Err(error(StatusCode::INTERNAL_SERVER_ERROR, message));
+                Output::Error(err) => {
+                    return Err(worker_api_err(err));
                 }
                 Output::Delta(_) => {}
             }
@@ -530,7 +569,7 @@ async fn generate(
 enum Output {
     Delta(Value),
     Complete(Value),
-    Error(String),
+    Error(WorkerError),
 }
 
 /// Hold only the suffix that might begin a stop string. Never expose part of a delimiter.
@@ -679,7 +718,7 @@ fn output_stream(
                     }
                     let decoded = match decoder.step(id as u32) {
                         Ok(Some(text)) => text, Ok(None) if chat => continue, Ok(None) => String::new(),
-                        Err(e) => { yield Output::Error(e.to_string()); return; }
+                        Err(e) => { yield Output::Error(WorkerError::internal(e.to_string())); return; }
                     };
                     if !chat {
                         if let Some(lp) = &mut lp {
@@ -700,12 +739,12 @@ fn output_stream(
                     if matched { stopped = true; done = true; break; }
                 }
                 GenerationEvent::Finished { cached_tokens, .. } => { cached = cached_tokens; done = true; break; }
-                GenerationEvent::Error(message) => { yield Output::Error(message); return; }
+                GenerationEvent::Error(err) => { yield Output::Error(err); return; }
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
         drop(generation); // cancellation also covers stop strings and a dropped HTTP response body
-        if !done { yield Output::Error("engine stream closed before completion (overload, shutdown, or worker failure)".into()); return; }
+        if !done { yield Output::Error(WorkerError::internal("engine stream closed before completion (overload, shutdown, or worker failure)")); return; }
         let tail = std::mem::take(&mut stops.pending);
         text.push_str(&tail);
         if !tail.is_empty() {
@@ -783,7 +822,7 @@ async fn chat_input_tokens(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| busy())?;
+        .map_err(admission_error)?;
     let mut body = read_json(&s, req).await?;
     if let Some(obj) = body.as_object_mut() {
         obj.remove("max_tokens");
@@ -819,7 +858,7 @@ async fn responses_input_tokens(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| busy())?;
+        .map_err(admission_error)?;
     let caller_scope = responses_caller_scope(&s, req.headers());
     let mut body = read_json(&s, req).await?;
     if let Some(obj) = body.as_object_mut() {
@@ -853,7 +892,7 @@ async fn anthropic_count_tokens(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| to_anthropic_err(busy()))?;
+        .map_err(|err| to_anthropic_err(admission_error(err)))?;
     let body = read_json(&s, req).await.map_err(to_anthropic_err)?;
     let (mut chat_req, _) =
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, 0, false)
@@ -950,7 +989,7 @@ async fn responses_create(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| busy())?;
+        .map_err(admission_error)?;
     let start = Instant::now();
     let caller_scope = responses_caller_scope(&s, request.headers());
     let body = read_json(&s, request).await?;
@@ -974,7 +1013,7 @@ async fn responses_create(
             prepared.params.clone(),
             prepared.constraint,
         )
-        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(worker_api_err)?;
     if let Some(ref scope) = caller_scope {
         s.response_store.register_active(
             meta.response_id.clone(),
@@ -1053,8 +1092,9 @@ async fn responses_create(
                         done = true;
                         break;
                     }
-                    GenerationEvent::Error(message) => {
-                        for (ev_name, payload) in sse.fail(&message) {
+                    GenerationEvent::Error(err) => {
+                        let msg = err.to_string();
+                        for (ev_name, payload) in sse.fail(&msg) {
                             yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                         }
                         return;
@@ -1167,8 +1207,8 @@ async fn responses_create(
                     done = true;
                     break;
                 }
-                GenerationEvent::Error(message) => {
-                    return Err(error(StatusCode::INTERNAL_SERVER_ERROR, message));
+                GenerationEvent::Error(err) => {
+                    return Err(worker_api_err(err));
                 }
             }
         }
@@ -1228,7 +1268,7 @@ async fn anthropic_messages(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| to_anthropic_err(busy()))?;
+        .map_err(|err| to_anthropic_err(admission_error(err)))?;
     let start = Instant::now();
     let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
     let request_id = s.metrics.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1248,12 +1288,7 @@ async fn anthropic_messages(
             prepared.params.clone(),
             prepared.constraint,
         )
-        .map_err(|e| {
-            anthropic_api_err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                crate::anthropic_api::AnthropicApiError::overloaded(e),
-            )
-        })?;
+        .map_err(|e| to_anthropic_err(worker_api_err(e)))?;
     s.metrics
         .prompt_tokens_total
         .fetch_add(prompt_len as u64, Ordering::Relaxed);
@@ -1321,8 +1356,9 @@ async fn anthropic_messages(
                         done = true;
                         break;
                     }
-                    GenerationEvent::Error(message) => {
-                        let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&message);
+                    GenerationEvent::Error(err) => {
+                        let msg = err.to_string();
+                        let (ev_name, payload) = crate::anthropic_api::AnthropicSseFormatter::error_event(&msg);
                         yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                         return;
                     }
@@ -1428,11 +1464,8 @@ async fn anthropic_messages(
                     done = true;
                     break;
                 }
-                GenerationEvent::Error(message) => {
-                    return Err(anthropic_api_err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        crate::anthropic_api::AnthropicApiError::api_error(message),
-                    ));
+                GenerationEvent::Error(err) => {
+                    return Err(to_anthropic_err(worker_api_err(err)));
                 }
             }
         }
@@ -1518,11 +1551,11 @@ async fn run_one_candidate_query(
     let (mut stream, rx) = s
         .worker
         .submit_decision_candidate_logits_with_images(prompt, images, cands, branch_hint)
-        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(worker_api_err)?;
     let tap = rx
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(worker_api_err)?;
     let mut cached_done = 0usize;
     while let Some(ev) = stream.events.recv().await {
         match ev {
@@ -1530,8 +1563,8 @@ async fn run_one_candidate_query(
                 cached_done = cached_tokens;
                 break;
             }
-            GenerationEvent::Error(msg) => {
-                return Err(error(StatusCode::INTERNAL_SERVER_ERROR, msg));
+            GenerationEvent::Error(err) => {
+                return Err(worker_api_err(err));
             }
             GenerationEvent::Token { .. } => {}
         }
@@ -1565,11 +1598,11 @@ async fn run_one_hidden_query(
             prefix_cap,
             branch_hint,
         )
-        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(worker_api_err)?;
     let tap = rx
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(worker_api_err)?;
     let mut cached_done = 0usize;
     while let Some(ev) = stream.events.recv().await {
         match ev {
@@ -1577,8 +1610,8 @@ async fn run_one_hidden_query(
                 cached_done = cached_tokens;
                 break;
             }
-            GenerationEvent::Error(msg) => {
-                return Err(error(StatusCode::INTERNAL_SERVER_ERROR, msg));
+            GenerationEvent::Error(err) => {
+                return Err(worker_api_err(err));
             }
             GenerationEvent::Token { .. } => {}
         }
@@ -1603,11 +1636,11 @@ async fn run_one_clef_query(
     let (mut stream, rx) = s
         .worker
         .submit_decision_clef_with_images(record, images)
-        .map_err(|e| error(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(worker_api_err)?;
     let tap = rx
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
-        .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(worker_api_err)?;
     let mut cached_done = 0usize;
     while let Some(ev) = stream.events.recv().await {
         match ev {
@@ -1615,8 +1648,8 @@ async fn run_one_clef_query(
                 cached_done = cached_tokens;
                 break;
             }
-            GenerationEvent::Error(msg) => {
-                return Err(error(StatusCode::INTERNAL_SERVER_ERROR, msg));
+            GenerationEvent::Error(err) => {
+                return Err(worker_api_err(err));
             }
             GenerationEvent::Token { .. } => {}
         }
@@ -1885,7 +1918,7 @@ async fn systemone_decide(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| busy())?;
+        .map_err(admission_error)?;
     let body = read_json(&s, request).await?;
     let resp = execute_systemone_json(&s, body).await?;
     Ok(Json(resp))
@@ -1899,7 +1932,7 @@ async fn decisions_adapter(
         .admission
         .clone()
         .try_acquire_owned()
-        .map_err(|_| busy())?;
+        .map_err(admission_error)?;
     let body = read_json(&s, request).await?;
     let canonical =
         crate::decision::normalize_decisions_adapter_request(&body).map_err(decision_err)?;
@@ -1983,7 +2016,10 @@ pub fn run_blocking_server(addr: &str, state: Arc<OpenAiServerState>) -> std::io
 
 #[cfg(test)]
 mod tests {
-    use super::StopBuffer;
+    use super::{StopBuffer, admission_error, to_anthropic_err, worker_api_err};
+    use crate::engine_worker::WorkerError;
+    use axum::http::StatusCode;
+
     #[test]
     fn stop_holdback_handles_every_utf8_split_and_overlaps() {
         let input = "hello 🛑END trailing";
@@ -1998,5 +2034,45 @@ mod tests {
             }
             assert_eq!(visible, "hello ");
         }
+    }
+
+    #[test]
+    fn admission_distinguishes_capacity_from_shutdown() {
+        let (status, body) = admission_error(tokio::sync::TryAcquireError::NoPermits);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body.0["error"]["type"], "rate_limit_error");
+        let (status, body) = admission_error(tokio::sync::TryAcquireError::Closed);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["error"]["type"], "server_error");
+    }
+
+    #[test]
+    fn worker_api_err_maps_openai_and_anthropic_status_codes_and_types() {
+        let (st, body) =
+            worker_api_err(WorkerError::overload("engine admission capacity exceeded"));
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body.0["error"]["type"], "rate_limit_error");
+
+        let (ast, abody) = to_anthropic_err((st, body));
+        assert_eq!(ast, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(abody.0["error"]["type"], "overloaded_error");
+
+        let (st, body) = worker_api_err(WorkerError::invalid_request(
+            "invalid tokens or request exceeds KV capacity",
+        ));
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"]["type"], "invalid_request_error");
+
+        let (ast, abody) = to_anthropic_err((st, body));
+        assert_eq!(ast, StatusCode::BAD_REQUEST);
+        assert_eq!(abody.0["error"]["type"], "invalid_request_error");
+
+        let (st, body) = worker_api_err(WorkerError::worker_panicked("boom"));
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0["error"]["type"], "server_error");
+
+        let (ast, abody) = to_anthropic_err((st, body));
+        assert_eq!(ast, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(abody.0["error"]["type"], "api_error");
     }
 }

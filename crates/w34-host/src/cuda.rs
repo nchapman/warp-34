@@ -1,6 +1,27 @@
 //! CUDA runtime substrate, memory arenas, `TP=2` collectives, `CapacityPlanner`,
 //! and `prepare_execution_plan()` kernel pre-warming.
-#![allow(clippy::undocumented_unsafe_blocks, clippy::too_many_arguments)]
+//!
+//! # Safety Contract
+//!
+//! These low-level wrappers rely on runtime callers to maintain the following
+//! invariants; raw addresses and public handles do not enforce them in the type system.
+//! 1. **Per-thread device context**: CUDA's active device is thread-local. Wrappers
+//!    select their owning device where required; `*_in_current_ctx` operations and
+//!    kernel/collective launches require the caller to select the device first.
+//! 2. **Stack out-parameters**: scalar out-pointers (`&raw mut ...`) reference live
+//!    initialized stack locals for the duration of the synchronous FFI call.
+//! 3. **Device pointer lifetime**: device addresses passed into asynchronous launches
+//!    are backed by `DeviceBuffer`, `DeviceArena`, or `MappedHostBuffer` owners
+//!    that outlive every stream/graph execution referencing them.
+//! 4. **Teardown synchronization**: `DeviceBuffer::drop` relies on `cudaFree`'s
+//!    implicit device synchronization; never replace `w34_free` with an asynchronous
+//!    allocator free without explicit stream synchronization.
+//! 5. **Graph capture pairing**: `CudaGraph::capture` pairs
+//!    `w34_graph_begin_capture` with `w34_graph_end_capture` when `body()` returns
+//!    an error. This pairing does not cover panics in the capture body.
+//! 6. **Cross-rank mapped staging**: `MappedHostBuffer` is `Send + Sync` only under
+//!    rank-partitioned writes or explicit GPU/host fence protocols (`Tp2Collectives`
+//!    epoch barriers and double-buffered decode staging).
 
 #[cfg(feature = "cuda")]
 use core::ffi::c_void;
@@ -41,18 +62,45 @@ impl CudaError {
             detail: Some(detail.into()),
         }
     }
+
+    /// Returns the human-readable `cudaGetErrorString` description for genuine
+    /// CUDA runtime error codes (`code >= 0`, excluding `w34_cublas_*` status
+    /// codes and negative host-level synthetic codes).
+    #[inline]
+    pub fn runtime_error_string(&self) -> Option<&'static str> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.code >= 0 && !self.context.starts_with("w34_cublas_") {
+                // SAFETY: `w34_cuda_error_string` accepts any integer and returns either null
+                // or a static NUL-terminated string literal owned by `libcudart`.
+                let ptr = unsafe { ffi::w34_cuda_error_string(self.code) };
+                if !ptr.is_null() {
+                    // SAFETY: `ptr` is non-null and points to a static NUL-terminated C string.
+                    return unsafe { core::ffi::CStr::from_ptr(ptr) }.to_str().ok();
+                }
+            }
+        }
+        None
+    }
 }
 
 impl fmt::Display for CudaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(detail) = &self.detail {
-            write!(
+        match (self.runtime_error_string(), &self.detail) {
+            (Some(rt), Some(detail)) => write!(
+                f,
+                "CUDA error {} ({}) in {}: {}",
+                self.code, rt, self.context, detail
+            ),
+            (Some(rt), None) => {
+                write!(f, "CUDA error {} ({}) in {}", self.code, rt, self.context)
+            }
+            (None, Some(detail)) => write!(
                 f,
                 "CUDA error {} in {}: {}",
                 self.code, self.context, detail
-            )
-        } else {
-            write!(f, "CUDA error {} in {}", self.code, self.context)
+            ),
+            (None, None) => write!(f, "CUDA error {} in {}", self.code, self.context),
         }
     }
 }
@@ -274,6 +322,7 @@ impl CudaDevice {
     pub fn count() -> Result<i32> {
         let mut count = 0i32;
         check_rc(
+            // SAFETY: `count` is a valid initialized stack `i32` out-parameter.
             unsafe { ffi::w34_get_device_count(&raw mut count) },
             "w34_get_device_count",
         )?;
@@ -281,12 +330,14 @@ impl CudaDevice {
     }
 
     pub fn set_current(device_id: i32) -> Result<Self> {
+        // SAFETY: `w34_set_device` validates `device_id` via `cudaSetDevice` and returns an error code.
         check_rc(unsafe { ffi::w34_set_device(device_id) }, "w34_set_device")?;
         Ok(Self { device_id })
     }
 
     pub fn make_current(&self) -> Result<()> {
         check_rc(
+            // SAFETY: `self.device_id` was validated on construction; return code is checked.
             unsafe { ffi::w34_set_device(self.device_id) },
             "w34_set_device",
         )
@@ -295,6 +346,7 @@ impl CudaDevice {
     pub fn synchronize(&self) -> Result<()> {
         self.make_current()?;
         check_rc(
+            // SAFETY: current thread's active device is set above; synchronizes device work.
             unsafe { ffi::w34_device_synchronize() },
             "w34_device_synchronize",
         )
@@ -305,6 +357,7 @@ impl CudaDevice {
         let mut free = 0usize;
         let mut total = 0usize;
         check_rc(
+            // SAFETY: `free` and `total` are valid stack `usize` out-parameters on the active device.
             unsafe { ffi::w34_get_mem_info(&raw mut free, &raw mut total) },
             "w34_get_mem_info",
         )?;
@@ -321,9 +374,11 @@ pub struct CudaStream {
 #[cfg(feature = "cuda")]
 impl CudaStream {
     pub fn new(device_id: i32) -> Result<Self> {
+        // SAFETY: selects `device_id` on this thread before creating the non-blocking stream.
         check_rc(unsafe { ffi::w34_set_device(device_id) }, "w34_set_device")?;
         let mut handle = 0usize;
         check_rc(
+            // SAFETY: `handle` is a valid stack out-parameter for the new `cudaStream_t`.
             unsafe { ffi::w34_stream_create(&raw mut handle) },
             "w34_stream_create",
         )?;
@@ -332,10 +387,12 @@ impl CudaStream {
 
     pub fn synchronize(&self) -> Result<()> {
         check_rc(
+            // SAFETY: selects the stream's owning device on the calling thread.
             unsafe { ffi::w34_set_device(self.device_id) },
             "w34_set_device",
         )?;
         check_rc(
+            // SAFETY: `self.handle` is a live `cudaStream_t` owned by `self`.
             unsafe { ffi::w34_stream_synchronize(self.handle) },
             "w34_stream_synchronize",
         )
@@ -351,6 +408,7 @@ impl CudaStream {
 
     pub fn wait_event(&self, event: &CudaEvent) -> Result<()> {
         check_rc(
+            // SAFETY: both `self.handle` and `event.handle` are live CUDA handles owned by their wrappers.
             unsafe { ffi::w34_stream_wait_event(self.handle, event.handle) },
             "w34_stream_wait_event",
         )
@@ -361,6 +419,7 @@ impl CudaStream {
 impl Drop for CudaStream {
     fn drop(&mut self) {
         if self.handle != 0 {
+            // SAFETY: `self.handle` is non-zero and uniquely owned by `self`; device context is set first.
             unsafe {
                 let _ = ffi::w34_set_device(self.device_id);
                 let _ = ffi::w34_stream_destroy(self.handle);
@@ -378,9 +437,11 @@ pub struct CudaEvent {
 #[cfg(feature = "cuda")]
 impl CudaEvent {
     pub fn new(device_id: i32, enable_timing: bool) -> Result<Self> {
+        // SAFETY: selects `device_id` on this thread before creating the CUDA event.
         check_rc(unsafe { ffi::w34_set_device(device_id) }, "w34_set_device")?;
         let mut handle = 0usize;
         check_rc(
+            // SAFETY: `handle` is a valid stack out-parameter for the new `cudaEvent_t`.
             unsafe { ffi::w34_event_create(&raw mut handle, i32::from(enable_timing)) },
             "w34_event_create",
         )?;
@@ -389,6 +450,7 @@ impl CudaEvent {
 
     pub fn record(&self, stream: &CudaStream) -> Result<()> {
         check_rc(
+            // SAFETY: selects the event's owning device before recording onto `stream`.
             unsafe { ffi::w34_set_device(self.device_id) },
             "w34_set_device",
         )?;
@@ -397,6 +459,7 @@ impl CudaEvent {
 
     pub fn record_in_current_ctx(&self, stream: &CudaStream) -> Result<()> {
         check_rc(
+            // SAFETY: `self.handle` and `stream.handle` are live event/stream handles on the same device.
             unsafe { ffi::w34_event_record(self.handle, stream.handle) },
             "w34_event_record",
         )
@@ -404,6 +467,7 @@ impl CudaEvent {
 
     pub fn synchronize(&self) -> Result<()> {
         check_rc(
+            // SAFETY: `self.handle` is a live `cudaEvent_t` owned by `self`.
             unsafe { ffi::w34_event_synchronize(self.handle) },
             "w34_event_synchronize",
         )
@@ -412,6 +476,7 @@ impl CudaEvent {
     pub fn elapsed_ms(&self, end: &CudaEvent) -> Result<f32> {
         let mut ms = 0.0f32;
         check_rc(
+            // SAFETY: `ms` is a stack `f32` out-parameter; `self` and `end` are live timing events.
             unsafe { ffi::w34_event_elapsed_ms(&raw mut ms, self.handle, end.handle) },
             "w34_event_elapsed_ms",
         )?;
@@ -423,6 +488,7 @@ impl CudaEvent {
 impl Drop for CudaEvent {
     fn drop(&mut self) {
         if self.handle != 0 {
+            // SAFETY: `self.handle` is non-zero and uniquely owned by `self`; device context is set first.
             unsafe {
                 let _ = ffi::w34_set_device(self.device_id);
                 let _ = ffi::w34_event_destroy(self.handle);
@@ -441,11 +507,13 @@ pub struct CublasHandle {
 impl CublasHandle {
     pub fn new(stream: &CudaStream) -> Result<Self> {
         check_rc(
+            // SAFETY: binds the calling thread to `stream.device_id` before creating `W34Blas`.
             unsafe { ffi::w34_set_device(stream.device_id) },
             "w34_set_device",
         )?;
         let mut handle = 0usize;
         check_rc(
+            // SAFETY: `handle` is a stack out-parameter and `stream.handle` is a live stream on `device_id`.
             unsafe { ffi::w34_cublas_create(&raw mut handle, stream.handle) },
             "w34_cublas_create",
         )?;
@@ -455,6 +523,7 @@ impl CublasHandle {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_f16(
         &self,
         a_ptr: u64,
@@ -465,6 +534,8 @@ impl CublasHandle {
         k: i32,
     ) -> Result<()> {
         check_rc(
+            // SAFETY: `self.handle` is a live `W34Blas` handle; caller guarantees `a_ptr`, `b_ptr`,
+            // and `c_ptr` reference valid FP16 device buffers sized for `[m, k]`, `[n, k]`, `[m, n]`.
             unsafe {
                 ffi::w34_cublas_gemm_f16(
                     self.handle,
@@ -490,6 +561,7 @@ impl CublasHandle {
     /// GEMMs sharing a handle must not overlap across different streams.
     /// Ordinary calls submit on the stream passed to `new`; keep it alive.
     /// The public handle value is opaque, not a vendor cuBLAS handle.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_f16_bias(
         &self,
         a_ptr: u64,
@@ -501,8 +573,10 @@ impl CublasHandle {
         k: i32,
     ) -> Result<()> {
         check_rc(
+            // SAFETY: `self.handle` is a live `W34Blas` handle; caller guarantees `a_ptr`, `b_ptr`,
+            // `bias_ptr`, and `c_ptr` reference valid FP16 device buffers outliving graph replay.
             unsafe {
-                w34_kernels::w34_cublas_gemm_f16_bias(
+                ffi::w34_cublas_gemm_f16_bias(
                     self.handle,
                     a_ptr as *const c_void,
                     b_ptr as *const c_void,
@@ -517,6 +591,7 @@ impl CublasHandle {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16(
         &self,
         a_ptr: u64,
@@ -527,6 +602,8 @@ impl CublasHandle {
         k: i32,
     ) -> Result<()> {
         check_rc(
+            // SAFETY: `self.handle` is a live `W34Blas` handle; caller guarantees `a_ptr`, `b_ptr`,
+            // and `c_ptr` reference valid BF16 device buffers sized for `[m, k]`, `[n, k]`, `[m, n]`.
             unsafe {
                 ffi::w34_cublas_gemm_bf16(
                     self.handle,
@@ -547,6 +624,7 @@ impl CublasHandle {
 impl Drop for CublasHandle {
     fn drop(&mut self) {
         if self.handle != 0 {
+            // SAFETY: `self.handle` is non-zero and uniquely owned by `self`; device context is set first.
             unsafe {
                 let _ = ffi::w34_set_device(self.device_id);
                 let _ = ffi::w34_cublas_destroy(self.handle);
@@ -569,16 +647,20 @@ impl CudaGraph {
         F: FnOnce() -> Result<()>,
     {
         check_rc(
+            // SAFETY: binds calling thread to `stream.device_id` prior to stream capture.
             unsafe { ffi::w34_set_device(stream.device_id) },
             "w34_set_device",
         )?;
         check_rc(
+            // SAFETY: `stream.handle` is a live non-default stream on `stream.device_id`.
             unsafe { ffi::w34_graph_begin_capture(stream.handle) },
             "w34_graph_begin_capture",
         )?;
         let body_res = body();
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
+        // SAFETY: always pairs `w34_graph_begin_capture` on `stream.handle` even if `body()` failed;
+        // `graph` and `graph_exec` are stack out-parameters transferred into `captured` for RAII cleanup.
         let end_rc = unsafe {
             ffi::w34_graph_end_capture(stream.handle, &raw mut graph, &raw mut graph_exec)
         };
@@ -594,10 +676,12 @@ impl CudaGraph {
 
     pub fn launch(&self, stream: &CudaStream) -> Result<()> {
         check_rc(
+            // SAFETY: binds calling thread to `self.device_id` before replaying `self.graph_exec`.
             unsafe { ffi::w34_set_device(self.device_id) },
             "w34_set_device",
         )?;
         check_rc(
+            // SAFETY: `self.graph_exec` and `stream.handle` are live handles on `self.device_id`.
             unsafe { ffi::w34_graph_launch(self.graph_exec, stream.handle) },
             "w34_graph_launch",
         )
@@ -608,6 +692,8 @@ impl CudaGraph {
 impl Drop for CudaGraph {
     fn drop(&mut self) {
         if self.graph != 0 || self.graph_exec != 0 {
+            // SAFETY: `self.graph` / `self.graph_exec` are uniquely owned by `self`; `w34_graph_destroy`
+            // tolerates zero handles on partial capture failures.
             unsafe {
                 let _ = ffi::w34_set_device(self.device_id);
                 let _ = ffi::w34_graph_destroy(self.graph, self.graph_exec);
@@ -623,26 +709,36 @@ pub struct DeviceBuffer {
     pub len_bytes: usize,
 }
 
+// SAFETY: `DeviceBuffer` owns a CUDA global-memory allocation (`cudaMalloc`) whose device
+// virtual address is valid across host threads once `cudaSetDevice(self.device_id)` is bound;
+// host code never dereferences `self.ptr`, and teardown uses `cudaFree`.
 #[cfg(feature = "cuda")]
 unsafe impl Send for DeviceBuffer {}
+// SAFETY: sharing this wrapper does not expose host references into device memory.
+// Callers must order GPU writes and copies with streams/events; sharing the wrapper
+// does not itself establish ordering between different streams.
 #[cfg(feature = "cuda")]
 unsafe impl Sync for DeviceBuffer {}
 
 #[cfg(feature = "cuda")]
 impl DeviceBuffer {
     pub fn alloc(device_id: i32, len_bytes: usize) -> Result<Self> {
+        // SAFETY: selects `device_id` on this thread before `cudaMalloc` + zero-init.
         check_rc(unsafe { ffi::w34_set_device(device_id) }, "w34_set_device")?;
         let alloc_bytes = len_bytes.max(16);
         let mut ptr: *mut c_void = core::ptr::null_mut();
         check_rc(
+            // SAFETY: `ptr` is a stack out-parameter and `alloc_bytes >= 16`.
             unsafe { ffi::w34_malloc(&raw mut ptr, alloc_bytes) },
             "w34_malloc",
         )?;
         check_rc(
+            // SAFETY: `ptr` was just allocated for `alloc_bytes` on `device_id`; stream 0 zero-fills it.
             unsafe { ffi::w34_memset_async(ptr, 0, alloc_bytes, 0) },
             "w34_memset_async",
         )?;
         check_rc(
+            // SAFETY: waits for the zero-fill on stream 0 before exposing `Self`.
             unsafe { ffi::w34_stream_synchronize(0) },
             "w34_stream_synchronize(0)",
         )?;
@@ -663,10 +759,12 @@ impl DeviceBuffer {
             return Ok(());
         }
         check_rc(
+            // SAFETY: binds calling thread to `self.device_id` before `cudaMemsetAsync`.
             unsafe { ffi::w34_set_device(self.device_id) },
             "w34_set_device",
         )?;
         check_rc(
+            // SAFETY: `self.ptr` is live for `self.len_bytes` on `self.device_id`, and `stream` is live.
             unsafe { ffi::w34_memset_async(self.ptr, 0, self.len_bytes, stream.handle) },
             "w34_memset_async",
         )
@@ -681,10 +779,14 @@ impl DeviceBuffer {
             return Ok(());
         }
         check_rc(
+            // SAFETY: binds calling thread to `self.device_id` before H2D copy.
             unsafe { ffi::w34_set_device(self.device_id) },
             "w34_set_device",
         )?;
         check_rc(
+            // SAFETY: the destination bound is checked above and `src` supplies `bytes`.
+            // Runtime callers must retain the host storage until the stream consumes it;
+            // this low-level API does not encode an asynchronous source lifetime.
             unsafe {
                 ffi::w34_memcpy_h2d_async(
                     self.ptr,
@@ -706,10 +808,13 @@ impl DeviceBuffer {
             return Ok(());
         }
         check_rc(
+            // SAFETY: binds calling thread to `self.device_id` before D2H copy.
             unsafe { ffi::w34_set_device(self.device_id) },
             "w34_set_device",
         )?;
         check_rc(
+            // SAFETY: `bytes <= self.len_bytes` is checked above, `dst` is uniquely borrowed for
+            // `bytes`, and `stream.synchronize()` below completes the DMA before `dst` is released.
             unsafe {
                 ffi::w34_memcpy_d2h_async(
                     dst.as_mut_ptr() as *mut c_void,
@@ -728,6 +833,8 @@ impl DeviceBuffer {
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // SAFETY: `self.ptr` is uniquely owned by `self` and allocated via `w34_malloc`
+            // (`cudaMalloc`); `w34_free` (`cudaFree`) implicitly synchronizes pending GPU work.
             unsafe {
                 let _ = ffi::w34_set_device(self.device_id);
                 let _ = ffi::w34_free(self.ptr);
@@ -813,10 +920,14 @@ impl DeviceArena {
         let addr = self.alloc_aligned(bytes.max(16))?;
         if bytes > 0 {
             check_rc(
+                // SAFETY: binds calling thread to `self.buf.device_id` before H2D copy into `addr`.
                 unsafe { ffi::w34_set_device(self.buf.device_id) },
                 "w34_set_device",
             )?;
             check_rc(
+                // SAFETY: `addr..addr + bytes` was just sub-allocated within `self.buf`.
+                // As with `copy_from_host`, callers must retain source storage until DMA
+                // completes; a borrowed slice alone does not prove that lifetime.
                 unsafe {
                     ffi::w34_memcpy_h2d_async(
                         addr as *mut c_void,
@@ -840,8 +951,13 @@ pub struct MappedHostBuffer {
     pub len_bytes: usize,
 }
 
+// SAFETY: `MappedHostBuffer` wraps `cudaHostAllocPortable | cudaHostAllocMapped` memory, which
+// CUDA explicitly makes accessible from any host thread and any GPU context in the process.
 #[cfg(feature = "cuda")]
 unsafe impl Send for MappedHostBuffer {}
+// SAFETY: Sharing `&MappedHostBuffer` across rank threads (`Arc<Tp2Collectives>`) is sound only
+// because callers partition writes per rank (`stage0`/`sig0` vs `stage1`/`sig1`) or synchronize
+// host/GPU access via CUDA event completion (`BatchedDecodeGraphIo` double-buffered slots).
 #[cfg(feature = "cuda")]
 unsafe impl Sync for MappedHostBuffer {}
 
@@ -852,6 +968,7 @@ impl MappedHostBuffer {
         let mut host_ptr: *mut c_void = core::ptr::null_mut();
         let mut dev_ptr: *mut c_void = core::ptr::null_mut();
         check_rc(
+            // SAFETY: `host_ptr` and `dev_ptr` are valid stack out-parameters and `alloc_bytes >= 128`.
             unsafe { ffi::w34_host_alloc_mapped(&raw mut host_ptr, &raw mut dev_ptr, alloc_bytes) },
             "w34_host_alloc_mapped",
         )?;
@@ -872,6 +989,7 @@ impl MappedHostBuffer {
 impl Drop for MappedHostBuffer {
     fn drop(&mut self) {
         if !self.host_ptr.is_null() {
+            // SAFETY: `self.host_ptr` is uniquely owned by `self` and allocated by `w34_host_alloc_mapped`.
             unsafe {
                 let _ = ffi::w34_host_free(self.host_ptr);
             }
@@ -893,6 +1011,7 @@ pub struct Tp2Collectives {
 impl Tp2Collectives {
     /// Allocates double-buffered staging (`2 * max_stage_bytes_per_epoch`) and signal structs.
     pub fn new(max_stage_bytes_per_epoch: usize) -> Result<Self> {
+        // SAFETY: `w34_tp2_signal_bytes` is a pure `sizeof(W34Tp2Signal)` query with no preconditions.
         let sig_bytes = unsafe { ffi::w34_tp2_signal_bytes() };
         let sig0 = MappedHostBuffer::alloc(sig_bytes)?;
         let sig1 = MappedHostBuffer::alloc(sig_bytes)?;
@@ -921,6 +1040,8 @@ impl Tp2Collectives {
             "all_reduce_f16 exceeds max_stage_bytes_per_epoch"
         );
         check_rc(
+            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // buffers owned by `self`, and caller guarantees valid `local_in_ptr`/`out_ptr` for `num_elems` FP16s.
             unsafe {
                 ffi::w34_tp2_all_reduce_f16(
                     ex,
@@ -961,6 +1082,8 @@ impl Tp2Collectives {
             "all_reduce_residual_gemma_rms_norm_f16 exceeds max_stage_bytes_per_epoch"
         );
         check_rc(
+            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // buffers owned by `self`, and caller guarantees valid device pointers for `[num_tokens, hidden_size]`.
             unsafe {
                 ffi::w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
                     ex,
@@ -999,6 +1122,8 @@ impl Tp2Collectives {
             "all_reduce_bf16 exceeds max_stage_bytes_per_epoch"
         );
         check_rc(
+            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // buffers owned by `self`, and caller guarantees valid BF16 device buffers for `num_elems`.
             unsafe {
                 ffi::w34_tp2_all_reduce_bf16(
                     ex,
@@ -1029,6 +1154,8 @@ impl Tp2Collectives {
             "all_reduce_f32 exceeds max_stage_bytes_per_epoch"
         );
         check_rc(
+            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // buffers owned by `self`, and caller guarantees valid FP32 device buffers for `num_elems`.
             unsafe {
                 ffi::w34_tp2_all_reduce_f32(
                     ex,
@@ -1059,6 +1186,8 @@ impl Tp2Collectives {
             "broadcast_i32 exceeds max_stage_bytes_per_epoch"
         );
         check_rc(
+            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // buffers owned by `self`, and caller guarantees valid `i32` device buffers for `num_elems`.
             unsafe {
                 ffi::w34_tp2_broadcast_i32(
                     ex,
@@ -1076,6 +1205,7 @@ impl Tp2Collectives {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn all_gather_top1_f32_i32(
         &self,
         ex: &W34Exec,
@@ -1091,6 +1221,8 @@ impl Tp2Collectives {
             "all_gather_top1_f32_i32 exceeds max_stage_bytes_per_epoch"
         );
         check_rc(
+            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // buffers owned by `self`, and caller guarantees valid `(f32, i32)` row buffers for `num_rows`.
             unsafe {
                 ffi::w34_tp2_all_gather_top1_f32_i32(
                     ex,
@@ -1124,6 +1256,8 @@ impl Tp2Collectives {
             "gather_vocab_f16 exceeds max_stage_bytes_per_epoch"
         );
         check_rc(
+            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // buffers owned by `self`, and caller guarantees valid FP16 shard/full buffers.
             unsafe {
                 ffi::w34_tp2_gather_vocab_f16(
                     ex,
@@ -1148,7 +1282,14 @@ impl Tp2Collectives {
 /// Mandatory under `docs/contracts/execution-contract.md` and `docs/contracts/collectives.md`
 /// before any `TP=2` collective barrier or `cudaStreamBeginCapture` to prevent CUDA 13
 /// lazy-module-loading deadlocks.
+///
+/// # Safety Notes
+/// Warmup launches use the local arena and dedicated fixtures below. Small shapes
+/// reuse 64 KiB buffers; wider attention, GDN, sampler and MoE specializations allocate
+/// separate storage. These owners remain live through the final `dev.synchronize()`.
+/// Keep fixture dimensions and capacities in sync when adding a specialization.
 #[cfg(feature = "cuda")]
+#[allow(clippy::undocumented_unsafe_blocks)]
 pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let dev = CudaDevice::set_current(device_id)?;
     let stream = CudaStream::new(device_id)?;
@@ -3042,6 +3183,8 @@ mod tests {
                 reserved: 0,
             };
             check_rc(
+                // SAFETY: `k_pool`/`v_pool`, `write_batch` arrays, and `k_in_dev`/`v_in_dev` are
+                // live device allocations sized for `max_tokens * kv_heads * head_dim`.
                 unsafe {
                     ffi::w34_kv_cache_write(
                         &ex,
@@ -3080,6 +3223,8 @@ mod tests {
                         for variant in [1, 2] {
                             let invoke = || {
                                 check_rc(
+                                    // SAFETY: `q_dev`, `out_128q`, `layout`, and `batch` pointers
+                                    // live in `arena`/`k_pool`/`v_pool` for the duration of the test.
                                     unsafe {
                                         ffi::w34_paged_attention_f16_force_kernel_for_test(
                                             &ex,
@@ -3148,6 +3293,8 @@ mod tests {
                         (2i32, out_128q.addr()),
                     ] {
                         check_rc(
+                            // SAFETY: `q_dev`, `dst`, `layout`, and `batch` pointers are live device
+                            // buffers sized for `q_len * num_q_heads * head_dim`.
                             unsafe {
                                 ffi::w34_paged_attention_f16_force_kernel_for_test(
                                     &ex,
@@ -3224,6 +3371,8 @@ mod tests {
                     (2i32, out_128q.addr()),
                 ] {
                     check_rc(
+                        // SAFETY: `q_dev`, `dst`, `layout`, and `mr_batch` pointers are live device
+                        // buffers sized for `256 * num_q_heads * head_dim`.
                         unsafe {
                             ffi::w34_paged_attention_f16_force_kernel_for_test(
                                 &ex,
@@ -3276,6 +3425,8 @@ mod tests {
                     dst.copy_from_host(&vec![0x5500u16; elems], &stream)
                         .unwrap();
                     check_rc(
+                        // SAFETY: `q_dev`, `dst`, `layout`, and `masked_batch` pointers (including
+                        // `valid_tokens_dev` and `valid_reqs_dev`) are live device buffers.
                         unsafe {
                             ffi::w34_paged_attention_f16_force_kernel_for_test(
                                 &ex,
@@ -3308,6 +3459,30 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_cuda_error_display_includes_runtime_message_only_for_cuda_codes() {
+        let synthetic = CudaError::with_detail(-10, "model loader error", "missing tensor");
+        assert_eq!(synthetic.runtime_error_string(), None);
+        assert_eq!(
+            synthetic.to_string(),
+            "CUDA error -10 in model loader error: missing tensor"
+        );
+
+        let cublas = CudaError::new(3, "w34_cublas_create");
+        assert_eq!(cublas.runtime_error_string(), None);
+        assert_eq!(cublas.to_string(), "CUDA error 3 in w34_cublas_create");
+
+        #[cfg(feature = "cuda")]
+        {
+            let oom = CudaError::new(2, "w34_malloc");
+            assert_eq!(oom.runtime_error_string(), Some("out of memory"));
+            assert_eq!(
+                oom.to_string(),
+                "CUDA error 2 (out of memory) in w34_malloc"
+            );
         }
     }
 }

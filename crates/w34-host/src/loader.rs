@@ -679,6 +679,8 @@ impl ModelConfig {
         let root: Json = serde_json::from_str(&cfg_text).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("bad config.json: {e}"))
         })?;
+        // This is the target-model loader. Drafter callers explicitly opt into
+        // windowed attention through from_drafter_json, never artifact metadata.
         let mut cfg = Self::from_json(&root)?;
         let tc = root.get("text_config").unwrap_or(&root);
         if root.get("quantization_config").is_none_or(Json::is_null)
@@ -730,7 +732,24 @@ impl ModelConfig {
         Ok(cfg)
     }
 
+    /// Parses a backbone (target-model) `config.json` tree.
+    ///
+    /// Backbones must use full causal attention; `sliding_window` fails fast.
     pub fn from_json(root: &Json) -> io::Result<Self> {
+        Self::from_json_with_policy(root, /* backbone_sliding_window_fatal = */ true)
+    }
+
+    /// Parses a DFlash2 drafter `transformer_layer_config` body.
+    ///
+    /// DFlash2 drafters legitimately pair sliding-window attention with
+    /// full-attention target layers, and `crate::dflash::DFlash2Config`
+    /// implements the windowed attention path, so the backbone-only
+    /// sliding-window fail-fast is not applied here.
+    pub fn from_drafter_json(root: &Json) -> io::Result<Self> {
+        Self::from_json_with_policy(root, /* backbone_sliding_window_fatal = */ false)
+    }
+
+    fn from_json_with_policy(root: &Json, backbone_sliding_window_fatal: bool) -> io::Result<Self> {
         let tc = root.get("text_config").unwrap_or(root);
         let is_truthy = |v: &serde_json::Value| -> bool {
             match v {
@@ -781,17 +800,18 @@ impl ModelConfig {
             ));
         }
 
-        if tc
-            .get("use_sliding_window")
-            .or_else(|| root.get("use_sliding_window"))
-            .and_then(|v| v.as_bool())
-            == Some(true)
-            || tc
-                .get("sliding_window")
-                .or_else(|| root.get("sliding_window"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                > 0
+        if backbone_sliding_window_fatal
+            && (tc
+                .get("use_sliding_window")
+                .or_else(|| root.get("use_sliding_window"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+                || tc
+                    .get("sliding_window")
+                    .or_else(|| root.get("sliding_window"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    > 0)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2519,6 +2539,57 @@ mod tests {
     }
 
     #[test]
+    fn standalone_dflash_window_policy_preserves_backbone_validation() {
+        let tmp = std::env::temp_dir().join(format!("w34_drafter_config_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut config = serde_json::json!({
+            "architectures": ["DFlash2DraftModel"],
+            "hidden_size": 2560,
+            "intermediate_size": 6912,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 28,
+            "vocab_size": 152064,
+            "sliding_window": 2048
+        });
+        let write_config = |value: &serde_json::Value| {
+            std::fs::write(tmp.join("config.json"), serde_json::to_vec(value).unwrap()).unwrap();
+        };
+        write_config(&config);
+        assert!(
+            ModelConfig::from_dir(&tmp)
+                .unwrap_err()
+                .to_string()
+                .contains("sliding_window"),
+            "a declared drafter architecture must not bypass target-model validation"
+        );
+        ModelConfig::from_drafter_json(&config).expect("explicit drafter parsing supports windows");
+        assert!(
+            ModelConfig::from_json(&config).is_err(),
+            "target parse remains strict"
+        );
+
+        config["hidden_act"] = serde_json::json!("gelu");
+        write_config(&config);
+        assert!(
+            ModelConfig::from_drafter_json(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("hidden_act")
+        );
+        config["hidden_act"] = serde_json::json!("silu");
+        config["architectures"] = serde_json::json!(["Qwen3_5ForConditionalGeneration"]);
+        write_config(&config);
+        assert!(
+            ModelConfig::from_dir(&tmp)
+                .unwrap_err()
+                .to_string()
+                .contains("sliding_window")
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
     fn test_model_config_rejects_unsupported_rope_scaling_and_biases() {
         let base_json = serde_json::json!({
             "hidden_size": 2560,
@@ -2567,10 +2638,17 @@ mod tests {
         let err = ModelConfig::from_json(&bad_act).unwrap_err();
         assert!(err.to_string().contains("unsupported hidden_act='gelu'"));
 
-        // sliding_window > 0 fails fast
+        // sliding_window > 0 fails fast on backbones
         let mut bad_swa = base_json.clone();
         bad_swa["sliding_window"] = serde_json::json!(4096);
         let err = ModelConfig::from_json(&bad_swa).unwrap_err();
         assert!(err.to_string().contains("unsupported sliding_window"));
+
+        // DFlash2 drafter bodies legitimately use sliding-window attention:
+        // the drafter parse path must accept them (regression: the blanket
+        // backbone check broke `incoai/Qwen3.8-27B-DFlash2` loading).
+        let mut drafter_swa = bad_swa.clone();
+        drafter_swa["use_sliding_window"] = serde_json::json!(true);
+        assert!(ModelConfig::from_drafter_json(&drafter_swa).is_ok());
     }
 }

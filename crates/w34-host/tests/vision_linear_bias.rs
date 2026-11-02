@@ -87,7 +87,7 @@ fn linear_bias_materialization() {
     assert_ne!(
         // SAFETY: the ABI rejects a null handle before accessing the live buffers.
         unsafe {
-            w34_kernels::w34_cublas_gemm_f16_bias(
+            w34_kernels::ffi::w34_cublas_gemm_f16_bias(
                 0,
                 a.addr() as _,
                 b.addr() as _,
