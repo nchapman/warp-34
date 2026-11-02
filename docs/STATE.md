@@ -29,11 +29,16 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
     `vllm_backend` resolution.
   - Added `.weight_shape` (`read_weight_shape_2d` with strict byte-length checks)
     and `embed_tokens` bit-width/symmetry resolution for `compressed-tensors`
-    checkpoints, per-expert and shared-expert dimension and `group_size`
-    validation in `load_moe_layer_weights`, accurate column-sharded/replicated
-    `estimate_weight_arena_bytes` accounting (skipping unused `.qzeros` and
-    `.weight_shape`), and 4-bit-only `experts_are_w4` MTP arena sizing.
-  - Verified with `mise run check`, `mise run test-cpu`, and `review`.
+    checkpoints, precedence for unquantized 2D `F16`/`BF16`/`F32` `.weight`
+    over experimental `.weight_packed` sidecars (fixing `--speculative mtp` on
+    `nchapman/Qwen3.8-27B-W4A16-GPTQ`), per-expert and shared-expert dimension
+    and `group_size` validation in `load_moe_layer_weights`, accurate
+    column-sharded/replicated `estimate_weight_arena_bytes` accounting (skipping
+    unused `.qzeros` and `.weight_shape`), and 4-bit-only `experts_are_w4` MTP
+    arena sizing.
+  - Verified with `mise run check`, `mise run test-cpu`, the opt-in
+    `cached_hf_quantized_and_unquantized_checkpoints` qualification test across
+    all 10 cached dense/MoE/MTP checkpoints, and `review`.
 - Workspace Clippy now enables `cognitive_complexity` with threshold **25** in
   `clippy.toml`, enforced by the existing CPU/CUDA all-target checks with
   `-D warnings`. No function-length or nesting limits are enabled, and no

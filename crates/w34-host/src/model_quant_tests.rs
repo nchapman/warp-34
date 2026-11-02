@@ -287,4 +287,35 @@ fn compressed_tensors_weight_shape_validates_and_resolves_embed_tokens_bits() {
         .err()
         .unwrap();
     assert!(err.to_string().contains("expected 16 bytes"), "{err}");
+
+    // Ignored / unquantized 2D BF16 .weight takes precedence over an experimental 1D U8 .weight_packed sidecar
+    let bf16_val = (1.5f32.to_bits() >> 16) as u16;
+    let sidecar_fixture = Fixture::new(vec![
+        (
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "BF16",
+            vec![n, k],
+            halves(&vec![bf16_val; n * k]),
+        ),
+        (
+            "mtp.layers.0.mlp.gate_proj.weight_packed",
+            "U8",
+            vec![n * k / 2],
+            vec![0u8; n * k / 2],
+        ),
+        (
+            "mtp.layers.0.mlp.gate_proj.weight_scale",
+            "U8",
+            vec![n, 2],
+            vec![0u8; n * 2],
+        ),
+    ]);
+    let loaded = RawLinearHost::load(
+        &sidecar_fixture.archive(),
+        "mtp.layers.0.mlp.gate_proj",
+        &ct(4, 128, true),
+    )
+    .unwrap();
+    assert_eq!(loaded.dims(), (n, k));
+    assert_eq!(loaded.to_f16_vec(), vec![f32_to_f16(1.5); n * k]);
 }

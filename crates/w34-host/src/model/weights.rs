@@ -307,9 +307,25 @@ impl RawLinearHost {
         base_prefix: &str,
         quant: &QuantScheme,
     ) -> Result<Self> {
+        let has_unquantized_weight = archive
+            .resolve_name(&format!("{base_prefix}.weight"))
+            .and_then(|k| archive.tensor_info(&k).ok())
+            .is_some_and(|info| {
+                info.shape.len() == 2
+                    && matches!(info.dtype.as_str(), "F16" | "BF16" | "F32")
+                    && archive
+                        .resolve_name(&format!("{base_prefix}.weight_scale_inv"))
+                        .is_none()
+                    && (archive
+                        .resolve_name(&format!("{base_prefix}.weight_scale"))
+                        .is_none()
+                        || archive
+                            .resolve_name(&format!("{base_prefix}.weight_packed"))
+                            .is_some())
+            });
         // 1. compressed-tensors pack-quantized (`*.weight_packed` + `*.weight_scale` [+ `*.weight_zero_point`])
         let packed_key = format!("{base_prefix}.weight_packed");
-        if let Some(real_packed) = archive.resolve_name(&packed_key) {
+        if !has_unquantized_weight && let Some(real_packed) = archive.resolve_name(&packed_key) {
             let scale_key = archive
                 .resolve_name(&format!("{base_prefix}.weight_scale"))
                 .ok_or_else(|| {
@@ -767,9 +783,12 @@ impl RawLinearHost {
                     ))
                 }
             })?;
-        if archive
+        if (archive
             .resolve_name(&format!("{base_prefix}.weight_scale"))
             .is_some()
+            && archive
+                .resolve_name(&format!("{base_prefix}.weight_packed"))
+                .is_none())
             || archive
                 .resolve_name(&format!("{base_prefix}.weight_scale_inv"))
                 .is_some()
