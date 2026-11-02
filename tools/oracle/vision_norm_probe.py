@@ -7,6 +7,7 @@ Donor source: pytorch/pytorch cf30153c4c131c8164ee7798e5022d810682e2cb,
 aten/src/ATen/native/cuda/layer_norm_kernel.cu and thread_constants.h.
 """
 import ctypes
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -25,10 +26,13 @@ class VisionNorm(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             libpath = str(Path(tmp) / "vision.so")
             subprocess.run(["/opt/cuda/bin/nvcc", "-shared", "-Xcompiler", "-fPIC",
-                            "-O3", "-use_fast_math", "-std=c++17", "-arch=sm_86",
+                            "-O3", "-use_fast_math", "-std=c++17",
+                            "-gencode=arch=compute_86,code=sm_86",
+                            "-gencode=arch=compute_89,code=sm_89",
+                            "-gencode=arch=compute_89,code=compute_89",
                             str(root / "crates/w34-kernels/csrc/ops/op_vision.cu"),
                             "-o", libpath], check=True)
-            lib = ctypes.CDLL(libpath)
+            lib = ctypes.CDLL(libpath, mode=os.RTLD_LAZY)
             norm = lib.w34_vision_layernorm_f16
             norm.argtypes = [ctypes.POINTER(Exec)] + [ctypes.c_void_p]*4 + [ctypes.c_int]*2 + [ctypes.c_float]
             norm.restype = ctypes.c_int

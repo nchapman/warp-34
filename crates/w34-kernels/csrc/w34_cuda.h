@@ -111,10 +111,27 @@ typedef struct {
 
 static_assert(sizeof(w34_gdn_batch) == 80, "w34_gdn_batch ABI size mismatch");
 
+typedef struct {
+    int32_t device_id;
+    int32_t compute_major;
+    int32_t compute_minor;
+    int32_t multi_processor_count;
+    int32_t max_shared_mem_per_block_optin;
+    int32_t max_shared_mem_per_multiprocessor;
+    int32_t l2_cache_bytes;
+    int32_t persisting_l2_max_bytes;
+    char    name[64];
+} w34_device_props;
+
+static_assert(sizeof(w34_device_props) == 96, "w34_device_props ABI size mismatch");
+
 // --- Runtime, Stream, Event, Graph, & cuBLAS primitives (op_init.cu) ---
 const char* w34_cuda_error_string(int code);
 int w34_cublas_runtime_version(int* out_version);
 int w34_get_device_count(int* out_count);
+int w34_get_device_props(int device_id, w34_device_props* out_props);
+int w34_get_current_device_props(w34_device_props* out_props);
+int w34_get_tp2_min_sm_count(int* out_min_sms);
 int w34_set_device(int device_id);
 int w34_device_synchronize(void);
 int w34_get_mem_info(size_t* out_free, size_t* out_total);
@@ -130,6 +147,7 @@ int w34_memset_async(void* dst, int value, size_t bytes, uintptr_t stream);
 int w34_stream_create(uintptr_t* out_stream);
 int w34_stream_destroy(uintptr_t stream);
 int w34_stream_synchronize(uintptr_t stream);
+int w34_stream_set_persisting_l2_window(uintptr_t stream, const void* base_ptr, size_t num_bytes);
 
 int w34_event_create(uintptr_t* out_event, int enable_timing);
 int w34_event_destroy(uintptr_t event);

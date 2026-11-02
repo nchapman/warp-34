@@ -389,14 +389,11 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         C == nullptr || workspace == nullptr || (has_zp && ZP == nullptr)) {
         return (int)cudaErrorInvalidValue;
     }
-    int sms = 0;
-    if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) {
-        return (int)cudaGetLastError();
-    }
-    int max_shared_mem = 0;
-    if (cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0) != cudaSuccess) {
-        return (int)cudaGetLastError();
-    }
+    w34_device_props dev_props{};
+    int props_rc = w34_get_current_device_props(&dev_props);
+    if (props_rc != 0) return props_rc;
+    int sms = dev_props.multi_processor_count;
+    int max_shared_mem = dev_props.max_shared_mem_per_block_optin;
     if (workspace_ints < sms) return (int)cudaErrorInvalidValue;
 
     int prob_m = (int)m, prob_n = (int)n, prob_k = (int)k;
@@ -418,20 +415,25 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     const int num_groups = (group_blocks == -1) ? 1 : (prob_k / groupsize);
 
     constexpr int stages = 4;
-    // When `(prob_n / 64) * 2 <= sms` and `prob_k >= 1024` (e.g. 4B `down_proj` [9728 -> 2560]
-    // and 35B-A3B MoE projections [2048..4096 -> 512..2048]), `mn_tiles <= 42` leaves 50-90% of
-    // the 84 SMs idle. Force `max_par = 1` + deterministic 2..4-slice Split-K across ALL
-    // `M = 1..16` with lock-based sequential reduction (no atomicAdd) so `M = 1..16` stay
-    // 0-ULP M-invariant!
-    // For wider `N` where `(prob_n / 64) * 2 > sms` (e.g. 27B `N = 5120 -> 80` tiles), 1-slice
-    // `cfg128 = {128, 64, 128}` already fills 80/84 SMs without Split-K reduction overhead.
+    // When `(prob_n / 64) * 2 <= sms` and `prob_k >= 1024`, `mn_tiles <= sms / 2` leaves
+    // 50-90% of the SMs idle. Force `max_par = 1` + deterministic 2..4-slice Split-K across
+    // ALL `M = 1..16` with lock-based sequential reduction (no atomicAdd) so `M = 1..16` stay
+    // 0-ULP M-invariant.
+    // Keep `N = 2560, K <= 4096` on 1-slice `{128, 64, 128}` so 4B golden parity is preserved
+    // across 84-SM (3090 Ti) and 128-SM (4090) GPUs while unlocking `N = 3072, K >= 2560`
+    // (e.g. 9B TP=2 `qkv` / `in_z` on 128 SMs).
+    const bool keep_2560_1slice = (prob_n == 2560 && prob_k <= 4096);
     const bool enable_m_invariant_split_k =
-        (prob_m <= 16) &&
+        (prob_m <= 16) && !keep_2560_1slice &&
         (((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
+         ((prob_n == 3072) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 2560)) ||
          ((prob_n >= 512) && (prob_n <= 2048) && (prob_k >= 1024) && (prob_k <= 2048)));
-    // Match donor vLLM marlin.cu: cap M-parallelism to 16 (M <= 1024, 8 MiB A) when N > 4096
-    // so activations stay resident in sm_86's 6 MiB L2 across wide N tiles.
-    int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : 16);
+    // Scale wide-N (N > 4096) M-parallelism directly from the card's reported L2 cache size:
+    // 16 (= 1024 M-rows) per 6 MiB of L2 cache so activations stay L2-resident across wide N
+    // tiles (e.g. 3 MiB -> 8, 6 MiB -> 16, 24 MiB -> 64, 72 MiB -> 128).
+    const int wide_n_max_par =
+        std::min(128, std::max(8, dev_props.l2_cache_bytes / (384 * 1024)));
+    int max_par = enable_m_invariant_split_k ? 1 : (prob_n <= 4096 ? 128 : wide_n_max_par);
     int rest_m = prob_m;
 
     while (rest_m > 0) {
@@ -525,10 +527,10 @@ extern "C" int w34_marlin_repack_int4(const w34_exec* ex, const uint32_t* src_n_
     if (k <= 0 || n <= 0 || (k % 32) != 0 || (n % 64) != 0) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = 0;
-    if (cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) {
-        return (int)cudaGetLastError();
-    }
+    w34_device_props dev_props{};
+    int props_rc = w34_get_current_device_props(&dev_props);
+    if (props_rc != 0) return props_rc;
+    int blocks = dev_props.multi_processor_count;
     size_t smem = w34_marlin::stage_int4s * sizeof(int4) * w34_marlin::repack_stages;
     w34_marlin::gptq_marlin_repack_n_major_kernel<w34_marlin::repack_threads, 4>
         <<<(unsigned)blocks, w34_marlin::repack_threads, smem, (cudaStream_t)ex->stream>>>(
@@ -544,10 +546,10 @@ extern "C" int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_
     if (k <= 0 || n <= 0 || (k % 32) != 0 || (n % 64) != 0) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = 0;
-    if (cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, 0) != cudaSuccess) {
-        return (int)cudaGetLastError();
-    }
+    w34_device_props dev_props{};
+    int props_rc = w34_get_current_device_props(&dev_props);
+    if (props_rc != 0) return props_rc;
+    int blocks = dev_props.multi_processor_count;
     size_t smem = (w34_marlin::stage_int4s * 2) * sizeof(int4) * w34_marlin::repack_stages;
     w34_marlin::gptq_marlin_repack_n_major_kernel<w34_marlin::repack_threads, 8>
         <<<(unsigned)blocks, w34_marlin::repack_threads, smem, (cudaStream_t)ex->stream>>>(

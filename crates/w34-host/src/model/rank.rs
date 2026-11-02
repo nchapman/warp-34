@@ -411,6 +411,9 @@ impl Qwen3_5ModelRank {
         let requested_kv_pages = capacity.kv_pages;
         prepare_execution_plan(device_id)?;
         let device = CudaDevice::set_current(device_id)?;
+        let dev_props = device.props()?;
+        dev_props.validate_supported()?;
+        let marlin_ws_bytes = dev_props.marlin_workspace_bytes();
         let stream = CudaStream::new(device_id)?;
         let cublas = CublasHandle::new(&stream)?;
         let (free_vram, total_vram) = device.mem_info()?;
@@ -455,8 +458,10 @@ impl Qwen3_5ModelRank {
 
         let mut weight_arena = DeviceArena::new(device_id, est_weight_bytes)?;
         let scratch_arena = DeviceArena::new(device_id, scratch_bytes)?;
+        let _ = stream
+            .set_persisting_l2_window(scratch_arena.allocation_base(), scratch_arena.capacity());
         let batch_meta_arena = DeviceArena::new(device_id, 16 * 1024 * 1024)?;
-        let marlin_ws = DeviceBuffer::alloc(device_id, 84 * 64 * 4)?;
+        let marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
         let repack_staging = DeviceBuffer::alloc(device_id, staging_bytes)?;
 
         // 1. embed_tokens (replicated in FP16; dequantized on host when packed)
@@ -897,7 +902,7 @@ impl Qwen3_5ModelRank {
         let batched_decode_io =
             BatchedDecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         let aux_stream = CudaStream::new(device_id)?;
-        let aux_marlin_ws = DeviceBuffer::alloc(device_id, 84 * 64 * 4)?;
+        let aux_marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
         let aux_fork_event = crate::cuda::CudaEvent::new(device_id, false)?;
         let aux_join_event = crate::cuda::CudaEvent::new(device_id, false)?;
         device.synchronize()?;

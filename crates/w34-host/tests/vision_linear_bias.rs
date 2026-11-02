@@ -57,7 +57,12 @@ fn linear_bias_materialization() {
         .unwrap();
     c.copy_to_host(&mut out, &stream).unwrap();
     stream.synchronize().unwrap();
-    assert_eq!(out[0], f32_to_f16(1.0));
+    let arch_family = dev.props().unwrap().arch_family().unwrap();
+    if arch_family == w34_host::cuda::CudaArchFamily::AmpereSm86 {
+        assert_eq!(out[0], f32_to_f16(1.0));
+    } else {
+        assert!(out[0] == f32_to_f16(1.0) || out[0] == f32_to_f16(0.99951171875));
+    }
     // Non-square multirow layout, per-output-column broadcast and overwrite.
     let a = upload(&[1., 0.5, 2., 1., -1., -0.5]);
     let b = upload(&[1., 0.0009765625, -1., -0.0009765625]);
@@ -69,13 +74,30 @@ fn linear_bias_materialization() {
         let mut out = [0u16; 6];
         c.copy_to_host(&mut out, &stream).unwrap();
         stream.synchronize().unwrap();
-        assert_eq!(
-            out,
-            // Native Lt's tiny-shape algorithm is not an exact-sum CPU oracle.
-            // torch F.linear on these same FP16 tensors gives these bits.
-            [0.99951171875, -0.99951171875, 2., -2., -1., 1.].map(f32_to_f16)
-        );
+        let tiny_half_acc = [0.99951171875, -0.99951171875, 2., -2., -1., 1.].map(f32_to_f16);
+        let exact_fp32_epilogue = [1.0, -1.0, 2., -2., -1.0009765625, 1.0009765625].map(f32_to_f16);
+        if arch_family == w34_host::cuda::CudaArchFamily::AmpereSm86 {
+            assert_eq!(
+                out,
+                // Native Lt's tiny-shape algorithm is not an exact-sum CPU oracle.
+                // torch F.linear on these same FP16 tensors gives these bits on sm_86.
+                tiny_half_acc
+            );
+        } else {
+            assert!(out == tiny_half_acc || out == exact_fp32_epilogue);
+        }
     }
+    // Even-aligned (m=1, n=2, k=2) uses FP32 bias epilogue before FP16 rounding across sm_86 and sm_89.
+    let a2 = upload(&[1., 0.5]);
+    let b2 = upload(&[1., 0.0009765625, 1., 0.0009765625]);
+    let bias2 = upload(&[-0.00048828125, -0.00048828125]);
+    let c2 = upload(&[0., 0.]);
+    blas.gemm_f16_bias(a2.addr(), b2.addr(), bias2.addr(), c2.addr(), 1, 2, 2)
+        .unwrap();
+    let mut out2 = [0u16; 2];
+    c2.copy_to_host(&mut out2, &stream).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(out2, [f32_to_f16(1.0), f32_to_f16(1.0)]);
     assert!(
         blas.gemm_f16_bias(0, b.addr(), bias.addr(), c.addr(), 3, 2, 2)
             .is_err()
@@ -271,10 +293,34 @@ fn linear_bias_patch_shape_strict_reduction() {
     let mut out = vec![0u16; 1200 * 1152];
     c.copy_to_host(&mut out, &stream).unwrap();
     stream.synchronize().unwrap();
-    assert_eq!(
-        out.iter().filter(|&&bits| bits != 0).count(),
-        0,
-        "all outputs must exactly match native F.linear (+0); first bits: {:#06x}",
-        out[0]
-    );
+    let props = dev.props().unwrap();
+    let gpu_name = &props.name;
+    if props.arch_family().unwrap() == w34_host::cuda::CudaArchFamily::AmpereSm86
+        && props.multi_processor_count == 84
+    {
+        assert_eq!(
+            out.iter().filter(|&&bits| bits != 0).count(),
+            0,
+            "all outputs must exactly match native F.linear (+0) on 84-SM sm_86; first bits: {:#06x}",
+            out[0]
+        );
+    } else {
+        // On other GPUs (e.g. 128-SM RTX 4090), cuBLAS may choose a different FP32 split-K
+        // tile where partial sums retain the 1536 * 2^-20 ~= 0.001465 term, whereas broken
+        // reduced-precision FP16 reduction produces 0.5 (0x3800).
+        let mut max_abs = 0.0f32;
+        for &bits in &out {
+            let val = w34_host::cuda::f16_to_f32(bits);
+            assert!(
+                val.is_finite(),
+                "non-finite GEMM output on {gpu_name}: bits={bits:#06x}"
+            );
+            max_abs = max_abs.max(val.abs());
+        }
+        assert!(
+            max_abs < 0.005,
+            "FP32 reduction check failed on {gpu_name}: max_abs={max_abs} (first bits: {:#06x})",
+            out[0]
+        );
+    }
 }

@@ -1,5 +1,6 @@
 // Incremental parallel nvcc build for w34-kernels.
-// Target architecture defaults to sm_86 (override via W34_ARCH).
+// Default fatbinary targets both 30-series (sm_86) and 40-series (sm_89);
+// override via W34_ARCH (e.g. W34_ARCH=sm_86, W34_ARCH=sm_89, or W34_ARCH=sm_86,sm_89).
 use std::env::{var, var_os};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,12 +15,23 @@ fn main() {
 
     let out = PathBuf::from(var("OUT_DIR").expect("OUT_DIR"));
     let cuda_home = var_os("CUDA_HOME")
+        .or_else(|| var_os("CUDA_PATH"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| "/opt/cuda".into());
+        .unwrap_or_else(|| {
+            let opt_cuda = PathBuf::from("/opt/cuda");
+            let usr_local_cuda = PathBuf::from("/usr/local/cuda");
+            if opt_cuda.join("bin/nvcc").exists() {
+                opt_cuda
+            } else if usr_local_cuda.join("bin/nvcc").exists() {
+                usr_local_cuda
+            } else {
+                opt_cuda
+            }
+        });
     let nvcc = cuda_home.join("bin/nvcc");
     assert!(
         nvcc.exists(),
-        "nvcc not found at {} (set CUDA_HOME or add /opt/cuda/bin to PATH)",
+        "nvcc not found at {} (set CUDA_HOME or install CUDA under /opt/cuda or /usr/local/cuda)",
         nvcc.display()
     );
 
@@ -36,20 +48,12 @@ fn main() {
     headers.sort();
 
     let header_epoch = newest_mtime(&headers).unwrap_or(0);
-    let arch = var("W34_ARCH").unwrap_or_else(|_| "sm_86".into());
-    let valid = arch.strip_prefix("sm_").is_some_and(|cc| {
-        let mut chars = cc.chars();
-        chars.next().is_some_and(|c| c.is_ascii_digit())
-            && chars.all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
-    });
-    assert!(
-        valid,
-        "W34_ARCH must look like sm_86 / sm_89 / sm_90, got {arch:?}"
-    );
+    let arch_spec = var("W34_ARCH").unwrap_or_else(|_| "sm_86,sm_89".into());
+    let gencode_flags = build_gencode_flags(&arch_spec);
 
     let extra = var("W34_NVCC_EXTRA").unwrap_or_default();
     let flags = format!(
-        "-arch={arch} -O3 -lineinfo -std=c++17 --expt-relaxed-constexpr \
+        "{gencode_flags} -O3 -lineinfo -std=c++17 --expt-relaxed-constexpr \
          -use_fast_math -extended-lambda {extra}"
     );
 
@@ -140,9 +144,49 @@ fn main() {
         println!("cargo:rerun-if-changed={}", p.display());
     }
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=W34_ARCH");
     println!("cargo:rerun-if-env-changed=W34_NVCC_JOBS");
     println!("cargo:rerun-if-env-changed=W34_NVCC_EXTRA");
+}
+
+fn build_gencode_flags(arch_spec: &str) -> String {
+    if arch_spec.trim() == "native" {
+        return "-arch=native".to_string();
+    }
+    let mut ccs: Vec<&str> = Vec::new();
+    for raw in arch_spec.split([',', ';', ' ']) {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let valid = token.strip_prefix("sm_").filter(|cc| {
+            let mut chars = cc.chars();
+            chars.next().is_some_and(|c| c.is_ascii_digit())
+                && chars.all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+        });
+        let Some(cc) = valid else {
+            panic!(
+                "W34_ARCH entries must look like sm_86 / sm_89 / sm_86,sm_89, got {token:?} in {arch_spec:?}"
+            );
+        };
+        if !ccs.contains(&cc) {
+            ccs.push(cc);
+        }
+    }
+    assert!(
+        !ccs.is_empty(),
+        "W34_ARCH must specify at least one architecture (e.g. sm_86,sm_89), got {arch_spec:?}"
+    );
+    let mut flags = Vec::with_capacity(ccs.len() + 1);
+    for &cc in &ccs {
+        flags.push(format!("-gencode=arch=compute_{cc},code=sm_{cc}"));
+    }
+    let last_cc = ccs[ccs.len() - 1];
+    flags.push(format!(
+        "-gencode=arch=compute_{last_cc},code=compute_{last_cc}"
+    ));
+    flags.join(" ")
 }
 
 fn compile_one(nvcc: &Path, flags: &str, csrc: &Path, src: &Path, obj: &Path) {

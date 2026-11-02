@@ -38,6 +38,9 @@ mod tests {
         assert_eq!(size_of::<W34GdnBatch>(), 80);
         assert_eq!(align_of::<W34GdnBatch>(), 8);
 
+        assert_eq!(size_of::<W34DeviceProps>(), 96);
+        assert_eq!(align_of::<W34DeviceProps>(), 4);
+
         assert_eq!(size_of::<W34SamplerRowCfg>(), 64);
         assert_eq!(align_of::<W34SamplerRowCfg>(), 4);
 
@@ -110,5 +113,11 @@ mod tests {
         assert_eq!(sparse.token_id, 0);
         assert_eq!(sparse.output_count, 0);
         assert_eq!(sparse.banned, 0);
+
+        let props = W34DeviceProps::default();
+        assert_eq!(props.device_id, 0);
+        assert_eq!(props.compute_major, 0);
+        assert_eq!(props.multi_processor_count, 0);
+        assert!(props.name.iter().all(|&b| b == 0));
     }
 }
