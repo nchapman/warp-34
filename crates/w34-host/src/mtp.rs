@@ -2166,7 +2166,6 @@ impl Qwen3_5MtpRank {
             } else {
                 let pairs = num_tokens * top_k;
                 let mut h_ids = vec![0i32; pairs];
-                let mut h_weights = vec![0.0f32; pairs];
                 check_rc(
                     // SAFETY: `h_ids` and `moe_topk_ids_buf` hold `pairs` i32 elements.
                     unsafe {
@@ -2179,18 +2178,6 @@ impl Qwen3_5MtpRank {
                     },
                     "MTP h_ids",
                 )?;
-                check_rc(
-                    // SAFETY: `h_weights` and `moe_topk_weights_buf` hold `pairs` f32 elements.
-                    unsafe {
-                        ffi::w34_memcpy_d2h_async(
-                            h_weights.as_mut_ptr().cast(),
-                            moe_topk_weights_buf as *const c_void,
-                            pairs * 4,
-                            t.stream.handle,
-                        )
-                    },
-                    "MTP h_weights",
-                )?;
                 t.stream.synchronize()?;
                 crate::moe_offload::TieredMoeEngine::execute_layer(
                     crate::moe_offload::MoeOffloadMode::Auto,
@@ -2202,7 +2189,7 @@ impl Qwen3_5MtpRank {
                     moe_topk_ids_buf,
                     moe_topk_weights_buf,
                     &h_ids,
-                    &h_weights,
+                    &[],
                     sh_out_ptr,
                     sh_gate_ptr,
                     mlp_out_buf,

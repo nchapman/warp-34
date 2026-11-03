@@ -60,6 +60,7 @@ pub struct Qwen3_5ModelRank {
     pub last_norm_hidden_ptr: u64,
     pub last_norm_hidden_rows: usize,
     pub tiered_moe: Option<crate::moe_offload::RankTieredMoe>,
+    pub tiered_moe_hot_per_layer: usize,
     pub ple_runtime: Option<PleRankRuntime>,
     pub is_capturing_graph: bool,
 }
@@ -72,18 +73,61 @@ pub(super) struct PoolCapacity {
     pub(super) rank0_extra_headroom_bytes: usize,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 pub(super) fn serving_state_slots(max_num_seqs: usize) -> Result<usize> {
     max_num_seqs
         .checked_mul(4)
         .filter(|&slots| slots != 0)
+        .map(|slots| slots.max(8))
         .ok_or_else(|| {
             loader_err("serving max_num_seqs must be nonzero and fit four state slots per sequence")
         })
 }
 
+/// Computes the per-layer hot expert cache capacity (`K_hot`) and total VRAM reserve
+/// for tiered MoE models (`qwen4_exp`), adapting `K_hot` down from `112` on `TP=2`
+/// when a larger KV/state pool is requested so multi-thousand-page contexts fit in 24 GiB.
+pub fn plan_tiered_moe_hot_per_layer(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    available_vram_after_weights_and_scratch: usize,
+    base_headroom_plus_kv_bytes: usize,
+    min_state_pool_bytes: usize,
+) -> (usize, usize) {
+    if !cfg.uses_tiered_moe() {
+        return (0, 0);
+    }
+    let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
+    let default_hot = if tp_size == 2 { 112usize } else { 48usize };
+    let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
+    if local_experts <= default_hot || exp_bytes == 0 || cfg.num_hidden_layers == 0 {
+        let hot = (local_experts / 2).max(1);
+        let reserve = (cfg.num_hidden_layers * hot + 512) * exp_bytes + 64 * 1024 * 1024;
+        return (hot, reserve);
+    }
+    let min_hot = if tp_size == 2 {
+        32usize.min(default_hot)
+    } else {
+        16usize.min(default_hot)
+    };
+    let fixed_overhead = base_headroom_plus_kv_bytes
+        .saturating_add(min_state_pool_bytes)
+        .saturating_add(512 * exp_bytes + 640 * 1024 * 1024);
+    let per_hot_step = cfg.num_hidden_layers * exp_bytes;
+    let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
+        let max_affordable =
+            (available_vram_after_weights_and_scratch - fixed_overhead) / per_hot_step;
+        let aligned = (max_affordable / 8) * 8;
+        aligned.clamp(min_hot, default_hot)
+    } else {
+        min_hot
+    };
+    let reserve = (cfg.num_hidden_layers * hot + 512) * exp_bytes + 640 * 1024 * 1024;
+    (hot, reserve)
+}
+
 // Preserve the minimum three-slot execution budget and the existing VRAM clamp.
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 pub(super) fn clamp_state_slots(
     requested: usize,
     free: usize,
@@ -926,14 +970,29 @@ impl Qwen3_5ModelRank {
         } else {
             crate::cuda::MIN_HEADROOM_BYTES
         };
-        let tiered_moe_reserve = if cfg.uses_tiered_moe() {
-            // Reserve VRAM for TieredMoeEngine hot expert cache + staging buffers + PLE staging
-            let hot_per_layer = if tp_size == 2 { 112usize } else { 48usize };
-            let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
-            (cfg.num_hidden_layers * hot_per_layer + 512) * exp_bytes + 64 * 1024 * 1024
+        let post_weight_available = if capacity.state_slots.is_some() || cfg.uses_tiered_moe() {
+            device.mem_info()?.0
         } else {
-            0
+            free_vram.saturating_sub(weight_arena.used().saturating_add(scratch_arena.capacity()))
         };
+        let min_state_slots_for_moe = if capacity.state_slots.is_some() {
+            requested_state_slots.clamp(3, 12)
+        } else {
+            requested_state_slots.min(6)
+        };
+        let (tiered_moe_hot_per_layer, tiered_moe_reserve) = plan_tiered_moe_hot_per_layer(
+            cfg,
+            tp_size,
+            post_weight_available,
+            base_headroom
+                .saturating_add(req_kv_bytes)
+                .saturating_add(if rank == 0 {
+                    capacity.rank0_extra_headroom_bytes
+                } else {
+                    0
+                }),
+            bytes_per_state_slot.saturating_mul(min_state_slots_for_moe),
+        );
         let required_headroom = base_headroom
             .saturating_add(tiered_moe_reserve)
             .saturating_add(if rank == 0 {
@@ -950,7 +1009,11 @@ impl Qwen3_5ModelRank {
             // Serving can request many more slots than single-request defaults.
             // Account for live arena capacity (not just used weight bytes) and
             // all auxiliary allocations before spending the remaining VRAM.
-            let available = device.mem_info()?.0;
+            // Note: `Qwen3VisionEncoder` is loaded lazily on the first multimodal
+            // request (`ensure_vision_encoder_loaded`) and fits inside `MIN_HEADROOM_BYTES`
+            // (1 GiB) when needed; only reserve dedicated ViT VRAM when `vision_reserve`
+            // still leaves room for all `requested_state_slots`.
+            let available = post_weight_available;
             let archive_has_vision = cfg.vision_config.is_some()
                 && (archive
                     .resolve_name("model.visual.patch_embed.proj.weight")
@@ -958,15 +1021,21 @@ impl Qwen3_5ModelRank {
                     || archive
                         .resolve_name("visual.patch_embed.proj.weight")
                         .is_some());
-            let vision_reserve =
-                if rank == 0 && archive_has_vision && default_pages.unwrap_or(0) < 14_336 {
-                    1536 * 1024 * 1024
-                } else {
-                    0
-                };
-            let reserved = required_headroom
-                .saturating_add(vision_reserve)
-                .saturating_add(req_kv_bytes);
+            let base_reserved = required_headroom.saturating_add(req_kv_bytes);
+            let desired_state_bytes = bytes_per_state_slot.saturating_mul(requested_state_slots);
+            let vision_reserve = if rank == 0
+                && archive_has_vision
+                && default_pages.unwrap_or(0) < 14_336
+                && available
+                    >= base_reserved
+                        .saturating_add(desired_state_bytes)
+                        .saturating_add(1536 * 1024 * 1024)
+            {
+                1536 * 1024 * 1024
+            } else {
+                0
+            };
+            let reserved = base_reserved.saturating_add(vision_reserve);
             if available < reserved.saturating_add(bytes_per_state_slot.saturating_mul(3)) {
                 return Err(loader_err(
                     "insufficient VRAM for serving state pool and headroom",
@@ -1082,6 +1151,7 @@ impl Qwen3_5ModelRank {
             last_norm_hidden_ptr: 0,
             last_norm_hidden_rows: 0,
             tiered_moe: None,
+            tiered_moe_hot_per_layer,
             ple_runtime: None,
             is_capturing_graph: false,
         })
@@ -1101,7 +1171,9 @@ impl Qwen3_5ModelRank {
         self.device.make_current()?;
         let local_experts = (self.cfg.num_experts / self.tp_size).max(1);
         let default_hot = if self.tp_size == 2 { 112usize } else { 48usize };
-        let hot_per_layer = if local_experts <= default_hot {
+        let hot_per_layer = if self.tiered_moe_hot_per_layer > 0 {
+            self.tiered_moe_hot_per_layer
+        } else if local_experts <= default_hot {
             (local_experts / 2).max(1)
         } else {
             default_hot

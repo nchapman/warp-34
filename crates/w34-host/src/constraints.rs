@@ -215,6 +215,7 @@ impl ConstraintFactory {
             eos_ids: self.eos_ids.clone(),
             terminal_eos: false,
             pending_token: None,
+            pre_eos_mask: None,
             mask,
             committed: 0,
         })
@@ -253,6 +254,7 @@ pub struct TokenBitmaskConstraint {
     eos_ids: Vec<i32>,
     terminal_eos: bool,
     pending_token: Option<i32>,
+    pre_eos_mask: Option<Vec<u32>>,
     mask: Vec<u32>,
     committed: usize,
 }
@@ -281,6 +283,7 @@ impl TokenBitmaskConstraint {
             eos_ids: Vec::new(),
             terminal_eos: false,
             pending_token: None,
+            pre_eos_mask: None,
             mask,
             committed: 0,
         }
@@ -299,14 +302,25 @@ impl TokenBitmaskConstraint {
             eos_ids: Vec::new(),
             terminal_eos: false,
             pending_token: None,
+            pre_eos_mask: None,
             mask,
             committed: 0,
         }
     }
 
+    pub fn with_terminal_eos_ids(mut self, eos_ids: Vec<i32>) -> Self {
+        self.eos_ids = eos_ids;
+        self
+    }
+
     #[inline]
     pub fn has_pending(&self) -> bool {
         self.pending_token.is_some()
+    }
+
+    #[inline]
+    pub fn is_terminal_eos(&self) -> bool {
+        self.terminal_eos
     }
 
     pub fn committed_len(&self) -> usize {
@@ -372,7 +386,13 @@ impl TokenBitmaskConstraint {
         if !self.is_token_allowed(id) {
             return Err(format!("token {id} violates grammar"));
         }
-        if self.matcher.is_some() && self.eos_ids.contains(&id) {
+        // `eos_ids` holds terminal EOS tokens (populated by `ConstraintFactory` or
+        // `with_terminal_eos_ids`). Save `pre_eos_mask` when matcher-less so `rollback`
+        // restores the pre-terminal bitmask.
+        if self.eos_ids.contains(&id) {
+            if self.matcher.is_none() {
+                self.pre_eos_mask = Some(self.mask.clone());
+            }
             self.terminal_eos = true;
             self.mask.fill(0);
             self.committed += 1;
@@ -394,7 +414,10 @@ impl TokenBitmaskConstraint {
         // EOS is an output event, not a grammar byte/token. llguidance may
         // already be stopped at NoExtension; consuming its EOS-only mask then
         // would error. Track EOS separately so rollback still counts emitted tokens.
-        if self.matcher.is_some() && self.eos_ids.contains(&id) {
+        if self.eos_ids.contains(&id) {
+            if self.matcher.is_none() {
+                self.pre_eos_mask = Some(self.mask.clone());
+            }
             self.terminal_eos = true;
             self.mask.fill(0);
             self.committed += 1;
@@ -445,6 +468,8 @@ impl TokenBitmaskConstraint {
             self.mask.clear();
             self.mask.extend_from_slice(mask.as_slice());
             self.matcher = Some(next);
+        } else if let Some(saved) = self.pre_eos_mask.take() {
+            self.mask = saved;
         }
         self.terminal_eos = false;
         self.committed -= rem;
@@ -508,5 +533,29 @@ mod tests {
             }
         });
         assert!(validate_strict_schema_options(&invalid).is_err());
+    }
+
+    #[test]
+    fn test_terminal_eos_advance_and_rollback_without_matcher() {
+        let mut c = TokenBitmaskConstraint::unconstrained(64).with_terminal_eos_ids(vec![7]);
+        assert!(!c.is_terminal_eos());
+        assert!(c.is_token_allowed(3));
+        assert!(c.is_token_allowed(7));
+
+        c.advance(3).unwrap();
+        assert!(!c.is_terminal_eos());
+        assert_eq!(c.committed_len(), 1);
+
+        c.advance(7).unwrap();
+        assert!(c.is_terminal_eos());
+        assert_eq!(c.committed_len(), 2);
+        assert!(!c.is_token_allowed(3));
+        assert!(!c.is_token_allowed(7));
+
+        c.rollback(1).unwrap();
+        assert!(!c.is_terminal_eos());
+        assert_eq!(c.committed_len(), 1);
+        assert!(c.is_token_allowed(3));
+        assert!(c.is_token_allowed(7));
     }
 }

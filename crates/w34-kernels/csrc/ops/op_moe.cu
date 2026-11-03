@@ -2378,32 +2378,40 @@ __global__ void moe_gpu_lru_plan_and_remap_kernel(
     if (lane == 0) {
         step = (*step_counter) + 1;
         *step_counter = step;
-        for (int i = 0; i < total_pairs; ++i) {
-            const int ge = global_topk_ids[i];
-            const int64_t le = (int64_t)ge - global_expert_offset;
-            if (le < 0 || le >= local_num_experts) {
-                remapped_topk_ids[i] = -1;
-            } else {
-                const int slot = expert_to_slot[le];
-                if (slot >= 0 && slot < k_hot) {
-                    slot_last_used[slot] = step;
-                    remapped_topk_ids[i] = slot;
-                } else {
-                    remapped_topk_ids[i] = -2;
-                }
-            }
-        }
     }
     step = __shfl_sync(0xffffffffu, step, 0);
 
+    for (int i = lane; i < total_pairs; i += 32) {
+        const int ge = global_topk_ids[i];
+        const int64_t le = (int64_t)ge - global_expert_offset;
+        if (le < 0 || le >= local_num_experts) {
+            remapped_topk_ids[i] = -1;
+        } else {
+            const int slot = expert_to_slot[le];
+            if (slot >= 0 && slot < k_hot) {
+                slot_last_used[slot] = step;
+                remapped_topk_ids[i] = slot;
+            } else {
+                remapped_topk_ids[i] = -2;
+            }
+        }
+    }
+    __syncwarp();
+
     int n_miss = 0;
-    for (int i = 0; i < total_pairs; ++i) {
-        int slot = 0;
-        int ge = 0;
-        int le = 0;
-        if (lane == 0) {
-            slot = remapped_topk_ids[i];
-            if (slot == -2) {
+    for (int base = 0; base < total_pairs; base += 32) {
+        const int idx = base + lane;
+        const bool is_cand = (idx < total_pairs) && (remapped_topk_ids[idx] == -2);
+        unsigned mask = __ballot_sync(0xffffffffu, is_cand);
+        while (mask != 0u) {
+            const int src_lane = __ffs(mask) - 1;
+            mask &= mask - 1u;
+            const int i = base + src_lane;
+
+            int slot = 0;
+            int ge = 0;
+            int le = 0;
+            if (lane == 0) {
                 ge = global_topk_ids[i];
                 le = (int)((int64_t)ge - global_expert_offset);
                 slot = expert_to_slot[le];
@@ -2413,48 +2421,49 @@ __global__ void moe_gpu_lru_plan_and_remap_kernel(
                     slot = -2;
                 }
             }
-        }
-        slot = __shfl_sync(0xffffffffu, slot, 0);
-        if (slot != -2) continue;
-        if (n_miss >= max_misses) {
-            if (lane == 0) remapped_topk_ids[i] = -1;
-            continue;
-        }
-
-        uint64_t best_ts = UINT64_MAX;
-        int best_slot = 0;
-        for (int s = lane; s < k_hot; s += 32) {
-            const uint64_t ts = slot_last_used[s];
-            if (ts < best_ts || (ts == best_ts && s < best_slot)) {
-                best_ts = ts;
-                best_slot = s;
+            slot = __shfl_sync(0xffffffffu, slot, 0);
+            if (slot != -2) continue;
+            if (n_miss >= max_misses) {
+                if (lane == 0) remapped_topk_ids[i] = -1;
+                continue;
             }
-        }
+
+            uint64_t best_ts = UINT64_MAX;
+            int best_slot = 0;
+            for (int s = lane; s < k_hot; s += 32) {
+                const uint64_t ts = slot_last_used[s];
+                if (ts < best_ts || (ts == best_ts && s < best_slot)) {
+                    best_ts = ts;
+                    best_slot = s;
+                }
+            }
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            const uint64_t other_ts = __shfl_down_sync(0xffffffffu, best_ts, off);
-            const int other_slot = __shfl_down_sync(0xffffffffu, best_slot, off);
-            if (other_ts < best_ts || (other_ts == best_ts && other_slot < best_slot)) {
-                best_ts = other_ts;
-                best_slot = other_slot;
+            for (int off = 16; off > 0; off >>= 1) {
+                const uint64_t other_ts = __shfl_down_sync(0xffffffffu, best_ts, off);
+                const int other_slot = __shfl_down_sync(0xffffffffu, best_slot, off);
+                if (other_ts < best_ts || (other_ts == best_ts && other_slot < best_slot)) {
+                    best_ts = other_ts;
+                    best_slot = other_slot;
+                }
             }
-        }
 
-        if (lane == 0) {
-            const int victim_slot = best_slot;
-            const int old_ge = slot_to_expert[victim_slot];
-            const int64_t old_le = (int64_t)old_ge - global_expert_offset;
-            if (old_le >= 0 && old_le < local_num_experts) {
-                expert_to_slot[old_le] = -1;
+            if (lane == 0) {
+                const int victim_slot = best_slot;
+                const int old_ge = slot_to_expert[victim_slot];
+                const int64_t old_le = (int64_t)old_ge - global_expert_offset;
+                if (old_le >= 0 && old_le < local_num_experts) {
+                    expert_to_slot[old_le] = -1;
+                }
+                expert_to_slot[le] = victim_slot;
+                slot_to_expert[victim_slot] = ge;
+                slot_last_used[victim_slot] = step;
+                miss_local_experts[n_miss] = le;
+                miss_victim_slots[n_miss] = victim_slot;
+                remapped_topk_ids[i] = victim_slot;
             }
-            expert_to_slot[le] = victim_slot;
-            slot_to_expert[victim_slot] = ge;
-            slot_last_used[victim_slot] = step;
-            miss_local_experts[n_miss] = le;
-            miss_victim_slots[n_miss] = victim_slot;
-            remapped_topk_ids[i] = victim_slot;
+            __syncwarp();
+            n_miss++;
         }
-        n_miss++;
     }
     if (lane == 0) {
         *num_misses_out = n_miss;
@@ -2719,7 +2728,7 @@ extern "C" int w34_moe_gpu_lru_update_and_pull(
             pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
             return (int)cudaErrorInvalidValue;
         }
-        dim3 grid(16, (unsigned)max_misses);
+        dim3 grid(64, (unsigned)max_misses);
         w34_moe::moe_gpu_lru_pull_mapped_experts_kernel<<<grid, 256, 0, stream>>>(
             static_cast<const uint8_t*>(mapped_host_packs),
             miss_local_experts,

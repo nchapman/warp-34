@@ -1370,7 +1370,9 @@ mod host_store {
             }
             cache.sync_from_device_if_dirty(compute_stream)?;
             assert_eq!(h_topk_ids.len(), num_tokens * top_k);
-            assert_eq!(h_topk_weights.len(), num_tokens * top_k);
+            if matches!(mode, MoeOffloadMode::CpuHybrid { .. }) {
+                assert_eq!(h_topk_weights.len(), num_tokens * top_k);
+            }
 
             // Identify unique active local experts and count cache hits/misses.
             let mut active_local: Vec<usize> = Vec::new();
@@ -1920,9 +1922,8 @@ mod host_store {
             }
             let pairs = num_tokens * top_k;
             let mut h_topk_ids = vec![0i32; pairs];
-            let mut h_topk_weights = vec![0.0f32; pairs];
             crate::cuda::check_rc(
-                // SAFETY: `d_topk_ids_addr` and `d_topk_weights_addr` hold `pairs` elements.
+                // SAFETY: `d_topk_ids_addr` holds `pairs` i32 elements.
                 unsafe {
                     w34_kernels::ffi::w34_memcpy_d2h_async(
                         h_topk_ids.as_mut_ptr().cast::<core::ffi::c_void>(),
@@ -1933,18 +1934,22 @@ mod host_store {
                 },
                 "w34_memcpy_d2h_async (h_topk_ids)",
             )?;
-            crate::cuda::check_rc(
-                // SAFETY: `d_topk_weights_addr` holds `pairs` f32 elements.
-                unsafe {
-                    w34_kernels::ffi::w34_memcpy_d2h_async(
-                        h_topk_weights.as_mut_ptr().cast::<core::ffi::c_void>(),
-                        d_topk_weights_addr as *const core::ffi::c_void,
-                        pairs * 4,
-                        compute_stream.handle,
-                    )
-                },
-                "w34_memcpy_d2h_async (h_topk_weights)",
-            )?;
+            let mut h_topk_weights = Vec::new();
+            if matches!(self.mode, MoeOffloadMode::CpuHybrid { .. }) {
+                h_topk_weights.resize(pairs, 0.0f32);
+                crate::cuda::check_rc(
+                    // SAFETY: `d_topk_weights_addr` holds `pairs` f32 elements.
+                    unsafe {
+                        w34_kernels::ffi::w34_memcpy_d2h_async(
+                            h_topk_weights.as_mut_ptr().cast::<core::ffi::c_void>(),
+                            d_topk_weights_addr as *const core::ffi::c_void,
+                            pairs * 4,
+                            compute_stream.handle,
+                        )
+                    },
+                    "w34_memcpy_d2h_async (h_topk_weights)",
+                )?;
+            }
             compute_stream.synchronize()?;
             TieredMoeEngine::execute_layer(
                 self.mode,

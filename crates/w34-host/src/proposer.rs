@@ -202,6 +202,10 @@ impl NativeProposer {
         })
     }
     fn reset(&mut self) -> Result<()> {
+        self.resident_tokens.clear();
+        self.processed = 0;
+        self.last_accepted.clear();
+        self.last_restored_tokens = 0;
         match &mut self.ranks {
             Ranks::Mtp(rs) => {
                 for r in rs {
@@ -214,10 +218,6 @@ impl NativeProposer {
                 }
             }
         }
-        self.resident_tokens.clear();
-        self.processed = 0;
-        self.last_accepted.clear();
-        self.last_restored_tokens = 0;
         Ok(())
     }
     fn can_restore(&self, tokens: &[i32]) -> bool {
@@ -294,7 +294,11 @@ impl NativeProposer {
                 let end = (start + step).min(tokens.len());
                 let bytes = &memo.features[start * self.row_bytes..end * self.row_bytes];
                 let mut pointers = Vec::with_capacity(engine.tp_size);
-                for (t, stage) in engine.ranks.iter().zip(&self.shifted) {
+                for t in &engine.ranks {
+                    let stage = t
+                        .last_final_hidden_f16
+                        .as_ref()
+                        .ok_or_else(|| loader_err("missing target feature capture"))?;
                     stage.copy_from_host(bytes, &t.stream)?;
                     pointers.push(stage.addr());
                 }
@@ -1026,16 +1030,27 @@ impl NativeProposer {
                     let mut hypothetical = sampler.clone();
                     let mut valid = 0;
                     for &id in &drafts {
-                        if hypothetical
-                            .constraint
-                            .as_ref()
-                            .is_some_and(|c| !c.is_token_allowed(id))
+                        if hypothetical.materialize_pending_constraint().is_err()
+                            || hypothetical
+                                .constraint
+                                .as_ref()
+                                .is_some_and(|c| c.is_terminal_eos() || !c.is_token_allowed(id))
                         {
                             break;
                         }
                         hypothetical
                             .try_commit_token(id)
                             .map_err(|_| loader_err("draft grammar commit failed"))?;
+                        if hypothetical
+                            .constraint
+                            .as_ref()
+                            .is_some_and(|c| c.is_terminal_eos())
+                        {
+                            // A terminal EOS draft closes the grammar (`mask.fill(0)`); omit it from
+                            // `drafts` so the bonus row itself samples/verifies that position with a
+                            // non-empty bitmask rather than evaluating an empty post-EOS bonus row.
+                            break;
+                        }
                         valid += 1;
                     }
                     drafts.truncate(valid);
@@ -1185,6 +1200,7 @@ impl NativeProposer {
     }
 
     pub(crate) fn abort_scheduled(&mut self) {
+        let _ = self.reset();
         self.current = None;
         if matches!(self.ranks, Ranks::DFlash(_)) {
             self.memo = None;
@@ -1266,7 +1282,13 @@ impl NativeProposer {
             None
         };
         seq.generated_tokens.push(anchor);
-        if seq.generated_tokens.len() >= seq.max_new_tokens || seq.should_stop_on_token(anchor) {
+        if seq.generated_tokens.len() >= seq.max_new_tokens
+            || seq.should_stop_on_token(anchor)
+            || sampler
+                .constraint
+                .as_ref()
+                .is_some_and(|c| c.is_terminal_eos())
+        {
             seq.finished = true;
         }
         Ok(Some((anchor, lp)))
@@ -1318,16 +1340,24 @@ impl NativeProposer {
             let mut hypothetical = sampler.clone();
             let mut valid = 0;
             for &id in &drafts {
-                if hypothetical
-                    .constraint
-                    .as_ref()
-                    .is_some_and(|c| !c.is_token_allowed(id))
+                if hypothetical.materialize_pending_constraint().is_err()
+                    || hypothetical
+                        .constraint
+                        .as_ref()
+                        .is_some_and(|c| c.is_terminal_eos() || !c.is_token_allowed(id))
                 {
                     break;
                 }
                 hypothetical
                     .try_commit_token(id)
                     .map_err(|_| loader_err("draft grammar commit failed"))?;
+                if hypothetical
+                    .constraint
+                    .as_ref()
+                    .is_some_and(|c| c.is_terminal_eos())
+                {
+                    break;
+                }
                 valid += 1;
             }
             drafts.truncate(valid);
@@ -1440,6 +1470,13 @@ impl NativeProposer {
                 seq.finished = true;
                 break;
             }
+        }
+        if sampler
+            .constraint
+            .as_ref()
+            .is_some_and(|c| c.is_terminal_eos())
+        {
+            seq.finished = true;
         }
         let lp_len = round_lps.len().min(pushed);
         self.last_verified_draft_tokens = k;

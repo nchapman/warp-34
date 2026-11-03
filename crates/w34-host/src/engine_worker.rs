@@ -2303,6 +2303,13 @@ fn step_plain(
         if let Some(slot) = replacement {
             engine.free_state_slots(&[slot]);
         }
+        if requests
+            .get(&s.req_id)
+            .and_then(|r| r.sampler.constraint.as_ref())
+            .is_some_and(|c| c.is_terminal_eos())
+        {
+            release(engine, sched.finish_request_early(s.req_id));
+        }
     }
     Ok(())
 }

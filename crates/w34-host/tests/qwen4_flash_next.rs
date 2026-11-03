@@ -876,7 +876,199 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
         );
     }
 
+    verify_qwen4_mtp_engine_worker_and_capacity(
+        &dir,
+        &prompt,
+        &out_tp1_eager.generated_token_ids,
+        &spec_cfg,
+    );
+
     let _ = fs::remove_dir_all(&dir);
+}
+
+fn verify_qwen4_mtp_engine_worker_and_capacity(
+    dir: &Path,
+    prompt: &[i32],
+    expected_short_ids: &[i32],
+    spec_cfg: &w34_host::proposer::SpeculativeConfig,
+) {
+    use w34_host::engine_worker::{EngineWorker, GenerationEvent, GenerationStream};
+    use w34_host::parser::{SamplingParams, TokenBitmaskConstraint};
+    use w34_host::scheduler::SchedulerConfig;
+
+    async fn collect_stream_tokens(mut stream: GenerationStream) -> Result<Vec<i32>, String> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+            let mut out = Vec::new();
+            while let Some(ev) = stream.events.recv().await {
+                match ev {
+                    GenerationEvent::Token { id, .. } => out.push(id),
+                    GenerationEvent::Finished { .. } => return Ok(out),
+                    GenerationEvent::Error(e) => return Err(e.to_string()),
+                }
+            }
+            Err("stream closed without Finished".into())
+        })
+        .await
+        .map_err(|_| "timed out waiting for GenerationStream".to_string())?
+    }
+
+    let mut target_long =
+        Qwen3_5Engine::load_from_dir(dir, 1, KvFormatPolicy::Fp16, Some(64), true)
+            .expect("load synthetic qwen4_exp TP=1 target for long prompt");
+    let long_300: Vec<i32> = (0..300).map(|i| (i * 7 + 3) % 250).collect();
+    let ref_long = target_long
+        .generate_tokens(&long_300, 6, false)
+        .expect("target 300-token reference");
+    drop(target_long);
+
+    let mut engine_serve = Qwen3_5Engine::load_for_serving(
+        dir.to_str().unwrap(),
+        1,
+        KvFormatPolicy::Fp16,
+        Some(64),
+        true,
+        1,
+    )
+    .expect(
+        "load synthetic qwen4_exp TP=1 via load_for_serving(max_num_seqs=1) for EngineWorker MTP",
+    );
+    assert!(
+        engine_serve.ranks[0].state_pool.total_slots >= 8,
+        "load_for_serving(max_num_seqs=1) must allocate >= 8 state slots for MTP-3 verification, got {}",
+        engine_serve.ranks[0].state_pool.total_slots
+    );
+    engine_serve
+        .enable_speculative(spec_cfg)
+        .expect("enable Qwen4 MTP on EngineWorker");
+    let worker = EngineWorker::start(
+        engine_serve,
+        SchedulerConfig {
+            chunk_prefill_size: 512,
+            max_num_seqs: 1,
+            ..SchedulerConfig::default()
+        },
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let params_long = SamplingParams {
+        temperature: 0.0,
+        max_tokens: 6,
+        stop_token_ids: vec![],
+        eos_token_ids: vec![],
+        ..SamplingParams::default()
+    };
+    let ids_long = rt
+        .block_on(collect_stream_tokens(
+            worker
+                .submit(long_300, params_long, None)
+                .expect("submit 300-token MTP request"),
+        ))
+        .expect("300-token single-chunk MTP prefill + verify must succeed");
+    assert_eq!(
+        ids_long, ref_long.generated_token_ids,
+        "EngineWorker MTP 300-token single-chunk prefill must match target greedy tokens"
+    );
+
+    // Constrained terminal-EOS draft verification: when a draft token is in terminal_eos_ids,
+    // MTP verify must truncate before the post-EOS empty-mask bonus row and finish cleanly
+    // right after emitting `draft_eos_id`.
+    let draft_eos_id = expected_short_ids[1];
+    let constraint_eos =
+        TokenBitmaskConstraint::unconstrained(256).with_terminal_eos_ids(vec![draft_eos_id]);
+    let params_constrained = SamplingParams {
+        temperature: 0.0,
+        max_tokens: 6,
+        stop_token_ids: vec![],
+        eos_token_ids: vec![],
+        ..SamplingParams::default()
+    };
+    let ids_constrained = rt
+        .block_on(collect_stream_tokens(
+            worker
+                .submit(prompt.to_vec(), params_constrained, Some(constraint_eos))
+                .expect("submit constrained terminal-EOS MTP request"),
+        ))
+        .expect("constrained terminal-EOS MTP request must not fail with empty bonus bitmask");
+    assert_eq!(
+        ids_constrained,
+        &expected_short_ids[..2],
+        "constrained terminal-EOS MTP request must stop immediately after draft_eos_id"
+    );
+
+    // Force an aborted request (empty allowed-token bitmask) and verify the next MTP request
+    // recovers cleanly with exact target greedy parity (`abort_scheduled` resets MTP state).
+    let empty_constraint = TokenBitmaskConstraint::from_allowed_tokens(256, vec![]);
+    let params_abort = SamplingParams {
+        temperature: 0.0,
+        max_tokens: 4,
+        stop_token_ids: vec![],
+        eos_token_ids: vec![],
+        ..SamplingParams::default()
+    };
+    let abort_res = rt.block_on(collect_stream_tokens(
+        worker
+            .submit(prompt.to_vec(), params_abort, Some(empty_constraint))
+            .expect("submit doomed constrained request"),
+    ));
+    assert!(abort_res.is_err(), "empty bitmask request must fail");
+
+    let params_recover = SamplingParams {
+        temperature: 0.0,
+        max_tokens: 6,
+        stop_token_ids: vec![],
+        eos_token_ids: vec![],
+        ..SamplingParams::default()
+    };
+    let ids_recover = rt
+        .block_on(collect_stream_tokens(
+            worker
+                .submit(prompt.to_vec(), params_recover, None)
+                .expect("submit recovery MTP request"),
+        ))
+        .expect("post-abort recovery MTP request must succeed");
+    assert_eq!(
+        ids_recover, expected_short_ids,
+        "post-abort MTP request must match target greedy tokens"
+    );
+
+    rt.block_on(worker.shutdown()).expect("worker shutdown");
+
+    // Verify `plan_tiered_moe_hot_per_layer` adapts TP=2 hot cache down from 112 when
+    // multi-thousand-page contexts (`4096..8192` pages) + MTP headroom are requested.
+    let cfg = w34_host::loader::ModelConfig::from_dir(dir).unwrap();
+    let mut real_like_cfg = cfg;
+    real_like_cfg.num_hidden_layers = 48;
+    real_like_cfg.num_experts = 512;
+    real_like_cfg.moe_intermediate_size = 640;
+    real_like_cfg.hidden_size = 2560;
+    let gib = 1024 * 1024 * 1024;
+    let (hot_small, _) = w34_host::model::plan_tiered_moe_hot_per_layer(
+        &real_like_cfg,
+        2,
+        19_600 * 1024 * 1024,
+        gib + 38 * 1024 * 1024,
+        450 * 1024 * 1024,
+    );
+    assert_eq!(hot_small, 112);
+    let base_plus_kv_12k = gib + 1536 * 1024 * 1024 + 1824 * 1024 * 1024;
+    let min_state_12k = 1200 * 1024 * 1024;
+    let (hot_12k, reserve_12k) = w34_host::model::plan_tiered_moe_hot_per_layer(
+        &real_like_cfg,
+        2,
+        19_600 * 1024 * 1024,
+        base_plus_kv_12k,
+        min_state_12k,
+    );
+    assert_eq!(
+        hot_12k, 104,
+        "expected adaptive hot_per_layer == 104 for 12288-page TP=2 + MTP, got {hot_12k}"
+    );
+    assert!(
+        base_plus_kv_12k + min_state_12k + reserve_12k <= 19_600 * 1024 * 1024,
+        "adaptive tiered_moe_reserve must fit inside available post-weight VRAM"
+    );
 }
 
 #[test]
