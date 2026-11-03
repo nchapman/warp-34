@@ -946,7 +946,10 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
             decoded_tp2,
             metrics_tp2.generated_token_ids,
         );
-        assert!(!metrics_tp2.generated_token_ids.is_empty());
+        assert_eq!(
+            metrics_tp2.generated_token_ids, metrics_tp1.generated_token_ids,
+            "TP=2 / EP=2 16-token greedy generation must match TP=1 token-for-token"
+        );
 
         let r1_tp2 = engine_tp2
             .generate_with_radix_cache(&long_prompt, 8, 64, false)

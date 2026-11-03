@@ -18,6 +18,7 @@ pub(super) struct Dimensions {
     pub shared: usize,
     pub hidden: usize,
     pub hc_count: usize,
+    pub uses_ple: bool,
     pub indexer_head_dim: usize,
 }
 
@@ -64,7 +65,7 @@ pub(super) fn layer_layout(d: Dimensions, tokens: usize) -> Option<LayerLayout> 
         [0; 7]
     };
     let hc_mult = d.hc_count.max(1);
-    let ple_hc_offsets = if d.hc_count > 1 {
+    let ple_hc_offsets = if d.hc_count > 1 || d.uses_ple {
         [
             ple_hc.alloc(&[tokens, d.hidden.checked_mul(hc_mult)?, 2])?,
             ple_hc.alloc(&[tokens, d.hidden.checked_mul(hc_mult)?, 2])?,
@@ -207,6 +208,30 @@ mod tests {
         let base = 4 * ALIGN;
         let persistent_after = base + bytes;
         assert!(ends.iter().all(|&end| base + end <= persistent_after));
+    }
+
+    #[test]
+    fn single_stream_ple_has_disjoint_scratch() {
+        let d = Dimensions {
+            q: 128,
+            kv: 128,
+            v_heads: 1,
+            v: 128,
+            k: 128,
+            interm: 256,
+            experts: 0,
+            top_k: 0,
+            moe: 0,
+            shared: 0,
+            hidden: 128,
+            hc_count: 1,
+            uses_ple: true,
+            indexer_head_dim: 0,
+        };
+        let (bytes, _, _, _, [a, b, value], _) = layer_layout(d, 2).unwrap();
+        assert!(b >= a + 2 * 128 * 2);
+        assert!(value >= b + 2 * 128 * 2);
+        assert!(bytes >= value + 2 * 128 * 2);
     }
 
     #[test]

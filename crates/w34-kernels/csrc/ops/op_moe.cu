@@ -1192,6 +1192,11 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
 // (512 contiguous bytes = 4 full 128B cache lines per warp instruction for all
 // K in {128, 256, 512, 1024, 2048}), with a 4-row register-cached `valid_cnt == 1`
 // fast path and a low-register per-slot loop for `valid_cnt >= 2` to preserve SM occupancy.
+static __host__ __device__ __forceinline__ int sparse_vec4_lpr(int k_dim) {
+    const int k_u4 = k_dim >> 5;
+    return (k_u4 >= 32) ? 32 : (k_u4 >= 16) ? 16 : (k_u4 >= 8) ? 8 : 4;
+}
+
 template <bool GATE>
 __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
     const __half * __restrict__ x,
@@ -1225,8 +1230,8 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
     const int wid = tid >> 5;
     const int lane = tid & 31;
     const int k_u4_per_row = K >> 5;
-    const int lpr = (k_u4_per_row >= 32) ? 32 : k_u4_per_row; // 4, 8, 16, or 32
-    const int rpw = 32 / lpr;                                 // 8, 4, 2, or 1
+    const int lpr = sparse_vec4_lpr(K); // 4, 8, 16, or 32
+    const int rpw = 32 / lpr;           // 8, 4, 2, or 1
     const int sub_lane = lane & (lpr - 1);
     const int sub_row = lane / lpr;
     const int wave_rows = 4 * rpw;
@@ -1938,9 +1943,9 @@ extern "C" int w34_moe_w4a16_mlp_f16(
         auto experts = reinterpret_cast<int32_t *>((char *)pairs + pb);
         auto down = reinterpret_cast<__half *>((char *)experts + eb);
         cudaStream_t st = (cudaStream_t)ex->stream;
-        const int lpr_gu = ((k_hidden >> 5) >= 32) ? 32 : (k_hidden >> 5);
+        const int lpr_gu = w34_moe::sparse_vec4_lpr(k_hidden);
         const int cta_rows_gu = 4 * 4 * (32 / lpr_gu);
-        const int lpr_dn = ((n_interm >> 5) >= 32) ? 32 : (n_interm >> 5);
+        const int lpr_dn = w34_moe::sparse_vec4_lpr(n_interm);
         const int cta_rows_dn = 4 * 4 * (32 / lpr_dn);
         w34_moe::moe_align_block_size_kernel<4>
             <<<1, 256, 0, st>>>(topk_ids, pairs, experts, np, num_experts, nt);

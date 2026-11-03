@@ -2046,7 +2046,17 @@ impl ModelConfig {
     }
 
     pub fn uses_qsa(&self) -> bool {
-        self.indexer_n_heads > 0
+        self.indexer_n_heads > 0 && self.indexer_head_dim > 0
+    }
+
+    pub fn uses_ple(&self) -> bool {
+        self.ple_embed_dim > 0 && !self.ple_layer_ids.is_empty()
+    }
+
+    pub fn uses_tiered_moe(&self) -> bool {
+        // Residency is currently a checkpoint-family policy, not an expert-count
+        // heuristic: other families may use formats unsupported by the host store.
+        self.is_qwen4_exp() && self.num_experts > 0
     }
 
     pub fn qsa_output_width(&self) -> usize {
@@ -2487,6 +2497,45 @@ mod tests {
         assert_eq!(cfg.vocab_size, 152064);
         assert_eq!(cfg.rms_norm_eps, 1e-6);
         assert_eq!(cfg.layer_types.len(), 4);
+    }
+
+    #[test]
+    fn test_architecture_capabilities_compose_independently() {
+        let mut cfg = ModelConfig::from_json(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 152064
+        }))
+        .unwrap();
+        assert!(!cfg.uses_hyper_connection());
+        assert!(!cfg.uses_qsa());
+        assert!(!cfg.uses_ple());
+        assert!(!cfg.uses_tiered_moe());
+
+        cfg.hc_count = 4;
+        assert!(cfg.uses_hyper_connection());
+        assert_eq!(cfg.hyper_hidden_size(), 10240);
+        assert!(!cfg.uses_qsa());
+        assert!(!cfg.uses_ple());
+        cfg.hc_count = 1;
+        cfg.indexer_n_heads = 4;
+        cfg.indexer_head_dim = 128;
+        assert!(cfg.uses_qsa());
+        assert!(!cfg.uses_hyper_connection());
+        cfg.ple_embed_dim = 2560;
+        assert!(!cfg.uses_ple());
+        cfg.ple_layer_ids = vec![2];
+        assert!(cfg.uses_ple());
+        cfg.num_experts = 512;
+        assert!(!cfg.uses_tiered_moe());
+        assert!(!cfg.is_qwen4_exp());
+        cfg.model_type = "qwen4_exp".into();
+        assert!(cfg.uses_tiered_moe());
+        assert!(!cfg.uses_hyper_connection());
     }
 
     #[test]

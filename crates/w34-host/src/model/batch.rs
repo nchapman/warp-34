@@ -166,7 +166,7 @@ impl Qwen3_5Engine {
             r.device.make_current()?;
             match phase {
                 ReplayPhase::Upload => {
-                    if r.cfg.is_qwen4_exp() {
+                    if r.ple_runtime.is_some() {
                         let mut ckpt_dst = Vec::with_capacity(s.checkpoints.len());
                         let mut ckpt_off = Vec::with_capacity(s.checkpoints.len());
                         for &(trig_off, dst_slot) in s.checkpoints {
@@ -270,9 +270,7 @@ impl Qwen3_5Engine {
             r.device.make_current()?;
             match phase {
                 ReplayPhase::Upload => {
-                    if r.cfg.is_qwen4_exp() {
-                        r.stage_ple_f8_for_decode_slices(slices)?;
-                    }
+                    r.stage_ple_f8_for_decode_slices(slices)?;
                     r.batched_decode_io
                         .upload_inputs(&host_meta, &host_masks, slices, &r.stream)
                 }
@@ -323,11 +321,14 @@ impl Qwen3_5Engine {
         if self.tp_size != 1 || !self.use_cuda_graph || slices.is_empty() {
             return false;
         }
-        let Some(_bucket_b) = decode_graph_bucket(slices.len()) else {
+        let Some(bucket_b) = decode_graph_bucket(slices.len()) else {
             return false;
         };
         let r0 = &self.ranks[0];
-        if r0.current_pos_plane_stride != 0 || r0.pending_visual_splice.is_some() {
+        if r0.current_pos_plane_stride != 0
+            || r0.pending_visual_splice.is_some()
+            || !r0.supports_cuda_graph_for_tokens(bucket_b)
+        {
             return false;
         }
         let max_pages = r0.kv_pool.num_pages;
@@ -392,9 +393,7 @@ impl Qwen3_5Engine {
             ));
         }
         r0.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, None)?;
-        if r0.cfg.is_qwen4_exp() {
-            r0.stage_ple_f8_for_decode_slices(slices)?;
-        }
+        r0.stage_ple_f8_for_decode_slices(slices)?;
         r0.batched_decode_io.upload_inputs_slot(
             slot,
             &host_meta,
@@ -620,6 +619,10 @@ impl Qwen3_5Engine {
         if all_emit
             && let Some(bucket_b) = decode_graph_bucket(slices.len())
             && self.use_cuda_graph
+            && self
+                .ranks
+                .iter()
+                .all(|r| r.supports_cuda_graph_for_tokens(bucket_b))
             && slices.iter().all(|s| {
                 s.tokens.len() == 1
                     && s.spec_slots.is_empty()
@@ -680,15 +683,10 @@ impl Qwen3_5Engine {
                 && s.spec_slots.len() == q_len
                 && s.checkpoints.len() <= MAX_SPEC_VERIFY_CHECKPOINTS
                 && s.block_table.len() <= self.ranks[0].spec_verify_io.max_blocks_per_req
-                && (!self.cfg.is_qwen4_exp()
-                    || self.ranks.iter().all(|r| {
-                        r.tiered_moe.as_ref().is_some_and(|tm| {
-                            (0..r.layers.len()).all(|li| {
-                                q_len * self.cfg.num_experts_per_tok.max(1) <= tm.layer_hot_k(li)
-                                    && tm.layer_has_mapped_store(li)
-                            })
-                        })
-                    }))
+                && self
+                    .ranks
+                    .iter()
+                    .all(|r| r.supports_cuda_graph_for_tokens(q_len))
                 && self.ranks.iter().all(|r| {
                     let expected_m = r
                         .speculative_logits

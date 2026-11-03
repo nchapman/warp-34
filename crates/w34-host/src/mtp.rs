@@ -18,9 +18,9 @@ use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
 use crate::loader::{ModelConfig, SafetensorsArchive};
 use crate::model::{
-    FfnBlockWeights, FullAttentionLayerWeights, HcBlockWeights, LinearProj, Qwen3_5ModelRank,
-    RawLinearHost, load_hc_block_weights, load_moe_layer_weights, load_qsa_indexer_weights,
-    load_tiered_moe_layer_weights, loader_err,
+    FfnBlockWeights, FinalResidual, FullAttentionLayerWeights, LayerResidual, LinearProj,
+    Qwen3_5ModelRank, RawLinearHost, load_hc_block_weights, load_moe_layer_weights,
+    load_qsa_indexer_weights, load_tiered_moe_layer_weights, loader_err,
 };
 use core::ffi::c_void;
 use std::path::Path;
@@ -73,19 +73,23 @@ struct MtpGraphIo {
     out_ids_dev: DeviceBuffer,
 }
 
-struct Qwen4MtpSubsystems {
-    fc_embedding: LinearProj,
-    fc_hidden: LinearProj,
-    pre_fc_norm_embedding_ptr: u64,
-    pre_fc_norm_hidden_ptr: u64,
-    attn_hc: HcBlockWeights,
-    mlp_hc: HcBlockWeights,
-    final_hc_mixer: HcBlockWeights,
-    tiered_moe: Option<(
-        crate::moe_offload::HostExpertStore,
-        crate::moe_offload::HotExpertCache,
-        crate::moe_offload::TieredMoeWorkspace,
-    )>,
+enum MtpInputFusion {
+    ConcatLinear {
+        fc: LinearProj,
+    },
+    DualStreamBroadcast {
+        fc_embedding: LinearProj,
+        fc_hidden: LinearProj,
+    },
+}
+
+type MtpTieredMoe = (
+    crate::moe_offload::HostExpertStore,
+    crate::moe_offload::HotExpertCache,
+    crate::moe_offload::TieredMoeWorkspace,
+);
+
+struct MtpQsaWorkspace {
     qsa_sel_phys_buf: DeviceBuffer,
     qsa_sel_log_buf: DeviceBuffer,
     qsa_num_sel_buf: DeviceBuffer,
@@ -116,12 +120,16 @@ pub struct Qwen3_5MtpRank {
     active_slot: usize,
     batch_mode: bool,
     slot_state: [(usize, usize); MAX_MTP_BATCH_SLOTS],
-    fc: LinearProj,
+    input_fusion: MtpInputFusion,
+    residual: LayerResidual,
+    final_residual: FinalResidual,
     fa: FullAttentionLayerWeights,
     ffn: FfnBlockWeights,
-    norms: [u64; 5],
-    qwen4: Option<Qwen4MtpSubsystems>,
-    /// Last MTP final-normalized hidden row, also the recurrent proposal input.
+    norms: [u64; 2],
+    tiered_moe: Option<MtpTieredMoe>,
+    qsa: Option<MtpQsaWorkspace>,
+    /// Recurrent proposal input: final-normalized for single-stream residuals,
+    /// or the uncollapsed multi-stream residual for HyperConnection fusion.
     pub hidden: DeviceBuffer,
     /// Contiguous outputs of the last forward; only batch_hidden_rows rows are live.
     pub batch_hidden: DeviceBuffer,
@@ -129,6 +137,22 @@ pub struct Qwen3_5MtpRank {
     max_batch_rows: usize,
 }
 impl Qwen3_5MtpRank {
+    fn concat_fc(&self) -> Result<&LinearProj> {
+        match &self.input_fusion {
+            MtpInputFusion::ConcatLinear { fc } => Ok(fc),
+            MtpInputFusion::DualStreamBroadcast { .. } => {
+                Err(loader_err("MTP concat fusion required"))
+            }
+        }
+    }
+
+    pub fn supports_cuda_graph(&self) -> bool {
+        matches!(self.input_fusion, MtpInputFusion::ConcatLinear { .. })
+            && !self.final_residual.is_hyper_connection()
+            && self.qsa.is_none()
+            && self.tiered_moe.is_none()
+    }
+
     pub fn load(target: &Qwen3_5ModelRank, dir: &Path, capacity: usize) -> Result<Self> {
         let c = &target.cfg;
         validate_geometry(c, target.rank, target.tp_size)?;
@@ -143,8 +167,8 @@ impl Qwen3_5MtpRank {
         let q = c.num_attention_heads * c.head_dim;
         let kv = c.num_key_value_heads * c.head_dim;
         let i = c.intermediate_size;
-        let is_qwen4 = c.is_qwen4_exp();
-        let hc_count = if is_qwen4 { c.hc_count.max(1) } else { 1 };
+        let uses_hc = c.uses_hyper_connection();
+        let hc_count = if uses_hc { c.hc_count.max(1) } else { 1 };
         let mtp_row_elems = hc_count * h;
         let is_moe_mtp = c.num_experts > 0
             && (archive
@@ -156,7 +180,8 @@ impl Qwen3_5MtpRank {
                 || archive
                     .resolve_name("mtp.layers.0.mlp.gate.weight_packed")
                     .is_some());
-        let is_tiered_moe_mtp = is_qwen4
+        let is_tiered_moe_mtp = uses_hc
+            && c.uses_tiered_moe()
             && is_moe_mtp
             && (archive
                 .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.qweight")
@@ -207,14 +232,23 @@ impl Qwen3_5MtpRank {
                 ))
             }
         };
-        let fc = if is_qwen4 {
-            LinearProj::DenseF16 {
-                weight_ptr: 0,
-                size_n: h,
-                size_k: h,
+        let input_fusion = if uses_hc {
+            MtpInputFusion::DualStreamBroadcast {
+                fc_embedding: load("fc_embedding", h, h)?.upload(
+                    &mut weights,
+                    &target.stream,
+                    &staging,
+                )?,
+                fc_hidden: load("fc_hidden", h, h)?.upload(
+                    &mut weights,
+                    &target.stream,
+                    &staging,
+                )?,
             }
         } else {
-            load("fc", h, 2 * h)?.upload(&mut weights, &target.stream, &staging)?
+            MtpInputFusion::ConcatLinear {
+                fc: load("fc", h, 2 * h)?.upload(&mut weights, &target.stream, &staging)?,
+            }
         };
         let qs = load("layers.0.self_attn.q_proj", 2 * q, h)?
             .slice_rows(r * 2 * q / tp, (r + 1) * 2 * q / tp);
@@ -269,7 +303,7 @@ impl Qwen3_5MtpRank {
                 down_proj,
             }
         };
-        let qsa_indexer = if is_qwen4 && c.indexer_head_dim > 0 {
+        let qsa_indexer = if c.uses_qsa() {
             Some(load_qsa_indexer_weights(
                 &archive,
                 c,
@@ -294,11 +328,7 @@ impl Qwen3_5MtpRank {
             weights.upload_slice(&v, &target.stream)
         };
         let max_batch_rows = capacity.min(256);
-        let (norms, qwen4) = if is_qwen4 {
-            let fc_embedding =
-                load("fc_embedding", h, h)?.upload(&mut weights, &target.stream, &staging)?;
-            let fc_hidden =
-                load("fc_hidden", h, h)?.upload(&mut weights, &target.stream, &staging)?;
+        let (norms, residual, final_residual) = if uses_hc {
             let attn_hc = load_hc_block_weights(
                 &archive,
                 c,
@@ -329,95 +359,93 @@ impl Qwen3_5MtpRank {
             drop(staging);
             let pre_fc_norm_embedding_ptr = norm(&mut weights, "pre_fc_norm_embedding", h)?;
             let pre_fc_norm_hidden_ptr = norm(&mut weights, "pre_fc_norm_hidden", hc_count * h)?;
-            let tiered_moe = if is_tiered_moe_mtp {
-                let group_size = c.quant.group_size_or(128);
-                let layout = crate::moe_offload::ExpertPackLayout::new(
-                    c.moe_intermediate_size,
-                    h,
-                    group_size,
-                )
-                .map_err(|e| {
+            (
+                [pre_fc_norm_embedding_ptr, pre_fc_norm_hidden_ptr, 0, 0, 0],
+                LayerResidual::HyperConnection { attn_hc, mlp_hc },
+                FinalResidual::HyperConnection {
+                    mixer: final_hc_mixer,
+                },
+            )
+        } else {
+            drop(staging);
+            let norms = [
+                norm(&mut weights, "pre_fc_norm_embedding", h)?,
+                norm(&mut weights, "pre_fc_norm_hidden", h)?,
+                norm(&mut weights, "layers.0.input_layernorm", h)?,
+                norm(&mut weights, "layers.0.post_attention_layernorm", h)?,
+                norm(&mut weights, "norm", h)?,
+            ];
+            (
+                norms,
+                LayerResidual::SingleStream {
+                    input_layernorm_ptr: norms[2],
+                    post_attention_layernorm_ptr: norms[3],
+                },
+                FinalResidual::SingleStream { norm_ptr: norms[4] },
+            )
+        };
+        let tiered_moe = if is_tiered_moe_mtp {
+            let group_size = c.quant.group_size_or(128);
+            let layout =
+                crate::moe_offload::ExpertPackLayout::new(c.moe_intermediate_size, h, group_size)
+                    .map_err(|e| {
                     crate::cuda::CudaError::with_detail(
                         -1,
                         "MTP ExpertPackLayout::new",
                         e.to_string(),
                     )
                 })?;
-                let local_experts = c.num_experts / tp;
-                let k_hot = 16.min(local_experts).max(1);
-                let stage_cap = 32.min(local_experts).max(1);
-                let mut ws = crate::moe_offload::TieredMoeWorkspace::new(
-                    target.device.device_id,
-                    layout.clone(),
-                    stage_cap,
-                    max_batch_rows.max(64),
-                    c.num_experts_per_tok.max(1),
-                )?;
-                let store = crate::moe_offload::HostExpertStore::load(
-                    &archive,
-                    "mtp.layers.0.mlp.experts",
-                    &c.quant,
-                    layout.clone(),
-                    c.num_experts,
-                    r,
-                    tp,
-                    usize::MAX,
-                )
-                .map_err(|e| {
-                    crate::cuda::CudaError::with_detail(
-                        -1,
-                        "MTP HostExpertStore::load",
-                        e.to_string(),
-                    )
-                })?;
-                let mut cache = crate::moe_offload::HotExpertCache::new(
-                    target.device.device_id,
-                    k_hot,
-                    store.expert_ids(),
-                    layout,
-                )?;
-                cache.populate_initial(&store, None, &mut ws, &target.stream)?;
-                Some((store, cache, ws))
-            } else {
-                None
-            };
+            let local_experts = c.num_experts / tp;
+            let k_hot = 16.min(local_experts).max(1);
+            let stage_cap = 32.min(local_experts).max(1);
+            let mut ws = crate::moe_offload::TieredMoeWorkspace::new(
+                target.device.device_id,
+                layout.clone(),
+                stage_cap,
+                max_batch_rows.max(64),
+                c.num_experts_per_tok.max(1),
+            )?;
+            let store = crate::moe_offload::HostExpertStore::load(
+                &archive,
+                "mtp.layers.0.mlp.experts",
+                &c.quant,
+                layout.clone(),
+                c.num_experts,
+                r,
+                tp,
+                usize::MAX,
+            )
+            .map_err(|e| {
+                crate::cuda::CudaError::with_detail(-1, "MTP HostExpertStore::load", e.to_string())
+            })?;
+            let mut cache = crate::moe_offload::HotExpertCache::new(
+                target.device.device_id,
+                k_hot,
+                store.expert_ids(),
+                layout,
+            )?;
+            cache.populate_initial(&store, None, &mut ws, &target.stream)?;
+            Some((store, cache, ws))
+        } else {
+            None
+        };
+        let qsa = if qsa_indexer.is_some() {
             let qsa_sel_phys_buf =
                 DeviceBuffer::alloc(target.device.device_id, max_batch_rows * 64 * 4)?;
             let qsa_sel_log_buf =
                 DeviceBuffer::alloc(target.device.device_id, max_batch_rows * 64 * 4)?;
             let qsa_num_sel_buf = DeviceBuffer::alloc(target.device.device_id, max_batch_rows * 4)?;
             let qsa_seq_pos_buf = DeviceBuffer::alloc(target.device.device_id, max_batch_rows * 4)?;
-            (
-                [pre_fc_norm_embedding_ptr, pre_fc_norm_hidden_ptr, 0, 0, 0],
-                Some(Qwen4MtpSubsystems {
-                    fc_embedding,
-                    fc_hidden,
-                    pre_fc_norm_embedding_ptr,
-                    pre_fc_norm_hidden_ptr,
-                    attn_hc,
-                    mlp_hc,
-                    final_hc_mixer,
-                    tiered_moe,
-                    qsa_sel_phys_buf,
-                    qsa_sel_log_buf,
-                    qsa_num_sel_buf,
-                    qsa_seq_pos_buf,
-                    skip_topk: false,
-                    step0_page_idx: usize::MAX,
-                }),
-            )
+            Some(MtpQsaWorkspace {
+                qsa_sel_phys_buf,
+                qsa_sel_log_buf,
+                qsa_num_sel_buf,
+                qsa_seq_pos_buf,
+                skip_topk: false,
+                step0_page_idx: usize::MAX,
+            })
         } else {
-            drop(staging);
-            (
-                [
-                    norm(&mut weights, "pre_fc_norm_embedding", h)?,
-                    norm(&mut weights, "pre_fc_norm_hidden", h)?,
-                    norm(&mut weights, "layers.0.input_layernorm", h)?,
-                    norm(&mut weights, "layers.0.post_attention_layernorm", h)?,
-                    norm(&mut weights, "norm", h)?,
-                ],
-                None,
-            )
+            None
         };
         let fa = FullAttentionLayerWeights {
             layer_id: c.num_hidden_layers,
@@ -438,7 +466,7 @@ impl Qwen3_5MtpRank {
             capacity.div_ceil(16),
             KvFormatPolicy::Fp16,
         )?;
-        if is_qwen4 && c.indexer_head_dim > 0 {
+        if c.uses_qsa() {
             kv.init_qsa_indexer_caches(c.indexer_head_dim, c.indexer_compress_ratio.max(1))?;
         }
         let pages: Vec<i32> = (0..kv.num_pages)
@@ -461,7 +489,9 @@ impl Qwen3_5MtpRank {
                 tmoe.num_experts + 4 * tmoe.top_k + 3 * tmoe.local_shared_interm + h + 64
             }
         };
-        let row_elements = (9 + 3 * hc_count) * h
+        let row_elements = (9 + 4 * hc_count) * h
+            + c.hc_lowrank.max(1)
+            + 3 * hc_count
             + 8 * q / tp
             + 6 * c.num_key_value_heads * c.head_dim / tp
             + 2 * (c.indexer_n_heads + c.indexer_kv_heads) * c.indexer_head_dim
@@ -485,7 +515,7 @@ impl Qwen3_5MtpRank {
         target.stream.synchronize()?;
         let all_pages = pages.clone();
         Ok(Self {
-            use_cuda_graph: !is_qwen4,
+            use_cuda_graph: !uses_hc && !is_tiered_moe_mtp && qsa.is_none(),
             target_embedding: target.embed_tokens_ptr,
             hidden_size: mtp_row_elems,
             capacity,
@@ -503,11 +533,14 @@ impl Qwen3_5MtpRank {
             active_slot: 0,
             batch_mode: false,
             slot_state: [(0, 0); MAX_MTP_BATCH_SLOTS],
-            fc,
+            input_fusion,
+            residual,
+            final_residual,
             fa,
             ffn,
-            norms,
-            qwen4,
+            norms: [norms[0], norms[1]],
+            tiered_moe,
+            qsa,
             hidden: DeviceBuffer::alloc(target.device.device_id, mtp_row_elems * 2)?,
             batch_hidden: DeviceBuffer::alloc(
                 target.device.device_id,
@@ -940,14 +973,18 @@ impl Qwen3_5MtpRank {
                     "MTP pre FC norm",
                 )?;
             }
-            Self::project(&self.fc, &ex, t, concat, residual_buf, 1)?;
+            Self::project(self.concat_fc()?, &ex, t, concat, residual_buf, 1)?;
             check_rc(
                 // SAFETY: residual_buf and normed_buf are valid device allocations for h_dim half elements, weight is valid norm weight.
                 unsafe {
                     ffi::w34_gemma_rms_norm_f16(
                         &ex,
                         residual_buf as *const c_void,
-                        self.norms[2] as *const c_void,
+                        self.residual
+                            .single_stream_input_norm_ptr()
+                            .ok_or_else(|| {
+                                loader_err("MTP graph requires single-stream residual")
+                            })? as *const c_void,
                         normed_buf as *mut c_void,
                         core::ptr::null(),
                         1,
@@ -1035,7 +1072,10 @@ impl Qwen3_5MtpRank {
                 "w34_apply_attn_output_gate_f16",
             )?;
             Self::project(&fa.o_proj, &ex, t, gated_attn_buf, block_out_buf, 1)?;
-            let post_ln_ptr = self.norms[3];
+            let post_ln_ptr = self
+                .residual
+                .single_stream_post_attn_norm_ptr()
+                .ok_or_else(|| loader_err("MTP graph requires single-stream residual"))?;
             if let Some(comm) = tp2 {
                 comm.all_reduce_residual_gemma_rms_norm_f16(
                     &ex,
@@ -1123,7 +1163,9 @@ impl Qwen3_5MtpRank {
                     mlp_out_buf,
                     0,
                     residual_buf,
-                    self.norms[4],
+                    self.final_residual
+                        .single_stream_norm_ptr()
+                        .ok_or_else(|| loader_err("MTP graph requires single-stream final norm"))?,
                     self.hidden.addr(),
                     0,
                     t.rank as i32,
@@ -1141,7 +1183,11 @@ impl Qwen3_5MtpRank {
                             &ex,
                             mlp_out_buf as *const c_void,
                             residual_buf as *mut c_void,
-                            self.norms[4] as *const c_void,
+                            self.final_residual
+                                .single_stream_norm_ptr()
+                                .ok_or_else(|| {
+                                    loader_err("MTP graph requires single-stream final norm")
+                                })? as *const c_void,
                             self.hidden.addr() as *mut c_void,
                             core::ptr::null(),
                             1,
@@ -1321,7 +1367,7 @@ impl Qwen3_5MtpRank {
         if !(1..=3).contains(&k) || self.len != self.committed || self.len + k > self.capacity {
             return Err(loader_err("invalid MTP proposal state or k"));
         }
-        if self.use_cuda_graph && self.qwen4.is_none() {
+        if self.use_cuda_graph && self.supports_cuda_graph() {
             self.validate_propose_args(target, anchor, target_hidden, k, Some(tp2.is_some()))?;
             self.ensure_propose_graph(target, k, tp2)?;
             self.launch_propose_graph_async(target, anchor, target_hidden, k)?;
@@ -1332,13 +1378,13 @@ impl Qwen3_5MtpRank {
         let mut out = Vec::with_capacity(k);
         let step0_page = self.len / 16;
         for step in 0..k {
-            if let Some(q4) = &mut self.qwen4 {
-                q4.step0_page_idx = step0_page;
-                q4.skip_topk = step > 0;
+            if let Some(qsa_ws) = &mut self.qsa {
+                qsa_ws.step0_page_idx = step0_page;
+                qsa_ws.skip_topk = step > 0;
             }
             let res = self.forward(target, &[token], hidden, tp2);
-            if let Some(q4) = &mut self.qwen4 {
-                q4.skip_topk = false;
+            if let Some(qsa_ws) = &mut self.qsa {
+                qsa_ws.skip_topk = false;
             }
             token = match res {
                 Ok(token) => token,
@@ -1399,6 +1445,7 @@ impl Qwen3_5MtpRank {
         self.forward_inner(target, tokens, input_hidden, tp2, true, true, false)?
             .ok_or_else(|| loader_err("MTP forward did not sample token"))
     }
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     fn forward_inner(
         &mut self,
         target: &Qwen3_5ModelRank,
@@ -1409,17 +1456,6 @@ impl Qwen3_5MtpRank {
         sync_stream: bool,
         kv_only: bool,
     ) -> Result<Option<i32>> {
-        if self.qwen4.is_some() {
-            return self.forward_qwen4_inner(
-                target,
-                tokens,
-                input_hidden,
-                tp2,
-                sample_last,
-                sync_stream,
-                kv_only,
-            );
-        }
         let t = target;
         if t.embed_tokens_ptr != self.target_embedding {
             return Err(loader_err("MTP target rank mismatch"));
@@ -1446,594 +1482,7 @@ impl Qwen3_5MtpRank {
         t.device.make_current()?;
         self.scratch.reset();
         let h_dim = t.cfg.hidden_size;
-        let head_dim = t.cfg.head_dim;
-        let local_q_heads = t.cfg.num_attention_heads / t.tp_size;
-        let local_kv_heads = t.cfg.num_key_value_heads / t.tp_size;
-        let local_interm = t.cfg.intermediate_size / t.tp_size;
-        let q_gate_dim = local_q_heads * head_dim * 2;
-        let kv_dim = local_kv_heads * head_dim;
-        let residual_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
-        let normed_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
-        let embed = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
-        let concat = self.scratch.alloc_aligned(num_tokens * (2 * h_dim) * 2)?;
-        let qkv_proj_buf = self
-            .scratch
-            .alloc_aligned(num_tokens * (q_gate_dim + 2 * kv_dim) * 2)?;
-        let q_buf = self
-            .scratch
-            .alloc_aligned(num_tokens * (local_q_heads * head_dim) * 2)?;
-        let k_buf = self.scratch.alloc_aligned(num_tokens * kv_dim * 2)?;
-        let gate_buf = self
-            .scratch
-            .alloc_aligned(num_tokens * (local_q_heads * head_dim) * 2)?;
-        let attn_out_buf = self
-            .scratch
-            .alloc_aligned(num_tokens * (local_q_heads * head_dim) * 2)?;
-        let gated_attn_buf = self
-            .scratch
-            .alloc_aligned(num_tokens * (local_q_heads * head_dim) * 2)?;
-        let block_out_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
-        let mlp_out_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
-        let (
-            gate_up_buf,
-            act_buf,
-            moe_router_logits_buf,
-            moe_topk_weights_buf,
-            moe_topk_ids_buf,
-            moe_interm_buf,
-            moe_sh_gu_buf,
-            moe_sh_act_buf,
-            moe_sh_out_buf,
-            moe_sh_gate_buf,
-        ) = match &self.ffn {
-            FfnBlockWeights::Dense { .. } => (
-                self.scratch
-                    .alloc_aligned(num_tokens * (2 * local_interm) * 2)?,
-                self.scratch.alloc_aligned(num_tokens * local_interm * 2)?,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ),
-            FfnBlockWeights::Moe(moe) => {
-                let sh_gu = if moe.local_shared_interm > 0 {
-                    self.scratch
-                        .alloc_aligned(num_tokens * 2 * moe.local_shared_interm * 2)?
-                } else {
-                    0
-                };
-                let sh_act = if moe.local_shared_interm > 0 {
-                    self.scratch
-                        .alloc_aligned(num_tokens * moe.local_shared_interm * 2)?
-                } else {
-                    0
-                };
-                let sh_out = if moe.local_shared_interm > 0 {
-                    self.scratch.alloc_aligned(num_tokens * h_dim * 2)?
-                } else {
-                    0
-                };
-                let sh_gate = if moe.shared_expert_gate.is_some() {
-                    self.scratch.alloc_aligned(num_tokens * 2)?
-                } else {
-                    0
-                };
-                (
-                    0,
-                    0,
-                    self.scratch
-                        .alloc_aligned(num_tokens * moe.num_experts * 2)?,
-                    self.scratch.alloc_aligned(num_tokens * moe.top_k * 4)?,
-                    self.scratch.alloc_aligned(num_tokens * moe.top_k * 4)?,
-                    self.scratch
-                        .alloc_aligned(num_tokens * moe.top_k * moe.local_moe_interm * 2)?,
-                    sh_gu,
-                    sh_act,
-                    sh_out,
-                    sh_gate,
-                )
-            }
-            FfnBlockWeights::TieredMoe(tmoe) => {
-                let sh_gu = if tmoe.local_shared_interm > 0 {
-                    self.scratch
-                        .alloc_aligned(num_tokens * 2 * tmoe.local_shared_interm * 2)?
-                } else {
-                    0
-                };
-                let sh_act = if tmoe.local_shared_interm > 0 {
-                    self.scratch
-                        .alloc_aligned(num_tokens * tmoe.local_shared_interm * 2)?
-                } else {
-                    0
-                };
-                let sh_out = if tmoe.local_shared_interm > 0 {
-                    self.scratch.alloc_aligned(num_tokens * h_dim * 2)?
-                } else {
-                    0
-                };
-                let sh_gate = if tmoe.shared_expert_gate.is_some() {
-                    self.scratch.alloc_aligned(num_tokens * 2)?
-                } else {
-                    0
-                };
-                (
-                    0,
-                    0,
-                    self.scratch
-                        .alloc_aligned(num_tokens * tmoe.num_experts * 2)?,
-                    self.scratch.alloc_aligned(num_tokens * tmoe.top_k * 4)?,
-                    self.scratch.alloc_aligned(num_tokens * tmoe.top_k * 4)?,
-                    0,
-                    sh_gu,
-                    sh_act,
-                    sh_out,
-                    sh_gate,
-                )
-            }
-        };
-        let mut meta = Vec::with_capacity(3 * num_tokens + 3);
-        meta.extend_from_slice(tokens);
-        meta.extend((self.len..self.len + num_tokens).map(|p| p as i32));
-        meta.extend(
-            (self.len..self.len + num_tokens).map(|p| self.pages[p / 16] * 16 + (p % 16) as i32),
-        );
-        meta.extend_from_slice(&[0i32, num_tokens as i32, (self.len + num_tokens) as i32]);
-        let meta_base = self.scratch.upload_slice(&meta, &t.stream)?;
-        let (ws_ptr, ws_cap) = self.scratch.remaining_workspace();
-        let ex = t.stream.exec(ws_ptr, ws_cap);
-        let token_ids_ptr = meta_base;
-        let positions_ptr = token_ids_ptr + (num_tokens * 4) as u64;
-        let slot = positions_ptr + (num_tokens * 4) as u64;
-        let qs = slot + (num_tokens * 4) as u64;
-        let after = qs + 8;
-        let attn_batch = &W34AttentionBatch {
-            query_start_loc: qs as *const i32,
-            context_lens_before: positions_ptr as *const i32,
-            seq_lens_after: after as *const i32,
-            block_tables: self.pages_dev as *const i32,
-            write_slot_mapping: slot as *const i32,
-            valid_token_mask: core::ptr::null(),
-            valid_req_mask: core::ptr::null(),
-            num_reqs: 1,
-            total_tokens: num_tokens as i32,
-            max_blocks_per_req: self.pages.len() as i32,
-            max_q_len: num_tokens as i32,
-            max_seq_len: (self.len + num_tokens) as i32,
-            mask_mode: W34_ATTN_MASK_CAUSAL,
-            sliding_window: 0,
-            sm_scale: (head_dim as f32).powf(-0.5),
-            reserved: 0,
-        };
-        check_rc(
-            // SAFETY: token_ids_ptr contains num_tokens valid token IDs, embed_tokens_ptr is valid device memory of vocab_size * h_dim half elements, embed has capacity for num_tokens * h_dim half elements.
-            unsafe {
-                ffi::w34_embed_lookup_f16(
-                    &ex,
-                    token_ids_ptr as *const i32,
-                    t.embed_tokens_ptr as *const c_void,
-                    embed as *mut c_void,
-                    core::ptr::null(),
-                    num_tokens as i32,
-                    h_dim as i32,
-                    t.cfg.vocab_size as i32,
-                )
-            },
-            "MTP embed",
-        )?;
-        if num_tokens == 1 {
-            for (input, weight, output) in [
-                (embed, self.norms[0], concat),
-                (input_hidden, self.norms[1], concat + (h_dim * 2) as u64),
-            ] {
-                check_rc(
-                    // SAFETY: input and output are valid device pointers with capacity for h_dim half elements, weight is valid norm weight.
-                    unsafe {
-                        ffi::w34_gemma_rms_norm_f16(
-                            &ex,
-                            input as *const c_void,
-                            weight as *const c_void,
-                            output as *mut c_void,
-                            core::ptr::null(),
-                            1,
-                            h_dim as i32,
-                            t.cfg.rms_norm_eps,
-                        )
-                    },
-                    "MTP pre FC norm",
-                )?;
-            }
-        } else {
-            let hidden_norm = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
-            for (input, weight, output) in [
-                (embed, self.norms[0], normed_buf),
-                (input_hidden, self.norms[1], hidden_norm),
-            ] {
-                check_rc(
-                    // SAFETY: input and output are valid device pointers for num_tokens * h_dim half elements, weight is valid norm weight.
-                    unsafe {
-                        ffi::w34_gemma_rms_norm_f16(
-                            &ex,
-                            input as *const c_void,
-                            weight as *const c_void,
-                            output as *mut c_void,
-                            core::ptr::null(),
-                            num_tokens as i32,
-                            h_dim as i32,
-                            t.cfg.rms_norm_eps,
-                        )
-                    },
-                    "MTP pre FC norm",
-                )?;
-            }
-            check_rc(
-                // SAFETY: normed_buf and hidden_norm contain num_tokens * h_dim half elements each, concat has capacity for num_tokens * 2 * h_dim half elements.
-                unsafe {
-                    ffi::w34_concat_cols_2_f16(
-                        &ex,
-                        normed_buf as *const c_void,
-                        hidden_norm as *const c_void,
-                        concat as *mut c_void,
-                        num_tokens as i32,
-                        h_dim as i32,
-                        h_dim as i32,
-                    )
-                },
-                "MTP concat",
-            )?;
-        }
-        Self::project(&self.fc, &ex, t, concat, residual_buf, num_tokens)?;
-        check_rc(
-            // SAFETY: residual_buf and normed_buf are valid device allocations for num_tokens * h_dim half elements, self.norms[2] is valid norm weight.
-            unsafe {
-                ffi::w34_gemma_rms_norm_f16(
-                    &ex,
-                    residual_buf as *const c_void,
-                    self.norms[2] as *const c_void,
-                    normed_buf as *mut c_void,
-                    core::ptr::null(),
-                    num_tokens as i32,
-                    h_dim as i32,
-                    t.cfg.rms_norm_eps,
-                )
-            },
-            "MTP input norm",
-        )?;
-        let fa = &self.fa;
-        Self::project(&fa.qkv_proj, &ex, t, normed_buf, qkv_proj_buf, num_tokens)?;
-        let qkv_row_stride = (q_gate_dim + 2 * kv_dim) as i32;
-        let q_gate_ptr = qkv_proj_buf;
-        let k_raw_ptr = qkv_proj_buf + (q_gate_dim * 2) as u64;
-        let v_ptr = qkv_proj_buf + ((q_gate_dim + kv_dim) * 2) as u64;
-        check_rc(
-            // SAFETY: q_gate_ptr, k_raw_ptr, and output buffers are valid strided device buffers for num_tokens, positions_ptr contains valid positions on t.stream.
-            unsafe {
-                ffi::w34_fused_qk_rmsnorm_rope_gate_strided_f16(
-                    &ex,
-                    q_gate_ptr as *const c_void,
-                    k_raw_ptr as *const c_void,
-                    fa.q_norm_ptr as *const c_void,
-                    fa.k_norm_ptr as *const c_void,
-                    positions_ptr as *const i32,
-                    core::ptr::null(),
-                    q_buf as *mut c_void,
-                    k_buf as *mut c_void,
-                    gate_buf as *mut c_void,
-                    num_tokens as i32,
-                    0, // 1D text positions: all 3 mRoPE planes share plane 0
-                    local_q_heads as i32,
-                    local_kv_heads as i32,
-                    head_dim as i32,
-                    t.cfg.rotary_dim as i32,
-                    t.cfg.mrope_section[0] as i32,
-                    t.cfg.mrope_section[1] as i32,
-                    t.cfg.mrope_section[2] as i32,
-                    qkv_row_stride,
-                    qkv_row_stride,
-                    t.cfg.rope_theta,
-                    t.cfg.rms_norm_eps,
-                )
-            },
-            "w34_fused_qk_rmsnorm_rope_gate_strided_f16",
-        )?;
-        let kv_layout = &self.kv.layers[fa.kv_layer_ordinal].layout;
-        check_rc(
-            // SAFETY: kv_layout describes valid paged memory, k_buf and v_ptr are valid device buffers with capacity for num_tokens * kv_dim elements.
-            unsafe {
-                ffi::w34_kv_cache_write_strided(
-                    &ex,
-                    kv_layout,
-                    attn_batch,
-                    k_buf as *const c_void,
-                    v_ptr as *const c_void,
-                    kv_dim as i32,
-                    qkv_row_stride,
-                )
-            },
-            "w34_kv_cache_write_strided",
-        )?;
-        if kv_only {
-            if sync_stream {
-                t.stream.synchronize()?;
-            }
-            self.batch_hidden_rows = 0;
-            self.len += num_tokens;
-            return Ok(None);
-        }
-        check_rc(
-            // SAFETY: kv_layout and attn_batch describe valid paged attention batch, q_buf and attn_out_buf have capacity for num_tokens * local_q_heads * head_dim elements.
-            unsafe {
-                ffi::w34_paged_attention_f16(
-                    &ex,
-                    kv_layout,
-                    attn_batch,
-                    q_buf as *const c_void,
-                    attn_out_buf as *mut c_void,
-                    local_q_heads as i32,
-                )
-            },
-            "w34_paged_attention_f16",
-        )?;
-        check_rc(
-            // SAFETY: attn_out_buf and gate_buf are valid device buffers of num_tokens * local_q_heads * head_dim half elements, gated_attn_buf has equal capacity.
-            unsafe {
-                ffi::w34_apply_attn_output_gate_f16(
-                    &ex,
-                    attn_out_buf as *const c_void,
-                    gate_buf as *const c_void,
-                    gated_attn_buf as *mut c_void,
-                    core::ptr::null(),
-                    num_tokens as i32,
-                    (local_q_heads * head_dim) as i32,
-                )
-            },
-            "w34_apply_attn_output_gate_f16",
-        )?;
-        Self::project(
-            &fa.o_proj,
-            &ex,
-            t,
-            gated_attn_buf,
-            block_out_buf,
-            num_tokens,
-        )?;
-        let post_ln_ptr = self.norms[3];
-        if let Some(comm) = tp2 {
-            comm.all_reduce_residual_gemma_rms_norm_f16(
-                &ex,
-                block_out_buf,
-                0,
-                residual_buf,
-                post_ln_ptr,
-                normed_buf,
-                0,
-                t.rank as i32,
-                num_tokens as i32,
-                h_dim as i32,
-                t.cfg.rms_norm_eps,
-                0,
-                0,
-            )?;
-        } else {
-            // Post-attention RMSNorm + MLP
-            check_rc(
-                // SAFETY: block_out_buf and residual_buf are valid device buffers for num_tokens * h_dim half elements, post_ln_ptr is valid norm weight.
-                unsafe {
-                    ffi::w34_fused_add_gemma_rms_norm_f16(
-                        &ex,
-                        block_out_buf as *const c_void,
-                        residual_buf as *mut c_void,
-                        post_ln_ptr as *const c_void,
-                        normed_buf as *mut c_void,
-                        core::ptr::null(),
-                        num_tokens as i32,
-                        h_dim as i32,
-                        t.cfg.rms_norm_eps,
-                    )
-                },
-                "w34_fused_add_gemma_rms_norm_f16 (post_attn)",
-            )?;
-        }
-
-        match &self.ffn {
-            FfnBlockWeights::Dense {
-                gate_up_proj,
-                down_proj,
-            } => {
-                Self::project(gate_up_proj, &ex, t, normed_buf, gate_up_buf, num_tokens)?;
-                check_rc(
-                    // SAFETY: gate_up_buf and act_buf are valid device buffers for num_tokens rows of local_interm elements on active stream.
-                    unsafe {
-                        ffi::w34_silu_and_mul_f16(
-                            &ex,
-                            gate_up_buf as *const c_void,
-                            act_buf as *mut c_void,
-                            core::ptr::null(),
-                            num_tokens as i32,
-                            local_interm as i32,
-                        )
-                    },
-                    "w34_silu_and_mul_f16",
-                )?;
-                Self::project(down_proj, &ex, t, act_buf, mlp_out_buf, num_tokens)?;
-            }
-            FfnBlockWeights::Moe(_) | FfnBlockWeights::TieredMoe(_) => {
-                self.ffn.forward(
-                    &ex,
-                    &t.cublas,
-                    t.marlin_ws.addr(),
-                    t.marlin_ws.len_bytes / 4,
-                    normed_buf,
-                    mlp_out_buf,
-                    num_tokens,
-                    h_dim,
-                    local_interm,
-                    gate_up_buf,
-                    act_buf,
-                    moe_router_logits_buf,
-                    moe_topk_weights_buf,
-                    moe_topk_ids_buf,
-                    moe_interm_buf,
-                    moe_sh_gu_buf,
-                    moe_sh_act_buf,
-                    moe_sh_out_buf,
-                    moe_sh_gate_buf,
-                )?;
-            }
-        }
-        if let Some(comm) = tp2 {
-            comm.all_reduce_residual_gemma_rms_norm_f16(
-                &ex,
-                mlp_out_buf,
-                0,
-                residual_buf,
-                self.norms[4],
-                self.batch_hidden.addr(),
-                0,
-                t.rank as i32,
-                num_tokens as i32,
-                h_dim as i32,
-                t.cfg.rms_norm_eps,
-                0,
-                0,
-            )?;
-        } else {
-            check_rc(
-                // SAFETY: mlp_out_buf and residual_buf are valid device buffers for num_tokens * h_dim half elements, self.norms[4] is valid norm weight, batch_hidden has capacity for num_tokens * h_dim half elements.
-                unsafe {
-                    ffi::w34_fused_add_gemma_rms_norm_f16(
-                        &ex,
-                        mlp_out_buf as *const c_void,
-                        residual_buf as *mut c_void,
-                        self.norms[4] as *const c_void,
-                        self.batch_hidden.addr() as *mut c_void,
-                        core::ptr::null(),
-                        num_tokens as i32,
-                        h_dim as i32,
-                        t.cfg.rms_norm_eps,
-                    )
-                },
-                "MTP final norm",
-            )?;
-        }
-        let last_hidden_ptr = self.batch_hidden.addr() + ((num_tokens - 1) * h_dim * 2) as u64;
-        check_rc(
-            // SAFETY: hidden and last_hidden_ptr are valid device buffers with capacity for h_dim * 2 bytes on t.stream.
-            unsafe {
-                ffi::w34_memcpy_d2d_async(
-                    self.hidden.addr() as *mut c_void,
-                    last_hidden_ptr as *const c_void,
-                    h_dim * 2,
-                    t.stream.handle,
-                )
-            },
-            "MTP last hidden",
-        )?;
-        let sampled_id = if sample_last {
-            let logits_buf = self.scratch.alloc_aligned(t.local_vocab_size * 2)?;
-            Self::project(&t.lm_head, &ex, t, last_hidden_ptr, logits_buf, 1)?;
-            let out_id = self.scratch.alloc_aligned(4)?;
-            let local_id = self.scratch.alloc_aligned(4)?;
-            let local_val = self.scratch.alloc_aligned(4)?;
-            let global_val = self.scratch.alloc_aligned(4)?;
-            check_rc(
-                // SAFETY: logits_buf contains local_vocab_size valid half logits, output pointers have capacity for argmax results.
-                unsafe {
-                    ffi::w34_sampler_greedy_top5_f16(
-                        &ex,
-                        logits_buf as *const c_void,
-                        if tp2.is_some() { local_id } else { out_id } as *mut i32,
-                        core::ptr::null_mut(),
-                        if tp2.is_some() {
-                            local_val as *mut f32
-                        } else {
-                            core::ptr::null_mut()
-                        },
-                        1,
-                        t.local_vocab_size as i32,
-                        t.vocab_offset as i32,
-                    )
-                },
-                "MTP greedy",
-            )?;
-            if let Some(comm) = tp2 {
-                comm.all_gather_top1_f32_i32(
-                    &ex,
-                    local_val,
-                    local_id,
-                    global_val,
-                    out_id,
-                    t.rank as i32,
-                    1,
-                )?;
-            }
-            let mut out = [0i32];
-            check_rc(
-                // SAFETY: out has capacity for 1 i32 element (4 bytes), out_id is valid device memory of 4 bytes on t.stream.
-                unsafe {
-                    ffi::w34_memcpy_d2h_async(
-                        out.as_mut_ptr().cast(),
-                        out_id as *const c_void,
-                        4,
-                        t.stream.handle,
-                    )
-                },
-                "MTP greedy copy",
-            )?;
-            t.stream.synchronize()?;
-            Some(out[0])
-        } else {
-            if sync_stream {
-                t.stream.synchronize()?;
-            }
-            None
-        };
-        self.batch_hidden_rows = num_tokens;
-        self.len += num_tokens;
-        Ok(sampled_id)
-    }
-
-    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
-    fn forward_qwen4_inner(
-        &mut self,
-        target: &Qwen3_5ModelRank,
-        tokens: &[i32],
-        input_hidden: u64,
-        tp2: Option<&Tp2Collectives>,
-        sample_last: bool,
-        sync_stream: bool,
-        kv_only: bool,
-    ) -> Result<Option<i32>> {
-        let t = target;
-        if t.embed_tokens_ptr != self.target_embedding {
-            return Err(loader_err("MTP target rank mismatch"));
-        }
-        let num_tokens = tokens.len();
-        let span = num_tokens
-            .checked_mul(self.hidden_size)
-            .and_then(|n| n.checked_mul(2));
-        if num_tokens == 0
-            || num_tokens > self.max_batch_rows
-            || num_tokens > self.capacity - self.len
-            || tokens
-                .iter()
-                .any(|&id| id < 0 || id as usize >= t.cfg.vocab_size)
-            || input_hidden == 0
-            || !input_hidden.is_multiple_of(2)
-            || span
-                .and_then(|n| input_hidden.checked_add(n as u64))
-                .is_none()
-            || (t.tp_size == 2) != tp2.is_some()
-        {
-            return Err(loader_err("invalid MTP batch or input span"));
-        }
-        t.device.make_current()?;
-        self.scratch.reset();
-        let h_dim = t.cfg.hidden_size;
-        let hc_count = t.cfg.hc_count.max(1);
+        let hc_count = self.hidden_size / h_dim;
         let hc_lowrank = t.cfg.hc_lowrank.max(1);
         let head_dim = t.cfg.head_dim;
         let local_q_heads = t.cfg.num_attention_heads / t.tp_size;
@@ -2045,6 +1494,7 @@ impl Qwen3_5MtpRank {
         let embed = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
         let normed_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
         let fc_embed_buf = self.scratch.alloc_aligned(num_tokens * h_dim * 2)?;
+        let concat = self.scratch.alloc_aligned(num_tokens * 2 * h_dim * 2)?;
         let hc_norm_buf = self
             .scratch
             .alloc_aligned(num_tokens * hc_count * h_dim * 2)?;
@@ -2235,7 +1685,7 @@ impl Qwen3_5MtpRank {
             reserved: 0,
         };
 
-        // 1. Dual-stream `residual_linear_shared` fusion
+        // Predictor input fusion: concat-linear or dual-stream broadcast-add.
         check_rc(
             // SAFETY: token_ids_ptr contains num_tokens valid token IDs, embed_tokens_ptr is valid device memory.
             unsafe {
@@ -2250,81 +1700,121 @@ impl Qwen3_5MtpRank {
                     t.cfg.vocab_size as i32,
                 )
             },
-            "Qwen4 MTP embed",
+            "MTP embed",
         )?;
-        let q4 = self.qwen4.as_ref().unwrap();
-        check_rc(
-            // SAFETY: embed and normed_buf hold num_tokens * h_dim FP16 elements.
-            unsafe {
-                ffi::w34_gemma_rms_norm_f16(
+        match &self.input_fusion {
+            MtpInputFusion::ConcatLinear { fc } => {
+                for (input, weight, output) in [
+                    (embed, self.norms[0], normed_buf),
+                    (input_hidden, self.norms[1], hc_norm_buf),
+                ] {
+                    check_rc(
+                        // SAFETY: inputs and outputs contain num_tokens * h_dim FP16 elements.
+                        unsafe {
+                            ffi::w34_gemma_rms_norm_f16(
+                                &ex,
+                                input as *const c_void,
+                                weight as *const c_void,
+                                output as *mut c_void,
+                                core::ptr::null(),
+                                num_tokens as i32,
+                                h_dim as i32,
+                                t.cfg.rms_norm_eps,
+                            )
+                        },
+                        "MTP pre FC norm",
+                    )?;
+                }
+                check_rc(
+                    // SAFETY: concat has room for both normalized num_tokens * h_dim inputs.
+                    unsafe {
+                        ffi::w34_concat_cols_2_f16(
+                            &ex,
+                            normed_buf as *const c_void,
+                            hc_norm_buf as *const c_void,
+                            concat as *mut c_void,
+                            num_tokens as i32,
+                            h_dim as i32,
+                            h_dim as i32,
+                        )
+                    },
+                    "MTP concat",
+                )?;
+                Self::project(fc, &ex, t, concat, hc_residual_buf, num_tokens)?;
+            }
+            MtpInputFusion::DualStreamBroadcast {
+                fc_embedding,
+                fc_hidden,
+            } => {
+                check_rc(
+                    // SAFETY: embed and normed_buf hold num_tokens * h_dim FP16 elements.
+                    unsafe {
+                        ffi::w34_gemma_rms_norm_f16(
+                            &ex,
+                            embed as *const c_void,
+                            self.norms[0] as *const c_void,
+                            normed_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            h_dim as i32,
+                            t.cfg.rms_norm_eps,
+                        )
+                    },
+                    "MTP pre_fc_norm_embedding",
+                )?;
+                Self::project(fc_embedding, &ex, t, normed_buf, fc_embed_buf, num_tokens)?;
+                check_rc(
+                    // SAFETY: input_hidden and hc_norm_buf hold num_tokens * hc_count * h_dim FP16 elements.
+                    unsafe {
+                        ffi::w34_gemma_rms_norm_f16(
+                            &ex,
+                            input_hidden as *const c_void,
+                            self.norms[1] as *const c_void,
+                            hc_norm_buf as *mut c_void,
+                            core::ptr::null(),
+                            num_tokens as i32,
+                            (hc_count * h_dim) as i32,
+                            t.cfg.rms_norm_eps,
+                        )
+                    },
+                    "MTP pre_fc_norm_hidden",
+                )?;
+                Self::project(
+                    fc_hidden,
                     &ex,
-                    embed as *const c_void,
-                    q4.pre_fc_norm_embedding_ptr as *const c_void,
-                    normed_buf as *mut c_void,
-                    core::ptr::null(),
-                    num_tokens as i32,
-                    h_dim as i32,
-                    t.cfg.rms_norm_eps,
-                )
-            },
-            "Qwen4 MTP pre_fc_norm_embedding",
-        )?;
-        Self::project(
-            &q4.fc_embedding,
-            &ex,
-            t,
-            normed_buf,
-            fc_embed_buf,
-            num_tokens,
-        )?;
-        check_rc(
-            // SAFETY: input_hidden and hc_norm_buf hold num_tokens * hc_count * h_dim FP16 elements.
-            unsafe {
-                ffi::w34_gemma_rms_norm_f16(
-                    &ex,
-                    input_hidden as *const c_void,
-                    q4.pre_fc_norm_hidden_ptr as *const c_void,
-                    hc_norm_buf as *mut c_void,
-                    core::ptr::null(),
-                    num_tokens as i32,
-                    (hc_count * h_dim) as i32,
-                    t.cfg.rms_norm_eps,
-                )
-            },
-            "Qwen4 MTP pre_fc_norm_hidden",
-        )?;
-        Self::project(
-            &q4.fc_hidden,
-            &ex,
-            t,
-            hc_norm_buf,
-            hc_residual_buf,
-            num_tokens * hc_count,
-        )?;
-        check_rc(
-            // SAFETY: fc_embed_buf holds [num_tokens, h_dim] and hc_residual_buf holds [num_tokens * hc_count, h_dim].
-            unsafe {
-                ffi::w34_qwen4_mtp_broadcast_add_f16(
-                    &ex,
-                    fc_embed_buf as *const c_void,
-                    hc_residual_buf as *const c_void,
-                    hc_residual_buf as *mut c_void,
-                    num_tokens as i32,
-                    hc_count as i32,
-                    h_dim as i32,
-                )
-            },
-            "w34_qwen4_mtp_broadcast_add_f16",
-        )?;
+                    t,
+                    hc_norm_buf,
+                    hc_residual_buf,
+                    num_tokens * hc_count,
+                )?;
+                check_rc(
+                    // SAFETY: fc_embed_buf holds [num_tokens, h_dim] and hc_residual_buf holds [num_tokens * hc_count, h_dim].
+                    unsafe {
+                        ffi::w34_qwen4_mtp_broadcast_add_f16(
+                            &ex,
+                            fc_embed_buf as *const c_void,
+                            hc_residual_buf as *const c_void,
+                            hc_residual_buf as *mut c_void,
+                            num_tokens as i32,
+                            hc_count as i32,
+                            h_dim as i32,
+                        )
+                    },
+                    "w34_qwen4_mtp_broadcast_add_f16",
+                )?;
+            }
+        }
 
-        // 2. Pre-Attention HyperConnection mix
+        // Normalize / mix the residual before attention.
         let marlin_ws_ptr = t.marlin_ws.addr();
         let marlin_ws_ints = t.marlin_ws.len_bytes / 4;
-        q4.attn_hc.forward_mix(
+        self.residual.pre_attn(
+            0,
             &ex,
             &t.cublas,
             marlin_ws_ptr,
             marlin_ws_ints,
+            hc_residual_buf,
             hc_residual_buf,
             normed_buf,
             hc_inj_weights_buf,
@@ -2338,7 +1828,7 @@ impl Qwen3_5MtpRank {
             t.cfg.rms_norm_eps,
         )?;
 
-        // 3. QSA Full Attention
+        // Full attention, with optional QSA indexing and block selection.
         let fa = &self.fa;
         Self::project(&fa.qkv_proj, &ex, t, normed_buf, qkv_proj_buf, num_tokens)?;
         let qkv_row_stride = (q_gate_dim + 2 * kv_dim) as i32;
@@ -2374,7 +1864,7 @@ impl Qwen3_5MtpRank {
                     t.cfg.rms_norm_eps,
                 )
             },
-            "w34_fused_qk_rmsnorm_rope_gate_strided_f16 (Qwen4 MTP)",
+            "w34_fused_qk_rmsnorm_rope_gate_strided_f16 (MTP)",
         )?;
         let kv_bufs = &self.kv.layers[fa.kv_layer_ordinal];
         let kv_layout = &kv_bufs.layout;
@@ -2391,11 +1881,16 @@ impl Qwen3_5MtpRank {
                     qkv_row_stride,
                 )
             },
-            "w34_kv_cache_write_strided (Qwen4 MTP)",
+            "w34_kv_cache_write_strided (MTP)",
         )?;
-        let reuse_step0_topk =
-            q4.skip_topk && num_tokens == 1 && (self.len / 16 == q4.step0_page_idx);
+        let reuse_step0_topk = self.qsa.as_ref().is_some_and(|helpers| {
+            helpers.skip_topk && num_tokens == 1 && self.len / 16 == helpers.step0_page_idx
+        });
         if let Some(qsa) = &fa.qsa_indexer {
+            let qsa_ws = self
+                .qsa
+                .as_ref()
+                .ok_or_else(|| loader_err("missing MTP QSA helpers"))?;
             qsa.index_qk_proj.forward(
                 &ex,
                 &t.cublas,
@@ -2451,10 +1946,10 @@ impl Qwen3_5MtpRank {
                     qsa_q_buf,
                     comp_k_cache_ptr,
                     attn_batch,
-                    q4.qsa_sel_phys_buf.addr(),
-                    q4.qsa_sel_log_buf.addr(),
-                    q4.qsa_num_sel_buf.addr(),
-                    q4.qsa_seq_pos_buf.addr(),
+                    qsa_ws.qsa_sel_phys_buf.addr(),
+                    qsa_ws.qsa_sel_log_buf.addr(),
+                    qsa_ws.qsa_num_sel_buf.addr(),
+                    qsa_ws.qsa_seq_pos_buf.addr(),
                     t.cfg.indexer_n_heads,
                     t.cfg.indexer_head_dim,
                     16,
@@ -2476,19 +1971,23 @@ impl Qwen3_5MtpRank {
             && kv_layout.k_format == ffi::W34_KV_FORMAT_FP16
             && kv_layout.v_format == ffi::W34_KV_FORMAT_FP16
         {
+            let qsa_ws = self
+                .qsa
+                .as_ref()
+                .ok_or_else(|| loader_err("missing MTP QSA helpers"))?;
             let seq_pos_ptr = if reuse_step0_topk {
                 positions_ptr
             } else {
-                q4.qsa_seq_pos_buf.addr()
+                qsa_ws.qsa_seq_pos_buf.addr()
             };
             crate::ple::gpu_ops::qsa_sparse_paged_attn_f16(
                 &ex,
                 q_buf,
                 gate_buf,
                 kv_layout,
-                q4.qsa_sel_phys_buf.addr(),
-                q4.qsa_sel_log_buf.addr(),
-                q4.qsa_num_sel_buf.addr(),
+                qsa_ws.qsa_sel_phys_buf.addr(),
+                qsa_ws.qsa_sel_log_buf.addr(),
+                qsa_ws.qsa_num_sel_buf.addr(),
                 seq_pos_ptr,
                 0,
                 gated_attn_buf,
@@ -2511,7 +2010,7 @@ impl Qwen3_5MtpRank {
                         local_q_heads as i32,
                     )
                 },
-                "w34_paged_attention_f16 (Qwen4 MTP)",
+                "w34_paged_attention_f16 (MTP)",
             )?;
             check_rc(
                 // SAFETY: `attn_out_buf`, `gate_buf`, and `gated_attn_buf` are valid device
@@ -2527,7 +2026,7 @@ impl Qwen3_5MtpRank {
                         (local_q_heads * head_dim) as i32,
                     )
                 },
-                "w34_apply_attn_output_gate_f16 (Qwen4 MTP)",
+                "w34_apply_attn_output_gate_f16 (MTP)",
             )?;
         }
         Self::project(
@@ -2538,32 +2037,15 @@ impl Qwen3_5MtpRank {
             block_out_buf,
             num_tokens,
         )?;
-        if let Some(comm) = tp2 {
-            comm.all_reduce_f16(
-                &ex,
-                block_out_buf,
-                block_out_buf,
-                t.rank as i32,
-                (num_tokens * h_dim) as i32,
-            )?;
-        }
-
-        // 4. Post-Attention HC combine + Pre-MLP HC mix
-        let q4 = self.qwen4.as_ref().unwrap();
-        q4.attn_hc.forward_combine(
-            &ex,
-            block_out_buf,
-            hc_inj_weights_buf,
-            hc_residual_buf,
-            num_tokens,
-            hc_count,
-            h_dim,
-        )?;
-        q4.mlp_hc.forward_mix(
+        self.residual.post_attn_pre_mlp(
             &ex,
             &t.cublas,
             marlin_ws_ptr,
             marlin_ws_ints,
+            tp2,
+            t.rank,
+            block_out_buf,
+            hc_residual_buf,
             hc_residual_buf,
             normed_buf,
             hc_inj_weights_buf,
@@ -2575,30 +2057,55 @@ impl Qwen3_5MtpRank {
             hc_lowrank,
             h_dim,
             t.cfg.rms_norm_eps,
+            false,
         )?;
 
-        // 5. MLP / MoE
-        self.ffn.forward(
-            &ex,
-            &t.cublas,
-            marlin_ws_ptr,
-            marlin_ws_ints,
-            normed_buf,
-            mlp_out_buf,
-            num_tokens,
-            h_dim,
-            local_interm,
-            gate_up_buf,
-            act_buf,
-            moe_router_logits_buf,
-            moe_topk_weights_buf,
-            moe_topk_ids_buf,
-            moe_interm_buf,
-            moe_sh_gu_buf,
-            moe_sh_act_buf,
-            moe_sh_out_buf,
-            moe_sh_gate_buf,
-        )?;
+        // Keep the concat predictor's donor-compatible cuBLAS dense FFN path.
+        if let FfnBlockWeights::Dense {
+            gate_up_proj,
+            down_proj,
+        } = &self.ffn
+            && matches!(self.input_fusion, MtpInputFusion::ConcatLinear { .. })
+        {
+            Self::project(gate_up_proj, &ex, t, normed_buf, gate_up_buf, num_tokens)?;
+            check_rc(
+                // SAFETY: gate_up_buf and act_buf contain num_tokens rows of 2*local_interm and local_interm FP16 elements.
+                unsafe {
+                    ffi::w34_silu_and_mul_f16(
+                        &ex,
+                        gate_up_buf as *const c_void,
+                        act_buf as *mut c_void,
+                        core::ptr::null(),
+                        num_tokens as i32,
+                        local_interm as i32,
+                    )
+                },
+                "w34_silu_and_mul_f16",
+            )?;
+            Self::project(down_proj, &ex, t, act_buf, mlp_out_buf, num_tokens)?;
+        } else {
+            self.ffn.forward(
+                &ex,
+                &t.cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                normed_buf,
+                mlp_out_buf,
+                num_tokens,
+                h_dim,
+                local_interm,
+                gate_up_buf,
+                act_buf,
+                moe_router_logits_buf,
+                moe_topk_weights_buf,
+                moe_topk_ids_buf,
+                moe_interm_buf,
+                moe_sh_gu_buf,
+                moe_sh_act_buf,
+                moe_sh_out_buf,
+                moe_sh_gate_buf,
+            )?;
+        }
         let tiered_info = match &self.ffn {
             FfnBlockWeights::TieredMoe(tmoe) => Some((
                 tmoe.top_k,
@@ -2616,8 +2123,7 @@ impl Qwen3_5MtpRank {
             _ => None,
         };
         if let Some((top_k, sh_out_ptr, sh_gate_ptr)) = tiered_info
-            && let Some(q4_mut) = &mut self.qwen4
-            && let Some((store, cache, ws)) = &mut q4_mut.tiered_moe
+            && let Some((store, cache, ws)) = &mut self.tiered_moe
         {
             if num_tokens * top_k <= cache.slots.capacity && store.mapped_dev_ptr() != 0 {
                 crate::moe_offload::TieredMoeEngine::execute_layer_device_lru(
@@ -2648,7 +2154,7 @@ impl Qwen3_5MtpRank {
                             t.stream.handle,
                         )
                     },
-                    "Qwen4 MTP h_ids",
+                    "MTP h_ids",
                 )?;
                 check_rc(
                     // SAFETY: `h_weights` and `moe_topk_weights_buf` hold `pairs` f32 elements.
@@ -2660,7 +2166,7 @@ impl Qwen3_5MtpRank {
                             t.stream.handle,
                         )
                     },
-                    "Qwen4 MTP h_weights",
+                    "MTP h_weights",
                 )?;
                 t.stream.synchronize()?;
                 crate::moe_offload::TieredMoeEngine::execute_layer(
@@ -2682,40 +2188,39 @@ impl Qwen3_5MtpRank {
                 )?;
             }
         }
-        if let Some(comm) = tp2 {
-            comm.all_reduce_f16(
-                &ex,
-                mlp_out_buf,
-                mlp_out_buf,
-                t.rank as i32,
-                (num_tokens * h_dim) as i32,
-            )?;
-        }
-
-        // 6. Post-MLP HC combine -> `multi_hidden` `[num_tokens, hc_count * h_dim]`
-        let q4 = self.qwen4.as_ref().unwrap();
-        q4.mlp_hc.forward_combine(
+        self.residual.post_mlp(
             &ex,
+            tp2,
+            t.rank,
             mlp_out_buf,
-            hc_inj_weights_buf,
             hc_residual_buf,
+            hc_residual_buf,
+            hc_inj_weights_buf,
+            self.final_residual.single_stream_norm_ptr().unwrap_or(0),
+            self.batch_hidden.addr(),
+            0,
+            0,
+            0,
             num_tokens,
             hc_count,
             h_dim,
+            t.cfg.rms_norm_eps,
         )?;
         let multi_row_bytes = hc_count * h_dim * 2;
-        check_rc(
-            // SAFETY: batch_hidden and hc_residual_buf hold num_tokens * multi_row_bytes.
-            unsafe {
-                ffi::w34_memcpy_d2d_async(
-                    self.batch_hidden.addr() as *mut c_void,
-                    hc_residual_buf as *const c_void,
-                    num_tokens * multi_row_bytes,
-                    t.stream.handle,
-                )
-            },
-            "Qwen4 MTP batch_hidden copy",
-        )?;
+        if self.final_residual.is_hyper_connection() {
+            check_rc(
+                // SAFETY: batch_hidden and hc_residual_buf hold num_tokens * multi_row_bytes.
+                unsafe {
+                    ffi::w34_memcpy_d2d_async(
+                        self.batch_hidden.addr() as *mut c_void,
+                        hc_residual_buf as *const c_void,
+                        num_tokens * multi_row_bytes,
+                        t.stream.handle,
+                    )
+                },
+                "MTP batch_hidden copy",
+            )?;
+        }
         let last_multi_ptr = self.batch_hidden.addr() + ((num_tokens - 1) * multi_row_bytes) as u64;
         check_rc(
             // SAFETY: self.hidden and last_multi_ptr hold multi_row_bytes.
@@ -2727,19 +2232,21 @@ impl Qwen3_5MtpRank {
                     t.stream.handle,
                 )
             },
-            "Qwen4 MTP last multi_hidden copy",
+            "MTP last multi_hidden copy",
         )?;
 
-        // 7. Collapse `last_multi_ptr` `[1, hc_count * h_dim]` -> `normed_buf` `[1, h_dim]` via `final_hc_mixer`
+        // Collapse multi-stream residuals only for the LM head. Single-stream
+        // post_mlp has already written the final-normalized recurrent hidden.
         let sampled_id = if sample_last {
-            q4.final_hc_mixer.forward_mix(
+            self.final_residual.finish_stack(
                 &ex,
+                &t.stream,
                 &t.cublas,
                 marlin_ws_ptr,
                 marlin_ws_ints,
                 last_multi_ptr,
                 normed_buf,
-                0,
+                None,
                 hc_scratch_a,
                 hc_scratch_b,
                 hc_scratch_c,
@@ -2750,7 +2257,12 @@ impl Qwen3_5MtpRank {
                 t.cfg.rms_norm_eps,
             )?;
             let logits_buf = self.scratch.alloc_aligned(t.local_vocab_size * 2)?;
-            Self::project(&t.lm_head, &ex, t, normed_buf, logits_buf, 1)?;
+            let lm_input = if self.final_residual.is_hyper_connection() {
+                normed_buf
+            } else {
+                last_multi_ptr
+            };
+            Self::project(&t.lm_head, &ex, t, lm_input, logits_buf, 1)?;
             let out_id = self.scratch.alloc_aligned(4)?;
             let local_id = self.scratch.alloc_aligned(4)?;
             let local_val = self.scratch.alloc_aligned(4)?;
@@ -2774,7 +2286,7 @@ impl Qwen3_5MtpRank {
                         t.vocab_offset as i32,
                     )
                 },
-                "Qwen4 MTP greedy",
+                "MTP greedy",
             )?;
             if let Some(comm) = tp2 {
                 comm.all_gather_top1_f32_i32(
@@ -2798,7 +2310,7 @@ impl Qwen3_5MtpRank {
                         t.stream.handle,
                     )
                 },
-                "Qwen4 MTP greedy copy",
+                "MTP greedy copy",
             )?;
             t.stream.synchronize()?;
             Some(out[0])

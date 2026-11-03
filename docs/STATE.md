@@ -21,7 +21,7 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
   - **`QF-3` (48-Layer `Qwen4Exp` Spine, `StateBundlePool`, `KvPool`, `MambaRadixCache`, `CUDAGraphRunner`)**: Assembled the 48-layer `3:1` `GDN:QSA` spine with `PLE` (`ple_conv_state_buf` + `ple_history_tokens` in `StateBundlePool`, `qsa_raw_k_buf` + `qsa_comp_k_buf` in `KvPool`), `MambaRadixCache` prefix reuse, and CUDA Graph capture/replay. Verified on `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`:
     - `TP=1` (1× RTX 3090 Ti): `26.9–30.1 tok/s` decode (`" Paris, which is also the largest city in the country..."`), `MambaRadixCache` 64-token prefix reuse bit-identical (`1543.00 ms -> 347.32 ms` TTFT).
     - `TP=2 / EP=2` (2× RTX 3090 Ti): `41.95–42.31 tok/s` decode (`20.81 ms` TTFT), `MambaRadixCache` 64-token prefix reuse bit-identical (`654.10 ms -> 21.49 ms` TTFT, matching `TP=1` token-for-token `ids=[760, 6511, 314, 9338, 369, 760, 6511, 314]`).
-  - **`QF-4` (Native `Qwen4` `MTP` Speculative Decoding)**: Implemented `Qwen4MtpSubsystems` and `forward_qwen4_inner` in `crates/w34-host/src/mtp.rs` with dual-stream `residual_linear_shared` (`pre_fc_norm_embedding` + `fc_embedding` + `pre_fc_norm_hidden` `[hc_count * H]` + `fc_hidden` + `w34_qwen4_mtp_broadcast_add_f16`), 1-layer `HC + QSA + MoE + final_hc_mixer`, and QSA step-0 top-k block index reuse (`skip_topk = step > 0`), verified losslessly on `TP=1` and `TP=2 / EP=2` in `crates/w34-host/tests/qwen4_flash_next.rs`.
+  - **`QF-4` (Native `Qwen4` `MTP` Speculative Decoding)**: Implemented native HC MTP (now composed through `MtpInputFusion` and the shared `forward_inner`) in `crates/w34-host/src/mtp.rs` with dual-stream `residual_linear_shared` (`pre_fc_norm_embedding` + `fc_embedding` + `pre_fc_norm_hidden` `[hc_count * H]` + `fc_hidden` + `w34_qwen4_mtp_broadcast_add_f16`), 1-layer `HC + QSA + MoE + final_hc_mixer`, and QSA step-0 top-k block index reuse (`skip_topk = step > 0`), verified losslessly on `TP=1` and `TP=2 / EP=2` in `crates/w34-host/tests/qwen4_flash_next.rs`.
   - **`QF-5` (Next Performance Milestones vs. Reference Headline Numbers — documented in [`QWEN_FLASH_NEXT.md` §5](QWEN_FLASH_NEXT.md#5-current-baseline-vs-reference-headline-numbers--next-performance-milestones-qf-5))**:
     - Current real-checkpoint measurements (`26.9–30.1 tok/s` on `TP=1`, `41.95–42.31 tok/s` on `TP=2 / EP=2`) reflect cold, un-speculated (`M=1` target-only) 16-token runs, matching the reference un-speculated cold/static hillclimb (`34.7–49.8 tok/s`).
     - To reach and beat the reference `MTP-3` + warm-cache headline numbers (`43–51 tok/s` on `1× 3090`, `84–111.5 tok/s` on `2× 3090`):
@@ -31,6 +31,41 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
       4. Add optional `MTP` draft `lm_head` active-vocabulary range filtering (`[[0, 65536], [248044, 248320]]`).
 
 ---
+
+## Composable Qwen architecture refactor
+
+- Target device-batch and selected-row execution now share one `run_layer_stack`;
+  MTP uses one `forward_inner` with `MtpInputFusion::{ConcatLinear,
+  DualStreamBroadcast}`. `LayerResidual` and `FinalResidual` replace optional HC
+  fields and sentinel normalization pointers while retaining single-stream fused
+  residual/norm collectives and GDN auxiliary-stream overlap.
+- PLE staging is bundled in `PleRankRuntime`; PLE, QSA, and tiered-MoE dispatch
+  compose independently of residual topology. Tiered residency remains restricted
+  to the supported Qwen4 checkpoint family, not inferred from expert count.
+- PLE scratch is reserved even for single-stream residuals. Single-token, batched,
+  pipelined, and verify graph routing check mapped hot-cache capacity, and tiered
+  dispatch rejects unsafe capture. Heap-backed stores fall back to eager execution.
+- Review fixes narrowed tiered residency, corrected PLE scratch allocation, and
+  guarded graph routing. The follow-up review's fixed-2048-row PLE staging
+  suggestion is deferred: the existing diagnostic/custom-position size limit is
+  unchanged; growing or chunking those paths is outside this refactor.
+- Verification: CPU suite, `check-quick`, full `mise run check`, and both
+  `qwen4_flash_next` tests (`test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph`
+  and the ignored real 48-layer `test_qwen4_exp_real_checkpoint_tp1_and_tp2`) pass.
+  Also resolved the pre-existing `TP=1` vs. `TP=2 / EP=2` divergence on
+  `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`:
+  1. `moe_sparse_vec4_kernel` (`crates/w34-kernels/csrc/ops/op_moe.cu`) previously computed
+     `lpr = min(32, K >> 5)`, which produced a non-power-of-two `lpr = 20` on
+     `Qwen3.8-Flash-Next`'s down-projection (`K = n_interm = 640`), breaking
+     `sub_lane = lane & (lpr - 1)` and `rpw = 32 / lpr` whenever `M in 4..=7` and
+     `M * top_k <= k_hot`. Clamping `sparse_vec4_lpr` to `{4, 8, 16, 32}` dropped
+     Layer 0 `TP=1` vs. `TP=2` `max_abs_diff` from `0.063751` to `0.000122` (1 FP16 ULP)
+     and made both the 16-token short-prompt generation (`" Paris. The capital of Germany is Berlin. The capital of Italy is Rome."`)
+     and the 70-token `MambaRadixCache` generation (`[760, 6511, 314, 9338, 369, 760, 6511, 314]`)
+     match 100% token-for-token between `TP=1` and `TP=2 / EP=2`.
+  2. Recorded `compute_done_events[buf_idx]` at the end of `TieredMoeWorkspace::stage_experts_to_slots`
+     and raised `MAX_PROCESS_PINNED_BYTES` to `64 GiB` in `crates/w34-host/src/moe_offload.rs` so
+     all 48 layers (`58.01 GiB`) receive mapped zero-copy backing on 128 GiB hosts.
 
 ## Public GitHub publication and Git LFS
 

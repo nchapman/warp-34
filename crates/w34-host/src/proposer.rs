@@ -85,11 +85,7 @@ impl NativeProposer {
             return Err(loader_err("insufficient speculative context capacity"));
         }
         let h = engine.cfg.hidden_size;
-        let mtp_row_bytes = if engine.cfg.is_qwen4_exp() {
-            engine.cfg.hc_count.max(1) * h * 2
-        } else {
-            h * 2
-        };
+        let mtp_row_bytes = engine.cfg.hyper_hidden_size() * 2;
         let use_graph = engine.use_cuda_graph;
         let (ranks, taps, k, row_bytes) = match config.kind {
             SpeculativeKind::Mtp => {
@@ -98,7 +94,7 @@ impl NativeProposer {
                     .iter()
                     .map(|t| {
                         let mut r = Qwen3_5MtpRank::load(t, &engine.model_dir, capacity)?;
-                        r.use_cuda_graph = use_graph && !engine.cfg.is_qwen4_exp();
+                        r.use_cuda_graph = use_graph && r.supports_cuda_graph();
                         Ok(r)
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -569,7 +565,10 @@ impl NativeProposer {
                 Ok(ids)
             }
             Ranks::Mtp(rs) => {
-                if self.current.is_none() && engine.use_cuda_graph && !engine.cfg.is_qwen4_exp() {
+                if self.current.is_none()
+                    && engine.use_cuda_graph
+                    && rs.iter().all(Qwen3_5MtpRank::supports_cuda_graph)
+                {
                     use crate::coordinated::{ReplayPhase, replay_ranks};
                     let row_bytes = self.row_bytes;
                     let before = self.processed;
@@ -689,10 +688,10 @@ impl NativeProposer {
         let comm = engine.tp2_comm.as_deref();
         match &mut self.ranks {
             Ranks::Mtp(rs) => {
-                let mtp_graph = use_graph && !engine.cfg.is_qwen4_exp();
                 for r in rs.iter_mut() {
-                    r.use_cuda_graph = mtp_graph;
+                    r.use_cuda_graph = use_graph && r.supports_cuda_graph();
                 }
+                let mtp_graph = use_graph && rs.iter().all(|r| r.supports_cuda_graph());
                 let outputs = if mtp_graph {
                     use crate::coordinated::{ReplayPhase, replay_ranks};
                     let replay_res = replay_ranks(rs.len(), |phase, rank| {

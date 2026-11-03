@@ -96,7 +96,7 @@ fn layer_scratch_layout(
     }
     let overflow = || loader_err("layer scratch layout overflow");
     let mul = |a: usize, b: usize| a.checked_mul(b).ok_or_else(overflow);
-    let moe = if cfg.is_qwen4_exp() {
+    let moe = if cfg.uses_tiered_moe() {
         cfg.moe_intermediate_size
     } else {
         cfg.moe_intermediate_size / tp
@@ -115,6 +115,7 @@ fn layer_scratch_layout(
             shared: cfg.shared_expert_intermediate_size / tp,
             hidden: cfg.hidden_size,
             hc_count: cfg.hc_count,
+            uses_ple: cfg.uses_ple(),
             indexer_head_dim: cfg.indexer_head_dim,
         },
         tokens,

@@ -176,7 +176,7 @@ impl Qwen3_5Engine {
                 .saturating_add(crate::clef::ClefJointHeadGpu::reserved_rank0_headroom_bytes(head));
         }
 
-        let qwen4_shared = if cfg.is_qwen4_exp() {
+        let ple_shared = if cfg.uses_ple() {
             let ple_abs_id = cfg.ple_layer_ids.first().copied().unwrap_or(2);
             let ple_layer_idx = ple_abs_id.saturating_sub(1);
             let ple_hasher = Arc::new(
@@ -203,8 +203,11 @@ impl Qwen3_5Engine {
                 kv_policy,
                 rank_capacity,
             )?;
-            if let Some((ref hasher, ref table)) = qwen4_shared {
-                rank_model.init_qwen4_subsystems(&archive, hasher.clone(), table.clone())?;
+            if cfg.uses_tiered_moe() {
+                rank_model.init_tiered_moe(&archive)?;
+            }
+            if let Some((ref hasher, ref table)) = ple_shared {
+                rank_model.init_ple(hasher.clone(), table.clone())?;
             }
             ranks.push(rank_model);
         }

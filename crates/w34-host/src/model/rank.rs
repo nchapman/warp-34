@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Shared PLE lookup data and rank-local staging buffers.
+#[cfg(feature = "cuda")]
+pub struct PleRankRuntime {
+    pub hasher: Arc<crate::ple::PleNgramHasher>,
+    pub mmap_table: Arc<crate::ple::PleMmapTable>,
+    pub f8_staging_dev: DeviceBuffer,
+    pub f8_host_scratch: Vec<u8>,
+    pub ids_scratch: Vec<i64>,
+}
+
 /// One rank of a Qwen 3.5 / 3.8 model resident on a single GPU.
 #[cfg(feature = "cuda")]
 pub struct Qwen3_5ModelRank {
@@ -16,7 +26,7 @@ pub struct Qwen3_5ModelRank {
     pub batch_meta_arena: DeviceArena,
     pub marlin_ws: DeviceBuffer,
     pub embed_tokens_ptr: u64,
-    pub final_norm_ptr: u64,
+    pub final_residual: FinalResidual,
     pub lm_head: LinearProj,
     pub local_vocab_size: usize,
     pub vocab_offset: usize,
@@ -49,13 +59,8 @@ pub struct Qwen3_5ModelRank {
     pub pending_visual_splice: Option<(u64, u64, usize)>,
     pub last_norm_hidden_ptr: u64,
     pub last_norm_hidden_rows: usize,
-    pub final_hc_mixer: Option<HcBlockWeights>,
     pub tiered_moe: Option<crate::moe_offload::RankTieredMoe>,
-    pub ple_hasher: Option<Arc<crate::ple::PleNgramHasher>>,
-    pub ple_mmap_table: Option<Arc<crate::ple::PleMmapTable>>,
-    pub ple_f8_staging_dev: Option<DeviceBuffer>,
-    pub ple_f8_host_scratch: Vec<u8>,
-    pub ple_ids_scratch: Vec<i64>,
+    pub ple_runtime: Option<PleRankRuntime>,
     pub is_capturing_graph: bool,
 }
 
@@ -238,7 +243,7 @@ impl Qwen3_5ModelRank {
                 || name.ends_with(".weight_g_idx")
                 || name.ends_with(".weight_shape")
                 || (name.ends_with(".qzeros") && !cfg.quant.expects_zero_points())
-                || (cfg.is_qwen4_exp() && name.contains(".experts."))
+                || (cfg.uses_tiered_moe() && name.contains(".experts."))
                 || (name.contains(".ple_embedding.") && !name.ends_with(".weight_scale"))
             {
                 continue;
@@ -482,9 +487,9 @@ impl Qwen3_5ModelRank {
         let embed_f16 = Self::load_embed_tokens_f16(archive, cfg)?;
         let embed_tokens_ptr = weight_arena.upload_slice(&embed_f16, &stream)?;
 
-        // 2. final norm or Qwen4 final HyperConnection mixer
-        let (final_norm_ptr, final_hc_mixer) = if cfg.is_qwen4_exp() {
-            let hc = load_hc_block_weights(
+        // 2. final norm or multi-stream HyperConnection mixer
+        let final_residual = if cfg.uses_hyper_connection() {
+            let mixer = load_hc_block_weights(
                 archive,
                 cfg,
                 "model.hyper_connection_mixer",
@@ -493,7 +498,7 @@ impl Qwen3_5ModelRank {
                 &stream,
                 &repack_staging,
             )?;
-            (0u64, Some(hc))
+            FinalResidual::HyperConnection { mixer }
         } else {
             let norm_key = archive
                 .resolve_name("model.norm.weight")
@@ -501,7 +506,9 @@ impl Qwen3_5ModelRank {
             let norm_f16 = archive
                 .read_f16_bits(&norm_key)
                 .map_err(|_| loader_err("read model.norm.weight"))?;
-            (weight_arena.upload_slice(&norm_f16, &stream)?, None)
+            FinalResidual::SingleStream {
+                norm_ptr: weight_arena.upload_slice(&norm_f16, &stream)?,
+            }
         };
 
         // 3. lm_head (sharded along vocab N across TP ranks)
@@ -548,9 +555,7 @@ impl Qwen3_5ModelRank {
 
         for layer_id in 0..cfg.num_hidden_layers {
             let pfx = format!("model.layers.{layer_id}");
-            let (input_layernorm_ptr, post_attention_layernorm_ptr, attn_hc, mlp_hc, ple) = if cfg
-                .is_qwen4_exp()
-            {
+            let residual = if cfg.uses_hyper_connection() {
                 let attn_hc = load_hc_block_weights(
                     archive,
                     cfg,
@@ -569,19 +574,7 @@ impl Qwen3_5ModelRank {
                     &stream,
                     &repack_staging,
                 )?;
-                let ple = if cfg.ple_layer_ids.contains(&(layer_id + 1)) {
-                    Some(load_ple_layer_weights(
-                        archive,
-                        cfg,
-                        &pfx,
-                        &mut weight_arena,
-                        &stream,
-                        &repack_staging,
-                    )?)
-                } else {
-                    None
-                };
-                (0u64, 0u64, Some(attn_hc), Some(mlp_hc), ple)
+                LayerResidual::HyperConnection { attn_hc, mlp_hc }
             } else {
                 let in_ln_key = archive
                     .resolve_name(&format!("{pfx}.input_layernorm.weight"))
@@ -598,13 +591,22 @@ impl Qwen3_5ModelRank {
                     .read_f16_bits(&post_ln_key)
                     .map_err(|_| loader_err("read post_attention_layernorm"))?;
                 let post_attention_layernorm_ptr = weight_arena.upload_slice(&post_ln, &stream)?;
-                (
+                LayerResidual::SingleStream {
                     input_layernorm_ptr,
                     post_attention_layernorm_ptr,
-                    None,
-                    None,
-                    None,
-                )
+                }
+            };
+            let ple = if cfg.uses_ple() && cfg.ple_layer_ids.contains(&(layer_id + 1)) {
+                Some(load_ple_layer_weights(
+                    archive,
+                    cfg,
+                    &pfx,
+                    &mut weight_arena,
+                    &stream,
+                    &repack_staging,
+                )?)
+            } else {
+                None
             };
 
             let block = match cfg.layer_types[layer_id] {
@@ -662,7 +664,7 @@ impl Qwen3_5ModelRank {
                         .map_err(|_| loader_err("read k_norm"))?;
                     let k_norm_ptr = weight_arena.upload_slice(&k_norm, &stream)?;
 
-                    let qsa_indexer = if cfg.is_qwen4_exp() && cfg.indexer_head_dim > 0 {
+                    let qsa_indexer = if cfg.uses_qsa() {
                         Some(load_qsa_indexer_weights(
                             archive,
                             cfg,
@@ -820,7 +822,7 @@ impl Qwen3_5ModelRank {
                         .resolve_name(&format!("{pfx}.mlp.gate.qweight"))
                         .is_some());
 
-            let ffn = if is_moe_layer && cfg.is_qwen4_exp() {
+            let ffn = if is_moe_layer && cfg.uses_tiered_moe() {
                 FfnBlockWeights::TieredMoe(Box::new(load_tiered_moe_layer_weights(
                     archive,
                     cfg,
@@ -871,10 +873,7 @@ impl Qwen3_5ModelRank {
 
             layers.push(DecoderLayerWeights {
                 layer_id,
-                input_layernorm_ptr,
-                post_attention_layernorm_ptr,
-                attn_hc,
-                mlp_hc,
+                residual,
                 ple,
                 block,
                 ffn,
@@ -892,7 +891,7 @@ impl Qwen3_5ModelRank {
             let kb = crate::cache::kv_format_row_bytes(kf, cfg.head_dim);
             let vb = crate::cache::kv_format_row_bytes(vf, cfg.head_dim);
             bytes_per_kv_page_all_layers += local_kv_heads * block_size * (kb + vb);
-            if cfg.is_qwen4_exp() && cfg.indexer_head_dim > 0 {
+            if cfg.uses_qsa() {
                 let comp_rows = block_size / cfg.indexer_compress_ratio.max(1);
                 bytes_per_kv_page_all_layers +=
                     cfg.indexer_kv_heads * (block_size + comp_rows) * cfg.indexer_head_dim * 2;
@@ -900,7 +899,7 @@ impl Qwen3_5ModelRank {
         }
 
         let conv_dim = 2 * gdn_k_local + gdn_v_local;
-        let ple_slot_bytes = if cfg.is_qwen4_exp() {
+        let ple_slot_bytes = if cfg.uses_ple() {
             cfg.ple_layer_ids.len() * cfg.hc_count * cfg.hidden_size * 9 * 2
         } else {
             0
@@ -909,7 +908,7 @@ impl Qwen3_5ModelRank {
             * (conv_dim * (cfg.linear_conv_kernel_dim - 1) * 2
                 + local_v_heads * cfg.linear_value_head_dim * cfg.linear_key_head_dim * 4)
             + ple_slot_bytes;
-        let default_state_slots = if cfg.is_qwen4_exp() {
+        let default_state_slots = if cfg.uses_ple() {
             12usize
         } else if est_weight_bytes >= 17 * 1024 * 1024 * 1024 {
             10usize
@@ -927,7 +926,7 @@ impl Qwen3_5ModelRank {
         } else {
             crate::cuda::MIN_HEADROOM_BYTES
         };
-        let qwen4_moe_reserve = if cfg.is_qwen4_exp() {
+        let tiered_moe_reserve = if cfg.uses_tiered_moe() {
             // Reserve VRAM for TieredMoeEngine hot expert cache + staging buffers + PLE staging
             let hot_per_layer = if tp_size == 2 { 64usize } else { 48usize };
             let exp_bytes = 2_686_976usize;
@@ -936,7 +935,7 @@ impl Qwen3_5ModelRank {
             0
         };
         let required_headroom = base_headroom
-            .saturating_add(qwen4_moe_reserve)
+            .saturating_add(tiered_moe_reserve)
             .saturating_add(if rank == 0 {
                 capacity.rank0_extra_headroom_bytes
             } else {
@@ -993,7 +992,7 @@ impl Qwen3_5ModelRank {
             cfg.linear_key_head_dim,
             cfg.linear_value_head_dim,
         )?;
-        if cfg.is_qwen4_exp() {
+        if cfg.uses_ple() {
             state_pool.init_ple_state(
                 cfg.hc_count * cfg.hidden_size,
                 cfg.eos_token_ids.first().copied().unwrap_or(248044),
@@ -1022,7 +1021,7 @@ impl Qwen3_5ModelRank {
             capacity_plan.max_kv_pages_per_layer,
             kv_policy,
         )?;
-        if cfg.is_qwen4_exp() && cfg.indexer_head_dim > 0 {
+        if cfg.uses_qsa() {
             kv_pool.init_qsa_indexer_caches(cfg.indexer_head_dim, cfg.indexer_compress_ratio)?;
         }
 
@@ -1050,7 +1049,7 @@ impl Qwen3_5ModelRank {
             batch_meta_arena,
             marlin_ws,
             embed_tokens_ptr,
-            final_norm_ptr,
+            final_residual,
             lm_head,
             local_vocab_size,
             vocab_offset,
@@ -1082,24 +1081,23 @@ impl Qwen3_5ModelRank {
             pending_visual_splice: None,
             last_norm_hidden_ptr: 0,
             last_norm_hidden_rows: 0,
-            final_hc_mixer,
             tiered_moe: None,
-            ple_hasher: None,
-            ple_mmap_table: None,
-            ple_f8_staging_dev: None,
-            ple_f8_host_scratch: Vec::new(),
-            ple_ids_scratch: Vec::new(),
+            ple_runtime: None,
             is_capturing_graph: false,
         })
     }
 
-    /// Initializes Qwen4 (`qwen4_exp`) PLE n-gram hasher + mmap table and RankTieredMoe on this rank.
-    pub fn init_qwen4_subsystems(
-        &mut self,
-        archive: &SafetensorsArchive,
-        ple_hasher: Arc<crate::ple::PleNgramHasher>,
-        ple_mmap_table: Arc<crate::ple::PleMmapTable>,
-    ) -> Result<()> {
+    /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph.
+    pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
+        let top_k = self.cfg.num_experts_per_tok.max(1);
+        self.tiered_moe.as_ref().is_none_or(|tm| {
+            (0..self.layers.len())
+                .all(|li| num_tokens * top_k <= tm.layer_hot_k(li) && tm.layer_has_mapped_store(li))
+        })
+    }
+
+    /// Initializes expert residency independently of residual topology and PLE.
+    pub fn init_tiered_moe(&mut self, archive: &SafetensorsArchive) -> Result<()> {
         self.device.make_current()?;
         let local_experts = (self.cfg.num_experts / self.tp_size).max(1);
         let default_hot = if self.tp_size == 2 { 64usize } else { 48usize };
@@ -1118,24 +1116,38 @@ impl Qwen3_5ModelRank {
             32,
             &self.stream,
         )?;
+        self.tiered_moe = Some(tiered_moe);
+        Ok(())
+    }
+
+    /// Initializes shared PLE tables and rank-local staging independently of MoE.
+    pub fn init_ple(
+        &mut self,
+        ple_hasher: Arc<crate::ple::PleNgramHasher>,
+        ple_mmap_table: Arc<crate::ple::PleMmapTable>,
+    ) -> Result<()> {
+        self.device.make_current()?;
         // Pre-allocate 2048 rows * ple_embed_dim F8 staging buffer at a fixed device address
-        // so both eager forward and CUDA Graphs can read from `ple_f8_staging_dev.addr()`.
+        // so both eager forward and CUDA Graphs can read from `f8_staging_dev.addr()`.
         let max_ple_tokens = 2048usize;
         let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
-        let ple_f8_staging_dev = DeviceBuffer::alloc(
+        let f8_staging_dev = DeviceBuffer::alloc(
             self.device.device_id,
             max_ple_tokens * ple_row_bytes.max(2560),
         )?;
-        self.tiered_moe = Some(tiered_moe);
-        self.ple_hasher = Some(ple_hasher);
-        self.ple_mmap_table = Some(ple_mmap_table);
-        self.ple_f8_staging_dev = Some(ple_f8_staging_dev);
+        self.ple_runtime = Some(PleRankRuntime {
+            hasher: ple_hasher,
+            mmap_table: ple_mmap_table,
+            f8_staging_dev,
+            f8_host_scratch: Vec::new(),
+            ids_scratch: Vec::new(),
+        });
         Ok(())
     }
 
     /// Computes PLE n-gram hashes for a batch, updates `state_pool.ple_ngram_context` across
     /// `state_in`/`state_out`/`spec_state_indices`/`checkpoint_dst_indices`, gathers F8_E4M3 rows
-    /// from `PleMmapTable`, and uploads them asynchronously into `ple_f8_staging_dev`.
+    /// from `PleMmapTable`, and uploads them asynchronously into `ple_runtime.f8_staging_dev`.
     #[allow(clippy::too_many_arguments)]
     pub fn stage_ple_f8_for_batch(
         &mut self,
@@ -1150,20 +1162,16 @@ impl Qwen3_5ModelRank {
         checkpoint_token_offsets: &[i32],
         max_checkpoints_per_req: usize,
     ) -> Result<()> {
-        let (Some(hasher), Some(table), Some(staging_dev)) = (
-            &self.ple_hasher,
-            &self.ple_mmap_table,
-            &self.ple_f8_staging_dev,
-        ) else {
+        let Some(ple) = &mut self.ple_runtime else {
             return Ok(());
         };
         if input_ids.is_empty() {
             return Ok(());
         }
         let num_tokens = input_ids.len();
-        let num_heads = hasher.ngram_heads;
-        self.ple_ids_scratch.resize(num_tokens * num_heads, 0);
-        hasher.compute_ngram_ids_for_slots(
+        let num_heads = ple.hasher.ngram_heads;
+        ple.ids_scratch.resize(num_tokens * num_heads, 0);
+        ple.hasher.compute_ngram_ids_for_slots(
             input_ids,
             query_start_loc,
             state_in_indices,
@@ -1175,21 +1183,22 @@ impl Qwen3_5ModelRank {
             checkpoint_token_offsets,
             max_checkpoints_per_req,
             &mut self.state_pool.ple_ngram_context,
-            &mut self.ple_ids_scratch,
+            &mut ple.ids_scratch,
         );
         let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
-        self.ple_f8_host_scratch
-            .resize(num_tokens * ple_row_bytes, 0);
-        table.gather_f8(&self.ple_ids_scratch, &mut self.ple_f8_host_scratch);
+        ple.f8_host_scratch.resize(num_tokens * ple_row_bytes, 0);
+        ple.mmap_table
+            .gather_f8(&ple.ids_scratch, &mut ple.f8_host_scratch);
         self.device.make_current()?;
-        staging_dev.copy_from_host(&self.ple_f8_host_scratch, &self.stream)
+        ple.f8_staging_dev
+            .copy_from_host(&ple.f8_host_scratch, &self.stream)
     }
 
     pub(super) fn stage_ple_f8_for_decode_slices(
         &mut self,
         slices: &[EngineBatchSlice<'_>],
     ) -> Result<()> {
-        if !self.cfg.is_qwen4_exp() || slices.is_empty() {
+        if self.ple_runtime.is_none() || slices.is_empty() {
             return Ok(());
         }
         let n = slices.len();
@@ -1274,11 +1283,7 @@ impl Qwen3_5ModelRank {
             None
         };
         let last_final_hidden_f16 = if export_final_hidden {
-            let hc_mult = if self.cfg.is_qwen4_exp() {
-                self.cfg.hc_count.max(1)
-            } else {
-                1
-            };
+            let hc_mult = self.cfg.hc_count.max(1);
             let bytes = row_elems
                 .checked_mul(hc_mult)
                 .and_then(|n| n.checked_mul(2))

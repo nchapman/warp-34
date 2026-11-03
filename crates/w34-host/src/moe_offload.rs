@@ -295,7 +295,7 @@ mod host_store {
 
     impl HostPackStorage {
         fn alloc(bytes: usize, prefer_mapped: bool) -> Result<Self> {
-            const MAX_PROCESS_PINNED_BYTES: usize = 32 * 1024 * 1024 * 1024;
+            const MAX_PROCESS_PINNED_BYTES: usize = 64 * 1024 * 1024 * 1024;
             let cur = TOTAL_PINNED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
             if prefer_mapped
                 && cur.saturating_add(bytes) <= MAX_PROCESS_PINNED_BYTES
@@ -1124,7 +1124,8 @@ mod host_store {
                 self.d_stage_packs[buf_idx].addr(),
                 self.d_stage_slots[buf_idx].addr(),
                 n,
-            )
+            )?;
+            self.compute_done_events[buf_idx].record(stream)
         }
     }
 
@@ -2076,7 +2077,7 @@ mod tests {
         let stream = CudaStream::new(0).unwrap();
 
         let num_experts = 16usize;
-        let n_interm = 128usize;
+        let n_interm = 640usize;
         let k_hidden = 128usize;
         let group_size = 128usize;
         let top_k = 4usize;
@@ -2460,6 +2461,48 @@ mod tests {
             let mut h_ep2 = vec![0u16; num_tokens * k_hidden];
             d_out_r0.copy_to_host(&mut h_ep2, &stream).unwrap();
             assert_close_f16(&h_ep2, &format!("TP=2/EP=2 {mode:?}"));
+        }
+
+        // 6. Verify `M = 4` (`num_tokens * top_k = 16 <= num_experts = 16`, `regime == 1` `moe_sparse_vec4_kernel`)
+        //    with non-power-of-two `n_interm = 640` (`k_u4_per_row = 20`) against CPU reference.
+        {
+            let m4 = 4usize;
+            let mut tasks = Vec::with_capacity(m4 * top_k);
+            for tok in 0..m4 {
+                for k in 0..top_k {
+                    let idx = tok * top_k + k;
+                    tasks.push((tok, h_topk_ids[idx] as usize, h_topk_weights[idx]));
+                }
+            }
+            let h_cpu_m4 = full_store.eval_cold_tasks_cpu(&h_x[..m4 * k_hidden], m4, &tasks);
+            let d_out_m4 =
+                DeviceBuffer::alloc(0, m4 * k_hidden * std::mem::size_of::<u16>()).unwrap();
+            TieredMoeEngine::execute_layer_device_lru(
+                &full_store,
+                &mut full_cache,
+                &ws_oracle,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                0,
+                0,
+                d_out_m4.addr(),
+                m4,
+                top_k,
+            )
+            .unwrap();
+            let mut h_gpu_m4 = vec![0u16; m4 * k_hidden];
+            d_out_m4.copy_to_host(&mut h_gpu_m4, &stream).unwrap();
+            let max_diff = h_gpu_m4
+                .iter()
+                .zip(&h_cpu_m4)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1.6e-2,
+                "M=4 sparse_vec4 (n_interm=640) max_abs_diff={max_diff} exceeds 1.6e-2"
+            );
         }
         let _ = DeviceExpertSlotTable::alloc;
     }
