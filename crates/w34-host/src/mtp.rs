@@ -265,7 +265,7 @@ impl Qwen3_5MtpRank {
             .slice_cols(r * q / tp, (r + 1) * q / tp)
             .upload(&mut weights, &target.stream, &staging)?;
         let ffn = if is_tiered_moe_mtp {
-            FfnBlockWeights::TieredMoe(Box::new(load_tiered_moe_layer_weights(
+            FfnBlockWeights::Moe(Box::new(load_tiered_moe_layer_weights(
                 &archive,
                 c,
                 c.num_hidden_layers,
@@ -478,15 +478,18 @@ impl Qwen3_5MtpRank {
         let ffn_row_elements = match &ffn {
             FfnBlockWeights::Dense { .. } => 3 * (i / tp),
             FfnBlockWeights::Moe(moe) => {
+                let routed_interm =
+                    if matches!(moe.experts, crate::model::MoeExpertStorage::Tiered { .. }) {
+                        0
+                    } else {
+                        moe.top_k * moe.local_moe_interm
+                    };
                 moe.num_experts
                     + 4 * moe.top_k
-                    + moe.top_k * moe.local_moe_interm
+                    + routed_interm
                     + 3 * moe.local_shared_interm
                     + h
                     + 64
-            }
-            FfnBlockWeights::TieredMoe(tmoe) => {
-                tmoe.num_experts + 4 * tmoe.top_k + 3 * tmoe.local_shared_interm + h + 64
             }
         };
         let row_elements = (9 + 4 * hc_count) * h
@@ -841,47 +844,19 @@ impl Qwen3_5MtpRank {
                 } else {
                     0
                 };
+                let moe_interm =
+                    if matches!(moe.experts, crate::model::MoeExpertStorage::Tiered { .. }) {
+                        0
+                    } else {
+                        arena.alloc_aligned(moe.top_k * moe.local_moe_interm * 2)?
+                    };
                 (
                     0,
                     0,
                     arena.alloc_aligned(moe.num_experts * 2)?,
                     arena.alloc_aligned(moe.top_k * 4)?,
                     arena.alloc_aligned(moe.top_k * 4)?,
-                    arena.alloc_aligned(moe.top_k * moe.local_moe_interm * 2)?,
-                    sh_gu,
-                    sh_act,
-                    sh_out,
-                    sh_gate,
-                )
-            }
-            FfnBlockWeights::TieredMoe(tmoe) => {
-                let sh_gu = if tmoe.local_shared_interm > 0 {
-                    arena.alloc_aligned(2 * tmoe.local_shared_interm * 2)?
-                } else {
-                    0
-                };
-                let sh_act = if tmoe.local_shared_interm > 0 {
-                    arena.alloc_aligned(tmoe.local_shared_interm * 2)?
-                } else {
-                    0
-                };
-                let sh_out = if tmoe.local_shared_interm > 0 {
-                    arena.alloc_aligned(h_dim * 2)?
-                } else {
-                    0
-                };
-                let sh_gate = if tmoe.shared_expert_gate.is_some() {
-                    arena.alloc_aligned(2)?
-                } else {
-                    0
-                };
-                (
-                    0,
-                    0,
-                    arena.alloc_aligned(tmoe.num_experts * 2)?,
-                    arena.alloc_aligned(tmoe.top_k * 4)?,
-                    arena.alloc_aligned(tmoe.top_k * 4)?,
-                    0,
+                    moe_interm,
                     sh_gu,
                     sh_act,
                     sh_out,
@@ -1133,7 +1108,7 @@ impl Qwen3_5MtpRank {
                     )?;
                     Self::project(down_proj, &ex, t, act_buf, mlp_out_buf, 1)?;
                 }
-                FfnBlockWeights::Moe(_) | FfnBlockWeights::TieredMoe(_) => {
+                FfnBlockWeights::Moe(_) => {
                     self.ffn.forward(
                         &ex,
                         &t.cublas,
@@ -1597,6 +1572,13 @@ impl Qwen3_5MtpRank {
                 } else {
                     0
                 };
+                let moe_interm =
+                    if matches!(moe.experts, crate::model::MoeExpertStorage::Tiered { .. }) {
+                        0
+                    } else {
+                        self.scratch
+                            .alloc_aligned(num_tokens * moe.top_k * moe.local_moe_interm * 2)?
+                    };
                 (
                     0,
                     0,
@@ -1604,45 +1586,7 @@ impl Qwen3_5MtpRank {
                         .alloc_aligned(num_tokens * moe.num_experts * 2)?,
                     self.scratch.alloc_aligned(num_tokens * moe.top_k * 4)?,
                     self.scratch.alloc_aligned(num_tokens * moe.top_k * 4)?,
-                    self.scratch
-                        .alloc_aligned(num_tokens * moe.top_k * moe.local_moe_interm * 2)?,
-                    sh_gu,
-                    sh_act,
-                    sh_out,
-                    sh_gate,
-                )
-            }
-            FfnBlockWeights::TieredMoe(tmoe) => {
-                let sh_gu = if tmoe.local_shared_interm > 0 {
-                    self.scratch
-                        .alloc_aligned(num_tokens * 2 * tmoe.local_shared_interm * 2)?
-                } else {
-                    0
-                };
-                let sh_act = if tmoe.local_shared_interm > 0 {
-                    self.scratch
-                        .alloc_aligned(num_tokens * tmoe.local_shared_interm * 2)?
-                } else {
-                    0
-                };
-                let sh_out = if tmoe.local_shared_interm > 0 {
-                    self.scratch.alloc_aligned(num_tokens * h_dim * 2)?
-                } else {
-                    0
-                };
-                let sh_gate = if tmoe.shared_expert_gate.is_some() {
-                    self.scratch.alloc_aligned(num_tokens * 2)?
-                } else {
-                    0
-                };
-                (
-                    0,
-                    0,
-                    self.scratch
-                        .alloc_aligned(num_tokens * tmoe.num_experts * 2)?,
-                    self.scratch.alloc_aligned(num_tokens * tmoe.top_k * 4)?,
-                    self.scratch.alloc_aligned(num_tokens * tmoe.top_k * 4)?,
-                    0,
+                    moe_interm,
                     sh_gu,
                     sh_act,
                     sh_out,
@@ -2113,19 +2057,23 @@ impl Qwen3_5MtpRank {
             )?;
         }
         let tiered_info = match &self.ffn {
-            FfnBlockWeights::TieredMoe(tmoe) => Some((
-                tmoe.top_k,
-                if tmoe.shared_down_proj.is_some() {
-                    moe_sh_out_buf
-                } else {
-                    0
-                },
-                if tmoe.shared_expert_gate.is_some() {
-                    moe_sh_gate_buf
-                } else {
-                    0
-                },
-            )),
+            FfnBlockWeights::Moe(moe)
+                if matches!(moe.experts, crate::model::MoeExpertStorage::Tiered { .. }) =>
+            {
+                Some((
+                    moe.top_k,
+                    if moe.shared_down_proj.is_some() {
+                        moe_sh_out_buf
+                    } else {
+                        0
+                    },
+                    if moe.shared_expert_gate.is_some() {
+                        moe_sh_gate_buf
+                    } else {
+                        0
+                    },
+                ))
+            }
             _ => None,
         };
         if let Some((top_k, sh_out_ptr, sh_gate_ptr)) = tiered_info

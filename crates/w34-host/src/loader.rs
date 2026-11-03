@@ -740,6 +740,25 @@ impl QuantScheme {
             }
         )
     }
+
+    /// Returns the group size if this scheme uses symmetric 4-bit GPTQ-style `qweight` packing (`U4B8`).
+    pub fn symmetric_gptq_u4_group_size(&self) -> Option<usize> {
+        match self {
+            Self::Gptq {
+                bits: 4,
+                group_size,
+                sym: true,
+                ..
+            }
+            | Self::AutoRound {
+                bits: 4,
+                group_size,
+                sym: true,
+                awq_packing: false,
+            } if *group_size > 0 => Some(*group_size),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2053,10 +2072,47 @@ impl ModelConfig {
         self.ple_embed_dim > 0 && !self.ple_layer_ids.is_empty()
     }
 
+    /// Returns the `ExpertPackLayout` if this model's MoE geometry supports host/VRAM
+    /// tiered `U4B8` expert storage.
+    pub fn moe_expert_pack_layout(&self) -> Option<crate::moe_offload::ExpertPackLayout> {
+        if self.num_experts == 0 {
+            return None;
+        }
+        let group_size = self
+            .quant
+            .symmetric_gptq_u4_group_size()
+            .unwrap_or_else(|| self.quant.group_size_or(32));
+        crate::moe_offload::ExpertPackLayout::new(
+            self.moe_intermediate_size,
+            self.hidden_size,
+            group_size,
+        )
+        .ok()
+    }
+
+    /// Total byte footprint of all routed experts across all MoE decoder layers
+    /// when stored in symmetric `U4B8` `ExpertPackLayout` slots.
+    pub fn routed_expert_total_bytes(&self) -> usize {
+        let Some(layout) = self.moe_expert_pack_layout() else {
+            return 0;
+        };
+        let moe_layers = self
+            .num_hidden_layers
+            .saturating_sub(self.mlp_only_layers.len());
+        moe_layers
+            .saturating_mul(self.num_experts)
+            .saturating_mul(layout.stride)
+    }
+
     pub fn uses_tiered_moe(&self) -> bool {
-        // Residency is currently a checkpoint-family policy, not an expert-count
-        // heuristic: other families may use formats unsupported by the host store.
-        self.is_qwen4_exp() && self.num_experts > 0
+        // Use host/VRAM tiered MoE storage whenever the checkpoint uses a compatible
+        // symmetric U4B8 expert layout and either:
+        // - the total routed-expert footprint exceeds a single 24 GiB GPU budget (> 20 GiB), or
+        // - the model uses the Qwen4 high-expert-count architecture (including small synthetic test fixtures).
+        self.moe_expert_pack_layout().is_some()
+            && ((self.quant.symmetric_gptq_u4_group_size().is_some()
+                && self.routed_expert_total_bytes() > 20 * 1024 * 1024 * 1024)
+                || self.is_qwen4_exp())
     }
 
     pub fn qsa_output_width(&self) -> usize {
@@ -2533,6 +2589,19 @@ mod tests {
         cfg.num_experts = 512;
         assert!(!cfg.uses_tiered_moe());
         assert!(!cfg.is_qwen4_exp());
+        // A non-qwen4_exp model whose symmetric U4B8 routed experts exceed 20 GiB
+        // automatically selects tiered host/VRAM MoE storage.
+        cfg.num_hidden_layers = 36;
+        cfg.moe_intermediate_size = 640;
+        cfg.quant = QuantScheme::Gptq {
+            bits: 4,
+            group_size: 32,
+            sym: true,
+            desc_act: false,
+        };
+        assert!(cfg.uses_tiered_moe());
+        cfg.num_hidden_layers = 4;
+        assert!(!cfg.uses_tiered_moe());
         cfg.model_type = "qwen4_exp".into();
         assert!(cfg.uses_tiered_moe());
         assert!(!cfg.uses_hyper_connection());

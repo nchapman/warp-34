@@ -1,4 +1,4 @@
-//! Tiered routed-expert storage and execution for Qwen4Exp.
+//! Tiered routed-expert storage and execution (pinned host RAM + VRAM hot cache + EP).
 
 use std::io;
 use std::ops::Range;
@@ -371,9 +371,8 @@ mod host_store {
                 "invalid expert parallel partition",
             )?;
             require(
-                matches!(quant, QuantScheme::AutoRound { bits: 4, group_size, sym: true, awq_packing: false }
-                if *group_size == layout.group_size),
-                "host expert store requires symmetric GPTQ-packed AutoRound W4A16",
+                quant.symmetric_gptq_u4_group_size() == Some(layout.group_size),
+                "host expert store requires symmetric 4-bit GPTQ/AutoRound W4A16",
             )?;
             // Revalidate public geometry before using it to size or address unsafe storage.
             require(

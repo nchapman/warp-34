@@ -702,7 +702,7 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
                 .iter()
                 .find_map(|l| match &l.ffn {
                     FfnBlockWeights::Moe(_) => Some(&l.ffn),
-                    FfnBlockWeights::Dense { .. } | FfnBlockWeights::TieredMoe(_) => None,
+                    FfnBlockWeights::Dense { .. } => None,
                 })
                 .expect("35B-A3B checkpoint must have MoE layers");
             let FfnBlockWeights::Moe(moe) = ffn else {

@@ -823,7 +823,7 @@ impl Qwen3_5ModelRank {
                         .is_some());
 
             let ffn = if is_moe_layer && cfg.uses_tiered_moe() {
-                FfnBlockWeights::TieredMoe(Box::new(load_tiered_moe_layer_weights(
+                FfnBlockWeights::Moe(Box::new(load_tiered_moe_layer_weights(
                     archive,
                     cfg,
                     layer_id,
@@ -929,7 +929,7 @@ impl Qwen3_5ModelRank {
         let tiered_moe_reserve = if cfg.uses_tiered_moe() {
             // Reserve VRAM for TieredMoeEngine hot expert cache + staging buffers + PLE staging
             let hot_per_layer = if tp_size == 2 { 64usize } else { 48usize };
-            let exp_bytes = 2_686_976usize;
+            let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
             (cfg.num_hidden_layers * hot_per_layer + 512) * exp_bytes + 64 * 1024 * 1024
         } else {
             0
@@ -1106,6 +1106,10 @@ impl Qwen3_5ModelRank {
         } else {
             default_hot
         };
+        let group_size = self
+            .cfg
+            .moe_expert_pack_layout()
+            .map_or_else(|| self.cfg.quant.group_size_or(32), |l| l.group_size);
         let tiered_moe = crate::moe_offload::RankTieredMoe::load_for_rank(
             archive,
             &self.cfg,
@@ -1113,7 +1117,7 @@ impl Qwen3_5ModelRank {
             self.rank,
             self.tp_size,
             hot_per_layer,
-            32,
+            group_size,
             &self.stream,
         )?;
         self.tiered_moe = Some(tiered_moe);

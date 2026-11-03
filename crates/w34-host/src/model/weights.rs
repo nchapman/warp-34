@@ -2287,6 +2287,10 @@ pub enum MoeExpertStorage {
         gate_up_ptr: u64,
         down_ptr: u64,
     },
+    /// Host/VRAM tiered expert storage managed by `RankTieredMoe` (or MTP's tiered workspace).
+    Tiered {
+        layer_id: usize,
+    },
 }
 
 #[cfg(feature = "cuda")]
@@ -2305,27 +2309,12 @@ pub struct MoeLayerWeights {
 }
 
 #[cfg(feature = "cuda")]
-pub struct TieredMoeLayerWeights {
-    pub layer_id: usize,
-    pub router_gate: LinearProj,
-    pub num_experts: usize,
-    pub top_k: usize,
-    pub norm_topk_prob: bool,
-    pub scoring_func: i32,
-    pub shared_gate_up_proj: Option<LinearProj>,
-    pub shared_down_proj: Option<LinearProj>,
-    pub shared_expert_gate: Option<LinearProj>,
-    pub local_shared_interm: usize,
-}
-
-#[cfg(feature = "cuda")]
 pub enum FfnBlockWeights {
     Dense {
         gate_up_proj: LinearProj,
         down_proj: LinearProj,
     },
     Moe(Box<MoeLayerWeights>),
-    TieredMoe(Box<TieredMoeLayerWeights>),
 }
 
 #[cfg(feature = "cuda")]
@@ -2655,89 +2644,14 @@ impl FfnBlockWeights {
                             "w34_moe_f16_down_accum",
                         )
                     }
+                    MoeExpertStorage::Tiered { .. } => Ok(()),
                 }
-            }
-            Self::TieredMoe(tmoe) => {
-                tmoe.router_gate.forward(
-                    ex,
-                    cublas,
-                    marlin_ws_ptr,
-                    marlin_ws_ints,
-                    normed_buf,
-                    moe_router_logits_buf,
-                    num_tokens,
-                )?;
-                check_rc(
-                    // SAFETY: router projection precedes this on ex.stream.
-                    unsafe {
-                        ffi::w34_moe_topk_router_f16(
-                            ex,
-                            moe_router_logits_buf as *const c_void,
-                            moe_topk_weights_buf as *mut f32,
-                            moe_topk_ids_buf as *mut i32,
-                            num_tokens as i32,
-                            tmoe.num_experts as i32,
-                            tmoe.top_k as i32,
-                            i32::from(tmoe.norm_topk_prob),
-                            tmoe.scoring_func,
-                        )
-                    },
-                    "w34_moe_topk_router_f16 (tiered)",
-                )?;
-                if let (Some(sh_gu), Some(sh_dn)) =
-                    (&tmoe.shared_gate_up_proj, &tmoe.shared_down_proj)
-                {
-                    sh_gu.forward(
-                        ex,
-                        cublas,
-                        marlin_ws_ptr,
-                        marlin_ws_ints,
-                        normed_buf,
-                        moe_sh_gu_buf,
-                        num_tokens,
-                    )?;
-                    check_rc(
-                        // SAFETY: shared gate_up produced [M, 2*shared] FP16.
-                        unsafe {
-                            ffi::w34_silu_and_mul_f16(
-                                ex,
-                                moe_sh_gu_buf as *const c_void,
-                                moe_sh_act_buf as *mut c_void,
-                                core::ptr::null(),
-                                num_tokens as i32,
-                                tmoe.local_shared_interm as i32,
-                            )
-                        },
-                        "w34_silu_and_mul_f16 (tiered shared_expert)",
-                    )?;
-                    sh_dn.forward(
-                        ex,
-                        cublas,
-                        marlin_ws_ptr,
-                        marlin_ws_ints,
-                        moe_sh_act_buf,
-                        moe_sh_out_buf,
-                        num_tokens,
-                    )?;
-                    if let Some(sh_gate) = &tmoe.shared_expert_gate {
-                        sh_gate.forward(
-                            ex,
-                            cublas,
-                            marlin_ws_ptr,
-                            marlin_ws_ints,
-                            normed_buf,
-                            moe_sh_gate_buf,
-                            num_tokens,
-                        )?;
-                    }
-                }
-                Ok(())
             }
         }
     }
 
-    /// Executes the host/VRAM tiered MoE dispatch when `self` is `FfnBlockWeights::TieredMoe`;
-    /// no-op for `Dense` and `Moe`.
+    /// Executes the host/VRAM tiered MoE dispatch when `self` is a tiered `FfnBlockWeights::Moe`;
+    /// no-op for `Dense` and VRAM-resident `Moe`.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_tiered(
         &self,
@@ -2752,23 +2666,26 @@ impl FfnBlockWeights {
         mlp_out_buf: u64,
         num_tokens: usize,
     ) -> Result<()> {
-        let Self::TieredMoe(tmoe) = self else {
+        let Self::Moe(moe) = self else {
+            return Ok(());
+        };
+        let MoeExpertStorage::Tiered { layer_id } = moe.experts else {
             return Ok(());
         };
         let tmoe_engine =
-            tiered_moe.ok_or_else(|| loader_err("missing RankTieredMoe for TieredMoe layer"))?;
-        let sh_out_ptr = if tmoe.shared_down_proj.is_some() {
+            tiered_moe.ok_or_else(|| loader_err("missing RankTieredMoe for tiered MoE layer"))?;
+        let sh_out_ptr = if moe.shared_down_proj.is_some() {
             moe_sh_out_buf
         } else {
             0
         };
-        let sh_gate_ptr = if tmoe.shared_expert_gate.is_some() {
+        let sh_gate_ptr = if moe.shared_expert_gate.is_some() {
             moe_sh_gate_buf
         } else {
             0
         };
-        let device_lru_safe = num_tokens * tmoe.top_k <= tmoe_engine.layer_hot_k(tmoe.layer_id)
-            && tmoe_engine.layer_has_mapped_store(tmoe.layer_id);
+        let device_lru_safe = num_tokens * moe.top_k <= tmoe_engine.layer_hot_k(layer_id)
+            && tmoe_engine.layer_has_mapped_store(layer_id);
         if is_capturing_graph && !device_lru_safe {
             return Err(loader_err(
                 "tiered MoE graph exceeds mapped hot-cache capacity",
@@ -2777,7 +2694,7 @@ impl FfnBlockWeights {
         if device_lru_safe {
             tmoe_engine.execute_layer_device_lru(
                 stream,
-                tmoe.layer_id,
+                layer_id,
                 normed_buf,
                 moe_topk_ids_buf,
                 moe_topk_weights_buf,
@@ -2785,12 +2702,12 @@ impl FfnBlockWeights {
                 sh_gate_ptr,
                 mlp_out_buf,
                 num_tokens,
-                tmoe.top_k,
+                moe.top_k,
             )
         } else {
             tmoe_engine.execute_layer(
                 stream,
-                tmoe.layer_id,
+                layer_id,
                 normed_buf,
                 moe_topk_ids_buf,
                 moe_topk_weights_buf,
@@ -2798,7 +2715,7 @@ impl FfnBlockWeights {
                 sh_gate_ptr,
                 mlp_out_buf,
                 num_tokens,
-                tmoe.top_k,
+                moe.top_k,
             )
         }
     }
@@ -2816,17 +2733,74 @@ pub(crate) fn load_moe_layer_weights(
     stream: &CudaStream,
     repack_staging: &DeviceBuffer,
 ) -> Result<MoeLayerWeights> {
+    load_moe_layer_weights_inner(
+        archive,
+        cfg,
+        None,
+        pfx,
+        rank,
+        tp_size,
+        weight_arena,
+        stream,
+        repack_staging,
+    )
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_tiered_moe_layer_weights(
+    archive: &SafetensorsArchive,
+    cfg: &ModelConfig,
+    layer_id: usize,
+    pfx: &str,
+    rank: usize,
+    tp_size: usize,
+    weight_arena: &mut DeviceArena,
+    stream: &CudaStream,
+    repack_staging: &DeviceBuffer,
+) -> Result<MoeLayerWeights> {
+    load_moe_layer_weights_inner(
+        archive,
+        cfg,
+        Some(layer_id),
+        pfx,
+        rank,
+        tp_size,
+        weight_arena,
+        stream,
+        repack_staging,
+    )
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn load_moe_layer_weights_inner(
+    archive: &SafetensorsArchive,
+    cfg: &ModelConfig,
+    tiered_layer_id: Option<usize>,
+    pfx: &str,
+    rank: usize,
+    tp_size: usize,
+    weight_arena: &mut DeviceArena,
+    stream: &CudaStream,
+    repack_staging: &DeviceBuffer,
+) -> Result<MoeLayerWeights> {
     let raw_router = RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), &cfg.quant)?;
     let router_gate = raw_router.upload(weight_arena, stream, repack_staging)?;
 
     let full_interm = cfg.moe_intermediate_size;
-    if !full_interm.is_multiple_of(tp_size) {
+    if tiered_layer_id.is_none() && !full_interm.is_multiple_of(tp_size) {
         return Err(loader_err_msg(format!(
             "moe_intermediate_size {} is not divisible by TP={tp_size}",
             full_interm
         )));
     }
-    let local_moe_interm = full_interm / tp_size;
+    // Tiered MoE partitions expert IDs across EP ranks, preserving full `moe_intermediate_size` per expert.
+    let local_moe_interm = if tiered_layer_id.is_some() {
+        full_interm
+    } else {
+        full_interm / tp_size
+    };
     let num_exp = cfg.num_experts;
     let top_k = cfg.num_experts_per_tok.max(1);
     let scoring_func = i32::from(cfg.scoring_func.eq_ignore_ascii_case("sigmoid"));
@@ -2839,7 +2813,9 @@ pub(crate) fn load_moe_layer_weights(
         .resolve_name(&format!("{pfx}.mlp.experts.down_proj"))
         .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.experts.down_proj.weight")));
 
-    let experts = if let (Some(gu_key), Some(dn_key)) = (fused_gu_key, fused_dn_key) {
+    let experts = if let Some(layer_id) = tiered_layer_id {
+        MoeExpertStorage::Tiered { layer_id }
+    } else if let (Some(gu_key), Some(dn_key)) = (fused_gu_key, fused_dn_key) {
         if archive
             .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj_scale_inv"))
             .is_some()
@@ -3490,76 +3466,6 @@ pub(crate) fn load_ple_layer_weights(
         norm_conv_ptr,
         conv1d_weight_ptr,
         weight_scale,
-    })
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn load_tiered_moe_layer_weights(
-    archive: &SafetensorsArchive,
-    cfg: &ModelConfig,
-    layer_id: usize,
-    pfx: &str,
-    rank: usize,
-    tp_size: usize,
-    weight_arena: &mut DeviceArena,
-    stream: &CudaStream,
-    repack_staging: &DeviceBuffer,
-) -> Result<TieredMoeLayerWeights> {
-    let raw_router = RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), &cfg.quant)?;
-    let router_gate = raw_router.upload(weight_arena, stream, repack_staging)?;
-    let h = cfg.hidden_size;
-    let full_shared_interm = cfg.shared_expert_intermediate_size;
-    let local_shared_interm = full_shared_interm / tp_size;
-    let s_gate_full = RawLinearHost::load(
-        archive,
-        &format!("{pfx}.mlp.shared_expert.gate_proj"),
-        &cfg.quant,
-    )?;
-    let s_gate =
-        s_gate_full.slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
-    let s_up_full = RawLinearHost::load(
-        archive,
-        &format!("{pfx}.mlp.shared_expert.up_proj"),
-        &cfg.quant,
-    )?;
-    let s_up = s_up_full.slice_rows(rank * local_shared_interm, (rank + 1) * local_shared_interm);
-    let s_gu = RawLinearHost::concat_rows(&[s_gate, s_up])?.upload(
-        weight_arena,
-        stream,
-        repack_staging,
-    )?;
-    let s_dn_full = RawLinearHost::load(
-        archive,
-        &format!("{pfx}.mlp.shared_expert.down_proj"),
-        &cfg.quant,
-    )?;
-    let s_dn = s_dn_full
-        .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
-        .upload(weight_arena, stream, repack_staging)?;
-    let raw_eg = RawLinearHost::load(
-        archive,
-        &format!("{pfx}.mlp.shared_expert_gate"),
-        &cfg.quant,
-    )?;
-    if raw_eg.dims() != (1, h) {
-        return Err(loader_err_msg(format!(
-            "shared_expert_gate dims {:?} at '{pfx}' != (1, {h})",
-            raw_eg.dims()
-        )));
-    }
-    let s_eg = raw_eg.upload(weight_arena, stream, repack_staging)?;
-    Ok(TieredMoeLayerWeights {
-        layer_id,
-        router_gate,
-        num_experts: cfg.num_experts,
-        top_k: cfg.num_experts_per_tok.max(1),
-        norm_topk_prob: cfg.norm_topk_prob,
-        scoring_func: i32::from(cfg.scoring_func.eq_ignore_ascii_case("sigmoid")),
-        shared_gate_up_proj: Some(s_gu),
-        shared_down_proj: Some(s_dn),
-        shared_expert_gate: Some(s_eg),
-        local_shared_interm,
     })
 }
 
