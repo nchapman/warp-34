@@ -160,7 +160,19 @@ impl Qwen3_5MtpRank {
             return Err(loader_err("invalid MTP capacity"));
         }
         target.device.make_current()?;
-        let archive = SafetensorsArchive::open(dir).map_err(|_| loader_err("open MTP archive"))?;
+        let mut archive =
+            SafetensorsArchive::open(dir).map_err(|_| loader_err("open MTP archive"))?;
+        if archive.resolve_name("mtp.norm.weight").is_none()
+            && archive
+                .resolve_name("mtp.hyper_connection_mixer.hc_norm.weight")
+                .is_none()
+        {
+            let compact_dir = dir.join("runtime/mtp-int4-g32");
+            if compact_dir.is_dir() {
+                archive = SafetensorsArchive::open(&compact_dir)
+                    .map_err(|_| loader_err("open compact MTP archive"))?;
+            }
+        }
         let r = target.rank;
         let tp = target.tp_size;
         let h = c.hidden_size;

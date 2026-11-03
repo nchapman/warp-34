@@ -687,7 +687,25 @@ fn build_synthetic_qwen4_exp_dir(tag: &str) -> PathBuf {
     }
 
     write_safetensors_file(&dir.join("model.safetensors"), &tensors).unwrap();
+    let runtime_dir = dir.join("runtime");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::write(
+        runtime_dir.join("static_hot_cache_rankings.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "0": [6, 5, 2, 1, 7, 4, 3, 0],
+            "1": [7, 4, 3, 2, 6, 5, 1, 0]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     dir
+}
+
+fn assert_hot_cache_slots(engine: &Qwen3_5Engine, rank: usize, layer: usize, expected: &[usize]) {
+    let cache = &engine.ranks[rank].tiered_moe.as_ref().unwrap().caches[layer];
+    let slots: Vec<Option<i32>> = expected.iter().map(|&gid| cache.slot_of(gid)).collect();
+    let expected_slots: Vec<Option<i32>> = (0..expected.len()).map(|s| Some(s as i32)).collect();
+    assert_eq!(slots, expected_slots);
 }
 
 #[test]
@@ -700,6 +718,7 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
     let mut engine_tp1_eager =
         Qwen3_5Engine::load_from_dir(&dir, 1, KvFormatPolicy::Fp16, Some(64), false)
             .expect("load synthetic qwen4_exp TP=1 eager");
+    assert_hot_cache_slots(&engine_tp1_eager, 0, 0, &[6, 5, 2, 1]);
     let out_tp1_eager = engine_tp1_eager
         .generate_tokens(&prompt, 6, false)
         .expect("generate_tokens TP=1 eager");

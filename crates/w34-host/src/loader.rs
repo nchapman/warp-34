@@ -35,11 +35,16 @@ impl TensorInfo {
 }
 
 pub struct SafetensorsArchive {
+    base_dir: Option<PathBuf>,
     files: HashMap<String, File>,
     entries: HashMap<String, TensorInfo>,
 }
 
 impl SafetensorsArchive {
+    /// Directory containing this archive, if opened from a path on disk.
+    pub fn base_dir(&self) -> Option<&Path> {
+        self.base_dir.as_deref()
+    }
     /// Opens either a checkpoint directory (`model.safetensors` or `model.safetensors.index.json`)
     /// or a standalone `.safetensors` file directly.
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -176,7 +181,11 @@ impl SafetensorsArchive {
         Self::insert_entries_from_header(&shard_key, data_base, file_len, &header, &mut entries)?;
         let mut files = HashMap::new();
         files.insert(shard_key, f);
-        Ok(Self { files, entries })
+        Ok(Self {
+            base_dir: file_path.parent().map(Path::to_path_buf),
+            files,
+            entries,
+        })
     }
 
     fn open_indexed_dir(dir: &Path, index_path: &Path) -> io::Result<Self> {
@@ -228,7 +237,11 @@ impl SafetensorsArchive {
             )?;
             files.insert(extra_name.to_string(), f);
         }
-        Ok(Self { files, entries })
+        Ok(Self {
+            base_dir: Some(dir.to_path_buf()),
+            files,
+            entries,
+        })
     }
 
     pub fn contains(&self, name: &str) -> bool {

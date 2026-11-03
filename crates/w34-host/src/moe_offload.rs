@@ -242,6 +242,88 @@ impl ExpertPackLayout {
     }
 }
 
+/// Optional static expert frequency rankings (`"<layer_id>": [<global_expert_id>, ...]`).
+///
+/// Discovered automatically from `static_hot_cache_rankings.json` or
+/// `runtime/static_hot_cache_rankings.json` inside a checkpoint directory when present.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HotExpertRankings {
+    by_layer: std::collections::HashMap<usize, Vec<usize>>,
+}
+
+impl HotExpertRankings {
+    pub fn from_json(val: &serde_json::Value) -> Option<Self> {
+        let obj = val.as_object()?;
+        let mut by_layer = std::collections::HashMap::with_capacity(obj.len());
+        for (k, v) in obj {
+            let Ok(layer_id) = k.parse::<usize>() else {
+                continue;
+            };
+            let Some(arr) = v.as_array() else {
+                continue;
+            };
+            let ids: Vec<usize> = arr
+                .iter()
+                .filter_map(|x| x.as_u64().and_then(|n| usize::try_from(n).ok()))
+                .collect();
+            if !ids.is_empty() {
+                by_layer.insert(layer_id, ids);
+            }
+        }
+        (!by_layer.is_empty()).then_some(Self { by_layer })
+    }
+
+    /// Probes standard checkpoint locations (`static_hot_cache_rankings.json` and
+    /// `runtime/static_hot_cache_rankings.json`) inside `model_dir`.
+    pub fn from_model_dir(model_dir: &std::path::Path) -> Option<Self> {
+        for rel in [
+            "static_hot_cache_rankings.json",
+            "runtime/static_hot_cache_rankings.json",
+        ] {
+            let path = model_dir.join(rel);
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(rankings) = Self::from_json(&val)
+            {
+                return Some(rankings);
+            }
+        }
+        None
+    }
+
+    /// Selects `k_hot` unique local expert IDs within `local_expert_ids` for `layer_id`
+    /// in ranked frequency order, backfilling with any remaining local expert IDs if needed.
+    pub fn select_for_layer(
+        &self,
+        layer_id: usize,
+        local_expert_ids: Range<usize>,
+        k_hot: usize,
+    ) -> Option<Vec<usize>> {
+        if k_hot == 0 || k_hot > local_expert_ids.len() {
+            return None;
+        }
+        let ranked = self.by_layer.get(&layer_id)?;
+        let mut chosen = Vec::with_capacity(k_hot);
+        for &gid in ranked {
+            if local_expert_ids.contains(&gid) && !chosen.contains(&gid) {
+                chosen.push(gid);
+                if chosen.len() == k_hot {
+                    return Some(chosen);
+                }
+            }
+        }
+        for gid in local_expert_ids {
+            if !chosen.contains(&gid) {
+                chosen.push(gid);
+                if chosen.len() == k_hot {
+                    return Some(chosen);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Execution policy for tiered 512-expert MoE layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeOffloadMode {
@@ -1677,6 +1759,9 @@ mod host_store {
                 2048,
                 cfg.num_experts_per_tok.max(1),
             )?;
+            let rankings = archive
+                .base_dir()
+                .and_then(HotExpertRankings::from_model_dir);
             let mut stores = Vec::with_capacity(cfg.num_hidden_layers);
             let mut caches = Vec::with_capacity(cfg.num_hidden_layers);
             for layer_id in 0..cfg.num_hidden_layers {
@@ -1696,7 +1781,10 @@ mod host_store {
                 })?;
                 let mut cache =
                     HotExpertCache::new(device_id, k_hot, store.expert_ids(), layout.clone())?;
-                cache.populate_initial(&store, None, &mut ws, stream)?;
+                let initial = rankings
+                    .as_ref()
+                    .and_then(|r| r.select_for_layer(layer_id, store.expert_ids(), k_hot));
+                cache.populate_initial(&store, initial.as_deref(), &mut ws, stream)?;
                 stores.push(store);
                 caches.push(cache);
             }
@@ -1846,6 +1934,28 @@ mod layout_tests {
         ] {
             assert!(ExpertPackLayout::new(i, h, g).is_err());
         }
+    }
+
+    #[test]
+    fn hot_expert_rankings_filter_dedup_and_backfill_per_ep_rank() {
+        let rankings = super::HotExpertRankings::from_json(&serde_json::json!({
+            "0": [6, 2, 7, 2, 1, 99, 5],
+            "1": [4]
+        }))
+        .unwrap();
+        // TP=1 (0..8), k_hot=4 -> [6, 2, 7, 1]
+        assert_eq!(
+            rankings.select_for_layer(0, 0..8, 4),
+            Some(vec![6, 2, 7, 1])
+        );
+        // EP=2 rank 0 (0..4), k_hot=3 -> [2, 1] from rankings + backfill [0]
+        assert_eq!(rankings.select_for_layer(0, 0..4, 3), Some(vec![2, 1, 0]));
+        // EP=2 rank 1 (4..8), k_hot=3 -> [6, 7, 5]
+        assert_eq!(rankings.select_for_layer(0, 4..8, 3), Some(vec![6, 7, 5]));
+        // Layer 1 on EP=2 rank 1 (4..8), k_hot=2 -> [4] + backfill [5]
+        assert_eq!(rankings.select_for_layer(1, 4..8, 2), Some(vec![4, 5]));
+        // Missing layer returns None (caller uses sequential 0..k_hot default)
+        assert_eq!(rankings.select_for_layer(2, 0..8, 3), None);
     }
 }
 
