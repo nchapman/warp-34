@@ -12,7 +12,7 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
-## Standalone benchmark completion — active
+## Standalone benchmark qualification — campaigns complete
 
 - Execution plan and task ledger: [`benchmarks/perf/COMPLETION_PLAN.md`](../benchmarks/perf/COMPLETION_PLAN.md).
 - Finish 27B reference baseline/KV/speculation comparisons first, then add Flash
@@ -24,8 +24,10 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
   summaries, comparison support and quick/full/release presets are implemented;
   `mise run perf-check` passes **89 tests**. Full `mise run check` passed:
   **357 Rust tests, zero failures, six ignored**, CPU/CUDA clippy, formatting,
-  oracle checks and dashboard checks/build. Review is triaged; commit remains
-  pending final Flash outcomes. See `qualification/completion-checks.json`.
+  oracle checks and dashboard checks/build. The final rerun also passes; the
+  evidence audit verified counts/hashes and reproduced all detailed reports.
+  Infrastructure/27B and final Flash evidence are separate verified commits. See
+  `benchmarks/perf/qualification/completion-checks.json`.
 - **27B campaigns complete:** four baseline bundles plus the 20-profile
   KV/speculation matrix and two capacity profiles. The advanced/capacity report
   contains 21 measured deployments, 22 startup outcomes and 1,944/1,944 HTTP
@@ -36,9 +38,28 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
   ranking. Evidence: `benchmarks/perf/qualification/27b-*-measurements.{json,md}`.
 - Flash reference images (specialized one-/two-3090 vLLM overlays) and the Strata
   native binary are built, and Strata GGUF packing/inventories are complete.
-  Strata's no-speculation IQ-pack probe failed startup; a separately named
-  lookup-window-4 probe is queued. Flash runs and full checks share the GPU
-  reservation. Indexed target/draft shards are present in the pinned Flash view.
+  Strata's no-speculation IQ-pack probe failed startup; the separately named
+  lookup-window-4 profile completed HTTP measurement. Flash runs and full checks
+  use a shared GPU reservation. Indexed target/draft shards are present in the pinned Flash view.
+  Native TP1 target completes its full HTTP campaign with passing baseline
+  quality. TP1 MTP3 has retained quality/SSE failures; TP2 4096-page profiles fail
+  serving-memory admission. The distinct TP2 target 512-page retry passes
+  quality and completes 72/72 HTTP requests; its MTP3 counterpart still fails
+  quality/warmup. Both specialized vLLM references pass baseline quality and
+  record non-agent measurements, but agent replay fails on unexpected live tool
+  calls. Strata lookup4 completes HTTP measurement but fails one retrieval check
+  by refusal. Flash serving reports retain seven bundles and ten startup outcomes;
+  long-context qualification is complete: native TP1 passes six retrieval checks
+  and 60/60 workload requests through 251,982 prompt tokens; TP2 large allocation
+  fails startup; the two-GPU reference passes retrieval and 3/3 cold reads but
+  fails six strict agent-replay trials on live tool calls.
+- Practical standing: **27B is competitive on one GPU and strong on two; Flash
+  trails specialized references, especially on longer inputs, and native Flash
+  MTP HTTP correctness is a blocker.** See
+  [`standings.md`](../benchmarks/perf/campaigns/standings.md) for concrete tables.
+  Flash evidence totals nine bundles, 13 startup outcomes and 375/381 successful
+  measured HTTP requests; no general quality equivalence or publication winner
+  is claimed.
 - Pinned tokenizer calibration records ~32K/~128K/~252K early/late retrieval
   fixtures; these are not server capacity attestations. Artifact inventories
   record GGUF/NInfer/Flash bytes without inventing unavailable upstream lineage.

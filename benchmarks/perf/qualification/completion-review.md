@@ -51,4 +51,20 @@ Report: `.pi/review/call_4ff4c994121542f5ab5b445b115c6cf2_fc_0e0c1a151f17172e016
   not a release criterion.
 - Unchanged Hub transport timeout finding remains outside this benchmark task.
 
-This records triage, not final verification or a claim that campaigns are complete.
+## Final Flash evidence audit
+
+A separate read-only evidence audit after the runtime campaigns checked new Flash
+configs/reports/docs, not unchanged implementation or previously declined
+suggestions. It verified all nine bundle / 13 startup / 375-of-381 counts,
+recomputed case rates, checked report-input hashes and resource peaks, reproduced
+all seven detailed Markdown reports and the 253-pair guarded comparison
+byte-for-byte, and confirmed scope exclusions are explicit.
+
+One important documentation error was fixed: TP1 MTP3 failed the **Python
+code-output check** (`0` instead of `14`), not the separate arithmetic check
+(which passed with `93`). SSE and warmup failures remain separately recorded.
+No runtime changes or new measurements were needed. The audit found no other
+material inconsistencies in the final evidence update.
+
+This records review triage; full-check receipts and raw campaign outcomes are
+retained separately.

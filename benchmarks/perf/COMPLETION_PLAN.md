@@ -32,11 +32,20 @@ historical settings still apply. Base implementation at planning: `66974d8`.
       `qualification/27b-*-measurements.{json,md}`. Reports do not certify
       publication equivalence: cross-format source lineage, independent restarts,
       thermal/host isolation and failed quality gates remain explicit blockers.
-- [ ] Qualify Flash Next reference projects, immutable artifacts and launch recipes.
-- [ ] Add and run Flash Next short-serving, coding/agent and long-context campaigns.
-- [ ] Publish quick/full/release presets and reproducible result indexes.
-- [ ] Run `mise run check`, review changes, update `docs/STATE.md`, and commit
-      verified task-related work.
+- [x] Qualify Flash Next reference projects, immutable artifacts and launch recipes.
+      Both DominikBucko overlays and Strata have retained runtime outcomes.
+- [x] Add and run Flash Next short-serving, coding/agent and long-context campaigns.
+      13 startup outcomes, nine run bundles, 375/381 measured HTTP requests
+      successful. Startup, warmup, quality and replay failures remain distinct.
+- [x] Publish quick/full/release presets and reproducible result indexes.
+      See `campaigns/standings.md`, `campaigns/completion-results.md`, compact
+      qualification reports, detailed latency reports and comparison hash receipts.
+- [x] Run `mise run check`, review changes, update `docs/STATE.md`, and commit
+      verified task-related work. Full check passed both before the infrastructure
+      milestone and after final campaigns (357 Rust tests passed, zero failed,
+      six ignored; 89 perf tests). Final evidence audit reproduced reports and
+      verified hashes/counts. See `qualification/completion-checks.json` and
+      `qualification/completion-review.md`.
 
 ## Existing evidence: do not confuse missing indexing with missing runs
 
@@ -103,6 +112,19 @@ Campaign groups:
 
 The Rust `test_qwen4_exp_reference_bench_suite` is useful development evidence,
 not a substitute for these standalone HTTP campaigns.
+
+## Executed scope versus broader design targets
+
+The selected full campaigns are complete, not every possible shape listed above.
+Flash uses C1, the reference recipes' single-sequence serving limits and natural
+EOS; C2/C8 and fixed 128-token reference-shaped prompts were **not measured**.
+There is no Flash concurrency-capacity claim. 27B has measured C8; the two-TP1
+replica point remains explicitly historical. Quick/release presets validate and
+are refreshable, but only full campaigns are claimed as measured here, not three
+independent restarted release trials. NInfer Flash's IQ2 artifact is excluded
+from the approximately 4-bit cohort; stock Flash vLLM/SGLang support is not
+inferred from specialized overlay results. These limitations remain visible in
+reports rather than being counted as successful qualification cells.
 
 ## Scope discipline
 

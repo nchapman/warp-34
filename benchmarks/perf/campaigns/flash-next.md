@@ -1,14 +1,15 @@
-# Flash-Next HTTP serving campaign (qualification in progress)
+# Flash-Next HTTP serving campaign
 
 Configuration: [flash-next-serving.toml](flash-next-serving.toml). This is a
 standalone `w34perf` HTTP campaign, not a server launcher or a results report.
-Deployment support remains **unverified** until its retained runtime evidence is
-assessed. Both specialized vLLM images and the Strata native binary are built;
-HTTP qualification is queued behind the serial 27B matrix. Strata has a runnable
-source-backed profile. NInfer's known Flash artifact is a different, IQ2_XS-derived
+Qualification attempts are complete, including failed cells. Frozen profiles
+retain their original **unverified** metadata; assessed outcomes are recorded
+separately rather than retroactively changing profile digests. Both specialized
+vLLM overlays and Strata have actual HTTP measurements and quality evidence. NInfer's known Flash artifact is a different, IQ2_XS-derived
 precision cohort, excluded here rather than labeled architecturally unsupported.
 See `qualification/reference-pins.json` for build identities and
-`campaigns/completion-results.md` for evolving evidence.
+[completion-results.md](completion-results.md) for the evidence ledger and
+[standings.md](standings.md) for the practical performance assessment.
 
 ## Workloads and protocol
 
@@ -177,5 +178,5 @@ OS page cache or persistent JIT caches. Do not drop system caches implicitly.
 
 Validation performed from `benchmarks/perf`:
 `python3 -m w34perf validate campaigns/flash-next-serving.toml` →
-`valid: 9 deployments, 5 cases`. This validates schema/fixtures only; no serving
+`valid: 11 deployments, 5 cases`. This validates schema/fixtures only; no serving
 measurements or support qualification are claimed.

@@ -1,4 +1,6 @@
-# Completion campaign evidence — in progress
+# Completion campaign evidence
+
+For the practical assessment, start with [Where warp-34 stands](standings.md).
 
 These are qualification results, **not a publication-ready winner table**.
 Historical results remain separate. Raw bundles live under `benchmarks/perf/results/`.
@@ -90,7 +92,73 @@ This driver is external to the portable runner.
   It uses the same cached bytes without another 121 GiB copy; reference mounts
   remain read-only. Native warp profiles keep the original snapshot path.
 
-## Capacity qualification and current outstanding work
+## Flash serving outcomes
+
+- **Native TP1 target, 4096 pages:** ready, baseline quality passed, full HTTP
+  campaign completed. This does not establish MTP or TP2 serving correctness.
+- **Native TP1 MTP3, 4096 pages:** ready but quality failed; several requests emit
+  SSE errors and the Python code-output check also fails (`0`, expected `14`);
+  the separate arithmetic check passes (`93`). The first measured-case
+  warmup emits an SSE error, so no successful performance run is claimed.
+- **Native TP2 target/MTP3, 4096 pages:** both exit before readiness with
+  `CUDA error -10 in insufficient VRAM for serving state pool and headroom`.
+  Separately named 512-page/8K variants were tested as reduced-capacity probes;
+  their outcomes cannot erase or qualify the original capacity requests.
+- **Specialized two-GPU vLLM overlay:** ready and baseline quality passed.
+  Non-agent cases have retained measurements; coding-agent replay aborts at
+  warmup with `unexpected live tool call in replay`. The response requested
+  `read_file`; the standalone replay deliberately does not execute live tools.
+  This is a recorded protocol/fixture incompatibility, not a successful agent
+  benchmark or an engine-wide startup failure.
+
+- **Specialized one-GPU vLLM overlay:** ready and baseline quality passed;
+  HTTP campaign retains partial measurements but fails agent-replay warmup.
+  Its result remains separate from the two-GPU overlay and its CPU-residency policy.
+- **Strata lookup-window-4:** ready and full HTTP campaign completed. Baseline
+  quality is **5/6**, not a pass: it refused to return the first synthetic
+  `TARGET_SECRET` as purportedly sensitive information. Other retrieval checks
+  passed. This is a retained refusal, not evidence that the token was absent from
+  context. No prompt rewriting or selective exclusion clears that failure.
+  Raw results: `completion-flash-strata-lookup/`.
+
+- **Native TP2 target, reduced 512-page/8K allocation:** ready, baseline quality
+  passed, full campaign **72/72 HTTP requests** completed. Native TP1 target also
+  completed 72/72. This successful smaller allocation does not clear the original
+  4096-page failures.
+- **Native TP2 MTP3, 512 pages:** reaches readiness, but quality and warmup fail
+  with SSE errors. Lowering KV allocation fixes admission, not MTP correctness.
+
+The retained [Flash serving report](../qualification/flash-serving-measurements.md)
+and JSON cover **7 run bundles and 10 startup outcomes**. Two MTP bundles have
+zero measured trials because warmup failed, not zero-throughput measurements.
+The five bundles with measurements total **312/312 successful measured HTTP
+requests**; this count excludes failed warmups and does not clear quality gates.
+Per-deployment TTFT, TPOT estimates, E2E, prefix-cache and agent-session reports
+are retained under [`qualification/reports/`](../qualification/reports/).
+
+### Observed resources, not normalized efficiency scores
+
+| Serving profile | Peak GPU 0 / GPU 1 MiB | Peak host used GiB | Samples |
+|---|---:|---:|---:|
+| Native TP1 target | 17973 / 18 (idle) | 75.43 | 1949 |
+| Native TP2 target, 8K | 21041 / 21011 | 75.60 | 1131 |
+| One-GPU vLLM overlay | 23045 / 18 (idle) | 73.86 | 554 |
+| Two-GPU vLLM overlay | 23901 / 23871 | 117.56 | 316 |
+| Strata lookup4 | 23835 / 18 (idle) | 57.84 | 494 |
+
+These peaks cover whole sampler windows including warmup/priming, not loading.
+Host used is `MemTotal - MemAvailable`, **not engine RSS**: reclaimable mmap/file
+pages can be counted in RSS while still contributing to `MemAvailable`. Strata's
+observed per-process peak RSS is 111,329,424 KiB, so the 57.84-GiB host-availability
+metric must not be presented as its entire model residency. PID RSS, UUID-keyed
+VRAM, temperature and measured power remain in JSON. Different workload coverage,
+precision, KV capacity and residency preclude a normalized memory/power winner.
+
+Evidence is under the `results/completion-flash-*` directories. Failed warmups
+and partial run manifests remain retained. Resource samples, model IDs, topology,
+declared cache/offload settings and startup logs stay attached to the bundles.
+
+## Completed capacity qualification and remaining limitations
 
 Pinned tokenizer/template calibration is retained in
 `qualification/{27b,flash}-capacity-calibration.json`: the six early/late probes
@@ -99,18 +167,32 @@ were independently reproduced after review; matching counts are not evidence of
 shared files or fabricated calibration. These counts remain **reference renderer
 counts**, not actual server attestations.
 
-`27b-capacity-completion.toml` completed with `fixtures/quality-capacity.json`;
-`flash-next-longctx.toml` remains queued with that fixture. Quality and HTTP
+Both `27b-capacity-completion.toml` and `flash-next-longctx.toml` completed their
+qualification attempts with `fixtures/quality-capacity.json`. Native Flash TP1
+passes all six retrieval checks and all nine workload trials (**60/60 HTTP
+requests**, up to 251,982 prompt tokens). Native TP2 fails startup at 16384 pages.
+The two-GPU reference passes all six retrieval checks and **3/3 cold reads**;
+all six agent-replay trials fail on unexpected live tool calls. Its total is
+**3/9 successful measured requests**, not a complete agent-capacity pass.
+See [Flash capacity measurements](../qualification/flash-capacity-measurements.md)
+and the detailed latency reports. Across serving/capacity, Flash has **9 run
+bundles, 13 startup outcomes, and 375/381 successful measured HTTP requests**.
+These totals exclude warmups; startup and quality failures remain separate. Quality and HTTP
 outcomes must be retained even when capacity requests fail. Strata's native
 `--spec 0` profile failed before readiness: this IQ pack requires a verify window
 of at least 2. The original evidence remains in `completion-flash-strata/`.
-A separately named prompt-lookup window-4 profile (no MTP drafter) is queued;
+A separately named prompt-lookup window-4 profile (no MTP drafter) completed;
 this is a declared recipe change, not an overwritten target-only result.
 See `strata-preparation.md` for commands.
-The one-GPU specialized Flash overlay has its own built image and queued profile,
+The one-GPU specialized Flash overlay has its own built image and measured profile,
 not an alias for the two-GPU image.
 
-Not yet complete: Flash HTTP execution and resource
-qualification, actual long-context quality/capacity outcomes, final cross-campaign
-indexes and full checks. The follow-up code review is triaged; `perf-check` passes
-89 tests. No publication certification or task commit has been made.
+All selected campaign attempts are complete, including evidenced failures.
+Full code verification passed and implementation review is triaged in
+`qualification/completion-review.md`; the verified infrastructure/27B milestone
+is committed as `3ebda3f`. Final Flash reports are a follow-up evidence update.
+No publication certification is claimed. Flash serving measurements use C1 and
+natural EOS; fixed 128-token reference-shaped inputs and C2/C8 Flash serving were
+not measured. Release presets are available, not independently restarted release
+trials. Broader tuning and fixing the discovered engine failures are follow-up
+work, not silently asserted successes.

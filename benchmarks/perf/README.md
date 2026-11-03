@@ -6,6 +6,8 @@ run it without Cargo, CUDA libraries, engine packages, or `tools/oracle`.
 This is a black-box HTTP client, **not** an oracle, profiler, kernel microbench,
 or automatic benchmark-results claim.
 
+- **[Where warp-34 stands: 27B and Flash Next](campaigns/standings.md)** — practical results, gaps and priorities
+- [Completed campaign evidence and limitations](campaigns/completion-results.md)
 - [Plan and persistent task list](PLAN.md)
 - [Engine recipes, qualification, and KV matrix](engines.md)
 - [Experiment template](suite.toml) — 10 deployment profiles, 13 workload cases

@@ -16,5 +16,17 @@
   "binary_sha256_after_check": "f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
   "review_triage": "benchmarks/perf/qualification/completion-review.md",
   "subsequent_configuration_validation": "mise run perf-check passed 89 tests; Flash campaign validates 9 deployments and 5 cases; git diff --check passed",
+  "final_verification": {
+    "command": "export PATH=/opt/cuda/bin:$PATH; mise run check",
+    "exit_code": 0,
+    "log": "benchmarks/perf/results/completion-final-check.log",
+    "log_sha256": "9bd190c83d3459d04d4c40b93228cc1f0ea6340a42503cfefeaa35cb42077c66",
+    "rust_tests_passed": 357,
+    "rust_tests_failed": 0,
+    "rust_tests_ignored": 6,
+    "rust_test_binaries": 44,
+    "final_evidence_audit": "All final Flash counts/rates/hashes verified; seven latency reports and guarded comparison reproduced byte-for-byte; code-check/arithmetic labeling corrected",
+    "documentation": "17 local campaign Markdown links checked; git diff --check passed"
+  },
   "note": "Ignored tests remain ignored, not claimed passed. Campaign outcomes are separate from code verification. No Rust/runtime source was changed by this benchmark task."
 }
