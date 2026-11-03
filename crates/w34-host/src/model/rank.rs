@@ -928,7 +928,7 @@ impl Qwen3_5ModelRank {
         };
         let tiered_moe_reserve = if cfg.uses_tiered_moe() {
             // Reserve VRAM for TieredMoeEngine hot expert cache + staging buffers + PLE staging
-            let hot_per_layer = if tp_size == 2 { 88usize } else { 48usize };
+            let hot_per_layer = if tp_size == 2 { 112usize } else { 48usize };
             let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
             (cfg.num_hidden_layers * hot_per_layer + 512) * exp_bytes + 64 * 1024 * 1024
         } else {
@@ -1100,7 +1100,7 @@ impl Qwen3_5ModelRank {
     pub fn init_tiered_moe(&mut self, archive: &SafetensorsArchive) -> Result<()> {
         self.device.make_current()?;
         let local_experts = (self.cfg.num_experts / self.tp_size).max(1);
-        let default_hot = if self.tp_size == 2 { 88usize } else { 48usize };
+        let default_hot = if self.tp_size == 2 { 112usize } else { 48usize };
         let hot_per_layer = if local_experts <= default_hot {
             (local_experts / 2).max(1)
         } else {
@@ -1118,6 +1118,14 @@ impl Qwen3_5ModelRank {
         )?;
         self.tiered_moe = Some(tiered_moe);
         Ok(())
+    }
+
+    pub(super) fn mark_tiered_moe_device_lru_dirty(&mut self) {
+        if let Some(tm) = &mut self.tiered_moe {
+            for c in &mut tm.caches {
+                c.device_lru_dirty = true;
+            }
+        }
     }
 
     /// Initializes shared PLE tables and rank-local staging independently of MoE.
@@ -1169,6 +1177,12 @@ impl Qwen3_5ModelRank {
             return Ok(());
         }
         let num_tokens = input_ids.len();
+        let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
+        if num_tokens * ple_row_bytes > ple.f8_staging_dev.len_bytes {
+            return Err(loader_err(
+                "PLE batch token count exceeds staging buffer capacity",
+            ));
+        }
         let num_heads = ple.hasher.ngram_heads;
         ple.ids_scratch.resize(num_tokens * num_heads, 0);
         ple.hasher.compute_ngram_ids_for_slots(
@@ -1185,7 +1199,6 @@ impl Qwen3_5ModelRank {
             &mut self.state_pool.ple_ngram_context,
             &mut ple.ids_scratch,
         );
-        let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
         ple.f8_host_scratch.resize(num_tokens * ple_row_bytes, 0);
         ple.mmap_table
             .gather_f8(&ple.ids_scratch, &mut ple.f8_host_scratch);

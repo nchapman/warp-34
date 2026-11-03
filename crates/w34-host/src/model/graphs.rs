@@ -11,6 +11,7 @@ impl Qwen3_5ModelRank {
         long_ctx: bool,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         if let Some((captured_long, _)) = &self.decode_graph
             && *captured_long == long_ctx
         {
@@ -118,6 +119,7 @@ impl Qwen3_5ModelRank {
         long_ctx: bool,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         if let Some((captured_key, _)) = &self.spec_verify_graph
             && *captured_key == (m_verify, long_ctx)
         {
@@ -217,6 +219,7 @@ impl Qwen3_5ModelRank {
         long_ctx: bool,
         sample_mode: DecodeGraphSampleMode,
     ) -> Option<(u64, &CudaGraph)> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         self.batched_decode_graphs
             .iter()
             .find(|(k, _, _)| *k == (bucket_b, long_ctx, sample_mode))
@@ -231,6 +234,7 @@ impl Qwen3_5ModelRank {
         sample_mode: DecodeGraphSampleMode,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         if self
             .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
             .is_some()

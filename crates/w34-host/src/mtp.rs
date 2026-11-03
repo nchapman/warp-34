@@ -444,7 +444,9 @@ impl Qwen3_5MtpRank {
                     )
                 })?;
             let local_experts = c.num_experts / tp;
-            let k_hot = if local_experts >= 64 {
+            let k_hot = if tp == 2 && local_experts >= 128 {
+                128
+            } else if local_experts >= 64 {
                 64
             } else {
                 16.min(local_experts).max(1)

@@ -63,6 +63,7 @@ pub struct NativeProposer {
     pub last_restored_tokens: usize,
 }
 const MEMO_BUDGET: usize = 64 * 1024 * 1024;
+const MTP_STAGE_ROWS: usize = 256;
 impl NativeProposer {
     pub fn load(engine: &mut Qwen3_5Engine, config: &SpeculativeConfig) -> Result<Self> {
         for t in &mut engine.ranks {
@@ -78,7 +79,11 @@ impl NativeProposer {
             ));
         }
         let capacity = engine.ranks[0].kv_pool.num_pages * 16;
-        let max_rows = capacity.min(256);
+        let max_rows = if config.kind == SpeculativeKind::Mtp && engine.cfg.uses_tiered_moe() {
+            capacity.min(2048)
+        } else {
+            capacity.min(256)
+        };
         if max_rows < 16 {
             return Err(loader_err("insufficient speculative context capacity"));
         }
@@ -128,7 +133,9 @@ impl NativeProposer {
         let shifted = engine
             .ranks
             .iter()
-            .map(|t| DeviceBuffer::alloc(t.device.device_id, max_rows * row_bytes))
+            .map(|t| {
+                DeviceBuffer::alloc(t.device.device_id, max_rows.min(MTP_STAGE_ROWS) * row_bytes)
+            })
             .collect::<Result<Vec<_>>>()?;
         let logits = engine
             .ranks
@@ -281,9 +288,10 @@ impl NativeProposer {
             .memo
             .take()
             .ok_or_else(|| loader_err("missing proposer prefix"))?;
+        let step = self.max_rows.min(MTP_STAGE_ROWS);
         let result = (|| {
-            for start in (0..tokens.len()).step_by(self.max_rows) {
-                let end = (start + self.max_rows).min(tokens.len());
+            for start in (0..tokens.len()).step_by(step) {
+                let end = (start + step).min(tokens.len());
                 let bytes = &memo.features[start * self.row_bytes..end * self.row_bytes];
                 let mut pointers = Vec::with_capacity(engine.tp_size);
                 for (t, stage) in engine.ranks.iter().zip(&self.shifted) {
@@ -320,6 +328,20 @@ impl NativeProposer {
         features: &[u64],
     ) -> Result<()> {
         if tokens.is_empty() {
+            return Ok(());
+        }
+        let stage_cap = self.max_rows.min(MTP_STAGE_ROWS);
+        if tokens.len() > stage_cap {
+            let mut offset = 0;
+            while offset < tokens.len() {
+                let take = (tokens.len() - offset).min(stage_cap);
+                let sub_features: Vec<u64> = features
+                    .iter()
+                    .map(|&p| p + (offset * self.row_bytes) as u64)
+                    .collect();
+                self.ingest(engine, &tokens[offset..offset + take], &sub_features)?;
+                offset += take;
+            }
             return Ok(());
         }
         if features.len() != engine.tp_size

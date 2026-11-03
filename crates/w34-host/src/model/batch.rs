@@ -144,7 +144,7 @@ impl Qwen3_5Engine {
 
     fn step_spec_verify_graph(&mut self, s: &EngineBatchSlice<'_>) -> Result<Vec<Vec<i32>>> {
         let q_len = s.tokens.len();
-        let long_ctx = s.ctx_len_before + q_len > 1024;
+        let long_ctx = !self.cfg.uses_qsa() && s.ctx_len_before + q_len > 1024;
         let host_meta = SpecVerifyGraphIo::pack_meta(s)?;
         use crate::coordinated::{ReplayPhase, replay_ranks};
         let comm = self.tp2_comm.as_ref().cloned();
@@ -198,6 +198,7 @@ impl Qwen3_5Engine {
                 }
                 ReplayPhase::Launch => {
                     r.spec_verify_graph.as_ref().unwrap().1.launch(&r.stream)?;
+                    r.mark_tiered_moe_device_lru_dirty();
                     r.speculative_logits_rows = if r.has_spec_logits_capacity(q_len) {
                         q_len
                     } else {
@@ -282,6 +283,7 @@ impl Qwen3_5Engine {
                         .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
                         .unwrap();
                     graph.launch(&r.stream)?;
+                    r.mark_tiered_moe_device_lru_dirty();
                     r.speculative_logits_rows = if r.has_spec_logits_capacity(bucket_b) {
                         bucket_b
                     } else {
@@ -411,6 +413,7 @@ impl Qwen3_5Engine {
             .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
             .unwrap();
         graph.launch(&r0.stream)?;
+        r0.mark_tiered_moe_device_lru_dirty();
         r0.speculative_logits_rows = if r0.has_spec_logits_capacity(bucket_b) {
             bucket_b
         } else {
@@ -700,7 +703,7 @@ impl Qwen3_5Engine {
                             .is_none_or(|((captured_m, _), _)| *captured_m == q_len)
                 });
             if can_use_spec_graph {
-                let long_ctx = seq_after > 1024;
+                let long_ctx = !self.cfg.uses_qsa() && seq_after > 1024;
                 let needs_capture = self.ranks.iter().any(|r| {
                     r.spec_verify_graph
                         .as_ref()

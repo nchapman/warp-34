@@ -602,6 +602,7 @@ impl Qwen3_5Engine {
             if self.use_cuda_graph && r0.supports_cuda_graph_for_tokens(1) {
                 r0.ensure_decode_graph(long_ctx, None)?;
                 r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
+                r0.mark_tiered_moe_device_lru_dirty();
                 r0.last_logits_ptr = r0.captured_decode_logits_ptr;
                 r0.last_logits_rows = 1;
             } else {
@@ -669,7 +670,7 @@ impl Qwen3_5Engine {
             let [r0, r1] = &mut self.ranks[..] else {
                 unreachable!()
             };
-            let long_ctx = seq_after > 1024;
+            let long_ctx = !self.cfg.uses_qsa() && seq_after > 1024;
             if use_graph
                 && r0
                     .decode_graph
@@ -703,6 +704,7 @@ impl Qwen3_5Engine {
                         .state_out_indices
                         .copy_from_host(&st_arr, &r.stream)?;
                     r.decode_graph.as_ref().unwrap().1.launch(&r.stream)?;
+                    r.mark_tiered_moe_device_lru_dirty();
                     r.last_logits_ptr = r.captured_decode_logits_ptr;
                     r.last_logits_rows = 1;
                 }
@@ -747,6 +749,7 @@ impl Qwen3_5Engine {
                     if use_graph {
                         r0.ensure_decode_graph(long_ctx, Some(&c0))?;
                         r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
+                        r0.mark_tiered_moe_device_lru_dirty();
                         r0.last_logits_ptr = r0.captured_decode_logits_ptr;
                         r0.last_logits_rows = 1;
                     } else {
@@ -837,6 +840,7 @@ impl Qwen3_5Engine {
                     if use_graph {
                         r1.ensure_decode_graph(long_ctx, Some(&c1))?;
                         r1.decode_graph.as_ref().unwrap().1.launch(&r1.stream)?;
+                        r1.mark_tiered_moe_device_lru_dirty();
                         r1.last_logits_ptr = r1.captured_decode_logits_ptr;
                         r1.last_logits_rows = 1;
                     } else {
@@ -906,11 +910,13 @@ impl Qwen3_5Engine {
         max_new_tokens: usize,
         stop_on_eos: bool,
     ) -> Result<BenchMetrics> {
+        self.reset_all_states()?;
+        self.radix = MambaRadixCache::new(16, 64);
         if self.speculative.is_some() {
             let m = self.generate_native_speculative(
                 prompt_token_ids,
                 max_new_tokens,
-                64,
+                2048,
                 stop_on_eos,
             )?;
             return Ok(BenchMetrics {
@@ -924,8 +930,6 @@ impl Qwen3_5Engine {
                 generated_token_ids: m.generated_token_ids,
             });
         }
-        self.reset_all_states()?;
-        self.radix = MambaRadixCache::new(16, 64);
         let total_needed_tokens = prompt_token_ids.len() + max_new_tokens + 4;
         let needed_pages = total_needed_tokens.div_ceil(16);
         let max_pages = self.ranks[0]

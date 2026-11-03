@@ -1020,9 +1020,11 @@ mod host_store {
                 let le = ge - self.expert_ids.start;
                 self.expert_to_slot[le] = slot as i32;
                 self.slot_to_expert[slot] = ge;
-                self.slot_last_used[slot] = self.step_clock;
+                // Preserve ranking order so the least-hot initial slot (`k_hot - 1`) is evicted
+                // before the hottest initial slot (`0`).
+                self.slot_last_used[slot] = (k_hot - slot) as u64;
             }
-            self.step_clock += 1;
+            self.step_clock = (k_hot as u64) + 1;
 
             // Upload in chunks of `ws.stage_capacity`.
             let chunk_cap = ws.stage_capacity;
@@ -1056,12 +1058,13 @@ mod host_store {
         }
 
         /// Pulls updated LRU metadata from device before host-side `execute_layer` runs.
-        /// Always synchronizes from device because captured CUDA Graph replays execute
-        /// `w34_moe_gpu_lru_update_and_pull` on the GPU without mutating host state.
         pub fn sync_from_device_if_dirty(
             &mut self,
             stream: &crate::cuda::CudaStream,
         ) -> crate::cuda::Result<()> {
+            if !self.device_lru_dirty {
+                return Ok(());
+            }
             let mut slot_i32 = vec![0i32; self.slots.capacity];
             let mut step_arr = [0u64; 1];
             self.d_expert_to_slot
@@ -1214,23 +1217,45 @@ mod host_store {
             }
             assert_eq!(n, dst_slots.len());
             assert!(n <= self.stage_capacity);
-            self.compute_done_events[buf_idx].synchronize()?;
             let stride = self.layout.stride;
-            let total_bytes = n * stride;
-            // SAFETY: caller ensures previous DMA from `h_stage_packs[buf_idx]` has completed.
-            let pinned_dst = unsafe {
-                std::slice::from_raw_parts_mut(
-                    self.h_stage_packs[buf_idx].host_ptr.cast::<u8>(),
-                    total_bytes,
-                )
-            };
-            for (i, &ge) in global_expert_ids.iter().enumerate() {
-                let src = store
-                    .expert_pack(ge)
-                    .expect("expert not owned by local HostExpertStore");
-                pinned_dst[i * stride..(i + 1) * stride].copy_from_slice(src);
+            if store.mapped_dev_ptr() != 0 {
+                for (i, &ge) in global_expert_ids.iter().enumerate() {
+                    let src = store
+                        .expert_pack(ge)
+                        .expect("expert not owned by local HostExpertStore");
+                    crate::cuda::check_rc(
+                        // SAFETY: `src` is a pinned host slice (`HostPackStorage::Mapped`) and
+                        // `d_stage_packs[buf_idx]` has capacity `stage_capacity * stride`.
+                        unsafe {
+                            w34_kernels::ffi::w34_memcpy_h2d_async(
+                                (self.d_stage_packs[buf_idx].addr() + (i * stride) as u64)
+                                    as *mut core::ffi::c_void,
+                                src.as_ptr().cast::<core::ffi::c_void>(),
+                                stride,
+                                stream.handle,
+                            )
+                        },
+                        "w34_memcpy_h2d_async (pinned expert pack)",
+                    )?;
+                }
+            } else {
+                self.compute_done_events[buf_idx].synchronize()?;
+                let total_bytes = n * stride;
+                // SAFETY: caller ensures previous DMA from `h_stage_packs[buf_idx]` has completed.
+                let pinned_dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.h_stage_packs[buf_idx].host_ptr.cast::<u8>(),
+                        total_bytes,
+                    )
+                };
+                for (i, &ge) in global_expert_ids.iter().enumerate() {
+                    let src = store
+                        .expert_pack(ge)
+                        .expect("expert not owned by local HostExpertStore");
+                    pinned_dst[i * stride..(i + 1) * stride].copy_from_slice(src);
+                }
+                self.d_stage_packs[buf_idx].copy_from_host(pinned_dst, stream)?;
             }
-            self.d_stage_packs[buf_idx].copy_from_host(pinned_dst, stream)?;
             self.d_stage_slots[buf_idx].copy_from_host(dst_slots, stream)?;
             dst_table.unpack_staged(
                 stream,
@@ -1376,17 +1401,10 @@ mod host_store {
                 }
             }
 
-            // Touch LRU timestamps on all hit slots first so they cannot be evicted this step.
-            let step = cache.step_clock;
-            cache.step_clock += 1;
-            for &ge in &hits_in_step {
-                let slot = cache.slot_of(ge).unwrap() as usize;
-                cache.slot_last_used[slot] = step;
-            }
-
             let effective_mode = match mode {
                 MoeOffloadMode::Auto => {
-                    if active_local.len() <= cache.slots.capacity
+                    if num_tokens <= 16
+                        && active_local.len() <= cache.slots.capacity
                         && misses_in_step.len() <= ws.stage_capacity
                     {
                         MoeOffloadMode::GpuLru
@@ -1405,6 +1423,16 @@ mod host_store {
                 }
                 other => other,
             };
+
+            let step = cache.step_clock;
+            if !matches!(effective_mode, MoeOffloadMode::StreamedPrefill) {
+                // Touch LRU timestamps on all hit slots first so they cannot be evicted this step.
+                cache.step_clock += 1;
+                for &ge in &hits_in_step {
+                    let slot = cache.slot_of(ge).unwrap() as usize;
+                    cache.slot_last_used[slot] = step;
+                }
+            }
 
             let ex = compute_stream.exec(ws.d_scratch.addr(), ws.d_scratch.len_bytes);
 
@@ -1431,14 +1459,19 @@ mod host_store {
                             victim_slots.push(victim_slot as i32);
                         }
                         cache.dma_experts_loaded += misses_in_step.len() as u64;
-                        ws.stage_experts_to_slots(
-                            0,
-                            store,
-                            &misses_in_step,
-                            &victim_slots,
-                            &cache.slots,
-                            compute_stream,
-                        )?;
+                        for (m_chunk, v_chunk) in misses_in_step
+                            .chunks(ws.stage_capacity)
+                            .zip(victim_slots.chunks(ws.stage_capacity))
+                        {
+                            ws.stage_experts_to_slots(
+                                0,
+                                store,
+                                m_chunk,
+                                v_chunk,
+                                &cache.slots,
+                                compute_stream,
+                            )?;
+                        }
                         ws.compute_done_events[0].record(compute_stream)?;
                         cache
                             .d_expert_to_slot
