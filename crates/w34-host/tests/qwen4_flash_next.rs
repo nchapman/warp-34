@@ -956,6 +956,54 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
         "[QF-3 TP=1 Radix] cached_prefix_tokens={} ttft_cold={:.2}ms ttft_warm={:.2}ms ids={:?}",
         r2.cached_prefix_tokens, r1.ttft_ms, r2.ttft_ms, r2.generated_token_ids,
     );
+    let warm_target_tp1_64 = engine_tp1
+        .generate_tokens(&prompt_ids, 64, false)
+        .expect("warm 64-token target decode TP=1");
+    eprintln!(
+        "[QF-5 TP=1 Warm Target 64-tok] ttft={:.2}ms decode={:.2} tok/s",
+        warm_target_tp1_64.ttft_ms, warm_target_tp1_64.decode_tok_per_s,
+    );
+    let spec_cfg = w34_host::proposer::SpeculativeConfig {
+        kind: w34_host::proposer::SpeculativeKind::Mtp,
+        draft_model: None,
+        mtp_k: 3,
+    };
+    engine_tp1
+        .enable_speculative(&spec_cfg)
+        .expect("enable real Qwen3.8 MTP-3 on TP=1");
+    let mtp_tp1_cold = engine_tp1
+        .generate_with_radix_cache(&prompt_ids, 64, 64, true)
+        .expect("MTP-3 cold 64-token run TP=1");
+    let mtp_tp1_warm = engine_tp1
+        .generate_with_radix_cache(&prompt_ids, 64, 64, true)
+        .expect("MTP-3 warm 64-token run TP=1");
+    assert_eq!(
+        mtp_tp1_warm.generated_token_ids, mtp_tp1_cold.generated_token_ids,
+        "Cold and warm MTP-3 runs on TP=1 must be deterministic across 64 tokens"
+    );
+    assert_eq!(
+        &mtp_tp1_warm.generated_token_ids[..32],
+        &warm_target_tp1_64.generated_token_ids[..32],
+        "Real 48-layer Qwen3.8 MTP-3 on TP=1 must match target greedy prefix"
+    );
+    let accepted_tp1_warm = engine_tp1
+        .speculative
+        .as_ref()
+        .map(|p| p.last_accepted.clone())
+        .unwrap_or_default();
+    let mean_acc_tp1 = if accepted_tp1_warm.is_empty() {
+        0.0
+    } else {
+        accepted_tp1_warm.iter().sum::<usize>() as f64 / accepted_tp1_warm.len() as f64
+    };
+    eprintln!(
+        "[QF-5 TP=1 MTP-3 Warm 64-tok] ttft={:.2}ms decode={:.2} tok/s rounds={} mean_accepted={:.2}/3 ({:.2} tok/round)",
+        mtp_tp1_warm.ttft_ms,
+        mtp_tp1_warm.decode_tok_per_s,
+        accepted_tp1_warm.len(),
+        mean_acc_tp1,
+        1.0 + mean_acc_tp1,
+    );
     drop(engine_tp1);
 
     // 2. TP=2 / EP=2 load, generation, and MambaRadixCache prefix reuse on 2x RTX 3090 Ti
@@ -1036,6 +1084,76 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
         eprintln!(
             "[QF-3 TP=2 Radix] cached_prefix_tokens={} ttft_cold={:.2}ms ttft_warm={:.2}ms ids={:?}",
             r2_tp2.cached_prefix_tokens, r1_tp2.ttft_ms, r2_tp2.ttft_ms, r2_tp2.generated_token_ids,
+        );
+
+        // Warm 64-token target-only decode benchmark on TP=2 / EP=2 (hot cache pre-warmed + graph captured)
+        let warm_target_64 = engine_tp2
+            .generate_tokens(&prompt_ids, 64, false)
+            .expect("warm 64-token target decode TP=2");
+        eprintln!(
+            "[QF-5 TP=2 Warm Target 64-tok] ttft={:.2}ms decode={:.2} tok/s",
+            warm_target_64.ttft_ms, warm_target_64.decode_tok_per_s,
+        );
+
+        // Enable real 512-expert MTP-3 (`runtime/mtp-int4-g32`, `mtp_k = 3`, `M_verify = 4`) on TP=2 / EP=2
+        let spec_cfg = w34_host::proposer::SpeculativeConfig {
+            kind: w34_host::proposer::SpeculativeKind::Mtp,
+            draft_model: None,
+            mtp_k: 3,
+        };
+        let t_mtp_load = std::time::Instant::now();
+        engine_tp2
+            .enable_speculative(&spec_cfg)
+            .expect("enable real Qwen3.8 MTP-3 on TP=2 / EP=2");
+        eprintln!(
+            "[QF-5 TP=2 MTP-3] Loaded compact INT4 MTP-3 in {:.2}s",
+            t_mtp_load.elapsed().as_secs_f64()
+        );
+        // Warm up MTP-3 verify graph on first run, then measure warm 64-token MTP-3 run
+        let mtp_cold = engine_tp2
+            .generate_with_radix_cache(&prompt_ids, 64, 64, true)
+            .expect("MTP-3 cold 64-token run TP=2");
+        assert_eq!(
+            mtp_cold.generated_token_ids, warm_target_64.generated_token_ids,
+            "Real 48-layer Qwen3.8 MTP-3 on TP=2 / EP=2 must match target greedy 64 tokens bit-for-bit"
+        );
+        let accepted_cold = engine_tp2
+            .speculative
+            .as_ref()
+            .map(|p| p.last_accepted.clone())
+            .unwrap_or_default();
+        eprintln!(
+            "[QF-5 TP=2 MTP-3 Cold 64-tok] ttft={:.2}ms decode={:.2} tok/s rounds={} accepted={:?}",
+            mtp_cold.ttft_ms,
+            mtp_cold.decode_tok_per_s,
+            accepted_cold.len(),
+            accepted_cold,
+        );
+        let mtp_warm = engine_tp2
+            .generate_with_radix_cache(&prompt_ids, 64, 64, true)
+            .expect("MTP-3 warm 64-token run TP=2");
+        assert_eq!(
+            mtp_warm.generated_token_ids, warm_target_64.generated_token_ids,
+            "Warm MTP-3 64-token run must match target greedy tokens"
+        );
+        let accepted_warm = engine_tp2
+            .speculative
+            .as_ref()
+            .map(|p| p.last_accepted.clone())
+            .unwrap_or_default();
+        let mean_accepted = if accepted_warm.is_empty() {
+            0.0
+        } else {
+            accepted_warm.iter().sum::<usize>() as f64 / accepted_warm.len() as f64
+        };
+        eprintln!(
+            "[QF-5 TP=2 MTP-3 Warm 64-tok] ttft={:.2}ms decode={:.2} tok/s rounds={} mean_accepted={:.2}/3 ({:.2} tok/round) accepted={:?}",
+            mtp_warm.ttft_ms,
+            mtp_warm.decode_tok_per_s,
+            accepted_warm.len(),
+            mean_accepted,
+            1.0 + mean_accepted,
+            accepted_warm,
         );
     }
 }

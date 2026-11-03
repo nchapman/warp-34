@@ -560,53 +560,86 @@ mod host_store {
                                     layout_ref.down_scales.clone(),
                                 ),
                             ] {
-                                let qw_key = archive
-                                    .resolve_name(&format!("{prefix}.{proj_name}.qweight"))
-                                    .ok_or_else(|| {
-                                        io::Error::other(format!(
-                                            "missing {prefix}.{proj_name}.qweight"
-                                        ))
-                                    })?;
-                                let sc_key = archive
-                                    .resolve_name(&format!("{prefix}.{proj_name}.scales"))
-                                    .ok_or_else(|| {
-                                        io::Error::other(format!(
-                                            "missing {prefix}.{proj_name}.scales"
-                                        ))
-                                    })?;
                                 let k8 = k_exp / 8;
                                 let num_groups = k_exp / layout_ref.group_size;
-                                let qw_info = archive.tensor_info(&qw_key)?;
-                                let sc_info = archive.tensor_info(&sc_key)?;
-                                require(
-                                    qw_info.shape == [k8, n_exp]
-                                        && sc_info.shape == [num_groups, n_exp],
-                                    format!(
-                                        "CUDA error -10 in model loader error: mismatched GPTQ qweight {:?} / scales {:?} (4-bit) on '{prefix}.{proj_name}'",
-                                        qw_info.shape, sc_info.shape
-                                    ),
-                                )?;
-                                let qw_buf = &mut raw_qw_bytes[..w_range.len()];
-                                archive.read_exact_into(&qw_key, qw_buf)?;
-                                let dst_w = &mut pack[w_range];
-                                // Transpose `[k8, n_exp]` u32 words -> `[n_exp, k8]` u32 words directly into `dst_w`
-                                for col in 0..k8 {
-                                    let src_row = &qw_buf[col * n_exp * 4..(col + 1) * n_exp * 4];
-                                    for row in 0..n_exp {
-                                        let src_off = row * 4;
-                                        let dst_off = (row * k8 + col) * 4;
-                                        dst_w[dst_off..dst_off + 4]
-                                            .copy_from_slice(&src_row[src_off..src_off + 4]);
+                                if let Some(wp_key) = archive
+                                    .resolve_name(&format!("{prefix}.{proj_name}.weight_packed"))
+                                {
+                                    let ws_key = archive
+                                        .resolve_name(&format!("{prefix}.{proj_name}.weight_scale"))
+                                        .ok_or_else(|| {
+                                            io::Error::other(format!(
+                                                "missing {prefix}.{proj_name}.weight_scale"
+                                            ))
+                                        })?;
+                                    let wp_info = archive.tensor_info(&wp_key)?;
+                                    let ws_info = archive.tensor_info(&ws_key)?;
+                                    require(
+                                        wp_info.shape == [n_exp, k8]
+                                            && ws_info.shape == [n_exp, num_groups],
+                                        format!(
+                                            "mismatched compressed-tensors weight_packed {:?} / weight_scale {:?} (4-bit) on '{prefix}.{proj_name}'",
+                                            wp_info.shape, ws_info.shape
+                                        ),
+                                    )?;
+                                    // `weight_packed` is already N-major `[n_exp, k8]`.
+                                    archive.read_exact_into(&wp_key, &mut pack[w_range])?;
+                                    // `weight_scale` is already N-major `[n_exp, num_groups]`.
+                                    let sc_f16 = archive.read_f16_bits(&ws_key)?;
+                                    let dst_s = &mut pack[s_range];
+                                    for (dst, &s) in
+                                        dst_s.as_chunks_mut::<2>().0.iter_mut().zip(&sc_f16)
+                                    {
+                                        dst.copy_from_slice(&s.to_le_bytes());
                                     }
-                                }
-                                let sc_f16 = archive.read_f16_bits(&sc_key)?;
-                                let dst_s = &mut pack[s_range];
-                                for g in 0..num_groups {
-                                    for row in 0..n_exp {
-                                        let dst_off = (row * num_groups + g) * 2;
-                                        dst_s[dst_off..dst_off + 2].copy_from_slice(
-                                            &sc_f16[g * n_exp + row].to_le_bytes(),
-                                        );
+                                } else {
+                                    let qw_key = archive
+                                        .resolve_name(&format!("{prefix}.{proj_name}.qweight"))
+                                        .ok_or_else(|| {
+                                            io::Error::other(format!(
+                                                "missing {prefix}.{proj_name}.qweight"
+                                            ))
+                                        })?;
+                                    let sc_key = archive
+                                        .resolve_name(&format!("{prefix}.{proj_name}.scales"))
+                                        .ok_or_else(|| {
+                                            io::Error::other(format!(
+                                                "missing {prefix}.{proj_name}.scales"
+                                            ))
+                                        })?;
+                                    let qw_info = archive.tensor_info(&qw_key)?;
+                                    let sc_info = archive.tensor_info(&sc_key)?;
+                                    require(
+                                        qw_info.shape == [k8, n_exp]
+                                            && sc_info.shape == [num_groups, n_exp],
+                                        format!(
+                                            "CUDA error -10 in model loader error: mismatched GPTQ qweight {:?} / scales {:?} (4-bit) on '{prefix}.{proj_name}'",
+                                            qw_info.shape, sc_info.shape
+                                        ),
+                                    )?;
+                                    let qw_buf = &mut raw_qw_bytes[..w_range.len()];
+                                    archive.read_exact_into(&qw_key, qw_buf)?;
+                                    let dst_w = &mut pack[w_range];
+                                    // Transpose `[k8, n_exp]` u32 words -> `[n_exp, k8]` u32 words directly into `dst_w`
+                                    for col in 0..k8 {
+                                        let src_row =
+                                            &qw_buf[col * n_exp * 4..(col + 1) * n_exp * 4];
+                                        for row in 0..n_exp {
+                                            let src_off = row * 4;
+                                            let dst_off = (row * k8 + col) * 4;
+                                            dst_w[dst_off..dst_off + 4]
+                                                .copy_from_slice(&src_row[src_off..src_off + 4]);
+                                        }
+                                    }
+                                    let sc_f16 = archive.read_f16_bits(&sc_key)?;
+                                    let dst_s = &mut pack[s_range];
+                                    for g in 0..num_groups {
+                                        for row in 0..n_exp {
+                                            let dst_off = (row * num_groups + g) * 2;
+                                            dst_s[dst_off..dst_off + 2].copy_from_slice(
+                                                &sc_f16[g * n_exp + row].to_le_bytes(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1022,14 +1055,13 @@ mod host_store {
             stream.synchronize()
         }
 
-        /// Pulls updated LRU metadata from device after `execute_layer_device_lru` runs.
+        /// Pulls updated LRU metadata from device before host-side `execute_layer` runs.
+        /// Always synchronizes from device because captured CUDA Graph replays execute
+        /// `w34_moe_gpu_lru_update_and_pull` on the GPU without mutating host state.
         pub fn sync_from_device_if_dirty(
             &mut self,
             stream: &crate::cuda::CudaStream,
         ) -> crate::cuda::Result<()> {
-            if !self.device_lru_dirty {
-                return Ok(());
-            }
             let mut slot_i32 = vec![0i32; self.slots.capacity];
             let mut step_arr = [0u64; 1];
             self.d_expert_to_slot

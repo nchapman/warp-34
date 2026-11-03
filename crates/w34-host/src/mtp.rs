@@ -397,7 +397,43 @@ impl Qwen3_5MtpRank {
             )
         };
         let tiered_moe = if is_tiered_moe_mtp {
-            let group_size = c.quant.group_size_or(128);
+            let (group_size, mtp_quant) = if let Some(ws_key) =
+                archive.resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_scale")
+                && let Ok(ws_info) = archive.tensor_info(&ws_key)
+                && ws_info.shape.len() == 2
+                && ws_info.shape[1] > 0
+                && h.is_multiple_of(ws_info.shape[1])
+            {
+                let gs = h / ws_info.shape[1];
+                (
+                    gs,
+                    crate::loader::QuantScheme::CompressedTensors {
+                        num_bits: 4,
+                        group_size: gs,
+                        symmetric: true,
+                        ignore: Vec::new(),
+                    },
+                )
+            } else if let Some(sc_key) =
+                archive.resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.scales")
+                && let Ok(sc_info) = archive.tensor_info(&sc_key)
+                && sc_info.shape.len() == 2
+                && sc_info.shape[0] > 0
+                && h.is_multiple_of(sc_info.shape[0])
+            {
+                let gs = h / sc_info.shape[0];
+                (
+                    gs,
+                    crate::loader::QuantScheme::AutoRound {
+                        bits: 4,
+                        group_size: gs,
+                        sym: true,
+                        awq_packing: false,
+                    },
+                )
+            } else {
+                (c.quant.group_size_or(128), c.quant.clone())
+            };
             let layout =
                 crate::moe_offload::ExpertPackLayout::new(c.moe_intermediate_size, h, group_size)
                     .map_err(|e| {
@@ -408,7 +444,11 @@ impl Qwen3_5MtpRank {
                     )
                 })?;
             let local_experts = c.num_experts / tp;
-            let k_hot = 16.min(local_experts).max(1);
+            let k_hot = if local_experts >= 64 {
+                64
+            } else {
+                16.min(local_experts).max(1)
+            };
             let stage_cap = 32.min(local_experts).max(1);
             let mut ws = crate::moe_offload::TieredMoeWorkspace::new(
                 target.device.device_id,
@@ -420,7 +460,7 @@ impl Qwen3_5MtpRank {
             let store = crate::moe_offload::HostExpertStore::load(
                 &archive,
                 "mtp.layers.0.mlp.experts",
-                &c.quant,
+                &mtp_quant,
                 layout.clone(),
                 c.num_experts,
                 r,
@@ -436,7 +476,15 @@ impl Qwen3_5MtpRank {
                 store.expert_ids(),
                 layout,
             )?;
-            cache.populate_initial(&store, None, &mut ws, &target.stream)?;
+            let initial =
+                crate::moe_offload::HotExpertRankings::from_model_dir(dir).and_then(|rk| {
+                    rk.select_for_layer(
+                        c.num_hidden_layers.saturating_sub(1),
+                        store.expert_ids(),
+                        k_hot,
+                    )
+                });
+            cache.populate_initial(&store, initial.as_deref(), &mut ws, &target.stream)?;
             Some((store, cache, ws))
         } else {
             None

@@ -754,10 +754,17 @@ impl QuantScheme {
         )
     }
 
-    /// Returns the group size if this scheme uses symmetric 4-bit GPTQ-style `qweight` packing (`U4B8`).
+    /// Returns the group size if this scheme uses symmetric 4-bit `U4B8` packing
+    /// (`Gptq`, `AutoRound`, or `CompressedTensors`).
     pub fn symmetric_gptq_u4_group_size(&self) -> Option<usize> {
         match self {
-            Self::Gptq {
+            Self::CompressedTensors {
+                num_bits: 4,
+                group_size,
+                symmetric: true,
+                ..
+            }
+            | Self::Gptq {
                 bits: 4,
                 group_size,
                 sym: true,

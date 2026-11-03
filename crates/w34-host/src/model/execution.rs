@@ -925,6 +925,7 @@ impl Qwen3_5Engine {
             });
         }
         self.reset_all_states()?;
+        self.radix = MambaRadixCache::new(16, 64);
         let total_needed_tokens = prompt_token_ids.len() + max_new_tokens + 4;
         let needed_pages = total_needed_tokens.div_ceil(16);
         let max_pages = self.ranks[0]

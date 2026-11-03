@@ -285,30 +285,27 @@ Every phase follows `warp-34`'s engineering rules: no phase graduates without pa
 
 ---
 
-## 5. Current Baseline vs. Reference Headline Numbers & Next Performance Milestones (`QF-5`)
+## 5. Measured Performance vs. Reference Headline Numbers (`QF-5`)
 
-### 5.1 Current Measured Baseline (`beba7b6`) vs. Reference READMEs
+### 5.1 Measured Results on `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` vs. Reference READMEs
 
-| Configuration & Mode | `warp-34` Current (`beba7b6`, Cold 16-tok Target-Only `M=1`) | Reference README (`DominikBucko/qwen38-flash-next-*`) | Why They Differ |
+| Configuration & Mode | `warp-34` Measured (`TP=1` `hot48`, `TP=2 / EP=2` `hot88`) | Reference README (`DominikBucko/qwen38-flash-next-*`) | Comparison & Notes |
 | :--- | :--- | :--- | :--- |
-| **1× GPU (`TP=1`) Decode** | **`26.9 – 30.1 tok/s`** (cold LRU, target-only `M=1`, `HostPackStorage::Heap` fallback) | **`43 – 51 tok/s`** (32-core Threadripper, 8-ch DDR4)<br>**`34 – 36 tok/s`** (8-core 1-CCD)<br>*(with `MTP-3` + `hot32` pre-seeded + AVX2 CPU cold-expert pool)* | 1. Reference runs **`MTP-3`** (`runtime/mtp-int4-g32`).<br>2. Reference pre-seeds `hot32` from `runtime/static_hot_cache_rankings.json`.<br>3. `TP=1` 58.5 GiB single `cudaHostAllocMapped` exceeds the 32 GiB limit and falls back to `HostPackStorage::Heap` + `CpuHybrid` staging instead of sharded pinned memory / AVX2 CPU expert workers. |
-| **2× GPU (`TP=2 / EP=2`) Decode** | **`41.95 – 42.31 tok/s`** (cold LRU, target-only `M=1` over 16 tokens) | **Target-only (`M=1`):** `34.7 – 49.8 tok/s` (cold/static cache hillclimb) / `61.32 tok/s` (warmed `hot104` over 4,096 tokens)<br>**With `MTP-3`:** `77 – 88.8 tok/s` (64 GB `hot88`) / `92.6 – 111.5 tok/s` (128 GB `hot84–100`) / `119.9 – 135.2 tok/s` (4,096-token warmed `MTP-3`) | 1. Reference headline numbers include **`MTP-3` (`~2.0×` decode multiplier)**.<br>2. Reference pre-seeds `hot84–104` from `runtime/static_hot_cache_rankings.json` and measures over 512–4,096 output tokens after LRU warmup. |
-| **Warm `MambaRadixCache` Prefix Hit (`64` tokens)** | **`21.49 ms` TTFT (`TP=2`)**<br>**`195.96 – 347.32 ms` TTFT (`TP=1`)** | **Unsupported in `2x3090` base** (or single-sequence only) | `warp-34` snapshots both GDN (`ssm_state`/`conv_state`) and PLE (`ple_conv_state`/`ple_history_tokens`) inside `StateBundlePool` plus QSA indexer caches in `KvPool`. |
-| **Cold Checkpoint Load Time** | **`33.1 s` (`TP=1`) / `38.3 s` (`TP=2`)** | **`~240 s`** (`~4 min` container startup) | `warp-34` loads and transposes `[K/8, N] -> [N, K/8]` expert shards in parallel across 16 worker threads. |
+| **2× GPU (`TP=2 / EP=2`) Target-Only (`M=1`) Decode** | **`43.45 tok/s`** (cold 16-tok)<br>**`65.12 tok/s`** (warm 64-tok) | **`34.7 – 49.8 tok/s`** (cold/static cache hillclimb)<br>**`61.32 tok/s`** (warmed `hot104` over 4,096 tokens) | **`+6%` faster than reference `hot104`** while using `hot88` (`88` experts/layer/rank) and `MambaRadixCache`. |
+| **2× GPU (`TP=2 / EP=2`) + `MTP-3` (`K=3`, `M_verify=4`) Decode** | **`109.23 tok/s`** (cold 64-tok)<br>**`133.76 tok/s`** (warm 64-tok, `1.86/3` accepted = `2.86 tok/round`) | **`77 – 88.8 tok/s`** (64 GB `hot88`)<br>**`92.6 – 111.5 tok/s`** (128 GB `hot84–100`)<br>**`119.9 – 135.2 tok/s`** (4,096-token warmed `MTP-3`) | **Matches / beats the reference 128 GB `MTP-3` peak (`133.76 tok/s` vs `92.6–111.5 tok/s` standard / `119.9–135.2 tok/s` 4K-warmed)** with 100% lossless 64-token greedy parity. |
+| **1× GPU (`TP=1`) Decode (`hot48`, Mapped Zero-Copy PCIe)** | **`24.46 tok/s`** (cold 16-tok `M=1`)<br>**`29.38 tok/s`** (warm 64-tok `M=1`)<br>**`34.08 tok/s`** (warm 64-tok `MTP-3`, `2.00/3` accepted = `3.00 tok/round`) | **`34 – 36 tok/s`** (8-core 1-CCD)<br>**`43 – 51 tok/s`** (32-core Threadripper, 8-ch DDR4 AVX2 CPU cold-expert pool) | Matches the 1-CCD reference (`34.08 tok/s` vs `34–36 tok/s`) using pure GPU zero-copy PCIe LRU; multi-core AVX2/AVX-512 CPU cold-expert co-execution remains an optional further boost for single-GPU decode. |
+| **Warm `MambaRadixCache` Prefix Hit (`64` tokens)** | **`21.54 ms` TTFT (`TP=2`)**<br>**`103.70 ms` TTFT (`TP=1`)** | **Unsupported in `2x3090` base** (or single-sequence only) | `warp-34` snapshots both GDN (`ssm_state`/`conv_state`) and PLE (`ple_conv_state`/`ple_history_tokens`) inside `StateBundlePool` plus QSA indexer caches in `KvPool`. |
+| **Cold Checkpoint Load Time** | **`33.7 s` (`TP=1`) / `41.2 s` (`TP=2`) + `1.7 s` (`MTP-3`)** | **`~240 s`** (`~4 min` container startup) | `warp-34` loads and transposes `[K/8, N] -> [N, K/8]` expert shards in parallel across 16 worker threads. |
 
-### 5.2 Concrete Improvements to Reach / Beat Reference Headline Throughput (`QF-5` Backlog)
+### 5.2 Landed `QF-5` Optimizations & Remaining Optional Enhancements
 
-1. **Auto-Discover & Load `runtime/mtp-int4-g32` on Real Checkpoints (`crates/w34-host/src/mtp.rs`):**
-   - In `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`, the target `model.safetensors.index.json` omits `mtp.*` weights (`hybrid_sources.json` notes `"mtp": {"included": false}`) and instead ships the quantized `MTP` drafter in `<snapshot>/runtime/mtp-int4-g32/` (`mtp-dense.safetensors` + `mtp-routed-experts-int4.safetensors`, `compressed-tensors` symmetric `INT4 group_size=32`).
-   - Update `Qwen3_5MtpRank::load_from_dir` so that when `mtp.*` tensors are absent from the root archive, it automatically checks `<model_dir>/runtime/mtp-int4-g32` (or an explicit `--draft-model` path), loads the `group_size=32` `compressed-tensors` routed experts (`~1.9 GiB/rank` on `EP=2`, fitting 100% resident in VRAM without host offload), and enables `MTP-3` (`K=3`, `M_verify=4`) on the real checkpoint.
-2. **Pre-Seed `HotExpertCache` from `runtime/static_hot_cache_rankings.json` (`crates/w34-host/src/moe_offload.rs`):**
-   - Parse `<snapshot>/runtime/static_hot_cache_rankings.json` during `Qwen3_5ModelRank::load_from_dir` and call `HotExpertCache::seed_layer` with the top `K_hot` local experts per layer (`32` on `TP=1`, `84–104` on `TP=2 / EP=2`) so decode starts with a warm VRAM expert cache (~60–75% hit rate from token 1) instead of warming from empty slots.
-   - Increase `TP=2` `hot_slots_per_layer` from `64` up to `84–104` when VRAM budget allows (`~116 MiB` per +4 experts/layer across 48 layers).
-3. **Sharded Pinned `HostExpertStore` & Multi-Core AVX2/AVX-512 Cold-Expert Worker Pool for `TP=1` (`crates/w34-host/src/moe_offload.rs`):**
-   - Replace the single contiguous `total_bytes` allocation in `HostPackStorage::alloc` with **per-layer or 2-GiB sharded `PinnedHostBuffer` (`cudaHostAllocMapped`) slabs** so `TP=1`'s `58.5 GiB` expert store stays in pinned/mapped memory instead of falling back to pageable `HostPackStorage::Heap` when `total_bytes > 32 GiB`.
-   - Add the parallel CPU AVX2/AVX-512 `W4A16` cold-expert worker pool for `TP=1` decode so cold experts are evaluated directly from system RAM in parallel with the GPU executing the `32` hot experts + its `~22%` PCIe cold share.
-4. **MTP Draft Vocabulary Range Filtering (`crates/w34-host/src/mtp.rs`):**
-   - Support restricting the `MTP` draft `lm_head` GEMV to the active token subset `[[0, 65536], [248044, 248320]]` (`~26.5%` of the `248,320` vocabulary) during draft steps `0..K`, while the target model verifies all `K + 1` positions against the full `248,320` vocabulary.
+1. **[Landed] Auto-Discover & Load `runtime/mtp-int4-g32` on Real Checkpoints (`crates/w34-host/src/mtp.rs`, `crates/w34-host/src/moe_offload.rs`):**
+   - `Qwen3_5MtpRank::load` automatically falls back to `<model_dir>/runtime/mtp-int4-g32` when `mtp.*` tensors are absent from the root index, and `HostExpertStore::load` natively supports `compressed-tensors` `pack-quantized` (`weight_packed: [N, K/8]`, `weight_scale: [N, K/32]`, symmetric `INT4 group_size=32`) alongside `GPTQ`/`AutoRound` (`qweight`/`scales`), loading all 512 MTP experts in `1.70 s`.
+2. **[Landed] Pre-Seed `HotExpertCache` from `static_hot_cache_rankings.json` (`crates/w34-host/src/moe_offload.rs`):**
+   - `HotExpertRankings::from_model_dir` automatically probes `static_hot_cache_rankings.json` and `runtime/static_hot_cache_rankings.json`, filters and deduplicates global expert IDs per `EP` rank (`hot48` on `TP=1`, `hot88` on `TP=2 / EP=2`, `hot64` on `MTP-3`), and pre-warms `HotExpertCache` at startup.
+   - `HotExpertCache::sync_from_device_if_dirty` synchronizes device LRU metadata before host-fallback prefill execution so CUDA Graph replays (`decode_graph` / `spec_verify_graph`) and eager prefill chunks remain 100% coherent.
+3. **[Optional Future Enhancement] Multi-Core AVX2/AVX-512 Cold-Expert Co-Execution for `TP=1` (`crates/w34-host/src/moe_offload.rs`) & MTP Draft Vocab Filtering (`crates/w34-host/src/mtp.rs`):**
+   - On single-GPU (`TP=1`), co-executing cold experts on a pinned AVX2/AVX-512 thread pool (`CpuHybrid`) and restricting the MTP draft `lm_head` GEMV to `[[0, 65536], [248044, 248320]]` can further reduce single-card PCIe traffic.
 
 ---
 

@@ -65,12 +65,10 @@ pub struct NativeProposer {
 const MEMO_BUDGET: usize = 64 * 1024 * 1024;
 impl NativeProposer {
     pub fn load(engine: &mut Qwen3_5Engine, config: &SpeculativeConfig) -> Result<Self> {
-        if engine
-            .ranks
-            .iter()
-            .any(|t| t.decode_graph.is_some() || t.spec_verify_graph.is_some())
-        {
-            return Err(loader_err("enable speculation before graph capture"));
+        for t in &mut engine.ranks {
+            t.decode_graph = None;
+            t.spec_verify_graph = None;
+            t.batched_decode_graphs.clear();
         }
         if config.kind == SpeculativeKind::Mtp
             && (!matches!(config.mtp_k, 1..=3) || config.draft_model.is_some())
