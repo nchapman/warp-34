@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -1191,6 +1192,11 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
 // (512 contiguous bytes = 4 full 128B cache lines per warp instruction for all
 // K in {128, 256, 512, 1024, 2048}), with a 4-row register-cached `valid_cnt == 1`
 // fast path and a low-register per-slot loop for `valid_cnt >= 2` to preserve SM occupancy.
+static __host__ __device__ __forceinline__ int sparse_vec4_lpr(int k_dim) {
+    const int k_u4 = k_dim >> 5;
+    return (k_u4 >= 32) ? 32 : (k_u4 >= 16) ? 16 : (k_u4 >= 8) ? 8 : 4;
+}
+
 template <bool GATE>
 __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
     const __half * __restrict__ x,
@@ -1224,8 +1230,8 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
     const int wid = tid >> 5;
     const int lane = tid & 31;
     const int k_u4_per_row = K >> 5;
-    const int lpr = (k_u4_per_row >= 32) ? 32 : k_u4_per_row; // 4, 8, 16, or 32
-    const int rpw = 32 / lpr;                                 // 8, 4, 2, or 1
+    const int lpr = sparse_vec4_lpr(K); // 4, 8, 16, or 32
+    const int rpw = 32 / lpr;           // 8, 4, 2, or 1
     const int sub_lane = lane & (lpr - 1);
     const int sub_row = lane / lpr;
     const int wave_rows = 4 * rpw;
@@ -1937,9 +1943,9 @@ extern "C" int w34_moe_w4a16_mlp_f16(
         auto experts = reinterpret_cast<int32_t *>((char *)pairs + pb);
         auto down = reinterpret_cast<__half *>((char *)experts + eb);
         cudaStream_t st = (cudaStream_t)ex->stream;
-        const int lpr_gu = ((k_hidden >> 5) >= 32) ? 32 : (k_hidden >> 5);
+        const int lpr_gu = w34_moe::sparse_vec4_lpr(k_hidden);
         const int cta_rows_gu = 4 * 4 * (32 / lpr_gu);
-        const int lpr_dn = ((n_interm >> 5) >= 32) ? 32 : (n_interm >> 5);
+        const int lpr_dn = w34_moe::sparse_vec4_lpr(n_interm);
         const int cta_rows_dn = 4 * 4 * (32 / lpr_dn);
         w34_moe::moe_align_block_size_kernel<4>
             <<<1, 256, 0, st>>>(topk_ids, pairs, experts, np, num_experts, nt);
@@ -2268,4 +2274,470 @@ extern "C" int w34_moe_f16_down_accum(
         (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
         num_tokens, top_k, num_experts, k_hidden, n_interm);
     return (int)cudaGetLastError();
+}
+
+namespace w34_moe {
+
+__global__ void moe_unpack_staged_experts_kernel(
+    const uint8_t* __restrict__ staged_packs,
+    const int32_t* __restrict__ dst_slots,
+    uint32_t* __restrict__ gate_up_packed_base,
+    uint16_t* __restrict__ gate_up_scales_base,
+    uint32_t* __restrict__ down_packed_base,
+    uint16_t* __restrict__ down_scales_base,
+    int num_staged,
+    int dst_capacity,
+    size_t pack_stride_bytes,
+    size_t gu_packed_bytes,
+    size_t gu_scales_bytes,
+    size_t dn_packed_bytes,
+    size_t dn_scales_bytes) {
+    const int s = (int)blockIdx.y;
+    if (s >= num_staged) return;
+    const int dst_slot = dst_slots[s];
+    if (dst_slot < 0 || dst_slot >= dst_capacity) return;
+
+    const uint8_t* src_pack = staged_packs + (size_t)s * pack_stride_bytes;
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+
+    // 1. Copy gate_up_packed (16B uint4 chunks)
+    const size_t gu_p_vec = gu_packed_bytes >> 4;
+    const uint4* src_gu_p = reinterpret_cast<const uint4*>(src_pack);
+    uint4* dst_gu_p = reinterpret_cast<uint4*>(
+        reinterpret_cast<uint8_t*>(gate_up_packed_base) + (size_t)dst_slot * gu_packed_bytes);
+    for (size_t i = tid; i < gu_p_vec; i += stride) {
+        dst_gu_p[i] = src_gu_p[i];
+    }
+
+    // 2. Copy gate_up_scales
+    const size_t gu_s_vec = gu_scales_bytes >> 4;
+    const uint4* src_gu_s = reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes);
+    uint4* dst_gu_s = reinterpret_cast<uint4*>(
+        reinterpret_cast<uint8_t*>(gate_up_scales_base) + (size_t)dst_slot * gu_scales_bytes);
+    for (size_t i = tid; i < gu_s_vec; i += stride) {
+        dst_gu_s[i] = src_gu_s[i];
+    }
+
+    // 3. Copy down_packed
+    const size_t dn_p_vec = dn_packed_bytes >> 4;
+    const uint4* src_dn_p =
+        reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes + gu_scales_bytes);
+    uint4* dst_dn_p = reinterpret_cast<uint4*>(
+        reinterpret_cast<uint8_t*>(down_packed_base) + (size_t)dst_slot * dn_packed_bytes);
+    for (size_t i = tid; i < dn_p_vec; i += stride) {
+        dst_dn_p[i] = src_dn_p[i];
+    }
+
+    // 4. Copy down_scales
+    const size_t dn_s_vec = dn_scales_bytes >> 4;
+    const uint4* src_dn_s = reinterpret_cast<const uint4*>(
+        src_pack + gu_packed_bytes + gu_scales_bytes + dn_packed_bytes);
+    uint4* dst_dn_s = reinterpret_cast<uint4*>(
+        reinterpret_cast<uint8_t*>(down_scales_base) + (size_t)dst_slot * dn_scales_bytes);
+    for (size_t i = tid; i < dn_s_vec; i += stride) {
+        dst_dn_s[i] = src_dn_s[i];
+    }
+}
+
+__global__ void moe_remap_topk_ids_i32_kernel(
+    const int32_t* __restrict__ global_topk_ids,
+    const int32_t* __restrict__ expert_to_slot,
+    int32_t* __restrict__ remapped_topk_ids,
+    int total_pairs,
+    int global_expert_offset,
+    int local_num_experts) {
+    const int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= total_pairs) return;
+    const int ge = global_topk_ids[idx];
+    const int64_t le = (int64_t)ge - global_expert_offset;
+    int32_t slot = -1;
+    if (le >= 0 && le < local_num_experts) {
+        slot = expert_to_slot[le];
+    }
+    remapped_topk_ids[idx] = slot;
+}
+
+__global__ void moe_gpu_lru_plan_and_remap_kernel(
+    const int32_t* __restrict__ global_topk_ids,
+    int32_t* __restrict__ expert_to_slot,
+    int32_t* __restrict__ slot_to_expert,
+    uint64_t* __restrict__ slot_last_used,
+    uint64_t* __restrict__ step_counter,
+    int32_t* __restrict__ remapped_topk_ids,
+    int32_t* __restrict__ miss_local_experts,
+    int32_t* __restrict__ miss_victim_slots,
+    int32_t* __restrict__ num_misses_out,
+    int total_pairs,
+    int global_expert_offset,
+    int local_num_experts,
+    int k_hot,
+    int max_misses) {
+    const int lane = (int)threadIdx.x;
+    uint64_t step = 0;
+    if (lane == 0) {
+        step = (*step_counter) + 1;
+        *step_counter = step;
+        for (int i = 0; i < total_pairs; ++i) {
+            const int ge = global_topk_ids[i];
+            const int64_t le = (int64_t)ge - global_expert_offset;
+            if (le < 0 || le >= local_num_experts) {
+                remapped_topk_ids[i] = -1;
+            } else {
+                const int slot = expert_to_slot[le];
+                if (slot >= 0 && slot < k_hot) {
+                    slot_last_used[slot] = step;
+                    remapped_topk_ids[i] = slot;
+                } else {
+                    remapped_topk_ids[i] = -2;
+                }
+            }
+        }
+    }
+    step = __shfl_sync(0xffffffffu, step, 0);
+
+    int n_miss = 0;
+    for (int i = 0; i < total_pairs; ++i) {
+        int slot = 0;
+        int ge = 0;
+        int le = 0;
+        if (lane == 0) {
+            slot = remapped_topk_ids[i];
+            if (slot == -2) {
+                ge = global_topk_ids[i];
+                le = (int)((int64_t)ge - global_expert_offset);
+                slot = expert_to_slot[le];
+                if (slot >= 0 && slot < k_hot) {
+                    remapped_topk_ids[i] = slot;
+                } else {
+                    slot = -2;
+                }
+            }
+        }
+        slot = __shfl_sync(0xffffffffu, slot, 0);
+        if (slot != -2) continue;
+        if (n_miss >= max_misses) {
+            if (lane == 0) remapped_topk_ids[i] = -1;
+            continue;
+        }
+
+        uint64_t best_ts = UINT64_MAX;
+        int best_slot = 0;
+        for (int s = lane; s < k_hot; s += 32) {
+            const uint64_t ts = slot_last_used[s];
+            if (ts < best_ts || (ts == best_ts && s < best_slot)) {
+                best_ts = ts;
+                best_slot = s;
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const uint64_t other_ts = __shfl_down_sync(0xffffffffu, best_ts, off);
+            const int other_slot = __shfl_down_sync(0xffffffffu, best_slot, off);
+            if (other_ts < best_ts || (other_ts == best_ts && other_slot < best_slot)) {
+                best_ts = other_ts;
+                best_slot = other_slot;
+            }
+        }
+
+        if (lane == 0) {
+            const int victim_slot = best_slot;
+            const int old_ge = slot_to_expert[victim_slot];
+            const int64_t old_le = (int64_t)old_ge - global_expert_offset;
+            if (old_le >= 0 && old_le < local_num_experts) {
+                expert_to_slot[old_le] = -1;
+            }
+            expert_to_slot[le] = victim_slot;
+            slot_to_expert[victim_slot] = ge;
+            slot_last_used[victim_slot] = step;
+            miss_local_experts[n_miss] = le;
+            miss_victim_slots[n_miss] = victim_slot;
+            remapped_topk_ids[i] = victim_slot;
+        }
+        n_miss++;
+    }
+    if (lane == 0) {
+        *num_misses_out = n_miss;
+    }
+}
+
+__global__ void moe_gpu_lru_pull_mapped_experts_kernel(
+    const uint8_t* __restrict__ mapped_host_packs,
+    const int32_t* __restrict__ miss_local_experts,
+    const int32_t* __restrict__ miss_victim_slots,
+    const int32_t* __restrict__ num_misses_buf,
+    uint32_t* __restrict__ gate_up_packed_base,
+    uint16_t* __restrict__ gate_up_scales_base,
+    uint32_t* __restrict__ down_packed_base,
+    uint16_t* __restrict__ down_scales_base,
+    int local_num_experts,
+    int k_hot,
+    size_t pack_stride_bytes,
+    size_t gu_packed_bytes,
+    size_t gu_scales_bytes,
+    size_t dn_packed_bytes,
+    size_t dn_scales_bytes) {
+    const int m = (int)blockIdx.y;
+    const int num_misses = *num_misses_buf;
+    if (m >= num_misses) return;
+
+    const int le = miss_local_experts[m];
+    const int dst_slot = miss_victim_slots[m];
+    if (le < 0 || le >= local_num_experts || dst_slot < 0 || dst_slot >= k_hot) return;
+
+    const uint8_t* src_pack = mapped_host_packs + (size_t)le * pack_stride_bytes;
+    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+
+    const size_t gu_p_vec = gu_packed_bytes >> 4;
+    const uint4* src_gu_p = reinterpret_cast<const uint4*>(src_pack);
+    uint4* dst_gu_p = reinterpret_cast<uint4*>(
+        reinterpret_cast<uint8_t*>(gate_up_packed_base) + (size_t)dst_slot * gu_packed_bytes);
+    for (size_t i = tid; i < gu_p_vec; i += stride) {
+        dst_gu_p[i] = src_gu_p[i];
+    }
+
+    const size_t gu_s_vec = gu_scales_bytes >> 4;
+    const uint4* src_gu_s = reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes);
+    uint4* dst_gu_s = reinterpret_cast<uint4*>(
+        reinterpret_cast<uint8_t*>(gate_up_scales_base) + (size_t)dst_slot * gu_scales_bytes);
+    for (size_t i = tid; i < gu_s_vec; i += stride) {
+        dst_gu_s[i] = src_gu_s[i];
+    }
+
+    const size_t dn_p_vec = dn_packed_bytes >> 4;
+    const uint4* src_dn_p =
+        reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes + gu_scales_bytes);
+    uint4* dst_dn_p = reinterpret_cast<uint4*>(
+        reinterpret_cast<uint8_t*>(down_packed_base) + (size_t)dst_slot * dn_packed_bytes);
+    for (size_t i = tid; i < dn_p_vec; i += stride) {
+        dst_dn_p[i] = src_dn_p[i];
+    }
+
+    const size_t dn_s_vec = dn_scales_bytes >> 4;
+    const uint4* src_dn_s = reinterpret_cast<const uint4*>(
+        src_pack + gu_packed_bytes + gu_scales_bytes + dn_packed_bytes);
+    uint4* dst_dn_s = reinterpret_cast<uint4*>(
+        reinterpret_cast<uint8_t*>(down_scales_base) + (size_t)dst_slot * dn_scales_bytes);
+    for (size_t i = tid; i < dn_s_vec; i += stride) {
+        dst_dn_s[i] = src_dn_s[i];
+    }
+}
+
+__global__ void add_inplace_f16_kernel(
+    __half* __restrict__ dst,
+    const __half* __restrict__ src,
+    int64_t num_elems) {
+    const int64_t idx2 = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (idx2 + 1 < num_elems) {
+        __half2* d2 = reinterpret_cast<__half2*>(dst + idx2);
+        const __half2* s2 = reinterpret_cast<const __half2*>(src + idx2);
+        *d2 = __hadd2(*d2, *s2);
+    } else if (idx2 < num_elems) {
+        dst[idx2] = __hadd(dst[idx2], src[idx2]);
+    }
+}
+
+} // namespace w34_moe
+
+extern "C" int w34_moe_unpack_staged_experts(
+    const w34_exec* ex,
+    const void* staged_packs,
+    const int32_t* dst_slots,
+    uint32_t* gate_up_packed_base,
+    void* gate_up_scales_base,
+    uint32_t* down_packed_base,
+    void* down_scales_base,
+    int num_staged,
+    int dst_capacity,
+    size_t pack_stride_bytes,
+    int n_interm,
+    int k_hidden,
+    int group_size) {
+    if (!ex || !staged_packs || !dst_slots || !gate_up_packed_base || !gate_up_scales_base ||
+        !down_packed_base || !down_scales_base || num_staged < 0 || dst_capacity <= 0 || n_interm <= 0 ||
+        (((uintptr_t)staged_packs | (uintptr_t)gate_up_packed_base |
+          (uintptr_t)gate_up_scales_base | (uintptr_t)down_packed_base |
+          (uintptr_t)down_scales_base) & 15) != 0 ||
+        k_hidden <= 0 || group_size <= 0 || num_staged > 65535 ||
+        n_interm > INT_MAX / 2 || n_interm % 8 != 0 || k_hidden % 8 != 0 ||
+        n_interm % group_size != 0 || k_hidden % group_size != 0 ||
+        (pack_stride_bytes & 15) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_staged == 0) return 0;
+
+    const size_t gu_packed_bytes = (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
+    const size_t gu_scales_bytes =
+        (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
+    const size_t dn_packed_bytes = (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
+    const size_t dn_scales_bytes =
+        (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
+    if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
+        (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
+        pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
+        return (int)cudaErrorInvalidValue;
+    }
+
+    dim3 grid(64, (unsigned)num_staged);
+    w34_moe::moe_unpack_staged_experts_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
+        static_cast<const uint8_t*>(staged_packs),
+        dst_slots,
+        gate_up_packed_base,
+        static_cast<uint16_t*>(gate_up_scales_base),
+        down_packed_base,
+        static_cast<uint16_t*>(down_scales_base),
+        num_staged,
+        dst_capacity,
+        pack_stride_bytes,
+        gu_packed_bytes,
+        gu_scales_bytes,
+        dn_packed_bytes,
+        dn_scales_bytes);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_moe_remap_topk_ids_i32(
+    const w34_exec* ex,
+    const int32_t* global_topk_ids,
+    const int32_t* expert_to_slot,
+    int32_t* remapped_topk_ids,
+    int total_pairs,
+    int global_expert_offset,
+    int local_num_experts) {
+    if (!ex || !global_topk_ids || !expert_to_slot || !remapped_topk_ids || total_pairs < 0 ||
+        local_num_experts <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (total_pairs == 0) return 0;
+    const int threads = 256;
+    const int blocks = (int)(((int64_t)total_pairs + threads - 1) / threads);
+    w34_moe::moe_remap_topk_ids_i32_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
+        global_topk_ids,
+        expert_to_slot,
+        remapped_topk_ids,
+        total_pairs,
+        global_expert_offset,
+        local_num_experts);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_add_inplace_f16(
+    const w34_exec* ex,
+    void* dst_f16,
+    const void* src_f16,
+    int64_t num_elems) {
+    if (!ex || !dst_f16 || !src_f16 || num_elems < 0 ||
+        (((uintptr_t)dst_f16 | (uintptr_t)src_f16) & 3) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_elems == 0) return 0;
+    const int64_t pairs = num_elems / 2 + num_elems % 2;
+    if (pairs > (int64_t)INT_MAX * 256) return (int)cudaErrorInvalidValue;
+    const int threads = 256;
+    const int blocks = (int)((pairs + threads - 1) / threads);
+    w34_moe::add_inplace_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
+        static_cast<__half*>(dst_f16),
+        static_cast<const __half*>(src_f16),
+        num_elems);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_moe_gpu_lru_update_and_pull(
+    const w34_exec* ex,
+    const int32_t* global_topk_ids,
+    int32_t* expert_to_slot,
+    int32_t* slot_to_expert,
+    uint64_t* slot_last_used,
+    uint64_t* step_counter,
+    int32_t* remapped_topk_ids,
+    int32_t* miss_local_experts,
+    int32_t* miss_victim_slots,
+    int32_t* num_misses_buf,
+    const void* mapped_host_packs,
+    uint32_t* gate_up_packed_base,
+    void* gate_up_scales_base,
+    uint32_t* down_packed_base,
+    void* down_scales_base,
+    int total_pairs,
+    int global_expert_offset,
+    int local_num_experts,
+    int k_hot,
+    int max_misses,
+    size_t pack_stride_bytes,
+    int n_interm,
+    int k_hidden,
+    int group_size) {
+    if (!ex || !global_topk_ids || !expert_to_slot || !slot_to_expert || !slot_last_used ||
+        !step_counter || !remapped_topk_ids || !miss_local_experts || !miss_victim_slots ||
+        !num_misses_buf || total_pairs < 0 || local_num_experts <= 0 || k_hot <= 0 ||
+        max_misses < 0 || max_misses > 65535) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (total_pairs == 0) return 0;
+
+    cudaStream_t stream = (cudaStream_t)ex->stream;
+    w34_moe::moe_gpu_lru_plan_and_remap_kernel<<<1, 32, 0, stream>>>(
+        global_topk_ids,
+        expert_to_slot,
+        slot_to_expert,
+        slot_last_used,
+        step_counter,
+        remapped_topk_ids,
+        miss_local_experts,
+        miss_victim_slots,
+        num_misses_buf,
+        total_pairs,
+        global_expert_offset,
+        local_num_experts,
+        k_hot,
+        max_misses);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return (int)err;
+
+    if (mapped_host_packs != nullptr && max_misses > 0) {
+        if (!gate_up_packed_base || !gate_up_scales_base || !down_packed_base || !down_scales_base ||
+            (((uintptr_t)mapped_host_packs | (uintptr_t)gate_up_packed_base |
+              (uintptr_t)gate_up_scales_base | (uintptr_t)down_packed_base |
+              (uintptr_t)down_scales_base) & 15) != 0 ||
+            n_interm <= 0 || k_hidden <= 0 || group_size <= 0 ||
+            n_interm > INT_MAX / 2 || n_interm % 8 != 0 || k_hidden % 8 != 0 ||
+            n_interm % group_size != 0 || k_hidden % group_size != 0 ||
+            (pack_stride_bytes & 15) != 0) {
+            return (int)cudaErrorInvalidValue;
+        }
+        const size_t gu_packed_bytes =
+            (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
+        const size_t gu_scales_bytes =
+            (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
+        const size_t dn_packed_bytes =
+            (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
+        const size_t dn_scales_bytes =
+            (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
+        if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
+            (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
+            pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
+            return (int)cudaErrorInvalidValue;
+        }
+        dim3 grid(16, (unsigned)max_misses);
+        w34_moe::moe_gpu_lru_pull_mapped_experts_kernel<<<grid, 256, 0, stream>>>(
+            static_cast<const uint8_t*>(mapped_host_packs),
+            miss_local_experts,
+            miss_victim_slots,
+            num_misses_buf,
+            gate_up_packed_base,
+            static_cast<uint16_t*>(gate_up_scales_base),
+            down_packed_base,
+            static_cast<uint16_t*>(down_scales_base),
+            local_num_experts,
+            k_hot,
+            pack_stride_bytes,
+            gu_packed_bytes,
+            gu_scales_bytes,
+            dn_packed_bytes,
+            dn_scales_bytes);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return (int)err;
+    }
+    return 0;
 }

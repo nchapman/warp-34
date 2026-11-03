@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Shared PLE lookup data and rank-local staging buffers.
+#[cfg(feature = "cuda")]
+pub struct PleRankRuntime {
+    pub hasher: Arc<crate::ple::PleNgramHasher>,
+    pub mmap_table: Arc<crate::ple::PleMmapTable>,
+    pub f8_staging_dev: DeviceBuffer,
+    pub f8_host_scratch: Vec<u8>,
+    pub ids_scratch: Vec<i64>,
+}
+
 /// One rank of a Qwen 3.5 / 3.8 model resident on a single GPU.
 #[cfg(feature = "cuda")]
 pub struct Qwen3_5ModelRank {
@@ -16,7 +26,7 @@ pub struct Qwen3_5ModelRank {
     pub batch_meta_arena: DeviceArena,
     pub marlin_ws: DeviceBuffer,
     pub embed_tokens_ptr: u64,
-    pub final_norm_ptr: u64,
+    pub final_residual: FinalResidual,
     pub lm_head: LinearProj,
     pub local_vocab_size: usize,
     pub vocab_offset: usize,
@@ -49,6 +59,9 @@ pub struct Qwen3_5ModelRank {
     pub pending_visual_splice: Option<(u64, u64, usize)>,
     pub last_norm_hidden_ptr: u64,
     pub last_norm_hidden_rows: usize,
+    pub tiered_moe: Option<crate::moe_offload::RankTieredMoe>,
+    pub ple_runtime: Option<PleRankRuntime>,
+    pub is_capturing_graph: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -230,10 +243,15 @@ impl Qwen3_5ModelRank {
                 || name.ends_with(".weight_g_idx")
                 || name.ends_with(".weight_shape")
                 || (name.ends_with(".qzeros") && !cfg.quant.expects_zero_points())
+                || (cfg.uses_tiered_moe() && name.contains(".experts."))
+                || (name.contains(".ple_embedding.") && !name.ends_with(".weight_scale"))
             {
                 continue;
             }
             let is_replicated = name.contains("norm.")
+                || name.contains("hyper_connection")
+                || name.contains(".ple.")
+                || name.contains(".indexer.")
                 || name.ends_with(".mlp.gate.weight")
                 || name.ends_with(".mlp.gate.weight_packed")
                 || name.ends_with(".mlp.gate.weight_scale")
@@ -391,6 +409,7 @@ impl Qwen3_5ModelRank {
         Err(loader_err_msg("missing model.embed_tokens.weight"))
     }
 
+    #[allow(clippy::cognitive_complexity)]
     pub(super) fn load_rank_with_capacity(
         archive: &SafetensorsArchive,
         cfg: &ModelConfig,
@@ -468,14 +487,29 @@ impl Qwen3_5ModelRank {
         let embed_f16 = Self::load_embed_tokens_f16(archive, cfg)?;
         let embed_tokens_ptr = weight_arena.upload_slice(&embed_f16, &stream)?;
 
-        // 2. final norm
-        let norm_key = archive
-            .resolve_name("model.norm.weight")
-            .ok_or_else(|| loader_err("missing model.norm.weight"))?;
-        let norm_f16 = archive
-            .read_f16_bits(&norm_key)
-            .map_err(|_| loader_err("read model.norm.weight"))?;
-        let final_norm_ptr = weight_arena.upload_slice(&norm_f16, &stream)?;
+        // 2. final norm or multi-stream HyperConnection mixer
+        let final_residual = if cfg.uses_hyper_connection() {
+            let mixer = load_hc_block_weights(
+                archive,
+                cfg,
+                "model.hyper_connection_mixer",
+                false,
+                &mut weight_arena,
+                &stream,
+                &repack_staging,
+            )?;
+            FinalResidual::HyperConnection { mixer }
+        } else {
+            let norm_key = archive
+                .resolve_name("model.norm.weight")
+                .ok_or_else(|| loader_err("missing model.norm.weight"))?;
+            let norm_f16 = archive
+                .read_f16_bits(&norm_key)
+                .map_err(|_| loader_err("read model.norm.weight"))?;
+            FinalResidual::SingleStream {
+                norm_ptr: weight_arena.upload_slice(&norm_f16, &stream)?,
+            }
+        };
 
         // 3. lm_head (sharded along vocab N across TP ranks)
         let local_vocab_size = cfg.vocab_size / tp_size;
@@ -521,21 +555,59 @@ impl Qwen3_5ModelRank {
 
         for layer_id in 0..cfg.num_hidden_layers {
             let pfx = format!("model.layers.{layer_id}");
-            let in_ln_key = archive
-                .resolve_name(&format!("{pfx}.input_layernorm.weight"))
-                .ok_or_else(|| loader_err("missing input_layernorm"))?;
-            let in_ln = archive
-                .read_f16_bits(&in_ln_key)
-                .map_err(|_| loader_err("read input_layernorm"))?;
-            let input_layernorm_ptr = weight_arena.upload_slice(&in_ln, &stream)?;
+            let residual = if cfg.uses_hyper_connection() {
+                let attn_hc = load_hc_block_weights(
+                    archive,
+                    cfg,
+                    &format!("{pfx}.attn_hyper_connection"),
+                    true,
+                    &mut weight_arena,
+                    &stream,
+                    &repack_staging,
+                )?;
+                let mlp_hc = load_hc_block_weights(
+                    archive,
+                    cfg,
+                    &format!("{pfx}.mlp_hyper_connection"),
+                    true,
+                    &mut weight_arena,
+                    &stream,
+                    &repack_staging,
+                )?;
+                LayerResidual::HyperConnection { attn_hc, mlp_hc }
+            } else {
+                let in_ln_key = archive
+                    .resolve_name(&format!("{pfx}.input_layernorm.weight"))
+                    .ok_or_else(|| loader_err("missing input_layernorm"))?;
+                let in_ln = archive
+                    .read_f16_bits(&in_ln_key)
+                    .map_err(|_| loader_err("read input_layernorm"))?;
+                let input_layernorm_ptr = weight_arena.upload_slice(&in_ln, &stream)?;
 
-            let post_ln_key = archive
-                .resolve_name(&format!("{pfx}.post_attention_layernorm.weight"))
-                .ok_or_else(|| loader_err("missing post_attention_layernorm"))?;
-            let post_ln = archive
-                .read_f16_bits(&post_ln_key)
-                .map_err(|_| loader_err("read post_attention_layernorm"))?;
-            let post_attention_layernorm_ptr = weight_arena.upload_slice(&post_ln, &stream)?;
+                let post_ln_key = archive
+                    .resolve_name(&format!("{pfx}.post_attention_layernorm.weight"))
+                    .ok_or_else(|| loader_err("missing post_attention_layernorm"))?;
+                let post_ln = archive
+                    .read_f16_bits(&post_ln_key)
+                    .map_err(|_| loader_err("read post_attention_layernorm"))?;
+                let post_attention_layernorm_ptr = weight_arena.upload_slice(&post_ln, &stream)?;
+                LayerResidual::SingleStream {
+                    input_layernorm_ptr,
+                    post_attention_layernorm_ptr,
+                }
+            };
+            let ple = if cfg.uses_ple() && cfg.ple_layer_ids.contains(&(layer_id + 1)) {
+                Some(load_ple_layer_weights(
+                    archive,
+                    cfg,
+                    &pfx,
+                    &mut weight_arena,
+                    &stream,
+                    &repack_staging,
+                )?)
+            } else {
+                None
+            };
 
             let block = match cfg.layer_types[layer_id] {
                 LayerKind::FullAttention => {
@@ -592,6 +664,19 @@ impl Qwen3_5ModelRank {
                         .map_err(|_| loader_err("read k_norm"))?;
                     let k_norm_ptr = weight_arena.upload_slice(&k_norm, &stream)?;
 
+                    let qsa_indexer = if cfg.uses_qsa() {
+                        Some(load_qsa_indexer_weights(
+                            archive,
+                            cfg,
+                            &pfx,
+                            &mut weight_arena,
+                            &stream,
+                            &repack_staging,
+                        )?)
+                    } else {
+                        None
+                    };
+
                     LayerBlockWeights::FullAttention(FullAttentionLayerWeights {
                         layer_id,
                         kv_layer_ordinal: kv_ord,
@@ -599,6 +684,7 @@ impl Qwen3_5ModelRank {
                         o_proj,
                         q_norm_ptr,
                         k_norm_ptr,
+                        qsa_indexer,
                     })
                 }
                 LayerKind::LinearAttention => {
@@ -736,7 +822,19 @@ impl Qwen3_5ModelRank {
                         .resolve_name(&format!("{pfx}.mlp.gate.qweight"))
                         .is_some());
 
-            let ffn = if is_moe_layer {
+            let ffn = if is_moe_layer && cfg.uses_tiered_moe() {
+                FfnBlockWeights::Moe(Box::new(load_tiered_moe_layer_weights(
+                    archive,
+                    cfg,
+                    layer_id,
+                    &pfx,
+                    rank,
+                    tp_size,
+                    &mut weight_arena,
+                    &stream,
+                    &repack_staging,
+                )?))
+            } else if is_moe_layer {
                 FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
                     archive,
                     cfg,
@@ -775,8 +873,8 @@ impl Qwen3_5ModelRank {
 
             layers.push(DecoderLayerWeights {
                 layer_id,
-                input_layernorm_ptr,
-                post_attention_layernorm_ptr,
+                residual,
+                ple,
                 block,
                 ffn,
             });
@@ -793,13 +891,26 @@ impl Qwen3_5ModelRank {
             let kb = crate::cache::kv_format_row_bytes(kf, cfg.head_dim);
             let vb = crate::cache::kv_format_row_bytes(vf, cfg.head_dim);
             bytes_per_kv_page_all_layers += local_kv_heads * block_size * (kb + vb);
+            if cfg.uses_qsa() {
+                let comp_rows = block_size / cfg.indexer_compress_ratio.max(1);
+                bytes_per_kv_page_all_layers +=
+                    cfg.indexer_kv_heads * (block_size + comp_rows) * cfg.indexer_head_dim * 2;
+            }
         }
 
         let conv_dim = 2 * gdn_k_local + gdn_v_local;
+        let ple_slot_bytes = if cfg.uses_ple() {
+            cfg.ple_layer_ids.len() * cfg.hc_count * cfg.hidden_size * 9 * 2
+        } else {
+            0
+        };
         let bytes_per_state_slot = gdn_layer_ids.len()
             * (conv_dim * (cfg.linear_conv_kernel_dim - 1) * 2
-                + local_v_heads * cfg.linear_value_head_dim * cfg.linear_key_head_dim * 4);
-        let default_state_slots = if est_weight_bytes >= 17 * 1024 * 1024 * 1024 {
+                + local_v_heads * cfg.linear_value_head_dim * cfg.linear_key_head_dim * 4)
+            + ple_slot_bytes;
+        let default_state_slots = if cfg.uses_ple() {
+            12usize
+        } else if est_weight_bytes >= 17 * 1024 * 1024 * 1024 {
             10usize
         } else {
             24usize
@@ -815,11 +926,21 @@ impl Qwen3_5ModelRank {
         } else {
             crate::cuda::MIN_HEADROOM_BYTES
         };
-        let required_headroom = base_headroom.saturating_add(if rank == 0 {
-            capacity.rank0_extra_headroom_bytes
+        let tiered_moe_reserve = if cfg.uses_tiered_moe() {
+            // Reserve VRAM for TieredMoeEngine hot expert cache + staging buffers + PLE staging
+            let hot_per_layer = if tp_size == 2 { 112usize } else { 48usize };
+            let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
+            (cfg.num_hidden_layers * hot_per_layer + 512) * exp_bytes + 64 * 1024 * 1024
         } else {
             0
-        });
+        };
+        let required_headroom = base_headroom
+            .saturating_add(tiered_moe_reserve)
+            .saturating_add(if rank == 0 {
+                capacity.rank0_extra_headroom_bytes
+            } else {
+                0
+            });
         let base_fixed = weight_arena
             .used()
             .saturating_add(scratch_arena.capacity())
@@ -861,7 +982,7 @@ impl Qwen3_5ModelRank {
             state_budget_fixed,
             bytes_per_state_slot,
         );
-        let state_pool = StateBundlePool::new(
+        let mut state_pool = StateBundlePool::new(
             device_id,
             &gdn_layer_ids,
             total_state_slots,
@@ -871,6 +992,12 @@ impl Qwen3_5ModelRank {
             cfg.linear_key_head_dim,
             cfg.linear_value_head_dim,
         )?;
+        if cfg.uses_ple() {
+            state_pool.init_ple_state(
+                cfg.hc_count * cfg.hidden_size,
+                cfg.eos_token_ids.first().copied().unwrap_or(248044),
+            )?;
+        }
         let state_pool_bytes = total_state_slots * bytes_per_state_slot;
 
         let capacity_plan = CapacityPlanner::plan_with_headroom(
@@ -885,7 +1012,7 @@ impl Qwen3_5ModelRank {
         )
         .map_err(|e| loader_err_ctx("CapacityPlanner failed", e))?;
 
-        let kv_pool = KvPool::new_target_full_attn(
+        let mut kv_pool = KvPool::new_target_full_attn(
             device_id,
             &full_attn_layer_ids,
             local_kv_heads,
@@ -894,6 +1021,9 @@ impl Qwen3_5ModelRank {
             capacity_plan.max_kv_pages_per_layer,
             kv_policy,
         )?;
+        if cfg.uses_qsa() {
+            kv_pool.init_qsa_indexer_caches(cfg.indexer_head_dim, cfg.indexer_compress_ratio)?;
+        }
 
         let decode_io =
             DecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
@@ -919,7 +1049,7 @@ impl Qwen3_5ModelRank {
             batch_meta_arena,
             marlin_ws,
             embed_tokens_ptr,
-            final_norm_ptr,
+            final_residual,
             lm_head,
             local_vocab_size,
             vocab_offset,
@@ -951,7 +1081,171 @@ impl Qwen3_5ModelRank {
             pending_visual_splice: None,
             last_norm_hidden_ptr: 0,
             last_norm_hidden_rows: 0,
+            tiered_moe: None,
+            ple_runtime: None,
+            is_capturing_graph: false,
         })
+    }
+
+    /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph.
+    pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
+        let top_k = self.cfg.num_experts_per_tok.max(1);
+        self.tiered_moe.as_ref().is_none_or(|tm| {
+            (0..self.layers.len())
+                .all(|li| num_tokens * top_k <= tm.layer_hot_k(li) && tm.layer_has_mapped_store(li))
+        })
+    }
+
+    /// Initializes expert residency independently of residual topology and PLE.
+    pub fn init_tiered_moe(&mut self, archive: &SafetensorsArchive) -> Result<()> {
+        self.device.make_current()?;
+        let local_experts = (self.cfg.num_experts / self.tp_size).max(1);
+        let default_hot = if self.tp_size == 2 { 112usize } else { 48usize };
+        let hot_per_layer = if local_experts <= default_hot {
+            (local_experts / 2).max(1)
+        } else {
+            default_hot
+        };
+        let tiered_moe = crate::moe_offload::RankTieredMoe::load_for_rank(
+            archive,
+            &self.cfg,
+            self.device.device_id,
+            self.rank,
+            self.tp_size,
+            hot_per_layer,
+            32,
+            &self.stream,
+        )?;
+        self.tiered_moe = Some(tiered_moe);
+        Ok(())
+    }
+
+    pub(super) fn mark_tiered_moe_device_lru_dirty(&mut self) {
+        if let Some(tm) = &mut self.tiered_moe {
+            for c in &mut tm.caches {
+                c.device_lru_dirty = true;
+            }
+        }
+    }
+
+    /// Initializes shared PLE tables and rank-local staging independently of MoE.
+    pub fn init_ple(
+        &mut self,
+        ple_hasher: Arc<crate::ple::PleNgramHasher>,
+        ple_mmap_table: Arc<crate::ple::PleMmapTable>,
+    ) -> Result<()> {
+        self.device.make_current()?;
+        // Pre-allocate 2048 rows * ple_embed_dim F8 staging buffer at a fixed device address
+        // so both eager forward and CUDA Graphs can read from `f8_staging_dev.addr()`.
+        let max_ple_tokens = 2048usize;
+        let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
+        let f8_staging_dev = DeviceBuffer::alloc(
+            self.device.device_id,
+            max_ple_tokens * ple_row_bytes.max(2560),
+        )?;
+        self.ple_runtime = Some(PleRankRuntime {
+            hasher: ple_hasher,
+            mmap_table: ple_mmap_table,
+            f8_staging_dev,
+            f8_host_scratch: Vec::new(),
+            ids_scratch: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Computes PLE n-gram hashes for a batch, updates `state_pool.ple_ngram_context` across
+    /// `state_in`/`state_out`/`spec_state_indices`/`checkpoint_dst_indices`, gathers F8_E4M3 rows
+    /// from `PleMmapTable`, and uploads them asynchronously into `ple_runtime.f8_staging_dev`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_ple_f8_for_batch(
+        &mut self,
+        input_ids: &[i32],
+        query_start_loc: &[i32],
+        state_in_indices: &[i32],
+        state_out_indices: &[i32],
+        has_initial_state: &[u8],
+        spec_state_indices: &[i32],
+        max_verify_tokens: usize,
+        checkpoint_dst_indices: &[i32],
+        checkpoint_token_offsets: &[i32],
+        max_checkpoints_per_req: usize,
+    ) -> Result<()> {
+        let Some(ple) = &mut self.ple_runtime else {
+            return Ok(());
+        };
+        if input_ids.is_empty() {
+            return Ok(());
+        }
+        let num_tokens = input_ids.len();
+        let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
+        if num_tokens * ple_row_bytes > ple.f8_staging_dev.len_bytes {
+            return Err(loader_err(
+                "PLE batch token count exceeds staging buffer capacity",
+            ));
+        }
+        let num_heads = ple.hasher.ngram_heads;
+        ple.ids_scratch.resize(num_tokens * num_heads, 0);
+        ple.hasher.compute_ngram_ids_for_slots(
+            input_ids,
+            query_start_loc,
+            state_in_indices,
+            state_out_indices,
+            has_initial_state,
+            spec_state_indices,
+            max_verify_tokens,
+            checkpoint_dst_indices,
+            checkpoint_token_offsets,
+            max_checkpoints_per_req,
+            &mut self.state_pool.ple_ngram_context,
+            &mut ple.ids_scratch,
+        );
+        ple.f8_host_scratch.resize(num_tokens * ple_row_bytes, 0);
+        ple.mmap_table
+            .gather_f8(&ple.ids_scratch, &mut ple.f8_host_scratch);
+        self.device.make_current()?;
+        ple.f8_staging_dev
+            .copy_from_host(&ple.f8_host_scratch, &self.stream)
+    }
+
+    pub(super) fn stage_ple_f8_for_decode_slices(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+    ) -> Result<()> {
+        if self.ple_runtime.is_none() || slices.is_empty() {
+            return Ok(());
+        }
+        let n = slices.len();
+        let mut tokens = Vec::with_capacity(n);
+        let mut q_start = Vec::with_capacity(n + 1);
+        q_start.push(0i32);
+        let mut st_in = Vec::with_capacity(n);
+        let mut st_out = Vec::with_capacity(n);
+        let mut has_init = Vec::with_capacity(n);
+        let mut ckpt_dst = vec![-1i32; n];
+        let mut ckpt_off = vec![-1i32; n];
+        for (i, s) in slices.iter().enumerate() {
+            tokens.extend_from_slice(s.tokens);
+            q_start.push(tokens.len() as i32);
+            st_in.push(s.state_in_slot);
+            st_out.push(s.state_out_slot);
+            has_init.push(u8::from(s.has_initial_state));
+            if let Some(&(trig_off, dst_slot)) = s.checkpoints.first() {
+                ckpt_off[i] = trig_off;
+                ckpt_dst[i] = dst_slot;
+            }
+        }
+        self.stage_ple_f8_for_batch(
+            &tokens,
+            &q_start,
+            &st_in,
+            &st_out,
+            &has_init,
+            &[],
+            0,
+            &ckpt_dst,
+            &ckpt_off,
+            1,
+        )
     }
 
     /// Configures replicated `TapPlan` auxiliary hidden-state capture for TP
@@ -1002,8 +1296,10 @@ impl Qwen3_5ModelRank {
             None
         };
         let last_final_hidden_f16 = if export_final_hidden {
+            let hc_mult = self.cfg.hc_count.max(1);
             let bytes = row_elems
-                .checked_mul(2)
+                .checked_mul(hc_mult)
+                .and_then(|n| n.checked_mul(2))
                 .ok_or_else(|| loader_err("final hidden capacity overflow"))?;
             Some(DeviceBuffer::alloc(self.device.device_id, bytes)?)
         } else {

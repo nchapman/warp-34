@@ -11,6 +11,7 @@ impl Qwen3_5ModelRank {
         long_ctx: bool,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         if let Some((captured_long, _)) = &self.decode_graph
             && *captured_long == long_ctx
         {
@@ -69,6 +70,7 @@ impl Qwen3_5ModelRank {
             unsafe { ffi::w34_graph_begin_capture(stream_handle) },
             "w34_graph_begin_capture",
         )?;
+        self.is_capturing_graph = true;
         let res = self.forward_device_batches(
             tok_ptr,
             pos_ptr,
@@ -81,6 +83,7 @@ impl Qwen3_5ModelRank {
             0,
             None,
         );
+        self.is_capturing_graph = false;
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
         // SAFETY: pair the successful begin with end even if the forward returned
@@ -116,6 +119,7 @@ impl Qwen3_5ModelRank {
         long_ctx: bool,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         if let Some((captured_key, _)) = &self.spec_verify_graph
             && *captured_key == (m_verify, long_ctx)
         {
@@ -176,6 +180,7 @@ impl Qwen3_5ModelRank {
             unsafe { ffi::w34_graph_begin_capture(stream_handle) },
             "w34_graph_begin_capture (spec_verify)",
         )?;
+        self.is_capturing_graph = true;
         let res = self.forward_selected_rows_device(
             tok_ptr,
             pos_ptr,
@@ -187,6 +192,7 @@ impl Qwen3_5ModelRank {
             Some(out_ids_ptr),
             true,
         );
+        self.is_capturing_graph = false;
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
         // SAFETY: pair the successful begin with end even if the forward returned
@@ -213,6 +219,7 @@ impl Qwen3_5ModelRank {
         long_ctx: bool,
         sample_mode: DecodeGraphSampleMode,
     ) -> Option<(u64, &CudaGraph)> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         self.batched_decode_graphs
             .iter()
             .find(|(k, _, _)| *k == (bucket_b, long_ctx, sample_mode))
@@ -227,6 +234,7 @@ impl Qwen3_5ModelRank {
         sample_mode: DecodeGraphSampleMode,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         if self
             .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
             .is_some()
@@ -288,6 +296,7 @@ impl Qwen3_5ModelRank {
             unsafe { ffi::w34_graph_begin_capture(stream_handle) },
             "w34_graph_begin_capture (batched_decode)",
         )?;
+        self.is_capturing_graph = true;
         let emit_device_greedy = sample_mode == DecodeGraphSampleMode::PlainGreedy;
         let res = self
             .forward_selected_rows_device(
@@ -332,6 +341,7 @@ impl Qwen3_5ModelRank {
                 }
                 Ok(v)
             });
+        self.is_capturing_graph = false;
         let mut graph = 0usize;
         let mut graph_exec = 0usize;
         // SAFETY: pair the successful begin with end even if the forward returned

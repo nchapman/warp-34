@@ -326,10 +326,11 @@ __global__ void fused_add_gemma_rms_norm_f16_kernel(
     }
 }
 
-// RMSNormGated(norm_before_gate=True, activation="silu"):
-// Specialized 1-warp-per-row kernel for head_dim == 128 (e.g. Qwen 3.5 / GDN).
+// RMSNormGated(norm_before_gate=True, activation="silu" or "sigmoid"):
+// Specialized 1-warp-per-row kernel for head_dim == 128 (e.g. Qwen 3.5 / Qwen 3.8 GDN).
 // Vectorized 64-bit uint2 loads, single intra-warp shuffle reduction, zero smem, zero syncthreads.
-__global__ void rms_norm_gated_silu_d128_warp_f16_kernel(
+template <bool IS_SIGMOID>
+__global__ void rms_norm_gated_d128_warp_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ z,
     const __half* __restrict__ weight,
@@ -376,10 +377,10 @@ __global__ void rms_norm_gated_silu_d128_warp_f16_kernel(
     const float2 w01 = __half22float2(wv_h2[0]);
     const float2 w23 = __half22float2(wv_h2[1]);
 
-    const float g0 = z01.x / (1.0f + expf(-z01.x));
-    const float g1 = z01.y / (1.0f + expf(-z01.y));
-    const float g2 = z23.x / (1.0f + expf(-z23.x));
-    const float g3 = z23.y / (1.0f + expf(-z23.y));
+    const float g0 = (IS_SIGMOID ? 1.0f : z01.x) / (1.0f + expf(-z01.x));
+    const float g1 = (IS_SIGMOID ? 1.0f : z01.y) / (1.0f + expf(-z01.y));
+    const float g2 = (IS_SIGMOID ? 1.0f : z23.x) / (1.0f + expf(-z23.x));
+    const float g3 = (IS_SIGMOID ? 1.0f : z23.y) / (1.0f + expf(-z23.y));
 
     const __half2 o01 = __floats2half2_rn(x01.x * inv_rms * w01.x * g0, x01.y * inv_rms * w01.y * g1);
     const __half2 o23 = __floats2half2_rn(x23.x * inv_rms * w23.x * g2, x23.y * inv_rms * w23.y * g3);
@@ -392,7 +393,8 @@ __global__ void rms_norm_gated_silu_d128_warp_f16_kernel(
 }
 
 // Generic fallback: Each block processes one (token, v_head) row of length head_dim.
-__global__ void rms_norm_gated_silu_f16_kernel(
+template <bool IS_SIGMOID>
+__global__ void rms_norm_gated_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ z,
     const __half* __restrict__ weight,
@@ -425,7 +427,7 @@ __global__ void rms_norm_gated_silu_f16_kernel(
         float zv = __half2float(z_row[i]);
         float wv = __half2float(weight[i]);
         float normed = xv * inv_rms * wv;
-        float gate = zv / (1.0f + expf(-zv));
+        float gate = (IS_SIGMOID ? 1.0f : zv) / (1.0f + expf(-zv));
         out_row[i] = __float2half(normed * gate);
     }
 }
@@ -640,7 +642,7 @@ extern "C" int w34_gemma_rms_norm_f16(const w34_exec* ex, const void* x, const v
     }
     if (num_tokens <= 0 || hidden_size <= 0) return 0;
     const bool vec8_ok =
-        (hidden_size <= 6144) && ((hidden_size & 7) == 0) &&
+        (hidden_size <= 12288) && ((hidden_size & 7) == 0) &&
         ((((uintptr_t)x | (uintptr_t)weight | (uintptr_t)out) & 15u) == 0u);
     if (vec8_ok) {
         if (hidden_size <= 2048) {
@@ -651,8 +653,12 @@ extern "C" int w34_gemma_rms_norm_f16(const w34_exec* ex, const void* x, const v
             w34::gemma_rms_norm_vec8_f16_kernel<1><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)x, (const __half*)weight, (__half*)out,
                 valid_token_mask, hidden_size, eps);
-        } else {
+        } else if (hidden_size <= 8192) {
             w34::gemma_rms_norm_vec8_f16_kernel<2><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)x, (const __half*)weight, (__half*)out,
+                valid_token_mask, hidden_size, eps);
+        } else {
+            w34::gemma_rms_norm_vec8_f16_kernel<3><<<num_tokens, 512, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)x, (const __half*)weight, (__half*)out,
                 valid_token_mask, hidden_size, eps);
         }
@@ -670,8 +676,12 @@ extern "C" int w34_gemma_rms_norm_f16(const w34_exec* ex, const void* x, const v
         w34::gemma_rms_norm_f16_kernel<20><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)x, (const __half*)weight, (__half*)out,
             valid_token_mask, hidden_size, eps);
-    } else {
+    } else if (hidden_size <= 6144) {
         w34::gemma_rms_norm_f16_kernel<24><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out,
+            valid_token_mask, hidden_size, eps);
+    } else {
+        w34::gemma_rms_norm_f16_kernel<48><<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)x, (const __half*)weight, (__half*)out,
             valid_token_mask, hidden_size, eps);
     }
@@ -778,11 +788,45 @@ extern "C" int w34_rms_norm_gated_silu_strided_f16(
         constexpr int threads_per_block = 256;
         constexpr int rows_per_block = threads_per_block / 32;
         const int blocks = (total_rows + rows_per_block - 1) / rows_per_block;
-        w34::rms_norm_gated_silu_d128_warp_f16_kernel<<<blocks, threads_per_block, 0, (cudaStream_t)ex->stream>>>(
+        w34::rms_norm_gated_d128_warp_f16_kernel<false><<<blocks, threads_per_block, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)x, (const __half*)z, (const __half*)weight, (__half*)out,
             valid_token_mask, total_rows, num_v_heads, z_token_stride, eps);
     } else {
-        w34::rms_norm_gated_silu_f16_kernel<<<total_rows, 128, 0, (cudaStream_t)ex->stream>>>(
+        w34::rms_norm_gated_f16_kernel<false><<<total_rows, 128, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)z, (const __half*)weight, (__half*)out,
+            valid_token_mask, num_v_heads, head_dim, z_token_stride, eps);
+    }
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_rms_norm_gated_sigmoid_strided_f16(
+    const w34_exec* ex,
+    const void* x,
+    const void* z,
+    const void* weight,
+    void* out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int num_v_heads,
+    int head_dim,
+    int z_token_stride,
+    float eps) {
+    if (ex == nullptr || x == nullptr || z == nullptr || weight == nullptr || out == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int total_rows = num_tokens * num_v_heads;
+    if (total_rows <= 0 || head_dim <= 0) return 0;
+    if (z_token_stride < num_v_heads * head_dim) return (int)cudaErrorInvalidValue;
+    if (head_dim == 128 && ((uintptr_t)x & 7) == 0 && ((uintptr_t)z & 7) == 0 &&
+        ((uintptr_t)weight & 7) == 0 && ((uintptr_t)out & 7) == 0 && (z_token_stride % 4) == 0) {
+        constexpr int threads_per_block = 256;
+        constexpr int rows_per_block = threads_per_block / 32;
+        const int blocks = (total_rows + rows_per_block - 1) / rows_per_block;
+        w34::rms_norm_gated_d128_warp_f16_kernel<true><<<blocks, threads_per_block, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)z, (const __half*)weight, (__half*)out,
+            valid_token_mask, total_rows, num_v_heads, z_token_stride, eps);
+    } else {
+        w34::rms_norm_gated_f16_kernel<true><<<total_rows, 128, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)x, (const __half*)z, (const __half*)weight, (__half*)out,
             valid_token_mask, num_v_heads, head_dim, z_token_stride, eps);
     }

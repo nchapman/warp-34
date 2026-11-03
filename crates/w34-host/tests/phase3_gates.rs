@@ -193,8 +193,12 @@ fn test_qwen3_parser_and_sampler_v1_speculative_rollback() {
 }
 
 #[cfg(feature = "cuda")]
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "cuda")]
 #[test]
 fn test_gate5_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
         1,
@@ -377,6 +381,7 @@ fn test_gate5_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
 #[cfg(feature = "cuda")]
 #[test]
 fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
         1,

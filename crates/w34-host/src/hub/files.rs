@@ -25,6 +25,10 @@ const METADATA: &[&str] = &[
     "preprocessor_config.json",
     "video_preprocessor_config.json",
     "joint_head_config.json",
+    "static_hot_cache_rankings.json",
+    "runtime/static_hot_cache_rankings.json",
+    "runtime/mtp-int4-g32/config.json",
+    "runtime/mtp-int4-g32/model.safetensors.index.json",
 ];
 
 pub(super) fn metadata_files(files: &BTreeSet<String>) -> io::Result<Vec<String>> {
@@ -80,6 +84,27 @@ pub(super) fn weight_files(dir: &Path, files: &BTreeSet<String>) -> io::Result<V
             selected.insert(name.into());
         }
     }
+    // Embedded Qwen4 MTP INT4 draft checkpoint shards (when published inside the target repo).
+    if files.contains("runtime/mtp-int4-g32/model.safetensors.index.json") {
+        let mtp_idx_path = dir.join("runtime/mtp-int4-g32/model.safetensors.index.json");
+        if mtp_idx_path.exists() {
+            let mtp_idx = read_json(&mtp_idx_path)?;
+            if let Some(map) = mtp_idx["weight_map"].as_object() {
+                for value in map.values() {
+                    let shard = value
+                        .as_str()
+                        .ok_or_else(|| invalid("invalid MTP safetensors shard filename"))?;
+                    let rel = format!("runtime/mtp-int4-g32/{shard}");
+                    safe_path(&rel)?;
+                    if files.contains(&rel) {
+                        selected.insert(rel);
+                    }
+                }
+            }
+        }
+    } else if files.contains("runtime/mtp-int4-g32/model.safetensors") {
+        selected.insert("runtime/mtp-int4-g32/model.safetensors".to_string());
+    }
     Ok(selected.into_iter().collect())
 }
 
@@ -95,7 +120,12 @@ pub(super) fn validate_config(dir: &Path, role: ModelRole) -> io::Result<()> {
                 .unwrap_or("");
             if !matches!(
                 kind,
-                "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text"
+                "qwen3_5"
+                    | "qwen3_5_text"
+                    | "qwen3_5_moe"
+                    | "qwen3_5_moe_text"
+                    | "qwen4_exp"
+                    | "qwen4_exp_text"
             ) {
                 return Err(invalid(format!(
                     "unsupported target model_type '{}'; expected a Qwen 3.5/3.6/3.8 hybrid checkpoint; remote model code is never executed",

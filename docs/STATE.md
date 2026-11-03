@@ -12,6 +12,65 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## `Qwen/Qwen3.8-Flash-Next` (`qwen4_exp` / `Qwen4ExpForConditionalGeneration`) on 1× and 2× RTX 3090 Ti
+
+- Implemented end-to-end native support for `Qwen/Qwen3.8-Flash-Next` (`model_type: "qwen4_exp"`, `Qwen4ExpForConditionalGeneration`) across 1× RTX 3090 Ti (`TP=1`) and 2× RTX 3090 Ti (`TP=2 / EP=2`), documented in [`QWEN_FLASH_NEXT.md`](QWEN_FLASH_NEXT.md):
+  - **`QF-0` (Config, Hub, `PleMmapTable`, `CapacityPlanner`)**: Extended `ModelConfig` and `hub::files` for `qwen4_exp`, AutoRound + FP8 `PLE` hybrid checkpoints (`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`), zero-copy 128-shard `PleMmapTable` (`49.68 GiB` `F8_E4M3` mmap + prime-modulo `splitmix64` bigram/trigram hashing), and `QwenFlashNextCapacityPlan` for `TP=1` and `TP=2 / EP=2`.
+  - **`QF-1` (`HyperConnection`, `PLE`, `QSA` CUDA Kernels)**: Added `op_hc.cu` (`w34_hc_expand_streams_f16`, `w34_hc_rmsnorm_f16`, `w34_hc_down_silu_inject_f16`, `w34_hc_mix_streams_f16`, `w34_hc_combine_streams_f16`, `w34_qwen4_mtp_broadcast_add_f16`), `op_ple.cu` (`w34_ple_dequant_fp8_to_f16`, `w34_ple_grouped_gemma_rmsnorm_f16`, `w34_ple_gate_scale_f16`, `w34_ple_short_conv_f16`), and `op_qsa.cu` (`w34_qsa_pre_index_norm_rope_f16`, `w34_qsa_update_index_k_cache_f16`, `w34_qsa_select_blocks_f16`, `w34_qsa_paged_attention_f16`).
+  - **`QF-2` (Tiered 512-Expert MoE Offloading)**: Added `op_moe.cu` and `crates/w34-host/src/moe_offload.rs` supporting 512 routed + 1 shared expert per layer across 48 layers (`HostExpertStore` with parallel in-place `[K/8, N] -> [N, K/8]` transpose and `HostPackStorage::Mapped`/`Heap`, `HotExpertCache` VRAM slots, device-side `w34_moe_lru_resolve` + zero-copy PCIe UVA fallback decode, CPU/PCIe hybrid decode, and double-buffered async H2D streamed prefill across `TP=1` and `TP=2 / EP=2`).
+  - **`QF-3` (48-Layer `Qwen4Exp` Spine, `StateBundlePool`, `KvPool`, `MambaRadixCache`, `CUDAGraphRunner`)**: Assembled the 48-layer `3:1` `GDN:QSA` spine with `PLE` (`ple_conv_state_buf` + `ple_history_tokens` in `StateBundlePool`, `qsa_raw_k_buf` + `qsa_comp_k_buf` in `KvPool`), `MambaRadixCache` prefix reuse, and CUDA Graph capture/replay. Verified on `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`:
+    - `TP=1` (1× RTX 3090 Ti): `26.9–30.1 tok/s` decode (`" Paris, which is also the largest city in the country..."`), `MambaRadixCache` 64-token prefix reuse bit-identical (`1543.00 ms -> 347.32 ms` TTFT).
+    - `TP=2 / EP=2` (2× RTX 3090 Ti): `41.95–42.31 tok/s` decode (`20.81 ms` TTFT), `MambaRadixCache` 64-token prefix reuse bit-identical (`654.10 ms -> 21.49 ms` TTFT, matching `TP=1` token-for-token `ids=[760, 6511, 314, 9338, 369, 760, 6511, 314]`).
+  - **`QF-4` (Native `Qwen4` `MTP` Speculative Decoding)**: Implemented native HC MTP (now composed through `MtpInputFusion` and the shared `forward_inner`) in `crates/w34-host/src/mtp.rs` with dual-stream `residual_linear_shared` (`pre_fc_norm_embedding` + `fc_embedding` + `pre_fc_norm_hidden` `[hc_count * H]` + `fc_hidden` + `w34_qwen4_mtp_broadcast_add_f16`), 1-layer `HC + QSA + MoE + final_hc_mixer`, and QSA step-0 top-k block index reuse (`skip_topk = step > 0`), verified losslessly on `TP=1` and `TP=2 / EP=2` in `crates/w34-host/tests/qwen4_flash_next.rs`.
+  - **`QF-5` (Warm Hot-Cache + `MTP-3` Performance Qualification — documented in [`QWEN_FLASH_NEXT.md` §5](QWEN_FLASH_NEXT.md#5-measured-performance-vs-reference-headline-numbers-qf-5))**:
+    - Auto-discovered `<snapshot>/runtime/static_hot_cache_rankings.json` (`HotExpertRankings` in `crates/w34-host/src/moe_offload.rs`) to pre-warm `HotExpertCache` (`hot48` on `TP=1`, `hot112` on `TP=2 / EP=2`, `hot128` on `MTP-3` with descending initial LRU timestamps so the hottest slots are protected from early eviction) and auto-discovered `<snapshot>/runtime/mtp-int4-g32` (`compressed-tensors` `INT4 group_size=32` routed experts, `2.1 s` load) in `Qwen3_5MtpRank::load`.
+    - Measured on `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` (`test_qwen4_exp_real_checkpoint_tp1_and_tp2` & `test_qwen4_exp_reference_bench_suite` over PCIe 4.0 x8):
+      - **`benchmark_serving.py` `short-chat` (`128:256` & `128:512`):** **`91.28 tok/s` (`128:256` warm)** and **`92.10 tok/s` (`128:512` cold) / `88.50 tok/s` (`128:512` warm)**, beating the reference `short-chat` (`77.29 tok/s`) and `128:256` hillclimb (`80.08 tok/s`) by `+14%–19%`.
+      - **5-Prompt Diverse `chat-512` Suite (`512` out each, cold per task):** **`81.07 tok/s` mean** (`creative_writing`: `74.04 tok/s`, `factual_essay`: `72.45 tok/s`, `technical_explain`: `80.11 tok/s`, `code_generation`: `85.96 tok/s`, `reasoning_math`: `92.76 tok/s`).
+      - **`scripts/bench.py` Code Review (`4096:256` & `8192:1024`):** **`1,050.9 – 1,120.0 tok/s` prefill** (`3.93 s` / `7.34 s` TTFT) and **`65.61 tok/s` decode** (`2.23/3` accepted = `3.23 tok/round`).
+      - **Short 64-Token Probe (`TP=2 / EP=2`):** `46.83 tok/s` cold / **`65.41 tok/s` warm** target-only (`M=1`), and **`108.24 tok/s` cold / `132.47 tok/s` warm** with `MTP-3` (`1.86/3` accepted = `2.86 tok/round`, 64/64 token parity).
+      - **`TP=1` (1× RTX 3090 Ti):** `24.35 tok/s` cold 16-tok `M=1`, **`29.34 tok/s` warm 64-tok `M=1`**, **`34.05 tok/s` warm 64-tok `MTP-3`** (`2.00/3` accepted = `3.00 tok/round`), and `84.45 ms` warm `MambaRadixCache` TTFT (`924.15 ms` cold).
+
+---
+
+## Composable Qwen architecture refactor
+
+- Target device-batch and selected-row execution now share one `run_layer_stack`;
+  MTP uses one `forward_inner` with `MtpInputFusion::{ConcatLinear,
+  DualStreamBroadcast}`. `LayerResidual` and `FinalResidual` replace optional HC
+  fields and sentinel normalization pointers while retaining single-stream fused
+  residual/norm collectives and GDN auxiliary-stream overlap.
+- PLE staging is bundled in `PleRankRuntime`; PLE, QSA, and tiered-MoE dispatch
+  compose independently of residual topology. Tiered residency remains restricted
+  to the supported Qwen4 checkpoint family, not inferred from expert count.
+- PLE scratch is reserved even for single-stream residuals. Single-token, batched,
+  pipelined, and verify graph routing check mapped hot-cache capacity, and tiered
+  dispatch rejects unsafe capture. Heap-backed stores fall back to eager execution.
+- Review fixes narrowed tiered residency, corrected PLE scratch allocation, and
+  guarded graph routing. The follow-up review's fixed-2048-row PLE staging
+  suggestion is deferred: the existing diagnostic/custom-position size limit is
+  unchanged; growing or chunking those paths is outside this refactor.
+- Verification: CPU suite, `check-quick`, full `mise run check`, and both
+  `qwen4_flash_next` tests (`test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph`
+  and the ignored real 48-layer `test_qwen4_exp_real_checkpoint_tp1_and_tp2`) pass.
+  Also resolved the pre-existing `TP=1` vs. `TP=2 / EP=2` divergence on
+  `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`:
+  1. `moe_sparse_vec4_kernel` (`crates/w34-kernels/csrc/ops/op_moe.cu`) previously computed
+     `lpr = min(32, K >> 5)`, which produced a non-power-of-two `lpr = 20` on
+     `Qwen3.8-Flash-Next`'s down-projection (`K = n_interm = 640`), breaking
+     `sub_lane = lane & (lpr - 1)` and `rpw = 32 / lpr` whenever `M in 4..=7` and
+     `M * top_k <= k_hot`. Clamping `sparse_vec4_lpr` to `{4, 8, 16, 32}` dropped
+     Layer 0 `TP=1` vs. `TP=2` `max_abs_diff` from `0.063751` to `0.000122` (1 FP16 ULP)
+     and made both the 16-token short-prompt generation (`" Paris. The capital of Germany is Berlin. The capital of Italy is Rome."`)
+     and the 70-token `MambaRadixCache` generation (`[760, 6511, 314, 9338, 369, 760, 6511, 314]`)
+     match 100% token-for-token between `TP=1` and `TP=2 / EP=2`.
+  2. Cross-checked `warp-34`'s `qwen4_exp` implementation against upstream `vLLM` (`origin/main @ 190df0b90`, documented in [`QWEN_FLASH_NEXT.md` §6](QWEN_FLASH_NEXT.md#6-upstream-vllm-originmain--190df0b90-cross-check-intrinsic-qwen4-architecture-vs-12-rtx-3090-ti-hardware-optimizations)):
+     - Generalized `op_hc.cu` (`hc_down_silu_inject_f16_kernel`, `hc_mix_streams_f16_kernel`, `hc_combine_f16_kernel`) and `op_ple.cu` (`ple_signed_sqrt_gate_f16_kernel`) from hardcoded `0.25f` (`hc_count = 4`) to `1.0f / (float)hc_count` and up to `8` HC streams, and added shared `[hidden_size]` `hc_norm.weight` broadcast support (`hc_per_branch_norm = false`).
+     - Added native `TQ4` (`132 B/row` with Seed-42 Rademacher + WHT-256 + Beta(256)) and `Q8_0` (`272 B/row`) KV cache decoding directly inside `qsa_sparse_paged_attn_f16_kernel` (`op_qsa.cu`), removing the dense-attention fallback in `FullAttentionLayerWeights::forward_qsa_attention` and `MtpPredictor` when KV compression is active.
+  2. Recorded `compute_done_events[buf_idx]` at the end of `TieredMoeWorkspace::stage_experts_to_slots`
+     and raised `MAX_PROCESS_PINNED_BYTES` to `64 GiB` in `crates/w34-host/src/moe_offload.rs` so
+     all 48 layers (`58.01 GiB`) receive mapped zero-copy backing on 128 GiB hosts.
+
 ## Public GitHub publication and Git LFS
 
 - Public repository: https://github.com/nchapman/warp-34 (`origin`, `main`).
@@ -73,6 +132,37 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
   Hub suggestions were left out of scope: transport timeouts remain delegated
   to the SDK per the prior explicit decision; the progress-thread clock-subtraction
   edge case is unrelated to serving controls. No follow-up review was needed.
+
+---
+
+## Qwen3.8-Flash-Next branch (`qwen-flash-next`)
+
+- QF-0 config/Hub parsing, zero-copy PLE mmap storage and TP=1/TP=2 capacity
+  planning are committed in `8786fb1`; QF-1 HC/PLE/QSA primitives and local
+  math-parity tests are committed in `71fb030`. These do **not** establish
+  end-to-end Qwen4Exp generation or reference-dump parity for the assembled model.
+- QF-2 is in progress. `moe_offload.rs` now defines a checked, page-aligned
+  N-major U4B8 expert pack and budget-bounded immutable pinned `HostExpertStore`.
+  It reuses `RawLinearHost` quantized loading, validates symmetric zero points
+  and static group indices, and partitions whole experts for EP=1/EP=2.
+- New CUDA helpers scatter staged packs into bounded cache slots and remap
+  global routed IDs to local slots; HC/PLE/QSA and offload helpers are registered
+  in cold-start warmup. The staging geometry regression was reproduced before
+  fixing incomplete-group acceptance; scatter/remap GPU tests passed afterward.
+- Checkpoint qualification loads two actual experts from the pinned albucino
+  snapshot and compares TP=1 and EP=2 pack bytes against checkpoint words.
+  After Clippy fixes and review-requested destination bounds/alignment checks,
+  `CUDA_VISIBLE_DEVICES=0 cargo test --release --features cuda --lib moe_offload
+  -- --include-ignored --test-threads=1` passed **5/5**, including the explicit
+  checkpoint qualification. The subsequent `mise run check` passed (exit 0),
+  including CPU/CUDA Clippy, frontend/oracle/performance checks and the release
+  CUDA suite. Host library results: **163 passed, 3 ignored**; the checkpoint
+  qualification was run explicitly above rather than inferred from that suite.
+  Evidence: session task `t-mvznr165.log`. No QF-2 completion claim yet.
+- Still required: GPU hot-cache/LRU lifecycle, CPU-hybrid workers, FP32 partial
+  accumulation and double-buffered streaming, followed by QF-3 model/cache/state/
+  graph integration and QF-4 Qwen4 MTP plus single-/dual-card end-to-end oracles
+  and benchmarks. The host store is not yet wired into model execution.
 
 ---
 

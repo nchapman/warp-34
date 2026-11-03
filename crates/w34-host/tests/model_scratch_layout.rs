@@ -21,6 +21,9 @@ fn model_bounds_and_maximality() {
                 top_k: 0,
                 moe: 0,
                 shared: 0,
+                hc_count: 1,
+                uses_ple: false,
+                indexer_head_dim: 0,
             };
             for d in [
                 dense,

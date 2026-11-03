@@ -63,14 +63,13 @@ pub struct NativeProposer {
     pub last_restored_tokens: usize,
 }
 const MEMO_BUDGET: usize = 64 * 1024 * 1024;
+const MTP_STAGE_ROWS: usize = 256;
 impl NativeProposer {
     pub fn load(engine: &mut Qwen3_5Engine, config: &SpeculativeConfig) -> Result<Self> {
-        if engine
-            .ranks
-            .iter()
-            .any(|t| t.decode_graph.is_some() || t.spec_verify_graph.is_some())
-        {
-            return Err(loader_err("enable speculation before graph capture"));
+        for t in &mut engine.ranks {
+            t.decode_graph = None;
+            t.spec_verify_graph = None;
+            t.batched_decode_graphs.clear();
         }
         if config.kind == SpeculativeKind::Mtp
             && (!matches!(config.mtp_k, 1..=3) || config.draft_model.is_some())
@@ -80,11 +79,16 @@ impl NativeProposer {
             ));
         }
         let capacity = engine.ranks[0].kv_pool.num_pages * 16;
-        let max_rows = capacity.min(256);
+        let max_rows = if config.kind == SpeculativeKind::Mtp && engine.cfg.uses_tiered_moe() {
+            capacity.min(2048)
+        } else {
+            capacity.min(256)
+        };
         if max_rows < 16 {
             return Err(loader_err("insufficient speculative context capacity"));
         }
         let h = engine.cfg.hidden_size;
+        let mtp_row_bytes = engine.cfg.hyper_hidden_size() * 2;
         let use_graph = engine.use_cuda_graph;
         let (ranks, taps, k, row_bytes) = match config.kind {
             SpeculativeKind::Mtp => {
@@ -93,11 +97,11 @@ impl NativeProposer {
                     .iter()
                     .map(|t| {
                         let mut r = Qwen3_5MtpRank::load(t, &engine.model_dir, capacity)?;
-                        r.use_cuda_graph = use_graph;
+                        r.use_cuda_graph = use_graph && r.supports_cuda_graph();
                         Ok(r)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                (Ranks::Mtp(ranks), vec![], config.mtp_k, h * 2)
+                (Ranks::Mtp(ranks), vec![], config.mtp_k, mtp_row_bytes)
             }
             SpeculativeKind::DFlash2 => {
                 let name = config
@@ -124,12 +128,14 @@ impl NativeProposer {
         let tail = engine
             .ranks
             .iter()
-            .map(|t| DeviceBuffer::alloc(t.device.device_id, h * 2))
+            .map(|t| DeviceBuffer::alloc(t.device.device_id, mtp_row_bytes))
             .collect::<Result<Vec<_>>>()?;
         let shifted = engine
             .ranks
             .iter()
-            .map(|t| DeviceBuffer::alloc(t.device.device_id, max_rows * row_bytes))
+            .map(|t| {
+                DeviceBuffer::alloc(t.device.device_id, max_rows.min(MTP_STAGE_ROWS) * row_bytes)
+            })
             .collect::<Result<Vec<_>>>()?;
         let logits = engine
             .ranks
@@ -157,12 +163,12 @@ impl NativeProposer {
                     let slot_tail = engine
                         .ranks
                         .iter()
-                        .map(|t| DeviceBuffer::alloc(t.device.device_id, h * 2))
+                        .map(|t| DeviceBuffer::alloc(t.device.device_id, mtp_row_bytes))
                         .collect::<Result<Vec<_>>>()?;
                     let captured_verify_hidden = engine
                         .ranks
                         .iter()
-                        .map(|t| DeviceBuffer::alloc(t.device.device_id, (k + 1) * h * 2))
+                        .map(|t| DeviceBuffer::alloc(t.device.device_id, (k + 1) * mtp_row_bytes))
                         .collect::<Result<Vec<_>>>()?;
                     Ok(MtpBatchSlot {
                         tail: slot_tail,
@@ -282,9 +288,10 @@ impl NativeProposer {
             .memo
             .take()
             .ok_or_else(|| loader_err("missing proposer prefix"))?;
+        let step = self.max_rows.min(MTP_STAGE_ROWS);
         let result = (|| {
-            for start in (0..tokens.len()).step_by(self.max_rows) {
-                let end = (start + self.max_rows).min(tokens.len());
+            for start in (0..tokens.len()).step_by(step) {
+                let end = (start + step).min(tokens.len());
                 let bytes = &memo.features[start * self.row_bytes..end * self.row_bytes];
                 let mut pointers = Vec::with_capacity(engine.tp_size);
                 for (t, stage) in engine.ranks.iter().zip(&self.shifted) {
@@ -321,6 +328,20 @@ impl NativeProposer {
         features: &[u64],
     ) -> Result<()> {
         if tokens.is_empty() {
+            return Ok(());
+        }
+        let stage_cap = self.max_rows.min(MTP_STAGE_ROWS);
+        if tokens.len() > stage_cap {
+            let mut offset = 0;
+            while offset < tokens.len() {
+                let take = (tokens.len() - offset).min(stage_cap);
+                let sub_features: Vec<u64> = features
+                    .iter()
+                    .map(|&p| p + (offset * self.row_bytes) as u64)
+                    .collect();
+                self.ingest(engine, &tokens[offset..offset + take], &sub_features)?;
+                offset += take;
+            }
             return Ok(());
         }
         if features.len() != engine.tp_size
@@ -380,7 +401,7 @@ impl NativeProposer {
                 })
             }
             Ranks::Mtp(rs) => {
-                let h = engine.cfg.hidden_size;
+                let row_bytes = self.row_bytes;
                 let before = self.processed;
                 let comm = engine.tp2_comm.as_deref();
                 std::thread::scope(|scope| {
@@ -399,12 +420,12 @@ impl NativeProposer {
                                 (&tokens[1..], ptr)
                             } else {
                                 check_rc(
-                                    // SAFETY: both resident buffers hold at least H FP16 elements.
+                                    // SAFETY: both resident buffers hold at least one MTP hidden row.
                                     unsafe {
                                         ffi::w34_memcpy_d2d_async(
                                             shifted.addr() as *mut _,
                                             tail.addr() as *const _,
-                                            h * 2,
+                                            row_bytes,
                                             t.stream.handle,
                                         )
                                     },
@@ -416,9 +437,9 @@ impl NativeProposer {
                                         // source is the owned live capture for this whole batch.
                                         unsafe {
                                             ffi::w34_memcpy_d2d_async(
-                                                (shifted.addr() + (h * 2) as u64) as *mut _,
+                                                (shifted.addr() + row_bytes as u64) as *mut _,
                                                 ptr as *const _,
-                                                (tokens.len() - 1) * h * 2,
+                                                (tokens.len() - 1) * row_bytes,
                                                 t.stream.handle,
                                             )
                                         },
@@ -430,12 +451,12 @@ impl NativeProposer {
                             r.ingest_kv_only(t, ids, input, comm)?;
                             check_rc(
                                 // SAFETY: tokens is nonempty and ptr spans every captured row;
-                                // tail owns exactly one H-element row and survives synchronization.
+                                // tail owns exactly one MTP hidden row and survives synchronization.
                                 unsafe {
                                     ffi::w34_memcpy_d2d_async(
                                         tail.addr() as *mut _,
-                                        (ptr + ((tokens.len() - 1) * h * 2) as u64) as *const _,
-                                        h * 2,
+                                        (ptr + ((tokens.len() - 1) * row_bytes) as u64) as *const _,
+                                        row_bytes,
                                         t.stream.handle,
                                     )
                                 },
@@ -564,9 +585,12 @@ impl NativeProposer {
                 Ok(ids)
             }
             Ranks::Mtp(rs) => {
-                if self.current.is_none() && engine.use_cuda_graph {
+                if self.current.is_none()
+                    && engine.use_cuda_graph
+                    && rs.iter().all(Qwen3_5MtpRank::supports_cuda_graph)
+                {
                     use crate::coordinated::{ReplayPhase, replay_ranks};
-                    let h = engine.cfg.hidden_size;
+                    let row_bytes = self.row_bytes;
                     let before = self.processed;
                     let comm = engine.tp2_comm.as_deref();
                     let replay_res = replay_ranks(rs.len(), |phase, rank| {
@@ -583,12 +607,12 @@ impl NativeProposer {
                                     (&tokens[1..], ptr)
                                 } else {
                                     check_rc(
-                                        // SAFETY: both resident buffers hold at least H FP16 elements.
+                                        // SAFETY: both resident buffers hold at least one MTP hidden row.
                                         unsafe {
                                             ffi::w34_memcpy_d2d_async(
                                                 shifted.addr() as *mut _,
                                                 tail.addr() as *const _,
-                                                h * 2,
+                                                row_bytes,
                                                 t.stream.handle,
                                             )
                                         },
@@ -600,9 +624,9 @@ impl NativeProposer {
                                             // source is the owned live capture for this whole batch.
                                             unsafe {
                                                 ffi::w34_memcpy_d2d_async(
-                                                    (shifted.addr() + (h * 2) as u64) as *mut _,
+                                                    (shifted.addr() + row_bytes as u64) as *mut _,
                                                     ptr as *const _,
-                                                    (tokens.len() - 1) * h * 2,
+                                                    (tokens.len() - 1) * row_bytes,
                                                     t.stream.handle,
                                                 )
                                             },
@@ -614,12 +638,13 @@ impl NativeProposer {
                                 r.ingest_kv_only_no_sync(t, ids, input, comm)?;
                                 check_rc(
                                     // SAFETY: tokens is nonempty and ptr spans every captured row;
-                                    // tail owns exactly one H-element row on this device.
+                                    // tail owns exactly one MTP hidden row on this device.
                                     unsafe {
                                         ffi::w34_memcpy_d2d_async(
                                             tail.addr() as *mut _,
-                                            (ptr + ((tokens.len() - 1) * h * 2) as u64) as *const _,
-                                            h * 2,
+                                            (ptr + ((tokens.len() - 1) * row_bytes) as u64)
+                                                as *const _,
+                                            row_bytes,
                                             t.stream.handle,
                                         )
                                     },
@@ -684,9 +709,10 @@ impl NativeProposer {
         match &mut self.ranks {
             Ranks::Mtp(rs) => {
                 for r in rs.iter_mut() {
-                    r.use_cuda_graph = use_graph;
+                    r.use_cuda_graph = use_graph && r.supports_cuda_graph();
                 }
-                let outputs = if use_graph {
+                let mtp_graph = use_graph && rs.iter().all(|r| r.supports_cuda_graph());
+                let outputs = if mtp_graph {
                     use crate::coordinated::{ReplayPhase, replay_ranks};
                     let replay_res = replay_ranks(rs.len(), |phase, rank| {
                         let r = &mut rs[rank];
@@ -796,11 +822,12 @@ impl NativeProposer {
         t0.device.make_current()?;
         match &self.ranks {
             Ranks::Mtp(rs) => {
-                let mut bits = vec![0u16; h];
+                let cols = self.row_bytes / 2;
+                let mut bits = vec![0u16; cols];
                 rs[0].hidden.copy_to_host(&mut bits, &t0.stream)?;
                 let vals: Vec<f32> = bits.into_iter().map(f16_to_f32).collect();
                 dump.tensors_f32
-                    .insert("drafter_hidden".to_string(), (vec![1, h], vals));
+                    .insert("drafter_hidden".to_string(), (vec![1, cols], vals));
             }
             Ranks::DFlash(rs) => {
                 let rows = rs[0].cfg.block_size;
@@ -1506,7 +1533,7 @@ impl NativeProposer {
             }
         }
         if pending_ingest_rows > 0 {
-            let h_bytes = engine.cfg.hidden_size * 2;
+            let h_bytes = self.row_bytes;
             for (rank_idx, t) in engine.ranks.iter().enumerate() {
                 let src = t
                     .last_final_hidden_f16
@@ -1601,7 +1628,7 @@ impl NativeProposer {
         if items.is_empty() {
             return Ok(vec![]);
         }
-        let h_bytes = engine.cfg.hidden_size * 2;
+        let h_bytes = self.row_bytes;
         struct PreparedItem {
             slot: usize,
             drafts: Vec<i32>,

@@ -133,6 +133,10 @@ pub struct KvLayerBuffer {
     pub k_buf: DeviceBuffer,
     pub v_buf: DeviceBuffer,
     pub layout: W34KvLayerLayout,
+    /// Optional QSA indexer raw key cache `[num_pages * block_size, indexer_head_dim]` in `FP16`.
+    pub qsa_raw_k_buf: Option<DeviceBuffer>,
+    /// Optional QSA indexer 4:1 compressed key cache `[num_pages * (block_size / compress_ratio), indexer_head_dim]` in `FP16`.
+    pub qsa_comp_k_buf: Option<DeviceBuffer>,
 }
 
 /// Ascending physical-order free-page bitmap (`O(1)` amortized scan via `next_word`).
@@ -283,6 +287,8 @@ impl KvPool {
                 k_buf,
                 v_buf,
                 layout,
+                qsa_raw_k_buf: None,
+                qsa_comp_k_buf: None,
             });
         }
         let free_pages = PageBitmap::new(num_pages);
@@ -293,6 +299,23 @@ impl KvPool {
             layers,
             free_pages,
         })
+    }
+
+    /// Allocates QSA indexer raw (`[num_pages * block_size, indexer_head_dim]`) and compressed
+    /// (`[num_pages * (block_size / compress_ratio), indexer_head_dim]`) `FP16` key caches per layer.
+    pub fn init_qsa_indexer_caches(
+        &mut self,
+        indexer_head_dim: usize,
+        compress_ratio: usize,
+    ) -> Result<()> {
+        let ratio = compress_ratio.max(1);
+        let raw_bytes = self.num_pages * self.block_size * (indexer_head_dim + 8) * 2;
+        let comp_bytes = self.num_pages * (self.block_size / ratio) * indexer_head_dim * 2;
+        for layer in &mut self.layers {
+            layer.qsa_raw_k_buf = Some(DeviceBuffer::alloc(self.device_id, raw_bytes)?);
+            layer.qsa_comp_k_buf = Some(DeviceBuffer::alloc(self.device_id, comp_bytes)?);
+        }
+        Ok(())
     }
 
     pub fn new_target_full_attn(
@@ -443,6 +466,12 @@ pub struct StateBundlePool {
     pub head_k_dim: usize,
     pub head_v_dim: usize,
     pub layers: Vec<GdnLayerStateBuffers>,
+    /// Optional PLE dilated conv1d state `[total_slots, ple_conv_dim, 9]` in `FP16`.
+    pub ple_conv_state: Option<DeviceBuffer>,
+    pub ple_conv_dim: usize,
+    /// Per-slot 2-token n-gram history `[w_prev2, w_prev1]` (`total_slots` entries).
+    pub ple_ngram_context: Vec<[i32; 2]>,
+    pub ple_eos_token_id: i32,
     free_slots: Vec<i32>,
 }
 
@@ -482,8 +511,24 @@ impl StateBundlePool {
             head_k_dim,
             head_v_dim,
             layers,
+            ple_conv_state: None,
+            ple_conv_dim: 0,
+            ple_ngram_context: Vec::new(),
+            ple_eos_token_id: 0,
             free_slots,
         })
+    }
+
+    /// Allocates PLE dilated conv1d state (`[total_slots, ple_conv_dim, 9]` `FP16`) and
+    /// initializes per-slot 2-token n-gram context to `[eos_token_id, eos_token_id]`.
+    pub fn init_ple_state(&mut self, ple_conv_dim: usize, eos_token_id: i32) -> Result<()> {
+        let span = 9usize; // dilation(3) * (kernel_size(4) - 1)
+        let bytes = self.total_slots * ple_conv_dim * span * 2;
+        self.ple_conv_state = Some(DeviceBuffer::alloc(self.device_id, bytes)?);
+        self.ple_conv_dim = ple_conv_dim;
+        self.ple_eos_token_id = eos_token_id;
+        self.ple_ngram_context = vec![[eos_token_id, eos_token_id]; self.total_slots];
+        Ok(())
     }
 
     pub fn free_count(&self) -> usize {
@@ -506,6 +551,10 @@ impl StateBundlePool {
 
     pub fn reset_all_slots(&mut self) {
         self.free_slots = (0..self.total_slots as i32).rev().collect();
+        if !self.ple_ngram_context.is_empty() {
+            self.ple_ngram_context
+                .fill([self.ple_eos_token_id, self.ple_eos_token_id]);
+        }
     }
 
     /// Clamps logical state-slot capacity downward so `TP=2` ranks operate in lockstep.

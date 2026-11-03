@@ -381,6 +381,20 @@ unsafe extern "C" {
         eps: f32,
     ) -> i32;
 
+    pub fn w34_rms_norm_gated_sigmoid_strided_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        z: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        num_v_heads: i32,
+        head_dim: i32,
+        z_token_stride: i32,
+        eps: f32,
+    ) -> i32;
+
     pub fn w34_fused_qk_rmsnorm_rope_gate_f16(
         ex: *const W34Exec,
         q_gate_in: *const c_void,
@@ -1311,6 +1325,241 @@ unsafe extern "C" {
         total_opts: i32,
         num_q: i32,
         width: i32,
+    ) -> i32;
+
+    pub fn w34_hc_init_streams_f16(
+        ex: *const W34Exec,
+        embed_in: *const c_void,
+        residual_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn w34_hc_rmsnorm_f16(
+        ex: *const W34Exec,
+        residual_in: *const c_void,
+        norm_weight: *const c_void,
+        normed_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_hc_down_silu_inject_f16(
+        ex: *const W34Exec,
+        down_in: *const c_void,
+        down_out: *mut c_void,
+        inj_in: *const c_void,
+        inject_weights_out: *mut f32,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hc_rank_dim: i32,
+        hc_count: i32,
+    ) -> i32;
+
+    pub fn w34_hc_mix_streams_f16(
+        ex: *const W34Exec,
+        residual_in: *const c_void,
+        up_raw_in: *const c_void,
+        mixed_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn w34_hc_combine_f16(
+        ex: *const W34Exec,
+        residual_in: *const c_void,
+        block_out: *const c_void,
+        inject_weights: *const f32,
+        ple_delta: *const c_void,
+        residual_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn w34_qwen4_mtp_broadcast_add_f16(
+        ex: *const W34Exec,
+        fc_embed: *const c_void,
+        fc_hidden: *const c_void,
+        out_multi_hidden: *mut c_void,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn w34_ple_dequant_f8_to_f16(
+        ex: *const W34Exec,
+        f8_in: *const u8,
+        f16_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        embed_dim: i32,
+        weight_scale: f32,
+    ) -> i32;
+
+    pub fn w34_ple_dilated_conv1d_f16(
+        ex: *const W34Exec,
+        key_in: *const c_void,
+        conv_weight: *const c_void,
+        conv_state_pool: *mut c_void,
+        key_out: *mut c_void,
+        batch: *const W34GdnBatch,
+        conv_dim: i32,
+    ) -> i32;
+
+    pub fn w34_ple_signed_sqrt_gate_f16(
+        ex: *const W34Exec,
+        norm_query: *const c_void,
+        norm_key: *const c_void,
+        value_in: *const c_void,
+        ple_delta_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hc_count: i32,
+        embed_dim: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_qsa_indexer_norm_rope_f16(
+        ex: *const W34Exec,
+        qk_in: *const c_void,
+        q_norm_weight: *const c_void,
+        k_norm_weight: *const c_void,
+        positions: *const i32,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        rope_theta: f32,
+        eps: f32,
+        mrope_s1: i32,
+        mrope_s2: i32,
+        pos_plane_stride: i32,
+    ) -> i32;
+
+    pub fn w34_qsa_indexer_cache_update_f16(
+        ex: *const W34Exec,
+        k_in: *const c_void,
+        raw_k_cache: *mut c_void,
+        comp_k_cache: *mut c_void,
+        k_norm_weight: *const c_void,
+        positions: *const i32,
+        write_slot_mapping: *const i32,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        rope_theta: f32,
+        eps: f32,
+        mrope_s1: i32,
+        mrope_s2: i32,
+        pos_plane_stride: i32,
+    ) -> i32;
+
+    pub fn w34_qsa_select_blocks_f16(
+        ex: *const W34Exec,
+        q_indexer: *const c_void,
+        comp_k_cache: *const c_void,
+        batch: *const W34AttentionBatch,
+        out_selected_phys_blocks: *mut i32,
+        out_selected_logical_blocks: *mut i32,
+        out_num_selected_blocks: *mut i32,
+        out_token_seq_pos: *mut i32,
+        q_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        select_k_blocks: i32,
+        sink_blocks: i32,
+        recent_blocks: i32,
+    ) -> i32;
+
+    pub fn w34_qsa_sparse_paged_attn_f16(
+        ex: *const W34Exec,
+        q: *const c_void,
+        gate: *const c_void,
+        kv_layout: *const W34KvLayerLayout,
+        selected_phys_blocks: *const i32,
+        selected_logical_blocks: *const i32,
+        num_selected_blocks: *const i32,
+        token_seq_pos: *const i32,
+        valid_token_mask: *const u8,
+        out: *mut c_void,
+        num_tokens: i32,
+        local_q_heads: i32,
+        select_k_blocks: i32,
+        sm_scale: f32,
+    ) -> i32;
+
+    pub fn w34_moe_unpack_staged_experts(
+        ex: *const W34Exec,
+        staged_packs: *const c_void,
+        dst_slots: *const i32,
+        gate_up_packed_base: *mut u32,
+        gate_up_scales_base: *mut c_void,
+        down_packed_base: *mut u32,
+        down_scales_base: *mut c_void,
+        num_staged: i32,
+        dst_capacity: i32,
+        pack_stride_bytes: usize,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+    ) -> i32;
+
+    pub fn w34_moe_remap_topk_ids_i32(
+        ex: *const W34Exec,
+        global_topk_ids: *const i32,
+        expert_to_slot: *const i32,
+        remapped_topk_ids: *mut i32,
+        total_pairs: i32,
+        global_expert_offset: i32,
+        local_num_experts: i32,
+    ) -> i32;
+
+    pub fn w34_add_inplace_f16(
+        ex: *const W34Exec,
+        dst_f16: *mut c_void,
+        src_f16: *const c_void,
+        num_elems: i64,
+    ) -> i32;
+
+    pub fn w34_moe_gpu_lru_update_and_pull(
+        ex: *const W34Exec,
+        global_topk_ids: *const i32,
+        expert_to_slot: *mut i32,
+        slot_to_expert: *mut i32,
+        slot_last_used: *mut u64,
+        step_counter: *mut u64,
+        remapped_topk_ids: *mut i32,
+        miss_local_experts: *mut i32,
+        miss_victim_slots: *mut i32,
+        num_misses_buf: *mut i32,
+        mapped_host_packs: *const c_void,
+        gate_up_packed_base: *mut u32,
+        gate_up_scales_base: *mut c_void,
+        down_packed_base: *mut u32,
+        down_scales_base: *mut c_void,
+        total_pairs: i32,
+        global_expert_offset: i32,
+        local_num_experts: i32,
+        k_hot: i32,
+        max_misses: i32,
+        pack_stride_bytes: usize,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
     ) -> i32;
 }
 

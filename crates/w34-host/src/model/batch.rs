@@ -144,7 +144,7 @@ impl Qwen3_5Engine {
 
     fn step_spec_verify_graph(&mut self, s: &EngineBatchSlice<'_>) -> Result<Vec<Vec<i32>>> {
         let q_len = s.tokens.len();
-        let long_ctx = s.ctx_len_before + q_len > 1024;
+        let long_ctx = !self.cfg.uses_qsa() && s.ctx_len_before + q_len > 1024;
         let host_meta = SpecVerifyGraphIo::pack_meta(s)?;
         use crate::coordinated::{ReplayPhase, replay_ranks};
         let comm = self.tp2_comm.as_ref().cloned();
@@ -166,6 +166,26 @@ impl Qwen3_5Engine {
             r.device.make_current()?;
             match phase {
                 ReplayPhase::Upload => {
+                    if r.ple_runtime.is_some() {
+                        let mut ckpt_dst = Vec::with_capacity(s.checkpoints.len());
+                        let mut ckpt_off = Vec::with_capacity(s.checkpoints.len());
+                        for &(trig_off, dst_slot) in s.checkpoints {
+                            ckpt_off.push(trig_off);
+                            ckpt_dst.push(dst_slot);
+                        }
+                        r.stage_ple_f8_for_batch(
+                            s.tokens,
+                            &[0, q_len as i32],
+                            &[s.state_in_slot],
+                            &[s.state_out_slot],
+                            &[u8::from(s.has_initial_state)],
+                            s.spec_slots,
+                            s.spec_slots.len(),
+                            &ckpt_dst,
+                            &ckpt_off,
+                            s.checkpoints.len(),
+                        )?;
+                    }
                     r.spec_verify_io
                         .meta_i32
                         .copy_from_host(&host_meta, &r.stream)?;
@@ -178,6 +198,7 @@ impl Qwen3_5Engine {
                 }
                 ReplayPhase::Launch => {
                     r.spec_verify_graph.as_ref().unwrap().1.launch(&r.stream)?;
+                    r.mark_tiered_moe_device_lru_dirty();
                     r.speculative_logits_rows = if r.has_spec_logits_capacity(q_len) {
                         q_len
                     } else {
@@ -250,6 +271,7 @@ impl Qwen3_5Engine {
             r.device.make_current()?;
             match phase {
                 ReplayPhase::Upload => {
+                    r.stage_ple_f8_for_decode_slices(slices)?;
                     r.batched_decode_io
                         .upload_inputs(&host_meta, &host_masks, slices, &r.stream)
                 }
@@ -261,6 +283,7 @@ impl Qwen3_5Engine {
                         .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
                         .unwrap();
                     graph.launch(&r.stream)?;
+                    r.mark_tiered_moe_device_lru_dirty();
                     r.speculative_logits_rows = if r.has_spec_logits_capacity(bucket_b) {
                         bucket_b
                     } else {
@@ -297,14 +320,17 @@ impl Qwen3_5Engine {
     }
 
     pub fn can_pipeline_decode_slices(&self, slices: &[EngineBatchSlice<'_>]) -> bool {
-        if self.tp_size != 1 || !self.use_cuda_graph || slices.is_empty() {
+        if self.tp_size != 1 || !self.use_cuda_graph || self.cfg.uses_ple() || slices.is_empty() {
             return false;
         }
-        let Some(_bucket_b) = decode_graph_bucket(slices.len()) else {
+        let Some(bucket_b) = decode_graph_bucket(slices.len()) else {
             return false;
         };
         let r0 = &self.ranks[0];
-        if r0.current_pos_plane_stride != 0 || r0.pending_visual_splice.is_some() {
+        if r0.current_pos_plane_stride != 0
+            || r0.pending_visual_splice.is_some()
+            || !r0.supports_cuda_graph_for_tokens(bucket_b)
+        {
             return false;
         }
         let max_pages = r0.kv_pool.num_pages;
@@ -334,6 +360,11 @@ impl Qwen3_5Engine {
     ) -> Result<InFlightDecodeTicket> {
         if self.tp_size != 1 {
             return Err(loader_err("pipelined decode overlap requires tp_size == 1"));
+        }
+        if self.cfg.uses_ple() {
+            return Err(loader_err(
+                "pipelined decode overlap is not supported with PLE staging",
+            ));
         }
         if let Some(deltas) = rope_pos_deltas
             && deltas.len() != slices.len()
@@ -369,6 +400,7 @@ impl Qwen3_5Engine {
             ));
         }
         r0.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, None)?;
+        r0.stage_ple_f8_for_decode_slices(slices)?;
         r0.batched_decode_io.upload_inputs_slot(
             slot,
             &host_meta,
@@ -386,6 +418,7 @@ impl Qwen3_5Engine {
             .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
             .unwrap();
         graph.launch(&r0.stream)?;
+        r0.mark_tiered_moe_device_lru_dirty();
         r0.speculative_logits_rows = if r0.has_spec_logits_capacity(bucket_b) {
             bucket_b
         } else {
@@ -594,6 +627,10 @@ impl Qwen3_5Engine {
         if all_emit
             && let Some(bucket_b) = decode_graph_bucket(slices.len())
             && self.use_cuda_graph
+            && self
+                .ranks
+                .iter()
+                .all(|r| r.supports_cuda_graph_for_tokens(bucket_b))
             && slices.iter().all(|s| {
                 s.tokens.len() == 1
                     && s.spec_slots.is_empty()
@@ -654,6 +691,10 @@ impl Qwen3_5Engine {
                 && s.spec_slots.len() == q_len
                 && s.checkpoints.len() <= MAX_SPEC_VERIFY_CHECKPOINTS
                 && s.block_table.len() <= self.ranks[0].spec_verify_io.max_blocks_per_req
+                && self
+                    .ranks
+                    .iter()
+                    .all(|r| r.supports_cuda_graph_for_tokens(q_len))
                 && self.ranks.iter().all(|r| {
                     let expected_m = r
                         .speculative_logits
@@ -667,7 +708,7 @@ impl Qwen3_5Engine {
                             .is_none_or(|((captured_m, _), _)| *captured_m == q_len)
                 });
             if can_use_spec_graph {
-                let long_ctx = seq_after > 1024;
+                let long_ctx = !self.cfg.uses_qsa() && seq_after > 1024;
                 let needs_capture = self.ranks.iter().any(|r| {
                     r.spec_verify_graph
                         .as_ref()

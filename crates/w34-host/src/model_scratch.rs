@@ -17,16 +17,28 @@ pub(super) struct Dimensions {
     pub moe: usize,
     pub shared: usize,
     pub hidden: usize,
+    pub hc_count: usize,
+    pub uses_ple: bool,
+    pub indexer_head_dim: usize,
 }
 
-/// High-water byte count and FA, GDN, FFN offsets within the shared reservation.
-pub(super) type LayerLayout = (usize, [usize; 6], [usize; 5], [Option<usize>; 10]);
+/// High-water byte count and FA, GDN, FFN, PLE/HC, QSA offsets within the shared reservation.
+pub(super) type LayerLayout = (
+    usize,
+    [usize; 6],
+    [usize; 5],
+    [Option<usize>; 10],
+    [usize; 3],
+    [usize; 7],
+);
 
+#[allow(clippy::cognitive_complexity)]
 pub(super) fn layer_layout(d: Dimensions, tokens: usize) -> Option<LayerLayout> {
     let conv = d.k.checked_mul(2)?.checked_add(d.v)?;
     let mut fa = Phase::default();
     let mut gdn = Phase::default();
     let mut ffn = Phase::default();
+    let mut ple_hc = Phase::default();
     let fa_offsets = [
         fa.alloc(&[
             tokens,
@@ -39,6 +51,29 @@ pub(super) fn layer_layout(d: Dimensions, tokens: usize) -> Option<LayerLayout> 
         fa.alloc(&[tokens, d.q, 2])?,
         fa.alloc(&[tokens, d.q, 2])?,
     ];
+    let qsa_offsets = if d.indexer_head_dim > 0 {
+        [
+            fa.alloc(&[tokens, d.indexer_head_dim.checked_mul(5)?, 2])?,
+            fa.alloc(&[tokens, d.indexer_head_dim.checked_mul(4)?, 2])?,
+            fa.alloc(&[tokens, d.indexer_head_dim, 2])?,
+            fa.alloc(&[tokens, 513, 4])?,
+            fa.alloc(&[tokens, 513, 4])?,
+            fa.alloc(&[tokens, 4])?,
+            fa.alloc(&[tokens, 4])?,
+        ]
+    } else {
+        [0; 7]
+    };
+    let hc_mult = d.hc_count.max(1);
+    let ple_hc_offsets = if d.hc_count > 1 || d.uses_ple {
+        [
+            ple_hc.alloc(&[tokens, d.hidden.checked_mul(hc_mult)?, 2])?,
+            ple_hc.alloc(&[tokens, d.hidden.checked_mul(hc_mult)?, 2])?,
+            ple_hc.alloc(&[tokens, d.hidden, 2])?,
+        ]
+    } else {
+        [0; 3]
+    };
     let gdn_offsets = [
         gdn.alloc(&[tokens, conv.checked_add(d.v)?, 2])?,
         gdn.alloc(&[tokens, 2, d.v_heads, 2])?,
@@ -76,10 +111,12 @@ pub(super) fn layer_layout(d: Dimensions, tokens: usize) -> Option<LayerLayout> 
         offsets[9] = Some(ffn.alloc(&[tokens, 2])?);
     }
     Some((
-        overlay_bytes(&[fa, gdn, ffn]),
+        overlay_bytes(&[fa, gdn, ffn, ple_hc]),
         fa_offsets,
         gdn_offsets,
         offsets,
+        ple_hc_offsets,
+        qsa_offsets,
     ))
 }
 
@@ -171,6 +208,30 @@ mod tests {
         let base = 4 * ALIGN;
         let persistent_after = base + bytes;
         assert!(ends.iter().all(|&end| base + end <= persistent_after));
+    }
+
+    #[test]
+    fn single_stream_ple_has_disjoint_scratch() {
+        let d = Dimensions {
+            q: 128,
+            kv: 128,
+            v_heads: 1,
+            v: 128,
+            k: 128,
+            interm: 256,
+            experts: 0,
+            top_k: 0,
+            moe: 0,
+            shared: 0,
+            hidden: 128,
+            hc_count: 1,
+            uses_ple: true,
+            indexer_head_dim: 0,
+        };
+        let (bytes, _, _, _, [a, b, value], _) = layer_layout(d, 2).unwrap();
+        assert!(b >= a + 2 * 128 * 2);
+        assert!(value >= b + 2 * 128 * 2);
+        assert!(bytes >= value + 2 * 128 * 2);
     }
 
     #[test]

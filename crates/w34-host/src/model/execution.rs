@@ -35,6 +35,9 @@ impl Qwen3_5Engine {
                 st.conv_state.zero_async(&r.stream)?;
                 st.ssm_state.zero_async(&r.stream)?;
             }
+            if let Some(ple_st) = &r.state_pool.ple_conv_state {
+                ple_st.zero_async(&r.stream)?;
+            }
             r.stream.synchronize()?;
         }
         Ok(())
@@ -176,6 +179,18 @@ impl Qwen3_5Engine {
         if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
             r0.device.make_current()?;
+            r0.stage_ple_f8_for_batch(
+                tokens,
+                &q_start,
+                &st_in_arr,
+                &st_out_arr,
+                &has_init_arr,
+                &[],
+                0,
+                &[],
+                &[],
+                0,
+            )?;
             let tok_dev = DeviceBuffer::alloc(r0.device.device_id, num_tokens * 4)?;
             let pos_dev = DeviceBuffer::alloc(r0.device.device_id, pos_host.len() * 4)?;
             let q_start_dev = DeviceBuffer::alloc(r0.device.device_id, 8)?;
@@ -282,6 +297,18 @@ impl Qwen3_5Engine {
                 let d0_ref = &mut dump0;
                 let h0 = sc.spawn(move || -> Result<(i32, f32, [i32; 5], [f32; 5])> {
                     r0.device.make_current()?;
+                    r0.stage_ple_f8_for_batch(
+                        tokens,
+                        &q_start,
+                        &st_in_arr,
+                        &st_out_arr,
+                        &has_init_arr,
+                        &[],
+                        0,
+                        &[],
+                        &[],
+                        0,
+                    )?;
                     let tok_dev = DeviceBuffer::alloc(r0.device.device_id, num_tokens * 4)?;
                     let pos_dev = DeviceBuffer::alloc(r0.device.device_id, pos_slice.len() * 4)?;
                     let q_start_dev = DeviceBuffer::alloc(r0.device.device_id, 8)?;
@@ -374,6 +401,18 @@ impl Qwen3_5Engine {
                 let c1 = comm.clone();
                 let h1 = sc.spawn(move || -> Result<(f32, [i32; 5], [f32; 5])> {
                     r1.device.make_current()?;
+                    r1.stage_ple_f8_for_batch(
+                        tokens,
+                        &q_start,
+                        &st_in_arr,
+                        &st_out_arr,
+                        &has_init_arr,
+                        &[],
+                        0,
+                        &[],
+                        &[],
+                        0,
+                    )?;
                     let tok_dev = DeviceBuffer::alloc(r1.device.device_id, num_tokens * 4)?;
                     let pos_dev = DeviceBuffer::alloc(r1.device.device_id, pos_slice.len() * 4)?;
                     let q_start_dev = DeviceBuffer::alloc(r1.device.device_id, 8)?;
@@ -516,6 +555,20 @@ impl Qwen3_5Engine {
         let seq_arr = [seq_after as i32];
         let slot_arr = [write_slot];
         let st_arr = [state_slot];
+        for r in &mut self.ranks {
+            r.stage_ple_f8_for_batch(
+                &tok_arr,
+                &[0, 1],
+                &st_arr,
+                &st_arr,
+                &[1u8],
+                &[],
+                0,
+                &[],
+                &[],
+                0,
+            )?;
+        }
 
         if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
@@ -546,9 +599,10 @@ impl Qwen3_5Engine {
                 .copy_from_host(&st_arr, &r0.stream)?;
 
             let long_ctx = seq_after > 1024;
-            if self.use_cuda_graph {
+            if self.use_cuda_graph && r0.supports_cuda_graph_for_tokens(1) {
                 r0.ensure_decode_graph(long_ctx, None)?;
                 r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
+                r0.mark_tiered_moe_device_lru_dirty();
                 r0.last_logits_ptr = r0.captured_decode_logits_ptr;
                 r0.last_logits_rows = 1;
             } else {
@@ -608,11 +662,15 @@ impl Qwen3_5Engine {
             Ok(gid[0])
         } else {
             let comm = self.tp2_comm.as_ref().unwrap().clone();
-            let use_graph = self.use_cuda_graph;
+            let use_graph = self.use_cuda_graph
+                && self
+                    .ranks
+                    .iter()
+                    .all(|r| r.supports_cuda_graph_for_tokens(1));
             let [r0, r1] = &mut self.ranks[..] else {
                 unreachable!()
             };
-            let long_ctx = seq_after > 1024;
+            let long_ctx = !self.cfg.uses_qsa() && seq_after > 1024;
             if use_graph
                 && r0
                     .decode_graph
@@ -646,6 +704,7 @@ impl Qwen3_5Engine {
                         .state_out_indices
                         .copy_from_host(&st_arr, &r.stream)?;
                     r.decode_graph.as_ref().unwrap().1.launch(&r.stream)?;
+                    r.mark_tiered_moe_device_lru_dirty();
                     r.last_logits_ptr = r.captured_decode_logits_ptr;
                     r.last_logits_rows = 1;
                 }
@@ -690,6 +749,7 @@ impl Qwen3_5Engine {
                     if use_graph {
                         r0.ensure_decode_graph(long_ctx, Some(&c0))?;
                         r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
+                        r0.mark_tiered_moe_device_lru_dirty();
                         r0.last_logits_ptr = r0.captured_decode_logits_ptr;
                         r0.last_logits_rows = 1;
                     } else {
@@ -780,6 +840,7 @@ impl Qwen3_5Engine {
                     if use_graph {
                         r1.ensure_decode_graph(long_ctx, Some(&c1))?;
                         r1.decode_graph.as_ref().unwrap().1.launch(&r1.stream)?;
+                        r1.mark_tiered_moe_device_lru_dirty();
                         r1.last_logits_ptr = r1.captured_decode_logits_ptr;
                         r1.last_logits_rows = 1;
                     } else {
@@ -849,11 +910,13 @@ impl Qwen3_5Engine {
         max_new_tokens: usize,
         stop_on_eos: bool,
     ) -> Result<BenchMetrics> {
+        self.reset_all_states()?;
+        self.radix = MambaRadixCache::new(16, 64);
         if self.speculative.is_some() {
             let m = self.generate_native_speculative(
                 prompt_token_ids,
                 max_new_tokens,
-                64,
+                2048,
                 stop_on_eos,
             )?;
             return Ok(BenchMetrics {
@@ -867,7 +930,6 @@ impl Qwen3_5Engine {
                 generated_token_ids: m.generated_token_ids,
             });
         }
-        self.reset_all_states()?;
         let total_needed_tokens = prompt_token_ids.len() + max_new_tokens + 4;
         let needed_pages = total_needed_tokens.div_ceil(16);
         let max_pages = self.ranks[0]

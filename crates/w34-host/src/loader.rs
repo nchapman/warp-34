@@ -35,11 +35,16 @@ impl TensorInfo {
 }
 
 pub struct SafetensorsArchive {
+    base_dir: Option<PathBuf>,
     files: HashMap<String, File>,
     entries: HashMap<String, TensorInfo>,
 }
 
 impl SafetensorsArchive {
+    /// Directory containing this archive, if opened from a path on disk.
+    pub fn base_dir(&self) -> Option<&Path> {
+        self.base_dir.as_deref()
+    }
     /// Opens either a checkpoint directory (`model.safetensors` or `model.safetensors.index.json`)
     /// or a standalone `.safetensors` file directly.
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -176,7 +181,11 @@ impl SafetensorsArchive {
         Self::insert_entries_from_header(&shard_key, data_base, file_len, &header, &mut entries)?;
         let mut files = HashMap::new();
         files.insert(shard_key, f);
-        Ok(Self { files, entries })
+        Ok(Self {
+            base_dir: file_path.parent().map(Path::to_path_buf),
+            files,
+            entries,
+        })
     }
 
     fn open_indexed_dir(dir: &Path, index_path: &Path) -> io::Result<Self> {
@@ -228,7 +237,11 @@ impl SafetensorsArchive {
             )?;
             files.insert(extra_name.to_string(), f);
         }
-        Ok(Self { files, entries })
+        Ok(Self {
+            base_dir: Some(dir.to_path_buf()),
+            files,
+            entries,
+        })
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -258,6 +271,37 @@ impl SafetensorsArchive {
 
     pub fn iter_entries(&self) -> impl Iterator<Item = (&str, &TensorInfo)> {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub fn shard_file(&self, shard_name: &str) -> Option<&File> {
+        self.files.get(shard_name)
+    }
+
+    pub fn shard_files(&self) -> &HashMap<String, File> {
+        &self.files
+    }
+
+    /// Reads the raw bytes of `name` directly into `dst` via `pread` (`read_exact_at`)
+    /// without allocating an intermediate `Vec<u8>`.
+    pub fn read_exact_into(&self, name: &str, dst: &mut [u8]) -> io::Result<()> {
+        let info = self.tensor_info(name)?;
+        if dst.len() as u64 != info.len_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tensor {name} byte length mismatch: expected {}, got {}",
+                    info.len_bytes,
+                    dst.len()
+                ),
+            ));
+        }
+        let f = self.files.get(&info.shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shard '{}' not open", info.shard_file),
+            )
+        })?;
+        f.read_exact_at(dst, info.offset)
     }
 
     /// Resolves either `<prefix>.<suffix>` or `model.language_model.<stripped>.<suffix>`.
@@ -313,6 +357,41 @@ impl SafetensorsArchive {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
+    }
+
+    pub fn read_i64(&self, name: &str) -> io::Result<Vec<i64>> {
+        let info = self.tensor_info(name)?;
+        let bytes = self.read_bytes(name)?;
+        match info.dtype.as_str() {
+            "I64" | "U64" => {
+                if !bytes.len().is_multiple_of(8) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("tensor {name} byte length not a multiple of 8"),
+                    ));
+                }
+                Ok(bytes
+                    .chunks_exact(8)
+                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                    .collect())
+            }
+            "I32" => {
+                if !bytes.len().is_multiple_of(4) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("tensor {name} byte length not a multiple of 4"),
+                    ));
+                }
+                Ok(bytes
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+                    .collect())
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported dtype {other} for read_i64({name})"),
+            )),
+        }
     }
 
     pub fn read_f32(&self, name: &str) -> io::Result<Vec<f32>> {
@@ -674,6 +753,32 @@ impl QuantScheme {
             }
         )
     }
+
+    /// Returns the group size if this scheme uses symmetric 4-bit `U4B8` packing
+    /// (`Gptq`, `AutoRound`, or `CompressedTensors`).
+    pub fn symmetric_gptq_u4_group_size(&self) -> Option<usize> {
+        match self {
+            Self::CompressedTensors {
+                num_bits: 4,
+                group_size,
+                symmetric: true,
+                ..
+            }
+            | Self::Gptq {
+                bits: 4,
+                group_size,
+                sym: true,
+                ..
+            }
+            | Self::AutoRound {
+                bits: 4,
+                group_size,
+                sym: true,
+                awq_packing: false,
+            } if *group_size > 0 => Some(*group_size),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -724,11 +829,32 @@ pub struct ModelConfig {
     pub mlp_only_layers: Vec<usize>,
     pub vision_config: Option<crate::vision::VisionConfig>,
     pub mtp_num_hidden_layers: usize,
+    pub mtp_use_dedicated_embeddings: bool,
     pub dflash_block_size: Option<usize>,
     pub dflash_target_layer_ids: Vec<usize>,
     pub eos_token_ids: Vec<i32>,
     pub quant: QuantScheme,
     pub decision_meta: DecisionConfigMeta,
+    // Qwen 3.8 Flash-Next (`qwen4_exp`) extensions:
+    pub hc_count: usize,
+    pub hc_lowrank: usize,
+    /// 1-based layer IDs from `config.json` (`ple_layer_ids`, e.g. `[2]` -> 0-based `layer_idx == 1`).
+    pub ple_layer_ids: Vec<usize>,
+    pub ple_embed_dim: usize,
+    pub ple_conv_kernel_size: usize,
+    pub ngram_size: usize,
+    pub heads_per_ngram: usize,
+    pub ngram_vocab_size_base: usize,
+    pub make_ngram_vocab_size_divisible_by: usize,
+    pub split_ngram_parts: usize,
+    pub ple_embedding_dtype: Option<String>,
+    pub ple_seed: u64,
+    pub indexer_n_heads: usize,
+    pub indexer_kv_heads: usize,
+    pub indexer_head_dim: usize,
+    pub indexer_budget: usize,
+    pub indexer_compress_ratio: usize,
+    pub output_gate_type: String,
 }
 
 impl ModelConfig {
@@ -1098,8 +1224,131 @@ impl ModelConfig {
         });
         let mtp_num_hidden_layers = tc
             .get("mtp_num_hidden_layers")
+            .or_else(|| tc.get("mtp").and_then(|m| m.get("num_hidden_layers")))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
+        let mtp_use_dedicated_embeddings = tc
+            .get("mtp_use_dedicated_embeddings")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let hc_count = tc.get("hc_count").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        if hc_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hc_count must be >= 1",
+            ));
+        }
+        let hc_lowrank = tc
+            .get("hc_lowrank")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(if hc_count > 1 { 320 } else { 0 }) as usize;
+
+        let ple_layer_ids: Vec<usize> = tc
+            .get("ple_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|u| u as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for &abs_id in &ple_layer_ids {
+            if abs_id == 0 || abs_id > num_hidden_layers {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid 1-based ple_layer_id={abs_id} for num_hidden_layers={num_hidden_layers}"
+                    ),
+                ));
+            }
+        }
+        let ple_embed_dim = tc.get("ple_embed_dim").and_then(|v| v.as_u64()).unwrap_or(
+            if ple_layer_ids.is_empty() {
+                0
+            } else {
+                hidden_size as u64
+            },
+        ) as usize;
+        let ple_conv_kernel_size =
+            tc.get("ple_conv_kernel_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if ple_layer_ids.is_empty() { 0 } else { 4 }) as usize;
+        let ngram_size =
+            tc.get("ngram_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if ple_layer_ids.is_empty() { 0 } else { 3 }) as usize;
+        let heads_per_ngram =
+            tc.get("heads_per_ngram")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if ple_layer_ids.is_empty() { 0 } else { 8 }) as usize;
+        let ngram_vocab_size_base = tc
+            .get("ngram_vocab_size_base")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(if ple_layer_ids.is_empty() {
+                0
+            } else {
+                20_000_000
+            }) as usize;
+        let make_ngram_vocab_size_divisible_by = tc
+            .get("make_ngram_vocab_size_divisible_by")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(128) as usize;
+        let split_ngram_parts =
+            tc.get("split_ngram_parts")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if ple_layer_ids.is_empty() { 0 } else { 128 }) as usize;
+        let ple_embedding_dtype = tc
+            .get("ple_embedding_dtype")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let ple_seed = tc
+            .get("seed")
+            .or_else(|| root.get("seed"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1234);
+
+        let indexer_n_heads = tc
+            .get("indexer_n_heads")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let indexer_kv_heads =
+            tc.get("indexer_kv_heads")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if indexer_n_heads > 0 { 1 } else { 0 }) as usize;
+        let indexer_head_dim =
+            tc.get("indexer_head_dim")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if indexer_n_heads > 0 { 128 } else { 0 }) as usize;
+        let indexer_budget =
+            tc.get("indexer_budget")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if indexer_n_heads > 0 { 2048 } else { 0 }) as usize;
+        let indexer_compress_ratio =
+            tc.get("indexer_compress_ratio")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if indexer_n_heads > 0 { 4 } else { 0 }) as usize;
+        if indexer_n_heads > 0 {
+            if indexer_kv_heads != 1 || indexer_head_dim != 128 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported QSA indexer geometry (indexer_kv_heads={indexer_kv_heads}, indexer_head_dim={indexer_head_dim}; expected 1 and 128)"
+                    ),
+                ));
+            }
+            if indexer_compress_ratio != 4
+                || indexer_budget == 0
+                || !indexer_budget.is_multiple_of(indexer_compress_ratio)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid QSA indexer budget/compression (indexer_budget={indexer_budget}, indexer_compress_ratio={indexer_compress_ratio}; expected compress_ratio=4)"
+                    ),
+                ));
+            }
+        }
 
         let dflash_cfg = root.get("dflash_config");
         let dflash_block_size = dflash_cfg
@@ -1174,6 +1423,13 @@ impl ModelConfig {
             decision_temperature: get_f64("decision_temperature").or_else(|| dc_f64("temperature")),
         };
 
+        let output_gate_type = tc
+            .get("output_gate_type")
+            .or_else(|| root.get("output_gate_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("silu")
+            .to_string();
+
         Ok(Self {
             architectures,
             model_type,
@@ -1205,11 +1461,30 @@ impl ModelConfig {
             mlp_only_layers,
             vision_config,
             mtp_num_hidden_layers,
+            mtp_use_dedicated_embeddings,
             dflash_block_size,
             dflash_target_layer_ids,
             eos_token_ids,
             quant,
             decision_meta,
+            hc_count,
+            hc_lowrank,
+            ple_layer_ids,
+            ple_embed_dim,
+            ple_conv_kernel_size,
+            ngram_size,
+            heads_per_ngram,
+            ngram_vocab_size_base,
+            make_ngram_vocab_size_divisible_by,
+            split_ngram_parts,
+            ple_embedding_dtype,
+            ple_seed,
+            indexer_n_heads,
+            indexer_kv_heads,
+            indexer_head_dim,
+            indexer_budget,
+            indexer_compress_ratio,
+            output_gate_type,
         })
     }
 
@@ -1792,6 +2067,113 @@ impl ModelConfig {
             .filter(|&&k| k == LayerKind::LinearAttention)
             .count()
     }
+
+    pub fn is_qwen4_exp(&self) -> bool {
+        matches!(self.model_type.as_str(), "qwen4_exp" | "qwen4_exp_text")
+            || self
+                .architectures
+                .iter()
+                .any(|a| a == "Qwen4ExpForConditionalGeneration")
+    }
+
+    pub fn uses_hyper_connection(&self) -> bool {
+        self.hc_count > 1
+    }
+
+    pub fn hyper_hidden_size(&self) -> usize {
+        self.hidden_size * self.hc_count.max(1)
+    }
+
+    pub fn uses_qsa(&self) -> bool {
+        self.indexer_n_heads > 0 && self.indexer_head_dim > 0
+    }
+
+    pub fn uses_ple(&self) -> bool {
+        self.ple_embed_dim > 0 && !self.ple_layer_ids.is_empty()
+    }
+
+    /// Returns the `ExpertPackLayout` if this model's MoE geometry supports host/VRAM
+    /// tiered `U4B8` expert storage.
+    pub fn moe_expert_pack_layout(&self) -> Option<crate::moe_offload::ExpertPackLayout> {
+        if self.num_experts == 0 {
+            return None;
+        }
+        let group_size = self
+            .quant
+            .symmetric_gptq_u4_group_size()
+            .unwrap_or_else(|| self.quant.group_size_or(32));
+        crate::moe_offload::ExpertPackLayout::new(
+            self.moe_intermediate_size,
+            self.hidden_size,
+            group_size,
+        )
+        .ok()
+    }
+
+    /// Total byte footprint of all routed experts across all MoE decoder layers
+    /// when stored in symmetric `U4B8` `ExpertPackLayout` slots.
+    pub fn routed_expert_total_bytes(&self) -> usize {
+        let Some(layout) = self.moe_expert_pack_layout() else {
+            return 0;
+        };
+        let moe_layers = self
+            .num_hidden_layers
+            .saturating_sub(self.mlp_only_layers.len());
+        moe_layers
+            .saturating_mul(self.num_experts)
+            .saturating_mul(layout.stride)
+    }
+
+    pub fn uses_tiered_moe(&self) -> bool {
+        // Use host/VRAM tiered MoE storage whenever all layers are MoE layers with a compatible
+        // symmetric U4B8 expert layout and either:
+        // - the total routed-expert footprint exceeds a single 24 GiB GPU budget (> 20 GiB), or
+        // - the model uses the Qwen4 high-expert-count architecture (including small synthetic test fixtures).
+        self.mlp_only_layers.is_empty()
+            && self.moe_expert_pack_layout().is_some()
+            && ((self.quant.symmetric_gptq_u4_group_size().is_some()
+                && self.routed_expert_total_bytes() > 20 * 1024 * 1024 * 1024)
+                || self.is_qwen4_exp())
+    }
+
+    pub fn qsa_output_width(&self) -> usize {
+        if self.uses_qsa() {
+            self.indexer_budget + self.indexer_compress_ratio.saturating_sub(1)
+        } else {
+            0
+        }
+    }
+
+    /// Sorted unique 0-based layer indices that host a PLE module.
+    pub fn ple_layer_indices(&self) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
+            .ple_layer_ids
+            .iter()
+            .filter_map(|&abs_id| abs_id.checked_sub(1))
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    pub fn num_ple_layers(&self) -> usize {
+        self.ple_layer_indices().len()
+    }
+
+    /// Returns the dense `0..num_ple_layers` index if `layer_idx` (0-based) owns a PLE layer.
+    pub fn ple_dense_layer_index(&self, layer_idx: usize) -> Option<usize> {
+        self.ple_layer_indices().binary_search(&layer_idx).ok()
+    }
+
+    /// Number of prior dilated conv steps retained in `StateBundle::ple_conv_state`:
+    /// `(ple_conv_kernel_size - 1) * ngram_size` (`(4 - 1) * 3 = 9` for `Qwen3.8-Flash-Next`).
+    pub fn ple_conv_state_len(&self) -> usize {
+        if self.ple_conv_kernel_size <= 1 || self.ngram_size == 0 {
+            0
+        } else {
+            (self.ple_conv_kernel_size - 1) * self.ngram_size
+        }
+    }
 }
 
 /// Permutes a `[K / group_size, N]` FP16 scale matrix into `vLLM` Marlin scale layout.
@@ -2192,6 +2574,58 @@ mod tests {
         assert_eq!(cfg.vocab_size, 152064);
         assert_eq!(cfg.rms_norm_eps, 1e-6);
         assert_eq!(cfg.layer_types.len(), 4);
+    }
+
+    #[test]
+    fn test_architecture_capabilities_compose_independently() {
+        let mut cfg = ModelConfig::from_json(&serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 2560,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 20,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 152064
+        }))
+        .unwrap();
+        assert!(!cfg.uses_hyper_connection());
+        assert!(!cfg.uses_qsa());
+        assert!(!cfg.uses_ple());
+        assert!(!cfg.uses_tiered_moe());
+
+        cfg.hc_count = 4;
+        assert!(cfg.uses_hyper_connection());
+        assert_eq!(cfg.hyper_hidden_size(), 10240);
+        assert!(!cfg.uses_qsa());
+        assert!(!cfg.uses_ple());
+        cfg.hc_count = 1;
+        cfg.indexer_n_heads = 4;
+        cfg.indexer_head_dim = 128;
+        assert!(cfg.uses_qsa());
+        assert!(!cfg.uses_hyper_connection());
+        cfg.ple_embed_dim = 2560;
+        assert!(!cfg.uses_ple());
+        cfg.ple_layer_ids = vec![2];
+        assert!(cfg.uses_ple());
+        cfg.num_experts = 512;
+        assert!(!cfg.uses_tiered_moe());
+        assert!(!cfg.is_qwen4_exp());
+        // A non-qwen4_exp model whose symmetric U4B8 routed experts exceed 20 GiB
+        // automatically selects tiered host/VRAM MoE storage.
+        cfg.num_hidden_layers = 36;
+        cfg.moe_intermediate_size = 640;
+        cfg.quant = QuantScheme::Gptq {
+            bits: 4,
+            group_size: 32,
+            sym: true,
+            desc_act: false,
+        };
+        assert!(cfg.uses_tiered_moe());
+        cfg.num_hidden_layers = 4;
+        assert!(!cfg.uses_tiered_moe());
+        cfg.model_type = "qwen4_exp".into();
+        assert!(cfg.uses_tiered_moe());
+        assert!(!cfg.uses_hyper_connection());
     }
 
     #[test]
@@ -2896,5 +3330,99 @@ mod tests {
         // For `scale_perm_single`, index 1 is `1`.
         assert_eq!(grouped[1], 8);
         assert_eq!(channelwise[1], 1);
+    }
+
+    #[test]
+    fn test_qwen4_exp_flash_next_config_and_validation() {
+        let qfn_json: Json = serde_json::from_str(
+            r#"{
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+            "image_token_id": 248056,
+            "vision_start_token_id": 248053,
+            "vision_end_token_id": 248054,
+            "quantization_config": {
+                "bits": 4,
+                "group_size": 128,
+                "packing_format": "auto_round:auto_gptq",
+                "quant_method": "auto-round",
+                "sym": true,
+                "extra_config": {
+                    "lm_head": { "bits": 16, "data_type": "fp" },
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv": { "bits": 16, "data_type": "fp" }
+                }
+            },
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "hidden_size": 2560,
+                "num_hidden_layers": 48,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "vocab_size": 248320,
+                "rms_norm_eps": 1e-6,
+                "hc_count": 4,
+                "hc_lowrank": 320,
+                "indexer_n_heads": 4,
+                "indexer_kv_heads": 1,
+                "indexer_head_dim": 128,
+                "indexer_budget": 2048,
+                "indexer_compress_ratio": 4,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 512,
+                "num_experts_per_tok": 10,
+                "moe_intermediate_size": 640,
+                "shared_expert_intermediate_size": 640,
+                "ple_layer_ids": [2],
+                "ple_embed_dim": 2560,
+                "ple_conv_kernel_size": 4,
+                "ngram_size": 3,
+                "heads_per_ngram": 8,
+                "ngram_vocab_size_base": 20000000,
+                "make_ngram_vocab_size_divisible_by": 128,
+                "split_ngram_parts": 128,
+                "ple_embedding_dtype": "float8_e4m3fn",
+                "mtp_num_hidden_layers": 1,
+                "mtp_use_dedicated_embeddings": false
+            }
+        }"#,
+        )
+        .unwrap();
+        let cfg = ModelConfig::from_json(&qfn_json).unwrap();
+        assert!(cfg.is_qwen4_exp());
+        assert!(cfg.uses_hyper_connection());
+        assert_eq!(cfg.hc_count, 4);
+        assert_eq!(cfg.hc_lowrank, 320);
+        assert_eq!(cfg.hyper_hidden_size(), 10240);
+        assert!(cfg.uses_qsa());
+        assert_eq!(cfg.indexer_n_heads, 4);
+        assert_eq!(cfg.indexer_kv_heads, 1);
+        assert_eq!(cfg.indexer_head_dim, 128);
+        assert_eq!(cfg.indexer_budget, 2048);
+        assert_eq!(cfg.indexer_compress_ratio, 4);
+        assert_eq!(cfg.qsa_output_width(), 2051);
+        assert_eq!(cfg.ple_layer_indices(), vec![1]);
+        assert_eq!(cfg.num_ple_layers(), 1);
+        assert_eq!(cfg.ple_dense_layer_index(0), None);
+        assert_eq!(cfg.ple_dense_layer_index(1), Some(0));
+        assert_eq!(cfg.ple_conv_state_len(), 9);
+        assert_eq!(cfg.num_full_attention_layers(), 12);
+        assert_eq!(cfg.num_linear_attention_layers(), 36);
+        assert_eq!(cfg.num_experts, 512);
+        assert_eq!(cfg.num_experts_per_tok, 10);
+        assert!(!cfg.mtp_use_dedicated_embeddings);
+
+        // Fail-fast on out-of-range ple_layer_ids or bad QSA indexer geometry
+        let mut bad_ple = qfn_json.clone();
+        bad_ple["text_config"]["ple_layer_ids"] = serde_json::json!([0]);
+        assert!(ModelConfig::from_json(&bad_ple).is_err());
+
+        let mut bad_qsa = qfn_json.clone();
+        bad_qsa["text_config"]["indexer_compress_ratio"] = serde_json::json!(3);
+        assert!(ModelConfig::from_json(&bad_qsa).is_err());
     }
 }
