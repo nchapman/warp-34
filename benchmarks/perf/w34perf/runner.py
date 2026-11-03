@@ -15,9 +15,11 @@ import time
 
 from . import __version__
 from .config import digest, public_config
+from .evidence import attach, quality_status
 from .metrics import summarize
 from .selection import select
 from .transport import stream
+from .telemetry import TelemetrySampler
 from .workloads import append_replay, body, messages
 
 
@@ -164,7 +166,7 @@ def run_trial(engine, case, run_cfg, phase, repetition, journal, *, namespace):
     return summarize(records, sessions, duration, case)
 
 
-def blockers(engine, cfg, summary):
+def blockers(engine, cfg, summary, *, attached_quality="missing"):
     reasons = []
     if engine.get("support", "unverified") != "supported":
         reasons.append("deployment support has not been qualified")
@@ -174,8 +176,10 @@ def blockers(engine, cfg, summary):
                 "quantization_details", "gpu_ids"):
         if not engine.get(key) or "unknown" in str(engine[key]).lower():
             reasons.append(f"unverified {key}")
-    if not engine.get("quality_evidence"):
-        reasons.append("no independent quality evidence for this 4-bit/KV deployment")
+    if attached_quality == "failed":
+        reasons.append("attached independent quality checks failed for this deployment")
+    elif attached_quality != "passed":
+        reasons.append("no matching attached independent quality evidence for this 4-bit/KV deployment")
     if cfg["run"]["repetitions"] < 3:
         reasons.append("fewer than three repetitions")
     if summary["failed_requests"] or summary["successful_sessions"] != summary["sessions"]:
@@ -186,7 +190,8 @@ def blockers(engine, cfg, summary):
     return reasons
 
 
-def execute(cfg, out, engine_ids=None, case_ids=None, *, gpu_count=None, exclude_ids=None):
+def execute(cfg, out, engine_ids=None, case_ids=None, *, gpu_count=None, exclude_ids=None,
+            evidence_paths=(), telemetry_interval=None, server_pids=()):
     engines, cases, coverage = select(cfg, engine_ids, case_ids,
                                       gpu_count=gpu_count, exclude_ids=exclude_ids)
     if len({e["base_url"].rstrip("/") for e in engines}) != len(engines):
@@ -194,12 +199,19 @@ def execute(cfg, out, engine_ids=None, case_ids=None, *, gpu_count=None, exclude
     for engine in engines:
         if engine.get("api_key_env") and not os.environ.get(engine["api_key_env"]):
             raise ValueError(f"missing credential environment variable {engine['api_key_env']}")
+    if server_pids and telemetry_interval is None:
+        raise ValueError("server_pids requires telemetry_interval")
+    for evidence_path in evidence_paths:
+        if not Path(evidence_path).is_file():
+            raise ValueError(f"evidence is not a file: {evidence_path}")
     out = Path(out)
     out.mkdir(parents=True, exist_ok=False)
+    attachments = attach(evidence_paths, out)
     manifest = {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
                 "config": public_config(cfg), "config_sha256": digest(cfg),
                 "provenance": provenance() if engines else {"not_collected": "no runnable deployments"},
                 "status": "running", "gpu_count_filter": gpu_count,
+                "evidence": attachments,
                 "excluded_engines": exclude_ids or [],
                 "requested_engines": engine_ids,
                 "selected_engines": [e["id"] for e in engines],
@@ -214,10 +226,17 @@ def execute(cfg, out, engine_ids=None, case_ids=None, *, gpu_count=None, exclude
 
     save_coverage()
     current = None
+    sampler = None
+    telemetry_failure = None
     try:
+        if engines and telemetry_interval is not None:
+            sampler = TelemetrySampler(out / "telemetry.jsonl", interval_s=telemetry_interval,
+                                       pids=server_pids)
+            sampler.__enter__()
         if not engines:
             print("No runnable deployments selected; skip reasons retained in coverage.json", flush=True)
         for engine in engines:
+            attached_quality = quality_status(attachments, out, engine)
             for case in cases:
                 current = next(c for c in coverage if c["engine_id"] == engine["id"] and c["case_id"] == case["id"])
                 current["status"] = "in_progress"
@@ -244,7 +263,8 @@ def execute(cfg, out, engine_ids=None, case_ids=None, *, gpu_count=None, exclude
                            "weight_format": engine["weight_format"], "kv_format": engine["kv_format"],
                            "speculation": engine["speculation"], "cache": case.get("cache", "unique"),
                            "fixture_sha256": case["fixture_sha256"],
-                           "publication_blockers": blockers(engine, cfg, summary), **summary}
+                           "attached_quality_status": attached_quality,
+                           "publication_blockers": blockers(engine, cfg, summary, attached_quality=attached_quality), **summary}
                     summaries.append(row)
                     current["completed_repetitions"] += 1
                     if (summary["failed_requests"] or not summary["token_accounting_complete"]
@@ -267,11 +287,20 @@ def execute(cfg, out, engine_ids=None, case_ids=None, *, gpu_count=None, exclude
             current["reason"] = f"{type(exc).__name__}; inspect requests.jsonl for evidence"
         raise
     finally:
+        if sampler is not None:
+            try:
+                sampler.stop()
+            except Exception as exc:
+                telemetry_failure = exc
+                manifest["status"] = "failed"
+                manifest["telemetry_error"] = type(exc).__name__
         journal.close()
         save_coverage()
         manifest["finished_utc"] = datetime.now(timezone.utc).isoformat()
         (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        inventory = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                     for p in sorted(out.iterdir()) if p.is_file() and p.name != "SHA256SUMS.json"}
+        inventory = {p.relative_to(out).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in sorted(out.rglob("*")) if p.is_file() and p != out / "SHA256SUMS.json"}
         (out / "SHA256SUMS.json").write_text(json.dumps(inventory, indent=2) + "\n")
+    if telemetry_failure is not None:
+        raise MeasurementError("telemetry failed; benchmark evidence retained") from telemetry_failure
     return summaries

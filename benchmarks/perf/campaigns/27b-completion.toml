@@ -1,0 +1,119 @@
+# Current-build completion campaign. Launch profiles serially; qualify before publication.
+schema_version = 1
+[run]
+seed = 34
+repetitions = 3
+warmup_requests = 1
+max_inflight = 8
+timeout_s = 180
+
+[presets.quick]
+cases = ["decode-c1", "agent-c1"]
+repetitions = 1
+[presets.full]
+cases = ["decode-c1", "throughput-c8", "agent-c1", "prefill-primed-c1"]
+repetitions = 3
+[presets.release]
+cases = ["decode-c1", "throughput-c8", "agent-c1", "prefill-primed-c1"]
+repetitions = 5
+
+[engine_defaults]
+support = "unverified"
+cohort = "27b-0df-identical-gptq"
+gpu_count = 1
+parallelism = "single"
+base_url = "http://127.0.0.1:18034/v1"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+source_model_revision = "unknown; identical artifact does not establish cross-format equivalence"
+artifact_sha256 = "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03"
+tokenizer_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+weight_format = "compressed-tensors-GPTQ-int4"
+quantization_details = "g128 symmetric static actorder; pinned identical snapshot"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "fp16"
+speculation = "none"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-tp1-fp16"
+engine = "warp-34"
+version = "66974d8; binary sha256 f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f"
+cache_config = "512 FP16 pages; native radix/graphs; FP32 SSM; default admission; no offload"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format fp16 --kv-pages 512 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "vllm-tp1-fp16"
+engine = "vllm"
+version = "0.31.0"
+cache_config = "FP16 auto KV; FP32 SSM; prefix on; max sequences 8; prefill budget 1024; GPU budget .90; CPU offload 0"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "llamacpp-tp1-fp16"
+engine = "llama.cpp"
+base_url = "http://127.0.0.1:18035/v1"
+gpu_ids = "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
+version = "25ae3a9b3; build 10481; image sha256 b2497f8834f5ecb4e38530f6bf2734b8e0be107ff48e4720145911c86930f2ce"
+cohort = "27b-gguf-practical-4bit"
+model = "qwen38-gguf"
+model_revision = "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+artifact_sha256 = "unknown; pinned download pending inventory"
+tokenizer_revision = "embedded GGUF"
+chat_template_sha256 = "unknown; embedded GGUF"
+weight_format = "GGUF UD-Q4_K_M"
+quantization_details = "Unsloth dynamic Q4_K_M; source/conversion equivalence unresolved"
+cache_config = "FP16 K/V; 8192 context; full GPU layers; no CPU weight offload"
+launch_command = "docker run --rm --gpus device=1 -p 127.0.0.1:18035:18034 -v /home/nchapman/.cache/huggingface/hub:/models:ro --entrypoint /app/llama-server ghcr.io/ggml-org/llama.cpp@sha256:b2497f8834f5ecb4e38530f6bf2734b8e0be107ff48e4720145911c86930f2ce --model /models/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf --alias qwen38-gguf --n-gpu-layers 999 --ctx-size 8192 --cache-type-k f16 --cache-type-v f16 --host 0.0.0.0 --port 18034"
+
+[[engines]]
+id = "ninfer-tp1-int8"
+engine = "ninfer-3090"
+version = "115dee6b4d2df1c2d491da498515bdeb4f7e3f01"
+cohort = "27b-ninfer-practical-4bit"
+model = "qwen38-ninfer"
+model_revision = "ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1"
+source_model_revision = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0; artifact publisher declaration"
+artifact_sha256 = "unknown; pinned download pending inventory"
+tokenizer_revision = "embedded ninfer"
+chat_template_sha256 = "unknown; native renderer"
+weight_format = "ninfer grouped_search mixed Q4/Q5"
+quantization_details = "Q4 embeddings Q6 head; not identical GPTQ"
+kv_format = "int8"
+cache_config = "int8 practical lane, not FP16 baseline; 8192 KV capacity; concurrency 8"
+launch_command = "CUDA_VISIBLE_DEVICES=0 /tmp/w34-benchmark-refs/ninfer-3090/build-linux/apps/ninfer-serve /home/nchapman/.cache/huggingface/hub/models--WarlaxZ--Qwen3.8-27B-NInfer-3090/snapshots/ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1/qwen3_8_27b.ninfer --model-id qwen38-ninfer --host 127.0.0.1 --port 18034 --max-context 8192 --kv-capacity 8192 --max-concurrency 8 --kv-dtype int8 --no-thinking"
+
+[[cases]]
+id = "decode-c1"
+fixture = "../fixtures/text.json"
+requests = 4
+concurrency = 1
+max_tokens = 256
+
+[[cases]]
+id = "throughput-c8"
+fixture = "../fixtures/text.json"
+requests = 16
+concurrency = 8
+max_tokens = 256
+
+[[cases]]
+id = "agent-c1"
+kind = "agent_replay"
+fixture = "../fixtures/coding_agent.json"
+requests = 2
+concurrency = 1
+max_tokens = 128
+cache = "natural"
+think_time_s = 0.05
+
+[[cases]]
+id = "prefill-primed-c1"
+fixture = "../fixtures/text.json"
+context_repetitions = 32
+requests = 4
+concurrency = 1
+max_tokens = 128
+cache = "primed"

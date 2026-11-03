@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-11-03T07:28:34.959502+00:00",
+  "root": "/home/nchapman/.cache/huggingface/hub/models--WarlaxZ--Qwen3.8-27B-NInfer-3090/snapshots/ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1",
+  "include": [],
+  "files": {
+    "qwen3_8_27b.ninfer": {
+      "bytes": 18982458624,
+      "sha256": "7f2a0086a071ee932c66106e1552d118a85cfec8ddef13c67a54cd64abb39706"
+    }
+  },
+  "total_bytes": 18982458624,
+  "inventory_sha256": "63280a424ebd6a2b6ce2ce47777f7f5e09f11aa3edfb974cb996f08bd4e8d3a6"
+}

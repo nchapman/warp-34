@@ -155,6 +155,14 @@ def load(path):
             raise ValueError("text fixture requires nonempty prompts")
         case["fixture_data"] = data
         case["fixture_sha256"] = digest(data)
+    presets = cfg.get("presets", {})
+    if not isinstance(presets, dict):
+        raise ValueError("presets must be a table")
+    from .presets import apply_preset
+    for name in presets:
+        if name not in ("quick", "full", "release"):
+            raise ValueError(f"unknown preset {name!r}")
+        apply_preset(cfg, name)
     return cfg
 
 

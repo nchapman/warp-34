@@ -1,0 +1,230 @@
+# Standalone HTTP campaign; launch one profile manually, never concurrently.
+# All profiles remain unverified: schema validation is not serving qualification.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 3
+warmup_requests = 1
+max_inflight = 1
+timeout_s = 1800
+
+[presets.quick]
+cases = ["short-chat", "coding-agent-replay"]
+repetitions = 1
+[presets.full]
+cases = ["short-chat", "prefill-context-r16", "code-context-r64", "prefix-primed-r16", "coding-agent-replay"]
+repetitions = 3
+[presets.release]
+cases = ["short-chat", "prefill-context-r16", "code-context-r64", "prefix-primed-r16", "coding-agent-replay"]
+repetitions = 5
+
+[engine_defaults]
+support = "unverified"
+cohort = "flash-next-ef554-serving"
+base_url = "http://127.0.0.1:18034/v1"
+model_revision = "ef554143369a706525336f6b42a09094835dc077"
+artifact_sha256 = "22f4df9d9667fc9dfbb528df1dc6f49236bdaf58627e32acd6ff8df60d54ee57"
+tokenizer_revision = "ef554143369a706525336f6b42a09094835dc077"
+chat_template_sha256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+weight_format = "AutoRound-W4A16-g128; FP8-E4M3-PLE; optional MTP-INT4-g32"
+request_overrides = {temperature = 0, chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-flash-tp1-target"
+engine = "warp-34"
+version = "66974d8"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "TP=1; routed EP=1"
+model = "/home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "tq4"
+speculation = "none"
+cache_config = "TQ4 main KV, 4096 pages; QSA side caches; FP32 GDN SSM and FP16 conv; radix prefix cache; target hot48/layer/rank, stage32; no MTP; mapped pinned host experts, mmap PLE backed by OS page cache; startup rankings auto-discovery; residency unmeasured"
+launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077 --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-flash-tp1-mtp3"
+engine = "warp-34"
+version = "66974d8"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "TP=1; routed EP=1"
+model = "/home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "tq4"
+speculation = "mtp-k3"
+cache_config = "TQ4 main KV, 4096 pages; QSA side caches; FP32 GDN SSM and FP16 conv; radix prefix cache; target hot48/layer/rank, stage32; MTP hot64, stage32; mapped pinned host experts, mmap PLE backed by OS page cache; startup rankings auto-discovery; residency unmeasured"
+launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077 --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
+
+[[engines]]
+id = "warp34-flash-tp2-target"
+engine = "warp-34"
+version = "66974d8"
+gpu_count = 2
+gpu_ids = "0,1"
+parallelism = "TP=2; routed EP=2"
+model = "/home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "tq4"
+speculation = "none"
+cache_config = "TQ4 main KV, 4096 pages; QSA side caches; FP32 GDN SSM and FP16 conv; radix prefix cache; target hot112/layer/rank, stage32; no MTP; mapped pinned host experts, mmap PLE backed by OS page cache; startup rankings auto-discovery; residency unmeasured"
+launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077 --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-flash-tp2-mtp3"
+engine = "warp-34"
+version = "66974d8"
+gpu_count = 2
+gpu_ids = "0,1"
+parallelism = "TP=2; routed EP=2"
+model = "/home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "tq4"
+speculation = "mtp-k3"
+cache_config = "TQ4 main KV, 4096 pages; QSA side caches; FP32 GDN SSM and FP16 conv; radix prefix cache; target hot112/layer/rank, stage32; MTP hot128, stage32; mapped pinned host experts, mmap PLE backed by OS page cache; startup rankings auto-discovery; residency unmeasured"
+launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077 --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
+
+[[engines]]
+id = "qfn-2x3090-mtp3"
+engine = "qfn-2x3090-vllm-overlay"
+version = "4dca58f7243f3910ba072a97e7f29fcf6f5636f3; vllm 0.1.dev20073+g8e685d198"
+gpu_count = 2
+gpu_ids = "0,1"
+parallelism = "TP=2; EP=2"
+model = "Qwen3.8-Flash-Next"
+activation_dtype = "bfloat16"
+conv_state_dtype = "runtime default; verify"
+kv_format = "bfloat16"
+speculation = "mtp-k3"
+cache_config = "128GB profile: hot84, dynamic LRU/mixed VMM, UVA expert offload 30 GB, CPU PLE; BF16 KV 4429185024 bytes, max len 262144, max seqs 1, chunk4096; prefix caching enabled, retention1600; approximate QSA; custom all-reduce disabled; loader may rely on swap"
+launch_command = "cd /tmp/w34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18034 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
+
+[[engines]]
+id = "qfn-3090-mtp3"
+engine = "qfn-3090-vllm-overlay"
+version = "10b24c282f59348037096a2259d3ba0948f1b202"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "TP1; CPU expert arena plus GPU hot cache"
+model = "Qwen3.8-Flash-Next"
+activation_dtype = "bfloat16"
+kv_format = "int8_per_token_head"
+speculation = "mtp-k3; filtered draft vocabulary"
+cache_config = "default 3090-64gb-128k profile scaled by host memory: hot32; CPU arena auto; mmap PLE; int8 KV3050000000 bytes; max len135168; seq1; chunk8192; approximate QSA; memory limit auto minus8GiB; OS cache not flushed"
+launch_command = "cd /tmp/w34-benchmark-refs/qfn-3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18034 GPU_DEVICE=0 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn1:10b24c2 bash scripts/docker_serve.sh"
+
+[[engines]]
+id = "ninfer-flash-unverified"
+engine = "ninfer"
+cohort = "flash-next-ninfer-iq2-excluded"
+model = "WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090"
+model_revision = "unknown; not downloaded for this approximately 4-bit campaign"
+artifact_sha256 = "unknown"
+tokenizer_revision = "unknown"
+chat_template_sha256 = "unknown"
+weight_format = "IQ2_XS-derived native ninfer; excluded precision cohort"
+gpu_count = 2
+enabled = false
+support = "unverified"
+skip_reason = "Known pinned native artifact is IQ2_XS-derived (WarlaxZ/Qwen3.8-Flash-Next-NInfer-3090), not the primary approximately 4-bit cohort; Windows-preview runtime is separately unqualified on Linux. Excluded from this cohort, not an unsupported-architecture claim."
+
+[[engines]]
+id = "strata-flash-tp1-target"
+engine = "Strata"
+version = "ffa80d73133ea5c548aefe57889a16e8085a938f; binary ec36d1be124a91093d5073821715bccbcc1a10d15de75bb46adbb8cfe04ff063"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "single GPU expert cache; resident CPU expert arena"
+support = "unverified"
+cohort = "flash-next-gguf-practical-iq4xs"
+model = "qwen38-flash-strata-iq4xs"
+model_revision = "38bb39ee97821de2c9009abb7e93950eec396e66"
+artifact_sha256 = "36de1d9c0dcf6f7193b3270019cd7425da086bb87563b8449d8b0c9376595683"
+conversion_inventory_sha256 = "213f4eae95e0d83f3baed3f12c5c451850fca222ff5e4d1a6e43d22c22d98a53"
+tokenizer_revision = "embedded GGUF; 38bb39ee97821de2c9009abb7e93950eec396e66"
+chat_template_sha256 = "unknown; extracted GGUF tokenizer and Strata renderer require separate attestation"
+weight_format = "GGUF UD-IQ4_XS; mixed IQ3_S/IQ4_XS/IQ4_NL/Q8_0 experts"
+quantization_details = "Unsloth dynamic quantization; Strata iq_pack --compat-bf16 rounds small projections to BF16; not the AutoRound artifact"
+activation_dtype = "source-native mixed BF16/F32"
+kv_format = "fp16"
+speculation = "none"
+cache_config = "72GiB resident budget; mmap native GGUF; auto GPU expert cache; embedded IQ4_NL PLE; context8192; parallel1 FIFO; no MTP; OS cache not flushed"
+launch_command = "cd /tmp/w34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m serve.server --engine strata --config /home/nchapman/Code/warp-34/benchmarks/perf/campaigns/strata-flash-http.json --host 127.0.0.1 --port 18034 --offline --no-api-key --no-fit-max-tokens --parallel 1"
+
+[[engines]]
+id = "strata-flash-tp1-lookup4"
+engine = "Strata"
+version = "ffa80d73133ea5c548aefe57889a16e8085a938f; binary ec36d1be124a91093d5073821715bccbcc1a10d15de75bb46adbb8cfe04ff063"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "single GPU expert cache; resident CPU expert arena"
+support = "unverified"
+cohort = "flash-next-gguf-practical-iq4xs"
+model = "qwen38-flash-strata-iq4xs"
+model_revision = "38bb39ee97821de2c9009abb7e93950eec396e66"
+artifact_sha256 = "36de1d9c0dcf6f7193b3270019cd7425da086bb87563b8449d8b0c9376595683"
+conversion_inventory_sha256 = "213f4eae95e0d83f3baed3f12c5c451850fca222ff5e4d1a6e43d22c22d98a53"
+tokenizer_revision = "embedded GGUF; 38bb39ee97821de2c9009abb7e93950eec396e66"
+chat_template_sha256 = "unknown; extracted GGUF tokenizer and Strata renderer require separate attestation"
+weight_format = "GGUF UD-IQ4_XS; mixed IQ3_S/IQ4_XS/IQ4_NL/Q8_0 experts"
+quantization_details = "Unsloth dynamic quantization; Strata iq_pack --compat-bf16 rounds small projections to BF16; not the AutoRound artifact"
+activation_dtype = "source-native mixed BF16/F32"
+kv_format = "fp16"
+speculation = "prompt lookup; verify window4; no MTP drafter"
+cache_config = "72GiB resident budget; mmap native GGUF; auto GPU expert cache; embedded IQ4_NL PLE; context8192; prefill512; parallel1 FIFO; OS cache not flushed"
+launch_command = "cd /tmp/w34-benchmark-refs/Strata && env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m serve.server --engine strata --config /home/nchapman/Code/warp-34/benchmarks/perf/campaigns/strata-flash-lookup-http.json --host 127.0.0.1 --port 18034 --offline --no-api-key --no-fit-max-tokens --parallel 1"
+
+# Repetitions of fixture context are NOT calibrated token buckets.
+[[cases]]
+id = "short-chat"
+fixture = "../fixtures/text.json"
+context_repetitions = 1
+cache = "unique"
+requests = 4
+concurrency = 1
+max_tokens = 256
+
+# Repetitions of fixture context are NOT calibrated token buckets.
+[[cases]]
+id = "prefill-context-r16"
+fixture = "../fixtures/text.json"
+context_repetitions = 16
+cache = "unique"
+requests = 4
+concurrency = 1
+max_tokens = 64
+
+# Repetitions of fixture context are NOT calibrated token buckets.
+[[cases]]
+id = "code-context-r64"
+fixture = "../fixtures/text.json"
+context_repetitions = 64
+cache = "unique"
+requests = 4
+concurrency = 1
+max_tokens = 256
+
+# Repetitions of fixture context are NOT calibrated token buckets.
+[[cases]]
+id = "prefix-primed-r16"
+fixture = "../fixtures/text.json"
+context_repetitions = 16
+cache = "primed"
+requests = 4
+concurrency = 1
+max_tokens = 64
+
+[[cases]]
+id = "coding-agent-replay"
+kind = "agent_replay"
+fixture = "../fixtures/coding_agent.json"
+cache = "natural"
+requests = 2
+concurrency = 1
+max_tokens = 128

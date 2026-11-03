@@ -1,0 +1,743 @@
+{
+  "schema_version": 1,
+  "publication_ready": false,
+  "limitations": [
+    "Qualification measurements; not a winner ranking.",
+    "Different weight/KV/cohort/renderer/GPU settings are not controlled equivalents.",
+    "Repetitions within one server lifetime are not independent restart trials.",
+    "Baseline quality passes do not establish long-context quality.",
+    "Resource peaks cover whole runs including warmup and priming."
+  ],
+  "startup_outcomes": [
+    {
+      "path": "benchmarks/perf/results/completion-27b-baselines/llamacpp-tp1-fp16/qualification.json",
+      "sha256": "51f4b6390a82aa5dfd0ffea5eddb08367d050074e1776fba637e95a9813303be",
+      "engine_id": "llamacpp-tp1-fp16",
+      "status": "ready",
+      "startup_s": 4.005191924981773,
+      "elapsed_s": null,
+      "error": null,
+      "quality_status": "failed",
+      "measurement_status": "complete",
+      "measurement_error": null
+    },
+    {
+      "path": "benchmarks/perf/results/completion-27b-baselines/vllm-tp1-fp16/qualification.json",
+      "sha256": "f37d5c795553c2417d57b38266486bfaac3f0529086e42d92b836551aaf2711b",
+      "engine_id": "vllm-tp1-fp16",
+      "status": "ready",
+      "startup_s": 31.012799193151295,
+      "elapsed_s": null,
+      "error": null,
+      "quality_status": "passed",
+      "measurement_status": "complete",
+      "measurement_error": null
+    },
+    {
+      "path": "benchmarks/perf/results/completion-27b-baselines/warp34-tp1-fp16/qualification.json",
+      "sha256": "b932458b14d1f62a68888a9431236536634eca59f1cd3a3892a94c1654f2229a",
+      "engine_id": "warp34-tp1-fp16",
+      "status": "ready",
+      "startup_s": 16.008047577925026,
+      "elapsed_s": null,
+      "error": null,
+      "quality_status": "passed",
+      "measurement_status": "complete",
+      "measurement_error": null
+    },
+    {
+      "path": "benchmarks/perf/results/completion-27b-ninfer-tp1-full",
+      "engine_id": "ninfer-tp1-int8",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "passed",
+      "measurement_status": "complete"
+    }
+  ],
+  "runs": [
+    {
+      "path": "benchmarks/perf/results/completion-27b-baselines/llamacpp-tp1-fp16/run",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "e97e3a66a04cb21f660f33ac7bf8702f6332d3fa2b1fa8d2c8c4abc5fb71520f",
+        "summary.json": "06b20a5c015332e8ee470133d9a59d93ac1c0b5ca10dfe73bedc6b4070937649",
+        "coverage.json": "a78fa0e185bab1b745917a637fb5b7512ee4d635722932b4091bfc64ed010ef1",
+        "SHA256SUMS.json": "bfc3166a4543cb66f85b3e1a0545ba963b9b4a7680af66a811553e1f4f4a9b01",
+        "telemetry.jsonl": "d7d6397fc6e3a3e1c100e79a399865266a408382351ffbd661d083ac763ddaab"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "27b-gguf-practical-4bit",
+          "gpu_count": 1,
+          "parallelism": "single",
+          "base_url": "http://127.0.0.1:18035/v1",
+          "model": "qwen38-gguf",
+          "model_revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+          "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
+          "artifact_sha256": "unknown; pinned download pending inventory",
+          "tokenizer_revision": "embedded GGUF",
+          "chat_template_sha256": "unknown; embedded GGUF",
+          "weight_format": "GGUF UD-Q4_K_M",
+          "quantization_details": "Unsloth dynamic Q4_K_M; source/conversion equivalence unresolved",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "fp16",
+          "speculation": "none",
+          "id": "llamacpp-tp1-fp16",
+          "engine": "llama.cpp",
+          "gpu_ids": "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a",
+          "version": "25ae3a9b3; build 10481; image sha256 b2497f8834f5ecb4e38530f6bf2734b8e0be107ff48e4720145911c86930f2ce",
+          "cache_config": "FP16 K/V; 8192 context; full GPU layers; no CPU weight offload",
+          "launch_command": "docker run --rm --gpus device=1 -p 127.0.0.1:18035:18034 -v /home/nchapman/.cache/huggingface/hub:/models:ro --entrypoint /app/llama-server ghcr.io/ggml-org/llama.cpp@sha256:b2497f8834f5ecb4e38530f6bf2734b8e0be107ff48e4720145911c86930f2ce --model /models/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf --alias qwen38-gguf --n-gpu-layers 999 --ctx-size 8192 --cache-type-k f16 --cache-type-v f16 --host 0.0.0.0 --port 18034",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "llamacpp-tp1-fp16",
+          "case": "agent-c1",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 39.95574606541108,
+          "peak_prompt_tokens": 1508,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "llamacpp-tp1-fp16",
+          "case": "decode-c1",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 44.35542334638022,
+          "peak_prompt_tokens": 178,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "llamacpp-tp1-fp16",
+          "case": "prefill-primed-c1",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 39.861202288582966,
+          "peak_prompt_tokens": 3034,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "llamacpp-tp1-fp16",
+          "case": "throughput-c8",
+          "trials": 3,
+          "requests": 48,
+          "success": 48,
+          "failed": 0,
+          "output_tokens_s": 96.47007889630866,
+          "peak_prompt_tokens": 180,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "llamacpp-tp1-fp16": "failed"
+      },
+      "resources": {
+        "sample_count": 404,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 2714781.88372297,
+          "end_s": 2715199.247286415
+        },
+        "duration_s": 417.3635634453967,
+        "gpus": {
+          "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 45.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 69.0,
+            "average_power_w": 28.525742574257425
+          },
+          "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 16271.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 97.0,
+            "peak_temperature_c": 85.0,
+            "average_power_w": 435.11106435643563
+          }
+        },
+        "host_peak_memory_used_kib": 26157612,
+        "pid_peak_rss_kib": {},
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {}
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/completion-27b-baselines/vllm-tp1-fp16/run",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "7f4c6cf98e24eaf174ab03f51d601beea8e2b05d019523e9cab3d83468b49bbd",
+        "summary.json": "9f58263dcb021b6b67f71627c2a4d3460e561f3f71934203f192b0a72817fad0",
+        "coverage.json": "7a1f56a5ee0d21d4967f140f62ad6efe729f431345e241307405dd2c43e6789b",
+        "SHA256SUMS.json": "dddbfea13c1e1f35a445a4b4c46e644fe04cd2f6874041843504f0559e8f2aab",
+        "telemetry.jsonl": "172291c58f4c1805d2d81a4af686665f0f0e73e3725dc6735ba6c8f0521419a0"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "27b-0df-identical-gptq",
+          "gpu_count": 1,
+          "parallelism": "single",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
+          "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
+          "tokenizer_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "compressed-tensors-GPTQ-int4",
+          "quantization_details": "g128 symmetric static actorder; pinned identical snapshot",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "fp16",
+          "speculation": "none",
+          "id": "vllm-tp1-fp16",
+          "engine": "vllm",
+          "version": "0.31.0",
+          "cache_config": "FP16 auto KV; FP32 SSM; prefix on; max sequences 8; prefill budget 1024; GPU budget .90; CPU offload 0",
+          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "vllm-tp1-fp16",
+          "case": "agent-c1",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 41.07904823781328,
+          "peak_prompt_tokens": 1437,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified gpu_ids",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "vllm-tp1-fp16",
+          "case": "decode-c1",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 50.76462766831592,
+          "peak_prompt_tokens": 178,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified gpu_ids",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "vllm-tp1-fp16",
+          "case": "prefill-primed-c1",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 42.96476450080258,
+          "peak_prompt_tokens": 3034,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified gpu_ids",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "vllm-tp1-fp16",
+          "case": "throughput-c8",
+          "trials": 3,
+          "requests": 48,
+          "success": 48,
+          "failed": 0,
+          "output_tokens_s": 309.89448528117424,
+          "peak_prompt_tokens": 180,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified gpu_ids",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "vllm-tp1-fp16": "passed"
+      },
+      "resources": {
+        "sample_count": 288,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 2714470.547651056,
+          "end_s": 2714768.458782395
+        },
+        "duration_s": 297.911131338682,
+        "gpus": {
+          "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22229.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 100.0,
+            "peak_temperature_c": 89.0,
+            "average_power_w": 445.97447916666664
+          },
+          "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 18.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 37.0,
+            "average_power_w": 25.556354166666665
+          }
+        },
+        "host_peak_memory_used_kib": 17968028,
+        "pid_peak_rss_kib": {},
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {}
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/completion-27b-baselines/warp34-tp1-fp16/run",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "892fba837a2dd469f2d83792c474a839588b5861aa58efd98a057b8607721a41",
+        "summary.json": "1fd30f4d7c8b5d9a6d0c08d90f666d6766149dcb5cc09cd9a999781490f3f26f",
+        "coverage.json": "4c4c2e21fe915e342b70cc264b24d9d31f226ee078424ee7c97e239907c0c40d",
+        "SHA256SUMS.json": "2e0e00e4c69c125c6b0c0c0baec702a12c287a1a3e57bffabbc9c41d6321a6c6",
+        "telemetry.jsonl": "ae10dda857c7edf58bfa718dc6179f5a003c417d76ddbc417cac987c28ed7d1d"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "27b-0df-identical-gptq",
+          "gpu_count": 1,
+          "parallelism": "single",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
+          "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
+          "tokenizer_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "compressed-tensors-GPTQ-int4",
+          "quantization_details": "g128 symmetric static actorder; pinned identical snapshot",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "fp16",
+          "speculation": "none",
+          "id": "warp34-tp1-fp16",
+          "engine": "warp-34",
+          "version": "66974d8; binary sha256 f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
+          "cache_config": "512 FP16 pages; native radix/graphs; FP32 SSM; default admission; no offload",
+          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format fp16 --kv-pages 512 --host 127.0.0.1 --port 18034",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-tp1-fp16",
+          "case": "agent-c1",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 49.01593655162629,
+          "peak_prompt_tokens": 1578,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified gpu_ids",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-tp1-fp16",
+          "case": "decode-c1",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 51.85599221079764,
+          "peak_prompt_tokens": 178,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified gpu_ids",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-tp1-fp16",
+          "case": "prefill-primed-c1",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 51.940521900449724,
+          "peak_prompt_tokens": 3034,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified gpu_ids",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-tp1-fp16",
+          "case": "throughput-c8",
+          "trials": 3,
+          "requests": 48,
+          "success": 48,
+          "failed": 0,
+          "output_tokens_s": 228.66071291167222,
+          "peak_prompt_tokens": 180,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified gpu_ids",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-tp1-fp16": "passed"
+      },
+      "resources": {
+        "sample_count": 301,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 2715222.911577257,
+          "end_s": 2715533.945299028
+        },
+        "duration_s": 311.0337217710912,
+        "gpus": {
+          "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 21711.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 100.0,
+            "peak_temperature_c": 91.0,
+            "average_power_w": 447.3755481727575
+          },
+          "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 18.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 60.0,
+            "average_power_w": 26.51747508305648
+          }
+        },
+        "host_peak_memory_used_kib": 21699036,
+        "pid_peak_rss_kib": {},
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {}
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/completion-27b-ninfer-tp1-full",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "0784512413f16c25fc0d754d993d8352588ffe0c50eb4c9745753bc4d776d502",
+        "summary.json": "adb9c5809a3dc1bdf7f829f62ece4f1dfcdedacb9c333a18b7903ae1c43dc6f2",
+        "coverage.json": "37897db47af170a5ebb4ffb6a2c1d49c956a52b9d446dc5fb815142a1d314bdd",
+        "SHA256SUMS.json": "5061f7744a107d4058bd0b70b350e607d6f4ea9d20e5ef68e0a75c80020196bf",
+        "telemetry.jsonl": "fc7b7fdd0a460f355423ee05c1ab4a1f8beeff9fd9c11c418efeed6c6294ae51"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "27b-ninfer-practical-4bit",
+          "gpu_count": 1,
+          "parallelism": "single",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "qwen38-ninfer",
+          "model_revision": "ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1",
+          "source_model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0; artifact publisher declaration",
+          "artifact_sha256": "unknown; pinned download pending inventory",
+          "tokenizer_revision": "embedded ninfer",
+          "chat_template_sha256": "unknown; native renderer",
+          "weight_format": "ninfer grouped_search mixed Q4/Q5",
+          "quantization_details": "Q4 embeddings Q6 head; not identical GPTQ",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "int8",
+          "speculation": "none",
+          "id": "ninfer-tp1-int8",
+          "engine": "ninfer-3090",
+          "version": "115dee6b4d2df1c2d491da498515bdeb4f7e3f01",
+          "cache_config": "int8 practical lane, not FP16 baseline; 8192 KV capacity; concurrency 8",
+          "launch_command": "CUDA_VISIBLE_DEVICES=0 /tmp/w34-benchmark-refs/ninfer-3090/build-linux/apps/ninfer-serve /home/nchapman/.cache/huggingface/hub/models--WarlaxZ--Qwen3.8-27B-NInfer-3090/snapshots/ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1/qwen3_8_27b.ninfer --model-id qwen38-ninfer --host 127.0.0.1 --port 18034 --max-context 8192 --kv-capacity 8192 --max-concurrency 8 --kv-dtype int8 --no-thinking",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "ninfer-tp1-int8",
+          "case": "agent-c1",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 47.000173756751856,
+          "peak_prompt_tokens": 1427,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids"
+          ]
+        },
+        {
+          "engine": "ninfer-tp1-int8",
+          "case": "decode-c1",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 52.08547970374112,
+          "peak_prompt_tokens": 178,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids"
+          ]
+        },
+        {
+          "engine": "ninfer-tp1-int8",
+          "case": "prefill-primed-c1",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 35.9001706863972,
+          "peak_prompt_tokens": 3034,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids"
+          ]
+        },
+        {
+          "engine": "ninfer-tp1-int8",
+          "case": "throughput-c8",
+          "trials": 3,
+          "requests": 48,
+          "success": 48,
+          "failed": 0,
+          "output_tokens_s": 243.78432599350597,
+          "peak_prompt_tokens": 180,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids"
+          ]
+        }
+      ],
+      "quality": {
+        "ninfer-tp1-int8": "passed"
+      },
+      "resources": {
+        "sample_count": 305,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 2714066.984943431,
+          "end_s": 2714382.058144421
+        },
+        "duration_s": 315.07320098998025,
+        "gpus": {
+          "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 18073.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 100.0,
+            "peak_temperature_c": 88.0,
+            "average_power_w": 443.1444918032787
+          },
+          "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 18.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 41.0,
+            "average_power_w": 27.142262295081967
+          }
+        },
+        "host_peak_memory_used_kib": 24688496,
+        "pid_peak_rss_kib": {},
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {}
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    }
+  ]
+}

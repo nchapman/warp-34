@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-11-03T07:28:22.100913+00:00",
+  "root": "/home/nchapman/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502",
+  "include": [],
+  "files": {
+    "Qwen3.8-27B-UD-Q4_K_M.gguf": {
+      "bytes": 16464440224,
+      "sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482"
+    }
+  },
+  "total_bytes": 16464440224,
+  "inventory_sha256": "fb3156810570fee220c15e659bf4f554e045a12c1e9f960a4a2df435b1a11c19"
+}

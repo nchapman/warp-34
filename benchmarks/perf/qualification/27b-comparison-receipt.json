@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "report": "benchmarks/perf/results/completion-27b-baseline-comparison.json",
+  "sha256": "fe1690c5a5a28749528fddcbea1b7d74799339098f22139b247f65608121bbb7",
+  "bytes": 2866801,
+  "reproduce_cwd": "benchmarks/perf",
+  "reproduce": "python3 -m w34perf compare results/completion-27b-baselines/warp34-tp1-fp16/run results/completion-27b-baselines/vllm-tp1-fp16/run results/completion-27b-baselines/llamacpp-tp1-fp16/run results/completion-27b-ninfer-tp1-full",
+  "comparisons": 120,
+  "statuses": {"incompatible": 120},
+  "publication_ready": false,
+  "rankings": [],
+  "interpretation": "All case/deployment pairs retain control differences or blockers. Incompatible does not mean unusable evidence; it prevents declaring controlled equivalence or a winner. The large report remains beside its raw run bundles, with this hash receipt tracked."
+}

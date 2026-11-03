@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "description": "Independent capacity retrieval at approximately 32K, 128K and 252K input tokens for the pinned Qwen tokenizers. Sizes are archive lines, not guaranteed token counts; use retained server usage to label actual qualified lengths. Run only against explicitly sized long-context deployments. Each length tests early and late needle depths.",
+  "checks": [
+    {"id":"capacity-1900-early","kind":"retrieval","prompt":"Return only the TARGET_SECRET value from the archive.","expected":"silver-finch-6107","context_lines":1900,"depth":0.1},
+    {"id":"capacity-1900-late","kind":"retrieval","prompt":"Return only the TARGET_SECRET value from the archive.","expected":"coral-wren-2938","context_lines":1900,"depth":0.9},
+    {"id":"capacity-7500-early","kind":"retrieval","prompt":"Return only the TARGET_SECRET value from the archive.","expected":"copper-tern-8452","context_lines":7500,"depth":0.1},
+    {"id":"capacity-7500-late","kind":"retrieval","prompt":"Return only the TARGET_SECRET value from the archive.","expected":"indigo-crane-1706","context_lines":7500,"depth":0.9},
+    {"id":"capacity-14800-early","kind":"retrieval","prompt":"Return only the TARGET_SECRET value from the archive.","expected":"scarlet-lark-9264","context_lines":14800,"depth":0.1},
+    {"id":"capacity-14800-late","kind":"retrieval","prompt":"Return only the TARGET_SECRET value from the archive.","expected":"pearl-robin-5803","context_lines":14800,"depth":0.9}
+  ]
+}

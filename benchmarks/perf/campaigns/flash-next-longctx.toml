@@ -1,0 +1,83 @@
+# Capacity qualification, distinct from short-serving speed comparisons.
+schema_version = 1
+[run]
+seed = 34
+repetitions = 3
+warmup_requests = 0
+max_inflight = 1
+timeout_s = 1800
+[presets.quick]
+cases = ["cold-read-60k"]
+repetitions = 1
+[presets.full]
+cases = ["cold-read-60k", "agent-120k", "agent-252k"]
+repetitions = 3
+[presets.release]
+cases = ["cold-read-60k", "agent-120k", "agent-252k"]
+repetitions = 5
+[engine_defaults]
+engine = "warp-34"
+version = "66974d8; f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f"
+support = "unverified"
+cohort = "flash-next-ef554-capacity"
+base_url = "http://127.0.0.1:18034/v1"
+model = "/home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077"
+model_revision = "ef554143369a706525336f6b42a09094835dc077"
+weight_format = "AutoRound-W4A16-g128; FP8-E4M3-PLE"
+activation_dtype = "float16"
+kv_format = "tq4"
+speculation = "none"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-flash-tp1-capacity"
+gpu_count = 1
+parallelism = "TP1 EP1"
+cache_config = "16384 TQ4 pages; QSA side caches; FP32 SSM; max sequences1; hot48 target; mapped host experts and mmap PLE; OS cache not flushed; qualify actual fit"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077 --offline --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-flash-tp2-capacity"
+gpu_count = 2
+parallelism = "TP2 EP2"
+cache_config = "16384 TQ4 pages; QSA side caches; FP32 SSM; max sequences1; hot112 target; mapped host experts and mmap PLE; OS cache not flushed; qualify actual fit"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077 --offline --tp 2 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "qfn-2x3090-capacity"
+engine = "qfn-2x3090-vllm-overlay"
+version = "4dca58f7243f3910ba072a97e7f29fcf6f5636f3; image d52ca1279fdc80543a7ca3538cd10a0bea3f90884866f7497c66aa7792acd4f1"
+gpu_count = 2
+parallelism = "TP2 EP2"
+model = "Qwen3.8-Flash-Next"
+activation_dtype = "bfloat16"
+kv_format = "bfloat16"
+speculation = "mtp-k3"
+cache_config = "128GB reference profile; hot84; CPU offload30GB; mmap PLE; BF16 KV4429185024 bytes; context262144; max seq1; chunk4096; approximate QSA; OS cache not flushed"
+launch_command = "cd /tmp/w34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18034 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
+
+[[cases]]
+id = "cold-read-60k"
+fixture = "../fixtures/open_swe_cold_read_60k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+cache = "unique"
+
+[[cases]]
+id = "agent-120k"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_120k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+cache = "natural"
+
+[[cases]]
+id = "agent-252k"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_252k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+cache = "natural"

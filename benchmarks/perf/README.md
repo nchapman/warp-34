@@ -52,6 +52,68 @@ A zero exit does **not** mean the run is publication-ready. Unknown provenance,
 quality evidence, failures, and release-audit requirements are visible in reports.
 No engine has been automatically installed, modified, or tuned.
 
+## Completion campaigns, quality and retained evidence
+
+The [completion ledger](COMPLETION_PLAN.md) tracks current 27B and Flash Next
+work separately from historical results. The new campaign configurations are
+`campaigns/27b-completion.toml` and `campaigns/flash-next-serving.toml`.
+
+```sh
+python3 -m w34perf plan campaigns/27b-completion.toml --preset quick
+python3 -m w34perf quality campaigns/27b-completion.toml \
+  --engine warp34-tp1-fp16 --out results/quality-001.json
+python3 -m w34perf run campaigns/27b-completion.toml \
+  --engine warp34-tp1-fp16 --preset full --telemetry-interval 1 \
+  --evidence results/quality-001.json --evidence /path/to/sanitized-startup.log \
+  --out results/run-001
+python3 -m w34perf audit results > /tmp/historical-ledger.json
+python3 -m w34perf compare results/run-001 results/run-002 > /tmp/comparison.json
+```
+
+`quick`, `full`, and `release` explicitly select campaign cases and repetitions;
+`--preset` cannot be combined with `--case`. Release repetitions are within one
+server lifetime, **not independent restarts**. Repeat release campaigns with
+fresh server processes and interleaved engine order for publication. None of
+these commands certify publication readiness or rank incompatible deployments.
+
+`quality` exits nonzero on failed checks and preserves responses and hashes.
+The default fixture tests small functional tasks and retrieval up to 256 archive
+lines; `--fixture fixtures/quality-long.json` separately tests 1200-line retrieval.
+These are not guaranteed token counts or proof of general task quality. Record
+actual usage and capacity failures; passing short tests never clears long-context
+failures. Quality results apply only to the exact fixture and deployment tested.
+
+`fixtures/quality-capacity.json` adds early/late retrieval around 32K/128K/252K.
+Its pinned 27B reference-template calibration is retained in
+`qualification/27b-capacity-calibration.json` (32,340 / 127,540–127,541 /
+251,640–251,641 tokens). Reproduce offline from the repository root with the
+optional preparation tool (requires Transformers, **not** required by w34perf):
+
+```sh
+python3 tools/perf_calibrate_quality.py /path/to/pinned/snapshot \
+  benchmarks/perf/fixtures/quality-capacity.json --out /tmp/capacity-calibration.json
+```
+
+The tool requires local tokenizer bytes, disables remote checkpoint code and
+records tokenizer/template/fixture hashes. These are reference-renderer counts,
+not attestations of a server's chat renderer. Use actual server usage to label
+tested capacity; do not run this large fixture on an 8K profile and call rejection
+a retrieval-quality regression.
+
+`--evidence` is repeatable and copies files into the immutable run bundle. Supply
+only sanitized logs: attachments are **not automatically redacted**. Hashes prove
+byte identity, not source authenticity or remote model residency. Attaching a
+report does not certify publication readiness. A recognized quality report only
+clears the missing-quality blocker for its exact profile; any attached matching
+failure takes precedence over passes. Other provenance/release blockers remain.
+
+Telemetry is opt-in. `--telemetry-interval 1` records GPU UUID, memory, utilization,
+clocks, temperature, power and host memory; repeat `--server-pid PID` to include
+explicit host-process RSS. Samples include timestamps and source errors; missing
+readings remain unknown, not zero. Sampling subprocess overhead is part of the
+measurement environment. Compare sampled and unsampled runs before interpreting
+small speed differences. No energy claim is derived from nameplate power.
+
 ## Optional two-card runs and coverage
 
 Use the same filters for `plan` (offline) and `run`:
@@ -194,9 +256,12 @@ Required **runnable** deployment fields: `id`, `engine`, `version`, `model`, `ba
 `cache_config`, and `launch_command`. Shared fields go in `[engine_defaults]`.
 Before release, also fill `gpu_ids` (physical UUIDs), `source_model_revision`,
 `model_revision`, `artifact_sha256` (an inventory hash for sharded weights),
-`tokenizer_revision`, `chat_template_sha256`, `quantization_details`, and
-`quality_evidence` (path/hash of separately retained functional-quality results).
+`tokenizer_revision`, `chat_template_sha256`, and `quantization_details`.
 `unknown` is allowed for exploration but becomes a publication blocker.
+The legacy `quality_evidence` text field is a manual audit note only: attach
+functional-quality JSON with `--evidence` to affect the automated quality gate.
+Only attachments matching the exact profile digest count; any matching failure
+wins over matching passes.
 **Metadata is operator-supplied, not proof that the server used that setting.**
 
 `request_overrides` holds engine-specific sampling/template options; e.g.

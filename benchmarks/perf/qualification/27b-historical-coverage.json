@@ -1,0 +1,2739 @@
+{
+  "schema_version": 1,
+  "publication_certified": false,
+  "scope": "Historical local bundles whose path contains 27b; no deduplication or current-build qualification",
+  "reproduce": "Source: python3 -m w34perf audit results. Snapshot projection retains only bundles with 27b in the path, excludes deployments and coverage fields plus top-level totals/count_semantics, and adds scope/reproduce. Counts describe trials and requests, not independent restarts; absent cells may be unselected, not necessarily unrun or unsupported. Later runs add bundles; verify each listed input SHA-256 rather than expecting the live directory inventory to be unchanged.",
+  "bundles": [
+    {
+      "path": "27b-fp16-final-20261030-202035",
+      "sha256": {
+        "manifest.json": "4163d3067172b9a03b1a2eff15b07af1bab4be7504f779e74ac11076923575a8",
+        "summary.json": "7b0152a4062f5ba8ffe597104d1b45b6485b6787e45bb928e21fa7acfe856a98",
+        "coverage.json": "b928fcc4563fe0e77ba4e3670c460a54a6db833a42f7110dca3fa79393d76623"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T03:20:35.456684+00:00"
+    },
+    {
+      "path": "27b-fp16-final-20261030-215439",
+      "sha256": {
+        "manifest.json": "148f6adf01f6f286391fbe29a9bf6f30792821000c0e7545bc81c142ca811efb",
+        "summary.json": "8d504a8c066c95460b6f8797f004c8320ff1c2b085eba7ed3ef0328e14589263",
+        "coverage.json": "b928fcc4563fe0e77ba4e3670c460a54a6db833a42f7110dca3fa79393d76623"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T04:54:39.948970+00:00"
+    },
+    {
+      "path": "27b-fp16-first-2026-10-30/sglang",
+      "sha256": {
+        "manifest.json": "defba4486060e331569d9cd9e821161fa85c1ace860ffee8479df2bcac65b5c0",
+        "summary.json": "b85f38ea1d7b81fc9a6f14d1f3f3b45db8e1df50991cc08545610a27aa3024d9",
+        "coverage.json": "6ae85ed85ab6adc7c55bb4d670e9cfbf4a8094f07d7d6cdafe062bd4fbfcaf7b"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "sglang27-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "sglang27-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "failed requests or incomplete agent sessions; publish failures alongside metrics",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 24,
+          "failed_requests": 8
+        }
+      ],
+      "status": "failed",
+      "created_utc": "2026-10-31T01:11:59.230243+00:00"
+    },
+    {
+      "path": "27b-fp16-first-2026-10-30/sglang-cached",
+      "sha256": {
+        "manifest.json": "5ab3bee1420eec6ef84f8977e15fa792eeacf6b2322b0e9cd306f6f968802953",
+        "summary.json": "18a176856e2e108654eeb1351084cefa6472b088da2ef0338d726e7240f1b3d9",
+        "coverage.json": "604220987eea2b45a594dd0ff0b8c8b8fbf9d2477b51ef1b5cab16fda08d949b"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "sglang27-fp16-cached",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "sglang27-fp16-cached",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T01:27:11.312348+00:00"
+    },
+    {
+      "path": "27b-fp16-first-2026-10-30/sglang-uncached",
+      "sha256": {
+        "manifest.json": "54f3e02681b1e9e64d14dd1b4169cc403a0629fc6519fbb59d695e12e24f8524",
+        "summary.json": "35e996890b77de9395d3946757b5e6b874c37fda5aed9e1b2c5b6048211310f0",
+        "coverage.json": "f7e9cd56842e0f980f20d86f2a1e485dc8a130de9e4f75dd103924ebc23af49b"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "sglang27-fp16-uncached",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "sglang27-fp16-uncached",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T01:21:37.942514+00:00"
+    },
+    {
+      "path": "27b-fp16-first-2026-10-30/vllm",
+      "sha256": {
+        "manifest.json": "2a7797f8c23c63983128c07cef0be22a62ca61752f99e2b6ea9c978efac67a90",
+        "summary.json": "0e7d0f32ec09d33ca837936bf41655c2773cdd31bdee2a217aef92a310d54080",
+        "coverage.json": "7466d3a77201c826fb2ed2d7e6e6a854bb8f44e94c7ca46da893a3152b367f3a"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "vllm27-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "vllm27-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "vllm27-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "vllm27-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T01:31:25.975018+00:00"
+    },
+    {
+      "path": "27b-fp16-first-2026-10-30/warp34",
+      "sha256": {
+        "manifest.json": "90f8c89c14f054acd987a1f3803029835411ebfa32f21feecf01f50c9b8736c6",
+        "summary.json": "924ff8a8f9147a3bdfae24945f35e76b842b03539208992860e147a6501c7397",
+        "coverage.json": "b928fcc4563fe0e77ba4e3670c460a54a6db833a42f7110dca3fa79393d76623"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T01:36:43.424545+00:00"
+    },
+    {
+      "path": "27b-fp16-pass2-20261030-200256",
+      "sha256": {
+        "manifest.json": "89e0e50454c5770bdd9a922b09eb555b663fdd0a7ebd4cc319ad3202ce2819f1",
+        "summary.json": "191921a6a172b47f595b8c0a50938d57a5be8695e28bce7144dbfdc29b2d9be9",
+        "coverage.json": "b928fcc4563fe0e77ba4e3670c460a54a6db833a42f7110dca3fa79393d76623"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T03:02:56.243762+00:00"
+    },
+    {
+      "path": "27b-fp16-pass3-20261030-204854",
+      "sha256": {
+        "manifest.json": "c6b647526521caa2f390ad11a63bb6d144e0320b097e1f1b49fa81a7265e3452",
+        "summary.json": "fd48a9230d9f436743f841489f39fb36e32e4fafa37b742348a4665f8aa27174",
+        "coverage.json": "b928fcc4563fe0e77ba4e3670c460a54a6db833a42f7110dca3fa79393d76623"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T03:48:54.113621+00:00"
+    },
+    {
+      "path": "27b-fp16-pass4-20261030-205949",
+      "sha256": {
+        "manifest.json": "f29746ef3d944c9518b46eb95d149db3c50507a165d94c6eb15f7d44e70ded66",
+        "summary.json": "28139d8f70a7dfe51cf66c44227ebe99ebb0634172169ae4cb7256f07d16eff1",
+        "coverage.json": "b928fcc4563fe0e77ba4e3670c460a54a6db833a42f7110dca3fa79393d76623"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T03:59:49.841650+00:00"
+    },
+    {
+      "path": "27b-fp16-pass5-20261030-211211",
+      "sha256": {
+        "manifest.json": "c1b5ba31e9c0af58ba869a95b7ea4ddaea33150cae6b43b19c8ee329f556a7b9",
+        "summary.json": "d3051aab8410a580640e445a1f67f7e32f7215d89bb83b7c095816f4236dfe78",
+        "coverage.json": "b928fcc4563fe0e77ba4e3670c460a54a6db833a42f7110dca3fa79393d76623"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T04:12:11.270584+00:00"
+    },
+    {
+      "path": "27b-fp16-sweep-20261030-203013",
+      "sha256": {
+        "manifest.json": "814de6dab582ef05941d7d3ccd80d901a79c3dc56f781ce50f2d61946e6909f1",
+        "summary.json": "698209357b5009b902c3526af6ae5b38a3fca5a48be26d5ab37f2bdc75a66d1c",
+        "coverage.json": "b928fcc4563fe0e77ba4e3670c460a54a6db833a42f7110dca3fa79393d76623"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "agent-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 24,
+          "successful_requests": 24,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "prefill-primed-c1",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 12,
+          "successful_requests": 12,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1,
+            2
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ],
+          "requests": 48,
+          "successful_requests": 48,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T03:30:13.941460+00:00"
+    },
+    {
+      "path": "27b-spec-and-tp2/warp34-27b-2xtp1-dp",
+      "sha256": {
+        "manifest.json": "d75b24999825a734cc256ea08ec4066c2fdbf3f2d24b2be74f69650b5f43e096",
+        "summary.json": "7e4af310f4b1fcd2717cb7c32b25f472b0c6cf866d66e3ebe6f6b2bab1bf3174",
+        "coverage.json": "9f829a6b2889fb9b7dcc29cf301e56c5fa916cd33d766af2d46eed1d2393744b"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-2xtp1-dp",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-2xtp1-dp",
+          "case_id": "prefill-3k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-2xtp1-dp",
+          "case_id": "spec-c2",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-2xtp1-dp",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T13:34:08.368769+00:00"
+    },
+    {
+      "path": "27b-spec-and-tp2/warp34-27b-tp1-fp16",
+      "sha256": {
+        "manifest.json": "4b81385992521643ec19fc3a21eafd73e9138302dea2a6227abcaaf9cd440b42",
+        "summary.json": "ffd9c30ba95995fbbefc7a47e2e82ef47b813c018f78325b493270c1cc5f8113",
+        "coverage.json": "cda45931f6dcb93d03f50494e74379796f3039643b93853ff513e65eff29cc21"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp1-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-fp16",
+          "case_id": "prefill-3k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-fp16",
+          "case_id": "spec-c2",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T13:32:14.575237+00:00"
+    },
+    {
+      "path": "27b-spec-and-tp2/warp34-27b-tp2-dflash2",
+      "sha256": {
+        "manifest.json": "3e775ce0243ab0fec9df7e9a80076247cd6284181928c2ce45c0e22329032f35",
+        "summary.json": "79b700997a10cb233b841a78ea7e15995a46a84b4a4dbb535976e77ff9b94f10",
+        "coverage.json": "e62716c4540ea94b05a8e857e3d8687f2b422f5889195199620040ce59545f98"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-dflash2",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-dflash2",
+          "case_id": "prefill-3k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-dflash2",
+          "case_id": "spec-c2",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-dflash2",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T13:26:06.741948+00:00"
+    },
+    {
+      "path": "27b-spec-and-tp2/warp34-27b-tp2-fp16",
+      "sha256": {
+        "manifest.json": "0df1d771565c9852c106ebd5b2ab8000340ae9da7d948e40b0b74a9500bbe94f",
+        "summary.json": "263a7826ee5639287d4c68177cb29bc16b3fe826313cbef8ba51271668c71794",
+        "coverage.json": "5f3ba577dea369c9c512ae82add1cf53c56e0a5801bd5b6b637c8eae61cc3bd7"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "prefill-3k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "spec-c2",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T13:23:34.609174+00:00"
+    },
+    {
+      "path": "27b-spec-and-tp2/warp34-27b-tp2-mtp2",
+      "sha256": {
+        "manifest.json": "20f0e391991a4e013b7030218ae6ad195ef70f49634cbf2fdf8f4c6941657003",
+        "summary.json": "57b6b05847861bfaa0f40dcaa05a3525f4c7a9feaae00b9ec0de283599e25f5d",
+        "coverage.json": "8fed0a8ebc8bce8a55428972eb98e2c3f8135aaf64e59ee531dad27a5bb0c787"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-mtp2",
+          "case_id": "decode-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-mtp2",
+          "case_id": "prefill-3k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-mtp2",
+          "case_id": "spec-c2",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 8,
+          "successful_requests": 8,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-mtp2",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T13:24:54.109098+00:00"
+    },
+    {
+      "path": "27b-tq4-longctx/warp34-27b-tp1-tq4-32k",
+      "sha256": {
+        "manifest.json": "aa4b2b2b9983fc25e46dc8e099ce1591afc111ecd1d89d07f0f217713bae8f9e",
+        "summary.json": "6137e2990c8a3ab295952bb98baa0bb17c8e97e0ffc42045395a10e65f428ea3",
+        "coverage.json": "044359b3ad810cf381883270cdff3b780c0818bfa79f35f031153c9547b63fe7"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp1-tq4-32k",
+          "case_id": "longctx-8k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 4,
+          "successful_requests": 4,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4-32k",
+          "case_id": "throughput-c16",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4-32k",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T13:40:23.294603+00:00"
+    },
+    {
+      "path": "27b-tq4-longctx/warp34-27b-tp1-tq4all-32k",
+      "sha256": {
+        "manifest.json": "2d14607ebb72c8bff83ad2b7d6efb4dd3a611fbc243615cd9c313738a4a9d41f",
+        "summary.json": "8423fdb2f115e2471c418de7a3d906b90c12b577c53ac4cf7d6b44e74a70727f",
+        "coverage.json": "77708c9444ca30f3e4e15dd39ec43ba32d823b563db6fda0b6cf7c5ae87c70a7"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp1-tq4all-32k",
+          "case_id": "longctx-8k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 4,
+          "successful_requests": 4,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4all-32k",
+          "case_id": "throughput-c16",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4all-32k",
+          "case_id": "throughput-c8",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 32,
+          "successful_requests": 32,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T13:42:00.537331+00:00"
+    },
+    {
+      "path": "27b_tp1_262k_http_tq4",
+      "sha256": {
+        "manifest.json": "ec056fa87a31a5d9832e9a943a9a38046173377247271369d1e5e036c309f33f",
+        "summary.json": "d2ea23f3a604c97c4b2f102433764166643ae3bb9dddfff304ff9ca16f4e98c5",
+        "coverage.json": "bbf57567b41a6a4ebb7e2d101c76027102f48ae37bb7bb10af786d6cf53dae7c"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp1-tq4-262k",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 1,
+          "successful_requests": 1,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4-262k",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 10,
+          "successful_requests": 10,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4-262k",
+          "case_id": "swe-agent-252k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 9,
+          "successful_requests": 9,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4-262k",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 9,
+          "successful_requests": 9,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T18:44:00.463109+00:00"
+    },
+    {
+      "path": "27b_tp1_262k_http_tq4all",
+      "sha256": {
+        "manifest.json": "a44905d40613e761c54af4f4467c03ac01b466f8f92d4d1a954c249a1a01166f",
+        "summary.json": "ce50da662325f5e0532ed2b25da5ea5bad24c0804e3476cf7f2921f0c42ac54d",
+        "coverage.json": "a140fef4c1fada7a6b798598ce7208d7ab95438189ed4c82c4dc82e1f09d70fe"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp1-tq4all-262k",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 1,
+          "successful_requests": 1,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4all-262k",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 10,
+          "successful_requests": 10,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4all-262k",
+          "case_id": "swe-agent-252k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 9,
+          "successful_requests": 9,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4all-262k",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 9,
+          "successful_requests": 9,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T18:55:36.401529+00:00"
+    },
+    {
+      "path": "27b_tp2_longctx_sglang_fp16",
+      "sha256": {
+        "manifest.json": "9ef6ebf4ecbdb94a644a64c8b66fbc8bcf31ebe50032bb60feece64fdd1fa41c",
+        "summary.json": "3e482093730807ae4faa88b5b571ba5547f1efde88dbc6181d5adc886c6c4304",
+        "coverage.json": "a85094e6a6513552433bf99e8024dadd8f731d7b163dbdf9e893839879ce945a"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "sglang-27b-tp2-fp16",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "sglang-27b-tp2-fp16",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "sglang-27b-tp2-fp16",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "sglang-27b-tp2-fp16",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T18:27:39.024109+00:00"
+    },
+    {
+      "path": "27b_tp2_longctx_vllm_fp16",
+      "sha256": {
+        "manifest.json": "8d3ad48cb74bc88f2c5e2fb7f5a16098490e0e0da3c70ec0ffc2717fb979eb2b",
+        "summary.json": "9e906372115e667d8034fcdf43889c4c41322258a0017f967803ca353694753b",
+        "coverage.json": "ef067682239b81fb917f408c7307a044cca367e7335d028a1c587da8ff9c218b"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "vllm-27b-tp2-fp16",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "vllm-27b-tp2-fp16",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "vllm-27b-tp2-fp16",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "vllm-27b-tp2-fp16",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T18:11:43.811390+00:00"
+    },
+    {
+      "path": "27b_tp2_longctx_warp34_fp16",
+      "sha256": {
+        "manifest.json": "1023d15989bfacd84628c9828c4fbc4d9771eb9b86701aaf89ea0dfda98f41c3",
+        "summary.json": "a5b9e27724a045a299ce1b9f1c7556f89dea3e7fcb42adca5da71e9114f7a4a2",
+        "coverage.json": "de364723f04b41dd0d03783361775f1e4c02bd6ba66b1b4b6d3fb96620aaa4e9"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T17:45:34.563151+00:00"
+    },
+    {
+      "path": "27b_tp2_longctx_warp34_tq4",
+      "sha256": {
+        "manifest.json": "909fcf1d848c3de719b87b1432dac6ddc38fdf02194145aac6dd842ad5a1be04",
+        "summary.json": "075d2cd9ee4c78b4f281274376922a0efcb8e48ae8d16af8d7bab96b268ebbcc",
+        "coverage.json": "677fa3c228a19a8dab3f4ebc908917e8eb6077a5385b80f3d44a8d3e692eff70"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T17:54:50.284967+00:00"
+    },
+    {
+      "path": "goal-27b-tp1-262k",
+      "sha256": {
+        "manifest.json": "e2dd2c2ad956cf6214c5a6cc3199f5cf4ea5bad1f108094c13608936d1b61e2c",
+        "summary.json": "33bb813af1aa0df2803f107d8344bef4381aab0394f8974777c57434d674c041",
+        "coverage.json": "79e04dbc5b18b3a084465e6d545c36ad8dc618f8d6ba6232421f06f04a8aae2a"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp1-tq4-262k",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 1,
+          "successful_requests": 1,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4-262k",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 10,
+          "successful_requests": 10,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4-262k",
+          "case_id": "swe-agent-252k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 9,
+          "successful_requests": 9,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp1-tq4-262k",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 9,
+          "successful_requests": 9,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-11-01T05:48:05.858325+00:00"
+    },
+    {
+      "path": "goal-27b-tp2-fp16",
+      "sha256": {
+        "manifest.json": "f7dd4974c3bf4515f88e35ae004f2e1b0fffb4edd9f9b86baa00c25cdd05bc2c",
+        "summary.json": "c70119655901b2fa5ae3e3797875fc2b2b4e459cc81d22ca00588ac924086ecb",
+        "coverage.json": "de364723f04b41dd0d03783361775f1e4c02bd6ba66b1b4b6d3fb96620aaa4e9"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-11-01T05:22:26.258625+00:00"
+    },
+    {
+      "path": "goal-27b-tp2-tq4",
+      "sha256": {
+        "manifest.json": "8ad6d392320470f6c7095e0e8222c4999c89b4deff41953a3dfcc99e32016970",
+        "summary.json": "7c96afb9588cfbfa5f059ca1bd257bed60cca73e34b2c3bfcab9b34c35776881",
+        "coverage.json": "677fa3c228a19a8dab3f4ebc908917e8eb6077a5385b80f3d44a8d3e692eff70"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-11-01T05:37:53.125957+00:00"
+    },
+    {
+      "path": "round2-27b-tp2-fp16",
+      "sha256": {
+        "manifest.json": "6dd2e5b8b0091e2ee3f4d634de1f24d153634d99fb5e46d8d96f01dc15e21273",
+        "summary.json": "4ca85fe686d41387578c038176ea35be1831d37889607c39387ea100d13858f2",
+        "coverage.json": "de364723f04b41dd0d03783361775f1e4c02bd6ba66b1b4b6d3fb96620aaa4e9"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-10-31T20:52:59.146245+00:00"
+    },
+    {
+      "path": "round2-27b-tp2-tq4",
+      "sha256": {
+        "manifest.json": "cc3efbb423c3380545d6064eb1e21e1312047d83cd778ed38a46ca2064c8a025",
+        "summary.json": "085ec152f51ff700be48032038d9884e9642acfc06ded22dafc0d830aa6a9d16",
+        "coverage.json": "dd3138a074d87c455b40524d14ee2dd2aa47822bb95e199381d121af31b2c5ef"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-tq4",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "running",
+      "created_utc": "2026-10-31T21:02:03.952898+00:00"
+    },
+    {
+      "path": "round6-27b-tp2-fp16",
+      "sha256": {
+        "manifest.json": "c9cf1ec7fa266772a37618a2e464086a786f0e0a8435b4fc4bad3f19b9cbbbd9",
+        "summary.json": "0cb94af98989a303aad0224e725c2a07e7961eeec10ef18000952adafcb739f9",
+        "coverage.json": "de364723f04b41dd0d03783361775f1e4c02bd6ba66b1b4b6d3fb96620aaa4e9"
+      },
+      "errors": [],
+      "cells": [
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "cold-file-read-115k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "cold-file-read-60k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 2,
+          "successful_requests": 2,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "swe-agent-120k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 20,
+          "successful_requests": 20,
+          "failed_requests": 0
+        },
+        {
+          "engine_id": "warp34-27b-tp2-fp16",
+          "case_id": "swe-agent-64k-c1",
+          "repetitions": [
+            0,
+            1
+          ],
+          "publication_blockers": [
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no independent quality evidence for this 4-bit/KV deployment",
+            "unverified artifact_sha256",
+            "unverified chat_template_sha256",
+            "unverified gpu_ids",
+            "unverified quantization_details",
+            "unverified source_model_revision",
+            "unverified tokenizer_revision"
+          ],
+          "requests": 18,
+          "successful_requests": 18,
+          "failed_requests": 0
+        }
+      ],
+      "status": "complete",
+      "created_utc": "2026-11-01T03:15:07.334873+00:00"
+    }
+  ]
+}

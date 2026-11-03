@@ -1,5 +1,9 @@
 # Performance-suite plan and task ledger
 
+Current execution track: [27B and Flash Next completion plan](COMPLETION_PLAN.md).
+That ledger orders the remaining comparisons and distinguishes historical runs
+from publication qualification; this document retains the broader suite backlog.
+
 ## Objective and decisions
 
 Produce regularly refreshable, shareable comparisons against **vLLM, SGLang,

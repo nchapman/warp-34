@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-11-03T07:52:31.174246+00:00",
+  "root": "/home/nchapman/.cache/w34-benchmark-models/strata-flash-iq4xs",
+  "include": [],
+  "files": {
+    "compat-bf16.json": {
+      "bytes": 21168,
+      "sha256": "f4a0d3f0c7ef07b0757dbf0726d0fd65be04e08652d19c5f49404cf6994cce4a"
+    },
+    "conversions.json": {
+      "bytes": 167312,
+      "sha256": "efeee4836f3fbc6e58f48e7bb2f4e396dba64e730a7285e0f8587b8e762aa6b0"
+    },
+    "dense.bin": {
+      "bytes": 1485688320,
+      "sha256": "f53174059b262ed342b82e143af62056081948ef5e5f1903a1a70eeb73fa4a23"
+    },
+    "index.txt": {
+      "bytes": 93559,
+      "sha256": "e61c835287c36ececdd3c0794c1d23bcc8e0714eadc6c4aec56c152abcb2364d"
+    },
+    "native_experts.txt": {
+      "bytes": 5803,
+      "sha256": "f9a8bdec38ab634fec9a31807cc3284e6497ef24c1afa0d8853127b0537c68db"
+    },
+    "tokenizer/chat_template.jinja": {
+      "bytes": 9993,
+      "sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+    },
+    "tokenizer/merges.txt": {
+      "bytes": 3353258,
+      "sha256": "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"
+    },
+    "tokenizer/token_type.json": {
+      "bytes": 744960,
+      "sha256": "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"
+    },
+    "tokenizer/tokenizer.json": {
+      "bytes": 541,
+      "sha256": "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"
+    },
+    "tokenizer/vocab.json": {
+      "bytes": 5737005,
+      "sha256": "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"
+    }
+  },
+  "total_bytes": 1495821919,
+  "inventory_sha256": "213f4eae95e0d83f3baed3f12c5c451850fca222ff5e4d1a6e43d22c22d98a53"
+}

@@ -12,6 +12,39 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
 
 ---
 
+## Standalone benchmark completion — active
+
+- Execution plan and task ledger: [`benchmarks/perf/COMPLETION_PLAN.md`](../benchmarks/perf/COMPLETION_PLAN.md).
+- Finish 27B reference baseline/KV/speculation comparisons first, then add Flash
+  Next standalone HTTP campaigns and qualify its specialized reference projects.
+- Historical speculation/TP2 results are present: five warp-34 deployments,
+  56 successful requests each, two repetitions. They remain engineering evidence,
+  not publication-ready results; provenance, quality and repetition blockers remain.
+- Standalone provenance/audit, quality attachments, external telemetry/resource
+  summaries, comparison support and quick/full/release presets are implemented;
+  `mise run perf-check` passes **89 tests**. Full `mise run check` passed:
+  **357 Rust tests, zero failures, six ignored**, CPU/CUDA clippy, formatting,
+  oracle checks and dashboard checks/build. Review is triaged; commit remains
+  pending final Flash outcomes. See `qualification/completion-checks.json`.
+- **27B campaigns complete:** four baseline bundles plus the 20-profile
+  KV/speculation matrix and two capacity profiles. The advanced/capacity report
+  contains 21 measured deployments, 22 startup outcomes and 1,944/1,944 HTTP
+  requests. vLLM packed-MTP startup failure and llama.cpp arithmetic-quality
+  failures are retained explicitly; HTTP completion is not equivalence.
+  TQ4/TQ4_all each pass six early/late retrieval checks with server-reported
+  prompt lengths through 251,641 tokens. Baseline guarded comparison emits no
+  ranking. Evidence: `benchmarks/perf/qualification/27b-*-measurements.{json,md}`.
+- Flash reference images (specialized one-/two-3090 vLLM overlays) and the Strata
+  native binary are built, and Strata GGUF packing/inventories are complete.
+  Strata's no-speculation IQ-pack probe failed startup; a separately named
+  lookup-window-4 probe is queued. Flash runs and full checks share the GPU
+  reservation. Indexed target/draft shards are present in the pinned Flash view.
+- Pinned tokenizer calibration records ~32K/~128K/~252K early/late retrieval
+  fixtures; these are not server capacity attestations. Artifact inventories
+  record GGUF/NInfer/Flash bytes without inventing unavailable upstream lineage.
+- Measurements remain qualification evidence, not controlled publication trials
+  or a winner ranking. See `benchmarks/perf/campaigns/completion-results.md`.
+
 ## `Qwen/Qwen3.8-Flash-Next` (`qwen4_exp` / `Qwen4ExpForConditionalGeneration`) on 1× and 2× RTX 3090 Ti
 
 - Implemented end-to-end native support for `Qwen/Qwen3.8-Flash-Next` (`model_type: "qwen4_exp"`, `Qwen4ExpForConditionalGeneration`) across 1× RTX 3090 Ti (`TP=1`) and 2× RTX 3090 Ti (`TP=2 / EP=2`), documented in [`QWEN_FLASH_NEXT.md`](QWEN_FLASH_NEXT.md):

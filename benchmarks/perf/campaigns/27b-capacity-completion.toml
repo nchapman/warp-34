@@ -1,0 +1,71 @@
+# Fresh capacity qualification; pair with fixtures/quality-capacity.json.
+schema_version = 1
+[run]
+seed = 34
+repetitions = 3
+warmup_requests = 0
+max_inflight = 1
+timeout_s = 1800
+[presets.quick]
+cases = ["cold-read-60k"]
+repetitions = 1
+[presets.full]
+cases = ["cold-read-60k", "agent-120k", "agent-252k"]
+repetitions = 3
+[presets.release]
+cases = ["cold-read-60k", "agent-120k", "agent-252k"]
+repetitions = 5
+[engine_defaults]
+engine = "warp-34"
+version = "66974d8; f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f"
+support = "unverified"
+cohort = "27b-0df-capacity"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "TP1"
+base_url = "http://127.0.0.1:18034/v1"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+weight_format = "compressed-tensors-GPTQ-int4"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+speculation = "none"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-27b-tp1-tq4-capacity"
+kv_format = "tq4"
+cache_config = "16384 pages; FP32 persistent SSM; max sequences1; no model offload; OS cache not flushed"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-27b-tp1-tq4all-capacity"
+kv_format = "tq4_all"
+cache_config = "16384 pages; all-layer TQ4; FP32 persistent SSM; max sequences1; no model offload; OS cache not flushed"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+
+[[cases]]
+id = "cold-read-60k"
+fixture = "../fixtures/open_swe_cold_read_60k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+cache = "unique"
+
+[[cases]]
+id = "agent-120k"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_120k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+cache = "natural"
+
+[[cases]]
+id = "agent-252k"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_agent_252k.json"
+requests = 1
+concurrency = 1
+max_tokens = 64
+cache = "natural"

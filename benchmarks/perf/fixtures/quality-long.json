@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "description": "Independently authored deterministic smoke checks; no external oracle. Retrieval sizes are lines, not tokenizer-dependent token claims.",
+  "checks": [
+    {"id":"arithmetic", "kind":"exact", "prompt":"Compute 17 * 6 - 9. Reply with only the integer.", "expected":"93"},
+    {"id":"json", "kind":"exact", "prompt":"Reply with exactly this compact JSON object, without fences or spaces: key total has integer value equal to 8 + 5, then key ok has boolean value true.", "expected":"{\"total\":13,\"ok\":true}"},
+    {"id":"code", "kind":"exact", "prompt":"What does this Python code print? Reply only with its output.\nprint(sum(x*x for x in range(4)))", "expected":"14"},
+    {"id":"needle-short-front", "kind":"retrieval", "prompt":"Return the TARGET_SECRET value from the archive.", "expected":"cobalt-otter-7183", "context_lines":24, "depth":0.0},
+    {"id":"needle-long-middle", "kind":"retrieval", "prompt":"Return the TARGET_SECRET value from the archive.", "expected":"amber-heron-4926", "context_lines":1200, "depth":0.5},
+    {"id":"needle-long-end", "kind":"retrieval", "prompt":"Return the TARGET_SECRET value from the archive.", "expected":"violet-ibis-8351", "context_lines":1200, "depth":1.0}
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "exe": "/home/nchapman/.cache/w34-benchmark-builds/Strata/strata",
+  "args": [
+    "--pack", "/home/nchapman/.cache/w34-benchmark-models/strata-flash-iq4xs",
+    "--native", "/home/nchapman/.cache/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/38bb39ee97821de2c9009abb7e93950eec396e66/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
+    "--resident-budget-gib", "72",
+    "--expert-profile", "data/expert-profile.bin",
+    "--expert-cache", "auto",
+    "--prefill", "512",
+    "--spec", "4",
+    "--kv", "fp16",
+    "--max-context", "8192"
+  ],
+  "cwd": "/tmp/w34-benchmark-refs/Strata",
+  "tokenizer": "/home/nchapman/.cache/w34-benchmark-models/strata-flash-iq4xs/tokenizer",
+  "model_name": "qwen38-flash-strata-iq4xs",
+  "log": "/tmp/w34-strata-engine.log",
+  "host": "127.0.0.1",
+  "port": 18034,
+  "fit_max_tokens": false
+}

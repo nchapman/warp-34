@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "base_revision": "66974d8",
+  "command": "export PATH=/opt/cuda/bin:$PATH; mise run check",
+  "gpu_isolation": "held /tmp/w34-benchmark-gpu-reservation.lock for the full command",
+  "exit_code": 0,
+  "log": "benchmarks/perf/results/completion-full-check.log",
+  "log_sha256": "e3b09f6403c18f2be98d3930d4c203a8b30f522c2687e3ab283c13eff7d786f9",
+  "rust_test_binaries": 44,
+  "rust_tests_passed": 357,
+  "rust_tests_failed": 0,
+  "rust_tests_ignored": 6,
+  "perf_tests_passed": 89,
+  "dashboard_tests_passed": 18,
+  "other_checks": ["cargo fmt", "clippy CPU", "clippy CUDA", "oracle-check", "dashboard build"],
+  "binary_sha256_after_check": "f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
+  "review_triage": "benchmarks/perf/qualification/completion-review.md",
+  "subsequent_configuration_validation": "mise run perf-check passed 89 tests; Flash campaign validates 9 deployments and 5 cases; git diff --check passed",
+  "note": "Ignored tests remain ignored, not claimed passed. Campaign outcomes are separate from code verification. No Rust/runtime source was changed by this benchmark task."
+}

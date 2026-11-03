@@ -1,0 +1,33 @@
+{
+  "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+  "tokenizer_sha256": "67d8113912fabc4af848be59c550922fb4945e3f9ad0853948d5def219fc4e46",
+  "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+  "fixture_sha256": "cbaf37e6ffe0adbb172ce3372676892edb1621436619d1a10688c25d1b928cab",
+  "method": "AutoTokenizer.apply_chat_template; return_dict=False; add_generation_prompt=True; enable_thinking=False; not server attestation; native renderers may differ",
+  "checks": [
+    {
+      "check": "capacity-1900-early",
+      "reference_template_prompt_tokens": 32340
+    },
+    {
+      "check": "capacity-1900-late",
+      "reference_template_prompt_tokens": 32340
+    },
+    {
+      "check": "capacity-7500-early",
+      "reference_template_prompt_tokens": 127540
+    },
+    {
+      "check": "capacity-7500-late",
+      "reference_template_prompt_tokens": 127541
+    },
+    {
+      "check": "capacity-14800-early",
+      "reference_template_prompt_tokens": 251641
+    },
+    {
+      "check": "capacity-14800-late",
+      "reference_template_prompt_tokens": 251640
+    }
+  ]
+}
