@@ -176,34 +176,46 @@ __global__ void qsa_indexer_norm_rope_f16_kernel(
     }
 }
 
-// Writes indexer keys [num_tokens, head_dim] into raw_k_cache [num_pages, 16, head_dim]
-// at write_slot_mapping[tok], then updates the corresponding 4:1 compressed sub-block
-// in comp_k_cache [num_pages, 4, head_dim] whenever a 4-token sub-block is populated.
+// Writes indexer keys [num_tokens, head_dim] into raw_k_cache [num_pages, 16, head_dim + 8]
+// at write_slot_mapping[tok], and on group-leader slots (`slot & 3 == 0`) caches the 3-plane
+// mRoPE coordinates of the group's first token in the 8-half metadata tail.
 __global__ void qsa_indexer_write_raw_k_f16_kernel(
     const __half* __restrict__ k_in,
     __half* __restrict__ raw_k_cache,
+    const int32_t* __restrict__ positions,
     const int32_t* __restrict__ write_slot_mapping,
     const uint8_t* __restrict__ valid_token_mask,
     int num_tokens,
-    int head_dim) {
+    int head_dim,
+    int pos_plane_stride) {
     const int tok = blockIdx.x;
     if (tok >= num_tokens) return;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
     const int32_t slot = write_slot_mapping[tok];
     if (slot < 0) return;
 
+    const int raw_stride = head_dim + 8;
     const __half* src = k_in + (size_t)tok * head_dim;
-    __half* dst = raw_k_cache + (size_t)slot * head_dim;
+    __half* dst = raw_k_cache + (size_t)slot * raw_stride;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         dst[d] = src[d];
     }
+    if ((slot & 3) == 0 && positions != nullptr) {
+        int32_t* meta = reinterpret_cast<int32_t*>(dst + head_dim);
+        if (threadIdx.x < 3) {
+            const int plane = (pos_plane_stride > 0) ? threadIdx.x : 0;
+            meta[threadIdx.x] = positions[(size_t)plane * pos_plane_stride + tok];
+        } else if (threadIdx.x == 3) {
+            meta[3] = 0x51534130; // cached group-first coordinates valid marker
+        }
+    }
 }
 
-// Updates 4:1 compressed key cache [num_pages, 4, head_dim] from raw_k_cache [num_pages, 16, head_dim]
-// for every touched slot's 4-token aligned sub-block:
+// Updates 4:1 compressed key cache [num_pages, 4, head_dim] from raw_k_cache [num_pages, 16, head_dim + 8]
+// using a single writer per completed 4-token compressed group (`(slot & 3) == 3`):
 //   1. Mean-pools the 4 raw keys in the sub-block: pooled = 0.25 * (v0 + v1 + v2 + v3)
-//   2. Applies GemmaRMSNorm(k_norm_weight, eps) + partial mRoPE at the sub-block's first position
-//      (matching upstream vLLM QSAIndexer.forward / _qsa_prepare_kernel).
+//   2. Applies GemmaRMSNorm(k_norm_weight, eps) + partial mRoPE at the sub-block's cached first
+//      mRoPE coordinates (matching upstream vLLM QSAIndexer.forward / _qsa_prepare_kernel).
 __global__ void qsa_indexer_update_comp_k_f16_kernel(
     const __half* __restrict__ raw_k_cache,
     __half* __restrict__ comp_k_cache,
@@ -225,19 +237,26 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
     const int32_t slot = write_slot_mapping[tok];
     if (slot < 0) return;
 
+    const int raw_stride = head_dim + 8;
     const int32_t sub_block = slot >> 2; // slot / 4
     const int32_t base_slot = sub_block << 2;
-    const __half* raw_base = raw_k_cache + (size_t)base_slot * head_dim;
+    const __half* raw_base = raw_k_cache + (size_t)base_slot * raw_stride;
     __half* comp_dst = comp_k_cache + (size_t)sub_block * head_dim;
 
     if (k_norm_weight == nullptr || positions == nullptr) {
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            const float v0 = __half2float(raw_base[0 * head_dim + d]);
-            const float v1 = __half2float(raw_base[1 * head_dim + d]);
-            const float v2 = __half2float(raw_base[2 * head_dim + d]);
-            const float v3 = __half2float(raw_base[3 * head_dim + d]);
+            const float v0 = __half2float(raw_base[0 * raw_stride + d]);
+            const float v1 = __half2float(raw_base[1 * raw_stride + d]);
+            const float v2 = __half2float(raw_base[2 * raw_stride + d]);
+            const float v3 = __half2float(raw_base[3 * raw_stride + d]);
             comp_dst[d] = __float2half(0.25f * (v0 + v1 + v2 + v3));
         }
+        return;
+    }
+
+    // Single writer per 4-token compressed group: only the CTA writing the 4th slot (`slot & 3 == 3`)
+    // commits the compressed group into `comp_k_cache`.
+    if ((slot & 3) != 3) {
         return;
     }
 
@@ -246,10 +265,10 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
 
     float sum_sq = 0.0f;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        const float v0 = __half2float(raw_base[0 * head_dim + d]);
-        const float v1 = __half2float(raw_base[1 * head_dim + d]);
-        const float v2 = __half2float(raw_base[2 * head_dim + d]);
-        const float v3 = __half2float(raw_base[3 * head_dim + d]);
+        const float v0 = __half2float(raw_base[0 * raw_stride + d]);
+        const float v1 = __half2float(raw_base[1 * raw_stride + d]);
+        const float v2 = __half2float(raw_base[2 * raw_stride + d]);
+        const float v3 = __half2float(raw_base[3 * raw_stride + d]);
         const float pooled = __half2float(__float2half(0.25f * (v0 + v1 + v2 + v3)));
         s_normed[d] = pooled;
         sum_sq += pooled * pooled;
@@ -275,6 +294,8 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
     }
     __syncthreads();
 
+    const int32_t* meta = reinterpret_cast<const int32_t*>(raw_base + head_dim);
+    const bool has_cached_first = (meta[3] == 0x51534130);
     const int32_t offset_in_group = slot & 3;
     const int half_rot = rotary_dim / 2;
     for (int i = threadIdx.x; i < half_rot; i += blockDim.x) {
@@ -284,8 +305,10 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
         } else if ((i % 3) == 2 && i < mrope_s2 * 3) {
             plane = 2;
         }
-        const int32_t pos_tok = positions[(size_t)plane * pos_plane_stride + tok];
-        const float first_pos = (float)(pos_tok - offset_in_group);
+        const int eff_plane = (pos_plane_stride > 0) ? plane : 0;
+        const float first_pos = has_cached_first
+            ? (float)meta[eff_plane]
+            : (float)(positions[(size_t)eff_plane * pos_plane_stride + tok] - offset_in_group);
         const float inv_freq =
             __fdiv_rn(1.0f, __nv_powf(rope_theta, (float)(2 * i) / (float)rotary_dim));
         const float angle = first_pos * inv_freq;
@@ -302,11 +325,14 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
     }
 }
 
-// Selects up to select_k_blocks (64) logical blocks per query token using the QSA Indexer:
-//   - If num_valid_blocks <= select_k_blocks: selects all 0..num_valid_blocks in ascending order.
-//   - Otherwise: forces sink blocks [0..sink_blocks) and recent blocks [num_valid_blocks-recent_blocks..num_valid_blocks),
-//     scores candidate middle blocks via exact per-head softmax + 4:1 max-pooling + head sum,
-//     picks top (select_k_blocks - num_forced) middle blocks, and sorts selected logical blocks ascending.
+// Selects up to `select_k_blocks` 4-token compressed groups per query token using the QSA Indexer:
+//   - Each entry in `out_selected_logical_blocks` is a logical 4-token group index `g` (covering tokens `4*g .. 4*g+4`).
+//   - Each entry in `out_selected_phys_blocks` is the resolved physical 4-token group index
+//     `phys_page * (block_size / 4) + (g % (block_size / 4))`.
+//   - If all valid 4-token groups fit within `select_k_blocks` (and completed groups <= 512): selects all `0..num_valid_groups`.
+//   - Otherwise: scores each completed 4-token group `g in [0..num_comp_groups)` directly at 4-token group granularity,
+//     selects the top completed groups (plus optional forced sink/recent completed groups), and always appends the
+//     incomplete causal tail group when `(token_pos + 1) % 4 != 0`.
 // Grid: num_tokens, Block: 128.
 __global__ void qsa_select_blocks_f16_kernel(
     const __half* __restrict__ q_indexer,
@@ -351,25 +377,30 @@ __global__ void qsa_select_blocks_f16_kernel(
     const int q_start = batch.query_start_loc[req];
     const int ctx_before = (batch.context_lens_before != nullptr) ? batch.context_lens_before[req] : 0;
     const int token_pos = ctx_before + (tok - q_start);
-    const int current_block = token_pos / block_size;
-    const int num_valid_blocks = current_block + 1;
+    const int groups_per_page = block_size >> 2;
+    const int num_comp_groups = (token_pos + 1) >> 2;
+    const bool has_tail_group = ((token_pos + 1) & 3) != 0;
+    const int num_valid_groups = num_comp_groups + (has_tail_group ? 1 : 0);
     const int32_t* req_block_table = batch.block_tables + (size_t)req * batch.max_blocks_per_req;
 
     if (threadIdx.x == 0) {
         out_token_seq_pos[tok] = token_pos;
     }
 
-    if (num_valid_blocks <= select_k_blocks) {
+    const int max_comp = (select_k_blocks > 512) ? 512 : select_k_blocks;
+    if (num_valid_groups <= select_k_blocks && num_comp_groups <= max_comp) {
         if (threadIdx.x == 0) {
-            out_num_selected_blocks[tok] = num_valid_blocks;
+            out_num_selected_blocks[tok] = num_valid_groups;
         }
-        for (int i = threadIdx.x; i < select_k_blocks; i += blockDim.x) {
-            if (i < num_valid_blocks) {
-                dst_phys[i] = req_block_table[i];
-                dst_log[i] = i;
+        for (int g = threadIdx.x; g < select_k_blocks; g += blockDim.x) {
+            if (g < num_valid_groups) {
+                const int32_t phys_page = req_block_table[g / groups_per_page];
+                const int sub_group = g % groups_per_page;
+                dst_phys[g] = (phys_page >= 0) ? (phys_page * groups_per_page + sub_group) : -1;
+                dst_log[g] = g;
             } else {
-                dst_phys[i] = -1;
-                dst_log[i] = -1;
+                dst_phys[g] = -1;
+                dst_log[g] = -1;
             }
         }
         return;
@@ -386,28 +417,28 @@ __global__ void qsa_select_blocks_f16_kernel(
     __syncthreads();
 
     const float scale = rsqrtf((float)head_dim);
-    // Compressed length ends at the last completed 4-token group before or at token_pos.
-    const int num_comp_groups = (token_pos + 1) / 4;
-    const int num_full_comp_blocks = num_comp_groups / 4;
-    const int rem_comp_groups = num_comp_groups % 4;
-
     const int wid = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int num_warps = blockDim.x >> 5;
-    const int total_comp_blocks = num_full_comp_blocks + ((rem_comp_groups > 0) ? 1 : 0);
 
-    // Candidate middle blocks are in [mid_start, mid_end).
-    const int mid_start = (sink_blocks < num_valid_blocks) ? sink_blocks : num_valid_blocks;
-    const int mid_end = ((num_valid_blocks - recent_blocks) > mid_start)
-        ? (num_valid_blocks - recent_blocks)
+    const int comp_budget = has_tail_group
+        ? ((select_k_blocks - 1 < max_comp) ? (select_k_blocks - 1) : max_comp)
+        : max_comp;
+
+    // Candidate middle completed groups are in [mid_start, mid_end).
+    const int mid_start = (sink_blocks < num_comp_groups) ? sink_blocks : num_comp_groups;
+    const int mid_end = ((num_comp_groups - recent_blocks) > mid_start)
+        ? (num_comp_groups - recent_blocks)
         : mid_start;
-    const int num_forced = mid_start + (num_valid_blocks - mid_end);
-    const int need_mid = (select_k_blocks > num_forced) ? (select_k_blocks - num_forced) : 0;
+    const int num_forced = mid_start + (num_comp_groups - mid_end);
+    int need_mid = (comp_budget > num_forced) ? (comp_budget - num_forced) : 0;
+    constexpr int kMaxSelectGroups = 513;
+    if (need_mid > kMaxSelectGroups) need_mid = kMaxSelectGroups;
 
-    // Maintain warp-collaborative top-need_mid candidate middle blocks in shared memory.
-    __shared__ float s_top_scores[128];
-    __shared__ int32_t s_top_blocks[128];
-    for (int i = threadIdx.x; i < 128; i += blockDim.x) {
+    // Maintain warp-collaborative top-need_mid candidate middle groups in shared memory.
+    __shared__ float s_top_scores[kMaxSelectGroups];
+    __shared__ int32_t s_top_blocks[kMaxSelectGroups];
+    for (int i = threadIdx.x; i < kMaxSelectGroups; i += blockDim.x) {
         s_top_scores[i] = -FLT_MAX;
         s_top_blocks[i] = -1;
     }
@@ -416,47 +447,45 @@ __global__ void qsa_select_blocks_f16_kernel(
     __shared__ float s_chunk_scores[4];
     __shared__ int32_t s_chunk_blocks[4];
 
-    for (int b_base = mid_start; b_base < mid_end; b_base += num_warps) {
-        const int b = b_base + wid;
-        float blk_score = -FLT_MAX;
-        if (b < mid_end && b < total_comp_blocks) {
-            const int32_t phys_page = req_block_table[b];
-            const int c_limit = (b < num_full_comp_blocks) ? 4 : rem_comp_groups;
-            if (phys_page >= 0 && c_limit > 0) {
-                for (int c = 0; c < c_limit; ++c) {
-                    const __half* ck = comp_k_cache + ((size_t)phys_page * 4 + c) * head_dim;
-                    float dot_h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int g_base = mid_start; g_base < mid_end; g_base += num_warps) {
+        const int g = g_base + wid;
+        float grp_score = -FLT_MAX;
+        if (g < mid_end && g < num_comp_groups) {
+            const int32_t phys_page = req_block_table[g / groups_per_page];
+            const int sub_group = g % groups_per_page;
+            if (phys_page >= 0) {
+                const __half* ck =
+                    comp_k_cache + ((size_t)phys_page * groups_per_page + sub_group) * head_dim;
+                float dot_h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        const int col = lane + i * 32;
-                        const float kv = __half2float(ck[col]);
-                        dot_h[0] += s_q[0][col] * kv;
-                        dot_h[1] += s_q[1][col] * kv;
-                        dot_h[2] += s_q[2][col] * kv;
-                        dot_h[3] += s_q[3][col] * kv;
-                    }
-                    float group_score = 0.0f;
-#pragma unroll
-                    for (int h = 0; h < 4; ++h) {
-                        const float logit = qsa_warp_reduce_sum(dot_h[h]);
-                        group_score += fmaxf(logit, 0.0f);
-                    }
-                    group_score *= scale;
-                    blk_score = fmaxf(blk_score, group_score);
+                for (int i = 0; i < 4; ++i) {
+                    const int col = lane + i * 32;
+                    const float kv = __half2float(ck[col]);
+                    dot_h[0] += s_q[0][col] * kv;
+                    dot_h[1] += s_q[1][col] * kv;
+                    dot_h[2] += s_q[2][col] * kv;
+                    dot_h[3] += s_q[3][col] * kv;
                 }
+                float sum_relu = 0.0f;
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    const float logit = qsa_warp_reduce_sum(dot_h[h]);
+                    sum_relu += fmaxf(logit, 0.0f);
+                }
+                grp_score = sum_relu * scale;
             }
         }
         if (lane == 0) {
-            s_chunk_scores[wid] = blk_score;
-            s_chunk_blocks[wid] = (b < mid_end) ? b : -1;
+            s_chunk_scores[wid] = grp_score;
+            s_chunk_blocks[wid] = (g < mid_end) ? g : -1;
         }
         __syncthreads();
 
         if (threadIdx.x == 0 && need_mid > 0) {
             for (int w = 0; w < num_warps; ++w) {
                 const float sc = s_chunk_scores[w];
-                const int32_t lb = s_chunk_blocks[w];
-                if (lb >= 0 && sc > s_top_scores[need_mid - 1]) {
+                const int32_t lg = s_chunk_blocks[w];
+                if (lg >= 0 && sc > s_top_scores[need_mid - 1]) {
                     int pos = need_mid - 1;
                     while (pos > 0 && sc > s_top_scores[pos - 1]) {
                         s_top_scores[pos] = s_top_scores[pos - 1];
@@ -464,7 +493,7 @@ __global__ void qsa_select_blocks_f16_kernel(
                         --pos;
                     }
                     s_top_scores[pos] = sc;
-                    s_top_blocks[pos] = lb;
+                    s_top_blocks[pos] = lg;
                 }
             }
         }
@@ -472,36 +501,50 @@ __global__ void qsa_select_blocks_f16_kernel(
     }
 
     if (threadIdx.x == 0) {
-        // Insertion-sort the selected middle blocks by logical block index ascending.
+        // Insertion-sort the selected middle groups by logical group index ascending.
         int valid_mid = 0;
         while (valid_mid < need_mid && s_top_blocks[valid_mid] >= 0) {
             ++valid_mid;
         }
         for (int i = 1; i < valid_mid; ++i) {
-            const int32_t key_b = s_top_blocks[i];
+            const int32_t key_g = s_top_blocks[i];
             int j = i - 1;
-            while (j >= 0 && s_top_blocks[j] > key_b) {
+            while (j >= 0 && s_top_blocks[j] > key_g) {
                 s_top_blocks[j + 1] = s_top_blocks[j];
                 --j;
             }
-            s_top_blocks[j + 1] = key_b;
+            s_top_blocks[j + 1] = key_g;
         }
 
         int out_idx = 0;
-        for (int b = 0; b < mid_start && out_idx < select_k_blocks; ++b) {
-            dst_log[out_idx] = b;
-            dst_phys[out_idx] = req_block_table[b];
+        for (int g = 0; g < mid_start && out_idx < comp_budget; ++g) {
+            const int32_t phys_page = req_block_table[g / groups_per_page];
+            dst_log[out_idx] = g;
+            dst_phys[out_idx] =
+                (phys_page >= 0) ? (phys_page * groups_per_page + (g % groups_per_page)) : -1;
             ++out_idx;
         }
-        for (int i = 0; i < valid_mid && out_idx < select_k_blocks; ++i) {
-            const int32_t b = s_top_blocks[i];
-            dst_log[out_idx] = b;
-            dst_phys[out_idx] = req_block_table[b];
+        for (int i = 0; i < valid_mid && out_idx < comp_budget; ++i) {
+            const int32_t g = s_top_blocks[i];
+            const int32_t phys_page = req_block_table[g / groups_per_page];
+            dst_log[out_idx] = g;
+            dst_phys[out_idx] =
+                (phys_page >= 0) ? (phys_page * groups_per_page + (g % groups_per_page)) : -1;
             ++out_idx;
         }
-        for (int b = mid_end; b < num_valid_blocks && out_idx < select_k_blocks; ++b) {
-            dst_log[out_idx] = b;
-            dst_phys[out_idx] = req_block_table[b];
+        for (int g = mid_end; g < num_comp_groups && out_idx < comp_budget; ++g) {
+            const int32_t phys_page = req_block_table[g / groups_per_page];
+            dst_log[out_idx] = g;
+            dst_phys[out_idx] =
+                (phys_page >= 0) ? (phys_page * groups_per_page + (g % groups_per_page)) : -1;
+            ++out_idx;
+        }
+        if (has_tail_group && out_idx < select_k_blocks) {
+            const int32_t g = num_comp_groups;
+            const int32_t phys_page = req_block_table[g / groups_per_page];
+            dst_log[out_idx] = g;
+            dst_phys[out_idx] =
+                (phys_page >= 0) ? (phys_page * groups_per_page + (g % groups_per_page)) : -1;
             ++out_idx;
         }
         out_num_selected_blocks[tok] = out_idx;
@@ -512,7 +555,7 @@ __global__ void qsa_select_blocks_f16_kernel(
     }
 }
 
-// Sparse Paged GQA over the selected blocks per token for FP16, Q8_0, and TQ4 KV caches.
+// Sparse Paged GQA over the selected 4-token groups per token for FP16, Q8_0, and TQ4 KV caches.
 // Grid: (num_tokens, local_q_heads), Block: 128 (4 warps, 8 dims per lane of head_dim=256).
 __global__ void qsa_sparse_paged_attn_f16_kernel(
     const __half* __restrict__ q,
@@ -544,6 +587,7 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
     const int n_sel = num_selected_blocks[tok];
     const int seq_pos = token_seq_pos[tok];
     const int block_size = kv_layout.block_size;
+    const int groups_per_page = block_size >> 2;
     const int gqa_group = local_q_heads / kv_layout.local_kv_heads;
     const int kv_head = q_head / gqa_group;
 
@@ -576,14 +620,16 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
     const uint8_t* k_base = reinterpret_cast<const uint8_t*>((uintptr_t)kv_layout.k_base);
     const uint8_t* v_base = reinterpret_cast<const uint8_t*>((uintptr_t)kv_layout.v_base);
 
-    const int total_sel_tokens = n_sel * block_size;
+    const int total_sel_tokens = n_sel * 4;
     for (int t_idx = wid; t_idx < total_sel_tokens; t_idx += num_warps) {
-        const int blk_idx = t_idx / block_size;
-        const int page_off = t_idx % block_size;
-        const int32_t phys_page = tok_phys[blk_idx];
-        const int32_t log_blk = tok_log[blk_idx];
-        const int kv_pos = log_blk * block_size + page_off;
-        if (phys_page < 0 || kv_pos > seq_pos) continue;
+        const int grp_idx = t_idx >> 2;
+        const int grp_off = t_idx & 3;
+        const int32_t phys_grp = tok_phys[grp_idx];
+        const int32_t log_grp = tok_log[grp_idx];
+        const int kv_pos = log_grp * 4 + grp_off;
+        if (phys_grp < 0 || kv_pos > seq_pos) continue;
+        const int32_t phys_page = phys_grp / groups_per_page;
+        const int page_off = (phys_grp % groups_per_page) * 4 + grp_off;
 
         const uint8_t* k_ptr =
             k_base + (size_t)phys_page * kv_layout.k_page_stride_bytes +
@@ -832,10 +878,12 @@ int w34_qsa_indexer_cache_update_f16(
     w34::qsa_indexer_write_raw_k_f16_kernel<<<num_tokens, 128, 0, stream>>>(
         static_cast<const __half*>(k_in),
         static_cast<__half*>(raw_k_cache),
+        positions,
         write_slot_mapping,
         valid_token_mask,
         num_tokens,
-        head_dim);
+        head_dim,
+        pos_plane_stride);
     w34::qsa_indexer_update_comp_k_f16_kernel<<<num_tokens, 128, 0, stream>>>(
         static_cast<const __half*>(raw_k_cache),
         static_cast<__half*>(comp_k_cache),

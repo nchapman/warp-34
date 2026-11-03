@@ -492,10 +492,16 @@ impl Qwen3_5MtpRank {
             None
         };
         let qsa = if qsa_indexer.is_some() {
-            let qsa_sel_phys_buf =
-                DeviceBuffer::alloc(target.device.device_id, max_batch_rows * 64 * 4)?;
-            let qsa_sel_log_buf =
-                DeviceBuffer::alloc(target.device.device_id, max_batch_rows * 64 * 4)?;
+            let max_select_groups =
+                (c.indexer_budget / c.indexer_compress_ratio.max(1)).clamp(1, 512) + 1;
+            let qsa_sel_phys_buf = DeviceBuffer::alloc(
+                target.device.device_id,
+                max_batch_rows * max_select_groups * 4,
+            )?;
+            let qsa_sel_log_buf = DeviceBuffer::alloc(
+                target.device.device_id,
+                max_batch_rows * max_select_groups * 4,
+            )?;
             let qsa_num_sel_buf = DeviceBuffer::alloc(target.device.device_id, max_batch_rows * 4)?;
             let qsa_seq_pos_buf = DeviceBuffer::alloc(target.device.device_id, max_batch_rows * 4)?;
             Some(MtpQsaWorkspace {
@@ -1413,10 +1419,10 @@ impl Qwen3_5MtpRank {
         let mut token = anchor;
         let mut hidden = target_hidden;
         let mut out = Vec::with_capacity(k);
-        let step0_page = self.len / 16;
+        let step0_group = self.len / 4;
         for step in 0..k {
             if let Some(qsa_ws) = &mut self.qsa {
-                qsa_ws.step0_page_idx = step0_page;
+                qsa_ws.step0_page_idx = step0_group;
                 qsa_ws.skip_topk = step > 0;
             }
             let res = self.forward(target, &[token], hidden, tp2);
@@ -1890,9 +1896,10 @@ impl Qwen3_5MtpRank {
             "w34_kv_cache_write_strided (MTP)",
         )?;
         let reuse_step0_topk = self.qsa.as_ref().is_some_and(|helpers| {
-            helpers.skip_topk && num_tokens == 1 && self.len / 16 == helpers.step0_page_idx
+            helpers.skip_topk && num_tokens == 1 && self.len / 4 == helpers.step0_page_idx
         });
-        let select_k_blocks = (t.cfg.indexer_budget / 16).clamp(1, 64);
+        let select_k_blocks =
+            (t.cfg.indexer_budget / t.cfg.indexer_compress_ratio.max(1)).clamp(1, 512) + 1;
         if let Some(qsa) = &fa.qsa_indexer {
             let qsa_ws = self
                 .qsa
@@ -1970,7 +1977,7 @@ impl Qwen3_5MtpRank {
                     16,
                     select_k_blocks,
                     0,
-                    1,
+                    0,
                 )?;
             }
         }

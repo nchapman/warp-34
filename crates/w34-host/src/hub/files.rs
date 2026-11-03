@@ -102,6 +102,8 @@ pub(super) fn weight_files(dir: &Path, files: &BTreeSet<String>) -> io::Result<V
                 }
             }
         }
+    } else if files.contains("runtime/mtp-int4-g32/model.safetensors") {
+        selected.insert("runtime/mtp-int4-g32/model.safetensors".to_string());
     }
     Ok(selected.into_iter().collect())
 }

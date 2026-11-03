@@ -320,7 +320,7 @@ impl Qwen3_5Engine {
     }
 
     pub fn can_pipeline_decode_slices(&self, slices: &[EngineBatchSlice<'_>]) -> bool {
-        if self.tp_size != 1 || !self.use_cuda_graph || slices.is_empty() {
+        if self.tp_size != 1 || !self.use_cuda_graph || self.cfg.uses_ple() || slices.is_empty() {
             return false;
         }
         let Some(bucket_b) = decode_graph_bucket(slices.len()) else {
@@ -360,6 +360,11 @@ impl Qwen3_5Engine {
     ) -> Result<InFlightDecodeTicket> {
         if self.tp_size != 1 {
             return Err(loader_err("pipelined decode overlap requires tp_size == 1"));
+        }
+        if self.cfg.uses_ple() {
+            return Err(loader_err(
+                "pipelined decode overlap is not supported with PLE staging",
+            ));
         }
         if let Some(deltas) = rope_pos_deltas
             && deltas.len() != slices.len()

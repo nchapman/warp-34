@@ -56,8 +56,8 @@ pub(super) fn layer_layout(d: Dimensions, tokens: usize) -> Option<LayerLayout> 
             fa.alloc(&[tokens, d.indexer_head_dim.checked_mul(5)?, 2])?,
             fa.alloc(&[tokens, d.indexer_head_dim.checked_mul(4)?, 2])?,
             fa.alloc(&[tokens, d.indexer_head_dim, 2])?,
-            fa.alloc(&[tokens, 64, 4])?,
-            fa.alloc(&[tokens, 64, 4])?,
+            fa.alloc(&[tokens, 513, 4])?,
+            fa.alloc(&[tokens, 513, 4])?,
             fa.alloc(&[tokens, 4])?,
             fa.alloc(&[tokens, 4])?,
         ]

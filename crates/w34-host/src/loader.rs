@@ -1337,14 +1337,14 @@ impl ModelConfig {
                     ),
                 ));
             }
-            if indexer_compress_ratio == 0
-                || !indexer_compress_ratio.is_power_of_two()
+            if indexer_compress_ratio != 4
+                || indexer_budget == 0
                 || !indexer_budget.is_multiple_of(indexer_compress_ratio)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "invalid QSA indexer budget/compression (indexer_budget={indexer_budget}, indexer_compress_ratio={indexer_compress_ratio})"
+                        "invalid QSA indexer budget/compression (indexer_budget={indexer_budget}, indexer_compress_ratio={indexer_compress_ratio}; expected compress_ratio=4)"
                     ),
                 ));
             }
@@ -2125,11 +2125,12 @@ impl ModelConfig {
     }
 
     pub fn uses_tiered_moe(&self) -> bool {
-        // Use host/VRAM tiered MoE storage whenever the checkpoint uses a compatible
+        // Use host/VRAM tiered MoE storage whenever all layers are MoE layers with a compatible
         // symmetric U4B8 expert layout and either:
         // - the total routed-expert footprint exceeds a single 24 GiB GPU budget (> 20 GiB), or
         // - the model uses the Qwen4 high-expert-count architecture (including small synthetic test fixtures).
-        self.moe_expert_pack_layout().is_some()
+        self.mlp_only_layers.is_empty()
+            && self.moe_expert_pack_layout().is_some()
             && ((self.quant.symmetric_gptq_u4_group_size().is_some()
                 && self.routed_expert_total_bytes() > 20 * 1024 * 1024 * 1024)
                 || self.is_qwen4_exp())

@@ -309,7 +309,7 @@ impl KvPool {
         compress_ratio: usize,
     ) -> Result<()> {
         let ratio = compress_ratio.max(1);
-        let raw_bytes = self.num_pages * self.block_size * indexer_head_dim * 2;
+        let raw_bytes = self.num_pages * self.block_size * (indexer_head_dim + 8) * 2;
         let comp_bytes = self.num_pages * (self.block_size / ratio) * indexer_head_dim * 2;
         for layer in &mut self.layers {
             layer.qsa_raw_k_buf = Some(DeviceBuffer::alloc(self.device_id, raw_bytes)?);

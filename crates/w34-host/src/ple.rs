@@ -1895,7 +1895,7 @@ mod tests {
         )
         .unwrap();
 
-        let d_raw_k = dev_from_slice(&vec![f32_to_f16(0.1); num_pages * 16 * 128], &stream);
+        let d_raw_k = dev_from_slice(&vec![f32_to_f16(0.1); num_pages * 16 * (128 + 8)], &stream);
         let d_comp_k = dev_from_slice(&vec![f32_to_f16(0.1); num_pages * 4 * 128], &stream);
         let d_qsl_attn = dev_from_slice(&[0, qsa_tokens as i32], &stream);
         let d_ctx_before = dev_from_slice(&[20], &stream);
@@ -1966,9 +1966,9 @@ mod tests {
         let h_num_sel: Vec<i32> = dev_to_vec(&d_num_sel, qsa_tokens, &stream);
         let h_seq_pos: Vec<i32> = dev_to_vec(&d_seq_pos, qsa_tokens, &stream);
         let h_sel_phys: Vec<i32> = dev_to_vec(&d_sel_phys, qsa_tokens * select_k, &stream);
-        assert_eq!(h_num_sel, vec![2, 2]);
+        assert_eq!(h_num_sel, vec![6, 6]);
         assert_eq!(h_seq_pos, vec![20, 21]);
-        assert_eq!(&h_sel_phys[0..2], &[2, 1]);
+        assert_eq!(&h_sel_phys[0..6], &[8, 9, 10, 11, 4, 5]);
 
         let d_q_main = dev_from_slice(
             &vec![f32_to_f16(0.1); qsa_tokens * q_heads * head_dim],
@@ -2032,17 +2032,18 @@ mod tests {
             f16_to_f32(h_hc2_down[0])
         );
 
-        // 4. Non-uniform QSA top-k block selection (4 blocks -> select_k = 2, recent_blocks = 1)
+        // 4. Non-uniform QSA top-k 4-token group selection (12 completed groups + 1 incomplete tail group
+        //    -> select_k = 5: 4 highest-scoring completed groups + tail group)
         //    + sparse paged GQA across FP16, Q8_0 (272 B/row), and TQ4 (132 B/row + Rademacher WHT256)
         //    against an exact CPU softmax + sigmoid-gate reference.
         let nu_pages = 4usize;
-        let nu_seq_len = 50usize; // 4 blocks: blk 0 (0..16), blk 1 (16..32), blk 2 (32..48), blk 3 (48..50)
-        let nu_select_k = 2usize; // must pick 1 highest-scoring past block + blk 3 (recent_blocks = 1)
+        let nu_seq_len = 50usize; // 12 completed 4-token groups (0..11, tokens 0..48) + tail group 12 (tokens 48..50)
+        let nu_select_k = 5usize; // must pick 4 highest-scoring completed groups (4..7) + tail group 12
         let nu_q_heads = 2usize;
         // Logical blocks [0, 1, 2, 3] -> physical pages [3, 1, 0, 2]
         let nu_blk_tbl = [3i32, 1, 0, 2];
-        // Set compressed K so logical block 1 (phys page 1) has positive dot product with q_idx (+1.0),
-        // while logical blocks 0 (phys 3) and 2 (phys 0) have negative dot products (-1.0).
+        // Set compressed K so logical groups 4..7 (phys page 1, phys groups 4..7) have positive dot product
+        // with q_idx (+0.75), while all other completed groups have negative dot products (-0.5).
         let mut h_nu_comp_k = vec![f32_to_f16(-0.5); nu_pages * 4 * 128];
         for sub in 0..4 {
             for d in 0..128 {
@@ -2091,17 +2092,17 @@ mod tests {
             128,
             block_size,
             nu_select_k,
-            0, // sink_blocks = 0 (matching vLLM QSA)
-            1, // recent_blocks = 1 (matching vLLM QSA)
+            0,
+            0,
         )
         .unwrap();
         let h_nu_num_sel: Vec<i32> = dev_to_vec(&d_nu_num_sel, 1, &stream);
         let h_nu_sel_log: Vec<i32> = dev_to_vec(&d_nu_sel_log, nu_select_k, &stream);
         let h_nu_sel_phys: Vec<i32> = dev_to_vec(&d_nu_sel_phys, nu_select_k, &stream);
-        assert_eq!(h_nu_num_sel, vec![2]);
-        // Must select logical block 1 (phys page 1, highest score) and logical block 3 (phys page 2, recent block)
-        assert_eq!(h_nu_sel_log, vec![1, 3]);
-        assert_eq!(h_nu_sel_phys, vec![1, 2]);
+        assert_eq!(h_nu_num_sel, vec![5]);
+        // Must select logical groups 4..7 (phys groups 4..7 on phys page 1) and tail group 12 (phys group 8 on phys page 2)
+        assert_eq!(h_nu_sel_log, vec![4, 5, 6, 7, 12]);
+        assert_eq!(h_nu_sel_phys, vec![4, 5, 6, 7, 8]);
 
         // Populate all 50 tokens across the 4 pages with deterministic non-uniform K and V via w34_kv_cache_write_strided
         // for FP16, Q8_0 (272 B/row), and TQ4 (132 B/row + Rademacher WHT256).

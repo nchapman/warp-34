@@ -1469,7 +1469,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         },
         "warmup w34_embed_lookup_f16",
     )?;
-    for hs in [128i32, 3072, 5120, 6144] {
+    for hs in [128i32, 3072, 5120, 6144, 10240] {
         for byte_off in [0u64, 4u64] {
             check_rc(
                 unsafe {
@@ -1486,22 +1486,24 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 },
                 "warmup w34_gemma_rms_norm_f16",
             )?;
-            check_rc(
-                unsafe {
-                    ffi::w34_fused_add_gemma_rms_norm_f16(
-                        &ex,
-                        (buf_a + byte_off) as *const c_void,
-                        (buf_b + byte_off) as *mut c_void,
-                        (buf_c + byte_off) as *const c_void,
-                        (buf_d + byte_off) as *mut c_void,
-                        core::ptr::null(),
-                        1,
-                        hs,
-                        1e-6,
-                    )
-                },
-                "warmup w34_fused_add_gemma_rms_norm_f16",
-            )?;
+            if hs <= 6144 {
+                check_rc(
+                    unsafe {
+                        ffi::w34_fused_add_gemma_rms_norm_f16(
+                            &ex,
+                            (buf_a + byte_off) as *const c_void,
+                            (buf_b + byte_off) as *mut c_void,
+                            (buf_c + byte_off) as *const c_void,
+                            (buf_d + byte_off) as *mut c_void,
+                            core::ptr::null(),
+                            1,
+                            hs,
+                            1e-6,
+                        )
+                    },
+                    "warmup w34_fused_add_gemma_rms_norm_f16",
+                )?;
+            }
         }
     }
     check_rc(

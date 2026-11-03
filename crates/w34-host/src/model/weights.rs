@@ -1529,7 +1529,8 @@ impl FullAttentionLayerWeights {
             cfg.mrope_section[1],
             pos_plane_stride as usize,
         )?;
-        let select_k_blocks = (cfg.indexer_budget / 16).clamp(1, 64);
+        let select_k_blocks =
+            (cfg.indexer_budget / cfg.indexer_compress_ratio.max(1)).clamp(1, 512) + 1;
         if !skip_topk {
             crate::ple::gpu_ops::qsa_select_blocks_f16(
                 ex,
@@ -1545,7 +1546,7 @@ impl FullAttentionLayerWeights {
                 16,
                 select_k_blocks,
                 0,
-                1,
+                0,
             )?;
         }
         crate::ple::gpu_ops::qsa_sparse_paged_attn_f16(
