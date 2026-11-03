@@ -63,6 +63,9 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
      and made both the 16-token short-prompt generation (`" Paris. The capital of Germany is Berlin. The capital of Italy is Rome."`)
      and the 70-token `MambaRadixCache` generation (`[760, 6511, 314, 9338, 369, 760, 6511, 314]`)
      match 100% token-for-token between `TP=1` and `TP=2 / EP=2`.
+  2. Cross-checked `warp-34`'s `qwen4_exp` implementation against upstream `vLLM` (`origin/main @ 190df0b90`, documented in [`QWEN_FLASH_NEXT.md` §6](QWEN_FLASH_NEXT.md#6-upstream-vllm-originmain--190df0b90-cross-check-intrinsic-qwen4-architecture-vs-12-rtx-3090-ti-hardware-optimizations)):
+     - Generalized `op_hc.cu` (`hc_down_silu_inject_f16_kernel`, `hc_mix_streams_f16_kernel`, `hc_combine_f16_kernel`) and `op_ple.cu` (`ple_signed_sqrt_gate_f16_kernel`) from hardcoded `0.25f` (`hc_count = 4`) to `1.0f / (float)hc_count` and up to `8` HC streams, and added shared `[hidden_size]` `hc_norm.weight` broadcast support (`hc_per_branch_norm = false`).
+     - Added native `TQ4` (`132 B/row` with Seed-42 Rademacher + WHT-256 + Beta(256)) and `Q8_0` (`272 B/row`) KV cache decoding directly inside `qsa_sparse_paged_attn_f16_kernel` (`op_qsa.cu`), removing the dense-attention fallback in `FullAttentionLayerWeights::forward_qsa_attention` and `MtpPredictor` when KV compression is active.
   2. Recorded `compute_done_events[buf_idx]` at the end of `TieredMoeWorkspace::stage_experts_to_slots`
      and raised `MAX_PROCESS_PINNED_BYTES` to `64 GiB` in `crates/w34-host/src/moe_offload.rs` so
      all 48 layers (`58.01 GiB`) receive mapped zero-copy backing on 128 GiB hosts.

@@ -692,9 +692,13 @@ int w34_qsa_indexer_norm_rope_f16(const w34_exec* ex, const void* qk_in,
                                   int pos_plane_stride);
 int w34_qsa_indexer_cache_update_f16(const w34_exec* ex, const void* k_in,
                                      void* raw_k_cache, void* comp_k_cache,
+                                     const void* k_norm_weight,
+                                     const int32_t* positions,
                                      const int32_t* write_slot_mapping,
                                      const uint8_t* valid_token_mask,
-                                     int num_tokens, int head_dim);
+                                     int num_tokens, int head_dim, int rotary_dim,
+                                     float rope_theta, float eps, int mrope_s1,
+                                     int mrope_s2, int pos_plane_stride);
 int w34_qsa_select_blocks_f16(const w34_exec* ex, const void* q_indexer,
                               const void* comp_k_cache, const w34_attention_batch* batch,
                               int32_t* out_selected_phys_blocks,

@@ -310,3 +310,52 @@ Every phase follows `warp-34`'s engineering rules: no phase graduates without pa
 4. **MTP Draft Vocabulary Range Filtering (`crates/w34-host/src/mtp.rs`):**
    - Support restricting the `MTP` draft `lm_head` GEMV to the active token subset `[[0, 65536], [248044, 248320]]` (`~26.5%` of the `248,320` vocabulary) during draft steps `0..K`, while the target model verifies all `K + 1` positions against the full `248,320` vocabulary.
 
+---
+
+## 6. Upstream `vLLM` (`origin/main @ 190df0b90`) Cross-Check: Intrinsic `Qwen4` Architecture vs. `1–2× RTX 3090 Ti` Hardware Optimizations
+
+To keep `warp-34`'s model spine clean, composable, and maintainable across `Qwen3.5`, `Qwen3.6`, and `Qwen3.8` (`qwen4_exp`), we explicitly separate **intrinsic `qwen4_exp` architectural semantics** (defined by the checkpoint and cross-checked against upstream `vLLM` `vllm/models/qwen4_exp/{common,nvidia}/**` at `190df0b90`) from **consumer-GPU (`sm_86`, 24 GiB VRAM) memory and compute adaptations**.
+
+### 6.1 Composable Architectural Capability Axes (`crates/w34-host/src/model/`)
+
+Instead of branching on `if is_qwen4_exp()` across `forward.rs` and `mtp.rs`, `warp-34` represents the `Qwen3.5 / 3.6 / 3.8` family as five orthogonal capability types driven by `ModelConfig`:
+
+| Capability Axis | `Qwen3.5` / `Qwen3.6` Variant | `Qwen3.8-Flash-Next` (`qwen4_exp`) Variant | Upstream `vLLM` (`190df0b90`) Equivalent |
+| :--- | :--- | :--- | :--- |
+| **Inter-Layer Residual (`LayerResidual`)** | `SingleStream { input_layernorm_ptr, post_attention_layernorm_ptr }` (`[T, H]`) | `HyperConnection { attn_hc, mlp_hc }` (`[T, hc_count, H]`) | `Qwen4ExpDecoderLayer.{attn,mlp}_hyper_connection` (`GatedResidual`) |
+| **Final Stack Output (`FinalResidual`)** | `SingleStream { norm_ptr }` (`GemmaRMSNorm`) | `HyperConnection { mixer }` (`mix_only` collapse `[T, hc_count, H] -> [T, H]` + pre-mixer `[T, hc_count * H]` export for MTP) | `Qwen4ExpModel.hyper_connection_mixer` (`use_combine=False`) + `_mtp_hidden_buffer` |
+| **Per-Layer Embedding (`PleRankRuntime` / `PleLayerWeights`)** | `None` | `Some(PleLayerWeights)` on `ple_layer_ids` (`splitmix64` prime-modulo n-gram hash, `F8_E4M3` dequant, signed-sqrt sigmoid gate, dilated `Conv1d(k=4, d=3, span=9)`) | `Qwen4ExpPLELayer` + `Qwen4ExpNGramEmbedding` (`ple_gate`, `ple_conv`) |
+| **Full-Attention Indexing (`FullAttentionLayerWeights::qsa_indexer`)** | `None` (dense causal/sliding-window GQA) | `Some(QsaIndexerWeights)` (`index_qk_proj`, `q/k_layernorm`, partial `mRoPE`, `4:1` compressed key cache, ReLU-sum MQA block selector, sparse paged GQA + sigmoid output gate) | `Qwen4ExpQSAAttention` + `QSAIndexer` (`qsa_prepare`, `qsa_select_paged_*`, `qsa_sparse_paged_attention`) |
+| **MTP Input Fusion (`MtpInputFusion`)** | `ConcatLinear { fc }` (`concat(norm(embed), norm(hidden)) -> Linear(2H, H)`) | `DualStreamBroadcast { fc_embedding, fc_hidden }` (`fc_embed(norm_e(embed))` broadcast-added across `hc_count` streams of `fc_hidden(norm_h(multi_hidden))`) | `Qwen4ExpMultiTokenPredictor` (`residual_linear_shared`: `pre_fc_norm_embedding`, `pre_fc_norm_hidden(hc_count * H)`, `fc_embedding`, `fc_hidden`) |
+
+### 6.2 Intrinsic `qwen4_exp` Mathematical Parity Checklist vs. Upstream `vLLM` (`190df0b90`)
+
+1. **HyperConnection (`GatedResidual`, `op_hc.cu` vs. `nvidia/ops/hc.py`):**
+   - Stream initialization: replicates `embed_tokens(input_ids)` (`[T, H]`) across `hc_count` streams (`[T, hc_count, H]`).
+   - Per-stream `GemmaRMSNorm`: normalizes each stream `s in 0..hc_count` independently over `H` (`eps = 1e-6`, affine `1.0 + w`), supporting both per-branch `[hc_count * H]` and shared `[H]` weights.
+   - Low-rank down activation & stream injection scale: divides by `hc_count` (`SiLU(down / hc_count)` over `[T, hc_lowrank]` and `2.0 * sigmoid(inj / hc_count)` over `[T, hc_count]`).
+   - Stream mixing: `out_mixed[t, d] = sum_{s=0..hc_count-1} (sigmoid(up[t, s, d]) / hc_count) * normed[t, s, d]`.
+   - Stream combine: `residual[t, s, d] += inject_w[t, s] * block_out[t, d]`.
+2. **Per-Layer Embedding (`PLE`, `ple.rs` & `op_ple.cu` vs. `common/ops/ple.py` & `nvidia/ple_layer.py`):**
+   - N-gram hash: 64-bit `splitmix64` multipliers seeded by `ple_seed + 10007 * ple_dense_layer_id` and deterministic 64-bit Miller-Rabin prime moduli `nth_prime_after(ngram_vocab_size_base - 1, global_head + 1)`, with `eos_token_id` boundary clamping (`crossed |= candidate == eos_token_id`) and Euclidean remainder (`rem_euclid`).
+   - Signed-sqrt sigmoid gate: `d = dot(norm_query, norm_key) / sqrt(H)`, `gate = sigmoid(sign(d) * sqrt(max(|d|, 1e-6)))`, `gated = gate * value`.
+   - Stateful dilated short-conv: `norm_conv(gated)` -> causal depthwise `Conv1d(kernel_size=4, dilation=3, span=9)` + `SiLU`, tracked in `StateBundlePool` for prefix caching and speculative rollback.
+3. **Query-Sparse Attention (`QSA`, `op_qsa.cu` vs. `nvidia/qsa.py` & `nvidia/qsa_indexer.py`):**
+   - Main attention: `24 Q` heads (with packed sigmoid output gate) and `2 KV` heads (`head_dim = 256`, `rotary_dim = 64`, `mrope_section = [11, 11, 10]`, `rope_theta = 1e7`).
+   - Indexer: `4 Q` heads and `1 KV` head (`head_dim = 128`, sharing `rotary_dim = 64` and `mrope_section = [11, 11, 10]` with main attention), `4:1` compressed key cache, ReLU-sum MQA scoring (`sum_h max(dot(q_h, k_c), 0) / sqrt(128)`), and `skip_topk = true` reuse on MTP draft steps `> 0`.
+4. **Fine-Grained MoE (`op_moe.cu` vs. `Qwen4ExpSparseMoeBlock`):**
+   - `512` routed experts (`top_k = 10`, `moe_intermediate_size = 640`, `norm_topk_prob = true`) + `1` shared expert (`shared_expert_intermediate_size = 640`) with sigmoid `shared_expert_gate`.
+   - Power-of-two sub-warp reduction (`sparse_vec4_lpr(k_dim)` in `{4, 8, 16, 32}`) in `moe_sparse_vec4_kernel` ensures exact `TP=1` vs. `TP=2 / EP=2` parity for non-power-of-two intermediate dimensions such as `K = 640` (`k_u4_per_row = 20`).
+
+### 6.3 Delineation: Intrinsic `Qwen4` Compatibility vs. `1–2× RTX 3090 Ti` (`sm_86`) Optimizations
+
+| Subsystem | Upstream `vLLM` (`origin/main @ 190df0b90`, Datacenter `sm_90 / sm_100` Target) | `warp-34` (`1–2× RTX 3090 Ti`, `sm_86`, 24 GiB VRAM Target) | Classification |
+| :--- | :--- | :--- | :--- |
+| **Activation Spine & Kernels** | `BF16`-only (`raise NotImplementedError("Qwen4Exp QSA currently requires BF16")`); Triton + CuTe-DSL (`sm_90+`) kernels | End-to-end `FP16` (`__half`) spine with `FP32` reductions/accumulators and native `sm_86` CUDA C++ kernels (`op_hc.cu`, `op_ple.cu`, `op_qsa.cu`, `op_moe.cu`) | **3090 Ti Hardware Optimization** (`sm_86` tensor core & bandwidth roofline) |
+| **51.3 GiB PLE Table Residency** | GPU-resident `VocabParallelEmbedding` (`~51.3 GiB` VRAM) or `OffloadManager` full-layer weight swaps | Zero-copy read-only `mmap` (`PleMmapTable`) + `MADV_WILLNEED` + `2.56 KB/tok` pinned async H2D staging (`0 B` persistent VRAM, `0 B` anonymous RAM) | **3090 Ti Hardware Optimization** (fits 51.3 GiB PLE in 0 MiB VRAM) |
+| **62.8 GiB Routed MoE Residency** | 100% GPU-resident `FusedMoE` (`> 62 GiB` VRAM required across TP/EP ranks) | `FfnBlockWeights::TieredMoe`: per-layer VRAM `HotExpertCache` (`K_hot` slots) + pinned `HostExpertStore` with on-GPU LRU + async PCIe pull (`gpu-lru`), hybrid CPU/GPU execution (`cpu-hybrid`), and 2-group-ahead prefill DMA streaming | **3090 Ti Hardware Optimization** (fits 62.8 GiB MoE on 1× or 2× 24 GiB GPUs) |
+| **QSA Main KV Cache Formats** | `BF16` or `FP8-e4m3` only (`raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")`) | Native `FP16`, `Q8_0` (`272 B/row`), and **TurboQuant 4-bit (`TQ4`, `132 B/row`, Seed-42 Rademacher + WHT-256 + Beta(256))** decoded directly inside `qsa_sparse_paged_attn_f16_kernel` | **3090 Ti Hardware Optimization** (`3.07×–3.88×` KV compression freeing VRAM for hot experts) |
+| **Multi-GPU Collectives (`TP=2 / EP=2`)** | NCCL P2P / NVLink `AllReduce` and `allgather_reducescatter` sequence parallelism (`use_hc_sequence_parallel`) | Pinned-sysmem two-hop `TP=2` `AllReduce` (`op_collectives.cu`) engineered for PCIe Gen4 x8 (`topo PHB`, no NVLink, P2P disabled) | **3090 Ti Hardware Optimization** (sub-20 µs latency without NVLink/P2P) |
+| **Hybrid State & Prefix Caching** | `MambaHybridModelState` + `PleShortConvAttentionBackend` | Unified `StateBundlePool` (`36× GDN` + `PLE conv_state` + `ple_history_tokens`) + `KvPool` (`QsaRawKeyCache` + `QsaCompressedKeyCache`) integrated with `MambaRadixCache` and speculative rejection rollback | **Architectural + Runtime Integration** |
+
+

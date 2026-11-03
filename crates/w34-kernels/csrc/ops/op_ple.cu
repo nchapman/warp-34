@@ -193,10 +193,11 @@ __global__ void ple_signed_sqrt_gate_f16_kernel(
     const __half* k_tok = norm_key + stream_base;
     const __half* v_tok = value_in + (size_t)tok * embed_dim;
 
-    float dot_s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    constexpr int MAX_HC = 8;
+    float dot_s[MAX_HC] = {0.0f};
     for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
 #pragma unroll
-        for (int s = 0; s < 4; ++s) {
+        for (int s = 0; s < MAX_HC; ++s) {
             if (s < hc_count) {
                 const size_t idx = (size_t)s * embed_dim + d;
                 dot_s[s] += __half2float(q_tok[idx]) * __half2float(k_tok[idx]);
@@ -207,11 +208,11 @@ __global__ void ple_signed_sqrt_gate_f16_kernel(
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int num_warps = blockDim.x >> 5;
-    __shared__ float s_warp[8][4];
-    __shared__ float s_gate[4];
+    __shared__ float s_warp[8][MAX_HC];
+    __shared__ float s_gate[MAX_HC];
 
 #pragma unroll
-    for (int s = 0; s < 4; ++s) {
+    for (int s = 0; s < MAX_HC; ++s) {
         float v = dot_s[s];
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -223,7 +224,7 @@ __global__ void ple_signed_sqrt_gate_f16_kernel(
     }
     __syncthreads();
 
-    if (threadIdx.x < 4) {
+    if (threadIdx.x < MAX_HC) {
         const int s = threadIdx.x;
         if (s < hc_count) {
             float sum = 0.0f;
@@ -244,7 +245,7 @@ __global__ void ple_signed_sqrt_gate_f16_kernel(
     for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
         const float val = __half2float(v_tok[d]);
 #pragma unroll
-        for (int s = 0; s < 4; ++s) {
+        for (int s = 0; s < MAX_HC; ++s) {
             if (s < hc_count) {
                 const size_t idx = (size_t)s * embed_dim + d;
                 dst_tok[idx] = __float2half(s_gate[s] * val);
@@ -316,7 +317,7 @@ int w34_ple_signed_sqrt_gate_f16(
     int embed_dim,
     float eps) {
     if (!ex || !norm_query || !norm_key || !value_in || !ple_delta_out || num_tokens < 0 ||
-        hc_count <= 0 || embed_dim <= 0 || hc_count > 4) {
+        hc_count <= 0 || embed_dim <= 0 || hc_count > 8) {
         return -1;
     }
     if (num_tokens == 0) return 0;

@@ -1455,7 +1455,6 @@ impl FullAttentionLayerWeights {
         normed_buf: u64,
         q_buf: u64,
         gate_buf: u64,
-        attn_out_buf: u64,
         gated_attn_buf: u64,
         [
             qsa_qk_buf,
@@ -1470,7 +1469,6 @@ impl FullAttentionLayerWeights {
         pos_plane_stride: i32,
         num_tokens: usize,
         local_q_heads: usize,
-        head_dim: usize,
         skip_topk: bool,
     ) -> Result<()> {
         let kv_bufs = &kv_pool.layers[self.kv_layer_ordinal];
@@ -1518,11 +1516,20 @@ impl FullAttentionLayerWeights {
             qsa_k_buf,
             raw_k_cache_ptr,
             comp_k_cache_ptr,
+            qsa_idx.k_layernorm_ptr,
+            positions_ptr,
             attn_batch.write_slot_mapping as usize as u64,
             0,
             num_tokens,
             cfg.indexer_head_dim,
+            cfg.rotary_dim,
+            cfg.rope_theta,
+            cfg.rms_norm_eps,
+            cfg.mrope_section[0],
+            cfg.mrope_section[1],
+            pos_plane_stride as usize,
         )?;
+        let select_k_blocks = (cfg.indexer_budget / 16).clamp(1, 64);
         if !skip_topk {
             crate::ple::gpu_ops::qsa_select_blocks_f16(
                 ex,
@@ -1536,61 +1543,27 @@ impl FullAttentionLayerWeights {
                 cfg.indexer_n_heads,
                 cfg.indexer_head_dim,
                 16,
-                64,
-                4,
-                8,
-            )?;
-        }
-        if kv_layout.k_format == ffi::W34_KV_FORMAT_FP16
-            && kv_layout.v_format == ffi::W34_KV_FORMAT_FP16
-        {
-            crate::ple::gpu_ops::qsa_sparse_paged_attn_f16(
-                ex,
-                q_buf,
-                gate_buf,
-                kv_layout,
-                qsa_sel_phys_buf,
-                qsa_sel_log_buf,
-                qsa_num_sel_buf,
-                qsa_seq_pos_buf,
+                select_k_blocks,
                 0,
-                gated_attn_buf,
-                num_tokens,
-                local_q_heads,
-                64,
-                attn_batch.sm_scale,
-            )
-        } else {
-            check_rc(
-                // SAFETY: `kv_layout`, `attn_batch`, `q_buf`, and `attn_out_buf` are valid for `num_tokens`.
-                unsafe {
-                    ffi::w34_paged_attention_f16(
-                        ex,
-                        kv_layout,
-                        attn_batch,
-                        q_buf as *const c_void,
-                        attn_out_buf as *mut c_void,
-                        local_q_heads as i32,
-                    )
-                },
-                "w34_paged_attention_f16 (qsa fallback)",
+                1,
             )?;
-            check_rc(
-                // SAFETY: `attn_out_buf`, `gate_buf`, and `gated_attn_buf` hold `num_tokens * local_q_heads * head_dim` FP16 elements.
-                unsafe {
-                    ffi::w34_apply_attn_output_gate_f16(
-                        ex,
-                        attn_out_buf as *const c_void,
-                        gate_buf as *const c_void,
-                        gated_attn_buf as *mut c_void,
-                        core::ptr::null(),
-                        num_tokens as i32,
-                        (local_q_heads * head_dim) as i32,
-                    )
-                },
-                "w34_apply_attn_output_gate_f16 (qsa fallback)",
-            )
         }
+        crate::ple::gpu_ops::qsa_sparse_paged_attn_f16(
+            ex,
+            q_buf,
+            gate_buf,
+            kv_layout,
+            qsa_sel_phys_buf,
+            qsa_sel_log_buf,
+            qsa_num_sel_buf,
+            qsa_seq_pos_buf,
+            0,
+            gated_attn_buf,
+            num_tokens,
+            local_q_heads,
+            select_k_blocks,
+            attn_batch.sm_scale,
+        )
     }
 }
 
@@ -2173,13 +2146,14 @@ impl PleLayerWeights {
         eps: f32,
     ) -> Result<()> {
         let total_dim = hc_count * h_dim;
+        let ple_embed_dim = self.key_proj.size_k();
         crate::ple::gpu_ops::ple_dequant_f8_to_f16(
             ex,
             ple_f8_staging_ptr,
             ple_val_buf,
             0,
             num_tokens,
-            h_dim,
+            ple_embed_dim,
             self.weight_scale,
         )?;
         self.key_proj.forward(
@@ -3301,13 +3275,17 @@ pub(crate) fn load_hc_block_weights(
     let hc_norm_key = archive
         .resolve_name(&format!("{hc_pfx}.hc_norm.weight"))
         .ok_or_else(|| loader_err_msg(format!("missing '{hc_pfx}.hc_norm.weight'")))?;
-    let hc_norm_bits = archive
+    let mut hc_norm_bits = archive
         .read_f16_bits(&hc_norm_key)
         .map_err(|e| loader_err_msg(format!("read '{hc_norm_key}': {e}")))?;
+    if hc_norm_bits.len() == cfg.hidden_size && cfg.hc_count > 1 {
+        hc_norm_bits = hc_norm_bits.repeat(cfg.hc_count);
+    }
     if hc_norm_bits.len() != total_dim {
         return Err(loader_err_msg(format!(
-            "'{hc_norm_key}' length {} != expected {total_dim}",
-            hc_norm_bits.len()
+            "'{hc_norm_key}' length {} != expected {total_dim} (or {})",
+            hc_norm_bits.len(),
+            cfg.hidden_size
         )));
     }
     let hc_norm_ptr = weight_arena.upload_slice(&hc_norm_bits, stream)?;

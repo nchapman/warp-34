@@ -858,14 +858,12 @@ impl Qwen3_5ModelRank {
                         s.normed,
                         q,
                         gate,
-                        out,
                         gated,
                         s.qsa,
                         positions,
                         self.current_pos_plane_stride,
                         rows,
                         qh,
-                        hd,
                         false,
                     )?;
                 } else {

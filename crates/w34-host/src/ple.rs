@@ -138,7 +138,7 @@ pub fn f8_e4m3_to_f32(byte: u8) -> f32 {
     let exp = (byte >> 3) & 0x0f;
     let mant = byte & 0x07;
     if exp == 0x0f && mant == 0x07 {
-        f32::NAN
+        0.0f32
     } else if exp == 0 {
         sign * (mant as f32) * (1.0f32 / 512.0f32)
     } else {
@@ -1188,10 +1188,18 @@ pub mod gpu_ops {
         k_in: u64,
         raw_k_cache: u64,
         comp_k_cache: u64,
+        k_norm_weight: u64,
+        positions: u64,
         write_slot_mapping: u64,
         valid_token_mask: u64,
         num_tokens: usize,
         head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        eps: f32,
+        mrope_s1: usize,
+        mrope_s2: usize,
+        pos_plane_stride: usize,
     ) -> Result<()> {
         // SAFETY: Device pointers are validated by the caller.
         let rc = unsafe {
@@ -1200,10 +1208,18 @@ pub mod gpu_ops {
                 k_in as usize as *const c_void,
                 raw_k_cache as usize as *mut c_void,
                 comp_k_cache as usize as *mut c_void,
+                k_norm_weight as usize as *const c_void,
+                positions as usize as *const i32,
                 write_slot_mapping as usize as *const i32,
                 valid_token_mask as usize as *const u8,
                 num_tokens as i32,
                 head_dim as i32,
+                rotary_dim as i32,
+                rope_theta,
+                eps,
+                mrope_s1 as i32,
+                mrope_s2 as i32,
+                pos_plane_stride as i32,
             )
         };
         check(rc, "w34_qsa_indexer_cache_update_f16")
@@ -1471,9 +1487,12 @@ mod tests {
     #[allow(clippy::cognitive_complexity)]
     fn test_gpu_hc_ple_qsa_kernels_parity() {
         use crate::cuda::{CudaDevice, CudaStream, DeviceBuffer, f16_to_f32};
+        use core::ffi::c_void;
         use w34_kernels::ffi::{
-            W34_ATTN_MASK_CAUSAL, W34_KV_FORMAT_FP16, W34_KV_NAMESPACE_TARGET_FULL_ATTN,
-            W34_KV_TRANSFORM_IDENTITY, W34AttentionBatch, W34GdnBatch, W34KvLayerLayout,
+            W34_ATTN_MASK_CAUSAL, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4,
+            W34_KV_NAMESPACE_TARGET_FULL_ATTN, W34_KV_TRANSFORM_IDENTITY,
+            W34_KV_TRANSFORM_RADEMACHER_WHT256, W34AttentionBatch, W34GdnBatch, W34KvLayerLayout,
+            w34_kv_cache_write_strided,
         };
 
         fn dev_from_slice<T: Copy>(src: &[T], stream: &CudaStream) -> DeviceBuffer {
@@ -1888,10 +1907,18 @@ mod tests {
             d_k_idx.addr(),
             d_raw_k.addr(),
             d_comp_k.addr(),
+            d_idx_norm_w.addr(),
+            d_pos_ids.addr(),
             d_slot_map.addr(),
             0,
             qsa_tokens,
             128,
+            64,
+            10_000_000.0,
+            1e-6,
+            11,
+            11,
+            qsa_tokens,
         )
         .unwrap();
         let attn_batch = W34AttentionBatch {
@@ -1978,5 +2005,428 @@ mod tests {
             let vf = f16_to_f32(v);
             assert!((vf - 0.125).abs() < 1e-3, "expected 0.125, got {vf}");
         }
+
+        // Verify hc_count = 2 scaling (1.0 / hc_count = 0.5, matching vLLM test_hc_ops.py)
+        let d_hc2_down_in = dev_from_slice(&[f32_to_f16(2.0); 4], &stream);
+        let d_hc2_down_out = DeviceBuffer::alloc(0, 4 * 2).unwrap();
+        let d_hc2_inj_in = dev_from_slice(&[f32_to_f16(0.0); 2], &stream);
+        let d_hc2_inj_out = DeviceBuffer::alloc(0, 2 * 4).unwrap();
+        gpu_ops::hc_down_silu_inject_f16(
+            &ex,
+            d_hc2_down_in.addr(),
+            d_hc2_down_out.addr(),
+            d_hc2_inj_in.addr(),
+            d_hc2_inj_out.addr(),
+            0,
+            1,
+            4,
+            2,
+        )
+        .unwrap();
+        let h_hc2_down: Vec<u16> = dev_to_vec(&d_hc2_down_out, 4, &stream);
+        // down = 2.0, hc_count = 2 -> x = 2.0 / 2 = 1.0 -> SiLU(1.0) = 1.0 / (1 + e^-1) = 0.7310586
+        let expected_silu1 = 1.0f32 / (1.0f32 + (-1.0f32).exp());
+        assert!(
+            (f16_to_f32(h_hc2_down[0]) - expected_silu1).abs() < 2e-3,
+            "expected SiLU(2.0 / 2) = {expected_silu1}, got {}",
+            f16_to_f32(h_hc2_down[0])
+        );
+
+        // 4. Non-uniform QSA top-k block selection (4 blocks -> select_k = 2, recent_blocks = 1)
+        //    + sparse paged GQA across FP16, Q8_0 (272 B/row), and TQ4 (132 B/row + Rademacher WHT256)
+        //    against an exact CPU softmax + sigmoid-gate reference.
+        let nu_pages = 4usize;
+        let nu_seq_len = 50usize; // 4 blocks: blk 0 (0..16), blk 1 (16..32), blk 2 (32..48), blk 3 (48..50)
+        let nu_select_k = 2usize; // must pick 1 highest-scoring past block + blk 3 (recent_blocks = 1)
+        let nu_q_heads = 2usize;
+        // Logical blocks [0, 1, 2, 3] -> physical pages [3, 1, 0, 2]
+        let nu_blk_tbl = [3i32, 1, 0, 2];
+        // Set compressed K so logical block 1 (phys page 1) has positive dot product with q_idx (+1.0),
+        // while logical blocks 0 (phys 3) and 2 (phys 0) have negative dot products (-1.0).
+        let mut h_nu_comp_k = vec![f32_to_f16(-0.5); nu_pages * 4 * 128];
+        for sub in 0..4 {
+            for d in 0..128 {
+                h_nu_comp_k[(4 + sub) * 128 + d] = f32_to_f16(0.75);
+            }
+        }
+        let d_nu_comp_k = dev_from_slice(&h_nu_comp_k, &stream);
+        let d_nu_q_idx = dev_from_slice(&vec![f32_to_f16(0.5); 4 * 128], &stream);
+        let d_nu_qsl = dev_from_slice(&[0i32, 1], &stream);
+        let d_nu_ctx_before = dev_from_slice(&[(nu_seq_len - 1) as i32], &stream);
+        let d_nu_seq_after = dev_from_slice(&[nu_seq_len as i32], &stream);
+        let d_nu_blk_tbl = dev_from_slice(&nu_blk_tbl, &stream);
+        let d_nu_slot_map = dev_from_slice(&[2i32 * 16 + 1], &stream);
+        let nu_attn_batch = W34AttentionBatch {
+            query_start_loc: d_nu_qsl.addr() as usize as *const i32,
+            context_lens_before: d_nu_ctx_before.addr() as usize as *const i32,
+            seq_lens_after: d_nu_seq_after.addr() as usize as *const i32,
+            block_tables: d_nu_blk_tbl.addr() as usize as *const i32,
+            write_slot_mapping: d_nu_slot_map.addr() as usize as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: 1,
+            max_blocks_per_req: 4,
+            max_q_len: 1,
+            max_seq_len: nu_seq_len as i32,
+            mask_mode: W34_ATTN_MASK_CAUSAL,
+            sliding_window: -1,
+            sm_scale: (head_dim as f32).powf(-0.5),
+            reserved: 0,
+        };
+        let d_nu_sel_phys = DeviceBuffer::alloc(0, nu_select_k * 4).unwrap();
+        let d_nu_sel_log = DeviceBuffer::alloc(0, nu_select_k * 4).unwrap();
+        let d_nu_num_sel = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_nu_seq_pos = DeviceBuffer::alloc(0, 4).unwrap();
+        gpu_ops::qsa_select_blocks_f16(
+            &ex,
+            d_nu_q_idx.addr(),
+            d_nu_comp_k.addr(),
+            &nu_attn_batch,
+            d_nu_sel_phys.addr(),
+            d_nu_sel_log.addr(),
+            d_nu_num_sel.addr(),
+            d_nu_seq_pos.addr(),
+            4,
+            128,
+            block_size,
+            nu_select_k,
+            0, // sink_blocks = 0 (matching vLLM QSA)
+            1, // recent_blocks = 1 (matching vLLM QSA)
+        )
+        .unwrap();
+        let h_nu_num_sel: Vec<i32> = dev_to_vec(&d_nu_num_sel, 1, &stream);
+        let h_nu_sel_log: Vec<i32> = dev_to_vec(&d_nu_sel_log, nu_select_k, &stream);
+        let h_nu_sel_phys: Vec<i32> = dev_to_vec(&d_nu_sel_phys, nu_select_k, &stream);
+        assert_eq!(h_nu_num_sel, vec![2]);
+        // Must select logical block 1 (phys page 1, highest score) and logical block 3 (phys page 2, recent block)
+        assert_eq!(h_nu_sel_log, vec![1, 3]);
+        assert_eq!(h_nu_sel_phys, vec![1, 2]);
+
+        // Populate all 50 tokens across the 4 pages with deterministic non-uniform K and V via w34_kv_cache_write_strided
+        // for FP16, Q8_0 (272 B/row), and TQ4 (132 B/row + Rademacher WHT256).
+        let h_nu_k: Vec<u16> = (0..nu_seq_len * head_dim)
+            .map(|i| f32_to_f16((((i * 17 + 3) % 53) as f32 - 26.0) * 0.03))
+            .collect();
+        let h_nu_v: Vec<u16> = (0..nu_seq_len * head_dim)
+            .map(|i| f32_to_f16((((i * 23 + 7) % 47) as f32 - 23.0) * 0.04))
+            .collect();
+        let h_nu_q: Vec<u16> = (0..nu_q_heads * head_dim)
+            .map(|i| f32_to_f16((((i * 13 + 11) % 37) as f32 - 18.0) * 0.05))
+            .collect();
+        let h_nu_gate: Vec<u16> = (0..nu_q_heads * head_dim)
+            .map(|i| f32_to_f16((((i * 19 + 5) % 29) as f32 - 14.0) * 0.08))
+            .collect();
+        let write_slots: Vec<i32> = (0..nu_seq_len)
+            .map(|t| {
+                let log_blk = t / block_size;
+                let off = t % block_size;
+                nu_blk_tbl[log_blk] * (block_size as i32) + (off as i32)
+            })
+            .collect();
+        let d_nu_k_in = dev_from_slice(&h_nu_k, &stream);
+        let d_nu_v_in = dev_from_slice(&h_nu_v, &stream);
+        let d_nu_q = dev_from_slice(&h_nu_q, &stream);
+        let d_nu_gate = dev_from_slice(&h_nu_gate, &stream);
+        let d_write_slots = dev_from_slice(&write_slots, &stream);
+        let d_write_qsl = dev_from_slice(&[0i32, nu_seq_len as i32], &stream);
+        let d_write_ctx0 = dev_from_slice(&[0i32], &stream);
+        let write_batch = W34AttentionBatch {
+            query_start_loc: d_write_qsl.addr() as usize as *const i32,
+            context_lens_before: d_write_ctx0.addr() as usize as *const i32,
+            seq_lens_after: d_nu_seq_after.addr() as usize as *const i32,
+            block_tables: d_nu_blk_tbl.addr() as usize as *const i32,
+            write_slot_mapping: d_write_slots.addr() as usize as *const i32,
+            max_q_len: nu_seq_len as i32,
+            total_tokens: nu_seq_len as i32,
+            ..nu_attn_batch
+        };
+
+        // Exact CPU reference over the selected logical blocks [1 (tokens 16..32), 3 (tokens 48..50)]:
+        let selected_tokens: Vec<usize> = (16..32).chain(48..50).collect();
+        let mut cpu_ref = vec![0.0f32; nu_q_heads * head_dim];
+        for qh in 0..nu_q_heads {
+            let mut logits = Vec::with_capacity(selected_tokens.len());
+            for &t in &selected_tokens {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += f16_to_f32(h_nu_q[qh * head_dim + d])
+                        * f16_to_f32(h_nu_k[t * head_dim + d]);
+                }
+                logits.push(dot * nu_attn_batch.sm_scale);
+            }
+            let max_l = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exp_l: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
+            let sum_e: f32 = exp_l.iter().sum();
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (idx, &t) in selected_tokens.iter().enumerate() {
+                    acc += (exp_l[idx] / sum_e) * f16_to_f32(h_nu_v[t * head_dim + d]);
+                }
+                let g = f16_to_f32(h_nu_gate[qh * head_dim + d]);
+                let sig = 1.0f32 / (1.0f32 + (-g).exp());
+                cpu_ref[qh * head_dim + d] = acc * sig;
+            }
+        }
+
+        for (fmt, xform, row_bytes, tol) in [
+            (
+                W34_KV_FORMAT_FP16,
+                W34_KV_TRANSFORM_IDENTITY,
+                head_dim * 2,
+                1.5e-3f32,
+            ),
+            (
+                W34_KV_FORMAT_Q8_0,
+                W34_KV_TRANSFORM_IDENTITY,
+                272usize,
+                4.0e-3f32,
+            ),
+            (
+                W34_KV_FORMAT_TQ4,
+                W34_KV_TRANSFORM_RADEMACHER_WHT256,
+                132usize,
+                2.5e-2f32,
+            ),
+        ] {
+            let d_kc = DeviceBuffer::alloc(0, nu_pages * block_size * row_bytes).unwrap();
+            let d_vc = DeviceBuffer::alloc(0, nu_pages * block_size * row_bytes).unwrap();
+            let layout = W34KvLayerLayout {
+                k_base: d_kc.addr(),
+                v_base: d_vc.addr(),
+                k_page_stride_bytes: (block_size * row_bytes) as u64,
+                k_head_stride_bytes: (block_size * row_bytes) as u64,
+                k_token_stride_bytes: row_bytes as u64,
+                v_page_stride_bytes: (block_size * row_bytes) as u64,
+                v_head_stride_bytes: (block_size * row_bytes) as u64,
+                v_token_stride_bytes: row_bytes as u64,
+                namespace_id: W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+                layer_id: 3,
+                local_kv_heads: 1,
+                head_dim: head_dim as i32,
+                block_size: block_size as i32,
+                k_format: fmt,
+                v_format: fmt,
+                k_transform: xform,
+                v_transform: xform,
+                reserved: 0,
+            };
+            // SAFETY: `d_kc`, `d_vc`, `d_nu_k_in`, `d_nu_v_in`, and `write_batch` buffers are live
+            // and sized for `nu_pages * block_size` rows of `row_bytes` bytes.
+            unsafe {
+                assert_eq!(
+                    w34_kv_cache_write_strided(
+                        &ex,
+                        &layout,
+                        &write_batch,
+                        d_nu_k_in.addr() as *const c_void,
+                        d_nu_v_in.addr() as *const c_void,
+                        head_dim as i32,
+                        head_dim as i32,
+                    ),
+                    0
+                );
+            }
+            let d_nu_out = DeviceBuffer::alloc(0, nu_q_heads * head_dim * 2).unwrap();
+            gpu_ops::qsa_sparse_paged_attn_f16(
+                &ex,
+                d_nu_q.addr(),
+                d_nu_gate.addr(),
+                &layout,
+                d_nu_sel_phys.addr(),
+                d_nu_sel_log.addr(),
+                d_nu_num_sel.addr(),
+                d_nu_seq_pos.addr(),
+                0,
+                d_nu_out.addr(),
+                1,
+                nu_q_heads,
+                nu_select_k,
+                nu_attn_batch.sm_scale,
+            )
+            .unwrap();
+            let h_nu_out: Vec<u16> = dev_to_vec(&d_nu_out, nu_q_heads * head_dim, &stream);
+            let max_err = h_nu_out
+                .iter()
+                .zip(cpu_ref.iter())
+                .map(|(&got, &exp)| (f16_to_f32(got) - exp).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_err < tol,
+                "QSA sparse paged attn format={fmt} max_err={max_err} exceeded tol={tol}"
+            );
+        }
+
+        // 5. Verify QSA Indexer 4:1 raw-key pooling -> GemmaRMSNorm(k_norm_weight) -> mRoPE(first_pos)
+        //    order on non-uniform 4-token inputs (ensuring pool-then-norm-rope is tested and distinct
+        //    from norm-rope-then-pool), plus hc_count = 6 (> 4, up to MAX_HC = 8) on hc_mix, hc_combine,
+        //    and ple_signed_sqrt_gate.
+        let g_tokens = 4usize;
+        let g_qk_in: Vec<u16> = (0..g_tokens * 5 * 128)
+            .map(|i| {
+                let tok = i / (5 * 128);
+                let d = i % 128;
+                let scale = match tok {
+                    0 => 0.2f32,
+                    1 => 1.5f32,
+                    2 => -0.8f32,
+                    _ => 2.1f32,
+                };
+                f32_to_f16((((d * 11 + tok * 29 + 3) % 41) as f32 - 20.0) * 0.05 * scale)
+            })
+            .collect();
+        let g_k_norm_w: Vec<u16> = (0..128)
+            .map(|d| f32_to_f16((((d * 7 + 5) % 23) as f32 - 11.0) * 0.04))
+            .collect();
+        let g_pos = [
+            100i32, 101, 102, 103, 100, 101, 102, 103, 100, 101, 102, 103,
+        ];
+        let g_slots = [8i32, 9, 10, 11]; // sub_block = 2 (slots 8..12)
+        let d_g_qk = dev_from_slice(&g_qk_in, &stream);
+        let d_g_knw = dev_from_slice(&g_k_norm_w, &stream);
+        let d_g_pos = dev_from_slice(&g_pos, &stream);
+        let d_g_slots = dev_from_slice(&g_slots, &stream);
+        let d_g_q_out = DeviceBuffer::alloc(0, g_tokens * 4 * 128 * 2).unwrap();
+        let d_g_k_out = DeviceBuffer::alloc(0, g_tokens * 128 * 2).unwrap();
+        let d_g_raw_k = DeviceBuffer::alloc(0, 16 * 128 * 2).unwrap();
+        let d_g_comp_k = DeviceBuffer::alloc(0, 4 * 128 * 2).unwrap();
+        gpu_ops::qsa_indexer_norm_rope_f16(
+            &ex,
+            d_g_qk.addr(),
+            d_g_knw.addr(),
+            d_g_knw.addr(),
+            d_g_pos.addr(),
+            d_g_q_out.addr(),
+            d_g_k_out.addr(),
+            0,
+            g_tokens,
+            4,
+            1,
+            128,
+            64,
+            10_000_000.0,
+            1e-6,
+            11,
+            11,
+            g_tokens,
+        )
+        .unwrap();
+        gpu_ops::qsa_indexer_cache_update_f16(
+            &ex,
+            d_g_k_out.addr(),
+            d_g_raw_k.addr(),
+            d_g_comp_k.addr(),
+            d_g_knw.addr(),
+            d_g_pos.addr(),
+            d_g_slots.addr(),
+            0,
+            g_tokens,
+            128,
+            64,
+            10_000_000.0,
+            1e-6,
+            11,
+            11,
+            g_tokens,
+        )
+        .unwrap();
+        let h_g_comp_k: Vec<u16> = dev_to_vec(&d_g_comp_k, 4 * 128, &stream);
+        let got_sub2 = &h_g_comp_k[2 * 128..3 * 128];
+
+        // CPU reference for pool(4 raw keys) -> GemmaRMSNorm -> mRoPE(first_pos = 100):
+        let mut pooled_raw = [0.0f32; 128];
+        for d in 0..128 {
+            let mut s = 0.0f32;
+            for tok in 0..4 {
+                s += f16_to_f32(g_qk_in[(tok * 5 + 4) * 128 + d]);
+            }
+            pooled_raw[d] = f16_to_f32(f32_to_f16(0.25f32 * s));
+        }
+        let sum_sq: f32 = pooled_raw.iter().map(|&x| x * x).sum();
+        let inv_rms = (sum_sq / 128.0f32 + 1e-6f32).powf(-0.5);
+        let mut normed_pooled = [0.0f32; 128];
+        for d in 0..128 {
+            normed_pooled[d] = f16_to_f32(f32_to_f16(
+                pooled_raw[d] * inv_rms * (1.0f32 + f16_to_f32(g_k_norm_w[d])),
+            ));
+        }
+        let mut ref_comp_k = normed_pooled;
+        for i in 0..32 {
+            let inv_freq = 1.0f32 / 10_000_000.0f32.powf((2 * i) as f32 / 64.0f32);
+            let angle = 100.0f32 * inv_freq; // first_pos = 100
+            let sin_a = f16_to_f32(f32_to_f16(angle.sin()));
+            let cos_a = f16_to_f32(f32_to_f16(angle.cos()));
+            let x1 = normed_pooled[i];
+            let x2 = normed_pooled[i + 32];
+            ref_comp_k[i] = x1 * cos_a - x2 * sin_a;
+            ref_comp_k[i + 32] = x2 * cos_a + x1 * sin_a;
+        }
+        for d in 0..128 {
+            let diff = (f16_to_f32(got_sub2[d]) - ref_comp_k[d]).abs();
+            assert!(
+                diff < 2e-3,
+                "comp_k pool->norm->rope mismatch at d={d}: got={} ref={}",
+                f16_to_f32(got_sub2[d]),
+                ref_comp_k[d]
+            );
+        }
+
+        // Verify hc_count = 6 (up to MAX_HC = 8) on hc_mix_streams_f16, hc_combine_f16, and ple_signed_sqrt_gate_f16:
+        let hc6 = 6usize;
+        let h6 = 64usize;
+        let d_res6 = dev_from_slice(&vec![f32_to_f16(1.0); hc6 * h6], &stream);
+        let d_up6 = dev_from_slice(&vec![f32_to_f16(0.0); hc6 * h6], &stream);
+        let d_mix6 = DeviceBuffer::alloc(0, h6 * 2).unwrap();
+        gpu_ops::hc_mix_streams_f16(
+            &ex,
+            d_res6.addr(),
+            d_up6.addr(),
+            d_mix6.addr(),
+            0,
+            1,
+            hc6,
+            h6,
+        )
+        .unwrap();
+        let h_mix6: Vec<u16> = dev_to_vec(&d_mix6, h6, &stream);
+        // 6 streams of 1.0 with gate = sigmoid(0.0) / 6 = 0.5 / 6 -> sum = 6 * (0.5 / 6) * 1.0 = 0.5
+        assert!((f16_to_f32(h_mix6[0]) - 0.5).abs() < 1e-3);
+
+        let d_blk6 = dev_from_slice(&vec![f32_to_f16(2.0); h6], &stream);
+        let d_inj6 = dev_from_slice(&vec![0.5f32; hc6], &stream);
+        let d_comb6 = DeviceBuffer::alloc(0, hc6 * h6 * 2).unwrap();
+        gpu_ops::hc_combine_f16(
+            &ex,
+            d_res6.addr(),
+            d_blk6.addr(),
+            d_inj6.addr(),
+            0,
+            d_comb6.addr(),
+            0,
+            1,
+            hc6,
+            h6,
+        )
+        .unwrap();
+        let h_comb6: Vec<u16> = dev_to_vec(&d_comb6, hc6 * h6, &stream);
+        assert!((f16_to_f32(h_comb6[5 * h6]) - 2.0).abs() < 1e-3);
+
+        let d_ple_out6 = DeviceBuffer::alloc(0, hc6 * h6 * 2).unwrap();
+        gpu_ops::ple_signed_sqrt_gate_f16(
+            &ex,
+            d_up6.addr(),
+            d_up6.addr(),
+            d_blk6.addr(),
+            d_ple_out6.addr(),
+            0,
+            1,
+            hc6,
+            h6,
+            1e-6,
+        )
+        .unwrap();
+        let h_ple_out6: Vec<u16> = dev_to_vec(&d_ple_out6, hc6 * h6, &stream);
+        // dot = 0 -> gate = sigmoid(0) = 0.5 -> 0.5 * 2.0 = 1.0 across all 6 streams
+        assert!((f16_to_f32(h_ple_out6[5 * h6]) - 1.0).abs() < 1e-3);
     }
 }

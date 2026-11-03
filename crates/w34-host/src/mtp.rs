@@ -1886,6 +1886,7 @@ impl Qwen3_5MtpRank {
         let reuse_step0_topk = self.qsa.as_ref().is_some_and(|helpers| {
             helpers.skip_topk && num_tokens == 1 && self.len / 16 == helpers.step0_page_idx
         });
+        let select_k_blocks = (t.cfg.indexer_budget / 16).clamp(1, 64);
         if let Some(qsa) = &fa.qsa_indexer {
             let qsa_ws = self
                 .qsa
@@ -1935,10 +1936,18 @@ impl Qwen3_5MtpRank {
                 qsa_k_buf,
                 raw_k_cache_ptr,
                 comp_k_cache_ptr,
+                qsa.k_layernorm_ptr,
+                positions_ptr,
                 slot,
                 0,
                 num_tokens,
                 t.cfg.indexer_head_dim,
+                t.cfg.rotary_dim,
+                t.cfg.rope_theta,
+                t.cfg.rms_norm_eps,
+                t.cfg.mrope_section[0],
+                t.cfg.mrope_section[1],
+                0,
             )?;
             if !kv_only && !reuse_step0_topk {
                 crate::ple::gpu_ops::qsa_select_blocks_f16(
@@ -1953,9 +1962,9 @@ impl Qwen3_5MtpRank {
                     t.cfg.indexer_n_heads,
                     t.cfg.indexer_head_dim,
                     16,
-                    64,
-                    4,
-                    8,
+                    select_k_blocks,
+                    0,
+                    1,
                 )?;
             }
         }
@@ -1967,10 +1976,7 @@ impl Qwen3_5MtpRank {
             self.len += num_tokens;
             return Ok(None);
         }
-        if fa.qsa_indexer.is_some()
-            && kv_layout.k_format == ffi::W34_KV_FORMAT_FP16
-            && kv_layout.v_format == ffi::W34_KV_FORMAT_FP16
-        {
+        if fa.qsa_indexer.is_some() {
             let qsa_ws = self
                 .qsa
                 .as_ref()
@@ -1993,7 +1999,7 @@ impl Qwen3_5MtpRank {
                 gated_attn_buf,
                 num_tokens,
                 local_q_heads,
-                64,
+                select_k_blocks,
                 attn_batch.sm_scale,
             )?;
         } else {

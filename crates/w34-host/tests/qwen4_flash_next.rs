@@ -146,9 +146,9 @@ fn build_synthetic_qwen4_exp_dir(tag: &str) -> PathBuf {
         "model_type": "qwen4_exp_text",
         "vocab_size": 256,
         "hidden_size": 256,
-        "intermediate_size": 128,
-        "moe_intermediate_size": 128,
-        "shared_expert_intermediate_size": 128,
+        "intermediate_size": 640,
+        "moe_intermediate_size": 640,
+        "shared_expert_intermediate_size": 640,
         "num_hidden_layers": 2,
         "num_attention_heads": 4,
         "num_key_value_heads": 2,
@@ -176,7 +176,7 @@ fn build_synthetic_qwen4_exp_dir(tag: &str) -> PathBuf {
         "indexer_n_heads": 4,
         "indexer_kv_heads": 1,
         "indexer_head_dim": 128,
-        "indexer_budget": 128,
+        "indexer_budget": 32,
         "indexer_compress_ratio": 4,
         "mtp_num_hidden_layers": 1,
         "rope_parameters": {
@@ -200,7 +200,7 @@ fn build_synthetic_qwen4_exp_dir(tag: &str) -> PathBuf {
     let hc_low = hc_count * 32; // 128
     let vocab = 256usize;
     let num_experts = 8usize;
-    let moe_interm = 128usize;
+    let moe_interm = 640usize;
 
     let mut tensors = Vec::new();
     push_bf16_tensor(
@@ -212,11 +212,11 @@ fn build_synthetic_qwen4_exp_dir(tag: &str) -> PathBuf {
     push_bf16_tensor(&mut tensors, "lm_head.weight", vec![vocab, h], |i| {
         ((i % 29) as f32 - 14.0) * 0.02
     });
-    // Final HC mixer
+    // Final HC mixer (uses shared [h] hc_norm.weight to exercise the hc_per_branch_norm=false broadcast path)
     push_bf16_tensor(
         &mut tensors,
         "model.language_model.hyper_connection_mixer.hc_norm.weight",
-        vec![hc_total],
+        vec![h],
         |i| 0.05 * ((i % 13) as f32 - 6.0),
     );
     push_bf16_tensor(
@@ -731,7 +731,12 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
         "MambaRadixCache prefix reuse must match uncached generate_tokens"
     );
 
-    // CUDA Graph capture & replay on TP=1
+    // CUDA Graph capture & replay on TP=1 (both target-only decode graph and MTP speculative verify graph)
+    let spec_cfg = w34_host::proposer::SpeculativeConfig {
+        kind: w34_host::proposer::SpeculativeKind::Mtp,
+        draft_model: None,
+        mtp_k: 3,
+    };
     let mut engine_tp1_graph =
         Qwen3_5Engine::load_from_dir(&dir, 1, KvFormatPolicy::Fp16, Some(64), true)
             .expect("load synthetic qwen4_exp TP=1 graph");
@@ -744,12 +749,22 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
     );
     drop(engine_tp1_graph);
 
+    let mut engine_tp1_graph_mtp =
+        Qwen3_5Engine::load_from_dir(&dir, 1, KvFormatPolicy::Fp16, Some(64), true)
+            .expect("load synthetic qwen4_exp TP=1 graph for MTP");
+    engine_tp1_graph_mtp
+        .enable_speculative(&spec_cfg)
+        .expect("enable Qwen4 MTP on TP=1 graph");
+    let out_tp1_graph_mtp = engine_tp1_graph_mtp
+        .generate_with_radix_cache(&extended_prompt, 4, 64, false)
+        .expect("generate_with_radix_cache Qwen4 MTP TP=1 graph");
+    assert_eq!(
+        out_tp1_graph_mtp.generated_token_ids, fresh_extended.generated_token_ids,
+        "CUDA Graph + MTP verify on qwen4_exp TP=1 must match target greedy tokens"
+    );
+    drop(engine_tp1_graph_mtp);
+
     // 2. Native Qwen4 MTP speculative decoding (`K=3`, `M_verify=4`, dual-stream HC handoff + QSA step-0 top-k reuse) on TP=1
-    let spec_cfg = w34_host::proposer::SpeculativeConfig {
-        kind: w34_host::proposer::SpeculativeKind::Mtp,
-        draft_model: None,
-        mtp_k: 3,
-    };
     engine_tp1_eager
         .enable_speculative(&spec_cfg)
         .expect("enable Qwen4 MTP on TP=1");
@@ -777,7 +792,21 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
     );
     drop(engine_tp1_eager);
 
-    // 3. TP=2 / EP=2 eager + CUDA Graph + Qwen4 MTP parity against TP=1 (when 2 GPUs are visible)
+    // 3. Verify Q8_0 and TQ4 KV compression (`KvFormatPolicy::Q8_0`, `KvFormatPolicy::Tq4All`)
+    //    on QSA sparse paged attention (> 32-token indexer_budget)
+    for policy in [KvFormatPolicy::Q8_0, KvFormatPolicy::Tq4All] {
+        let mut engine_tp1_qkv = Qwen3_5Engine::load_from_dir(&dir, 1, policy, Some(64), true)
+            .expect("load synthetic qwen4_exp TP=1 quantized KV");
+        let out_tp1_qkv = engine_tp1_qkv
+            .generate_tokens(&extended_prompt, 4, false)
+            .expect("generate_tokens TP=1 quantized KV on extended_prompt");
+        assert_eq!(out_tp1_qkv.generated_token_ids.len(), 4);
+        for &tok in &out_tp1_qkv.generated_token_ids {
+            assert!((0..256).contains(&tok), "invalid {policy:?} token id {tok}");
+        }
+    }
+
+    // 4. TP=2 / EP=2 eager + CUDA Graph + MambaRadixCache (68 tokens > 32-token indexer_budget, 4-token suffix hitting M=4 sparse_vec4 K=640) + Qwen4 MTP parity against TP=1
     if w34_host::cuda::CudaDevice::set_current(1).is_ok() {
         let mut engine_tp2 =
             Qwen3_5Engine::load_from_dir(&dir, 2, KvFormatPolicy::Fp16, Some(64), true)
@@ -788,6 +817,21 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
         assert_eq!(
             out_tp2.generated_token_ids, out_tp1_eager.generated_token_ids,
             "TP=2 / EP=2 greedy tokens must match TP=1 on qwen4_exp"
+        );
+        let radix_tp2_run1 = engine_tp2
+            .generate_with_radix_cache(&extended_prompt, 4, 64, false)
+            .expect("TP=2 / EP=2 radix run 1 on 68-token prompt");
+        let radix_tp2_run2 = engine_tp2
+            .generate_with_radix_cache(&extended_prompt, 4, 64, false)
+            .expect("TP=2 / EP=2 radix run 2 on 68-token prompt");
+        assert_eq!(radix_tp2_run2.cached_prefix_tokens, 64);
+        assert_eq!(
+            radix_tp2_run1.generated_token_ids, fresh_extended.generated_token_ids,
+            "TP=2 / EP=2 cold radix run (68 tokens > indexer_budget=32) must match TP=1"
+        );
+        assert_eq!(
+            radix_tp2_run2.generated_token_ids, fresh_extended.generated_token_ids,
+            "TP=2 / EP=2 warm radix run (M=4 suffix with K=640) must match TP=1"
         );
         drop(engine_tp2);
 
@@ -803,6 +847,13 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
         assert_eq!(
             out_tp2_mtp.generated_token_ids, out_tp2.generated_token_ids,
             "Qwen4 MTP speculative decoding on TP=2 / EP=2 must match target greedy tokens losslessly"
+        );
+        let out_tp2_mtp_long = engine_tp2_mtp
+            .generate_with_radix_cache(&extended_prompt, 4, 64, false)
+            .expect("generate_with_radix_cache Qwen4 MTP TP=2 / EP=2 on 68-token prompt");
+        assert_eq!(
+            out_tp2_mtp_long.generated_token_ids, fresh_extended.generated_token_ids,
+            "Qwen4 MTP speculative decoding on TP=2 / EP=2 (68 tokens > indexer_budget=32) must match TP=1"
         );
     }
 

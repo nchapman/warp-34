@@ -106,8 +106,8 @@ __global__ void hc_rmsnorm_f16_kernel(
     }
 }
 
-// Applies SiLU(down / 4.0) in-place or out-of-place on [num_tokens, hc_rank_dim]
-// and optionally computes inject_weights = 2.0 * sigmoid(inj / 4.0) on [num_tokens, hc_count].
+// Applies SiLU(down / hc_count) in-place or out-of-place on [num_tokens, hc_rank_dim]
+// and optionally computes inject_weights = 2.0 * sigmoid(inj / hc_count) on [num_tokens, hc_count].
 __global__ void hc_down_silu_inject_f16_kernel(
     const __half* __restrict__ down_in,
     __half* __restrict__ down_out,
@@ -120,6 +120,7 @@ __global__ void hc_down_silu_inject_f16_kernel(
     const int tok = blockIdx.x;
     if (tok >= num_tokens) return;
     const bool valid = (valid_token_mask == nullptr) || (valid_token_mask[tok] != 0);
+    const float inv_hc = 1.0f / (float)hc_count;
 
     const __half* d_in = down_in + (size_t)tok * hc_rank_dim;
     __half* d_out = down_out + (size_t)tok * hc_rank_dim;
@@ -127,7 +128,7 @@ __global__ void hc_down_silu_inject_f16_kernel(
         if (!valid) {
             d_out[c] = __float2half(0.0f);
         } else {
-            const float x = __half2float(d_in[c]) * 0.25f;
+            const float x = __half2float(d_in[c]) * inv_hc;
             const float silu = x / (1.0f + expf(-x));
             d_out[c] = __float2half(silu);
         }
@@ -138,7 +139,7 @@ __global__ void hc_down_silu_inject_f16_kernel(
         if (!valid) {
             inject_weights_out[(size_t)tok * hc_count + s] = 0.0f;
         } else {
-            const float x = __half2float(inj_in[(size_t)tok * hc_count + s]) * 0.25f;
+            const float x = __half2float(inj_in[(size_t)tok * hc_count + s]) * inv_hc;
             const float sig = 1.0f / (1.0f + expf(-x));
             inject_weights_out[(size_t)tok * hc_count + s] = 2.0f * sig;
         }
@@ -146,7 +147,7 @@ __global__ void hc_down_silu_inject_f16_kernel(
 }
 
 // Mixes hc_count streams into a single hidden state [num_tokens, hidden_size]:
-//   out_mixed[tok, d] = sum_{s=0..hc_count-1} (sigmoid(up_raw[tok, s, d]) / 4.0) * residual[tok, s, d]
+//   out_mixed[tok, d] = sum_{s=0..hc_count-1} (sigmoid(up_raw[tok, s, d]) / hc_count) * residual[tok, s, d]
 __global__ void hc_mix_streams_f16_kernel(
     const __half* __restrict__ residual_in,
     const __half* __restrict__ up_raw_in,
@@ -168,25 +169,23 @@ __global__ void hc_mix_streams_f16_kernel(
     const size_t base = (size_t)tok * hc_count * hidden_size;
     const __half* res_tok = residual_in + base;
     const __half* up_tok = up_raw_in + base;
+    const float inv_hc = 1.0f / (float)hc_count;
 
     for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
         float acc = 0.0f;
-#pragma unroll
-        for (int s = 0; s < 4; ++s) {
-            if (s < hc_count) {
-                const size_t idx = (size_t)s * hidden_size + d;
-                const float u = __half2float(up_tok[idx]);
-                const float gate = 0.25f / (1.0f + expf(-u));
-                const float r = __half2float(res_tok[idx]);
-                acc += gate * r;
-            }
+        for (int s = 0; s < hc_count; ++s) {
+            const size_t idx = (size_t)s * hidden_size + d;
+            const float u = __half2float(up_tok[idx]);
+            const float gate = inv_hc / (1.0f + expf(-u));
+            const float r = __half2float(res_tok[idx]);
+            acc += gate * r;
         }
         dst[d] = __float2half(acc);
     }
 }
 
 // Combines block output [num_tokens, hidden_size] (and optional PLE delta [num_tokens, hc_count, hidden_size])
-// back into the 4-stream residual state [num_tokens, hc_count, hidden_size]:
+// back into the hc_count-stream residual state [num_tokens, hc_count, hidden_size]:
 //   residual_out[tok, s, d] = residual_in[tok, s, d] + inject_w[tok, s] * block_out[tok, d] (+ ple_delta[tok, s, d])
 __global__ void hc_combine_f16_kernel(
     const __half* __restrict__ residual_in,
@@ -209,27 +208,17 @@ __global__ void hc_combine_f16_kernel(
     __half* res_out_tok = residual_out + base;
     const __half* blk_tok = block_out + (size_t)tok * hidden_size;
     const __half* ple_tok = (ple_delta != nullptr) ? (ple_delta + base) : nullptr;
-
-    float inj_w[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-        if (s < hc_count) {
-            inj_w[s] = inject_weights[(size_t)tok * hc_count + s];
-        }
-    }
+    const float* inj_tok = inject_weights + (size_t)tok * hc_count;
 
     for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
         const float y = __half2float(blk_tok[d]);
-#pragma unroll
-        for (int s = 0; s < 4; ++s) {
-            if (s < hc_count) {
-                const size_t idx = (size_t)s * hidden_size + d;
-                float val = __half2float(res_in_tok[idx]) + inj_w[s] * y;
-                if (ple_tok != nullptr) {
-                    val += __half2float(ple_tok[idx]);
-                }
-                res_out_tok[idx] = __float2half(val);
+        for (int s = 0; s < hc_count; ++s) {
+            const size_t idx = (size_t)s * hidden_size + d;
+            float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
+            if (ple_tok != nullptr) {
+                val += __half2float(ple_tok[idx]);
             }
+            res_out_tok[idx] = __float2half(val);
         }
     }
 }
@@ -327,7 +316,7 @@ int w34_hc_mix_streams_f16(
     int hc_count,
     int hidden_size) {
     if (!ex || !residual_in || !up_raw_in || !mixed_out || num_tokens < 0 || hc_count <= 0 ||
-        hidden_size <= 0 || hc_count > 4) {
+        hidden_size <= 0 || hc_count > 8) {
         return -1;
     }
     if (num_tokens == 0) return 0;
@@ -355,7 +344,7 @@ int w34_hc_combine_f16(
     int hc_count,
     int hidden_size) {
     if (!ex || !residual_in || !block_out || !inject_weights || !residual_out || num_tokens < 0 ||
-        hc_count <= 0 || hidden_size <= 0 || hc_count > 4) {
+        hc_count <= 0 || hidden_size <= 0 || hc_count > 8) {
         return -1;
     }
     if (num_tokens == 0) return 0;
@@ -402,7 +391,7 @@ int w34_qwen4_mtp_broadcast_add_f16(
     int hc_count,
     int hidden_size) {
     if (!ex || !fc_embed || !fc_hidden || !out_multi_hidden || num_tokens < 0 ||
-        hc_count <= 0 || hidden_size <= 0 || hc_count > 4) {
+        hc_count <= 0 || hidden_size <= 0 || hc_count > 8) {
         return -1;
     }
     if (num_tokens == 0) return 0;

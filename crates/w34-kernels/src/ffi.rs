@@ -1454,10 +1454,18 @@ unsafe extern "C" {
         k_in: *const c_void,
         raw_k_cache: *mut c_void,
         comp_k_cache: *mut c_void,
+        k_norm_weight: *const c_void,
+        positions: *const i32,
         write_slot_mapping: *const i32,
         valid_token_mask: *const u8,
         num_tokens: i32,
         head_dim: i32,
+        rotary_dim: i32,
+        rope_theta: f32,
+        eps: f32,
+        mrope_s1: i32,
+        mrope_s2: i32,
+        pos_plane_stride: i32,
     ) -> i32;
 
     pub fn w34_qsa_select_blocks_f16(

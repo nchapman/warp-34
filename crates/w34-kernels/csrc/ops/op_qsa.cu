@@ -1,11 +1,12 @@
 // Qwen3.8-Flash-Next (qwen4_exp) Query-Sparse Attention (QSA) & Indexer CUDA Kernels.
-// Reference: nvidia/indexer_qsa.py, nvidia/qsa.py, nvidia/ops/qsa.py, nvidia/ops/qsa_special_kernels.py
-//   - Pre-indexer GemmaRMSNorm + partial interleaved NeoX mRoPE (head_dim=128, rotary_dim=32, [6,5,5])
+// Reference: nvidia/qsa_indexer.py, nvidia/qsa.py, nvidia/ops/qsa.py, nvidia/ops/qsa_indexer.py
+//   - Pre-indexer GemmaRMSNorm + partial interleaved NeoX mRoPE (head_dim=128, rotary_dim=64, [11,11,10])
 //   - Paged raw key cache [num_pages, 16, 128] + 4:1 compressed key cache [num_pages, 4, 128]
-//   - Exact online-LSE per-head softmax + max-pool block scoring & top-k block selector (k=64 blocks = 1024 tokens,
-//     8 sink blocks + 16 recent blocks + 40 top-scored middle blocks)
-//   - Sparse paged GQA over selected blocks with causal boundary masking & optional sigmoid output gate
+//   - ReLU-sum MQA scoring + top-k block selector (k=64 blocks = 1024 tokens)
+//   - Sparse paged GQA over selected blocks (FP16, Q8_0 272B/row, and TQ4 132B/row with Rademacher+WHT256)
+//     with causal boundary masking & optional sigmoid output gate
 #include "../w34_cuda.h"
+#include "../tq/tq4_codebook.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -18,12 +19,60 @@ extern "C" __device__ float __nv_powf(float, float);
 
 namespace w34 {
 
+#pragma pack(push, 1)
+struct qsa_block_tq4_0 {
+    __half  d;
+    uint8_t qs[64];
+};
+static_assert(sizeof(qsa_block_tq4_0) == 66, "qsa_block_tq4_0 must be 66 bytes");
+
+struct qsa_block_q8_0_64 {
+    float  d;
+    int8_t qs[64];
+};
+static_assert(sizeof(qsa_block_q8_0_64) == 68, "qsa_block_q8_0_64 must be 68 bytes");
+#pragma pack(pop)
+
 __device__ __forceinline__ float qsa_warp_reduce_sum(float val) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_xor_sync(0xffffffffu, val, offset);
     }
     return val;
+}
+
+__device__ __forceinline__ void qsa_wht256_warp(float (&v)[8], int lane) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float val = v[j];
+#pragma unroll
+        for (int h = 1; h < 32; h <<= 1) {
+            float o = __shfl_xor_sync(0xffffffffu, val, h);
+            val = (lane & h) ? (o - val) : (val + o);
+        }
+        v[j] = val;
+    }
+#pragma unroll
+    for (int j = 0; j < 8; j += 2) {
+        float a = v[j], b = v[j + 1];
+        v[j] = a + b;
+        v[j + 1] = a - b;
+    }
+#pragma unroll
+    for (int g = 0; g < 8; g += 4) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float a = v[g + i], b = v[g + i + 2];
+            v[g + i] = a + b;
+            v[g + i + 2] = a - b;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float a = v[i], b = v[i + 4];
+        v[i] = (a + b) * 0.0625f;
+        v[i + 4] = (a - b) * 0.0625f;
+    }
 }
 
 // Grid: (num_tokens, q_heads + kv_heads), Block: 128 (1 thread per dim of head_dim=128).
@@ -63,7 +112,15 @@ __global__ void qsa_indexer_norm_rope_f16_kernel(
     }
 
     const __half* src_head = qk_in + ((size_t)tok * total_heads + h) * head_dim;
-    const __half* norm_w = is_q ? q_norm_weight : k_norm_weight;
+    if (!is_q) {
+        // Upstream vLLM stores raw (pre-norm, pre-RoPE) keys in raw_key_cache;
+        // k_layernorm + RoPE(first_position) are applied AFTER 4:1 mean-pooling.
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            dst_head[d] = src_head[d];
+        }
+        return;
+    }
+    const __half* norm_w = q_norm_weight;
 
     __shared__ float s_warp[8];
     __shared__ float s_normed[128];
@@ -143,14 +200,25 @@ __global__ void qsa_indexer_write_raw_k_f16_kernel(
 }
 
 // Updates 4:1 compressed key cache [num_pages, 4, head_dim] from raw_k_cache [num_pages, 16, head_dim]
-// for every touched slot's 4-token aligned sub-block.
+// for every touched slot's 4-token aligned sub-block:
+//   1. Mean-pools the 4 raw keys in the sub-block: pooled = 0.25 * (v0 + v1 + v2 + v3)
+//   2. Applies GemmaRMSNorm(k_norm_weight, eps) + partial mRoPE at the sub-block's first position
+//      (matching upstream vLLM QSAIndexer.forward / _qsa_prepare_kernel).
 __global__ void qsa_indexer_update_comp_k_f16_kernel(
     const __half* __restrict__ raw_k_cache,
     __half* __restrict__ comp_k_cache,
+    const __half* __restrict__ k_norm_weight,
+    const int32_t* __restrict__ positions,
     const int32_t* __restrict__ write_slot_mapping,
     const uint8_t* __restrict__ valid_token_mask,
     int num_tokens,
-    int head_dim) {
+    int head_dim,
+    int rotary_dim,
+    float rope_theta,
+    float eps,
+    int mrope_s1,
+    int mrope_s2,
+    int pos_plane_stride) {
     const int tok = blockIdx.x;
     if (tok >= num_tokens) return;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
@@ -162,12 +230,75 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
     const __half* raw_base = raw_k_cache + (size_t)base_slot * head_dim;
     __half* comp_dst = comp_k_cache + (size_t)sub_block * head_dim;
 
+    if (k_norm_weight == nullptr || positions == nullptr) {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            const float v0 = __half2float(raw_base[0 * head_dim + d]);
+            const float v1 = __half2float(raw_base[1 * head_dim + d]);
+            const float v2 = __half2float(raw_base[2 * head_dim + d]);
+            const float v3 = __half2float(raw_base[3 * head_dim + d]);
+            comp_dst[d] = __float2half(0.25f * (v0 + v1 + v2 + v3));
+        }
+        return;
+    }
+
+    __shared__ float s_warp[8];
+    __shared__ float s_normed[128];
+
+    float sum_sq = 0.0f;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         const float v0 = __half2float(raw_base[0 * head_dim + d]);
         const float v1 = __half2float(raw_base[1 * head_dim + d]);
         const float v2 = __half2float(raw_base[2 * head_dim + d]);
         const float v3 = __half2float(raw_base[3 * head_dim + d]);
-        comp_dst[d] = __float2half(0.25f * (v0 + v1 + v2 + v3));
+        const float pooled = __half2float(__float2half(0.25f * (v0 + v1 + v2 + v3)));
+        s_normed[d] = pooled;
+        sum_sq += pooled * pooled;
+    }
+    sum_sq = qsa_warp_reduce_sum(sum_sq);
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    if (lane == 0) s_warp[wid] = sum_sq;
+    __syncthreads();
+    const int num_warps = blockDim.x >> 5;
+    sum_sq = (threadIdx.x < num_warps) ? s_warp[lane] : 0.0f;
+    if (wid == 0) {
+        sum_sq = qsa_warp_reduce_sum(sum_sq);
+        if (lane == 0) s_warp[0] = sum_sq;
+    }
+    __syncthreads();
+    const float inv_rms = rsqrtf(s_warp[0] / (float)head_dim + eps);
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float v = s_normed[d] * inv_rms;
+        const float w = 1.0f + __half2float(k_norm_weight[d]);
+        s_normed[d] = __half2float(__float2half(v * w));
+    }
+    __syncthreads();
+
+    const int32_t offset_in_group = slot & 3;
+    const int half_rot = rotary_dim / 2;
+    for (int i = threadIdx.x; i < half_rot; i += blockDim.x) {
+        int plane = 0;
+        if ((i % 3) == 1 && i < mrope_s1 * 3) {
+            plane = 1;
+        } else if ((i % 3) == 2 && i < mrope_s2 * 3) {
+            plane = 2;
+        }
+        const int32_t pos_tok = positions[(size_t)plane * pos_plane_stride + tok];
+        const float first_pos = (float)(pos_tok - offset_in_group);
+        const float inv_freq =
+            __fdiv_rn(1.0f, __nv_powf(rope_theta, (float)(2 * i) / (float)rotary_dim));
+        const float angle = first_pos * inv_freq;
+        float sin_a = __half2float(__float2half_rn(__nv_sinf(angle)));
+        float cos_a = __half2float(__float2half_rn(__nv_cosf(angle)));
+
+        const float x1 = s_normed[i];
+        const float x2 = s_normed[i + half_rot];
+        comp_dst[i] = __float2half(x1 * cos_a - x2 * sin_a);
+        comp_dst[i + half_rot] = __float2half(x2 * cos_a + x1 * sin_a);
+    }
+    for (int d = rotary_dim + threadIdx.x; d < head_dim; d += blockDim.x) {
+        comp_dst[d] = __float2half(s_normed[d]);
     }
 }
 
@@ -381,8 +512,8 @@ __global__ void qsa_select_blocks_f16_kernel(
     }
 }
 
-// Sparse Paged GQA over the selected blocks per token for FP16/BF16 KV cache.
-// Grid: (num_tokens, local_q_heads), Block: 128 (4 warps, 2 dims per lane of head_dim=256).
+// Sparse Paged GQA over the selected blocks per token for FP16, Q8_0, and TQ4 KV caches.
+// Grid: (num_tokens, local_q_heads), Block: 128 (4 warps, 8 dims per lane of head_dim=256).
 __global__ void qsa_sparse_paged_attn_f16_kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ gate,
@@ -417,19 +548,27 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
     const int kv_head = q_head / gqa_group;
 
     const __half* q_head_ptr = q + ((size_t)tok * local_q_heads + q_head) * head_dim;
-    __shared__ float s_q[256];
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        s_q[d] = __half2float(q_head_ptr[d]) * sm_scale;
-    }
-    __syncthreads();
-
     const int wid = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int num_warps = blockDim.x >> 5;
 
+    float q_reg[8];
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int d = lane + j * 32;
+        q_reg[j] = (d < head_dim) ? (__half2float(q_head_ptr[d]) * sm_scale) : 0.0f;
+    }
+    if (head_dim == 256 && kv_layout.k_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            q_reg[j] *= kTq4Signs256[lane + 32 * j];
+        }
+        qsa_wht256_warp(q_reg, lane);
+    }
+
     float m_i = -FLT_MAX;
     float d_i = 0.0f;
-    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     const int32_t* tok_phys = selected_phys_blocks + (size_t)tok * select_k_blocks;
     const int32_t* tok_log = selected_logical_blocks + (size_t)tok * select_k_blocks;
@@ -446,21 +585,50 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
         const int kv_pos = log_blk * block_size + page_off;
         if (phys_page < 0 || kv_pos > seq_pos) continue;
 
-        const __half* k_tok = reinterpret_cast<const __half*>(
+        const uint8_t* k_ptr =
             k_base + (size_t)phys_page * kv_layout.k_page_stride_bytes +
             (size_t)kv_head * kv_layout.k_head_stride_bytes +
-            (size_t)page_off * kv_layout.k_token_stride_bytes);
-        const __half* v_tok = reinterpret_cast<const __half*>(
+            (size_t)page_off * kv_layout.k_token_stride_bytes;
+        const uint8_t* v_ptr =
             v_base + (size_t)phys_page * kv_layout.v_page_stride_bytes +
             (size_t)kv_head * kv_layout.v_head_stride_bytes +
-            (size_t)page_off * kv_layout.v_token_stride_bytes);
+            (size_t)page_off * kv_layout.v_token_stride_bytes;
 
         float dot = 0.0f;
+        if (head_dim == 256 && kv_layout.k_format == W34_KV_FORMAT_TQ4) {
+            const qsa_block_tq4_0* k_blks = reinterpret_cast<const qsa_block_tq4_0*>(k_ptr);
+            const float d0 = __half2float(k_blks[0].d);
+            const float d1 = __half2float(k_blks[1].d);
+            const int odd = lane & 1;
+            float dot0 = 0.0f;
+            float dot1 = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int d = lane + j * 32;
-            if (d < head_dim) {
-                dot += s_q[d] * __half2float(k_tok[d]);
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t p0 = k_blks[0].qs[(lane + 32 * j) >> 1];
+                const uint8_t p1 = k_blks[1].qs[(lane + 32 * j) >> 1];
+                const uint8_t n0 = odd ? (p0 >> 4) : (p0 & 0x0Fu);
+                const uint8_t n1 = odd ? (p1 >> 4) : (p1 & 0x0Fu);
+                dot0 += q_reg[j] * kTq4D256Centroids[n0];
+                dot1 += q_reg[j + 4] * kTq4D256Centroids[n1];
+            }
+            dot = d0 * dot0 + d1 * dot1;
+        } else if (head_dim == 256 && kv_layout.k_format == W34_KV_FORMAT_Q8_0) {
+            const qsa_block_q8_0_64* k_blks = reinterpret_cast<const qsa_block_q8_0_64*>(k_ptr);
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float d = k_blks[sb].d;
+                const float k0 = (float)k_blks[sb].qs[lane];
+                const float k1 = (float)k_blks[sb].qs[lane + 32];
+                dot += d * (q_reg[2 * sb] * k0 + q_reg[2 * sb + 1] * k1);
+            }
+        } else {
+            const __half* k_tok = reinterpret_cast<const __half*>(k_ptr);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int d = lane + j * 32;
+                if (d < head_dim) {
+                    dot += q_reg[j] * __half2float(k_tok[d]);
+                }
             }
         }
         const float score = qsa_warp_reduce_sum(dot);
@@ -468,19 +636,45 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
         const float alpha = expf(m_i - m_new);
         const float beta = expf(score - m_new);
         d_i = d_i * alpha + beta;
+        m_i = m_new;
+
+        if (head_dim == 256 && kv_layout.v_format == W34_KV_FORMAT_TQ4) {
+            const qsa_block_tq4_0* v_blks = reinterpret_cast<const qsa_block_tq4_0*>(v_ptr);
+            const float pd0 = beta * __half2float(v_blks[0].d);
+            const float pd1 = beta * __half2float(v_blks[1].d);
+            const int odd = lane & 1;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int d = lane + j * 32;
-            if (d < head_dim) {
-                acc[j] = acc[j] * alpha + beta * __half2float(v_tok[d]);
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t p0 = v_blks[0].qs[(lane + 32 * j) >> 1];
+                const uint8_t p1 = v_blks[1].qs[(lane + 32 * j) >> 1];
+                const uint8_t n0 = odd ? (p0 >> 4) : (p0 & 0x0Fu);
+                const uint8_t n1 = odd ? (p1 >> 4) : (p1 & 0x0Fu);
+                acc[j] = acc[j] * alpha + pd0 * kTq4D256Centroids[n0];
+                acc[j + 4] = acc[j + 4] * alpha + pd1 * kTq4D256Centroids[n1];
+            }
+        } else if (head_dim == 256 && kv_layout.v_format == W34_KV_FORMAT_Q8_0) {
+            const qsa_block_q8_0_64* v_blks = reinterpret_cast<const qsa_block_q8_0_64*>(v_ptr);
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float pd = beta * v_blks[sb].d;
+                acc[2 * sb] = acc[2 * sb] * alpha + pd * (float)v_blks[sb].qs[lane];
+                acc[2 * sb + 1] = acc[2 * sb + 1] * alpha + pd * (float)v_blks[sb].qs[lane + 32];
+            }
+        } else {
+            const __half* v_tok = reinterpret_cast<const __half*>(v_ptr);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int d = lane + j * 32;
+                if (d < head_dim) {
+                    acc[j] = acc[j] * alpha + beta * __half2float(v_tok[d]);
+                }
             }
         }
-        m_i = m_new;
     }
 
-    __shared__ float s_m[8];
-    __shared__ float s_d[8];
-    __shared__ float s_acc[8][256];
+    __shared__ float s_m[4];
+    __shared__ float s_d[4];
+    __shared__ float s_acc[4][256];
 
     if (lane == 0) {
         s_m[wid] = m_i;
@@ -496,14 +690,16 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
     __syncthreads();
 
     float m_all = -FLT_MAX;
-    for (int w = 0; w < num_warps; ++w) {
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
         if (s_d[w] > 0.0f) {
             m_all = fmaxf(m_all, s_m[w]);
         }
     }
     float d_all = 0.0f;
-    float w_scale[8];
-    for (int w = 0; w < num_warps; ++w) {
+    float w_scale[4];
+#pragma unroll
+    for (int w = 0; w < 4; ++w) {
         if (s_d[w] > 0.0f) {
             w_scale[w] = expf(s_m[w] - m_all);
             d_all += s_d[w] * w_scale[w];
@@ -517,9 +713,37 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
         ? (gate + ((size_t)tok * local_q_heads + q_head) * head_dim)
         : nullptr;
 
+    if (head_dim == 256 && kv_layout.v_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+        if (wid == 0) {
+            float out_v[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int col = lane + 32 * j;
+                float sum_v = s_acc[0][col] * w_scale[0]
+                            + s_acc[1][col] * w_scale[1]
+                            + s_acc[2][col] * w_scale[2]
+                            + s_acc[3][col] * w_scale[3];
+                out_v[j] = sum_v * inv_d;
+            }
+            qsa_wht256_warp(out_v, lane);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int col = lane + 32 * j;
+                float val = out_v[j] * kTq4Signs256[col];
+                if (gate_head != nullptr) {
+                    const float g = __half2float(gate_head[col]);
+                    val *= (1.0f / (1.0f + expf(-g)));
+                }
+                dst_head[col] = __float2half(val);
+            }
+        }
+        return;
+    }
+
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float sum_v = 0.0f;
-        for (int w = 0; w < num_warps; ++w) {
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
             sum_v += s_acc[w][d] * w_scale[w];
         }
         float val = sum_v * inv_d;
@@ -587,12 +811,20 @@ int w34_qsa_indexer_cache_update_f16(
     const void* k_in,
     void* raw_k_cache,
     void* comp_k_cache,
+    const void* k_norm_weight,
+    const int32_t* positions,
     const int32_t* write_slot_mapping,
     const uint8_t* valid_token_mask,
     int num_tokens,
-    int head_dim) {
+    int head_dim,
+    int rotary_dim,
+    float rope_theta,
+    float eps,
+    int mrope_s1,
+    int mrope_s2,
+    int pos_plane_stride) {
     if (!ex || !k_in || !raw_k_cache || !comp_k_cache || !write_slot_mapping || num_tokens < 0 ||
-        head_dim <= 0) {
+        head_dim != 128) {
         return -1;
     }
     if (num_tokens == 0) return 0;
@@ -607,10 +839,18 @@ int w34_qsa_indexer_cache_update_f16(
     w34::qsa_indexer_update_comp_k_f16_kernel<<<num_tokens, 128, 0, stream>>>(
         static_cast<const __half*>(raw_k_cache),
         static_cast<__half*>(comp_k_cache),
+        static_cast<const __half*>(k_norm_weight),
+        positions,
         write_slot_mapping,
         valid_token_mask,
         num_tokens,
-        head_dim);
+        head_dim,
+        rotary_dim,
+        rope_theta,
+        eps,
+        mrope_s1,
+        mrope_s2,
+        pos_plane_stride);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
 }
 
