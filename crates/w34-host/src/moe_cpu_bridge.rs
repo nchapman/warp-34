@@ -112,7 +112,10 @@ impl Wake {
         }
     }
     fn wait(&self, seen: u32) {
-        for _ in 0..(1 << 16) {
+        // Spin across the ~8-10ms GPU lm_head + MTP-3 draft window between Target
+        // Verify rounds so worker cores stay out of kernel futex / C-states during
+        // active generation, then sleep at 0% CPU once idle.
+        for _ in 0..(1 << 18) {
             if self.epoch.load(Ordering::Acquire) != seen {
                 return;
             }
@@ -143,6 +146,13 @@ impl Wake {
 struct Dispatch {
     batch: Option<Arc<Batch>>,
 }
+#[derive(Default)]
+struct RoutingScratch {
+    tok_to_compact: Vec<u32>,
+    active_toks: Vec<usize>,
+    token_routes: Vec<Vec<usize>>,
+    expert_to_job: Vec<u32>,
+}
 struct Pool {
     state: Arc<(Mutex<Dispatch>, Wake)>,
     cpus: Vec<usize>,
@@ -152,6 +162,7 @@ struct Pool {
     spare: Mutex<Vec<Job>>,
     spare_outputs: Mutex<Vec<Mutex<Vec<f32>>>>,
     spare_inputs: Mutex<(Vec<f32>, Vec<f32>)>,
+    spare_routing: Mutex<RoutingScratch>,
     caller_scratch: Mutex<Scratch>,
 }
 impl Pool {
@@ -165,6 +176,7 @@ impl Pool {
             spare: Mutex::new(Vec::new()),
             spare_outputs: Mutex::new(Vec::new()),
             spare_inputs: Mutex::new((Vec::new(), Vec::new())),
+            spare_routing: Mutex::new(RoutingScratch::default()),
             caller_scratch: Mutex::new(Scratch::default()),
         };
         // The submitting responder is worker zero on `cpus[0]`. Background workers
@@ -252,6 +264,12 @@ impl Pool {
                 .unwrap()
                 .0;
         }
+        drop(remaining);
+        self.state
+            .1
+            .batch
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.state.0.lock().unwrap().batch = None;
         if batch.failed.load(Ordering::Relaxed) {
             return Err(bridge_error("expert worker failed"));
         }
@@ -286,6 +304,8 @@ pub(crate) struct Runtime {
     layers: Arc<Mutex<Vec<Arc<Mailbox>>>>,
     layer_count: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
+    prefill_active: Arc<AtomicBool>,
+    prefill_park: Arc<(Mutex<()>, Condvar)>,
     server: Option<JoinHandle<()>>,
     device: i32,
 }
@@ -296,9 +316,17 @@ impl Runtime {
         let pool = Arc::new(Pool::new()?);
         let layers = Arc::new(Mutex::new(Vec::<Arc<Mailbox>>::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let prefill_active = Arc::new(AtomicBool::new(false));
+        let prefill_park = Arc::new((Mutex::new(()), Condvar::new()));
         let layer_count = Arc::new(AtomicUsize::new(0));
         let count = layer_count.clone();
-        let (p, l, s) = (pool.clone(), layers.clone(), stop.clone());
+        let (p, l, s, pa, pp) = (
+            pool.clone(),
+            layers.clone(),
+            stop.clone(),
+            prefill_active.clone(),
+            prefill_park.clone(),
+        );
         let server = std::thread::Builder::new()
             .name("moe-responder".into())
             .spawn(move || {
@@ -306,6 +334,13 @@ impl Runtime {
                 let mut mailboxes = Vec::<Arc<Mailbox>>::new();
                 let mut seen = Vec::new();
                 while !s.load(Ordering::Acquire) {
+                    if pa.load(Ordering::Acquire) {
+                        let mut guard = pp.0.lock().unwrap();
+                        while pa.load(Ordering::Acquire) && !s.load(Ordering::Acquire) {
+                            guard = pp.1.wait(guard).unwrap();
+                        }
+                        continue;
+                    }
                     // Registration is append-only. Once loaded, polling needs no
                     // registry mutex or response-page reads: this is its sole writer.
                     if count.load(Ordering::Acquire) != mailboxes.len() {
@@ -339,23 +374,31 @@ impl Runtime {
                                     );
                                     let h = m.store.layout().hidden;
                                     assert_eq!(r.hidden as usize, h);
-                                    let tasks = (0..r.tokens as usize * r.top_k as usize)
-                                        .filter(|&i| r.ids[i] >= 0)
-                                        .map(|i| {
-                                            (i / r.top_k as usize, r.ids[i] as usize, r.weights[i])
-                                        })
-                                        .collect::<Vec<_>>();
-                                    evaluate(
+                                    let total = r.tokens as usize * r.top_k as usize;
+                                    let mut tasks = [(0usize, 0usize, 0.0f32); 64];
+                                    let mut n_tasks = 0;
+                                    for i in 0..total {
+                                        if r.ids[i] >= 0 {
+                                            tasks[n_tasks] = (
+                                                i / r.top_k as usize,
+                                                r.ids[i] as usize,
+                                                r.weights[i],
+                                            );
+                                            n_tasks += 1;
+                                        }
+                                    }
+                                    let elems = r.tokens as usize * h;
+                                    evaluate_into(
                                         &p,
                                         &m.store,
-                                        &r.x[..r.tokens as usize * h],
+                                        Input::F32(&r.x[..elems]),
                                         r.tokens as usize,
-                                        &tasks,
+                                        &tasks[..n_tasks],
+                                        Output::F32(&mut (&mut (*rs).y)[..elems]),
                                     )
                                 }));
                             match result {
-                                Ok(Ok(y)) => {
-                                    (&mut (*rs).y)[..y.len()].copy_from_slice(&y);
+                                Ok(Ok(())) => {
                                     (*rs).status = 0;
                                 }
                                 error => {
@@ -377,6 +420,8 @@ impl Runtime {
             layers,
             layer_count,
             stop,
+            prefill_active,
+            prefill_park,
             server: Some(server),
             device,
         }))
@@ -445,11 +490,15 @@ impl Runtime {
                     .map(move |s| (toks[j * 96 + s] as usize, e as usize, weights[j * 96 + s]))
             })
             .collect::<Vec<_>>();
-        let y = evaluate_input(&self.pool, store, Input::F16(x), tokens, &tasks)?;
-        for (o, y) in out.iter_mut().zip(y) {
-            *o = crate::cuda::f32_to_f16(y);
-        }
-        Ok(())
+        let _guard = PrefillGuard::enter(self);
+        evaluate_into(
+            &self.pool,
+            store,
+            Input::F16(x),
+            tokens,
+            &tasks,
+            Output::F16(out),
+        )
     }
 }
 impl Drop for Runtime {
@@ -463,9 +512,55 @@ impl Drop for Runtime {
             std::process::abort();
         }
         self.stop.store(true, Ordering::Release);
+        {
+            let _guard = self.prefill_park.0.lock().unwrap();
+            self.prefill_park.1.notify_all();
+        }
         if let Some(t) = self.server.take() {
             let _ = t.join();
         }
+    }
+}
+struct PrefillGuard<'a> {
+    runtime: &'a Runtime,
+    #[cfg(target_os = "linux")]
+    saved_mask: Option<libc::cpu_set_t>,
+}
+impl<'a> PrefillGuard<'a> {
+    fn enter(runtime: &'a Runtime) -> Self {
+        runtime.prefill_active.store(true, Ordering::Release);
+        // Wait for any in-flight responder batch on `cpus[0]` to finish before pinning.
+        drop(runtime.pool.submit.lock().unwrap());
+        #[cfg(target_os = "linux")]
+        // SAFETY: `cpu_set_t` is plain old data; `sched_getaffinity(0, ...)` queries the current thread.
+        let saved_mask = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+                pin_current_thread(runtime.pool.cpus[0]);
+                Some(set)
+            } else {
+                None
+            }
+        };
+        Self {
+            runtime,
+            #[cfg(target_os = "linux")]
+            saved_mask,
+        }
+    }
+}
+impl Drop for PrefillGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some(ref set) = self.saved_mask {
+            // SAFETY: `set` was captured from `sched_getaffinity` on this thread in `enter`.
+            unsafe {
+                let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set);
+            }
+        }
+        let _guard = self.runtime.prefill_park.0.lock().unwrap();
+        self.runtime.prefill_active.store(false, Ordering::Release);
+        self.runtime.prefill_park.1.notify_all();
     }
 }
 const MAX_WORKERS: usize = 32;
@@ -663,13 +758,25 @@ impl Input<'_> {
             Self::F16(x) => x.len(),
         }
     }
-    fn prepare(&self, xp: &mut [f32], xg: &mut [f32]) -> Result<(), eval::EvalError> {
+    fn prepare_row(
+        &self,
+        tok: usize,
+        h: usize,
+        xp: &mut [f32],
+        xg: &mut [f32],
+    ) -> Result<(), eval::EvalError> {
+        let range = tok * h..(tok + 1) * h;
         match self {
-            Self::F32(x) => eval::prepare_x_perm(x, xp, xg),
-            Self::F16(x) => eval::prepare_x_perm_f16(x, xp, xg),
+            Self::F32(x) => eval::prepare_x_perm(&x[range], xp, xg),
+            Self::F16(x) => eval::prepare_x_perm_f16(&x[range], xp, xg),
         }
     }
 }
+enum Output<'a> {
+    F32(&'a mut [f32]),
+    F16(&'a mut [u16]),
+}
+#[cfg(test)]
 fn evaluate(
     pool: &Pool,
     store: &HostExpertStore,
@@ -677,23 +784,43 @@ fn evaluate(
     tokens: usize,
     tasks: &[(usize, usize, f32)],
 ) -> crate::cuda::Result<Vec<f32>> {
-    evaluate_input(pool, store, Input::F32(x), tokens, tasks)
+    let mut y = vec![0.; tokens * store.layout().hidden];
+    evaluate_into(
+        pool,
+        store,
+        Input::F32(x),
+        tokens,
+        tasks,
+        Output::F32(&mut y),
+    )?;
+    Ok(y)
 }
-fn evaluate_input(
+fn evaluate_into(
     pool: &Pool,
     store: &HostExpertStore,
     x: Input<'_>,
     tokens: usize,
     tasks: &[(usize, usize, f32)],
-) -> crate::cuda::Result<Vec<f32>> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    out: Output<'_>,
+) -> crate::cuda::Result<()> {
+    let h = store.layout().hidden;
+    if x.len() != tokens.saturating_mul(h) {
+        return Err(bridge_error("invalid input shape"));
+    }
+    let num_experts = store.expert_ids().len();
+    for &(tok, expert, _) in tasks {
+        if tok >= tokens || expert >= num_experts {
+            return Err(bridge_error("invalid expert route"));
+        }
+    }
+    let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     // A timed-out batch is still owned by the pool/workers. Do not publish another
     // epoch until it finishes: every worker must observe each submitted epoch.
     let _submit = loop {
         if let Ok(guard) = pool.submit.try_lock() {
             break guard;
         }
-        if std::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= lock_deadline {
             return Err(bridge_error("pool busy for 30s"));
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -706,48 +833,83 @@ fn evaluate_input(
             return Err(bridge_error("previous timed-out batch still running"));
         }
     }
-    let h = store.layout().hidden;
-    if x.len() != tokens * h {
-        return Err(bridge_error("invalid input shape"));
-    }
     let mut jobs = std::mem::take(&mut *pool.spare.lock().unwrap());
     for job in &mut jobs {
         job.rows.clear();
     }
-    let mut used = 0;
+    let mut routing = std::mem::take(&mut *pool.spare_routing.lock().unwrap());
+    // Compact only tokens that actually appear in `tasks` (`n_act <= tokens`) so prefill
+    // never transposes or reduces non-routed prompt rows.
+    routing.tok_to_compact.clear();
+    routing.tok_to_compact.resize(tokens, u32::MAX);
+    routing.active_toks.clear();
+    for routes in &mut routing.token_routes {
+        routes.clear();
+    }
+    routing.expert_to_job.clear();
+    routing.expert_to_job.resize(num_experts, u32::MAX);
+    let mut used = 0usize;
     for &(tok, expert, weight) in tasks {
-        if tok >= tokens || expert >= store.expert_ids().len() {
-            return Err(bridge_error("invalid expert route"));
+        let compact_tok = if routing.tok_to_compact[tok] == u32::MAX {
+            let c = routing.active_toks.len();
+            routing.tok_to_compact[tok] = c as u32;
+            routing.active_toks.push(tok);
+            if c == routing.token_routes.len() {
+                routing.token_routes.push(Vec::with_capacity(10));
+            }
+            c
+        } else {
+            routing.tok_to_compact[tok] as usize
+        };
+        if !routing.token_routes[compact_tok].contains(&expert) {
+            routing.token_routes[compact_tok].push(expert);
         }
-        let j = (0..used)
-            .find(|&j| jobs[j].expert == expert)
-            .unwrap_or_else(|| {
-                if used == jobs.len() {
-                    jobs.push(Job::default());
-                }
-                jobs[used].expert = expert;
-                used += 1;
-                used - 1
-            });
+        let j = if routing.expert_to_job[expert] == u32::MAX {
+            if used == jobs.len() {
+                jobs.push(Job::default());
+            }
+            jobs[used].expert = expert;
+            routing.expert_to_job[expert] = used as u32;
+            used += 1;
+            used - 1
+        } else {
+            routing.expert_to_job[expert] as usize
+        };
         let rows = &mut jobs[j].rows;
-        if let Some(row) = rows.iter_mut().find(|r| r.0 == tok) {
+        if let Some(row) = rows.iter_mut().find(|r| r.0 == compact_tok) {
             row.1 += weight;
         } else {
-            rows.push((tok, weight));
+            rows.push((compact_tok, weight));
         }
     }
     jobs.truncate(used);
     jobs.sort_by_key(|j| std::cmp::Reverse(j.rows.len()));
+    for (j, job) in jobs.iter().enumerate() {
+        routing.expert_to_job[job.expert] = j as u32;
+    }
     let slices = if tokens <= 4 && store.layout().intermediate / 128 >= 2 {
         2
     } else {
         1
     };
+    let n_act = routing.active_toks.len();
+    let h_groups = h / 128;
     let (mut xp, mut xg) = std::mem::take(&mut *pool.spare_inputs.lock().unwrap());
-    xp.resize(x.len(), 0.);
-    xg.resize(x.len() / 128, 0.);
-    x.prepare(&mut xp, &mut xg)
-        .map_err(|e| bridge_error(format!("{e:?}")))?;
+    xp.resize(n_act * h, 0.);
+    xg.resize(n_act * h_groups, 0.);
+    for (c, &tok) in routing.active_toks.iter().enumerate() {
+        if let Err(e) = x.prepare_row(
+            tok,
+            h,
+            &mut xp[c * h..(c + 1) * h],
+            &mut xg[c * h_groups..(c + 1) * h_groups],
+        ) {
+            *pool.spare.lock().unwrap() = jobs;
+            *pool.spare_inputs.lock().unwrap() = (xp, xg);
+            *pool.spare_routing.lock().unwrap() = routing;
+            return Err(bridge_error(format!("{e:?}")));
+        }
+    }
     let mut outputs = std::mem::take(&mut *pool.spare_outputs.lock().unwrap());
     outputs.resize_with(jobs.len() * slices, || Mutex::new(Vec::new()));
     let batch = Arc::new(Batch {
@@ -762,42 +924,84 @@ fn evaluate_input(
         failed: AtomicBool::new(false),
         completion: Completion::new(pool.threads.len()),
     });
-    pool.run(&batch, deadline)?;
-    let mut y = vec![0.; tokens * h];
-    // Fixed router order, including the original slice order, independent of scheduling.
-    for t in 0..tokens {
-        let mut first = true;
-        for (route, &(_, expert, _)) in tasks.iter().enumerate().filter(|(_, r)| r.0 == t) {
-            if tasks[..route].iter().any(|r| r.0 == t && r.1 == expert) {
-                continue;
-            }
-            let j = batch.jobs.iter().position(|j| j.expert == expert).unwrap();
-            let job = &batch.jobs[j];
-            let row = job.rows.iter().position(|r| r.0 == t).unwrap();
-            for slice in 0..slices {
-                let start = row * h;
-                let output = batch.outputs[j * slices + slice].lock().unwrap();
-                let src = &output[start..start + h];
-                let dst = &mut y[t * h..(t + 1) * h];
-                if first {
-                    dst.copy_from_slice(src);
-                    first = false;
-                } else {
-                    for (o, v) in dst.iter_mut().zip(src) {
-                        *o += v;
-                    }
-                }
-            }
-        }
+    let work_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let run_result = pool.run(&batch, work_deadline);
+    if run_result.is_ok() {
+        reduce_batch_outputs(&batch, &routing, h, slices, out);
     }
-    // Workers drop their batch ownership before publishing completion.
-    pool.state.0.lock().unwrap().batch.take();
+    *pool.spare_routing.lock().unwrap() = routing;
     if let Ok(batch) = Arc::try_unwrap(batch) {
         *pool.spare.lock().unwrap() = batch.jobs;
         *pool.spare_outputs.lock().unwrap() = batch.outputs;
         *pool.spare_inputs.lock().unwrap() = (batch.xp, batch.xg);
     }
-    Ok(y)
+    run_result
+}
+fn reduce_batch_outputs(
+    batch: &Batch,
+    routing: &RoutingScratch,
+    h: usize,
+    slices: usize,
+    out: Output<'_>,
+) {
+    match out {
+        Output::F32(y) => {
+            for (tok, &compact) in routing.tok_to_compact.iter().enumerate() {
+                if compact == u32::MAX {
+                    y[tok * h..(tok + 1) * h].fill(0.);
+                }
+            }
+            for (c, &tok) in routing.active_toks.iter().enumerate() {
+                let dst = &mut y[tok * h..(tok + 1) * h];
+                let mut first = true;
+                for &expert in &routing.token_routes[c] {
+                    let j = routing.expert_to_job[expert] as usize;
+                    let row = batch.jobs[j].rows.iter().position(|r| r.0 == c).unwrap();
+                    let start = row * h;
+                    for slice in 0..slices {
+                        let output = batch.outputs[j * slices + slice].lock().unwrap();
+                        let src = &output[start..start + h];
+                        if first {
+                            dst.copy_from_slice(src);
+                            first = false;
+                        } else {
+                            eval::add_assign_slice(dst, src);
+                        }
+                    }
+                }
+            }
+        }
+        Output::F16(out_f16) => {
+            for (tok, &compact) in routing.tok_to_compact.iter().enumerate() {
+                if compact == u32::MAX {
+                    out_f16[tok * h..(tok + 1) * h].fill(0);
+                }
+            }
+            let mut acc = [0.0f32; 4096];
+            for (c, &tok) in routing.active_toks.iter().enumerate() {
+                let dst_f32 = &mut acc[..h];
+                let mut first = true;
+                for &expert in &routing.token_routes[c] {
+                    let j = routing.expert_to_job[expert] as usize;
+                    let row = batch.jobs[j].rows.iter().position(|r| r.0 == c).unwrap();
+                    let start = row * h;
+                    for slice in 0..slices {
+                        let output = batch.outputs[j * slices + slice].lock().unwrap();
+                        let src = &output[start..start + h];
+                        if first {
+                            dst_f32.copy_from_slice(src);
+                            first = false;
+                        } else {
+                            eval::add_assign_slice(dst_f32, src);
+                        }
+                    }
+                }
+                if !first {
+                    eval::f32_to_f16_slice(dst_f32, &mut out_f16[tok * h..(tok + 1) * h]);
+                }
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -958,6 +1162,7 @@ mod tests {
             spare: Mutex::new(Vec::new()),
             spare_outputs: Mutex::new(Vec::new()),
             spare_inputs: Mutex::new((Vec::new(), Vec::new())),
+            spare_routing: Mutex::new(RoutingScratch::default()),
             caller_scratch: Mutex::new(Scratch::default()),
         };
         let batch = Arc::new(Batch {
@@ -1048,6 +1253,101 @@ mod tests {
                 samples[100], samples[180]
             );
         }
+        drop(pool);
+        // Restore full process CPU affinity before spawning Runtime's worker pool.
+        #[cfg(target_os = "linux")]
+        // SAFETY: `cpu_set_t` is plain old data; setting bits `0..32` restores the host cpuset.
+        unsafe {
+            let mut full: libc::cpu_set_t = std::mem::zeroed();
+            for cpu in 0..32 {
+                libc::CPU_SET(cpu, &mut full);
+            }
+            let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &full);
+        }
+        let _device = CudaDevice::set_current(0).unwrap();
+        let stream = crate::cuda::CudaStream::new(0).unwrap();
+        let runtime = Runtime::new(&stream).unwrap();
+        let prefill_tokens = 6144;
+        let x_f16 = vec![0x3000u16; prefill_tokens * layout.hidden];
+        let mut out_f16 = vec![0u16; prefill_tokens * layout.hidden];
+        let experts = (0..16).collect::<Vec<i32>>();
+        let counts = vec![12i32; 16];
+        let mut toks = vec![0i32; 16 * 96];
+        let mut wts = vec![0.0f32; 16 * 96];
+        for j in 0..16 {
+            for s in 0..12 {
+                toks[j * 96 + s] = ((j * 37 + s * 191) % prefill_tokens) as i32;
+                wts[j * 96 + s] = 0.125;
+            }
+        }
+        let mut prefill_samples = Vec::new();
+        for step in 0..25 {
+            let start = std::time::Instant::now();
+            runtime
+                .prefill(
+                    &store,
+                    &x_f16,
+                    prefill_tokens,
+                    &experts,
+                    &counts,
+                    &toks,
+                    &wts,
+                    &mut out_f16,
+                )
+                .unwrap();
+            if step >= 5 {
+                prefill_samples.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        prefill_samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "prefill tokens={prefill_tokens} (16x12 active) median={:.1}us p90={:.1}us",
+            prefill_samples[10], prefill_samples[18]
+        );
+        let heavy_jobs = 220usize;
+        let heavy_toks_per_job = 5usize;
+        let heavy_packs = vec![0x89u8; 256 * layout.stride];
+        let heavy_store = HostExpertStore::from_raw_packs(
+            layout.clone(),
+            0..256,
+            &heavy_packs,
+            heavy_packs.len(),
+        )
+        .unwrap();
+        let heavy_experts = (0..heavy_jobs as i32).collect::<Vec<i32>>();
+        let heavy_counts = vec![heavy_toks_per_job as i32; heavy_jobs];
+        let mut heavy_toks = vec![0i32; heavy_jobs * 96];
+        let mut heavy_wts = vec![0.0f32; heavy_jobs * 96];
+        for j in 0..heavy_jobs {
+            for s in 0..heavy_toks_per_job {
+                heavy_toks[j * 96 + s] = ((j * 29 + s * 131) % prefill_tokens) as i32;
+                heavy_wts[j * 96 + s] = 0.125;
+            }
+        }
+        let mut heavy_samples = Vec::new();
+        for step in 0..15 {
+            let start = std::time::Instant::now();
+            runtime
+                .prefill(
+                    &heavy_store,
+                    &x_f16,
+                    prefill_tokens,
+                    &heavy_experts,
+                    &heavy_counts,
+                    &heavy_toks,
+                    &heavy_wts,
+                    &mut out_f16,
+                )
+                .unwrap();
+            if step >= 3 {
+                heavy_samples.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        heavy_samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "prefill tokens={prefill_tokens} ({heavy_jobs}x{heavy_toks_per_job} active) median={:.1}us p90={:.1}us",
+            heavy_samples[6], heavy_samples[10]
+        );
     }
 
     #[test]
