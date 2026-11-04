@@ -1580,19 +1580,10 @@ unsafe extern "C" {
         group_size: i32,
     ) -> i32;
 
-    pub fn w34_moe_cpu_bridge_register_layer(
-        layer_id: i32,
-        host_packs_base: *const c_void,
-        pack_stride_bytes: usize,
-        local_num_experts: i32,
-        intermediate: i32,
-        hidden: i32,
-        group_size: i32,
-    ) -> i32;
-
     pub fn w34_moe_hybrid_submit_and_pull(
         ex: *const W34Exec,
         layer_id: i32,
+        d_req_slot: *mut c_void,
         x_f16: *const c_void,
         global_topk_ids: *const i32,
         topk_weights: *const f32,
@@ -1621,23 +1612,12 @@ unsafe extern "C" {
 
     pub fn w34_moe_hybrid_wait_and_add(
         ex: *const W34Exec,
-        layer_id: i32,
+        d_req_slot: *const c_void,
+        d_resp_slot: *const c_void,
         out_f16: *mut c_void,
         num_misses_buf: *const i32,
         num_tokens: i32,
         k_hidden: i32,
-    ) -> i32;
-
-    pub fn w34_moe_cpu_eval_prefill_batch(
-        layer_id: i32,
-        x_f16: *const u16,
-        num_tokens: i32,
-        job_le: *const i32,
-        job_n_tok: *const i32,
-        job_tok_ids: *const i32,
-        job_weights: *const f32,
-        num_jobs: i32,
-        out_f16: *mut u16,
     ) -> i32;
 }
 

@@ -491,10 +491,125 @@ impl CudaDevice {
     }
 }
 
+/// Sticky host failures shared by streams and events through flat slot snapshots.
+/// Register slots before launching any GPU work or graphs that use them. A host
+/// worker must publish its error before acknowledging completion to the GPU.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Default)]
+pub(crate) struct HostFailures {
+    slots: std::sync::Mutex<Vec<std::sync::Arc<std::sync::OnceLock<CudaError>>>>,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl HostFailures {
+    pub(crate) fn register(&self) -> std::sync::Arc<std::sync::OnceLock<CudaError>> {
+        let slot = std::sync::Arc::new(std::sync::OnceLock::new());
+        self.slots.lock().unwrap().push(slot.clone());
+        slot
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        for slot in self.slots.lock().unwrap().iter() {
+            if let Some(error) = slot.get() {
+                return Err(error.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn inherit(&self, source: &Self) {
+        // Release the source lock before taking ours, including for self-inheritance.
+        // Sharing slots (not owners) preserves late publication without cycles.
+        let snapshot = source.slots.lock().unwrap().clone();
+        if snapshot.is_empty() {
+            return;
+        }
+        let mut slots = self.slots.lock().unwrap();
+        for slot in snapshot {
+            if !slots
+                .iter()
+                .any(|existing| std::sync::Arc::ptr_eq(existing, &slot))
+            {
+                slots.push(slot);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_failure_tests {
+    use super::{CudaError, HostFailures};
+
+    #[test]
+    fn late_publication_after_snapshot() {
+        let source = HostFailures::default();
+        let slot = source.register();
+        let target = HostFailures::default();
+        target.inherit(&source);
+        assert_eq!(target.check(), Ok(()));
+        let error = CudaError::new(-1, "host compute");
+        std::thread::spawn(move || slot.set(error).unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(target.check(), Err(CudaError::new(-1, "host compute")));
+    }
+
+    #[test]
+    fn failures_are_sticky_and_first_error_wins() {
+        let failures = HostFailures::default();
+        assert_eq!(failures.check(), Ok(()));
+        let first = failures.register();
+        let second = failures.register();
+        let error = CudaError::with_detail(-1, "host compute", "failed response");
+        first.set(error.clone()).unwrap();
+        second.set(CudaError::new(-2, "later failure")).unwrap();
+        for _ in 0..3 {
+            assert_eq!(failures.check(), Err(error.clone()));
+        }
+        assert!(first.set(CudaError::new(-3, "replacement")).is_err());
+        assert_eq!(failures.check(), Err(error));
+    }
+
+    #[test]
+    fn repeated_and_bidirectional_inheritance_deduplicates() {
+        let source = HostFailures::default();
+        let first = source.register();
+        let target = HostFailures::default();
+        let second = target.register();
+        for _ in 0..3 {
+            target.inherit(&source);
+            source.inherit(&target);
+            target.inherit(&target);
+        }
+        assert_eq!(source.slots.lock().unwrap().len(), 2);
+        assert_eq!(target.slots.lock().unwrap().len(), 2);
+        drop(source);
+        drop(target);
+        assert_eq!(std::sync::Arc::strong_count(&first), 1);
+        assert_eq!(std::sync::Arc::strong_count(&second), 1);
+    }
+
+    #[test]
+    fn transitive_inheritance_outlives_source_owners() {
+        let source = HostFailures::default();
+        let slot = source.register();
+        let event = HostFailures::default();
+        event.inherit(&source);
+        let dependent = HostFailures::default();
+        dependent.inherit(&event);
+        drop(source);
+        drop(event);
+        let error = CudaError::new(-1, "host compute");
+        slot.set(error.clone()).unwrap();
+        assert_eq!(dependent.check(), Err(error));
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub struct CudaStream {
     pub device_id: i32,
     pub handle: usize,
+    pub(crate) host_failures: HostFailures,
 }
 
 #[cfg(feature = "cuda")]
@@ -508,7 +623,11 @@ impl CudaStream {
             unsafe { ffi::w34_stream_create(&raw mut handle) },
             "w34_stream_create",
         )?;
-        Ok(Self { device_id, handle })
+        Ok(Self {
+            device_id,
+            handle,
+            host_failures: HostFailures::default(),
+        })
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -521,7 +640,8 @@ impl CudaStream {
             // SAFETY: `self.handle` is a live `cudaStream_t` owned by `self`.
             unsafe { ffi::w34_stream_synchronize(self.handle) },
             "w34_stream_synchronize",
-        )
+        )?;
+        self.host_failures.check()
     }
 
     pub fn exec(&self, scratch_ptr: u64, scratch_size: usize) -> W34Exec {
@@ -533,6 +653,7 @@ impl CudaStream {
     }
 
     pub fn wait_event(&self, event: &CudaEvent) -> Result<()> {
+        self.host_failures.inherit(&event.host_failures);
         check_rc(
             // SAFETY: both `self.handle` and `event.handle` are live CUDA handles owned by their wrappers.
             unsafe { ffi::w34_stream_wait_event(self.handle, event.handle) },
@@ -579,6 +700,7 @@ impl Drop for CudaStream {
 pub struct CudaEvent {
     pub device_id: i32,
     pub handle: usize,
+    pub(crate) host_failures: HostFailures,
 }
 
 #[cfg(feature = "cuda")]
@@ -592,7 +714,11 @@ impl CudaEvent {
             unsafe { ffi::w34_event_create(&raw mut handle, i32::from(enable_timing)) },
             "w34_event_create",
         )?;
-        Ok(Self { device_id, handle })
+        Ok(Self {
+            device_id,
+            handle,
+            host_failures: HostFailures::default(),
+        })
     }
 
     pub fn record(&self, stream: &CudaStream) -> Result<()> {
@@ -605,6 +731,7 @@ impl CudaEvent {
     }
 
     pub fn record_in_current_ctx(&self, stream: &CudaStream) -> Result<()> {
+        self.host_failures.inherit(&stream.host_failures);
         check_rc(
             // SAFETY: `self.handle` and `stream.handle` are live event/stream handles on the same device.
             unsafe { ffi::w34_event_record(self.handle, stream.handle) },
@@ -617,7 +744,8 @@ impl CudaEvent {
             // SAFETY: `self.handle` is a live `cudaEvent_t` owned by `self`.
             unsafe { ffi::w34_event_synchronize(self.handle) },
             "w34_event_synchronize",
-        )
+        )?;
+        self.host_failures.check()
     }
 
     pub fn elapsed_ms(&self, end: &CudaEvent) -> Result<f32> {

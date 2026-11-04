@@ -1,5 +1,16 @@
 # warp-34 — Session Orientation & Current State
 
+## Rust CPU MoE bridge migration (completed & verified)
+
+- **Architecture:** Host SIMD `u4b8` evaluation, dynamic physical-core worker pool, responder, and mapped mailbox ownership now live in `crates/w34-host/src/moe_cpu_bridge.rs` and `crates/w34-host/src/moe_cpu_bridge/eval.rs`. `crates/w34-kernels/csrc/ops/op_moe_cpu_bridge.cu` contains only stateless GPU mailbox kernels and explicit-pointer launch wrappers (`w34_moe_hybrid_submit_and_pull`, `w34_moe_hybrid_wait_and_add`); no C++ host singleton or detached threads remain.
+- **Dynamic core topology & lock-free dispatch:** `detect_worker_cpus()` queries `sched_getaffinity` and deduplicates SMT siblings via `/sys/devices/system/cpu/cpu*/topology/{physical_package_id,core_id}` (capped at `32` workers, with `available_parallelism` fallback), pinning the responder as worker `0` on `cpus[0]` and spawning `cpus.len() - 1` background workers on `cpus[1..]`. `Wake` tracks `sleeping` workers with `SeqCst` ordering so `FUTEX_WAKE` syscalls are skipped while workers are in their user-space spin window, and workers read published batches via an atomic pointer retained until all completion acknowledgments.
+- **Numerical parity:** Standalone comparison against the original NVCC-compiled evaluator (`-O3 -use_fast_math`) matched all output bits across **20/20 expert cases** (`H=2560`, `I=640`, decode slices at `1–4` tokens, prefill at `1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 96`; `/tmp/w34-verify/final.txt`), and `prepare_x_perm_f16` matches `prepare_x_perm` across all `63,488` finite IEEE-754 binary16 values.
+- **Performance non-regression (`/tmp/w34-bridge-dynamic-cpus.log`):**
+  - Pool microbenchmark (`benchmark_flash_next_pool`): `tokens=1` median **148.7 us** (`p90 159.5 us`) vs C++ **147.1 us** (`p90 160.7 us`); `tokens=4` median **383.8 us** (`p90 443.8 us`) vs C++ **416.0 us** (`p90 464.1 us`).
+  - Real-checkpoint `test_qwen4_exp_real_checkpoint_tp1_and_tp2`: `TP=1` warm target decode **34.26 tok/s** and `TP=1` warm `MTP-3` **44.92 tok/s** (`TP=2` warm target **64.99 tok/s**, `TP=2` warm `MTP-3` **125.22 tok/s**), matching or exceeding the C++ baseline runs (**32.79–34.16 tok/s** target / **43.89–44.79 tok/s** `MTP-3` in `/tmp/w34-cpp-bridge-baseline.log` and `/tmp/w34-cpp-bridge-repeat1.log`).
+- **Safe failure propagation & review disposition:** Decode evaluation errors acknowledge the mailbox with `status = 1` (skipping stale output addition on the GPU) and latch a sticky host failure on the owning `CudaStream` (inherited across `CudaEvent`s and dependent streams). At serving tick boundaries (`engine_worker.rs`), `require_healthy_host_compute` escalates to the supervised worker boundary, closing ingress and notifying active and queued requests rather than continuing to serve from corrupted KV/recurrent state. Full `mise run check` passed (`/tmp/w34-bridge-final-check.log`).
+
+
 ## Status: Phases 0–6 complete (with ratified `sm_86` HBM/PCIe proposer rooflines in `ROADMAP.md` §4 `6.1`)
 
 The [Phase 6 criterion-by-criterion evidence ledger](PHASE6_EVIDENCE.md) records

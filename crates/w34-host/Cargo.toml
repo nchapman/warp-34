@@ -17,6 +17,7 @@ default = []
 cuda = ["w34-kernels/cuda"]
 
 [dependencies]
+libc = "0.2"
 w34-kernels = { path = "../w34-kernels" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

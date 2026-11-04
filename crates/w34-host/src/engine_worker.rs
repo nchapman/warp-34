@@ -927,6 +927,20 @@ struct SpeculativeLoopState {
     mtp_batch_slots: MtpBatchSlots,
 }
 
+/// A failed host-assisted graph may have written invalid KV/recurrent state.
+/// Escalate to the existing supervised worker boundary: it closes ingress,
+/// publishes failed health and notifies active/queued requests before CUDA teardown.
+/// Do not clear the error and keep serving from a potentially corrupted model.
+fn require_healthy_host_compute<'a>(
+    failures: impl IntoIterator<Item = &'a crate::cuda::HostFailures>,
+) {
+    for failures in failures {
+        if let Err(error) = failures.check() {
+            panic!("host-assisted compute failed; restart engine: {error}");
+        }
+    }
+}
+
 fn run_loop(
     engine: &mut Qwen3_5Engine,
     config: SchedulerConfig,
@@ -942,6 +956,7 @@ fn run_loop(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
+        require_healthy_host_compute(engine.ranks.iter().map(|r| &r.stream.host_failures));
         let first = if requests.is_empty() {
             match receiver.blocking_recv() {
                 Some(r) => Some(r),
@@ -2998,6 +3013,43 @@ mod full_hidden_tap_tests {
             assert_eq!(err.http_status(), axum::http::StatusCode::BAD_REQUEST);
             assert!(err.to_string().contains("context limit"));
         }
+    }
+
+    #[test]
+    fn terminal_host_compute_error_closes_ingress_before_model_teardown() {
+        let failures = crate::cuda::HostFailures::default();
+        let slot = failures.register();
+        require_healthy_host_compute([&failures]);
+        slot.set(crate::cuda::CudaError::with_detail(
+            -1,
+            "CPU MoE bridge",
+            "injected failure",
+        ))
+        .unwrap();
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut requests = HashMap::new();
+        let stats = WorkerStats::default();
+        let panicked = AtomicBool::new(false);
+        let reason = Mutex::new(None);
+        run_supervised_loop(
+            &mut receiver,
+            &mut requests,
+            &stats,
+            &panicked,
+            &reason,
+            |_, _| {
+                require_healthy_host_compute([&failures]);
+            },
+        );
+        assert!(panicked.load(Ordering::Acquire));
+        assert!(receiver.is_closed());
+        let reason = reason.lock().unwrap();
+        assert!(reason.as_ref().unwrap().contains("restart engine"));
+        assert!(reason.as_ref().unwrap().contains("injected failure"));
+        assert!(
+            failures.check().is_err(),
+            "must not silently reset invalid model state"
+        );
     }
 
     #[test]

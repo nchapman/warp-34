@@ -8,6 +8,53 @@
 
 ---
 
+## Rust CPU bridge migration (completed & verified)
+
+The host evaluator, dynamic physical-core worker pool, and mailbox ownership
+live in `crates/w34-host/src/moe_cpu_bridge.rs` and `moe_cpu_bridge/eval.rs`.
+`op_moe_cpu_bridge.cu` contains only device kernels and launch wrappers.
+`detect_worker_cpus()` queries `sched_getaffinity` and deduplicates SMT siblings
+via `/sys/devices/system/cpu/cpu*/topology/{physical_package_id,core_id}` (up to
+32 physical cores, with `available_parallelism` fallback), pinning the responder
+as worker zero on `cpus[0]` alongside `cpus.len() - 1` pinned background workers
+on `cpus[1..]`. Expert packs are shared through owned `Arc` backing; shutdown
+drains GPU work before joining responders and freeing mailboxes.
+
+Arithmetic retains fixed two-slice decode, router-order reduction, and the
+original scalar bias FMA contraction. The standalone NVCC comparison covers
+20 expert cases (decode slices at 1–4 tokens and prefill at
+1/2/3/4/5/8/9/16/17/32/33/96), all bit-identical (`/tmp/w34-verify/final.txt`).
+The direct FP16 preparation helper separately matches FP32 preparation for every
+finite binary16 value. On `test_qwen4_exp_real_checkpoint_tp1_and_tp2`
+(`/tmp/w34-bridge-dynamic-cpus.log`), `TP=1` warm target decode reaches
+**34.26 tok/s** and `TP=1` warm `MTP-3` reaches **44.92 tok/s** (`TP=2` warm
+target **64.99 tok/s**, `TP=2` warm `MTP-3` **125.22 tok/s**), matching or
+exceeding the C++ baseline (**32.79–34.16 tok/s** target / **43.89–44.79 tok/s**
+`MTP-3` in `/tmp/w34-cpp-bridge-baseline.log` and
+`/tmp/w34-cpp-bridge-repeat1.log`).
+
+**Failure policy:** an unsuccessful host-assisted graph acknowledges a failed
+mailbox so the device does not consume stale output or wait forever for that
+response. Its CUDA stream and dependent events carry a sticky host error.
+The serving worker checks this terminal condition at tick boundaries and exits
+through its existing supervised failure path, closing ingress and notifying
+queued/active callers before model destruction. Recovery requires an engine
+restart/reload with fresh streams and state; this is deliberately not a
+request-local retry. Clearing the error alone would permit reuse of KV/recurrent
+state already modified by a failed graph. No automatic in-process reload is
+implemented. Raw device synchronization remains available to drain teardown.
+
+Review disposition: the two important findings about silently poisoning future
+traffic are addressed by the supervised worker exit above, rather than by
+clearing the error. Timeout/error classification does not make an already
+failed graph's state reusable. Suggested active-token prefill compaction and
+richer worker diagnostics remain performance/diagnostic follow-ups. Device
+polling still relies on a live responder; normal evaluation failures are
+acknowledged, but a process-wide host stall is not covered by a GPU watchdog.
+The mapped staging-slot and test-capacity suggestions concern pre-existing
+code, not this migration. Full `mise run check` passed
+(`/tmp/w34-bridge-final-check.log`).
+
 ## 1. Model Architecture & Delta vs. `Qwen3.5` / `Qwen3.6`
 
 `Qwen/Qwen3.8-Flash-Next` (`180B` total parameters: `125B` backbone with `6B` activated per token + `51.2B` PLE n-gram table + `4B` MTP drafter) shares the 3:1 hybrid recurrence schedule and multimodal stem already proven in `warp-34` Phases 0–6, while introducing five Qwen4-generation architectural primitives.

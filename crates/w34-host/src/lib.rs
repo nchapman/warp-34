@@ -20,6 +20,8 @@ pub mod hub;
 pub mod loader;
 #[cfg(feature = "cuda")]
 pub mod model;
+#[cfg(feature = "cuda")]
+mod moe_cpu_bridge;
 pub mod moe_offload;
 #[cfg(feature = "cuda")]
 pub mod mtp;

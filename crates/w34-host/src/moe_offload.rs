@@ -426,8 +426,9 @@ mod host_store {
         }
     }
 
+    #[derive(Clone)]
     pub struct HostExpertStore {
-        storage: HostPackStorage,
+        storage: std::sync::Arc<HostPackStorage>,
         layout: ExpertPackLayout,
         expert_ids: Range<usize>,
     }
@@ -655,7 +656,7 @@ mod host_store {
                 Ok(())
             })?;
             Ok(Self {
-                storage,
+                storage: std::sync::Arc::new(storage),
                 layout,
                 expert_ids,
             })
@@ -693,7 +694,7 @@ mod host_store {
             let mut storage = HostPackStorage::alloc(bytes, true)?;
             storage.as_mut_slice().copy_from_slice(raw_packs);
             Ok(Self {
-                storage,
+                storage: std::sync::Arc::new(storage),
                 layout,
                 expert_ids,
             })
@@ -982,6 +983,8 @@ mod host_store {
         pub d_slot_last_used: crate::cuda::DeviceBuffer,
         pub d_step_counter: crate::cuda::DeviceBuffer,
         pub bridge_layer_id: Option<usize>,
+        bridge_runtime: Option<std::sync::Arc<crate::moe_cpu_bridge::Runtime>>,
+        bridge_mailbox: Option<std::sync::Arc<crate::moe_cpu_bridge::Mailbox>>,
         pub k_static: usize,
         pub device_lru_dirty: bool,
         pub step_clock: u64,
@@ -1030,6 +1033,8 @@ mod host_store {
                 d_slot_last_used,
                 d_step_counter,
                 bridge_layer_id: None,
+                bridge_runtime: None,
+                bridge_mailbox: None,
                 k_static: k_hot,
                 device_lru_dirty: false,
                 step_clock: 1,
@@ -1120,8 +1125,7 @@ mod host_store {
             }
         }
 
-        /// Registers this layer with the C++ AVX2/FMA CPU+GPU hybrid cold-expert bridge
-        /// (`w34_moe_cpu_bridge_register_layer`) and reserves the top `k_hot - k_static`
+        /// Registers this layer with the owned Rust SIMD CPU+GPU hybrid cold-expert bridge and reserves the top `k_hot - k_static`
         /// slots (`k_static..k_hot`) as transient GPU PCIe staging slots while keeping
         /// slots `0..k_static` permanently resident in VRAM.
         pub fn register_cpu_bridge(
@@ -1149,21 +1153,11 @@ mod host_store {
             self.d_slot_to_expert
                 .copy_from_host(&self.slot_to_expert_i32, stream)?;
             stream.synchronize()?;
-            crate::cuda::check_rc(
-                // SAFETY: `store.raw_packs_ptr()` is valid for the lifetime of `store`.
-                unsafe {
-                    w34_kernels::ffi::w34_moe_cpu_bridge_register_layer(
-                        layer_id as i32,
-                        store.raw_packs_ptr().cast::<core::ffi::c_void>(),
-                        store.layout().stride,
-                        store.expert_ids().len() as i32,
-                        store.layout().intermediate as i32,
-                        store.layout().hidden as i32,
-                        store.layout().group_size as i32,
-                    )
-                },
-                "w34_moe_cpu_bridge_register_layer",
-            )?;
+            if self.bridge_runtime.is_none() {
+                self.bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
+            }
+            let runtime = self.bridge_runtime.as_ref().unwrap();
+            self.bridge_mailbox = Some(runtime.register(store)?);
             self.bridge_layer_id = Some(layer_id);
             self.k_static = k_static;
             Ok(())
@@ -1506,6 +1500,7 @@ mod host_store {
                         w34_kernels::ffi::w34_moe_hybrid_submit_and_pull(
                             &ex,
                             layer_id as i32,
+                            cache.bridge_mailbox.as_ref().unwrap().request_ptr(),
                             x_addr as *const core::ffi::c_void,
                             d_topk_ids_addr as *const i32,
                             d_topk_weights_addr as *const f32,
@@ -1555,7 +1550,8 @@ mod host_store {
                     unsafe {
                         w34_kernels::ffi::w34_moe_hybrid_wait_and_add(
                             &ex,
-                            layer_id as i32,
+                            cache.bridge_mailbox.as_ref().unwrap().request_ptr(),
+                            cache.bridge_mailbox.as_ref().unwrap().response_ptr(),
                             out_addr as *mut core::ffi::c_void,
                             ws.d_num_misses.addr() as *const i32,
                             num_tokens as i32,
@@ -2286,27 +2282,29 @@ mod host_store {
                     // `ws.d2h_done_event` (which was recorded before Pass 0!) and evaluate `cpu_job_le`
                     // across the 16-core AVX2/FMA worker pool in DDR5 RAM!
                     if !cpu_job_le.is_empty()
-                        && let Some(layer_id) = cache.bridge_layer_id
+                        && let Some(_layer_id) = cache.bridge_layer_id
                     {
                         ws.d2h_done_event.synchronize()?;
                         cache.cpu_cold_evals += cpu_job_le.len() as u64;
-                        crate::cuda::check_rc(
-                            // SAFETY: pinned `ws.h_prefill_x` and `ws.h_prefill_out` cover `num_tokens * hidden` FP16 elements.
-                            unsafe {
-                                w34_kernels::ffi::w34_moe_cpu_eval_prefill_batch(
-                                    layer_id as i32,
+                        // SAFETY: event completed D2H; these pinned buffers cover the batch and are exclusively used here.
+                        unsafe {
+                            cache.bridge_runtime.as_ref().unwrap().prefill(
+                                store,
+                                std::slice::from_raw_parts(
                                     ws.h_prefill_x.host_ptr.cast::<u16>(),
-                                    num_tokens as i32,
-                                    cpu_job_le.as_ptr(),
-                                    cpu_job_n.as_ptr(),
-                                    cpu_job_toks.as_ptr(),
-                                    cpu_job_wts.as_ptr(),
-                                    cpu_job_le.len() as i32,
+                                    num_tokens * ws.layout.hidden,
+                                ),
+                                num_tokens,
+                                &cpu_job_le,
+                                &cpu_job_n,
+                                &cpu_job_toks,
+                                &cpu_job_wts,
+                                std::slice::from_raw_parts_mut(
                                     ws.h_prefill_out.host_ptr.cast::<u16>(),
-                                )
-                            },
-                            "w34_moe_cpu_eval_prefill_batch",
-                        )?;
+                                    num_tokens * ws.layout.hidden,
+                                ),
+                            )?;
+                        }
                         crate::cuda::check_rc(
                             // SAFETY: `ws.h_prefill_out` is pinned host memory and `ws.d_chunk_out` fits `x_bytes`.
                             unsafe {
@@ -2382,6 +2380,7 @@ mod host_store {
                 .and_then(HotExpertRankings::from_model_dir);
             let mut stores = Vec::with_capacity(cfg.num_hidden_layers);
             let mut caches = Vec::with_capacity(cfg.num_hidden_layers);
+            let mut bridge_runtime = None;
             for layer_id in 0..cfg.num_hidden_layers {
                 let prefix = format!("model.layers.{layer_id}.mlp.experts");
                 let store = HostExpertStore::load(
@@ -2410,6 +2409,10 @@ mod host_store {
                     && HotExpertCache::cpu_bridge_supported()
                 {
                     let k_static = k_hot;
+                    if bridge_runtime.is_none() {
+                        bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
+                    }
+                    cache.bridge_runtime = bridge_runtime.clone();
                     cache.register_cpu_bridge(layer_id, &store, k_static, stream)?;
                 }
                 stores.push(store);
