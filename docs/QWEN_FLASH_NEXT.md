@@ -309,8 +309,36 @@ Every phase follows `warp-34`'s engineering rules: no phase graduates without pa
 2. **[Landed] Pre-Seed `HotExpertCache` from `static_hot_cache_rankings.json` (`crates/w34-host/src/moe_offload.rs`):**
    - `HotExpertRankings::from_model_dir` automatically probes `static_hot_cache_rankings.json` and `runtime/static_hot_cache_rankings.json`, filters and deduplicates global expert IDs per `EP` rank (`hot48` on `TP=1`, `hot88` on `TP=2 / EP=2`, `hot64` on `MTP-3`), and pre-warms `HotExpertCache` at startup.
    - `HotExpertCache::sync_from_device_if_dirty` synchronizes device LRU metadata before host-fallback prefill execution so CUDA Graph replays (`decode_graph` / `spec_verify_graph`) and eager prefill chunks remain 100% coherent.
-3. **[Optional Future Enhancement] Multi-Core AVX2/AVX-512 Cold-Expert Co-Execution for `TP=1` (`crates/w34-host/src/moe_offload.rs`) & MTP Draft Vocab Filtering (`crates/w34-host/src/mtp.rs`):**
-   - On single-GPU (`TP=1`), co-executing cold experts on a pinned AVX2/AVX-512 thread pool (`CpuHybrid`) and restricting the MTP draft `lm_head` GEMV to `[[0, 65536], [248044, 248320]]` can further reduce single-card PCIe traffic.
+3. **[Landed] CUDA-Graph-Safe 16-Core AVX-512F/F16C Hybrid Cold-Expert Bridge (`crates/w34-kernels/csrc/ops/op_moe_cpu_bridge.cu`, `crates/w34-host/src/moe_offload.rs`):**
+   - **In-Graph System-Atomic Mailbox (`w34_moe_hybrid_submit_and_pull` + `w34_moe_hybrid_wait_and_add`):** For single-GPU (`TP=1`, `k_hot = 80`, `k_static = 78`), `moe_hybrid_plan_and_submit_kernel` partitions routed experts inside a captured CUDA Graph into:
+     1. **Static hot hits (`slots[0..78]`):** Executed on the GPU.
+     2. **Transient PCIe cold share (`slots[78..80]`, `gpu_share_frac = 0.14`):** Pulled directly over zero-copy PCIe (`moe_hybrid_pull_mapped_experts_kernel`) without evicting any static hot expert.
+     3. **CPU DDR5 cold share:** Published via `st.release.sys.global.b64` to a persistent 16-core Zen 4 worker pool (`CpuWorkerPool` with `futex` idle sleep and 3.5 ms spin window) while the GPU concurrently runs `launch_moe_w4a16`, followed by `moe_hybrid_wait_and_add_kernel` (`ld.acquire.sys.global.b64` + fused residual add).
+   - **512-Bit `__m512` `u4b8` Nibbles-at-Once Kernels & 3D V-Cache Packing:**
+     - `prepare_x_perm` permutes each 128-element activation group into `dst[b * 16 + l]` so each of the 8 nibble shifts (`B = 0..7`) unpacks all 16 `uint32_t` words of a 64-byte cache line in a single `__m512i` register (`_mm512_loadu_si512` $\rightarrow$ `_mm512_srli_epi32` + `_mm512_and_si512` + `_mm512_cvtepi32_ps` + `_mm512_fmadd_ps`).
+     - `eval_four_rows_u4b8<1>` evaluates 2 gate + 2 up rows (or 4 down rows) simultaneously in **18 of 32 ZMM registers** with zero register spills, and `eval_four_rows_tile_u4b8` evaluates up to 8 routed tokens per cold expert in a single weight pass during prefill.
+     - `compute_prefill_cpu` packs per-job outputs contiguously by `job_row_off[j]` (`~71 MB` instead of `240 MB`), keeping the buffer resident in the Ryzen 9 7950X3D's **96 MB 3D V-Cache L3**, and parallelizes F16C (`_mm256_cvtph_ps` / `_mm256_cvtps_ph`) activation conversion and reduction across all 16 cores.
+   - **Zero-Extra-PCIe Prompt-Frequency Hot-Slot Promotion in `StreamedPrefill`:**
+     - On long prompts (`num_tokens >= 1024`), `StreamedPrefill` ranks cold misses by their frequency in the current prompt, places up to 16 cold experts that are $\ge 3\times$ more frequent than the lowest-frequency slots in `slots[58..78]` at the start of `gpu_misses` (sorted by expert ID so host DDR5 reads remain sequential), and unpacks them directly from `ws.d_stage_packs[0]` into `cache.slots[58..78]` inside GDDR6X (`1,008 GB/s`, `~30 µs/layer`, **zero extra PCIe traffic**).
+4. **[Landed] Parallel QSA Block Selection + GQA-6 Shared-Tile & Split-K `TQ4` Attention (`crates/w34-kernels/csrc/ops/op_qsa.cu`):**
+   - Replaced serial `threadIdx.x == 0` selection in `qsa_select_blocks_f16_kernel` with 128-thread warp-collaborative scoring and parallel radix/threshold top-`k` selection.
+   - Added `qsa_sparse_paged_attn_gqa_f16_kernel` so all **6 query heads sharing a KV head** run in one CTA and dequantize each selected 4-token `TQ4` (`WHT-256`) KV block **once into shared memory** (`6×` fewer `TQ4` dequantizations), plus `qsa_sparse_paged_attn_splitk_merge_f16_kernel` for Split-K decode/MTP verify (`M <= 4`).
+5. **[Landed] Single-Pass 6,144-Token Prefill, Double-Buffered H2D DMA, Parallel PLE Stream Overlap, & Prefix-Primed `MTP` Memoization (`crates/w34-host/src/{moe_offload.rs,ple.rs,mtp.rs,proposer.rs,model/rank.rs}`):**
+   - Expanded the prefill scratch arena to `1056 MiB` (`<= 8192` KV pages) with `hc_extra` accounting in `ordinary_prefill_token_capacity`, enabling single-pass `6,144`-token prefill (`stage_capacity = 96`) and double-buffered async H2D DMA on `ws.h2d_stream`.
+   - Vectorized `PleMmapTable` host gathers across a persistent worker pool on a dedicated `ple_stream`, raised single-layer `MTP` `k_hot` on `TP=1` from `64` to `192` with single-chunk MTP prefill, and added a 16-entry `PrefixMemo` cache (`256 MiB` budget) with branching-prefix checkpoint donation (`mamba_branching_seqlen`).
+
+### 5.3 Standalone HTTP Serving Campaign Sweep (`benchmarks/perf/campaigns/flash-next-serving.toml`)
+
+With the optimizations in §5.2, `warp-34` sweeps **5/5** serving workloads on **both** 1× RTX 3090 Ti (`warp34-flash-tp1-mtp3` vs `qfn-3090-mtp3`) and 2× RTX 3090 Ti (`warp34-flash-tp2-mtp3` vs `qfn-2x3090-mtp3`), plus `cold-read-60k` (`57,611` prompt tokens):
+
+| Workload | `warp34-flash-tp1-mtp3` (1× 3090 Ti) | `qfn-3090-mtp3` (1× 3090 Ti) | `warp34-flash-tp2-mtp3` (2× 3090 Ti) | `qfn-2x3090-mtp3` (2× 3090 Ti) |
+|---|---:|---:|---:|---:|
+| `short-chat` | **32.41–33.56 tok/s** (`+5.2%–8.9%`) | 30.82 tok/s | **69.25 tok/s** (`+23.2%`) | 56.20 tok/s |
+| `prefill-context-r16` | **18.37–18.54 tok/s** (`+79.6%`) | 10.23 tok/s | **27.09 tok/s** (`+27.4%`) | 21.27 tok/s |
+| `code-context-r64` (~6K prompt) | **21.51–21.90 tok/s** (`+1.3%–3.2%`) | 21.23 tok/s | **28.81 tok/s** (`+2.2%`) | 28.20 tok/s |
+| `prefix-primed-r16` (warm prefix) | **28.67 tok/s** (`+181.9%`, `2.82×`) | 10.17 tok/s | **45.90 tok/s** (`+123.7%`, `2.24×`) | 20.52 tok/s |
+| `coding-agent-replay` (strict replay) | **27.25–29.78 tok/s** (`8/8` passed) | Failed (`0/8` HTTP 400) | **55.49 tok/s** (`8/8` passed) | Failed (`0/8` HTTP 400) |
+| `cold-read-60k` (`57,611` prompt) | **6/6** retrieval through ~252K | Not supported | **68.2 s** (`0.938 tok/s`, `1.471` steady) | 72.3 s (`0.885 tok/s`) |
 
 ---
 
