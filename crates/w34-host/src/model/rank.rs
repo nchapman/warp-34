@@ -98,7 +98,7 @@ pub fn plan_tiered_moe_hot_per_layer(
         return (0, 0);
     }
     let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
-    let default_hot = if tp_size == 2 { 112usize } else { 48usize };
+    let default_hot = if tp_size == 2 { 112usize } else { 80usize };
     let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
     if local_experts <= default_hot || exp_bytes == 0 || cfg.num_hidden_layers == 0 {
         let hot = (local_experts / 2).max(1);
@@ -497,6 +497,8 @@ impl Qwen3_5ModelRank {
             336 * 1024 * 1024
         } else if tp_size == 1 && est_weight_bytes >= 16 * 1024 * 1024 * 1024 {
             384 * 1024 * 1024
+        } else if cfg.uses_tiered_moe() && requested_kv_pages.unwrap_or(0) <= 8192 {
+            1056 * 1024 * 1024
         } else {
             512 * 1024 * 1024
         };
@@ -1170,7 +1172,7 @@ impl Qwen3_5ModelRank {
     pub fn init_tiered_moe(&mut self, archive: &SafetensorsArchive) -> Result<()> {
         self.device.make_current()?;
         let local_experts = (self.cfg.num_experts / self.tp_size).max(1);
-        let default_hot = if self.tp_size == 2 { 112usize } else { 48usize };
+        let default_hot = if self.tp_size == 2 { 112usize } else { 80usize };
         let hot_per_layer = if self.tiered_moe_hot_per_layer > 0 {
             self.tiered_moe_hot_per_layer
         } else if local_experts <= default_hot {
@@ -1178,6 +1180,7 @@ impl Qwen3_5ModelRank {
         } else {
             default_hot
         };
+        let stage_cap = local_experts.clamp(1, 96);
         let tiered_moe = crate::moe_offload::RankTieredMoe::load_for_rank(
             archive,
             &self.cfg,
@@ -1185,7 +1188,7 @@ impl Qwen3_5ModelRank {
             self.rank,
             self.tp_size,
             hot_per_layer,
-            32,
+            stage_cap,
             &self.stream,
         )?;
         self.tiered_moe = Some(tiered_moe);
@@ -1209,7 +1212,11 @@ impl Qwen3_5ModelRank {
         self.device.make_current()?;
         // Pre-allocate 2048 rows * ple_embed_dim F8 staging buffer at a fixed device address
         // so both eager forward and CUDA Graphs can read from `f8_staging_dev.addr()`.
-        let max_ple_tokens = 2048usize;
+        let max_ple_tokens = if self.cfg.uses_tiered_moe() {
+            6144usize
+        } else {
+            2048usize
+        };
         let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
         let f8_staging_dev = DeviceBuffer::alloc(
             self.device.device_id,
@@ -1395,15 +1402,23 @@ impl Qwen3_5ModelRank {
 
     /// Maximum aligned ordinary prefill budget, including worst-case selected outputs.
     pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
-        model_scratch::token_capacity(
+        let max_chunks = if self.cfg.uses_tiered_moe() { 96 } else { 32 };
+        model_scratch::token_capacity_up_to(
             self.scratch_arena.capacity(),
             self.cfg.hidden_size,
             self.local_vocab_size,
             max_num_seqs,
+            max_chunks,
             |tokens| {
+                let hc_extra = if self.final_residual.is_hyper_connection() {
+                    let streams = self.cfg.hc_count.max(1);
+                    tokens * (streams - 1) * self.cfg.hidden_size * 2 + tokens * streams * 4 + 512
+                } else {
+                    0
+                };
                 layer_scratch_layout(&self.cfg, self.tp_size, tokens)
                     .ok()
-                    .map(|l| l.0)
+                    .map(|l| l.0.saturating_add(hc_extra))
             },
         )
         .ok_or_else(|| loader_err("scratch cannot fit one 64-token prefill chunk"))

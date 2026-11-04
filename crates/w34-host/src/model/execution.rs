@@ -913,10 +913,22 @@ impl Qwen3_5Engine {
         self.reset_all_states()?;
         self.radix = MambaRadixCache::new(16, 64);
         if self.speculative.is_some() {
+            let max_chunk = if self.cfg.uses_tiered_moe() {
+                6144
+            } else {
+                2048
+            };
+            let chunk = self
+                .ranks
+                .iter()
+                .filter_map(|r| r.ordinary_prefill_token_capacity(1).ok())
+                .min()
+                .unwrap_or(2048)
+                .clamp(64, max_chunk);
             let m = self.generate_native_speculative(
                 prompt_token_ids,
                 max_new_tokens,
-                2048,
+                chunk,
                 stop_on_eos,
             )?;
             return Ok(BenchMetrics {

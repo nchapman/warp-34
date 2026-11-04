@@ -2429,5 +2429,181 @@ mod tests {
         let h_ple_out6: Vec<u16> = dev_to_vec(&d_ple_out6, hc6 * h6, &stream);
         // dot = 0 -> gate = sigmoid(0) = 0.5 -> 0.5 * 2.0 = 1.0 across all 6 streams
         assert!((f16_to_f32(h_ple_out6[5 * h6]) - 1.0).abs() < 1e-3);
+
+        // 6. Verify multi-chunk (> 512 groups) Bitonic Top-K `qsa_select_blocks_f16` and
+        //    GQA-6 (`local_q_heads = 6, local_kv_heads = 1`) + Split-K `qsa_sparse_paged_attn_f16`.
+        let lg_pages = 380usize;
+        let lg_seq_len = 6002usize; // 1500 completed 4-token groups + 1 incomplete tail group (group 1500)
+        let lg_select_k = 513usize;
+        let lg_sink = 16usize;
+        let lg_recent = 32usize;
+        let lg_blk_tbl: Vec<i32> = (0..lg_pages as i32).collect();
+        let d_lg_blk_tbl = dev_from_slice(&lg_blk_tbl, &stream);
+        let d_lg_qsl = dev_from_slice(&[0i32, 1i32], &stream);
+        let d_lg_ctx_before = dev_from_slice(&[(lg_seq_len - 1) as i32], &stream);
+        let d_lg_seq_after = dev_from_slice(&[lg_seq_len as i32], &stream);
+        let d_lg_slot = dev_from_slice(&[(lg_seq_len - 1) as i32], &stream);
+        let lg_batch = W34AttentionBatch {
+            query_start_loc: d_lg_qsl.addr() as usize as *const i32,
+            context_lens_before: d_lg_ctx_before.addr() as usize as *const i32,
+            seq_lens_after: d_lg_seq_after.addr() as usize as *const i32,
+            block_tables: d_lg_blk_tbl.addr() as usize as *const i32,
+            write_slot_mapping: d_lg_slot.addr() as usize as *const i32,
+            valid_token_mask: std::ptr::null(),
+            num_reqs: 1,
+            total_tokens: 1,
+            max_q_len: 1,
+            max_seq_len: lg_seq_len as i32,
+            max_blocks_per_req: lg_pages as i32,
+            ..nu_attn_batch
+        };
+        let d_lg_q_idx = dev_from_slice(&vec![f32_to_f16(1.0); 4 * 128], &stream);
+        let mut h_lg_comp_k = vec![f32_to_f16(-1.0); lg_pages * 4 * 128];
+        let mut expected_mid: Vec<i32> = Vec::new();
+        // Plant 464 high-scoring groups across all three 512-group chunks in [16, 1468):
+        for idx in 0..(512 - lg_sink - lg_recent) {
+            let g = 20 + idx * 3; // spans chunks 0, 1, and 2 (up to g = 1409)
+            expected_mid.push(g as i32);
+            let score_val = f32_to_f16(0.5 + (idx as f32) * 0.01);
+            for d in 0..128 {
+                h_lg_comp_k[g * 128 + d] = score_val;
+            }
+        }
+        let d_lg_comp_k = dev_from_slice(&h_lg_comp_k, &stream);
+        let d_lg_sel_phys = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_lg_sel_log = DeviceBuffer::alloc(0, lg_select_k * 4).unwrap();
+        let d_lg_num_sel = DeviceBuffer::alloc(0, 4).unwrap();
+        let d_lg_seq_pos = DeviceBuffer::alloc(0, 4).unwrap();
+        gpu_ops::qsa_select_blocks_f16(
+            &ex,
+            d_lg_q_idx.addr(),
+            d_lg_comp_k.addr(),
+            &lg_batch,
+            d_lg_sel_phys.addr(),
+            d_lg_sel_log.addr(),
+            d_lg_num_sel.addr(),
+            d_lg_seq_pos.addr(),
+            4,
+            128,
+            block_size,
+            lg_select_k,
+            lg_sink,
+            lg_recent,
+        )
+        .unwrap();
+        let h_lg_num_sel: Vec<i32> = dev_to_vec(&d_lg_num_sel, 1, &stream);
+        let h_lg_sel_log: Vec<i32> = dev_to_vec(&d_lg_sel_log, lg_select_k, &stream);
+        assert_eq!(h_lg_num_sel, vec![lg_select_k as i32]);
+        let mut exp_all: Vec<i32> = (0..lg_sink as i32)
+            .chain(expected_mid)
+            .chain((1500 - lg_recent as i32)..1500)
+            .chain(std::iter::once(1500))
+            .collect();
+        assert_eq!(exp_all.len(), lg_select_k);
+        assert_eq!(h_lg_sel_log, exp_all);
+        exp_all.dedup();
+        assert_eq!(exp_all.len(), lg_select_k);
+
+        // Verify GQA-6 (`local_q_heads = 6, local_kv_heads = 1`) with and without Split-K scratch:
+        let gqa6_heads = 6usize;
+        let h_gqa6_q: Vec<u16> = (0..gqa6_heads * head_dim)
+            .map(|i| f32_to_f16((((i * 13 + 7) % 43) as f32 - 21.0) * 0.04))
+            .collect();
+        let h_gqa6_gate: Vec<u16> = (0..gqa6_heads * head_dim)
+            .map(|i| f32_to_f16((((i * 19 + 3) % 31) as f32 - 15.0) * 0.06))
+            .collect();
+        let d_gqa6_q = dev_from_slice(&h_gqa6_q, &stream);
+        let d_gqa6_gate = dev_from_slice(&h_gqa6_gate, &stream);
+        let d_kc6 = DeviceBuffer::alloc(0, nu_pages * block_size * 132).unwrap();
+        let d_vc6 = DeviceBuffer::alloc(0, nu_pages * block_size * 132).unwrap();
+        let layout6 = W34KvLayerLayout {
+            k_base: d_kc6.addr(),
+            v_base: d_vc6.addr(),
+            k_page_stride_bytes: (block_size * 132) as u64,
+            k_head_stride_bytes: (block_size * 132) as u64,
+            k_token_stride_bytes: 132,
+            v_page_stride_bytes: (block_size * 132) as u64,
+            v_head_stride_bytes: (block_size * 132) as u64,
+            v_token_stride_bytes: 132,
+            namespace_id: W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+            layer_id: 3,
+            local_kv_heads: 1,
+            head_dim: head_dim as i32,
+            block_size: block_size as i32,
+            k_format: W34_KV_FORMAT_TQ4,
+            v_format: W34_KV_FORMAT_TQ4,
+            k_transform: W34_KV_TRANSFORM_RADEMACHER_WHT256,
+            v_transform: W34_KV_TRANSFORM_RADEMACHER_WHT256,
+            reserved: 0,
+        };
+        // SAFETY: `d_kc6`, `d_vc6`, `d_nu_k_in`, and `d_nu_v_in` are valid device allocations matching `layout6` and `write_batch`.
+        unsafe {
+            assert_eq!(
+                w34_kv_cache_write_strided(
+                    &ex,
+                    &layout6,
+                    &write_batch,
+                    d_nu_k_in.addr() as *const c_void,
+                    d_nu_v_in.addr() as *const c_void,
+                    head_dim as i32,
+                    head_dim as i32,
+                ),
+                0
+            );
+        }
+        let d_out_nosplit = DeviceBuffer::alloc(0, gqa6_heads * head_dim * 2).unwrap();
+        let d_out_splitk = DeviceBuffer::alloc(0, gqa6_heads * head_dim * 2).unwrap();
+        let d_scratch = DeviceBuffer::alloc(0, 256 * 1024).unwrap();
+        let mut ex_splitk = ex;
+        ex_splitk.scratch_ptr = d_scratch.addr();
+        ex_splitk.scratch_size = 256 * 1024;
+        let mut ex_nosplit = ex;
+        ex_nosplit.scratch_ptr = 0;
+        ex_nosplit.scratch_size = 0;
+        gpu_ops::qsa_sparse_paged_attn_f16(
+            &ex_nosplit,
+            d_gqa6_q.addr(),
+            d_gqa6_gate.addr(),
+            &layout6,
+            d_nu_sel_phys.addr(),
+            d_nu_sel_log.addr(),
+            d_nu_num_sel.addr(),
+            d_nu_seq_pos.addr(),
+            0,
+            d_out_nosplit.addr(),
+            1,
+            gqa6_heads,
+            nu_select_k,
+            nu_attn_batch.sm_scale,
+        )
+        .unwrap();
+        gpu_ops::qsa_sparse_paged_attn_f16(
+            &ex_splitk,
+            d_gqa6_q.addr(),
+            d_gqa6_gate.addr(),
+            &layout6,
+            d_nu_sel_phys.addr(),
+            d_nu_sel_log.addr(),
+            d_nu_num_sel.addr(),
+            d_nu_seq_pos.addr(),
+            0,
+            d_out_splitk.addr(),
+            1,
+            gqa6_heads,
+            nu_select_k,
+            nu_attn_batch.sm_scale,
+        )
+        .unwrap();
+        let h_out_nosplit: Vec<u16> = dev_to_vec(&d_out_nosplit, gqa6_heads * head_dim, &stream);
+        let h_out_splitk: Vec<u16> = dev_to_vec(&d_out_splitk, gqa6_heads * head_dim, &stream);
+        let max_split_diff = h_out_nosplit
+            .iter()
+            .zip(h_out_splitk.iter())
+            .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_split_diff < 1e-3,
+            "GQA-6 Split-K vs no-split mismatch: max_split_diff={max_split_diff}"
+        );
     }
 }

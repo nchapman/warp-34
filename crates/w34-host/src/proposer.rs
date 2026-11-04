@@ -81,7 +81,7 @@ impl NativeProposer {
         }
         let capacity = engine.ranks[0].kv_pool.num_pages * 16;
         let max_rows = if config.kind == SpeculativeKind::Mtp && engine.cfg.uses_tiered_moe() {
-            capacity.min(2048)
+            capacity.min(6144)
         } else {
             capacity.min(256)
         };

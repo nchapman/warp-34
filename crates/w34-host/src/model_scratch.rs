@@ -166,14 +166,27 @@ pub(super) fn required_bytes(
     p.bytes.checked_add(ALIGN)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn token_capacity(
     arena: usize,
     hidden: usize,
     vocab: usize,
     rows: usize,
+    layout: impl FnMut(usize) -> Option<usize>,
+) -> Option<usize> {
+    token_capacity_up_to(arena, hidden, vocab, rows, 32, layout)
+}
+
+pub(super) fn token_capacity_up_to(
+    arena: usize,
+    hidden: usize,
+    vocab: usize,
+    rows: usize,
+    max_chunks: usize,
     mut layout: impl FnMut(usize) -> Option<usize>,
 ) -> Option<usize> {
-    (1..=32).rev().map(|n| n * 64).find(|&tokens| {
+    (1..=max_chunks).rev().map(|n| n * 64).find(|&tokens| {
         layout(tokens)
             .and_then(|overlay| required_bytes(tokens, hidden, vocab, rows, overlay))
             .is_some_and(|bytes| bytes <= arena)

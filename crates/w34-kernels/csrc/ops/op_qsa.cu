@@ -325,15 +325,99 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
     }
 }
 
+__device__ __forceinline__ bool qsa_cand_better(
+    float sc_a,
+    int32_t blk_a,
+    float sc_b,
+    int32_t blk_b) {
+    if (blk_a < 0) return false;
+    if (blk_b < 0) return true;
+    return (sc_a > sc_b) || (sc_a == sc_b && blk_a < blk_b);
+}
+
+// Parallel 512-element bitonic merge step in descending `qsa_cand_better` order across 256 threads.
+__device__ __forceinline__ void qsa_bitonic_merge_512_desc(
+    float* s_sc,
+    int32_t* s_blk,
+    int tid) {
+#pragma unroll
+    for (int j = 256; j > 0; j >>= 1) {
+        const int low = tid & (j - 1);
+        const int ix = ((tid - low) << 1) + low;
+        const int iy = ix ^ j;
+        const float sa = s_sc[ix];
+        const float sb = s_sc[iy];
+        const int32_t ba = s_blk[ix];
+        const int32_t bb = s_blk[iy];
+        if (qsa_cand_better(sb, bb, sa, ba)) {
+            s_sc[ix] = sb;
+            s_blk[ix] = bb;
+            s_sc[iy] = sa;
+            s_blk[iy] = ba;
+        }
+        __syncthreads();
+    }
+}
+
+// Parallel 512-element bitonic sort in descending `qsa_cand_better` order across 256 threads.
+__device__ __forceinline__ void qsa_bitonic_sort_512_desc(
+    float* s_sc,
+    int32_t* s_blk,
+    int tid) {
+    for (int k = 2; k <= 512; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const int low = tid & (j - 1);
+            const int ix = ((tid - low) << 1) + low;
+            const int iy = ix ^ j;
+            const bool desc = ((ix & k) == 0);
+            const float sa = s_sc[ix];
+            const float sb = s_sc[iy];
+            const int32_t ba = s_blk[ix];
+            const int32_t bb = s_blk[iy];
+            const bool swap = desc
+                ? qsa_cand_better(sb, bb, sa, ba)
+                : qsa_cand_better(sa, ba, sb, bb);
+            if (swap) {
+                s_sc[ix] = sb;
+                s_blk[ix] = bb;
+                s_sc[iy] = sa;
+                s_blk[iy] = ba;
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Parallel 512-element bitonic sort in ascending int32 order across 256 threads.
+__device__ __forceinline__ void qsa_bitonic_sort_512_i32_asc(
+    int32_t* s_blk,
+    int tid) {
+    for (int k = 2; k <= 512; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const int low = tid & (j - 1);
+            const int ix = ((tid - low) << 1) + low;
+            const int iy = ix ^ j;
+            const bool asc = ((ix & k) == 0);
+            const int32_t ba = s_blk[ix];
+            const int32_t bb = s_blk[iy];
+            if (asc ? (ba > bb) : (ba < bb)) {
+                s_blk[ix] = bb;
+                s_blk[iy] = ba;
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // Selects up to `select_k_blocks` 4-token compressed groups per query token using the QSA Indexer:
 //   - Each entry in `out_selected_logical_blocks` is a logical 4-token group index `g` (covering tokens `4*g .. 4*g+4`).
 //   - Each entry in `out_selected_phys_blocks` is the resolved physical 4-token group index
 //     `phys_page * (block_size / 4) + (g % (block_size / 4))`.
 //   - If all valid 4-token groups fit within `select_k_blocks` (and completed groups <= 512): selects all `0..num_valid_groups`.
-//   - Otherwise: scores each completed 4-token group `g in [0..num_comp_groups)` directly at 4-token group granularity,
-//     selects the top completed groups (plus optional forced sink/recent completed groups), and always appends the
-//     incomplete causal tail group when `(token_pos + 1) % 4 != 0`.
-// Grid: num_tokens, Block: 128.
+//   - Otherwise: scores completed 4-token groups in 512-group batches across 8 warps (256 threads),
+//     maintains the exact top-`need_mid` groups via parallel bitonic merge in shared memory, sorts the selected
+//     logical group indices ascending in parallel, and appends any incomplete causal tail group.
+// Grid: num_tokens, Block: 256.
 __global__ void qsa_select_blocks_f16_kernel(
     const __half* __restrict__ q_indexer,
     const __half* __restrict__ comp_k_cache,
@@ -406,21 +490,32 @@ __global__ void qsa_select_blocks_f16_kernel(
         return;
     }
 
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    const int num_warps = blockDim.x >> 5; // 8 warps
+
     // Load q_indexer[tok, 0..4, 0..128] into shared memory.
     __shared__ float s_q[4][128];
     const __half* q_tok = q_indexer + (size_t)tok * q_heads * head_dim;
-    for (int idx = threadIdx.x; idx < 4 * head_dim; idx += blockDim.x) {
+    for (int idx = tid; idx < 4 * head_dim; idx += blockDim.x) {
         const int h = idx / head_dim;
         const int d = idx % head_dim;
         s_q[h][d] = (h < q_heads) ? __half2float(q_tok[idx]) : 0.0f;
     }
+
+    __shared__ float s_top_sc[512];
+    __shared__ int32_t s_top_blk[512];
+    __shared__ float s_cand_sc[512];
+    __shared__ int32_t s_cand_blk[512];
+
+    s_top_sc[tid] = -FLT_MAX;
+    s_top_blk[tid] = -1;
+    s_top_sc[tid + 256] = -FLT_MAX;
+    s_top_blk[tid + 256] = -1;
     __syncthreads();
 
     const float scale = rsqrtf((float)head_dim);
-    const int wid = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int num_warps = blockDim.x >> 5;
-
     const int comp_budget = has_tail_group
         ? ((select_k_blocks - 1 < max_comp) ? (select_k_blocks - 1) : max_comp)
         : max_comp;
@@ -432,217 +527,543 @@ __global__ void qsa_select_blocks_f16_kernel(
         : mid_start;
     const int num_forced = mid_start + (num_comp_groups - mid_end);
     int need_mid = (comp_budget > num_forced) ? (comp_budget - num_forced) : 0;
-    constexpr int kMaxSelectGroups = 513;
-    if (need_mid > kMaxSelectGroups) need_mid = kMaxSelectGroups;
+    if (need_mid > 512) need_mid = 512;
 
-    // Maintain warp-collaborative top-need_mid candidate middle groups in shared memory.
-    __shared__ float s_top_scores[kMaxSelectGroups];
-    __shared__ int32_t s_top_blocks[kMaxSelectGroups];
-    for (int i = threadIdx.x; i < kMaxSelectGroups; i += blockDim.x) {
-        s_top_scores[i] = -FLT_MAX;
-        s_top_blocks[i] = -1;
+    if (need_mid > 0 && mid_end > mid_start) {
+        for (int chunk_base = mid_start; chunk_base < mid_end; chunk_base += 512) {
+            const int rem = mid_end - chunk_base;
+            const int chunk_cnt = (rem < 512) ? rem : 512;
+            const bool is_first_chunk = (chunk_base == mid_start);
+            float* dst_sc = is_first_chunk ? s_top_sc : s_cand_sc;
+            int32_t* dst_blk = is_first_chunk ? s_top_blk : s_cand_blk;
+
+            // 8 warps score up to 512 groups in 64 warp steps without inner barriers.
+            for (int c_off = wid; c_off < chunk_cnt; c_off += num_warps) {
+                const int g = chunk_base + c_off;
+                float grp_score = -FLT_MAX;
+                const int32_t phys_page = req_block_table[g / groups_per_page];
+                const int sub_group = g % groups_per_page;
+                if (phys_page >= 0) {
+                    const __half* ck =
+                        comp_k_cache + ((size_t)phys_page * groups_per_page + sub_group) * head_dim;
+                    float dot_h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int col = lane + i * 32;
+                        const float kv = __half2float(ck[col]);
+                        dot_h[0] += s_q[0][col] * kv;
+                        dot_h[1] += s_q[1][col] * kv;
+                        dot_h[2] += s_q[2][col] * kv;
+                        dot_h[3] += s_q[3][col] * kv;
+                    }
+                    float sum_relu = 0.0f;
+#pragma unroll
+                    for (int h = 0; h < 4; ++h) {
+                        const float logit = qsa_warp_reduce_sum(dot_h[h]);
+                        sum_relu += fmaxf(logit, 0.0f);
+                    }
+                    grp_score = sum_relu * scale;
+                }
+                if (lane == 0) {
+                    dst_sc[c_off] = grp_score;
+                    dst_blk[c_off] = g;
+                }
+            }
+
+            if (is_first_chunk) {
+                __syncthreads();
+                qsa_bitonic_sort_512_desc(s_top_sc, s_top_blk, tid);
+            } else {
+                if (tid >= chunk_cnt) {
+                    s_cand_sc[tid] = -FLT_MAX;
+                    s_cand_blk[tid] = -1;
+                }
+                if (tid + 256 >= chunk_cnt) {
+                    s_cand_sc[tid + 256] = -FLT_MAX;
+                    s_cand_blk[tid + 256] = -1;
+                }
+                __syncthreads();
+
+                const float thresh_sc = s_top_sc[need_mid - 1];
+                const int32_t thresh_blk = s_top_blk[need_mid - 1];
+                const bool b0 =
+                    qsa_cand_better(s_cand_sc[tid], s_cand_blk[tid], thresh_sc, thresh_blk);
+                const bool b1 = qsa_cand_better(
+                    s_cand_sc[tid + 256], s_cand_blk[tid + 256], thresh_sc, thresh_blk);
+                if (__syncthreads_or(b0 || b1)) {
+                    qsa_bitonic_sort_512_desc(s_cand_sc, s_cand_blk, tid);
+#pragma unroll
+                    for (int half_idx = 0; half_idx < 512; half_idx += 256) {
+                        const int i = tid + half_idx;
+                        const int mirror = 511 - i;
+                        if (qsa_cand_better(
+                                s_cand_sc[mirror], s_cand_blk[mirror], s_top_sc[i], s_top_blk[i])) {
+                            s_top_sc[i] = s_cand_sc[mirror];
+                            s_top_blk[i] = s_cand_blk[mirror];
+                        }
+                    }
+                    __syncthreads();
+                    qsa_bitonic_merge_512_desc(s_top_sc, s_top_blk, tid);
+                }
+            }
+        }
+    }
+
+    // Mask entries beyond `need_mid` (or invalid `< 0`) to INT32_MAX and sort ascending by logical group index.
+#pragma unroll
+    for (int half_idx = 0; half_idx < 512; half_idx += 256) {
+        const int i = tid + half_idx;
+        if (i >= need_mid || s_top_blk[i] < 0) {
+            s_top_blk[i] = 0x7fffffff;
+        }
     }
     __syncthreads();
-
-    __shared__ float s_chunk_scores[4];
-    __shared__ int32_t s_chunk_blocks[4];
-    __shared__ float s_w_sc[4];
-    __shared__ int32_t s_w_blk[4];
-    __shared__ int s_w_pos[4];
-
-    for (int g_base = mid_start; g_base < mid_end; g_base += num_warps) {
-        const int g = g_base + wid;
-        float grp_score = -FLT_MAX;
-        if (g < mid_end && g < num_comp_groups) {
-            const int32_t phys_page = req_block_table[g / groups_per_page];
-            const int sub_group = g % groups_per_page;
-            if (phys_page >= 0) {
-                const __half* ck =
-                    comp_k_cache + ((size_t)phys_page * groups_per_page + sub_group) * head_dim;
-                float dot_h[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    const int col = lane + i * 32;
-                    const float kv = __half2float(ck[col]);
-                    dot_h[0] += s_q[0][col] * kv;
-                    dot_h[1] += s_q[1][col] * kv;
-                    dot_h[2] += s_q[2][col] * kv;
-                    dot_h[3] += s_q[3][col] * kv;
-                }
-                float sum_relu = 0.0f;
-#pragma unroll
-                for (int h = 0; h < 4; ++h) {
-                    const float logit = qsa_warp_reduce_sum(dot_h[h]);
-                    sum_relu += fmaxf(logit, 0.0f);
-                }
-                grp_score = sum_relu * scale;
-            }
-        }
-        if (lane == 0) {
-            s_chunk_scores[wid] = grp_score;
-            s_chunk_blocks[wid] = (g < mid_end) ? g : -1;
-        }
-        __syncthreads();
-
-        if (need_mid > 0) {
-            // Compute the minimum-score slot in s_top_scores[0..need_mid) once using all 128 threads,
-            // breaking ties by larger logical block index (so earliest logical group wins ties).
-            float my_min_sc = FLT_MAX;
-            int32_t my_min_blk = 0;
-            int my_min_pos = need_mid;
-            for (int i = threadIdx.x; i < need_mid; i += blockDim.x) {
-                const float sc = s_top_scores[i];
-                const int32_t blk = s_top_blocks[i];
-                const bool take_i = (my_min_pos >= need_mid) ||
-                    (blk < 0 && (my_min_blk >= 0 || i < my_min_pos)) ||
-                    (blk >= 0 && my_min_blk >= 0 &&
-                     (sc < my_min_sc || (sc == my_min_sc && blk > my_min_blk)));
-                if (take_i) {
-                    my_min_sc = sc;
-                    my_min_blk = blk;
-                    my_min_pos = i;
-                }
-            }
-            // Warp-reduce minimum victim slot.
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                const float o_sc = __shfl_down_sync(0xffffffffu, my_min_sc, off);
-                const int32_t o_blk = __shfl_down_sync(0xffffffffu, my_min_blk, off);
-                const int o_pos = __shfl_down_sync(0xffffffffu, my_min_pos, off);
-                if (o_pos < need_mid) {
-                    const bool take_o = (my_min_pos >= need_mid) ||
-                        (o_blk < 0 && (my_min_blk >= 0 || o_pos < my_min_pos)) ||
-                        (o_blk >= 0 && my_min_blk >= 0 &&
-                         (o_sc < my_min_sc || (o_sc == my_min_sc && o_blk > my_min_blk)));
-                    if (take_o) {
-                        my_min_sc = o_sc;
-                        my_min_blk = o_blk;
-                        my_min_pos = o_pos;
-                    }
-                }
-            }
-            if (lane == 0) {
-                s_w_sc[wid] = my_min_sc;
-                s_w_blk[wid] = my_min_blk;
-                s_w_pos[wid] = my_min_pos;
-            }
-            __syncthreads();
-
-            if (threadIdx.x == 0) {
-                for (int w = 0; w < num_warps; ++w) {
-                    const float sc = s_chunk_scores[w];
-                    const int32_t lg = s_chunk_blocks[w];
-                    if (lg < 0) continue;
-                    int v_pos = s_w_pos[0];
-                    float v_sc = s_w_sc[0];
-                    int32_t v_blk = s_w_blk[0];
-                    for (int rw = 1; rw < 4; ++rw) {
-                        const int op = s_w_pos[rw];
-                        if (op >= need_mid) continue;
-                        const float osc = s_w_sc[rw];
-                        const int32_t oblk = s_w_blk[rw];
-                        const bool take_o = (v_pos >= need_mid) ||
-                            (oblk < 0 && (v_blk >= 0 || op < v_pos)) ||
-                            (oblk >= 0 && v_blk >= 0 &&
-                             (osc < v_sc || (osc == v_sc && oblk > v_blk)));
-                        if (take_o) {
-                            v_pos = op;
-                            v_sc = osc;
-                            v_blk = oblk;
-                        }
-                    }
-                    if (v_pos < need_mid && (v_blk < 0 || sc > v_sc)) {
-                        s_top_scores[v_pos] = sc;
-                        s_top_blocks[v_pos] = lg;
-                        if (w + 1 < num_warps) {
-                            int best_p = 0;
-                            float best_s = s_top_scores[0];
-                            int32_t best_b = s_top_blocks[0];
-                            for (int i = 1; i < need_mid; ++i) {
-                                const float isc = s_top_scores[i];
-                                const int32_t iblk = s_top_blocks[i];
-                                const bool take_i =
-                                    (iblk < 0 && (best_b >= 0 || i < best_p)) ||
-                                    (iblk >= 0 && best_b >= 0 &&
-                                     (isc < best_s || (isc == best_s && iblk > best_b)));
-                                if (take_i) {
-                                    best_p = i;
-                                    best_s = isc;
-                                    best_b = iblk;
-                                }
-                            }
-                            s_w_pos[0] = best_p;
-                            s_w_sc[0] = best_s;
-                            s_w_blk[0] = best_b;
-                            s_w_pos[1] = need_mid;
-                            s_w_pos[2] = need_mid;
-                            s_w_pos[3] = need_mid;
-                        }
-                    }
-                }
-            }
-            __syncthreads();
-        }
+    if (need_mid > 0 && mid_end > mid_start) {
+        qsa_bitonic_sort_512_i32_asc(s_top_blk, tid);
     }
 
-    if (threadIdx.x == 0) {
-        // Compact and insertion-sort the selected middle groups by logical group index ascending.
-        int valid_mid = 0;
-        for (int i = 0; i < need_mid; ++i) {
-            if (s_top_blocks[i] >= 0) {
-                s_top_blocks[valid_mid++] = s_top_blocks[i];
-            }
-        }
-        for (int i = 1; i < valid_mid; ++i) {
-            const int32_t key_g = s_top_blocks[i];
-            int j = i - 1;
-            while (j >= 0 && s_top_blocks[j] > key_g) {
-                s_top_blocks[j + 1] = s_top_blocks[j];
-                --j;
-            }
-            s_top_blocks[j + 1] = key_g;
-        }
+    const int avail_mid = (mid_end > mid_start) ? (mid_end - mid_start) : 0;
+    const int valid_mid = (need_mid < avail_mid) ? need_mid : avail_mid;
+    const int prefix_cnt = (mid_start < comp_budget) ? mid_start : comp_budget;
+    const int rem_after_prefix = comp_budget - prefix_cnt;
+    const int mid_cnt = (valid_mid < rem_after_prefix) ? valid_mid : rem_after_prefix;
+    const int rem_after_mid = rem_after_prefix - mid_cnt;
+    const int suffix_avail = num_comp_groups - mid_end;
+    const int suffix_cnt = (suffix_avail < rem_after_mid) ? suffix_avail : rem_after_mid;
+    const int comp_out = prefix_cnt + mid_cnt + suffix_cnt;
+    const int total_out =
+        (has_tail_group && comp_out < select_k_blocks) ? (comp_out + 1) : comp_out;
 
-        int out_idx = 0;
-        for (int g = 0; g < mid_start && out_idx < comp_budget; ++g) {
+    if (tid == 0) {
+        out_num_selected_blocks[tok] = total_out;
+    }
+
+    for (int out_idx = tid; out_idx < select_k_blocks; out_idx += blockDim.x) {
+        if (out_idx < total_out) {
+            int32_t g;
+            if (out_idx < prefix_cnt) {
+                g = out_idx;
+            } else if (out_idx < prefix_cnt + mid_cnt) {
+                g = s_top_blk[out_idx - prefix_cnt];
+            } else if (out_idx < comp_out) {
+                g = mid_end + (out_idx - prefix_cnt - mid_cnt);
+            } else {
+                g = num_comp_groups;
+            }
             const int32_t phys_page = req_block_table[g / groups_per_page];
             dst_log[out_idx] = g;
             dst_phys[out_idx] =
                 (phys_page >= 0) ? (phys_page * groups_per_page + (g % groups_per_page)) : -1;
-            ++out_idx;
-        }
-        for (int i = 0; i < valid_mid && out_idx < comp_budget; ++i) {
-            const int32_t g = s_top_blocks[i];
-            const int32_t phys_page = req_block_table[g / groups_per_page];
-            dst_log[out_idx] = g;
-            dst_phys[out_idx] =
-                (phys_page >= 0) ? (phys_page * groups_per_page + (g % groups_per_page)) : -1;
-            ++out_idx;
-        }
-        for (int g = mid_end; g < num_comp_groups && out_idx < comp_budget; ++g) {
-            const int32_t phys_page = req_block_table[g / groups_per_page];
-            dst_log[out_idx] = g;
-            dst_phys[out_idx] =
-                (phys_page >= 0) ? (phys_page * groups_per_page + (g % groups_per_page)) : -1;
-            ++out_idx;
-        }
-        if (has_tail_group && out_idx < select_k_blocks) {
-            const int32_t g = num_comp_groups;
-            const int32_t phys_page = req_block_table[g / groups_per_page];
-            dst_log[out_idx] = g;
-            dst_phys[out_idx] =
-                (phys_page >= 0) ? (phys_page * groups_per_page + (g % groups_per_page)) : -1;
-            ++out_idx;
-        }
-        out_num_selected_blocks[tok] = out_idx;
-        for (int i = out_idx; i < select_k_blocks; ++i) {
-            dst_log[i] = -1;
-            dst_phys[i] = -1;
+        } else {
+            dst_log[out_idx] = -1;
+            dst_phys[out_idx] = -1;
         }
     }
 }
 
-// Sparse Paged GQA over the selected 4-token groups per token for FP16, Q8_0, and TQ4 KV caches.
+// GQA-grouped + Split-K Sparse Paged Attention over the selected 4-token groups per token for
+// FP16, Q8_0, and TQ4 KV caches (head_dim == 256, 1 <= q_group_size <= 6).
+// All `q_group_size` Q heads in the sub-group share the same `kv_head` and run in the same CTA so
+// each selected KV row is fetched and dequantized once instead of `q_group_size` times.
+// Grid: (num_tokens, local_q_heads / q_group_size, num_splits), Block: 128 (4 warps).
+__global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
+    const __half* __restrict__ q,
+    const __half* __restrict__ gate,
+    w34_kv_layer_layout kv_layout,
+    const int32_t* __restrict__ selected_phys_blocks,
+    const int32_t* __restrict__ selected_logical_blocks,
+    const int32_t* __restrict__ num_selected_blocks,
+    const int32_t* __restrict__ token_seq_pos,
+    const uint8_t* __restrict__ valid_token_mask,
+    __half* __restrict__ out,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_d,
+    float* __restrict__ partial_acc,
+    int num_tokens,
+    int local_q_heads,
+    int q_group_size,
+    int select_k_blocks,
+    int num_splits,
+    float sm_scale) {
+    constexpr int kMaxGqa = 6;
+    const int tok = blockIdx.x;
+    const int q_group_idx = blockIdx.y;
+    const int split_id = blockIdx.z;
+    const int q_head_base = q_group_idx * q_group_size;
+    if (tok >= num_tokens || q_head_base >= local_q_heads || split_id >= num_splits) return;
+    const int full_gqa = local_q_heads / kv_layout.local_kv_heads;
+    const int kv_head = q_head_base / full_gqa;
+    const int gqa_group = q_group_size;
+
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        if (num_splits == 1) {
+            for (int h = 0; h < gqa_group; ++h) {
+                const int q_head = q_head_base + h;
+                __half* dst_head = out + ((size_t)tok * local_q_heads + q_head) * 256;
+                for (int d = threadIdx.x; d < 256; d += blockDim.x) {
+                    dst_head[d] = __float2half(0.0f);
+                }
+            }
+        }
+        return;
+    }
+
+    const int wid = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    // 16 KB shared workspace: aliased as `s_q[6][256]` during the KV loop and `s_work[4][4][256]`
+    // during the two-pass 4-warp reduction at the end.
+    __shared__ float s_work[4][4][256];
+    __shared__ float s_m[kMaxGqa][4];
+    __shared__ float s_d[kMaxGqa][4];
+    float (*s_q)[256] = &s_work[0][0];
+
+    for (int h = wid; h < gqa_group; h += 4) {
+        const int q_head = q_head_base + h;
+        const __half* q_head_ptr = q + ((size_t)tok * local_q_heads + q_head) * 256;
+        float q_reg[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int col = lane + 32 * j;
+            q_reg[j] = __half2float(q_head_ptr[col]) * sm_scale;
+            if (kv_layout.k_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+                q_reg[j] *= kTq4Signs256[col];
+            }
+        }
+        if (kv_layout.k_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+            qsa_wht256_warp(q_reg, lane);
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            s_q[h][lane + 32 * j] = q_reg[j];
+        }
+    }
+    __syncthreads();
+
+    const int n_sel = num_selected_blocks[tok];
+    const int seq_pos = token_seq_pos[tok];
+    const int groups_per_page = kv_layout.block_size >> 2;
+    const int groups_per_split = (n_sel + num_splits - 1) / num_splits;
+    const int grp_start = split_id * groups_per_split;
+    const int grp_end =
+        ((grp_start + groups_per_split) < n_sel) ? (grp_start + groups_per_split) : n_sel;
+    const int t_start = grp_start * 4;
+    const int t_end = (grp_end > grp_start) ? (grp_end * 4) : t_start;
+
+    float acc[kMaxGqa][8];
+    float m_i[kMaxGqa];
+    float d_i[kMaxGqa];
+#pragma unroll
+    for (int h = 0; h < kMaxGqa; ++h) {
+        m_i[h] = -FLT_MAX;
+        d_i[h] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            acc[h][j] = 0.0f;
+        }
+    }
+
+    const int32_t* tok_phys = selected_phys_blocks + (size_t)tok * select_k_blocks;
+    const int32_t* tok_log = selected_logical_blocks + (size_t)tok * select_k_blocks;
+    const uint8_t* k_base = reinterpret_cast<const uint8_t*>((uintptr_t)kv_layout.k_base);
+    const uint8_t* v_base = reinterpret_cast<const uint8_t*>((uintptr_t)kv_layout.v_base);
+
+    for (int t_idx = t_start + wid; t_idx < t_end; t_idx += 4) {
+        const int grp_idx = t_idx >> 2;
+        const int grp_off = t_idx & 3;
+        const int32_t phys_grp = tok_phys[grp_idx];
+        const int32_t log_grp = tok_log[grp_idx];
+        const int kv_pos = log_grp * 4 + grp_off;
+        if (phys_grp < 0 || kv_pos > seq_pos) continue;
+
+        const int32_t phys_page = phys_grp / groups_per_page;
+        const int page_off = (phys_grp % groups_per_page) * 4 + grp_off;
+        const uint8_t* k_ptr =
+            k_base + (size_t)phys_page * kv_layout.k_page_stride_bytes +
+            (size_t)kv_head * kv_layout.k_head_stride_bytes +
+            (size_t)page_off * kv_layout.k_token_stride_bytes;
+        const uint8_t* v_ptr =
+            v_base + (size_t)phys_page * kv_layout.v_page_stride_bytes +
+            (size_t)kv_head * kv_layout.v_head_stride_bytes +
+            (size_t)page_off * kv_layout.v_token_stride_bytes;
+
+        float k_val[8];
+        if (kv_layout.k_format == W34_KV_FORMAT_TQ4) {
+            const qsa_block_tq4_0* k_blks = reinterpret_cast<const qsa_block_tq4_0*>(k_ptr);
+            const float kd0 = __half2float(k_blks[0].d);
+            const float kd1 = __half2float(k_blks[1].d);
+            const int odd = lane & 1;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t p0 = k_blks[0].qs[(lane + 32 * j) >> 1];
+                const uint8_t p1 = k_blks[1].qs[(lane + 32 * j) >> 1];
+                const uint8_t n0 = odd ? (p0 >> 4) : (p0 & 0x0Fu);
+                const uint8_t n1 = odd ? (p1 >> 4) : (p1 & 0x0Fu);
+                k_val[j] = kd0 * kTq4D256Centroids[n0];
+                k_val[j + 4] = kd1 * kTq4D256Centroids[n1];
+            }
+        } else if (kv_layout.k_format == W34_KV_FORMAT_Q8_0) {
+            const qsa_block_q8_0_64* k_blks = reinterpret_cast<const qsa_block_q8_0_64*>(k_ptr);
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float kd = k_blks[sb].d;
+                k_val[2 * sb] = kd * (float)k_blks[sb].qs[lane];
+                k_val[2 * sb + 1] = kd * (float)k_blks[sb].qs[lane + 32];
+            }
+        } else {
+            const __half* k_tok = reinterpret_cast<const __half*>(k_ptr);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                k_val[j] = __half2float(k_tok[lane + 32 * j]);
+            }
+        }
+
+        float alpha[kMaxGqa];
+        float beta[kMaxGqa];
+#pragma unroll
+        for (int h = 0; h < kMaxGqa; ++h) {
+            if (h < gqa_group) {
+                float dot = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    dot += s_q[h][lane + 32 * j] * k_val[j];
+                }
+                const float score = qsa_warp_reduce_sum(dot);
+                const float m_new = fmaxf(m_i[h], score);
+                alpha[h] = expf(m_i[h] - m_new);
+                beta[h] = expf(score - m_new);
+                d_i[h] = d_i[h] * alpha[h] + beta[h];
+                m_i[h] = m_new;
+            }
+        }
+
+        float v_val[8];
+        if (kv_layout.v_format == W34_KV_FORMAT_TQ4) {
+            const qsa_block_tq4_0* v_blks = reinterpret_cast<const qsa_block_tq4_0*>(v_ptr);
+            const float vd0 = __half2float(v_blks[0].d);
+            const float vd1 = __half2float(v_blks[1].d);
+            const int odd = lane & 1;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t p0 = v_blks[0].qs[(lane + 32 * j) >> 1];
+                const uint8_t p1 = v_blks[1].qs[(lane + 32 * j) >> 1];
+                const uint8_t n0 = odd ? (p0 >> 4) : (p0 & 0x0Fu);
+                const uint8_t n1 = odd ? (p1 >> 4) : (p1 & 0x0Fu);
+                v_val[j] = vd0 * kTq4D256Centroids[n0];
+                v_val[j + 4] = vd1 * kTq4D256Centroids[n1];
+            }
+        } else if (kv_layout.v_format == W34_KV_FORMAT_Q8_0) {
+            const qsa_block_q8_0_64* v_blks = reinterpret_cast<const qsa_block_q8_0_64*>(v_ptr);
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float vd = v_blks[sb].d;
+                v_val[2 * sb] = vd * (float)v_blks[sb].qs[lane];
+                v_val[2 * sb + 1] = vd * (float)v_blks[sb].qs[lane + 32];
+            }
+        } else {
+            const __half* v_tok = reinterpret_cast<const __half*>(v_ptr);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                v_val[j] = __half2float(v_tok[lane + 32 * j]);
+            }
+        }
+
+#pragma unroll
+        for (int h = 0; h < kMaxGqa; ++h) {
+            if (h < gqa_group) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    acc[h][j] = acc[h][j] * alpha[h] + beta[h] * v_val[j];
+                }
+            }
+        }
+    }
+
+    if (lane == 0) {
+#pragma unroll
+        for (int h = 0; h < kMaxGqa; ++h) {
+            if (h < gqa_group) {
+                s_m[h][wid] = m_i[h];
+                s_d[h][wid] = d_i[h];
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int pass_base = 0; pass_base < gqa_group; pass_base += 4) {
+        if (pass_base > 0) {
+            __syncthreads();
+        }
+#pragma unroll
+        for (int h = 0; h < kMaxGqa; ++h) {
+            if (h >= pass_base && h < pass_base + 4 && h < gqa_group) {
+                const int slot = h - pass_base;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    s_work[slot][wid][lane + 32 * j] = acc[h][j];
+                }
+            }
+        }
+        __syncthreads();
+
+        const int h_out = pass_base + wid;
+        if (h_out < gqa_group) {
+            const int q_head = q_head_base + h_out;
+            float m_all = -FLT_MAX;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                if (s_d[h_out][w] > 0.0f) {
+                    m_all = fmaxf(m_all, s_m[h_out][w]);
+                }
+            }
+            float d_all = 0.0f;
+            float w_scale[4];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                if (s_d[h_out][w] > 0.0f) {
+                    w_scale[w] = expf(s_m[h_out][w] - m_all);
+                    d_all += s_d[h_out][w] * w_scale[w];
+                } else {
+                    w_scale[w] = 0.0f;
+                }
+            }
+
+            if (num_splits > 1) {
+                const size_t split_idx =
+                    ((size_t)tok * local_q_heads + q_head) * num_splits + split_id;
+                if (lane == 0) {
+                    partial_m[split_idx] = m_all;
+                    partial_d[split_idx] = d_all;
+                }
+                float* dst_acc = partial_acc + split_idx * 256;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = lane + 32 * j;
+                    dst_acc[col] = s_work[wid][0][col] * w_scale[0]
+                                 + s_work[wid][1][col] * w_scale[1]
+                                 + s_work[wid][2][col] * w_scale[2]
+                                 + s_work[wid][3][col] * w_scale[3];
+                }
+            } else {
+                const float inv_d = (d_all > 0.0f) ? (1.0f / d_all) : 0.0f;
+                float out_v[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = lane + 32 * j;
+                    const float sum_v = s_work[wid][0][col] * w_scale[0]
+                                      + s_work[wid][1][col] * w_scale[1]
+                                      + s_work[wid][2][col] * w_scale[2]
+                                      + s_work[wid][3][col] * w_scale[3];
+                    out_v[j] = sum_v * inv_d;
+                }
+                if (kv_layout.v_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+                    qsa_wht256_warp(out_v, lane);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        out_v[j] *= kTq4Signs256[lane + 32 * j];
+                    }
+                }
+                const __half* gate_head = (gate != nullptr)
+                    ? (gate + ((size_t)tok * local_q_heads + q_head) * 256)
+                    : nullptr;
+                __half* dst_head = out + ((size_t)tok * local_q_heads + q_head) * 256;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = lane + 32 * j;
+                    float val = out_v[j];
+                    if (gate_head != nullptr) {
+                        const float g = __half2float(gate_head[col]);
+                        val *= (1.0f / (1.0f + expf(-g)));
+                    }
+                    dst_head[col] = __float2half(val);
+                }
+            }
+        }
+    }
+}
+
+// 1-warp Split-K reduction kernel for `qsa_sparse_paged_attn_gqa_f16_kernel` (`num_splits` in 2..=32).
+// Grid: (num_tokens, local_q_heads), Block: 32.
+__global__ void qsa_sparse_paged_attn_merge_f16_kernel(
+    const float* __restrict__ partial_m,
+    const float* __restrict__ partial_d,
+    const float* __restrict__ partial_acc,
+    const __half* __restrict__ gate,
+    const uint8_t* __restrict__ valid_token_mask,
+    __half* __restrict__ out,
+    int num_tokens,
+    int local_q_heads,
+    int num_splits,
+    uint32_t v_transform) {
+    const int tok = blockIdx.x;
+    const int q_head = blockIdx.y;
+    if (tok >= num_tokens || q_head >= local_q_heads) return;
+
+    const int lane = threadIdx.x;
+    __half* dst_head = out + ((size_t)tok * local_q_heads + q_head) * 256;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            dst_head[lane + 32 * j] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    const size_t base_idx = ((size_t)tok * local_q_heads + q_head) * num_splits;
+    const float m_s = (lane < num_splits) ? partial_m[base_idx + lane] : -FLT_MAX;
+    const float d_s = (lane < num_splits) ? partial_d[base_idx + lane] : 0.0f;
+
+    float m_all = (d_s > 0.0f) ? m_s : -FLT_MAX;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        m_all = fmaxf(m_all, __shfl_xor_sync(0xffffffffu, m_all, off));
+    }
+    const float w_my = (d_s > 0.0f) ? expf(m_s - m_all) : 0.0f;
+    const float d_all = qsa_warp_reduce_sum(d_s * w_my);
+    const float inv_d = (d_all > 0.0f) ? (1.0f / d_all) : 0.0f;
+
+    float out_v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int s = 0; s < num_splits; ++s) {
+        const float ws = __shfl_sync(0xffffffffu, w_my, s);
+        if (ws > 0.0f) {
+            const float* acc_s = partial_acc + (base_idx + s) * 256;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                out_v[j] += acc_s[lane + 32 * j] * ws;
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        out_v[j] *= inv_d;
+    }
+
+    if (v_transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+        qsa_wht256_warp(out_v, lane);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            out_v[j] *= kTq4Signs256[lane + 32 * j];
+        }
+    }
+
+    const __half* gate_head = (gate != nullptr)
+        ? (gate + ((size_t)tok * local_q_heads + q_head) * 256)
+        : nullptr;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int col = lane + 32 * j;
+        float val = out_v[j];
+        if (gate_head != nullptr) {
+            const float g = __half2float(gate_head[col]);
+            val *= (1.0f / (1.0f + expf(-g)));
+        }
+        dst_head[col] = __float2half(val);
+    }
+}
+
+// Generic Sparse Paged GQA fallback (used when `local_kv_heads == 0`, `local_q_heads` is not
+// divisible by `local_kv_heads`, or `head_dim != 256`; divisible GQA with `head_dim == 256`
+// uses `qsa_sparse_paged_attn_gqa_f16_kernel` with `q_group_size` in `1..=6`).
 // Grid: (num_tokens, local_q_heads), Block: 128 (4 warps, 8 dims per lane of head_dim=256).
 __global__ void qsa_sparse_paged_attn_f16_kernel(
     const __half* __restrict__ q,
@@ -1011,7 +1432,7 @@ int w34_qsa_select_blocks_f16(
     }
     if (batch->total_tokens <= 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::qsa_select_blocks_f16_kernel<<<batch->total_tokens, 128, 0, stream>>>(
+    w34::qsa_select_blocks_f16_kernel<<<batch->total_tokens, 256, 0, stream>>>(
         static_cast<const __half*>(q_indexer),
         static_cast<const __half*>(comp_k_cache),
         *batch,
@@ -1050,6 +1471,82 @@ int w34_qsa_sparse_paged_attn_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    const int local_kv_heads = kv_layout->local_kv_heads;
+    int q_group_size = 0;
+    if (local_kv_heads > 0 && (local_q_heads % local_kv_heads) == 0) {
+        const int full_gqa = local_q_heads / local_kv_heads;
+        for (int cand = 6; cand >= 1; --cand) {
+            if ((full_gqa % cand) == 0) {
+                q_group_size = cand;
+                break;
+            }
+        }
+    }
+    if (q_group_size >= 1 && q_group_size <= 6 && select_k_blocks > 0) {
+        const int num_q_groups = local_q_heads / q_group_size;
+        const int base_ctas = num_tokens * num_q_groups;
+        int target_splits = 1;
+        if (base_ctas <= 4) {
+            target_splits = 16;
+        } else if (base_ctas <= 16) {
+            target_splits = 8;
+        } else if (base_ctas <= 64) {
+            target_splits = 4;
+        } else if (base_ctas <= 128) {
+            target_splits = 2;
+        }
+        const int max_by_blocks = select_k_blocks >> 1;
+        if (target_splits > max_by_blocks) {
+            target_splits = (max_by_blocks >= 1) ? max_by_blocks : 1;
+        }
+        const size_t total_splits = (size_t)num_tokens * local_q_heads * target_splits;
+        const size_t needed_bytes = total_splits * 258 * sizeof(float);
+        const int num_splits =
+            (target_splits > 1 && ex->scratch_ptr != 0 && ex->scratch_size >= needed_bytes)
+                ? target_splits
+                : 1;
+        float* partial_m =
+            (num_splits > 1) ? reinterpret_cast<float*>((uintptr_t)ex->scratch_ptr) : nullptr;
+        float* partial_d = (num_splits > 1) ? (partial_m + total_splits) : nullptr;
+        float* partial_acc = (num_splits > 1) ? (partial_d + total_splits) : nullptr;
+
+        dim3 grid(num_tokens, num_q_groups, num_splits);
+        w34::qsa_sparse_paged_attn_gqa_f16_kernel<<<grid, 128, 0, stream>>>(
+            static_cast<const __half*>(q),
+            static_cast<const __half*>(gate),
+            *kv_layout,
+            selected_phys_blocks,
+            selected_logical_blocks,
+            num_selected_blocks,
+            token_seq_pos,
+            valid_token_mask,
+            static_cast<__half*>(out),
+            partial_m,
+            partial_d,
+            partial_acc,
+            num_tokens,
+            local_q_heads,
+            q_group_size,
+            select_k_blocks,
+            num_splits,
+            sm_scale);
+        if (num_splits > 1) {
+            dim3 merge_grid(num_tokens, local_q_heads);
+            w34::qsa_sparse_paged_attn_merge_f16_kernel<<<merge_grid, 32, 0, stream>>>(
+                partial_m,
+                partial_d,
+                partial_acc,
+                static_cast<const __half*>(gate),
+                valid_token_mask,
+                static_cast<__half*>(out),
+                num_tokens,
+                local_q_heads,
+                num_splits,
+                kv_layout->v_transform);
+        }
+        return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+    }
+
     dim3 grid(num_tokens, local_q_heads);
     w34::qsa_sparse_paged_attn_f16_kernel<<<grid, 128, 0, stream>>>(
         static_cast<const __half*>(q),

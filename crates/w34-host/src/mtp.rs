@@ -444,7 +444,10 @@ impl Qwen3_5MtpRank {
                     )
                 })?;
             let local_experts = c.num_experts / tp;
-            let k_hot = if tp == 2 && local_experts >= 128 {
+            let free_vram = target.device.mem_info().map_or(0, |(free, _)| free);
+            let k_hot = if tp == 1 && local_experts >= 192 && free_vram >= 2048 * 1024 * 1024 {
+                192
+            } else if local_experts >= 128 && free_vram >= 1536 * 1024 * 1024 {
                 128
             } else if local_experts >= 64 {
                 64
@@ -571,7 +574,7 @@ impl Qwen3_5MtpRank {
         let scratch_bytes = max_batch_rows
             .checked_mul(row_elements)
             .and_then(|n| n.checked_mul(2))
-            .and_then(|n| n.checked_add(131072 + capacity.div_ceil(16) * 4))
+            .and_then(|n| n.checked_add(2 * 1024 * 1024 + 131072 + capacity.div_ceil(16) * 4))
             .ok_or_else(|| loader_err("MTP scratch size overflow"))?;
         let propose_arena_bytes = row_elements
             .checked_mul(2)

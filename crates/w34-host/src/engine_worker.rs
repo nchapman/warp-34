@@ -316,6 +316,13 @@ impl EngineWorker {
                     );
                     publish_pools(&engine, &engine.radix, &worker_stats.telemetry);
                     let mut clamped_cfg = config;
+                    if engine.cfg.uses_tiered_moe()
+                        && clamped_cfg.chunk_prefill_size == 2048
+                        && clamped_cfg.max_num_batched_tokens == 2048
+                    {
+                        clamped_cfg.max_num_batched_tokens = 6144;
+                        clamped_cfg.chunk_prefill_size = 6144;
+                    }
                     for rank in &engine.ranks {
                         match rank.ordinary_prefill_token_capacity(clamped_cfg.max_num_seqs) {
                             Ok(cap) => clamped_cfg.clamp_for_token_capacity(cap),

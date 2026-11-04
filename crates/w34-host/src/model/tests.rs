@@ -114,7 +114,7 @@ mod serving_capacity_tests {
             (0, 0)
         );
 
-        // TP=1 and TP=2 with ample VRAM preserve default_hot (48 and 112)
+        // TP=1 and TP=2 with ample VRAM preserve default_hot (80 and 112)
         let (hot_tp1_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             1,
@@ -122,7 +122,7 @@ mod serving_capacity_tests {
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp1_default, 48);
+        assert_eq!(hot_tp1_default, 80);
 
         let (hot_tp2_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,

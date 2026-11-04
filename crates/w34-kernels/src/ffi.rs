@@ -1579,6 +1579,66 @@ unsafe extern "C" {
         k_hidden: i32,
         group_size: i32,
     ) -> i32;
+
+    pub fn w34_moe_cpu_bridge_register_layer(
+        layer_id: i32,
+        host_packs_base: *const c_void,
+        pack_stride_bytes: usize,
+        local_num_experts: i32,
+        intermediate: i32,
+        hidden: i32,
+        group_size: i32,
+    ) -> i32;
+
+    pub fn w34_moe_hybrid_submit_and_pull(
+        ex: *const W34Exec,
+        layer_id: i32,
+        x_f16: *const c_void,
+        global_topk_ids: *const i32,
+        topk_weights: *const f32,
+        expert_to_slot: *const i32,
+        remapped_topk_ids: *mut i32,
+        miss_local_experts: *mut i32,
+        miss_victim_slots: *mut i32,
+        num_misses_buf: *mut i32,
+        mapped_host_packs: *const c_void,
+        gate_up_packed_base: *mut u32,
+        gate_up_scales_base: *mut c_void,
+        down_packed_base: *mut u32,
+        down_scales_base: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        global_expert_offset: i32,
+        local_num_experts: i32,
+        k_static: i32,
+        k_hot: i32,
+        pack_stride_bytes: usize,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+        gpu_share_frac: f32,
+    ) -> i32;
+
+    pub fn w34_moe_hybrid_wait_and_add(
+        ex: *const W34Exec,
+        layer_id: i32,
+        out_f16: *mut c_void,
+        num_misses_buf: *const i32,
+        num_tokens: i32,
+        k_hidden: i32,
+    ) -> i32;
+
+    pub fn w34_moe_cpu_eval_prefill_batch(
+        layer_id: i32,
+        x_f16: *const u16,
+        num_tokens: i32,
+        job_le: *const i32,
+        job_n_tok: *const i32,
+        job_tok_ids: *const i32,
+        job_weights: *const f32,
+        num_jobs: i32,
+        out_f16: *mut u16,
+    ) -> i32;
 }
 
 /// Returns the linked cuBLAS runtime version (`major * 10000 + minor * 100 + patch`).

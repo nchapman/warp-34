@@ -2428,9 +2428,10 @@ __global__ void moe_gpu_lru_plan_and_remap_kernel(
                 continue;
             }
 
+            const int k_protected = (k_hot > 40 && total_pairs <= 40) ? (k_hot - 40) : 0;
             uint64_t best_ts = UINT64_MAX;
-            int best_slot = 0;
-            for (int s = lane; s < k_hot; s += 32) {
+            int best_slot = k_protected;
+            for (int s = k_protected + lane; s < k_hot; s += 32) {
                 const uint64_t ts = slot_last_used[s];
                 if (ts < best_ts || (ts == best_ts && s < best_slot)) {
                     best_ts = ts;
