@@ -483,7 +483,7 @@ static void eval_expert_slice_u4b8(
     int g_interm_end,
     const float* __restrict__ job_xp,
     const float* __restrict__ job_xg,
-    float* __restrict__ worker_y_acc) {
+    float* __restrict__ item_y_out) {
     const int H = desc.hidden;
     const int I = desc.intermediate;
     const int h_words = H / 8;
@@ -594,11 +594,11 @@ static void eval_expert_slice_u4b8(
                 d_val2,
                 d_val3);
             const float wt = jb.wt[0];
-            float* dst = worker_y_acc + jb.tok[0] * H + h;
-            dst[0] += wt * d_val0[0];
-            dst[1] += wt * d_val1[0];
-            dst[2] += wt * d_val2[0];
-            dst[3] += wt * d_val3[0];
+            float* dst = item_y_out + h;
+            dst[0] = wt * d_val0[0];
+            dst[1] = wt * d_val1[0];
+            dst[2] = wt * d_val2[0];
+            dst[3] = wt * d_val3[0];
         }
     }
     for (; h + 2 <= H; h += 2) {
@@ -618,8 +618,9 @@ static void eval_expert_slice_u4b8(
             d_val1);
 #pragma unroll
         for (int t = 0; t < T; ++t) {
-            worker_y_acc[jb.tok[t] * H + h] += jb.wt[t] * d_val0[t];
-            worker_y_acc[jb.tok[t] * H + h + 1] += jb.wt[t] * d_val1[t];
+            float* dst = item_y_out + (size_t)t * H + h;
+            dst[0] = jb.wt[t] * d_val0[t];
+            dst[1] = jb.wt[t] * d_val1[t];
         }
     }
     for (; h < H; ++h) {
@@ -635,7 +636,7 @@ static void eval_expert_slice_u4b8(
             d_val);
 #pragma unroll
         for (int t = 0; t < T; ++t) {
-            worker_y_acc[jb.tok[t] * H + h] += jb.wt[t] * d_val[t];
+            item_y_out[(size_t)t * H + h] = jb.wt[t] * d_val[t];
         }
     }
 }
@@ -647,7 +648,7 @@ static void compute_slot_cpu(
     const MoeBridgeReqSlot* rq,
     MoeBridgeRespSlot* rs,
     float* worker_scratch,
-    float* workers_y_base) {
+    float* items_y_base) {
     const int T = rq->num_tokens;
     const int top_k = rq->top_k;
     const int H = desc.hidden;
@@ -668,9 +669,10 @@ static void compute_slot_cpu(
             jobs[J].n = 0;
             ++J;
         }
-        const int slot = jobs[j].n;
-        if (slot > 0 && jobs[j].tok[slot - 1] == tok) {
-            jobs[j].wt[slot - 1] += wt;
+        int slot = 0;
+        while (slot < jobs[j].n && jobs[j].tok[slot] != tok) ++slot;
+        if (slot < jobs[j].n) {
+            jobs[j].wt[slot] += wt;
         } else if (slot < kMaxTokens) {
             jobs[j].tok[slot] = tok;
             jobs[j].wt[slot] = wt;
@@ -722,23 +724,24 @@ static void compute_slot_cpu(
         }
     }
 
-    const int nw = pool->size();
-    const size_t per_worker_y = (size_t)kMaxTokens * H;
-    for (int w = 0; w < nw; ++w) {
-        std::memset(workers_y_base + (size_t)w * per_worker_y, 0, sizeof(float) * T * H);
-    }
-
     const int i_groups = I / kGroupSize;
     int slice_bounds[3] = {0, i_groups, i_groups};
     int num_slices = 1;
-    if (J < 8 && i_groups >= 2) {
+    if (i_groups >= 2) {
         slice_bounds[0] = 0;
         slice_bounds[1] = i_groups / 2;
         slice_bounds[2] = i_groups;
         num_slices = 2;
     }
 
-    pool->run(J * num_slices, [&](int item, int w) {
+    const int num_items = J * num_slices;
+    int item_row_off[kMaxPairs * 2 + 1];
+    item_row_off[0] = 0;
+    for (int item = 0; item < num_items; ++item) {
+        item_row_off[item + 1] = item_row_off[item] + jobs[item / num_slices].n;
+    }
+
+    pool->run(num_items, [&](int item, int) {
         const int j = item / num_slices;
         const int s = item % num_slices;
         const int g0 = slice_bounds[s];
@@ -746,34 +749,71 @@ static void compute_slot_cpu(
         const ExpertJob& jb = jobs[j];
         const float* j_xp = jobs_xp_base + (size_t)j * per_job_xp;
         const float* j_xg = jobs_xg_base + (size_t)j * per_job_xg;
-        float* wy = workers_y_base + (size_t)w * per_worker_y;
+        float* item_y = items_y_base + (size_t)item_row_off[item] * H;
         switch (jb.n) {
             case 1:
-                eval_expert_slice_u4b8<1>(desc, jb, g0, g1, j_xp, j_xg, wy);
+                eval_expert_slice_u4b8<1>(desc, jb, g0, g1, j_xp, j_xg, item_y);
                 break;
             case 2:
-                eval_expert_slice_u4b8<2>(desc, jb, g0, g1, j_xp, j_xg, wy);
+                eval_expert_slice_u4b8<2>(desc, jb, g0, g1, j_xp, j_xg, item_y);
                 break;
             case 3:
-                eval_expert_slice_u4b8<3>(desc, jb, g0, g1, j_xp, j_xg, wy);
+                eval_expert_slice_u4b8<3>(desc, jb, g0, g1, j_xp, j_xg, item_y);
                 break;
             default:
-                eval_expert_slice_u4b8<4>(desc, jb, g0, g1, j_xp, j_xg, wy);
+                eval_expert_slice_u4b8<4>(desc, jb, g0, g1, j_xp, j_xg, item_y);
                 break;
         }
     });
 
-    std::memcpy(rs->y_f32, workers_y_base, sizeof(float) * T * H);
-    for (int w = 1; w < nw; ++w) {
-        const float* wy = workers_y_base + (size_t)w * per_worker_y;
-        int i = 0;
-        for (; i + 8 <= T * H; i += 8) {
-            __m256 a = _mm256_loadu_ps(rs->y_f32 + i);
-            __m256 b = _mm256_loadu_ps(wy + i);
-            _mm256_storeu_ps(rs->y_f32 + i, _mm256_add_ps(a, b));
+    // Reduce per-item output rows in each token's own deterministic router order (`k = 0..top_k-1`,
+    // `s = 0..num_slices-1`) so output is bit-for-bit invariant to OS thread scheduling and to other
+    // tokens in a speculative verification batch.
+    for (int t = 0; t < T; ++t) {
+        float* dst_y = rs->y_f32 + (size_t)t * H;
+        int contrib_rows[kMaxTopK * 2];
+        int n_contrib = 0;
+        int seen_jobs[kMaxTopK];
+        int n_seen = 0;
+        for (int k = 0; k < top_k; ++k) {
+            const int le = rq->local_expert_ids[t * top_k + k];
+            if (le < 0 || le >= desc.local_num_experts) continue;
+            int j = 0;
+            while (j < J && jobs[j].le != le) ++j;
+            if (j == J) continue;
+            bool dup = false;
+            for (int u = 0; u < n_seen; ++u) {
+                if (seen_jobs[u] == j) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            seen_jobs[n_seen++] = j;
+            int local_t = 0;
+            while (local_t < jobs[j].n && jobs[j].tok[local_t] != t) ++local_t;
+            if (local_t == jobs[j].n) continue;
+            for (int s = 0; s < num_slices; ++s) {
+                const int item = j * num_slices + s;
+                contrib_rows[n_contrib++] = item_row_off[item] + local_t;
+            }
         }
-        for (; i < T * H; ++i) {
-            rs->y_f32[i] += wy[i];
+        if (n_contrib == 0) {
+            std::memset(dst_y, 0, sizeof(float) * H);
+            continue;
+        }
+        std::memcpy(dst_y, items_y_base + (size_t)contrib_rows[0] * H, sizeof(float) * H);
+        for (int c = 1; c < n_contrib; ++c) {
+            const float* src_y = items_y_base + (size_t)contrib_rows[c] * H;
+            int i = 0;
+            for (; i + 8 <= H; i += 8) {
+                __m256 a = _mm256_loadu_ps(dst_y + i);
+                __m256 b = _mm256_loadu_ps(src_y + i);
+                _mm256_storeu_ps(dst_y + i, _mm256_add_ps(a, b));
+            }
+            for (; i < H; ++i) {
+                dst_y[i] += src_y[i];
+            }
         }
     }
 }
@@ -1267,7 +1307,7 @@ static int ensure_bridge_started() {
     g_bridge.server_thread = std::thread([num_workers] {
         auto* pool = new CpuWorkerPool(num_workers);
         std::vector<float> scratch(4 << 20, 0.0f);
-        std::vector<float> workers_y((size_t)num_workers * kMaxTokens * kMaxHidden, 0.0f);
+        std::vector<float> workers_y((size_t)kMaxPairs * 2 * kMaxHidden, 0.0f);
         std::vector<float> prefill_xp;
         std::vector<float> prefill_xg;
         std::vector<float> prefill_job_out;

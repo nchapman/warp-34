@@ -101,7 +101,7 @@ All 5 Decisive Pre-Freeze Gate Tests (**Gate #1–#5**) pass in `crates/w34-host
       - **5-Prompt Diverse `chat-512` Suite (`512` out each, cold per task):** **`81.07 tok/s` mean** (`creative_writing`: `74.04 tok/s`, `factual_essay`: `72.45 tok/s`, `technical_explain`: `80.11 tok/s`, `code_generation`: `85.96 tok/s`, `reasoning_math`: `92.76 tok/s`).
       - **`scripts/bench.py` Code Review (`4096:256` & `8192:1024`):** **`1,050.9 – 1,120.0 tok/s` prefill** (`3.93 s` / `7.34 s` TTFT) and **`65.61 tok/s` decode** (`2.23/3` accepted = `3.23 tok/round`).
       - **Short 64-Token Probe (`TP=2 / EP=2`):** `46.83 tok/s` cold / **`65.41 tok/s` warm** target-only (`M=1`), and **`108.24 tok/s` cold / `132.47 tok/s` warm** with `MTP-3` (`1.86/3` accepted = `2.86 tok/round`, 64/64 token parity).
-      - **`TP=1` (1× RTX 3090 Ti):** `24.35 tok/s` cold 16-tok `M=1`, **`29.34 tok/s` warm 64-tok `M=1`**, **`34.05 tok/s` warm 64-tok `MTP-3`** (`2.00/3` accepted = `3.00 tok/round`), and `84.45 ms` warm `MambaRadixCache` TTFT (`924.15 ms` cold).
+      - **`TP=1` (1× RTX 3090 Ti):** `30.07 tok/s` cold 16-tok `M=1` (`26.44 ms` TTFT), **`34.48 tok/s` warm 64-tok `M=1`**, **`43.51 tok/s` warm 64-tok `MTP-3`** (`1.86/3` accepted = `2.86 tok/round`, 64/64 deterministic parity across cold, warm, and target greedy), and `27.73 ms` warm `MambaRadixCache` TTFT (`477.91 ms` cold).
 
 ---
 

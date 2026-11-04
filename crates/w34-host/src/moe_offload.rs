@@ -1529,7 +1529,11 @@ mod host_store {
                             store.layout().intermediate as i32,
                             store.layout().hidden as i32,
                             store.layout().group_size as i32,
-                            0.14f32,
+                            if cache.k_static < k_hot {
+                                0.14f32
+                            } else {
+                                0.0f32
+                            },
                         )
                     },
                     "w34_moe_hybrid_submit_and_pull",
@@ -2405,7 +2409,7 @@ mod host_store {
                     && group_size == 128
                     && HotExpertCache::cpu_bridge_supported()
                 {
-                    let k_static = k_hot.saturating_sub(2).max(k_hot * 3 / 4);
+                    let k_static = k_hot;
                     cache.register_cpu_bridge(layer_id, &store, k_static, stream)?;
                 }
                 stores.push(store);
