@@ -1518,6 +1518,24 @@ unsafe extern "C" {
         group_size: i32,
     ) -> i32;
 
+    pub fn w34_moe_pull_mapped_experts(
+        ex: *const W34Exec,
+        mapped_host_packs: *const c_void,
+        src_local_experts: *const i32,
+        dst_slots: *const i32,
+        gate_up_packed_base: *mut u32,
+        gate_up_scales_base: *mut c_void,
+        down_packed_base: *mut u32,
+        down_scales_base: *mut c_void,
+        num_staged: i32,
+        local_num_experts: i32,
+        dst_capacity: i32,
+        pack_stride_bytes: usize,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+    ) -> i32;
+
     pub fn w34_moe_remap_topk_ids_i32(
         ex: *const W34Exec,
         global_topk_ids: *const i32,

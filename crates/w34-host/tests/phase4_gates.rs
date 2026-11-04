@@ -78,6 +78,9 @@ fn lossless_cold_and_warm(kind: SpeculativeKind, tp: usize, large: bool) {
         warm.cached_prefix_tokens
     );
     assert_eq!(warm.generated_token_ids, baseline, "warm {kind:?}");
+    if kind == SpeculativeKind::Mtp {
+        verify_mtp_branching_and_multi_memo(&mut engine, &prompt, &seed);
+    }
     let short = engine.generate_tokens(&prompt, 2, false).unwrap();
     assert_eq!(
         short.generated_token_ids,
@@ -97,6 +100,61 @@ fn lossless_cold_and_warm(kind: SpeculativeKind, tp: usize, large: bool) {
         &baseline[..2]
     );
     exercise_http(engine);
+}
+
+fn verify_mtp_branching_and_multi_memo(engine: &mut Qwen3_5Engine, prompt: &[i32], seed: &[i32]) {
+    let mut branch_a = prompt.to_vec();
+    branch_a.resize(140, seed[0]);
+    branch_a[70..140].fill(seed[1 % seed.len()]);
+    let mut branch_b = branch_a.clone();
+    branch_b[70..140].fill(seed[2 % seed.len()]);
+    let mut branch_c = branch_a.clone();
+    branch_c[70..140].fill(seed[3 % seed.len()]);
+
+    let run_a1 = engine
+        .generate_with_radix_cache(&branch_a, 8, 256, false)
+        .unwrap();
+    let run_b1 = engine
+        .generate_with_radix_cache(&branch_b, 8, 256, false)
+        .unwrap();
+    let run_c1 = engine
+        .generate_with_radix_cache(&branch_c, 8, 256, false)
+        .unwrap();
+    assert_eq!(
+        run_c1.cached_prefix_tokens, 64,
+        "branching single-chunk prefill must split and donate 64-token shared prefix"
+    );
+    assert_eq!(
+        engine.speculative.as_ref().unwrap().last_restored_tokens,
+        64
+    );
+    let run_c2 = engine
+        .generate_with_radix_cache(&branch_c, 8, 256, false)
+        .unwrap();
+    assert_eq!(run_c2.cached_prefix_tokens, 128);
+    assert_eq!(
+        engine.speculative.as_ref().unwrap().last_restored_tokens,
+        128
+    );
+    assert_eq!(run_c2.generated_token_ids, run_c1.generated_token_ids);
+    let run_a2 = engine
+        .generate_with_radix_cache(&branch_a, 8, 256, false)
+        .unwrap();
+    assert!(run_a2.cached_prefix_tokens >= 64);
+    assert_eq!(
+        engine.speculative.as_ref().unwrap().last_restored_tokens,
+        run_a2.cached_prefix_tokens
+    );
+    assert_eq!(run_a2.generated_token_ids, run_a1.generated_token_ids);
+    let run_b2 = engine
+        .generate_with_radix_cache(&branch_b, 8, 256, false)
+        .unwrap();
+    assert!(run_b2.cached_prefix_tokens >= 64);
+    assert_eq!(
+        engine.speculative.as_ref().unwrap().last_restored_tokens,
+        run_b2.cached_prefix_tokens
+    );
+    assert_eq!(run_b2.generated_token_ids, run_b1.generated_token_ids);
 }
 mod common;
 fn exercise_http(engine: Qwen3_5Engine) {

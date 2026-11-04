@@ -881,6 +881,46 @@ mod host_store {
             )
         }
 
+        /// Pulls `num_staged` experts directly from zero-copy mapped host memory (`mapped_packs_addr`)
+        /// at `src_local_experts_addr` into `dst_slots_addr` on `stream`.
+        pub fn pull_mapped(
+            &self,
+            stream: &crate::cuda::CudaStream,
+            mapped_packs_addr: u64,
+            src_local_experts_addr: u64,
+            dst_slots_addr: u64,
+            num_staged: usize,
+            local_num_experts: usize,
+        ) -> crate::cuda::Result<()> {
+            if num_staged == 0 {
+                return Ok(());
+            }
+            let ex = stream.exec(0, 0);
+            crate::cuda::check_rc(
+                // SAFETY: device pointers and capacities are owned and validated by `self` and caller.
+                unsafe {
+                    w34_kernels::ffi::w34_moe_pull_mapped_experts(
+                        &ex,
+                        mapped_packs_addr as *const core::ffi::c_void,
+                        src_local_experts_addr as *const i32,
+                        dst_slots_addr as *const i32,
+                        self.gate_up_packed.addr() as *mut u32,
+                        self.gate_up_scales.addr() as *mut core::ffi::c_void,
+                        self.down_packed.addr() as *mut u32,
+                        self.down_scales.addr() as *mut core::ffi::c_void,
+                        num_staged as i32,
+                        local_num_experts as i32,
+                        self.capacity as i32,
+                        self.layout.stride,
+                        self.layout.intermediate as i32,
+                        self.layout.hidden as i32,
+                        self.layout.group_size as i32,
+                    )
+                },
+                "w34_moe_pull_mapped_experts",
+            )
+        }
+
         /// Launches `w34_moe_w4a16_mlp_f16` against this slot table.
         #[allow(clippy::too_many_arguments)]
         pub fn launch_moe_w4a16(
@@ -1101,6 +1141,7 @@ mod host_store {
         pub top_k: usize,
         pub h_stage_packs: [MappedHostBuffer; 2],
         pub d_stage_packs: [crate::cuda::DeviceBuffer; 2],
+        pub d_stage_src_local_experts: [crate::cuda::DeviceBuffer; 2],
         pub d_stage_slots: [crate::cuda::DeviceBuffer; 2],
         pub stage_tables: [DeviceExpertSlotTable; 2],
         pub h2d_stream: crate::cuda::CudaStream,
@@ -1134,6 +1175,10 @@ mod host_store {
             let d_stage_packs = [
                 DeviceBuffer::alloc(device_id, stage_bytes)?,
                 DeviceBuffer::alloc(device_id, stage_bytes)?,
+            ];
+            let d_stage_src_local_experts = [
+                DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
+                DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
             ];
             let d_stage_slots = [
                 DeviceBuffer::alloc(device_id, stage_cap * core::mem::size_of::<i32>())?,
@@ -1185,6 +1230,7 @@ mod host_store {
                 top_k,
                 h_stage_packs,
                 d_stage_packs,
+                d_stage_src_local_experts,
                 d_stage_slots,
                 stage_tables,
                 h2d_stream,
@@ -1219,43 +1265,39 @@ mod host_store {
             assert!(n <= self.stage_capacity);
             let stride = self.layout.stride;
             if store.mapped_dev_ptr() != 0 {
-                for (i, &ge) in global_expert_ids.iter().enumerate() {
-                    let src = store
-                        .expert_pack(ge)
-                        .expect("expert not owned by local HostExpertStore");
-                    crate::cuda::check_rc(
-                        // SAFETY: `src` is a pinned host slice (`HostPackStorage::Mapped`) and
-                        // `d_stage_packs[buf_idx]` has capacity `stage_capacity * stride`.
-                        unsafe {
-                            w34_kernels::ffi::w34_memcpy_h2d_async(
-                                (self.d_stage_packs[buf_idx].addr() + (i * stride) as u64)
-                                    as *mut core::ffi::c_void,
-                                src.as_ptr().cast::<core::ffi::c_void>(),
-                                stride,
-                                stream.handle,
-                            )
-                        },
-                        "w34_memcpy_h2d_async (pinned expert pack)",
-                    )?;
-                }
-            } else {
-                self.compute_done_events[buf_idx].synchronize()?;
-                let total_bytes = n * stride;
-                // SAFETY: caller ensures previous DMA from `h_stage_packs[buf_idx]` has completed.
-                let pinned_dst = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        self.h_stage_packs[buf_idx].host_ptr.cast::<u8>(),
-                        total_bytes,
-                    )
-                };
-                for (i, &ge) in global_expert_ids.iter().enumerate() {
-                    let src = store
-                        .expert_pack(ge)
-                        .expect("expert not owned by local HostExpertStore");
-                    pinned_dst[i * stride..(i + 1) * stride].copy_from_slice(src);
-                }
-                self.d_stage_packs[buf_idx].copy_from_host(pinned_dst, stream)?;
+                let start = store.expert_ids().start;
+                let local_ids: Vec<i32> = global_expert_ids
+                    .iter()
+                    .map(|&ge| (ge - start) as i32)
+                    .collect();
+                self.d_stage_src_local_experts[buf_idx].copy_from_host(&local_ids, stream)?;
+                self.d_stage_slots[buf_idx].copy_from_host(dst_slots, stream)?;
+                dst_table.pull_mapped(
+                    stream,
+                    store.mapped_dev_ptr(),
+                    self.d_stage_src_local_experts[buf_idx].addr(),
+                    self.d_stage_slots[buf_idx].addr(),
+                    n,
+                    store.expert_ids().len(),
+                )?;
+                return self.compute_done_events[buf_idx].record(stream);
             }
+            self.compute_done_events[buf_idx].synchronize()?;
+            let total_bytes = n * stride;
+            // SAFETY: caller ensures previous DMA from `h_stage_packs[buf_idx]` has completed.
+            let pinned_dst = unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.h_stage_packs[buf_idx].host_ptr.cast::<u8>(),
+                    total_bytes,
+                )
+            };
+            for (i, &ge) in global_expert_ids.iter().enumerate() {
+                let src = store
+                    .expert_pack(ge)
+                    .expect("expert not owned by local HostExpertStore");
+                pinned_dst[i * stride..(i + 1) * stride].copy_from_slice(src);
+            }
+            self.d_stage_packs[buf_idx].copy_from_host(pinned_dst, stream)?;
             self.d_stage_slots[buf_idx].copy_from_host(dst_slots, stream)?;
             dst_table.unpack_staged(
                 stream,
@@ -1375,6 +1417,9 @@ mod host_store {
             }
 
             // Identify unique active local experts and count cache hits/misses.
+            let local_start = cache.expert_ids.start;
+            let local_len = cache.expert_ids.len();
+            let mut seen_local = vec![false; local_len];
             let mut active_local: Vec<usize> = Vec::new();
             let mut hits_in_step: Vec<usize> = Vec::new();
             let mut misses_in_step: Vec<usize> = Vec::new();
@@ -1384,20 +1429,22 @@ mod host_store {
                     continue;
                 }
                 let ge = raw_id as usize;
-                if !cache.expert_ids.contains(&ge) {
+                let le = ge.wrapping_sub(local_start);
+                if le >= local_len {
                     continue;
                 }
-                if !active_local.contains(&ge) {
-                    active_local.push(ge);
-                }
-                if cache.slot_of(ge).is_some() {
+                let is_hit = cache.expert_to_slot[le] >= 0;
+                if is_hit {
                     cache.hits += 1;
-                    if !hits_in_step.contains(&ge) {
-                        hits_in_step.push(ge);
-                    }
                 } else {
                     cache.misses += 1;
-                    if !misses_in_step.contains(&ge) {
+                }
+                if !seen_local[le] {
+                    seen_local[le] = true;
+                    active_local.push(ge);
+                    if is_hit {
+                        hits_in_step.push(ge);
+                    } else {
                         misses_in_step.push(ge);
                     }
                 }
@@ -1740,15 +1787,22 @@ mod host_store {
                             ws.h2d_done_events[next_buf].record(&ws.h2d_stream)?;
                         }
 
-                        // Build per-pair remapped IDs for `chunk`.
+                        // Build per-pair remapped IDs for `chunk` via O(1) local-expert lookup.
+                        let local_start = cache.expert_ids.start;
+                        let local_len = cache.expert_ids.len();
+                        let mut local_to_chunk_slot = vec![-1i32; local_len];
+                        for (pos, &ge) in chunk.iter().enumerate() {
+                            local_to_chunk_slot[ge - local_start] = pos as i32;
+                        }
                         let mut chunk_remap = vec![-1i32; num_tokens * top_k];
                         for (pair_idx, &raw_id) in h_topk_ids.iter().enumerate() {
                             if raw_id < 0 {
                                 continue;
                             }
                             let ge = raw_id as usize;
-                            if let Some(pos) = chunk.iter().position(|&e| e == ge) {
-                                chunk_remap[pair_idx] = pos as i32;
+                            let le = ge.wrapping_sub(local_start);
+                            if le < local_len {
+                                chunk_remap[pair_idx] = local_to_chunk_slot[le];
                             }
                         }
 

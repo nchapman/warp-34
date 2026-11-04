@@ -726,6 +726,13 @@ int w34_moe_unpack_staged_experts(const w34_exec* ex, const void* staged_packs,
                                   void* down_scales_base, int num_staged, int dst_capacity,
                                   size_t pack_stride_bytes, int n_interm, int k_hidden,
                                   int group_size);
+int w34_moe_pull_mapped_experts(const w34_exec* ex, const void* mapped_host_packs,
+                                const int32_t* src_local_experts, const int32_t* dst_slots,
+                                uint32_t* gate_up_packed_base, void* gate_up_scales_base,
+                                uint32_t* down_packed_base, void* down_scales_base,
+                                int num_staged, int local_num_experts, int dst_capacity,
+                                size_t pack_stride_bytes, int n_interm, int k_hidden,
+                                int group_size);
 int w34_moe_remap_topk_ids_i32(const w34_exec* ex, const int32_t* global_topk_ids,
                                const int32_t* expert_to_slot, int32_t* remapped_topk_ids,
                                int total_pairs, int global_expert_offset,

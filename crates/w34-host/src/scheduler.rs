@@ -335,7 +335,9 @@ impl SchedulerV1 {
             let mut match_res = if raw_hit.matched_tokens > 0
                 && !allow_prefix_hit(w.req_id, &w.prompt_tokens, raw_hit.matched_tokens)
             {
-                self.radix.match_prefix(&[])
+                let mut cold = self.radix.match_prefix(&[]);
+                cold.mamba_branching_seqlen = raw_hit.mamba_branching_seqlen;
+                cold
             } else {
                 raw_hit
             };

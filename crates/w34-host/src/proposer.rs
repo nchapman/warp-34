@@ -50,7 +50,7 @@ pub struct NativeProposer {
     k: usize,
     tail: Vec<DeviceBuffer>,
     shifted: Vec<DeviceBuffer>,
-    memo: Option<PrefixMemo>,
+    memos: Vec<PrefixMemo>,
     current: Option<PrefixMemo>,
     resident_tokens: Vec<i32>,
     processed: usize,
@@ -62,7 +62,8 @@ pub struct NativeProposer {
     pub(crate) last_verified_draft_tokens: usize,
     pub last_restored_tokens: usize,
 }
-const MEMO_BUDGET: usize = 64 * 1024 * 1024;
+const MEMO_BUDGET: usize = 256 * 1024 * 1024;
+const MAX_MEMO_ENTRIES: usize = 16;
 const MTP_STAGE_ROWS: usize = 256;
 impl NativeProposer {
     pub fn load(engine: &mut Qwen3_5Engine, config: &SpeculativeConfig) -> Result<Self> {
@@ -190,7 +191,7 @@ impl NativeProposer {
             k,
             tail,
             shifted,
-            memo: None,
+            memos: vec![],
             current: None,
             resident_tokens: vec![],
             processed: 0,
@@ -220,14 +221,44 @@ impl NativeProposer {
         }
         Ok(())
     }
+    fn commit_current_memo(&mut self) {
+        let Some(memo) = self.current.take() else {
+            return;
+        };
+        if memo.tokens.is_empty() {
+            return;
+        }
+        if matches!(self.ranks, Ranks::DFlash(_)) {
+            self.memos.clear();
+            self.memos.push(memo);
+            return;
+        }
+        self.memos
+            .retain(|existing| !memo.tokens.starts_with(&existing.tokens));
+        if let Some(pos) = self
+            .memos
+            .iter()
+            .position(|existing| existing.tokens.starts_with(&memo.tokens))
+        {
+            let existing = self.memos.remove(pos);
+            self.memos.push(existing);
+            return;
+        }
+        let mut total_bytes: usize = self.memos.iter().map(|m| m.features.len()).sum();
+        while !self.memos.is_empty()
+            && (self.memos.len() >= MAX_MEMO_ENTRIES
+                || total_bytes.saturating_add(memo.features.len()) > MEMO_BUDGET)
+        {
+            let removed = self.memos.remove(0);
+            total_bytes = total_bytes.saturating_sub(removed.features.len());
+        }
+        self.memos.push(memo);
+    }
     fn can_restore(&self, tokens: &[i32]) -> bool {
         if tokens.is_empty() {
             return true;
         }
-        let has_memo = self
-            .memo
-            .as_ref()
-            .is_some_and(|m| m.tokens.starts_with(tokens));
+        let has_memo = self.memos.iter().any(|m| m.tokens.starts_with(tokens));
         match &self.ranks {
             Ranks::DFlash(_) => has_memo && self.resident_tokens.starts_with(tokens),
             Ranks::Mtp(_) => has_memo,
@@ -246,9 +277,12 @@ impl NativeProposer {
         // truncate the drafter KV cache in-place and restore MTP's 1-row tail without
         // re-running drafter prefill over the cached prefix.
         if self.resident_tokens.starts_with(tokens)
-            && let Some(memo) = &self.memo
-            && memo.tokens.starts_with(tokens)
+            && let Some(idx) = self
+                .memos
+                .iter()
+                .rposition(|m| m.tokens.starts_with(tokens))
         {
+            let memo = self.memos.remove(idx);
             let n = tokens.len();
             match &mut self.ranks {
                 Ranks::DFlash(rs) => {
@@ -273,6 +307,7 @@ impl NativeProposer {
             } else {
                 vec![]
             };
+            self.memos.push(memo);
             self.current = Some(PrefixMemo {
                 tokens: tokens.to_vec(),
                 features,
@@ -284,10 +319,12 @@ impl NativeProposer {
             tokens: vec![],
             features: vec![],
         });
-        let memo = self
-            .memo
-            .take()
+        let idx = self
+            .memos
+            .iter()
+            .rposition(|m| m.tokens.starts_with(tokens))
             .ok_or_else(|| loader_err("missing proposer prefix"))?;
+        let memo = self.memos.remove(idx);
         let step = self.max_rows.min(MTP_STAGE_ROWS);
         let result = (|| {
             for start in (0..tokens.len()).step_by(step) {
@@ -306,7 +343,7 @@ impl NativeProposer {
             }
             Ok(())
         })();
-        self.memo = Some(memo);
+        self.memos.push(memo);
         result?;
         self.last_restored_tokens = tokens.len();
         Ok(())
@@ -921,7 +958,9 @@ impl NativeProposer {
         let hit = if self.can_restore(&prompt[..lookup.matched_tokens]) {
             lookup
         } else {
-            engine.radix.match_prefix(&[])
+            let mut cold = engine.radix.match_prefix(&[]);
+            cold.mamba_branching_seqlen = lookup.mamba_branching_seqlen;
+            cold
         };
         let cached = hit.matched_tokens;
         self.restore(engine, &prompt[..cached])?;
@@ -949,7 +988,26 @@ impl NativeProposer {
             let mut anchor = 0;
             let mut cursor = cached;
             while cursor < prompt.len() {
-                let end = (cursor + chunk.max(1).min(self.max_rows)).min(prompt.len());
+                let rem = prompt.len() - cursor;
+                let mamba_chunk = req.mamba_chunk_size.max(1);
+                let mut max_take = rem.min(chunk.max(1).min(self.max_rows));
+                if let Some(branch_end) = hit.mamba_branching_seqlen {
+                    let aligned_branch = (branch_end / mamba_chunk) * mamba_chunk;
+                    if aligned_branch > cursor && aligned_branch < prompt.len() {
+                        max_take = max_take.min(aligned_branch - cursor);
+                    }
+                }
+                let take = if cursor + max_take < prompt.len() {
+                    let next_aligned = ((cursor + max_take) / mamba_chunk) * mamba_chunk;
+                    if next_aligned > cursor {
+                        next_aligned - cursor
+                    } else {
+                        max_take
+                    }
+                } else {
+                    max_take
+                };
+                let end = cursor + take;
                 let tokens = &prompt[cursor..end];
                 let planned = req.plan_checkpoints(tokens.len());
                 let pairs: Vec<_> = planned
@@ -972,6 +1030,14 @@ impl NativeProposer {
                 self.ingest(engine, tokens, &features)?;
                 req.commit_tokens(tokens, &planned);
                 cursor = end;
+                if (cursor < prompt.len() || max_new > 1)
+                    && req.last_track_seqlen.is_some()
+                    && let Some(rep) = engine.alloc_state_slot()
+                {
+                    let don = req.donate_committed_checkpoint(&mut engine.radix, Some(rep), false);
+                    engine.free_kv_pages(&don.freed_kv_pages);
+                    engine.free_state_slots(&don.freed_mamba_slots);
+                }
             }
             tx.committed_slot = req.active_state_slot;
             tx.commit_prefill(prompt.len());
@@ -1145,7 +1211,7 @@ impl NativeProposer {
                 engine.free_state_slots(&release.freed_mamba_slots);
                 self.current = None;
                 if matches!(self.ranks, Ranks::DFlash(_)) {
-                    self.memo = None;
+                    self.memos.clear();
                 }
                 return Err(e);
             }
@@ -1153,7 +1219,7 @@ impl NativeProposer {
         let donation = req.donate_committed_checkpoint(&mut engine.radix, None, true);
         engine.free_kv_pages(&donation.freed_kv_pages);
         engine.free_state_slots(&donation.freed_mamba_slots);
-        self.memo = self.current.take();
+        self.commit_current_memo();
         let steps = generated.len().saturating_sub(1);
         Ok(RadixBenchMetrics {
             prompt_len: prompt.len(),
@@ -1203,7 +1269,7 @@ impl NativeProposer {
         let _ = self.reset();
         self.current = None;
         if matches!(self.ranks, Ranks::DFlash(_)) {
-            self.memo = None;
+            self.memos.clear();
         }
     }
 
@@ -1217,7 +1283,7 @@ impl NativeProposer {
             self.ingest(engine, pending_ingest, &features)?;
             pending_ingest.clear();
         }
-        self.memo = self.current.take();
+        self.commit_current_memo();
         Ok(())
     }
 
@@ -1232,7 +1298,26 @@ impl NativeProposer {
         chunk: usize,
     ) -> Result<Option<(i32, Option<crate::parser::StepLogprobs>)>> {
         let start = seq.prefilled_tokens;
-        let end = (start + chunk.max(1).min(self.max_rows)).min(seq.prompt_tokens.len());
+        let rem = seq.prompt_tokens.len() - start;
+        let mamba_chunk = seq.radix_state.mamba_chunk_size.max(1);
+        let mut max_take = rem.min(chunk.max(1).min(self.max_rows));
+        if let Some(branch_end) = seq.mamba_branching_seqlen {
+            let aligned_branch = (branch_end / mamba_chunk) * mamba_chunk;
+            if aligned_branch > start && aligned_branch < seq.prompt_tokens.len() {
+                max_take = max_take.min(aligned_branch - start);
+            }
+        }
+        let take = if start + max_take < seq.prompt_tokens.len() {
+            let next_aligned = ((start + max_take) / mamba_chunk) * mamba_chunk;
+            if next_aligned > start {
+                next_aligned - start
+            } else {
+                max_take
+            }
+        } else {
+            max_take
+        };
+        let end = start + take;
         let tokens = &seq.prompt_tokens[start..end];
         let planned = seq.radix_state.plan_checkpoints(tokens.len());
         let pairs: Vec<_> = planned
@@ -1290,6 +1375,16 @@ impl NativeProposer {
                 .is_some_and(|c| c.is_terminal_eos())
         {
             seq.finished = true;
+        }
+        if !seq.finished
+            && seq.radix_state.last_track_seqlen.is_some()
+            && let Some(rep) = engine.alloc_state_slot_from(radix)
+        {
+            let don = seq
+                .radix_state
+                .donate_committed_checkpoint(radix, Some(rep), false);
+            engine.free_kv_pages(&don.freed_kv_pages);
+            engine.free_state_slots(&don.freed_mamba_slots);
         }
         Ok(Some((anchor, lp)))
     }
@@ -1536,7 +1631,7 @@ impl NativeProposer {
         self.processed = 0;
         self.current = None;
         if enable {
-            self.memo = None;
+            self.memos.clear();
             self.mtp_batch_active_slot = 0;
             self.capacity = rs[0].batch_slot_capacity();
         } else {
@@ -1595,7 +1690,7 @@ impl NativeProposer {
                 t.stream.synchronize()?;
             }
         }
-        self.memo = None;
+        self.memos.clear();
         self.current = None;
         self.mtp_batch_active_slot = 0;
         self.capacity = rs[0].batch_slot_capacity();

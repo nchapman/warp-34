@@ -446,6 +446,9 @@ __global__ void qsa_select_blocks_f16_kernel(
 
     __shared__ float s_chunk_scores[4];
     __shared__ int32_t s_chunk_blocks[4];
+    __shared__ float s_w_sc[4];
+    __shared__ int32_t s_w_blk[4];
+    __shared__ int s_w_pos[4];
 
     for (int g_base = mid_start; g_base < mid_end; g_base += num_warps) {
         const int g = g_base + wid;
@@ -481,30 +484,114 @@ __global__ void qsa_select_blocks_f16_kernel(
         }
         __syncthreads();
 
-        if (threadIdx.x == 0 && need_mid > 0) {
-            for (int w = 0; w < num_warps; ++w) {
-                const float sc = s_chunk_scores[w];
-                const int32_t lg = s_chunk_blocks[w];
-                if (lg >= 0 && sc > s_top_scores[need_mid - 1]) {
-                    int pos = need_mid - 1;
-                    while (pos > 0 && sc > s_top_scores[pos - 1]) {
-                        s_top_scores[pos] = s_top_scores[pos - 1];
-                        s_top_blocks[pos] = s_top_blocks[pos - 1];
-                        --pos;
-                    }
-                    s_top_scores[pos] = sc;
-                    s_top_blocks[pos] = lg;
+        if (need_mid > 0) {
+            // Compute the minimum-score slot in s_top_scores[0..need_mid) once using all 128 threads,
+            // breaking ties by larger logical block index (so earliest logical group wins ties).
+            float my_min_sc = FLT_MAX;
+            int32_t my_min_blk = 0;
+            int my_min_pos = need_mid;
+            for (int i = threadIdx.x; i < need_mid; i += blockDim.x) {
+                const float sc = s_top_scores[i];
+                const int32_t blk = s_top_blocks[i];
+                const bool take_i = (my_min_pos >= need_mid) ||
+                    (blk < 0 && (my_min_blk >= 0 || i < my_min_pos)) ||
+                    (blk >= 0 && my_min_blk >= 0 &&
+                     (sc < my_min_sc || (sc == my_min_sc && blk > my_min_blk)));
+                if (take_i) {
+                    my_min_sc = sc;
+                    my_min_blk = blk;
+                    my_min_pos = i;
                 }
             }
+            // Warp-reduce minimum victim slot.
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float o_sc = __shfl_down_sync(0xffffffffu, my_min_sc, off);
+                const int32_t o_blk = __shfl_down_sync(0xffffffffu, my_min_blk, off);
+                const int o_pos = __shfl_down_sync(0xffffffffu, my_min_pos, off);
+                if (o_pos < need_mid) {
+                    const bool take_o = (my_min_pos >= need_mid) ||
+                        (o_blk < 0 && (my_min_blk >= 0 || o_pos < my_min_pos)) ||
+                        (o_blk >= 0 && my_min_blk >= 0 &&
+                         (o_sc < my_min_sc || (o_sc == my_min_sc && o_blk > my_min_blk)));
+                    if (take_o) {
+                        my_min_sc = o_sc;
+                        my_min_blk = o_blk;
+                        my_min_pos = o_pos;
+                    }
+                }
+            }
+            if (lane == 0) {
+                s_w_sc[wid] = my_min_sc;
+                s_w_blk[wid] = my_min_blk;
+                s_w_pos[wid] = my_min_pos;
+            }
+            __syncthreads();
+
+            if (threadIdx.x == 0) {
+                for (int w = 0; w < num_warps; ++w) {
+                    const float sc = s_chunk_scores[w];
+                    const int32_t lg = s_chunk_blocks[w];
+                    if (lg < 0) continue;
+                    int v_pos = s_w_pos[0];
+                    float v_sc = s_w_sc[0];
+                    int32_t v_blk = s_w_blk[0];
+                    for (int rw = 1; rw < 4; ++rw) {
+                        const int op = s_w_pos[rw];
+                        if (op >= need_mid) continue;
+                        const float osc = s_w_sc[rw];
+                        const int32_t oblk = s_w_blk[rw];
+                        const bool take_o = (v_pos >= need_mid) ||
+                            (oblk < 0 && (v_blk >= 0 || op < v_pos)) ||
+                            (oblk >= 0 && v_blk >= 0 &&
+                             (osc < v_sc || (osc == v_sc && oblk > v_blk)));
+                        if (take_o) {
+                            v_pos = op;
+                            v_sc = osc;
+                            v_blk = oblk;
+                        }
+                    }
+                    if (v_pos < need_mid && (v_blk < 0 || sc > v_sc)) {
+                        s_top_scores[v_pos] = sc;
+                        s_top_blocks[v_pos] = lg;
+                        if (w + 1 < num_warps) {
+                            int best_p = 0;
+                            float best_s = s_top_scores[0];
+                            int32_t best_b = s_top_blocks[0];
+                            for (int i = 1; i < need_mid; ++i) {
+                                const float isc = s_top_scores[i];
+                                const int32_t iblk = s_top_blocks[i];
+                                const bool take_i =
+                                    (iblk < 0 && (best_b >= 0 || i < best_p)) ||
+                                    (iblk >= 0 && best_b >= 0 &&
+                                     (isc < best_s || (isc == best_s && iblk > best_b)));
+                                if (take_i) {
+                                    best_p = i;
+                                    best_s = isc;
+                                    best_b = iblk;
+                                }
+                            }
+                            s_w_pos[0] = best_p;
+                            s_w_sc[0] = best_s;
+                            s_w_blk[0] = best_b;
+                            s_w_pos[1] = need_mid;
+                            s_w_pos[2] = need_mid;
+                            s_w_pos[3] = need_mid;
+                        }
+                    }
+                }
+            }
+            __syncthreads();
         }
-        __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        // Insertion-sort the selected middle groups by logical group index ascending.
+        // Compact and insertion-sort the selected middle groups by logical group index ascending.
         int valid_mid = 0;
-        while (valid_mid < need_mid && s_top_blocks[valid_mid] >= 0) {
-            ++valid_mid;
+        for (int i = 0; i < need_mid; ++i) {
+            if (s_top_blocks[i] >= 0) {
+                s_top_blocks[valid_mid++] = s_top_blocks[i];
+            }
         }
         for (int i = 1; i < valid_mid; ++i) {
             const int32_t key_g = s_top_blocks[i];

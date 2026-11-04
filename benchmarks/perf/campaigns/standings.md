@@ -2,7 +2,7 @@
 
 ## Bottom line
 
-**27B leads on both one GPU and two GPUs (`310.49 tok/s` weighted / `312.47 tok/s` median at 1-GPU FP16-KV C8 vs vLLM `309.89` / `277.67`). Native Flash Next MTP-3 (`warp34-flash-tp1-mtp3` and `warp34-flash-tp2-mtp3`) and TP2 4096-page / 16384-page capacity admission now pass baseline quality (`6/6`) and complete all HTTP workloads cleanly, with TP2 MTP-3 leading on short chat (`66.68 tok/s` vs `56.20 tok/s`) and strict coding-agent replay (`49.82 tok/s`).** Longer-input prefill/decode throughput on Flash Next improved by `+22%` on target-only and `+85%` with MTP-3 (`3.53 -> 5.19 tok/s` on TP1, `3.79 -> 8.49 tok/s` on TP2), though specialized references remain ahead on `code-context-r64`.
+**27B leads on both one GPU and two GPUs (`310.49 tok/s` weighted / `312.47 tok/s` median at 1-GPU FP16-KV C8 vs vLLM `309.89` / `277.67`), and Qwen3.5-4B sweeps all 7/7 serving cases against both vLLM 0.19.0 and SGLang 0.5.10 (`188.62 tok/s` TP1 / `200.28 tok/s` TP2 on `burst-chat-c4` with batched multi-slot MTP). Native Flash Next MTP-3 (`warp34-flash-tp1-mtp3` and `warp34-flash-tp2-mtp3`) and TP2 4096-page / 16384-page capacity admission pass all quality checks (`6/6` serving and `6/6` capacity retrieval through `~252K`), with TP2 MTP-3 leading `qfn-2x3090-mtp3` on short chat (`66.68` vs `56.20 tok/s`), `prefill-context-r16` (`23.69` vs `21.27 tok/s`), `prefix-primed-r16` (`41.45` vs `20.52 tok/s`, `+102%` at `94.8%` warm-prefix hit rate), and strict coding-agent replay (`50.30` vs `44.96 tok/s`).**
 
 These are local practical-deployment results on 1–2 RTX 3090 Ti GPUs, not a
 composite winner ranking. Rates below are total output tokens divided by total
@@ -72,8 +72,8 @@ The separate two-TP1-replica evidence remains historical, not a fresh DP2 result
   2. `NativeProposer::restore` slow path (`crates/w34-host/src/proposer.rs`) staged host `memo.features` into `self.shifted` and then executed an overlapping device-to-device `cudaMemcpyAsync` within `self.shifted` whenever `before > 0` across multi-stage (>256-token) prefills, corrupting MTP hidden features and causing `code` quality to fail. Staging `memo.features` into `t.last_final_hidden_f16` eliminated the overlap.
   3. `TokenBitmaskConstraint::is_terminal_eos()` truncation in `proposer.rs` and `engine_worker.rs` prevents empty-bitmask errors when a draft token hits a grammar terminal EOS, and `abort_scheduled` now resets `NativeProposer` state cleanly.
 - **Flash Next TP2 VRAM admission (`warp34-flash-tp2-target`, `warp34-flash-tp2-mtp3` at `4096` pages, and `warp34-flash-tp2-capacity` at `16384` pages) now boots and serves cleanly.** `plan_tiered_moe_hot_per_layer` (`crates/w34-host/src/model/rank.rs`) queries live post-weight `device.mem_info()` and adapts `hot_per_layer` down from `112` (in multiples of 8, clamped to `[32, 112]` with a `640 MiB` auxiliary/MTP reserve) when larger KV/state pools are requested.
-- **On 2× RTX 3090 Ti with MTP-3 (`warp34-flash-tp2-mtp3`, 4096 pages), `warp-34` reaches `66.68 tok/s` weighted (`66.36 tok/s` median) on `short-chat` (+18.6% over `qfn-2x3090-mtp3`'s `56.20 tok/s`), `23.69 tok/s` on `prefill-context-r16` (+11.4% over `21.27 tok/s`), `22.93 tok/s` on `prefix-primed-r16` (+11.7% over `20.52 tok/s`), and `49.82 tok/s` (`49.98 tok/s` median) on `coding-agent-replay`.**
-- **Longer-input MoE offload optimizations** (eliminating redundant `h_topk_weights` D2H copies in `GpuLru`/`StreamedPrefill` modes, parallelizing `moe_gpu_lru_plan_and_remap_kernel` across all 32 warp lanes, and widening `moe_gpu_lru_pull_mapped_experts_kernel` from `16` to `64` CTAs/miss in `op_moe.cu`) improved target-only `code-context-r64` by `+22%` (`2.89 -> 3.54 tok/s` on TP1, `3.79 -> 4.63 tok/s` on TP2) and `8.49 tok/s` (`8.59 tok/s` median) with TP2 MTP-3.
+- **On 2× RTX 3090 Ti with MTP-3 (`warp34-flash-tp2-mtp3`, 4096 pages), `warp-34` reaches `66.68 tok/s` weighted (`66.36 tok/s` median) on `short-chat` (+18.6% over `qfn-2x3090-mtp3`'s `56.20 tok/s`), `23.69 tok/s` on `prefill-context-r16` (+11.4% over `21.27 tok/s`), `41.45 tok/s` (`41.56 tok/s` median, `570 ms` p50 TTFT at `94.8%` warm-prefix hit rate) on `prefix-primed-r16` (+102.0% over `20.52 tok/s`), and `50.30 tok/s` (`50.79 tok/s` median) on `coding-agent-replay`. On 1× RTX 3090 Ti (`warp34-flash-tp1-mtp3`), `prefix-primed-r16` reaches `12.40 tok/s` (`12.46 tok/s` median), +21.9% over `qfn-3090-mtp3` (`10.17 tok/s`).**
+- **Longer-input MoE offload & QSA optimizations** (eliminating redundant `h_topk_weights` D2H copies in `GpuLru`/`StreamedPrefill` modes, parallelizing `moe_gpu_lru_plan_and_remap_kernel` across all 32 warp lanes, widening `moe_gpu_lru_pull_mapped_experts_kernel` from `16` to `64` CTAs/miss, adding zero-copy `w34_moe_pull_mapped_experts` in `StreamedPrefill::stage_experts_to_slots`, and parallelizing victim-slot reduction in `qsa_select_blocks_f16_kernel`) improved target-only `code-context-r64` by `+22%` (`2.89 -> 3.54 tok/s` on TP1, `3.79 -> 4.63 tok/s` on TP2) and `6.84–8.49 tok/s` with TP2 MTP-3.
 - The specialized references emitted live tool calls in strict recorded replay.
   The client correctly refused to execute them. This is a fixture/protocol
   incompatibility, **not evidence that real agent performance is worse**.
@@ -82,12 +82,12 @@ The separate two-TP1-replica evidence remains historical, not a fresh DP2 result
   throughput is not a quality-equivalent replacement claim. Its original
   no-speculation IQ-pack recipe failed startup and remains retained separately.
 
-## Flash long context: usable TP1 capacity, TP2 16384-page startup resolved
+## Flash long context: usable TP1 & TP2 capacity (`6/6` through ~252K)
 
 | Deployment | Retrieval checks | ~60K cold read | 120K/252K strict agent replay |
 |---|---|---|---|
 | Native TP1 target | 6/6 through ~252K | 0.240 output tok/s | Complete; 60/60 total workload requests |
-| Native TP2, 16384 pages (post-fix) | Startup ready; passes 32K early/late (2/6 overall) | 0.410 output tok/s | Startup admission resolved (`72` hot experts/layer) |
+| Native TP2, 16384 pages (post-fix) | 6/6 through ~252K | 0.410 output tok/s | Startup admission & 252K retrieval qualified (`72` hot experts/layer) |
 | Two-GPU specialized vLLM, MTP3 | 6/6 through ~252K | 1.466 output tok/s | Six trials fail on live tool calls |
 
 The reference's cold-read rate is about **3.6×** native TP2 target (`1.466` vs `0.410 output tok/s`) and **6.1×** native TP1, and uses two GPUs
@@ -97,8 +97,8 @@ TP1's complete agent workload reached **251,982 prompt tokens**.
 
 ## Resolved post-campaign gaps (commits `3ebda3f`, `25b2ebf`, and follow-up)
 
-1. **Flash MTP HTTP correctness (RESOLVED):** Fixed `serving_state_slots(1) -> 8`, `NativeProposer::restore` non-overlapping staging buffer (`t.last_final_hidden_f16`), terminal-EOS draft truncation, and post-abort MTP reset. Both `warp34-flash-tp1-mtp3` and `warp34-flash-tp2-mtp3` pass `6/6` quality and all 5 HTTP workloads.
-2. **Flash TP2 memory admission/capacity (RESOLVED):** Adaptive `plan_tiered_moe_hot_per_layer` fits `4096`-page (`104` hot experts/layer) and `16384`-page (`72` hot experts/layer) TP2 configurations cleanly within 24 GiB/card.
+1. **Flash MTP HTTP correctness & warm-prefix caching (RESOLVED):** Fixed `serving_state_slots(1) -> 8`, `NativeProposer::restore` non-overlapping staging buffer (`t.last_final_hidden_f16`), terminal-EOS draft truncation, post-abort MTP reset, branching-prefix chunk splitting (`mamba_branching_seqlen`) + end-of-prefill checkpoint donation in `NativeProposer`, and `256 MiB` multi-memo cache (`MAX_MEMO_ENTRIES = 16`). Both `warp34-flash-tp1-mtp3` and `warp34-flash-tp2-mtp3` pass `6/6` quality and achieve `94.8%` warm-prefix cache hit ratio on `prefix-primed-r16` (`41.45 tok/s` on TP2 MTP-3, `+102%` over `qfn-2x3090-mtp3`; `12.40 tok/s` on TP1 MTP-3, `+21.9%` over `qfn-3090-mtp3`).
+2. **Flash TP2 memory admission & 252K capacity qualification (RESOLVED):** Adaptive `plan_tiered_moe_hot_per_layer` fits `4096`-page (`104` hot experts/layer) and `16384`-page (`72` hot experts/layer) TP2 configurations cleanly within 24 GiB/card, and `warp34-flash-tp2-capacity` passes all `6/6` early/late retrieval checks through `~252K` tokens.
 3. **Flash longer-input performance (IMPROVED +22% target / +85% MTP-3):** Eliminated D2H weight copies and widened GPU LRU remap/PCIe pull kernels; `warp34-flash-tp2-mtp3` now leads `qfn-2x3090-mtp3` on `short-chat`, `prefill-context-r16`, `prefix-primed-r16`, and `coding-agent-replay`, while `code-context-r64` (`8.49 tok/s`) remains the main further optimization target.
 4. **27B TP1 FP16-KV concurrency (RESOLVED):** Conditional lazy `vision_reserve` preserves all `32` serving state slots at `max_num_seqs=8`, lifting `throughput-c8` from `228.66` (`226.47` median) to **`310.49 tok/s` (`312.47 tok/s` median, `+38.0%`)**, ahead of vLLM.
 

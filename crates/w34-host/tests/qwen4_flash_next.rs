@@ -962,13 +962,51 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
     let ids_long = rt
         .block_on(collect_stream_tokens(
             worker
-                .submit(long_300, params_long, None)
+                .submit(long_300.clone(), params_long.clone(), None)
                 .expect("submit 300-token MTP request"),
         ))
         .expect("300-token single-chunk MTP prefill + verify must succeed");
     assert_eq!(
         ids_long, ref_long.generated_token_ids,
         "EngineWorker MTP 300-token single-chunk prefill must match target greedy tokens"
+    );
+
+    // Multi-prompt prefix-memo LRU test: run a second distinct prompt (`long_alt`), then replay
+    // `long_300` and verify `cached_prefix_tokens > 0` (regression test for `prefix-primed-r16`
+    // where multiple primed prompts previously overwrote a single `memo` slot).
+    let long_alt: Vec<i32> = (0..160).map(|i| (i * 11 + 19) % 250).collect();
+    let _ = rt
+        .block_on(collect_stream_tokens(
+            worker
+                .submit(long_alt, params_long.clone(), None)
+                .expect("submit second distinct prompt"),
+        ))
+        .expect("second distinct MTP prompt must succeed");
+    let mut stream_reused = worker
+        .submit(long_300, params_long, None)
+        .expect("re-submit first 300-token MTP prompt after intervening prompt");
+    let (ids_reused, cached_reused) = rt
+        .block_on(async move {
+            let mut out = Vec::new();
+            while let Some(ev) = stream_reused.events.recv().await {
+                match ev {
+                    GenerationEvent::Token { id, .. } => out.push(id),
+                    GenerationEvent::Finished { cached_tokens, .. } => {
+                        return Ok::<_, String>((out, cached_tokens));
+                    }
+                    GenerationEvent::Error(e) => return Err(e.to_string()),
+                }
+            }
+            Err("stream closed without Finished".into())
+        })
+        .expect("replayed 300-token MTP request must succeed");
+    assert!(
+        cached_reused >= 256,
+        "expected multi-entry MTP PrefixMemo to preserve warm prefix hit >= 256 after intervening prompt, got {cached_reused}"
+    );
+    assert_eq!(
+        ids_reused, ref_long.generated_token_ids,
+        "replayed warm-prefix MTP request must match target greedy tokens"
     );
 
     // Constrained terminal-EOS draft verification: when a draft token is in terminal_eos_ids,
