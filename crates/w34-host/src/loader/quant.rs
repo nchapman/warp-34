@@ -83,16 +83,34 @@ pub fn dequant_u4b8_n_major_to_f16(
     assert_eq!(packed_n_by_k8.len(), size_n * words_per_row);
     assert_eq!(scales_n_by_kg.len(), size_n * groups_per_row);
     let mut out = vec![0u16; size_n * size_k];
-    for n in 0..size_n {
-        for w_idx in 0..words_per_row {
-            let word = packed_n_by_k8[n * words_per_row + w_idx];
-            for b in 0..8 {
-                let k = w_idx * 8 + b;
-                let nib = ((word >> (b * 4)) & 0xF) as i32 - 8;
-                let scale = f16_to_f32(scales_n_by_kg[n * groups_per_row + (k / group_size)]);
-                out[n * size_k + k] = f32_to_f16((nib as f32) * scale);
+    let dequant_rows = |row_start: usize, dst_rows: &mut [u16]| {
+        for (rel_n, dst_row) in dst_rows.chunks_exact_mut(size_k).enumerate() {
+            let n = row_start + rel_n;
+            let row_words = &packed_n_by_k8[n * words_per_row..(n + 1) * words_per_row];
+            let row_scales = &scales_n_by_kg[n * groups_per_row..(n + 1) * groups_per_row];
+            for (w_idx, &word) in row_words.iter().enumerate() {
+                for b in 0..8 {
+                    let k = w_idx * 8 + b;
+                    let nib = ((word >> (b * 4)) & 0xF) as i32 - 8;
+                    let scale = f16_to_f32(row_scales[k / group_size]);
+                    dst_row[k] = f32_to_f16((nib as f32) * scale);
+                }
             }
         }
+    };
+    if size_n < 2048 {
+        dequant_rows(0, &mut out);
+    } else {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 8))
+            .unwrap_or(4);
+        let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
+        std::thread::scope(|s| {
+            for (chunk_idx, dst_chunk) in out.chunks_mut(rows_per_chunk * size_k).enumerate() {
+                let row_start = chunk_idx * rows_per_chunk;
+                s.spawn(move || dequant_rows(row_start, dst_chunk));
+            }
+        });
     }
     out
 }
@@ -106,9 +124,24 @@ pub fn transpose_gptq_qweight_k8_n_to_n_major(
     let k8 = size_k / 8;
     assert_eq!(qweight_k8_by_n.len(), k8 * size_n);
     let mut out = vec![0u32; size_n * k8];
-    for kr in 0..k8 {
-        for n in 0..size_n {
-            out[n * k8 + kr] = qweight_k8_by_n[kr * size_n + n];
+    const TILE: usize = 32;
+    let mut tile = [[0u32; TILE]; TILE];
+    for kr_base in (0..k8).step_by(TILE) {
+        let kr_len = (k8 - kr_base).min(TILE);
+        for n_base in (0..size_n).step_by(TILE) {
+            let n_len = (size_n - n_base).min(TILE);
+            for (tk, tile_row) in tile.iter_mut().enumerate().take(kr_len) {
+                let src = &qweight_k8_by_n[(kr_base + tk) * size_n + n_base..];
+                for (tn, slot) in tile_row.iter_mut().enumerate().take(n_len) {
+                    *slot = src[tn];
+                }
+            }
+            for tn in 0..n_len {
+                let dst = &mut out[(n_base + tn) * k8 + kr_base..];
+                for (tk, &row) in tile.iter().enumerate().take(kr_len) {
+                    dst[tk] = row[tn];
+                }
+            }
         }
     }
     out
@@ -123,9 +156,24 @@ pub fn transpose_gptq_qweight_k4_n_to_n_major(
     let k4 = size_k / 4;
     assert_eq!(qweight_k4_by_n.len(), k4 * size_n);
     let mut out = vec![0u32; size_n * k4];
-    for kr in 0..k4 {
-        for n in 0..size_n {
-            out[n * k4 + kr] = qweight_k4_by_n[kr * size_n + n];
+    const TILE: usize = 32;
+    let mut tile = [[0u32; TILE]; TILE];
+    for kr_base in (0..k4).step_by(TILE) {
+        let kr_len = (k4 - kr_base).min(TILE);
+        for n_base in (0..size_n).step_by(TILE) {
+            let n_len = (size_n - n_base).min(TILE);
+            for (tk, tile_row) in tile.iter_mut().enumerate().take(kr_len) {
+                let src = &qweight_k4_by_n[(kr_base + tk) * size_n + n_base..];
+                for (tn, slot) in tile_row.iter_mut().enumerate().take(n_len) {
+                    *slot = src[tn];
+                }
+            }
+            for tn in 0..n_len {
+                let dst = &mut out[(n_base + tn) * k4 + kr_base..];
+                for (tk, &row) in tile.iter().enumerate().take(kr_len) {
+                    dst[tk] = row[tn];
+                }
+            }
         }
     }
     out
@@ -290,16 +338,34 @@ pub fn dequant_u8b128_n_major_to_f16(
     assert_eq!(packed_n_by_k4.len(), size_n * words_per_row);
     assert_eq!(scales_n_by_kg.len(), size_n * groups_per_row);
     let mut out = vec![0u16; size_n * size_k];
-    for n in 0..size_n {
-        for w_idx in 0..words_per_row {
-            let word = packed_n_by_k4[n * words_per_row + w_idx];
-            for b in 0..4 {
-                let k = w_idx * 4 + b;
-                let q = ((word >> (b * 8)) & 0xFF) as i32 - 128;
-                let scale = f16_to_f32(scales_n_by_kg[n * groups_per_row + (k / eff_gs)]);
-                out[n * size_k + k] = f32_to_f16((q as f32) * scale);
+    let dequant_rows = |row_start: usize, dst_rows: &mut [u16]| {
+        for (rel_n, dst_row) in dst_rows.chunks_exact_mut(size_k).enumerate() {
+            let n = row_start + rel_n;
+            let row_words = &packed_n_by_k4[n * words_per_row..(n + 1) * words_per_row];
+            let row_scales = &scales_n_by_kg[n * groups_per_row..(n + 1) * groups_per_row];
+            for (w_idx, &word) in row_words.iter().enumerate() {
+                for b in 0..4 {
+                    let k = w_idx * 4 + b;
+                    let q = ((word >> (b * 8)) & 0xFF) as i32 - 128;
+                    let scale = f16_to_f32(row_scales[k / eff_gs]);
+                    dst_row[k] = f32_to_f16((q as f32) * scale);
+                }
             }
         }
+    };
+    if size_n < 2048 {
+        dequant_rows(0, &mut out);
+    } else {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 8))
+            .unwrap_or(4);
+        let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
+        std::thread::scope(|s| {
+            for (chunk_idx, dst_chunk) in out.chunks_mut(rows_per_chunk * size_k).enumerate() {
+                let row_start = chunk_idx * rows_per_chunk;
+                s.spawn(move || dequant_rows(row_start, dst_chunk));
+            }
+        });
     }
     out
 }

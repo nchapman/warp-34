@@ -742,9 +742,17 @@ impl RawLinearHost {
                 )));
             }
             let mut scales_n_kg = vec![0u16; n * num_groups];
-            for g in 0..num_groups {
-                for c in 0..n {
-                    scales_n_kg[c * num_groups + g] = scales_kg_n[g * n + c];
+            const TILE: usize = 32;
+            for g_base in (0..num_groups).step_by(TILE) {
+                let g_end = (g_base + TILE).min(num_groups);
+                for c_base in (0..n).step_by(TILE) {
+                    let c_end = (c_base + TILE).min(n);
+                    for g in g_base..g_end {
+                        let src_row = &scales_kg_n[g * n..g * n + c_end];
+                        for (c, &val) in src_row.iter().enumerate().skip(c_base) {
+                            scales_n_kg[c * num_groups + g] = val;
+                        }
+                    }
                 }
             }
             return if bits == 8 {

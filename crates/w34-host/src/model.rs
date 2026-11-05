@@ -42,14 +42,14 @@ pub(crate) mod weights;
 pub use engine::*;
 pub use graph_io::*;
 #[cfg(feature = "cuda")]
-use rank::PoolCapacity;
-#[cfg(feature = "cuda")]
 pub use rank::Qwen3_5ModelRank;
 #[cfg(test)]
 use rank::clamp_state_slots;
 pub use rank::plan_tiered_moe_hot_per_layer;
 #[cfg(any(test, feature = "cuda"))]
 use rank::serving_state_slots;
+#[cfg(feature = "cuda")]
+use rank::{PoolCapacity, SharedVocabHost};
 pub(crate) use weights::RawLinearHost;
 #[cfg(feature = "cuda")]
 pub(crate) use weights::load_moe_layer_weights;

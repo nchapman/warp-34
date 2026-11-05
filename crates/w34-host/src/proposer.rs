@@ -95,15 +95,40 @@ impl NativeProposer {
         let use_graph = engine.use_cuda_graph;
         let (ranks, taps, k, row_bytes) = match config.kind {
             SpeculativeKind::Mtp => {
-                let ranks = engine
-                    .ranks
-                    .iter()
-                    .map(|t| {
-                        let mut r = Qwen3_5MtpRank::load(t, &engine.model_dir, capacity)?;
-                        r.use_cuda_graph = use_graph && r.supports_cuda_graph();
-                        Ok(r)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let model_dir = &engine.model_dir;
+                let ranks = if engine.ranks.len() <= 1 {
+                    engine
+                        .ranks
+                        .iter()
+                        .map(|t| {
+                            let mut r = Qwen3_5MtpRank::load(t, model_dir, capacity)?;
+                            r.use_cuda_graph = use_graph && r.supports_cuda_graph();
+                            Ok(r)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    std::thread::scope(|s| -> Result<Vec<Qwen3_5MtpRank>> {
+                        let handles: Vec<_> = engine
+                            .ranks
+                            .iter()
+                            .map(|t| {
+                                s.spawn(move || {
+                                    let mut r = Qwen3_5MtpRank::load(t, model_dir, capacity)?;
+                                    r.use_cuda_graph = use_graph && r.supports_cuda_graph();
+                                    Ok(r)
+                                })
+                            })
+                            .collect();
+                        let mut out = Vec::with_capacity(handles.len());
+                        for h in handles {
+                            out.push(
+                                h.join()
+                                    .map_err(|_| loader_err("MTP rank loader thread panicked"))??,
+                            );
+                        }
+                        Ok(out)
+                    })?
+                };
                 (Ranks::Mtp(ranks), vec![], config.mtp_k, mtp_row_bytes)
             }
             SpeculativeKind::DFlash2 => {
@@ -113,15 +138,39 @@ impl NativeProposer {
                     .ok_or_else(|| loader_err("DFlash2 requires --draft-model"))?;
                 let dir = resolve_hf_model_dir(name)
                     .map_err(|_| loader_err("resolve DFlash2 checkpoint"))?;
-                let ranks = engine
-                    .ranks
-                    .iter()
-                    .map(|t| {
-                        let mut r = DFlash2Rank::load(t, &dir, capacity, max_rows)?;
-                        r.use_cuda_graph = use_graph;
-                        Ok(r)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let ranks = if engine.ranks.len() <= 1 {
+                    engine
+                        .ranks
+                        .iter()
+                        .map(|t| {
+                            let mut r = DFlash2Rank::load(t, &dir, capacity, max_rows)?;
+                            r.use_cuda_graph = use_graph;
+                            Ok(r)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    let dir_ref = &dir;
+                    std::thread::scope(|s| -> Result<Vec<DFlash2Rank>> {
+                        let handles: Vec<_> = engine
+                            .ranks
+                            .iter()
+                            .map(|t| {
+                                s.spawn(move || {
+                                    let mut r = DFlash2Rank::load(t, dir_ref, capacity, max_rows)?;
+                                    r.use_cuda_graph = use_graph;
+                                    Ok(r)
+                                })
+                            })
+                            .collect();
+                        let mut out = Vec::with_capacity(handles.len());
+                        for h in handles {
+                            out.push(h.join().map_err(|_| {
+                                loader_err("DFlash2 rank loader thread panicked")
+                            })??);
+                        }
+                        Ok(out)
+                    })?
+                };
                 let taps = ranks[0].cfg.target_layers.clone();
                 let k = ranks[0].cfg.block_size - 1;
                 let row_bytes = h * taps.len() * 2;

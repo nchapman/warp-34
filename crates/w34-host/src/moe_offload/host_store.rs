@@ -154,7 +154,6 @@ impl HostExpertStore {
         let expert_ids = ep_rank * count..(ep_rank + 1) * count;
         let mut storage = HostPackStorage::alloc(bytes, prefer_mapped)?;
         let dst = storage.as_mut_slice();
-        dst.fill(0);
 
         // Validate qzeros and g_idx on the first local expert (plus dimensions on all experts in parallel).
         if let Some(first_expert_id) = expert_ids.clone().next() {
@@ -184,10 +183,33 @@ impl HostExpertStore {
             }
         }
 
+        // Resolve the canonical prefix (`model.layers...` vs `model.language_model.layers...`)
+        // and packing format (`weight_packed` vs `qweight`) once per layer rather than 6x per expert.
+        let first_id = expert_ids.start;
+        let (resolved_prefix, is_compressed_tensors) = if let Some(real_wp) = archive.resolve_name(
+            &format!("{experts_prefix}.{first_id}.gate_proj.weight_packed"),
+        ) {
+            let pfx = real_wp
+                .strip_suffix(&format!(".{first_id}.gate_proj.weight_packed"))
+                .unwrap_or(experts_prefix)
+                .to_string();
+            (pfx, true)
+        } else if let Some(real_qw) =
+            archive.resolve_name(&format!("{experts_prefix}.{first_id}.gate_proj.qweight"))
+        {
+            let pfx = real_qw
+                .strip_suffix(&format!(".{first_id}.gate_proj.qweight"))
+                .unwrap_or(experts_prefix)
+                .to_string();
+            (pfx, false)
+        } else {
+            (experts_prefix.to_string(), false)
+        };
+        let resolved_prefix_ref = resolved_prefix.as_str();
+
         let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(|n| (n.get() / ep_size.max(1)).clamp(1, 16))
             .unwrap_or(8)
-            .clamp(1, 16)
             .min(count.max(1));
         let experts_per_chunk = count.div_ceil(num_threads).max(1);
         let stride = layout.stride;
@@ -202,12 +224,16 @@ impl HostExpertStore {
                 let local_start = chunk_idx * experts_per_chunk;
                 let chunk_count = dst_chunk.len() / stride;
                 handles.push(s.spawn(move || -> Result<()> {
-                    let mut raw_qw_bytes = vec![0u8; gu_half_packed.max(layout_ref.down_packed.len())];
+                    let mut raw_qw_bytes =
+                        vec![0u8; gu_half_packed.max(layout_ref.down_packed.len())];
+                    let mut raw_sc_words =
+                        vec![0u16; (gu_half_scales / 2).max(layout_ref.down_scales.len() / 2)];
+                    let mut key_buf = String::with_capacity(96);
                     for i in 0..chunk_count {
                         let local_id = local_start + i;
                         let expert_id = base_expert + local_id;
-                        let prefix = format!("{experts_prefix}.{expert_id}");
                         let pack = &mut dst_chunk[i * stride..(i + 1) * stride];
+                        pack[layout_ref.down_scales.end..stride].fill(0);
                         for (proj_name, n_exp, k_exp, w_range, s_range) in [
                             (
                                 "gate_proj",
@@ -235,84 +261,121 @@ impl HostExpertStore {
                                 layout_ref.down_scales.clone(),
                             ),
                         ] {
+                            use std::fmt::Write as _;
                             let k8 = k_exp / 8;
                             let num_groups = k_exp / layout_ref.group_size;
-                            if let Some(wp_key) = archive
-                                .resolve_name(&format!("{prefix}.{proj_name}.weight_packed"))
-                            {
-                                let ws_key = archive
-                                    .resolve_name(&format!("{prefix}.{proj_name}.weight_scale"))
-                                    .ok_or_else(|| {
-                                        io::Error::other(format!(
-                                            "missing {prefix}.{proj_name}.weight_scale"
-                                        ))
-                                    })?;
-                                let wp_info = archive.tensor_info(&wp_key)?;
-                                let ws_info = archive.tensor_info(&ws_key)?;
+                            if is_compressed_tensors {
+                                key_buf.clear();
+                                let _ = write!(
+                                    key_buf,
+                                    "{resolved_prefix_ref}.{expert_id}.{proj_name}.weight_packed"
+                                );
+                                let wp_info = archive.tensor_info(&key_buf)?;
+                                key_buf.clear();
+                                let _ = write!(
+                                    key_buf,
+                                    "{resolved_prefix_ref}.{expert_id}.{proj_name}.weight_scale"
+                                );
+                                let ws_info = archive.tensor_info(&key_buf).map_err(|_| {
+                                    io::Error::other(format!(
+                                        "missing {experts_prefix}.{expert_id}.{proj_name}.weight_scale"
+                                    ))
+                                })?;
                                 require(
                                     wp_info.shape == [n_exp, k8]
                                         && ws_info.shape == [n_exp, num_groups],
                                     format!(
-                                        "mismatched compressed-tensors weight_packed {:?} / weight_scale {:?} (4-bit) on '{prefix}.{proj_name}'",
+                                        "mismatched compressed-tensors weight_packed {:?} / weight_scale {:?} (4-bit) on '{experts_prefix}.{expert_id}.{proj_name}'",
                                         wp_info.shape, ws_info.shape
                                     ),
                                 )?;
                                 // `weight_packed` is already N-major `[n_exp, k8]`.
-                                archive.read_exact_into(&wp_key, &mut pack[w_range])?;
+                                archive.read_exact_info(wp_info, &mut pack[w_range])?;
                                 // `weight_scale` is already N-major `[n_exp, num_groups]`.
-                                let sc_f16 = archive.read_f16_bits(&ws_key)?;
+                                let sc_words = &mut raw_sc_words[..n_exp * num_groups];
+                                archive.read_f16_bits_info_into(ws_info, sc_words)?;
                                 let dst_s = &mut pack[s_range];
                                 for (dst, &s) in
-                                    dst_s.as_chunks_mut::<2>().0.iter_mut().zip(&sc_f16)
+                                    dst_s.as_chunks_mut::<2>().0.iter_mut().zip(&*sc_words)
                                 {
                                     dst.copy_from_slice(&s.to_le_bytes());
                                 }
                             } else {
-                                let qw_key = archive
-                                    .resolve_name(&format!("{prefix}.{proj_name}.qweight"))
-                                    .ok_or_else(|| {
-                                        io::Error::other(format!(
-                                            "missing {prefix}.{proj_name}.qweight"
-                                        ))
-                                    })?;
-                                let sc_key = archive
-                                    .resolve_name(&format!("{prefix}.{proj_name}.scales"))
-                                    .ok_or_else(|| {
-                                        io::Error::other(format!(
-                                            "missing {prefix}.{proj_name}.scales"
-                                        ))
-                                    })?;
-                                let qw_info = archive.tensor_info(&qw_key)?;
-                                let sc_info = archive.tensor_info(&sc_key)?;
+                                key_buf.clear();
+                                let _ = write!(
+                                    key_buf,
+                                    "{resolved_prefix_ref}.{expert_id}.{proj_name}.qweight"
+                                );
+                                let qw_info = archive.tensor_info(&key_buf).map_err(|_| {
+                                    io::Error::other(format!(
+                                        "missing {experts_prefix}.{expert_id}.{proj_name}.qweight"
+                                    ))
+                                })?;
+                                key_buf.clear();
+                                let _ = write!(
+                                    key_buf,
+                                    "{resolved_prefix_ref}.{expert_id}.{proj_name}.scales"
+                                );
+                                let sc_info = archive.tensor_info(&key_buf).map_err(|_| {
+                                    io::Error::other(format!(
+                                        "missing {experts_prefix}.{expert_id}.{proj_name}.scales"
+                                    ))
+                                })?;
                                 require(
                                     qw_info.shape == [k8, n_exp]
                                         && sc_info.shape == [num_groups, n_exp],
                                     format!(
-                                        "CUDA error -10 in model loader error: mismatched GPTQ qweight {:?} / scales {:?} (4-bit) on '{prefix}.{proj_name}'",
+                                        "CUDA error -10 in model loader error: mismatched GPTQ qweight {:?} / scales {:?} (4-bit) on '{experts_prefix}.{expert_id}.{proj_name}'",
                                         qw_info.shape, sc_info.shape
                                     ),
                                 )?;
                                 let qw_buf = &mut raw_qw_bytes[..w_range.len()];
-                                archive.read_exact_into(&qw_key, qw_buf)?;
+                                archive.read_exact_info(qw_info, qw_buf)?;
                                 let dst_w = &mut pack[w_range];
-                                // Transpose `[k8, n_exp]` u32 words -> `[n_exp, k8]` u32 words directly into `dst_w`
-                                for col in 0..k8 {
-                                    let src_row =
-                                        &qw_buf[col * n_exp * 4..(col + 1) * n_exp * 4];
-                                    for row in 0..n_exp {
-                                        let src_off = row * 4;
-                                        let dst_off = (row * k8 + col) * 4;
-                                        dst_w[dst_off..dst_off + 4]
-                                            .copy_from_slice(&src_row[src_off..src_off + 4]);
+                                // Cache-blocked transpose `[k8, n_exp]` u32 words -> `[n_exp, k8]` u32 words
+                                // with sequential destination writes into pinned `dst_w`.
+                                const TILE: usize = 32;
+                                let mut tile = [[[0u8; 4]; TILE]; TILE];
+                                for col_base in (0..k8).step_by(TILE) {
+                                    let col_len = (k8 - col_base).min(TILE);
+                                    for row_base in (0..n_exp).step_by(TILE) {
+                                        let row_len = (n_exp - row_base).min(TILE);
+                                        for c in 0..col_len {
+                                            let src_row = &qw_buf
+                                                [(col_base + c) * n_exp * 4 + row_base * 4..];
+                                            for (r, slot) in
+                                                src_row.as_chunks::<4>().0.iter().enumerate().take(row_len)
+                                            {
+                                                tile[r][c] = *slot;
+                                            }
+                                        }
+                                        for (r, tile_row) in tile.iter().enumerate().take(row_len) {
+                                            let dst_row_off =
+                                                ((row_base + r) * k8 + col_base) * 4;
+                                            let dst_slice = &mut dst_w
+                                                [dst_row_off..dst_row_off + col_len * 4];
+                                            for (dst_word, src_word) in dst_slice
+                                                .as_chunks_mut::<4>()
+                                                .0
+                                                .iter_mut()
+                                                .zip(&tile_row[..col_len])
+                                            {
+                                                *dst_word = *src_word;
+                                            }
+                                        }
                                     }
                                 }
-                                let sc_f16 = archive.read_f16_bits(&sc_key)?;
+                                let sc_words = &mut raw_sc_words[..num_groups * n_exp];
+                                archive.read_f16_bits_info_into(sc_info, sc_words)?;
                                 let dst_s = &mut pack[s_range];
-                                for g in 0..num_groups {
-                                    for row in 0..n_exp {
-                                        let dst_off = (row * num_groups + g) * 2;
-                                        dst_s[dst_off..dst_off + 2].copy_from_slice(
-                                            &sc_f16[g * n_exp + row].to_le_bytes(),
+                                for row in 0..n_exp {
+                                    let dst_row =
+                                        &mut dst_s[row * num_groups * 2..(row + 1) * num_groups * 2];
+                                    for (g, dst_elem) in
+                                        dst_row.as_chunks_mut::<2>().0.iter_mut().enumerate()
+                                    {
+                                        dst_elem.copy_from_slice(
+                                            &sc_words[g * n_exp + row].to_le_bytes(),
                                         );
                                     }
                                 }

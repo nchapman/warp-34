@@ -280,15 +280,15 @@ impl SafetensorsArchive {
         &self.files
     }
 
-    /// Reads the raw bytes of `name` directly into `dst` via `pread` (`read_exact_at`)
-    /// without allocating an intermediate `Vec<u8>`.
-    pub fn read_exact_into(&self, name: &str, dst: &mut [u8]) -> io::Result<()> {
-        let info = self.tensor_info(name)?;
+    /// Reads the raw bytes of `info` directly into `dst` via `pread` (`read_exact_at`)
+    /// without repeating a `HashMap` lookup or allocating an intermediate `Vec<u8>`.
+    pub fn read_exact_info(&self, info: &TensorInfo, dst: &mut [u8]) -> io::Result<()> {
         if dst.len() as u64 != info.len_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "tensor {name} byte length mismatch: expected {}, got {}",
+                    "tensor {} byte length mismatch: expected {}, got {}",
+                    info.name,
                     info.len_bytes,
                     dst.len()
                 ),
@@ -301,6 +301,13 @@ impl SafetensorsArchive {
             )
         })?;
         f.read_exact_at(dst, info.offset)
+    }
+
+    /// Reads the raw bytes of `name` directly into `dst` via `pread` (`read_exact_at`)
+    /// without allocating an intermediate `Vec<u8>`.
+    pub fn read_exact_into(&self, name: &str, dst: &mut [u8]) -> io::Result<()> {
+        let info = self.tensor_info(name)?;
+        self.read_exact_info(info, dst)
     }
 
     /// Resolves either `<prefix>.<suffix>` or `model.language_model.<stripped>.<suffix>`.
@@ -330,38 +337,129 @@ impl SafetensorsArchive {
         Ok(buf)
     }
 
-    pub fn read_u32(&self, name: &str) -> io::Result<Vec<u32>> {
-        let bytes = self.read_bytes(name)?;
-        if !bytes.len().is_multiple_of(4) {
+    fn read_le_u16_vec(&self, name: &str, info: &TensorInfo) -> io::Result<Vec<u16>> {
+        let len_bytes = info.len_bytes as usize;
+        if !len_bytes.is_multiple_of(2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tensor {name} byte length not a multiple of 2"),
+            ));
+        }
+        let f = self.files.get(&info.shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shard '{}' not open", info.shard_file),
+            )
+        })?;
+        let num_elems = len_bytes / 2;
+        let mut out = vec![0u16; num_elems];
+        if len_bytes < 8 * 1024 * 1024 {
+            // SAFETY: `out` is an initialized contiguous `u16` buffer of `len_bytes` bytes,
+            // and any bit pattern is valid for `u16`.
+            let byte_slice =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), len_bytes) };
+            f.read_exact_at(byte_slice, info.offset)?;
+            #[cfg(target_endian = "big")]
+            for w in &mut out {
+                *w = u16::from_le(*w);
+            }
+        } else {
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(1, 8))
+                .unwrap_or(4);
+            let chunk_elems = num_elems.div_ceil(num_threads).max(1);
+            let base_offset = info.offset;
+            std::thread::scope(|s| -> io::Result<()> {
+                let mut handles = Vec::with_capacity(num_threads);
+                for (chunk_idx, dst_chunk) in out.chunks_mut(chunk_elems).enumerate() {
+                    let elem_offset = chunk_idx * chunk_elems;
+                    let byte_offset = base_offset + (elem_offset as u64) * 2;
+                    handles.push(s.spawn(move || -> io::Result<()> {
+                        let chunk_bytes = dst_chunk.len() * 2;
+                        // SAFETY: `dst_chunk` is a disjoint mutable `[u16]` slice of `chunk_bytes` bytes.
+                        let byte_slice = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                dst_chunk.as_mut_ptr().cast::<u8>(),
+                                chunk_bytes,
+                            )
+                        };
+                        f.read_exact_at(byte_slice, byte_offset)?;
+                        #[cfg(target_endian = "big")]
+                        for w in dst_chunk.iter_mut() {
+                            *w = u16::from_le(*w);
+                        }
+                        Ok(())
+                    }));
+                }
+                for h in handles {
+                    h.join().map_err(|_| {
+                        io::Error::other("safetensors u16 reader thread panicked")
+                    })??;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(out)
+    }
+
+    fn read_le_u32_vec(&self, name: &str, info: &TensorInfo) -> io::Result<Vec<u32>> {
+        let len_bytes = info.len_bytes as usize;
+        if !len_bytes.is_multiple_of(4) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("tensor {name} byte length not a multiple of 4"),
             ));
         }
-        Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .copied()
-            .map(u32::from_le_bytes)
-            .collect())
+        let f = self.files.get(&info.shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shard '{}' not open", info.shard_file),
+            )
+        })?;
+        let mut out = vec![0u32; len_bytes / 4];
+        // SAFETY: `out` is an initialized contiguous `u32` buffer of `len_bytes` bytes,
+        // and any bit pattern is valid for `u32`.
+        let byte_slice =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), len_bytes) };
+        f.read_exact_at(byte_slice, info.offset)?;
+        #[cfg(target_endian = "big")]
+        for w in &mut out {
+            *w = u32::from_le(*w);
+        }
+        Ok(out)
+    }
+
+    pub fn read_u32(&self, name: &str) -> io::Result<Vec<u32>> {
+        let info = self.tensor_info(name)?;
+        self.read_le_u32_vec(name, info)
     }
 
     pub fn read_i32(&self, name: &str) -> io::Result<Vec<i32>> {
-        let bytes = self.read_bytes(name)?;
-        if !bytes.len().is_multiple_of(4) {
+        let info = self.tensor_info(name)?;
+        let len_bytes = info.len_bytes as usize;
+        if !len_bytes.is_multiple_of(4) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("tensor {name} byte length not a multiple of 4"),
             ));
         }
-        Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .copied()
-            .map(i32::from_le_bytes)
-            .collect())
+        let f = self.files.get(&info.shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("shard '{}' not open", info.shard_file),
+            )
+        })?;
+        let mut out = vec![0i32; len_bytes / 4];
+        // SAFETY: `out` is an initialized contiguous `i32` buffer of `len_bytes` bytes,
+        // and any bit pattern is valid for `i32`.
+        let byte_slice =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), len_bytes) };
+        f.read_exact_at(byte_slice, info.offset)?;
+        #[cfg(target_endian = "big")]
+        for w in &mut out {
+            *w = i32::from_le(*w);
+        }
+        Ok(out)
     }
 
     pub fn read_i64(&self, name: &str) -> io::Result<Vec<i64>> {
@@ -407,29 +505,19 @@ impl SafetensorsArchive {
 
     pub fn read_f32(&self, name: &str) -> io::Result<Vec<f32>> {
         let info = self.tensor_info(name)?;
-        let bytes = self.read_bytes(name)?;
         match info.dtype.as_str() {
-            "F32" => Ok(bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .copied()
-                .map(f32::from_le_bytes)
-                .collect()),
-            "F16" => Ok(bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .copied()
-                .map(|c| f16_to_f32(u16::from_le_bytes(c)))
-                .collect()),
-            "BF16" => Ok(bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .copied()
-                .map(|c| bf16_to_f32(u16::from_le_bytes(c)))
-                .collect()),
+            "F32" => {
+                let words = self.read_le_u32_vec(name, info)?;
+                Ok(words.into_iter().map(f32::from_bits).collect())
+            }
+            "F16" => {
+                let words = self.read_le_u16_vec(name, info)?;
+                Ok(words.into_iter().map(f16_to_f32).collect())
+            }
+            "BF16" => {
+                let words = self.read_le_u16_vec(name, info)?;
+                Ok(words.into_iter().map(bf16_to_f32).collect())
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported dtype {other} for read_f32({name})"),
@@ -514,29 +602,38 @@ impl SafetensorsArchive {
     /// Reads any floating-point tensor (`F16`, `BF16`, `F32`) and converts to IEEE-754 `FP16` bits.
     pub fn read_f16_bits(&self, name: &str) -> io::Result<Vec<u16>> {
         let info = self.tensor_info(name)?;
-        let bytes = self.read_bytes(name)?;
         match info.dtype.as_str() {
-            "F16" => Ok(bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .copied()
-                .map(u16::from_le_bytes)
-                .collect()),
-            "BF16" => Ok(bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .copied()
-                .map(|c| bf16_to_f16(u16::from_le_bytes(c)))
-                .collect()),
-            "F32" => Ok(bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .copied()
-                .map(|c| f32_to_f16(f32::from_le_bytes(c)))
-                .collect()),
+            "F16" => self.read_le_u16_vec(name, info),
+            "BF16" => {
+                let mut words = self.read_le_u16_vec(name, info)?;
+                if words.len() < 4 * 1024 * 1024 {
+                    for w in &mut words {
+                        *w = bf16_to_f16(*w);
+                    }
+                } else {
+                    let num_threads = std::thread::available_parallelism()
+                        .map(|n| n.get().clamp(1, 8))
+                        .unwrap_or(4);
+                    let chunk_elems = words.len().div_ceil(num_threads).max(1);
+                    std::thread::scope(|s| {
+                        for chunk in words.chunks_mut(chunk_elems) {
+                            s.spawn(move || {
+                                for w in chunk {
+                                    *w = bf16_to_f16(*w);
+                                }
+                            });
+                        }
+                    });
+                }
+                Ok(words)
+            }
+            "F32" => {
+                let words = self.read_le_u32_vec(name, info)?;
+                Ok(words
+                    .into_iter()
+                    .map(|bits| f32_to_f16(f32::from_bits(bits)))
+                    .collect())
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported dtype {other} for read_f16_bits({name})"),
@@ -544,32 +641,97 @@ impl SafetensorsArchive {
         }
     }
 
+    /// Reads any floating-point tensor (`F16`, `BF16`, `F32`) described by `info` into `dst`
+    /// as IEEE-754 `FP16` bits without repeating a `HashMap` lookup.
+    pub fn read_f16_bits_info_into(&self, info: &TensorInfo, dst: &mut [u16]) -> io::Result<()> {
+        match info.dtype.as_str() {
+            "F16" | "BF16" => {
+                let len_bytes = dst.len() * 2;
+                if info.len_bytes != len_bytes as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "tensor {} byte length mismatch: expected {}, got {len_bytes}",
+                            info.name, info.len_bytes
+                        ),
+                    ));
+                }
+                let f = self.files.get(&info.shard_file).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("shard '{}' not open", info.shard_file),
+                    )
+                })?;
+                // SAFETY: `dst` is a valid mutable `[u16]` slice of `len_bytes` bytes.
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), len_bytes)
+                };
+                f.read_exact_at(byte_slice, info.offset)?;
+                #[cfg(target_endian = "big")]
+                for w in dst.iter_mut() {
+                    *w = u16::from_le(*w);
+                }
+                if info.dtype == "BF16" {
+                    for w in dst.iter_mut() {
+                        *w = bf16_to_f16(*w);
+                    }
+                }
+                Ok(())
+            }
+            "F32" => {
+                let raw_u32 = self.read_le_u32_vec(&info.name, info)?;
+                if raw_u32.len() != dst.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "tensor {} element count mismatch: expected {}, got {}",
+                            info.name,
+                            raw_u32.len(),
+                            dst.len()
+                        ),
+                    ));
+                }
+                for (out, &bits) in dst.iter_mut().zip(&raw_u32) {
+                    *out = f32_to_f16(f32::from_bits(bits));
+                }
+                Ok(())
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported dtype {other} for read_f16_bits_into({})",
+                    info.name
+                ),
+            )),
+        }
+    }
+
+    /// Reads any floating-point tensor (`F16`, `BF16`, `F32`) into `dst` as IEEE-754 `FP16` bits
+    /// without allocating an intermediate `Vec<u16>` when `dtype` is `F16` or `BF16`.
+    pub fn read_f16_bits_into(&self, name: &str, dst: &mut [u16]) -> io::Result<()> {
+        let info = self.tensor_info(name)?;
+        self.read_f16_bits_info_into(info, dst)
+    }
+
     /// Reads any floating-point tensor (`BF16`, `F16`, `F32`) and converts to `BF16` bits.
     pub fn read_bf16_bits(&self, name: &str) -> io::Result<Vec<u16>> {
         let info = self.tensor_info(name)?;
-        let bytes = self.read_bytes(name)?;
         match info.dtype.as_str() {
-            "BF16" => Ok(bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .copied()
-                .map(u16::from_le_bytes)
-                .collect()),
-            "F16" => Ok(bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .copied()
-                .map(|c| f32_to_bf16(f16_to_f32(u16::from_le_bytes(c))))
-                .collect()),
-            "F32" => Ok(bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .copied()
-                .map(|c| f32_to_bf16(f32::from_le_bytes(c)))
-                .collect()),
+            "BF16" => self.read_le_u16_vec(name, info),
+            "F16" => {
+                let mut words = self.read_le_u16_vec(name, info)?;
+                for w in &mut words {
+                    *w = f32_to_bf16(f16_to_f32(*w));
+                }
+                Ok(words)
+            }
+            "F32" => {
+                let words = self.read_le_u32_vec(name, info)?;
+                Ok(words
+                    .into_iter()
+                    .map(|bits| f32_to_bf16(f32::from_bits(bits)))
+                    .collect())
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported dtype {other} for read_bf16_bits({name})"),
