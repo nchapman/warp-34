@@ -114,7 +114,8 @@ mod serving_capacity_tests {
             (0, 0)
         );
 
-        // TP=1 and TP=2 with ample VRAM preserve default_hot (80 and 112)
+        // TP=1 (<=1.5 GiB base+KV) and TP=2 with ample VRAM preserve default_hot (96 and 112),
+        // while TP=1 with 4096-page KV reserve uses 88 so MTP-3 keeps k_hot = 192 in VRAM.
         let (hot_tp1_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             1,
@@ -122,7 +123,15 @@ mod serving_capacity_tests {
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp1_default, 80);
+        assert_eq!(hot_tp1_default, 96);
+        let (hot_tp1_4k_kv, _) = plan_tiered_moe_hot_per_layer(
+            &cfg,
+            1,
+            19_600 * 1024 * 1024,
+            2 * gib,
+            450 * 1024 * 1024,
+        );
+        assert_eq!(hot_tp1_4k_kv, 88);
 
         let (hot_tp2_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,

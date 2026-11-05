@@ -253,6 +253,38 @@ fn categorical(weights: &[f64], uniform: f64) -> Result<i32> {
     Ok(last_positive.expect("positive total implies positive entry"))
 }
 
+/// Searches `history` (most-recent match first) for a suffix of `tail` of length in
+/// `min_ngram..=max_ngram` and returns the `take` tokens immediately following the match.
+pub fn lookup_suffix_continuation(
+    history: &[i32],
+    tail: &[i32],
+    min_ngram: usize,
+    max_ngram: usize,
+    take: usize,
+) -> Option<Vec<i32>> {
+    if min_ngram == 0
+        || min_ngram > max_ngram
+        || take == 0
+        || history.len() < min_ngram + take
+        || tail.len() < min_ngram
+    {
+        return None;
+    }
+    let searchable_end = history.len() - take;
+    let hi = max_ngram.min(tail.len()).min(searchable_end);
+    for ngram in (min_ngram..=hi).rev() {
+        let needle = &tail[tail.len() - ngram..];
+        let first = needle[0];
+        let max_start = searchable_end - ngram;
+        for start in (0..=max_start).rev() {
+            if history[start] == first && &history[start..start + ngram] == needle {
+                return Some(history[start + ngram..start + ngram + take].to_vec());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +365,28 @@ mod tests {
         assert_eq!(v.accepted_drafts(), 1);
         assert_eq!(v.emitted_tokens().len(), 2); // 1 accepted draft + 1 bonus token
         assert_eq!(v.emitted_tokens()[0], 1);
+    }
+
+    #[test]
+    fn test_lookup_suffix_continuation_prefers_longer_and_recent_matches() {
+        let history = vec![
+            1, 10, 20, 30, 40, 100, 101, 102, // older 5-gram [1, 10, 20, 30, 40]
+            2, 10, 20, 30, 40, 200, 201, 202, // newer 4-gram [10, 20, 30, 40]
+            9, 8, 7, 10, 20, 30,
+        ];
+        // Tail ends with [1, 10, 20, 30, 40]: 5-gram match beats newer 4-gram match.
+        assert_eq!(
+            lookup_suffix_continuation(&history, &[1, 10, 20, 30, 40], 4, 6, 3),
+            Some(vec![100, 101, 102])
+        );
+        // Tail ends with [99, 10, 20, 30, 40]: falls back to 4-gram and picks most recent.
+        assert_eq!(
+            lookup_suffix_continuation(&history, &[99, 10, 20, 30, 40], 4, 6, 2),
+            Some(vec![200, 201])
+        );
+        assert_eq!(
+            lookup_suffix_continuation(&history, &[55, 66, 77, 88], 4, 6, 2),
+            None
+        );
     }
 }

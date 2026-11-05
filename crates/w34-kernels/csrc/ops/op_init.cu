@@ -7,10 +7,38 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <shared_mutex>
 
 namespace {
 constexpr int kMaxCachedDevices = 32;
 std::mutex g_device_props_mutex;
+std::shared_mutex g_capture_sync_mutex;
+thread_local uintptr_t tls_capturing_stream = 0;
+
+struct ThreadCaptureCleanup {
+    ~ThreadCaptureCleanup() {
+        if (tls_capturing_stream != 0) {
+            cudaGraph_t abandoned = nullptr;
+            cudaStreamEndCapture((cudaStream_t)tls_capturing_stream, &abandoned);
+            if (abandoned != nullptr) cudaGraphDestroy(abandoned);
+            tls_capturing_stream = 0;
+            g_capture_sync_mutex.unlock_shared();
+        }
+    }
+};
+thread_local ThreadCaptureCleanup tls_capture_cleanup;
+
+std::unique_lock<std::shared_mutex> acquire_device_sync_lock() {
+    (void)tls_capture_cleanup;
+    if (tls_capturing_stream != 0) {
+        cudaGraph_t abandoned = nullptr;
+        cudaStreamEndCapture((cudaStream_t)tls_capturing_stream, &abandoned);
+        if (abandoned != nullptr) cudaGraphDestroy(abandoned);
+        tls_capturing_stream = 0;
+        g_capture_sync_mutex.unlock_shared();
+    }
+    return std::unique_lock<std::shared_mutex>(g_capture_sync_mutex);
+}
 std::atomic<uint32_t> g_device_props_mask{0u};
 w34_device_props g_device_props[kMaxCachedDevices] = {};
 std::atomic<int> g_tp2_min_sms{0};
@@ -173,6 +201,7 @@ extern "C" int w34_set_device(int device_id) {
 }
 
 extern "C" int w34_device_synchronize(void) {
+    auto lock = acquire_device_sync_lock();
     return (int)cudaDeviceSynchronize();
 }
 
@@ -183,16 +212,19 @@ extern "C" int w34_get_mem_info(size_t* out_free, size_t* out_total) {
 
 extern "C" int w34_malloc(void** out_ptr, size_t bytes) {
     if (out_ptr == nullptr) return (int)cudaErrorInvalidValue;
+    auto lock = acquire_device_sync_lock();
     return (int)cudaMalloc(out_ptr, bytes);
 }
 
 extern "C" int w34_free(void* ptr) {
     if (ptr == nullptr) return 0;
+    auto lock = acquire_device_sync_lock();
     return (int)cudaFree(ptr);
 }
 
 extern "C" int w34_host_alloc_mapped(void** out_host_ptr, void** out_dev_ptr, size_t bytes) {
     if (out_host_ptr == nullptr || out_dev_ptr == nullptr) return (int)cudaErrorInvalidValue;
+    auto lock = acquire_device_sync_lock();
     cudaError_t err = cudaHostAlloc(out_host_ptr, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
     if (err != cudaSuccess) return (int)err;
     err = cudaHostGetDevicePointer(out_dev_ptr, *out_host_ptr, 0);
@@ -206,6 +238,7 @@ extern "C" int w34_host_alloc_mapped(void** out_host_ptr, void** out_dev_ptr, si
 
 extern "C" int w34_host_free(void* host_ptr) {
     if (host_ptr == nullptr) return 0;
+    auto lock = acquire_device_sync_lock();
     return (int)cudaFreeHost(host_ptr);
 }
 
@@ -229,6 +262,7 @@ extern "C" int w34_vision_fa2_prepare();
 extern "C" int w34_paged_fa2_prepare();
 extern "C" int w34_stream_create(uintptr_t* out_stream) {
     if (out_stream == nullptr) return (int)cudaErrorInvalidValue;
+    auto lock = acquire_device_sync_lock();
     // Eagerly load and opt in vision and paged FA2 variants before captures.
     int prepare_rc = w34_vision_fa2_prepare();
     if (prepare_rc) return prepare_rc;
@@ -243,6 +277,7 @@ extern "C" int w34_stream_create(uintptr_t* out_stream) {
 
 extern "C" int w34_stream_destroy(uintptr_t stream) {
     if (stream == 0) return 0;
+    auto lock = acquire_device_sync_lock();
     return (int)cudaStreamDestroy((cudaStream_t)stream);
 }
 
@@ -337,13 +372,37 @@ extern "C" int w34_event_elapsed_ms(float* out_ms, uintptr_t start_event, uintpt
 }
 
 extern "C" int w34_graph_begin_capture(uintptr_t stream) {
-    return (int)cudaStreamBeginCapture((cudaStream_t)stream, cudaStreamCaptureModeThreadLocal);
+    (void)tls_capture_cleanup;
+    if (stream == 0) return (int)cudaErrorInvalidResourceHandle;
+    if (tls_capturing_stream != 0) return (int)cudaErrorStreamCaptureUnsupported;
+    g_capture_sync_mutex.lock_shared();
+    cudaError_t err = cudaStreamBeginCapture((cudaStream_t)stream, cudaStreamCaptureModeRelaxed);
+    if (err == cudaSuccess) {
+        tls_capturing_stream = stream;
+    } else {
+        g_capture_sync_mutex.unlock_shared();
+    }
+    return (int)err;
 }
 
 extern "C" int w34_graph_end_capture(uintptr_t stream, uintptr_t* out_graph, uintptr_t* out_graph_exec) {
-    if (out_graph == nullptr || out_graph_exec == nullptr) return (int)cudaErrorInvalidValue;
+    const bool owns_lock = (tls_capturing_stream != 0 && tls_capturing_stream == stream);
+    if (out_graph == nullptr || out_graph_exec == nullptr) {
+        if (owns_lock) {
+            cudaGraph_t abandoned = nullptr;
+            cudaStreamEndCapture((cudaStream_t)stream, &abandoned);
+            if (abandoned != nullptr) cudaGraphDestroy(abandoned);
+            tls_capturing_stream = 0;
+            g_capture_sync_mutex.unlock_shared();
+        }
+        return (int)cudaErrorInvalidValue;
+    }
     cudaGraph_t g = nullptr;
     cudaError_t err = cudaStreamEndCapture((cudaStream_t)stream, &g);
+    if (owns_lock) {
+        tls_capturing_stream = 0;
+        g_capture_sync_mutex.unlock_shared();
+    }
     if (err != cudaSuccess) return (int)err;
     cudaGraphExec_t ge = nullptr;
     err = cudaGraphInstantiate(&ge, g, 0);
@@ -361,6 +420,7 @@ extern "C" int w34_graph_launch(uintptr_t graph_exec, uintptr_t stream) {
 }
 
 extern "C" int w34_graph_destroy(uintptr_t graph, uintptr_t graph_exec) {
+    auto lock = acquire_device_sync_lock();
     if (graph_exec != 0) cudaGraphExecDestroy((cudaGraphExec_t)graph_exec);
     if (graph != 0) cudaGraphDestroy((cudaGraph_t)graph);
     return 0;
@@ -368,6 +428,7 @@ extern "C" int w34_graph_destroy(uintptr_t graph, uintptr_t graph_exec) {
 
 extern "C" int w34_cublas_create(uintptr_t* out_handle, uintptr_t stream) {
     if (out_handle == nullptr) return (int)cudaErrorInvalidValue;
+    auto lock = acquire_device_sync_lock();
     cublasHandle_t h = nullptr;
     cublasStatus_t st = cublasCreate_v2(&h);
     if (st != CUBLAS_STATUS_SUCCESS) return (int)st;
@@ -388,6 +449,7 @@ extern "C" int w34_cublas_create(uintptr_t* out_handle, uintptr_t stream) {
 
 extern "C" int w34_cublas_destroy(uintptr_t handle) {
     if (handle == 0) return 0;
+    auto lock = acquire_device_sync_lock();
     auto owner = (W34Blas*)handle;
     int previous;
     cudaError_t err = cudaGetDevice(&previous);

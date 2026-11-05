@@ -437,10 +437,18 @@ impl Qwen3_5MtpRank {
                 })?;
             let local_experts = c.num_experts / tp;
             let free_vram = target.device.mem_info().map_or(0, |(free, _)| free);
+            let slots_all_need = local_experts
+                .saturating_mul(layout.stride)
+                .saturating_add(512 * 1024 * 1024);
+            let slots_192_need = 192usize
+                .saturating_mul(layout.stride)
+                .saturating_add(256 * 1024 * 1024);
             let slots_128_need = 128usize
                 .saturating_mul(layout.stride)
                 .saturating_add(256 * 1024 * 1024);
-            let k_hot = if tp == 1 && local_experts >= 192 && free_vram >= 2048 * 1024 * 1024 {
+            let k_hot = if tp > 1 && free_vram >= slots_all_need {
+                local_experts
+            } else if tp == 1 && local_experts >= 192 && free_vram >= slots_192_need {
                 192
             } else if local_experts >= 128 && free_vram >= slots_128_need.max(512 * 1024 * 1024) {
                 128

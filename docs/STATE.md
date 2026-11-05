@@ -1,5 +1,21 @@
 # warp-34 — Session Orientation & Current State
 
+## `Qwen3.8-Flash-Next` Hot Expert Cache (`k_hot`), `MTP` Residency & Parallel Weight Loading (completed & verified)
+
+- **Parallel Model Weight Loading (`crates/w34-host/src/model/rank.rs`, `weights.rs`, `moe_offload/store.rs`, `ple/runtime.rs`):**
+  - Replaced sequential per-layer projection repacking (`MarlinW4A16`, `MarlinW8A16`, `DenseF16`) with `PreparedLinearShard` and per-layer `std::thread::scope` parallel preparation across all attention/GDN/shared-expert projections before ordered `DeviceArena` upload, cutting `Qwen3.8-27B` load time by **3.09×** (`33.15s -> 10.72s`) and `Qwen3.8-Flash-Next` load time to **`~29.5s`** while keeping peak host RAM bounded to a single layer's projections.
+  - Parallelized `HostExpertStore::load_with_pin` across worker chunks and `PleWeightStore::load` across all 36 PLE layers.
+  - Serialized device-wide synchronization/allocation entrypoints (`w34_device_synchronize`, `w34_cublas_destroy`, `w34_malloc`, `w34_free`, `w34_host_alloc_mapped`, `w34_host_free`, `w34_stream_create`, `w34_stream_destroy`, `w34_graph_destroy`, `w34_cublas_create`) against active `w34_graph_begin_capture` (`cudaStreamCaptureModeRelaxed`) via `std::shared_mutex` in `crates/w34-kernels/csrc/ops/op_init.cu`.
+- **`Qwen3.8-Flash-Next` (`qwen4_exp`) GPU Expert Cache & `MTP` Residency (`crates/w34-host/src/model/rank.rs`, `crates/w34-host/src/mtp.rs`, `crates/w34-host/src/speculative.rs`):**
+  - Expanded `plan_tiered_moe_hot_per_layer` default hot experts per layer to **`96`** on `TP=1` (`<= 1.5 GiB` KV+headroom), **`88`** on `TP=1` with `4,096`-page (`64K`) serving KV pools, and **`112`** per rank on `TP=2 / EP=2` (`224 / 512 = 43.75%` of target experts resident in VRAM across 2 GPUs).
+  - Updated `Qwen3_5MtpRank::load` (`crates/w34-host/src/mtp.rs`) so `TP >= 2` loads all `local_experts` (`256/rank = 100%` of `MTP` routed experts in VRAM, skipping `cudaHostAllocMapped` and releasing temporary host storage) when `free_vram >= slots_all_need`, and `TP=1` retains `k_hot = 192` whenever `free_vram >= slots_192_need` (`762 MiB`).
+  - Added lossless prompt/context suffix n-gram continuation lookup (`lookup_suffix_continuation` in `crates/w34-host/src/speculative.rs`).
+  - **2× RTX 3090 Ti (`sm_86`) `Qwen3.8-Flash-Next` Verification:**
+    - `test_qwen4_exp_real_checkpoint_tp1_and_tp2`: `TP=1` warm target decode **32.04 tok/s**, `TP=1 MTP-3` warm decode **46.80 tok/s** (`3.00 tok/round`); `TP=2` warm target decode **68.04 tok/s**, `TP=2 MTP-3` cold decode **112.10 tok/s**, `TP=2 MTP-3` warm decode **134.05 tok/s** (`2.86 tok/round`, 32-token prefix parity + 64-token cold/warm determinism PASS).
+    - `flash-next-serving.toml` (`4,096` TQ4 pages): `warp34-flash-tp1-mtp3` reaches **31.51 tok/s** on `short-chat` (`587 ms` TTFT, **`1.91×` vs prior `16.50 tok/s`** and faster than `qfn-3090-mtp3` `30.60 tok/s`) and **28.67 tok/s** on `coding-agent-replay` (**`2.29×` vs prior `12.51 tok/s`**); `warp34-flash-tp2-mtp3` reaches **65.29 tok/s** on `short-chat` (`13.34 ms` TPOT, vs `qfn-2x3090-mtp3` `55.61 tok/s`) and **47.98 tok/s** on `coding-agent-replay`.
+
+---
+
 ## 1–2× RTX 4090 (`sm_89`) Verification, `nsys` Profiling & Portable CPU MoE Bridge (completed & verified)
 
 - **Target Hardware:** 2× NVIDIA GeForce RTX 4090 (`sm_89`, `24,564 MiB` each, 128 SMs, 72 MiB L2, `NODE` PCIe 4.0 x16 topology) + AMD EPYC 7542 32-Core Processor (`Zen 2`, `32C/64T`, `avx2 + fma + f16c`, `251 GiB` RAM), cross-verified alongside local AMD Ryzen 9 7950X3D (`16C/32T`, `avx512f + avx512vl`, 96 MiB 3D V-Cache) + 2× RTX 3090 Ti (`sm_86`, PCIe 4.0 x8).

@@ -331,11 +331,13 @@ pub fn plan_tiered_moe_hot_per_layer(
         local_experts
     } else if tp_size == 2 {
         112usize.min(local_experts)
+    } else if base_headroom_plus_kv_bytes <= 1536 * 1024 * 1024 {
+        96usize.min(local_experts)
     } else {
-        80usize.min(local_experts)
+        88usize.min(local_experts)
     };
     let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
-    if (tp_size < 4 && local_experts <= default_hot)
+    if (tp_size < 4 && local_experts <= 80)
         || cfg.num_experts < 64
         || exp_bytes == 0
         || cfg.num_hidden_layers == 0
@@ -1333,9 +1335,9 @@ impl Qwen3_5ModelRank {
         let default_hot = if self.tp_size >= 4 {
             local_experts
         } else if self.tp_size == 2 {
-            112usize
+            112usize.min(local_experts)
         } else {
-            80usize
+            88usize.min(local_experts)
         };
         let hot_per_layer = if self.tiered_moe_hot_per_layer > 0 {
             self.tiered_moe_hot_per_layer
