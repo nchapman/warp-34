@@ -1485,7 +1485,6 @@ impl ResponsesSseFormatter {
         out
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn finish(
         &mut self,
         turn: &ParsedAssistantTurn,

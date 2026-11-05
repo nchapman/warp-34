@@ -18,9 +18,9 @@ use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
 use crate::loader::{ModelConfig, SafetensorsArchive};
 use crate::model::{
-    FfnBlockWeights, FinalResidual, FullAttentionLayerWeights, LayerResidual, LinearProj,
-    Qwen3_5ModelRank, RawLinearHost, load_hc_block_weights, load_moe_layer_weights,
-    load_qsa_indexer_weights, load_tiered_moe_layer_weights, loader_err,
+    FfnBlockWeights, FinalResidual, FullAttentionLayerWeights, HcStepContext, LayerResidual,
+    LinearProj, Qwen3_5ModelRank, RawLinearHost, TapExport, load_hc_block_weights,
+    load_moe_layer_weights, load_qsa_indexer_weights, loader_err,
 };
 use core::ffi::c_void;
 use std::path::Path;
@@ -283,28 +283,15 @@ impl Qwen3_5MtpRank {
         let o_proj = load("layers.0.self_attn.o_proj", h, q)?
             .slice_cols(r * q / tp, (r + 1) * q / tp)
             .upload(&mut weights, &target.stream, &staging)?;
-        let ffn = if is_tiered_moe_mtp {
-            FfnBlockWeights::Moe(Box::new(load_tiered_moe_layer_weights(
-                &archive,
-                c,
-                c.num_hidden_layers,
-                "mtp.layers.0",
-                r,
-                tp,
-                &mut weights,
-                &target.stream,
-                &staging,
-            )?))
-        } else if is_moe_mtp {
+        let ffn = if is_moe_mtp {
             FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
                 &archive,
                 c,
+                is_tiered_moe_mtp.then_some(c.num_hidden_layers),
                 "mtp.layers.0",
-                r,
-                tp,
+                [r, tp],
                 &mut weights,
-                &target.stream,
-                &staging,
+                (&target.stream, &staging),
             )?))
         } else {
             let gs = load("layers.0.mlp.gate_proj", i, h)?.slice_rows(r * i / tp, (r + 1) * i / tp);
@@ -1839,25 +1826,22 @@ impl Qwen3_5MtpRank {
         // Normalize / mix the residual before attention.
         let marlin_ws_ptr = t.marlin_ws.addr();
         let marlin_ws_ints = t.marlin_ws.len_bytes / 4;
-        self.residual.pre_attn(
-            0,
-            &ex,
-            &t.cublas,
+        let hc_ctx = HcStepContext {
+            ex: &ex,
+            cublas: &t.cublas,
             marlin_ws_ptr,
             marlin_ws_ints,
+            residual_buf: hc_residual_buf,
             hc_residual_buf,
-            hc_residual_buf,
-            normed_buf,
             hc_inj_weights_buf,
-            hc_scratch_a,
-            hc_scratch_b,
-            hc_scratch_c,
+            ple_bufs: [hc_scratch_a, hc_scratch_b, hc_scratch_c],
             num_tokens,
             hc_count,
             hc_lowrank,
             h_dim,
-            t.cfg.rms_norm_eps,
-        )?;
+            eps: t.cfg.rms_norm_eps,
+        };
+        self.residual.pre_attn(0, &hc_ctx, normed_buf)?;
 
         // Full attention, with optional QSA indexing and block selection.
         let fa = &self.fa;
@@ -2075,28 +2059,8 @@ impl Qwen3_5MtpRank {
             block_out_buf,
             num_tokens,
         )?;
-        self.residual.post_attn_pre_mlp(
-            &ex,
-            &t.cublas,
-            marlin_ws_ptr,
-            marlin_ws_ints,
-            tp2,
-            t.rank,
-            block_out_buf,
-            hc_residual_buf,
-            hc_residual_buf,
-            normed_buf,
-            hc_inj_weights_buf,
-            hc_scratch_a,
-            hc_scratch_b,
-            hc_scratch_c,
-            num_tokens,
-            hc_count,
-            hc_lowrank,
-            h_dim,
-            t.cfg.rms_norm_eps,
-            false,
-        )?;
+        self.residual
+            .post_attn_pre_mlp(&hc_ctx, tp2, t.rank, block_out_buf, normed_buf, false)?;
 
         // Keep the concat predictor's donor-compatible cuBLAS dense FFN path.
         if let FfnBlockWeights::Dense {
@@ -2220,22 +2184,15 @@ impl Qwen3_5MtpRank {
             }
         }
         self.residual.post_mlp(
-            &ex,
+            &hc_ctx,
             tp2,
             t.rank,
             mlp_out_buf,
-            hc_residual_buf,
-            hc_residual_buf,
-            hc_inj_weights_buf,
-            self.final_residual.single_stream_norm_ptr().unwrap_or(0),
-            self.batch_hidden.addr(),
-            0,
-            0,
-            0,
-            num_tokens,
-            hc_count,
-            h_dim,
-            t.cfg.rms_norm_eps,
+            [
+                self.final_residual.single_stream_norm_ptr().unwrap_or(0),
+                self.batch_hidden.addr(),
+            ],
+            TapExport::default(),
         )?;
         let multi_row_bytes = hc_count * h_dim * 2;
         if self.final_residual.is_hyper_connection() {
@@ -2269,24 +2226,12 @@ impl Qwen3_5MtpRank {
         // Collapse multi-stream residuals only for the LM head. Single-stream
         // post_mlp has already written the final-normalized recurrent hidden.
         let sampled_id = if sample_last {
-            self.final_residual.finish_stack(
-                &ex,
-                &t.stream,
-                &t.cublas,
-                marlin_ws_ptr,
-                marlin_ws_ints,
-                last_multi_ptr,
-                normed_buf,
-                None,
-                hc_scratch_a,
-                hc_scratch_b,
-                hc_scratch_c,
-                1,
-                hc_count,
-                hc_lowrank,
-                h_dim,
-                t.cfg.rms_norm_eps,
-            )?;
+            let mut final_hc_ctx = hc_ctx;
+            final_hc_ctx.residual_buf = last_multi_ptr;
+            final_hc_ctx.hc_residual_buf = last_multi_ptr;
+            final_hc_ctx.num_tokens = 1;
+            self.final_residual
+                .finish_stack(&final_hc_ctx, &t.stream, normed_buf, None)?;
             let logits_buf = self.scratch.alloc_aligned(t.local_vocab_size * 2)?;
             let lm_input = if self.final_residual.is_hyper_connection() {
                 normed_buf

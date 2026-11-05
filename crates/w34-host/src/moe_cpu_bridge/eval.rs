@@ -125,12 +125,10 @@ pub(super) fn scratch_len(tokens: usize, slice_groups: usize) -> Option<usize> {
     tokens.checked_mul(slice_groups)?.checked_mul(257)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate(
     d: ExpertLayout<'_>,
     groups: &Range<usize>,
-    xp: &[f32],
-    xg: &[f32],
+    [xp, xg]: [&[f32]; 2],
     wt: &[f32],
     out: &[f32],
     scratch: &[f32],
@@ -265,12 +263,20 @@ pub(super) fn eval_expert_slice(
     out: &mut [f32],
     scratch: &mut [f32],
 ) -> Result<(), EvalError> {
-    validate(d, &groups, xp, xg, weights, out, scratch, 4)?;
+    validate(d, &groups, [xp, xg], weights, out, scratch, 4)?;
     #[cfg(target_arch = "x86_64")]
     if supported() {
         // SAFETY: runtime ISA guard and all sizes/ranges checked above.
         unsafe {
-            simd::expert(d, groups, xp, xg, weights, out, scratch, weights.len() == 1);
+            simd::expert(
+                d,
+                groups,
+                [xp, xg],
+                weights,
+                out,
+                scratch,
+                weights.len() == 1,
+            );
         }
         return Ok(());
     }
@@ -289,12 +295,12 @@ pub(super) fn eval_expert_prefill(
     scratch: &mut [f32],
 ) -> Result<(), EvalError> {
     let groups = 0..d.intermediate / 128;
-    validate(d, &groups, xp, xg, weights, out, scratch, 96)?;
+    validate(d, &groups, [xp, xg], weights, out, scratch, 96)?;
     #[cfg(target_arch = "x86_64")]
     if supported() {
         // SAFETY: runtime ISA guard and all sizes/ranges checked above.
         unsafe {
-            simd::expert(d, groups, xp, xg, weights, out, scratch, true);
+            simd::expert(d, groups, [xp, xg], weights, out, scratch, true);
         }
         return Ok(());
     }
@@ -601,35 +607,30 @@ mod simd {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn expert(
         d: ExpertLayout<'_>,
         range: Range<usize>,
-        xp: &[f32],
-        xg: &[f32],
+        [xp, xg]: [&[f32]; 2],
         wt: &[f32],
         out: &mut [f32],
         scratch: &mut [f32],
         tile: bool,
     ) {
         if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl") {
-            expert_avx512(d, range, xp, xg, wt, out, scratch, tile);
+            expert_avx512(d, range, [xp, xg], wt, out, scratch, tile);
         } else {
-            expert_avx2(d, range, xp, xg, wt, out, scratch, tile);
+            expert_avx2(d, range, [xp, xg], wt, out, scratch);
         }
     }
 
     #[target_feature(enable = "avx2,fma,f16c")]
-    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn expert_avx2(
         d: ExpertLayout<'_>,
         range: Range<usize>,
-        xp: &[f32],
-        xg: &[f32],
+        [xp, xg]: [&[f32]; 2],
         wt: &[f32],
         out: &mut [f32],
         scratch: &mut [f32],
-        _tile: bool,
     ) {
         let h = d.hidden;
         let i = d.intermediate;
@@ -693,12 +694,10 @@ mod simd {
     }
 
     #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
-    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn expert_avx512(
         d: ExpertLayout<'_>,
         range: Range<usize>,
-        xp: &[f32],
-        xg: &[f32],
+        [xp, xg]: [&[f32]; 2],
         wt: &[f32],
         out: &mut [f32],
         scratch: &mut [f32],
@@ -920,7 +919,7 @@ mod tests {
                 let mut out_avx2 = vec![0.0; nt * h];
                 // SAFETY: `supported()` verified AVX2 + FMA + F16C and buffer bounds above.
                 unsafe {
-                    simd::expert_avx2(d, 0..2, &xp, &xg, &wt, &mut out_avx2, &mut scratch, true);
+                    simd::expert_avx2(d, 0..2, [&xp, &xg], &wt, &mut out_avx2, &mut scratch);
                 }
                 assert_eq!(
                     out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -938,23 +937,13 @@ mod tests {
                         simd::expert_avx512(
                             d,
                             0..2,
-                            &xp,
-                            &xg,
+                            [&xp, &xg],
                             &wt,
                             &mut slice_avx512,
                             &mut scratch,
                             false,
                         );
-                        simd::expert_avx2(
-                            d,
-                            0..2,
-                            &xp,
-                            &xg,
-                            &wt,
-                            &mut slice_avx2,
-                            &mut scratch,
-                            false,
-                        );
+                        simd::expert_avx2(d, 0..2, [&xp, &xg], &wt, &mut slice_avx2, &mut scratch);
                     }
                     assert_eq!(
                         slice_avx512.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),

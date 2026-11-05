@@ -929,7 +929,6 @@ impl NativeProposer {
         let sampler = SamplerV1::new(params, prompt, constraint);
         self.generate_impl(engine, prompt, count, chunk, true, Some(sampler))
     }
-    #[allow(clippy::too_many_arguments)]
     fn generate_impl(
         &mut self,
         engine: &mut Qwen3_5Engine,
@@ -1287,7 +1286,6 @@ impl NativeProposer {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step_scheduled_prefill_chunk(
         &mut self,
         engine: &mut Qwen3_5Engine,
@@ -1389,7 +1387,6 @@ impl NativeProposer {
         Ok(Some((anchor, lp)))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step_scheduled_verify_round(
         &mut self,
         engine: &mut Qwen3_5Engine,

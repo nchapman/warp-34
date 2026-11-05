@@ -798,7 +798,6 @@ impl CublasHandle {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn gemm_f16(
         &self,
         a_ptr: u64,
@@ -866,7 +865,6 @@ impl CublasHandle {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16(
         &self,
         a_ptr: u64,

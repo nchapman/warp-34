@@ -296,7 +296,6 @@ impl Qwen3_5Engine {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step_single_slice_with_mrope_and_vision(
         &mut self,
         slice: &EngineBatchSlice<'_>,

@@ -167,7 +167,6 @@ pub(super) fn required_bytes(
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 pub(super) fn token_capacity(
     arena: usize,
     hidden: usize,
@@ -268,5 +267,9 @@ mod tests {
         assert_eq!(p.bytes, usize::MAX - 255);
         p.bytes = usize::MAX;
         assert_eq!(p.alloc(&[0]), None);
+        assert_eq!(
+            token_capacity(64 * 1024 * 1024, 1024, 32768, 1, |_| Some(0)),
+            Some(2048)
+        );
     }
 }

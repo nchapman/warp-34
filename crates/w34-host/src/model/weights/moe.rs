@@ -394,18 +394,19 @@ impl FfnBlockWeights {
 
     /// Executes the host/VRAM tiered MoE dispatch when `self` is a tiered `FfnBlockWeights::Moe`;
     /// no-op for `Dense` and VRAM-resident `Moe`.
-    #[allow(clippy::too_many_arguments)]
     pub fn execute_tiered(
         &self,
         tiered_moe: Option<&mut crate::moe_offload::RankTieredMoe>,
         stream: &CudaStream,
         is_capturing_graph: bool,
         normed_buf: u64,
-        moe_topk_ids_buf: u64,
-        moe_topk_weights_buf: u64,
-        moe_sh_out_buf: u64,
-        moe_sh_gate_buf: u64,
-        mlp_out_buf: u64,
+        [
+            moe_topk_ids_buf,
+            moe_topk_weights_buf,
+            moe_sh_out_buf,
+            moe_sh_gate_buf,
+            mlp_out_buf,
+        ]: [u64; 5],
         num_tokens: usize,
     ) -> Result<()> {
         let Self::Moe(moe) = self else {
@@ -465,68 +466,14 @@ impl FfnBlockWeights {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn load_moe_layer_weights(
-    archive: &SafetensorsArchive,
-    cfg: &ModelConfig,
-    pfx: &str,
-    rank: usize,
-    tp_size: usize,
-    weight_arena: &mut DeviceArena,
-    stream: &CudaStream,
-    repack_staging: &DeviceBuffer,
-) -> Result<MoeLayerWeights> {
-    load_moe_layer_weights_inner(
-        archive,
-        cfg,
-        None,
-        pfx,
-        rank,
-        tp_size,
-        weight_arena,
-        stream,
-        repack_staging,
-    )
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn load_tiered_moe_layer_weights(
-    archive: &SafetensorsArchive,
-    cfg: &ModelConfig,
-    layer_id: usize,
-    pfx: &str,
-    rank: usize,
-    tp_size: usize,
-    weight_arena: &mut DeviceArena,
-    stream: &CudaStream,
-    repack_staging: &DeviceBuffer,
-) -> Result<MoeLayerWeights> {
-    load_moe_layer_weights_inner(
-        archive,
-        cfg,
-        Some(layer_id),
-        pfx,
-        rank,
-        tp_size,
-        weight_arena,
-        stream,
-        repack_staging,
-    )
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn load_moe_layer_weights_inner(
     archive: &SafetensorsArchive,
     cfg: &ModelConfig,
     tiered_layer_id: Option<usize>,
     pfx: &str,
-    rank: usize,
-    tp_size: usize,
+    [rank, tp_size]: [usize; 2],
     weight_arena: &mut DeviceArena,
-    stream: &CudaStream,
-    repack_staging: &DeviceBuffer,
+    (stream, repack_staging): (&CudaStream, &DeviceBuffer),
 ) -> Result<MoeLayerWeights> {
     let raw_router = RawLinearHost::load(archive, &format!("{pfx}.mlp.gate"), &cfg.quant)?;
     let router_gate = raw_router.upload(weight_arena, stream, repack_staging)?;

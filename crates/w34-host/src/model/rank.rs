@@ -894,28 +894,15 @@ impl Qwen3_5ModelRank {
                         .resolve_name(&format!("{pfx}.mlp.gate.qweight"))
                         .is_some());
 
-            let ffn = if is_moe_layer && cfg.uses_tiered_moe() {
-                FfnBlockWeights::Moe(Box::new(load_tiered_moe_layer_weights(
-                    archive,
-                    cfg,
-                    layer_id,
-                    &pfx,
-                    rank,
-                    tp_size,
-                    &mut weight_arena,
-                    &stream,
-                    &repack_staging,
-                )?))
-            } else if is_moe_layer {
+            let ffn = if is_moe_layer {
                 FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
                     archive,
                     cfg,
+                    cfg.uses_tiered_moe().then_some(layer_id),
                     &pfx,
-                    rank,
-                    tp_size,
+                    [rank, tp_size],
                     &mut weight_arena,
-                    &stream,
-                    &repack_staging,
+                    (&stream, &repack_staging),
                 )?))
             } else {
                 let raw_gate =

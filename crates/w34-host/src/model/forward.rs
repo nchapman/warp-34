@@ -193,9 +193,11 @@ impl Qwen3_5ModelRank {
                 logits,
                 1,
                 out_greedy_id_ptr,
-                self.decode_io.local_max_id.addr(),
-                self.decode_io.local_max_val.addr(),
-                self.decode_io.global_max_val.addr(),
+                [
+                    self.decode_io.local_max_id.addr(),
+                    self.decode_io.local_max_val.addr(),
+                    self.decode_io.global_max_val.addr(),
+                ],
             )?;
         }
         if tp2.is_none() || (out_top5_ids_ptr != 0 && out_top5_logprobs_ptr != 0) {
@@ -245,7 +247,6 @@ impl Qwen3_5ModelRank {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn sample_forward_rows(
         &self,
         ex: &W34Exec,
@@ -253,9 +254,7 @@ impl Qwen3_5ModelRank {
         logits: u64,
         rows: usize,
         output: u64,
-        local_ids: u64,
-        local_vals: u64,
-        global_vals: u64,
+        [local_ids, local_vals, global_vals]: [u64; 3],
     ) -> Result<()> {
         check_rc(
             // SAFETY: caller reserves rows logits and ID/value outputs; null top IDs selects local argmax.
@@ -337,32 +336,6 @@ impl Qwen3_5ModelRank {
     /// Device-only selected-row core; no synchronization unless tiered host dispatch requires it.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_selected_rows_device(
-        &mut self,
-        token_ids_ptr: u64,
-        positions_ptr: u64,
-        num_tokens: usize,
-        attn_batch: &W34AttentionBatch,
-        gdn_batch: &W34GdnBatch,
-        tp2: Option<&Tp2Collectives>,
-        selected_rows: &[usize],
-        out_greedy_ids_override: Option<u64>,
-        emit_device_greedy: bool,
-    ) -> Result<(u64, bool)> {
-        self.forward_selected_rows_inner(
-            token_ids_ptr,
-            positions_ptr,
-            num_tokens,
-            attn_batch,
-            gdn_batch,
-            tp2,
-            selected_rows,
-            out_greedy_ids_override,
-            emit_device_greedy,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn forward_selected_rows_inner(
         &mut self,
         token_ids_ptr: u64,
         positions_ptr: u64,
@@ -491,9 +464,7 @@ impl Qwen3_5ModelRank {
                 logits,
                 n,
                 output,
-                local_ids,
-                local_vals,
-                global_vals,
+                [local_ids, local_vals, global_vals],
             )?;
         }
         Ok((output, use_spec))
@@ -610,46 +581,29 @@ impl Qwen3_5ModelRank {
             // PLE mutates the residual: a single-stream layer must then redo the input norm,
             // rather than consume the norm fused by its predecessor before that mutation.
             let norm_layer_idx = if layer.ple.is_some() { 0 } else { layer_idx };
-            layer.residual.pre_attn(
-                norm_layer_idx,
+            let hc_ctx = super::HcStepContext {
                 ex,
-                &self.cublas,
-                mw,
-                mi,
-                s.residual,
-                s.residual,
-                s.normed,
-                s.injection,
-                pa,
-                pb,
-                pv,
-                rows,
-                streams,
-                lowrank,
-                h,
+                cublas: &self.cublas,
+                marlin_ws_ptr: mw,
+                marlin_ws_ints: mi,
+                residual_buf: s.residual,
+                hc_residual_buf: s.residual,
+                hc_inj_weights_buf: s.injection,
+                ple_bufs: [pa, pb, pv],
+                num_tokens: rows,
+                hc_count: streams,
+                hc_lowrank: lowrank,
+                h_dim: h,
                 eps,
-            )?;
+            };
+            layer.residual.pre_attn(norm_layer_idx, &hc_ctx, s.normed)?;
             self.run_attention_block(ex, layer_idx, positions, rows, attn, gdn_batch, s)?;
             layer.residual.post_attn_pre_mlp(
-                ex,
-                &self.cublas,
-                mw,
-                mi,
+                &hc_ctx,
                 tp2,
                 self.rank,
                 s.block,
-                s.residual,
-                s.residual,
                 s.normed,
-                s.injection,
-                pa,
-                pb,
-                pv,
-                rows,
-                streams,
-                lowrank,
-                h,
-                eps,
                 dump_out.is_some(),
             )?;
             if let Some(dump) = dump_out.as_deref_mut()
@@ -689,11 +643,7 @@ impl Qwen3_5ModelRank {
                 &self.stream,
                 self.is_capturing_graph,
                 s.normed,
-                topids,
-                topw,
-                shout,
-                shgate,
-                s.mlp,
+                [topids, topw, shout, shgate, s.mlp],
                 rows,
             )?;
             let (next_weight, next_out) = if let Some(next) = self.layers.get(layer_idx + 1) {
@@ -707,24 +657,18 @@ impl Qwen3_5ModelRank {
                     final_out,
                 )
             };
-            let (tap, stride, offset) = self.layer_tap_target(layer_idx, rows, h);
+            let (dst, stride, offset) = self.layer_tap_target(layer_idx, rows, h);
             self.layers[layer_idx].residual.post_mlp(
-                ex,
+                &hc_ctx,
                 tp2,
                 self.rank,
                 s.mlp,
-                s.residual,
-                s.residual,
-                s.injection,
-                next_weight,
-                next_out,
-                tap,
-                stride,
-                offset,
-                rows,
-                streams,
-                h,
-                eps,
+                [next_weight, next_out],
+                super::TapExport {
+                    dst,
+                    stride,
+                    offset,
+                },
             )?;
             if layer_idx + 1 < self.layers.len()
                 && let Some(dump) = dump_out.as_deref_mut()
@@ -739,27 +683,30 @@ impl Qwen3_5ModelRank {
                 )?;
             }
         }
-        self.final_residual.finish_stack(
+        let final_hc_ctx = super::HcStepContext {
             ex,
+            cublas: &self.cublas,
+            marlin_ws_ptr: mw,
+            marlin_ws_ints: mi,
+            residual_buf: s.residual,
+            hc_residual_buf: s.residual,
+            hc_inj_weights_buf: s.injection,
+            ple_bufs: [pa, pb, pv],
+            num_tokens: rows,
+            hc_count: streams,
+            hc_lowrank: lowrank,
+            h_dim: h,
+            eps,
+        };
+        self.final_residual.finish_stack(
+            &final_hc_ctx,
             &self.stream,
-            &self.cublas,
-            mw,
-            mi,
-            s.residual,
             final_out,
             if rows <= self.max_tap_rows {
                 self.last_final_hidden_f16.as_ref()
             } else {
                 None
             },
-            pa,
-            pb,
-            pv,
-            rows,
-            streams,
-            lowrank,
-            h,
-            eps,
         )?;
         self.last_norm_hidden_ptr = final_out;
         self.last_norm_hidden_rows = rows;

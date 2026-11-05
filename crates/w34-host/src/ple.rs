@@ -919,7 +919,6 @@ pub mod gpu_ops {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn hc_init_streams_f16(
         ex: &W34Exec,
         embed_in: u64,

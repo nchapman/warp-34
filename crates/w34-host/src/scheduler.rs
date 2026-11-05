@@ -197,7 +197,7 @@ impl SchedulerV1 {
         stop_token_ids: Vec<i32>,
     ) -> u64 {
         let radix_key_tokens = prompt_tokens.clone();
-        self.submit_request_configured(
+        self.submit_request_with_prefix_options(
             prompt_tokens,
             radix_key_tokens,
             max_new_tokens,
@@ -206,57 +206,7 @@ impl SchedulerV1 {
             stop_token_ids,
             Vec::new(),
             false,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn submit_request_configured(
-        &mut self,
-        prompt_tokens: Vec<i32>,
-        radix_key_tokens: Vec<i32>,
-        max_new_tokens: usize,
-        min_tokens: usize,
-        ignore_eos: bool,
-        stop_token_ids: Vec<i32>,
-        eos_token_ids: Vec<i32>,
-        custom_prefill: bool,
-    ) -> u64 {
-        self.submit_request_with_prefix_cap(
-            prompt_tokens,
-            radix_key_tokens,
-            max_new_tokens,
-            min_tokens,
-            ignore_eos,
-            stop_token_ids,
-            eos_token_ids,
-            custom_prefill,
             None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn submit_request_with_prefix_cap(
-        &mut self,
-        prompt_tokens: Vec<i32>,
-        radix_key_tokens: Vec<i32>,
-        max_new_tokens: usize,
-        min_tokens: usize,
-        ignore_eos: bool,
-        stop_token_ids: Vec<i32>,
-        eos_token_ids: Vec<i32>,
-        custom_prefill: bool,
-        max_prefix_lookup_len: Option<usize>,
-    ) -> u64 {
-        self.submit_request_with_prefix_options(
-            prompt_tokens,
-            radix_key_tokens,
-            max_new_tokens,
-            min_tokens,
-            ignore_eos,
-            stop_token_ids,
-            eos_token_ids,
-            custom_prefill,
-            max_prefix_lookup_len,
             None,
         )
     }

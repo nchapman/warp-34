@@ -158,28 +158,50 @@ pub struct HcBlockWeights {
     pub block_inject_weight: Option<LinearProj>,
 }
 
+/// Shared execution, scratch, and geometry context for single-stream and HyperConnection
+/// residual updates across a decoder layer stack.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+pub struct HcStepContext<'a> {
+    pub ex: &'a W34Exec,
+    pub cublas: &'a CublasHandle,
+    pub marlin_ws_ptr: u64,
+    pub marlin_ws_ints: usize,
+    pub residual_buf: u64,
+    pub hc_residual_buf: u64,
+    pub hc_inj_weights_buf: u64,
+    pub ple_bufs: [u64; 3],
+    pub num_tokens: usize,
+    pub hc_count: usize,
+    pub hc_lowrank: usize,
+    pub h_dim: usize,
+    pub eps: f32,
+}
+
+/// Optional BF16 hidden-state tap export destination for `DFlash2` / `MTP` verification.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Default)]
+pub struct TapExport {
+    pub dst: u64,
+    pub stride: i32,
+    pub offset: i32,
+}
+
 #[cfg(feature = "cuda")]
 impl HcBlockWeights {
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_mix(
-        &self,
-        ex: &W34Exec,
-        cublas: &CublasHandle,
-        marlin_ws_ptr: u64,
-        marlin_ws_ints: usize,
-        hc_residual_buf: u64,
-        out_mixed_buf: u64,
-        hc_inj_weights_buf: u64,
-        ple_buf_a: u64,
-        ple_buf_b: u64,
-        ple_val_buf: u64,
-        num_tokens: usize,
-        hc_count: usize,
-        hc_lowrank: usize,
-        h_dim: usize,
-        eps: f32,
-    ) -> Result<()> {
-        let low_dim = hc_lowrank;
+    pub fn forward_mix(&self, ctx: &HcStepContext<'_>, out_mixed_buf: u64) -> Result<()> {
+        let ex = ctx.ex;
+        let cublas = ctx.cublas;
+        let marlin_ws_ptr = ctx.marlin_ws_ptr;
+        let marlin_ws_ints = ctx.marlin_ws_ints;
+        let hc_residual_buf = ctx.hc_residual_buf;
+        let hc_inj_weights_buf = ctx.hc_inj_weights_buf;
+        let [ple_buf_a, ple_buf_b, ple_val_buf] = ctx.ple_bufs;
+        let num_tokens = ctx.num_tokens;
+        let hc_count = ctx.hc_count;
+        let low_dim = ctx.hc_lowrank;
+        let h_dim = ctx.h_dim;
+        let eps = ctx.eps;
         let hc_down_buf = ple_val_buf;
         let hc_inj_raw_buf = ple_val_buf + (num_tokens * low_dim * 2) as u64;
         crate::ple::gpu_ops::hc_rmsnorm_f16(
@@ -297,28 +319,18 @@ impl HcBlockWeights {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_combine(
-        &self,
-        ex: &W34Exec,
-        block_out_buf: u64,
-        hc_inj_weights_buf: u64,
-        hc_residual_buf: u64,
-        num_tokens: usize,
-        hc_count: usize,
-        h_dim: usize,
-    ) -> Result<()> {
+    pub fn forward_combine(&self, ctx: &HcStepContext<'_>, block_out_buf: u64) -> Result<()> {
         crate::ple::gpu_ops::hc_combine_f16(
-            ex,
-            hc_residual_buf,
+            ctx.ex,
+            ctx.hc_residual_buf,
             block_out_buf,
-            hc_inj_weights_buf,
+            ctx.hc_inj_weights_buf,
             0,
-            hc_residual_buf,
+            ctx.hc_residual_buf,
             0,
-            num_tokens,
-            hc_count,
-            h_dim,
+            ctx.num_tokens,
+            ctx.hc_count,
+            ctx.h_dim,
         )
     }
 }
@@ -365,26 +377,11 @@ impl LayerResidual {
     /// Runs the pre-attention normalization / stream mixing step.
     /// On `SingleStream`, `layer_idx > 0` is a no-op because the preceding layer's
     /// `post_mlp` fused the residual addition with this layer's `input_layernorm`.
-    #[allow(clippy::too_many_arguments)]
     pub fn pre_attn(
         &self,
         layer_idx: usize,
-        ex: &W34Exec,
-        cublas: &CublasHandle,
-        marlin_ws_ptr: u64,
-        marlin_ws_ints: usize,
-        residual_buf: u64,
-        hc_residual_buf: u64,
+        ctx: &HcStepContext<'_>,
         normed_buf: u64,
-        hc_inj_weights_buf: u64,
-        ple_buf_a: u64,
-        ple_buf_b: u64,
-        ple_val_buf: u64,
-        num_tokens: usize,
-        hc_count: usize,
-        hc_lowrank: usize,
-        h_dim: usize,
-        eps: f32,
     ) -> Result<()> {
         match self {
             Self::SingleStream {
@@ -397,14 +394,14 @@ impl LayerResidual {
                         // FP16 buffers; `input_layernorm_ptr` holds `h_dim` FP16 elements.
                         unsafe {
                             ffi::w34_gemma_rms_norm_f16(
-                                ex,
-                                residual_buf as *const c_void,
+                                ctx.ex,
+                                ctx.residual_buf as *const c_void,
                                 *input_layernorm_ptr as *const c_void,
                                 normed_buf as *mut c_void,
                                 core::ptr::null(),
-                                num_tokens as i32,
-                                h_dim as i32,
-                                eps,
+                                ctx.num_tokens as i32,
+                                ctx.h_dim as i32,
+                                ctx.eps,
                             )
                         },
                         "w34_gemma_rms_norm_f16",
@@ -412,49 +409,18 @@ impl LayerResidual {
                 }
                 Ok(())
             }
-            Self::HyperConnection { attn_hc, .. } => attn_hc.forward_mix(
-                ex,
-                cublas,
-                marlin_ws_ptr,
-                marlin_ws_ints,
-                hc_residual_buf,
-                normed_buf,
-                hc_inj_weights_buf,
-                ple_buf_a,
-                ple_buf_b,
-                ple_val_buf,
-                num_tokens,
-                hc_count,
-                hc_lowrank,
-                h_dim,
-                eps,
-            ),
+            Self::HyperConnection { attn_hc, .. } => attn_hc.forward_mix(ctx, normed_buf),
         }
     }
 
     /// Runs the post-attention residual update and pre-MLP normalization / stream mixing step.
-    #[allow(clippy::too_many_arguments)]
     pub fn post_attn_pre_mlp(
         &self,
-        ex: &W34Exec,
-        cublas: &CublasHandle,
-        marlin_ws_ptr: u64,
-        marlin_ws_ints: usize,
+        ctx: &HcStepContext<'_>,
         tp2: Option<&Tp2Collectives>,
         rank: usize,
         block_out_buf: u64,
-        residual_buf: u64,
-        hc_residual_buf: u64,
         normed_buf: u64,
-        hc_inj_weights_buf: u64,
-        ple_buf_a: u64,
-        ple_buf_b: u64,
-        ple_val_buf: u64,
-        num_tokens: usize,
-        hc_count: usize,
-        hc_lowrank: usize,
-        h_dim: usize,
-        eps: f32,
         preserve_block_out_on_tp2: bool,
     ) -> Result<()> {
         match self {
@@ -469,17 +435,17 @@ impl LayerResidual {
                         0
                     };
                     comm.all_reduce_residual_gemma_rms_norm_f16(
-                        ex,
+                        ctx.ex,
                         block_out_buf,
                         ar_out,
-                        residual_buf,
+                        ctx.residual_buf,
                         *post_attention_layernorm_ptr,
                         normed_buf,
                         0,
                         rank as i32,
-                        num_tokens as i32,
-                        h_dim as i32,
-                        eps,
+                        ctx.num_tokens as i32,
+                        ctx.h_dim as i32,
+                        ctx.eps,
                         0,
                         0,
                     )
@@ -489,15 +455,15 @@ impl LayerResidual {
                         // `num_tokens * h_dim` FP16 elements.
                         unsafe {
                             ffi::w34_fused_add_gemma_rms_norm_f16(
-                                ex,
+                                ctx.ex,
                                 block_out_buf as *const c_void,
-                                residual_buf as *mut c_void,
+                                ctx.residual_buf as *mut c_void,
                                 *post_attention_layernorm_ptr as *const c_void,
                                 normed_buf as *mut c_void,
                                 core::ptr::null(),
-                                num_tokens as i32,
-                                h_dim as i32,
-                                eps,
+                                ctx.num_tokens as i32,
+                                ctx.h_dim as i32,
+                                ctx.eps,
                             )
                         },
                         "w34_fused_add_gemma_rms_norm_f16 (post_attn)",
@@ -507,100 +473,65 @@ impl LayerResidual {
             Self::HyperConnection { attn_hc, mlp_hc } => {
                 if let Some(comm) = tp2 {
                     comm.all_reduce_f16(
-                        ex,
+                        ctx.ex,
                         block_out_buf,
                         block_out_buf,
                         rank as i32,
-                        (num_tokens * h_dim) as i32,
+                        (ctx.num_tokens * ctx.h_dim) as i32,
                     )?;
                 }
-                attn_hc.forward_combine(
-                    ex,
-                    block_out_buf,
-                    hc_inj_weights_buf,
-                    hc_residual_buf,
-                    num_tokens,
-                    hc_count,
-                    h_dim,
-                )?;
-                mlp_hc.forward_mix(
-                    ex,
-                    cublas,
-                    marlin_ws_ptr,
-                    marlin_ws_ints,
-                    hc_residual_buf,
-                    normed_buf,
-                    hc_inj_weights_buf,
-                    ple_buf_a,
-                    ple_buf_b,
-                    ple_val_buf,
-                    num_tokens,
-                    hc_count,
-                    hc_lowrank,
-                    h_dim,
-                    eps,
-                )
+                attn_hc.forward_combine(ctx, block_out_buf)?;
+                mlp_hc.forward_mix(ctx, normed_buf)
             }
         }
     }
 
     /// Runs the post-MLP residual update (fusing the next layer's input norm or final norm on `SingleStream`).
-    #[allow(clippy::too_many_arguments)]
     pub fn post_mlp(
         &self,
-        ex: &W34Exec,
+        ctx: &HcStepContext<'_>,
         tp2: Option<&Tp2Collectives>,
         rank: usize,
         mlp_out_buf: u64,
-        residual_buf: u64,
-        hc_residual_buf: u64,
-        hc_inj_weights_buf: u64,
-        next_norm_weight: u64,
-        next_norm_out: u64,
-        tap_dst: u64,
-        tap_stride: i32,
-        tap_offset: i32,
-        num_tokens: usize,
-        hc_count: usize,
-        h_dim: usize,
-        eps: f32,
+        [next_norm_weight, next_norm_out]: [u64; 2],
+        tap: TapExport,
     ) -> Result<()> {
         match self {
             Self::SingleStream { .. } => {
                 if let Some(comm) = tp2 {
                     comm.all_reduce_residual_gemma_rms_norm_f16(
-                        ex,
+                        ctx.ex,
                         mlp_out_buf,
                         0,
-                        residual_buf,
+                        ctx.residual_buf,
                         next_norm_weight,
                         next_norm_out,
-                        tap_dst,
+                        tap.dst,
                         rank as i32,
-                        num_tokens as i32,
-                        h_dim as i32,
-                        eps,
-                        tap_stride,
-                        tap_offset,
+                        ctx.num_tokens as i32,
+                        ctx.h_dim as i32,
+                        ctx.eps,
+                        tap.stride,
+                        tap.offset,
                     )
                 } else {
                     check_rc(
                         // SAFETY: `mlp_out_buf`, `residual_buf`, and `next_norm_out` hold
-                        // `num_tokens * h_dim` FP16 elements; `tap_dst` is 0 or a validated BF16 tap buffer.
+                        // `num_tokens * h_dim` FP16 elements; `tap.dst` is 0 or a validated BF16 tap buffer.
                         unsafe {
                             ffi::w34_fused_add_gemma_rms_norm_tap_f16(
-                                ex,
+                                ctx.ex,
                                 mlp_out_buf as *const c_void,
-                                residual_buf as *mut c_void,
+                                ctx.residual_buf as *mut c_void,
                                 next_norm_weight as *const c_void,
                                 next_norm_out as *mut c_void,
-                                tap_dst as *mut c_void,
+                                tap.dst as *mut c_void,
                                 core::ptr::null(),
-                                num_tokens as i32,
-                                h_dim as i32,
-                                eps,
-                                tap_stride,
-                                tap_offset,
+                                ctx.num_tokens as i32,
+                                ctx.h_dim as i32,
+                                ctx.eps,
+                                tap.stride,
+                                tap.offset,
                             )
                         },
                         "w34_fused_add_gemma_rms_norm_tap_f16 (post_mlp)",
@@ -610,22 +541,14 @@ impl LayerResidual {
             Self::HyperConnection { mlp_hc, .. } => {
                 if let Some(comm) = tp2 {
                     comm.all_reduce_f16(
-                        ex,
+                        ctx.ex,
                         mlp_out_buf,
                         mlp_out_buf,
                         rank as i32,
-                        (num_tokens * h_dim) as i32,
+                        (ctx.num_tokens * ctx.h_dim) as i32,
                     )?;
                 }
-                mlp_hc.forward_combine(
-                    ex,
-                    mlp_out_buf,
-                    hc_inj_weights_buf,
-                    hc_residual_buf,
-                    num_tokens,
-                    hc_count,
-                    h_dim,
-                )
+                mlp_hc.forward_combine(ctx, mlp_out_buf)
             }
         }
     }
@@ -682,31 +605,18 @@ impl FinalResidual {
     /// On `SingleStream`, the last layer's `post_mlp` already wrote `final_norm_out_buf`.
     /// On `HyperConnection`, exports `hc_residual_buf` (`[num_tokens, hc_count * h_dim]`) to
     /// `last_final_hidden_f16` (if enabled) and collapses `hc_residual_buf -> final_norm_out_buf`.
-    #[allow(clippy::too_many_arguments)]
     pub fn finish_stack(
         &self,
-        ex: &W34Exec,
+        ctx: &HcStepContext<'_>,
         stream: &CudaStream,
-        cublas: &CublasHandle,
-        marlin_ws_ptr: u64,
-        marlin_ws_ints: usize,
-        hc_residual_buf: u64,
         final_norm_out_buf: u64,
         last_final_hidden_f16: Option<&DeviceBuffer>,
-        ple_buf_a: u64,
-        ple_buf_b: u64,
-        ple_val_buf: u64,
-        num_tokens: usize,
-        hc_count: usize,
-        hc_lowrank: usize,
-        h_dim: usize,
-        eps: f32,
     ) -> Result<()> {
         match self {
             Self::SingleStream { .. } => Ok(()),
             Self::HyperConnection { mixer } => {
                 if let Some(final_h_buf) = last_final_hidden_f16
-                    && num_tokens * hc_count * h_dim * 2 <= final_h_buf.len_bytes
+                    && ctx.num_tokens * ctx.hc_count * ctx.h_dim * 2 <= final_h_buf.len_bytes
                 {
                     check_rc(
                         // SAFETY: `hc_residual_buf` and `final_h_buf` hold at least
@@ -714,31 +624,17 @@ impl FinalResidual {
                         unsafe {
                             ffi::w34_memcpy_d2d_async(
                                 final_h_buf.addr() as *mut c_void,
-                                hc_residual_buf as *const c_void,
-                                num_tokens * hc_count * h_dim * 2,
+                                ctx.hc_residual_buf as *const c_void,
+                                ctx.num_tokens * ctx.hc_count * ctx.h_dim * 2,
                                 stream.handle,
                             )
                         },
                         "export pre-mixer last_final_hidden_f16",
                     )?;
                 }
-                mixer.forward_mix(
-                    ex,
-                    cublas,
-                    marlin_ws_ptr,
-                    marlin_ws_ints,
-                    hc_residual_buf,
-                    final_norm_out_buf,
-                    0,
-                    ple_buf_a,
-                    ple_buf_b,
-                    ple_val_buf,
-                    num_tokens,
-                    hc_count,
-                    hc_lowrank,
-                    h_dim,
-                    eps,
-                )
+                let mut mix_ctx = *ctx;
+                mix_ctx.hc_inj_weights_buf = 0;
+                mixer.forward_mix(&mix_ctx, final_norm_out_buf)
             }
         }
     }
