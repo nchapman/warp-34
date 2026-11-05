@@ -477,7 +477,6 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
     __shared__ int s_local_cnt;
     __shared__ int s_min_tid;
     __shared__ int s_max_tid;
-    __shared__ int s_has_bias;
 
     const int chunk_elems = ((vocab_size + kFastGreedySplits - 1) / kFastGreedySplits + 7) & ~7;
     const int col_start = split_idx * chunk_elems;
@@ -489,7 +488,6 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
         int cnt = 0;
         int min_t = vocab_size;
         int max_t = -1;
-        int any_bias = 0;
         if (sparse_entries != nullptr && cfg.sparse_count > 0 && cfg.sparse_offset >= 0) {
             const w34_sampler_sparse_entry* row_sp = sparse_entries + cfg.sparse_offset;
             for (int i = 0; i < cfg.sparse_count; ++i) {
@@ -498,14 +496,12 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
                     s_local[cnt++] = e;
                     if (e.token_id < min_t) min_t = e.token_id;
                     if (e.token_id > max_t) max_t = e.token_id;
-                    if (e.logit_bias != 0.0f) any_bias = 1;
                 }
             }
         }
         s_local_cnt = cnt;
         s_min_tid = min_t;
         s_max_tid = max_t;
-        s_has_bias = any_bias;
     }
     __syncthreads();
 

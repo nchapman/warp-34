@@ -303,7 +303,7 @@ int w34_marlin_gemm_f16u8(const w34_exec* ex, const void* a, const void* b,
                           int64_t m, int64_t n, int64_t k,
                           int64_t workspace_ints, int group_blocks);
 
-// --- Descriptor-Driven Paged Attention (op_paged_attn.cu) ---
+// --- Descriptor-Driven KV Cache Write & Paged Attention (op_kv_cache.cu, op_paged_attn.cu) ---
 int w34_kv_cache_write(const w34_exec* ex, const w34_kv_layer_layout* layout,
                        const w34_attention_batch* batch,
                        const void* k_in, const void* v_in);
@@ -325,7 +325,7 @@ int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_layout* layou
                             const void* q_in, void* attn_out,
                             int num_q_heads);
 
-// --- Gated DeltaNet (op_gdn.cu) ---
+// --- Gated DeltaNet (op_gdn.cu, op_gdn_wy.cu) ---
 int w34_gdn_causal_conv1d_f16(const w34_exec* ex, const w34_gdn_batch* batch,
                               const void* x_in, const void* conv_weight,
                               const void* conv_bias, void* conv_state_pool,
@@ -575,7 +575,7 @@ int w34_embedding_splice_f16(const w34_exec* ex, void* dst_embeds,
                              const void* src_visual_embeds, const int32_t* token_indices,
                              int num_visual_tokens, int hidden_size);
 
-// --- Qwen3.5 / 3.6 / 3.8 Hybrid MoE Kernels (op_moe.cu) ---
+// --- Qwen3.5 / 3.6 / 3.8 Hybrid MoE Kernels (op_moe.cu, op_moe_router.cu) ---
 int w34_moe_topk_router_f16(const w34_exec* ex, const void* router_logits,
                             float* topk_weights, int32_t* topk_ids,
                             int num_tokens, int num_experts, int top_k,
