@@ -1,7 +1,7 @@
 # warp-34
 
-Clean-room Rust + CUDA inference engine for **Qwen3.5 hybrid models** on
-RTX 3090 Ti (`sm_86`, 24 GB, 1008 GB/s), architected around **`vLLM`** from day
+Clean-room Rust + CUDA inference engine for **Qwen 3.5 / 3.6 / 3.8 hybrid models** on
+**RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs**, architected around **`vLLM`** and **`SGLang`** from day
 one.
 
 ## Core Design Principles
@@ -13,8 +13,8 @@ one.
 2. **End-to-end `f16` activation spine:** Hidden states, residuals, norms, RoPE,
    attention, GDN, and Marlin GEMMs consume and produce `f16` directly — zero
    `f32 ↔ f16` adapter casts between ops.
-3. **Continuous Oracle & `nsys` Scoreboard from Phase 0:** Every op and phase is
-   gated by `w34-oracle` (`dump-diff` tensor parity, `greedy-diff` token parity,
+3. **Continuous Oracle & `nsys` Scoreboard:** Every op and subsystem is
+   verified by `w34` oracle modes (`dump-diff` tensor parity, `greedy-diff` token parity,
    and `profile-diff` side-by-side `nsys` kernel timing against `vLLM` / `SGLang`).
 
 ## Workspace Layout
@@ -23,9 +23,14 @@ one.
 crates/
   w34-kernels/   CUDA kernels + C/Rust FFI seam (built incrementally via nvcc)
   w34-host/      Rust runtime, safetensors loader, scheduler, CLI, and server
-dashboard/      React + TypeScript + Vite frontend (pnpm; embedded in w34)
+dashboard/       React + TypeScript + Vite frontend (pnpm; embedded in w34)
 docs/
-  ROADMAP.md     Phased engineering roadmap & vLLM / SGLang / warp3090 source map
+  ROADMAP.md     Architecture & vLLM / SGLang / warp3090 donor reference map
+  HARDWARE.md    RTX 30-series (sm_86) & 40-series (sm_89) rooflines & ISA guide
+  MODELS.md      Model downloads, authentication, and offline behavior
+  SERVING.md     Serving controls, authentication scope, and limits
+  METRICS.md     Dashboard, Prometheus metrics, and JSON telemetry contract
+  STATE.md       Current engine state & verified hardware benchmark summary
 ```
 
 ## Clone and large test fixtures
@@ -129,9 +134,10 @@ python3 -m w34perf run suite.toml --engine warp34-1-fp16 --case smoke \
 
 ## Local Docker
 
-Requires an x86-64 host with AVX2 (`x86-64-v3`), RTX 3090 Ti GPU(s), a
-CUDA 13.4-compatible NVIDIA driver, and NVIDIA Container Toolkit configured
-for Docker. Building needs no GPU; running inference requires `--gpus`.
+Requires an x86-64 host with AVX2 (`x86-64-v3`), RTX 30-series (`sm_86`) or
+40-series (`sm_89`) GPU(s), a CUDA 13.4-compatible NVIDIA driver, and NVIDIA
+Container Toolkit configured for Docker. Building needs no GPU; running
+inference requires `--gpus`.
 
 ```sh
 docker build -t warp-34:local .

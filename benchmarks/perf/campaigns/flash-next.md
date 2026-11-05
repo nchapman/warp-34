@@ -75,7 +75,7 @@ and record hashes; missing assets or startup failure must remain failures rather
 than silently substituting a model.
 
 Native HTTP model IDs deliberately equal the full snapshot path passed to
-`--model`: no alias is set. `server_http.rs` advertises the configured model name
+`--model`: no alias is set. `crates/w34-host/src/server/http.rs` advertises the configured model name
 at `/v1/models`. The reference explicitly serves `Qwen3.8-Flash-Next`, matching
 its TOML request model. Always inspect `/v1/models` before running; do not send
 the upstream base-model ID to a server advertising a different ID.

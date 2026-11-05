@@ -14,7 +14,7 @@
 
 ### 1.1 Current warp-34 surface
 
-`crates/w34-host/src/server_http.rs:128-134`:
+`crates/w34-host/src/server/http.rs`:
 
 | Route | Notes |
 |---|---|

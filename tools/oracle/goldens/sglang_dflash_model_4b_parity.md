@@ -10,11 +10,11 @@ Its tensors and provenance were not changed to resolve numerical differences.
 
 ## Verified full-model and operator results
 
-- `phase4_dflash actual_sglang_full_model_hidden_parity` checks original input
+- `dflash_proposer actual_sglang_full_model_hidden_parity` checks original input
   tokens, anchor, and bitwise target BF16 taps (`w34_tap_add_f16_to_bf16`), then
   compares final hidden states against the `< 0.005` relative-L2 gate (`relL2=0,
   maxabs=0` measured on this 4B capture).
-- `phase4_bf16_attention` measured bit-exact outputs for each of five layers
+- `dflash_bf16_attention` measured bit-exact outputs for each of five layers
   when replaying the donor's attention operands at head dimension 256.
 - All 20 real-shape grouped-convolution replays, captured norm outputs,
   QK/RoPE replays, layer-0 GEMMs, and five SiLU replays pass their `< 1e-4`
@@ -49,11 +49,11 @@ FlashInfer's own auto-split vs explicitly unsplit outputs differ by
 mask mismatch. Native attention is unsplit, so its strict comparison uses a
 new actual donor capture generated with `disable_split_kv=True` by
 `sglang_dflash_unsplit_dump.py`. Original auto-split tensors remain unchanged
-and retain their separate coverage in `phase4_draft_kernels`.
+and retain their separate coverage in `dflash_draft_kernels`.
 
 `sglang_dump.py` now bundles only actual captures, fails on missing inputs or
 provenance, and preserves their hashes and metadata. It no longer manufactures
-the incorrect Phase 0 block-end-mask reference. The bundle contains original
+synthetic block-end-mask references. The bundle contains original
 attention outputs and explicitly named `*.unsplit_out` outputs.
 
 The focused `sglang_dflash2_fixtures_operator_dump_diff_parity` gate passes with

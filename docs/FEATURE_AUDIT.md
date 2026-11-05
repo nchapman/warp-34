@@ -45,7 +45,7 @@
   - Quantized embedding tables: Automatic host dequantization of `model.embed_tokens.weight_packed` or `.qweight` into the FP16 embedding table.
   - Pre-boot VRAM capacity enforcement: Sizing `weight_arena` directly from archive metadata with sharding and alignment headroom, sizing `repack_staging` dynamically (`(128 MiB).max(3 * max_packed_tensor_bytes)`), and asserting `min_boot_bytes <= free_vram`.
   - Fail-fast diagnostics: Strict, early rejection with sanitized diagnostics of unsupported formats (`fp8`, `mxfp4`, `nvfp4`, `bitsandbytes`, activation quantization `W8A8`, asymmetric 8-bit, dynamic actorder, non-sequential `g_idx`, AWQ `version != "gemm"`, 8-bit MoE, and quantized DFlash2 drafters).
-- **Verification:** Unit tests in `loader.rs` (`test_model_config_from_json_parsing`, `test_awq_and_u8b128_unpack_and_dequant_roundtrip`, `test_parse_quant_supported_schemes`, `test_parse_quant_rejects_unsupported_schemes_with_clear_diagnostics`, `test_model_config_rejects_unsupported_rope_scaling_and_biases`); integration test in `tests/phase0_1_2_gates.rs` and `tests/quant_formats.rs` (8 cached real HuggingFace checkpoints).
+- **Verification:** Unit tests in `loader.rs` (`test_model_config_from_json_parsing`, `test_awq_and_u8b128_unpack_and_dequant_roundtrip`, `test_parse_quant_supported_schemes`, `test_parse_quant_rejects_unsupported_schemes_with_clear_diagnostics`, `test_model_config_rejects_unsupported_rope_scaling_and_biases`); integration tests in `tests/backbone_and_collectives.rs` and `tests/quant_formats.rs` (8 cached real HuggingFace checkpoints).
 
 ---
 
@@ -62,7 +62,7 @@
     - `TQ4_All`: Full 4-bit TurboQuant across all layers (3.88× compression).
   - `StateBundlePool`: Manages persistent GDN `ssm_state` ($[H_v, 128, 128]$ FP32, 72 MiB/rank per 27B snapshot) + `conv_state` (FP16).
   - Transactional rollback: `StateTx` tracks reservations, page allocations, and supports atomic commit/rollback.
-- **Verification:** Unit tests in `cache.rs` (`test_kv_format_row_bytes_dimensions`, `test_kv_format_policy_resolve_layer_invariants`, `test_state_tx_lifecycle_and_rollback`); 27B 262k needle retrieval gate in `tests/phase5_gates.rs`.
+- **Verification:** Unit tests in `cache.rs` (`test_kv_format_row_bytes_dimensions`, `test_kv_format_policy_resolve_layer_invariants`, `test_state_tx_lifecycle_and_rollback`); 27B 262k needle retrieval test in `tests/tq4_vision_and_moe.rs`.
 
 ---
 
@@ -85,7 +85,7 @@
   - **Fused Norms & Positional Embeddings (`op_norms_rope_act.cu`):** `GemmaRMSNorm` (unit-offset `1.0 + weight`), `fused_qk_rmsnorm_rope_gate`, SiLU/SwiGLU elementwise fusions, 3D text/vision `mRoPE`.
   - **Collectives (`op_collectives.cu`):** Pinned-sysmem PCIe Gen4 x8 `TP=2` AllReduce with system-scope release/acquire fences, zero-copy staging, and typed entrypoints (`FP16`, `BF16`, `FP32`, `INT32`).
   - **Sampler (`op_sampler.cu`):** 9-step GPU sampler (`w34_sampler_step`), two-stage in-graph `FastGreedy` argmax split/merge under stateful `tool_choice: "none"` bitmasks (`w34_sampler_step_fast_greedy_masked_f16`), and device-side next-token scatter.
-- **Verification:** All custom kernels audited via `cuobjdump --dump-resource-usage` strictly confirming `STACK:0 LOCAL:0`; Decisive Pre-Freeze Gates #1, #2, #3, #4 in `tests/phase0_1_2_gates.rs`; scalar parity tests in `tests/quant_formats.rs`.
+- **Verification:** All custom kernels audited via `cuobjdump --dump-resource-usage` strictly confirming `STACK:0 LOCAL:0`; core invariant tests in `tests/backbone_and_collectives.rs`; scalar parity tests in `tests/quant_formats.rs`.
 
 ---
 
@@ -98,7 +98,7 @@
   - **Preprocessing:** `smart_resize` factor-32 aspect-ratio preserving rounding with 200:1 aspect ratio clamp, Torchvision-aligned bicubic resampling ($a = -0.75$), CHW normalization, temporal duplication ($T = 2$), and $2 \times 2$ merge grouping.
   - **Multi-Image Support:** Contiguous runs of `<|image_pad|>` validated, 3D `mRoPE` grid positions computed across all images with monotonic coordinate advance (`st_idx = max_coord + 1`), and multimodal radix cache hashing using negative synthetic token IDs (`-1000 - (h & 0x3FFFFFFF)`).
   - **Vision Transformer:** ViT patch embedding, 3D `mRoPE` positional encoding, ViT attention, 2-layer MLP merger projection, and multimodal radix cache hashing.
-- **Verification:** 6/6 canonical `Qwen3.5-VL` PNG/JPEG gates (`4B`, `27B`, `35B-A3B`) passing against `vLLM` golden tensors in `tests/phase6_vision_*.rs` and `tools/oracle/vision_matrix.py`.
+- **Verification:** 6/6 canonical `Qwen3.5-VL` PNG/JPEG cases (`4B`, `27B`, `35B-A3B`) passing against `vLLM` golden tensors in `tests/vision_*.rs` and `tools/oracle/vision_matrix.py`.
 
 ---
 
@@ -110,7 +110,7 @@
   - **Native BF16 `DFlash2`:** Preserves unquantized BF16 weights and activations on 4B drafter to prevent FP16 overflow, supporting 4B and 27B drafters with fail-fast validation against unhandled fields (`output_multiplier != 1.0`, `final_logit_softcapping > 0`).
   - **Speculative Verify CUDA Graphs:** Fixed-shape $M_{\text{verify}} = K + 1$ graph capture and execution, handling anchor token consumption and bonus token recovery.
   - **Rejection Sampling (`speculative.rs`):** Greedy rejection with tie-breaking, stochastic distribution quotient sampling, rollback math for target KV and GDN state, handling edge cases (empty drafts, all accepted, first mismatch).
-- **Verification:** Gate #5 in `tests/phase3_gates.rs`; `tests/phase4_dflash.rs` (10 tests); `tests/phase4_gates.rs` (9 tests); unit tests in `speculative.rs`.
+- **Verification:** Cross-boundary warm-prefix speculation test in `tests/radix_cache_and_scheduler.rs`; `tests/dflash_proposer.rs` (10 tests); `tests/speculative_decoding.rs` (9 tests); unit tests in `speculative.rs`.
 
 ---
 
@@ -142,7 +142,7 @@
 ---
 
 ### Layer 8: Dual-GPU Coordination, Generative & Decision Serving
-- **Source Files:** `crates/w34-host/src/coordinated.rs`, `crates/w34-host/src/server.rs`, `crates/w34-host/src/server_http.rs`, `crates/w34-host/src/responses_api.rs`, `crates/w34-host/src/anthropic_api.rs`, `crates/w34-host/src/clef.rs`, `crates/w34-host/src/decision.rs`
+- **Source Files:** `crates/w34-host/src/coordinated.rs`, `crates/w34-host/src/server.rs`, `crates/w34-host/src/server/http.rs`, `crates/w34-host/src/responses_api.rs`, `crates/w34-host/src/anthropic_api.rs`, `crates/w34-host/src/clef.rs`, `crates/w34-host/src/decision.rs`
 - **Donor Provenance:** `vLLM 0.31.0` (OpenAI & Anthropic API contracts), `SGLang v0.5.19` (SSE serving concurrency), Cloudflare Clef (`joint_schema_model.py`)
 - **Key Capabilities:**
   - **Dual-GPU Orchestration (`coordinated.rs`):** Rank 0 (leader/HTTP host) and Rank 1 (follower) communication via shared-memory barriers, synchronized shutdown, and upload error propagation.
@@ -189,7 +189,7 @@ Following the discovery that Pass 1 missed low-level quantization layout differe
 | **Multi-Image Vision** | `qwen2_vl.py:762-891` | `scheduled_vision.rs:36-113`, `vision.rs:777-871` | **Exact Match**: Contiguous image token runs validated; 3D mRoPE grid coordinates advanced monotonically across all images (`st_idx = max_coord + 1`); content-hash negative IDs in radix cache. |
 | **Bicubic SmartResize** | `video_processing_qwen2_vl.py:43-70` | `vision.rs:154-310` | **Exact Match**: Factor-32 rounding, ties-to-even, $a = -0.75$ cubic kernel, and 200:1 aspect ratio clamp. |
 | **Structured Outputs & Tools** | `vllm/parser/qwen3.py`, `llguidance` | `constraints.rs`, `tool_constraints.rs`, `parser.rs` | **Exact Match**: Dynamic bitmasks, `<think>` reasoning transition, implicit `</think>` on `<tool_call>`, tool choice (`none`, `auto`, `required`, named). |
-| **Serving APIs** | OpenAI, Anthropic, Cloudflare Clef | `server_http.rs`, `responses_api.rs`, `anthropic_api.rs`, `clef.rs` | **Exact Match**: Full wire specifications implemented and verified across generative and decision endpoints. |
+| **Serving APIs** | OpenAI, Anthropic, Cloudflare Clef | `server/http.rs`, `responses_api.rs`, `anthropic_api.rs`, `clef.rs` | **Exact Match**: Full wire specifications implemented and verified across generative and decision endpoints. |
 
 ---
 

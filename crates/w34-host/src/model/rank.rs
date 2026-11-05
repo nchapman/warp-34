@@ -1439,7 +1439,7 @@ impl Qwen3_5ModelRank {
     /// Maximum aligned ordinary prefill budget, including worst-case selected outputs.
     pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
         let max_chunks = if self.cfg.uses_tiered_moe() { 96 } else { 32 };
-        model_scratch::token_capacity_up_to(
+        scratch::token_capacity_up_to(
             self.scratch_arena.capacity(),
             self.cfg.hidden_size,
             self.local_vocab_size,

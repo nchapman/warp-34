@@ -8,7 +8,7 @@ execution per standalone process: loaded Python hooks survive file restoration;
 concurrent users of the same package tree are not supported.
 --profile is an external capture responsibility: run nsys inside the container.
 Use profile_diff --oracle-nvtx-correlated with runtime JSON after export.
-Runtime timings include synchronizing acceptance telemetry. Phase 6 stays false.
+Runtime timings include synchronizing acceptance telemetry.
 """
 import argparse
 import hashlib
@@ -133,7 +133,7 @@ PLAN = [
     'retain prefill in trace but exclude its correlated launches from decode analysis.',
     'Save streamed output IDs, actual generated count=128, TTFT/decode wall ms, worker '
     'round events and resolved settings. Missing IDs/telemetry/dtype evidence fails closed. '
-    'No Phase 6 claim until fresh donor and w34 artifacts are compared.',
+    'No parity claim until fresh donor and w34 artifacts are compared.',
 ]
 
 
@@ -163,7 +163,7 @@ def execute(args, data, root):
                 quantization_deviation='Pinned target declares compressed-tensors; explicit gptq_marlin rejected. Auto resolves checkpoint quantization.',
                 profiling_limitations='External nsys required; ORACLE_PROFILE_FLUSH=1 flushes worker traces before shutdown. No matched w34 correctness/profile gate.',
                 instrumentation='worker NVTX per decode round; synchronous commit telemetry; draft ModelConfig dtype override',
-                phase6_passed=False)
+                comparison_complete=False)
     data['protocol']['runtime_telemetry'] = 'Execution starting; runtime evidence pending.'
     args.out.write_text(json.dumps(data, indent=2)+'\n')
     environment = {'ORACLE_EVENTS': str(events), 'SGLANG_MAMBA_CONV_DTYPE': 'float16'}
@@ -250,7 +250,7 @@ def main(argv=None):
         tokenizer = AutoTokenizer.from_pretrained(str(args.target),
                                                   local_files_only=True,
                                                   trust_remote_code=False)
-        data = dict(status='preflight_only_capture_blocked', phase6_passed=False,
+        data = dict(status='preflight_only_capture_blocked', comparison_complete=False,
                     image_id=IMAGE, sglang_version=version, target=target, draft=draft,
                     tokenizer_hash=target['metadata_sha256']['tokenizer.json'],
                     protocol=protocol(tokenizer), source_evidence=src,

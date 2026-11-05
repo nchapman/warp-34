@@ -2740,7 +2740,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         )?;
     }
 
-    // 5. Sampler & Phase 4 MTP / DFlash2 kernels
+    // 5. Sampler & MTP / DFlash2 kernels
     check_rc(
         unsafe { ffi::w34_tp2_warmup() },
         "warmup op_collectives module",
@@ -3215,7 +3215,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup w34_rejection_stochastic",
     )?;
 
-    // Warm Phase 5.2 (Vision) & Phase 5.3 (MoE) kernels so CUDA 13 lazy loading
+    // Warm Vision & MoE kernels so CUDA 13 lazy loading
     // resolves all module symbols before any TP=2 collective or graph capture.
     let cu_seqlens = arena.upload_slice(&[0i32, 1i32], &stream)?;
     check_rc(

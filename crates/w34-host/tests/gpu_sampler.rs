@@ -1,4 +1,4 @@
-//! Phase 6.6a GPU-resident stochastic `SamplerV1` + device grammar bitmasking gates.
+//! GPU-resident stochastic `SamplerV1` + device grammar bitmasking integration tests.
 #![cfg(feature = "cuda")]
 
 mod common;

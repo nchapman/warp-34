@@ -68,7 +68,7 @@ code, not this migration. Full `mise run check` passed
 | `hidden_size` / `vocab_size` | `2560` / `248,320` (`bos` / `eos` = `248044`) | Same vocab size & tokenizer family as Qwen 3.5 / 3.8 |
 | `max_position_embeddings` | `262,144` (extensible to `1,000,000` via YaRN) | Supported by existing capacity & RoPE infrastructure |
 | **Gated DeltaNet (`linear_attention`, 36 layers)** | `H_v = 48`, `H_qk = 16`, `head_dim = 128`, `conv_kernel = 4`, `FP32` `ssm_state` | **Already implemented** (`csrc/gdn/`, `StateBundlePool`) |
-| **Vision (`Qwen3_VisionTransformer`) & 3D `mRoPE`** | `mrope_section = [11, 11, 10]`, `partial_rotary_factor = 0.25`, `theta = 1e7` | **Already implemented** (Phase 5 `vision.rs`) |
+| **Vision (`Qwen3_VisionTransformer`) & 3D `mRoPE`** | `mrope_section = [11, 11, 10]`, `partial_rotary_factor = 0.25`, `theta = 1e7` | **Already implemented** (`vision.rs`) |
 | **HyperConnection (`GatedResidual`)** | `hc_count = 4` streams (`[T, 4, 2560]`), `hc_lowrank = 320`, per-branch `GemmaRMSNorm` | **New** (`csrc/hc.cu`, `model/hc.rs`) |
 | **Qwen Sparse Attention (`QSA`, 12 layers)** | Main GQA `24 Q / 2 KV` (`d = 256`, output sigmoid gate) + MQA Indexer (`4 Q / 1 KV`, `d = 128`, `compress_ratio = 4`, `budget = 2048` tokens = `512` blocks) | **New** (`csrc/qsa.cu`, `KvNamespace` extensions) |
 | **N-Gram Per-Layer Embedding (`PLE`)** | `ple_layer_ids = [2]` (0-based layer `1`), `ngram_size = 3`, `heads_per_ngram = 8` (`16` heads × `160` dim = `2560`), `~20M` rows/head (`51.2B` params across `128` shards), dilated short-conv (`kernel = 4`, `dilation = 3`, `state_len = 9`) | **New** (`csrc/ple.cu`, host `PleMmapTable`, `StateBundlePool` extension) |
@@ -170,7 +170,7 @@ Because `Qwen3.8-Flash-Next` has only **12 full-attention (QSA) layers** with **
 
 1. **`PrecisionPolicy` (`docs/contracts/precision-policy.md`):**
    - `Qwen3.8-Flash-Next` checkpoints store `HyperConnection` norms/projections, QSA indexer weights, and routers in `BF16`.
-   - Before freezing the `qwen4_exp` kernel ABI, Phase 1 `dump-diff` will verify whether `HyperConnection` 4-stream states and `PLE` gated activations remain strictly within `FP16` finite bounds (`< 65,504`) or require a native `BF16` activation spine (reusing `warp-34`'s existing `sm_86` native `BF16` MMA and norm templates built for `DFlash2`).
+   - `dump-diff` verifies that `HyperConnection` 4-stream states and `PLE` gated activations remain strictly within `FP16` finite bounds (`< 65,504`) across the unified `FP16` activation spine.
    - Persistent GDN `ssm_state` (`[36, H_v, 128, 128]`), `A_log`, `dt_bias`, router softmax, and `SamplerV1` logits remain strictly **`FP32`**.
 2. **`KvPool` & `KvNamespace` (`docs/contracts/cache-layout.md`):**
    - Add `W34_KV_NAMESPACE_QSA_INDEXER_RAW` (`head_dim = 128`, `1` head, `B = 16`) and `W34_KV_NAMESPACE_QSA_INDEXER_COMPRESSED` (`head_dim = 128`, `1` head, 1 compressed row per `compress_ratio = 4` tokens) alongside `TargetFullAttn` and `MtpFullAttn`.

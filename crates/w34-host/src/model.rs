@@ -56,8 +56,7 @@ pub(crate) use weights::load_moe_layer_weights;
 pub use weights::*;
 
 #[cfg(any(feature = "cuda", test))]
-#[path = "model_scratch.rs"]
-mod model_scratch;
+mod scratch;
 
 type LayerScratchAddrs = ([u64; 6], [u64; 5], [u64; 10], [u64; 3], [u64; 7], u64);
 
@@ -93,7 +92,7 @@ fn layer_scratch_layout(
     cfg: &ModelConfig,
     tp: usize,
     tokens: usize,
-) -> Result<model_scratch::LayerLayout> {
+) -> Result<scratch::LayerLayout> {
     if tp == 0 {
         return Err(loader_err("zero scratch TP size"));
     }
@@ -104,8 +103,8 @@ fn layer_scratch_layout(
     } else {
         cfg.moe_intermediate_size / tp
     };
-    model_scratch::layer_layout(
-        model_scratch::Dimensions {
+    scratch::layer_layout(
+        scratch::Dimensions {
             q: mul(cfg.num_attention_heads / tp, cfg.head_dim)?,
             kv: mul(cfg.local_kv_heads(tp), cfg.head_dim)?,
             v_heads: cfg.linear_num_value_heads / tp,
@@ -183,8 +182,6 @@ fn normalize_hf_tokenizer(mut tok: Tokenizer) -> Tokenizer {
 }
 
 #[cfg(test)]
-#[path = "model_quant_tests.rs"]
 mod quant_tests;
 #[cfg(test)]
-#[path = "model/tests.rs"]
 mod tests;

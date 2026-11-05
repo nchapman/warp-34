@@ -1,4 +1,4 @@
-//! Incremental Phase 4 host tests, not the complete Phase 4 integration gate.
+//! Host rejection sampler and transactional rollback unit/integration tests.
 use w34_host::cache::{StateTx, StateTxPhase};
 use w34_host::parser::{SamplerV1, SamplingParams, TokenBitmaskConstraint};
 use w34_host::speculative::RejectionSampler;

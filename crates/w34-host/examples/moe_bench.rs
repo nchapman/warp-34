@@ -1,4 +1,4 @@
-//! Actual-checkpoint Phase 6.3 routed-MLP-only benchmark (shared expert omitted on both paths).
+//! Actual-checkpoint routed-MLP-only benchmark (shared expert omitted on both paths).
 //! Usage: cargo run --release -p w34-host --features cuda --example moe_bench -- MODEL OUTPUT.json [ITERATIONS]
 //! Select a physical GPU externally with CUDA_VISIBLE_DEVICES; this program uses logical GPU 0.
 //! Loads TP1, FP16 KV (32 pages), borrows the first MoE layer's weights without copying them.

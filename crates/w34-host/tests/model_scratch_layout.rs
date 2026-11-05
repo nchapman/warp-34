@@ -1,5 +1,5 @@
 // The model module is CUDA-gated; exercise its pure layout without CUDA linkage.
-#[path = "../src/model_scratch.rs"]
+#[path = "../src/model/scratch.rs"]
 mod model_scratch;
 
 use model_scratch::{Dimensions, layer_layout, required_bytes, token_capacity};

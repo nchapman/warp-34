@@ -1,4 +1,4 @@
-// Phase 4: Native MTP (FP16) and DFlash2 (BF16) speculative decoding kernels for sm_86.
+// Native MTP (FP16) and DFlash2 (BF16) speculative decoding kernels for sm_86 / sm_89.
 // Target spine stays FP16; DFlash2 preserves native BF16 weights and activations with
 // FP32 reductions. Semantics match SGLang v0.5.19 models/dflash.py and dflash_utils.py.
 #include "../w34_cuda.h"

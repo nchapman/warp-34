@@ -1,13 +1,13 @@
-//! Phase 5 Verification Gates:
-//! - Phase 5.1: Paged `TQ4` (`132 B`/row) & `Q8_0` (`272 B`/row) KV cache with Seed-42
+//! TQ4 KV Cache, Multimodal Vision, and Hybrid MoE Integration Tests:
+//! - Paged `TQ4` (`132 B`/row) & `Q8_0` (`272 B`/row) KV cache with Seed-42
 //!   Rademacher + WHT-256 rotation, boundary-anchored `Tq4` (`21,376 B/token`, `3.07x`:
 //!   rotated `Q8_0` on first 2 & last 2 full-attention layers + least-squares `TQ4` interior),
 //!   uniform `Tq4All` (`16,896 B/token`, `3.88x`), 0-ULP page-table permutation invariance,
 //!   and long-context needle-in-a-haystack retrieval.
-//! - Phase 5.2: Multimodal Vision (`smart_resize`, bicubic + normalize, 3D `mRoPE`,
+//! - Multimodal Vision (`smart_resize`, bicubic + normalize, 3D `mRoPE`,
 //!   content-hashed `MambaRadixCache` keys, OpenAI `image_url`, `op_vision.cu` kernels,
 //!   and `Qwen3VisionEncoder` + multimodal generation).
-//! - Phase 5.3: Hybrid MoE (`op_moe.cu` top-k router, fused `W4A16` & `FP16` MoE
+//! - Hybrid MoE (`op_moe.cu` top-k router, fused `W4A16` & `FP16` MoE
 //!   gate+up+SiLU + down+shared_expert+gate kernels, `Qwen3.6-35B-A3B` config & engine).
 #![allow(clippy::undocumented_unsafe_blocks)]
 
@@ -34,7 +34,7 @@ use w34_kernels::ffi::{self, W34_ATTN_MASK_CAUSAL, W34AttentionBatch};
 static GPU_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
-fn test_phase5_1_tq4_and_q8_0_byte_budgets() {
+fn test_tq4_and_q8_0_byte_budgets() {
     // Qwen 27B: 16 full-attention layers, 4 KV heads total, head_dim = 256.
     let num_full = 16usize;
     let kv_heads = 4usize;
@@ -82,7 +82,7 @@ fn test_phase5_1_tq4_and_q8_0_byte_budgets() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn test_phase5_1_wht256_outlier_protection_and_long_context_needle() {
+fn test_wht256_outlier_protection_and_long_context_needle() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dev = CudaDevice::set_current(0).expect("CudaDevice(0)");
     let stream = CudaStream::new(dev.device_id).expect("stream");
@@ -392,7 +392,7 @@ fn encode_base64_for_test(data: &[u8]) -> String {
 }
 
 #[test]
-fn phase5_2_vision_smart_resize_mrope_and_multimodal_radix_key() {
+fn vision_smart_resize_mrope_and_multimodal_radix_key() {
     use w34_host::server::parse_openai_messages_multimodal;
     use w34_host::vision::{
         compute_mrope_positions, compute_multimodal_radix_key, preprocess_rgb_image, smart_resize,
@@ -534,7 +534,7 @@ fn check_image_decoding_and_url_policy() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn phase5_2_vision_cuda_kernels_and_embedding_splice() {
+fn vision_cuda_kernels_and_embedding_splice() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _dev = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();
@@ -620,7 +620,7 @@ fn phase5_2_vision_cuda_kernels_and_embedding_splice() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn phase5_3_moe_router_and_fused_w4a16_f16_kernels() {
+fn moe_router_and_fused_w4a16_f16_kernels() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _dev = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();
@@ -763,11 +763,11 @@ fn phase5_3_moe_router_and_fused_w4a16_f16_kernels() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn phase5_2_live_qwen3_vision_encoder_and_multimodal_radix_cache() {
+fn live_qwen3_vision_encoder_and_multimodal_radix_cache() {
     use w34_host::model::Qwen3_5Engine;
     use w34_host::vision::preprocess_rgb_image;
 
-    let test_name = "phase5_2_live_qwen3_vision_encoder_and_multimodal_radix_cache";
+    let test_name = "live_qwen3_vision_encoder_and_multimodal_radix_cache";
     if !common::require_or_skip_gpus(1, test_name) {
         return;
     }
@@ -839,13 +839,13 @@ fn phase5_2_live_qwen3_vision_encoder_and_multimodal_radix_cache() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn phase5_3_moe_checkpoint_config_and_dense_f16_tp_parity() {
+fn moe_checkpoint_config_and_dense_f16_tp_parity() {
     use w34_host::loader::ModelConfig;
 
     // 1. Verify Qwen3.6-35B-A3B MoE checkpoint config parsing if cached on disk
     if let Some(dir) = common::require_or_skip_cached_model(
         "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4",
-        "phase5_3_moe_checkpoint_config_and_dense_f16_tp_parity",
+        "moe_checkpoint_config_and_dense_f16_tp_parity",
     ) {
         let cfg = ModelConfig::from_dir(&dir).expect("parse 35B-A3B MoE config");
         assert_eq!(cfg.num_hidden_layers, 40);
@@ -946,13 +946,13 @@ fn phase5_3_moe_checkpoint_config_and_dense_f16_tp_parity() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn phase6_2_gqa_mma_and_split_kv_long_context_parity() {
+fn gqa_mma_and_split_kv_long_context_parity() {
     check_gqa_split_kv_parity(4096);
 }
 
 #[cfg(feature = "cuda")]
 #[test]
-fn phase6_2_short_split_kv_parity() {
+fn short_split_kv_parity() {
     for seq_len in [128usize, 192, 256, 512, 1024] {
         check_gqa_split_kv_parity(seq_len);
     }
@@ -1532,7 +1532,7 @@ fn check_gqa_split_kv_parity(seq_len: usize) {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn phase6_3_moe_grouped_mma_exact_parity_and_tp2() {
+fn moe_grouped_mma_exact_parity_and_tp2() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _dev = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();

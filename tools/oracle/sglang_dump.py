@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Bundle actual pinned SGLang DFlash2 operator captures for Phase 4 gates.
+"""Bundle actual pinned SGLang DFlash2 operator captures for parity verification.
 
 This does not execute SGLang or synthesize reference outputs. Generate the
 source captures with sglang_dflash_bf16_dump.py,
 sglang_dflash_attention_dump.py, and sglang_dflash_unsplit_dump.py in
 lmsysorg/sglang:v0.5.19 first. Missing captures,
 missing provenance, mismatched donors, and duplicate tensor names fail closed.
-The obsolete Phase 0 block-end-mask reference is deliberately not included.
+Synthetic block-end-mask references are deliberately not included.
 """
 import argparse
 import hashlib

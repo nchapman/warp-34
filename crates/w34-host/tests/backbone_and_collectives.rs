@@ -28,7 +28,7 @@ use w34_kernels::ffi::{
 };
 
 #[test]
-fn test_phase0_loader_all_five_cached_checkpoints() {
+fn test_loader_all_five_cached_checkpoints() {
     let models = [
         ("nchapman/Qwen3.5-4B-W4A16-GPTQ", 32usize, 2560usize, 1usize),
         ("nchapman/Qwen3.5-9B-W4A16-GPTQ", 32usize, 4096usize, 2usize),
@@ -117,7 +117,7 @@ fn assert_f16_within_tol(got: &[u16], expected: &[f32], tol: f32) {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn test_phase1_op_fixtures_dump_diff() {
+fn test_op_fixtures_dump_diff() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -430,7 +430,7 @@ fn test_phase1_op_fixtures_dump_diff() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn test_gate1_fragmented_paged_attention_and_tq4_strides() {
+fn test_fragmented_paged_attention_and_tq4_strides() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dev = CudaDevice::set_current(0).expect("CudaDevice(0)");
     let stream = CudaStream::new(dev.device_id).expect("stream");
@@ -543,7 +543,7 @@ fn test_gate1_fragmented_paged_attention_and_tq4_strides() {
         let out_perm = run_with_pages([11, 4, 9], &d_out_perm);
         assert_eq!(
             out_contig, out_perm,
-            "Gate #1: 0-ULP page-table permutation invariance for {policy:?}"
+            "0-ULP page-table permutation invariance for {policy:?}"
         );
     }
 
@@ -629,7 +629,7 @@ fn test_gate1_fragmented_paged_attention_and_tq4_strides() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn test_gate2_gdn_continuation_checkpoint_and_rejection_parity() {
+fn test_gdn_continuation_checkpoint_and_rejection_parity() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dev = CudaDevice::set_current(0).expect("CudaDevice(0)");
     let stream = CudaStream::new(dev.device_id).expect("stream");
@@ -864,11 +864,11 @@ fn test_gate2_gdn_continuation_checkpoint_and_rejection_parity() {
     let mut all_ssm = vec![0.0f32; 16 * state_elems];
     st.ssm_state.copy_to_host(&mut all_ssm, &stream).unwrap();
 
-    assert_eq!(out_a, out_b, "Gate #2: 0-ULP GDN output parity");
+    assert_eq!(out_a, out_b, "0-ULP GDN output parity");
     assert_eq!(
         &all_ssm[6 * state_elems..7 * state_elems],
         &all_ssm[11 * state_elems..12 * state_elems],
-        "Gate #2: 0-ULP GDN speculative rejection state parity (slot 6 == slot 11)"
+        "0-ULP GDN speculative rejection state parity (slot 6 == slot 11)"
     );
 
     // Also verify 27B geometry (`hk=16, hv=96, dk=128, dv=128` -> `<8, 5>` TILE_S=16 prefill
@@ -1003,12 +1003,12 @@ fn test_gate2_gdn_continuation_checkpoint_and_rejection_parity() {
 
         assert_eq!(
             out_pf, out_dec,
-            "Gate #2: 0-ULP hv=96 GDN TILE_S=16 prefill vs single-step decode output parity"
+            "0-ULP hv=96 GDN TILE_S=16 prefill vs single-step decode output parity"
         );
         assert_eq!(
             &ssm96[..state_elems96],
             &ssm96[state_elems96..],
-            "Gate #2: 0-ULP hv=96 GDN TILE_S=16 prefill vs single-step decode ssm_state parity"
+            "0-ULP hv=96 GDN TILE_S=16 prefill vs single-step decode ssm_state parity"
         );
     }
 }
@@ -1668,9 +1668,9 @@ fn test_gdn_wy_mixed_decode_prefill_batch_parity() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn test_gate3_and_gate4_cuda_graph_spec_rollback_and_tp2_collectives() {
+fn test_cuda_graph_spec_rollback_and_tp2_collectives() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Gate #4: Cold-start TP=2 init & typed collectives stress (including token IDs > 65504)
+    // Cold-start TP=2 init & typed collectives stress (including token IDs > 65504)
     let dev0 = CudaDevice::set_current(0).expect("CudaDevice(0)");
     let dev1 = CudaDevice::set_current(1).expect("CudaDevice(1)");
     let stream0 = CudaStream::new(dev0.device_id).expect("stream0");
@@ -1733,13 +1733,10 @@ fn test_gate3_and_gate4_cuda_graph_spec_rollback_and_tp2_collectives() {
     let mut win1 = [0i32; 1];
     d_out_id0.copy_to_host(&mut win0, &stream0).unwrap();
     d_out_id1.copy_to_host(&mut win1, &stream1).unwrap();
-    assert_eq!(
-        win0[0], 240_123,
-        "Gate #4: INT32 token ID > 65504 preserved"
-    );
-    assert_eq!(win1[0], 240_123, "Gate #4: both ranks agree on top-1");
+    assert_eq!(win0[0], 240_123, "INT32 token ID > 65504 preserved");
+    assert_eq!(win1[0], 240_123, "both ranks agree on top-1");
 
-    // Gate #3: CUDA Graph replay under metadata mutation + TapPlan + StateTx speculative rollback
+    // CUDA Graph replay under metadata mutation + TapPlan + StateTx speculative rollback
     let taps = TapPlan {
         layer_ids: vec![5, 19, 31],
     };
@@ -1769,7 +1766,7 @@ fn test_gate3_and_gate4_cuda_graph_spec_rollback_and_tp2_collectives() {
     let m_eager = eng_eager.generate_tokens(&prompt_ids, 16, false).unwrap();
     assert_eq!(
         m_graph.generated_token_ids, m_eager.generated_token_ids,
-        "Gate #3: CUDA Graph replay matches eager execution bit-for-bit"
+        "CUDA Graph replay matches eager execution bit-for-bit"
     );
 
     // Also verify StateTx speculative verify & rollback schedule (accepted_len = 3 out of 1+4)

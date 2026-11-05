@@ -1,4 +1,4 @@
-// Phase 5.3: Qwen3.5 / Qwen3.6 Hybrid MoE Kernels (Top-K Softmax Router,
+// Qwen3.5 / Qwen3.6 / Qwen3.8 Hybrid MoE Kernels (Top-K Softmax Router,
 // Fused W4A16 & FP16 Gate+Up+SiLU and Down+TopK-Accum+SharedExpert Gate).
 #include "../w34_cuda.h"
 
@@ -769,7 +769,7 @@ __global__ void moe_f16_down_accum_kernel(
     }
 }
 
-// --- Phase 6.3: Token-grouped (expert_id, token_slot) Marlin/moe_wna16 mma.sync MoE (M >= 4) ---
+// --- Token-grouped (expert_id, token_slot) Marlin/moe_wna16 mma.sync MoE (M >= 4) ---
 
 // Templated CUDA-Graph-safe single-CTA shared-memory counting sort grouping
 // `total_pairs = num_tokens * top_k` routed (token, topk_slot) pairs into homogeneous

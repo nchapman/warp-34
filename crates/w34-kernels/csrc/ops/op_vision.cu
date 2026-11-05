@@ -1,4 +1,4 @@
-// Phase 5.2: Qwen3_VisionTransformer (ViT) + Multimodal Embedding Splice Kernels.
+// Qwen3_VisionTransformer (ViT) + Multimodal Embedding Splice Kernels.
 #include "../w34_cuda.h"
 
 #include <cuda_fp16.h>

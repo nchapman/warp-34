@@ -20,7 +20,7 @@ One `StateBundle` slot represents the complete GDN state across all `L_gdn` line
 - **Qwen3.5-9B / 4B (`L_gdn = 24`, `H_k = 16`, `H_v = 32`, `d_k = 128`, `d_v = 128`):**
   - Unsharded (`TP=1`): `ssm_state = 24 * 32 * 128 * 128 * 4 B = 48.00 MiB`; `conv_state = 24 * 8192 * 3 * 2 B = 1.125 MiB` → **`49.13 MiB / slot`** (`24.56 MiB / rank` on `TP=2`).
 
-Because each 27B `StateBundle` is `~73.4 MiB/rank`, all state slots (active request slots, speculative verify scratch slots, ping-pong checkpoint track buffers, and `MambaRadixCache` snapshot slots) are pre-budgeted by `CapacityPlanner` in Phase 0.
+Because each 27B `StateBundle` is `~73.4 MiB/rank`, all state slots (active request slots, speculative verify scratch slots, ping-pong checkpoint track buffers, and `MambaRadixCache` snapshot slots) are pre-budgeted upfront by `CapacityPlanner`.
 
 ## 3. Three Distinct Chunk Geometries (`B = 16`, `BT = 64`, `C = k * 64`)
 

@@ -1,4 +1,4 @@
-//! Phase 3.1 Token-Budget Continuous Batching Scheduler (`SchedulerV1`).
+//! Token-Budget Continuous Batching Scheduler (`SchedulerV1`).
 //!
 //! Schedules up to `max_num_batched_tokens` per step, mixing active decode/verify
 //! sequences with chunked prefill slices aligned to the `MambaRadixCache` checkpoint

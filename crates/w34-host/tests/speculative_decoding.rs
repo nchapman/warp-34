@@ -1,4 +1,4 @@
-//! Production-engine Phase 4 integration gates, using real checkpoint proposals.
+//! End-to-end speculative decoding integration tests using real checkpoint proposals.
 #![cfg(feature = "cuda")]
 use w34_host::{
     cache::KvFormatPolicy,

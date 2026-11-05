@@ -1,4 +1,4 @@
-//! Phase 3.3: `SamplerV1` (penalties, temperature, `top_k`, `top_p`, `min_p`, seeded RNG,
+//! `SamplerV1` (penalties, temperature, `top_k`, `top_p`, `min_p`, seeded RNG,
 //! and structured-output `TokenBitmaskConstraint` with speculative rollback) and
 //! `Qwen3Parser` (`vllm/parser/qwen3.py` parity for `<think>...</think>` reasoning and
 //! Qwen3-XML / Hermes JSON `<tool_call>` extraction).
@@ -566,7 +566,7 @@ impl SamplerV1 {
     }
 
     /// Rolls back `num_rejected` speculative tokens from `output_history`, `output_counts`,
-    /// and `constraint` (`docs/ROADMAP.md` §4 Phase 3.3).
+    /// and `constraint`.
     pub fn rollback_tokens(&mut self, num_rejected: usize) {
         self.try_rollback_tokens(num_rejected)
             .expect("invalid sampler rollback");

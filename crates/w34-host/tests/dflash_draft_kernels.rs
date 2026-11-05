@@ -1,5 +1,5 @@
 #![cfg(feature = "cuda")]
-//! Focused kernel regressions; these are not end-to-end Phase 4 gates.
+//! Focused DFlash2 draft-kernel regression tests.
 use core::ffi::c_void;
 use w34_host::cuda::{CudaDevice, CudaStream, DeviceBuffer, check_rc};
 use w34_kernels::ffi;

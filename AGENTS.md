@@ -10,7 +10,7 @@
   - **`vllm.cpp` (`50d425bec`)**: `/home/nchapman/Code/warp3090/vendor/vllm.cpp`. Donor for native CUDA C++ GDN kernels (`src/vt/cuda/cuda_gdn.cu`), verified against `vLLM` FLA golden dumps.
   - **`SGLang v0.5.19` (`0bcd822377`)**: `/home/nchapman/Code/warp3090-dflash/vendor/sglang` & Docker `lmsysorg/sglang:v0.5.19`. Donor for `MambaRadixCache` + `HybridReqToTokenPool` (`extra_buffer` ping-pong GDN checkpoint donation) and `DFlashWorkerV2` (`M=8` verify on 27B, `M=16` on 4B).
   - **`warp3090` (`/home/nchapman/Code/warp3090`)**: Donor for TurboQuant 4-bit KV (`TQ4`: `block_tq4_0` 132B/row, Rademacher+WHT-256, Beta(256) codebook, `FirstLast2` `2.52×` `f16b`, `fattn_vec_tq` + `fattn_mma_tq`) and pinned-sysmem `TP=2` collectives (`op_all_reduce.cu`).
-- **Key Docs:** `docs/STATE.md` (current status & Phase 0 entry point), `docs/ROADMAP.md` (phased plan, seam contracts, & 5 Decisive Pre-Freeze Gate Tests), `docs/HARDWARE.md` (30-series `sm_86` & 40-series `sm_89` rooflines & ISA traps).
+- **Key Docs:** `docs/STATE.md` (current status & verified benchmarks), `docs/ROADMAP.md` (architecture & donor reference map, seam contracts, & core invariant tests), `docs/HARDWARE.md` (30-series `sm_86` & 40-series `sm_89` rooflines & ISA traps).
 
 ## Commands
 
@@ -36,7 +36,7 @@ for p in $(pgrep -x w34); do kill "$p"; done                              # stop
   - **Precision policy:** Target model spine is end-to-end `FP16` (`__half`); `DFlash2` drafters preserve native `BF16` (`__nv_bfloat16`) where required (4B drafter overflows `FP16`); persistent GDN `ssm_state` (`72 MiB/rank` per 27B `TP=2` snapshot) and reductions are `FP32` in global memory.
   - **KV addressing:** Logical `page_id`s are decoupled from physical storage via per-layer `KvLayerLayout` descriptors (`fp16`, `q8_0` `272 B` rows, `tq4` `3.07×` rotated `Q8_0` boundaries + `132 B` LSQ `TQ4` interior, `tq4_all` `3.88×`, and `DFlashDraftContext` namespaces).
   - **Cold-start `TP=2` init:** Always register new kernels in `prepare_execution_plan()` so both ranks warm all specializations and `cudaDeviceSynchronize` before collective warmup or graph capture (preventing CUDA 13 lazy-loading deadlocks).
-  - **Continuous `w34-oracle` verification:** Every op and phase must pass `dump-diff` (tensor parity), `greedy-diff` (token parity), and `profile-diff` (`nsys` SQLite category `ms/round` vs `vLLM`/`SGLang`).
+  - **Continuous `w34` oracle verification:** Every op and subsystem must pass `dump-diff` (tensor parity), `greedy-diff` (token parity), and `profile-diff` (`nsys` SQLite category `ms/round` vs `vLLM`/`SGLang`).
 
 ## Boundaries
 

@@ -928,7 +928,7 @@ __device__ __forceinline__ void unpack_tq4_rows_to_smem_f16(
     }
 }
 
-// Phase 6.2: GQA-grouped + multi-token m16n8k16 mma.sync paged attention (head_dim=256,
+// GQA-grouped + multi-token m16n8k16 mma.sync paged attention (head_dim=256,
 // block_size=16) across TQ4, Q8_0, and FP16 KV caches with optional parallel Split-KV.
 // Grid: (ceil(total_tokens / tok_tile), local_kv_heads * q_subgroups, num_splits), Block: 128.
 __global__ void paged_attention_gqa_mma_f16_kernel(

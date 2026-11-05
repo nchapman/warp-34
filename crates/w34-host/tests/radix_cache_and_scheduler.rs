@@ -197,7 +197,7 @@ static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(feature = "cuda")]
 #[test]
-fn test_gate5_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
+fn test_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
@@ -206,7 +206,7 @@ fn test_gate5_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
         Some(128),
         false,
     )
-    .expect("load 4B TP=1 for Gate #5");
+    .expect("load 4B TP=1 for warm prefix speculation test");
 
     // Build a 122-token prompt (`64` prefix + `58` suffix -> 6 tokens short of the `C = 128` checkpoint boundary!)
     let prompt_122: Vec<i32> = (0..122).map(|i| 1500 + ((i * 7 + 3) % 400)).collect();
@@ -344,7 +344,7 @@ fn test_gate5_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
     r0.stream.synchronize().unwrap();
     assert_eq!(
         b_conv, cold_conv,
-        "Gate #5 conv_state must be bit-identical (0 ULP) to cold non-speculative reference"
+        "conv_state must be bit-identical (0 ULP) to cold non-speculative reference"
     );
     let max_ssm_diff = b_ssm
         .iter()
@@ -353,7 +353,7 @@ fn test_gate5_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
         .fold(0.0f32, f32::max);
     assert_eq!(
         max_ssm_diff, 0.0,
-        "Gate #5 ssm_state must be bit-identical (0.0 max abs diff) to cold non-speculative reference"
+        "ssm_state must be bit-identical (0.0 max abs diff) to cold non-speculative reference"
     );
 
     // 4. Request C hits Request B's newly donated 128-token checkpoint in `MambaRadixCache`
@@ -375,7 +375,7 @@ fn test_gate5_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
     engine
         .radix
         .sanity_check()
-        .expect("radix sanity after Gate #5");
+        .expect("radix sanity after cross-boundary rejection");
 }
 
 #[cfg(feature = "cuda")]
@@ -389,7 +389,7 @@ fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
         Some(256),
         true,
     )
-    .expect("load 4B TP=1 for Phase 3 benchmark & server test");
+    .expect("load 4B TP=1 for warm-prefix benchmark & server test");
     engine.reset_all_states().unwrap();
 
     // 1. Measure cold vs warm TTFT on a 516-token prompt (`512` prefix tokens = 8 x 64 checkpoints + `4` suffix tokens)
@@ -410,7 +410,7 @@ fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
     );
     let ttft_drop_ratio = 1.0 - (warm_m.ttft_ms / cold_m.ttft_ms);
     println!(
-        "[phase3-gate] 516-token prompt cold_ttft={:.2}ms warm_ttft={:.2}ms reduction={:.1}%",
+        "[radix-cache] 516-token prompt cold_ttft={:.2}ms warm_ttft={:.2}ms reduction={:.1}%",
         cold_m.ttft_ms,
         warm_m.ttft_ms,
         ttft_drop_ratio * 100.0

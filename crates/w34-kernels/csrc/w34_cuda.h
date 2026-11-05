@@ -505,7 +505,7 @@ int w34_rejection_stochastic(const w34_exec* ex, const int32_t* drafts,
     const double* recovery, const uint8_t* valid, int32_t* emitted,
     int32_t* accepted, int32_t* status, int num_reqs, int k, int vocab);
 
-// --- Phase 4: MTP & DFlash2 Speculative Decoding Kernels (op_dflash2.cu) ---
+// --- MTP & DFlash2 Speculative Decoding Kernels (op_dflash2.cu) ---
 // BF16 activation path. RMSNorm may update a distinct residual in place;
 // x==y is supported, but residual must not alias either. Other outputs must not
 // overlap inputs. RoPE table [table_rows,dim] contains [cos || sin].
@@ -560,7 +560,7 @@ int w34_topk_rows_split_f16(const w34_exec* ex, const void* logits_f16,
                             int num_rows, int local_vocab_size, int vocab_offset,
                             int top_k, int num_splits);
 
-// --- Phase 5.2: Qwen3_VisionTransformer & Multimodal Kernels (op_vision.cu) ---
+// --- Qwen3_VisionTransformer & Multimodal Kernels (op_vision.cu) ---
 int w34_vision_bias_add_f16(const w34_exec* ex, const void* x, const void* bias,
                             const void* residual, void* out, int rows, int cols);
 int w34_vision_layernorm_f16(const w34_exec* ex, const void* x, const void* weight,
@@ -575,7 +575,7 @@ int w34_embedding_splice_f16(const w34_exec* ex, void* dst_embeds,
                              const void* src_visual_embeds, const int32_t* token_indices,
                              int num_visual_tokens, int hidden_size);
 
-// --- Phase 5.3: Qwen3.5 / 3.6 Hybrid MoE Kernels (op_moe.cu) ---
+// --- Qwen3.5 / 3.6 / 3.8 Hybrid MoE Kernels (op_moe.cu) ---
 int w34_moe_topk_router_f16(const w34_exec* ex, const void* router_logits,
                             float* topk_weights, int32_t* topk_ids,
                             int num_tokens, int num_experts, int top_k,

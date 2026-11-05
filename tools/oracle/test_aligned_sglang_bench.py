@@ -129,7 +129,7 @@ class AlignedProtocolTests(unittest.TestCase):
                 self.assertEqual(shutdown, [] if constructor_failure else [True])
                 for path, original in originals.items():
                     self.assertEqual(path.read_bytes(), original)
-                self.assertFalse(data['phase6_passed'])
+                self.assertFalse(data['comparison_complete'])
 
     def test_prompt_repeats_ids_not_text(self):
         ids = a.prompt_ids(Tokenizer(), 128)
