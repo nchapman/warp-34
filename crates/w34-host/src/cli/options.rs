@@ -19,12 +19,12 @@ pub fn print_usage() {
     eprintln!(
         "Usage: w34 <subcommand> [options]\n\
          Subcommands:\n\
-           generate     --model <id|path> [--tp 1|2|4] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
-           bench        --model <id|path> [--tp 1|2|4] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format tq4|tq4_all|q8_0|fp16] [--out <json>]\n\
-           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2|4] [--max-prompts <n>] [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16] [--verify-lossless] [--verify-radix-warm]\n\
+           generate     --model <id|path> [--tp 1|2|4] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16|bf16]\n\
+           bench        --model <id|path> [--tp 1|2|4] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format tq4|tq4_all|q8_0|fp16|bf16] [--out <json>]\n\
+           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2|4] [--max-prompts <n>] [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16|bf16] [--verify-lossless] [--verify-radix-warm]\n\
            dump-diff    --model <id|path> [--tp 1|2|4] [--prompt <str>] [--image <path|url>]... [--compare-tp2] [--golden <safetensors>]\n\
            profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
-           serve        --model <id|path> [--tp 1|2|4] [--host <addr>] [--port <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
+           serve        --model <id|path> [--tp 1|2|4] [--host <addr>] [--port <n>] [--kv-format tq4|tq4_all|q8_0|fp16|bf16]\n\
            chat         --model <id|path> [--tp 1|2|4] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--no-thinking]\n\
          Serve-only: --api-key <value> OR --api-key-env <name> (explicit lookup; no ambient default).\n\
            Protects API routes; dashboard, metrics and health remain public. Default: no authentication.\n\
@@ -288,11 +288,11 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                         .map_err(|_| "invalid --kv-pages")?,
                 );
             }
-            "--model" | "-m" => {
+            "--model" | "-m" | "--model-path" => {
                 i += 1;
                 model = args.get(i).cloned().ok_or("missing --model value")?;
             }
-            "--tp" => {
+            "--tp" | "-tp" | "--tp-size" | "--tensor-parallel-size" => {
                 i += 1;
                 tp = args
                     .get(i)
@@ -328,7 +328,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                     .parse()
                     .map_err(|_| "invalid --gen-len")?;
             }
-            "--kv-format" => {
+            "--kv-format" | "--kv-cache-dtype" => {
                 i += 1;
                 kv_format = args.get(i).cloned().ok_or("missing --kv-format")?;
             }
@@ -348,7 +348,7 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                     .parse()
                     .map_err(|_| "invalid --max-prompts")?;
             }
-            "--no-cuda-graph" => {
+            "--no-cuda-graph" | "--enforce-eager" | "--disable-cuda-graph" => {
                 use_cuda_graph = false;
             }
             "--compare-tp2" => {

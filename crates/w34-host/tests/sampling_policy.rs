@@ -28,11 +28,16 @@ fn native_http_sampling_parameters_are_validated() {
     }
     for bad in [
         json!({"temperature":-1}),
+        json!({"temperature":2.1}),
         json!({"temperature":"0.8"}),
         json!({"top_p":0}),
         json!({"top_k":1e20}),
         json!({"seed":-1}),
         json!({"repetition_penalty":0}),
+        json!({"frequency_penalty":2.5}),
+        json!({"frequency_penalty":-2.5}),
+        json!({"presence_penalty":2.1}),
+        json!({"presence_penalty":-2.1}),
         json!({"stop":["a","b","c","d","e"]}),
     ] {
         assert!(native_sampling_params(&bad, 8).is_err(), "{bad}");

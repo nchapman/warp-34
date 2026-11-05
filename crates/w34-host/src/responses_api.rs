@@ -689,6 +689,88 @@ fn parse_input_items(
     }
 }
 
+fn parse_reasoning_and_text_config(
+    obj: &Map<String, Value>,
+) -> Result<(Option<bool>, Value, Option<Value>, Value), ResponsesApiError> {
+    let mut enable_thinking: Option<bool> = None;
+    let reasoning_echo = if let Some(r_val) = obj.get("reasoning").filter(|v| !v.is_null()) {
+        let r_obj = r_val
+            .as_object()
+            .ok_or_else(|| ResponsesApiError::bad_request("'reasoning' must be an object"))?;
+        if let Some(effort) = r_obj.get("effort").filter(|v| !v.is_null()) {
+            let eff = effort.as_str().ok_or_else(|| {
+                ResponsesApiError::bad_request("'reasoning.effort' must be a string")
+            })?;
+            match eff {
+                "none" | "minimal" => enable_thinking = Some(false),
+                "low" | "medium" | "high" | "xhigh" | "max" => enable_thinking = Some(true),
+                other => {
+                    return Err(ResponsesApiError::bad_request(format!(
+                        "unsupported reasoning.effort '{other}'"
+                    )));
+                }
+            }
+        }
+        json!({
+            "effort": r_obj.get("effort").cloned().unwrap_or(Value::Null),
+            "summary": r_obj.get("summary").cloned().unwrap_or(Value::Null),
+        })
+    } else {
+        json!({"effort": Value::Null, "summary": Value::Null})
+    };
+
+    let mut response_format: Option<Value> = None;
+    let text_echo = if let Some(text_val) = obj.get("text").filter(|v| !v.is_null()) {
+        let text_obj = text_val
+            .as_object()
+            .ok_or_else(|| ResponsesApiError::bad_request("'text' must be an object"))?;
+        if let Some(fmt_val) = text_obj.get("format").filter(|v| !v.is_null()) {
+            let fmt_obj = fmt_val
+                .as_object()
+                .ok_or_else(|| ResponsesApiError::bad_request("'text.format' must be an object"))?;
+            let fmt_type = fmt_obj.get("type").and_then(Value::as_str).ok_or_else(|| {
+                ResponsesApiError::bad_request("'text.format.type' must be a string")
+            })?;
+            match fmt_type {
+                "text" => {}
+                "json_object" => {
+                    response_format = Some(json!({"type": "json_object"}));
+                }
+                "json_schema" => {
+                    let schema = fmt_obj.get("schema").ok_or_else(|| {
+                        ResponsesApiError::bad_request(
+                            "text.format type 'json_schema' requires 'schema'",
+                        )
+                    })?;
+                    let name = fmt_obj
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("response_schema");
+                    response_format = Some(json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": name,
+                            "strict": true,
+                            "schema": schema,
+                        }
+                    }));
+                }
+                other => {
+                    return Err(ResponsesApiError::bad_request(format!(
+                        "unsupported text.format.type '{other}'"
+                    )));
+                }
+            }
+            json!({"format": fmt_val})
+        } else {
+            json!({"format": {"type": "text"}})
+        }
+    } else {
+        json!({"format": {"type": "text"}})
+    };
+    Ok((enable_thinking, reasoning_echo, response_format, text_echo))
+}
+
 /// Translates an OpenAI Responses API request body into `(canonical_chat_request, meta)`.
 pub fn translate_responses_to_chat(
     req: &Value,
@@ -776,85 +858,8 @@ pub fn translate_responses_to_chat(
         }
     }
     let (chat_tool_choice, tool_choice_echo) = normalize_tool_choice(obj.get("tool_choice"))?;
-
-    // Reasoning controls -> chat_template_kwargs.enable_thinking
-    let mut enable_thinking: Option<bool> = None;
-    let reasoning_echo = if let Some(r_val) = obj.get("reasoning").filter(|v| !v.is_null()) {
-        let r_obj = r_val
-            .as_object()
-            .ok_or_else(|| ResponsesApiError::bad_request("'reasoning' must be an object"))?;
-        if let Some(effort) = r_obj.get("effort").filter(|v| !v.is_null()) {
-            let eff = effort.as_str().ok_or_else(|| {
-                ResponsesApiError::bad_request("'reasoning.effort' must be a string")
-            })?;
-            match eff {
-                "none" | "minimal" => enable_thinking = Some(false),
-                "low" | "medium" | "high" => enable_thinking = Some(true),
-                other => {
-                    return Err(ResponsesApiError::bad_request(format!(
-                        "unsupported reasoning.effort '{other}'"
-                    )));
-                }
-            }
-        }
-        json!({
-            "effort": r_obj.get("effort").cloned().unwrap_or(Value::Null),
-            "summary": r_obj.get("summary").cloned().unwrap_or(Value::Null),
-        })
-    } else {
-        json!({"effort": Value::Null, "summary": Value::Null})
-    };
-
-    // text.format -> response_format / structured_outputs
-    let mut response_format: Option<Value> = None;
-    let text_echo = if let Some(text_val) = obj.get("text").filter(|v| !v.is_null()) {
-        let text_obj = text_val
-            .as_object()
-            .ok_or_else(|| ResponsesApiError::bad_request("'text' must be an object"))?;
-        if let Some(fmt_val) = text_obj.get("format").filter(|v| !v.is_null()) {
-            let fmt_obj = fmt_val
-                .as_object()
-                .ok_or_else(|| ResponsesApiError::bad_request("'text.format' must be an object"))?;
-            let fmt_type = fmt_obj.get("type").and_then(Value::as_str).ok_or_else(|| {
-                ResponsesApiError::bad_request("'text.format.type' must be a string")
-            })?;
-            match fmt_type {
-                "text" => {}
-                "json_object" => {
-                    response_format = Some(json!({"type": "json_object"}));
-                }
-                "json_schema" => {
-                    let schema = fmt_obj.get("schema").ok_or_else(|| {
-                        ResponsesApiError::bad_request(
-                            "text.format type 'json_schema' requires 'schema'",
-                        )
-                    })?;
-                    let name = fmt_obj
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("response_schema");
-                    response_format = Some(json!({
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": name,
-                            "strict": true,
-                            "schema": schema,
-                        }
-                    }));
-                }
-                other => {
-                    return Err(ResponsesApiError::bad_request(format!(
-                        "unsupported text.format.type '{other}'"
-                    )));
-                }
-            }
-            json!({"format": fmt_val})
-        } else {
-            json!({"format": {"type": "text"}})
-        }
-    } else {
-        json!({"format": {"type": "text"}})
-    };
+    let (enable_thinking, reasoning_echo, response_format, text_echo) =
+        parse_reasoning_and_text_config(obj)?;
 
     let max_output_tokens = match obj
         .get("max_output_tokens")
@@ -944,8 +949,31 @@ pub fn translate_responses_to_chat(
     if let Some(top_k) = obj.get("top_k").filter(|v| !v.is_null()) {
         chat_req.insert("top_k".into(), top_k.clone());
     }
-    if let Some(stop) = obj.get("stop").filter(|v| !v.is_null()) {
-        chat_req.insert("stop".into(), stop.clone());
+    for key in [
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "seed",
+        "stop",
+        "stop_token_ids",
+        "min_tokens",
+        "ignore_eos",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+    ] {
+        if let Some(val) = obj.get(key).filter(|v| !v.is_null()) {
+            chat_req.insert(key.into(), val.clone());
+        }
+    }
+    if chat_req
+        .get("top_logprobs")
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n > 0)
+        && !chat_req.contains_key("logprobs")
+    {
+        chat_req.insert("logprobs".into(), json!(true));
     }
     if !chat_tools.is_empty() {
         chat_req.insert("tools".into(), Value::Array(chat_tools));
@@ -953,13 +981,32 @@ pub fn translate_responses_to_chat(
     if let Some(tc) = chat_tool_choice {
         chat_req.insert("tool_choice".into(), tc);
     }
+    if let Some(so) = obj.get("structured_outputs").filter(|v| !v.is_null()) {
+        if response_format.is_some() {
+            return Err(ResponsesApiError::bad_request(
+                "cannot specify both structured_outputs and non-text text.format",
+            ));
+        }
+        chat_req.insert("structured_outputs".into(), so.clone());
+    }
     if let Some(rf) = response_format {
         chat_req.insert("response_format".into(), rf);
     }
+    let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
+        None => Map::new(),
+        Some(v) => v.as_object().cloned().ok_or_else(|| {
+            ResponsesApiError::bad_request("'chat_template_kwargs' must be an object")
+        })?,
+    };
     if let Some(thinking) = enable_thinking {
+        template_kwargs
+            .entry("enable_thinking")
+            .or_insert_with(|| json!(thinking));
+    }
+    if !template_kwargs.is_empty() {
         chat_req.insert(
             "chat_template_kwargs".into(),
-            json!({"enable_thinking": thinking}),
+            Value::Object(template_kwargs),
         );
     }
 
@@ -1618,339 +1665,4 @@ impl ResponsesSseFormatter {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parser::{ParsedFunctionCall, Qwen3Parser};
-    use crate::request_constraints::RequestConstraint;
-    use crate::tool_constraints::ToolChoice;
-
-    #[test]
-    fn translates_flat_tools_tool_choice_none_and_previous_response_chain() {
-        let store = ResponseStore::with_capacity(8);
-        let req1 = json!({
-            "model": "qwen-test",
-            "instructions": "Be concise.",
-            "input": "Read Cargo.toml",
-            "tools": [{
-                "type": "function",
-                "name": "read_file",
-                "description": "Read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]
-                }
-            }],
-            "tool_choice": "none",
-            "max_output_tokens": 128
-        });
-
-        let (chat1, meta1) =
-            translate_responses_to_chat(&req1, "qwen-test", &store, Some("tenant_a"), 1).unwrap();
-        assert!(!meta1.store);
-        assert!(meta1.response_id.starts_with("resp_") && meta1.response_id.len() == 37);
-        assert!(
-            translate_responses_to_chat(
-                &json!({"input": "hi", "store": true}),
-                "qwen-test",
-                &store,
-                None,
-                1
-            )
-            .is_err()
-        );
-        assert_eq!(
-            (
-                chat1["messages"][0]["role"].as_str(),
-                chat1["messages"][0]["content"].as_str(),
-                chat1["messages"][1]["role"].as_str(),
-                chat1["messages"][1]["content"].as_str(),
-                chat1["tool_choice"].as_str(),
-            ),
-            (
-                Some("system"),
-                Some("Be concise."),
-                Some("user"),
-                Some("Read Cargo.toml"),
-                Some("none"),
-            )
-        );
-
-        // Verify stateful tool_choice="none" bitmask constraint parses identically to Chat API
-        let constraint = RequestConstraint::parse(&chat1).unwrap().unwrap();
-        assert!(matches!(
-            constraint,
-            RequestConstraint::Tools {
-                choice: ToolChoice::None,
-                ..
-            }
-        ));
-
-        let turn1 = ParsedAssistantTurn {
-            reasoning_content: Some("Need to call read_file".into()),
-            content: None,
-            tool_calls: vec![ParsedToolCall {
-                id: "call_abc".into(),
-                call_type: "function".into(),
-                function: ParsedFunctionCall {
-                    name: "read_file".into(),
-                    arguments: "{\"path\":\"Cargo.toml\"}".into(),
-                },
-            }],
-        };
-        let (resp1, hist1) = build_response_object(&meta1, &turn1, "tool_calls", 50, 0, 20, 8);
-        assert_eq!(resp1["status"], "completed");
-        assert_eq!(resp1["output"].as_array().unwrap().len(), 2); // reasoning + function_call
-        assert_eq!(resp1["output"][1]["type"], "function_call");
-        assert_eq!(resp1["output"][1]["call_id"], "call_abc");
-
-        store.insert(StoredResponse {
-            id: meta1.response_id.clone(),
-            owner_scope: "tenant_a".into(),
-            response: resp1,
-            history_messages: hist1,
-        });
-        assert!(store.get_response(&meta1.response_id, "tenant_b").is_none());
-        // Flooding tenant_b up to and beyond store capacity must not evict tenant_a's sole entry.
-        for idx in 0..16 {
-            store.insert(StoredResponse {
-                id: format!("resp_flood_{idx}"),
-                owner_scope: "tenant_b".into(),
-                response: json!({"id": idx}),
-                history_messages: Vec::new(),
-            });
-        }
-        assert!(store.get_response(&meta1.response_id, "tenant_a").is_some());
-
-        // Turn 2 chains via previous_response_id with function_call_output
-        let req2 = json!({
-            "previous_response_id": meta1.response_id,
-            "input": [{
-                "type": "function_call_output",
-                "call_id": "call_abc",
-                "output": "[package]\nname = \"w34\""
-            }],
-            "reasoning": {"effort": "none"},
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "pkg",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"name": {"type": "string"}},
-                        "required": ["name"],
-                        "additionalProperties": false
-                    }
-                }
-            }
-        });
-        let (chat2, _meta2) =
-            translate_responses_to_chat(&req2, "qwen-test", &store, Some("tenant_a"), 2).unwrap();
-        assert!(
-            translate_responses_to_chat(&req2, "qwen-test", &store, Some("tenant_b"), 2).is_err()
-        );
-        assert!(translate_responses_to_chat(&req2, "qwen-test", &store, None, 2).is_err());
-        let msgs2 = chat2["messages"].as_array().unwrap();
-        assert_eq!(msgs2.len(), 4); // system, user, assistant(tool_calls), tool
-        assert_eq!(msgs2[2]["role"], "assistant");
-        assert_eq!(msgs2[3]["role"], "tool");
-        assert_eq!(chat2["chat_template_kwargs"]["enable_thinking"], false);
-        assert_eq!(chat2["response_format"]["type"], "json_schema");
-
-        // Unknown previous_response_id returns 404 NotFound
-        let bad_prev = json!({
-            "previous_response_id": "resp_missing",
-            "input": "hello"
-        });
-        let err = translate_responses_to_chat(&bad_prev, "qwen-test", &store, Some("tenant_a"), 3)
-            .unwrap_err();
-        assert_eq!(err.kind, ResponsesErrorKind::NotFound);
-    }
-
-    #[test]
-    fn sse_formatter_emits_monotonic_zero_indexed_sequence_numbers() {
-        let store = ResponseStore::default();
-        let req = json!({"input": "Solve 2+2 and call report"});
-        let (_, meta) = translate_responses_to_chat(&req, "qwen-test", &store, None, 7).unwrap();
-
-        let mut parser = Qwen3Parser::new(true);
-        let mut sse = ResponsesSseFormatter::new(meta);
-        let mut frames = sse.start();
-        for chunk in [
-            "2+2 is 4.</think>",
-            "Answer: 4.\n<tool_call>\n<function=report>\n<parameter=ans>\n4\n</parameter>\n</function>\n</tool_call>",
-            "\n",
-        ] {
-            let d = parser.push_str(chunk);
-            frames.extend(sse.push_delta(d));
-        }
-        let (tail, turn) = parser.finish();
-        frames.extend(sse.push_delta(tail));
-        let (end_frames, final_resp, _) = sse.finish(&turn, "tool_calls", 32, 16, 24, 6);
-        frames.extend(end_frames);
-        // Trailing "\n" after </tool_call> must not spawn a duplicate/empty message item.
-        assert_eq!(final_resp["output"].as_array().unwrap().len(), 3);
-        assert_eq!(
-            store.scope_for_credential(Some(b"Bearer secret-token")),
-            store.scope_for_credential(Some(b"secret-token"))
-        );
-
-        for (expected_seq, (ev_name, data)) in frames.iter().enumerate() {
-            assert_eq!(data["type"], ev_name.as_str());
-            assert_eq!(data["sequence_number"], expected_seq as u64);
-        }
-        assert_eq!(frames.first().unwrap().0, "response.created");
-        assert_eq!(frames[1].0, "response.in_progress");
-        assert_eq!(frames.last().unwrap().0, "response.completed");
-        assert_eq!(final_resp["output"].as_array().unwrap().len(), 3);
-        assert_eq!(
-            final_resp["usage"]["input_tokens_details"]["cached_tokens"],
-            16
-        );
-        assert_eq!(
-            final_resp["usage"]["output_tokens_details"]["reasoning_tokens"],
-            6
-        );
-    }
-
-    #[test]
-    fn response_store_cancellation_deletion_and_lru_limits() {
-        let store = ResponseStore::with_capacity(3);
-        let flag = Arc::new(AtomicBool::new(false));
-        store.register_active("resp_active_1".into(), "tenant_x".into(), flag.clone());
-
-        // Cancel with wrong scope returns None, flag unchanged
-        assert!(store.cancel("resp_active_1", "tenant_y").is_none());
-        assert!(!flag.load(Ordering::Acquire));
-
-        // Cancel with matching scope sets flag and returns cancelled response
-        let canc = store.cancel("resp_active_1", "tenant_x").unwrap();
-        assert_eq!(canc["status"], "cancelled");
-        assert!(flag.load(Ordering::Acquire));
-
-        // Delete active/nonexistent
-        assert!(!store.delete("resp_active_1", "tenant_x"));
-
-        // Store responses with in_progress status and test cancel
-        store.insert(StoredResponse {
-            id: "resp_prog".into(),
-            owner_scope: "tenant_x".into(),
-            response: json!({"id": "resp_prog", "status": "in_progress"}),
-            history_messages: vec![json!({"role": "user", "content": "hi"})],
-        });
-        let canc_stored = store.cancel("resp_prog", "tenant_x").unwrap();
-        assert_eq!(canc_stored["status"], "cancelled");
-
-        // Delete stored response
-        assert!(store.delete("resp_prog", "tenant_x"));
-        assert!(!store.delete("resp_prog", "tenant_x"));
-
-        // LRU eviction when hitting capacity: insert 4 items
-        for i in 1..=4 {
-            store.insert(StoredResponse {
-                id: format!("resp_lru_{i}"),
-                owner_scope: "tenant_x".into(),
-                response: json!({"id": format!("resp_lru_{i}"), "status": "completed"}),
-                history_messages: Vec::new(),
-            });
-        }
-        // First item (resp_lru_1) should have been evicted
-        assert!(store.get_response("resp_lru_1", "tenant_x").is_none());
-        assert!(store.get_response("resp_lru_4", "tenant_x").is_some());
-    }
-
-    #[test]
-    fn responses_api_error_helpers_and_id_uniqueness() {
-        let e1 = ResponsesApiError::bad_request("invalid field");
-        let j1 = e1.to_openai_json();
-        assert_eq!(j1["error"]["type"], "invalid_request_error");
-        assert_eq!(j1["error"]["message"], "invalid field");
-
-        let e2 = ResponsesApiError::not_found("not found id");
-        let j2 = e2.to_openai_json();
-        assert_eq!(j2["error"]["type"], "not_found_error");
-
-        let mut ids = std::collections::HashSet::new();
-        for i in 0..20 {
-            let id = generate_unguessable_response_id(i);
-            assert!(id.starts_with("resp_"));
-            assert_eq!(id.len(), 37);
-            assert!(ids.insert(id));
-        }
-    }
-
-    #[test]
-    fn validates_all_responses_bad_request_paths() {
-        let store = ResponseStore::default();
-        let bad_cases = [
-            json!([]),
-            json!({"model": "q"}),
-            json!({"input": []}),
-            json!({"input": [123]}),
-            json!({"input": [{"type": "message", "content": "hi"}]}),
-            json!({"input": [{"type": "message", "role": "user"}]}),
-            json!({"input": [{"type": "message", "role": "admin", "content": "hi"}]}),
-            json!({"input": [{"type": "message", "role": "user", "content": [123]}]}),
-            json!({"input": [{"type": "message", "role": "user", "content": [{"type": "text"}]}]}),
-            json!({"input": [{"type": "message", "role": "user", "content": [{"type": "input_image"}]}]}),
-            json!({"input": [{"type": "message", "role": "system", "content": [{"type": "input_image", "image_url": "https://a.png"}]}]}),
-            json!({"input": [{"type": "message", "role": "user", "content": [{"type": "video"}]}]}),
-            json!({"input": [{"type": "function_call", "arguments": "{}"}]}),
-            json!({"input": [{"type": "function_call", "name": "foo"}]}),
-            json!({"input": [{"type": "function_call", "name": "foo", "arguments": "not json"}]}),
-            json!({"input": [{"type": "function_call_output"}]}),
-            json!({"input": [{"type": "unsupported"}]}),
-            json!({"input": "hi", "tools": "tools"}),
-            json!({"input": "hi", "tools": [1]}),
-            json!({"input": "hi", "tools": [{"type": "code_interpreter"}]}),
-            json!({"input": "hi", "tool_choice": "maybe"}),
-            json!({"input": "hi", "tool_choice": {"type": "function"}}),
-            json!({"input": "hi", "reasoning": {"effort": "extreme"}}),
-            json!({"input": "hi", "text": {"format": "yaml"}}),
-            json!({"input": "hi", "temperature": "high"}),
-            json!({"input": "hi", "top_p": "high"}),
-            json!({"input": "hi", "max_output_tokens": 0}),
-        ];
-        for case in &bad_cases {
-            assert!(
-                translate_responses_to_chat(case, "q", &store, None, 1).is_err(),
-                "expected bad-request error for payload: {case}"
-            );
-        }
-    }
-
-    #[test]
-    fn responses_sse_fail_and_incomplete_lifecycle() {
-        let store = ResponseStore::default();
-        let req = json!({"input": "stream test"});
-        let (_, meta) = translate_responses_to_chat(&req, "qwen", &store, None, 1).unwrap();
-
-        // Failure event
-        let mut sse1 = ResponsesSseFormatter::new(meta.clone());
-        let _ = sse1.start();
-        let fail_events = sse1.fail("pipeline broken");
-        assert_eq!(fail_events.len(), 1);
-        assert_eq!(fail_events[0].0, "response.failed");
-        assert_eq!(fail_events[0].1["response"]["status"], "failed");
-        assert_eq!(
-            fail_events[0].1["response"]["error"]["message"],
-            "pipeline broken"
-        );
-
-        // Incomplete event due to length limit
-        let mut sse2 = ResponsesSseFormatter::new(meta);
-        let _ = sse2.start();
-        let turn = ParsedAssistantTurn {
-            reasoning_content: None,
-            content: Some("cut off midway".into()),
-            tool_calls: Vec::new(),
-        };
-        let (events, final_resp, _) = sse2.finish(&turn, "length", 10, 0, 5, 0);
-        assert_eq!(events.last().unwrap().0, "response.incomplete");
-        assert_eq!(final_resp["status"], "incomplete");
-        assert_eq!(
-            final_resp["incomplete_details"]["reason"],
-            "max_output_tokens"
-        );
-    }
-}
+mod tests;

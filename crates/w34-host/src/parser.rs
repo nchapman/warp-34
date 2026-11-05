@@ -76,7 +76,7 @@ impl SamplingParams {
 
     pub fn validate(&self) -> Result<(), String> {
         if !self.temperature.is_finite()
-            || self.temperature < 0.0
+            || !(0.0..=2.0).contains(&self.temperature)
             || self.top_k < -1
             || !self.top_p.is_finite()
             || self.top_p <= 0.0
@@ -86,7 +86,9 @@ impl SamplingParams {
             || !self.repetition_penalty.is_finite()
             || self.repetition_penalty <= 0.0
             || !self.frequency_penalty.is_finite()
+            || !(-2.0..=2.0).contains(&self.frequency_penalty)
             || !self.presence_penalty.is_finite()
+            || !(-2.0..=2.0).contains(&self.presence_penalty)
             || self.top_logprobs > w34_kernels::ffi::W34_MAX_TOP_LOGPROBS
         {
             return Err("invalid sampling parameters".into());

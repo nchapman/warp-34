@@ -333,6 +333,28 @@ pub fn native_sampling_params(
     Ok(params)
 }
 
+/// Resolves `enable_thinking` for chat requests from `chat_template_kwargs.enable_thinking`
+/// and top-level `reasoning_effort` (`vLLM` `ChatCompletionRequest.build_chat_params` parity).
+pub fn resolve_chat_enable_thinking(req: &serde_json::Value) -> Result<bool, String> {
+    let effort_thinking = match req.get("reasoning_effort").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => match v.as_str().ok_or("reasoning_effort must be a string")? {
+            "none" | "minimal" => Some(false),
+            "low" | "medium" | "high" | "xhigh" | "max" => Some(true),
+            other => return Err(format!("unsupported reasoning_effort '{other}'")),
+        },
+    };
+    if let Some(kw) = req
+        .pointer("/chat_template_kwargs/enable_thinking")
+        .filter(|v| !v.is_null())
+    {
+        return kw
+            .as_bool()
+            .ok_or_else(|| "invalid chat_template_kwargs.enable_thinking".into());
+    }
+    Ok(effort_thinking.unwrap_or(true))
+}
+
 pub fn parse_openai_messages_multimodal(
     messages: &serde_json::Value,
 ) -> Result<(Vec<ChatMessage>, Vec<crate::vision::PreprocessedImage>), String> {
@@ -363,13 +385,15 @@ pub fn parse_openai_messages_with_image_policy(
     let mut out = Vec::with_capacity(arr.len());
     let mut images = Vec::new();
     for (index, item) in arr.iter().enumerate() {
-        let role = item
+        let raw_role = item
             .get("role")
             .and_then(|v| v.as_str())
             .ok_or("message missing string 'role'")?;
-        if !matches!(role, "system" | "user" | "assistant" | "tool") {
-            return Err(format!("unsupported message role '{role}'"));
-        }
+        let role = match raw_role {
+            "system" | "developer" => "system",
+            "user" | "assistant" | "tool" => raw_role,
+            other => return Err(format!("unsupported message role '{other}'")),
+        };
         if role == "system" && index != 0 {
             return Err("system message must be at the beginning".into());
         }
@@ -379,6 +403,7 @@ pub fn parse_openai_messages_with_image_policy(
         }
         let reasoning_content = item
             .get("reasoning_content")
+            .or_else(|| item.get("reasoning"))
             .and_then(|v| v.as_str())
             .map(str::to_owned);
         let content = match item.get("content") {
@@ -527,6 +552,45 @@ mod tests {
         assert_eq!(params.temperature, 0.8);
         assert_eq!(params.top_p, 0.95);
         assert_eq!(params.seed, 42);
+    }
+
+    #[test]
+    fn test_resolve_chat_enable_thinking_and_developer_role() {
+        assert!(resolve_chat_enable_thinking(&serde_json::json!({})).unwrap());
+        assert!(
+            !resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "none"}))
+                .unwrap()
+        );
+        assert!(
+            !resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "minimal"}))
+                .unwrap()
+        );
+        for eff in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(
+                resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": eff}))
+                    .unwrap()
+            );
+        }
+        assert!(
+            resolve_chat_enable_thinking(&serde_json::json!({
+                "reasoning_effort": "none",
+                "chat_template_kwargs": {"enable_thinking": true}
+            }))
+            .unwrap()
+        );
+        assert!(
+            resolve_chat_enable_thinking(&serde_json::json!({"reasoning_effort": "bogus"}))
+                .is_err()
+        );
+
+        let (msgs, _) = parse_openai_messages_multimodal(&serde_json::json!([
+            {"role": "developer", "content": "Be strict."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello", "reasoning": "thought"}
+        ]))
+        .unwrap();
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[2].reasoning_content.as_deref(), Some("thought"));
     }
 
     #[test]

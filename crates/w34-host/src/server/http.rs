@@ -428,11 +428,11 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
     {
         return Err("stop_token_ids/logit_bias token outside model vocabulary".into());
     }
-    let thinking = chat
-        && request
-            .pointer("/chat_template_kwargs/enable_thinking")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+    let thinking = if chat {
+        super::resolve_chat_enable_thinking(&request)?
+    } else {
+        false
+    };
     params.enable_thinking = thinking;
     let (prompt, images) = if chat {
         let (messages, images) = super::parse_openai_messages_with_image_policy(
@@ -860,6 +860,7 @@ async fn chat_input_tokens(
     if let Some(obj) = body.as_object_mut() {
         obj.remove("max_tokens");
         obj.remove("max_completion_tokens");
+        obj.remove("min_tokens");
     }
     let prep_state = s.clone();
     let count = cpu(&s, move || {
@@ -897,6 +898,7 @@ async fn responses_input_tokens(
     if let Some(obj) = body.as_object_mut() {
         obj.remove("max_output_tokens");
         obj.remove("max_tokens");
+        obj.remove("min_tokens");
     }
     let (chat_req, _) = crate::responses_api::translate_responses_to_chat(
         &body,
@@ -932,6 +934,7 @@ async fn anthropic_count_tokens(
             .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     if let Some(obj) = chat_req.as_object_mut() {
         obj.insert("max_tokens".into(), json!(256));
+        obj.remove("min_tokens");
     }
     let prep_state = s.clone();
     let count = cpu(&s, move || {

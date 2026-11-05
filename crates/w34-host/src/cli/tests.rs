@@ -221,6 +221,25 @@ fn hub_options_default_and_parse_independently() {
     assert!(options.offline);
     let target_only = parse(&["generate", "--revision", "target-commit"]);
     assert!(target_only.draft_revision.is_none());
+
+    let aliased = parse(&[
+        "serve",
+        "--model-path",
+        "org/aliased",
+        "--tensor-parallel-size",
+        "4",
+        "--kv-cache-dtype",
+        "bf16",
+        "--enforce-eager",
+    ]);
+    assert_eq!(aliased.model, "org/aliased");
+    assert_eq!(aliased.tp, 4);
+    assert_eq!(aliased.kv_format, "bf16");
+    assert!(!aliased.use_cuda_graph);
+
+    let sglang_aliased = parse(&["serve", "--tp-size", "2", "--disable-cuda-graph"]);
+    assert_eq!(sglang_aliased.tp, 2);
+    assert!(!sglang_aliased.use_cuda_graph);
 }
 
 #[test]

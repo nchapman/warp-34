@@ -650,12 +650,29 @@ pub fn translate_anthropic_to_chat(
         enable_thinking = Some(false);
     }
 
-    // output_config.format -> response_format
+    // output_config.effort & output_config.format -> response_format
     let mut response_format: Option<Value> = None;
     if let Some(oc_val) = obj.get("output_config").filter(|v| !v.is_null()) {
         let oc_obj = oc_val
             .as_object()
             .ok_or_else(|| AnthropicApiError::bad_request("'output_config' must be an object"))?;
+        if let Some(effort_val) = oc_obj.get("effort").filter(|v| !v.is_null()) {
+            let eff = effort_val.as_str().ok_or_else(|| {
+                AnthropicApiError::bad_request("'output_config.effort' must be a string")
+            })?;
+            match eff {
+                "low" | "medium" | "high" | "xhigh" | "max" => {
+                    if enable_thinking.is_none() && !is_forced_tool_choice {
+                        enable_thinking = Some(true);
+                    }
+                }
+                _ => {
+                    return Err(AnthropicApiError::bad_request(format!(
+                        "unsupported output_config.effort '{eff}'"
+                    )));
+                }
+            }
+        }
         if let Some(fmt_val) = oc_obj.get("format").filter(|v| !v.is_null()) {
             let fmt_obj = fmt_val.as_object().ok_or_else(|| {
                 AnthropicApiError::bad_request("'output_config.format' must be an object")
@@ -709,6 +726,20 @@ pub fn translate_anthropic_to_chat(
     if let Some(stops) = obj.get("stop_sequences").filter(|v| !v.is_null()) {
         chat_req.insert("stop".into(), stops.clone());
     }
+    for key in [
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "seed",
+        "stop_token_ids",
+        "min_tokens",
+        "ignore_eos",
+    ] {
+        if let Some(val) = obj.get(key).filter(|v| !v.is_null()) {
+            chat_req.insert(key.into(), val.clone());
+        }
+    }
     if !chat_tools.is_empty() {
         chat_req.insert("tools".into(), Value::Array(chat_tools));
     }
@@ -718,10 +749,19 @@ pub fn translate_anthropic_to_chat(
     if let Some(rf) = response_format {
         chat_req.insert("response_format".into(), rf);
     }
+    let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
+        None => Map::new(),
+        Some(v) => v.as_object().cloned().ok_or_else(|| {
+            AnthropicApiError::bad_request("'chat_template_kwargs' must be an object")
+        })?,
+    };
     if let Some(thinking) = enable_thinking {
+        template_kwargs.insert("enable_thinking".into(), json!(thinking));
+    }
+    if !template_kwargs.is_empty() {
         chat_req.insert(
             "chat_template_kwargs".into(),
-            json!({"enable_thinking": thinking}),
+            Value::Object(template_kwargs),
         );
     }
 
@@ -1397,6 +1437,8 @@ mod tests {
             json!({"thinking": "enabled", "messages": [{"role": "user", "content": "hi"}]}),
             json!({"thinking": {"type": "magic"}, "messages": [{"role": "user", "content": "hi"}]}),
             json!({"thinking": {"type": "enabled"}, "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"output_config": {"effort": "invalid"}, "messages": [{"role": "user", "content": "hi"}]}),
+            json!({"chat_template_kwargs": "bad", "messages": [{"role": "user", "content": "hi"}]}),
         ];
         for case in &bad_cases {
             assert!(
@@ -1404,5 +1446,24 @@ mod tests {
                 "expected bad-request error for payload: {case}"
             );
         }
+        let (chat, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"effort": "high"},
+                "seed": 99,
+                "presence_penalty": 0.25,
+                "chat_template_kwargs": {"preserve_thinking": true}
+            }),
+            "q",
+            1,
+            true,
+        )
+        .unwrap();
+        assert_eq!(chat["seed"], 99);
+        assert_eq!(chat["presence_penalty"], 0.25);
+        assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(chat["chat_template_kwargs"]["preserve_thinking"], true);
     }
 }
