@@ -789,7 +789,7 @@ impl Qwen3_5ModelRank {
             LayerBlockWeights::FullAttention(fa) => {
                 let [qkv, q, k, gate, out, gated] = s.attention;
                 let qh = self.cfg.num_attention_heads / self.tp_size;
-                let kh = self.cfg.num_key_value_heads / self.tp_size;
+                let kh = self.cfg.local_kv_heads(self.tp_size);
                 let hd = self.cfg.head_dim;
                 let qgd = qh * hd * 2;
                 let kd = kh * hd;

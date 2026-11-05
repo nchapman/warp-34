@@ -446,8 +446,34 @@ mod host_store {
             ep_size: usize,
             max_pinned_bytes: usize,
         ) -> Result<Self> {
+            Self::load_with_pin(
+                archive,
+                experts_prefix,
+                quant,
+                layout,
+                num_experts,
+                ep_rank,
+                ep_size,
+                max_pinned_bytes,
+                true,
+            )
+        }
+
+        /// Load only this EP rank's experts, optionally using mapped pinned RAM (`prefer_mapped`).
+        #[allow(clippy::too_many_arguments)]
+        pub fn load_with_pin(
+            archive: &SafetensorsArchive,
+            experts_prefix: &str,
+            quant: &QuantScheme,
+            layout: ExpertPackLayout,
+            num_experts: usize,
+            ep_rank: usize,
+            ep_size: usize,
+            max_pinned_bytes: usize,
+            prefer_mapped: bool,
+        ) -> Result<Self> {
             require(
-                matches!(ep_size, 1 | 2)
+                matches!(ep_size, 1 | 2 | 4)
                     && ep_rank < ep_size
                     && num_experts > 0
                     && num_experts.is_multiple_of(ep_size),
@@ -477,7 +503,7 @@ mod host_store {
                 format!("expert store needs {bytes} pinned bytes, budget is {max_pinned_bytes}"),
             )?;
             let expert_ids = ep_rank * count..(ep_rank + 1) * count;
-            let mut storage = HostPackStorage::alloc(bytes, true)?;
+            let mut storage = HostPackStorage::alloc(bytes, prefer_mapped)?;
             let dst = storage.as_mut_slice();
             dst.fill(0);
 
@@ -716,6 +742,11 @@ mod host_store {
             self.storage.as_slice().as_ptr()
         }
 
+        /// Releases the host backing buffer once all local experts are permanently resident in VRAM.
+        pub fn release_host_storage(&mut self) {
+            self.storage = std::sync::Arc::new(HostPackStorage::Heap(Vec::new()));
+        }
+
         /// Read-only bytes, also suitable as a source for a synchronized H2D copy.
         pub fn expert_pack(&self, global_id: usize) -> Option<&[u8]> {
             if !self.expert_ids.contains(&global_id) {
@@ -723,6 +754,9 @@ mod host_store {
             }
             let offset = (global_id - self.expert_ids.start) * self.layout.stride;
             let slice = self.storage.as_slice();
+            if offset.saturating_add(self.layout.stride) > slice.len() {
+                return None;
+            }
             Some(&slice[offset..offset + self.layout.stride])
         }
 
@@ -1489,6 +1523,37 @@ mod host_store {
             }
             let k_hot = cache.slots.capacity;
             let ex = compute_stream.exec(ws.d_scratch.addr(), ws.d_scratch.len_bytes);
+            if k_hot >= cache.expert_ids.len() {
+                let total_pairs = num_tokens * top_k;
+                crate::cuda::check_rc(
+                    // SAFETY: `d_topk_ids_addr`, `d_expert_to_slot`, and `d_remapped_topk_ids[0]` are
+                    // live device buffers sized for `total_pairs` and `cache.expert_ids.len()`.
+                    unsafe {
+                        w34_kernels::ffi::w34_moe_remap_topk_ids_i32(
+                            &ex,
+                            d_topk_ids_addr as *const i32,
+                            cache.d_expert_to_slot.addr() as *const i32,
+                            ws.d_remapped_topk_ids[0].addr() as *mut i32,
+                            total_pairs as i32,
+                            cache.expert_ids.start as i32,
+                            cache.expert_ids.len() as i32,
+                        )
+                    },
+                    "w34_moe_remap_topk_ids_i32",
+                )?;
+                return cache.slots.launch_moe_w4a16(
+                    &ex,
+                    x_addr,
+                    ws.d_remapped_topk_ids[0].addr(),
+                    d_topk_weights_addr,
+                    shared_expert_out_addr,
+                    shared_expert_gate_addr,
+                    ws.d_interm_buf.addr(),
+                    out_addr,
+                    num_tokens,
+                    top_k,
+                );
+            }
             if let Some(layer_id) = cache.bridge_layer_id
                 && num_tokens <= 4
                 && top_k <= 16
@@ -2381,9 +2446,11 @@ mod host_store {
             let mut stores = Vec::with_capacity(cfg.num_hidden_layers);
             let mut caches = Vec::with_capacity(cfg.num_hidden_layers);
             let mut bridge_runtime = None;
+            let local_experts = cfg.num_experts / ep_size.max(1);
+            let fully_resident = k_hot >= local_experts;
             for layer_id in 0..cfg.num_hidden_layers {
                 let prefix = format!("model.layers.{layer_id}.mlp.experts");
-                let store = HostExpertStore::load(
+                let mut store = HostExpertStore::load_with_pin(
                     archive,
                     &prefix,
                     &cfg.quant,
@@ -2392,6 +2459,7 @@ mod host_store {
                     ep_rank,
                     ep_size,
                     usize::MAX,
+                    !fully_resident,
                 )
                 .map_err(|e| {
                     crate::cuda::CudaError::with_detail(-1, "HostExpertStore::load", e.to_string())
@@ -2402,7 +2470,10 @@ mod host_store {
                     .as_ref()
                     .and_then(|r| r.select_for_layer(layer_id, store.expert_ids(), k_hot));
                 cache.populate_initial(&store, initial.as_deref(), &mut ws, stream)?;
-                if ep_size == 1
+                if fully_resident {
+                    stream.synchronize()?;
+                    store.release_host_storage();
+                } else if ep_size == 1
                     && k_hot >= 16
                     && cfg.num_hidden_layers <= 60
                     && group_size == 128
@@ -2430,6 +2501,12 @@ mod host_store {
             self.stores
                 .get(layer_idx)
                 .is_some_and(|s| s.mapped_dev_ptr() != 0)
+        }
+
+        pub fn layer_is_fully_resident(&self, layer_idx: usize) -> bool {
+            self.caches
+                .get(layer_idx)
+                .is_some_and(|c| c.slots.capacity >= c.expert_ids.len())
         }
 
         pub fn layer_hot_k(&self, layer_idx: usize) -> usize {

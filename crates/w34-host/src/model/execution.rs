@@ -282,9 +282,7 @@ impl Qwen3_5Engine {
             Ok((greedy_id[0], top5_ids, top5_lps))
         } else {
             let comm = self.tp2_comm.as_ref().unwrap().clone();
-            let [r0, r1] = &mut self.ranks[..] else {
-                unreachable!()
-            };
+            let (r0, peer_ranks) = self.ranks.split_first_mut().unwrap();
             let mut dump0 = if dump_out.is_some() {
                 Some(ForwardDump::default())
             } else {
@@ -292,7 +290,7 @@ impl Qwen3_5Engine {
             };
             let pos_slice = pos_host;
             let slots_slice = write_slots.as_slice();
-            let (res0, res1) = std::thread::scope(|sc| {
+            let (res0, peer_results) = std::thread::scope(|sc| {
                 let c0 = comm.clone();
                 let d0_ref = &mut dump0;
                 let h0 = sc.spawn(move || -> Result<(i32, f32, [i32; 5], [f32; 5])> {
@@ -398,118 +396,137 @@ impl Qwen3_5Engine {
                     Ok((greedy_id[0], local_max[0], top5_ids, top5_lps))
                 });
 
-                let c1 = comm.clone();
-                let h1 = sc.spawn(move || -> Result<(f32, [i32; 5], [f32; 5])> {
-                    r1.device.make_current()?;
-                    r1.stage_ple_f8_for_batch(
-                        tokens,
-                        &q_start,
-                        &st_in_arr,
-                        &st_out_arr,
-                        &has_init_arr,
-                        &[],
-                        0,
-                        &[],
-                        &[],
-                        0,
-                    )?;
-                    let tok_dev = DeviceBuffer::alloc(r1.device.device_id, num_tokens * 4)?;
-                    let pos_dev = DeviceBuffer::alloc(r1.device.device_id, pos_slice.len() * 4)?;
-                    let q_start_dev = DeviceBuffer::alloc(r1.device.device_id, 8)?;
-                    let ctx_dev = DeviceBuffer::alloc(r1.device.device_id, 4)?;
-                    let seq_dev = DeviceBuffer::alloc(r1.device.device_id, 4)?;
-                    let blk_dev = DeviceBuffer::alloc(r1.device.device_id, block_table.len() * 4)?;
-                    let slot_dev = DeviceBuffer::alloc(r1.device.device_id, num_tokens * 4)?;
-                    let st_in_dev = DeviceBuffer::alloc(r1.device.device_id, 4)?;
-                    let st_out_dev = DeviceBuffer::alloc(r1.device.device_id, 4)?;
-                    let has_init_dev = DeviceBuffer::alloc(r1.device.device_id, 4)?;
+                let mut peer_handles = Vec::with_capacity(peer_ranks.len());
+                for r_peer in peer_ranks {
+                    let cp = comm.clone();
+                    peer_handles.push(sc.spawn(move || -> Result<(f32, [i32; 5], [f32; 5])> {
+                        r_peer.device.make_current()?;
+                        r_peer.stage_ple_f8_for_batch(
+                            tokens,
+                            &q_start,
+                            &st_in_arr,
+                            &st_out_arr,
+                            &has_init_arr,
+                            &[],
+                            0,
+                            &[],
+                            &[],
+                            0,
+                        )?;
+                        let tok_dev = DeviceBuffer::alloc(r_peer.device.device_id, num_tokens * 4)?;
+                        let pos_dev =
+                            DeviceBuffer::alloc(r_peer.device.device_id, pos_slice.len() * 4)?;
+                        let q_start_dev = DeviceBuffer::alloc(r_peer.device.device_id, 8)?;
+                        let ctx_dev = DeviceBuffer::alloc(r_peer.device.device_id, 4)?;
+                        let seq_dev = DeviceBuffer::alloc(r_peer.device.device_id, 4)?;
+                        let blk_dev =
+                            DeviceBuffer::alloc(r_peer.device.device_id, block_table.len() * 4)?;
+                        let slot_dev =
+                            DeviceBuffer::alloc(r_peer.device.device_id, num_tokens * 4)?;
+                        let st_in_dev = DeviceBuffer::alloc(r_peer.device.device_id, 4)?;
+                        let st_out_dev = DeviceBuffer::alloc(r_peer.device.device_id, 4)?;
+                        let has_init_dev = DeviceBuffer::alloc(r_peer.device.device_id, 4)?;
 
-                    tok_dev.copy_from_host(tokens, &r1.stream)?;
-                    pos_dev.copy_from_host(pos_slice, &r1.stream)?;
-                    q_start_dev.copy_from_host(&q_start, &r1.stream)?;
-                    ctx_dev.copy_from_host(&ctx_arr, &r1.stream)?;
-                    seq_dev.copy_from_host(&seq_arr, &r1.stream)?;
-                    blk_dev.copy_from_host(block_table, &r1.stream)?;
-                    slot_dev.copy_from_host(slots_slice, &r1.stream)?;
-                    st_in_dev.copy_from_host(&st_in_arr, &r1.stream)?;
-                    st_out_dev.copy_from_host(&st_out_arr, &r1.stream)?;
-                    has_init_dev.copy_from_host(&has_init_arr, &r1.stream)?;
+                        tok_dev.copy_from_host(tokens, &r_peer.stream)?;
+                        pos_dev.copy_from_host(pos_slice, &r_peer.stream)?;
+                        q_start_dev.copy_from_host(&q_start, &r_peer.stream)?;
+                        ctx_dev.copy_from_host(&ctx_arr, &r_peer.stream)?;
+                        seq_dev.copy_from_host(&seq_arr, &r_peer.stream)?;
+                        blk_dev.copy_from_host(block_table, &r_peer.stream)?;
+                        slot_dev.copy_from_host(slots_slice, &r_peer.stream)?;
+                        st_in_dev.copy_from_host(&st_in_arr, &r_peer.stream)?;
+                        st_out_dev.copy_from_host(&st_out_arr, &r_peer.stream)?;
+                        has_init_dev.copy_from_host(&has_init_arr, &r_peer.stream)?;
 
-                    let attn_batch = W34AttentionBatch {
-                        query_start_loc: q_start_dev.addr() as *const i32,
-                        context_lens_before: ctx_dev.addr() as *const i32,
-                        seq_lens_after: seq_dev.addr() as *const i32,
-                        block_tables: blk_dev.addr() as *const i32,
-                        write_slot_mapping: slot_dev.addr() as *const i32,
-                        valid_token_mask: core::ptr::null(),
-                        valid_req_mask: core::ptr::null(),
-                        num_reqs: 1,
-                        total_tokens: num_tokens as i32,
-                        max_blocks_per_req: block_table.len() as i32,
-                        max_q_len: num_tokens as i32,
-                        max_seq_len: seq_after as i32,
-                        mask_mode: W34_ATTN_MASK_CAUSAL,
-                        sliding_window: 0,
-                        sm_scale: (r1.cfg.head_dim as f32).powf(-0.5),
-                        reserved: 0,
-                    };
-                    let gdn_batch = W34GdnBatch {
-                        query_start_loc: q_start_dev.addr() as *const i32,
-                        state_in_indices: st_in_dev.addr() as *const i32,
-                        state_out_indices: st_out_dev.addr() as *const i32,
-                        spec_state_indices: core::ptr::null(),
-                        checkpoint_dst_indices: core::ptr::null(),
-                        checkpoint_token_offsets: core::ptr::null(),
-                        has_initial_state: has_init_dev.addr() as *const u8,
-                        valid_req_mask: core::ptr::null(),
-                        num_reqs: 1,
-                        total_tokens: num_tokens as i32,
-                        max_verify_tokens: 0,
-                        max_checkpoints_per_req: 0,
-                    };
-                    let out_id_ptr = r1.decode_io.out_greedy_id.addr();
-                    let top5_id_ptr = r1.decode_io.out_top5_ids.addr();
-                    let top5_lp_ptr = r1.decode_io.out_top5_logprobs.addr();
-                    r1.forward_device_batches(
-                        tok_dev.addr(),
-                        pos_dev.addr(),
-                        num_tokens,
-                        &attn_batch,
-                        &gdn_batch,
-                        Some(&c1),
-                        out_id_ptr,
-                        top5_id_ptr,
-                        top5_lp_ptr,
-                        None,
-                    )?;
-                    let mut local_max = [0.0f32; 1];
-                    let mut top5_ids = [0i32; 5];
-                    let mut top5_lps = [0.0f32; 5];
-                    r1.decode_io
-                        .local_max_val
-                        .copy_to_host(&mut local_max, &r1.stream)?;
-                    r1.decode_io
-                        .out_top5_ids
-                        .copy_to_host(&mut top5_ids, &r1.stream)?;
-                    r1.decode_io
-                        .out_top5_logprobs
-                        .copy_to_host(&mut top5_lps, &r1.stream)?;
-                    r1.stream.synchronize()?;
-                    Ok((local_max[0], top5_ids, top5_lps))
-                });
-                (h0.join().unwrap(), h1.join().unwrap())
+                        let attn_batch = W34AttentionBatch {
+                            query_start_loc: q_start_dev.addr() as *const i32,
+                            context_lens_before: ctx_dev.addr() as *const i32,
+                            seq_lens_after: seq_dev.addr() as *const i32,
+                            block_tables: blk_dev.addr() as *const i32,
+                            write_slot_mapping: slot_dev.addr() as *const i32,
+                            valid_token_mask: core::ptr::null(),
+                            valid_req_mask: core::ptr::null(),
+                            num_reqs: 1,
+                            total_tokens: num_tokens as i32,
+                            max_blocks_per_req: block_table.len() as i32,
+                            max_q_len: num_tokens as i32,
+                            max_seq_len: seq_after as i32,
+                            mask_mode: W34_ATTN_MASK_CAUSAL,
+                            sliding_window: 0,
+                            sm_scale: (r_peer.cfg.head_dim as f32).powf(-0.5),
+                            reserved: 0,
+                        };
+                        let gdn_batch = W34GdnBatch {
+                            query_start_loc: q_start_dev.addr() as *const i32,
+                            state_in_indices: st_in_dev.addr() as *const i32,
+                            state_out_indices: st_out_dev.addr() as *const i32,
+                            spec_state_indices: core::ptr::null(),
+                            checkpoint_dst_indices: core::ptr::null(),
+                            checkpoint_token_offsets: core::ptr::null(),
+                            has_initial_state: has_init_dev.addr() as *const u8,
+                            valid_req_mask: core::ptr::null(),
+                            num_reqs: 1,
+                            total_tokens: num_tokens as i32,
+                            max_verify_tokens: 0,
+                            max_checkpoints_per_req: 0,
+                        };
+                        let out_id_ptr = r_peer.decode_io.out_greedy_id.addr();
+                        let top5_id_ptr = r_peer.decode_io.out_top5_ids.addr();
+                        let top5_lp_ptr = r_peer.decode_io.out_top5_logprobs.addr();
+                        r_peer.forward_device_batches(
+                            tok_dev.addr(),
+                            pos_dev.addr(),
+                            num_tokens,
+                            &attn_batch,
+                            &gdn_batch,
+                            Some(&cp),
+                            out_id_ptr,
+                            top5_id_ptr,
+                            top5_lp_ptr,
+                            None,
+                        )?;
+                        let mut local_max = [0.0f32; 1];
+                        let mut top5_ids = [0i32; 5];
+                        let mut top5_lps = [0.0f32; 5];
+                        r_peer
+                            .decode_io
+                            .local_max_val
+                            .copy_to_host(&mut local_max, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .out_top5_ids
+                            .copy_to_host(&mut top5_ids, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .out_top5_logprobs
+                            .copy_to_host(&mut top5_lps, &r_peer.stream)?;
+                        r_peer.stream.synchronize()?;
+                        Ok((local_max[0], top5_ids, top5_lps))
+                    }));
+                }
+
+                let mut peers = Vec::with_capacity(peer_handles.len());
+                for hp in peer_handles {
+                    peers.push(hp.join().unwrap());
+                }
+                (h0.join().unwrap(), peers)
             });
             let (gid, max0, ids0, lps0) = res0?;
-            let (max1, ids1, lps1) = res1?;
-            // Reconstruct exact global log-sum-exp across both shards and merge top-5
-            let log_z0 = max0 - lps0[0];
-            let log_z1 = max1 - lps1[0];
-            let m_z = log_z0.max(log_z1);
-            let log_z_global = m_z + ((log_z0 - m_z).exp() + (log_z1 - m_z).exp()).ln();
-            let mut cands = [(0.0f32, 0i32); 10];
-            for k in 0..5 {
-                cands[k] = (lps0[k] + log_z0 - log_z_global, ids0[k]);
-                cands[5 + k] = (lps1[k] + log_z1 - log_z_global, ids1[k]);
+            let mut all_shards = Vec::with_capacity(1 + peer_results.len());
+            all_shards.push((max0, ids0, lps0));
+            for pr in peer_results {
+                all_shards.push(pr?);
+            }
+            // Reconstruct exact global log-sum-exp across all shards and merge top-5
+            let log_zs: Vec<f32> = all_shards.iter().map(|(m, _, lps)| *m - lps[0]).collect();
+            let m_z = log_zs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f32 = log_zs.iter().map(|&lz| (lz - m_z).exp()).sum();
+            let log_z_global = m_z + sum_exp.ln();
+            let mut cands = Vec::with_capacity(all_shards.len() * 5);
+            for ((_, ids, lps), &lz) in all_shards.iter().zip(&log_zs) {
+                for k in 0..5 {
+                    cands.push((lps[k] + lz - log_z_global, ids[k]));
+                }
             }
             cands.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
             let mut top5_ids = [0i32; 5];
@@ -667,21 +684,15 @@ impl Qwen3_5Engine {
                     .ranks
                     .iter()
                     .all(|r| r.supports_cuda_graph_for_tokens(1));
-            let [r0, r1] = &mut self.ranks[..] else {
-                unreachable!()
-            };
             let long_ctx = !self.cfg.uses_qsa() && seq_after > 1024;
             if use_graph
-                && r0
-                    .decode_graph
-                    .as_ref()
-                    .is_some_and(|(lc, _)| *lc == long_ctx)
-                && r1
-                    .decode_graph
-                    .as_ref()
-                    .is_some_and(|(lc, _)| *lc == long_ctx)
+                && self.ranks.iter().all(|r| {
+                    r.decode_graph
+                        .as_ref()
+                        .is_some_and(|(lc, _)| *lc == long_ctx)
+                })
             {
-                for r in [&mut *r0, &mut *r1] {
+                for r in &mut self.ranks {
                     r.device.make_current()?;
                     r.decode_io.token_ids.copy_from_host(&tok_arr, &r.stream)?;
                     r.decode_io.positions.copy_from_host(&pos_arr, &r.stream)?;
@@ -708,17 +719,21 @@ impl Qwen3_5Engine {
                     r.last_logits_ptr = r.captured_decode_logits_ptr;
                     r.last_logits_rows = 1;
                 }
-                r0.device.make_current()?;
+                self.ranks[0].device.make_current()?;
                 let mut gid = [0i32; 1];
-                r0.decode_io
+                self.ranks[0]
+                    .decode_io
                     .out_greedy_id
-                    .copy_to_host(&mut gid, &r0.stream)?;
-                r0.stream.synchronize()?;
-                r1.device.make_current()?;
-                r1.stream.synchronize()?;
+                    .copy_to_host(&mut gid, &self.ranks[0].stream)?;
+                self.ranks[0].stream.synchronize()?;
+                for r in &self.ranks[1..] {
+                    r.device.make_current()?;
+                    r.stream.synchronize()?;
+                }
                 return Ok(gid[0]);
             }
-            let (res0, res1) = std::thread::scope(|sc| {
+            let (r0, peer_ranks) = self.ranks.split_first_mut().unwrap();
+            let (res0, peer_results) = std::thread::scope(|sc| {
                 let c0 = comm.clone();
                 let h0 = sc.spawn(move || -> Result<i32> {
                     r0.device.make_current()?;
@@ -810,95 +825,123 @@ impl Qwen3_5Engine {
                     Ok(gid[0])
                 });
 
-                let c1 = comm.clone();
-                let h1 = sc.spawn(move || -> Result<()> {
-                    r1.device.make_current()?;
-                    r1.decode_io
-                        .token_ids
-                        .copy_from_host(&tok_arr, &r1.stream)?;
-                    r1.decode_io
-                        .positions
-                        .copy_from_host(&pos_arr, &r1.stream)?;
-                    r1.decode_io
-                        .ctx_lens_before
-                        .copy_from_host(&ctx_arr, &r1.stream)?;
-                    r1.decode_io
-                        .seq_lens_after
-                        .copy_from_host(&seq_arr, &r1.stream)?;
-                    r1.decode_io
-                        .block_tables
-                        .copy_from_host(block_table, &r1.stream)?;
-                    r1.decode_io
-                        .write_slot_mapping
-                        .copy_from_host(&slot_arr, &r1.stream)?;
-                    r1.decode_io
-                        .state_in_indices
-                        .copy_from_host(&st_arr, &r1.stream)?;
-                    r1.decode_io
-                        .state_out_indices
-                        .copy_from_host(&st_arr, &r1.stream)?;
-                    if use_graph {
-                        r1.ensure_decode_graph(long_ctx, Some(&c1))?;
-                        r1.decode_graph.as_ref().unwrap().1.launch(&r1.stream)?;
-                        r1.mark_tiered_moe_device_lru_dirty();
-                        r1.last_logits_ptr = r1.captured_decode_logits_ptr;
-                        r1.last_logits_rows = 1;
-                    } else {
-                        let attn_batch = W34AttentionBatch {
-                            query_start_loc: r1.decode_io.q_start_loc.addr() as *const i32,
-                            context_lens_before: r1.decode_io.ctx_lens_before.addr() as *const i32,
-                            seq_lens_after: r1.decode_io.seq_lens_after.addr() as *const i32,
-                            block_tables: r1.decode_io.block_tables.addr() as *const i32,
-                            write_slot_mapping: r1.decode_io.write_slot_mapping.addr()
-                                as *const i32,
-                            valid_token_mask: core::ptr::null(),
-                            valid_req_mask: core::ptr::null(),
-                            num_reqs: 1,
-                            total_tokens: 1,
-                            max_blocks_per_req: r1.decode_io.max_blocks_per_req as i32,
-                            max_q_len: 1,
-                            max_seq_len: seq_after as i32,
-                            mask_mode: W34_ATTN_MASK_CAUSAL,
-                            sliding_window: 0,
-                            sm_scale: (r1.cfg.head_dim as f32).powf(-0.5),
-                            reserved: 0,
-                        };
-                        let gdn_batch = W34GdnBatch {
-                            query_start_loc: r1.decode_io.q_start_loc.addr() as *const i32,
-                            state_in_indices: r1.decode_io.state_in_indices.addr() as *const i32,
-                            state_out_indices: r1.decode_io.state_out_indices.addr() as *const i32,
-                            spec_state_indices: core::ptr::null(),
-                            checkpoint_dst_indices: core::ptr::null(),
-                            checkpoint_token_offsets: core::ptr::null(),
-                            has_initial_state: r1.decode_io.has_initial_state.addr() as *const u8,
-                            valid_req_mask: core::ptr::null(),
-                            num_reqs: 1,
-                            total_tokens: 1,
-                            max_verify_tokens: 0,
-                            max_checkpoints_per_req: 0,
-                        };
-                        let tok_ptr = r1.decode_io.token_ids.addr();
-                        let pos_ptr = r1.decode_io.positions.addr();
-                        let out_id_ptr = r1.decode_io.out_greedy_id.addr();
-                        r1.forward_device_batches(
-                            tok_ptr,
-                            pos_ptr,
-                            1,
-                            &attn_batch,
-                            &gdn_batch,
-                            Some(&c1),
-                            out_id_ptr,
-                            0,
-                            0,
-                            None,
-                        )?;
-                    }
-                    r1.stream.synchronize()?;
-                    Ok(())
-                });
-                (h0.join().unwrap(), h1.join().unwrap())
+                let mut peer_handles = Vec::with_capacity(peer_ranks.len());
+                for r_peer in peer_ranks {
+                    let cp = comm.clone();
+                    peer_handles.push(sc.spawn(move || -> Result<()> {
+                        r_peer.device.make_current()?;
+                        r_peer
+                            .decode_io
+                            .token_ids
+                            .copy_from_host(&tok_arr, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .positions
+                            .copy_from_host(&pos_arr, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .ctx_lens_before
+                            .copy_from_host(&ctx_arr, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .seq_lens_after
+                            .copy_from_host(&seq_arr, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .block_tables
+                            .copy_from_host(block_table, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .write_slot_mapping
+                            .copy_from_host(&slot_arr, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .state_in_indices
+                            .copy_from_host(&st_arr, &r_peer.stream)?;
+                        r_peer
+                            .decode_io
+                            .state_out_indices
+                            .copy_from_host(&st_arr, &r_peer.stream)?;
+                        if use_graph {
+                            r_peer.ensure_decode_graph(long_ctx, Some(&cp))?;
+                            r_peer
+                                .decode_graph
+                                .as_ref()
+                                .unwrap()
+                                .1
+                                .launch(&r_peer.stream)?;
+                            r_peer.mark_tiered_moe_device_lru_dirty();
+                            r_peer.last_logits_ptr = r_peer.captured_decode_logits_ptr;
+                            r_peer.last_logits_rows = 1;
+                        } else {
+                            let attn_batch = W34AttentionBatch {
+                                query_start_loc: r_peer.decode_io.q_start_loc.addr() as *const i32,
+                                context_lens_before: r_peer.decode_io.ctx_lens_before.addr()
+                                    as *const i32,
+                                seq_lens_after: r_peer.decode_io.seq_lens_after.addr()
+                                    as *const i32,
+                                block_tables: r_peer.decode_io.block_tables.addr() as *const i32,
+                                write_slot_mapping: r_peer.decode_io.write_slot_mapping.addr()
+                                    as *const i32,
+                                valid_token_mask: core::ptr::null(),
+                                valid_req_mask: core::ptr::null(),
+                                num_reqs: 1,
+                                total_tokens: 1,
+                                max_blocks_per_req: r_peer.decode_io.max_blocks_per_req as i32,
+                                max_q_len: 1,
+                                max_seq_len: seq_after as i32,
+                                mask_mode: W34_ATTN_MASK_CAUSAL,
+                                sliding_window: 0,
+                                sm_scale: (r_peer.cfg.head_dim as f32).powf(-0.5),
+                                reserved: 0,
+                            };
+                            let gdn_batch = W34GdnBatch {
+                                query_start_loc: r_peer.decode_io.q_start_loc.addr() as *const i32,
+                                state_in_indices: r_peer.decode_io.state_in_indices.addr()
+                                    as *const i32,
+                                state_out_indices: r_peer.decode_io.state_out_indices.addr()
+                                    as *const i32,
+                                spec_state_indices: core::ptr::null(),
+                                checkpoint_dst_indices: core::ptr::null(),
+                                checkpoint_token_offsets: core::ptr::null(),
+                                has_initial_state: r_peer.decode_io.has_initial_state.addr()
+                                    as *const u8,
+                                valid_req_mask: core::ptr::null(),
+                                num_reqs: 1,
+                                total_tokens: 1,
+                                max_verify_tokens: 0,
+                                max_checkpoints_per_req: 0,
+                            };
+                            let tok_ptr = r_peer.decode_io.token_ids.addr();
+                            let pos_ptr = r_peer.decode_io.positions.addr();
+                            let out_id_ptr = r_peer.decode_io.out_greedy_id.addr();
+                            r_peer.forward_device_batches(
+                                tok_ptr,
+                                pos_ptr,
+                                1,
+                                &attn_batch,
+                                &gdn_batch,
+                                Some(&cp),
+                                out_id_ptr,
+                                0,
+                                0,
+                                None,
+                            )?;
+                        }
+                        r_peer.stream.synchronize()?;
+                        Ok(())
+                    }));
+                }
+
+                let mut peers = Vec::with_capacity(peer_handles.len());
+                for hp in peer_handles {
+                    peers.push(hp.join().unwrap());
+                }
+                (h0.join().unwrap(), peers)
             });
-            res1?;
+            for pr in peer_results {
+                pr?;
+            }
             res0
         }
     }

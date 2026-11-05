@@ -1272,32 +1272,107 @@ impl Drop for MappedHostBuffer {
     }
 }
 
-/// Pinned-sysmem `TP=2` collective context shared between rank 0 and rank 1.
+#[cfg(feature = "cuda")]
+pub enum CommBuffer {
+    MappedHost(MappedHostBuffer),
+    DeviceVram(DeviceBuffer),
+}
+
+#[cfg(feature = "cuda")]
+impl CommBuffer {
+    #[inline]
+    pub fn dev_ptr(&self) -> *mut c_void {
+        match self {
+            Self::MappedHost(b) => b.dev_ptr,
+            Self::DeviceVram(b) => b.ptr,
+        }
+    }
+}
+
+/// Pinned-sysmem or P2P-VRAM (`NVLink`) `TP=2` / `TP=4` collective context shared across ranks.
 #[cfg(feature = "cuda")]
 pub struct Tp2Collectives {
-    pub sig0: MappedHostBuffer,
-    pub sig1: MappedHostBuffer,
-    pub stage0: MappedHostBuffer,
-    pub stage1: MappedHostBuffer,
+    pub tp_size: usize,
+    pub p2p_vram: bool,
+    pub sigs: Vec<CommBuffer>,
+    pub stages: Vec<CommBuffer>,
     pub max_stage_bytes_per_epoch: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl Tp2Collectives {
-    /// Allocates double-buffered staging (`2 * max_stage_bytes_per_epoch`) and signal structs.
+    /// Allocates double-buffered staging (`2 * max_stage_bytes_per_epoch`) and signal structs for `TP=2`.
     pub fn new(max_stage_bytes_per_epoch: usize) -> Result<Self> {
+        Self::new_for_tp(2, max_stage_bytes_per_epoch)
+    }
+
+    /// Allocates double-buffered staging (`2 * max_stage_bytes_per_epoch`) and signal structs for `tp_size` (`2` or `4`),
+    /// automatically enabling P2P VRAM staging when all rank pairs have native NVLink P2P support.
+    pub fn new_for_tp(tp_size: usize, max_stage_bytes_per_epoch: usize) -> Result<Self> {
+        Self::new_for_tp_with_p2p(tp_size, max_stage_bytes_per_epoch, true)
+    }
+
+    /// Allocates collective buffers for `tp_size` (`2` or `4`), optionally allowing P2P VRAM staging.
+    pub fn new_for_tp_with_p2p(
+        tp_size: usize,
+        max_stage_bytes_per_epoch: usize,
+        allow_p2p: bool,
+    ) -> Result<Self> {
+        if !matches!(tp_size, 2 | 4) {
+            return Err(CudaError::new(
+                -1,
+                "Tp2Collectives supports tp_size == 2 or tp_size == 4",
+            ));
+        }
         // SAFETY: `w34_tp2_signal_bytes` is a pure `sizeof(W34Tp2Signal)` query with no preconditions.
         let sig_bytes = unsafe { ffi::w34_tp2_signal_bytes() };
-        let sig0 = MappedHostBuffer::alloc(sig_bytes)?;
-        let sig1 = MappedHostBuffer::alloc(sig_bytes)?;
         let stage_bytes = max_stage_bytes_per_epoch.saturating_mul(2).max(4096);
-        let stage0 = MappedHostBuffer::alloc(stage_bytes)?;
-        let stage1 = MappedHostBuffer::alloc(stage_bytes)?;
+
+        let mut all_p2p = allow_p2p;
+        if all_p2p {
+            for i in 0..tp_size {
+                for j in (i + 1)..tp_size {
+                    let mut can_p2p = 0i32;
+                    // SAFETY: queries and enables bidirectional peer access between `i` and `j`.
+                    let rc = unsafe {
+                        ffi::w34_device_can_enable_p2p(i as i32, j as i32, 1, &raw mut can_p2p)
+                    };
+                    if rc != 0 || can_p2p == 0 {
+                        all_p2p = false;
+                        break;
+                    }
+                }
+                if !all_p2p {
+                    break;
+                }
+            }
+        }
+
+        let mut sigs = Vec::with_capacity(tp_size);
+        let mut stages = Vec::with_capacity(tp_size);
+        if all_p2p {
+            for r in 0..tp_size {
+                sigs.push(CommBuffer::DeviceVram(DeviceBuffer::alloc(
+                    r as i32, sig_bytes,
+                )?));
+                stages.push(CommBuffer::DeviceVram(DeviceBuffer::alloc(
+                    r as i32,
+                    stage_bytes,
+                )?));
+            }
+        } else {
+            for _ in 0..tp_size {
+                sigs.push(CommBuffer::MappedHost(MappedHostBuffer::alloc(sig_bytes)?));
+                stages.push(CommBuffer::MappedHost(MappedHostBuffer::alloc(
+                    stage_bytes,
+                )?));
+            }
+        }
         Ok(Self {
-            sig0,
-            sig1,
-            stage0,
-            stage1,
+            tp_size,
+            p2p_vram: all_p2p,
+            sigs,
+            stages,
             max_stage_bytes_per_epoch,
         })
     }
@@ -1314,18 +1389,42 @@ impl Tp2Collectives {
             (num_elems as usize) * 2 <= self.max_stage_bytes_per_epoch,
             "all_reduce_f16 exceeds max_stage_bytes_per_epoch"
         );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid `local_in_ptr`/`out_ptr` for `num_elems` FP16s.
+                unsafe {
+                    ffi::w34_tp4_all_reduce_f16(
+                        ex,
+                        local_in_ptr as *const c_void,
+                        out_ptr as *mut c_void,
+                        self.stages[0].dev_ptr(),
+                        self.stages[1].dev_ptr(),
+                        self.stages[2].dev_ptr(),
+                        self.stages[3].dev_ptr(),
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_elems,
+                    )
+                },
+                "w34_tp4_all_reduce_f16",
+            );
+        }
         check_rc(
-            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
             // buffers owned by `self`, and caller guarantees valid `local_in_ptr`/`out_ptr` for `num_elems` FP16s.
             unsafe {
                 ffi::w34_tp2_all_reduce_f16(
                     ex,
                     local_in_ptr as *const c_void,
                     out_ptr as *mut c_void,
-                    self.stage0.dev_ptr,
-                    self.stage1.dev_ptr,
-                    self.sig0.dev_ptr,
-                    self.sig1.dev_ptr,
+                    self.stages[0].dev_ptr(),
+                    self.stages[1].dev_ptr(),
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
                     rank,
                     num_elems,
                 )
@@ -1356,8 +1455,40 @@ impl Tp2Collectives {
             num_elems * 2 <= self.max_stage_bytes_per_epoch,
             "all_reduce_residual_gemma_rms_norm_f16 exceeds max_stage_bytes_per_epoch"
         );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid device pointers for `[num_tokens, hidden_size]`.
+                unsafe {
+                    ffi::w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
+                        ex,
+                        local_in_ptr as *const c_void,
+                        ar_out_ptr as *mut c_void,
+                        residual_ptr as *mut c_void,
+                        weight_ptr as *const c_void,
+                        out_ptr as *mut c_void,
+                        tap_dst_bf16_ptr as *mut c_void,
+                        self.stages[0].dev_ptr(),
+                        self.stages[1].dev_ptr(),
+                        self.stages[2].dev_ptr(),
+                        self.stages[3].dev_ptr(),
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_tokens,
+                        hidden_size,
+                        eps,
+                        tap_row_stride,
+                        tap_col_offset,
+                    )
+                },
+                "w34_tp4_all_reduce_residual_gemma_rms_norm_f16",
+            );
+        }
         check_rc(
-            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
             // buffers owned by `self`, and caller guarantees valid device pointers for `[num_tokens, hidden_size]`.
             unsafe {
                 ffi::w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
@@ -1368,10 +1499,10 @@ impl Tp2Collectives {
                     weight_ptr as *const c_void,
                     out_ptr as *mut c_void,
                     tap_dst_bf16_ptr as *mut c_void,
-                    self.stage0.dev_ptr,
-                    self.stage1.dev_ptr,
-                    self.sig0.dev_ptr,
-                    self.sig1.dev_ptr,
+                    self.stages[0].dev_ptr(),
+                    self.stages[1].dev_ptr(),
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
                     rank,
                     num_tokens,
                     hidden_size,
@@ -1396,18 +1527,42 @@ impl Tp2Collectives {
             (num_elems as usize) * 2 <= self.max_stage_bytes_per_epoch,
             "all_reduce_bf16 exceeds max_stage_bytes_per_epoch"
         );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid BF16 device buffers for `num_elems`.
+                unsafe {
+                    ffi::w34_tp4_all_reduce_bf16(
+                        ex,
+                        local_in_ptr as *const c_void,
+                        out_ptr as *mut c_void,
+                        self.stages[0].dev_ptr(),
+                        self.stages[1].dev_ptr(),
+                        self.stages[2].dev_ptr(),
+                        self.stages[3].dev_ptr(),
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_elems,
+                    )
+                },
+                "w34_tp4_all_reduce_bf16",
+            );
+        }
         check_rc(
-            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
             // buffers owned by `self`, and caller guarantees valid BF16 device buffers for `num_elems`.
             unsafe {
                 ffi::w34_tp2_all_reduce_bf16(
                     ex,
                     local_in_ptr as *const c_void,
                     out_ptr as *mut c_void,
-                    self.stage0.dev_ptr,
-                    self.stage1.dev_ptr,
-                    self.sig0.dev_ptr,
-                    self.sig1.dev_ptr,
+                    self.stages[0].dev_ptr(),
+                    self.stages[1].dev_ptr(),
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
                     rank,
                     num_elems,
                 )
@@ -1428,18 +1583,42 @@ impl Tp2Collectives {
             (num_elems as usize) * 4 <= self.max_stage_bytes_per_epoch,
             "all_reduce_f32 exceeds max_stage_bytes_per_epoch"
         );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid FP32 device buffers for `num_elems`.
+                unsafe {
+                    ffi::w34_tp4_all_reduce_f32(
+                        ex,
+                        local_in_ptr as *const f32,
+                        out_ptr as *mut f32,
+                        self.stages[0].dev_ptr() as *mut f32,
+                        self.stages[1].dev_ptr() as *mut f32,
+                        self.stages[2].dev_ptr() as *mut f32,
+                        self.stages[3].dev_ptr() as *mut f32,
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_elems,
+                    )
+                },
+                "w34_tp4_all_reduce_f32",
+            );
+        }
         check_rc(
-            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
             // buffers owned by `self`, and caller guarantees valid FP32 device buffers for `num_elems`.
             unsafe {
                 ffi::w34_tp2_all_reduce_f32(
                     ex,
                     local_in_ptr as *const f32,
                     out_ptr as *mut f32,
-                    self.stage0.dev_ptr as *mut f32,
-                    self.stage1.dev_ptr as *mut f32,
-                    self.sig0.dev_ptr,
-                    self.sig1.dev_ptr,
+                    self.stages[0].dev_ptr() as *mut f32,
+                    self.stages[1].dev_ptr() as *mut f32,
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
                     rank,
                     num_elems,
                 )
@@ -1460,18 +1639,42 @@ impl Tp2Collectives {
             (num_elems as usize) * 4 <= self.max_stage_bytes_per_epoch,
             "broadcast_i32 exceeds max_stage_bytes_per_epoch"
         );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid `i32` device buffers for `num_elems`.
+                unsafe {
+                    ffi::w34_tp4_broadcast_i32(
+                        ex,
+                        src_rank0_ptr as *const i32,
+                        out_ptr as *mut i32,
+                        self.stages[0].dev_ptr() as *mut i32,
+                        self.stages[1].dev_ptr() as *mut i32,
+                        self.stages[2].dev_ptr() as *mut i32,
+                        self.stages[3].dev_ptr() as *mut i32,
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_elems,
+                    )
+                },
+                "w34_tp4_broadcast_i32",
+            );
+        }
         check_rc(
-            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
             // buffers owned by `self`, and caller guarantees valid `i32` device buffers for `num_elems`.
             unsafe {
                 ffi::w34_tp2_broadcast_i32(
                     ex,
                     src_rank0_ptr as *const i32,
                     out_ptr as *mut i32,
-                    self.stage0.dev_ptr as *mut i32,
-                    self.stage1.dev_ptr as *mut i32,
-                    self.sig0.dev_ptr,
-                    self.sig1.dev_ptr,
+                    self.stages[0].dev_ptr() as *mut i32,
+                    self.stages[1].dev_ptr() as *mut i32,
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
                     rank,
                     num_elems,
                 )
@@ -1495,8 +1698,34 @@ impl Tp2Collectives {
             (num_rows as usize) * 8 <= self.max_stage_bytes_per_epoch,
             "all_gather_top1_f32_i32 exceeds max_stage_bytes_per_epoch"
         );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid `(f32, i32)` row buffers for `num_rows`.
+                unsafe {
+                    ffi::w34_tp4_all_gather_top1_f32_i32(
+                        ex,
+                        local_max_val_ptr as *const f32,
+                        local_max_id_ptr as *const i32,
+                        global_max_val_ptr as *mut f32,
+                        global_max_id_ptr as *mut i32,
+                        self.stages[0].dev_ptr(),
+                        self.stages[1].dev_ptr(),
+                        self.stages[2].dev_ptr(),
+                        self.stages[3].dev_ptr(),
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_rows,
+                    )
+                },
+                "w34_tp4_all_gather_top1_f32_i32",
+            );
+        }
         check_rc(
-            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
             // buffers owned by `self`, and caller guarantees valid `(f32, i32)` row buffers for `num_rows`.
             unsafe {
                 ffi::w34_tp2_all_gather_top1_f32_i32(
@@ -1505,10 +1734,10 @@ impl Tp2Collectives {
                     local_max_id_ptr as *const i32,
                     global_max_val_ptr as *mut f32,
                     global_max_id_ptr as *mut i32,
-                    self.stage0.dev_ptr,
-                    self.stage1.dev_ptr,
-                    self.sig0.dev_ptr,
-                    self.sig1.dev_ptr,
+                    self.stages[0].dev_ptr(),
+                    self.stages[1].dev_ptr(),
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
                     rank,
                     num_rows,
                 )
@@ -1530,18 +1759,43 @@ impl Tp2Collectives {
             (num_rows as usize) * (local_vocab_size as usize) * 2 <= self.max_stage_bytes_per_epoch,
             "gather_vocab_f16 exceeds max_stage_bytes_per_epoch"
         );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid FP16 shard/full buffers.
+                unsafe {
+                    ffi::w34_tp4_gather_vocab_f16(
+                        ex,
+                        local_logits_ptr as *const c_void,
+                        rank0_full_logits_ptr as *mut c_void,
+                        self.stages[0].dev_ptr(),
+                        self.stages[1].dev_ptr(),
+                        self.stages[2].dev_ptr(),
+                        self.stages[3].dev_ptr(),
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_rows,
+                        local_vocab_size,
+                    )
+                },
+                "w34_tp4_gather_vocab_f16",
+            );
+        }
         check_rc(
-            // SAFETY: staging capacity is asserted above; `stage0/1` and `sig0/1` are live mapped
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
             // buffers owned by `self`, and caller guarantees valid FP16 shard/full buffers.
             unsafe {
                 ffi::w34_tp2_gather_vocab_f16(
                     ex,
                     local_logits_ptr as *const c_void,
                     rank0_full_logits_ptr as *mut c_void,
-                    self.stage0.dev_ptr,
-                    self.stage1.dev_ptr,
-                    self.sig0.dev_ptr,
-                    self.sig1.dev_ptr,
+                    self.stages[0].dev_ptr(),
+                    self.stages[1].dev_ptr(),
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
                     rank,
                     num_rows,
                     local_vocab_size,
@@ -1860,6 +2114,8 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         let sig_u32_len = (unsafe { ffi::w34_tp2_signal_bytes() } as usize).div_ceil(4);
         let mut fake_sig = vec![0u32; sig_u32_len.max(1216)];
         fake_sig[1] = 1; // pre-satisfy start[0][1] == epoch(1) for single-GPU warmup
+        fake_sig[2] = 1;
+        fake_sig[3] = 1;
         let sig_dev = arena.upload_slice(&fake_sig, &stream)?;
         check_rc(
             unsafe {
@@ -1884,6 +2140,39 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 )
             },
             "warmup w34_tp2_all_reduce_residual_gemma_rms_norm_f16",
+        )?;
+        let mut fake_sig4 = vec![0u32; sig_u32_len.max(1216)];
+        fake_sig4[1] = 1;
+        fake_sig4[2] = 1;
+        fake_sig4[3] = 1;
+        let sig4_dev = arena.upload_slice(&fake_sig4, &stream)?;
+        check_rc(
+            unsafe {
+                ffi::w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
+                    &ex,
+                    buf_a as *const c_void,
+                    core::ptr::null_mut(),
+                    buf_b as *mut c_void,
+                    buf_c as *const c_void,
+                    buf_d as *mut c_void,
+                    core::ptr::null_mut(),
+                    buf_ws as *mut c_void,
+                    buf_ws as *mut c_void,
+                    buf_ws as *mut c_void,
+                    buf_ws as *mut c_void,
+                    sig4_dev as *mut c_void,
+                    sig4_dev as *mut c_void,
+                    sig4_dev as *mut c_void,
+                    sig4_dev as *mut c_void,
+                    0,
+                    1,
+                    hs,
+                    1e-6,
+                    0,
+                    0,
+                )
+            },
+            "warmup w34_tp4_all_reduce_residual_gemma_rms_norm_f16",
         )?;
     }
 

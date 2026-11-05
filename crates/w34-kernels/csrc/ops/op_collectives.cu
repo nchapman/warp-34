@@ -593,6 +593,545 @@ __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
     }
 }
 
+struct Tp4Ptrs {
+    void* s[4];
+    Signal* sig[4];
+};
+
+__device__ __forceinline__ void barrier_tp4_epoch_release(
+    const Tp4Ptrs& ptrs,
+    Signal* self_sg,
+    int rank,
+    uint32_t* out_epoch) {
+    __syncthreads();
+    uint32_t epoch = self_sg->flag[blockIdx.x] + 1;
+    if (threadIdx.x == 0) {
+#pragma unroll
+        for (int peer = 0; peer < 4; ++peer) {
+            if (peer != rank) {
+                st_flag_release(&ptrs.sig[peer]->start[blockIdx.x][rank], epoch);
+            }
+        }
+#pragma unroll
+        for (int peer = 0; peer < 4; ++peer) {
+            if (peer != rank) {
+                uint32_t* self_counter = &self_sg->start[blockIdx.x][peer];
+                while (static_cast<int32_t>(ld_flag_acquire(self_counter) - epoch) < 0) {
+                }
+            }
+        }
+        self_sg->flag[blockIdx.x] = epoch;
+    }
+    __syncthreads();
+    *out_epoch = epoch;
+}
+
+__global__ void __launch_bounds__(512, 1) tp4_all_reduce_f16_kernel(
+    const __half* local_in,
+    __half* out,
+    Tp4Ptrs ptrs,
+    int rank,
+    int num_elems) {
+    Signal* self_sg = ptrs.sig[rank];
+    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
+    bool odd = (epoch_pre & 1u) != 0;
+
+    __half* s_buf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        __half* base = reinterpret_cast<__half*>(ptrs.s[r]);
+        s_buf[r] = odd ? (base + num_elems) : base;
+    }
+    __half* __restrict__ my_s = s_buf[rank];
+
+    const bool vec8 = ((num_elems & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)s_buf[0] |
+                         (uintptr_t)s_buf[1] | (uintptr_t)s_buf[2] | (uintptr_t)s_buf[3]) & 15u) == 0);
+    if (vec8) {
+        const int vec_elems = num_elems >> 3;
+        const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+        uint4* my_v = reinterpret_cast<uint4*>(my_s);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+            my_v[i] = local_v[i];
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+            my_s[i] = local_in[i];
+        }
+    }
+
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+
+    if (vec8) {
+        const int vec_elems = num_elems >> 3;
+        const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+        const uint4* s0_v = reinterpret_cast<const uint4*>(s_buf[0]);
+        const uint4* s1_v = reinterpret_cast<const uint4*>(s_buf[1]);
+        const uint4* s2_v = reinterpret_cast<const uint4*>(s_buf[2]);
+        const uint4* s3_v = reinterpret_cast<const uint4*>(s_buf[3]);
+        uint4* out_v = reinterpret_cast<uint4*>(out);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+            const uint4 lv = local_v[i];
+            const uint4 v0 = (rank == 0) ? lv : s0_v[i];
+            const uint4 v1 = (rank == 1) ? lv : s1_v[i];
+            const uint4 v2 = (rank == 2) ? lv : s2_v[i];
+            const uint4 v3 = (rank == 3) ? lv : s3_v[i];
+            const __half* h0 = reinterpret_cast<const __half*>(&v0);
+            const __half* h1 = reinterpret_cast<const __half*>(&v1);
+            const __half* h2 = reinterpret_cast<const __half*>(&v2);
+            const __half* h3 = reinterpret_cast<const __half*>(&v3);
+            uint4 ov;
+            __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const float f0 = __half2float(h0[d]);
+                const float f1 = __half2float(h1[d]);
+                const float f2 = __half2float(h2[d]);
+                const float f3 = __half2float(h3[d]);
+                oh[d] = __float2half((f0 + f1) + (f2 + f3));
+            }
+            out_v[i] = ov;
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+            const float lf = __half2float(local_in[i]);
+            const float f0 = (rank == 0) ? lf : __half2float(s_buf[0][i]);
+            const float f1 = (rank == 1) ? lf : __half2float(s_buf[1][i]);
+            const float f2 = (rank == 2) ? lf : __half2float(s_buf[2][i]);
+            const float f3 = (rank == 3) ? lf : __half2float(s_buf[3][i]);
+            out[i] = __float2half((f0 + f1) + (f2 + f3));
+        }
+    }
+}
+
+template <int THREADS, int MAX_ITERS>
+__global__ void __launch_bounds__(THREADS, 2) tp4_all_reduce_residual_gemma_rms_norm_f16_kernel(
+    const __half* local_in,
+    __half* ar_out,
+    __half* __restrict__ residual,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    __nv_bfloat16* __restrict__ tap_dst_bf16,
+    Tp4Ptrs ptrs,
+    int rank,
+    int num_tokens,
+    int hidden_size,
+    float eps,
+    int tap_row_stride,
+    int tap_col_offset) {
+    const int num_elems = num_tokens * hidden_size;
+    Signal* self_sg = ptrs.sig[rank];
+    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
+    bool odd = (epoch_pre & 1u) != 0;
+
+    __half* s_buf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        __half* base = reinterpret_cast<__half*>(ptrs.s[r]);
+        s_buf[r] = odd ? (base + num_elems) : base;
+    }
+    __half* __restrict__ my_s = s_buf[rank];
+
+    constexpr int VEC_ITERS = (MAX_ITERS + 7) / 8;
+    const bool vec8 = ((hidden_size & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)s_buf[0] | (uintptr_t)s_buf[1] |
+                         (uintptr_t)s_buf[2] | (uintptr_t)s_buf[3] |
+                         (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)out |
+                         (uintptr_t)ar_out) & 15u) == 0);
+
+    __shared__ float s_warp[32];
+
+    if (vec8) {
+        const int vec_cols = hidden_size >> 3;
+        for (int row = (int)blockIdx.x; row < num_tokens; row += (int)gridDim.x) {
+            const uint4* src_v = reinterpret_cast<const uint4*>(local_in + (size_t)row * hidden_size);
+            uint4* dst_v = reinterpret_cast<uint4*>(my_s + (size_t)row * hidden_size);
+#pragma unroll
+            for (int k = 0; k < VEC_ITERS; ++k) {
+                const int c = threadIdx.x + k * THREADS;
+                if (c < vec_cols) {
+                    dst_v[c] = src_v[c];
+                }
+            }
+        }
+    } else {
+        for (int row = (int)blockIdx.x; row < num_tokens; row += (int)gridDim.x) {
+            const __half* src_r = local_in + (size_t)row * hidden_size;
+            __half* dst_r = my_s + (size_t)row * hidden_size;
+            for (int c = threadIdx.x; c < hidden_size; c += THREADS) {
+                dst_r[c] = src_r[c];
+            }
+        }
+    }
+
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+
+    if (vec8) {
+        const int vec_cols = hidden_size >> 3;
+        const uint4* weight_v = reinterpret_cast<const uint4*>(weight);
+        for (int row = (int)blockIdx.x; row < num_tokens; row += (int)gridDim.x) {
+            const uint4* local_v = reinterpret_cast<const uint4*>(local_in + (size_t)row * hidden_size);
+            const uint4* s0_v = reinterpret_cast<const uint4*>(s_buf[0] + (size_t)row * hidden_size);
+            const uint4* s1_v = reinterpret_cast<const uint4*>(s_buf[1] + (size_t)row * hidden_size);
+            const uint4* s2_v = reinterpret_cast<const uint4*>(s_buf[2] + (size_t)row * hidden_size);
+            const uint4* s3_v = reinterpret_cast<const uint4*>(s_buf[3] + (size_t)row * hidden_size);
+            uint4* ar_v = (ar_out != nullptr)
+                ? reinterpret_cast<uint4*>(ar_out + (size_t)row * hidden_size)
+                : nullptr;
+            uint4* res_v = reinterpret_cast<uint4*>(residual + (size_t)row * hidden_size);
+            uint4* out_v = reinterpret_cast<uint4*>(out + (size_t)row * hidden_size);
+            __nv_bfloat16* tap_row = (tap_dst_bf16 != nullptr)
+                ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
+                : nullptr;
+
+            float v_reg[VEC_ITERS][8];
+            float sum_sq = 0.0f;
+#pragma unroll
+            for (int k = 0; k < VEC_ITERS; ++k) {
+                const int c = threadIdx.x + k * THREADS;
+                if (c < vec_cols) {
+                    const uint4 lv = local_v[c];
+                    const uint4 v0 = (rank == 0) ? lv : s0_v[c];
+                    const uint4 v1 = (rank == 1) ? lv : s1_v[c];
+                    const uint4 v2 = (rank == 2) ? lv : s2_v[c];
+                    const uint4 v3 = (rank == 3) ? lv : s3_v[c];
+                    const uint4 rv = res_v[c];
+                    const __half* h0 = reinterpret_cast<const __half*>(&v0);
+                    const __half* h1 = reinterpret_cast<const __half*>(&v1);
+                    const __half* h2 = reinterpret_cast<const __half*>(&v2);
+                    const __half* h3 = reinterpret_cast<const __half*>(&v3);
+                    const __half* rh = reinterpret_cast<const __half*>(&rv);
+                    uint4 arv, sumv;
+                    __half* arh = reinterpret_cast<__half*>(&arv);
+                    __half* sh = reinterpret_cast<__half*>(&sumv);
+                    const int base_i = c << 3;
+#pragma unroll
+                    for (int d = 0; d < 8; ++d) {
+                        const float f0 = __half2float(h0[d]);
+                        const float f1 = __half2float(h1[d]);
+                        const float f2 = __half2float(h2[d]);
+                        const float f3 = __half2float(h3[d]);
+                        const float ar_f = (f0 + f1) + (f2 + f3);
+                        const __half ar_h = __float2half(ar_f);
+                        arh[d] = ar_h;
+                        const __half res_old = rh[d];
+                        const float ar_hf = __half2float(ar_h);
+                        const float res_hf = __half2float(res_old);
+                        if (tap_row != nullptr) {
+                            tap_row[base_i + d] = __float2bfloat16(res_hf + ar_hf);
+                        }
+                        sh[d] = __hadd(ar_h, res_old);
+                        const float v = ar_hf + res_hf;
+                        v_reg[k][d] = v;
+                        sum_sq += v * v;
+                    }
+                    if (ar_v != nullptr) {
+                        ar_v[c] = arv;
+                    }
+                    res_v[c] = sumv;
+                }
+            }
+            sum_sq = block_reduce_sum<THREADS>(sum_sq, s_warp);
+            const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+#pragma unroll
+            for (int k = 0; k < VEC_ITERS; ++k) {
+                const int c = threadIdx.x + k * THREADS;
+                if (c < vec_cols) {
+                    const uint4 wv = weight_v[c];
+                    const __half* wh = reinterpret_cast<const __half*>(&wv);
+                    uint4 ov;
+                    __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+                    for (int d = 0; d < 8; ++d) {
+                        const float v = v_reg[k][d] * inv_rms;
+                        const float w = 1.0f + __half2float(wh[d]);
+                        oh[d] = __float2half(v * w);
+                    }
+                    out_v[c] = ov;
+                }
+            }
+        }
+    } else {
+        for (int row = (int)blockIdx.x; row < num_tokens; row += (int)gridDim.x) {
+            const __half* local_row = local_in + (size_t)row * hidden_size;
+            const __half* s0_row = s_buf[0] + (size_t)row * hidden_size;
+            const __half* s1_row = s_buf[1] + (size_t)row * hidden_size;
+            const __half* s2_row = s_buf[2] + (size_t)row * hidden_size;
+            const __half* s3_row = s_buf[3] + (size_t)row * hidden_size;
+            __half* ar_row = (ar_out != nullptr) ? (ar_out + (size_t)row * hidden_size) : nullptr;
+            __half* res_row = residual + (size_t)row * hidden_size;
+            __half* out_row = out + (size_t)row * hidden_size;
+            __nv_bfloat16* tap_row = (tap_dst_bf16 != nullptr)
+                ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
+                : nullptr;
+
+            float v_scalar[MAX_ITERS];
+            float sum_sq = 0.0f;
+#pragma unroll
+            for (int k = 0; k < MAX_ITERS; k++) {
+                const int i = threadIdx.x + k * THREADS;
+                if (i < hidden_size) {
+                    const float lf = __half2float(local_row[i]);
+                    const float f0 = (rank == 0) ? lf : __half2float(s0_row[i]);
+                    const float f1 = (rank == 1) ? lf : __half2float(s1_row[i]);
+                    const float f2 = (rank == 2) ? lf : __half2float(s2_row[i]);
+                    const float f3 = (rank == 3) ? lf : __half2float(s3_row[i]);
+                    const float ar_f = (f0 + f1) + (f2 + f3);
+                    const __half ar_h = __float2half(ar_f);
+                    if (ar_row != nullptr) {
+                        ar_row[i] = ar_h;
+                    }
+                    const __half res_old = res_row[i];
+                    if (tap_row != nullptr) {
+                        tap_row[i] = __float2bfloat16(__half2float(res_old) + __half2float(ar_h));
+                    }
+                    const __half sum_h = __hadd(ar_h, res_old);
+                    res_row[i] = sum_h;
+                    const float v = __half2float(ar_h) + __half2float(res_old);
+                    v_scalar[k] = v;
+                    sum_sq += v * v;
+                }
+            }
+            sum_sq = block_reduce_sum<THREADS>(sum_sq, s_warp);
+            const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+#pragma unroll
+            for (int k = 0; k < MAX_ITERS; k++) {
+                const int i = threadIdx.x + k * THREADS;
+                if (i < hidden_size) {
+                    const float v = v_scalar[k] * inv_rms;
+                    const float w = 1.0f + __half2float(weight[i]);
+                    out_row[i] = __float2half(v * w);
+                }
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(512, 1) tp4_all_reduce_bf16_kernel(
+    const __nv_bfloat16* local_in,
+    __nv_bfloat16* out,
+    Tp4Ptrs ptrs,
+    int rank,
+    int num_elems) {
+    Signal* self_sg = ptrs.sig[rank];
+    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
+    bool odd = (epoch_pre & 1u) != 0;
+
+    __nv_bfloat16* s_buf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        __nv_bfloat16* base = reinterpret_cast<__nv_bfloat16*>(ptrs.s[r]);
+        s_buf[r] = odd ? (base + num_elems) : base;
+    }
+    __nv_bfloat16* __restrict__ my_s = s_buf[rank];
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+        my_s[i] = local_in[i];
+    }
+
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+        const float lf = __bfloat162float(local_in[i]);
+        const float f0 = (rank == 0) ? lf : __bfloat162float(s_buf[0][i]);
+        const float f1 = (rank == 1) ? lf : __bfloat162float(s_buf[1][i]);
+        const float f2 = (rank == 2) ? lf : __bfloat162float(s_buf[2][i]);
+        const float f3 = (rank == 3) ? lf : __bfloat162float(s_buf[3][i]);
+        out[i] = __float2bfloat16((f0 + f1) + (f2 + f3));
+    }
+}
+
+__global__ void __launch_bounds__(512, 1) tp4_all_reduce_f32_kernel(
+    const float* local_in,
+    float* out,
+    Tp4Ptrs ptrs,
+    int rank,
+    int num_elems) {
+    Signal* self_sg = ptrs.sig[rank];
+    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
+    bool odd = (epoch_pre & 1u) != 0;
+
+    float* s_buf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        float* base = reinterpret_cast<float*>(ptrs.s[r]);
+        s_buf[r] = odd ? (base + num_elems) : base;
+    }
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+        s_buf[rank][i] = local_in[i];
+    }
+
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+        const float lf = local_in[i];
+        const float f0 = (rank == 0) ? lf : s_buf[0][i];
+        const float f1 = (rank == 1) ? lf : s_buf[1][i];
+        const float f2 = (rank == 2) ? lf : s_buf[2][i];
+        const float f3 = (rank == 3) ? lf : s_buf[3][i];
+        out[i] = (f0 + f1) + (f2 + f3);
+    }
+}
+
+__global__ void __launch_bounds__(256, 1) tp4_broadcast_i32_kernel(
+    const int32_t* __restrict__ src_rank0,
+    int32_t* __restrict__ out,
+    Tp4Ptrs ptrs,
+    int rank,
+    int num_elems) {
+    Signal* self_sg = ptrs.sig[rank];
+    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
+    bool odd = (epoch_pre & 1u) != 0;
+    int32_t* s0_base = reinterpret_cast<int32_t*>(ptrs.s[0]);
+    int32_t* s0_buf = odd ? (s0_base + num_elems) : s0_base;
+
+    if (rank == 0) {
+        for (int i = threadIdx.x; i < num_elems; i += blockDim.x) {
+            s0_buf[i] = src_rank0[i];
+        }
+    }
+
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+
+    for (int i = threadIdx.x; i < num_elems; i += blockDim.x) {
+        out[i] = s0_buf[i];
+    }
+}
+
+__global__ void __launch_bounds__(256, 1) tp4_all_gather_top1_f32_i32_kernel(
+    const float* __restrict__ local_max_val,
+    const int32_t* __restrict__ local_max_id,
+    float* __restrict__ global_max_val,
+    int32_t* __restrict__ global_max_id,
+    Tp4Ptrs ptrs,
+    int rank,
+    int num_rows) {
+    Signal* self_sg = ptrs.sig[rank];
+    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
+    bool odd = (epoch_pre & 1u) != 0;
+
+    Top1Pair* s_buf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        Top1Pair* base = reinterpret_cast<Top1Pair*>(ptrs.s[r]);
+        s_buf[r] = odd ? (base + num_rows) : base;
+    }
+
+    for (int i = threadIdx.x; i < num_rows; i += blockDim.x) {
+        s_buf[rank][i] = Top1Pair{local_max_val[i], local_max_id[i]};
+    }
+
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+
+    for (int i = threadIdx.x; i < num_rows; i += blockDim.x) {
+        Top1Pair best = s_buf[0][i];
+#pragma unroll
+        for (int r = 1; r < 4; ++r) {
+            Top1Pair cand = s_buf[r][i];
+            if ((cand.val > best.val) || (cand.val == best.val && cand.id < best.id)) {
+                best = cand;
+            }
+        }
+        global_max_val[i] = best.val;
+        global_max_id[i] = best.id;
+    }
+}
+
+__global__ void __launch_bounds__(512, 1) tp4_gather_vocab_f16_kernel(
+    const __half* __restrict__ local_in,
+    __half* __restrict__ rank0_full_out,
+    Tp4Ptrs ptrs,
+    int rank,
+    int num_rows,
+    int local_vocab_size) {
+    const int num_elems = num_rows * local_vocab_size;
+    Signal* self_sg = ptrs.sig[rank];
+    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
+    bool odd = (epoch_pre & 1u) != 0;
+
+    __half* s_buf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        __half* base = reinterpret_cast<__half*>(ptrs.s[r]);
+        s_buf[r] = odd ? (base + num_elems) : base;
+    }
+    const int full_vocab = local_vocab_size * 4;
+
+    const bool vec8 = ((local_vocab_size & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)s_buf[1] | (uintptr_t)s_buf[2] |
+                         (uintptr_t)s_buf[3] | (uintptr_t)rank0_full_out) & 15u) == 0);
+    if (rank != 0) {
+        if (vec8) {
+            const int vec_elems = num_elems >> 3;
+            const uint4* in_v = reinterpret_cast<const uint4*>(local_in);
+            uint4* my_v = reinterpret_cast<uint4*>(s_buf[rank]);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+                my_v[i] = in_v[i];
+            }
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+                s_buf[rank][i] = local_in[i];
+            }
+        }
+    } else if (vec8) {
+        const int vec_vocab = local_vocab_size >> 3;
+        const int vec_full = full_vocab >> 3;
+        const int vec_elems = num_rows * vec_vocab;
+        const uint4* in_v = reinterpret_cast<const uint4*>(local_in);
+        uint4* out_v = reinterpret_cast<uint4*>(rank0_full_out);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+            const int row = i / vec_vocab;
+            const int col = i - row * vec_vocab;
+            out_v[(size_t)row * vec_full + col] = in_v[i];
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+            const int row = i / local_vocab_size;
+            const int col = i - row * local_vocab_size;
+            rank0_full_out[(size_t)row * full_vocab + col] = local_in[i];
+        }
+    }
+
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+
+    if (rank == 0) {
+        if (vec8) {
+            const int vec_vocab = local_vocab_size >> 3;
+            const int vec_full = full_vocab >> 3;
+            const int vec_elems = num_rows * vec_vocab;
+            const uint4* s1_v = reinterpret_cast<const uint4*>(s_buf[1]);
+            const uint4* s2_v = reinterpret_cast<const uint4*>(s_buf[2]);
+            const uint4* s3_v = reinterpret_cast<const uint4*>(s_buf[3]);
+            uint4* out_v = reinterpret_cast<uint4*>(rank0_full_out);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+                const int row = i / vec_vocab;
+                const int col = i - row * vec_vocab;
+                out_v[(size_t)row * vec_full + vec_vocab + col] = s1_v[i];
+                out_v[(size_t)row * vec_full + 2 * vec_vocab + col] = s2_v[i];
+                out_v[(size_t)row * vec_full + 3 * vec_vocab + col] = s3_v[i];
+            }
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
+                const int row = i / local_vocab_size;
+                const int col = i - row * local_vocab_size;
+                rank0_full_out[(size_t)row * full_vocab + local_vocab_size + col] = s_buf[1][i];
+                rank0_full_out[(size_t)row * full_vocab + 2 * local_vocab_size + col] = s_buf[2][i];
+                rank0_full_out[(size_t)row * full_vocab + 3 * local_vocab_size + col] = s_buf[3][i];
+            }
+        }
+    }
+}
+
 }  // namespace w34_comm
 
 extern "C" size_t w34_tp2_signal_bytes(void) {
@@ -807,6 +1346,338 @@ extern "C" int w34_tp2_gather_vocab_f16(
     return (int)cudaGetLastError();
 }
 
+extern "C" int w34_device_can_enable_p2p(int dev_a, int dev_b, int require_native_atomic, int* out_can_p2p) {
+    if (out_can_p2p == nullptr) return (int)cudaErrorInvalidValue;
+    *out_can_p2p = 0;
+    if (dev_a < 0 || dev_b < 0) return (int)cudaErrorInvalidDevice;
+    if (dev_a == dev_b) {
+        *out_can_p2p = 1;
+        return 0;
+    }
+    int can_ab = 0;
+    int can_ba = 0;
+    cudaError_t err = cudaDeviceCanAccessPeer(&can_ab, dev_a, dev_b);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaDeviceCanAccessPeer(&can_ba, dev_b, dev_a);
+    if (err != cudaSuccess) return (int)err;
+    if (!can_ab || !can_ba) {
+        return 0;
+    }
+    if (require_native_atomic) {
+        int atomic_ab = 0;
+        int atomic_ba = 0;
+        err = cudaDeviceGetP2PAttribute(&atomic_ab, cudaDevP2PAttrNativeAtomicSupported, dev_a, dev_b);
+        if (err != cudaSuccess) return (int)err;
+        err = cudaDeviceGetP2PAttribute(&atomic_ba, cudaDevP2PAttrNativeAtomicSupported, dev_b, dev_a);
+        if (err != cudaSuccess) return (int)err;
+        if (!atomic_ab || !atomic_ba) {
+            return 0;
+        }
+    }
+    int prev_dev = 0;
+    (void)cudaGetDevice(&prev_dev);
+    err = cudaSetDevice(dev_a);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaDeviceEnablePeerAccess(dev_b, 0);
+    if (err == cudaErrorPeerAccessAlreadyEnabled) {
+        (void)cudaGetLastError();
+    } else if (err != cudaSuccess) {
+        (void)cudaSetDevice(prev_dev);
+        return (int)err;
+    }
+    err = cudaSetDevice(dev_b);
+    if (err != cudaSuccess) {
+        (void)cudaSetDevice(prev_dev);
+        return (int)err;
+    }
+    err = cudaDeviceEnablePeerAccess(dev_a, 0);
+    if (err == cudaErrorPeerAccessAlreadyEnabled) {
+        (void)cudaGetLastError();
+    } else if (err != cudaSuccess) {
+        (void)cudaSetDevice(prev_dev);
+        return (int)err;
+    }
+    (void)cudaSetDevice(prev_dev);
+    *out_can_p2p = 1;
+    return 0;
+}
+
+extern "C" int w34_tp4_all_reduce_f16(
+    const w34_exec* ex,
+    const void* local_in,
+    void* out,
+    void* stage0,
+    void* stage1,
+    void* stage2,
+    void* stage3,
+    void* sig0,
+    void* sig1,
+    void* sig2,
+    void* sig3,
+    int rank,
+    int num_elems) {
+    if (ex == nullptr || local_in == nullptr || out == nullptr ||
+        stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
+        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
+        rank < 0 || rank >= 4 || num_elems <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    int blocks = (num_elems + 511) / 512;
+    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (blocks > cap) blocks = cap;
+    if (blocks < 1) blocks = 1;
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    w34_comm::tp4_all_reduce_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)local_in, (__half*)out, ptrs, rank, num_elems);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
+    const w34_exec* ex,
+    const void* local_in,
+    void* ar_out,
+    void* residual,
+    const void* weight,
+    void* out,
+    void* tap_dst_bf16,
+    void* stage0,
+    void* stage1,
+    void* stage2,
+    void* stage3,
+    void* sig0,
+    void* sig1,
+    void* sig2,
+    void* sig3,
+    int rank,
+    int num_tokens,
+    int hidden_size,
+    float eps,
+    int tap_row_stride,
+    int tap_col_offset) {
+    if (ex == nullptr || local_in == nullptr || residual == nullptr ||
+        weight == nullptr || out == nullptr ||
+        stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
+        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
+        rank < 0 || rank >= 4 || num_tokens < 0 || hidden_size <= 0 || hidden_size > 6144) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (tap_dst_bf16 != nullptr &&
+        (tap_col_offset < 0 || tap_row_stride < hidden_size ||
+         tap_col_offset > tap_row_stride - hidden_size)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens == 0) return 0;
+    int blocks = num_tokens;
+    int cap = w34_comm::tp2_block_cap(true);
+    if (cap > 16) cap = 16;
+    if (blocks > cap) blocks = cap;
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    if (hidden_size <= 2560) {
+        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>
+            <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
+                (const __half*)weight, (__half*)out,
+                (__nv_bfloat16*)tap_dst_bf16, ptrs,
+                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+    } else if (hidden_size <= 4096) {
+        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>
+            <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
+                (const __half*)weight, (__half*)out,
+                (__nv_bfloat16*)tap_dst_bf16, ptrs,
+                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+    } else if (hidden_size <= 5120) {
+        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>
+            <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
+                (const __half*)weight, (__half*)out,
+                (__nv_bfloat16*)tap_dst_bf16, ptrs,
+                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+    } else {
+        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>
+            <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
+                (const __half*)weight, (__half*)out,
+                (__nv_bfloat16*)tap_dst_bf16, ptrs,
+                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+    }
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp4_all_reduce_bf16(
+    const w34_exec* ex,
+    const void* local_in,
+    void* out,
+    void* stage0,
+    void* stage1,
+    void* stage2,
+    void* stage3,
+    void* sig0,
+    void* sig1,
+    void* sig2,
+    void* sig3,
+    int rank,
+    int num_elems) {
+    if (ex == nullptr || local_in == nullptr || out == nullptr ||
+        stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
+        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
+        rank < 0 || rank >= 4 || num_elems <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    int blocks = (num_elems + 511) / 512;
+    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (blocks > cap) blocks = cap;
+    if (blocks < 1) blocks = 1;
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    w34_comm::tp4_all_reduce_bf16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+        (const __nv_bfloat16*)local_in, (__nv_bfloat16*)out, ptrs, rank, num_elems);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp4_all_reduce_f32(
+    const w34_exec* ex,
+    const float* local_in,
+    float* out,
+    float* stage0,
+    float* stage1,
+    float* stage2,
+    float* stage3,
+    void* sig0,
+    void* sig1,
+    void* sig2,
+    void* sig3,
+    int rank,
+    int num_elems) {
+    if (ex == nullptr || local_in == nullptr || out == nullptr ||
+        stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
+        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
+        rank < 0 || rank >= 4 || num_elems <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    int blocks = (num_elems + 511) / 512;
+    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (blocks > cap) blocks = cap;
+    if (blocks < 1) blocks = 1;
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    w34_comm::tp4_all_reduce_f32_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+        local_in, out, ptrs, rank, num_elems);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp4_broadcast_i32(
+    const w34_exec* ex,
+    const int32_t* src_rank0,
+    int32_t* out,
+    int32_t* stage0,
+    int32_t* stage1,
+    int32_t* stage2,
+    int32_t* stage3,
+    void* sig0,
+    void* sig1,
+    void* sig2,
+    void* sig3,
+    int rank,
+    int num_elems) {
+    if (ex == nullptr || (rank == 0 && src_rank0 == nullptr) || out == nullptr ||
+        stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
+        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
+        rank < 0 || rank >= 4 || num_elems <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    w34_comm::tp4_broadcast_i32_kernel<<<1, 256, 0, (cudaStream_t)ex->stream>>>(
+        src_rank0, out, ptrs, rank, num_elems);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp4_all_gather_top1_f32_i32(
+    const w34_exec* ex,
+    const float* local_max_val,
+    const int32_t* local_max_id,
+    float* global_max_val,
+    int32_t* global_max_id,
+    void* stage0,
+    void* stage1,
+    void* stage2,
+    void* stage3,
+    void* sig0,
+    void* sig1,
+    void* sig2,
+    void* sig3,
+    int rank,
+    int num_rows) {
+    if (ex == nullptr || local_max_val == nullptr || local_max_id == nullptr ||
+        global_max_val == nullptr || global_max_id == nullptr ||
+        stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
+        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
+        rank < 0 || rank >= 4 || num_rows <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    w34_comm::tp4_all_gather_top1_f32_i32_kernel<<<1, 256, 0, (cudaStream_t)ex->stream>>>(
+        local_max_val, local_max_id, global_max_val, global_max_id, ptrs, rank, num_rows);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp4_gather_vocab_f16(
+    const w34_exec* ex,
+    const void* local_logits_f16,
+    void* rank0_full_logits_f16,
+    void* stage0,
+    void* stage1,
+    void* stage2,
+    void* stage3,
+    void* sig0,
+    void* sig1,
+    void* sig2,
+    void* sig3,
+    int rank,
+    int num_rows,
+    int local_vocab_size) {
+    if (ex == nullptr || local_logits_f16 == nullptr ||
+        (rank == 0 && rank0_full_logits_f16 == nullptr) ||
+        stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
+        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
+        rank < 0 || rank >= 4 || num_rows <= 0 || local_vocab_size <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int num_elems = num_rows * local_vocab_size;
+    int blocks = (num_elems + 511) / 512;
+    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (blocks > cap) blocks = cap;
+    if (blocks < 1) blocks = 1;
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    w34_comm::tp4_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)local_logits_f16,
+        (__half*)rank0_full_logits_f16,
+        ptrs,
+        rank,
+        num_rows,
+        local_vocab_size);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int w34_tp2_warmup(void) {
     cudaFuncAttributes attr;
     cudaError_t err = cudaFuncGetAttributes(&attr, w34_comm::tp2_all_reduce_f16_kernel);
@@ -828,5 +1699,29 @@ extern "C" int w34_tp2_warmup(void) {
     err = cudaFuncGetAttributes(&attr, w34_comm::tp2_gather_vocab_f16_kernel);
     if (err != cudaSuccess) return (int)err;
     err = cudaFuncGetAttributes(&attr, w34_comm::tp2_broadcast_i32_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_all_reduce_f16_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(
+        &attr, w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(
+        &attr, w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(
+        &attr, w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(
+        &attr, w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_all_reduce_bf16_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_all_reduce_f32_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_all_gather_top1_f32_i32_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_gather_vocab_f16_kernel);
+    if (err != cudaSuccess) return (int)err;
+    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_broadcast_i32_kernel);
     return (int)err;
 }

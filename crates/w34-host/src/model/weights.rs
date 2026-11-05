@@ -2685,8 +2685,9 @@ impl FfnBlockWeights {
         } else {
             0
         };
-        let device_lru_safe = num_tokens * moe.top_k <= tmoe_engine.layer_hot_k(layer_id)
-            && tmoe_engine.layer_has_mapped_store(layer_id);
+        let device_lru_safe = tmoe_engine.layer_is_fully_resident(layer_id)
+            || (num_tokens * moe.top_k <= tmoe_engine.layer_hot_k(layer_id)
+                && tmoe_engine.layer_has_mapped_store(layer_id));
         if is_capturing_graph && !device_lru_safe {
             return Err(loader_err(
                 "tiered MoE graph exceeds mapped hot-cache capacity",

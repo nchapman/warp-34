@@ -30,13 +30,13 @@ fn print_usage() {
     eprintln!(
         "Usage: w34 <subcommand> [options]\n\
          Subcommands:\n\
-           generate     --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
-           bench        --model <id|path> [--tp 1|2] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format tq4|tq4_all|q8_0|fp16] [--out <json>]\n\
-           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2] [--max-prompts <n>] [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16] [--verify-lossless] [--verify-radix-warm]\n\
-           dump-diff    --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--compare-tp2] [--golden <safetensors>]\n\
+           generate     --model <id|path> [--tp 1|2|4] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
+           bench        --model <id|path> [--tp 1|2|4] [--stage decode|radix|scheduler|vision|all] [--batch-size <n>] [--prompt-len <n>] [--gen-len <n>] [--kv-format tq4|tq4_all|q8_0|fp16] [--out <json>]\n\
+           greedy-diff  --model <id|path> --golden <dir|json> [--tp 1|2|4] [--max-prompts <n>] [--max-tokens <n>] [--kv-format tq4|tq4_all|q8_0|fp16] [--verify-lossless] [--verify-radix-warm]\n\
+           dump-diff    --model <id|path> [--tp 1|2|4] [--prompt <str>] [--image <path|url>]... [--compare-tp2] [--golden <safetensors>]\n\
            profile-diff [--oracle <sqlite|json>] [--preset <key>] [--w34 <sqlite|json>] [--live] [--rounds <n>]\n\
-           serve        --model <id|path> [--tp 1|2] [--host <addr>] [--port <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
-           chat         --model <id|path> [--tp 1|2] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--no-thinking]\n\
+           serve        --model <id|path> [--tp 1|2|4] [--host <addr>] [--port <n>] [--kv-format tq4|tq4_all|q8_0|fp16]\n\
+           chat         --model <id|path> [--tp 1|2|4] [--prompt <str>] [--image <path|url>]... [--max-tokens <n>] [--no-thinking]\n\
          Serve-only: --api-key <value> OR --api-key-env <name> (explicit lookup; no ambient default).\n\
            Protects API routes; dashboard, metrics and health remain public. Default: no authentication.\n\
            --served-model-name <name> advertises an alias (default: original model ID).\n\
@@ -568,8 +568,8 @@ fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Result<(), Stri
         }
         return Err(format!("unknown subcommand: {sub}"));
     }
-    if !matches!(options.tp, 1 | 2) {
-        return Err("--tp must be 1 or 2".into());
+    if !matches!(options.tp, 1 | 2 | 4) {
+        return Err("--tp must be 1, 2, or 4".into());
     }
     if sub == "greedy-diff" && options.golden_path.is_none() {
         return Err("--golden <dir-or-json> is required".into());
@@ -2162,8 +2162,9 @@ mod tests {
         let cases: &[(&[&str], &str)] = &[
             (&["unknown"], "unknown subcommand"),
             (&["generate", "--unknown"], "unknown argument"),
-            (&["generate", "--tp", "0"], "--tp must be 1 or 2"),
-            (&["generate", "--tp", "3"], "--tp must be 1 or 2"),
+            (&["generate", "--tp", "0"], "--tp must be 1, 2, or 4"),
+            (&["generate", "--tp", "3"], "--tp must be 1, 2, or 4"),
+            (&["generate", "--tp", "5"], "--tp must be 1, 2, or 4"),
             (&["greedy-diff"], "--golden"),
             (&["bench", "--batch-size", "0"], "--batch-size"),
             (&["generate", "--kv-format", "unknown"], "--kv-format"),

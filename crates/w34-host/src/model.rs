@@ -107,7 +107,7 @@ fn layer_scratch_layout(
     model_scratch::layer_layout(
         model_scratch::Dimensions {
             q: mul(cfg.num_attention_heads / tp, cfg.head_dim)?,
-            kv: mul(cfg.num_key_value_heads / tp, cfg.head_dim)?,
+            kv: mul(cfg.local_kv_heads(tp), cfg.head_dim)?,
             v_heads: cfg.linear_num_value_heads / tp,
             v: mul(cfg.linear_num_value_heads / tp, cfg.linear_value_head_dim)?,
             k: mul(cfg.linear_num_key_heads / tp, cfg.linear_key_head_dim)?,

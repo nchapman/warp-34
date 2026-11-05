@@ -38,10 +38,14 @@ pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> 
             && c.num_experts_per_tok <= 16
             && c.num_experts_per_tok <= c.num_experts
             && c.moe_intermediate_size > 0
-            && c.moe_intermediate_size.is_multiple_of(tp)
+            && (if c.uses_tiered_moe() {
+                c.num_experts.is_multiple_of(tp) && c.moe_intermediate_size.is_multiple_of(8)
+            } else {
+                c.moe_intermediate_size.is_multiple_of(tp)
+            })
             && c.shared_expert_intermediate_size.is_multiple_of(tp)
     };
-    if !matches!(tp, 1 | 2)
+    if !matches!(tp, 1 | 2 | 4)
         || rank >= tp
         || !ffn_ok
         || c.mtp_num_hidden_layers != 1
@@ -55,9 +59,9 @@ pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> 
         || c.num_attention_heads == 0
         || !c.hidden_size.is_multiple_of(tp)
         || !c.num_attention_heads.is_multiple_of(tp)
-        || !c.num_key_value_heads.is_multiple_of(tp)
+        || !c.kv_heads_compatible_with_tp(tp)
         || !c.vocab_size.is_multiple_of(tp)
-        || !c.num_attention_heads.is_multiple_of(c.num_key_value_heads)
+        || !(c.num_attention_heads / tp).is_multiple_of(c.local_kv_heads(tp))
     {
         return Err(loader_err("unsupported MTP TP geometry"));
     }
@@ -178,6 +182,8 @@ impl Qwen3_5MtpRank {
         let h = c.hidden_size;
         let q = c.num_attention_heads * c.head_dim;
         let kv = c.num_key_value_heads * c.head_dim;
+        let local_kv = c.local_kv_heads(tp) * c.head_dim;
+        let kv_shard_idx = c.kv_head_shard_index(r, tp);
         let i = c.intermediate_size;
         let uses_hc = c.uses_hyper_connection();
         let hc_count = if uses_hc { c.hc_count.max(1) } else { 1 };
@@ -223,7 +229,8 @@ impl Qwen3_5MtpRank {
         };
         let bytes = 2
             * (2 * h * h
-                + (2 * q + 2 * kv) * h / tp
+                + (2 * q) * h / tp
+                + (2 * local_kv) * h
                 + h * q / tp
                 + (5 + hc_count) * h
                 + 2 * c.head_dim)
@@ -264,10 +271,10 @@ impl Qwen3_5MtpRank {
         };
         let qs = load("layers.0.self_attn.q_proj", 2 * q, h)?
             .slice_rows(r * 2 * q / tp, (r + 1) * 2 * q / tp);
-        let ks =
-            load("layers.0.self_attn.k_proj", kv, h)?.slice_rows(r * kv / tp, (r + 1) * kv / tp);
-        let vs =
-            load("layers.0.self_attn.v_proj", kv, h)?.slice_rows(r * kv / tp, (r + 1) * kv / tp);
+        let ks = load("layers.0.self_attn.k_proj", kv, h)?
+            .slice_rows(kv_shard_idx * local_kv, (kv_shard_idx + 1) * local_kv);
+        let vs = load("layers.0.self_attn.v_proj", kv, h)?
+            .slice_rows(kv_shard_idx * local_kv, (kv_shard_idx + 1) * local_kv);
         let qkv_proj = RawLinearHost::concat_rows(&[qs, ks, vs])?.upload(
             &mut weights,
             &target.stream,
@@ -445,15 +452,19 @@ impl Qwen3_5MtpRank {
                 })?;
             let local_experts = c.num_experts / tp;
             let free_vram = target.device.mem_info().map_or(0, |(free, _)| free);
+            let slots_128_need = 128usize
+                .saturating_mul(layout.stride)
+                .saturating_add(256 * 1024 * 1024);
             let k_hot = if tp == 1 && local_experts >= 192 && free_vram >= 2048 * 1024 * 1024 {
                 192
-            } else if local_experts >= 128 && free_vram >= 1536 * 1024 * 1024 {
+            } else if local_experts >= 128 && free_vram >= slots_128_need.max(512 * 1024 * 1024) {
                 128
             } else if local_experts >= 64 {
                 64
             } else {
                 16.min(local_experts).max(1)
             };
+            let fully_resident = k_hot >= local_experts;
             let stage_cap = 32.min(local_experts).max(1);
             let mut ws = crate::moe_offload::TieredMoeWorkspace::new(
                 target.device.device_id,
@@ -462,7 +473,7 @@ impl Qwen3_5MtpRank {
                 max_batch_rows.max(64),
                 c.num_experts_per_tok.max(1),
             )?;
-            let store = crate::moe_offload::HostExpertStore::load(
+            let mut store = crate::moe_offload::HostExpertStore::load_with_pin(
                 &archive,
                 "mtp.layers.0.mlp.experts",
                 &mtp_quant,
@@ -471,6 +482,7 @@ impl Qwen3_5MtpRank {
                 r,
                 tp,
                 usize::MAX,
+                !fully_resident,
             )
             .map_err(|e| {
                 crate::cuda::CudaError::with_detail(-1, "MTP HostExpertStore::load", e.to_string())
@@ -490,6 +502,10 @@ impl Qwen3_5MtpRank {
                     )
                 });
             cache.populate_initial(&store, initial.as_deref(), &mut ws, &target.stream)?;
+            if fully_resident {
+                target.stream.synchronize()?;
+                store.release_host_storage();
+            }
             Some((store, cache, ws))
         } else {
             None
@@ -531,7 +547,7 @@ impl Qwen3_5MtpRank {
             target.device.device_id,
             W34_KV_NAMESPACE_MTP_FULL_ATTN,
             &[c.num_hidden_layers],
-            c.num_key_value_heads / tp,
+            c.local_kv_heads(tp),
             c.head_dim,
             16,
             capacity.div_ceil(16),
@@ -567,7 +583,7 @@ impl Qwen3_5MtpRank {
             + c.hc_lowrank.max(1)
             + 3 * hc_count
             + 8 * q / tp
-            + 6 * c.num_key_value_heads * c.head_dim / tp
+            + 6 * local_kv
             + 2 * (c.indexer_n_heads + c.indexer_kv_heads) * c.indexer_head_dim
             + ffn_row_elements
             + target.local_vocab_size;
@@ -822,7 +838,7 @@ impl Qwen3_5MtpRank {
             return Err(loader_err("MTP target rank mismatch"));
         }
         if let Some(has_tp2) = tp2_expected
-            && (target.tp_size == 2) != has_tp2
+            && (target.tp_size > 1) != has_tp2
         {
             return Err(loader_err("invalid MTP TP2 collective state"));
         }
@@ -853,7 +869,7 @@ impl Qwen3_5MtpRank {
         let h_dim = t.cfg.hidden_size;
         let head_dim = t.cfg.head_dim;
         let local_q_heads = t.cfg.num_attention_heads / t.tp_size;
-        let local_kv_heads = t.cfg.num_key_value_heads / t.tp_size;
+        let local_kv_heads = t.cfg.local_kv_heads(t.tp_size);
         let local_interm = t.cfg.intermediate_size / t.tp_size;
         let q_gate_dim = local_q_heads * head_dim * 2;
         let kv_dim = local_kv_heads * head_dim;
@@ -1521,7 +1537,7 @@ impl Qwen3_5MtpRank {
             || span
                 .and_then(|n| input_hidden.checked_add(n as u64))
                 .is_none()
-            || (t.tp_size == 2) != tp2.is_some()
+            || (t.tp_size > 1) != tp2.is_some()
         {
             return Err(loader_err("invalid MTP batch or input span"));
         }
@@ -1532,7 +1548,7 @@ impl Qwen3_5MtpRank {
         let hc_lowrank = t.cfg.hc_lowrank.max(1);
         let head_dim = t.cfg.head_dim;
         let local_q_heads = t.cfg.num_attention_heads / t.tp_size;
-        let local_kv_heads = t.cfg.num_key_value_heads / t.tp_size;
+        let local_kv_heads = t.cfg.local_kv_heads(t.tp_size);
         let local_interm = t.cfg.intermediate_size / t.tp_size;
         let q_gate_dim = local_q_heads * head_dim * 2;
         let kv_dim = local_kv_heads * head_dim;
@@ -2151,7 +2167,9 @@ impl Qwen3_5MtpRank {
         if let Some((top_k, sh_out_ptr, sh_gate_ptr)) = tiered_info
             && let Some((store, cache, ws)) = &mut self.tiered_moe
         {
-            if num_tokens * top_k <= cache.slots.capacity && store.mapped_dev_ptr() != 0 {
+            if cache.slots.capacity >= cache.expert_ids.len()
+                || (num_tokens * top_k <= cache.slots.capacity && store.mapped_dev_ptr() != 0)
+            {
                 crate::moe_offload::TieredMoeEngine::execute_layer_device_lru(
                     store,
                     cache,

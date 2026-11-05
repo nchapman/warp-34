@@ -2061,6 +2061,38 @@ impl ModelConfig {
             .count()
     }
 
+    pub const fn kv_heads_compatible_with_tp(&self, tp_size: usize) -> bool {
+        if self.num_key_value_heads == 0
+            || tp_size == 0
+            || (tp_size > 1 && self.num_key_value_heads < 2)
+        {
+            false
+        } else if self.num_key_value_heads >= tp_size {
+            self.num_key_value_heads.is_multiple_of(tp_size)
+        } else {
+            tp_size.is_multiple_of(self.num_key_value_heads)
+        }
+    }
+
+    pub const fn local_kv_heads(&self, tp_size: usize) -> usize {
+        if tp_size <= 1 || self.num_key_value_heads == 0 {
+            self.num_key_value_heads
+        } else if self.num_key_value_heads >= tp_size {
+            self.num_key_value_heads / tp_size
+        } else {
+            1
+        }
+    }
+
+    pub const fn kv_head_shard_index(&self, rank: usize, tp_size: usize) -> usize {
+        if tp_size <= 1 || self.num_key_value_heads == 0 || self.num_key_value_heads >= tp_size {
+            rank
+        } else {
+            let rep = tp_size / self.num_key_value_heads;
+            rank / rep
+        }
+    }
+
     pub fn num_linear_attention_layers(&self) -> usize {
         self.layer_types
             .iter()

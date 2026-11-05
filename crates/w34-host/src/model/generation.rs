@@ -386,9 +386,7 @@ impl Qwen3_5Engine {
                 Ok(ids[0])
             } else {
                 let comm = self.tp2_comm.as_ref().unwrap().clone();
-                let [r0, r1] = &mut self.ranks[..] else {
-                    unreachable!()
-                };
+                let (r0, peer_ranks) = self.ranks.split_first_mut().unwrap();
                 let ft_ref = slice.tokens;
                 let fp_ref = custom_positions;
                 let qs_ref = &q_start_loc;
@@ -402,7 +400,7 @@ impl Qwen3_5Engine {
                 let cd_ref = &checkpoint_dst_indices;
                 let co_ref = &checkpoint_token_offsets;
                 let sr_ref = &selected_rows;
-                let (res0, res1) = std::thread::scope(|sc| {
+                let (res0, peer_results) = std::thread::scope(|sc| {
                     let c0 = comm.clone();
                     let h0 = sc.spawn(move || -> Result<Vec<i32>> {
                         let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
@@ -437,44 +435,54 @@ impl Qwen3_5Engine {
                             sr_ref,
                         )
                     });
-                    let c1 = comm.clone();
-                    let h1 = sc.spawn(move || -> Result<()> {
-                        let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r1.upload_batch_meta(
-                            ft_ref,
-                            fp_ref,
-                            qs_ref,
-                            cb_ref,
-                            sa_ref,
-                            bt_ref,
-                            ws_ref,
-                            si_ref,
-                            so_ref,
-                            hi_ref,
-                            &[],
-                            cd_ref,
-                            co_ref,
-                            1,
-                            q_len,
-                            bt_ref.len(),
-                            q_len,
-                            seq_after,
-                            0,
-                            max_checkpoints_per_req,
-                        )?;
-                        let _ = r1.forward_selected_rows(
-                            tok_ptr,
-                            pos_ptr,
-                            q_len,
-                            &attn_batch,
-                            &gdn_batch,
-                            Some(&c1),
-                            sr_ref,
-                        )?;
-                        Ok(())
-                    });
-                    (h0.join().unwrap(), h1.join().unwrap())
+                    let mut peer_handles = Vec::with_capacity(peer_ranks.len());
+                    for r_peer in peer_ranks {
+                        let cp = comm.clone();
+                        peer_handles.push(sc.spawn(move || -> Result<()> {
+                            let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r_peer
+                                .upload_batch_meta(
+                                    ft_ref,
+                                    fp_ref,
+                                    qs_ref,
+                                    cb_ref,
+                                    sa_ref,
+                                    bt_ref,
+                                    ws_ref,
+                                    si_ref,
+                                    so_ref,
+                                    hi_ref,
+                                    &[],
+                                    cd_ref,
+                                    co_ref,
+                                    1,
+                                    q_len,
+                                    bt_ref.len(),
+                                    q_len,
+                                    seq_after,
+                                    0,
+                                    max_checkpoints_per_req,
+                                )?;
+                            let _ = r_peer.forward_selected_rows(
+                                tok_ptr,
+                                pos_ptr,
+                                q_len,
+                                &attn_batch,
+                                &gdn_batch,
+                                Some(&cp),
+                                sr_ref,
+                            )?;
+                            Ok(())
+                        }));
+                    }
+                    let mut peers = Vec::with_capacity(peer_handles.len());
+                    for hp in peer_handles {
+                        peers.push(hp.join().unwrap());
+                    }
+                    (h0.join().unwrap(), peers)
                 });
-                res1?;
+                for pr in peer_results {
+                    pr?;
+                }
                 Ok(res0?[0])
             }
         })();

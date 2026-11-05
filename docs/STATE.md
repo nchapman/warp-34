@@ -1,5 +1,32 @@
 # warp-34 — Session Orientation & Current State
 
+## NVLink P2P Collectives & TP=4 / EP=4 Execution (completed & verified)
+
+- **P2P/NVLink VRAM collectives (`Tp2Collectives::new_for_tp_with_p2p`):** `w34_device_can_enable_p2p(dev_a, dev_b, require_native_atomic, out_can_p2p)` probes `cudaDeviceCanAccessPeer` + `cudaDeviceGetP2PAttribute` and enables bidirectional `cudaDeviceEnablePeerAccess` across TP peer pairs. When all pairs support direct P2P (`TP=2` over bonded `NV4` NVLink `112.5 GB/s`), `Tp2Collectives` allocates `sigs` and `stages` in `CommBuffer::DeviceVram` (`DeviceBuffer`) so peer kernels perform 1-hop NVLink VRAM reads/writes with `threadfence_system()` release/acquire flags; when any pair lacks P2P (`TP=2` over non-P2P PCIe or `TP=4` across dual NVLink pairs connected by `NODE`), it transparently falls back to `CommBuffer::MappedHost` (`MappedHostBuffer`).
+- **`TP=4 / EP=4` kernels & runtime (`op_collectives.cu`, `crates/w34-host`):**
+  - Added `w34_tp4_all_reduce_f16`, `w34_tp4_all_reduce_residual_gemma_rms_norm_f16`, `w34_tp4_all_reduce_bf16`, `w34_tp4_all_reduce_f32`, `w34_tp4_broadcast_i32`, `w34_tp4_all_gather_top1_f32_i32`, and `w34_tp4_gather_vocab_f16`, all CUDA-Graph capturable with monotonic epoch barriers (`barrier_tp4_epoch_release` + `flag_counter`).
+  - Generalized `ModelConfig` sharding (`Qwen3_5ModelRank::validate_tp_geometry`, `local_kv_heads`, `kv_head_shard_index` replicating `2` KV heads across rank pairs `(0,1)` and `(2,3)` on `TP=4` when `num_key_value_heads < tp_size`), `PleWeightStore` `TP=4` shard loading (`d_ple / 4 = 512`), `Qwen3_5MTP` (`tp_size = 1 | 2 | 4`), `DFlash2` (`broadcast_from_rank0_i32`), and `Qwen3_5Engine` worker synchronization across `1`, `2`, or `4` ranks.
+  - **100% VRAM-resident `EP=4` MoE fast path (`moe_offload.rs`):** On `TP=4 / EP=4` for `Qwen3.8-Flash-Next-W4A16-FP8PLE`, all `512` routed experts (`128` local experts/rank = `3.50 GiB/rank`) fit in the `k_hot = 128` GPU hot cache (`k_hot == num_local_experts`). `HostExpertStore::load_with_pin(..., pin_host = false)` uses unpinned heap memory during weight loading and calls `release_host_storage()` immediately after `DeviceLruExpertCache::populate_initial` + `stream.synchronize()`, avoiding `74 GiB` of locked host memory. `execute_layer_device_lru` dispatches `w34_moe_remap_topk_ids_i32` + `launch_moe_w4a16` directly on the GPU for both prefill and decode without CPU synchronization or LRU traffic.
+- **4× RTX 3090 Dual-NVLink Pod (`ssh-1`: `GPU0<->GPU3` and `GPU1<->GPU2` bonded `NV4`, AMD EPYC 7B13) Verification & Benchmarks (`prompt_len=512`, `gen_len=128`, `--kv-format tq4`):**
+  - **Unit & Parity Gates:** `test_tp2_p2p_and_tp4_collectives` passes on both `TP=2` NVLink (`CUDA_VISIBLE_DEVICES=0,3`, `is_p2p_vram() == true`) and `TP=4` (`0,3,1,2`), and `--verify-lossless` passes on `TP=4` for both `27B + DFlash2` and `Flash-Next + MTP (k=3)`.
+  - **`nchapman/Qwen3.8-27B-W4A16-GPTQ`:**
+    - `TP=2` PCIe (`0,1`) vs `TP=2` NVLink P2P (`0,3`):
+      - Plain decode (`M=1`): 512-tok TTFT **329.93 ms → 205.73 ms (`1,551.8 → 2,488.7 tok/s`, `+60.4%`)**; decode **90.25 → 91.29 tok/s** (`10.95 ms/tok`).
+      - `MTP (k=3)`: TTFT **362.99 ms → 216.34 ms (`+67.8%`)**; verify **18.80 → 17.86 ms/round**; decode **146.88 → 154.61 tok/s** (`6.47 ms/tok`).
+      - `DFlash2 (M=16)`: TTFT **389.49 ms → 217.03 ms (`1,314.5 → 2,359.1 tok/s`, `+79.5%`)**; verify **19.75 → 17.42 ms/round (`-2.32 ms/round`)**; decode **173.81 → 197.00 tok/s (`+13.3%`, `5.08 ms/tok`)** with bit-identical output tokens.
+    - `TP=4` (`0,3,1,2`):
+      - Plain decode (`M=1`): **129.10 tok/s** (`7.75 ms/tok`, **`+41.4%`** over `TP=2` NVLink).
+      - `MTP (k=3)`: **13.22 ms/verify_round** (**291.04 tok/s**, `3.44 ms/tok` at `3.85 tok/round`).
+      - `DFlash2 (M=16)`: **15.25 ms/verify_round** (**438.29 tok/s**, `2.28 ms/tok` at `6.68 tok/round`, `--verify-lossless` PASS).
+  - **`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` (`512` experts, `top-10`):**
+    - `TP=2` PCIe (`0,1`) vs `TP=2` NVLink P2P (`0,3`):
+      - Plain decode (`M=1`): TTFT **420.84 ms → 372.30 ms (`1,216.6 → 1,375.2 tok/s`, `+13.0%`)**; decode **62.02 → 62.65 tok/s** (`15.96 ms/tok`).
+      - `MTP (k=3)`: TTFT **453.53 ms → 393.80 ms (`1,128.9 → 1,300.2 tok/s`, `+15.2%`)**; verify **31.61 → 31.05 ms/round**; decode **89.28 → 90.89 tok/s** (`11.00 ms/tok`).
+    - `TP=4 / EP=4` (`0,3,1,2`, 100% VRAM-resident 512 experts, zero CPU offload):
+      - 512-tok Prefill: **186.80 ms (`2,740.9 tok/s`, `2.00×` vs `TP=2` NVLink, `2.25×` vs `TP=2` PCIe)**.
+      - Plain decode (`M=1`): **90.64 tok/s** (`11.03 ms/tok`, **`+44.7%`** over `TP=2`).
+      - `MTP (k=3)`: **17.97 ms/verify_round (`1.73×` faster round vs `TP=2`) → 147.23 tok/s (`6.79 ms/tok`, `+62.0%` over `TP=2`, `--verify-lossless` PASS)**.
+
 ## Rust CPU MoE bridge migration (completed & verified)
 
 - **Architecture:** Host SIMD `u4b8` evaluation, dynamic physical-core worker pool, responder, and mapped mailbox ownership now live in `crates/w34-host/src/moe_cpu_bridge.rs` and `crates/w34-host/src/moe_cpu_bridge/eval.rs`. `crates/w34-kernels/csrc/ops/op_moe_cpu_bridge.cu` contains only stateless GPU mailbox kernels and explicit-pointer launch wrappers (`w34_moe_hybrid_submit_and_pull`, `w34_moe_hybrid_wait_and_add`); no C++ host singleton or detached threads remain.

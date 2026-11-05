@@ -740,8 +740,10 @@ impl QwenFlashNextCapacityPlan {
         requested_hot_experts_per_layer: Option<usize>,
         include_mtp_in_vram: bool,
     ) -> Result<Self, String> {
-        if tp_size != 1 && tp_size != 2 {
-            return Err(format!("unsupported tp_size={tp_size} (expected 1 or 2)"));
+        if !matches!(tp_size, 1 | 2 | 4) {
+            return Err(format!(
+                "unsupported tp_size={tp_size} (expected 1, 2, or 4)"
+            ));
         }
         let num_layers = cfg.num_hidden_layers;
         let num_full_attn = cfg
@@ -844,8 +846,10 @@ impl QwenFlashNextCapacityPlan {
             (avail_for_hot / bytes_per_hot_expert_across_layers).min(local_total_experts_per_layer);
         let default_hot = if tp_size == 1 {
             max_hot_per_layer.min(48)
-        } else {
+        } else if tp_size == 2 {
             max_hot_per_layer.min(104)
+        } else {
+            max_hot_per_layer.min(local_total_experts_per_layer)
         };
         let hot_experts_per_layer_per_rank = match requested_hot_experts_per_layer {
             Some(req) => {
@@ -1453,6 +1457,30 @@ mod tests {
         .unwrap();
         assert!(plan_tp2.hot_experts_per_layer_per_rank >= 96);
         assert!(plan_tp2.headroom_per_rank_bytes >= 512 * 1024 * 1024);
+
+        let plan_tp4 = QwenFlashNextCapacityPlan::plan(
+            &cfg,
+            4,
+            vram_24g,
+            free_23_5g,
+            KvFormatPolicy::Tq4,
+            16,
+            Some(4096),
+            Some(16),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan_tp4.hot_experts_per_layer_per_rank, 128);
+        assert_eq!(plan_tp4.cold_experts_per_layer_per_rank, 0);
+        assert_eq!(plan_tp4.host_expert_pinned_ram_bytes, 0);
+        assert!(plan_tp4.headroom_per_rank_bytes >= 512 * 1024 * 1024);
+        assert!(cfg.kv_heads_compatible_with_tp(4));
+        assert_eq!(cfg.local_kv_heads(4), 1);
+        assert_eq!(
+            [0, 1, 2, 3].map(|r| cfg.kv_head_shard_index(r, 4)),
+            [0, 0, 1, 1]
+        );
     }
 
     #[test]

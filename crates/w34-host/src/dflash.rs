@@ -271,7 +271,7 @@ impl DFlash2Rank {
         let cfg = DFlash2Config::load(dir)?;
         let c = &cfg.model;
         let (h, d, tp, r) = (c.hidden_size, c.head_dim, t.tp_size, t.rank);
-        if !matches!(tp, 1 | 2)
+        if !matches!(tp, 1 | 2 | 4)
             || r >= tp
             || h != t.cfg.hidden_size
             || c.vocab_size != t.cfg.vocab_size
@@ -1123,7 +1123,7 @@ impl DFlash2Rank {
         self.validate_target(t)?;
         if anchor < 0
             || anchor as usize >= self.cfg.model.vocab_size
-            || (self.tp == 2) != comm.is_some()
+            || (self.tp > 1) != comm.is_some()
         {
             return Err(loader_err("invalid DFlash forward"));
         }

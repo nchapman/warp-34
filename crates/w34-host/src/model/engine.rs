@@ -86,7 +86,7 @@ impl Qwen3_5Engine {
         max_num_seqs: usize,
     ) -> Result<Self> {
         let state_slots = serving_state_slots(max_num_seqs)?;
-        assert!(tp_size == 1 || tp_size == 2, "tp_size must be 1 or 2");
+        assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
         let dir = resolve_hf_model_dir(model_spec)
             .map_err(|e| loader_err_ctx("resolve_hf_model_dir", e.to_string()))?;
         Self::load_from_dir_with_capacity(
@@ -109,7 +109,7 @@ impl Qwen3_5Engine {
         requested_kv_pages: Option<usize>,
         use_cuda_graph: bool,
     ) -> Result<Self> {
-        assert!(tp_size == 1 || tp_size == 2, "tp_size must be 1 or 2");
+        assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
         let dir = resolve_hf_model_dir(model_spec)
             .map_err(|e| loader_err_ctx("resolve_hf_model_dir", e.to_string()))?;
         Self::load_from_dir(&dir, tp_size, kv_policy, requested_kv_pages, use_cuda_graph)
@@ -158,9 +158,12 @@ impl Qwen3_5Engine {
                     .resolve_name("visual.patch_embed.proj.weight")
                     .is_some());
 
-        let tp2_comm = if tp_size == 2 {
+        let tp2_comm = if tp_size > 1 {
             // Max collective payload: 4096 tokens * 5120 hidden_size * 2 bytes = 40 MiB
-            Some(Arc::new(Tp2Collectives::new(40 * 1024 * 1024)?))
+            Some(Arc::new(Tp2Collectives::new_for_tp(
+                tp_size,
+                40 * 1024 * 1024,
+            )?))
         } else {
             None
         };

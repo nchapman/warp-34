@@ -32,14 +32,13 @@ impl Qwen3_5Engine {
                     "insufficient scratch workspace for TP=2 GPU sampler",
                 ));
             }
-            let [r0, r1] = &mut self.ranks[..] else {
-                unreachable!()
-            };
-            if r1.last_logits_ptr == 0 || r1.last_logits_rows < num_rows {
-                return Err(loader_err("missing rank 1 device logits for GPU sampler"));
+            for r in &self.ranks[1..] {
+                if r.last_logits_ptr == 0 || r.last_logits_rows < num_rows {
+                    return Err(loader_err("missing rank 1 device logits for GPU sampler"));
+                }
             }
             let shard_bytes = num_rows
-                .checked_mul(r0.local_vocab_size)
+                .checked_mul(self.ranks[0].local_vocab_size)
                 .and_then(|v| v.checked_mul(2))
                 .ok_or_else(|| loader_err("tp2 vocab gather byte overflow"))?;
             if shard_bytes > comm.max_stage_bytes_per_epoch {
@@ -48,26 +47,18 @@ impl Qwen3_5Engine {
                 ));
             }
             let full_ptr = ws_base;
-            let ex0 = r0.stream.exec(0, 0);
-            let ex1 = r1.stream.exec(0, 0);
-            r0.device.make_current()?;
-            comm.gather_vocab_f16(
-                &ex0,
-                r0.last_logits_ptr,
-                full_ptr,
-                0,
-                num_rows as i32,
-                r0.local_vocab_size as i32,
-            )?;
-            r1.device.make_current()?;
-            comm.gather_vocab_f16(
-                &ex1,
-                r1.last_logits_ptr,
-                0,
-                1,
-                num_rows as i32,
-                r1.local_vocab_size as i32,
-            )?;
+            for (rank_idx, r) in self.ranks.iter().enumerate() {
+                let ex = r.stream.exec(0, 0);
+                r.device.make_current()?;
+                comm.gather_vocab_f16(
+                    &ex,
+                    r.last_logits_ptr,
+                    if rank_idx == 0 { full_ptr } else { 0 },
+                    rank_idx as i32,
+                    num_rows as i32,
+                    r.local_vocab_size as i32,
+                )?;
+            }
             (full_ptr, ws_base + full_bytes as u64, ws_cap - full_bytes)
         };
 
@@ -314,13 +305,14 @@ impl Qwen3_5Engine {
                 .pinned_in_flight
                 .store(false, std::sync::atomic::Ordering::Release);
         }
-        if self.tp_size == 2 {
-            self.ranks[1].device.make_current()?;
-            self.ranks[1].stream.synchronize()?;
-            self.ranks[1]
-                .batched_decode_io
-                .pinned_in_flight
-                .store(false, std::sync::atomic::Ordering::Release);
+        if self.tp_size > 1 {
+            for r in &self.ranks[1..] {
+                r.device.make_current()?;
+                r.stream.synchronize()?;
+                r.batched_decode_io
+                    .pinned_in_flight
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
         }
         Ok(outs)
     }

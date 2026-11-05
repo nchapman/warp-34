@@ -98,21 +98,36 @@ pub fn plan_tiered_moe_hot_per_layer(
         return (0, 0);
     }
     let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
-    let default_hot = if tp_size == 2 { 112usize } else { 80usize };
+    let default_hot = if tp_size >= 4 {
+        local_experts
+    } else if tp_size == 2 {
+        112usize.min(local_experts)
+    } else {
+        80usize.min(local_experts)
+    };
     let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
-    if local_experts <= default_hot || exp_bytes == 0 || cfg.num_hidden_layers == 0 {
+    if (tp_size < 4 && local_experts <= default_hot)
+        || cfg.num_experts < 64
+        || exp_bytes == 0
+        || cfg.num_hidden_layers == 0
+    {
         let hot = (local_experts / 2).max(1);
         let reserve = (cfg.num_hidden_layers * hot + 512) * exp_bytes + 64 * 1024 * 1024;
         return (hot, reserve);
     }
-    let min_hot = if tp_size == 2 {
+    let min_hot = if tp_size >= 2 {
         32usize.min(default_hot)
     } else {
         16usize.min(default_hot)
     };
+    let extra_reserve = if tp_size >= 4 {
+        256 * exp_bytes
+    } else {
+        512 * exp_bytes + 640 * 1024 * 1024
+    };
     let fixed_overhead = base_headroom_plus_kv_bytes
         .saturating_add(min_state_pool_bytes)
-        .saturating_add(512 * exp_bytes + 640 * 1024 * 1024);
+        .saturating_add(extra_reserve);
     let per_hot_step = cfg.num_hidden_layers * exp_bytes;
     let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
         let max_affordable =
@@ -122,7 +137,7 @@ pub fn plan_tiered_moe_hot_per_layer(
     } else {
         min_hot
     };
-    let reserve = (cfg.num_hidden_layers * hot + 512) * exp_bytes + 640 * 1024 * 1024;
+    let reserve = (cfg.num_hidden_layers * hot) * exp_bytes + extra_reserve;
     (hot, reserve)
 }
 
@@ -169,9 +184,9 @@ impl Qwen3_5ModelRank {
     }
 
     fn validate_tp_geometry(cfg: &ModelConfig, tp_size: usize) -> Result<()> {
-        if !matches!(tp_size, 1 | 2) {
+        if !matches!(tp_size, 1 | 2 | 4) {
             return Err(loader_err_msg(format!(
-                "unsupported tp_size={tp_size} (warp-34 supports TP=1 or TP=2)"
+                "unsupported tp_size={tp_size} (warp-34 supports TP=1, TP=2, or TP=4)"
             )));
         }
         if cfg.vocab_size == 0 || !cfg.vocab_size.is_multiple_of(tp_size) {
@@ -184,20 +199,18 @@ impl Qwen3_5ModelRank {
             if cfg.num_attention_heads == 0
                 || cfg.num_key_value_heads == 0
                 || !cfg.num_attention_heads.is_multiple_of(tp_size)
-                || !cfg.num_key_value_heads.is_multiple_of(tp_size)
+                || !cfg.kv_heads_compatible_with_tp(tp_size)
             {
                 return Err(loader_err_msg(format!(
-                    "attention heads (q={}, kv={}) are not divisible by tp_size={tp_size}; retry with --tp 1",
+                    "attention heads (q={}, kv={}) are not compatible with tp_size={tp_size}; retry with --tp 1",
                     cfg.num_attention_heads, cfg.num_key_value_heads
                 )));
             }
-            if !(cfg.num_attention_heads / tp_size)
-                .is_multiple_of(cfg.num_key_value_heads / tp_size)
-            {
+            let local_kv = cfg.local_kv_heads(tp_size);
+            if !(cfg.num_attention_heads / tp_size).is_multiple_of(local_kv) {
                 return Err(loader_err_msg(format!(
-                    "local Q heads ({}) must be a multiple of local KV heads ({})",
+                    "local Q heads ({}) must be a multiple of local KV heads ({local_kv})",
                     cfg.num_attention_heads / tp_size,
-                    cfg.num_key_value_heads / tp_size
                 )));
             }
         }
@@ -221,7 +234,17 @@ impl Qwen3_5ModelRank {
             }
         }
         if cfg.num_experts > 0 {
-            if cfg.moe_intermediate_size == 0
+            if cfg.uses_tiered_moe() {
+                if !cfg.num_experts.is_multiple_of(tp_size)
+                    || cfg.moe_intermediate_size == 0
+                    || !cfg.moe_intermediate_size.is_multiple_of(8)
+                {
+                    return Err(loader_err_msg(format!(
+                        "tiered MoE num_experts={} / moe_intermediate_size={} incompatible with TP={tp_size}",
+                        cfg.num_experts, cfg.moe_intermediate_size
+                    )));
+                }
+            } else if cfg.moe_intermediate_size == 0
                 || !cfg.moe_intermediate_size.is_multiple_of(tp_size * 8)
             {
                 return Err(loader_err_msg(format!(
@@ -586,7 +609,8 @@ impl Qwen3_5ModelRank {
         let mut gdn_layer_ids = Vec::new();
 
         let local_q_heads = cfg.num_attention_heads / tp_size;
-        let local_kv_heads = cfg.num_key_value_heads / tp_size;
+        let local_kv_heads = cfg.local_kv_heads(tp_size);
+        let kv_shard_idx = cfg.kv_head_shard_index(rank, tp_size);
         let q_gate_total = cfg.num_attention_heads * cfg.head_dim * 2;
         let q_gate_local = local_q_heads * cfg.head_dim * 2;
         let kv_local = local_kv_heads * cfg.head_dim;
@@ -673,14 +697,16 @@ impl Qwen3_5ModelRank {
                         &format!("{pfx}.self_attn.k_proj"),
                         &cfg.quant,
                     )?;
-                    let k_shard = raw_k.slice_rows(rank * kv_local, (rank + 1) * kv_local);
+                    let k_shard =
+                        raw_k.slice_rows(kv_shard_idx * kv_local, (kv_shard_idx + 1) * kv_local);
 
                     let raw_v = RawLinearHost::load(
                         archive,
                         &format!("{pfx}.self_attn.v_proj"),
                         &cfg.quant,
                     )?;
-                    let v_shard = raw_v.slice_rows(rank * kv_local, (rank + 1) * kv_local);
+                    let v_shard =
+                        raw_v.slice_rows(kv_shard_idx * kv_local, (kv_shard_idx + 1) * kv_local);
 
                     let qkv_shard = RawLinearHost::concat_rows(&[q_shard, k_shard, v_shard])?;
                     let qkv_proj = qkv_shard.upload(&mut weight_arena, &stream, &repack_staging)?;
@@ -1163,8 +1189,10 @@ impl Qwen3_5ModelRank {
     pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
         let top_k = self.cfg.num_experts_per_tok.max(1);
         self.tiered_moe.as_ref().is_none_or(|tm| {
-            (0..self.layers.len())
-                .all(|li| num_tokens * top_k <= tm.layer_hot_k(li) && tm.layer_has_mapped_store(li))
+            (0..self.layers.len()).all(|li| {
+                tm.layer_is_fully_resident(li)
+                    || (num_tokens * top_k <= tm.layer_hot_k(li) && tm.layer_has_mapped_store(li))
+            })
         })
     }
 
@@ -1172,15 +1200,25 @@ impl Qwen3_5ModelRank {
     pub fn init_tiered_moe(&mut self, archive: &SafetensorsArchive) -> Result<()> {
         self.device.make_current()?;
         let local_experts = (self.cfg.num_experts / self.tp_size).max(1);
-        let default_hot = if self.tp_size == 2 { 112usize } else { 80usize };
+        let default_hot = if self.tp_size >= 4 {
+            local_experts
+        } else if self.tp_size == 2 {
+            112usize
+        } else {
+            80usize
+        };
         let hot_per_layer = if self.tiered_moe_hot_per_layer > 0 {
             self.tiered_moe_hot_per_layer
-        } else if local_experts <= default_hot {
+        } else if self.cfg.num_experts < 64 {
             (local_experts / 2).max(1)
         } else {
             default_hot
         };
-        let stage_cap = local_experts.clamp(1, 96);
+        let stage_cap = if self.tp_size >= 4 {
+            local_experts.clamp(1, 32)
+        } else {
+            local_experts.clamp(1, 96)
+        };
         let tiered_moe = crate::moe_offload::RankTieredMoe::load_for_rank(
             archive,
             &self.cfg,

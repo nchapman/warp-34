@@ -1782,3 +1782,153 @@ fn test_gate3_and_gate4_cuda_graph_spec_rollback_and_tp2_collectives() {
     assert_eq!(tx.committed_slot, 2);
     assert_eq!(freed, vec![0, 1, 3, 4]);
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_tp2_p2p_and_tp4_collectives() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let num_gpus = CudaDevice::count().unwrap_or(0);
+    if num_gpus < 2 {
+        return;
+    }
+    for dev_id in 0..2 {
+        prepare_execution_plan(dev_id).unwrap();
+    }
+    for allow_p2p in [false, true] {
+        let comm = Tp2Collectives::new_for_tp_with_p2p(2, 64 * 1024, allow_p2p).unwrap();
+        let dev0 = CudaDevice::set_current(0).unwrap();
+        let dev1 = CudaDevice::set_current(1).unwrap();
+        let s0 = CudaStream::new(0).unwrap();
+        let s1 = CudaStream::new(1).unwrap();
+        let n = 2560usize;
+        let in0: Vec<u16> = (0..n).map(|i| f32_to_f16((i % 17) as f32 * 0.25)).collect();
+        let in1: Vec<u16> = (0..n)
+            .map(|i| f32_to_f16(((i + 5) % 19) as f32 * 0.5))
+            .collect();
+        let d_in0 = DeviceBuffer::alloc(0, n * 2).unwrap();
+        let d_out0 = DeviceBuffer::alloc(0, n * 2).unwrap();
+        let d_in1 = DeviceBuffer::alloc(1, n * 2).unwrap();
+        let d_out1 = DeviceBuffer::alloc(1, n * 2).unwrap();
+        d_in0.copy_from_host(&in0, &s0).unwrap();
+        d_in1.copy_from_host(&in1, &s1).unwrap();
+        std::thread::scope(|sc| {
+            let h0 = sc.spawn(|| {
+                dev0.make_current().unwrap();
+                let ex = s0.exec(0, 0);
+                comm.all_reduce_f16(&ex, d_in0.addr(), d_out0.addr(), 0, n as i32)
+                    .unwrap();
+                s0.synchronize().unwrap();
+            });
+            let h1 = sc.spawn(|| {
+                dev1.make_current().unwrap();
+                let ex = s1.exec(0, 0);
+                comm.all_reduce_f16(&ex, d_in1.addr(), d_out1.addr(), 1, n as i32)
+                    .unwrap();
+                s1.synchronize().unwrap();
+            });
+            h0.join().unwrap();
+            h1.join().unwrap();
+        });
+        let mut h_out0 = vec![0u16; n];
+        let mut h_out1 = vec![0u16; n];
+        d_out0.copy_to_host(&mut h_out0, &s0).unwrap();
+        d_out1.copy_to_host(&mut h_out1, &s1).unwrap();
+        s0.synchronize().unwrap();
+        s1.synchronize().unwrap();
+        assert_eq!(h_out0, h_out1);
+        for i in 0..n {
+            let expected = f16_to_f32(in0[i]) + f16_to_f32(in1[i]);
+            assert!((f16_to_f32(h_out0[i]) - expected).abs() <= 1e-2);
+        }
+    }
+
+    if num_gpus >= 4 {
+        for dev_id in 0..4 {
+            prepare_execution_plan(dev_id).unwrap();
+        }
+        let comm4 = Tp2Collectives::new_for_tp(4, 256 * 1024).unwrap();
+        let n = 2560usize;
+        let mut devs = Vec::new();
+        let mut streams = Vec::new();
+        let mut d_ins = Vec::new();
+        let mut d_outs = Vec::new();
+        let mut d_vals = Vec::new();
+        let mut d_ids = Vec::new();
+        let mut d_gvals = Vec::new();
+        let mut d_gids = Vec::new();
+        for r in 0..4i32 {
+            let dev = CudaDevice::set_current(r).unwrap();
+            let s = CudaStream::new(r).unwrap();
+            let h_in: Vec<u16> = (0..n)
+                .map(|i| f32_to_f16(((i + r as usize) % 13) as f32 * 0.25))
+                .collect();
+            let d_in = DeviceBuffer::alloc(r, n * 2).unwrap();
+            let d_out = DeviceBuffer::alloc(r, n * 2).unwrap();
+            d_in.copy_from_host(&h_in, &s).unwrap();
+            let d_val = DeviceBuffer::alloc(r, 4).unwrap();
+            let d_id = DeviceBuffer::alloc(r, 4).unwrap();
+            let d_gval = DeviceBuffer::alloc(r, 4).unwrap();
+            let d_gid = DeviceBuffer::alloc(r, 4).unwrap();
+            d_val
+                .copy_from_host(&[10.0f32 + (r as f32) * 3.5], &s)
+                .unwrap();
+            d_id.copy_from_host(&[100_000i32 + r * 50_000], &s).unwrap();
+            s.synchronize().unwrap();
+            devs.push(dev);
+            streams.push(s);
+            d_ins.push(d_in);
+            d_outs.push(d_out);
+            d_vals.push(d_val);
+            d_ids.push(d_id);
+            d_gvals.push(d_gval);
+            d_gids.push(d_gid);
+        }
+        std::thread::scope(|sc| {
+            let mut handles = Vec::new();
+            for (r, ((((((dev, s), d_in), d_out), d_val), d_id), (d_gval, d_gid))) in devs
+                .iter()
+                .zip(streams.iter())
+                .zip(d_ins.iter())
+                .zip(d_outs.iter())
+                .zip(d_vals.iter())
+                .zip(d_ids.iter())
+                .zip(d_gvals.iter().zip(d_gids.iter()))
+                .enumerate()
+            {
+                let c = &comm4;
+                handles.push(sc.spawn(move || {
+                    dev.make_current().unwrap();
+                    let ex = s.exec(0, 0);
+                    c.all_reduce_f16(&ex, d_in.addr(), d_out.addr(), r as i32, n as i32)
+                        .unwrap();
+                    c.all_gather_top1_f32_i32(
+                        &ex,
+                        d_val.addr(),
+                        d_id.addr(),
+                        d_gval.addr(),
+                        d_gid.addr(),
+                        r as i32,
+                        1,
+                    )
+                    .unwrap();
+                    s.synchronize().unwrap();
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+        let mut ref_out = vec![0u16; n];
+        d_outs[0].copy_to_host(&mut ref_out, &streams[0]).unwrap();
+        streams[0].synchronize().unwrap();
+        for r in 0..4 {
+            let mut h_out = vec![0u16; n];
+            let mut gid = [0i32; 1];
+            d_outs[r].copy_to_host(&mut h_out, &streams[r]).unwrap();
+            d_gids[r].copy_to_host(&mut gid, &streams[r]).unwrap();
+            streams[r].synchronize().unwrap();
+            assert_eq!(h_out, ref_out);
+            assert_eq!(gid[0], 250_000);
+        }
+    }
+}

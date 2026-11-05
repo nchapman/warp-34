@@ -33,9 +33,9 @@ impl Qwen3_5Engine {
 
     pub fn alloc_kv_page_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
         if let Some(p0) = self.ranks[0].kv_pool.alloc_page() {
-            if self.tp_size == 2 {
-                let p1 = self.ranks[1].kv_pool.alloc_page();
-                debug_assert_eq!(Some(p0), p1);
+            for r in &mut self.ranks[1..] {
+                let p_peer = r.kv_pool.alloc_page();
+                debug_assert_eq!(Some(p0), p_peer);
             }
             return Some(p0);
         }
@@ -44,9 +44,9 @@ impl Qwen3_5Engine {
             self.free_kv_pages(&ev.freed_kv_pages);
             self.free_state_slots(&ev.freed_mamba_slots);
             if let Some(p0) = self.ranks[0].kv_pool.alloc_page() {
-                if self.tp_size == 2 {
-                    let p1 = self.ranks[1].kv_pool.alloc_page();
-                    debug_assert_eq!(Some(p0), p1);
+                for r in &mut self.ranks[1..] {
+                    let p_peer = r.kv_pool.alloc_page();
+                    debug_assert_eq!(Some(p0), p_peer);
                 }
                 return Some(p0);
             }
@@ -83,9 +83,9 @@ impl Qwen3_5Engine {
                 .kv_pool
                 .alloc_page()
                 .expect("free_count verified before page allocation");
-            if self.tp_size == 2 {
-                let p1 = self.ranks[1].kv_pool.alloc_page();
-                debug_assert_eq!(Some(p0), p1);
+            for r in &mut self.ranks[1..] {
+                let p_peer = r.kv_pool.alloc_page();
+                debug_assert_eq!(Some(p0), p_peer);
             }
             dst.push(p0);
         }
@@ -111,9 +111,9 @@ impl Qwen3_5Engine {
 
     pub fn alloc_state_slot_from(&mut self, radix: &mut MambaRadixCache) -> Option<i32> {
         if let Some(s0) = self.ranks[0].state_pool.alloc_slot() {
-            if self.tp_size == 2 {
-                let s1 = self.ranks[1].state_pool.alloc_slot();
-                debug_assert_eq!(Some(s0), s1);
+            for r in &mut self.ranks[1..] {
+                let s_peer = r.state_pool.alloc_slot();
+                debug_assert_eq!(Some(s0), s_peer);
             }
             return Some(s0);
         }
@@ -122,9 +122,9 @@ impl Qwen3_5Engine {
             self.free_kv_pages(&ev.freed_kv_pages);
             self.free_state_slots(&ev.freed_mamba_slots);
             if let Some(s0) = self.ranks[0].state_pool.alloc_slot() {
-                if self.tp_size == 2 {
-                    let s1 = self.ranks[1].state_pool.alloc_slot();
-                    debug_assert_eq!(Some(s0), s1);
+                for r in &mut self.ranks[1..] {
+                    let s_peer = r.state_pool.alloc_slot();
+                    debug_assert_eq!(Some(s0), s_peer);
                 }
                 return Some(s0);
             }
@@ -873,9 +873,7 @@ impl Qwen3_5Engine {
             )?
         } else {
             let comm = self.tp2_comm.as_ref().unwrap().clone();
-            let [r0, r1] = &mut self.ranks[..] else {
-                unreachable!()
-            };
+            let (r0, peer_ranks) = self.ranks.split_first_mut().unwrap();
             let ft_ref = &flat_tokens;
             let fp_ref = &flat_positions;
             let qs_ref = &q_start_loc;
@@ -901,7 +899,7 @@ impl Qwen3_5Engine {
                 ));
             }
 
-            let (res0, res1) = std::thread::scope(|sc| {
+            let (res0, peer_results) = std::thread::scope(|sc| {
                 let c0 = comm.clone();
                 let h0 = sc.spawn(move || -> Result<Vec<i32>> {
                     let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
@@ -937,50 +935,59 @@ impl Qwen3_5Engine {
                     )
                 });
 
-                let c1 = comm.clone();
-                let h1 = sc.spawn(move || -> Result<()> {
-                    let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r1.upload_batch_meta(
-                        ft_ref,
-                        fp_ref,
-                        qs_ref,
-                        cb_ref,
-                        sa_ref,
-                        bt_ref,
-                        ws_ref,
-                        si_ref,
-                        so_ref,
-                        hi_ref,
-                        sp_ref,
-                        cd_ref,
-                        co_ref,
-                        num_reqs,
-                        total_tokens,
-                        max_blocks_per_req,
-                        max_q_len,
-                        max_seq_len,
-                        max_verify_tokens,
-                        max_checkpoints_per_req,
-                    )?;
-                    let _ = r1.forward_selected_rows(
-                        tok_ptr,
-                        pos_ptr,
-                        total_tokens,
-                        &attn_batch,
-                        &gdn_batch,
-                        Some(&c1),
-                        sr_ref,
-                    )?;
-                    Ok(())
-                });
+                let mut peer_handles = Vec::with_capacity(peer_ranks.len());
+                for r_peer in peer_ranks {
+                    let cp = comm.clone();
+                    peer_handles.push(sc.spawn(move || -> Result<()> {
+                        let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r_peer.upload_batch_meta(
+                            ft_ref,
+                            fp_ref,
+                            qs_ref,
+                            cb_ref,
+                            sa_ref,
+                            bt_ref,
+                            ws_ref,
+                            si_ref,
+                            so_ref,
+                            hi_ref,
+                            sp_ref,
+                            cd_ref,
+                            co_ref,
+                            num_reqs,
+                            total_tokens,
+                            max_blocks_per_req,
+                            max_q_len,
+                            max_seq_len,
+                            max_verify_tokens,
+                            max_checkpoints_per_req,
+                        )?;
+                        let _ = r_peer.forward_selected_rows(
+                            tok_ptr,
+                            pos_ptr,
+                            total_tokens,
+                            &attn_batch,
+                            &gdn_batch,
+                            Some(&cp),
+                            sr_ref,
+                        )?;
+                        Ok(())
+                    }));
+                }
                 let j0 = h0
                     .join()
                     .map_err(|_| loader_err("tp2 rank 0 worker thread panicked"));
-                let j1 = h1
-                    .join()
-                    .map_err(|_| loader_err("tp2 rank 1 worker thread panicked"));
-                (j0, j1)
+                let mut peers = Vec::with_capacity(peer_handles.len());
+                for hp in peer_handles {
+                    peers.push(
+                        hp.join()
+                            .map_err(|_| loader_err("tp2 peer worker thread panicked")),
+                    );
+                }
+                (j0, peers)
             });
-            res1??;
+            for pr in peer_results {
+                pr??;
+            }
             res0??
         };
 
