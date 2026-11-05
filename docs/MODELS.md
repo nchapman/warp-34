@@ -127,6 +127,15 @@ runs before downloading weights, and existing runtime geometry/quantization
 checks still apply. There is no `trust_remote_code` switch and no repository code
 execution.
 
+## Supported architectures and quantization formats
+
+| Category | Supported formats & configurations |
+|---|---|
+| **Architectures** | `Qwen3_5ForCausalLM` / `Qwen3_5ForConditionalGeneration` (dense `0.8B`, `4B`, `9B`, `27B`), `Qwen3_5MoeForCausalLM` / `Qwen3_5MoeForConditionalGeneration` (`35B-A3B` 256-expert MoE), `Qwen4ExpForCausalLM` (`Qwen3.8-Flash-Next` 512-expert MoE with `HyperConnection`, `QSA`, `PLE`, and `Qwen4MTP`), `DFlashDraftModel` (`4B`, `27B`), and System One decision heads (`Clef`, `Kev`, `Nimble`, `Tev1`, `OpenJev`, `Xor` / `Lev`). |
+| **Weight Quantization** | `GPTQ` (`sym=true` and `sym=false`, `4-bit` and `8-bit`, `desc_act=false`), `AWQ` (`4-bit`, symmetric and asymmetric), `compressed-tensors` (`pack-quantized` `4-bit` and `8-bit`, symmetric and asymmetric), `AutoRound` (`4-bit`, symmetric and asymmetric), FP8 `PLE` (`F8_E4M3` + `BF16` per-row scale), and unquantized `FP16` / `BF16`. |
+| **KV Cache Policies** | `--kv-format fp16` (16-bit baseline), `--kv-format q8_0` (`1.88×` compression, `272 B/row`), `--kv-format tq4` (`3.07×` hybrid: rotated `Q8_0` on the first 2 and last 2 full-attention layers + rotated LSQ `TQ4` `132 B/row` on interior layers), and `--kv-format tq4_all` (`3.88×` uniform `TQ4`). |
+| **Multi-GPU & Offload** | `--tp 1`, `--tp 2` (NVLink P2P VRAM or pinned-sysmem PCIe), and `--tp 4` (`EP=4` 100% VRAM-resident 512-expert MoE); `--moe-offload auto|gpu-lru|cpu-hybrid` with three-tier 0-ULP CPU MoE evaluation (`AVX-512`, `AVX2+FMA+F16C`, or portable scalar). |
+
 ## Library callers and tests
 
 `w34_host::hub::resolve_model` is the explicit acquisition API. The older

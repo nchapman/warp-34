@@ -25,12 +25,16 @@ crates/
   w34-host/      Rust runtime, safetensors loader, scheduler, CLI, and server
 dashboard/       React + TypeScript + Vite frontend (pnpm; embedded in w34)
 docs/
-  ROADMAP.md     Architecture & vLLM / SGLang / warp3090 donor reference map
-  HARDWARE.md    RTX 30-series (sm_86) & 40-series (sm_89) rooflines & ISA guide
-  MODELS.md      Model downloads, authentication, and offline behavior
-  SERVING.md     Serving controls, authentication scope, and limits
-  METRICS.md     Dashboard, Prometheus metrics, and JSON telemetry contract
-  STATE.md       Current engine state & verified hardware benchmark summary
+  ROADMAP.md          Architecture & vLLM / SGLang / warp3090 donor reference map
+  HARDWARE.md         RTX 30-series (sm_86) & 40-series (sm_89) rooflines & ISA guide
+  MODELS.md           Model downloads, quantization formats, and offline behavior
+  SERVING.md          Serving controls, authentication scope, and limits
+  GENERATIVE_APIS.md  OpenAI (/v1/chat/completions, /v1/responses) & Anthropic (/v1/messages)
+  DECISION_MODELS.md  Decision-model serving (/v1/systemone, /v1/decisions)
+  QWEN_FLASH_NEXT.md  Qwen3.8-Flash-Next (qwen4_exp: HC, QSA, PLE, 512-expert MoE)
+  METRICS.md          Dashboard, Prometheus metrics, and JSON telemetry contract
+  STATE.md            Current engine state & verified hardware benchmark summary
+  contracts/          Frozen precision, KV layout, GDN state-tx, and collective contracts
 ```
 
 ## Clone and large test fixtures
@@ -75,6 +79,28 @@ CLI is required. Local model-directory paths still work without network access.
 `HF_HUB_OFFLINE` are supported. DFlash2 has an independent `--draft-revision`.
 Only supported Safetensors architectures are loaded; repository Python code is
 never executed. See [model downloads, authentication, and offline behavior](docs/MODELS.md).
+
+## Quickstart: CLI & HTTP Serving
+
+```sh
+# 1. Benchmark offline prefill + decode with DFlash2 or MTP speculative decoding:
+./target/release/w34 bench \
+  --model nchapman/Qwen3.8-27B-W4A16-GPTQ \
+  --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash \
+  --kv-format tq4 --tp 1 --prompt-len 512 --gen-len 128 --verify-lossless
+
+# 2. Start the multi-protocol HTTP server (OpenAI + Anthropic + Decision APIs):
+./target/release/w34 serve \
+  --model nchapman/Qwen3.8-27B-W4A16-GPTQ \
+  --speculative mtp --spec-tokens 3 --kv-format tq4 --tp 2 --port 8000
+
+# 3. Query via OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages:
+curl -fsS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"nchapman/Qwen3.8-27B-W4A16-GPTQ","messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
+```
+
+See [`docs/GENERATIVE_APIS.md`](docs/GENERATIVE_APIS.md) for `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and `/v1/messages` wire contracts, and [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) for `/v1/systemone` and `/v1/decisions`.
 
 ## Serving controls
 
