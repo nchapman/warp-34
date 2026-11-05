@@ -332,9 +332,9 @@ const PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS: usize = 12;
 const STANDARD_DEFAULT_STATE_SLOTS: usize = 24;
 
 /// Estimated weight footprint threshold (`15 GiB`) above which non-serving mode uses
-/// [`PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS`].
-#[cfg(feature = "cuda")]
-const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
+/// `PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS` and single-GPU scratch uses
+/// [`crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES`].
+pub const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
 
 /// Dedicated VRAM reserve (`1.5 GiB`) set aside on rank 0 for lazy `Qwen3VisionEncoder`
 /// loading when serving multimodal checkpoints with sufficient free VRAM.
@@ -342,12 +342,42 @@ const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
 const VISION_ENCODER_LAZY_RESERVE_BYTES: usize = 1536 * 1024 * 1024;
 
 /// Layer-count threshold (`64` layers) for applying [`crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES`].
-#[cfg(feature = "cuda")]
-const EXTREME_LONGCTX_MIN_LAYERS: usize = 64;
+pub const EXTREME_LONGCTX_MIN_LAYERS: usize = 64;
 
 /// Page-count threshold (`14,336` pages = `224K` tokens) for extreme long-context headroom.
+pub const EXTREME_LONGCTX_MIN_PAGES: usize = 14_336;
+
+/// Rounding quantum (`2 MiB`) for `weight_arena` capacity estimation.
 #[cfg(feature = "cuda")]
-const EXTREME_LONGCTX_MIN_PAGES: usize = 14_336;
+const WEIGHT_ARENA_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Minimum `weight_arena` allocation (`128 MiB`) for tiny synthetic models.
+#[cfg(feature = "cuda")]
+const MIN_WEIGHT_ARENA_BYTES: usize = 128 * 1024 * 1024;
+
+/// Default alignment/padding margin (`96 MiB`) added to raw estimated weight bytes.
+#[cfg(feature = "cuda")]
+const WEIGHT_ARENA_DEFAULT_MARGIN_BYTES: usize = 96 * 1024 * 1024;
+
+/// Compact alignment/padding margin (`32 MiB`) added to raw estimated weight bytes under extreme long-context budgets.
+#[cfg(feature = "cuda")]
+const WEIGHT_ARENA_EXTREME_LONGCTX_MARGIN_BYTES: usize = 32 * 1024 * 1024;
+
+/// Minimum temporary repack staging buffer (`128 MiB`) allocated during weight upload.
+#[cfg(feature = "cuda")]
+const MIN_REPACK_STAGING_BYTES: usize = 128 * 1024 * 1024;
+
+/// Multiplier (`3×` largest packed tensor) used to size the temporary repack staging buffer.
+#[cfg(feature = "cuda")]
+const REPACK_STAGING_TENSOR_MULTIPLIER: usize = 3;
+
+/// Extra safety margin (`16 MiB`) checked before initial weight + scratch arena boot allocations.
+#[cfg(feature = "cuda")]
+const MIN_BOOT_MARGIN_BYTES: usize = 16 * 1024 * 1024;
+
+/// Capacity (`16 MiB`) of the per-rank `batch_meta_arena` used for batch descriptors and page tables.
+#[cfg(feature = "cuda")]
+const BATCH_META_ARENA_BYTES: usize = 16 * 1024 * 1024;
 
 /// Alignment quantum (`8` slots) for per-layer GPU hot expert cache sizing.
 pub const TIERED_MOE_HOT_SLOT_ALIGNMENT: usize = 8;
@@ -400,14 +430,6 @@ const TIERED_MOE_STAGE_CAPACITY_DEFAULT: usize = 96;
 /// Double-buffered H2D staging capacity (`32` experts) for `RankTieredMoe` on `TP >= 4`.
 #[cfg(feature = "cuda")]
 const TIERED_MOE_STAGE_CAPACITY_TP4: usize = 32;
-
-/// Maximum `PLE` batch token staging capacity (`6,144` rows) for tiered-MoE checkpoints.
-#[cfg(feature = "cuda")]
-const TIERED_MOE_MAX_PLE_BATCH_TOKENS: usize = 6144;
-
-/// Maximum `PLE` batch token staging capacity (`2,048` rows) for non-tiered checkpoints.
-#[cfg(feature = "cuda")]
-const STANDARD_MAX_PLE_BATCH_TOKENS: usize = 2048;
 
 /// Minimum per-row byte stride (`2,560 B`) for `PLE` FP8 staging buffers.
 #[cfg(feature = "cuda")]
@@ -494,6 +516,31 @@ pub fn plan_mtp_tiered_moe_hot_experts(
         MTP_COMPACT_HOT_EXPERTS
     } else {
         MTP_FALLBACK_HOT_EXPERTS.min(local_experts).max(1)
+    }
+}
+
+/// Selects the per-rank transient `scratch_arena` capacity (`336 MiB`, `384 MiB`,
+/// `512 MiB`, or `1,056 MiB`) based on model geometry, `tp_size`, estimated weight
+/// footprint, and requested KV pages.
+pub fn plan_scratch_arena_bytes(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    est_weight_bytes: usize,
+    requested_kv_pages: Option<usize>,
+) -> usize {
+    if tp_size == 1
+        && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
+        && requested_kv_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
+    {
+        crate::scheduler::EXTREME_LONGCTX_SCRATCH_ARENA_BYTES
+    } else if tp_size == 1 && est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
+        crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES
+    } else if cfg.uses_tiered_moe()
+        && requested_kv_pages.unwrap_or(0) <= crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES
+    {
+        crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+    } else {
+        crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES
     }
 }
 
@@ -809,19 +856,18 @@ impl Qwen3_5ModelRank {
 
         let per_rank_raw = replicated_bytes.saturating_add(sharded_bytes.div_ceil(tp_size));
         let extreme_longctx = tp_size == 1
-            && cfg.num_hidden_layers >= 64
-            && requested_kv_pages.unwrap_or(0) >= 14_336;
+            && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
+            && requested_kv_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES;
         let margin = if extreme_longctx {
-            32 * 1024 * 1024
+            WEIGHT_ARENA_EXTREME_LONGCTX_MARGIN_BYTES
         } else {
-            96 * 1024 * 1024
+            WEIGHT_ARENA_DEFAULT_MARGIN_BYTES
         };
-        let two_mib = 2 * 1024 * 1024;
         let rounded = per_rank_raw
             .saturating_add(margin)
-            .div_ceil(two_mib)
-            .saturating_mul(two_mib);
-        rounded.max(128 * 1024 * 1024)
+            .div_ceil(WEIGHT_ARENA_ALIGNMENT_BYTES)
+            .saturating_mul(WEIGHT_ARENA_ALIGNMENT_BYTES);
+        rounded.max(MIN_WEIGHT_ARENA_BYTES)
     }
 
     fn load_embed_tokens_f16(archive: &SafetensorsArchive, cfg: &ModelConfig) -> Result<Vec<u16>> {
@@ -935,23 +981,14 @@ impl Qwen3_5ModelRank {
             .map(|(_, info)| info.len_bytes as usize)
             .max()
             .unwrap_or(0);
-        let staging_bytes = (128 * 1024 * 1024).max(max_packed_tensor_bytes.saturating_mul(3));
-        let scratch_bytes = if tp_size == 1
-            && cfg.num_hidden_layers >= 64
-            && requested_kv_pages.unwrap_or(0) >= 14_336
-        {
-            336 * 1024 * 1024
-        } else if tp_size == 1 && est_weight_bytes >= 15 * 1024 * 1024 * 1024 {
-            384 * 1024 * 1024
-        } else if cfg.uses_tiered_moe() && requested_kv_pages.unwrap_or(0) <= 8192 {
-            1056 * 1024 * 1024
-        } else {
-            512 * 1024 * 1024
-        };
+        let staging_bytes = MIN_REPACK_STAGING_BYTES
+            .max(max_packed_tensor_bytes.saturating_mul(REPACK_STAGING_TENSOR_MULTIPLIER));
+        let scratch_bytes =
+            plan_scratch_arena_bytes(cfg, tp_size, est_weight_bytes, requested_kv_pages);
         let min_boot_bytes = est_weight_bytes
             .saturating_add(scratch_bytes)
             .saturating_add(staging_bytes)
-            .saturating_add(16 * 1024 * 1024);
+            .saturating_add(MIN_BOOT_MARGIN_BYTES);
         if min_boot_bytes > free_vram {
             let gib = 1024.0 * 1024.0 * 1024.0;
             let hint = if tp_size == 1 {
@@ -971,7 +1008,7 @@ impl Qwen3_5ModelRank {
         let scratch_arena = DeviceArena::new(device_id, scratch_bytes)?;
         let _ = stream
             .set_persisting_l2_window(scratch_arena.allocation_base(), scratch_arena.capacity());
-        let batch_meta_arena = DeviceArena::new(device_id, 16 * 1024 * 1024)?;
+        let batch_meta_arena = DeviceArena::new(device_id, BATCH_META_ARENA_BYTES)?;
         let marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
         let repack_staging = DeviceBuffer::alloc(device_id, staging_bytes)?;
 
@@ -1575,9 +1612,9 @@ impl Qwen3_5ModelRank {
         // Pre-allocate batch rows * ple_embed_dim F8 staging buffer at a fixed device address
         // so both eager forward and CUDA Graphs can read from `f8_staging_dev.addr()`.
         let max_ple_tokens = if self.cfg.uses_tiered_moe() {
-            TIERED_MOE_MAX_PLE_BATCH_TOKENS
+            crate::moe_offload::TIERED_MOE_MAX_BATCH_TOKENS
         } else {
-            STANDARD_MAX_PLE_BATCH_TOKENS
+            crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
         };
         let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
         let f8_staging_dev = DeviceBuffer::alloc(

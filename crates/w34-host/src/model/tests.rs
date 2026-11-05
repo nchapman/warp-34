@@ -205,4 +205,84 @@ mod serving_capacity_tests {
             MTP_FALLBACK_HOT_EXPERTS
         );
     }
+
+    #[test]
+    fn plan_scratch_arena_bytes_aligns_with_scheduler_token_caps() {
+        let tiered_cfg = sample_qwen4_exp_config();
+        let mut dense_64l = tiered_cfg.clone();
+        dense_64l.num_experts = 0;
+        dense_64l.num_hidden_layers = EXTREME_LONGCTX_MIN_LAYERS;
+
+        // 1. Extreme long-context TP=1 -> 336 MiB -> scheduler clamps to 1,024 tokens
+        let extreme_bytes = plan_scratch_arena_bytes(
+            &dense_64l,
+            1,
+            5 * 1024 * 1024 * 1024,
+            Some(EXTREME_LONGCTX_MIN_PAGES),
+        );
+        assert_eq!(
+            extreme_bytes,
+            crate::scheduler::EXTREME_LONGCTX_SCRATCH_ARENA_BYTES
+        );
+        let mut sched = SchedulerConfig::default();
+        sched.clamp_for_scratch_bytes(extreme_bytes);
+        assert_eq!(
+            sched.max_num_batched_tokens,
+            crate::scheduler::MEDIUM_SCRATCH_MAX_BATCHED_TOKENS
+        );
+
+        // 2. Large model (>= 15 GiB weights) on TP=1 -> 384 MiB -> scheduler clamps to 1,024 tokens
+        let large_tp1_bytes =
+            plan_scratch_arena_bytes(&dense_64l, 1, LARGE_MODEL_WEIGHT_THRESHOLD_BYTES, Some(256));
+        assert_eq!(
+            large_tp1_bytes,
+            crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES
+        );
+        let mut sched = SchedulerConfig::default();
+        sched.clamp_for_scratch_bytes(large_tp1_bytes);
+        assert_eq!(
+            sched.max_num_batched_tokens,
+            crate::scheduler::MEDIUM_SCRATCH_MAX_BATCHED_TOKENS
+        );
+
+        // 3. Tiered MoE (None or <= 8,192 KV pages) -> 1,056 MiB -> fits 2,048-token layer scratch layout
+        assert_eq!(
+            plan_scratch_arena_bytes(&tiered_cfg, 1, 3 * 1024 * 1024 * 1024, None),
+            crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+        );
+        let tiered_bytes = plan_scratch_arena_bytes(
+            &tiered_cfg,
+            1,
+            3 * 1024 * 1024 * 1024,
+            Some(crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES),
+        );
+        assert_eq!(
+            tiered_bytes,
+            crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+        );
+        let (tiered_2k_scratch_bytes, ..) = crate::model::layer_scratch_layout(
+            &tiered_cfg,
+            1,
+            crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS,
+        )
+        .expect("tiered 2048-token scratch layout");
+        assert!(tiered_2k_scratch_bytes <= tiered_bytes);
+        let mut sched = SchedulerConfig::default();
+        sched.clamp_for_scratch_bytes(tiered_bytes);
+        assert_eq!(
+            sched.max_num_batched_tokens,
+            crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
+        );
+
+        // 4. Standard model or TP=2 large model -> 512 MiB -> scheduler keeps full 2,048 tokens
+        let default_bytes =
+            plan_scratch_arena_bytes(&dense_64l, 2, LARGE_MODEL_WEIGHT_THRESHOLD_BYTES, Some(256));
+        assert_eq!(default_bytes, crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES);
+        let mut sched = SchedulerConfig::default();
+        sched.clamp_for_scratch_bytes(default_bytes);
+        assert_eq!(
+            sched.max_num_batched_tokens,
+            crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
+        );
+    }
 }

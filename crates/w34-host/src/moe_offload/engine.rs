@@ -62,8 +62,8 @@ impl TieredMoeEngine {
             );
         }
         if let Some(layer_id) = cache.bridge_layer_id
-            && num_tokens <= 4
-            && top_k <= 16
+            && num_tokens <= TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
+            && top_k <= TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
             && store.mapped_dev_ptr() != 0
         {
             crate::cuda::check_rc(
@@ -97,7 +97,7 @@ impl TieredMoeEngine {
                         store.layout().hidden as i32,
                         store.layout().group_size as i32,
                         if cache.k_static < k_hot {
-                            0.14f32
+                            TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
                         } else {
                             0.0f32
                         },
@@ -936,7 +936,7 @@ impl RankTieredMoe {
             device_id,
             layout.clone(),
             stage_capacity,
-            6144,
+            TIERED_MOE_MAX_BATCH_TOKENS,
             cfg.num_experts_per_tok.max(1),
         )?;
         let rankings = archive
@@ -973,9 +973,9 @@ impl RankTieredMoe {
                 stream.synchronize()?;
                 store.release_host_storage();
             } else if ep_size == 1
-                && k_hot >= 16
-                && cfg.num_hidden_layers <= 60
-                && group_size == 128
+                && k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
+                && cfg.num_hidden_layers <= TIERED_MOE_CPU_BRIDGE_MAX_LAYERS
+                && group_size == TIERED_MOE_CPU_BRIDGE_GROUP_SIZE
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 let k_static = k_hot;

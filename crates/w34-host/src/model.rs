@@ -48,6 +48,7 @@ use rank::clamp_state_slots;
 #[cfg(any(test, feature = "cuda"))]
 use rank::serving_state_slots;
 pub use rank::{
+    EXTREME_LONGCTX_MIN_LAYERS, EXTREME_LONGCTX_MIN_PAGES, LARGE_MODEL_WEIGHT_THRESHOLD_BYTES,
     MTP_COMPACT_HOT_EXPERTS, MTP_FALLBACK_HOT_EXPERTS, MTP_FULL_RESIDENCY_HEADROOM_BYTES,
     MTP_MEDIUM_HOT_EXPERTS, MTP_MEDIUM_MIN_FREE_VRAM_BYTES, MTP_PARTIAL_CACHE_HEADROOM_BYTES,
     MTP_TP1_STREAMED_PREFILL_MAX_HOT, TIERED_MOE_HOT_SLOT_ALIGNMENT, TIERED_MOE_MIN_MODEL_EXPERTS,
@@ -56,7 +57,8 @@ pub use rank::{
     TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT, TIERED_MOE_TP1_COMPACT_KV_THRESHOLD_BYTES,
     TIERED_MOE_TP1_MIN_HOT_EXPERTS, TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT,
     TIERED_MOE_TP2_DEFAULT_HOT, TIERED_MOE_TP2_MIN_HOT_EXPERTS, TIERED_MOE_TP4_STAGE_RESERVE_SLOTS,
-    default_tiered_moe_hot_ceiling, plan_mtp_tiered_moe_hot_experts, plan_tiered_moe_hot_per_layer,
+    default_tiered_moe_hot_ceiling, plan_mtp_tiered_moe_hot_experts, plan_scratch_arena_bytes,
+    plan_tiered_moe_hot_per_layer,
 };
 #[cfg(feature = "cuda")]
 use rank::{PoolCapacity, SharedVocabHost};

@@ -10,6 +10,50 @@ use crate::radix::{
     MambaRadixCache, PlannedCheckpoint, RadixDonationOutcome, RadixEvictResult, ReqRadixState,
 };
 
+/// Default maximum tokens scheduled in a single prefill/decode step (`2,048` tokens).
+pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 2048;
+
+/// Default maximum concurrent sequences per batch (`16` sequences, matching CUDA Graph buckets).
+pub const DEFAULT_MAX_NUM_SEQS: usize = 16;
+
+/// Default paged-attention KV block size (`16` tokens per page).
+pub const DEFAULT_KV_PAGE_SIZE_TOKENS: usize = 16;
+
+/// Default `MambaRadixCache` recurrent checkpoint interval (`64` tokens).
+pub const DEFAULT_MAMBA_CHUNK_SIZE_TOKENS: usize = 64;
+
+/// Default maximum prefill chunk size (`2,048` tokens) when no decode sequences are active.
+pub const DEFAULT_CHUNK_PREFILL_TOKENS: usize = 2048;
+
+/// Default maximum prefill tokens (`256`) co-scheduled when `>= 1` decode sequence is active.
+pub const DEFAULT_MIXED_CHUNK_PREFILL_TOKENS: usize = 256;
+
+/// Scratch-arena threshold (`256 MiB`) below which batched-token capacity clamps to [`COMPACT_SCRATCH_MAX_BATCHED_TOKENS`].
+pub const COMPACT_SCRATCH_ARENA_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum batched tokens (`256`) when `scratch_arena` is smaller than [`COMPACT_SCRATCH_ARENA_MAX_BYTES`].
+pub const COMPACT_SCRATCH_MAX_BATCHED_TOKENS: usize = 256;
+
+/// Scratch-arena size (`336 MiB`) for single-GPU extreme long-context (`>= 64` layers, `>= 14,336` pages).
+pub const EXTREME_LONGCTX_SCRATCH_ARENA_BYTES: usize = 336 * 1024 * 1024;
+
+/// Scratch-arena size (`384 MiB`) for single-GPU large models (`>= 15 GiB` weights).
+pub const LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES: usize = 384 * 1024 * 1024;
+
+/// Standard transient `scratch_arena` size (`512 MiB`), supporting `2,048`-token prefill chunks.
+pub const DEFAULT_SCRATCH_ARENA_BYTES: usize = 512 * 1024 * 1024;
+
+/// Maximum batched tokens (`1,024`) when `scratch_arena` is between `256 MiB` and `512 MiB`
+/// (e.g. [`EXTREME_LONGCTX_SCRATCH_ARENA_BYTES`] or [`LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES`]).
+pub const MEDIUM_SCRATCH_MAX_BATCHED_TOKENS: usize = 1024;
+
+/// Expanded transient `scratch_arena` size (`1,056 MiB`) for tiered-MoE checkpoints (`qwen4_exp`)
+/// when `requested_kv_pages <= TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES`.
+pub const TIERED_MOE_SCRATCH_ARENA_BYTES: usize = 1056 * 1024 * 1024;
+
+/// Maximum requested KV pages (`8,192` pages = `128K` tokens) for allocating [`TIERED_MOE_SCRATCH_ARENA_BYTES`].
+pub const TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES: usize = 8192;
+
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerConfig {
     pub max_num_batched_tokens: usize,
@@ -46,13 +90,13 @@ impl SchedulerConfig {
     }
 
     /// Clamp batched-token budgets to fit a rank's transient `scratch_arena` capacity:
-    /// - `< 256 MiB` (fallback for compact arenas) -> `256` tokens.
-    /// - `< 512 MiB` (336 MiB extreme-context or 384 MiB large-model arena) -> `1024` tokens.
+    /// - `< COMPACT_SCRATCH_ARENA_MAX_BYTES` (`256 MiB`) -> `256` tokens.
+    /// - `< DEFAULT_SCRATCH_ARENA_BYTES` (`512 MiB`, e.g. `336 MiB` extreme-context or `384 MiB` large-model arena) -> `1024` tokens.
     pub fn clamp_for_scratch_bytes(&mut self, scratch_cap_bytes: usize) {
-        let raw_cap = if scratch_cap_bytes < 256 * 1024 * 1024 {
-            Some(256usize)
-        } else if scratch_cap_bytes < 512 * 1024 * 1024 {
-            Some(1024usize)
+        let raw_cap = if scratch_cap_bytes < COMPACT_SCRATCH_ARENA_MAX_BYTES {
+            Some(COMPACT_SCRATCH_MAX_BATCHED_TOKENS)
+        } else if scratch_cap_bytes < DEFAULT_SCRATCH_ARENA_BYTES {
+            Some(MEDIUM_SCRATCH_MAX_BATCHED_TOKENS)
         } else {
             None
         };
@@ -71,12 +115,12 @@ impl SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            max_num_batched_tokens: 2048,
-            max_num_seqs: 16,
-            page_size: 16,
-            mamba_chunk_size: 64,
-            chunk_prefill_size: 2048,
-            mixed_chunk_prefill_size: 256,
+            max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
+            max_num_seqs: DEFAULT_MAX_NUM_SEQS,
+            page_size: DEFAULT_KV_PAGE_SIZE_TOKENS,
+            mamba_chunk_size: DEFAULT_MAMBA_CHUNK_SIZE_TOKENS,
+            chunk_prefill_size: DEFAULT_CHUNK_PREFILL_TOKENS,
+            mixed_chunk_prefill_size: DEFAULT_MIXED_CHUNK_PREFILL_TOKENS,
         }
     }
 }
@@ -838,29 +882,66 @@ mod tests {
 
     #[test]
     fn test_clamp_for_scratch_bytes_tiers() {
+        assert_eq!(COMPACT_SCRATCH_MAX_BATCHED_TOKENS, 256);
+        assert_eq!(MEDIUM_SCRATCH_MAX_BATCHED_TOKENS, 1024);
+        assert_eq!(DEFAULT_MAX_NUM_BATCHED_TOKENS, 2048);
+
         let mut compact = SchedulerConfig::default();
-        compact.clamp_for_scratch_bytes(128 * 1024 * 1024);
-        assert_eq!(compact.max_num_batched_tokens, 256);
-        assert_eq!(compact.chunk_prefill_size, 256);
-        assert_eq!(compact.mixed_chunk_prefill_size, 256);
+        compact.clamp_for_scratch_bytes(COMPACT_SCRATCH_ARENA_MAX_BYTES / 2);
+        assert_eq!(
+            compact.max_num_batched_tokens,
+            COMPACT_SCRATCH_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(
+            compact.chunk_prefill_size,
+            COMPACT_SCRATCH_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(
+            compact.mixed_chunk_prefill_size,
+            DEFAULT_MIXED_CHUNK_PREFILL_TOKENS
+        );
 
         let mut tp1_large = SchedulerConfig::default();
-        tp1_large.clamp_for_scratch_bytes(384 * 1024 * 1024);
-        assert_eq!(tp1_large.max_num_batched_tokens, 1024);
-        assert_eq!(tp1_large.chunk_prefill_size, 1024);
-        assert_eq!(tp1_large.mixed_chunk_prefill_size, 256);
+        tp1_large.clamp_for_scratch_bytes(LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES);
+        assert_eq!(
+            tp1_large.max_num_batched_tokens,
+            MEDIUM_SCRATCH_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(
+            tp1_large.chunk_prefill_size,
+            MEDIUM_SCRATCH_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(
+            tp1_large.mixed_chunk_prefill_size,
+            DEFAULT_MIXED_CHUNK_PREFILL_TOKENS
+        );
 
         let mut extreme_context = SchedulerConfig::default();
-        extreme_context.clamp_for_scratch_bytes(336 * 1024 * 1024);
-        assert_eq!(extreme_context.max_num_batched_tokens, 1024);
-        assert_eq!(extreme_context.chunk_prefill_size, 1024);
-        assert_eq!(extreme_context.mixed_chunk_prefill_size, 256);
+        extreme_context.clamp_for_scratch_bytes(EXTREME_LONGCTX_SCRATCH_ARENA_BYTES);
+        assert_eq!(
+            extreme_context.max_num_batched_tokens,
+            MEDIUM_SCRATCH_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(
+            extreme_context.chunk_prefill_size,
+            MEDIUM_SCRATCH_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(
+            extreme_context.mixed_chunk_prefill_size,
+            DEFAULT_MIXED_CHUNK_PREFILL_TOKENS
+        );
 
         let mut tp2_full = SchedulerConfig::default();
-        tp2_full.clamp_for_scratch_bytes(512 * 1024 * 1024);
-        assert_eq!(tp2_full.max_num_batched_tokens, 2048);
-        assert_eq!(tp2_full.chunk_prefill_size, 2048);
-        assert_eq!(tp2_full.mixed_chunk_prefill_size, 256);
+        tp2_full.clamp_for_scratch_bytes(DEFAULT_SCRATCH_ARENA_BYTES);
+        assert_eq!(
+            tp2_full.max_num_batched_tokens,
+            DEFAULT_MAX_NUM_BATCHED_TOKENS
+        );
+        assert_eq!(tp2_full.chunk_prefill_size, DEFAULT_CHUNK_PREFILL_TOKENS);
+        assert_eq!(
+            tp2_full.mixed_chunk_prefill_size,
+            DEFAULT_MIXED_CHUNK_PREFILL_TOKENS
+        );
     }
 
     #[test]

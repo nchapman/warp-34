@@ -11,6 +11,30 @@ use serde_json::Value;
 use std::path::Path;
 use w34_kernels::ffi::{self, W34AttentionBatch};
 
+/// Required number of transformer layers (`5`) and target hidden-state taps in a `DFlash2` drafter.
+pub const DFLASH2_NUM_LAYERS: usize = 5;
+
+/// Maximum candidate selector `top_k` (`16`) supported by the native `DFlash2` selector kernel.
+pub const DFLASH2_MAX_TOP_K: usize = 16;
+
+/// Maximum low-rank codebook dimension (`1,024`) supported by `DFlash2` candidate selection.
+pub const DFLASH2_MAX_SELECTOR_RANK: usize = 1024;
+
+/// Maximum context token capacity (`262,144` tokens) supported by `DFlash2Rank`.
+pub const DFLASH2_MAX_KV_CAPACITY: usize = 262_144;
+
+/// Maximum batch rows (`256` tokens) supported in a single `DFlash2Rank` forward pass.
+pub const DFLASH2_MAX_BATCH_ROWS: usize = 256;
+
+/// Paged-attention block size (`16` tokens/page) for the `DFlash2` draft context KV pool.
+const DFLASH2_KV_PAGE_BLOCK_TOKENS: usize = 16;
+
+/// Alignment/padding slack (`1 MiB`) added to the `DFlash2Rank` weight arena capacity.
+const DFLASH2_WEIGHT_ARENA_SLACK_BYTES: usize = 1024 * 1024;
+
+/// Capacity (`32 MiB`) of the fixed-address scratch arena used during `DFlash2` CUDA Graph capture.
+const DFLASH2_FORWARD_GRAPH_ARENA_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct DFlash2Config {
     pub model: ModelConfig,
@@ -104,17 +128,17 @@ impl DFlash2Config {
         };
         let m = &cfg.model;
         if !matches!(cfg.block_size, 8 | 16)
-            || m.num_hidden_layers != 5
-            || cfg.target_layers.len() != 5
+            || m.num_hidden_layers != DFLASH2_NUM_LAYERS
+            || cfg.target_layers.len() != DFLASH2_NUM_LAYERS
             || cfg.target_layers.windows(2).any(|v| v[0] >= v[1])
             || cfg.group == 0
             || !m.hidden_size.is_multiple_of(cfg.group)
             || cfg.taps == 0
             || cfg.taps > cfg.block_size
             || cfg.top_k == 0
-            || cfg.top_k > 16
+            || cfg.top_k > DFLASH2_MAX_TOP_K
             || cfg.selector_rank == 0
-            || cfg.selector_rank > 1024
+            || cfg.selector_rank > DFLASH2_MAX_SELECTOR_RANK
             || cfg.mask_token < 0
             || cfg.mask_token as usize >= m.vocab_size
             || !matches!(m.hidden_size, 2560 | 5120)
@@ -282,9 +306,9 @@ impl DFlash2Rank {
                 .iter()
                 .any(|&x| x >= t.cfg.num_hidden_layers)
             || capacity == 0
-            || capacity > 262144
+            || capacity > DFLASH2_MAX_KV_CAPACITY
             || max_rows == 0
-            || max_rows > 256
+            || max_rows > DFLASH2_MAX_BATCH_ROWS
             || capacity < max_rows
         {
             return Err(loader_err("DFlash target/rank/capacity mismatch"));
@@ -313,7 +337,7 @@ impl DFlash2Rank {
         let rope_rows = capacity + cfg.block_size;
         let mut weights = DeviceArena::new(
             t.device.device_id,
-            elems * 2 + rope_rows * d * 4 + 1024 * 1024,
+            elems * 2 + rope_rows * d * 4 + DFLASH2_WEIGHT_ARENA_SLACK_BYTES,
         )?;
         fn read(a: &SafetensorsArchive, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
             let info = a
@@ -366,8 +390,8 @@ impl DFlash2Rank {
         )?;
         let hidden_norm = upload(&mut weights, "hidden_norm.weight", &[h])?;
         let final_norm = upload(&mut weights, "norm.weight", &[h])?;
-        let mut layers = Vec::with_capacity(5);
-        for l in 0..5 {
+        let mut layers = Vec::with_capacity(c.num_hidden_layers);
+        for l in 0..c.num_hidden_layers {
             let prefix = format!("layers.{l}");
             let norm = |arena: &mut DeviceArena, name: &str, size: usize| {
                 upload(arena, &format!("{prefix}.{name}.weight"), &[size])
@@ -484,14 +508,15 @@ impl DFlash2Rank {
             }
         }
         let rope = weights.upload_slice(&table, &t.stream)?;
+        let layer_ids: Vec<usize> = (0..c.num_hidden_layers).collect();
         let mut kv = KvPool::new(
             t.device.device_id,
             ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
-            &[0, 1, 2, 3, 4],
+            &layer_ids,
             c.num_key_value_heads / tp,
             d,
-            16,
-            rope_rows.div_ceil(16),
+            DFLASH2_KV_PAGE_BLOCK_TOKENS,
+            rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS),
             KvFormatPolicy::Bf16,
         )?;
         let pages: Vec<i32> = (0..kv.num_pages)
@@ -508,7 +533,7 @@ impl DFlash2Rank {
         let graph_io = DFlashGraphIo {
             forward_graph: None,
             select_greedy_graph: None,
-            forward_arena: DeviceArena::new(t.device.device_id, 32 * 1024 * 1024)?,
+            forward_arena: DeviceArena::new(t.device.device_id, DFLASH2_FORWARD_GRAPH_ARENA_BYTES)?,
             meta_dev: DeviceBuffer::alloc(t.device.device_id, (3 * cfg.block_size + 4) * 4)?,
             topk_ids_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
             topk_scores_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
