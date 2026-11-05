@@ -9,7 +9,6 @@ use std::ops::Range;
 pub(super) enum EvalError {
     InvalidLayout,
     InvalidShape,
-    UnsupportedCpu,
 }
 
 /// Borrowed storage for exactly one expert. Extra trailing storage is permitted.
@@ -163,10 +162,94 @@ fn validate(
     if xp.len() < nh || xg.len() < nh / 128 || out.len() < nh || scratch.len() < ns {
         return Err(EvalError::InvalidShape);
     }
-    if !supported() {
-        return Err(EvalError::UnsupportedCpu);
-    }
     Ok(())
+}
+
+fn row_portable(w: &[u32], s: &[u16], xp_t: &[f32], xg_t: &[f32], groups: usize) -> f32 {
+    let mut total = [0.0f32; 16];
+    let mut bias = 0.0f32;
+    for g in 0..groups {
+        let scale = crate::cuda::f16_to_f32(s[g]);
+        let mut acc = [0.0f32; 16];
+        let wg = &w[g * 16..(g + 1) * 16];
+        let xpg = &xp_t[g * 128..(g + 1) * 128];
+        for b in 0..8 {
+            let xb = &xpg[b * 16..(b + 1) * 16];
+            for l in 0..16 {
+                let nib = ((wg[l] >> (4 * b)) & 15) as f32;
+                acc[l] = nib.mul_add(xb[l], acc[l]);
+            }
+        }
+        for l in 0..16 {
+            total[l] = acc[l].mul_add(scale, total[l]);
+        }
+        bias = scale.mul_add(xg_t[g], bias);
+    }
+    let mut s8 = [0.0f32; 8];
+    for i in 0..8 {
+        s8[i] = total[i] + total[i + 8];
+    }
+    let mut s4 = [0.0f32; 4];
+    for i in 0..4 {
+        s4[i] = s8[i] + s8[i + 4];
+    }
+    let s2_0 = s4[0] + s4[1];
+    let s2_1 = s4[2] + s4[3];
+    (s2_0 + s2_1) - 8.0 * bias
+}
+
+fn expert_portable(
+    d: ExpertLayout<'_>,
+    range: Range<usize>,
+    xp: &[f32],
+    xg: &[f32],
+    wt: &[f32],
+    out: &mut [f32],
+    scratch: &mut [f32],
+) {
+    let h = d.hidden;
+    let i = d.intermediate;
+    let n = wt.len();
+    let g_in = h / 128;
+    let sg = range.end - range.start;
+    let cols = sg * 128;
+    let (act, rest) = scratch.split_at_mut(n * cols);
+    let (ap, ag) = rest.split_at_mut(n * cols);
+    let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
+    let gs = |r: usize| &d.gate_up_scales[r * g_in..];
+    for c in 0..cols {
+        let r = range.start * 128 + c;
+        let w_gate = gw(r);
+        let s_gate = gs(r);
+        let w_up = gw(i + r);
+        let s_up = gs(i + r);
+        for t in 0..n {
+            let xp_t = &xp[t * h..(t + 1) * h];
+            let xg_t = &xg[t * g_in..(t + 1) * g_in];
+            let g = row_portable(w_gate, s_gate, xp_t, xg_t, g_in);
+            let u = row_portable(w_up, s_up, xp_t, xg_t, g_in);
+            act[t * cols + c] = (g / (1.0f32 + (-g).exp())) * u;
+        }
+    }
+    for t in 0..n {
+        prepare_x_perm(
+            &act[t * cols..(t + 1) * cols],
+            &mut ap[t * cols..(t + 1) * cols],
+            &mut ag[t * sg..(t + 1) * sg],
+        )
+        .unwrap();
+    }
+    let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
+    let ds = |r: usize| &d.down_scales[r * (i / 128) + range.start..];
+    for r in 0..h {
+        let w_dn = dw(r);
+        let s_dn = ds(r);
+        for (t, &w_tok) in wt.iter().enumerate() {
+            let ap_t = &ap[t * cols..(t + 1) * cols];
+            let ag_t = &ag[t * sg..(t + 1) * sg];
+            out[t * h + r] = w_tok * row_portable(w_dn, s_dn, ap_t, ag_t, sg);
+        }
+    }
 }
 
 /// Evaluate 1..=4 prepared tokens over a nonempty intermediate GROUP range.
@@ -184,10 +267,14 @@ pub(super) fn eval_expert_slice(
 ) -> Result<(), EvalError> {
     validate(d, &groups, xp, xg, weights, out, scratch, 4)?;
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: runtime ISA guard and all sizes/ranges checked above.
-    unsafe {
-        simd::expert(d, groups, xp, xg, weights, out, scratch, weights.len() == 1);
+    if supported() {
+        // SAFETY: runtime ISA guard and all sizes/ranges checked above.
+        unsafe {
+            simd::expert(d, groups, xp, xg, weights, out, scratch, weights.len() == 1);
+        }
+        return Ok(());
     }
+    expert_portable(d, groups, xp, xg, weights, out, scratch);
     Ok(())
 }
 
@@ -204,10 +291,14 @@ pub(super) fn eval_expert_prefill(
     let groups = 0..d.intermediate / 128;
     validate(d, &groups, xp, xg, weights, out, scratch, 96)?;
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: runtime ISA guard and all sizes/ranges checked above.
-    unsafe {
-        simd::expert(d, groups, xp, xg, weights, out, scratch, true);
+    if supported() {
+        // SAFETY: runtime ISA guard and all sizes/ranges checked above.
+        unsafe {
+            simd::expert(d, groups, xp, xg, weights, out, scratch, true);
+        }
+        return Ok(());
     }
+    expert_portable(d, groups, xp, xg, weights, out, scratch);
     Ok(())
 }
 
@@ -783,10 +874,6 @@ mod tests {
     }
     #[test]
     fn expert_scalar_and_tile_agreement() {
-        if !supported() {
-            eprintln!("AVX2+FMA+F16C unavailable; skipping arithmetic test");
-            return;
-        }
         let h = 256;
         let i = 256;
         let gu = words(2 * i * h / 8, 5);
@@ -821,8 +908,15 @@ mod tests {
             let mut out = vec![0.0; nt * h];
             let mut scratch = vec![0.0; scratch_len(nt, 2).unwrap()];
             eval_expert_prefill(d, &xp, &xg, &wt, &mut out, &mut scratch).unwrap();
+            let mut out_portable = vec![0.0; nt * h];
+            expert_portable(d, 0..2, &xp, &xg, &wt, &mut out_portable, &mut scratch);
+            assert_eq!(
+                out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                out_portable.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "portable and SIMD prefill diverged at nt={nt}"
+            );
             #[cfg(target_arch = "x86_64")]
-            {
+            if supported() {
                 let mut out_avx2 = vec![0.0; nt * h];
                 // SAFETY: `supported()` verified AVX2 + FMA + F16C and buffer bounds above.
                 unsafe {

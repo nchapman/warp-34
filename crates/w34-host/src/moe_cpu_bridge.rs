@@ -465,9 +465,6 @@ impl Runtime {
         weights: &[f32],
         out: &mut [u16],
     ) -> crate::cuda::Result<()> {
-        if !eval::supported() {
-            return Err(bridge_error("unsupported CPU"));
-        }
         let h = store.layout().hidden;
         if x.len() != tokens.saturating_mul(h)
             || out.len() != x.len()
@@ -600,6 +597,25 @@ fn select_physical_cpus(
     all.into_iter().take(count.max(1)).map(|(c, _)| c).collect()
 }
 
+fn parse_canonical_core_key(
+    pkg: i32,
+    die: Option<i32>,
+    core: i32,
+    thread_siblings_list: Option<&str>,
+) -> (i32, i32) {
+    if let Some(list) = thread_siblings_list
+        && let Some(first) = list
+            .trim()
+            .split([',', '-'])
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    {
+        return (pkg, first);
+    }
+    let die_bits = die.unwrap_or(0).max(0) & 0x7fff;
+    (pkg, (die_bits << 16) ^ (core & 0xffff))
+}
+
 fn read_cpu_core_key(cpu: usize) -> Option<(i32, i32)> {
     let base = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
     let pkg = std::fs::read_to_string(format!("{base}/physical_package_id"))
@@ -612,7 +628,16 @@ fn read_cpu_core_key(cpu: usize) -> Option<(i32, i32)> {
         .trim()
         .parse::<i32>()
         .ok()?;
-    Some((pkg, core))
+    let die = std::fs::read_to_string(format!("{base}/die_id"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+    let siblings = std::fs::read_to_string(format!("{base}/thread_siblings_list")).ok();
+    Some(parse_canonical_core_key(
+        pkg,
+        die,
+        core,
+        siblings.as_deref(),
+    ))
 }
 
 fn detect_worker_cpus() -> Vec<usize> {
@@ -1139,9 +1164,6 @@ mod tests {
     }
     #[test]
     fn pool_reuses_buffers_and_reduces_deterministically() {
-        if !eval::supported() {
-            return;
-        }
         let pool = Pool::new().unwrap();
         let store = zero_store();
         let tasks = [(0, 1, 0.2), (0, 0, 0.3), (0, 1, 0.5), (1, 0, 0.7)];
@@ -1371,6 +1393,39 @@ mod tests {
         assert_eq!(
             select_physical_cpus((0..32).map(|c| (c, None)), MAX_WORKERS).len(),
             16
+        );
+        // Multi-CCD / multi-die topology where `core_id` repeats `0..4` per die:
+        // `parse_canonical_core_key` keeps dies distinct via `thread_siblings_list` or `die_id`.
+        let multi_ccd = (0..16).map(|c| {
+            let physical = c % 8;
+            let die = (physical / 4) as i32;
+            let core_in_die = (physical % 4) as i32;
+            let siblings = format!("{physical},{}", physical + 8);
+            (
+                c,
+                Some(parse_canonical_core_key(
+                    0,
+                    Some(die),
+                    core_in_die,
+                    Some(&siblings),
+                )),
+            )
+        });
+        assert_eq!(
+            select_physical_cpus(multi_ccd, MAX_WORKERS),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        let multi_die_no_siblings = (0..8).map(|c| {
+            let die = (c / 4) as i32;
+            let core_in_die = (c % 4) as i32;
+            (
+                c,
+                Some(parse_canonical_core_key(0, Some(die), core_in_die, None)),
+            )
+        });
+        assert_eq!(
+            select_physical_cpus(multi_die_no_siblings, MAX_WORKERS),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
         );
         assert_eq!(
             select_physical_cpus(std::iter::empty(), MAX_WORKERS),
