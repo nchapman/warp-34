@@ -158,8 +158,51 @@ mod serving_capacity_tests {
 
         // Insufficient VRAM falls back to min_hot (16 on TP=1, 32 on TP=2)
         let (hot_tp1_min, _) = plan_tiered_moe_hot_per_layer(&cfg, 1, gib, 2 * gib, gib);
-        assert_eq!(hot_tp1_min, 16);
+        assert_eq!(hot_tp1_min, TIERED_MOE_TP1_MIN_HOT_EXPERTS);
         let (hot_tp2_min, _) = plan_tiered_moe_hot_per_layer(&cfg, 2, gib, 2 * gib, gib);
-        assert_eq!(hot_tp2_min, 32);
+        assert_eq!(hot_tp2_min, TIERED_MOE_TP2_MIN_HOT_EXPERTS);
+    }
+
+    #[test]
+    fn plan_mtp_tiered_moe_hot_experts_matches_target_post_load_reserve() {
+        let cfg = sample_qwen4_exp_config();
+        let exp_bytes = cfg
+            .moe_expert_pack_layout()
+            .expect("qwen4_exp expert layout")
+            .stride;
+        let post_target_extra_reserve =
+            TIERED_MOE_STAGE_RESERVE_SLOTS * exp_bytes + TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES;
+
+        // Joint contract: the extra reserve set aside by `plan_tiered_moe_hot_per_layer`
+        // (even after RankTieredMoe consumes ~275 MiB for staging + slot tables) leaves enough
+        // free VRAM for `plan_mtp_tiered_moe_hot_experts` to pick 192 on TP=1 and 256 on TP=2.
+        let post_target_free_vram = post_target_extra_reserve - 280 * 1024 * 1024;
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, post_target_free_vram),
+            MTP_TP1_STREAMED_PREFILL_MAX_HOT
+        );
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(
+                2,
+                cfg.num_experts / 2,
+                exp_bytes,
+                post_target_free_vram
+            ),
+            cfg.num_experts / 2
+        );
+
+        // Stepped degradation under tighter VRAM budgets
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(1, 512, exp_bytes, 600 * 1024 * 1024),
+            MTP_MEDIUM_HOT_EXPERTS
+        );
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(1, 512, exp_bytes, 300 * 1024 * 1024),
+            MTP_COMPACT_HOT_EXPERTS
+        );
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(1, 32, exp_bytes, 300 * 1024 * 1024),
+            MTP_FALLBACK_HOT_EXPERTS
+        );
     }
 }

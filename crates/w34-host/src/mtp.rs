@@ -26,6 +26,12 @@ use w34_kernels::ffi::{self, W34_KV_NAMESPACE_MTP_FULL_ATTN};
 
 mod propose;
 
+/// Double-buffered H2D staging capacity (`32` experts) for the single-layer `MTP` MoE workspace.
+const MTP_MOE_STAGE_CAPACITY: usize = 32;
+
+/// Minimum batch token capacity (`64` rows) allocated for the `MTP` tiered-MoE workspace.
+const MTP_MOE_MIN_WORKSPACE_BATCH_ROWS: usize = 64;
+
 /// Validate before slicing weights: both dense (`Qwen3_5MTP`) and MoE (`Qwen3_5MoeMTP`) geometries are checked explicitly.
 pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> {
     let ffn_ok = if c.num_experts == 0 {
@@ -437,33 +443,19 @@ impl Qwen3_5MtpRank {
                 })?;
             let local_experts = c.num_experts / tp;
             let free_vram = target.device.mem_info().map_or(0, |(free, _)| free);
-            let slots_all_need = local_experts
-                .saturating_mul(layout.stride)
-                .saturating_add(512 * 1024 * 1024);
-            let slots_192_need = 192usize
-                .saturating_mul(layout.stride)
-                .saturating_add(256 * 1024 * 1024);
-            let slots_128_need = 128usize
-                .saturating_mul(layout.stride)
-                .saturating_add(256 * 1024 * 1024);
-            let k_hot = if tp > 1 && free_vram >= slots_all_need {
-                local_experts
-            } else if tp == 1 && local_experts >= 192 && free_vram >= slots_192_need {
-                192
-            } else if local_experts >= 128 && free_vram >= slots_128_need.max(512 * 1024 * 1024) {
-                128
-            } else if local_experts >= 64 {
-                64
-            } else {
-                16.min(local_experts).max(1)
-            };
+            let k_hot = crate::model::plan_mtp_tiered_moe_hot_experts(
+                tp,
+                local_experts,
+                layout.stride,
+                free_vram,
+            );
             let fully_resident = k_hot >= local_experts;
-            let stage_cap = 32.min(local_experts).max(1);
+            let stage_cap = MTP_MOE_STAGE_CAPACITY.min(local_experts).max(1);
             let mut ws = crate::moe_offload::TieredMoeWorkspace::new(
                 target.device.device_id,
                 layout.clone(),
                 stage_cap,
-                max_batch_rows.max(64),
+                max_batch_rows.max(MTP_MOE_MIN_WORKSPACE_BATCH_ROWS),
                 c.num_experts_per_tok.max(1),
             )?;
             let mut store = crate::moe_offload::HostExpertStore::load_with_pin(

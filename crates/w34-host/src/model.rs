@@ -45,9 +45,19 @@ pub use graph_io::*;
 pub use rank::Qwen3_5ModelRank;
 #[cfg(test)]
 use rank::clamp_state_slots;
-pub use rank::plan_tiered_moe_hot_per_layer;
 #[cfg(any(test, feature = "cuda"))]
 use rank::serving_state_slots;
+pub use rank::{
+    MTP_COMPACT_HOT_EXPERTS, MTP_FALLBACK_HOT_EXPERTS, MTP_FULL_RESIDENCY_HEADROOM_BYTES,
+    MTP_MEDIUM_HOT_EXPERTS, MTP_MEDIUM_MIN_FREE_VRAM_BYTES, MTP_PARTIAL_CACHE_HEADROOM_BYTES,
+    MTP_TP1_STREAMED_PREFILL_MAX_HOT, TIERED_MOE_HOT_SLOT_ALIGNMENT, TIERED_MOE_MIN_MODEL_EXPERTS,
+    TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES, TIERED_MOE_STAGE_RESERVE_SLOTS,
+    TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES, TIERED_MOE_SYNTHETIC_LOCAL_EXPERTS_MAX,
+    TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT, TIERED_MOE_TP1_COMPACT_KV_THRESHOLD_BYTES,
+    TIERED_MOE_TP1_MIN_HOT_EXPERTS, TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT,
+    TIERED_MOE_TP2_DEFAULT_HOT, TIERED_MOE_TP2_MIN_HOT_EXPERTS, TIERED_MOE_TP4_STAGE_RESERVE_SLOTS,
+    default_tiered_moe_hot_ceiling, plan_mtp_tiered_moe_hot_experts, plan_tiered_moe_hot_per_layer,
+};
 #[cfg(feature = "cuda")]
 use rank::{PoolCapacity, SharedVocabHost};
 pub(crate) use weights::RawLinearHost;

@@ -302,12 +302,207 @@ pub(super) struct PoolCapacity {
     pub(super) rank0_extra_headroom_bytes: usize,
 }
 
+/// Number of state slots allocated per active sequence in serving mode (three private
+/// decode/speculative rollback slots plus one borrowed radix-prefix checkpoint slot).
+#[cfg(any(test, feature = "cuda"))]
+const SERVING_STATE_SLOTS_PER_SEQ: usize = 4;
+
+/// Minimum total serving state slots across the pool even when `max_num_seqs == 1`.
+#[cfg(any(test, feature = "cuda"))]
+const MIN_SERVING_STATE_SLOTS_TOTAL: usize = 8;
+
+/// Minimum state-bundle slots required to execute single-sequence prefill + speculative verify.
+#[cfg(any(test, feature = "cuda"))]
+const MIN_ACTIVE_STATE_SLOTS: usize = 3;
+
+/// Default target KV page count (`256 * 16 = 4,096` tokens) when `--kv-pages` is omitted.
+#[cfg(feature = "cuda")]
+const DEFAULT_TARGET_KV_PAGES: usize = 256;
+
+/// Tokens per paged-attention KV block (`KvPool` page size).
+#[cfg(feature = "cuda")]
+const KV_PAGE_BLOCK_TOKENS: usize = 16;
+
+/// Default state-bundle slot count for PLE / large (`>= 15 GiB`) checkpoints in non-serving mode.
+#[cfg(feature = "cuda")]
+const PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS: usize = 12;
+
+/// Default state-bundle slot count for smaller non-PLE checkpoints in non-serving mode.
+#[cfg(feature = "cuda")]
+const STANDARD_DEFAULT_STATE_SLOTS: usize = 24;
+
+/// Estimated weight footprint threshold (`15 GiB`) above which non-serving mode uses
+/// [`PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS`].
+#[cfg(feature = "cuda")]
+const LARGE_MODEL_WEIGHT_THRESHOLD_BYTES: usize = 15 * 1024 * 1024 * 1024;
+
+/// Dedicated VRAM reserve (`1.5 GiB`) set aside on rank 0 for lazy `Qwen3VisionEncoder`
+/// loading when serving multimodal checkpoints with sufficient free VRAM.
+#[cfg(feature = "cuda")]
+const VISION_ENCODER_LAZY_RESERVE_BYTES: usize = 1536 * 1024 * 1024;
+
+/// Layer-count threshold (`64` layers) for applying [`crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES`].
+#[cfg(feature = "cuda")]
+const EXTREME_LONGCTX_MIN_LAYERS: usize = 64;
+
+/// Page-count threshold (`14,336` pages = `224K` tokens) for extreme long-context headroom.
+#[cfg(feature = "cuda")]
+const EXTREME_LONGCTX_MIN_PAGES: usize = 14_336;
+
+/// Alignment quantum (`8` slots) for per-layer GPU hot expert cache sizing.
+pub const TIERED_MOE_HOT_SLOT_ALIGNMENT: usize = 8;
+
+/// Minimum total model experts (`64`) required before applying full tiered-MoE VRAM planning.
+pub const TIERED_MOE_MIN_MODEL_EXPERTS: usize = 64;
+
+/// Maximum local experts per rank (`80`) treated as a tiny synthetic test model (`hot = local / 2`).
+pub const TIERED_MOE_SYNTHETIC_LOCAL_EXPERTS_MAX: usize = 80;
+
+/// Minimum per-layer GPU hot expert cache capacity on `TP=1` under extreme KV pressure.
+pub const TIERED_MOE_TP1_MIN_HOT_EXPERTS: usize = 16;
+
+/// Minimum per-layer GPU hot expert cache capacity per rank on `TP >= 2` under extreme KV pressure.
+pub const TIERED_MOE_TP2_MIN_HOT_EXPERTS: usize = 32;
+
+/// `base_headroom + kv_pool` threshold (`1.5 GiB`) separating compact `TP=1` KV budgets (`256` pages)
+/// from multi-thousand-page serving KV budgets (`4,096` pages).
+pub const TIERED_MOE_TP1_COMPACT_KV_THRESHOLD_BYTES: usize = 1536 * 1024 * 1024;
+
+/// Auto-tuned `TP=1` per-layer GPU hot expert ceiling for compact KV budgets (`<= 1.5 GiB`),
+/// leaving `>= 1.35 GiB` post-target VRAM for `MTP` (`k_hot = 192`) and CUDA graphs on 24 GiB cards.
+pub const TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT: usize = 96;
+
+/// Auto-tuned `TP=1` per-layer GPU hot expert ceiling for larger serving KV budgets (`> 1.5 GiB`).
+pub const TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT: usize = 88;
+
+/// Auto-tuned `TP=2` per-rank GPU hot expert ceiling (`224 / 512` experts across 2 GPUs),
+/// leaving room for `100%` VRAM-resident `MTP` (`256 / 256` local experts) plus `>= 2 GiB` headroom.
+pub const TIERED_MOE_TP2_DEFAULT_HOT: usize = 112;
+
+/// Extra expert-stride slots (`512`) reserved on `TP=1` / `TP=2` for `TieredMoeWorkspace` staging
+/// and downstream `MTP` expert cache allocation.
+pub const TIERED_MOE_STAGE_RESERVE_SLOTS: usize = 512;
+
+/// Extra expert-stride slots (`256`) reserved on `TP >= 4` where all local experts fit in VRAM.
+pub const TIERED_MOE_TP4_STAGE_RESERVE_SLOTS: usize = 256;
+
+/// Fixed post-target VRAM reserve (`640 MiB`) on `TP=1` / `TP=2` for `MTP` non-expert weights,
+/// `QSA` workspace buffers, and CUDA graph capture pools.
+pub const TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES: usize = 640 * 1024 * 1024;
+
+/// Fixed extra VRAM reserve (`64 MiB`) for tiny synthetic tiered-MoE unit-test models.
+pub const TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Double-buffered H2D staging capacity (`96` experts) for `RankTieredMoe` on `TP=1` / `TP=2`.
+#[cfg(feature = "cuda")]
+const TIERED_MOE_STAGE_CAPACITY_DEFAULT: usize = 96;
+
+/// Double-buffered H2D staging capacity (`32` experts) for `RankTieredMoe` on `TP >= 4`.
+#[cfg(feature = "cuda")]
+const TIERED_MOE_STAGE_CAPACITY_TP4: usize = 32;
+
+/// Maximum `PLE` batch token staging capacity (`6,144` rows) for tiered-MoE checkpoints.
+#[cfg(feature = "cuda")]
+const TIERED_MOE_MAX_PLE_BATCH_TOKENS: usize = 6144;
+
+/// Maximum `PLE` batch token staging capacity (`2,048` rows) for non-tiered checkpoints.
+#[cfg(feature = "cuda")]
+const STANDARD_MAX_PLE_BATCH_TOKENS: usize = 2048;
+
+/// Minimum per-row byte stride (`2,560 B`) for `PLE` FP8 staging buffers.
+#[cfg(feature = "cuda")]
+const MIN_PLE_ROW_STAGING_BYTES: usize = 2560;
+
+/// Free VRAM headroom (`512 MiB`) preserved after placing `100%` of `MTP` local experts in VRAM on `TP >= 2`.
+pub const MTP_FULL_RESIDENCY_HEADROOM_BYTES: usize = 512 * 1024 * 1024;
+
+/// Free VRAM headroom (`256 MiB`) preserved after allocating a partial `MTP` `HotExpertCache`
+/// so `QSA` workspaces, `FullAttentionLayerWeights`, and `MTP` CUDA graphs fit comfortably.
+pub const MTP_PARTIAL_CACHE_HEADROOM_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum `MTP` GPU hot expert count (`192`) on `TP=1` (`local_experts = 512`).
+///
+/// Keeping `k_hot < local_experts` on `TP=1` preserves `StreamedPrefill` chunking during
+/// `MTP::ingest_kv_only` instead of dispatching `num_experts = 512` with `group_size = 32`
+/// into `w34_moe_w4a16_mlp_f16` (which falls back to GEMV when `total_pairs < 512`).
+pub const MTP_TP1_STREAMED_PREFILL_MAX_HOT: usize = 192;
+
+/// Intermediate `MTP` GPU hot expert count (`128`) when free VRAM cannot fit `192` slots.
+pub const MTP_MEDIUM_HOT_EXPERTS: usize = 128;
+
+/// Minimum free VRAM (`512 MiB`) required to select [`MTP_MEDIUM_HOT_EXPERTS`].
+pub const MTP_MEDIUM_MIN_FREE_VRAM_BYTES: usize = 512 * 1024 * 1024;
+
+/// Compact `MTP` GPU hot expert count (`64`) under tight VRAM budgets.
+pub const MTP_COMPACT_HOT_EXPERTS: usize = 64;
+
+/// Fallback `MTP` GPU hot expert count (`16`) for tiny synthetic models (`local_experts < 64`).
+pub const MTP_FALLBACK_HOT_EXPERTS: usize = 16;
+
+/// Returns the auto-tuned per-layer GPU hot expert ceiling for a tiered-MoE target rank.
+#[inline]
+pub fn default_tiered_moe_hot_ceiling(
+    tp_size: usize,
+    local_experts: usize,
+    base_headroom_plus_kv_bytes: usize,
+) -> usize {
+    if tp_size >= 4 {
+        local_experts
+    } else if tp_size == 2 {
+        TIERED_MOE_TP2_DEFAULT_HOT.min(local_experts)
+    } else if base_headroom_plus_kv_bytes <= TIERED_MOE_TP1_COMPACT_KV_THRESHOLD_BYTES {
+        TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT.min(local_experts)
+    } else {
+        TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT.min(local_experts)
+    }
+}
+
+/// Computes the `MTP` proposer's GPU hot expert cache capacity (`k_hot`) from live free VRAM.
+///
+/// On `TP >= 2` (`local_experts <= 256`), places `100%` of local `MTP` experts in VRAM when
+/// `free_vram_bytes` covers all local experts plus [`MTP_FULL_RESIDENCY_HEADROOM_BYTES`].
+/// On `TP == 1` (`local_experts == 512`), caps at [`MTP_TP1_STREAMED_PREFILL_MAX_HOT`] (`192`)
+/// when affordable so `MTP` prompt ingestion retains fast `StreamedPrefill` chunking.
+pub fn plan_mtp_tiered_moe_hot_experts(
+    tp_size: usize,
+    local_experts: usize,
+    expert_stride_bytes: usize,
+    free_vram_bytes: usize,
+) -> usize {
+    let local_experts = local_experts.max(1);
+    let slots_all_need = local_experts
+        .saturating_mul(expert_stride_bytes)
+        .saturating_add(MTP_FULL_RESIDENCY_HEADROOM_BYTES);
+    let slots_tp1_max_need = MTP_TP1_STREAMED_PREFILL_MAX_HOT
+        .saturating_mul(expert_stride_bytes)
+        .saturating_add(MTP_PARTIAL_CACHE_HEADROOM_BYTES);
+    let slots_medium_need = MTP_MEDIUM_HOT_EXPERTS
+        .saturating_mul(expert_stride_bytes)
+        .saturating_add(MTP_PARTIAL_CACHE_HEADROOM_BYTES);
+    if tp_size > 1 && free_vram_bytes >= slots_all_need {
+        local_experts
+    } else if tp_size == 1
+        && local_experts >= MTP_TP1_STREAMED_PREFILL_MAX_HOT
+        && free_vram_bytes >= slots_tp1_max_need
+    {
+        MTP_TP1_STREAMED_PREFILL_MAX_HOT
+    } else if local_experts >= MTP_MEDIUM_HOT_EXPERTS
+        && free_vram_bytes >= slots_medium_need.max(MTP_MEDIUM_MIN_FREE_VRAM_BYTES)
+    {
+        MTP_MEDIUM_HOT_EXPERTS
+    } else if local_experts >= MTP_COMPACT_HOT_EXPERTS {
+        MTP_COMPACT_HOT_EXPERTS
+    } else {
+        MTP_FALLBACK_HOT_EXPERTS.min(local_experts).max(1)
+    }
+}
+
 #[cfg(any(test, feature = "cuda"))]
 pub(super) fn serving_state_slots(max_num_seqs: usize) -> Result<usize> {
     max_num_seqs
-        .checked_mul(4)
+        .checked_mul(SERVING_STATE_SLOTS_PER_SEQ)
         .filter(|&slots| slots != 0)
-        .map(|slots| slots.max(8))
+        .map(|slots| slots.max(MIN_SERVING_STATE_SLOTS_TOTAL))
         .ok_or_else(|| {
             loader_err("serving max_num_seqs must be nonzero and fit four state slots per sequence")
         })
@@ -327,34 +522,28 @@ pub fn plan_tiered_moe_hot_per_layer(
         return (0, 0);
     }
     let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
-    let default_hot = if tp_size >= 4 {
-        local_experts
-    } else if tp_size == 2 {
-        112usize.min(local_experts)
-    } else if base_headroom_plus_kv_bytes <= 1536 * 1024 * 1024 {
-        96usize.min(local_experts)
-    } else {
-        88usize.min(local_experts)
-    };
+    let default_hot =
+        default_tiered_moe_hot_ceiling(tp_size, local_experts, base_headroom_plus_kv_bytes);
     let exp_bytes = cfg.moe_expert_pack_layout().map_or(0, |l| l.stride);
-    if (tp_size < 4 && local_experts <= 80)
-        || cfg.num_experts < 64
+    if (tp_size < 4 && local_experts <= TIERED_MOE_SYNTHETIC_LOCAL_EXPERTS_MAX)
+        || cfg.num_experts < TIERED_MOE_MIN_MODEL_EXPERTS
         || exp_bytes == 0
         || cfg.num_hidden_layers == 0
     {
         let hot = (local_experts / 2).max(1);
-        let reserve = (cfg.num_hidden_layers * hot + 512) * exp_bytes + 64 * 1024 * 1024;
+        let reserve = (cfg.num_hidden_layers * hot + TIERED_MOE_STAGE_RESERVE_SLOTS) * exp_bytes
+            + TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES;
         return (hot, reserve);
     }
     let min_hot = if tp_size >= 2 {
-        32usize.min(default_hot)
+        TIERED_MOE_TP2_MIN_HOT_EXPERTS.min(default_hot)
     } else {
-        16usize.min(default_hot)
+        TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot)
     };
     let extra_reserve = if tp_size >= 4 {
-        256 * exp_bytes
+        TIERED_MOE_TP4_STAGE_RESERVE_SLOTS * exp_bytes
     } else {
-        512 * exp_bytes + 640 * 1024 * 1024
+        TIERED_MOE_STAGE_RESERVE_SLOTS * exp_bytes + TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES
     };
     let fixed_overhead = base_headroom_plus_kv_bytes
         .saturating_add(min_state_pool_bytes)
@@ -363,7 +552,8 @@ pub fn plan_tiered_moe_hot_per_layer(
     let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
         let max_affordable =
             (available_vram_after_weights_and_scratch - fixed_overhead) / per_hot_step;
-        let aligned = (max_affordable / 8) * 8;
+        let aligned =
+            (max_affordable / TIERED_MOE_HOT_SLOT_ALIGNMENT) * TIERED_MOE_HOT_SLOT_ALIGNMENT;
         aligned.clamp(min_hot, default_hot)
     } else {
         min_hot
@@ -383,9 +573,9 @@ pub(super) fn clamp_state_slots(
     if per_slot == 0 {
         requested
     } else if free > fixed {
-        ((free - fixed) / per_slot).clamp(3, requested)
+        ((free - fixed) / per_slot).clamp(MIN_ACTIVE_STATE_SLOTS, requested)
     } else {
-        3usize.min(requested)
+        MIN_ACTIVE_STATE_SLOTS.min(requested)
     }
 }
 
@@ -1090,7 +1280,7 @@ impl Qwen3_5ModelRank {
         stream.synchronize()?;
 
         // 5. StateBundlePool & KvPool via CapacityPlanner
-        let block_size = 16usize;
+        let block_size = KV_PAGE_BLOCK_TOKENS;
         let mut bytes_per_kv_page_all_layers = 0usize;
         for ord in 0..full_attn_layer_ids.len() {
             let (kf, vf, _, _) = kv_policy.resolve_layer(ord, full_attn_layer_ids.len());
@@ -1114,17 +1304,19 @@ impl Qwen3_5ModelRank {
             * (conv_dim * (cfg.linear_conv_kernel_dim - 1) * 2
                 + local_v_heads * cfg.linear_value_head_dim * cfg.linear_key_head_dim * 4)
             + ple_slot_bytes;
-        let default_state_slots = if cfg.uses_ple() || est_weight_bytes >= 15 * 1024 * 1024 * 1024 {
-            12usize
-        } else {
-            24usize
-        };
+        let default_state_slots =
+            if cfg.uses_ple() || est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
+                PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
+            } else {
+                STANDARD_DEFAULT_STATE_SLOTS
+            };
         let requested_state_slots = capacity.state_slots.unwrap_or(default_state_slots);
-        let default_pages = requested_kv_pages.or(Some(256));
-        let req_kv_bytes = default_pages.unwrap_or(256) * bytes_per_kv_page_all_layers;
+        let default_pages = requested_kv_pages.or(Some(DEFAULT_TARGET_KV_PAGES));
+        let req_kv_bytes =
+            default_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES) * bytes_per_kv_page_all_layers;
         let base_headroom = if tp_size == 1
-            && cfg.num_hidden_layers >= 64
-            && default_pages.unwrap_or(0) >= 14_336
+            && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
+            && default_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
         {
             crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES
         } else {
@@ -1136,9 +1328,12 @@ impl Qwen3_5ModelRank {
             free_vram.saturating_sub(weight_arena.used().saturating_add(scratch_arena.capacity()))
         };
         let min_state_slots_for_moe = if capacity.state_slots.is_some() {
-            requested_state_slots.clamp(3, 12)
+            requested_state_slots.clamp(
+                MIN_ACTIVE_STATE_SLOTS,
+                PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS,
+            )
         } else {
-            requested_state_slots.min(6)
+            requested_state_slots.min(PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS / 2)
         };
         let (tiered_moe_hot_per_layer, tiered_moe_reserve) = plan_tiered_moe_hot_per_layer(
             cfg,
@@ -1185,18 +1380,21 @@ impl Qwen3_5ModelRank {
             let desired_state_bytes = bytes_per_state_slot.saturating_mul(requested_state_slots);
             let vision_reserve = if rank == 0
                 && archive_has_vision
-                && default_pages.unwrap_or(0) < 14_336
+                && default_pages.unwrap_or(0) < EXTREME_LONGCTX_MIN_PAGES
                 && available
                     >= base_reserved
                         .saturating_add(desired_state_bytes)
-                        .saturating_add(1536 * 1024 * 1024)
+                        .saturating_add(VISION_ENCODER_LAZY_RESERVE_BYTES)
             {
-                1536 * 1024 * 1024
+                VISION_ENCODER_LAZY_RESERVE_BYTES
             } else {
                 0
             };
             let reserved = base_reserved.saturating_add(vision_reserve);
-            if available < reserved.saturating_add(bytes_per_state_slot.saturating_mul(3)) {
+            if available
+                < reserved
+                    .saturating_add(bytes_per_state_slot.saturating_mul(MIN_ACTIVE_STATE_SLOTS))
+            {
                 return Err(loader_err(
                     "insufficient VRAM for serving state pool and headroom",
                 ));
@@ -1332,24 +1530,18 @@ impl Qwen3_5ModelRank {
     pub fn init_tiered_moe(&mut self, archive: &SafetensorsArchive) -> Result<()> {
         self.device.make_current()?;
         let local_experts = (self.cfg.num_experts / self.tp_size).max(1);
-        let default_hot = if self.tp_size >= 4 {
-            local_experts
-        } else if self.tp_size == 2 {
-            112usize.min(local_experts)
-        } else {
-            88usize.min(local_experts)
-        };
+        let default_hot = default_tiered_moe_hot_ceiling(self.tp_size, local_experts, usize::MAX);
         let hot_per_layer = if self.tiered_moe_hot_per_layer > 0 {
             self.tiered_moe_hot_per_layer
-        } else if self.cfg.num_experts < 64 {
+        } else if self.cfg.num_experts < TIERED_MOE_MIN_MODEL_EXPERTS {
             (local_experts / 2).max(1)
         } else {
             default_hot
         };
         let stage_cap = if self.tp_size >= 4 {
-            local_experts.clamp(1, 32)
+            local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_TP4)
         } else {
-            local_experts.clamp(1, 96)
+            local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_DEFAULT)
         };
         let tiered_moe = crate::moe_offload::RankTieredMoe::load_for_rank(
             archive,
@@ -1380,17 +1572,17 @@ impl Qwen3_5ModelRank {
         ple_mmap_table: Arc<crate::ple::PleMmapTable>,
     ) -> Result<()> {
         self.device.make_current()?;
-        // Pre-allocate 2048 rows * ple_embed_dim F8 staging buffer at a fixed device address
+        // Pre-allocate batch rows * ple_embed_dim F8 staging buffer at a fixed device address
         // so both eager forward and CUDA Graphs can read from `f8_staging_dev.addr()`.
         let max_ple_tokens = if self.cfg.uses_tiered_moe() {
-            6144usize
+            TIERED_MOE_MAX_PLE_BATCH_TOKENS
         } else {
-            2048usize
+            STANDARD_MAX_PLE_BATCH_TOKENS
         };
         let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
         let f8_staging_dev = DeviceBuffer::alloc(
             self.device.device_id,
-            max_ple_tokens * ple_row_bytes.max(2560),
+            max_ple_tokens * ple_row_bytes.max(MIN_PLE_ROW_STAGING_BYTES),
         )?;
         self.ple_runtime = Some(PleRankRuntime {
             hasher: ple_hasher,
