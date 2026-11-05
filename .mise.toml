@@ -73,6 +73,11 @@ description = "Fast library code coverage report with CUDA"
 depends = ["dashboard-build"]
 run = "cargo llvm-cov --features cuda --lib --summary-only"
 
+[tasks."coverage-full"]
+description = "Full library + integration test code coverage report with CUDA"
+depends = ["dashboard-build"]
+run = "cargo llvm-cov --features cuda --lib --tests --summary-only -- --test-threads=1"
+
 [tasks."coverage-html"]
 description = "Generate HTML coverage report for lib with CUDA"
 depends = ["dashboard-build"]

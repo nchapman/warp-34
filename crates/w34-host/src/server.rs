@@ -4,6 +4,8 @@ use core::fmt;
 
 pub use crate::chatml::{ChatMessage, format_chatml_prompt, format_chatml_prompt_with_options};
 #[cfg(feature = "cuda")]
+mod decision_http;
+#[cfg(feature = "cuda")]
 mod http;
 #[cfg(feature = "cuda")]
 pub use http::*;

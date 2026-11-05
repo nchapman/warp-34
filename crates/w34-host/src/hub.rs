@@ -201,6 +201,20 @@ fn resolve_remote(
     result.map_err(|e| io::Error::new(e.kind(), format!("Hugging Face {id}@{revision}: {e}")))
 }
 
+fn repo_download_lock(repo_dir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, OnceLock},
+    };
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    map.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(repo_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn download(
     repo: &HFRepositorySync<RepoTypeModel>,
     id: &str,
@@ -209,6 +223,8 @@ fn download(
     role: ModelRole,
     progress: bool,
 ) -> io::Result<PathBuf> {
+    let lock = repo_download_lock(repo_dir);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let info = repo.info().revision(revision).send().map_err(hub_error)?;
     let commit = info
         .sha

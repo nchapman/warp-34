@@ -61,6 +61,8 @@ mise install            # pinned Rust, Python, Node, and pnpm tooling
 mise run build          # build dashboard, then cargo build --release --features cuda
 mise run check-quick    # fmt --check + clippy (with and without cuda)
 mise run check          # fmt + clippy + release test suite
+mise run coverage       # fast library code coverage report (--lib --features cuda)
+mise run coverage-full  # full library + integration test coverage (--lib --tests --features cuda)
 ```
 
 ## Models: download on first use
