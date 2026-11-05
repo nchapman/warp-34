@@ -1,6 +1,5 @@
 //! Sparse MoE parity, real-weight M4/M8/M16/M306 validation, shared expert, invalid routes, and TP1/TP2 execution.
 #![cfg(feature = "cuda")]
-#![allow(clippy::undocumented_unsafe_blocks)]
 
 mod common;
 
@@ -396,6 +395,7 @@ fn check_sparse(shape: SparseShape) {
     let ex_ref = stream.exec(0, 0);
     let ex_mma = stream.exec(d_ws.addr(), ws_cap);
     assert_eq!(
+        // SAFETY: `ex_ref` is a valid `W34Exec` descriptor.
         unsafe {
             w34_moe_w4a16_select_regime(
                 &ex_ref,
@@ -409,6 +409,7 @@ fn check_sparse(shape: SparseShape) {
         },
         0
     );
+    // SAFETY: `ex_mma` is a valid `W34Exec` descriptor with `d_ws` scratch.
     let actual_regime = unsafe {
         w34_moe_w4a16_select_regime(
             &ex_mma,
@@ -429,6 +430,7 @@ fn check_sparse(shape: SparseShape) {
         (&ex_mma, &d_interm_mma, &d_out_mma),
     ] {
         assert_eq!(
+            // SAFETY: All MoE input, weight, routing, intermediate, and output buffers are live and sized for the batch.
             unsafe {
                 ffi::w34_moe_w4a16_mlp_f16(
                     ex,
@@ -457,6 +459,7 @@ fn check_sparse(shape: SparseShape) {
 
     let mut ws_after = vec![0u8; ws_cap.min(64)];
     assert_eq!(
+        // SAFETY: `ws_after` and `d_ws` are live for `ws_after.len()` bytes and synchronized on `stream`.
         unsafe {
             ffi::w34_memcpy_d2h_async(
                 ws_after.as_mut_ptr() as *mut c_void,
@@ -582,6 +585,7 @@ fn check_sparse(shape: SparseShape) {
     }
 
     assert_eq!(
+        // SAFETY: All full-expert MoE device buffers are live and sized for `(num_tokens, top_k, num_experts)`.
         unsafe {
             ffi::w34_moe_w4a16_mlp_f16(
                 &ex_mma,
@@ -620,6 +624,7 @@ fn check_sparse(shape: SparseShape) {
         d_dn_wr.copy_from_host(&dn_w_r[r], &stream).unwrap();
         d_dn_sr.copy_from_host(&dn_s_r[r], &stream).unwrap();
         assert_eq!(
+            // SAFETY: Sharded MoE device buffers are live and sized for `(num_tokens, top_k, num_experts, interm_r)`.
             unsafe {
                 ffi::w34_moe_w4a16_mlp_f16(
                     &ex_mma,
@@ -741,6 +746,7 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
             let ex_opt = stream.exec(d_ws.addr(), ws_cap);
 
             for (m, expected_regime) in [(4usize, 1i32), (8, 2), (16, 2), (64, 2), (306, 3)] {
+                // SAFETY: `ex_opt` is a valid `W34Exec` descriptor with `d_ws` scratch.
                 let got_regime = unsafe {
                     w34_moe_w4a16_select_regime(
                         &ex_opt,
@@ -950,6 +956,7 @@ fn dual_small_n_gemm_and_warp256_router_match_references() {
             let d_got1 = DeviceBuffer::alloc(dev.device_id, m * n1 * 2).unwrap();
 
             assert_eq!(
+                // SAFETY: `d_x`, `d_w0`, and `d_ref0` are live FP16 buffers of shapes `[m, size_k]`, `[n0, size_k]`, `[m, n0]`.
                 unsafe {
                     ffi::w34_small_n_gemm_f16(
                         &ex,
@@ -964,6 +971,7 @@ fn dual_small_n_gemm_and_warp256_router_match_references() {
                 0
             );
             assert_eq!(
+                // SAFETY: `d_x`, `d_w1`, and `d_ref1` are live FP16 buffers of shapes `[m, size_k]`, `[n1, size_k]`, `[m, n1]`.
                 unsafe {
                     ffi::w34_small_n_gemm_f16(
                         &ex,
@@ -978,6 +986,7 @@ fn dual_small_n_gemm_and_warp256_router_match_references() {
                 0
             );
             assert_eq!(
+                // SAFETY: Dual GEMM inputs/outputs `d_x`, `d_w0`, `d_got0`, `d_w1`, `d_got1` are live and match `(m, n0, n1, size_k)`.
                 unsafe {
                     ffi::w34_small_n_gemm_dual_f16(
                         &ex,
@@ -1057,6 +1066,7 @@ fn dual_small_n_gemm_and_warp256_router_match_references() {
         for use_sigmoid in [0i32, 1] {
             // For softmax (`use_sigmoid == 0`), an extra `-65504` column adds exp(-65504) == 0.0f in FP32!
             assert_eq!(
+                // SAFETY: `d_l256`, `d_w256`, and `d_i256` are live device buffers for `rows * 256` logits and `rows * top_k` outputs.
                 unsafe {
                     ffi::w34_moe_topk_router_f16(
                         &ex,
@@ -1073,6 +1083,7 @@ fn dual_small_n_gemm_and_warp256_router_match_references() {
                 0
             );
             assert_eq!(
+                // SAFETY: `d_l257`, `d_w257`, and `d_i257` are live device buffers for `rows * 257` logits and `rows * top_k` outputs.
                 unsafe {
                     ffi::w34_moe_topk_router_f16(
                         &ex,

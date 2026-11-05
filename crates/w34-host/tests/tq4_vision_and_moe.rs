@@ -9,7 +9,6 @@
 //!   and `Qwen3VisionEncoder` + multimodal generation).
 //! - Hybrid MoE (`op_moe.cu` top-k router, fused `W4A16` & `FP16` MoE
 //!   gate+up+SiLU + down+shared_expert+gate kernels, `Qwen3.6-35B-A3B` config & engine).
-#![allow(clippy::undocumented_unsafe_blocks)]
 
 mod common;
 
@@ -188,6 +187,7 @@ fn test_wht256_outlier_protection_and_long_context_needle() {
                 reserved: 0,
             };
             assert_eq!(
+                // SAFETY: `layout`, `batch`, `d_k`, and `d_v` are live on device 0 for `seq_len` tokens.
                 unsafe {
                     ffi::w34_kv_cache_write(
                         &ex,
@@ -201,6 +201,7 @@ fn test_wht256_outlier_protection_and_long_context_needle() {
             );
             batch.total_tokens = q_len as i32;
             assert_eq!(
+                // SAFETY: `layout`, `batch`, `d_q`, `d_gate`, and `d_out` are live on device 0.
                 unsafe {
                     ffi::w34_paged_attention_f16(
                         &ex,
@@ -321,6 +322,7 @@ fn test_wht256_outlier_protection_and_long_context_needle() {
             reserved: 0,
         };
         assert_eq!(
+            // SAFETY: `layout`, `batch`, `d_k`, and `d_v` are live on device 0 for needle KV write.
             unsafe {
                 ffi::w34_kv_cache_write(
                     &ex,
@@ -334,6 +336,7 @@ fn test_wht256_outlier_protection_and_long_context_needle() {
         );
         batch.total_tokens = 1;
         assert_eq!(
+            // SAFETY: `layout`, `batch`, `d_q`, `d_gate`, and `d_out` are live on device 0 for needle query.
             unsafe {
                 ffi::w34_paged_attention_f16(
                     &ex,
@@ -567,6 +570,7 @@ fn vision_cuda_kernels_and_embedding_splice() {
     d_cu.copy_from_host(&cu_seqlens, &stream).unwrap();
 
     assert_eq!(
+        // SAFETY: `d_qkv`, `d_bias`, `d_pos`, `d_cu`, and `d_out` are live buffers matching vision RoPE+attn geometry.
         unsafe {
             ffi::w34_vision_qkv_rope_attn_f16(
                 &ex,
@@ -599,6 +603,7 @@ fn vision_cuda_kernels_and_embedding_splice() {
     d_vis.copy_from_host(&vis_emb, &stream).unwrap();
     d_idx.copy_from_host(&splice_idx, &stream).unwrap();
     assert_eq!(
+        // SAFETY: `d_tok`, `d_vis`, and `d_idx` are live buffers on device 0 with valid splice indices.
         unsafe {
             ffi::w34_embedding_splice_f16(
                 &ex,
@@ -634,6 +639,7 @@ fn moe_router_and_fused_w4a16_f16_kernels() {
     let d_ids = DeviceBuffer::alloc(0, 2 * 4).unwrap();
     d_logits.copy_from_host(&logits_f16, &stream).unwrap();
     assert_eq!(
+        // SAFETY: `d_logits`, `d_weights`, and `d_ids` are live on device 0 for `1 * 4` logits and `top_k = 2`.
         unsafe {
             ffi::w34_moe_topk_router_f16(
                 &ex,
@@ -706,6 +712,7 @@ fn moe_router_and_fused_w4a16_f16_kernels() {
         .unwrap();
 
     assert_eq!(
+        // SAFETY: All `W4A16` MoE gate+up+SiLU buffers are live on device 0 and match the synthetic geometry.
         unsafe {
             ffi::w34_moe_w4a16_gate_up_silu_f16(
                 &ex,
@@ -725,6 +732,7 @@ fn moe_router_and_fused_w4a16_f16_kernels() {
         0
     );
     assert_eq!(
+        // SAFETY: All `W4A16` MoE down+shared accumulation buffers are live on device 0.
         unsafe {
             ffi::w34_moe_w4a16_down_accum_f16(
                 &ex,
@@ -899,6 +907,7 @@ fn moe_checkpoint_config_and_dense_f16_tp_parity() {
     d_sh_gate.copy_from_host(&sh_gate_host, &stream).unwrap();
 
     assert_eq!(
+        // SAFETY: All `FP16` MoE gate+up+SiLU buffers are live on device 0.
         unsafe {
             ffi::w34_moe_f16_gate_up_silu(
                 &ex,
@@ -916,6 +925,7 @@ fn moe_checkpoint_config_and_dense_f16_tp_parity() {
         0
     );
     assert_eq!(
+        // SAFETY: All `FP16` MoE down+shared accumulation buffers are live on device 0.
         unsafe {
             ffi::w34_moe_f16_down_accum(
                 &ex,
@@ -1099,8 +1109,8 @@ fn check_batched_decode_short_split_tp1_tp2_0ulp() {
         let dv = DeviceBuffer::alloc(0, vh.len() * 2).unwrap();
         dk.copy_from_host(kh, &stream).unwrap();
         dv.copy_from_host(vh, &stream).unwrap();
-        // SAFETY: `dk`, `dv`, `wb`, and `layout` live on device 0 with matching dimensions.
         assert_eq!(
+            // SAFETY: `dk`, `dv`, `wb`, and `layout` live on device 0 with matching dimensions.
             unsafe {
                 ffi::w34_kv_cache_write(
                     &ex_split,
@@ -1335,6 +1345,7 @@ fn check_gqa_split_kv_parity(seq_len: usize) {
             reserved: 0,
         };
         assert_eq!(
+            // SAFETY: `layout_c`, `wb`, `d_k`, and `d_v` are live on device 0 for contiguous KV write.
             unsafe {
                 ffi::w34_kv_cache_write(
                     &ex_no_split,
@@ -1349,6 +1360,7 @@ fn check_gqa_split_kv_parity(seq_len: usize) {
         wb.block_tables = d_bt_p.addr() as *const i32;
         wb.write_slot_mapping = d_slots_p.addr() as *const i32;
         assert_eq!(
+            // SAFETY: `layout_p`, `wb`, `d_k`, and `d_v` are live on device 0 for permuted KV write.
             unsafe {
                 ffi::w34_kv_cache_write(
                     &ex_no_split,
@@ -1399,6 +1411,7 @@ fn check_gqa_split_kv_parity(seq_len: usize) {
             };
 
             assert_eq!(
+                // SAFETY: `layout_c`, `ab`, `d_q`, and `d_out_single` are live on device 0.
                 unsafe {
                     ffi::w34_paged_attention_f16(
                         &ex_no_split,
@@ -1412,6 +1425,7 @@ fn check_gqa_split_kv_parity(seq_len: usize) {
                 0
             );
             assert_eq!(
+                // SAFETY: `layout_c`, `ab`, `d_q`, and `d_out_split_c` are live on device 0 with split-KV workspace.
                 unsafe {
                     ffi::w34_paged_attention_f16(
                         &ex_split,
@@ -1426,6 +1440,7 @@ fn check_gqa_split_kv_parity(seq_len: usize) {
             );
             ab.block_tables = d_bt_p.addr() as *const i32;
             assert_eq!(
+                // SAFETY: `layout_p`, `ab`, `d_q`, and `d_out_split_p` are live on device 0 with permuted block tables.
                 unsafe {
                     ffi::w34_paged_attention_f16(
                         &ex_split,
@@ -1492,6 +1507,7 @@ fn check_gqa_split_kv_parity(seq_len: usize) {
                 packed.max_q_len = 17;
                 packed.valid_token_mask = d_mask.addr() as *const u8;
                 assert_eq!(
+                    // SAFETY: `layout_c`, `packed`, `d_q17`, `d_g17`, and `d_out17` are live on device 0 for 17 tokens.
                     unsafe {
                         ffi::w34_paged_attention_f16(
                             &ex_no_split,
@@ -1640,6 +1656,7 @@ fn moe_grouped_mma_exact_parity_and_tp2() {
         (&ex_mma, &d_interm_mma, &d_out_mma),
     ] {
         assert_eq!(
+            // SAFETY: All `W4A16` MoE input, weight, routing, intermediate, and output buffers are live on device 0.
             unsafe {
                 ffi::w34_moe_w4a16_mlp_f16(
                     ex,
@@ -1735,6 +1752,7 @@ fn moe_grouped_mma_exact_parity_and_tp2() {
     }
 
     assert_eq!(
+        // SAFETY: All full-expert `W4A16` MoE buffers are live on device 0.
         unsafe {
             ffi::w34_moe_w4a16_mlp_f16(
                 &ex_mma,
@@ -1773,6 +1791,7 @@ fn moe_grouped_mma_exact_parity_and_tp2() {
         d_dn_wr.copy_from_host(&dn_w_r[r], &stream).unwrap();
         d_dn_sr.copy_from_host(&dn_s_r[r], &stream).unwrap();
         assert_eq!(
+            // SAFETY: Sharded `W4A16` MoE buffers for rank `r` are live on device 0.
             unsafe {
                 ffi::w34_moe_w4a16_mlp_f16(
                     &ex_mma,

@@ -2,7 +2,6 @@
 //! Committed target taps are projected once into a separate paged KV namespace.
 //! A proposal writes only a private, disposable M-row suffix; it never advances
 //! committed context. Attention/MLP are TP-sharded; context FC and convs replicated.
-#![allow(clippy::too_many_arguments)]
 use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives, check_rc};
 use crate::loader::{ModelConfig, QuantScheme, SafetensorsArchive};

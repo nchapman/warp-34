@@ -612,8 +612,8 @@ impl Qwen3_5MtpRank {
         Ok(out)
     }
 
-    /// Anchor is token[p+1], target_hidden is target final hidden[p], and len must
-    /// equal p. Returns k genuine greedy MTP drafts; cache grows by k provisional
+    /// Anchor is `token[p+1]`, `target_hidden` is target final `hidden[p]`, and `len` must
+    /// equal `p`. Returns `k` genuine greedy MTP drafts; cache grows by `k` provisional
     /// rows. The anchor itself is not returned. Truncate to the round's starting
     /// length and ingest accepted target pairs before the next proposal round.
     pub fn propose(

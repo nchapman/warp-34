@@ -1,6 +1,5 @@
 //! Descriptor-driven `KvPool` (`docs/contracts/cache-layout.md`) and transactional
 //! `StateBundlePool` / `StateTx` (`docs/contracts/state-transaction.md`).
-#![allow(clippy::too_many_arguments)]
 
 #[cfg(feature = "cuda")]
 use crate::cuda::{DeviceBuffer, Result};
@@ -239,6 +238,7 @@ pub struct KvPool {
 
 #[cfg(feature = "cuda")]
 impl KvPool {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_id: i32,
         namespace_id: i32,

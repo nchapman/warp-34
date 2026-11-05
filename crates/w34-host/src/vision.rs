@@ -1,7 +1,6 @@
 //! `Qwen3_VisionTransformer` (`model.visual.*`), `smart_resize` + bicubic +
 //! normalize preprocessing, 2D bilinear `pos_embed` interpolation, 2D axial RoPE,
 //! `PatchMerger`, 3D `mRoPE` position builder, and multimodal `MambaRadixCache` hashing.
-#![allow(clippy::too_many_arguments)]
 
 use serde::Deserialize;
 use std::sync::Arc;
@@ -224,6 +223,7 @@ fn fnv1a_hash_bytes(bytes: &[u8]) -> u64 {
 /// Resizes an `[H, W, 3]` RGB `u8` image via `smart_resize` + bicubic interpolation,
 /// normalizes with `mean = [0.5, 0.5, 0.5], std = [0.5, 0.5, 0.5]`, duplicates across
 /// `temporal_patch_size = 2`, and extracts `[N_patches, 1536]` in `2x2` merge-grouped order.
+#[allow(clippy::too_many_arguments)]
 pub fn preprocess_rgb_image(
     rgb: &[u8],
     height: usize,

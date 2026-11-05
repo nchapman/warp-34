@@ -1,5 +1,3 @@
-#![allow(clippy::undocumented_unsafe_blocks)]
-
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
 use w34_host::cuda::CapacityPlanner;
@@ -142,6 +140,7 @@ fn test_op_fixtures_dump_diff() {
         let d_out = DeviceBuffer::alloc(0, x.len() * 2).unwrap();
         d_x.copy_from_host(&x, &stream).unwrap();
         d_w.copy_from_host(&w, &stream).unwrap();
+        // SAFETY: `d_x`, `d_w`, and `d_out` are live FP16 buffers matching `(rows, cols)`.
         let rc = unsafe {
             ffi::w34_gemma_rms_norm_f16(
                 &ex,
@@ -168,6 +167,7 @@ fn test_op_fixtures_dump_diff() {
         let ref_f_out = archive.read_f32("fused_add_gemma_rms_norm.out").unwrap();
         let d_res = DeviceBuffer::alloc(0, res_in.len() * 2).unwrap();
         d_res.copy_from_host(&res_in, &stream).unwrap();
+        // SAFETY: `d_x`, `d_res`, `d_w`, and `d_out` are live FP16 buffers matching `(rows, cols)`.
         let rc = unsafe {
             ffi::w34_fused_add_gemma_rms_norm_f16(
                 &ex,
@@ -196,6 +196,7 @@ fn test_op_fixtures_dump_diff() {
         let d_in = DeviceBuffer::alloc(0, inp.len() * 2).unwrap();
         let d_out = DeviceBuffer::alloc(0, ref_out.len() * 2).unwrap();
         d_in.copy_from_host(&inp, &stream).unwrap();
+        // SAFETY: `d_in` (`[rows, 2 * d]`) and `d_out` (`[rows, d]`) are live FP16 buffers.
         let rc = unsafe {
             ffi::w34_silu_and_mul_f16(
                 &ex,
@@ -222,6 +223,7 @@ fn test_op_fixtures_dump_diff() {
         d_gx.copy_from_host(&gx, &stream).unwrap();
         d_gz.copy_from_host(&gz, &stream).unwrap();
         d_gw.copy_from_host(&gw, &stream).unwrap();
+        // SAFETY: `d_gx`, `d_gz`, `d_gw`, and `d_go` are live FP16 buffers matching `(rows, cols, group_size)`.
         let rc = unsafe {
             ffi::w34_rms_norm_gated_silu_f16(
                 &ex,
@@ -268,6 +270,7 @@ fn test_op_fixtures_dump_diff() {
         d_knw.copy_from_host(&k_nw, &stream).unwrap();
         d_pos.copy_from_host(&pos_i32, &stream).unwrap();
 
+        // SAFETY: All Q/K/gate/norm/position buffers are live on device 0 and match the fixture geometry.
         let rc = unsafe {
             ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
                 &ex,
@@ -318,6 +321,7 @@ fn test_op_fixtures_dump_diff() {
         let d_qp = DeviceBuffer::alloc(0, q_packed.len() * 4).unwrap();
         let d_rep = DeviceBuffer::alloc(0, ref_repacked.len() * 4).unwrap();
         d_qp.copy_from_host(&q_packed, &stream).unwrap();
+        // SAFETY: `d_qp` and `d_rep` are live `u32` buffers sized for `(size_k, size_n)`.
         let rc = unsafe {
             ffi::w34_marlin_repack_int4(
                 &ex,
@@ -335,12 +339,14 @@ fn test_op_fixtures_dump_diff() {
         let d_sc = DeviceBuffer::alloc(0, sc_perm.len() * 2).unwrap();
         let d_ws = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
         d_sc.copy_from_host(&sc_perm, &stream).unwrap();
+        // SAFETY: `d_ws` holds `65536` `i32` elements on device 0.
         unsafe { ffi::w34_zero_i32(&ex, d_ws.addr() as *mut c_void, 65536) };
 
         for (m, a_host, ref_host) in [(1i64, &a_m1, &ref_m1), (16i64, &a_m16, &ref_m16)] {
             let d_a = DeviceBuffer::alloc(0, a_host.len() * 2).unwrap();
             let d_c = DeviceBuffer::alloc(0, ref_host.len() * 2).unwrap();
             d_a.copy_from_host(a_host, &stream).unwrap();
+            // SAFETY: `d_a`, `d_rep`, `d_sc`, `d_c`, and `d_ws` are live buffers matching `(m, n, k, group_size)`.
             let rc = unsafe {
                 ffi::w34_marlin_gemm_f16u4(
                     &ex,
@@ -399,6 +405,7 @@ fn test_op_fixtures_dump_diff() {
             max_verify_tokens: 0,
             max_checkpoints_per_req: 0,
         };
+        // SAFETY: `gdn_batch` and all conv1d/recurrent device buffers are live on device 0 and sized for 8 tokens.
         let rc = unsafe {
             ffi::w34_gdn_causal_conv1d_f16(
                 &ex,
@@ -507,6 +514,7 @@ fn test_fragmented_paged_attention_and_tq4_strides() {
                 reserved: 0,
             };
             assert_eq!(
+                // SAFETY: `layout`, `write_batch`, `d_k`, and `d_v` are live on device 0 for `total_tokens`.
                 unsafe {
                     ffi::w34_kv_cache_write(
                         &ex,
@@ -522,6 +530,7 @@ fn test_fragmented_paged_attention_and_tq4_strides() {
             let mut read_batch = write_batch;
             read_batch.total_tokens = 1;
             assert_eq!(
+                // SAFETY: `layout`, `read_batch`, `d_q`, `d_gate`, and `d_out` are live on device 0.
                 unsafe {
                     ffi::w34_paged_attention_f16(
                         &ex,
@@ -599,6 +608,7 @@ fn test_fragmented_paged_attention_and_tq4_strides() {
         sm_scale: 1.0 / (128.0f32).sqrt(),
         reserved: 0,
     };
+    // SAFETY: `df_layout`, `df_batch`, and all DFlash2 KV/Q/O buffers are live on device 0.
     unsafe {
         assert_eq!(
             ffi::w34_kv_cache_write(
@@ -696,6 +706,7 @@ fn test_gdn_continuation_checkpoint_and_rejection_parity() {
         max_verify_tokens: 0,
         max_checkpoints_per_req: 1,
     };
+    // SAFETY: `batch_a1` and all GDN conv/recurrent buffers are live on device 0 for 64 tokens.
     unsafe {
         assert_eq!(
             ffi::w34_gdn_causal_conv1d_f16(
@@ -754,6 +765,7 @@ fn test_gdn_continuation_checkpoint_and_rejection_parity() {
         max_verify_tokens: 8,
         max_checkpoints_per_req: 0,
     };
+    // SAFETY: `batch_a2` and all GDN conv/recurrent buffers are live on device 0 for 8 verify tokens.
     unsafe {
         assert_eq!(
             ffi::w34_gdn_causal_conv1d_f16(
@@ -814,6 +826,7 @@ fn test_gdn_continuation_checkpoint_and_rejection_parity() {
         max_verify_tokens: 0,
         max_checkpoints_per_req: 0,
     };
+    // SAFETY: `batch_b` and all GDN conv/recurrent buffers are live on device 0 for 69 tokens.
     unsafe {
         assert_eq!(
             ffi::w34_gdn_causal_conv1d_f16(
@@ -924,6 +937,7 @@ fn test_gdn_continuation_checkpoint_and_rejection_parity() {
             max_checkpoints_per_req: 0,
         };
         assert_eq!(
+            // SAFETY: `batch_pf` and all 96-token GDN recurrent buffers are live on device 0.
             unsafe {
                 ffi::w34_gdn_recurrent_f16(
                     &ex,
@@ -967,6 +981,7 @@ fn test_gdn_continuation_checkpoint_and_rejection_parity() {
                 max_checkpoints_per_req: 0,
             };
             assert_eq!(
+                // SAFETY: `batch_dec` and per-step GDN recurrent pointers are in-bounds on device 0.
                 unsafe {
                     ffi::w34_gdn_recurrent_f16(
                         &ex,
@@ -1076,6 +1091,7 @@ fn test_gdn_conv_paired_prefill_matches_chunked_scalar() {
                 max_checkpoints_per_req: 2,
             };
             let dst = if mode == 0 { &out } else { &reference };
+            // SAFETY: `batch`, `x`, `weight`, `pool`, and `dst` are live on device 0.
             unsafe {
                 assert_eq!(
                     ffi::w34_gdn_causal_conv1d_f16(
@@ -1184,6 +1200,7 @@ fn test_gdn_wy_split_and_fallback_prefill_parity() {
         max_verify_tokens: 0,
         max_checkpoints_per_req: 0,
     };
+    // SAFETY: `batch_init` and GDN initialization buffers are live on device 0.
     unsafe {
         assert_eq!(
             ffi::w34_gdn_recurrent_f16(
@@ -1254,6 +1271,7 @@ fn test_gdn_wy_split_and_fallback_prefill_parity() {
             max_verify_tokens: 0,
             max_checkpoints_per_req: 3,
         };
+        // SAFETY: `batch_ref` and reference GDN recurrent buffers are live on device 0.
         unsafe {
             assert_eq!(
                 ffi::w34_gdn_recurrent_f16(
@@ -1356,6 +1374,7 @@ fn test_gdn_wy_split_and_fallback_prefill_parity() {
             max_verify_tokens: 0,
             max_checkpoints_per_req: 3,
         };
+        // SAFETY: `batch_wy` and WY GDN recurrent buffers are live on device 0.
         unsafe {
             assert_eq!(
                 ffi::w34_gdn_recurrent_f16(
@@ -1488,6 +1507,7 @@ fn run_gdn_batch(
         max_verify_tokens: 0,
         max_checkpoints_per_req: 0,
     };
+    // SAFETY: `batch` and GDN recurrent buffers for range `qsl[0..r]` are live on device 0.
     unsafe {
         assert_eq!(
             ffi::w34_gdn_recurrent_f16(

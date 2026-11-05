@@ -1,6 +1,5 @@
 //! Native vLLM 0.31.0 Gemma residual boundary regression (GPU-only, no model).
 #![cfg(feature = "cuda")]
-#![allow(clippy::undocumented_unsafe_blocks)]
 use std::ffi::c_void;
 use w34_host::cuda::{CudaDevice, CudaStream, DeviceBuffer, f32_to_f16};
 use w34_kernels::ffi;
@@ -123,6 +122,7 @@ fn vec8_rms_norm_and_silu_mul_match_vec2_fallback_zero_ulp() {
             let sentinel = vec![0x7BFFu16; pad_u16 + rows * hs];
             d_o.copy_from_host(&sentinel, &stream).unwrap();
             let byte_off = (offset_u16 * 2) as u64;
+            // SAFETY: Device buffers remain live until `stream.synchronize()` below and hold `pad_u16 + rows * hs` elements.
             let rc = unsafe {
                 ffi::w34_fused_add_gemma_rms_norm_f16(
                     &ex,
@@ -182,6 +182,7 @@ fn vec8_rms_norm_and_silu_mul_match_vec2_fallback_zero_ulp() {
             let sentinel = vec![0x7BFFu16; pad_u16 + rows * d];
             d_out.copy_from_host(&sentinel, &stream).unwrap();
             let byte_off = (offset_u16 * 2) as u64;
+            // SAFETY: Device buffers remain live until `stream.synchronize()` below and hold `pad_u16 + rows * 2 * d` / `pad_u16 + rows * d` elements.
             let rc = unsafe {
                 ffi::w34_silu_and_mul_f16(
                     &ex,

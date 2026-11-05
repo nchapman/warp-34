@@ -1,5 +1,4 @@
 //! Unified Safetensors & HuggingFace Hub checkpoint loader (`w34-host::loader`).
-#![allow(clippy::chunks_exact_to_as_chunks)]
 //!
 //! Supports:
 //! - Single-file (`model.safetensors`) and sharded (`model.safetensors.index.json`) archives,
@@ -340,8 +339,11 @@ impl SafetensorsArchive {
             ));
         }
         Ok(bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
             .collect())
     }
 
@@ -354,8 +356,11 @@ impl SafetensorsArchive {
             ));
         }
         Ok(bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(i32::from_le_bytes)
             .collect())
     }
 
@@ -371,8 +376,11 @@ impl SafetensorsArchive {
                     ));
                 }
                 Ok(bytes
-                    .chunks_exact(8)
-                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(i64::from_le_bytes)
                     .collect())
             }
             "I32" => {
@@ -383,8 +391,11 @@ impl SafetensorsArchive {
                     ));
                 }
                 Ok(bytes
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as i64)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(|c| i32::from_le_bytes(c) as i64)
                     .collect())
             }
             other => Err(io::Error::new(
@@ -399,16 +410,25 @@ impl SafetensorsArchive {
         let bytes = self.read_bytes(name)?;
         match info.dtype.as_str() {
             "F32" => Ok(bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_le_bytes)
                 .collect()),
             "F16" => Ok(bytes
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(|c| f16_to_f32(u16::from_le_bytes(c)))
                 .collect()),
             "BF16" => Ok(bytes
-                .chunks_exact(2)
-                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(|c| bf16_to_f32(u16::from_le_bytes(c)))
                 .collect()),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -467,16 +487,25 @@ impl SafetensorsArchive {
         f.read_exact_at(&mut buf, info.offset + rel_off)?;
         match info.dtype.as_str() {
             "F32" => Ok(buf
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(f32::from_le_bytes)
                 .collect()),
             "F16" => Ok(buf
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(|c| f16_to_f32(u16::from_le_bytes(c)))
                 .collect()),
             "BF16" => Ok(buf
-                .chunks_exact(2)
-                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(|c| bf16_to_f32(u16::from_le_bytes(c)))
                 .collect()),
             _ => unreachable!(),
         }
@@ -488,16 +517,25 @@ impl SafetensorsArchive {
         let bytes = self.read_bytes(name)?;
         match info.dtype.as_str() {
             "F16" => Ok(bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
                 .collect()),
             "BF16" => Ok(bytes
-                .chunks_exact(2)
-                .map(|c| bf16_to_f16(u16::from_le_bytes([c[0], c[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(|c| bf16_to_f16(u16::from_le_bytes(c)))
                 .collect()),
             "F32" => Ok(bytes
-                .chunks_exact(4)
-                .map(|c| f32_to_f16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(|c| f32_to_f16(f32::from_le_bytes(c)))
                 .collect()),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -512,16 +550,25 @@ impl SafetensorsArchive {
         let bytes = self.read_bytes(name)?;
         match info.dtype.as_str() {
             "BF16" => Ok(bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
                 .collect()),
             "F16" => Ok(bytes
-                .chunks_exact(2)
-                .map(|c| f32_to_bf16(f16_to_f32(u16::from_le_bytes([c[0], c[1]]))))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(|c| f32_to_bf16(f16_to_f32(u16::from_le_bytes(c))))
                 .collect()),
             "F32" => Ok(bytes
-                .chunks_exact(4)
-                .map(|c| f32_to_bf16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(|c| f32_to_bf16(f32::from_le_bytes(c)))
                 .collect()),
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

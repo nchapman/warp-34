@@ -1,4 +1,3 @@
-#![allow(clippy::undocumented_unsafe_blocks)]
 use w34_host::parser::{Qwen3Parser, SamplerV1, SamplingParams, TokenBitmaskConstraint};
 use w34_host::radix::{MambaRadixCache, RadixNodeId};
 
@@ -229,6 +228,7 @@ fn test_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
         r0.state_pool.local_v_heads * r0.state_pool.head_v_dim * r0.state_pool.head_k_dim;
     let mut cold_conv = vec![0u16; conv_elems_per_slot];
     let mut cold_ssm = vec![0.0f32; ssm_elems_per_slot];
+    // SAFETY: `cold_conv`/`cold_ssm` are sized to one slot and synchronized on `r0.stream` below.
     unsafe {
         w34_kernels::ffi::w34_memcpy_d2h_async(
             cold_conv.as_mut_ptr() as *mut core::ffi::c_void,
@@ -325,6 +325,7 @@ fn test_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
     let r0 = &engine.ranks[0];
     let mut b_conv = vec![0u16; conv_elems_per_slot];
     let mut b_ssm = vec![0.0f32; ssm_elems_per_slot];
+    // SAFETY: `b_conv`/`b_ssm` are sized to one slot and synchronized on `r0.stream` below.
     unsafe {
         w34_kernels::ffi::w34_memcpy_d2h_async(
             b_conv.as_mut_ptr() as *mut core::ffi::c_void,

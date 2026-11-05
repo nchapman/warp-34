@@ -50,9 +50,14 @@ description = "Clippy without CUDA feature"
 depends = ["dashboard-build"]
 run = "cargo clippy --all-targets -- -D warnings"
 
+[tasks."doc-check"]
+description = "Check Rust documentation with warnings denied"
+depends = ["dashboard-build"]
+run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --features cuda"
+
 [tasks."check-quick"]
-description = "Format check + clippy (both feature states)"
-depends = ["fmt-check", "clippy", "clippy-cpu"]
+description = "Format check, clippy (both feature states), and rustdoc check"
+depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check"]
 
 [tasks."test-quick"]
 description = "Unit tests only (lib target with CUDA)"
@@ -89,8 +94,8 @@ depends = ["dashboard-build"]
 run = "cargo test --release --features cuda"
 
 [tasks.check]
-description = "Format check, clippy (both states), and full release test suite"
-depends = ["fmt-check", "clippy", "clippy-cpu", "test", "oracle-check", "perf-check", "dashboard-check"]
+description = "Format check, clippy (both states), rustdoc check, and full release test suite"
+depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "test", "oracle-check", "perf-check", "dashboard-check"]
 
 [tasks."perf-check"]
 description = "CPU-only tests and manifest validation for the independent performance suite"

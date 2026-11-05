@@ -2,7 +2,6 @@
 #![cfg(feature = "cuda")]
 // Preserve exact decimal representations of native FP16 oracle values.
 #![allow(clippy::excessive_precision)]
-#![allow(clippy::undocumented_unsafe_blocks)]
 use std::ffi::c_void;
 use w34_host::cuda::{CudaDevice, CudaStream, DeviceBuffer, f32_to_f16};
 use w34_kernels::ffi;
@@ -125,6 +124,7 @@ fn vision_tanh_gelu_matches_native_activation() {
     x.copy_from_host(&input.map(f32_to_f16), &stream).unwrap();
     let out = DeviceBuffer::alloc(device.device_id, input.len() * 2).unwrap();
     assert_eq!(
+        // SAFETY: `x` and `out` are live FP16 device buffers of length `input.len()`.
         unsafe {
             ffi::w34_vision_bias_gelu_f16(
                 &ex,
@@ -168,6 +168,7 @@ fn vision_rope_preserves_native_small_angle_coefficients() {
         qkv.copy_from_host(&input, &stream).unwrap();
         let out = DeviceBuffer::alloc(device.device_id, d * 2).unwrap();
         assert_eq!(
+            // SAFETY: `qkv`, `pos`, `seq`, and `out` are live device buffers sized for `3 * d` and `d` elements.
             unsafe {
                 ffi::w34_vision_qkv_rope_attn_f16(
                     &ex,

@@ -2,10 +2,10 @@
 //! using the target stream and shared vocabulary weights.
 //!
 //! Donor: vLLM qwen3_5_mtp.py and llm_base_proposer.py. At MTP position p,
-//! the inputs are target FINAL-normalized hidden[p] and token[p+1], NOT
-//! hidden[p-1] and token[p]. Positions stay p when input IDs shift left.
-//! Ingest prompt pairs up to p-1, then propose with hidden[p] and the target's
-//! newly sampled anchor token[p+1]. The output predicts token[p+2]. Later
+//! the inputs are target FINAL-normalized `hidden[p]` and `token[p+1]`, NOT
+//! `hidden[p-1]` and `token[p]`. Positions stay p when input IDs shift left.
+//! Ingest prompt pairs up to p-1, then propose with `hidden[p]` and the target's
+//! newly sampled anchor `token[p+1]`. The output predicts `token[p+2]`. Later
 //! steps feed the previous MTP final-normalized hidden and sampled draft,
 //! increasing position by one. No target GDN state is touched.
 //!
@@ -13,7 +13,6 @@
 //! replicated (algebraically the donor's column-shard + gather), attention
 //! and dense/MoE FFN are TP-sharded. Vocabulary storage is borrowed, never copied.
 //! TP2 callers must run both ranks concurrently with the same collective order.
-#![allow(clippy::too_many_arguments)]
 use crate::cache::{KvFormatPolicy, KvPool};
 use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives};
 use crate::loader::{ModelConfig, SafetensorsArchive};
@@ -716,8 +715,8 @@ impl Qwen3_5MtpRank {
         self.slot_state[self.active_slot] = (self.len, self.committed);
         Ok(())
     }
-    /// Ingest shifted committed pairs: next_tokens[j] is token[start+j+1],
-    /// target_hidden contains final-normalized target hidden[start+j], FP16.
+    /// Ingest shifted committed pairs: `next_tokens[j]` is `token[start+j+1]`,
+    /// `target_hidden` contains final-normalized target `hidden[start+j]`, FP16.
     /// Caller must keep `next_tokens.len() * hidden_size * 2` readable device
     /// bytes at this pointer on the target device through this call. The span
     /// may be a separate restored-prefix buffer, not necessarily the tap buffer.

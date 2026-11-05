@@ -25,7 +25,7 @@ pub fn marlin_permute_scales_k_by_n(
                 scale_perm[i * 8 + j] = i + 8 * j;
             }
         }
-        for (chunk_idx, src_chunk) in scales_k_by_n.chunks_exact(64).enumerate() {
+        for (chunk_idx, src_chunk) in scales_k_by_n.as_chunks::<64>().0.iter().enumerate() {
             let dst_base = chunk_idx * 64;
             for (i, &p) in scale_perm.iter().enumerate() {
                 out[dst_base + i] = src_chunk[p];
@@ -39,7 +39,7 @@ pub fn marlin_permute_scales_k_by_n(
                 scale_perm_single[i * 8 + j] = 2 * i + b;
             }
         }
-        for (chunk_idx, src_chunk) in scales_k_by_n.chunks_exact(32).enumerate() {
+        for (chunk_idx, src_chunk) in scales_k_by_n.as_chunks::<32>().0.iter().enumerate() {
             let dst_base = chunk_idx * 32;
             for (i, &p) in scale_perm_single.iter().enumerate() {
                 out[dst_base + i] = src_chunk[p];
@@ -221,7 +221,7 @@ pub fn marlin_permute_zero_points_from_n_major(
             scale_perm[i * 8 + j] = i + 8 * j;
         }
     }
-    for (chunk_idx, src_chunk) in zp_g_by_n.chunks_exact(64).enumerate() {
+    for (chunk_idx, src_chunk) in zp_g_by_n.as_chunks::<64>().0.iter().enumerate() {
         let dst_base = chunk_idx * 64;
         for (i, &p) in scale_perm.iter().enumerate() {
             permed[dst_base + i] = src_chunk[p];
@@ -229,7 +229,7 @@ pub fn marlin_permute_zero_points_from_n_major(
     }
 
     let mut out = vec![0u32; num_groups * n8];
-    for (word_idx, chunk8) in permed.chunks_exact(8).enumerate() {
+    for (word_idx, chunk8) in permed.as_chunks::<8>().0.iter().enumerate() {
         let mut packed = 0u32;
         for (i, &src_i) in INTERLEAVE.iter().enumerate() {
             packed |= ((chunk8[src_i] & 0xF) as u32) << (i * 4);
