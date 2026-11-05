@@ -518,7 +518,7 @@ impl Qwen3_5ModelRank {
             && requested_kv_pages.unwrap_or(0) >= 14_336
         {
             336 * 1024 * 1024
-        } else if tp_size == 1 && est_weight_bytes >= 16 * 1024 * 1024 * 1024 {
+        } else if tp_size == 1 && est_weight_bytes >= 15 * 1024 * 1024 * 1024 {
             384 * 1024 * 1024
         } else if cfg.uses_tiered_moe() && requested_kv_pages.unwrap_or(0) <= 8192 {
             1056 * 1024 * 1024
@@ -980,10 +980,8 @@ impl Qwen3_5ModelRank {
             * (conv_dim * (cfg.linear_conv_kernel_dim - 1) * 2
                 + local_v_heads * cfg.linear_value_head_dim * cfg.linear_key_head_dim * 4)
             + ple_slot_bytes;
-        let default_state_slots = if cfg.uses_ple() {
+        let default_state_slots = if cfg.uses_ple() || est_weight_bytes >= 15 * 1024 * 1024 * 1024 {
             12usize
-        } else if est_weight_bytes >= 17 * 1024 * 1024 * 1024 {
-            10usize
         } else {
             24usize
         };

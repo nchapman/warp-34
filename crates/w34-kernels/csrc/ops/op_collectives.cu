@@ -1146,8 +1146,12 @@ extern "C" int w34_tp2_all_reduce_f16(const w34_exec* ex, const void* local_in, 
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    const bool vec8 = ((num_elems & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1) & 15u) == 0);
+    const int elems_per_block = vec8 ? 4096 : 512;
+    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
+    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1239,8 +1243,12 @@ extern "C" int w34_tp2_all_reduce_bf16(const w34_exec* ex, const void* local_in,
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    const bool vec8 = ((num_elems & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1) & 15u) == 0);
+    const int elems_per_block = vec8 ? 4096 : 512;
+    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
+    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_bf16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1259,8 +1267,12 @@ extern "C" int w34_tp2_all_reduce_f32(const w34_exec* ex, const float* local_in,
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    const bool vec4 = ((num_elems & 3) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1) & 15u) == 0);
+    const int elems_per_block = vec4 ? 2048 : 512;
+    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
+    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_f32_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1422,8 +1434,12 @@ extern "C" int w34_tp4_all_reduce_f16(
         rank < 0 || rank >= 4 || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    const bool vec8 = ((num_elems & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1 | (uintptr_t)stage2 | (uintptr_t)stage3) & 15u) == 0);
+    const int elems_per_block = vec8 ? 4096 : 512;
+    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
+    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::Tp4Ptrs ptrs{
@@ -1530,8 +1546,12 @@ extern "C" int w34_tp4_all_reduce_bf16(
         rank < 0 || rank >= 4 || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    const bool vec8 = ((num_elems & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1 | (uintptr_t)stage2 | (uintptr_t)stage3) & 15u) == 0);
+    const int elems_per_block = vec8 ? 4096 : 512;
+    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
+    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::Tp4Ptrs ptrs{
@@ -1563,8 +1583,12 @@ extern "C" int w34_tp4_all_reduce_f32(
         rank < 0 || rank >= 4 || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    const bool vec4 = ((num_elems & 3) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1 | (uintptr_t)stage2 | (uintptr_t)stage3) & 15u) == 0);
+    const int elems_per_block = vec4 ? 2048 : 512;
+    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
+    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::Tp4Ptrs ptrs{

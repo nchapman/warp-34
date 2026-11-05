@@ -194,10 +194,14 @@ impl LinearProj {
                 size_n,
                 size_k,
             } => {
-                // Small-N projections (GDN in_proj_ba, size_n <= 256) use a single
-                // batch-size-invariant warp-reduction kernel to avoid per-row cuBLAS
-                // split-K launches and guarantee 0-ULP ssm_state parity across all M.
-                if size_n <= 256 && size_k.is_multiple_of(8) {
+                // Small-N projections:
+                // - `size_n <= 256` (GDN `in_proj_ba`, 256-expert `router_gate`, etc.) uses the
+                //   batch-size-invariant warp-reduction kernel across all `m` for 0-ULP prefill/decode parity.
+                // - `256 < size_n <= 512` (`hc_lowrank = 320`, 512-expert `router_gate`) uses the
+                //   warp-reduction kernel for decode and speculative verify (`m <= 16`, guaranteeing
+                //   0-ULP parity between `M = 1` decode and `M <= 16` MTP/DFlash2 verify) while keeping
+                //   `m > 16` chunked prefill on cuBLAS Tensor Cores.
+                if (size_n <= 256 || (size_n <= 512 && m <= 16)) && size_k.is_multiple_of(8) {
                     check_rc(
                         // SAFETY: this branch enforces the small-N and K alignment
                         // specialization. The loaded weight is NxK FP16; input and
@@ -1611,28 +1615,77 @@ impl HcBlockWeights {
             h_dim,
             eps,
         )?;
-        self.input_mix_weight_down.forward(
-            ex,
-            cublas,
-            marlin_ws_ptr,
-            marlin_ws_ints,
-            ple_buf_a,
-            hc_down_buf,
-            num_tokens,
-        )?;
-        let (inj_raw_ptr, inj_w_ptr) = if let Some(inj_proj) = &self.block_inject_weight {
-            inj_proj.forward(
+        // Fuse HC down (`N0 <= 512`, e.g. `hc_lowrank = 320`) + inject (`N1 <= 256`, e.g. `4`)
+        // for decode and speculative verification (`num_tokens <= 16`), preserving 0-ULP parity
+        // between `M = 1` decode and `M <= 16` speculative verify while keeping `m > 16` prefill
+        // on cuBLAS Tensor Cores.
+        let fused_dual_hc = match (
+            &self.input_mix_weight_down,
+            &self.block_inject_weight,
+            num_tokens <= 16,
+        ) {
+            (
+                LinearProj::DenseF16 {
+                    weight_ptr: w0,
+                    size_n: n0,
+                    size_k: k0,
+                },
+                Some(LinearProj::DenseF16 {
+                    weight_ptr: w1,
+                    size_n: n1,
+                    size_k: k1,
+                }),
+                true,
+            ) if *n0 <= 512 && *n1 <= 256 && *k0 == *k1 && k0.is_multiple_of(8) => {
+                Some((*w0, *n0, *w1, *n1, *k0))
+            }
+            _ => None,
+        };
+        let (inj_raw_ptr, inj_w_ptr) = if let Some((w0, n0, w1, n1, k)) = fused_dual_hc {
+            check_rc(
+                // SAFETY: both HC down and inject weights share the same K extent (`ple_buf_a`)
+                // and write to disjoint `hc_down_buf` / `hc_inj_raw_buf` regions in `ple_val_buf`.
+                unsafe {
+                    ffi::w34_small_n_gemm_dual_f16(
+                        ex,
+                        ple_buf_a as *const c_void,
+                        w0 as *const c_void,
+                        hc_down_buf as *mut c_void,
+                        n0 as i32,
+                        w1 as *const c_void,
+                        hc_inj_raw_buf as *mut c_void,
+                        n1 as i32,
+                        num_tokens as i32,
+                        k as i32,
+                    )
+                },
+                "w34_small_n_gemm_dual_f16 (hc_down + hc_inj)",
+            )?;
+            (hc_inj_raw_buf, hc_inj_weights_buf)
+        } else {
+            self.input_mix_weight_down.forward(
                 ex,
                 cublas,
                 marlin_ws_ptr,
                 marlin_ws_ints,
                 ple_buf_a,
-                hc_inj_raw_buf,
+                hc_down_buf,
                 num_tokens,
             )?;
-            (hc_inj_raw_buf, hc_inj_weights_buf)
-        } else {
-            (0, 0)
+            if let Some(inj_proj) = &self.block_inject_weight {
+                inj_proj.forward(
+                    ex,
+                    cublas,
+                    marlin_ws_ptr,
+                    marlin_ws_ints,
+                    ple_buf_a,
+                    hc_inj_raw_buf,
+                    num_tokens,
+                )?;
+                (hc_inj_raw_buf, hc_inj_weights_buf)
+            } else {
+                (0, 0)
+            }
         };
         crate::ple::gpu_ops::hc_down_silu_inject_f16(
             ex,
@@ -2405,7 +2458,14 @@ impl FfnBlockWeights {
                             size_k: k1,
                         }),
                         true,
-                    ) if *n0 <= 256 && *n1 <= 256 && *k0 == *k1 && k0.is_multiple_of(8) => {
+                        // `n0 <= 256` runs across all `num_tokens`; `256 < n0 <= 512` (512-expert router)
+                        // runs for decode and speculative verify (`num_tokens <= 16`) so `M = 1` and
+                        // `M <= 16` verify are 0-ULP identical while `m > 16` prefill uses Tensor Cores.
+                    ) if (*n0 <= 256 || (*n0 <= 512 && num_tokens <= 16))
+                        && *n1 <= 256
+                        && *k0 == *k1
+                        && k0.is_multiple_of(8) =>
+                    {
                         Some((*w0, *n0, *w1, *n1, *k0))
                     }
                     _ => None,

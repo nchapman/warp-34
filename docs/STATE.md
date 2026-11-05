@@ -1,5 +1,32 @@
 # warp-34 — Session Orientation & Current State
 
+## 1–2× RTX 4090 (`sm_89`) Verification, `nsys` Profiling & Optimizations (completed & verified)
+
+- **Target Hardware (`ssh-2`):** 2× NVIDIA GeForce RTX 4090 (`sm_89`, `24,564 MiB` each, 128 SMs, 72 MiB L2, CUDA 13.2, `NODE` PCIe 4.0 x16 topology on NUMA node 0) + AMD EPYC 7542 32-Core Processor (`Zen 2`, `32C/64T`, `avx2 + fma + f16c`, no AVX-512, `251 GiB` RAM).
+- **`sm_89` / Zen 2 Profiling & Optimizations:**
+  1. **Bit-identical `AVX2 + FMA + F16C` MoE CPU evaluator (`crates/w34-host/src/moe_cpu_bridge/eval.rs`, `moe_offload.rs`):** Added `expert_avx2` and `row_tile_avx2::<R, T>` (`R = 2, T = 2` register-resident YMM tiles) with dynamic runtime dispatch (`avx512f && avx512vl` selects `expert_avx512`, otherwise `expert_avx2`). `HotExpertCache::cpu_bridge_supported()` now delegates to `crate::moe_cpu_bridge::supported()` so explicit `register_cpu_bridge` / `CpuHybrid` and all 11 `moe_cpu_bridge` tests + `tiered_moe_gpu_lru_cpu_hybrid_and_streamed_prefill_parity_tp1_and_ep2` execute on AVX2-only hosts (`EPYC 7542` `benchmark_flash_next_pool`: `tokens=1` median `500.9 µs`, `tokens=4` median `1.10 ms`), while `HotExpertCache::auto_cpu_bridge_preferred()` gates automatic `TP=1` static-slot override on `avx512f && avx512vl` so AVX2 + PCIe 4.0 x16 hosts keep the faster dynamic `GpuLru` path by default.
+  2. **Payload-proportional `TP=2` / `TP=4` collective CTA sizing (`crates/w34-kernels/csrc/ops/op_collectives.cu`):** `nsys` on 2× RTX 4090 revealed `tp2_all_reduce_f16_kernel` was launching `min(128, (N + 511)/512) = 112` CTAs for `Flash-Next` `M=1` (`N = 5120`) and `M=3` (`N = 15360`) even though each 512-thread CTA processes `4096` `FP16`/`BF16` elements (`vec8`) or `2048` `FP32` elements (`vec4`), leaving `72–87%` of CTAs transferring zero bytes while contending on PCIe root-complex barrier cache lines (`504 µs/tok` on `Flash-Next TP=2`). Sizing `w34_tp2_all_reduce_{f16,bf16,f32}` and `w34_tp4_all_reduce_{f16,bf16,f32}` by `elems_per_block` (`4096` / `2048`) and capping small payloads (`<= 36 * 5120`) at `16` CTAs cut `tp2_all_reduce_f16_kernel` GPU time on `Flash-Next TP=2` by **47%** (`504 µs/tok → 268 µs/tok`) and boosted `Flash-Next TP=2` decode from **62.11 → 72.34 tok/s (`+16.5%`)**.
+  3. **Fused dual small-N GEMM for HyperConnection & 512-expert routers (`crates/w34-host/src/model/weights.rs`):** Fused `HcBlockWeights::forward_mix` (`input_mix_weight_down [320, 10240]` + `block_inject_weight [4, 10240]`) via `w34_small_n_gemm_dual_f16` for decode/spec-verify (`num_tokens <= 16`) and extended `LinearProj::DenseF16` / `FfnBlockWeights::Moe` small-N dispatch from `size_n <= 256` to `size_n <= 256 || (size_n <= 512 && m <= 16)`, eliminating 240 separate cuBLAS split-K launches per step on `Flash-Next` while preserving 0-ULP parity between `M = 1` decode and `M <= 16` speculative verification.
+  4. **`27B TP=1` state-slot budget for `DFlash2` on 24 GiB cards (`crates/w34-host/src/model/rank.rs`):** `Qwen3.8-27B-W4A16-GPTQ` on `TP=1` has `est_weight_bytes ≈ 16.13 GiB` (below the prior `17 GiB` threshold), which previously allocated `24` GDN/KV state slots (`3.44 GiB`) and left insufficient VRAM for the `3.60 GiB` `BF16` `DFlash2` drafter on a single 24 GiB card. Lowering the threshold to `15 GiB` with `default_state_slots = 12` (`1.72 GiB`) retains all `11` state slots required by `DFlash2` (`block_size = 8`, `k = 7` verify schedule) while leaving `>1.6 GiB` free VRAM for `DFlash2Rank::load` + KV pages.
+- **1–2× RTX 4090 (`sm_89`) Benchmark Matrix (`prompt_len=512`, `gen_len=128`, `--kv-format tq4`, all `--verify-lossless` PASS):**
+  - **`nchapman/Qwen3.8-27B-W4A16-GPTQ` (`TQ4` KV):**
+    - `TP=1` (1× RTX 4090):
+      - Plain decode (`M=1`): **55.01 tok/s** (`18.18 ms/tok`, 512-tok TTFT **162.91 ms** / **3,142.8 tok/s**).
+      - `MTP (k=3)`: **125.84 tok/s** (`7.95 ms/tok`, `30.58 ms/round`, `mean_tokens_per_round = 3.85`, **`2.29×` vs plain**).
+      - `DFlash2 (k=7)`: **253.02 tok/s** (`3.95 ms/tok`, `27.89 ms/round`, `mean_tokens_per_round = 7.06`, **`4.60×` vs plain**).
+    - `TP=2` (2× RTX 4090, PCIe `NODE`):
+      - Plain decode (`M=1`): **92.51 tok/s** (`10.81 ms/tok`, 512-tok TTFT **229.96 ms** / **2,226.5 tok/s**).
+      - `MTP (k=3)`: **175.37 tok/s** (`5.70 ms/tok`, `18.57 ms/round`, `mean_tokens_per_round = 3.26`, **`1.90×` vs plain**).
+      - `DFlash2 (k=7)`: **203.39 tok/s** (`4.92 ms/tok`, `18.92 ms/round`, `mean_tokens_per_round = 3.85`, **`2.20×` vs plain**).
+  - **`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE@ef554143369a706525336f6b42a09094835dc077` (`512` experts, `top-10`):**
+    - `TP=1` (1× RTX 4090, dynamic `GpuLru` PCIe 4.0 x16):
+      - Plain decode (`M=1`): **33.86 tok/s** (`29.53 ms/tok`, 512-tok TTFT **846.56 ms** / **604.8 tok/s**).
+      - `MTP (k=2)`: **39.50 tok/s** (`25.32 ms/tok`, `60.67 ms/round`, `mean_tokens_per_round = 2.40`).
+    - `TP=2` (2× RTX 4090, `EP=2`, `48` hot experts/layer/rank):
+      - Plain decode (`M=1`): **67.55–72.34 tok/s** (`13.82–14.80 ms/tok`, 512-tok TTFT **371.27 ms** / **1,379.1 tok/s**).
+      - `MTP (k=2)`: **104.91 tok/s** (`9.53 ms/tok`, `23.74 ms/round`, `mean_tokens_per_round = 2.49`, **`1.45–1.55×` vs plain**).
+      - `MTP (k=3)`: **90.10 tok/s** (`11.10 ms/tok`, `30.64 ms/round`, `mean_tokens_per_round = 2.76`).
+
 ## NVLink P2P Collectives & TP=4 / EP=4 Execution (completed & verified)
 
 - **P2P/NVLink VRAM collectives (`Tp2Collectives::new_for_tp_with_p2p`):** `w34_device_can_enable_p2p(dev_a, dev_b, require_native_atomic, out_can_p2p)` probes `cudaDeviceCanAccessPeer` + `cudaDeviceGetP2PAttribute` and enables bidirectional `cudaDeviceEnablePeerAccess` across TP peer pairs. When all pairs support direct P2P (`TP=2` over bonded `NV4` NVLink `112.5 GB/s`), `Tp2Collectives` allocates `sigs` and `stages` in `CommBuffer::DeviceVram` (`DeviceBuffer`) so peer kernels perform 1-hop NVLink VRAM reads/writes with `threadfence_system()` release/acquire flags; when any pair lacks P2P (`TP=2` over non-P2P PCIe or `TP=4` across dual NVLink pairs connected by `NODE`), it transparently falls back to `CommBuffer::MappedHost` (`MappedHostBuffer`).

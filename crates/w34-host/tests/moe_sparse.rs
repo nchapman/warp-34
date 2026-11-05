@@ -920,105 +920,112 @@ fn dual_small_n_gemm_and_warp256_router_match_references() {
     let stream = CudaStream::new(dev.device_id).unwrap();
     let ex = stream.exec(0, 0);
 
-    // 1. Fused dual small-N GEMM (`N0 = 256` router + `N1 = 1` shared gate) must be 0-ULP
-    // bit-identical to two separate `w34_small_n_gemm_f16` launches across M = 1, 4, 8.
+    // 1. Fused dual small-N GEMM (`N0 = 256/512` router + `N1 = 1` shared gate, and
+    // `N0 = 320` HC down + `N1 = 4` HC inject) must be 0-ULP bit-identical to two separate
+    // `w34_small_n_gemm_f16` launches and M-invariant across M = 1..=23.
     let size_k = 2048usize;
-    let n0 = 256usize;
-    let n1 = 1usize;
-    let w0_host: Vec<u16> = (0..n0 * size_k)
-        .map(|i| f32_to_f16(((i % 67) as f32 - 33.0) * 0.015625))
-        .collect();
-    let w1_host: Vec<u16> = (0..n1 * size_k)
-        .map(|i| f32_to_f16(((i % 41) as f32 - 20.0) * 0.03125))
-        .collect();
-    let d_w0 = DeviceBuffer::alloc(dev.device_id, w0_host.len() * 2).unwrap();
-    let d_w1 = DeviceBuffer::alloc(dev.device_id, w1_host.len() * 2).unwrap();
-    d_w0.copy_from_host(&w0_host, &stream).unwrap();
-    d_w1.copy_from_host(&w1_host, &stream).unwrap();
-
-    let mut ref0_m23 = Vec::new();
-    let mut ref1_m23 = Vec::new();
-    for m in [23usize, 17, 16, 8, 7, 4, 1] {
-        let x_host: Vec<u16> = (0..m * size_k)
-            .map(|i| f32_to_f16(((i % 89) as f32 - 44.0) * 0.02))
+    for (n0, n1) in [(256usize, 1usize), (320, 4), (512, 1)] {
+        let w0_host: Vec<u16> = (0..n0 * size_k)
+            .map(|i| f32_to_f16(((i % 67) as f32 - 33.0) * 0.015625))
             .collect();
-        let d_x = DeviceBuffer::alloc(dev.device_id, x_host.len() * 2).unwrap();
-        d_x.copy_from_host(&x_host, &stream).unwrap();
-        let d_ref0 = DeviceBuffer::alloc(dev.device_id, m * n0 * 2).unwrap();
-        let d_ref1 = DeviceBuffer::alloc(dev.device_id, m * n1 * 2).unwrap();
-        let d_got0 = DeviceBuffer::alloc(dev.device_id, m * n0 * 2).unwrap();
-        let d_got1 = DeviceBuffer::alloc(dev.device_id, m * n1 * 2).unwrap();
+        let w1_host: Vec<u16> = (0..n1 * size_k)
+            .map(|i| f32_to_f16(((i % 41) as f32 - 20.0) * 0.03125))
+            .collect();
+        let d_w0 = DeviceBuffer::alloc(dev.device_id, w0_host.len() * 2).unwrap();
+        let d_w1 = DeviceBuffer::alloc(dev.device_id, w1_host.len() * 2).unwrap();
+        d_w0.copy_from_host(&w0_host, &stream).unwrap();
+        d_w1.copy_from_host(&w1_host, &stream).unwrap();
 
-        assert_eq!(
-            unsafe {
-                ffi::w34_small_n_gemm_f16(
-                    &ex,
-                    d_x.addr() as *const c_void,
-                    d_w0.addr() as *const c_void,
-                    d_ref0.addr() as *mut c_void,
-                    m as i32,
-                    n0 as i32,
-                    size_k as i32,
-                )
-            },
-            0
-        );
-        assert_eq!(
-            unsafe {
-                ffi::w34_small_n_gemm_f16(
-                    &ex,
-                    d_x.addr() as *const c_void,
-                    d_w1.addr() as *const c_void,
-                    d_ref1.addr() as *mut c_void,
-                    m as i32,
-                    n1 as i32,
-                    size_k as i32,
-                )
-            },
-            0
-        );
-        assert_eq!(
-            unsafe {
-                ffi::w34_small_n_gemm_dual_f16(
-                    &ex,
-                    d_x.addr() as *const c_void,
-                    d_w0.addr() as *const c_void,
-                    d_got0.addr() as *mut c_void,
-                    n0 as i32,
-                    d_w1.addr() as *const c_void,
-                    d_got1.addr() as *mut c_void,
-                    n1 as i32,
-                    m as i32,
-                    size_k as i32,
-                )
-            },
-            0
-        );
-        let mut ref0 = vec![0u16; m * n0];
-        let mut ref1 = vec![0u16; m * n1];
-        let mut got0 = vec![0u16; m * n0];
-        let mut got1 = vec![0u16; m * n1];
-        d_ref0.copy_to_host(&mut ref0, &stream).unwrap();
-        d_ref1.copy_to_host(&mut ref1, &stream).unwrap();
-        d_got0.copy_to_host(&mut got0, &stream).unwrap();
-        d_got1.copy_to_host(&mut got1, &stream).unwrap();
-        stream.synchronize().unwrap();
-        assert_eq!(got0, ref0, "dual_small_n out0 0-ULP mismatch at M={m}");
-        assert_eq!(got1, ref1, "dual_small_n out1 0-ULP mismatch at M={m}");
-        if m == 23 {
-            ref0_m23 = ref0;
-            ref1_m23 = ref1;
-        } else {
+        let mut ref0_m23 = Vec::new();
+        let mut ref1_m23 = Vec::new();
+        for m in [23usize, 17, 16, 8, 7, 4, 1] {
+            let x_host: Vec<u16> = (0..m * size_k)
+                .map(|i| f32_to_f16(((i % 89) as f32 - 44.0) * 0.02))
+                .collect();
+            let d_x = DeviceBuffer::alloc(dev.device_id, x_host.len() * 2).unwrap();
+            d_x.copy_from_host(&x_host, &stream).unwrap();
+            let d_ref0 = DeviceBuffer::alloc(dev.device_id, m * n0 * 2).unwrap();
+            let d_ref1 = DeviceBuffer::alloc(dev.device_id, m * n1 * 2).unwrap();
+            let d_got0 = DeviceBuffer::alloc(dev.device_id, m * n0 * 2).unwrap();
+            let d_got1 = DeviceBuffer::alloc(dev.device_id, m * n1 * 2).unwrap();
+
             assert_eq!(
-                &ref0[..],
-                &ref0_m23[..m * n0],
-                "small_n_gemm_f16 out0 0-ULP M-invariance mismatch at M={m} vs M=23"
+                unsafe {
+                    ffi::w34_small_n_gemm_f16(
+                        &ex,
+                        d_x.addr() as *const c_void,
+                        d_w0.addr() as *const c_void,
+                        d_ref0.addr() as *mut c_void,
+                        m as i32,
+                        n0 as i32,
+                        size_k as i32,
+                    )
+                },
+                0
             );
             assert_eq!(
-                &ref1[..],
-                &ref1_m23[..m * n1],
-                "small_n_gemm_f16 out1 0-ULP M-invariance mismatch at M={m} vs M=23"
+                unsafe {
+                    ffi::w34_small_n_gemm_f16(
+                        &ex,
+                        d_x.addr() as *const c_void,
+                        d_w1.addr() as *const c_void,
+                        d_ref1.addr() as *mut c_void,
+                        m as i32,
+                        n1 as i32,
+                        size_k as i32,
+                    )
+                },
+                0
             );
+            assert_eq!(
+                unsafe {
+                    ffi::w34_small_n_gemm_dual_f16(
+                        &ex,
+                        d_x.addr() as *const c_void,
+                        d_w0.addr() as *const c_void,
+                        d_got0.addr() as *mut c_void,
+                        n0 as i32,
+                        d_w1.addr() as *const c_void,
+                        d_got1.addr() as *mut c_void,
+                        n1 as i32,
+                        m as i32,
+                        size_k as i32,
+                    )
+                },
+                0
+            );
+            let mut ref0 = vec![0u16; m * n0];
+            let mut ref1 = vec![0u16; m * n1];
+            let mut got0 = vec![0u16; m * n0];
+            let mut got1 = vec![0u16; m * n1];
+            d_ref0.copy_to_host(&mut ref0, &stream).unwrap();
+            d_ref1.copy_to_host(&mut ref1, &stream).unwrap();
+            d_got0.copy_to_host(&mut got0, &stream).unwrap();
+            d_got1.copy_to_host(&mut got1, &stream).unwrap();
+            stream.synchronize().unwrap();
+            assert_eq!(
+                got0, ref0,
+                "dual_small_n out0 0-ULP mismatch at N0={n0}, N1={n1}, M={m}"
+            );
+            assert_eq!(
+                got1, ref1,
+                "dual_small_n out1 0-ULP mismatch at N0={n0}, N1={n1}, M={m}"
+            );
+            if m == 23 {
+                ref0_m23 = ref0;
+                ref1_m23 = ref1;
+            } else {
+                assert_eq!(
+                    &ref0[..],
+                    &ref0_m23[..m * n0],
+                    "small_n_gemm_f16 out0 0-ULP M-invariance mismatch at N0={n0}, M={m} vs M=23"
+                );
+                assert_eq!(
+                    &ref1[..],
+                    &ref1_m23[..m * n1],
+                    "small_n_gemm_f16 out1 0-ULP M-invariance mismatch at N1={n1}, M={m} vs M=23"
+                );
+            }
         }
     }
 

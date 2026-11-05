@@ -1145,11 +1145,19 @@ mod host_store {
 
         #[inline]
         pub fn cpu_bridge_supported() -> bool {
+            crate::moe_cpu_bridge::supported()
+        }
+
+        /// Whether `RankTieredMoe::load_for_rank` should enable the static-slot CPU MoE bridge
+        /// by default on `TP=1`. Requires AVX-512 (`avx512f` + `avx512vl`), where 512-bit CPU SIMD
+        /// outruns PCIe GPU LRU staging; on AVX2-only hosts with PCIe 4.0 x16 GPUs, dynamic
+        /// `GpuLru` is faster by default while `register_cpu_bridge` remains available via
+        /// `cpu_bridge_supported()`.
+        #[inline]
+        pub fn auto_cpu_bridge_preferred() -> bool {
             #[cfg(target_arch = "x86_64")]
             {
-                std::arch::is_x86_feature_detected!("avx2")
-                    && std::arch::is_x86_feature_detected!("fma")
-                    && std::arch::is_x86_feature_detected!("f16c")
+                Self::cpu_bridge_supported()
                     && std::arch::is_x86_feature_detected!("avx512f")
                     && std::arch::is_x86_feature_detected!("avx512vl")
             }
@@ -2477,7 +2485,7 @@ mod host_store {
                     && k_hot >= 16
                     && cfg.num_hidden_layers <= 60
                     && group_size == 128
-                    && HotExpertCache::cpu_bridge_supported()
+                    && HotExpertCache::auto_cpu_bridge_preferred()
                 {
                     let k_static = k_hot;
                     if bridge_runtime.is_none() {

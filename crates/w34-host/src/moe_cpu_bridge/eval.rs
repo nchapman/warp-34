@@ -23,14 +23,12 @@ pub(super) struct ExpertLayout<'a> {
     pub down_scales: &'a [u16],
 }
 
-pub(super) fn supported() -> bool {
+pub(crate) fn supported() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         std::is_x86_feature_detected!("avx2")
             && std::is_x86_feature_detected!("fma")
             && std::is_x86_feature_detected!("f16c")
-            && std::is_x86_feature_detected!("avx512f")
-            && std::is_x86_feature_detected!("avx512vl")
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -272,15 +270,133 @@ mod simd {
         }
     }
 
-    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
-    unsafe fn hsum(v: __m512) -> f32 {
-        let s = _mm256_add_ps(
-            _mm512_castps512_ps256(v),
-            _mm256_castpd_ps(_mm512_extractf64x4_pd::<1>(_mm512_castps_pd(v))),
-        );
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn hsum256_pair(lo: __m256, hi: __m256) -> f32 {
+        let s = _mm256_add_ps(lo, hi);
         let s = _mm_add_ps(_mm256_castps256_ps128(s), _mm256_extractf128_ps::<1>(s));
         let s = _mm_hadd_ps(s, s);
         _mm_cvtss_f32(_mm_hadd_ps(s, s))
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
+    unsafe fn hsum(v: __m512) -> f32 {
+        hsum256_pair(
+            _mm512_castps512_ps256(v),
+            _mm256_castpd_ps(_mm512_extractf64x4_pd::<1>(_mm512_castps_pd(v))),
+        )
+    }
+
+    // AVX2 + FMA + F16C fallback for Zen 2 / Zen 3 / Alder Lake / Raptor Lake CPUs
+    // without AVX-512. Splits each 16-lane group into (lo, hi) __m256 pairs with
+    // identical FMA and reduction tree to `row_tile` (0 ULP bit-identical output).
+    #[target_feature(enable = "avx2,fma,f16c")]
+    #[allow(clippy::cognitive_complexity, clippy::needless_range_loop)]
+    unsafe fn row_tile_avx2<const R: usize, const T: usize>(
+        w: [&[u32]; R],
+        s: [&[u16]; R],
+        xp: &[f32],
+        xg: &[f32],
+        groups: usize,
+    ) -> [[f32; R]; T] {
+        let z = _mm256_setzero_ps();
+        let mut total_lo = [[z; R]; T];
+        let mut total_hi = [[z; R]; T];
+        let mut bias = [[0.0f32; R]; T];
+        let mask15 = _mm256_set1_epi32(15);
+        for g in 0..groups {
+            let mut q_lo = [_mm256_setzero_si256(); R];
+            let mut q_hi = [_mm256_setzero_si256(); R];
+            for r in 0..R {
+                let ptr = w[r].as_ptr().add(g * 16);
+                q_lo[r] = _mm256_loadu_si256(ptr.cast());
+                q_hi[r] = _mm256_loadu_si256(ptr.add(8).cast());
+                if (g + 4) * 16 < w[r].len() {
+                    _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
+                }
+            }
+            let mut scale = [0.0; R];
+            let mut vscale = [z; R];
+            for r in 0..R {
+                scale[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                    *s[r].get_unchecked(g) as i32
+                )));
+                vscale[r] = _mm256_set1_ps(scale[r]);
+            }
+            let mut acc_lo = [[z; R]; T];
+            let mut acc_hi = [[z; R]; T];
+            macro_rules! nib256 {
+                ($b:literal) => {{
+                    for r in 0..R {
+                        let ws_lo = _mm256_cvtepi32_ps(_mm256_and_si256(
+                            _mm256_srli_epi32::<{ 4 * $b }>(q_lo[r]),
+                            mask15,
+                        ));
+                        let ws_hi = _mm256_cvtepi32_ps(_mm256_and_si256(
+                            _mm256_srli_epi32::<{ 4 * $b }>(q_hi[r]),
+                            mask15,
+                        ));
+                        for t in 0..T {
+                            let x_ptr = xp.as_ptr().add(t * groups * 128 + g * 128 + 16 * $b);
+                            let x_lo = _mm256_loadu_ps(x_ptr);
+                            let x_hi = _mm256_loadu_ps(x_ptr.add(8));
+                            acc_lo[t][r] = _mm256_fmadd_ps(ws_lo, x_lo, acc_lo[t][r]);
+                            acc_hi[t][r] = _mm256_fmadd_ps(ws_hi, x_hi, acc_hi[t][r]);
+                        }
+                    }
+                }};
+            }
+            nib256!(0);
+            nib256!(1);
+            nib256!(2);
+            nib256!(3);
+            nib256!(4);
+            nib256!(5);
+            nib256!(6);
+            nib256!(7);
+            for t in 0..T {
+                let xgv = *xg.get_unchecked(t * groups + g);
+                for r in 0..R {
+                    total_lo[t][r] = _mm256_fmadd_ps(acc_lo[t][r], vscale[r], total_lo[t][r]);
+                    total_hi[t][r] = _mm256_fmadd_ps(acc_hi[t][r], vscale[r], total_hi[t][r]);
+                    bias[t][r] = scale[r].mul_add(xgv, bias[t][r]);
+                }
+            }
+        }
+        let mut out = [[0.0; R]; T];
+        for t in 0..T {
+            for r in 0..R {
+                out[t][r] = hsum256_pair(total_lo[t][r], total_hi[t][r]) - 8.0 * bias[t][r];
+            }
+        }
+        out
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn rows_avx2<const R: usize>(
+        w: [&[u32]; R],
+        s: [&[u16]; R],
+        xp: &[f32],
+        xg: &[f32],
+        groups: usize,
+        n: usize,
+        mut emit: impl FnMut(usize, [f32; R]),
+    ) {
+        let xp_stride = groups * 128;
+        let mut t = 0;
+        if R <= 2 {
+            while t + 2 <= n {
+                let v =
+                    row_tile_avx2::<R, 2>(w, s, &xp[t * xp_stride..], &xg[t * groups..], groups);
+                emit(t, v[0]);
+                emit(t + 1, v[1]);
+                t += 2;
+            }
+        }
+        while t < n {
+            let v = row_tile_avx2::<R, 1>(w, s, &xp[t * xp_stride..], &xg[t * groups..], groups);
+            emit(t, v[0]);
+            t += 1;
+        }
     }
 
     // R=1/2/4 is the row/two-row/four-row kernel. T>=8 uses the original
@@ -394,9 +510,100 @@ mod simd {
         }
     }
 
-    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn expert(
+        d: ExpertLayout<'_>,
+        range: Range<usize>,
+        xp: &[f32],
+        xg: &[f32],
+        wt: &[f32],
+        out: &mut [f32],
+        scratch: &mut [f32],
+        tile: bool,
+    ) {
+        if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512vl") {
+            expert_avx512(d, range, xp, xg, wt, out, scratch, tile);
+        } else {
+            expert_avx2(d, range, xp, xg, wt, out, scratch, tile);
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn expert_avx2(
+        d: ExpertLayout<'_>,
+        range: Range<usize>,
+        xp: &[f32],
+        xg: &[f32],
+        wt: &[f32],
+        out: &mut [f32],
+        scratch: &mut [f32],
+        _tile: bool,
+    ) {
+        let h = d.hidden;
+        let i = d.intermediate;
+        let n = wt.len();
+        let sg = range.end - range.start;
+        let cols = sg * 128;
+        let (act, rest) = scratch.split_at_mut(n * cols);
+        let (ap, ag) = rest.split_at_mut(n * cols);
+        let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
+        let gs = |r: usize| &d.gate_up_scales[r * (h / 128)..];
+        let mut c = 0;
+        while c < cols {
+            let r = range.start * 128 + c;
+            rows_avx2::<2>(
+                [gw(r), gw(i + r)],
+                [gs(r), gs(i + r)],
+                xp,
+                xg,
+                h / 128,
+                n,
+                |t, v| {
+                    let g = v[0];
+                    act[t * cols + c] = (g / (1.0f32 + (-g).exp())) * v[1];
+                },
+            );
+            c += 1;
+        }
+        for t in 0..n {
+            prepare_x_perm(
+                &act[t * cols..(t + 1) * cols],
+                &mut ap[t * cols..(t + 1) * cols],
+                &mut ag[t * sg..(t + 1) * sg],
+            )
+            .unwrap();
+        }
+        let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
+        let ds = |r: usize| &d.down_scales[r * (i / 128) + range.start..];
+        let mut r = 0;
+        while r + 2 <= h {
+            rows_avx2::<2>(
+                [dw(r), dw(r + 1)],
+                [ds(r), ds(r + 1)],
+                ap,
+                ag,
+                sg,
+                n,
+                |t, v| {
+                    for j in 0..2 {
+                        out[t * h + r + j] = wt[t] * v[j];
+                    }
+                },
+            );
+            r += 2;
+        }
+        while r < h {
+            rows_avx2::<1>([dw(r)], [ds(r)], ap, ag, sg, n, |t, v| {
+                out[t * h + r] = wt[t] * v[0];
+            });
+            r += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn expert_avx512(
         d: ExpertLayout<'_>,
         range: Range<usize>,
         xp: &[f32],
@@ -577,7 +784,7 @@ mod tests {
     #[test]
     fn expert_scalar_and_tile_agreement() {
         if !supported() {
-            eprintln!("AVX512 unavailable; skipping arithmetic test");
+            eprintln!("AVX2+FMA+F16C unavailable; skipping arithmetic test");
             return;
         }
         let h = 256;
@@ -614,6 +821,54 @@ mod tests {
             let mut out = vec![0.0; nt * h];
             let mut scratch = vec![0.0; scratch_len(nt, 2).unwrap()];
             eval_expert_prefill(d, &xp, &xg, &wt, &mut out, &mut scratch).unwrap();
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut out_avx2 = vec![0.0; nt * h];
+                // SAFETY: `supported()` verified AVX2 + FMA + F16C and buffer bounds above.
+                unsafe {
+                    simd::expert_avx2(d, 0..2, &xp, &xg, &wt, &mut out_avx2, &mut scratch, true);
+                }
+                assert_eq!(
+                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    out_avx2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "AVX2 and AVX512 (tile=true) diverged at nt={nt}"
+                );
+                if nt <= 4
+                    && std::is_x86_feature_detected!("avx512f")
+                    && std::is_x86_feature_detected!("avx512vl")
+                {
+                    let mut slice_avx512 = vec![0.0; nt * h];
+                    let mut slice_avx2 = vec![0.0; nt * h];
+                    // SAFETY: runtime AVX-512 + AVX2 guards and buffer bounds verified above.
+                    unsafe {
+                        simd::expert_avx512(
+                            d,
+                            0..2,
+                            &xp,
+                            &xg,
+                            &wt,
+                            &mut slice_avx512,
+                            &mut scratch,
+                            false,
+                        );
+                        simd::expert_avx2(
+                            d,
+                            0..2,
+                            &xp,
+                            &xg,
+                            &wt,
+                            &mut slice_avx2,
+                            &mut scratch,
+                            false,
+                        );
+                    }
+                    assert_eq!(
+                        slice_avx512.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        slice_avx2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "AVX2 and AVX512 (tile=false) diverged at nt={nt}"
+                    );
+                }
+            }
             for t in 0..nt {
                 let act: Vec<_> = (0..i)
                     .map(|r| {
