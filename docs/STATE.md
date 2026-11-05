@@ -104,3 +104,17 @@
   - 2-GPU `TP=2` (`35b-a3b-moe-serving.toml`): `decode-c1` **`250.65 tok/s`** plain / **`319.60 tok/s`** (`MTP k=2`) vs `vLLM` `191.42 tok/s`; `throughput-c8` **`1,009.72 tok/s`** vs `vLLM` `856.95 tok/s`; 1-GPU `TP=1 TQ4` fits on a single 24 GiB card at **`186.50 tok/s`** (`C=1`) and **`710.18 tok/s`** (`C=8`).
 - **Qwen3.8-Flash-Next (`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`):**
   - Sweeps **5/5** HTTP serving workloads on both `TP=1` (`warp34-flash-tp1-mtp3` vs `qfn-3090-mtp3`: `short-chat` `33.56 vs 30.82 tok/s`, `prefill-context-r16` `18.37 vs 10.23`, `code-context-r64` `21.90 vs 21.23`, `prefix-primed-r16` `28.67 vs 10.17`, `coding-agent-replay` `29.78 tok/s` `8/8` passed) and `TP=2` (`warp34-flash-tp2-mtp3` vs `qfn-2x3090-mtp3`: `short-chat` `69.25 vs 56.20 tok/s`, `prefill-context-r16` `27.09 vs 21.27`, `code-context-r64` `28.81 vs 28.20`, `prefix-primed-r16` `45.90 vs 20.52`, `coding-agent-replay` `55.49 tok/s` `8/8` passed), plus `6/6` long-context retrieval checks through `~252K` input tokens on both `TP=1` and `TP=2`.
+
+---
+
+## Codebase Modularity, Lint Hygiene & Coverage Audit (completed & verified)
+
+- **Documentation Consolidation (`docs/`, `README.md`):** Folded the supported model architecture, quantization scheme (`W4A16`/`W8A16`/`FP8 PLE`/`FP16`/`BF16`), KV policy (`fp16`/`bf16`/`q8_0`/`tq4`/`tq4_all`), and TP/EP/offload reference matrix into [`MODELS.md`](MODELS.md), pruned obsolete research surveys (`docs/API_LANDSCAPE.md` and `docs/FEATURE_AUDIT.md`), and expanded [`README.md`](../README.md) with quickstart CLI/HTTP examples and the canonical documentation index.
+- **CUDA Translation Unit Splits (`crates/w34-kernels/csrc/ops/`):**
+  - `op_gdn.cu` (`1,168` lines: conv1d, gated RMSNorm, single-token decode) + `op_gdn_wy.cu` (`1,956` lines: fused WY chunked-64 prefill, recurrent continuation, multi-token verify).
+  - `op_moe_router.cu` (`999` lines: top-k softmax/sigmoid routers, expert alignment/gather, small-N GEMM) + `op_moe.cu` (`1,910` lines: `W4A16` / `FP16` sparse MoE GEMV & grouped-MMA kernels).
+  - `csrc/tq/tq4_kv_common.cuh` (`122` lines) + `op_kv_cache.cu` (`1,141` lines: `FP16`/`BF16`/`Q8_0`/`TQ4` paged KV write & `DFlash2` context copy) + `op_paged_attn.cu` (`1,473` lines: FlashAttention-2 prefill & paged GQA decode/split-KV).
+- **Host Module Decomposition (`crates/w34-host/src/`):** Split `main.rs` (`27` lines) + `cli/{options,commands,oracle,tests}.rs`, `cuda/{collectives,warmup,tests}.rs`, `loader/{config,quant,tests}.rs`, `clef/{encoding,gpu,tests}.rs`, `decision/{scoring,batch,tests}.rs`, `moe_offload/{host_store,engine,tests}.rs`, and `model/weights/{layers,moe}.rs`.
+- **`#[allow(...)]` Cleanup (`crates/w34-host/src/`):** Eliminated all `#[allow(dead_code)]` and `#[allow(clippy::undocumented_unsafe_blocks)]` attributes and reduced total `#[allow(...)]` attributes from `83` to `57` (`-541` lines net) using `HcStepContext`, `TapExport`, unified `load_moe_layer_weights`, and `[xp, xg]` tile pairs.
+- **Unit Test Coverage (`mise run coverage`):** Raised `--lib` line coverage from **49.54%** to **65.80%** (`+16.26%`, `215` unit tests + `4` `w34-kernels` unit tests + `30` integration test suites).
+

@@ -2,11 +2,11 @@ use super::*;
 
 #[cfg(feature = "cuda")]
 pub(crate) fn prepare_multimodal_prompt_and_images(
-    cfg: &w34_host::loader::ModelConfig,
+    cfg: &crate::loader::ModelConfig,
     raw_prompt: &str,
     image_urls: &[String],
     allow_remote_images: bool,
-) -> Result<(String, Vec<w34_host::vision::PreprocessedImage>), String> {
+) -> Result<(String, Vec<crate::vision::PreprocessedImage>), String> {
     if image_urls.is_empty() {
         return Ok((raw_prompt.to_string(), Vec::new()));
     }
@@ -18,10 +18,10 @@ pub(crate) fn prepare_multimodal_prompt_and_images(
     let mut images = Vec::with_capacity(image_urls.len());
     let mut prefix = String::new();
     for url in image_urls {
-        let (rgb, h, w) = w34_host::vision::load_cli_image_with_policy(url, allow_remote_images)
+        let (rgb, h, w) = crate::vision::load_cli_image_with_policy(url, allow_remote_images)
             .map_err(|e| e.to_string())?;
-        w34_host::vision::validate_image_aspect_ratio(h, w)?;
-        let pre = w34_host::vision::preprocess_rgb_image(
+        crate::vision::validate_image_aspect_ratio(h, w)?;
+        let pre = crate::vision::preprocess_rgb_image(
             &rgb,
             h,
             w,
@@ -50,12 +50,12 @@ pub(crate) fn prepare_multimodal_prompt_and_images(
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
+pub fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
     let Some(PreparedCudaCli {
         options,
         policy,
         spec_config,
-    }) = prepare_cuda_cli(args, w34_host::hub::resolve_model)?
+    }) = prepare_cuda_cli(args, crate::hub::resolve_model)?
     else {
         return Ok(ExitCode::SUCCESS);
     };
@@ -75,7 +75,7 @@ pub(crate) fn run_cuda_cli(args: &[String]) -> Result<ExitCode, String> {
 pub(crate) fn run_generate(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
-    spec_config: Option<w34_host::proposer::SpeculativeConfig>,
+    spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
@@ -150,7 +150,7 @@ pub(crate) fn run_generate(
 pub(crate) fn run_bench(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
-    spec_config: Option<w34_host::proposer::SpeculativeConfig>,
+    spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
@@ -199,15 +199,15 @@ pub(crate) fn run_bench(
         .map_err(|e| e.to_string())?;
 
     let spec_label = speculative_kind.map(|k| match k {
-        w34_host::proposer::SpeculativeKind::Mtp => "mtp",
-        w34_host::proposer::SpeculativeKind::DFlash2 => "dflash2",
+        crate::proposer::SpeculativeKind::Mtp => "mtp",
+        crate::proposer::SpeculativeKind::DFlash2 => "dflash2",
     });
 
     let mut decode_summary = serde_json::Value::Null;
     if matches!(bench_stage.as_str(), "decode" | "all") {
         engine.reset_all_states().map_err(|e| e.to_string())?;
         let metrics = {
-            let _measured = w34_host::profiling::Range::new(c"w34.bench.measured");
+            let _measured = crate::profiling::Range::new(c"w34.bench.measured");
             engine
                 .generate_tokens(&synth_prompt, gen_len, false)
                 .map_err(|e| e.to_string())?
@@ -333,7 +333,7 @@ pub(crate) fn run_bench(
         let _ = engine
             .generate_with_radix_cache(&batch_prompts[0], 2, 64, false)
             .map_err(|e| e.to_string())?;
-        let sched_cfg = w34_host::scheduler::SchedulerConfig {
+        let sched_cfg = crate::scheduler::SchedulerConfig {
             max_num_seqs: batch_size.min(8),
             ..Default::default()
         };
@@ -501,7 +501,7 @@ pub(crate) fn run_bench(
 pub(crate) fn run_serve(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
-    spec_config: Option<w34_host::proposer::SpeculativeConfig>,
+    spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
@@ -524,7 +524,7 @@ pub(crate) fn run_serve(
     let bind_addr = format!("{host}:{port}");
     println!("[w34 serve] loading model={model} tp={tp} for http://{bind_addr}");
     let worker_model = resolved_model;
-    let state = w34_host::server::OpenAiServerState::from_loader_with_options(
+    let state = crate::server::OpenAiServerState::from_loader_with_options(
         model,
         allow_remote_images,
         serve.options,
@@ -552,7 +552,7 @@ pub(crate) fn run_serve(
         if auth_enabled { "enabled" } else { "disabled" },
         state.worker.max_model_len(),
     );
-    w34_host::server::run_blocking_server(&bind_addr, state)
+    crate::server::run_blocking_server(&bind_addr, state)
         .map_err(|e| format!("server error: {e}"))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -561,7 +561,7 @@ pub(crate) fn run_serve(
 pub(crate) fn run_chat(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
-    spec_config: Option<w34_host::proposer::SpeculativeConfig>,
+    spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
@@ -592,13 +592,13 @@ pub(crate) fn run_chat(
         &image_urls,
         allow_remote_images,
     )?;
-    let msgs = vec![w34_host::server::ChatMessage {
+    let msgs = vec![crate::server::ChatMessage {
         tool_calls: Vec::new(),
         role: "user".to_string(),
         content: Some(expanded_prompt),
         reasoning_content: None,
     }];
-    let formatted = w34_host::server::format_chatml_prompt(&msgs, None, enable_thinking);
+    let formatted = crate::server::format_chatml_prompt(&msgs, None, enable_thinking);
     let prompt_ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
     let metrics = if mm_images.is_empty() {
         engine
@@ -612,7 +612,7 @@ pub(crate) fn run_chat(
     let raw_text = engine
         .decode(&metrics.generated_token_ids)
         .map_err(|e| e.to_string())?;
-    let parsed = w34_host::parser::Qwen3Parser::parse_complete(&raw_text, enable_thinking);
+    let parsed = crate::parser::Qwen3Parser::parse_complete(&raw_text, enable_thinking);
     let img_tag = if mm_images.is_empty() {
         String::new()
     } else {

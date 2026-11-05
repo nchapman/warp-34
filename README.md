@@ -87,12 +87,12 @@ never executed. See [model downloads, authentication, and offline behavior](docs
 ./target/release/w34 bench \
   --model nchapman/Qwen3.8-27B-W4A16-GPTQ \
   --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash \
-  --kv-format tq4 --tp 1 --prompt-len 512 --gen-len 128 --verify-lossless
+  --kv-format tq4 --tp 1 --prompt-len 512 --gen-len 128
 
 # 2. Start the multi-protocol HTTP server (OpenAI + Anthropic + Decision APIs):
 ./target/release/w34 serve \
   --model nchapman/Qwen3.8-27B-W4A16-GPTQ \
-  --speculative mtp --spec-tokens 3 --kv-format tq4 --tp 2 --port 8000
+  --speculative mtp --mtp-k 3 --kv-format tq4 --tp 2 --port 8000
 
 # 3. Query via OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages:
 curl -fsS http://127.0.0.1:8000/v1/chat/completions \
@@ -100,7 +100,7 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"nchapman/Qwen3.8-27B-W4A16-GPTQ","messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
 ```
 
-See [`docs/GENERATIVE_APIS.md`](docs/GENERATIVE_APIS.md) for `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and `/v1/messages` wire contracts, and [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) for `/v1/systemone` and `/v1/decisions`.
+See [`docs/SERVING.md`](docs/SERVING.md) for `/v1/completions` and server controls, [`docs/GENERATIVE_APIS.md`](docs/GENERATIVE_APIS.md) for `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` wire contracts, and [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) for `/v1/systemone` and `/v1/decisions`.
 
 ## Serving controls
 

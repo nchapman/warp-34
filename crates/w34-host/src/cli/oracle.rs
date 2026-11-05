@@ -21,7 +21,13 @@ pub(crate) fn tensor_diff_metrics(a: &[f32], b: &[f32]) -> (f32, f64, f64) {
     }
     let rel_l2 = (err_sq / b_sq.max(1e-30)).sqrt();
     let denom = (a_sq * b_sq).sqrt();
-    let cosine = if denom > 1e-30 { dot / denom } else { 1.0 };
+    let cosine = if denom > 1e-30 {
+        dot / denom
+    } else if a_sq <= 1e-30 && b_sq <= 1e-30 {
+        1.0
+    } else {
+        0.0
+    };
     (max_abs, rel_l2, cosine)
 }
 
@@ -127,7 +133,7 @@ pub(crate) fn load_greedy_cases(
 pub(crate) fn run_greedy_diff(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
-    spec_config: Option<w34_host::proposer::SpeculativeConfig>,
+    spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
@@ -164,6 +170,9 @@ pub(crate) fn run_greedy_diff(
     let mut lossless_passes = 0usize;
     let mut radix_warm_passes = 0usize;
     let num_cases = cases.len().min(max_prompts);
+    if num_cases == 0 {
+        return Err("no golden cases found to compare".into());
+    }
 
     for (id, prompt_ids, ref_gen_ids, top5_opt) in cases.iter().take(num_cases) {
         let cmp_len = ref_gen_ids.len().min(max_tokens);
@@ -183,7 +192,7 @@ pub(crate) fn run_greedy_diff(
         let metrics = if verify_radix_warm {
             engine
                 .generate_with_radix_cache(prompt_ids, cmp_len, 64, false)
-                .map(|m| w34_host::model::BenchMetrics {
+                .map(|m| crate::model::BenchMetrics {
                     prompt_len: m.prompt_len,
                     gen_len: m.gen_len,
                     ttft_ms: m.ttft_ms,
@@ -339,7 +348,7 @@ pub(crate) fn run_greedy_diff(
 pub(crate) fn run_dump_diff(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
-    spec_config: Option<w34_host::proposer::SpeculativeConfig>,
+    spec_config: Option<crate::proposer::SpeculativeConfig>,
 ) -> Result<ExitCode, String> {
     let CudaCliOptions {
         model,
@@ -486,7 +495,7 @@ pub(crate) fn run_dump_diff(
         }
     }
     if let Some(gpath) = golden_path {
-        let archive = w34_host::loader::SafetensorsArchive::open(Path::new(&gpath))
+        let archive = crate::loader::SafetensorsArchive::open(Path::new(&gpath))
             .map_err(|e| e.to_string())?;
         let mut compared = 0usize;
         let mut max_diff = 0.0f32;
@@ -535,12 +544,12 @@ pub(crate) fn profile_bench_args(options: &CudaCliOptions, exe: &Path) -> Vec<St
     if let Some(kind) = options.speculative_kind {
         args.push("--speculative".to_string());
         match kind {
-            w34_host::proposer::SpeculativeKind::Mtp => {
+            crate::proposer::SpeculativeKind::Mtp => {
                 args.push("mtp".to_string());
                 args.push("--mtp-k".to_string());
                 args.push(options.mtp_k.to_string());
             }
-            w34_host::proposer::SpeculativeKind::DFlash2 => {
+            crate::proposer::SpeculativeKind::DFlash2 => {
                 args.push("dflash2".to_string());
             }
         }
@@ -561,6 +570,13 @@ pub(crate) fn profile_bench_args(options: &CudaCliOptions, exe: &Path) -> Vec<St
     if let Some(pages) = options.kv_pages {
         args.push("--kv-pages".to_string());
         args.push(pages.to_string());
+    }
+    if !options.use_cuda_graph {
+        args.push("--no-cuda-graph".to_string());
+    }
+    if options.bench_stage != "all" {
+        args.push("--stage".to_string());
+        args.push(options.bench_stage.clone());
     }
     args
 }

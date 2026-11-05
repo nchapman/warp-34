@@ -184,3 +184,159 @@ pub fn tool_grammar(
     grammar.push_str(&definitions);
     Ok(grammar)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_choice_parsing_and_validation() {
+        assert_eq!(ToolChoice::parse(&json!("none")).unwrap(), ToolChoice::None);
+        assert_eq!(ToolChoice::parse(&json!("auto")).unwrap(), ToolChoice::Auto);
+        assert_eq!(
+            ToolChoice::parse(&json!("required")).unwrap(),
+            ToolChoice::Required
+        );
+        assert_eq!(
+            ToolChoice::parse(&json!({"type": "function", "function": {"name": "search"}}))
+                .unwrap(),
+            ToolChoice::Named("search".into())
+        );
+        assert!(ToolChoice::parse(&json!({"type": "function", "function": {"name": ""}})).is_err());
+        assert!(ToolChoice::parse(&json!("invalid")).is_err());
+    }
+
+    #[test]
+    fn tool_grammar_xml_and_hermes_and_rejections() {
+        let tools = json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "units": {"type": "string"}
+                        },
+                        "required": ["city"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "ping"
+                }
+            }
+        ]);
+
+        let none_g = tool_grammar(&tools, &ToolChoice::None, ToolFormat::QwenXml).unwrap();
+        assert!(none_g.contains("~/(?s:.*)<tool_call>"));
+
+        let xml_auto = tool_grammar(&tools, &ToolChoice::Auto, ToolFormat::QwenXml).unwrap();
+        assert!(xml_auto.contains("head[lazy]"));
+        assert!(xml_auto.contains("<function=get_weather>"));
+        assert!(xml_auto.contains("param_0_0"));
+
+        let hermes_req =
+            tool_grammar(&tools, &ToolChoice::Required, ToolFormat::HermesJson).unwrap();
+        assert!(hermes_req.contains("start: call+ WS"));
+        assert!(hermes_req.contains("%json"));
+
+        let named_g = tool_grammar(
+            &tools,
+            &ToolChoice::Named("ping".into()),
+            ToolFormat::QwenXml,
+        )
+        .unwrap();
+        assert!(named_g.contains("<function=ping>"));
+        assert!(!named_g.contains("get_weather"));
+
+        // Validation error paths
+        assert!(tool_grammar(&json!([]), &ToolChoice::Auto, ToolFormat::QwenXml).is_err());
+        assert!(
+            tool_grammar(
+                &json!([{"type": "custom", "function": {"name": "x"}}]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &json!([{"type": "function", "function": {"name": "bad name"}}]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &json!([
+                    {"type": "function", "function": {"name": "dup"}},
+                    {"type": "function", "function": {"name": "dup"}}
+                ]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &tools,
+                &ToolChoice::Named("missing".into()),
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "array"}}}]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "anyOf": []}}}]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": "bad"}}}]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "required": "bad"}}}]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}, "required": ["missing"]}}}]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                &json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"bad=key": {"type": "string"}}}}}]),
+                &ToolChoice::Auto,
+                ToolFormat::QwenXml
+            )
+            .is_err()
+        );
+    }
+}

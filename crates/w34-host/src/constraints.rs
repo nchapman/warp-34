@@ -558,4 +558,122 @@ mod tests {
         assert!(c.is_token_allowed(3));
         assert!(c.is_token_allowed(7));
     }
+
+    fn make_test_factory() -> (tokenizers::Tokenizer, ConstraintFactory) {
+        let mut alphabet: Vec<_> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+            .into_iter()
+            .collect();
+        alphabet.sort();
+        let mut vocab = serde_json::Map::new();
+        for (id, ch) in alphabet.into_iter().enumerate() {
+            vocab.insert(ch.to_string(), serde_json::json!(id));
+        }
+        vocab.insert("<|im_end|>".into(), serde_json::json!(256));
+        vocab.insert("<think>".into(), serde_json::json!(257));
+        vocab.insert("</think>".into(), serde_json::json!(258));
+        vocab.insert("<tool_call>".into(), serde_json::json!(259));
+        vocab.insert("</tool_call>".into(), serde_json::json!(260));
+        let tok = tokenizers::Tokenizer::from_bytes(
+            serde_json::to_vec(&serde_json::json!({
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [
+                    {"id": 256, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                    {"id": 257, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false},
+                    {"id": 258, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false},
+                    {"id": 259, "content": "<tool_call>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false},
+                    {"id": 260, "content": "</tool_call>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}
+                ],
+                "normalizer": null,
+                "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
+                "post_processor": null,
+                "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
+                "model": {"type": "BPE", "vocab": vocab, "merges": []}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let factory = ConstraintFactory::new(tok.clone(), 264, &[256]).unwrap();
+        (tok, factory)
+    }
+
+    #[test]
+    fn test_constraint_factory_grammars_advance_deferred_and_rollback() {
+        let (tok, factory) = make_test_factory();
+        assert!(ConstraintFactory::new(tok.clone(), 264, &[]).is_err());
+        assert!(ConstraintFactory::new(tok.clone(), 264, &[999]).is_err());
+
+        let mut c = factory.regex("ab", false).unwrap();
+        assert!(format!("{c:?}").contains("TokenBitmaskConstraint"));
+        assert!(!c.current_bitmask().is_empty());
+
+        let ids = tok.encode("ab", false).unwrap().get_ids().to_vec();
+        c.advance_deferred(ids[0] as i32).unwrap();
+        assert!(c.has_pending());
+        c.materialize_pending().unwrap();
+        assert!(!c.has_pending());
+
+        c.advance_deferred(ids[1] as i32).unwrap();
+        c.rollback(1).unwrap();
+        assert!(!c.has_pending());
+        c.advance(ids[1] as i32).unwrap();
+        c.advance(256).unwrap();
+        assert!(c.is_terminal_eos());
+        c.rollback(2).unwrap();
+        assert!(!c.is_terminal_eos());
+        assert!(c.rollback(99).is_err());
+
+        // JSON object, thinking wrapper, structural tags, and tools
+        assert!(factory.json_object(true).is_ok());
+        let tag = StructuralTag {
+            begin: "<tool>".into(),
+            end: "</tool>".into(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        assert!(
+            factory
+                .structural_tags(std::slice::from_ref(&tag), &["<tool".into()], false)
+                .is_ok()
+        );
+        assert!(
+            factory
+                .structural_tags(&[], &["<tool".into()], false)
+                .is_err()
+        );
+        assert!(
+            factory
+                .structural_tags(
+                    std::slice::from_ref(&tag),
+                    &["<t".into(), "<tool".into()],
+                    false
+                )
+                .is_err()
+        );
+        assert!(
+            factory
+                .structural_tags(&[tag], &["<other".into()], false)
+                .is_err()
+        );
+
+        let tools = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "ping",
+                    "parameters": {"type": "object", "properties": {"x": {"type": "integer"}}}
+                }
+            }
+        ]);
+        assert!(
+            factory
+                .tools(
+                    &tools,
+                    &crate::tool_constraints::ToolChoice::Auto,
+                    crate::tool_constraints::ToolFormat::QwenXml,
+                    true,
+                )
+                .is_ok()
+        );
+    }
 }

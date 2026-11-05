@@ -714,11 +714,10 @@ impl ModelConfig {
                 }
             }
         }
-        if !eos_token_ids.contains(&248044) {
-            eos_token_ids.push(248044);
-        }
-        if !eos_token_ids.contains(&248046) {
-            eos_token_ids.push(248046);
+        for default_eos in [248044i32, 248046i32] {
+            if (default_eos as usize) < vocab_size && !eos_token_ids.contains(&default_eos) {
+                eos_token_ids.push(default_eos);
+            }
         }
 
         let quant = Self::parse_quant(

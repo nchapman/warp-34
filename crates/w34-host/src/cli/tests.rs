@@ -461,3 +461,25 @@ fn non_utf8_resolved_paths_are_rejected() {
     });
     assert!(result.err().unwrap().contains("not valid UTF-8"));
 }
+
+#[test]
+fn kv_policy_parsing_and_tensor_diff_metrics() {
+    assert_eq!(parse_kv_policy("fp16").unwrap(), KvFormatPolicy::Fp16);
+    assert_eq!(parse_kv_policy("bf16").unwrap(), KvFormatPolicy::Bf16);
+    assert_eq!(parse_kv_policy("q8_0").unwrap(), KvFormatPolicy::Q8_0);
+    assert_eq!(parse_kv_policy("tq4").unwrap(), KvFormatPolicy::Tq4);
+    assert_eq!(parse_kv_policy("tq4_all").unwrap(), KvFormatPolicy::Tq4All);
+    assert!(parse_kv_policy("invalid").is_err());
+
+    let (max_abs, rel_l2, cos) = tensor_diff_metrics(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
+    assert_eq!(max_abs, 0.0);
+    assert!(rel_l2 < 1e-12);
+    assert!((cos - 1.0).abs() < 1e-12);
+
+    let (max_abs_z, rel_z, cos_z) = tensor_diff_metrics(&[0.0, 0.0], &[0.0, 0.0]);
+    assert_eq!(max_abs_z, 0.0);
+    assert_eq!(rel_z, 0.0);
+    assert_eq!(cos_z, 1.0);
+    let (_, _, cos_one_zero) = tensor_diff_metrics(&[0.0, 0.0], &[1.0, 1.0]);
+    assert_eq!(cos_one_zero, 0.0);
+}

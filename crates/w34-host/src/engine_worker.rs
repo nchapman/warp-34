@@ -672,6 +672,8 @@ impl EngineWorker {
             temperature: 0.0,
             top_k: 1,
             max_tokens: 0,
+            stop_token_ids: self.eos_token_ids.clone(),
+            eos_token_ids: self.eos_token_ids.clone(),
             ..SamplingParams::default()
         };
         let sampler = SamplerV1::new(params, &prompt, None);

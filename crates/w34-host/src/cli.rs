@@ -8,11 +8,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 #[cfg(feature = "cuda")]
-use w34_host::cache::KvFormatPolicy;
+use crate::cache::KvFormatPolicy;
 #[cfg(feature = "cuda")]
-use w34_host::hub::{HubOptions, ModelRole};
+use crate::hub::{HubOptions, ModelRole};
 #[cfg(feature = "cuda")]
-use w34_host::model::Qwen3_5Engine;
+use crate::model::Qwen3_5Engine;
 
 #[cfg(feature = "cuda")]
 mod commands;
@@ -21,7 +21,11 @@ mod options;
 mod oracle;
 
 #[cfg(feature = "cuda")]
+pub use commands::run_cuda_cli;
+#[cfg(feature = "cuda")]
 pub(crate) use commands::*;
+pub use options::print_usage;
+#[cfg(feature = "cuda")]
 pub(crate) use options::*;
 #[cfg(feature = "cuda")]
 pub(crate) use oracle::*;

@@ -28,12 +28,10 @@ pub const CLEF_SYSTEM_PROMPT: &str = "Read the complete state and schema. Decide
 const CLEF_NOUL_TRUE_DEFAULT: &str = "The proposition is true or the answer is yes.";
 const CLEF_NOUL_FALSE_DEFAULT: &str = "The proposition is false or the answer is no.";
 
-#[cfg(test)]
 unsafe extern "C" {
     fn erf(x: f64) -> f64;
 }
 
-#[cfg(test)]
 #[inline]
 fn exact_gelu(x: f32) -> f32 {
     let xd = x as f64;
@@ -347,7 +345,6 @@ impl LayerNormWeights {
         Ok(Self { weight, bias })
     }
 
-    #[cfg(test)]
     fn apply_row(&self, input: &[f32], out: &mut [f32]) {
         let d = self.weight.len();
         debug_assert_eq!(input.len(), d);
@@ -369,7 +366,6 @@ impl LayerNormWeights {
         }
     }
 
-    #[cfg(test)]
     fn apply_matrix(&self, input: &[f32], rows: usize) -> Vec<f32> {
         let d = self.weight.len();
         debug_assert_eq!(input.len(), rows * d);
@@ -384,9 +380,7 @@ impl LayerNormWeights {
 
 #[derive(Clone, Debug)]
 struct LinearWeights {
-    #[cfg(test)]
     out_dim: usize,
-    #[cfg(test)]
     in_dim: usize,
     weight: Vec<f32>,
     bias: Option<Vec<f32>>,
@@ -409,16 +403,13 @@ impl LinearWeights {
             None
         };
         Ok(Self {
-            #[cfg(test)]
             out_dim,
-            #[cfg(test)]
             in_dim,
             weight,
             bias,
         })
     }
 
-    #[cfg(test)]
     fn apply(&self, input: &[f32], rows: usize) -> Vec<f32> {
         matmul_nt_scalar(
             input,
@@ -433,9 +424,7 @@ impl LinearWeights {
 
 #[derive(Clone, Debug)]
 struct MultiheadAttnWeights {
-    #[cfg(test)]
     width: usize,
-    #[cfg(test)]
     heads: usize,
     q_proj: LinearWeights,
     kv_proj: LinearWeights,
@@ -449,24 +438,18 @@ impl MultiheadAttnWeights {
         width: usize,
         heads: usize,
     ) -> Result<Self, String> {
-        #[cfg(not(test))]
-        let _ = heads;
         let w_name = format!("{prefix}.in_proj_weight");
         let b_name = format!("{prefix}.in_proj_bias");
         let in_w = read_exact_2d(archive, &w_name, 3 * width, width)?;
         let in_b = read_exact_1d(archive, &b_name, 3 * width)?;
         let q_proj = LinearWeights {
-            #[cfg(test)]
             out_dim: width,
-            #[cfg(test)]
             in_dim: width,
             weight: in_w[..width * width].to_vec(),
             bias: Some(in_b[..width].to_vec()),
         };
         let kv_proj = LinearWeights {
-            #[cfg(test)]
             out_dim: 2 * width,
-            #[cfg(test)]
             in_dim: width,
             weight: in_w[width * width..].to_vec(),
             bias: Some(in_b[width..].to_vec()),
@@ -474,9 +457,7 @@ impl MultiheadAttnWeights {
         let out_proj =
             LinearWeights::load(archive, &format!("{prefix}.out_proj"), width, width, true)?;
         Ok(Self {
-            #[cfg(test)]
             width,
-            #[cfg(test)]
             heads,
             q_proj,
             kv_proj,
@@ -484,7 +465,6 @@ impl MultiheadAttnWeights {
         })
     }
 
-    #[cfg(test)]
     fn forward(&self, queries: &[f32], q_len: usize, memory: &[f32], m_len: usize) -> Vec<f32> {
         let w = self.width;
         let h = self.heads;
@@ -586,7 +566,6 @@ impl EvidenceRoutingLayerWeights {
         })
     }
 
-    #[cfg(test)]
     fn forward(&self, queries: &[f32], q_len: usize, memory: &[f32], m_len: usize) -> Vec<f32> {
         let norm_q = self.query_norm.apply_matrix(queries, q_len);
         let norm_m = self.memory_norm.apply_matrix(memory, m_len);
@@ -657,7 +636,6 @@ impl DecoderLayerWeights {
         })
     }
 
-    #[cfg(test)]
     fn forward(&self, tgt: &[f32], q_len: usize, memory: &[f32], m_len: usize) -> Vec<f32> {
         let n1 = self.norm1.apply_matrix(tgt, q_len);
         let sa = self.self_attn.forward(&n1, q_len, &n1, q_len);
@@ -683,7 +661,6 @@ impl DecoderLayerWeights {
 }
 
 #[derive(Debug)]
-#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 pub struct ClefJointHead {
     pub config: ClefHeadConfig,
     hidden_norm: LayerNormWeights,
@@ -871,7 +848,6 @@ impl ClefJointHead {
 
     /// Reference scalar `JointSchemaHead.forward` oracle used by unit tests to verify
     /// `ClefJointHeadGpu` against PyTorch goldens.
-    #[cfg(test)]
     pub fn forward(
         &self,
         hidden_rows: &[Vec<f32>],
@@ -1172,7 +1148,6 @@ fn read_scalar_f32(archive: &SafetensorsArchive, name: &str) -> Result<f32, Stri
     Ok(vals[0])
 }
 
-#[cfg(test)]
 fn mean_span_into(
     matrix: &[f32],
     rows: usize,
@@ -1200,7 +1175,6 @@ fn mean_span_into(
     Ok(())
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn l2_normalize_in_place(v: &mut [f32], eps: f32) {
     let norm = (v
         .iter()
@@ -1214,7 +1188,6 @@ fn l2_normalize_in_place(v: &mut [f32], eps: f32) {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
 fn cosine_similarity_f32(a: &[f32], b: &[f32], eps: f32) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut dot = 0.0f64;
@@ -1231,7 +1204,6 @@ fn cosine_similarity_f32(a: &[f32], b: &[f32], eps: f32) -> f32 {
     (dot / denom) as f32
 }
 
-#[cfg(any(feature = "cuda", test))]
 #[inline]
 fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
@@ -1262,7 +1234,6 @@ fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(test)]
 fn matmul_nt_scalar(
     a: &[f32],
     m: usize,

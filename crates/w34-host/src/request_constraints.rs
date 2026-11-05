@@ -260,4 +260,97 @@ mod tests {
         .expect("oversized regex must fail");
         assert!(err.contains("byte limit"), "{err}");
     }
+
+    #[test]
+    fn parses_all_response_format_and_structured_outputs_variants() {
+        assert!(
+            RequestConstraint::parse(&json!({"response_format": {"type": "text"}}))
+                .unwrap()
+                .is_none()
+        );
+        let jo = RequestConstraint::parse(&json!({"response_format": {"type": "json_object"}}))
+            .unwrap()
+            .unwrap();
+        assert!(jo.is_mandatory());
+
+        let js = RequestConstraint::parse(&json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "strict": true,
+                    "schema": {"type": "object"}
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(js.is_mandatory());
+        assert!(
+            RequestConstraint::parse(&json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"strict": false, "schema": {"type": "object"}}
+                }
+            }))
+            .is_err()
+        );
+
+        let st = RequestConstraint::parse(&json!({
+            "response_format": {
+                "type": "structural_tag",
+                "structures": [{"begin": "<a>", "end": "</a>", "schema": {"type": "object"}}],
+                "triggers": ["<a>"]
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(st.is_mandatory());
+
+        assert!(
+            RequestConstraint::parse(&json!({"structured_outputs": {"json": {"type": "object"}}}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({"structured_outputs": {"regex": "[0-9]+"}}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({"structured_outputs": {"grammar": "start: \"ok\""}}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({
+                "structured_outputs": {
+                    "structural_tag": {
+                        "structures": [{"begin": "<a>", "end": "</a>", "schema": {"type": "object"}}],
+                        "triggers": ["<a>"]
+                    }
+                }
+            }))
+            .unwrap()
+            .is_some()
+        );
+
+        // Mutual exclusion & validation errors
+        assert!(
+            RequestConstraint::parse(&json!({
+                "response_format": {"type": "json_object"},
+                "structured_outputs": {"regex": "a"}
+            }))
+            .is_err()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({
+                "response_format": {"type": "json_object"},
+                "tools": [{"type": "function", "function": {"name": "f"}}]
+            }))
+            .is_err()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({"tools": [], "tool_choice": "required"})).is_err()
+        );
+    }
 }

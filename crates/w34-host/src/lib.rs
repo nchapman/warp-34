@@ -5,6 +5,7 @@ pub mod api_auth;
 pub mod cache;
 pub mod chatml;
 pub mod clef;
+pub mod cli;
 pub mod constraints;
 #[cfg(feature = "cuda")]
 mod coordinated;
@@ -52,4 +53,12 @@ pub mod vision;
 /// ```
 pub const fn cuda_enabled() -> bool {
     w34_kernels::cuda_enabled()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cuda_enabled_matches_feature_cfg() {
+        assert_eq!(super::cuda_enabled(), cfg!(feature = "cuda"));
+    }
 }

@@ -419,6 +419,7 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
     } else {
         super::completion_sampling_params(&request, max_tokens)?
     };
+    params.eos_token_ids.clone_from(&s.worker.eos_token_ids);
     if params
         .stop_token_ids
         .iter()

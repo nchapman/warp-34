@@ -1,4 +1,4 @@
-mod cli;
+use w34_host::cli;
 
 use std::env;
 use std::process::ExitCode;

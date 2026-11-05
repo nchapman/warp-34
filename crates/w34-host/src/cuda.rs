@@ -1245,6 +1245,10 @@ impl MappedHostBuffer {
             unsafe { ffi::w34_host_alloc_mapped(&raw mut host_ptr, &raw mut dev_ptr, alloc_bytes) },
             "w34_host_alloc_mapped",
         )?;
+        // SAFETY: `host_ptr` was just allocated by `w34_host_alloc_mapped` for `alloc_bytes` bytes.
+        unsafe {
+            core::ptr::write_bytes(host_ptr.cast::<u8>(), 0, alloc_bytes);
+        }
         Ok(Self {
             host_ptr,
             dev_ptr,

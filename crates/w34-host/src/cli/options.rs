@@ -15,7 +15,7 @@ pub(crate) fn parse_kv_policy(s: &str) -> Result<KvFormatPolicy, String> {
     }
 }
 
-pub(crate) fn print_usage() {
+pub fn print_usage() {
     eprintln!(
         "Usage: w34 <subcommand> [options]\n\
          Subcommands:\n\
@@ -44,7 +44,7 @@ pub(crate) fn print_usage() {
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub(crate) struct ServeCliConfig {
-    pub(crate) options: w34_host::server::ServeOptions,
+    pub(crate) options: crate::server::ServeOptions,
     pub(crate) model_name: Option<String>,
     pub(crate) api_key: Option<String>,
     pub(crate) api_key_env: Option<String>,
@@ -153,7 +153,7 @@ impl ServeCliConfig {
                 .transpose()?,
         };
         self.options.api_key = value
-            .map(w34_host::api_auth::ApiKey::new)
+            .map(crate::api_auth::ApiKey::new)
             .transpose()
             .map_err(|_| "invalid API key".to_string())?;
         Ok(())
@@ -187,7 +187,7 @@ pub(crate) struct CudaCliOptions {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) enable_thinking: bool,
-    pub(crate) speculative_kind: Option<w34_host::proposer::SpeculativeKind>,
+    pub(crate) speculative_kind: Option<crate::proposer::SpeculativeKind>,
     pub(crate) draft_model: Option<String>,
     pub(crate) mtp_k: usize,
     pub(crate) kv_pages: Option<usize>,
@@ -262,8 +262,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
             "--speculative" => {
                 i += 1;
                 speculative_kind = Some(match args.get(i).map(String::as_str) {
-                    Some("mtp") => w34_host::proposer::SpeculativeKind::Mtp,
-                    Some("dflash2") => w34_host::proposer::SpeculativeKind::DFlash2,
+                    Some("mtp") => crate::proposer::SpeculativeKind::Mtp,
+                    Some("dflash2") => crate::proposer::SpeculativeKind::DFlash2,
                     _ => return Err("--speculative expects mtp or dflash2".into()),
                 });
             }
@@ -517,20 +517,21 @@ pub(crate) fn validate_cuda_options(
     if !matches!(mtp_k, 1..=3) {
         return Err("--mtp-k must be 1..3".into());
     }
-    if draft_model.is_some()
-        && *speculative_kind != Some(w34_host::proposer::SpeculativeKind::DFlash2)
+    if draft_model.is_some() && *speculative_kind != Some(crate::proposer::SpeculativeKind::DFlash2)
     {
         return Err(
             "--draft-model requires --speculative dflash2; native MTP uses target weights".into(),
         );
     }
-    if *speculative_kind == Some(w34_host::proposer::SpeculativeKind::DFlash2)
-        && draft_model.is_none()
+    if *speculative_kind == Some(crate::proposer::SpeculativeKind::DFlash2) && draft_model.is_none()
     {
         return Err("--speculative dflash2 requires --draft-model".into());
     }
     if *verify_lossless && speculative_kind.is_none() {
         return Err("--verify-lossless requires --speculative".into());
+    }
+    if options.max_prompts == 0 {
+        return Err("--max-prompts must be >= 1".into());
     }
     validate_cuda_command(options, sub)?;
     Ok(policy)
@@ -543,8 +544,8 @@ pub(crate) fn load_cli_engine(
     policy: KvFormatPolicy,
     kv_pages: Option<usize>,
     use_cuda_graph: bool,
-    spec_config: &Option<w34_host::proposer::SpeculativeConfig>,
-) -> w34_host::cuda::Result<Qwen3_5Engine> {
+    spec_config: &Option<crate::proposer::SpeculativeConfig>,
+) -> crate::cuda::Result<Qwen3_5Engine> {
     // Leave VRAM for the resident drafter instead of filling it with target KV.
     // Speculative taps/logits are configured in enable_speculative before lazy graph capture.
     let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
@@ -559,7 +560,7 @@ pub(crate) fn load_cli_engine(
 pub(crate) struct PreparedCudaCli {
     pub(crate) options: CudaCliOptions,
     pub(crate) policy: KvFormatPolicy,
-    pub(crate) spec_config: Option<w34_host::proposer::SpeculativeConfig>,
+    pub(crate) spec_config: Option<crate::proposer::SpeculativeConfig>,
 }
 
 #[cfg(feature = "cuda")]
@@ -637,7 +638,7 @@ pub(crate) fn prepare_cuda_cli_with_env(
         .transpose()?;
     let spec_config = options
         .speculative_kind
-        .map(|kind| w34_host::proposer::SpeculativeConfig {
+        .map(|kind| crate::proposer::SpeculativeConfig {
             kind,
             draft_model,
             mtp_k: options.mtp_k,

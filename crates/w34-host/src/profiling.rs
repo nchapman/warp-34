@@ -33,3 +33,13 @@ impl Drop for Range {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Range;
+
+    #[test]
+    fn nvtx_range_push_and_pop_balances() {
+        let _r = Range::new(c"w34_unit_test_scope");
+    }
+}

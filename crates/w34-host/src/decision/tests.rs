@@ -1366,6 +1366,44 @@ fn kev_encoding_and_profile_temperature_bounds() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+fn synthetic_decision_tokenizer() -> Tokenizer {
+    use tokenizers::AddedToken;
+    use tokenizers::models::bpe::{BPE, Vocab};
+
+    let mut vocab = Vocab::default();
+    vocab.insert("[UNK]".to_owned(), 0);
+    for (next_id, ch) in (1u32..).zip(
+        ['\t', '\n', '\r']
+            .into_iter()
+            .chain((0x20u8..=0x7eu8).map(|b| b as char)),
+    ) {
+        vocab.insert(ch.to_string(), next_id);
+    }
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, Vec::new())
+        .unk_token("[UNK]".to_owned())
+        .build()
+        .unwrap();
+    let mut t = Tokenizer::new(bpe);
+    let added: Vec<AddedToken> = [
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|image_pad|>",
+        "<think>",
+        "</think>",
+        "<tool_call>",
+        "</tool_call>",
+    ]
+    .iter()
+    .map(|&s| AddedToken::from(s, true))
+    .collect();
+    t.add_special_tokens(&added);
+    t
+}
+
 #[test]
 fn decision_images_parsing_max_probability_confidence_and_adapter_forwarding() {
     let profile = DecisionModelProfile::Tev1 { temperature: 1.0 };
@@ -1458,43 +1496,7 @@ fn decision_images_parsing_max_probability_confidence_and_adapter_forwarding() {
 
     // Synthetic in-memory BPE tokenizer so multimodal prompt-insertion assertions run
     // unconditionally on every machine and CI without any external HF cache dependency.
-    let tok = {
-        use tokenizers::AddedToken;
-        use tokenizers::models::bpe::{BPE, Vocab};
-
-        let mut vocab = Vocab::default();
-        vocab.insert("[UNK]".to_owned(), 0);
-        for (next_id, ch) in (1u32..).zip(
-            ['\t', '\n', '\r']
-                .into_iter()
-                .chain((0x20u8..=0x7eu8).map(|b| b as char)),
-        ) {
-            vocab.insert(ch.to_string(), next_id);
-        }
-        let bpe = BPE::builder()
-            .vocab_and_merges(vocab, Vec::new())
-            .unk_token("[UNK]".to_owned())
-            .build()
-            .unwrap();
-        let mut t = Tokenizer::new(bpe);
-        let added: Vec<AddedToken> = [
-            "<|endoftext|>",
-            "<|im_start|>",
-            "<|im_end|>",
-            "<|vision_start|>",
-            "<|vision_end|>",
-            "<|image_pad|>",
-            "<think>",
-            "</think>",
-            "<tool_call>",
-            "</tool_call>",
-        ]
-        .iter()
-        .map(|&s| AddedToken::from(s, true))
-        .collect();
-        t.add_special_tokens(&added);
-        t
-    };
+    let tok = synthetic_decision_tokenizer();
 
     let mut vcfg: crate::vision::VisionConfig = serde_json::from_value(json!({})).unwrap();
     vcfg.vision_start_token_id = tok.token_to_id("<|vision_start|>").unwrap() as i32;
@@ -1610,4 +1612,61 @@ fn decision_images_parsing_max_probability_confidence_and_adapter_forwarding() {
         dump_python_json(&json!({"big": 1e20, "tiny": 1.5e-7})).unwrap(),
         r#"{"big": 1e+20, "tiny": 1.5e-07}"#
     );
+}
+
+#[test]
+fn decision_nimble_openjev_and_xor_batch_preparation() {
+    let tok = synthetic_decision_tokenizer();
+    let std_req = json!({
+        "model": "test",
+        "state": "Sky is blue",
+        "questions": {
+            "q_bool": {
+                "type": "noul",
+                "instructions": "Is sky blue?"
+            },
+            "q_choice": {
+                "type": "choice",
+                "instructions": "Color?",
+                "criteria": {"red": "Red", "blue": "Blue"}
+            }
+        }
+    });
+    for profile in [
+        DecisionModelProfile::Nimble {
+            temperature: 0.7,
+            max_length: 4096,
+        },
+        DecisionModelProfile::OpenJev { temperature: 1.0 },
+        DecisionModelProfile::Xor {
+            temperature: 0.5,
+            lev_noul_9_scale: false,
+        },
+        DecisionModelProfile::Xor {
+            temperature: 1.0,
+            lev_noul_9_scale: true,
+        },
+    ] {
+        let (_, prepared) = prepare_decision_batch(&profile, &tok, 4096, &std_req).unwrap();
+        match prepared {
+            PreparedDecisionBatch::CandidateLogits {
+                temperature,
+                conf_kind,
+                fields,
+                prompts,
+                candidates,
+                ..
+            } => {
+                assert_eq!(prompts.len(), 2);
+                assert_eq!(candidates.len(), 2);
+                let ans =
+                    answer_from_logits(&fields[1], &[2.0, -1.0], temperature, conf_kind).unwrap();
+                assert_eq!(ans["type"], "choice");
+            }
+            PreparedDecisionBatch::Xor { variants, .. } => {
+                assert_eq!(variants.len(), 2);
+            }
+            other => panic!("unexpected batch: {other:?}"),
+        }
+    }
 }

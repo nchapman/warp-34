@@ -676,3 +676,140 @@ fn test_runtime_gpu_device_props_and_tp2_sm_cap() {
     .unwrap();
     assert!(min_sms >= 24 && min_sms <= props.multi_processor_count);
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_tp2_collectives_entrypoints_and_validation() {
+    assert!(Tp2Collectives::new_for_tp(1, 4096).is_err());
+    assert!(Tp2Collectives::new_for_tp(3, 4096).is_err());
+    if CudaDevice::count().unwrap_or(0) < 2 {
+        return;
+    }
+    let comm = Tp2Collectives::new_for_tp_with_p2p(2, 64 * 1024, false).unwrap();
+    assert_eq!(comm.tp_size, 2);
+    assert!(!comm.p2p_vram);
+
+    let s0 = CudaStream::new(0).unwrap();
+    let s1 = CudaStream::new(1).unwrap();
+    let ex0 = s0.exec(0, 0);
+    let ex1 = s1.exec(0, 0);
+
+    let n = 128usize;
+    let d0_f16 = DeviceBuffer::alloc(0, n * 2).unwrap();
+    let d1_f16 = DeviceBuffer::alloc(1, n * 2).unwrap();
+    let d0_res = DeviceBuffer::alloc(0, n * 2).unwrap();
+    let d1_res = DeviceBuffer::alloc(1, n * 2).unwrap();
+    let d0_w = DeviceBuffer::alloc(0, n * 2).unwrap();
+    let d1_w = DeviceBuffer::alloc(1, n * 2).unwrap();
+
+    d0_f16
+        .copy_from_host(&vec![f32_to_f16(1.0); n], &s0)
+        .unwrap();
+    d1_f16
+        .copy_from_host(&vec![f32_to_f16(2.0); n], &s1)
+        .unwrap();
+    d0_res
+        .copy_from_host(&vec![f32_to_f16(0.5); n], &s0)
+        .unwrap();
+    d1_res
+        .copy_from_host(&vec![f32_to_f16(0.5); n], &s1)
+        .unwrap();
+    d0_w.copy_from_host(&vec![f32_to_f16(0.0); n], &s0).unwrap();
+    d1_w.copy_from_host(&vec![f32_to_f16(0.0); n], &s1).unwrap();
+
+    // 1. all_reduce_f16
+    comm.all_reduce_f16(&ex0, d0_f16.addr(), d0_f16.addr(), 0, n as i32)
+        .unwrap();
+    comm.all_reduce_f16(&ex1, d1_f16.addr(), d1_f16.addr(), 1, n as i32)
+        .unwrap();
+    // 2. all_reduce_residual_gemma_rms_norm_f16
+    comm.all_reduce_residual_gemma_rms_norm_f16(
+        &ex0,
+        d0_f16.addr(),
+        0,
+        d0_res.addr(),
+        d0_w.addr(),
+        d0_f16.addr(),
+        0,
+        0,
+        1,
+        n as i32,
+        1e-6,
+        0,
+        0,
+    )
+    .unwrap();
+    comm.all_reduce_residual_gemma_rms_norm_f16(
+        &ex1,
+        d1_f16.addr(),
+        0,
+        d1_res.addr(),
+        d1_w.addr(),
+        d1_f16.addr(),
+        0,
+        1,
+        1,
+        n as i32,
+        1e-6,
+        0,
+        0,
+    )
+    .unwrap();
+    // 3. all_reduce_bf16
+    comm.all_reduce_bf16(&ex0, d0_f16.addr(), d0_f16.addr(), 0, n as i32)
+        .unwrap();
+    comm.all_reduce_bf16(&ex1, d1_f16.addr(), d1_f16.addr(), 1, n as i32)
+        .unwrap();
+
+    // 4. all_reduce_f32 & broadcast_i32 & all_gather_top1_f32_i32 & gather_vocab_f16
+    let d0_f32 = DeviceBuffer::alloc(0, 64 * 4).unwrap();
+    let d1_f32 = DeviceBuffer::alloc(1, 64 * 4).unwrap();
+    d0_f32.copy_from_host(&[1.5f32; 64], &s0).unwrap();
+    d1_f32.copy_from_host(&[2.5f32; 64], &s1).unwrap();
+    comm.all_reduce_f32(&ex0, d0_f32.addr(), d0_f32.addr(), 0, 64)
+        .unwrap();
+    comm.all_reduce_f32(&ex1, d1_f32.addr(), d1_f32.addr(), 1, 64)
+        .unwrap();
+
+    let d0_i32 = DeviceBuffer::alloc(0, 16 * 4).unwrap();
+    let d1_i32 = DeviceBuffer::alloc(1, 16 * 4).unwrap();
+    d0_i32.copy_from_host(&[42i32; 16], &s0).unwrap();
+    comm.broadcast_i32(&ex0, d0_i32.addr(), d0_i32.addr(), 0, 16)
+        .unwrap();
+    comm.broadcast_i32(&ex1, d1_i32.addr(), d1_i32.addr(), 1, 16)
+        .unwrap();
+
+    comm.all_gather_top1_f32_i32(
+        &ex0,
+        d0_f32.addr(),
+        d0_i32.addr(),
+        d0_f32.addr() + 32,
+        d0_i32.addr() + 32,
+        0,
+        4,
+    )
+    .unwrap();
+    comm.all_gather_top1_f32_i32(
+        &ex1,
+        d1_f32.addr(),
+        d1_i32.addr(),
+        d1_f32.addr() + 32,
+        d1_i32.addr() + 32,
+        1,
+        4,
+    )
+    .unwrap();
+
+    let d0_full = DeviceBuffer::alloc(0, n * 4).unwrap();
+    comm.gather_vocab_f16(&ex0, d0_f16.addr(), d0_full.addr(), 0, 1, n as i32)
+        .unwrap();
+    comm.gather_vocab_f16(&ex1, d1_f16.addr(), 0, 1, 1, n as i32)
+        .unwrap();
+
+    s0.synchronize().unwrap();
+    s1.synchronize().unwrap();
+    let mut bcast_out = vec![0i32; 16];
+    d1_i32.copy_to_host(&mut bcast_out, &s1).unwrap();
+    s1.synchronize().unwrap();
+    assert_eq!(bcast_out[0], 42);
+}
