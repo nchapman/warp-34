@@ -9,24 +9,9 @@ use w34_host::{
     vision,
 };
 
-fn checkpoint() -> PathBuf {
-    let cache = std::env::var_os("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
-        });
-    let path = cache.join("models--nchapman--Qwen3.5-2B-W4A16-HGPTQ-g64/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c");
-    assert!(
-        path.join("model_mtp.safetensors").exists(),
-        "download pinned HGPTQ checkpoint first: {}",
-        path.display()
-    );
-    path
-}
-
-fn qualify(tp: usize) -> Vec<i32> {
+fn qualify_model(model_dir: &std::path::Path, tp: usize) -> Vec<i32> {
     let mut engine = Qwen3_5Engine::load(
-        checkpoint().to_str().unwrap(),
+        model_dir.to_str().unwrap(),
         tp,
         KvFormatPolicy::Fp16,
         Some(64),
@@ -77,16 +62,43 @@ fn qualify(tp: usize) -> Vec<i32> {
 }
 
 #[test]
-#[ignore = "requires pinned HGPTQ 2B checkpoint and two free CUDA GPUs"]
+#[ignore = "requires pinned HGPTQ checkpoints and two free CUDA GPUs"]
 fn pinned_hgptq_text_graph_mtp_and_tp2() {
-    let tp1 = qualify(1);
-    let tp2 = qualify(2);
-    assert_eq!(tp1, tp2, "TP=1 vs TP=2 greedy continuation");
+    let cache = std::env::var_os("HF_HUB_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
+        });
+    for rel_dir in [
+        "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ-g64/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
+        "models--nchapman--Qwen3.5-9B-W4A16-HGPTQ-g64/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
+        "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ-g64/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
+    ] {
+        let dir = cache.join(rel_dir);
+        assert!(
+            dir.join("model_mtp.safetensors").exists(),
+            "missing pinned HGPTQ checkpoint at {}",
+            dir.display()
+        );
+        let tp1 = qualify_model(&dir, 1);
+        let tp2 = qualify_model(&dir, 2);
+        assert_eq!(
+            tp1,
+            tp2,
+            "TP=1 vs TP=2 greedy continuation for {}",
+            dir.display()
+        );
+    }
 }
 
 #[test]
-#[ignore = "requires pinned HGPTQ 2B checkpoint and two free CUDA GPUs"]
+#[ignore = "requires pinned HGPTQ checkpoints and two free CUDA GPUs"]
 fn pinned_hgptq_vision_matches_vllm_and_tp2() {
+    let cache = std::env::var_os("HF_HUB_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
+        });
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tools/oracle/fixtures/coco_sample.png");
     let (rgb, h, w) = vision::load_cli_image_with_policy(fixture.to_str().unwrap(), false).unwrap();
@@ -96,31 +108,71 @@ fn pinned_hgptq_vision_matches_vllm_and_tp2() {
         &"<|image_pad|>".repeat(image.num_merged_tokens(2)),
     );
     let images = [image];
-    let expected_vllm_ids = vec![
-        561, 2099, 4774, 1330, 18833, 19823, 383, 264, 17676, 25313, 13, 561, 18833, 513, 2107,
-        5474, 1634, 18833, 11, 321, 781, 513, 2107, 20479, 13, 2532, 513, 1330, 8434, 11241, 383,
-        279,
+
+    let cases: [(&str, &str, &[i32]); 3] = [
+        (
+            "2B",
+            "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ-g64/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
+            &[
+                561, 2099, 4774, 1330, 18833, 19823, 383, 264, 17676, 25313, 13, 561, 18833, 513,
+                2107, 5474, 1634, 18833, 11, 321, 781, 513, 2107, 20479, 13, 2532, 513, 1330, 8434,
+                11241, 383, 279,
+            ],
+        ),
+        (
+            "9B",
+            "models--nchapman--Qwen3.5-9B-W4A16-HGPTQ-g64/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
+            &[8771, 18833, 513, 20479, 383, 264, 17676, 36781, 13, 248044],
+        ),
+        (
+            "27B",
+            "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ-g64/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
+            &[
+                8771, 18833, 513, 20479, 383, 264, 17676, 36781, 440, 1330, 8434, 11241, 13, 3648,
+                7993, 369, 264, 74035, 11, 321, 279, 975, 369, 449, 6474, 13, 561, 74035, 369, 383,
+                279, 2047,
+            ],
+        ),
     ];
 
-    let run_tp = |tp: usize| -> Vec<i32> {
-        let mut engine = Qwen3_5Engine::load(
-            checkpoint().to_str().unwrap(),
-            tp,
-            KvFormatPolicy::Fp16,
-            Some(32),
-            true,
-        )
-        .unwrap();
-        let prompt = engine.encode(&expanded).unwrap();
-        assert_eq!(prompt.len(), 306);
-        engine
-            .generate_multimodal_with_radix_cache(&prompt, &images, 32, 64, false)
-            .unwrap()
-            .generated_token_ids
-    };
-
-    let tp1 = run_tp(1);
-    let tp2 = run_tp(2);
-    assert_eq!(tp1, expected_vllm_ids, "TP=1 vision greedy vs vLLM 0.31.0");
-    assert_eq!(tp1, tp2, "TP=1 vs TP=2 multimodal greedy continuation");
+    for (label, rel_dir, expected_vllm_ids) in cases {
+        let model_dir = cache.join(rel_dir);
+        assert!(
+            model_dir.join("config.json").exists(),
+            "missing pinned HGPTQ checkpoint at {}",
+            model_dir.display()
+        );
+        let run_tp = |tp: usize| -> Vec<i32> {
+            let mut engine = Qwen3_5Engine::load(
+                model_dir.to_str().unwrap(),
+                tp,
+                KvFormatPolicy::Fp16,
+                Some(32),
+                true,
+            )
+            .unwrap();
+            let prompt = engine.encode(&expanded).unwrap();
+            assert_eq!(prompt.len(), 306);
+            engine
+                .generate_multimodal_with_radix_cache(
+                    &prompt,
+                    &images,
+                    expected_vllm_ids.len(),
+                    64,
+                    false,
+                )
+                .unwrap()
+                .generated_token_ids
+        };
+        let tp1 = run_tp(1);
+        let tp2 = run_tp(2);
+        assert_eq!(
+            tp1, expected_vllm_ids,
+            "{label} TP=1 vision greedy vs vLLM 0.31.0"
+        );
+        assert_eq!(
+            tp1, tp2,
+            "{label} TP=1 vs TP=2 multimodal greedy continuation"
+        );
+    }
 }

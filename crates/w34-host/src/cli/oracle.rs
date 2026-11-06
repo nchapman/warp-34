@@ -32,6 +32,74 @@ pub(crate) fn tensor_diff_metrics(a: &[f32], b: &[f32]) -> (f32, f64, f64) {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn evaluate_golden_tensor_diff(
+    name: &str,
+    shape: &[usize],
+    vals: &[f32],
+    ref_vals: &[f32],
+    is_multimodal: bool,
+) -> Result<(f32, f64, f64), String> {
+    if vals.len() != ref_vals.len() {
+        return Err(format!(
+            "dump-diff golden length mismatch on {name}: got {}, expected {}",
+            vals.len(),
+            ref_vals.len()
+        ));
+    }
+    let expected_len = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| format!("dump-diff golden shape overflow on {name}: {shape:?}"))?;
+    if !shape.is_empty() && expected_len != vals.len() {
+        return Err(format!(
+            "dump-diff golden shape mismatch on {name}: shape {shape:?} implies {expected_len}, got {}",
+            vals.len()
+        ));
+    }
+    let (d, full_rel, full_cos) = tensor_diff_metrics(vals, ref_vals);
+    let is_deep_mm_layer = is_multimodal
+        && shape.len() == 2
+        && shape[0] > 1
+        && shape[1] > 0
+        && (name == "final_norm" || (name.starts_with("layer_") && name != "layer_0_hidden_after"));
+    if is_deep_mm_layer {
+        if full_rel > 0.16 {
+            return Err(format!(
+                "dump-diff multimodal full-sequence envelope failed on {name}: full_rel_l2={full_rel:.6}"
+            ));
+        }
+        let cols = shape[1];
+        for r in 0..shape[0] {
+            let row_start = r * cols;
+            let row_end = row_start + cols;
+            let (_, row_rel, row_cos) =
+                tensor_diff_metrics(&vals[row_start..row_end], &ref_vals[row_start..row_end]);
+            if row_cos < 0.95 {
+                return Err(format!(
+                    "dump-diff multimodal row {r} cosine failed on {name}: row_rel_l2={row_rel:.6} row_cosine={row_cos:.6}"
+                ));
+            }
+        }
+        let last_start = (shape[0] - 1) * cols;
+        let (last_d, last_rel, last_cos) =
+            tensor_diff_metrics(&vals[last_start..], &ref_vals[last_start..]);
+        if last_rel > 0.05 || last_cos < 0.998 {
+            return Err(format!(
+                "dump-diff multimodal prompt-end check failed on {name}: last_rel_l2={last_rel:.6} last_cosine={last_cos:.6}"
+            ));
+        }
+        Ok((d.max(last_d), last_rel, full_cos.min(last_cos)))
+    } else {
+        if full_rel > 0.05 {
+            return Err(format!(
+                "dump-diff golden check failed on {name}: rel_l2={full_rel:.6} cosine={full_cos:.6}"
+            ));
+        }
+        Ok((d, full_rel, full_cos))
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) type GreedyCase = (String, Vec<i32>, Vec<i32>, Option<Vec<Vec<(i32, f64)>>>);
 
 #[cfg(feature = "cuda")]
@@ -501,11 +569,13 @@ pub(crate) fn run_dump_diff(
         let mut max_diff = 0.0f32;
         let mut max_rel_l2 = 0.0f64;
         let mut min_cosine = 1.0f64;
-        for (name, (_shape, vals)) in &dump.tensors_f32 {
+        let is_multimodal = !mm_images.is_empty();
+        for (name, (shape, vals)) in &dump.tensors_f32 {
             if let Some(resolved) = archive.resolve_name(name) {
                 let ref_vals = archive.read_f32(&resolved).map_err(|e| e.to_string())?;
                 if ref_vals.len() == vals.len() {
-                    let (d, rel, cos) = tensor_diff_metrics(vals, &ref_vals);
+                    let (d, rel, cos) =
+                        evaluate_golden_tensor_diff(name, shape, vals, &ref_vals, is_multimodal)?;
                     max_diff = max_diff.max(d);
                     max_rel_l2 = max_rel_l2.max(rel);
                     min_cosine = min_cosine.min(cos);

@@ -74,13 +74,14 @@ impl Qwen3_5Engine {
         pos_3d.extend_from_slice(&mrope_planes[2]);
 
         let h_dim = self.cfg.hidden_size;
+        let mut vision_trace = std::collections::BTreeMap::new();
         let vis_dev0 = {
             let r0 = &self.ranks[0];
             r0.device.make_current()?;
             self.vision_encoder
                 .as_ref()
                 .unwrap()
-                .encode_images(images, &r0.cublas, &r0.stream)?
+                .encode_images_with_trace(images, &r0.cublas, &r0.stream, Some(&mut vision_trace))?
         };
         let num_u16 = vis_dev0.len_bytes / 2;
         let mut all_vis_embeds_host = vec![0u16; num_u16];
@@ -92,6 +93,9 @@ impl Qwen3_5Engine {
         }
 
         let mut dump = ForwardDump::default();
+        for (k, v) in vision_trace {
+            dump.tensors_f32.insert(k, v);
+        }
         let vis_f32: Vec<f32> = all_vis_embeds_host
             .iter()
             .copied()

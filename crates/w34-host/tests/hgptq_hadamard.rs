@@ -212,7 +212,15 @@ fn benchmark_block_hadamard() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _device = CudaDevice::set_current(0).unwrap();
     let stream = CudaStream::new(0).unwrap();
-    for (block, k, padded_k) in [(64, 2048, 2048), (64, 6144, 6144), (16, 4304, 4352)] {
+    for (block, k, padded_k) in [
+        (64, 2048, 2048),
+        (64, 4096, 4096),
+        (64, 5120, 5120),
+        (64, 6144, 6144),
+        (64, 12288, 12288),
+        (64, 17408, 17408),
+        (16, 4304, 4352),
+    ] {
         for rows in [1, 8, 16, 512, 4096] {
             let src = upload(&vec![f32_to_f16(0.25); rows * k], &stream);
             let dst = upload(&vec![0; rows * padded_k], &stream);

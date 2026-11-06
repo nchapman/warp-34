@@ -321,7 +321,10 @@ impl Qwen3_5MtpRank {
             + capacity.div_ceil(16) * 4
             + 32 * 1024 * 1024;
         let mut weights = DeviceArena::new(target.device.device_id, bytes)?;
-        let staging = DeviceBuffer::alloc(target.device.device_id, 64 * 1024 * 1024)?;
+        let gate_up_staging_bytes =
+            ((2 * (i / tp).div_ceil(64) * 64) * (h.div_ceil(128) * 128) * c.quant.bits()) / 8;
+        let staging_bytes = (64 * 1024 * 1024).max(gate_up_staging_bytes);
+        let staging = DeviceBuffer::alloc(target.device.device_id, staging_bytes)?;
         let load = |name: &str, n: usize, k: usize| -> Result<RawLinearHost> {
             let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), &c.quant)?;
             if raw.dims() == (n, k) {

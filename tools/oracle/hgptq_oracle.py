@@ -33,7 +33,8 @@ def patch_transforms():
         raise RuntimeError(f'Requires vLLM 0.31.0, got {vllm.__version__}')
     # Initialize the public quantization module first (linear imports it back).
     from vllm.model_executor.layers.quantization.compressed_tensors import compressed_tensors  # noqa: F401
-    from vllm.model_executor.layers.quantization.compressed_tensors.transform import linear
+    from vllm.model_executor.layers.quantization.compressed_tensors.transform import linear, module as tfm_module
+    from vllm.model_executor.kernels.linear.mixed_precision import marlin as mp_marlin
     cls = linear.CompressedTensorsLinearTransformMethod
     records = []
     for name, old, new in [
@@ -48,6 +49,63 @@ def patch_transforms():
         exec(compile(replacement, f'<hgptq-oracle:{name}>', 'exec'), vars(linear), namespace)
         setattr(cls, name, namespace[name])
         records.append(dict(method=name, old=old, new=new, original_sha256=hashlib.sha256(source.encode()).hexdigest(), patched_sha256=hashlib.sha256(replacement.encode()).hexdigest()))
+    # Patch HadamardTransform.forward so non-multiple-of-32 block counts (e.g.
+    # 1200 * (4304 // 16) = 322800 in 9B/27B vision fc2) do not hit hadacore's
+    # tail-tile corruption on the final 16 rows.
+    orig_had_fwd = tfm_module.HadamardTransform.forward
+    orig_had_src = textwrap.dedent(inspect.getsource(orig_had_fwd))
+    def patched_had_fwd(self, value, part_id=0):
+        if part_id in self.weight.partitions and self.transforms[part_id].scheme.type == 'hadamard':
+            ws = self.transforms[part_id].scheme.head_dim or value.shape[-1]
+            orig_shape = value.shape
+            flat = value.reshape(-1, ws)
+            rem = flat.shape[0] % 32
+            if rem != 0:
+                flat = tfm_module.torch.nn.functional.pad(flat, (0, 0, 0, 32 - rem))
+            out = tfm_module.ops.hadacore_transform(flat, inplace=False)
+            if rem != 0:
+                out = out[:flat.shape[0] - (32 - rem)]
+            return out.reshape(orig_shape)
+        return orig_had_fwd(self, value, part_id)
+    tfm_module.HadamardTransform.forward = patched_had_fwd
+    records.append(dict(
+        method='HadamardTransform.forward',
+        module=tfm_module.__file__,
+        module_sha256=sha(tfm_module.__file__),
+        original_sha256=hashlib.sha256(orig_had_src.encode()).hexdigest(),
+        patched_sha256=hashlib.sha256(textwrap.dedent(inspect.getsource(patched_had_fwd)).encode()).hexdigest(),
+    ))
+    # Patch MarlinLinearKernel.apply_weights for group_size == -1 (channelwise)
+    # with an exact 2^-3 / 2^+3 exponent shift so vLLM's unscaled FP16 cast
+    # inside marlin_template.h does not overflow FP16 before multiplying w_s.
+    orig_marlin_apply = mp_marlin.MarlinLinearKernel.apply_weights
+    orig_marlin_src = textwrap.dedent(inspect.getsource(orig_marlin_apply))
+    def patched_marlin_apply(self, layer, x, bias=None):
+        if self.config.group_size == -1:
+            c = self.config
+            w_q, w_s, w_zp = self._get_weight_params(layer)
+            return mp_marlin.apply_gptq_marlin_linear(
+                input=x * 0.125,
+                weight=w_q,
+                weight_scale=w_s * 8.0,
+                weight_zp=w_zp,
+                workspace=None,
+                wtype=c.weight_type,
+                input_size_per_partition=c.partition_weight_shape[0],
+                output_size_per_partition=c.partition_weight_shape[1],
+                input_global_scale=getattr(layer, 'input_global_scale', None),
+                bias=bias,
+                input_dtype=c.act_type,
+            )
+        return orig_marlin_apply(self, layer, x, bias=bias)
+    mp_marlin.MarlinLinearKernel.apply_weights = patched_marlin_apply
+    records.append(dict(
+        method='MarlinLinearKernel.apply_weights',
+        module=mp_marlin.__file__,
+        module_sha256=sha(mp_marlin.__file__),
+        original_sha256=hashlib.sha256(orig_marlin_src.encode()).hexdigest(),
+        patched_sha256=hashlib.sha256(textwrap.dedent(inspect.getsource(patched_marlin_apply)).encode()).hexdigest(),
+    ))
     return dict(path=linear.__file__, file_sha256=sha(linear.__file__), patches=records)
 
 
@@ -105,6 +163,7 @@ def main():
     ap.add_argument('--warm-runs', type=int, default=2)
     ap.add_argument('--bench-runs', type=int, default=5)
     ap.add_argument('--max-len', type=int, default=4096)
+    ap.add_argument('--gpu-memory-utilization', type=float, default=0.88)
     args = ap.parse_args()
     if args.bench_prompt_ids and (args.image or args.capture_layers or args.capture_vision_layers):
         ap.error('benchmark must run separately without capture hooks')
@@ -131,7 +190,8 @@ def main():
     if any(out.iterdir()):
         ap.error('output directory must be empty')
     manifest = dict(status='starting', argv=sys.argv, model=str(model), revision=REVISION,
-                    options={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, prompts=PROMPTS, arithmetic='vLLM default Hadacore; no native rounding substitution',
+                    options={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, prompts=PROMPTS,
+                    arithmetic='vLLM Hadacore (32-row tail-padded for non-32 block counts) + exact 2^-3/2^+3 channelwise Marlin exponent shift',
                     env={k: os.environ.get(k) for k in ('CUDA_VISIBLE_DEVICES', 'PATH', 'VLLM_ENABLE_V1_MULTIPROCESSING', 'HF_HUB_OFFLINE')},
                     python=sys.version, executable=sys.executable,
                     script_sha256=sha(__file__))
@@ -154,7 +214,8 @@ def main():
             capture_dir = out / 'vision'
             argv = ['vllm_vl_dump', '--model', str(model), '--image', args.image,
                     '--prompt', args.prompt, '--out-dir', str(capture_dir),
-                    '--tokens', str(args.tokens), '--max-len', str(args.max_len)]
+                    '--tokens', str(args.tokens), '--max-len', str(args.max_len),
+                    '--gpu-memory-utilization', str(args.gpu_memory_utilization)]
             if args.capture_layers:
                 argv.append('--capture-layers')
             if args.capture_vision_layers:
@@ -175,7 +236,7 @@ def main():
             return
         options = dict(model=str(model), tokenizer=str(model), dtype='float16', tensor_parallel_size=1,
                        distributed_executor_backend='uni', enforce_eager=not args.graph_mode, seed=0,
-                       max_model_len=args.max_len, max_num_seqs=1, gpu_memory_utilization=0.65,
+                       max_model_len=args.max_len, max_num_seqs=1, gpu_memory_utilization=args.gpu_memory_utilization,
                        enable_prefix_caching=False, enable_chunked_prefill=True)
         manifest['llm_options'] = options
         record()

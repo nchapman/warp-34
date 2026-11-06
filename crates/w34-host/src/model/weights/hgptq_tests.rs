@@ -303,3 +303,59 @@ fn transformed_projection_matches_independent_reference_and_graph() {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn channelwise_hadamard_k4304_does_not_overflow_fp16_before_scale() {
+    let _device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let cublas = CublasHandle::new(&stream).unwrap();
+    let staging = DeviceBuffer::alloc(0, 16 * 1024 * 1024).unwrap();
+    let locks = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    locks.copy_from_host(&vec![0i32; 65536], &stream).unwrap();
+
+    let (n, k, block) = (1152, 4304, 16);
+    // Pack nibble 15 (q - 8 = +7) across all K=4304 elements with channelwise scale 0.05.
+    // For constant input x = 1.0, H16(x)[0] = 4.0 and H16(x)[1..16] = 0.0, so the
+    // unscaled accumulator on nibble-15 columns is (4304 / 16) * 4.0 * 7.0 * 10 = 75,320 > 65,504
+    // when input = 10.0, while the true scaled output is 75,320 * 0.05 = 3,766.0 <= 65,504.
+    let raw = RawLinearHost::U4B8NMajor {
+        packed: vec![0xFFFF_FFFF; n * (k / 8)],
+        scales: vec![f32_to_f16(0.05); n],
+        n,
+        k,
+        group_size: k,
+    };
+    let weights = raw.to_f16_vec();
+    let rotated = RawLinearHost::Hadamard {
+        inner: Box::new(raw),
+        block_size: block,
+    };
+    let mut arena = DeviceArena::new(0, 16 * 1024 * 1024).unwrap();
+    let proj = rotated.upload(&mut arena, &stream, &staging).unwrap();
+    for m in [1, 16] {
+        let input = vec![f32_to_f16(10.0); m * k];
+        let x = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+        x.copy_from_host(&input, &stream).unwrap();
+        let y = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        let scratch =
+            DeviceBuffer::alloc(0, proj.input_transform_workspace_bytes(m).unwrap()).unwrap();
+        let ex = stream.exec(scratch.addr(), scratch.len_bytes);
+        proj.forward(&ex, &cublas, locks.addr(), 65536, x.addr(), y.addr(), m)
+            .unwrap();
+        let mut actual = vec![0u16; m * n];
+        y.copy_to_host(&mut actual, &stream).unwrap();
+        let hx = rotate(&input, block);
+        let expected_col0: f32 = (0..k)
+            .map(|i| f16_to_f32(hx[i]) * f16_to_f32(weights[i]))
+            .sum();
+        assert!(expected_col0 > 3700.0 && expected_col0 < 3800.0);
+        for &bits in &actual {
+            let got = f16_to_f32(bits);
+            assert!(
+                got.is_finite() && (got - expected_col0).abs() / expected_col0 < 0.002,
+                "m={m} got={got} expected={expected_col0}"
+            );
+        }
+    }
+}
