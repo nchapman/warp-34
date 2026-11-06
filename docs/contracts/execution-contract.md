@@ -51,19 +51,13 @@ To support `DFlash2` and `MTP` without dynamic graph branching or extra forward 
   - `layer_to_slot: [i8; 64]`: maps layer index `l` to tap buffer plane `0..num_tap_layers`.
 - Output buffer layout: `tap_buffer: [num_tap_layers, N_max, hidden_size]` (`FP16`), written only for `valid_token_mask[t] == 1`.
 
-## 5. Composite CUDA `GraphKey`
+## 5. CUDA Graph Families & Valid-Row Isolation (`crates/w34-host/src/model/graphs.rs`)
 
-CUDA Graphs are keyed by the 6-tuple `GraphKey`:
+`Qwen3_5ModelRank` captures four distinct CUDA Graph families keyed by execution shape and attention context regime (`long_ctx = !uses_qsa() && seq_after > 1024`):
 
-```rust
-pub struct GraphKey {
-    pub execution_mode: ExecutionMode,   // DecodeM1 | SpecVerify { block_rows: u8 }
-    pub req_bucket: u16,                 // Padded request count R_max (e.g. 1, 2, 4, 8, 16)
-    pub tok_bucket: u16,                 // Padded token count N_max (e.g. 1, 2, 4, 8, 16, 64, 128)
-    pub query_len_class: QueryLenClass,  // SingleToken | UniformVerify(u8) | Heterogeneous
-    pub kv_layout_mode: KvLayoutMode,    // Fp16 | Tq4FirstLast2 | K8v4FirstLast2
-    pub tap_plan_id: u8,                 // 0 = None, 1 = DFlash2, 2 = Mtp
-}
-```
+1. **Single-Request `M = 1` Decode (`decode_graph`):** Keyed by `long_ctx: bool` (`false` = single-pass GQA MMA, `true` = parallel Split-KV).
+2. **Batched Multi-Request `M = 1` Decode (`batched_decode_graphs`):** Keyed by `(bucket_b, long_ctx, sample_mode)` for `bucket_b in {1, 2, 4, 8, 16}` and `sample_mode in {PlainGreedy, FastGreedy, LogitsOnly}`, using `valid_token_mask` and `valid_req_mask` to isolate padded rows `r >= R`.
+3. **Single-Request Speculative Verify (`spec_verify_graph`):** Keyed by `(m_verify, long_ctx)` for `m_verify = 1 + k` (`2..=16`), writing step-indexed GDN candidate states into `spec_state_indices[0..m_verify]`.
+4. **Batched Multi-Request Speculative Verify (`spec_verify_batch_graphs`):** Keyed by `(bucket_b, m_verify, long_ctx, emit_device_greedy)` for `bucket_b in {2, 4}` (`total_tokens = bucket_b * m_verify`), isolating each request's `[anchor, draft_1, ..., draft_k]` causal segment via `query_start_loc` and `spec_state_indices`.
 
-Keying by `total_tokens` alone is forbidden because `8 reqs x 1 tok` (`DecodeM1`) and `1 req x 8 tok` (`SpecVerify { block_rows: 8 }`) have distinct `query_start_loc` strides, GDN recurrent scan lengths, and attention causal masks.
+Keying by `total_tokens` alone is forbidden because `8 reqs x 1 tok` (`batched_decode_graphs`) and `1 req x 8 tok` (`spec_verify_graph`) have distinct `query_start_loc` strides, GDN recurrent scan lengths, and attention causal masks.

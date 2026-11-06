@@ -41,9 +41,9 @@ All generative endpoints translate into `warp-34`'s single canonical prompt-prep
 ```
 
 ### Module Layout
-- `crates/w34-host/src/server/mod.rs` — Axum router registration, auth middleware (`Authorization: Bearer <token>` and Anthropic `x-api-key: <token>` accepted equivalently when `--api-key` is configured; `anthropic-version` and `anthropic-beta` headers tolerated), shared `PreparedPrompt` builder, and `/v1/chat/completions` + `*/input_tokens`.
-- `crates/w34-host/src/server/responses.rs` — OpenAI Responses request/response types, bounded `ResponseStore` (`Mutex<VecDeque<StoredResponse>>`, capacity 256), `previous_response_id` history stitching, sync JSON builder, and 0-indexed `sequence_number` SSE state machine.
-- `crates/w34-host/src/server/anthropic.rs` — Anthropic Messages request/response types, `cch=` billing-header normalization, `thinking` / `tool_use` / `tool_result` / `image` block translation, sync JSON builder, typed Anthropic SSE state machine, `/v1/messages/count_tokens`, and Anthropic error envelopes.
+- `crates/w34-host/src/server.rs` & `crates/w34-host/src/server/http.rs` — Axum router registration, auth middleware (`Authorization: Bearer <token>` and Anthropic `x-api-key: <token>` accepted equivalently when `--api-key` is configured; `anthropic-version` and `anthropic-beta` headers tolerated), shared `PreparedPrompt` builder, `/v1/chat/completions`, `/v1/completions`, `*/input_tokens`, and `/tokenize` + `/detokenize`.
+- `crates/w34-host/src/responses_api.rs` — OpenAI Responses request/response types, bounded `ResponseStore` (`Mutex<VecDeque<StoredResponse>>`, capacity 256), `previous_response_id` history stitching, sync JSON builder, `/v1/responses/{response_id}/cancel`, and 0-indexed `sequence_number` SSE state machine.
+- `crates/w34-host/src/anthropic_api.rs` — Anthropic Messages request/response types, `cch=` billing-header normalization, `thinking` / `tool_use` / `tool_result` / `image` block translation, sync JSON builder, typed Anthropic SSE state machine, `/v1/messages/count_tokens`, and Anthropic error envelopes.
 
 ### Invariants Preserved Across All Protocols
 1. **Stateful `tool_choice: "none"` safety invariant**: Whenever `tools` is non-empty and `tool_choice` resolves to `"none"`, `resolve_request_constraint()` attaches `TokenBitmaskConstraint::from_disallowed_tokens` banning `<tool_call>` token emission (`op_sampler.cu` fast masked greedy / full masked sampler), while keeping tool schemas rendered in the system prompt so `MambaRadixCache` prefixes remain byte-identical across turns toggling `tool_choice`.
@@ -52,9 +52,9 @@ All generative endpoints translate into `warp-34`'s single canonical prompt-prep
 
 ---
 
-## 3. Token-Counting Endpoints
+## 3. Token-Counting & Tokenization Endpoints
 
-All three token-counting routes execute `prepare_chat_prompt()` (including Jinja chat template rendering, tool schema injection, `enable_thinking` prompt suffixing, and multimodal `<|vision_start|><|image_pad|>...<|vision_end|>` token expansion) and return immediately without allocating KV/SSM blocks or scheduling a GPU forward pass.
+All three token-counting routes execute `prepare_chat_prompt()` (including Jinja chat template rendering, tool schema injection, `enable_thinking` prompt suffixing, and multimodal `<|vision_start|><|image_pad|>...<|vision_end|>` token expansion) and return immediately without allocating KV/SSM blocks or scheduling a GPU forward pass. In addition, `/tokenize` (`POST /tokenize`, `POST /v1/tokenize`) and `/detokenize` (`POST /detokenize`, `POST /v1/detokenize`) provide raw text/chat tokenization and token-ID decoding utilities compatible with `vLLM`.
 
 | Route | Request Body | Success Response (`200 OK`) | Error Envelope |
 |---|---|---|---|

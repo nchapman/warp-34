@@ -12,8 +12,7 @@ references are **1–2× RTX 3090 / 3090 Ti (`sm_86`)** and **1–2× RTX 4090
 Sources are tagged inline:
 
 - **[BOX]** queried on this machine (2× RTX 3090 Ti, driver 615.71.09, CUDA 13.4)
-- **[VENDOR]** pinned llama.cpp source (`vendor/llama.cpp`, cb7934c5) — block
-  structs / kernel dispatch, the spec for format internals
+- **[VENDOR]** reference `llama.cpp` (`cb7934c5`) block structs / kernel dispatch for format internals
 - **[WP]** NVIDIA Ampere GA102 GPU Architecture Whitepaper (v1/v2)
 - **[ADA]** NVIDIA Ada Whitepaper Appendix A (official RTX 3090 Ti performance table)
 - **[CC]** CUDA C++ Programming Guide, Compute Capabilities appendix (CUDA 13.x)
@@ -23,13 +22,12 @@ Sources are tagged inline:
 - **[TPU]** TechPowerUp GPU database
 - **[PTXAS]** verified by assembling PTX with this box's `ptxas` (CUDA 13.4)
 
-> **The box is not what the project name says.** `nvidia-smi` reports **2×
-> GeForce RTX 3090 Ti** (GA102-350, fully-enabled die), not RTX 3090. All
-> numbers below are for the 3090 Ti. Differences that matter: 84 SMs (not 82),
-> 336 tensor cores, 21 Gbps GDDR6X (1008 GB/s, not 936), boost 1860 MHz
-> (not 1695), 450W stock TDP — and **no NVLink** (removed on 3090 Ti).
-> PLAN.md still says "RTX 3090"; every target/decision below assumes sm_86,
-> which both cards share.
+> **Primary `sm_86` reference machine:** `nvidia-smi` reports **2×
+> GeForce RTX 3090 Ti** (GA102-350, fully-enabled die). All numbers in §§1–11
+> are for the 3090 Ti. Differences vs RTX 3090 (`GA102-300`): 84 SMs (vs 82),
+> 336 tensor cores (vs 328), 21 Gbps GDDR6X (`1008 GB/s` vs `936 GB/s`), boost
+> 1860 MHz (vs 1695 MHz), 450W stock TDP — and **no NVLink** (removed on 3090 Ti;
+> RTX 3090 retains 2-way NVLink). Both share `sm_86`.
 
 ---
 
@@ -52,7 +50,7 @@ Sources are tagged inline:
 | Register file per SM | 64K × 32-bit (256 KB) | [WP][ATG] |
 | TDP | 450W stock — ran power-capped at 275W during early perf research; **both cards at stock 450 W since 2026-10-03** (ops, commit `ac9b9cd`; §8 measured: the cap does not bind); pre-lift IMMA/power ceilings in perf notes are conservative | [TPU][BOX] |
 | PCIe | Gen4 x16 card; **this box wires each card at x8** (2-GPU bifurcation) | [TPU][BOX] |
-| GPU0↔GPU1 | `nvidia-smi topo -m` = **PHB** (same host bridge) — **P2P is dead on this box**: `cudaDeviceCanAccessPeer` = 0 both directions, `cudaDeviceEnablePeerAccess` → "peer access is not supported" (AMD Ryzen root complex; measured, `docs/contracts/mtp-tp.md` LV2). Cross-GPU traffic is pinned-sysmem two-hop — the TP substrate (`src/cuda/tpm.rs` dispatches P2P one-shot when available, sysmem otherwise); strategy in `docs/contracts/multi-gpu.md` | measured 2026-10-04; P2P probe 2026-10-14 |
+| GPU0↔GPU1 | `nvidia-smi topo -m` = **PHB** (same host bridge) — **P2P is disabled on this box**: `cudaDeviceCanAccessPeer` = 0 both directions, `cudaDeviceEnablePeerAccess` → "peer access is not supported" (AMD Ryzen root complex). Cross-GPU traffic uses pinned-sysmem two-hop when P2P is unavailable and 1-hop NVLink VRAM when P2P is available (`crates/w34-host/src/cuda/collectives.rs` & `crates/w34-kernels/csrc/ops/op_collectives.cu`); contract in `docs/contracts/collectives.md` | measured 2026-10-04; P2P probe 2026-10-14 |
 | NVLink | **None.** 3090 Ti removed it (RTX 3090 had 2-way NVLink) | NVIDIA dev forums; note some vendor spec sheets still list "2-way NVLink" — template noise, the PCB has no NVLink fingers |
 | ECC | No | [BOX][TPU] |
 | Copy engines (`asyncEngineCount`) | 2 → H2D and D2H can overlap | [BOX] |
@@ -212,16 +210,15 @@ smem and `test_wait`-style barriers** — Hopper niceties don't exist here.
 
 [BOX] Both cards:
 
-- Power limit **450 W (stock) since 2026-10-03** (ops change on `main`;
-  was 275 W before — all numbers derived under the 275 W cap were stale
-  until re-measured, see §11 and `research/log.md`).
+- Power limit **450 W (stock) since 2026-10-03** (was 275 W during initial
+  hardware bringup — see §11).
 - **Measured (2026-10-03, GPU 1, synthetic loads): the cap does not bind.**
   DRAM streaming held 1950 MHz at ~305 W; pure-mma tensor loads held
   1950–1965 MHz at only 205–238 W. So §4 peak tables scale by 1950/1860
   (+4.8%) at these operating points, not down.
 - Real kernels mix pipes + DRAM and may draw more than any synthetic —
-  sustained clocks under actual GEMM/decode get confirmed per-kernel by
-  the census/micro layers in `research/`, not assumed from these numbers.
+  sustained clocks under actual GEMM/decode are verified via `w34 profile-diff`
+  and `nsys` traces rather than assumed from synthetic loads.
 - GDDR6X junction temps run hot; `nvidia-smi` doesn't expose memory
   temperature on this driver — watch for memory-clock throttling during long
   decode runs.
@@ -230,45 +227,37 @@ smem and `test_wait`-style barriers** — Hopper niceties don't exist here.
 
 ## 9. Roofline mapping to our workloads
 
-Models on disk (dev/parity) [BOX]: `Qwen3.5-0.8B-Q4_K_M.gguf` = 508 MB,
-`Qwen3.5-9B-Q4_K_M.gguf` = 5.3 GB. **Production lane (since the lane
-consolidation): GPTQ W4A16 g128** (`docs/contracts/gptq-g128.md`,
-Qwen3.8-27B staged) — the Q4_K_M rows below are the retired GGUF lane's
-reference math, kept for the llama-bench comparisons. Bandwidth model
-uses the **measured 959.5 GB/s** read ceiling (§11; 95.2% of 1008 theory).
+`warp-34` executes Safetensors checkpoints in unified Marlin **`W4A16` / `W8A16`**
+tile layout (`docs/MODELS.md`, `crates/w34-kernels/csrc/ops/op_marlin.cu`). The
+GGUF `Q4_K_M` figures below are included as reference math for cross-engine
+roofline comparisons (`benchmarks/perf/`). Bandwidth model uses the **measured
+959.5 GB/s** read ceiling (§11; 95.2% of 1008 theory).
 
 - **Decode (batch 1) is DRAM-bound**: per-token traffic ≈ all weights + KV
   row reads.
-  - 9B Q4_K_M: 5.3 GB/token → ceiling ≈ 959.5/5.3 ≈ **181 tok/s**
+  - 9B `W4A16` / `Q4_K_M`: ~5.3–5.4 GB/token → ceiling ≈ 959.5/5.3 ≈ **181 tok/s**
     (weights only). Tensor cores idle.
-  - 27B Q4_K_M (production target): 16.3 GB file, but decode reads
-    14.02 GB/token (GGUF enumeration, research/results/PROXY.md: minus
-    the 0.72 GB duplicate-vocab tensor, norms, non-weight state) →
-    ceiling ≈ **68.4 tok/s** at measured BW. The 58.8 figure (16.3 GB
-    total) remains the conservative bound; the 52 tok/s M1 target = 76%
-    of the decode-read ceiling.
-  - 0.8B Q4_K_M: 508 MB/token → ceiling ≈ **1890 tok/s** theory-bound —
+  - 27B `W4A16` / `Q4_K_M` (production target): ~14.0–14.5 GB/token streamed →
+    ceiling ≈ **66–68 tok/s** at measured BW (`warp-34` achieves `54.5 tok/s` end-to-end on 1× 3090 Ti).
+  - 0.8B `W4A16` / `Q4_K_M`: ~508 MB/token → ceiling ≈ **1890 tok/s** theory-bound —
     but at ~30 kernels/layer the measured 1.36 µs pipelined launch
     overhead (§11) dominates long before that: **CUDA graphs / kernel
     fusion is the lever for the 0.8B** (graphs amortize to 0.58 µs/node).
 - **Prefill is tensor-bound**. Ceilings: **83.8 TF measured sustained**
   (F16 mma, FP32-acc, 1950 MHz) / **337 TOPS measured** (s8 IMMA) / ~80
   TOPS (dp4a path). Arithmetic-intensity crossover vs measured DRAM:
-  F16-TC 83.8e12/959.5e9 ≈ **87 FLOP/B**; IMMA ≈ **351 OP/B**. K-quants:
-  dequant cost rides the INT32/FP32 pipes concurrently with mma.
+  F16-TC 83.8e12/959.5e9 ≈ **87 FLOP/B**; IMMA ≈ **351 OP/B**.
 - **L2 (6 MB) cannot hold a layer** (9B: ~190 MB/layer average) — decode
-  bandwidth math must assume DRAM for weights. The 4.125 MB persisting
-  set-aside fits things like the embedding table slice or a hot KV page.
+  bandwidth math on `sm_86` must assume DRAM for weights. The 4.125 MB persisting
+  set-aside fits hot scratch activations or a hot KV slice (whereas on RTX 4090
+  `sm_89`, the 72 MB L2 + 49.5 MB persisting window holds full activation matrices
+  and scratch arenas — see §12).
 - **KV cache per token** (full-attention layers):
-  `2 × n_attn_layers × n_kv_heads × head_dim × bytes` — pull exact dims from
-  the GGUF headers when sizing; budget is tens of GB-free so even fp16 KV
-  for 32k ctx is fine on 24 GB with 5.3 GB weights.
-- **Two GPUs, no NVLink, no P2P** (§1): weights-parallel sharding over both
-cards works (each holds half the layers); cross-card traffic goes over
-PCIe Gen4 x8 via pinned sysmem. TP=2 is VIABLE on this substrate and
-landed — 9B tg128 231 t/s vs vLLM TP=2 169.7 (`docs/contracts/tp2.md`);
-the seam is a two-hop sysmem exchange (~37–55 µs at 8–24 KB payloads on
-the PHB wire, the per-seam floor without P2P).
+  `2 × n_attn_layers × n_kv_heads × head_dim × bytes` (`docs/contracts/cache-layout.md`).
+- **Two GPUs, no NVLink, no P2P** (§1): tensor-parallel sharding over both
+  cards splits weights in half per rank; cross-card traffic goes over PCIe Gen4 x8
+  via pinned sysmem (`docs/contracts/collectives.md`) in ~18–22 µs per all-reduce,
+  delivering `211.7 tok/s` on 9B `TP=2` and `90.8 tok/s` on 27B `TP=2` (vs `vLLM` `57.2 tok/s`).
 - Model load over PCIe Gen4 x8 ≈ 16 GB/s → 5.3 GB in ~0.35 s; `asyncEngineCount=2`
   lets H2D and D2H overlap [BOX].
 
@@ -351,7 +340,7 @@ layer-split only (no NVLink, §1) — and layer-split streams each card's half
 **sequentially**, so it buys capacity, not speed: two-card Q8_0 27B ≈
 30 tok/s is slower than one-card Q4_K_M ≈ 52 tok/s.
 
-## 11. Measured on this box (calibration 2026-10-03, GPU 1; `research/log.md` + `research/results/calib/*.json`)
+## 11. Measured on this box (calibration 2026-10-03, GPU 1)
 
 1. **DRAM bandwidth — MEASURED**: read stream **959.5 GB/s** (95.2% of
    theory; p10–p90 spread 0.04%), memcpy D2D 909 GB/s effective.
@@ -364,19 +353,16 @@ layer-split only (no NVLink, §1) — and layer-split streams each card's half
    1-node graph replay. Implication: at ~150 launches/token the 0.8B pays
    ~37% of its weight-bound budget in dispatch — graphs/fusion are
    first-class for 0.8B; host-side syncs are ruinous.
-4. **P2P between the two cards — RESOLVED (dead)**: `cudaDeviceCanAccessPeer`
-   = 0 both directions; enable → "peer access is not supported between
-   these two devices" (2026-10-14, `docs/contracts/mtp-tp.md` LV2). The TP
-   seam runs pinned-sysmem two-hop by necessity.
-5. Optional: L2 line/sector behavior and shared-memory latency numbers for
-   the tuning docs (microbench; not verified in this pass).
+4. **P2P between the two cards — RESOLVED (disabled on AMD Ryzen PHB)**:
+   `cudaDeviceCanAccessPeer` = 0 both directions; `cudaDeviceEnablePeerAccess`
+   returns "peer access is not supported between these two devices"
+   (`docs/contracts/collectives.md`). The TP seam runs pinned-sysmem two-hop on
+   non-P2P PCIe and 1-hop NVLink VRAM when P2P is available.
 
-Re-verification one-liners:
+Re-verification one-liner:
 
 ```sh
 nvidia-smi --query-gpu=index,name,power.limit,power.default_limit,clocks.sm,clocks.mem,pcie.link.gen.current,pcie.link.width.current --format=csv
-nvcc -o /tmp/devprops tools/hw/devprops.cu && /tmp/devprops   # cudaDeviceProp dump
-for t in sm_86 sm_90; do sed "s/^.target .*/.target $t/" tools/hw/feat.ptx > /tmp/feat_$t.ptx; ptxas -arch=$t /tmp/feat_$t.ptx -o /dev/null; done  # feature-gate probes
 ```
 
 ---

@@ -9,12 +9,14 @@ Page allocation and radix prefix indexing operate exclusively on **logical `page
 
 No scheduler, radix tree, or block-table manager may multiply a `page_id` or `slot` by a global "bytes per token" constant. Physical byte offsets are resolved per layer through `KvLayerLayout`.
 
-## 2. Cache Namespaces (`KvNamespace`)
+## 2. Cache Namespaces (`KvNamespace`) & QSA Indexer Slices
 
 A single `KvPool` manages isolated logical page tables across three cache namespaces:
-1. `TargetFullAttn` (`0`): Target model full-attention layers (e.g., 16 full-attn layers on 27B, 8 on 9B, 8 on 4B; `head_dim = 256`).
-2. `MtpFullAttn` (`1`): Native `Qwen3_5MTP` 1-layer full-attention KV cache (`head_dim = 256`).
+1. `TargetFullAttn` (`0`): Target model full-attention layers (e.g., 16 full-attn layers on 27B, 8 on 9B, 8 on 4B, 12 QSA layers on `Qwen3.8-Flash-Next`; `head_dim = 256`).
+2. `MtpFullAttn` (`1`): Native `Qwen3_5MTP` / `Qwen4` `MTP` 1-layer full-attention KV cache (`head_dim = 256`).
 3. `DFlashDraftContext` (`2`): `DFlash2` proposer cross-attention draft-context KV cache (`head_dim = 128` on 27B with non-causal query-relative left window `2048`; `BF16` full attention on 4B).
+
+For `Qwen3.8-Flash-Next` (`qwen4_exp`), `KvPool` additionally allocates per-layer QSA indexer side-caches (`qsa_raw_k`: `[num_pages, B=16, 128]` `FP16` and `qsa_comp_k`: `[num_pages, B/4=4, 128]` `FP16` with 4:1 mean-pooled keys) indexed by the exact same logical `page_id`s as `TargetFullAttn` (and `MtpFullAttn`).
 
 ## 3. Per-Layer Physical Descriptor (`KvLayerLayout`)
 
@@ -75,6 +77,7 @@ For physical page `p`, local KV head `h in 0..local_kv_heads`, and intra-page to
 typedef enum {
     W34_ATTN_MASK_CAUSAL                  = 0,
     W34_ATTN_MASK_SYMMETRIC_WINDOW        = 1, // Non-causal within query chunk, sliding window
+    W34_ATTN_MASK_NONCAUSAL_WINDOW        = 1,
 } w34_attn_mask_mode;
 
 typedef struct {
@@ -93,6 +96,7 @@ typedef struct {
     int32_t mask_mode;                   // w34_attn_mask_mode
     int32_t sliding_window;              // 0 = full, >0 = window size (e.g. 2048)
     float   sm_scale;                    // 1.0f / sqrtf(head_dim)
+    int32_t reserved;
 } w34_attention_batch;
 ```
 

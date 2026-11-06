@@ -9,7 +9,7 @@
   - **`vLLM 0.31.0` (`8352b2427`)**: Installed at `~/.local/share/mise/installs/python/3.12.12/lib/python3.12/site-packages/vllm/` (sparse tree at `/home/nchapman/Code/warp3090/vendor/vllm`). Donor for `FP16` model spine, Marlin GEMMs (`W4A16`/`W8A16`/`W4A8`/`moe_wna16`), `GemmaRMSNorm`, `fused_qk_rmsnorm_rope_gate`, `Qwen3_5MTP`, 9-step GPU sampler, and `Qwen3Parser` (reasoning/tools/vision).
   - **`vllm.cpp` (`50d425bec`)**: `/home/nchapman/Code/warp3090/vendor/vllm.cpp`. Donor for native CUDA C++ GDN kernels (`src/vt/cuda/cuda_gdn.cu`), verified against `vLLM` FLA golden dumps.
   - **`SGLang v0.5.19` (`0bcd822377`)**: `/home/nchapman/Code/warp3090-dflash/vendor/sglang` & Docker `lmsysorg/sglang:v0.5.19`. Donor for `MambaRadixCache` + `HybridReqToTokenPool` (`extra_buffer` ping-pong GDN checkpoint donation) and `DFlashWorkerV2` (`M=8` verify on 27B, `M=16` on 4B).
-  - **`warp3090` (`/home/nchapman/Code/warp3090`)**: Donor for TurboQuant 4-bit KV (`TQ4`: `block_tq4_0` 132B/row, Rademacher+WHT-256, Beta(256) codebook, `FirstLast2` `2.52×` `f16b`, `fattn_vec_tq` + `fattn_mma_tq`) and pinned-sysmem `TP=2` collectives (`op_all_reduce.cu`).
+  - **`warp3090` (`/home/nchapman/Code/warp3090`)**: Donor for TurboQuant 4-bit KV (`TQ4`: `block_tq4_0` 132B/row, Rademacher+WHT-256, Beta(256) codebook, rotated `Q8_0` boundaries + LSQ `TQ4` interior `3.07×`, `fattn_vec_tq` + `fattn_mma_tq`) and pinned-sysmem / NVLink P2P `TP=2` & `TP=4` collectives (`op_collectives.cu`).
 - **Key Docs:** `docs/STATE.md` (current status & verified benchmarks), `docs/ROADMAP.md` (architecture & donor reference map, seam contracts, & core invariant tests), `docs/HARDWARE.md` (30-series `sm_86` & 40-series `sm_89` rooflines & ISA traps).
 
 ## Commands

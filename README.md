@@ -9,7 +9,7 @@ one.
 1. **Explicit Reference Donor per Subsystem ([`docs/ROADMAP.md`](docs/ROADMAP.md)):**
    - **`vLLM 0.31.0` (`8352b2427`)**: Primary donor for the `FP16` model spine, Marlin GEMMs (`W4A16` / `W8A16` / `W4A8` / `moe_wna16`), layer fusions (`GemmaRMSNorm`, `fused_qk_rmsnorm_rope_gate`, GDN `chunk` + `fused_recurrent`), native `MTP`, 9-step GPU sampler, and Qwen3 reasoning/tool/vision parsers.
    - **`SGLang v0.5.19` (`0bcd822377`)**: Primary donor for **Hybrid Prefix Caching (`MambaRadixCache` + `HybridReqToTokenPool` `extra_buffer` strategy)** and **`DFlash2` (`DFlashWorkerV2` `M=8` speculative verify)** — the two areas where `vLLM 0.31.0` cannot combine hybrid prefix caching with draft models or breaks on `TP=2` (`tau=1.000`).
-   - **`warp3090` (`sm_86` proven IP)**: Primary donor for **TurboQuant 4-bit KV (`TQ4`)** (`block_tq4_0` 4.125 bpw, Rademacher+WHT-256 rotation, Beta(256) Lloyd-Max codebook, `FirstLast2` `FP16` boundary layers, fused `fattn_mma_tq` + GQA-8 `fattn_vec_tq`) and **Pinned-Sysmem PCIe Gen4 x8 `TP=2` AllReduce** (`~18 µs`).
+   - **`warp3090` (`sm_86` proven IP)**: Primary donor for **TurboQuant 4-bit KV (`TQ4`)** (`block_tq4_0` 4.125 bpw, Rademacher+WHT-256 rotation, Beta(256) Lloyd-Max codebook, rotated `Q8_0` boundary layers + LSQ `TQ4` interior layers, fused `fattn_mma_tq` + GQA-8 `fattn_vec_tq`) and **Pinned-Sysmem PCIe Gen4 x8 / NVLink P2P `TP=2` & `TP=4` Collectives** (`~18 µs`).
 2. **End-to-end `f16` activation spine:** Hidden states, residuals, norms, RoPE,
    attention, GDN, and Marlin GEMMs consume and produce `f16` directly — zero
    `f32 ↔ f16` adapter casts between ops.

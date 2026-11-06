@@ -19,6 +19,8 @@ One `StateBundle` slot represents the complete GDN state across all `L_gdn` line
   - Sharded (`TP=2`): `ssm_state = 72.00 MiB / rank`; `conv_state = 1.41 MiB / rank` → **`73.41 MiB / rank / slot`**.
 - **Qwen3.5-9B / 4B (`L_gdn = 24`, `H_k = 16`, `H_v = 32`, `d_k = 128`, `d_v = 128`):**
   - Unsharded (`TP=1`): `ssm_state = 24 * 32 * 128 * 128 * 4 B = 48.00 MiB`; `conv_state = 24 * 8192 * 3 * 2 B = 1.125 MiB` → **`49.13 MiB / slot`** (`24.56 MiB / rank` on `TP=2`).
+- **Qwen3.8-Flash-Next (`qwen4_exp`: `L_gdn = 36`, `H_k = 16`, `H_v = 48`, `d_k = 128`, `d_v = 128`, `ple_layer_ids = [2]`):**
+  - Includes `36` GDN layers (`ssm_state` `FP32` + `conv_state` `FP16`) plus `ple_conv_state` (`[num_ple_layers, hc_count * hidden_size, 9]` `FP16`, `184,320 B/slot` unsharded) and `ple_history_tokens` (`[ngram_size - 1]` `u32` token IDs per slot) → **`110.3 MiB / slot` on `TP=1`** (`55.2 MiB / rank / slot` on `TP=2`).
 
 Because each 27B `StateBundle` is `~73.4 MiB/rank`, all state slots (active request slots, speculative verify scratch slots, ping-pong checkpoint track buffers, and `MambaRadixCache` snapshot slots) are pre-budgeted upfront by `CapacityPlanner`.
 

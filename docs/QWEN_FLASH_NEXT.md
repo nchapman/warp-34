@@ -1,79 +1,32 @@
-# Qwen3.8-Flash-Next (`qwen4_exp`) — Architecture & Implementation Plan
+# Qwen3.8-Flash-Next (`qwen4_exp`) — Architecture & Verification Reference
 
-> **Posture:** Native, production-grade support for **`Qwen3.8-Flash-Next` (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`)** on **both 1× and 2× RTX 3090 Ti (`sm_86`)** in `warp-34`, built on the `CudaDeviceProps` / `w34_device_props` multi-arch (`sm_86,sm_89`) foundation so a subsequent RTX 4090 (`sm_89`) tuning pass requires no structural rework.
+> **Posture:** Native, production-grade support for **`Qwen3.8-Flash-Next` (`Qwen4ExpForConditionalGeneration`, `model_type: "qwen4_exp"`)** across **1–4× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs** in `warp-34`, built on the `CudaDeviceProps` / `w34_device_props` multi-arch (`sm_86,sm_89`) foundation.
 >
-> **Strategic Scope:** `Qwen3.8-Flash-Next` is the first open-weight release of the **Qwen4 architecture family** (`qwen4_exp` / `qwen4_exp_text`). Every new primitive introduced here — **HyperConnection (`GatedResidual`)**, **Qwen Sparse Attention (`QSA`)**, **N-Gram Per-Layer Embeddings (`PLE`)**, **Tiered 512-Expert MoE Offloading**, and **Multi-Stream `Qwen4` `MTP`** — is designed as a first-class, reusable `warp-34` subsystem that composes cleanly with our existing `CudaDeviceProps` device abstraction, `KvPool`, `StateBundlePool`, `MambaRadixCache`, `CUDAGraphRunner`, and `w34-oracle` verification contracts.
+> **Strategic Scope:** `Qwen3.8-Flash-Next` is the first open-weight release of the **Qwen4 architecture family** (`qwen4_exp` / `qwen4_exp_text`). Every primitive introduced here — **HyperConnection (`GatedResidual`)**, **Qwen Sparse Attention (`QSA`)**, **N-Gram Per-Layer Embeddings (`PLE`)**, **Tiered 512-Expert MoE Offloading**, and **Multi-Stream `Qwen4` `MTP`** — is a first-class, reusable `warp-34` subsystem that composes cleanly with `CudaDeviceProps`, `KvPool`, `StateBundlePool`, `MambaRadixCache`, `CUDAGraphRunner`, and `w34` oracle verification contracts.
 >
 > **Non-Goals:** No runtime abliteration / weight-modification hacks, no `llama.cpp` / GGUF side-quests, and no single-sequence-only shortcuts that break `warp-34`'s transactional scheduler or prefix cache.
 
 ---
 
-## Rust CPU bridge migration (completed & verified)
-
-The host evaluator, dynamic physical-core worker pool, and mailbox ownership
-live in `crates/w34-host/src/moe_cpu_bridge.rs` and `moe_cpu_bridge/eval.rs`.
-`op_moe_cpu_bridge.cu` contains only device kernels and launch wrappers.
-`detect_worker_cpus()` queries `sched_getaffinity` and deduplicates SMT siblings
-via `/sys/devices/system/cpu/cpu*/topology/{physical_package_id,core_id}` (up to
-32 physical cores, with `available_parallelism` fallback), pinning the responder
-as worker zero on `cpus[0]` alongside `cpus.len() - 1` pinned background workers
-on `cpus[1..]`. Expert packs are shared through owned `Arc` backing; shutdown
-drains GPU work before joining responders and freeing mailboxes.
-
-Arithmetic retains fixed two-slice decode, router-order reduction, and the
-original scalar bias FMA contraction. The standalone NVCC comparison covers
-20 expert cases (decode slices at 1–4 tokens and prefill at
-1/2/3/4/5/8/9/16/17/32/33/96), all bit-identical (`/tmp/w34-verify/final.txt`).
-The direct FP16 preparation helper separately matches FP32 preparation for every
-finite binary16 value. On `test_qwen4_exp_real_checkpoint_tp1_and_tp2`
-(`/tmp/w34-bridge-dynamic-cpus.log`), `TP=1` warm target decode reaches
-**34.26 tok/s** and `TP=1` warm `MTP-3` reaches **44.92 tok/s** (`TP=2` warm
-target **64.99 tok/s**, `TP=2` warm `MTP-3` **125.22 tok/s**), matching or
-exceeding the C++ baseline (**32.79–34.16 tok/s** target / **43.89–44.79 tok/s**
-`MTP-3` in `/tmp/w34-cpp-bridge-baseline.log` and
-`/tmp/w34-cpp-bridge-repeat1.log`).
-
-**Failure policy:** an unsuccessful host-assisted graph acknowledges a failed
-mailbox so the device does not consume stale output or wait forever for that
-response. Its CUDA stream and dependent events carry a sticky host error.
-The serving worker checks this terminal condition at tick boundaries and exits
-through its existing supervised failure path, closing ingress and notifying
-queued/active callers before model destruction. Recovery requires an engine
-restart/reload with fresh streams and state; this is deliberately not a
-request-local retry. Clearing the error alone would permit reuse of KV/recurrent
-state already modified by a failed graph. No automatic in-process reload is
-implemented. Raw device synchronization remains available to drain teardown.
-
-Review disposition: the two important findings about silently poisoning future
-traffic are addressed by the supervised worker exit above, rather than by
-clearing the error. Timeout/error classification does not make an already
-failed graph's state reusable. Suggested active-token prefill compaction and
-richer worker diagnostics remain performance/diagnostic follow-ups. Device
-polling still relies on a live responder; normal evaluation failures are
-acknowledged, but a process-wide host stall is not covered by a GPU watchdog.
-The mapped staging-slot and test-capacity suggestions concern pre-existing
-code, not this migration. Full `mise run check` passed
-(`/tmp/w34-bridge-final-check.log`).
-
 ## 1. Model Architecture & Delta vs. `Qwen3.5` / `Qwen3.6`
 
-`Qwen/Qwen3.8-Flash-Next` (`180B` total parameters: `125B` backbone with `6B` activated per token + `51.2B` PLE n-gram table + `4B` MTP drafter) shares the 3:1 hybrid recurrence schedule and multimodal stem already proven in `warp-34` Phases 0–6, while introducing five Qwen4-generation architectural primitives.
+`Qwen/Qwen3.8-Flash-Next` (`180B` total parameters: `125B` backbone with `6B` activated per token + `51.2B` PLE n-gram table + `4B` MTP drafter) shares the 3:1 hybrid recurrence schedule and multimodal stem proven across `warp-34`, while introducing five Qwen4-generation architectural primitives.
 
 ### 1.1 Structural Overview (`config.json`)
 
-| Parameter | Value | `warp-34` Status / Subsystem |
+| Parameter | Value | `warp-34` Subsystem |
 |---|---|---|
-| `architectures` / `model_type` | `Qwen4ExpForConditionalGeneration` / `qwen4_exp` (`qwen4_exp_text`) | **New** family registration in `loader.rs` & `model/` |
-| `num_hidden_layers` | `48` (`12 × [3 × GDN → MoE, 1 × QSA → MoE]`) | Reuses hybrid 3:1 layer schedule |
+| `architectures` / `model_type` | `Qwen4ExpForConditionalGeneration` / `qwen4_exp` (`qwen4_exp_text`) | `crates/w34-host/src/loader/config.rs` & `src/model/` |
+| `num_hidden_layers` | `48` (`12 × [3 × GDN → MoE, 1 × QSA → MoE]`) | Hybrid 3:1 layer schedule |
 | `hidden_size` / `vocab_size` | `2560` / `248,320` (`bos` / `eos` = `248044`) | Same vocab size & tokenizer family as Qwen 3.5 / 3.8 |
 | `max_position_embeddings` | `262,144` (extensible to `1,000,000` via YaRN) | Supported by existing capacity & RoPE infrastructure |
-| **Gated DeltaNet (`linear_attention`, 36 layers)** | `H_v = 48`, `H_qk = 16`, `head_dim = 128`, `conv_kernel = 4`, `FP32` `ssm_state` | **Already implemented** (`csrc/gdn/`, `StateBundlePool`) |
-| **Vision (`Qwen3_VisionTransformer`) & 3D `mRoPE`** | `mrope_section = [11, 11, 10]`, `partial_rotary_factor = 0.25`, `theta = 1e7` | **Already implemented** (`vision.rs`) |
-| **HyperConnection (`GatedResidual`)** | `hc_count = 4` streams (`[T, 4, 2560]`), `hc_lowrank = 320`, per-branch `GemmaRMSNorm` | **New** (`csrc/hc.cu`, `model/hc.rs`) |
-| **Qwen Sparse Attention (`QSA`, 12 layers)** | Main GQA `24 Q / 2 KV` (`d = 256`, output sigmoid gate) + MQA Indexer (`4 Q / 1 KV`, `d = 128`, `compress_ratio = 4`, `budget = 2048` tokens = `512` blocks) | **New** (`csrc/qsa.cu`, `KvNamespace` extensions) |
-| **N-Gram Per-Layer Embedding (`PLE`)** | `ple_layer_ids = [2]` (0-based layer `1`), `ngram_size = 3`, `heads_per_ngram = 8` (`16` heads × `160` dim = `2560`), `~20M` rows/head (`51.2B` params across `128` shards), dilated short-conv (`kernel = 4`, `dilation = 3`, `state_len = 9`) | **New** (`csrc/ple.cu`, host `PleMmapTable`, `StateBundlePool` extension) |
-| **512-Expert Sparse MoE (`48` layers)** | `num_experts = 512`, `top_k = 10` routed + `1` shared expert, `moe_intermediate_size = 640`, `shared_expert_intermediate_size = 640` (`~62.8 GB` at `W4A16 g128`) | **New** tieredVRAM/RAM/CPU-PCIe execution engine extending `csrc/moe/` |
-| **Qwen4 Multi-Token Predictor (`MTP`)** | `1` layer (`full_attention` QSA + `512`-expert `INT4 g32` MoE), `residual_linear_shared` (`fc_embedding` + `fc_hidden`), dual-stream output (`[T, 2560]` + `[T, 10240]`), `K = 3` (`M_verify = 4`) | **New** (`mtp.rs` Qwen4 variant) |
+| **Gated DeltaNet (`linear_attention`, 36 layers)** | `H_v = 48`, `H_qk = 16`, `head_dim = 128`, `conv_kernel = 4`, `FP32` `ssm_state` | `csrc/ops/{op_gdn,op_gdn_wy}.cu`, `StateBundlePool` |
+| **Vision (`Qwen3_VisionTransformer`) & 3D `mRoPE`** | `mrope_section = [11, 11, 10]`, `partial_rotary_factor = 0.25`, `theta = 1e7` | `csrc/ops/{op_vision,op_vision_fa2}.cu`, `src/vision.rs` |
+| **HyperConnection (`GatedResidual`)** | `hc_count = 4` streams (`[T, 4, 2560]`), `hc_lowrank = 320`, per-branch `GemmaRMSNorm` | `csrc/ops/op_hc.cu`, `src/model/weights/layers.rs` |
+| **Qwen Sparse Attention (`QSA`, 12 layers)** | Main GQA `24 Q / 2 KV` (`d = 256`, output sigmoid gate) + MQA Indexer (`4 Q / 1 KV`, `d = 128`, `compress_ratio = 4`, `budget = 2048` tokens = `512` blocks) | `csrc/ops/op_qsa.cu`, `src/cache.rs` |
+| **N-Gram Per-Layer Embedding (`PLE`)** | `ple_layer_ids = [2]` (0-based layer `1`), `ngram_size = 3`, `heads_per_ngram = 8` (`16` heads × `160` dim = `2560`), `~20M` rows/head (`51.2B` params across `128` shards), dilated short-conv (`kernel = 4`, `dilation = 3`, `state_len = 9`) | `csrc/ops/op_ple.cu`, `src/ple.rs`, `StateBundlePool` |
+| **512-Expert Sparse MoE (`48` layers)** | `num_experts = 512`, `top_k = 10` routed + `1` shared expert, `moe_intermediate_size = 640`, `shared_expert_intermediate_size = 640` (`~62.8 GB` at `W4A16 g128`) | `csrc/ops/{op_moe,op_moe_router,op_moe_cpu_bridge}.cu`, `src/{moe_offload,moe_cpu_bridge}.rs` |
+| **Qwen4 Multi-Token Predictor (`MTP`)** | `1` layer (`full_attention` QSA + `512`-expert `INT4 g32` MoE), `residual_linear_shared` (`fc_embedding` + `fc_hidden`), dual-stream output (`[T, 2560]` + `[T, 10240]`), `K = 3` (`M_verify = 4`) | `src/mtp.rs`, `src/mtp/propose.rs` |
 
 ### 1.2 Canonical Checkpoint Target
 
@@ -91,7 +44,7 @@ Our primary reference checkpoint is [`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`]
 ### 2.1 Host Hardware Envelope (`docs/HARDWARE.md`)
 
 - **Primary Target GPUs:** **1× and 2× NVIDIA GeForce RTX 3090 Ti (`sm_86`, 84 SMs, 6 MiB L2, 24 GiB GDDR6X @ 1008 GB/s, 80 TF FP16-mma FP32-acc)** on PCIe Gen4 x8 (`topo PHB`, P2P disabled; cross-GPU communication uses `warp-34`'s `~18 µs` pinned-sysmem two-hop `TP=2` collectives).
-  - All new `qwen4_exp` kernels (`hc.cu`, `ple.cu`, `qsa.cu`, `moe_offload.cu`) use `w34_get_current_device_props` / `CudaDeviceProps` (`multi_processor_count`, `l2_cache_bytes`) rather than hardcoding 84-SM or 6-MiB-L2 constants, keeping the codebase clean for a dedicated RTX 4090 (`sm_89`) optimization pass once 3090 Ti qualification is complete.
+  - All `qwen4_exp` kernels (`op_hc.cu`, `op_ple.cu`, `op_qsa.cu`, `op_moe.cu`, `op_moe_cpu_bridge.cu`) use `w34_get_current_device_props` / `CudaDeviceProps` (`multi_processor_count`, `l2_cache_bytes`) rather than hardcoding 84-SM or 6-MiB-L2 constants, running natively across `sm_86` and `sm_89`.
 - **CPU:** **AMD Ryzen 9 7950X3D (16C / 32T, Zen 4)** with native **AVX-512** (`avx512f`, `avx512bw`, `avx512vnni`, `avx512_bf16`) + AVX2/FMA.
 - **System Memory & Storage:** **124 GiB DDR5 RAM** + **124 GiB NVMe swap** + **3.7 TB PCIe Gen4 NVMe** (`2.5 TB` free).
 
@@ -183,22 +136,22 @@ Because `Qwen3.8-Flash-Next` has only **12 full-attention (QSA) layers** with **
 
 ---
 
-### 3.2 HyperConnection (`GatedResidual`, `csrc/hc.cu`)
+### 3.2 HyperConnection (`GatedResidual`, `csrc/ops/op_hc.cu` & `src/model/weights/layers.rs`)
 
 Each of the 48 decoder layers wraps its token mixer (`GDN` or `QSA`) and its `MoE` block in a 4-branch `GatedResidual` (`hc_count = 4`, `hidden_size = 2560`, `hyper_hidden_size = 10240`, `hc_lowrank = 320`):
 - **State Layout:** Inter-layer hidden state has checkpoint-native shape `[T, 4, 2560]` (`HC` outer, `H` inner).
-- **Checkpoint Weight Mapping:** At load time, `loader.rs` concatenates `hyper_connection.input_mix_weight_down.weight` (`[320, 10240]`) and `hyper_connection.block_inject_weight.weight` (`[4, 10240]`) into a single 16-row-aligned projection `[336, 10240]` (zero-padded in rows `324..336` for Tensor Core alignment).
+- **Checkpoint Weight Mapping:** At load time, `loader` loads `hyper_connection.input_mix_weight_down.weight` (`[320, 10240]`) and `hyper_connection.block_inject_weight.weight` (`[4, 10240]`), executing them via fused `w34_small_n_gemm_dual_f16` during decode/verify (`T <= 16`) or cuBLAS during prefill.
 - **Fused Kernel Pipeline (`combine_and_mix`):**
   1. **`w34_hc_combine_and_grouped_gemma_rmsnorm`:** For each token `t` and branch `b ∈ 0..4`:
      - If a pending `(prev_block_output: [T, 2560], prev_injection: [T, 4])` exists from the preceding sub-block, fuses `hidden_states[t, b, :] += (2.0 * sigmoid(prev_injection[t, b] / 4.0)) * prev_block_output[t, :]` (rounding to activation dtype before norm reduction).
      - Computes independent `FP32` RMS variance per branch `b` over `2560` elements and writes normalized output `xn[t, b, i] = hidden_states[t, b, i] * rrms * (1.0f + weight[b, i])`.
-  2. **Low-Rank Down + Inject GEMM:** Skinny GEMM (`xn: [T, 10240] × W_down_inj^T: [10240, 336] → [T, 336]`), splitting `down: [T, 320]` and raw `inject_logits: [T, 4]`.
+  2. **Low-Rank Down + Inject GEMM:** Dual skinny GEMM (`xn: [T, 10240] → down: [T, 320], inject_logits: [T, 4]`).
   3. **`w34_hc_silu` + `w34_hc_gate_mix`:** Computes `lora = SiLU(down / 4.0)`, multiplies by `input_mix_weight_up^T` (`[320, 10240]`), applies `sigmoid(gate) / 4.0` element-wise read gates to the normalized streams `xn: [T, 4, 2560]`, and sums over the 4 branches into `block_input: [T, 2560]` while returning `inject_logits: [T, 4]`.
 - **Final Layer Mixer:** Before `lm_head` (no separate `model.language_model.norm` exists in `qwen4_exp`), `model.language_model.hyper_connection_mixer` (`use_combine = false`) runs `combine_and_mix` to materialize the last layer's combine into `multi_hidden: [T, 10240]` (retained as a `TapPlan` output for `Qwen4` `MTP`) and collapse it into `sample_hidden_states: [T, 2560]`.
 
 ---
 
-### 3.3 N-Gram Per-Layer Embedding (`PLE`, `csrc/ple.cu` & `model/ple.rs`)
+### 3.3 N-Gram Per-Layer Embedding (`PLE`, `csrc/ops/op_ple.cu` & `src/ple.rs`)
 
 At layer index `1` (`ple_layer_ids = [2]` in 1-based config indexing), before `attn_hyper_connection.mix`:
 1. **Materialize Pending HC Combine:** Any pending `(prev_block_output, prev_injection)` from Layer 0's MoE is combined into `hidden_states: [T, 10240]` first.
@@ -208,7 +161,7 @@ At layer index `1` (`ple_layer_ids = [2]` in 1-based config indexing), before `a
 3. **Zero-Copy `PleMmapTable` Gather + Async H2D:**
    - Groups the `16 * T` row IDs by shard (`0..128`), issues coalesced `madvise(MADV_WILLNEED)` across unique 4 KiB OS pages, gathers `16 × 160 B` (`2,560 B/tok`) of `F8_E4M3` bytes into a pinned host staging buffer using the CPU thread pool, and copies to GPU (`2.56 KB` for `M=1` decode, `10.24 KB` for `M=4` verify, `20 MiB` for an `8192`-token prefill chunk).
    - For CUDA Graph capture/replay (`M=1` decode and `M=4` verify), the host prepares the n-gram IDs from the known input token IDs (or runs a lightweight host-launch callback / pre-step gather for known anchor tokens, and in-graph pinned gather for draft tokens) into fixed-address device buffers.
-4. **GPU PLE Gating & Dilated Short-Conv (`csrc/ple.cu`):**
+4. **GPU PLE Gating & Dilated Short-Conv (`csrc/ops/op_ple.cu`):**
    - Dequantizes `F8_E4M3` embeddings via `weight_scale` into `[T, 2560]`.
    - Computes `key = key_proj(embeddings)` (`[T, 4, 2560]`) and `value = value_proj(embeddings)` (`[T, 2560]`).
    - Applies grouped `GemmaRMSNorm(group_size = 2560)` to `key` and `query = hidden_states.view(T, 4, 2560)`.
@@ -219,7 +172,7 @@ At layer index `1` (`ple_layer_ids = [2]` in 1-based config indexing), before `a
 
 ---
 
-### 3.4 Qwen Sparse Attention (`QSA`, `csrc/qsa.cu`)
+### 3.4 Qwen Sparse Attention (`QSA`, `csrc/ops/op_qsa.cu`)
 
 On the 12 full-attention layers (`layer_idx ∈ {3, 7, 11, ..., 47}`):
 1. **Fused Pre-Indexer (`w34_qsa_pre_indexer`):**
@@ -238,28 +191,30 @@ On the 12 full-attention layers (`layer_idx ∈ {3, 7, 11, ..., 47}`):
 
 ---
 
-### 3.5 Tiered 512-Expert MoE Engine (`csrc/moe/` & `model/moe_offload.rs`)
+### 3.5 Tiered 512-Expert MoE Engine (`csrc/ops/{op_moe,op_moe_router,op_moe_cpu_bridge}.cu` & `src/{moe_offload,moe_cpu_bridge}.rs`)
 
 Each of the 48 layers routes every token to `top_k = 10` of `512` experts (`gate_up: [2560, 1280]`, `down: [640, 2560]`, `W4A16 g128` = `2,621,440 B` packed weights + `40,960 B` scales = **`2.54 MiB` per expert**) plus `1` GPU-resident shared expert (`shared_expert` + `shared_expert_gate`).
 
-#### A. Multi-GPU Sharding (`TP=1` vs. `TP=2 / EP=2`)
-- **Single Card (`TP=1`):** Owns all `512` experts per layer (`K_hot = 32..48` in VRAM; remaining `464..480` in `HostExpertStore`).
+#### A. Multi-GPU Sharding (`TP=1` vs. `TP=2 / EP=2` vs. `TP=4 / EP=4`)
+- **Single Card (`TP=1`):** Owns all `512` experts per layer (`K_hot = 88..96` in VRAM via `plan_tiered_moe_hot_per_layer`; remaining cold experts in `HostExpertStore`).
 - **Dual Card (`TP=2` with `EP=2` on Routed Experts):**
   - Rank 0 owns experts `0..256`; Rank 1 owns experts `256..512`.
-  - Each rank caches `K_hot = 88..112` of its `256` local experts in VRAM (`176..224` hot experts cached per layer across the two cards!) and stores only its remaining `144..168` cold experts in its NUMA/CCD-local `HostExpertStore` (`~16.6–19.4 GiB` per rank = **`~33–39 GiB` total pinned RAM** in hot-only ownership mode, or `~58 GiB` in full dynamic-LRU mode).
-  - The post-MoE `TP=2` pinned-sysmem `AllReduce` sums both ranks' routed + shared expert outputs in a single `~18 µs` exchange (no extra collective needed for `EP=2`).
+  - Each rank caches `K_hot = 88..112` of its `256` local experts in VRAM (`176..224` hot experts cached per layer across the two cards!) and stores its local cold experts in `HostExpertStore`.
+  - The post-MoE `TP=2` pinned-sysmem (or NVLink P2P) `AllReduce` sums both ranks' routed + shared expert outputs in a single `~18 µs` exchange (no extra collective needed for `EP=2`).
+- **Quad Card (`TP=4` with `EP=4` on Routed Experts):**
+  - Each rank owns `128` local experts (`3.50 GiB/rank`), fitting **100% of all 512 routed experts in VRAM (`K_hot = 128`)** with zero host-memory pinning (`release_host_storage()`) and zero PCIe cold-expert transfers.
 
 #### B. Decode & Verify (`M <= 16` tokens): Adaptive Dual-Path Execution
-We support two complementary cold-expert decode mechanisms controlled by `CapacityPlanner` (and CLI flags `--moe-offload-mode {auto,gpu-lru,cpu-hybrid}`):
-1. **Dynamic GPU LRU + PCIe Pull (`gpu-lru`, default on `2× 3090 Ti` with `>= 96 GiB` RAM):**
+We support two complementary cold-expert decode mechanisms controlled by `CapacityPlanner` (and CLI flags `--moe-offload {auto,gpu-lru,cpu-hybrid}`):
+1. **Dynamic GPU LRU + PCIe Pull (`gpu-lru`, default on `TP=2` and on AVX2 + PCIe 4.0 x16 `TP=1` hosts):**
    - Each layer maintains on-device `cache_map[512]`, `slot_global_ids[K_hot]`, and `slot_ages[K_hot]` initialized from a static popularity profile (`static_hot_cache_rankings.json`).
    - An integer-only GPU kernel (`w34_moe_lru_update`) identifies unique local expert misses in the current step (`M = 1` or `M = 4` MTP verify), selects non-protected LRU victim slots, issues async PCIe reads from pinned `HostExpertStore` into the victim VRAM slots (overlapping down-proj transfers with gate/up compute), and runs the GPU `w34_moe_w4a16` kernel over all active experts.
-2. **CUDA-Graph-Safe Hybrid CPU AVX-512 + GPU PCIe Co-Execution (`cpu-hybrid`, default on `1× 3090 Ti` and `< 96 GiB` RAM):**
+2. **CUDA-Graph-Safe Hybrid CPU AVX-512 / AVX2 + GPU PCIe Co-Execution (`cpu-hybrid`, default on `1× 3090 Ti` with AVX-512):**
    - For each layer, the router kernel partitions selected `(token, expert)` pairs into:
      - **Hot GPU set:** Experts resident in the GPU's `K_hot` cache.
-     - **GPU PCIe share (`gpu_share_frac`, default `0.22–0.30`):** Top-ranked cold experts read directly over PCIe by a zero-copy GPU kernel while the CPU works.
-     - **CPU cold set:** Written into a fixed-address pinned request ring buffer (`bridge_cuda.cu`), signaling a persistent **pinned Zen 4 AVX-512 / AVX2 worker pool** (`1` thread per physical core) that computes the `W4A16` expert GEMVs in `FP32` straight from `HostExpertStore` and writes the partial sum back to a pinned response slot.
-   - Because the GPU bridge uses device-side atomic/volatile polling on mapped pinned memory, **the entire 48-layer decode / `M=4` verify step remains inside a single captured CUDA Graph**.
+     - **GPU PCIe share (`gpu_share_frac`, default `0.14`):** Top-ranked cold experts read directly over PCIe into transient staging slots by a zero-copy GPU kernel while the CPU works.
+     - **CPU cold set:** Written into a fixed-address pinned request mailbox (`csrc/ops/op_moe_cpu_bridge.cu`), signaling a persistent **pinned physical-core worker pool (`src/moe_cpu_bridge.rs` & `src/moe_cpu_bridge/eval.rs`)** that computes the `W4A16` expert GEMVs in `FP32` (using 0-ULP bit-identical `AVX-512`, `AVX2+FMA+F16C`, or portable scalar kernels) straight from `HostExpertStore` and writes the partial sum back to a mapped response buffer.
+   - Because the GPU bridge uses device-side system-scope release/acquire polling on mapped pinned memory, **the entire 48-layer decode / `M=4` verify step remains inside a single captured CUDA Graph**.
 
 #### C. Chunked Prefill (`total_tokens >= 512`, e.g., `4096` or `8192` tokens): Double-Buffered GPU Streaming
 - Large prefill chunks activate nearly all 512 experts per layer, making CPU GEMM uncompetitive and making per-chunk PCIe streaming optimal (`1.31 GiB` per layer on `TP=1`, `670 MiB` per layer per rank on `TP=2`).
@@ -283,52 +238,23 @@ We support two complementary cold-expert decode mechanisms controlled by `Capaci
 
 ---
 
-## 4. Phased Implementation & Verification Plan
+## 4. Verification Gates (`QF-0` – `QF-4`, Completed)
 
-Every phase follows `warp-34`'s engineering rules: no phase graduates without passing `w34 dump-diff` (tensor parity), `w34 greedy-diff` (token parity), and `w34 profile-diff` (kernel timing & throughput verification).
+Every subsystem is verified by `w34 dump-diff` (tensor parity), `w34 greedy-diff` (token parity), `w34 profile-diff` (kernel timing), and `crates/w34-host/tests/qwen4_flash_next.rs`:
 
-### Phase QF-0: Checkpoint Acquisition, Golden Oracle Dumps, & Config/Loader Plumbing
-1. **Checkpoint & Golden Dumps:**
-   - Acquire `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` (`ef554143369a706525336f6b42a09094835dc077`) into the local HF cache (`/home/nchapman/.cache/huggingface/hub/`).
-   - Add `tools/oracle/qwen4_exp_dump.py` to dump reference per-op tensors for:
-     - Layer 0 (`HyperConnection` + `GDN` + `512-expert MoE`)
-     - Layer 1 (`PLE` n-gram hash/lookup/gate/dilated-conv + `HyperConnection` + `GDN` + `MoE`)
-     - Layer 3 (`HyperConnection` + `QSA` indexer/top-k/sparse-attn + `MoE`)
-     - `MTP` draft step 0..2 and `M_verify = 4` target verification.
-   - Verify activation dynamic ranges across all 48 layers to lock the `FP16` vs. `BF16` spine precision rule for `qwen4_exp`.
-2. **Config & Three-Tier Loader (`crates/w34-host/src/loader.rs`):**
-   - Parse `model_type: "qwen4_exp"` / `"qwen4_exp_text"` and `Qwen4ExpForConditionalGeneration`.
-   - Implement shard-streaming `HostExpertStore` (repacking `W4A16` experts shard-by-shard into pinned memory without exceeding physical RAM) and zero-copy `PleMmapTable` (`mmap` + `MADV_RANDOM` + `MADV_WILLNEED`).
-   - Update `CapacityPlanner` to size `K_hot`, `HostExpertStore`, `QsaRawKeyCache`, `QsaCompressedKeyCache`, and `StateBundle` (`+ ple_conv_state`).
-- **Exit Gate:** Loader unit tests and `CapacityPlanner` validate both `TP=1` (24 GiB) and `TP=2` (2× 24 GiB) memory plans against `Qwen3.8-Flash-Next-W4A16-FP8PLE` with zero swap thrashing.
-
-### Phase QF-1: `HyperConnection`, `PLE`, & `QSA` Kernels + Per-Op Parity (`dump-diff`)
-1. **`csrc/hc.cu`:** Implement `w34_hc_combine_and_grouped_gemma_rmsnorm`, merged low-rank projection, and `w34_hc_silu_up_sigmoid_mix`.
-2. **`csrc/ple.cu` & `model/ple.rs`:** Implement 64-bit `splitmix64` prime-modulo n-gram hashing, `PleMmapTable` parallel gather, FP8 dequantization, signed-sqrt sigmoid gating, and stateful dilated short-conv (`kernel=4, dilation=3, state_len=9`) across prefill, decode, and speculative rollback.
-3. **`csrc/qsa.cu`:** Implement `w34_qsa_pre_indexer` (4Q/1K norm + partial mRoPE + raw/4:1 compressed cache write), bounded-memory `w34_qsa_select_blocks` (`budget = 512` blocks), and `w34_qsa_sparse_paged_attn` (`FP16`/`BF16`, `Q8_0`, and `TQ4`).
-- **Exit Gate:** 100% of `HC`, `PLE`, and `QSA` kernels pass `w34 dump-diff` against reference dumps (`max_abs_err` / `rel_l2` / cosine similarity) and pass `cuobjdump --dump-resource-usage` (`STACK:0 LOCAL:0`).
-
-### Phase QF-2: Tiered 512-Expert MoE Engine (`TP=1` & `TP=2 / EP=2`)
-1. **Pre-Repacked Pinned `HostExpertStore` & Double-Buffered Prefill Streaming:**
-   - Implement 2-group-ahead async H2D DMA streaming + Grouped-MMA `w34_moe_w4a16` accumulation into `FP32` without on-GPU repack overhead.
-2. **Decode Offload Paths:**
-   - Implement on-GPU `w34_moe_lru_update` + async PCIe expert pull (`gpu-lru` mode).
-   - Implement pinned CPU Zen 4 AVX-512 / AVX2 expert worker pool + CUDA-graph-safe device bridge (`bridge.cu`) + concurrent GPU PCIe cold-expert share (`cpu-hybrid` mode).
-- **Exit Gate:** Single-layer and multi-layer 512-expert MoE microbenchmarks pass `dump-diff` across `gpu-lru`, `cpu-hybrid`, and `stream-prefill` modes on both `TP=1` and `TP=2`.
-
-### Phase QF-3: End-to-End `Qwen4Exp` Model Spine, CUDA Graphs, & `MambaRadixCache`
-1. Assemble the 48-layer `Qwen4Exp` forward pass in `crates/w34-host/src/model/` for `TP=1` and `TP=2`.
-2. Wire `StateBundlePool` (`GDN` + `PLE` state) and `KvPool` (`TargetFullAttn` + `QsaRawKeyCache` + `QsaCompressedKeyCache`) into `MambaRadixCache` and `SchedulerV1`.
-3. Capture composite CUDA Graphs (`M=1` decode and `M_verify = 4` verify) and register all new kernels in `prepare_execution_plan()` for deadlock-free cold-start `TP=2` initialization.
-- **Exit Gate:**
-  - `w34 greedy-diff` passes on canonical prompts across `TP=1` and `TP=2`.
-  - Multi-turn warm prefix hits via `MambaRadixCache` restore `GDN`, `PLE`, and `QSA` caches cleanly and pass **Decisive Gate Test #5** (synthetic speculative rejection across chunk boundaries).
-
-### Phase QF-4: Native `Qwen4` `MTP` Speculative Decoding & Long-Context (`128K–256K`) Qualification
-1. Implement the `Qwen4` `MTP` drafter (`K = 3`, `M_verify = 4`) with dual-stream HC state passing, QSA step-0 top-k index reuse, and optional draft-vocab range filtering.
-2. Qualify `128K` and `256K` long-context prefill, needle retrieval, and sustained decode on both **1× RTX 3090 Ti** and **2× RTX 3090 Ti**, recording `nsys` `profile-diff` and end-to-end throughput in `docs/STATE.md`:
-   - **1× RTX 3090 Ti (`TP=1`) Target:** `> 2,200 tok/s` prefill, `> 50 tok/s` decode at `128K` context (`256K` supported with `Q8_0`/`TQ4` KV).
-   - **2× RTX 3090 Ti (`TP=2 / EP=2`) Target:** `> 3,800–4,200 tok/s` prefill, `> 115–135 tok/s` decode across `128K–256K` context without requiring CUDA P2P.
+1. **`QF-0` — Checkpoint, Golden Dumps, & Three-Tier Loader (`crates/w34-host/src/loader/`):**
+   - Parses `model_type: "qwen4_exp"` / `"qwen4_exp_text"` and `Qwen4ExpForConditionalGeneration` (`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE@ef554143369a706525336f6b42a09094835dc077`).
+   - Implements shard-streaming `HostExpertStore` (`crates/w34-host/src/moe_offload/host_store.rs`), zero-copy `PleMmapTable` (`crates/w34-host/src/ple.rs`), and `CapacityPlanner` sizing for `K_hot`, `QsaRawKeyCache`, `QsaCompressedKeyCache`, and `StateBundle` (`+ ple_conv_state`).
+2. **`QF-1` — `HyperConnection`, `PLE`, & `QSA` Kernels (`csrc/ops/{op_hc,op_ple,op_qsa}.cu`):**
+   - `op_hc.cu`: `w34_hc_combine_and_grouped_gemma_rmsnorm`, dual low-rank projection, and `w34_hc_silu_up_sigmoid_mix`.
+   - `op_ple.cu` & `src/ple.rs`: 64-bit `splitmix64` prime-modulo n-gram hashing, `PleMmapTable` parallel gather, FP8 dequantization, signed-sqrt sigmoid gating, and stateful dilated short-conv (`kernel=4, dilation=3, state_len=9`) across prefill, decode, and speculative rollback.
+   - `op_qsa.cu`: `w34_qsa_pre_indexer` (4Q/1K norm + partial mRoPE + raw/4:1 compressed cache write), warp-parallel `w34_qsa_select_blocks` (`budget = 512` blocks), and `w34_qsa_sparse_paged_attn` (`FP16`/`BF16`, `Q8_0`, and `TQ4` with GQA-6 shared-tile dequantization).
+   - All kernels pass `dump-diff` and `cuobjdump --dump-resource-usage` (`STACK:0 LOCAL:0`).
+3. **`QF-2` — Tiered 512-Expert MoE Engine (`csrc/ops/{op_moe,op_moe_router,op_moe_cpu_bridge}.cu`, `src/{moe_offload,moe_cpu_bridge}.rs`):**
+   - Double-buffered 2-group-ahead prefill DMA streaming + Grouped-MMA `w34_moe_w4a16` accumulation into `FP32`.
+   - On-GPU `w34_moe_lru_update` + async PCIe expert pull (`gpu-lru`) and pure-Rust 0-ULP AVX-512/AVX2/portable CPU worker pool + CUDA-graph-safe device bridge (`cpu-hybrid`).
+4. **`QF-3` & `QF-4` — End-to-End `Qwen4Exp` Spine, CUDA Graphs, `MambaRadixCache`, & `Qwen4` `MTP` (`src/model/`, `src/mtp.rs`):**
+   - 48-layer `Qwen4Exp` forward pass across `TP=1`, `TP=2`, and `TP=4` with composite CUDA Graphs (`M=1` decode and `M_verify = 4` verify), `MambaRadixCache` (`GDN` + `PLE` + `QSA` restoration), and native `Qwen4` `MTP` (`K = 3`, `M_verify = 4`) with online GPU `MarlinW4A16` (`group_size = 64`) `draft_lm_head` quantization.
 
 ---
 
@@ -372,7 +298,9 @@ Every phase follows `warp-34`'s engineering rules: no phase graduates without pa
    - Added `qsa_sparse_paged_attn_gqa_f16_kernel` so all **6 query heads sharing a KV head** run in one CTA and dequantize each selected 4-token `TQ4` (`WHT-256`) KV block **once into shared memory** (`6×` fewer `TQ4` dequantizations), plus `qsa_sparse_paged_attn_splitk_merge_f16_kernel` for Split-K decode/MTP verify (`M <= 4`).
 5. **[Landed] Single-Pass 6,144-Token Prefill, Double-Buffered H2D DMA, Parallel PLE Stream Overlap, & Prefix-Primed `MTP` Memoization (`crates/w34-host/src/{moe_offload.rs,ple.rs,mtp.rs,proposer.rs,model/rank.rs}`):**
    - Expanded the prefill scratch arena to `1056 MiB` (`<= 8192` KV pages) with `hc_extra` accounting in `ordinary_prefill_token_capacity`, enabling single-pass `6,144`-token prefill (`stage_capacity = 96`) and double-buffered async H2D DMA on `ws.h2d_stream`.
-   - Vectorized `PleMmapTable` host gathers across a persistent worker pool on a dedicated `ple_stream`, raised single-layer `MTP` `k_hot` on `TP=1` from `64` to `192` with single-chunk MTP prefill, and added a 16-entry `PrefixMemo` cache (`256 MiB` budget) with branching-prefix checkpoint donation (`mamba_branching_seqlen`).
+   - Vectorized `PleMmapTable` host gathers across a persistent worker pool on a dedicated `ple_stream`, raised single-layer `MTP` `k_hot` on `TP=1` from `64` to `192` (`MTP_TP1_STREAMED_PREFILL_MAX_HOT`) and `256` (`100%` VRAM-resident) on `TP=2`, and added a 16-entry `PrefixMemo` cache (`256 MiB` budget) with branching-prefix checkpoint donation (`mamba_branching_seqlen`).
+6. **[Landed] Online GPU `MarlinW4A16` (`group_size = 64`) Quantization for `MTP` `draft_lm_head` (`crates/w34-kernels/csrc/ops/op_marlin.cu`, `crates/w34-host/src/mtp.rs`):**
+   - Quantizes `DenseF16` `target.lm_head` shards on GPU at startup via `w34_marlin_quantize_f16_u4b8` (`151.6 MiB/rank` on `TP=1`, `75.8 MiB/rank` on `TP=2`, `3.56×` smaller than `DenseF16`, guarded by `plan_mtp_draft_lm_head_bytes`), boosting `TP=1 MTP-3` `short-chat 128:512` to **`92.76 tok/s`** and `TP=2 MTP-3` `512:128` bench decode to **`71.90 tok/s`** while keeping target verification 100% lossless against `target.lm_head`.
 
 ### 5.3 Standalone HTTP Serving Campaign Sweep (`benchmarks/perf/campaigns/flash-next-serving.toml`)
 
