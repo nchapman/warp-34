@@ -5,13 +5,20 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from safetensors import safe_open
-from safetensors.torch import save_file
-import torch
+try:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    import torch
+    from sglang_dump import SOURCES, bundle
+except ModuleNotFoundError:
+    safe_open = None
+    save_file = None
+    torch = None
+    SOURCES = ()
+    bundle = None
 
-from sglang_dump import SOURCES, bundle
 
-
+@unittest.skipIf(torch is None or safe_open is None, "torch/safetensors not installed")
 class BundleTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

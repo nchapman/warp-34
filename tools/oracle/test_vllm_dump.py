@@ -7,9 +7,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import torch
-from safetensors import safe_open
-from safetensors.torch import save_file
+try:
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+except ModuleNotFoundError:
+    torch = None
+    safe_open = None
+    save_file = None
 
 import vllm_dump
 
@@ -22,6 +27,7 @@ class FusedGemmaRefreshTests(unittest.TestCase):
         )
         self.assertIn("--refresh-fused-gemma", result.stdout)
 
+    @unittest.skipIf(torch is None or safe_open is None, "torch/safetensors not installed")
     def test_refresh_preserves_other_bits_and_metadata(self):
         tensors = {
             "gemma_rms_norm.x": torch.tensor([[1., 2.]], dtype=torch.float16),
