@@ -163,7 +163,9 @@ impl CompressedTensorRules {
             }) || group.get("type").and_then(Json::as_str) != Some("hadamard")
                 || group.get("randomize").and_then(Json::as_bool) != Some(false)
                 || group.get("requires_grad").is_some_and(|v| v != false)
-                || group.get("precision").is_some_and(|v| v != "torch.float32")
+                || group
+                    .get("precision")
+                    .is_some_and(|v| v != "torch.float32" && v != "float32")
             {
                 return Err(invalid(
                     "unsupported non-deterministic HGPTQ transform metadata",

@@ -188,6 +188,8 @@ int w34_linear_epilogue_f16(const w34_exec* ex, const void* src,
 
 int w34_block_hadamard_f16(const w34_exec* ex, const void* src, void* dst,
                            int rows, int k, int padded_k, int block_size);
+int w34_block_hadamard_bf16(const w34_exec* ex, const void* src, void* dst,
+                            int rows, int k, int padded_k, int block_size);
 
 int w34_copy_masked_rows_f16(const w34_exec* ex, const void* src, void* dst,
                              const uint8_t* valid_token_mask,
@@ -308,6 +310,10 @@ int w34_marlin_gemm_f16u4(const w34_exec* ex, const void* a, const void* b,
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
                           int64_t workspace_ints, int group_blocks);
+int w34_marlin_gemm_bf16u4(const w34_exec* ex, const void* a, const void* b,
+                           const void* scales, void* c, int32_t* workspace,
+                           int64_t m, int64_t n, int64_t k,
+                           int64_t workspace_ints, int group_blocks);
 int w34_marlin_gemm_f16u4_zp(const w34_exec* ex, const void* a, const void* b,
                              const void* scales, const void* zeros, void* c,
                              int32_t* workspace, int64_t m, int64_t n, int64_t k,

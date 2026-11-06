@@ -70,9 +70,9 @@ fn pinned_hgptq_text_graph_mtp_and_tp2() {
             PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
         });
     for rel_dir in [
-        "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ-g64/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
-        "models--nchapman--Qwen3.5-9B-W4A16-HGPTQ-g64/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
-        "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ-g64/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
+        "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
+        "models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
+        "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
     ] {
         let dir = cache.join(rel_dir);
         assert!(
@@ -112,7 +112,7 @@ fn pinned_hgptq_vision_matches_vllm_and_tp2() {
     let cases: [(&str, &str, &[i32]); 3] = [
         (
             "2B",
-            "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ-g64/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
+            "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
             &[
                 561, 2099, 4774, 1330, 18833, 19823, 383, 264, 17676, 25313, 13, 561, 18833, 513,
                 2107, 5474, 1634, 18833, 11, 321, 781, 513, 2107, 20479, 13, 2532, 513, 1330, 8434,
@@ -121,12 +121,12 @@ fn pinned_hgptq_vision_matches_vllm_and_tp2() {
         ),
         (
             "9B",
-            "models--nchapman--Qwen3.5-9B-W4A16-HGPTQ-g64/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
+            "models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
             &[8771, 18833, 513, 20479, 383, 264, 17676, 36781, 13, 248044],
         ),
         (
             "27B",
-            "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ-g64/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
+            "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
             &[
                 8771, 18833, 513, 20479, 383, 264, 17676, 36781, 440, 1330, 8434, 11241, 13, 3648,
                 7993, 369, 264, 74035, 11, 321, 279, 975, 369, 449, 6474, 13, 561, 74035, 369, 383,
@@ -173,6 +173,63 @@ fn pinned_hgptq_vision_matches_vllm_and_tp2() {
         assert_eq!(
             tp1, tp2,
             "{label} TP=1 vs TP=2 multimodal greedy continuation"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires pinned HGPTQ 27B + DFlash2-W4A16-HGPTQ checkpoints and two free CUDA GPUs"]
+fn pinned_hgptq_dflash2_lossless_and_tp2() {
+    let cache = std::env::var_os("HF_HUB_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
+        });
+    let target_dir = cache
+        .join("models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2");
+    let draft_dir = cache
+        .join("models--nchapman--Qwen3.8-27B-DFlash2-W4A16-HGPTQ/snapshots/46b87ea125d24924affa8da9c3e981a937aab216");
+    assert!(target_dir.join("config.json").exists());
+    assert!(draft_dir.join("config.json").exists());
+
+    for tp in [1usize, 2usize] {
+        let mut engine = Qwen3_5Engine::load(
+            target_dir.to_str().unwrap(),
+            tp,
+            KvFormatPolicy::Tq4,
+            Some(64),
+            true,
+        )
+        .unwrap();
+        let seed = engine.encode("The capital of France is").unwrap();
+        let prompt: Vec<i32> = seed.iter().copied().cycle().take(128).collect();
+        let plain = engine
+            .generate_tokens(&prompt, 32, false)
+            .unwrap()
+            .generated_token_ids;
+        engine
+            .enable_speculative(&SpeculativeConfig {
+                kind: SpeculativeKind::DFlash2,
+                mtp_k: 1,
+                draft_model: Some(draft_dir.to_str().unwrap().to_string()),
+            })
+            .unwrap();
+        let spec = engine.generate_tokens(&prompt, 32, false).unwrap();
+        assert_eq!(
+            spec.generated_token_ids, plain,
+            "DFlash2-W4A16-HGPTQ lossless greedy parity TP={tp}"
+        );
+        let accepted: usize = engine
+            .speculative
+            .as_ref()
+            .unwrap()
+            .last_accepted
+            .iter()
+            .copied()
+            .sum();
+        assert!(
+            accepted >= 16,
+            "expected strong acceptance on TP={tp}, got {accepted}"
         );
     }
 }

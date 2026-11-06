@@ -1,7 +1,7 @@
 use super::*;
 
 // Quantization metadata copied verbatim from revision
-// 0fbb9a38f631ea63678f4b51a491e7ecb26c681c (Qwen3.5-2B-W4A16-HGPTQ-g64).
+// 0fbb9a38f631ea63678f4b51a491e7ecb26c681c (Qwen3.5-2B-W4A16-HGPTQ).
 fn fixture() -> Json {
     serde_json::from_str(include_str!("config_rules_2b.json")).unwrap()
 }

@@ -331,6 +331,15 @@ unsafe extern "C" {
         padded_k: i32,
         block_size: i32,
     ) -> i32;
+    pub fn w34_block_hadamard_bf16(
+        ex: *const W34Exec,
+        src: *const c_void,
+        dst: *mut c_void,
+        rows: i32,
+        k: i32,
+        padded_k: i32,
+        block_size: i32,
+    ) -> i32;
 
     pub fn w34_copy_masked_rows_f16(
         ex: *const W34Exec,
@@ -568,6 +577,19 @@ unsafe extern "C" {
         group_size: i32,
     ) -> i32;
     pub fn w34_marlin_gemm_f16u4(
+        ex: *const W34Exec,
+        a: *const c_void,
+        b: *const c_void,
+        scales: *const c_void,
+        c: *mut c_void,
+        workspace: *mut i32,
+        m: i64,
+        n: i64,
+        k: i64,
+        workspace_ints: i64,
+        group_blocks: i32,
+    ) -> i32;
+    pub fn w34_marlin_gemm_bf16u4(
         ex: *const W34Exec,
         a: *const c_void,
         b: *const c_void,

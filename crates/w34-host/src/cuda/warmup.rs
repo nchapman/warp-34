@@ -103,18 +103,20 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     // HGPTQ input transforms are independent of GEMM and must be resident before
     // any rank enters graph capture or a collective warmup barrier.
     for block_size in [16, 64] {
-        warmup_ffi!(
-            ffi::w34_block_hadamard_f16(
-                &ex,
-                buf_a as *const c_void,
-                buf_b as *mut c_void,
-                2,
-                128,
-                192,
-                block_size,
-            ),
-            "warmup w34_block_hadamard_f16"
-        )?;
+        for had_fn in [ffi::w34_block_hadamard_f16, ffi::w34_block_hadamard_bf16] {
+            warmup_ffi!(
+                had_fn(
+                    &ex,
+                    buf_a as *const c_void,
+                    buf_b as *mut c_void,
+                    2,
+                    128,
+                    192,
+                    block_size,
+                ),
+                "warmup w34_block_hadamard"
+            )?;
+        }
     }
 
     warmup_ffi!(
@@ -274,22 +276,28 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     )?;
     for m_warm in [1i64, 16, 40, 64] {
         for group_blocks in [8i32, 4, 2, -1] {
-            warmup_ffi!(
-                ffi::w34_marlin_gemm_f16u4(
-                    &ex,
-                    buf_a as *const c_void,
-                    buf_b as *const c_void,
-                    buf_c as *const c_void,
-                    buf_d as *mut c_void,
-                    buf_ws as *mut i32,
-                    m_warm,
-                    64,
-                    128,
-                    marlin_ws_ints,
-                    group_blocks,
-                ),
-                "warmup w34_marlin_gemm_f16u4"
-            )?;
+            for gemm_fn in [
+                ffi::w34_marlin_gemm_f16u4,
+                ffi::w34_marlin_gemm_bf16u4,
+                ffi::w34_marlin_gemm_f16u8,
+            ] {
+                warmup_ffi!(
+                    gemm_fn(
+                        &ex,
+                        buf_a as *const c_void,
+                        buf_b as *const c_void,
+                        buf_c as *const c_void,
+                        buf_d as *mut c_void,
+                        buf_ws as *mut i32,
+                        m_warm,
+                        64,
+                        128,
+                        marlin_ws_ints,
+                        group_blocks,
+                    ),
+                    "warmup w34_marlin_gemm"
+                )?;
+            }
             if group_blocks == -1 {
                 continue;
             }
@@ -309,24 +317,6 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                     group_blocks,
                 ),
                 "warmup w34_marlin_gemm_f16u4_zp"
-            )?;
-        }
-        for group_blocks in [8i32, 4, 2, -1] {
-            warmup_ffi!(
-                ffi::w34_marlin_gemm_f16u8(
-                    &ex,
-                    buf_a as *const c_void,
-                    buf_b as *const c_void,
-                    buf_c as *const c_void,
-                    buf_d as *mut c_void,
-                    buf_ws as *mut i32,
-                    m_warm,
-                    64,
-                    128,
-                    marlin_ws_ints,
-                    group_blocks,
-                ),
-                "warmup w34_marlin_gemm_f16u8"
             )?;
         }
     }

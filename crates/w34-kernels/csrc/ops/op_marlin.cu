@@ -12,6 +12,7 @@
 
 namespace marlin {
 static constexpr int kF16 = vllm::ST_ID_F16;
+static constexpr int kBF16 = vllm::ST_ID_BF16;
 static constexpr int kU4 = vllm::ST_ID_U4;
 static constexpr int kU4B8 = vllm::ST_ID_U4B8;
 static constexpr int kU8B128 = vllm::ST_ID_U8B128;
@@ -334,31 +335,56 @@ static bool is_valid_config(thread_config_t const& th_config, int thread_m_block
 
 typedef void (*MarlinFuncPtr)(MARLIN_KERNEL_PARAMS);
 
-#define MARLIN_CASE_BTYPE(BTYPE, T_K, T_N, THR, M_BLOCKS, M8, GBX)            \
-    if (th_config.thread_k == (T_K) && th_config.thread_n == (T_N) &&         \
-        th_config.num_threads == (THR) && thread_m_blocks == (M_BLOCKS) &&    \
-        m_block_size_8 == (M8)) {                                             \
-        return &Marlin<marlin::kF16, (BTYPE), marlin::kF16,                   \
-                       marlin::kF16, (THR), (M_BLOCKS), (T_N) / 16,           \
-                       (T_K) / 16, (M8), 4, (GBX), false>;                    \
+#define MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, T_K, T_N, THR, M_BLOCKS, M8, GBX) \
+    if (th_config.thread_k == (T_K) && th_config.thread_n == (T_N) &&           \
+        th_config.num_threads == (THR) && thread_m_blocks == (M_BLOCKS) &&      \
+        m_block_size_8 == (M8)) {                                               \
+        return &Marlin<(ATYPE), (BTYPE), (ATYPE),                               \
+                       (ATYPE), (THR), (M_BLOCKS), (T_N) / 16,                  \
+                       (T_K) / 16, (M8), 4, (GBX), false>;                      \
     }
 
-#define MARLIN_CASES_15(BTYPE, GBX)                                           \
-    MARLIN_CASE_BTYPE(BTYPE, 128, 128, 256, 1, false, GBX)                    \
-    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 1, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 1, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 128, 128, 256, 1, true, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 1, true, GBX)                      \
-    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 1, true, GBX)                      \
-    MARLIN_CASE_BTYPE(BTYPE, 64, 256, 256, 2, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 2, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 2, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 64, 256, 256, 3, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 3, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 3, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 64, 256, 256, 4, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 64, 128, 128, 4, false, GBX)                     \
-    MARLIN_CASE_BTYPE(BTYPE, 128, 64, 128, 4, false, GBX)
+#define MARLIN_CASES_15_ATYPE(ATYPE, BTYPE, GBX)                              \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 128, 128, 256, 1, false, GBX)       \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 64, 128, 128, 1, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 128, 64, 128, 1, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 128, 128, 256, 1, true, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 64, 128, 128, 1, true, GBX)         \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 128, 64, 128, 1, true, GBX)         \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 64, 256, 256, 2, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 64, 128, 128, 2, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 128, 64, 128, 2, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 64, 256, 256, 3, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 64, 128, 128, 3, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 128, 64, 128, 3, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 64, 256, 256, 4, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 64, 128, 128, 4, false, GBX)        \
+    MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, 128, 64, 128, 4, false, GBX)
+
+#define MARLIN_CASES_15(BTYPE, GBX) MARLIN_CASES_15_ATYPE(marlin::kF16, BTYPE, GBX)
+
+static MarlinFuncPtr get_marlin_kernel_bf16u4(thread_config_t const& th_config,
+                                              int thread_m_blocks,
+                                              bool m_block_size_8,
+                                              int group_blocks) {
+    if (group_blocks == -1) {
+        MARLIN_CASES_15_ATYPE(marlin::kBF16, marlin::kU4B8, -1)
+        return nullptr;
+    }
+    if (group_blocks == 2) {
+        MARLIN_CASES_15_ATYPE(marlin::kBF16, marlin::kU4B8, 2)
+        return nullptr;
+    }
+    if (group_blocks == 4) {
+        MARLIN_CASES_15_ATYPE(marlin::kBF16, marlin::kU4B8, 4)
+        return nullptr;
+    }
+    if (group_blocks == 8) {
+        MARLIN_CASES_15_ATYPE(marlin::kBF16, marlin::kU4B8, 8)
+        return nullptr;
+    }
+    return nullptr;
+}
 
 static MarlinFuncPtr get_marlin_kernel_f16u4(thread_config_t const& th_config,
                                              int thread_m_blocks,
@@ -480,7 +506,7 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
                             const void* S, const void* ZP, void* C, int32_t* workspace,
                             int64_t m, int64_t n, int64_t k,
                             int64_t workspace_ints, int group_blocks, int num_bits,
-                            bool has_zp) {
+                            bool has_zp, bool is_bf16 = false) {
     if (ex == nullptr || A == nullptr || B == nullptr || S == nullptr ||
         C == nullptr || workspace == nullptr || (has_zp && ZP == nullptr)) {
         return (int)cudaErrorInvalidValue;
@@ -581,8 +607,10 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         }
         if (blocks < 1) blocks = 1;
 
-        auto kernel = get_marlin_kernel_f16(
-            th_cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks);
+        auto kernel = is_bf16
+            ? get_marlin_kernel_bf16u4(th_cfg, thread_m_blocks, m_block_size_8, group_blocks)
+            : get_marlin_kernel_f16(
+                  th_cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks);
         if (kernel == nullptr) return (int)cudaErrorInvalidValue;
 
         if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem) != cudaSuccess) {
@@ -685,7 +713,15 @@ extern "C" int w34_marlin_gemm_f16u4(const w34_exec* ex, const void* a, const vo
                                      int64_t m, int64_t n, int64_t k,
                                      int64_t workspace_ints, int group_blocks) {
     return w34_marlin::marlin_gemm_impl(
-        ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 4, false);
+        ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 4, false, false);
+}
+
+extern "C" int w34_marlin_gemm_bf16u4(const w34_exec* ex, const void* a, const void* b,
+                                      const void* scales, void* c, int32_t* workspace,
+                                      int64_t m, int64_t n, int64_t k,
+                                      int64_t workspace_ints, int group_blocks) {
+    return w34_marlin::marlin_gemm_impl(
+        ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 4, false, true);
 }
 
 extern "C" int w34_marlin_gemm_f16u4_zp(const w34_exec* ex, const void* a, const void* b,

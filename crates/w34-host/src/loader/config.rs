@@ -905,7 +905,7 @@ impl ModelConfig {
         }
     }
 
-    fn parse_quant(qcfg: Option<&Json>) -> io::Result<QuantScheme> {
+    pub(crate) fn parse_quant(qcfg: Option<&Json>) -> io::Result<QuantScheme> {
         let Some(q) = qcfg else {
             return Ok(QuantScheme::Unquantized);
         };

@@ -19,7 +19,7 @@ import statistics
 
 REVISION = "0fbb9a38f631ea63678f4b51a491e7ecb26c681c"
 HF_HOME = Path(os.environ.get('HF_HOME', Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'huggingface'))
-MODEL = Path(os.environ.get('HF_HUB_CACHE', HF_HOME / 'hub')) / 'models--nchapman--Qwen3.5-2B-W4A16-HGPTQ-g64' / 'snapshots' / REVISION
+MODEL = Path(os.environ.get('HF_HUB_CACHE', HF_HOME / 'hub')) / 'models--nchapman--Qwen3.5-2B-W4A16-HGPTQ' / 'snapshots' / REVISION
 PROMPTS = ["The capital of France is", "Calculate 7 * 8. The answer is", "Write a Python function that adds two numbers.\n", "The quick brown fox"]
 
 

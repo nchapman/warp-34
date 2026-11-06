@@ -1,18 +1,57 @@
 #include "../w34_cuda.h"
 #include "hadamard_inline.cuh"
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
 namespace {
 
+template <typename T>
+struct HadScalar;
+
+template <>
+struct HadScalar<__half> {
+    using Vec2 = __half2;
+    __device__ __forceinline__ static float2 to_float2(uint32_t raw) {
+        return __half22float2(*reinterpret_cast<const __half2*>(&raw));
+    }
+    __device__ __forceinline__ static float to_float(__half v) { return __half2float(v); }
+    __device__ __forceinline__ static __half2 from_floats2(float a, float b) {
+        return __floats2half2_rn(a, b);
+    }
+    __device__ __forceinline__ static __half low(__half2 v) { return __low2half(v); }
+    __device__ __forceinline__ static __half high(__half2 v) { return __high2half(v); }
+};
+
+template <>
+struct HadScalar<__nv_bfloat16> {
+    using Vec2 = __nv_bfloat162;
+    __device__ __forceinline__ static float2 to_float2(uint32_t raw) {
+        return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&raw));
+    }
+    __device__ __forceinline__ static float to_float(__nv_bfloat16 v) {
+        return __bfloat162float(v);
+    }
+    __device__ __forceinline__ static __nv_bfloat162 from_floats2(float a, float b) {
+        return __floats2bfloat162_rn(a, b);
+    }
+    __device__ __forceinline__ static __nv_bfloat16 low(__nv_bfloat162 v) {
+        return __low2bfloat16(v);
+    }
+    __device__ __forceinline__ static __nv_bfloat16 high(__nv_bfloat162 v) {
+        return __high2bfloat16(v);
+    }
+};
+
 // Each 4-lane subgroup owns H16 (4 values/lane); each 16-lane subgroup owns H64 (4 values/lane).
 // Executing bits 0..1 via an in-register H4 butterfly followed by bits 2..log2(B)-1 via warp
 // shuffles preserves strict bit-order FP32 summation while coalescing 8-byte (uint2) loads/stores.
-template <int B>
-__global__ void block_hadamard_f16(const __half* src, __half* dst,
-                                  int k, int padded_k, int64_t groups) {
-    static_assert(B == 16 || B == 64, "block_hadamard_f16 supports B=16 or B=64");
+template <typename T, int B>
+__global__ void block_hadamard_16bit(const T* src, T* dst,
+                                     int k, int padded_k, int64_t groups) {
+    static_assert(B == 16 || B == 64, "block_hadamard_16bit supports B=16 or B=64");
+    using S = HadScalar<T>;
     constexpr int lanes = B / 4;
     constexpr float scale = (B == 16) ? 0.25f : 0.125f;
     const int lane = threadIdx.x & (lanes - 1);
@@ -27,22 +66,20 @@ __global__ void block_hadamard_f16(const __half* src, __half* dst,
         const int col = int(group % blocks_per_row) * B + lane * 4;
         float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
         if (col < k) {
-            const __half* sp = src + row * k + col;
+            const T* sp = src + row * k + col;
             if (vec_aligned) {
                 const uint2 raw = *reinterpret_cast<const uint2*>(sp);
-                const __half2 h01 = *reinterpret_cast<const __half2*>(&raw.x);
-                const __half2 h23 = *reinterpret_cast<const __half2*>(&raw.y);
-                const float2 f01 = __half22float2(h01);
-                const float2 f23 = __half22float2(h23);
+                const float2 f01 = S::to_float2(raw.x);
+                const float2 f23 = S::to_float2(raw.y);
                 v0 = f01.x;
                 v1 = f01.y;
                 v2 = f23.x;
                 v3 = f23.y;
             } else {
-                v0 = __half2float(sp[0]);
-                v1 = __half2float(sp[1]);
-                v2 = __half2float(sp[2]);
-                v3 = __half2float(sp[3]);
+                v0 = S::to_float(sp[0]);
+                v1 = S::to_float(sp[1]);
+                v2 = S::to_float(sp[2]);
+                v3 = S::to_float(sp[3]);
             }
         }
 
@@ -72,28 +109,27 @@ __global__ void block_hadamard_f16(const __half* src, __half* dst,
             v3 = sub ? (o3 - v3) : (v3 + o3);
         }
 
-        __half* dp = dst + row * padded_k + col;
-        const __half2 out01 = __floats2half2_rn(v0 * scale, v1 * scale);
-        const __half2 out23 = __floats2half2_rn(v2 * scale, v3 * scale);
+        T* dp = dst + row * padded_k + col;
+        const typename S::Vec2 out01 = S::from_floats2(v0 * scale, v1 * scale);
+        const typename S::Vec2 out23 = S::from_floats2(v2 * scale, v3 * scale);
         if (vec_aligned) {
             uint2 packed_out;
             packed_out.x = *reinterpret_cast<const uint32_t*>(&out01);
             packed_out.y = *reinterpret_cast<const uint32_t*>(&out23);
             *reinterpret_cast<uint2*>(dp) = packed_out;
         } else {
-            dp[0] = __low2half(out01);
-            dp[1] = __high2half(out01);
-            dp[2] = __low2half(out23);
-            dp[3] = __high2half(out23);
+            dp[0] = S::low(out01);
+            dp[1] = S::high(out01);
+            dp[2] = S::low(out23);
+            dp[3] = S::high(out23);
         }
     }
 }
 
-} // namespace
-
-extern "C" int w34_block_hadamard_f16(const w34_exec* ex, const void* src,
-                                      void* dst, int rows, int k, int padded_k,
-                                      int block_size) {
+template <typename T>
+int launch_block_hadamard(const w34_exec* ex, const void* src,
+                          void* dst, int rows, int k, int padded_k,
+                          int block_size) {
     if (!ex || rows < 0 || k <= 0 || padded_k < k ||
         (block_size != 16 && block_size != 64) ||
         k % block_size != 0 || padded_k % block_size != 0) {
@@ -102,11 +138,11 @@ extern "C" int w34_block_hadamard_f16(const w34_exec* ex, const void* src,
     if (rows == 0) return int(cudaSuccess);
     const uintptr_t s = reinterpret_cast<uintptr_t>(src);
     const uintptr_t d = reinterpret_cast<uintptr_t>(dst);
-    const uint64_t src_bytes = uint64_t(rows) * k * sizeof(__half);
-    const uint64_t dst_bytes = uint64_t(rows) * padded_k * sizeof(__half);
+    const uint64_t src_bytes = uint64_t(rows) * k * sizeof(T);
+    const uint64_t dst_bytes = uint64_t(rows) * padded_k * sizeof(T);
     // Reject overlapping ranges, including partial aliasing: callers must not
     // destroy shared inputs. Validate arithmetic before comparing end pointers.
-    if (!s || !d || s % alignof(__half) || d % alignof(__half) ||
+    if (!s || !d || s % alignof(T) || d % alignof(T) ||
         s > UINTPTR_MAX - src_bytes || d > UINTPTR_MAX - dst_bytes ||
         (s < d + dst_bytes && d < s + src_bytes)) {
         return int(cudaErrorInvalidValue);
@@ -117,13 +153,27 @@ extern "C" int w34_block_hadamard_f16(const w34_exec* ex, const void* src,
     const int grid = int(needed < 65535 ? needed : 65535);
     const auto stream = reinterpret_cast<cudaStream_t>(ex->stream);
     if (block_size == 16) {
-        block_hadamard_f16<16><<<grid, 256, 0, stream>>>(
-            static_cast<const __half*>(src), static_cast<__half*>(dst), k, padded_k, groups);
+        block_hadamard_16bit<T, 16><<<grid, 256, 0, stream>>>(
+            static_cast<const T*>(src), static_cast<T*>(dst), k, padded_k, groups);
     } else {
-        block_hadamard_f16<64><<<grid, 256, 0, stream>>>(
-            static_cast<const __half*>(src), static_cast<__half*>(dst), k, padded_k, groups);
+        block_hadamard_16bit<T, 64><<<grid, 256, 0, stream>>>(
+            static_cast<const T*>(src), static_cast<T*>(dst), k, padded_k, groups);
     }
     return int(cudaGetLastError());
+}
+
+} // namespace
+
+extern "C" int w34_block_hadamard_f16(const w34_exec* ex, const void* src,
+                                      void* dst, int rows, int k, int padded_k,
+                                      int block_size) {
+    return launch_block_hadamard<__half>(ex, src, dst, rows, k, padded_k, block_size);
+}
+
+extern "C" int w34_block_hadamard_bf16(const w34_exec* ex, const void* src,
+                                       void* dst, int rows, int k, int padded_k,
+                                       int block_size) {
+    return launch_block_hadamard<__nv_bfloat16>(ex, src, dst, rows, k, padded_k, block_size);
 }
 
 namespace {

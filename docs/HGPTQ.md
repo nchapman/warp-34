@@ -2,22 +2,25 @@
 
 ## Status
 
-**Complete and verified end-to-end** against `vLLM 0.31.0` across all three flagship HGPTQ models:
-- **`nchapman/Qwen3.5-2B-W4A16-HGPTQ-g64`** (`0fbb9a38f631ea63678f4b51a491e7ecb26c681c`)
-- **`nchapman/Qwen3.5-9B-W4A16-HGPTQ-g64`** (`7b2e48b7e7e8ee38925f5337c66feed22d3b031b`)
-- **`nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64`** (`1de743eedefdb7422e6b171174c7080204f5b005`, plus `incoai/Qwen3.8-27B-DFlash2`)
+**Complete and verified end-to-end** against `vLLM 0.31.0` across all three flagship HGPTQ target models and the quantized `DFlash2` drafter:
+- **`nchapman/Qwen3.5-2B-W4A16-HGPTQ`** (`0fbb9a38f631ea63678f4b51a491e7ecb26c681c`)
+- **`nchapman/Qwen3.5-9B-W4A16-HGPTQ`** (`7b2e48b7e7e8ee38925f5337c66feed22d3b031b`)
+- **`nchapman/Qwen3.8-27B-W4A16-HGPTQ`** (`1de743eedefdb7422e6b171174c7080204f5b005` / `ae51987e3339a2a70070702548571e10fe8bcbc2`)
+- **`nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ`** (`46b87ea125d24924affa8da9c3e981a937aab216`, `2.16 GiB` vs `4.81 GiB` for `incoai/Qwen3.8-27B-DFlash2`)
 
-Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `DFlash2` (`M=8` lossless), Vision (`coco_sample.png`, including 9B/27B `b=16` channelwise `K/N=4304`), CUDA Graphs, and `TP=1 == TP=2`.
+Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `DFlash2` (`M=8` lossless, both `BF16` and `W4A16-HGPTQ`), Vision (`coco_sample.png`, including 9B/27B `b=16` channelwise `K/N=4304`), CUDA Graphs, and `TP=1 == TP=2`.
 
 ## Pinned checkpoint inventory
 
-1. **`nchapman/Qwen3.5-2B-W4A16-HGPTQ-g64`** (`0fbb9a38f631ea63678f4b51a491e7ecb26c681c`):
+1. **`nchapman/Qwen3.5-2B-W4A16-HGPTQ`** (`0fbb9a38f631ea63678f4b51a491e7ecb26c681c`):
    - `quant_method=compressed-tensors`, `format=pack-quantized`, symmetric INT4 (`U4B8`), `group_size=64`, `actorder=static`.
    - **150 text + 98 vision + 7 MTP** packed linears (`head_dim=64` block-Hadamard across text, vision, and MTP).
-2. **`nchapman/Qwen3.5-9B-W4A16-HGPTQ-g64`** (`7b2e48b7e7e8ee38925f5337c66feed22d3b031b`):
+2. **`nchapman/Qwen3.5-9B-W4A16-HGPTQ`** (`7b2e48b7e7e8ee38925f5337c66feed22d3b031b`):
    - **32 text layers + 27 vision blocks + 1 MTP layer** (`K/N=4304` vision MLP with `group_0` `g=64, b=64` and `group_1` channelwise `strategy="channel", b=16` on `blocks.*.mlp.linear_fc2`).
-3. **`nchapman/Qwen3.8-27B-W4A16-HGPTQ-g64`** (`1de743eedefdb7422e6b171174c7080204f5b005`):
+3. **`nchapman/Qwen3.8-27B-W4A16-HGPTQ`** (`1de743eedefdb7422e6b171174c7080204f5b005` / `ae51987e3339a2a70070702548571e10fe8bcbc2`):
    - **64 text layers + 27 vision blocks + 1 MTP layer** (`K/N=4304` vision MLP with `group_1` channelwise `strategy="channel", b=16` on `blocks.*.mlp.linear_fc2`).
+4. **`nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ`** (`46b87ea125d24924affa8da9c3e981a937aab216`):
+   - **5 DFlash2 layers + `fc` (`[5120, 25600]`)** quantized with symmetric INT4 (`U4B8`), `group_size=64`, and online `H_64` block-Hadamard rotation (`2.16 GiB` total vs `4.81 GiB` unquantized `BF16`, saving `2.65 GiB` VRAM while preserving native `BF16` activations, `BF16` norms, `BF16` grouped convolutions, and `BF16` selector heads).
 - Target rules use negative lookbehind (`re:.*(?<!mtp\.)model\.layers\.\d+\.mlp\.(gate|up|down)_proj$`) and explicit `ignore` lists (`lm_head`, `patch_embed.proj`, `mtp.fc`, `in_proj_a`, `in_proj_b`), resolved via bounded `fancy-regex` in `crates/w34-host/src/loader/config_rules.rs`.
 
 ## Architecture, kernel contracts & bug fixes
@@ -48,8 +51,11 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
    - **0-ULP bit-for-bit parity:** `w34::hadamard64_vec8_f16` (8-lane subgroup, 8 halves/lane, 3 `__shfl_xor_sync` stages) and `w34::hadamard64_vec4_f16` (16-lane subgroup, 4 halves/lane) round the producer output to `__half` before executing the bit-order `FP32` butterfly and `* 0.125f` RN rounding, matching standalone `w34_block_hadamard_f16(..., 64)` with **0 ULP** (`producer_fused_hadamard64_matches_standalone_0_ulp` & `tp2_all_reduce_residual_gemma_rms_norm_hadamard64_matches_standalone_0_ulp`).
    - **Dual-output norm for GDN shared input:** On GDN layers where `in_proj_ba` (`DenseF16`) needs unrotated `s.normed` and `in_proj_qkvz` (`Hadamard` `B=64`) needs `H_64(s.normed)`, `LayerBlockWeights::pre_attn_norm_targets` returns `[s.normed, ex.scratch_ptr]` so the norm kernel writes both unrotated `s.normed` and rotated `ex.scratch_ptr` in a single pass; on FullAttention (`qkv_proj`) and Dense FFN (`gate_up_proj`), it returns `[0, s.normed]` so only the rotated buffer is written.
    - **Verified with `nsys`:** Across 2B, 9B, and 27B (`TP=1` & `TP=2`, `MTP-3`), `block_hadamard_f16<64>` executes only once per rank during `prepare_execution_plan()` warmup and **0 times** during prefill, decode, or MTP drafting.
-6. **Cold-start TP warmup (`crates/w34-host/src/cuda/warmup.rs`):**
-   - Pre-warms `w34_block_hadamard_f16` (`B=16` and `B=64`), all 7 producer-fused `H_64` entrypoints across all `hidden_size` template regimes (`<=2560, <=4096, <=5120, <=6144`), `w34_linear_epilogue_f16`, and channelwise `w34_marlin_gemm_f16u4(..., -1)` in `prepare_execution_plan()`.
+6. **Native `BF16` Marlin W4 + `BF16` Block-Hadamard for `DFlash2-W4A16-HGPTQ` (`op_marlin.cu`, `op_hadamard.cu`, `dflash.rs`, `config_rules.rs`, `hub/files.rs`):**
+   - Instantiated `MARLIN_BF16_CASES_15(marlin::kU4B8, 2/4/8/-1)` (`w34_marlin_gemm_bf16u4`) in `crates/w34-kernels/csrc/ops/op_marlin.cu` and `w34_block_hadamard_bf16` (`B=16, 64`) in `crates/w34-kernels/csrc/ops/op_hadamard.cu` so `DFlash2Rank` executes quantized `U4B8` projections with native `BF16` activations and `BF16` scales inside its captured CUDA Graphs (`forward_graph` and `select_greedy_graph`).
+   - Added `Linear::MarlinBf16U4B8` to `crates/w34-host/src/dflash.rs`, fusing `q_proj + k_proj + v_proj` (`qkv`) and `gate_proj + up_proj` (`gate_up`) at load time while repacking a separate `kv` (`k_proj + v_proj`) projection for `commit_context` (since Marlin `[k/16, n*2]` tiles cannot be pointer-offset sliced across `N`).
+7. **Cold-start TP warmup (`crates/w34-host/src/cuda/warmup.rs`):**
+   - Pre-warms `w34_block_hadamard_f16` & `w34_block_hadamard_bf16` (`B=16` and `B=64`), all 7 producer-fused `H_64` entrypoints across all `hidden_size` template regimes (`<=2560, <=4096, <=5120, <=6144`), `w34_linear_epilogue_f16`, channelwise `w34_marlin_gemm_f16u4(..., -1)`, and `w34_marlin_gemm_bf16u4` (`gs=-1, 32, 64, 128`) in `prepare_execution_plan()`.
 
 ## Verification & benchmarks on 1–2× RTX 3090 Ti (`sm_86`)
 
@@ -90,10 +96,10 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
 | **9B HGPTQ** | `TP=2` | `MTP-3` | `4,401` / **540.1** (`3.88x`) | `5,231` / **545.9** (`3.85x`) | `5,060` / **507.0** (`3.88x`) | — | **`4.79×`** | **`+6.5%`** vs GPTQ (`507.2`) |
 | **27B HGPTQ** | `TP=1` | Plain | `1,331` / **51.8** | — | — | `344.4 ms` / **49.3 tok/s** | **`1.19×`** (vs `43.5 tok/s`) | `97.6%` of GPTQ (`53.1`) |
 | **27B HGPTQ** | `TP=1` | `MTP-3` | `1,314` / **108.7** (`2.58x`) | `1,450` / **150.1** (`3.63x`) | `1,418` / **139.3** (`3.44x`) | — | **`3.45×`** (`512:128`) | `162.9 tok/s` on `greedy-diff` |
-| **27B HGPTQ** | `TP=1` | `DFlash2` | `1,331` / **96.5** (`2.82x`) | `1,449` / **224.1** (`6.68x`) | — | — | **`5.15×`** (`512:128`) | `154.9 tok/s` on `greedy-diff` |
+| **27B HGPTQ** | `TP=1` | `DFlash2-W4` | `1,293` / **107.1** (`2.82x`) | `1,472` / **247.9** (`6.68x`) | — | — | **`5.70×`** (`512:128`) | **`+10.6%`** vs `BF16` DFlash2 (`224.1`), `-2.65 GiB` VRAM |
 | **27B HGPTQ** | `TP=2` | Plain | `1,644` / **85.4** | — | — | `300.8 ms` / **77.9 tok/s** | **`1.96×`** | `96.8%` of GPTQ (`88.2`) |
 | **27B HGPTQ** | `TP=2` | `MTP-3` | `1,628` / **252.1** (`3.88x`) | `1,848` / **235.6** (`3.63x`) | `1,822` / **213.2** (`3.44x`) | — | **`5.80×`** | **`+3.8%`** vs GPTQ (`242.9`) |
-| **27B HGPTQ** | `TP=2` | `DFlash2` | `1,594` / **324.9** (`6.20x`) | `1,834` / **337.1** (`6.68x`) | — | — | **`7.75×`** (`512:128`) | `337.1 tok/s` (`6.68x` tau) |
+| **27B HGPTQ** | `TP=2` | `DFlash2-W4` | `1,545` / **351.0** (`6.20x`) | `1,826` / **365.1** (`6.68x`) | — | — | **`8.39×`** (`512:128`) | **`+8.3%`** vs `BF16` DFlash2 (`337.1`), `17.66 ms/round` |
 
 ## Reproducing checks
 
