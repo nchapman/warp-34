@@ -903,3 +903,34 @@ fn test_qwen4_exp_flash_next_config_and_validation() {
     bad_qsa["text_config"]["indexer_compress_ratio"] = serde_json::json!(3);
     assert!(ModelConfig::from_json(&bad_qsa).is_err());
 }
+
+#[test]
+fn test_safetensors_archive_rejects_truncated_and_out_of_bounds_headers() {
+    use std::io::Write;
+    let tmp = std::env::temp_dir().join(format!("w34_bad_st_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // 1. Truncated file (< 8 bytes)
+    let p_short = tmp.join("model.safetensors");
+    std::fs::write(&p_short, [1u8, 2, 3]).unwrap();
+    assert!(SafetensorsArchive::open(&tmp).is_err());
+
+    // 2. Header length exceeds file length
+    let mut f = std::fs::File::create(&p_short).unwrap();
+    f.write_all(&1024u64.to_le_bytes()).unwrap();
+    f.write_all(b"{}").unwrap();
+    drop(f);
+    assert!(SafetensorsArchive::open(&tmp).is_err());
+
+    // 3. Tensor data_offsets out of bounds of data section
+    let hdr = br#"{"w":{"dtype":"F16","shape":[4,4],"data_offsets":[0,32]}}"#;
+    let mut f = std::fs::File::create(&p_short).unwrap();
+    f.write_all(&(hdr.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(hdr).unwrap();
+    f.write_all(&[0u8; 16]).unwrap(); // only 16 bytes instead of 32
+    drop(f);
+    assert!(SafetensorsArchive::open(&tmp).is_err());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

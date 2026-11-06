@@ -1254,6 +1254,13 @@ mod tests {
         }
         let store =
             HostExpertStore::from_raw_packs(layout.clone(), 0..32, &packs, packs.len()).unwrap();
+        #[cfg(target_os = "linux")]
+        // SAFETY: `cpu_set_t` is plain old data; `sched_getaffinity` reads the current thread's affinity mask.
+        let saved_mask = unsafe {
+            let mut m: libc::cpu_set_t = std::mem::zeroed();
+            let _ = libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut m);
+            m
+        };
         let pool = Pool::new().unwrap();
         pin_current_thread(pool.cpus[0]);
         for tokens in [1, 4, 16] {
@@ -1277,15 +1284,11 @@ mod tests {
             );
         }
         drop(pool);
-        // Restore full process CPU affinity before spawning Runtime's worker pool.
+        // Restore original process CPU affinity before spawning Runtime's worker pool.
         #[cfg(target_os = "linux")]
-        // SAFETY: `cpu_set_t` is plain old data; setting bits `0..32` restores the host cpuset.
+        // SAFETY: `saved_mask` was captured by `sched_getaffinity` before `pin_current_thread`.
         unsafe {
-            let mut full: libc::cpu_set_t = std::mem::zeroed();
-            for cpu in 0..32 {
-                libc::CPU_SET(cpu, &mut full);
-            }
-            let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &full);
+            let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &saved_mask);
         }
         let _device = CudaDevice::set_current(0).unwrap();
         let stream = crate::cuda::CudaStream::new(0).unwrap();

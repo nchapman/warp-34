@@ -39,6 +39,8 @@ fn native_conv_products_match_for_prefill_and_split_continuation() {
     slot.copy_from_host(&[0i32], &stream).unwrap();
     let has_init = DeviceBuffer::alloc(device.device_id, 1).unwrap();
     for chunk in [f.tokens, 1, 3, 8] {
+        y.copy_from_host(&vec![0x7BFFu16; f.output.len()], &stream)
+            .unwrap();
         state
             .copy_from_host(&vec![0u16; state_elements], &stream)
             .unwrap();

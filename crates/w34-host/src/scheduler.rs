@@ -992,4 +992,90 @@ mod tests {
         assert_eq!(sched.active[0].prefilled_tokens, 0);
         assert!(free_pool.is_empty());
     }
+
+    #[test]
+    fn test_scheduler_stop_eos_min_tokens_ignore_eos_and_cancel() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        let prompt: Vec<i32> = (0..16).collect();
+        let req_id = sched.submit_request_with_prefix_options(
+            prompt.clone(),
+            prompt,
+            8,
+            3,     // min_tokens = 3
+            false, // ignore_eos = false
+            vec![99],
+            vec![151645],
+            false,
+            None,
+            None,
+        );
+        sched.admit_waiting(|_| Some((1, [2, 3])));
+        sched.active[0].radix_state.kv_pages = vec![0, 1];
+
+        // Prefill chunk emits EOS (151645) at token 1 (< min_tokens = 3): must NOT finish!
+        let step0 = sched.schedule_step();
+        assert_eq!(step0.len(), 1);
+        assert!(
+            sched
+                .commit_slice(&step0[0], Some(151645), || None)
+                .is_none()
+        );
+        assert!(!sched.active[0].finished);
+
+        // Decode token 2 emits stop token (99) at token 2 (< min_tokens = 3): must NOT finish!
+        let step1 = sched.schedule_step();
+        assert!(sched.commit_slice(&step1[0], Some(99), || None).is_none());
+        assert!(!sched.active[0].finished);
+
+        // Decode token 3 emits EOS (151645) at token 3 (== min_tokens = 3): MUST finish!
+        let step2 = sched.schedule_step();
+        let donated = sched.commit_slice(&step2[0], Some(151645), || None);
+        assert!(donated.is_some());
+        assert!(sched.active[0].finished);
+        assert_eq!(sched.take_finished().len(), 1);
+        assert!(sched.cancel_request(req_id).is_none());
+
+        // Verify ignore_eos=true ignores EOS even past min_tokens, but honors explicit stop_token_ids.
+        let p2: Vec<i32> = (100..116).collect();
+        let req2 = sched.submit_request_with_prefix_options(
+            p2.clone(),
+            p2,
+            8,
+            0,
+            true, // ignore_eos = true
+            vec![777],
+            vec![151645],
+            false,
+            None,
+            None,
+        );
+        sched.admit_waiting(|_| Some((4, [5, 6])));
+        sched.active[0].radix_state.kv_pages = vec![2, 3];
+        let s0 = sched.schedule_step();
+        sched.commit_slice(&s0[0], Some(151645), || None);
+        assert!(!sched.active[0].finished, "ignore_eos=true must ignore EOS");
+        let s1 = sched.schedule_step();
+        sched.commit_slice(&s1[0], Some(777), || None);
+        assert!(
+            sched.active[0].finished,
+            "stop_token_ids must still stop under ignore_eos=true"
+        );
+        let _ = sched.take_finished();
+        let _ = req2;
+
+        // Verify failed admission when total free + evictable < 3 does not partially evict radix.
+        let cached: Vec<i32> = (500..564).collect();
+        sched.radix.insert(&cached, &[10, 11, 12, 13], &[], 42, 0);
+        let tiny_pool = vec![50i32]; // 1 free + 1 evictable = 2 < 3
+        sched.submit_request((600..616).collect(), 4, vec![]);
+        sched.admit_waiting(|radix| {
+            if tiny_pool.len() + radix.mamba_evictable_slots() < 3 {
+                return None;
+            }
+            unreachable!()
+        });
+        assert!(sched.active.is_empty());
+        assert_eq!(sched.radix.mamba_evictable_slots(), 1);
+        assert_eq!(tiny_pool, vec![50]);
+    }
 }

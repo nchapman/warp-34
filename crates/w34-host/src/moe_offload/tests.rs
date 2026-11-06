@@ -56,11 +56,11 @@ mod cuda_tests {
     #[ignore = "requires the pinned Qwen3.8-Flash-Next checkpoint"]
     fn canonical_checkpoint_host_store_tp1_and_ep2_agree() {
         use super::super::{ExpertPackLayout, HostExpertStore};
-        use crate::loader::{ModelConfig, SafetensorsArchive};
+        use crate::loader::{ModelConfig, SafetensorsArchive, resolve_hf_model_dir};
         let _device = CudaDevice::set_current(0).unwrap();
-        let snapshot = std::path::Path::new(
-            "/home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077",
-        );
+        let snapshot_buf =
+            resolve_hf_model_dir("albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE").unwrap();
+        let snapshot = snapshot_buf.as_path();
         let archive = SafetensorsArchive::open(snapshot).unwrap();
         let cfg = ModelConfig::from_dir(snapshot).unwrap();
         let layout = ExpertPackLayout::new(640, 2560, 128).unwrap();

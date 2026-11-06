@@ -73,3 +73,47 @@ fn insufficient_capacity_and_overflow_fail_closed() {
     );
     assert_eq!(token_capacity(usize::MAX, 1, 1, 1, |_| None), None);
 }
+
+#[test]
+fn qwen4_flash_next_hc_ple_qsa_layout_aligned_and_bounded() {
+    for tp in [1, 2] {
+        let d = Dimensions {
+            q: 32 * 256 / tp,
+            kv: 2 * 256 / tp,
+            v_heads: 48 / tp,
+            v: 48 * 128 / tp,
+            k: 16 * 128 / tp,
+            interm: 640 / tp,
+            hidden: 2560,
+            experts: 512,
+            top_k: 10,
+            moe: 640,
+            shared: 640 / tp,
+            hc_count: 4,
+            uses_ple: true,
+            indexer_head_dim: 128,
+        };
+        for tokens in [1, 4, 64, 512, 2048] {
+            let (total, attn, gdn, moe, hc, qsa) =
+                layer_layout(d, tokens).expect("qwen4_flash_next layer_layout");
+            assert_eq!(total % 256, 0, "total layer scratch must be 256B-aligned");
+            for off in attn
+                .into_iter()
+                .chain(gdn)
+                .chain(moe.into_iter().flatten())
+                .chain(hc)
+                .chain(qsa)
+            {
+                assert_eq!(off % 256, 0, "scratch offset {off} must be 256B-aligned");
+                assert!(off < total, "scratch offset {off} must lie within {total}");
+            }
+        }
+        let arena = 512 * 1024 * 1024;
+        let vocab = 248320 / tp;
+        let cap = token_capacity(arena, d.hidden, vocab, 16, |t| {
+            layer_layout(d, t).map(|l| l.0)
+        })
+        .expect("qwen4_flash_next token_capacity");
+        assert!((64..=2048).contains(&cap) && cap % 64 == 0);
+    }
+}

@@ -221,6 +221,22 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
     let Some(obj) = body.as_object() else {
         return Err(DecisionError::bad_request("request body must be an object"));
     };
+    const TOP_KEYS: &[&str] = &[
+        "model",
+        "state",
+        "context",
+        "questions",
+        "decisions",
+        "images",
+        "videos",
+    ];
+    for k in obj.keys() {
+        if !TOP_KEYS.contains(&k.as_str()) {
+            return Err(DecisionError::bad_request(format!(
+                "unsupported top-level key '{k}'"
+            )));
+        }
+    }
     if obj.contains_key("questions") && obj.get("questions").is_some_and(Value::is_object) {
         let mut canonical = Map::new();
         if let Some(m) = obj.get("model") {
@@ -253,6 +269,15 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
         ));
     };
 
+    const ITEM_KEYS: &[&str] = &[
+        "id",
+        "name",
+        "type",
+        "instructions",
+        "question",
+        "criteria",
+        "options",
+    ];
     let mut questions = Map::new();
     for (idx, item) in items.iter().enumerate() {
         let Some(im) = item.as_object() else {
@@ -260,6 +285,13 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
                 "decisions[{idx}] must be an object"
             )));
         };
+        for k in im.keys() {
+            if !ITEM_KEYS.contains(&k.as_str()) {
+                return Err(DecisionError::bad_request(format!(
+                    "decisions[{idx}]: unsupported key '{k}'"
+                )));
+            }
+        }
         let default_id = format!("decision_{idx}");
         let id = im
             .get("id")
@@ -294,6 +326,13 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
                             .or_else(|| om.get("id"))
                             .and_then(Value::as_str)
                     {
+                        for ok in om.keys() {
+                            if !matches!(ok.as_str(), "key" | "id" | "description") {
+                                return Err(DecisionError::bad_request(format!(
+                                    "decision '{id}': unsupported choice option key '{ok}'"
+                                )));
+                            }
+                        }
                         let desc = om.get("description").and_then(Value::as_str).unwrap_or(k);
                         (k.to_owned(), desc.to_owned())
                     } else {

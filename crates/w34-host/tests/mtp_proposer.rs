@@ -57,6 +57,10 @@ fn cached_4b_mtp_k123() {
     let mut previous = vec![];
     for k in 1..=3 {
         let drafts = mtp.propose(target, anchor, last, k, None).unwrap();
+        assert!(
+            mtp.has_propose_graph(k),
+            "MTP rank with quantized draft_lm_head must capture propose CUDA graph for k={k}"
+        );
         eprintln!("k={k} anchor={anchor} MTP={drafts:?}");
         assert_eq!(drafts.len(), k);
         assert!(
@@ -87,9 +91,60 @@ fn cached_4b_mtp_k123() {
         mtp.propose(target, anchor, last, 3, None).unwrap(),
         previous
     );
+    mtp.truncate(p).unwrap();
+    check_draft_lm_head_quantized_vs_fp16_fallback(
+        &mut engine,
+        &mut mtp,
+        &tokens,
+        p,
+        anchor,
+        last,
+        &previous,
+    );
     check_lossless_rounds(&mut engine, &mut mtp, &tokens, 2);
     check_lossless_rounds(&mut engine, &mut mtp, &tokens, 12);
     check_vllm_hidden_replay(&engine, &mut mtp);
+}
+
+fn check_draft_lm_head_quantized_vs_fp16_fallback(
+    engine: &mut Qwen3_5Engine,
+    mtp: &mut Qwen3_5MtpRank,
+    tokens: &[i32],
+    p: usize,
+    anchor: i32,
+    last: u64,
+    quant_graph_drafts: &[i32],
+) {
+    let target = &engine.ranks[0];
+    // 1. Eager quantized draft_lm_head must match CUDA Graph quantized draft_lm_head bit-for-bit.
+    mtp.use_cuda_graph = false;
+    let quant_eager = mtp.propose(target, anchor, last, 3, None).unwrap();
+    assert_eq!(quant_eager, quant_graph_drafts);
+    mtp.truncate(p).unwrap();
+
+    // 2. Detach quantized draft_lm_head to exercise DenseF16 target.lm_head fallback (both eager & CUDA graph).
+    let saved_head = mtp.take_quantized_draft_lm_head();
+    assert!(saved_head.is_some() && !mtp.has_quantized_draft_lm_head());
+    assert!(!mtp.has_propose_graph(3));
+    let fp16_eager = mtp.propose(target, anchor, last, 3, None).unwrap();
+    mtp.truncate(p).unwrap();
+    mtp.use_cuda_graph = true;
+    let fp16_graph = mtp.propose(target, anchor, last, 3, None).unwrap();
+    assert!(mtp.has_propose_graph(3));
+    assert_eq!(fp16_eager, fp16_graph);
+    assert!(
+        fp16_graph
+            .iter()
+            .all(|&id| id >= 0 && (id as usize) < engine.cfg.vocab_size)
+    );
+    mtp.truncate(p).unwrap();
+    // Lossless target verification with DenseF16 target.lm_head fallback must match greedy baseline.
+    check_lossless_rounds(engine, mtp, tokens, 6);
+
+    // 3. Restore quantized draft_lm_head.
+    mtp.restore_quantized_draft_lm_head(saved_head);
+    assert!(mtp.has_quantized_draft_lm_head());
+    assert!(!mtp.has_propose_graph(3));
 }
 
 fn check_mtp_input_validation(

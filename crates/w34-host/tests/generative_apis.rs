@@ -424,6 +424,31 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
                 }),
                 "expected thinking content_block_start in {anth_sse_raw}"
             );
+            assert!(
+                anth_frames.iter().any(|(ev, d)| {
+                    ev == "content_block_start"
+                        && d["content_block"]["type"] == "tool_use"
+                        && d["content_block"]["name"] == "get_time"
+                }),
+                "expected tool_use content_block_start for get_time in {anth_sse_raw}"
+            );
+            let tool_json_str: String = anth_frames
+                .iter()
+                .filter(|(ev, d)| {
+                    ev == "content_block_delta" && d["delta"]["type"] == "input_json_delta"
+                })
+                .map(|(_, d)| d["delta"]["partial_json"].as_str().unwrap_or(""))
+                .collect();
+            let tool_args: Value = serde_json::from_str(&tool_json_str).unwrap_or_else(|e| {
+                panic!("invalid streamed tool_use input_json_delta '{tool_json_str}': {e}")
+            });
+            assert_eq!(tool_args["tz"], "UTC");
+            assert!(
+                anth_frames.iter().any(|(ev, d)| {
+                    ev == "message_delta" && d["delta"]["stop_reason"] == "tool_use"
+                }),
+                "expected message_delta stop_reason=tool_use in {anth_sse_raw}"
+            );
 
             // Multimodal base64 PNG image via Anthropic /v1/messages
             let png_b64 = tiny_red_png_base64();
@@ -574,6 +599,62 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
                     .unwrap()
                     .status(),
                 200
+            );
+            // Verify POST /v1/responses/{id}/cancel tenant isolation and terminal status.
+            assert_eq!(
+                client
+                    .post(format!("{base}/v1/responses/{tenant_a_id}/cancel"))
+                    .header("Authorization", "Bearer tenant-beta")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                404
+            );
+            let cancel_a: Value = client
+                .post(format!("{base}/v1/responses/{tenant_a_id}/cancel"))
+                .header("Authorization", "Bearer tenant-alpha")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(cancel_a["id"], tenant_a_id);
+            assert_eq!(cancel_a["status"], tenant_a_resp["status"]);
+
+            // Verify /tokenize and /detokenize roundtrip + invalid token rejection.
+            let tok_resp: Value = client
+                .post(format!("{base}/tokenize"))
+                .json(&json!({"prompt": "Hello warp-34!"}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let tok_ids = tok_resp["tokens"].as_array().unwrap();
+            assert!(!tok_ids.is_empty());
+            assert_eq!(tok_resp["count"].as_u64(), Some(tok_ids.len() as u64));
+            let detok_resp: Value = client
+                .post(format!("{base}/detokenize"))
+                .json(&json!({"tokens": tok_ids}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(detok_resp["text"], "Hello warp-34!");
+            assert_eq!(
+                client
+                    .post(format!("{base}/detokenize"))
+                    .json(&json!({"tokens": [999_999_999u32]}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                400
             );
 
             let _ = stop_tx.send(());

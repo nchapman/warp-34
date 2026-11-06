@@ -73,9 +73,21 @@ fn assert_4b_tap_parity(target_dir: &std::path::Path, rel: f64, energy: f64) {
             "target tap drift exceeds sub-percent oracle budget: {rel}"
         );
     } else {
+        let strict = ["W34_STRICT_TESTS", "CI"].into_iter().any(|var| {
+            std::env::var(var).is_ok_and(|val| {
+                let t = val.trim();
+                t == "1" || t.eq_ignore_ascii_case("true")
+            })
+        });
         assert!(
-            rel.is_finite() && energy > 0.0,
-            "target taps must be finite on non-provenance target snapshot"
+            !strict,
+            "strict mode requires pinned 4B provenance snapshot d5874365f7093b28b69379722d2f45d660fcbca6, got {}",
+            target_dir.display()
+        );
+        assert!(
+            rel.is_finite() && energy > 0.0 && rel < 0.05,
+            "target taps drift {rel} or energy {energy} out of bounds on {}",
+            target_dir.display()
         );
     }
 }

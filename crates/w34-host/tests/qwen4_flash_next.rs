@@ -812,21 +812,22 @@ fn test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph() {
     drop(engine_tp1_eager);
 
     // 3. Verify Q8_0 and TQ4 KV compression (`KvFormatPolicy::Q8_0`, `KvFormatPolicy::Tq4All`)
-    //    on QSA sparse paged attention (> 32-token indexer_budget)
-    for policy in [KvFormatPolicy::Q8_0, KvFormatPolicy::Tq4All] {
-        let mut engine_tp1_qkv = Qwen3_5Engine::load_from_dir(&dir, 1, policy, Some(64), true)
-            .expect("load synthetic qwen4_exp TP=1 quantized KV");
-        let out_tp1_qkv = engine_tp1_qkv
-            .generate_tokens(&extended_prompt, 4, false)
-            .expect("generate_tokens TP=1 quantized KV on extended_prompt");
-        assert_eq!(out_tp1_qkv.generated_token_ids.len(), 4);
-        for &tok in &out_tp1_qkv.generated_token_ids {
-            assert!((0..256).contains(&tok), "invalid {policy:?} token id {tok}");
-        }
-    }
+    //    on QSA sparse paged attention (> 32-token indexer_budget) against the FP16 baseline.
+    verify_qwen4_exp_quantized_kv(&dir, &extended_prompt);
 
     // 4. TP=2 / EP=2 eager + CUDA Graph + MambaRadixCache (68 tokens > 32-token indexer_budget, 4-token suffix hitting M=4 sparse_vec4 K=640) + Qwen4 MTP parity against TP=1
-    if w34_host::cuda::CudaDevice::set_current(1).is_ok() {
+    if w34_host::cuda::CudaDevice::set_current(1).is_err() {
+        let strict = ["W34_STRICT_TESTS", "CI"].into_iter().any(|var| {
+            std::env::var(var).is_ok_and(|val| {
+                let t = val.trim();
+                t == "1" || t.eq_ignore_ascii_case("true")
+            })
+        });
+        assert!(
+            !strict,
+            "test_qwen4_exp_synthetic_2layer_tp1_tp2_radix_and_cuda_graph requires 2 GPUs in strict mode"
+        );
+    } else {
         let mut engine_tp2 =
             Qwen3_5Engine::load_from_dir(&dir, 2, KvFormatPolicy::Fp16, Some(64), true)
                 .expect("load synthetic qwen4_exp TP=2 / EP=2");
@@ -1109,17 +1110,62 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
     );
 }
 
+fn verify_qwen4_exp_quantized_kv(dir: &Path, extended_prompt: &[i32]) {
+    let mut engine_tp1_fp16_ref =
+        Qwen3_5Engine::load_from_dir(dir, 1, KvFormatPolicy::Fp16, Some(64), true)
+            .expect("load synthetic qwen4_exp TP=1 FP16 ref");
+    let fp16_dump = engine_tp1_fp16_ref
+        .dump_prompt(extended_prompt)
+        .expect("dump_prompt TP=1 FP16 ref");
+    drop(engine_tp1_fp16_ref);
+
+    for (policy, min_cos) in [
+        (KvFormatPolicy::Q8_0, 0.999),
+        (KvFormatPolicy::Tq4All, 0.99),
+    ] {
+        let mut engine_tp1_qkv = Qwen3_5Engine::load_from_dir(dir, 1, policy, Some(64), true)
+            .expect("load synthetic qwen4_exp TP=1 quantized KV");
+        let qkv_dump = engine_tp1_qkv
+            .dump_prompt(extended_prompt)
+            .expect("dump_prompt TP=1 quantized KV");
+        let fp16_fn = &fp16_dump.tensors_f32["final_norm"].1;
+        let qkv_fn = &qkv_dump.tensors_f32["final_norm"].1;
+        let dot: f64 = fp16_fn
+            .iter()
+            .zip(qkv_fn.iter())
+            .map(|(&a, &b)| (a as f64) * (b as f64))
+            .sum();
+        let n_a: f64 = fp16_fn
+            .iter()
+            .map(|&a| (a as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let n_b: f64 = qkv_fn
+            .iter()
+            .map(|&b| (b as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let cos = dot / (n_a * n_b).max(1e-12);
+        assert!(
+            cos >= min_cos,
+            "{policy:?} final_norm cosine similarity {cos:.6} < {min_cos} vs FP16"
+        );
+        let out_tp1_qkv = engine_tp1_qkv
+            .generate_tokens(extended_prompt, 4, false)
+            .expect("generate_tokens TP=1 quantized KV on extended_prompt");
+        assert_eq!(out_tp1_qkv.generated_token_ids.len(), 4);
+        for &tok in &out_tp1_qkv.generated_token_ids {
+            assert!((0..256).contains(&tok), "invalid {policy:?} token id {tok}");
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires local albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE checkpoint"]
 fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
-    let snap = Path::new(
-        "/home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077",
-    );
-    assert!(
-        snap.exists(),
-        "missing real checkpoint at {}",
-        snap.display()
-    );
+    let snap = w34_host::loader::resolve_hf_model_dir("albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE")
+        .expect("resolve albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE");
+    let snap = snap.as_path();
 
     // 1. TP=1 load, eager + CUDA Graph generation, and MambaRadixCache prefix reuse
     let t_load_tp1 = std::time::Instant::now();
@@ -1408,16 +1454,13 @@ fn test_qwen4_exp_reference_bench_suite() {
     if CudaDevice::count().unwrap_or(0) < 2 {
         return;
     }
-    let dir = Path::new(
-        "/home/nchapman/.cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077",
-    );
-    if !dir.join("model.safetensors.index.json").exists() {
-        eprintln!(
-            "Skipping test_qwen4_exp_reference_bench_suite: checkpoint not found at {}",
-            dir.display()
-        );
+    let Ok(dir_buf) =
+        w34_host::loader::resolve_hf_model_dir("albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE")
+    else {
+        eprintln!("Skipping test_qwen4_exp_reference_bench_suite: checkpoint not cached");
         return;
-    }
+    };
+    let dir = dir_buf.as_path();
 
     let mut engine = Qwen3_5Engine::load_from_dir(dir, 2, KvFormatPolicy::Fp16, Some(640), true)
         .expect("load real Qwen3.8-Flash-Next TP=2 / EP=2");
@@ -1535,6 +1578,12 @@ fn test_qwen4_exp_reference_bench_suite() {
         acc_cold_short.len(),
         mean_acc_cold,
         1.0 + mean_acc_cold,
+    );
+
+    assert_eq!(m_cold_short.generated_token_ids.len(), 512);
+    assert!(
+        mean_acc_cold > 1.0,
+        "expected MTP acceptance > 1.0, got {mean_acc_cold}"
     );
 
     // 1b. Warm `short-chat 128:256` & `128:512` (matching `benchmark_serving.py` 1 warmup + measured protocol)

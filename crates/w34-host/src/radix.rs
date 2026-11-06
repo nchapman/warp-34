@@ -1234,8 +1234,6 @@ mod tests {
         assert_eq!(ev_full.freed_kv_pages, vec![10, 20, 30, 40]);
         assert_eq!(ev_full.freed_mamba_slots, vec![99]);
         assert!(cache.sanity_check().is_ok());
-        assert_eq!(ev_full.freed_kv_pages, vec![10, 20, 30, 40]);
-        assert!(cache.sanity_check().is_ok());
     }
 
     #[test]
@@ -1267,5 +1265,51 @@ mod tests {
         let match_res = radix.match_prefix(&tokens);
         assert_eq!(match_res.matched_tokens, 64);
         assert_eq!(match_res.mamba_slot, Some(6));
+    }
+
+    #[test]
+    fn test_radix_multi_checkpoint_drain_rollback_and_multi_node_lru() {
+        // 1. Multi-chunk prefill crossing > 2 checkpoints (256 tokens = 4 * 64) retains only the last 2.
+        let mut req = ReqRadixState::new(16, 64, 5, [6, 7]);
+        let ckpts_256 = req.plan_checkpoints(256);
+        assert_eq!(ckpts_256.len(), 2);
+        assert_eq!(ckpts_256[0].abs_seq_len, 192);
+        assert_eq!(ckpts_256[0].dst_slot, 6);
+        assert_eq!(ckpts_256[0].track_idx, 0);
+        assert_eq!(ckpts_256[1].abs_seq_len, 256);
+        assert_eq!(ckpts_256[1].dst_slot, 7);
+        assert_eq!(ckpts_256[1].track_idx, 1);
+
+        // 2. Partial commit (mid-block speculative rejection at 200 tokens < 256) commits only <= 200.
+        let tokens_200: Vec<i32> = (0..200).collect();
+        req.kv_pages = (100..116).collect(); // 16 pages (256 capacity), only 13 pages needed for 200 tokens
+        req.protected_pages = 4;
+        req.commit_tokens(&tokens_200, &ckpts_256);
+        assert_eq!(req.last_track_seqlen, Some(192));
+        assert_eq!(req.next_track_idx, 1);
+        let freed = req.rollback_uncommitted_kv_pages();
+        assert_eq!(freed, vec![113, 114, 115]);
+        assert_eq!(req.kv_pages.len(), 13);
+
+        // 3. Multi-node LRU eviction order: insert A, B, C, touch A, then evict one by one.
+        let mut cache = MambaRadixCache::new(16, 64);
+        let tok_a: Vec<i32> = (0..64).collect();
+        let tok_b: Vec<i32> = (100..164).collect();
+        let tok_c: Vec<i32> = (200..264).collect();
+        cache.insert(&tok_a, &[1, 2, 3, 4], &[], 11, 0);
+        cache.insert(&tok_b, &[5, 6, 7, 8], &[], 22, 0);
+        cache.insert(&tok_c, &[9, 10, 11, 12], &[], 33, 0);
+        // Touch A so LRU order becomes B (oldest), C, A (newest).
+        assert_eq!(cache.match_prefix(&tok_a).mamba_slot, Some(11));
+        assert_eq!(cache.mamba_evictable_slots(), 3);
+
+        let ev1 = cache.evict_mamba(1);
+        assert_eq!(ev1.freed_mamba_slots, vec![22]);
+        let ev2 = cache.evict_mamba(1);
+        assert_eq!(ev2.freed_mamba_slots, vec![33]);
+        let ev3 = cache.evict_mamba(1);
+        assert_eq!(ev3.freed_mamba_slots, vec![11]);
+        assert_eq!(cache.mamba_evictable_slots(), 0);
+        assert!(cache.sanity_check().is_ok());
     }
 }

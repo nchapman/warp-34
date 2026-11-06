@@ -816,11 +816,27 @@ fn resolve_clef_flash_hf_tokenizer() -> Option<std::path::PathBuf> {
     None
 }
 
+fn strict_test_env() -> bool {
+    ["W34_STRICT_TESTS", "CI"].into_iter().any(|var| {
+        std::env::var(var).is_ok_and(|val| {
+            let trimmed = val.trim();
+            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        })
+    })
+}
+
 #[test]
-#[ignore = "requires Cloudflare/clef-flash tokenizer in local HF cache or W34_CLEF_TOKENIZER"]
 fn clef_encode_record_matches_clef_flash_hf_tokenizer_goldens() {
-    let tok_path = resolve_clef_flash_hf_tokenizer()
-        .expect("set W34_CLEF_TOKENIZER or cache Cloudflare/clef-flash");
+    let Some(tok_path) = resolve_clef_flash_hf_tokenizer() else {
+        assert!(
+            !strict_test_env(),
+            "set W34_CLEF_TOKENIZER or cache Cloudflare/clef-flash in strict mode"
+        );
+        eprintln!(
+            "Skipping clef_encode_record_matches_clef_flash_hf_tokenizer_goldens: tokenizer not cached"
+        );
+        return;
+    };
     let tokenizer = Tokenizer::from_file(&tok_path).unwrap();
     let body = json!({
         "state": {"zeta": 2, "alpha": "hello"},

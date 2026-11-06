@@ -19,6 +19,9 @@ impl Qwen3_5Engine {
         &mut self,
         radix: &mut MambaRadixCache,
     ) -> Option<(i32, [i32; 2])> {
+        if self.ranks[0].state_pool.free_count() + radix.mamba_evictable_slots() < 3 {
+            return None;
+        }
         let s0 = self.alloc_state_slot_from(radix)?;
         let Some(s1) = self.alloc_state_slot_from(radix) else {
             self.free_state_slots(&[s0]);

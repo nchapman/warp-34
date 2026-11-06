@@ -57,12 +57,15 @@ fn lossless_cold_and_warm(kind: SpeculativeKind, tp: usize, large: bool) {
     assert_eq!(cold.cached_prefix_tokens, 0);
     assert_eq!(cold.generated_token_ids, baseline, "cold {kind:?}");
     assert!(
-        !engine
+        engine
             .speculative
             .as_ref()
             .unwrap()
             .last_accepted
-            .is_empty()
+            .iter()
+            .any(|&a| a >= 1),
+        "cold {kind:?}: expected at least one verify round accepting >= 1 draft token, got {:?}",
+        engine.speculative.as_ref().unwrap().last_accepted
     );
     let warm = engine
         .generate_with_radix_cache(&prompt, 12, 64, false)
@@ -80,6 +83,20 @@ fn lossless_cold_and_warm(kind: SpeculativeKind, tp: usize, large: bool) {
     assert_eq!(warm.generated_token_ids, baseline, "warm {kind:?}");
     if kind == SpeculativeKind::Mtp {
         verify_mtp_branching_and_multi_memo(&mut engine, &prompt, &seed);
+        for k in [1usize, 2, 3] {
+            engine.speculative.as_mut().unwrap().set_mtp_k(k).unwrap();
+            let run_k = engine.generate_tokens(&prompt, 8, false).unwrap();
+            assert_eq!(
+                run_k.generated_token_ids,
+                &baseline[..8],
+                "MTP k={k} greedy tokens must match baseline"
+            );
+            let accepted_k = &engine.speculative.as_ref().unwrap().last_accepted;
+            assert!(
+                !accepted_k.is_empty() && accepted_k.iter().all(|&a| (0..=k).contains(&a)),
+                "MTP k={k} accepted draft counts out of range 0..={k}: {accepted_k:?}"
+            );
+        }
     }
     let short = engine.generate_tokens(&prompt, 2, false).unwrap();
     assert_eq!(
@@ -173,14 +190,48 @@ fn exercise_http(engine: Qwen3_5Engine) {
                 response.contains("text/event-stream") && response.contains("data: [DONE]"),
                 "{response}"
             );
+            let (_, body_text) = response.split_once("\r\n\r\n").unwrap();
+            let mut delta_chars = 0usize;
+            for line in body_text.lines() {
+                if let Some(json_str) = line.strip_prefix("data: ")
+                    && json_str.trim() != "[DONE]"
+                {
+                    let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
+                    if let Some(c) = v["choices"][0]["delta"]["content"].as_str() {
+                        delta_chars += c.len();
+                    }
+                }
+            }
+            assert!(
+                delta_chars > 0,
+                "expected non-empty streamed delta content: {response}"
+            );
         } else {
             assert!(response.contains("chat.completion"), "{response}");
+            let (_, body_text) = response.split_once("\r\n\r\n").unwrap();
+            let v: serde_json::Value = serde_json::from_str(body_text).unwrap();
+            assert_eq!(v["usage"]["completion_tokens"].as_u64(), Some(8));
+            assert!(
+                !v["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .is_empty(),
+                "expected non-empty completion content: {response}"
+            );
         }
         assert!(
             state.worker.stats.verify_rounds.load(Ordering::Relaxed) > rounds,
             "server bypassed native proposer"
         );
-        assert!(state.worker.stats.accepted_drafts.load(Ordering::Relaxed) >= accepted);
+        let new_accepted = state.worker.stats.accepted_drafts.load(Ordering::Relaxed);
+        if !stream {
+            assert!(
+                new_accepted > accepted,
+                "expected greedy HTTP request to accept at least 1 draft token (before={accepted}, after={new_accepted})"
+            );
+        } else {
+            assert!(new_accepted >= accepted);
+        }
     }
     common::shutdown(&state);
 }

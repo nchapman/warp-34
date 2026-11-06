@@ -590,7 +590,76 @@ fn vision_cuda_kernels_and_embedding_splice() {
     );
     let mut attn_out = vec![0u16; total_tokens * hidden];
     d_out.copy_to_host(&mut attn_out, &stream).unwrap();
-    assert!(attn_out.iter().all(|&x| f16_to_f32(x).is_finite()));
+    // Exact CPU reference for 2D vision RoPE (`head_dim = 64`, `half_dim = 32`, `quarter = 16`) + softmax attention:
+    let quarter = head_dim / 4;
+    let half_dim = head_dim / 2;
+    let mut q_rot = vec![0.0f32; total_tokens * hidden];
+    let mut k_rot = vec![0.0f32; total_tokens * hidden];
+    let mut v_bias = vec![0.0f32; total_tokens * hidden];
+    for t in 0..total_tokens {
+        let ph = pos_hw[2 * t] as f32;
+        let pw = pos_hw[2 * t + 1] as f32;
+        for h in 0..num_heads {
+            for d in 0..head_dim {
+                let q_idx = t * 3 * hidden + h * head_dim + d;
+                let k_idx = t * 3 * hidden + hidden + h * head_dim + d;
+                let v_idx = t * 3 * hidden + 2 * hidden + h * head_dim + d;
+                q_rot[t * hidden + h * head_dim + d] = f16_to_f32(f32_to_f16(
+                    f16_to_f32(qkv_host[q_idx]) + f16_to_f32(bias_host[h * head_dim + d]),
+                ));
+                k_rot[t * hidden + h * head_dim + d] = f16_to_f32(f32_to_f16(
+                    f16_to_f32(qkv_host[k_idx]) + f16_to_f32(bias_host[hidden + h * head_dim + d]),
+                ));
+                v_bias[t * hidden + h * head_dim + d] = f16_to_f32(f32_to_f16(
+                    f16_to_f32(qkv_host[v_idx])
+                        + f16_to_f32(bias_host[2 * hidden + h * head_dim + d]),
+                ));
+            }
+            for i in 0..half_dim {
+                let pos_val = if i < quarter { ph } else { pw };
+                let freq_idx = if i < quarter { i } else { i - quarter };
+                let inv_freq = 1.0f32 / 10000.0f32.powf((2 * freq_idx) as f32 / (half_dim as f32));
+                let angle = pos_val * inv_freq;
+                let cos_a = f16_to_f32(f32_to_f16(angle.cos()));
+                let sin_a = f16_to_f32(f32_to_f16(angle.sin()));
+                let i0 = t * hidden + h * head_dim + i;
+                let i1 = i0 + half_dim;
+                let (q0, q1) = (q_rot[i0], q_rot[i1]);
+                q_rot[i0] = f16_to_f32(f32_to_f16(q0 * cos_a - q1 * sin_a));
+                q_rot[i1] = f16_to_f32(f32_to_f16(q1 * cos_a + q0 * sin_a));
+                let (k0, k1) = (k_rot[i0], k_rot[i1]);
+                k_rot[i0] = f16_to_f32(f32_to_f16(k0 * cos_a - k1 * sin_a));
+                k_rot[i1] = f16_to_f32(f32_to_f16(k1 * cos_a + k0 * sin_a));
+            }
+        }
+    }
+    let scale = (head_dim as f32).powf(-0.5);
+    for t in 0..total_tokens {
+        for h in 0..num_heads {
+            let mut scores = [0.0f32; 4];
+            for s in 0..total_tokens {
+                let dot: f32 = (0..head_dim)
+                    .map(|d| {
+                        q_rot[t * hidden + h * head_dim + d] * k_rot[s * hidden + h * head_dim + d]
+                    })
+                    .sum();
+                scores[s] = dot * scale;
+            }
+            let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
+            let sum_e: f32 = exps.iter().sum();
+            for d in 0..head_dim {
+                let exp_out: f32 = (0..total_tokens)
+                    .map(|s| (exps[s] / sum_e) * v_bias[s * hidden + h * head_dim + d])
+                    .sum();
+                let got_out = f16_to_f32(attn_out[t * hidden + h * head_dim + d]);
+                assert!(
+                    (got_out - exp_out).abs() < 2e-3,
+                    "vision_qkv_rope_attn mismatch at t={t} h={h} d={d}: got {got_out} vs {exp_out}"
+                );
+            }
+        }
+    }
 
     // Test embedding splice: overwrite token 1 and token 3 in a 4-token sequence
     let mut tok_emb = vec![f32_to_f16(1.0); 4 * 16];
@@ -880,11 +949,19 @@ fn moe_checkpoint_config_and_dense_f16_tp_parity() {
     let hidden = 128usize;
     let interm = 64usize;
 
-    let gu_w = vec![f32_to_f16(0.01); num_experts * (2 * interm) * hidden];
-    let dn_w = vec![f32_to_f16(0.02); num_experts * hidden * interm];
-    let x_host = vec![f32_to_f16(1.0); num_tokens * hidden];
-    let sh_out_host = vec![f32_to_f16(0.5); num_tokens * hidden];
-    let sh_gate_host = vec![f32_to_f16(0.0); num_tokens];
+    let gu_w: Vec<u16> = (0..num_experts * (2 * interm) * hidden)
+        .map(|i| f32_to_f16((((i * 13 + 5) % 41) as f32 - 20.0) * 0.01))
+        .collect();
+    let dn_w: Vec<u16> = (0..num_experts * hidden * interm)
+        .map(|i| f32_to_f16((((i * 17 + 3) % 37) as f32 - 18.0) * 0.01))
+        .collect();
+    let x_host: Vec<u16> = (0..num_tokens * hidden)
+        .map(|i| f32_to_f16((((i * 7 + 1) % 29) as f32 - 14.0) * 0.05))
+        .collect();
+    let sh_out_host: Vec<u16> = (0..num_tokens * hidden)
+        .map(|i| f32_to_f16((((i * 11 + 2) % 23) as f32 - 11.0) * 0.04))
+        .collect();
+    let sh_gate_host = vec![f32_to_f16(0.25); num_tokens];
 
     let d_x = DeviceBuffer::alloc(0, x_host.len() * 2).unwrap();
     let d_gu = DeviceBuffer::alloc(0, gu_w.len() * 2).unwrap();
@@ -896,13 +973,13 @@ fn moe_checkpoint_config_and_dense_f16_tp_parity() {
     let d_sh_gate = DeviceBuffer::alloc(0, sh_gate_host.len() * 2).unwrap();
     let d_out = DeviceBuffer::alloc(0, num_tokens * hidden * 2).unwrap();
 
+    let sel_experts = [1i32, 3i32];
+    let sel_weights = [0.6f32, 0.4f32];
     d_x.copy_from_host(&x_host, &stream).unwrap();
     d_gu.copy_from_host(&gu_w, &stream).unwrap();
     d_dn.copy_from_host(&dn_w, &stream).unwrap();
-    d_ids.copy_from_host(&[1i32, 2i32], &stream).unwrap();
-    d_weights
-        .copy_from_host(&[0.6f32, 0.4f32], &stream)
-        .unwrap();
+    d_ids.copy_from_host(&sel_experts, &stream).unwrap();
+    d_weights.copy_from_host(&sel_weights, &stream).unwrap();
     d_sh_out.copy_from_host(&sh_out_host, &stream).unwrap();
     d_sh_gate.copy_from_host(&sh_gate_host, &stream).unwrap();
 
@@ -947,11 +1024,44 @@ fn moe_checkpoint_config_and_dense_f16_tp_parity() {
     );
     let mut out_host = vec![0u16; hidden];
     d_out.copy_to_host(&mut out_host, &stream).unwrap();
-    let got = f16_to_f32(out_host[0]);
-    assert!(
-        (got - 1.8907).abs() < 0.02,
-        "MoE FP16 fused output mismatch: got {got}, expected ~1.8907"
-    );
+    let mut ref_interm = vec![0.0f32; top_k * interm];
+    for (k_idx, &exp_id) in sel_experts.iter().enumerate() {
+        let e = exp_id as usize;
+        for m_col in 0..interm {
+            let gate: f32 = (0..hidden)
+                .map(|j| {
+                    f16_to_f32(x_host[j]) * f16_to_f32(gu_w[(e * 2 * interm + m_col) * hidden + j])
+                })
+                .sum();
+            let up: f32 = (0..hidden)
+                .map(|j| {
+                    f16_to_f32(x_host[j])
+                        * f16_to_f32(gu_w[(e * 2 * interm + interm + m_col) * hidden + j])
+                })
+                .sum();
+            let silu = gate / (1.0 + (-gate).exp());
+            ref_interm[k_idx * interm + m_col] = f16_to_f32(f32_to_f16(silu * up));
+        }
+    }
+    let sh_sig = 1.0f32 / (1.0f32 + (-f16_to_f32(sh_gate_host[0])).exp());
+    for h_col in 0..hidden {
+        let mut acc = sh_sig * f16_to_f32(sh_out_host[h_col]);
+        for (k_idx, &exp_id) in sel_experts.iter().enumerate() {
+            let e = exp_id as usize;
+            let down: f32 = (0..interm)
+                .map(|m_col| {
+                    ref_interm[k_idx * interm + m_col]
+                        * f16_to_f32(dn_w[(e * hidden + h_col) * interm + m_col])
+                })
+                .sum();
+            acc += sel_weights[k_idx] * down;
+        }
+        let got = f16_to_f32(out_host[h_col]);
+        assert!(
+            (got - acc).abs() < 3e-3,
+            "MoE FP16 fused output mismatch at col={h_col}: got {got}, expected {acc}"
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]

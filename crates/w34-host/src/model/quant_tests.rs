@@ -851,6 +851,29 @@ fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
                     "POST {post_path} failed with {}",
                     resp.status()
                 );
+                let text = resp.text().await.unwrap();
+                assert!(!text.is_empty(), "POST {post_path} returned empty body");
+                if !payload
+                    .get("stream")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let body_json: serde_json::Value = serde_json::from_str(&text)
+                        .unwrap_or_else(|e| panic!("POST {post_path} invalid JSON '{text}': {e}"));
+                    match post_path {
+                        "/tokenize" => assert!(body_json["tokens"].is_array()),
+                        "/detokenize" => assert!(body_json["text"].is_string()),
+                        "/v1/completions" | "/v1/chat/completions" => {
+                            assert!(body_json["choices"].as_array().is_some_and(|a| !a.is_empty()));
+                        }
+                        "/v1/messages" => assert!(body_json["content"].is_array()),
+                        "/v1/messages/count_tokens" | "/v1/responses/input_tokens" => {
+                            assert!(body_json["input_tokens"].as_u64().unwrap_or(0) > 0);
+                        }
+                        "/v1/responses" => assert!(body_json["output"].is_array()),
+                        _ => {}
+                    }
+                }
             }
 
             let _ = tx.send(());

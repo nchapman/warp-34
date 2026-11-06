@@ -50,6 +50,7 @@ pub struct NativeProposer {
     max_rows: usize,
     row_bytes: usize,
     k: usize,
+    max_k: usize,
     tail: Vec<DeviceBuffer>,
     shifted: Vec<DeviceBuffer>,
     memos: Vec<PrefixMemo>,
@@ -68,6 +69,16 @@ const MEMO_BUDGET: usize = 256 * 1024 * 1024;
 const MAX_MEMO_ENTRIES: usize = 16;
 const MTP_STAGE_ROWS: usize = 256;
 impl NativeProposer {
+    pub fn set_mtp_k(&mut self, k: usize) -> Result<()> {
+        if !matches!(self.ranks, Ranks::Mtp(_)) || !(1..=self.max_k).contains(&k) {
+            return Err(loader_err(
+                "set_mtp_k requires MTP proposer and k in 1..=max_k",
+            ));
+        }
+        self.k = k;
+        Ok(())
+    }
+
     pub fn load(engine: &mut Qwen3_5Engine, config: &SpeculativeConfig) -> Result<Self> {
         for t in &mut engine.ranks {
             t.decode_graph = None;
@@ -240,6 +251,7 @@ impl NativeProposer {
             max_rows,
             row_bytes,
             k,
+            max_k: k,
             tail,
             shifted,
             memos: vec![],

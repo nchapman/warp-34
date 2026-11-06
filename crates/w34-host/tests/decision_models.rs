@@ -939,5 +939,34 @@ fn decision_endpoints_verify_tev1_kev_xor_and_donor_token_goldens() {
         let _ = std::fs::remove_dir_all(&tmp_clef);
     }
 
+    // 7. Verify normalize_decisions_adapter_request rejects unknown top-level, item, and option keys.
+    assert!(
+        w34_host::decision::normalize_decisions_adapter_request(&json!({
+            "state": "s",
+            "decisions": [{"id": "q", "type": "noul", "instructions": "i"}],
+            "unknown_top": 1
+        }))
+        .is_err()
+    );
+    assert!(
+        w34_host::decision::normalize_decisions_adapter_request(&json!({
+            "state": "s",
+            "decisions": [{"id": "q", "type": "noul", "instructions": "i", "unknown_item": 1}]
+        }))
+        .is_err()
+    );
+    assert!(
+        w34_host::decision::normalize_decisions_adapter_request(&json!({
+            "state": "s",
+            "decisions": [{
+                "id": "q",
+                "type": "choice",
+                "instructions": "i",
+                "options": [{"key": "a", "description": "A", "unknown_opt": 1}]
+            }]
+        }))
+        .is_err()
+    );
+
     let _ = std::fs::remove_dir_all(&tmp_kev);
 }

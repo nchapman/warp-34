@@ -229,4 +229,102 @@ fn batched_mtp_b4_matches_single_stream_losslessly() {
         batch_worker.stats.accepted_drafts.load(Ordering::Relaxed) > 0,
         "expected accepted MTP drafts in batched B=4 verify"
     );
+
+    // 2. Verify B=2 batched MTP (`M=8` CUDA Graph slot) matches single-stream B=1 bit-for-bit,
+    //    then verify B=2 GPU-resident stochastic verification (`verify_batched_speculative_gpu_steps`),
+    //    and finally verify B=5 (> MAX_MTP_BATCH_SLOTS = 4) yields cleanly to ordinary batched decode.
+    let b2_worker = worker(SpeculativeKind::Mtp);
+    let (got_b2, gpu_stoch_a, gpu_stoch_b, got_b5) = rt.block_on(async {
+        let mut s0 = b2_worker
+            .submit(prompts[0].clone(), params(), None)
+            .unwrap();
+        let mut s1 = b2_worker
+            .submit(prompts[1].clone(), params(), None)
+            .unwrap();
+        let got_b2 = tokio::time::timeout(Duration::from_secs(120), async {
+            let (o0, o1) = tokio::join!(collect(&mut s0, vec![]), collect(&mut s1, vec![]));
+            Ok::<_, String>(vec![o0?, o1?])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        // 2a. Plain greedy (`ignore_eos = false`) exercises the `any_gpu_sampler == false`
+        //     (`RejectionSampler::greedy`) branch in `step_scheduled_batched_mtp_verify_round`,
+        //     while `params()` (`ignore_eos = true`) above exercised `verify_batched_speculative_gpu_steps`.
+        let mut plain_greedy = params();
+        plain_greedy.ignore_eos = false;
+        let rounds_before_plain = b2_worker.stats.verify_rounds.load(Ordering::Relaxed);
+        let mut g0 = b2_worker
+            .submit(prompts[2].clone(), plain_greedy.clone(), None)
+            .unwrap();
+        let mut g1 = b2_worker
+            .submit(prompts[3].clone(), plain_greedy, None)
+            .unwrap();
+        let (gpu_stoch_a, gpu_stoch_b) = tokio::time::timeout(Duration::from_secs(120), async {
+            let (o0, o1) = tokio::join!(collect(&mut g0, vec![]), collect(&mut g1, vec![]));
+            Ok::<_, String>((o0?, o1?))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            b2_worker.stats.verify_rounds.load(Ordering::Relaxed) > rounds_before_plain,
+            "B=2 plain-greedy path must execute speculative verify rounds"
+        );
+
+        let mut f0 = b2_worker
+            .submit(prompts[0].clone(), params(), None)
+            .unwrap();
+        let mut f1 = b2_worker
+            .submit(prompts[1].clone(), params(), None)
+            .unwrap();
+        let mut f2 = b2_worker
+            .submit(prompts[2].clone(), params(), None)
+            .unwrap();
+        let mut f3 = b2_worker
+            .submit(prompts[3].clone(), params(), None)
+            .unwrap();
+        let mut f4 = b2_worker
+            .submit(prompts[0].clone(), params(), None)
+            .unwrap();
+        let got_b5 = tokio::time::timeout(Duration::from_secs(120), async {
+            let (o0, o1, o2, o3, o4) = tokio::join!(
+                collect(&mut f0, vec![]),
+                collect(&mut f1, vec![]),
+                collect(&mut f2, vec![]),
+                collect(&mut f3, vec![]),
+                collect(&mut f4, vec![]),
+            );
+            Ok::<_, String>(vec![o0?, o1?, o2?, o3?, o4?])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        b2_worker.shutdown().await.unwrap();
+        (got_b2, gpu_stoch_a, gpu_stoch_b, got_b5)
+    });
+    assert_eq!(
+        &got_b2[..],
+        &baselines[..2],
+        "B=2 batched MTP must match B=1"
+    );
+    assert_eq!(
+        gpu_stoch_a, baselines[2],
+        "B=2 plain-greedy slot 0 must match baseline[2]"
+    );
+    assert_eq!(
+        gpu_stoch_b, baselines[3],
+        "B=2 plain-greedy slot 1 must match baseline[3]"
+    );
+    assert_eq!(
+        &got_b5[..3],
+        &baselines[..3],
+        "B=5 fallback slots 0..3 must match B=1"
+    );
+    assert_eq!(got_b5[3].len(), 64);
+    assert_eq!(&got_b5[3][..24], &baselines[3][..24]);
+    assert_eq!(got_b5[4], baselines[0], "5th stream must match baseline[0]");
+    assert_eq!(b2_worker.stats.peak_active.load(Ordering::Relaxed), 5);
 }

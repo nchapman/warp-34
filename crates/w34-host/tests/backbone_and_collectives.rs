@@ -603,7 +603,7 @@ fn test_fragmented_paged_attention_and_tq4_strides() {
         max_blocks_per_req: 1,
         max_q_len: df_seq as i32,
         max_seq_len: df_seq as i32,
-        sliding_window: 8,
+        sliding_window: 3,
         mask_mode: W34_ATTN_MASK_SYMMETRIC_WINDOW,
         sm_scale: 1.0 / (128.0f32).sqrt(),
         reserved: 0,
@@ -634,7 +634,36 @@ fn test_fragmented_paged_attention_and_tq4_strides() {
     }
     let mut df_got = vec![0u16; df_q.len()];
     d_df_out.copy_to_host(&mut df_got, &stream).unwrap();
-    assert!(df_got.iter().any(|&v| f16_to_f32(v).abs() > 1e-4));
+    for t in 0..df_seq {
+        let min_kv = t.saturating_sub(2);
+        for qh in 0..4usize {
+            let kvh = qh / 2;
+            let mut scores = Vec::with_capacity(df_seq - min_kv);
+            for s in min_kv..df_seq {
+                let dot: f32 = (0..128)
+                    .map(|d| {
+                        f16_to_f32(df_q[(t * 4 + qh) * 128 + d])
+                            * f16_to_f32(df_kv[(s * 2 + kvh) * 128 + d])
+                    })
+                    .sum();
+                scores.push(dot * df_batch.sm_scale);
+            }
+            let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp()).collect();
+            let sum_e: f32 = exps.iter().sum();
+            for d in 0..128 {
+                let exp_v: f32 = (min_kv..df_seq)
+                    .enumerate()
+                    .map(|(i, s)| (exps[i] / sum_e) * f16_to_f32(df_kv[(s * 2 + kvh) * 128 + d]))
+                    .sum();
+                let got_v = f16_to_f32(df_got[(t * 4 + qh) * 128 + d]);
+                assert!(
+                    (got_v - exp_v).abs() < 2e-3,
+                    "DFlash2 symmetric window mismatch at t={t} qh={qh} d={d}: got {got_v} vs {exp_v}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1806,6 +1835,13 @@ fn test_tp2_p2p_and_tp4_collectives() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let num_gpus = CudaDevice::count().unwrap_or(0);
     if num_gpus < 2 {
+        let strict = ["W34_STRICT_TESTS", "CI"].into_iter().any(|var| {
+            std::env::var(var).is_ok_and(|val| {
+                let t = val.trim();
+                t == "1" || t.eq_ignore_ascii_case("true")
+            })
+        });
+        assert!(!strict, "test_tp2_p2p_and_tp4_collectives requires 2 GPUs");
         return;
     }
     for dev_id in 0..2 {

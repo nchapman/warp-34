@@ -220,6 +220,19 @@ impl Qwen3_5MtpRank {
         self.draft_lm_head.is_some()
     }
 
+    /// Temporarily detaches the online-quantized `draft_lm_head` (falling back to `target.lm_head`)
+    /// and invalidates any captured `propose_graphs`.
+    pub fn take_quantized_draft_lm_head(&mut self) -> Option<LinearProj> {
+        self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+        self.draft_lm_head.take()
+    }
+
+    /// Restores a previously detached `draft_lm_head` and invalidates any captured `propose_graphs`.
+    pub fn restore_quantized_draft_lm_head(&mut self, head: Option<LinearProj>) {
+        self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+        self.draft_lm_head = head;
+    }
+
     pub fn supports_cuda_graph(&self) -> bool {
         matches!(self.input_fusion, MtpInputFusion::ConcatLinear { .. })
             && !self.final_residual.is_hyper_connection()

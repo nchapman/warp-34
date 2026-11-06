@@ -523,8 +523,30 @@ fn online_marlin_quantize_f16_u4b8_matches_cpu_reference_and_tracks_fp16_logits(
         .map(|i| {
             let row = i / k;
             let col = i % k;
-            let v = (((row * 37 + col * 13) % 101) as f32 - 50.0) * 0.015;
-            f32_to_f16(v)
+            match row {
+                0 => 0u16,
+                1 => 0x0001u16,
+                2 => {
+                    if col == 0 {
+                        f32_to_f16(7.0 * 0.0625)
+                    } else {
+                        f32_to_f16(((col % 16) as f32 - 7.5) * 0.0625)
+                    }
+                }
+                3 => {
+                    if col == 0 {
+                        0x3901u16
+                    } else if col == 1 {
+                        0xB901u16
+                    } else {
+                        f32_to_f16(((col % 15) as f32 - 7.0) * 0.08)
+                    }
+                }
+                _ => {
+                    let v = (((row * 37 + col * 13) % 101) as f32 - 50.0) * 0.015;
+                    f32_to_f16(v)
+                }
+            }
         })
         .collect();
     let src_dev = upload(&src_f16, &stream);
@@ -673,5 +695,49 @@ fn online_marlin_quantize_f16_u4b8_matches_cpu_reference_and_tracks_fp16_logits(
             &expected_dequant,
             &format!("online quantize gemm group_size={group_size}"),
         );
+    }
+
+    // 4. Multi-wave grid-stride coverage (`total_tiles = (512/16) * (2048/64) = 1024 > SMs * 8`)
+    //    and boundary/alignment error validation.
+    let (mw_n, mw_k, mw_gs) = (2048usize, 512usize, 32usize);
+    let mw_src: Vec<u16> = (0..mw_n * mw_k)
+        .map(|i| f32_to_f16((((i * 19 + i / mw_k * 11) % 97) as f32 - 48.0) * 0.02))
+        .collect();
+    let mw_src_dev = upload(&mw_src, &stream);
+    let mw_qweight_dev = DeviceBuffer::alloc(0, (mw_n * (mw_k / 8)) * 4).unwrap();
+    let mw_scales_dev = DeviceBuffer::alloc(0, (mw_n * (mw_k / mw_gs)) * 2).unwrap();
+    // SAFETY: `mw_src_dev`, `mw_qweight_dev`, and `mw_scales_dev` match `(mw_k, mw_n, mw_gs)`.
+    let rc = unsafe {
+        ffi::w34_marlin_quantize_f16_u4b8(
+            &ex,
+            mw_src_dev.addr() as *const c_void,
+            mw_qweight_dev.addr() as *mut u32,
+            mw_scales_dev.addr() as *mut c_void,
+            mw_k as i64,
+            mw_n as i64,
+            mw_gs as i32,
+        )
+    };
+    assert_eq!(rc, 0, "multi-wave quantize");
+
+    for (src_ptr, bad_k, bad_n, bad_gs) in [
+        (src_dev.addr() + 2, 256, 256, 64),
+        (src_dev.addr(), 48, 256, 64),
+        (src_dev.addr(), 256, 32, 64),
+        (src_dev.addr(), 256, 256, 16),
+    ] {
+        // SAFETY: invalid parameters are rejected before launching any kernel.
+        let rc = unsafe {
+            ffi::w34_marlin_quantize_f16_u4b8(
+                &ex,
+                src_ptr as *const c_void,
+                mw_qweight_dev.addr() as *mut u32,
+                mw_scales_dev.addr() as *mut c_void,
+                bad_k,
+                bad_n,
+                bad_gs,
+            )
+        };
+        assert_ne!(rc, 0, "expected error for ({bad_k}, {bad_n}, {bad_gs})");
     }
 }

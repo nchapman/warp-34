@@ -161,3 +161,23 @@ fn native_positions_full_grid_fingerprints() {
         assert_eq!(hash, expected, "grid {n}: {t}x{h}x{w}, hidden {d}");
     }
 }
+
+#[test]
+fn multi_image_cu_seqlens_and_rot_ids_concatenate_cleanly() {
+    let weights: Vec<f32> = (0..27)
+        .map(|i| ((i * 137 % 509) as f32 - 254.0) / 256.0)
+        .collect();
+    let (single_pos, single_ids, _) =
+        interpolate_pos_embed_and_rot_ids(&weights, 3, 3, 2, &[[1, 4, 6]]);
+    let (second_pos, second_ids, _) =
+        interpolate_pos_embed_and_rot_ids(&weights, 3, 3, 2, &[[1, 2, 4]]);
+    let (multi_pos, multi_ids, cu) =
+        interpolate_pos_embed_and_rot_ids(&weights, 3, 3, 2, &[[1, 4, 6], [1, 2, 4]]);
+    assert_eq!(cu, [0, 24, 32]);
+    assert_eq!(multi_pos.len(), 32 * 3);
+    assert_eq!(multi_ids.len(), 32 * 2);
+    assert_eq!(&multi_pos[..24 * 3], &single_pos[..]);
+    assert_eq!(&multi_ids[..24 * 2], &single_ids[..]);
+    assert_eq!(&multi_pos[24 * 3..], &second_pos[..]);
+    assert_eq!(&multi_ids[24 * 2..], &second_ids[..]);
+}
