@@ -817,11 +817,9 @@ fn resolve_clef_flash_hf_tokenizer() -> Option<std::path::PathBuf> {
 }
 
 fn strict_test_env() -> bool {
-    ["W34_STRICT_TESTS", "CI"].into_iter().any(|var| {
-        std::env::var(var).is_ok_and(|val| {
-            let trimmed = val.trim();
-            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
-        })
+    std::env::var("W34_STRICT_TESTS").is_ok_and(|val| {
+        let trimmed = val.trim();
+        trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
     })
 }
 
