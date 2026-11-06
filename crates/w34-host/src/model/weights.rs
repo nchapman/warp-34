@@ -1,6 +1,31 @@
 //! Host quantization, weight loading, and device linear/FFN projections.
 
 use super::*;
+pub use crate::loader::{HADAMARD_BLOCK_16, HADAMARD_BLOCK_64, SUPPORTED_HADAMARD_BLOCKS};
+
+pub const PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE: usize = 6144;
+pub const MARLIN_TILE_N: usize = 64;
+pub const MARLIN_TILE_K_W4: usize = 128;
+pub const MARLIN_GROUP_BLOCK_K: usize = 16;
+pub const MARLIN_CHANNELWISE_GROUP_BLOCKS: i32 = -1;
+pub const U4B8_PACKED_ZERO_WORD: u32 = 0x8888_8888;
+pub const U4_NIBBLES_PER_U32: usize = 8;
+pub const U8_BYTES_PER_U32: usize = 4;
+pub const DEVICE_SCRATCH_ALIGNMENT_BYTES: usize = 256;
+pub const SMALL_N_GEMM_ALWAYS_MAX_N: usize = 256;
+pub const SMALL_N_GEMM_ROUTER_512_MAX_N: usize = 512;
+pub const SMALL_N_GEMM_DECODE_MAX_DIM: usize = 2048;
+pub const SMALL_N_GEMM_DECODE_MAX_M: usize = 16;
+pub const SMALL_N_GEMM_K_ALIGN: usize = 8;
+
+#[inline]
+pub const fn align_up_scratch(bytes: usize) -> Option<usize> {
+    let mask = DEVICE_SCRATCH_ALIGNMENT_BYTES - 1;
+    match bytes.checked_add(mask) {
+        Some(v) => Some(v & !mask),
+        None => None,
+    }
+}
 
 #[cfg(feature = "cuda")]
 pub enum LinearProj {
@@ -74,7 +99,7 @@ impl LinearProj {
                 let groups = if *group_blocks < 0 {
                     1
                 } else {
-                    size_k / (*group_blocks as usize * 16)
+                    size_k / (*group_blocks as usize * MARLIN_GROUP_BLOCK_K)
                 };
                 (size_n * size_k / 2) + (size_n * groups * 2)
             }
@@ -84,7 +109,7 @@ impl LinearProj {
                 group_blocks,
                 ..
             } => {
-                let g = (*group_blocks as usize) * 16;
+                let g = (*group_blocks as usize) * MARLIN_GROUP_BLOCK_K;
                 (size_n * size_k / 2) + (size_n * (size_k / g) * 2) + ((size_n / 2) * (size_k / g))
             }
             Self::MarlinW8A16 {
@@ -96,7 +121,7 @@ impl LinearProj {
                 let num_groups = if *group_blocks < 0 {
                     1
                 } else {
-                    size_k / ((*group_blocks as usize) * 16)
+                    size_k / ((*group_blocks as usize) * MARLIN_GROUP_BLOCK_K)
                 };
                 (size_n * size_k) + (size_n * num_groups * 2)
             }
@@ -108,6 +133,20 @@ impl LinearProj {
     /// loader supplies weights; forward supplies MxK input, MxN output, and
     /// nonaliasing workspace on the execution stream. This legacy raw-address
     /// API does not enforce those capacities, lifetimes, or device affinity.
+    /// Whether this projection can execute on `aux_stream` without `ex.scratch_ptr` or `cuBLAS`.
+    #[inline]
+    pub fn can_fork_on_aux_stream(&self) -> bool {
+        match *self {
+            Self::Hadamard { .. } => false,
+            Self::DenseF16 { size_n, size_k, .. } => {
+                size_n <= SMALL_N_GEMM_ALWAYS_MAX_N && size_k.is_multiple_of(SMALL_N_GEMM_K_ALIGN)
+            }
+            Self::MarlinW4A16 { .. } | Self::MarlinW4A16Zp { .. } | Self::MarlinW8A16 { .. } => {
+                true
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -238,8 +277,11 @@ impl LinearProj {
                 //   warp-reduction kernel for decode and speculative verify (`m <= 16`, guaranteeing
                 //   0-ULP parity between `M = 1` decode and `M <= 16` MTP/DFlash2 verify) while keeping
                 //   `m > 16` chunked prefill on cuBLAS Tensor Cores.
-                if (size_n <= 256 || (size_n <= 2048 && size_k <= 2048 && m <= 16))
-                    && size_k.is_multiple_of(8)
+                if (size_n <= SMALL_N_GEMM_ALWAYS_MAX_N
+                    || (size_n <= SMALL_N_GEMM_DECODE_MAX_DIM
+                        && size_k <= SMALL_N_GEMM_DECODE_MAX_DIM
+                        && m <= SMALL_N_GEMM_DECODE_MAX_M))
+                    && size_k.is_multiple_of(SMALL_N_GEMM_K_ALIGN)
                 {
                     check_rc(
                         // SAFETY: this branch enforces the small-N and K alignment
@@ -1375,8 +1417,8 @@ impl RawLinearHost {
         repack_staging: &DeviceBuffer,
     ) -> Result<LinearProj> {
         let marlin_geom_ok = |n: usize, k: usize| {
-            (n.is_multiple_of(64) && k.is_multiple_of(128))
-                || (n.is_multiple_of(128) && k.is_multiple_of(64))
+            (n.is_multiple_of(MARLIN_TILE_N) && k.is_multiple_of(MARLIN_TILE_K_W4))
+                || (n.is_multiple_of(MARLIN_TILE_K_W4) && k.is_multiple_of(MARLIN_TILE_N))
         };
         match self {
             Self::Hadamard { inner, block_size } => {
@@ -1389,7 +1431,7 @@ impl RawLinearHost {
                 k,
                 group_size,
             } => {
-                let channelwise = *group_size == *k && *group_size > 128;
+                let channelwise = *group_size == *k && *group_size > MARLIN_TILE_K_W4;
                 if marlin_geom_ok(*n, *k) && (channelwise || matches!(*group_size, 32 | 64 | 128)) {
                     let b_q_weight_ptr = Self::repack_with_staging(
                         packed,
@@ -1413,9 +1455,9 @@ impl RawLinearHost {
                         size_n: *n,
                         size_k: *k,
                         group_blocks: if channelwise {
-                            -1
+                            MARLIN_CHANNELWISE_GROUP_BLOCKS
                         } else {
-                            (*group_size / 16) as i32
+                            (*group_size / MARLIN_GROUP_BLOCK_K) as i32
                         },
                     })
                 } else {

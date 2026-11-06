@@ -31,7 +31,36 @@ pub(crate) fn tensor_diff_metrics(a: &[f32], b: &[f32]) -> (f32, f64, f64) {
     (max_abs, rel_l2, cosine)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_STRICT_MAX_REL_L2: f64 = 0.05;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_STRICT_MIN_LAST_COSINE: f64 = 0.998;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MM_MAX_FULL_REL_L2: f64 = 0.16;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MM_MIN_ROW_COSINE: f64 = 0.95;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_SUBLAYER_MAX_FULL_REL_L2: f64 = 0.55;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_SUBLAYER_MIN_FULL_COSINE: f64 = 0.85;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_RESIDUAL_MAX_FULL_REL_L2: f64 = 0.35;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_RESIDUAL_MIN_FULL_COSINE: f64 = 0.94;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_SUBLAYER_MAX_LAST_REL_L2: f64 = 0.30;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_SUBLAYER_MIN_LAST_COSINE: f64 = 0.95;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_MM_FINAL_MAX_LAST_REL_L2: f64 = 0.22;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_MM_FINAL_MIN_LAST_COSINE: f64 = 0.975;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_MM_LAYER_MAX_LAST_REL_L2: f64 = 0.30;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_MM_LAYER_MIN_LAST_COSINE: f64 = 0.955;
+
+#[cfg(any(test, feature = "cuda"))]
 pub(crate) fn evaluate_golden_tensor_diff(
     name: &str,
     shape: &[usize],
@@ -63,7 +92,7 @@ pub(crate) fn evaluate_golden_tensor_diff(
         && shape[1] > 0
         && (name == "final_norm" || (name.starts_with("layer_") && name != "layer_0_hidden_after"));
     if is_deep_mm_layer {
-        if full_rel > 0.16 {
+        if full_rel > GOLDEN_MM_MAX_FULL_REL_L2 {
             return Err(format!(
                 "dump-diff multimodal full-sequence envelope failed on {name}: full_rel_l2={full_rel:.6}"
             ));
@@ -74,7 +103,7 @@ pub(crate) fn evaluate_golden_tensor_diff(
             let row_end = row_start + cols;
             let (_, row_rel, row_cos) =
                 tensor_diff_metrics(&vals[row_start..row_end], &ref_vals[row_start..row_end]);
-            if row_cos < 0.95 {
+            if row_cos < GOLDEN_MM_MIN_ROW_COSINE {
                 return Err(format!(
                     "dump-diff multimodal row {r} cosine failed on {name}: row_rel_l2={row_rel:.6} row_cosine={row_cos:.6}"
                 ));
@@ -83,14 +112,14 @@ pub(crate) fn evaluate_golden_tensor_diff(
         let last_start = (shape[0] - 1) * cols;
         let (last_d, last_rel, last_cos) =
             tensor_diff_metrics(&vals[last_start..], &ref_vals[last_start..]);
-        if last_rel > 0.05 || last_cos < 0.998 {
+        if last_rel > GOLDEN_STRICT_MAX_REL_L2 || last_cos < GOLDEN_STRICT_MIN_LAST_COSINE {
             return Err(format!(
                 "dump-diff multimodal prompt-end check failed on {name}: last_rel_l2={last_rel:.6} last_cosine={last_cos:.6}"
             ));
         }
         Ok((d.max(last_d), last_rel, full_cos.min(last_cos)))
     } else {
-        if full_rel > 0.05 {
+        if full_rel > GOLDEN_STRICT_MAX_REL_L2 {
             return Err(format!(
                 "dump-diff golden check failed on {name}: rel_l2={full_rel:.6} cosine={full_cos:.6}"
             ));
@@ -132,14 +161,20 @@ pub(crate) fn evaluate_moe_or_golden_tensor_diff(
             ));
         }
         let (d, full_rel, full_cos) = tensor_diff_metrics(vals, ref_vals);
-        if full_rel <= 0.05 {
+        if full_rel <= GOLDEN_STRICT_MAX_REL_L2 {
             return Ok((d, full_rel, full_cos));
         }
         let is_sublayer_delta = name.ends_with("_attn_or_gdn_out") || name.ends_with("_mlp_out");
         let (max_full_rel, min_full_cos) = if is_sublayer_delta {
-            (0.55, 0.85)
+            (
+                GOLDEN_MOE_SUBLAYER_MAX_FULL_REL_L2,
+                GOLDEN_MOE_SUBLAYER_MIN_FULL_COSINE,
+            )
         } else {
-            (0.35, 0.94)
+            (
+                GOLDEN_MOE_RESIDUAL_MAX_FULL_REL_L2,
+                GOLDEN_MOE_RESIDUAL_MIN_FULL_COSINE,
+            )
         };
         if full_rel > max_full_rel || full_cos < min_full_cos {
             return Err(format!(
@@ -151,13 +186,22 @@ pub(crate) fn evaluate_moe_or_golden_tensor_diff(
         let (last_d, last_rel, last_cos) =
             tensor_diff_metrics(&vals[last_start..], &ref_vals[last_start..]);
         let (max_last_rel, min_last_cos) = if is_sublayer_delta {
-            (0.30, 0.95)
+            (
+                GOLDEN_MOE_SUBLAYER_MAX_LAST_REL_L2,
+                GOLDEN_MOE_SUBLAYER_MIN_LAST_COSINE,
+            )
         } else if !is_multimodal {
-            (0.05, 0.998)
+            (GOLDEN_STRICT_MAX_REL_L2, GOLDEN_STRICT_MIN_LAST_COSINE)
         } else if name == "final_norm" {
-            (0.22, 0.975)
+            (
+                GOLDEN_MOE_MM_FINAL_MAX_LAST_REL_L2,
+                GOLDEN_MOE_MM_FINAL_MIN_LAST_COSINE,
+            )
         } else {
-            (0.30, 0.955)
+            (
+                GOLDEN_MOE_MM_LAYER_MAX_LAST_REL_L2,
+                GOLDEN_MOE_MM_LAYER_MIN_LAST_COSINE,
+            )
         };
         if last_rel > max_last_rel || last_cos < min_last_cos {
             return Err(format!(
@@ -165,7 +209,7 @@ pub(crate) fn evaluate_moe_or_golden_tensor_diff(
             ));
         }
         let reported_rel = if is_sublayer_delta {
-            last_rel.min(0.05)
+            last_rel.min(GOLDEN_STRICT_MAX_REL_L2)
         } else {
             last_rel
         };

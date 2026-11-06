@@ -43,8 +43,8 @@ impl RawLinearHost {
         if *n == 0
             || *k == 0
             || !k.is_multiple_of(block_size)
-            || *n > i32::MAX as usize - 128
-            || *k > i32::MAX as usize - 128
+            || *n > i32::MAX as usize - MARLIN_TILE_K_W4
+            || *k > i32::MAX as usize - MARLIN_TILE_K_W4
             || *group_size != resolved.group_size_or(*k)
         {
             return Err(loader_err_msg(format!(
@@ -91,7 +91,7 @@ impl RawLinearHost {
     ) -> Result<LinearProj> {
         let (n, k) = self.dims();
         let padded;
-        let storage = if n.is_multiple_of(64) && k.is_multiple_of(128) {
+        let storage = if n.is_multiple_of(MARLIN_TILE_N) && k.is_multiple_of(MARLIN_TILE_K_W4) {
             self
         } else {
             padded = self.pad_hadamard_weight()?;
@@ -123,19 +123,21 @@ impl RawLinearHost {
         else {
             return Err(loader_err("HGPTQ padding expects symmetric W4"));
         };
-        let pn = n.div_ceil(64) * 64;
-        let pk = k.div_ceil(128) * 128;
+        let pn = n.div_ceil(MARLIN_TILE_N) * MARLIN_TILE_N;
+        let pk = k.div_ceil(MARLIN_TILE_K_W4) * MARLIN_TILE_K_W4;
         let channelwise = *group_size == *k;
         if !channelwise && !matches!(*group_size, 32 | 64 | 128) {
             return Err(loader_err("unsupported HGPTQ group size"));
         }
         let groups = if channelwise { 1 } else { pk / group_size };
         let old_groups = k / group_size;
-        let mut padded = vec![0x8888_8888; pn * (pk / 8)];
+        let words_pk = pk / U4_NIBBLES_PER_U32;
+        let words_k = k / U4_NIBBLES_PER_U32;
+        let mut padded = vec![U4B8_PACKED_ZERO_WORD; pn * words_pk];
         let mut padded_scales = vec![f32_to_f16(1.0); pn * groups];
         for row in 0..*n {
-            padded[row * (pk / 8)..row * (pk / 8) + k / 8]
-                .copy_from_slice(&packed[row * (k / 8)..(row + 1) * (k / 8)]);
+            padded[row * words_pk..row * words_pk + words_k]
+                .copy_from_slice(&packed[row * words_k..(row + 1) * words_k]);
             padded_scales[row * groups..row * groups + old_groups]
                 .copy_from_slice(&scales[row * old_groups..(row + 1) * old_groups]);
         }
@@ -183,17 +185,13 @@ impl LinearProj {
     pub fn input_transform_workspace_bytes(&self, rows: usize) -> Option<usize> {
         match self {
             Self::Hadamard { inner, size_n, .. } => {
-                let input = rows.checked_mul(inner.size_k())?.checked_mul(2)?;
+                let input = align_up_scratch(rows.checked_mul(inner.size_k())?.checked_mul(2)?)?;
                 let output = if *size_n != inner.size_n() {
-                    rows.checked_mul(inner.size_n())?.checked_mul(2)?
+                    align_up_scratch(rows.checked_mul(inner.size_n())?.checked_mul(2)?)?
                 } else {
                     0
                 };
-                let input = input.checked_add(255)? & !255;
-                input
-                    .checked_add(output)?
-                    .checked_add(255)
-                    .map(|n| n & !255)
+                input.checked_add(output)
             }
             _ => Some(0),
         }
@@ -209,10 +207,10 @@ impl LinearProj {
                 inner,
                 size_n,
                 size_k,
-                block_size: 64,
+                block_size: HADAMARD_BLOCK_64,
             } if *size_k == inner.size_k()
                 && *size_n == inner.size_n()
-                && size_k.is_multiple_of(64)
+                && size_k.is_multiple_of(HADAMARD_BLOCK_64)
         )
     }
 
@@ -235,7 +233,7 @@ impl LinearProj {
                 inner,
                 size_n,
                 size_k,
-                block_size: 64,
+                block_size: HADAMARD_BLOCK_64,
             } if *size_k == inner.size_k() && *size_n == inner.size_n() => inner.forward(
                 ex,
                 cublas,
@@ -298,14 +296,12 @@ impl LinearProj {
         let input_bytes = rows
             .checked_mul(inner.size_k())
             .and_then(|v| v.checked_mul(2))
-            .and_then(|v| v.checked_add(255))
-            .map(|v| v & !255)
+            .and_then(align_up_scratch)
             .ok_or_else(|| loader_err("HGPTQ input scratch overflow"))?;
         let output_bytes = if n != inner.size_n() {
             rows.checked_mul(inner.size_n())
                 .and_then(|v| v.checked_mul(2))
-                .and_then(|v| v.checked_add(255))
-                .map(|v| v & !255)
+                .and_then(align_up_scratch)
                 .ok_or_else(|| loader_err("HGPTQ output scratch overflow"))?
         } else {
             0

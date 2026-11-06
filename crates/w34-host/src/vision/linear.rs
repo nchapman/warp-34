@@ -1,6 +1,8 @@
 //! Vision-local biased projection dispatch. Dense cuBLAS rounding is intentional.
 use super::*;
-use crate::model::RawLinearHost;
+use crate::model::{
+    DEVICE_SCRATCH_ALIGNMENT_BYTES, MARLIN_TILE_K_W4, MARLIN_TILE_N, RawLinearHost,
+};
 use w34_kernels::ffi::W34Exec;
 
 #[allow(clippy::too_many_arguments)]
@@ -60,9 +62,12 @@ fn repack_bytes(raw: &RawLinearHost) -> Result<usize> {
         RawLinearHost::U8B128NMajor { n, k, .. } => (*n, *k, 1),
         RawLinearHost::DenseF16 { .. } => return Ok(0),
     };
-    n.checked_add(63)
-        .map(|v| v / 64 * 64)
-        .zip(k.checked_add(127).map(|v| v / 128 * 128))
+    n.checked_add(MARLIN_TILE_N - 1)
+        .map(|v| v / MARLIN_TILE_N * MARLIN_TILE_N)
+        .zip(
+            k.checked_add(MARLIN_TILE_K_W4 - 1)
+                .map(|v| v / MARLIN_TILE_K_W4 * MARLIN_TILE_K_W4),
+        )
         .and_then(|(n, k)| n.checked_mul(k))
         .map(|bytes| bytes / divisor)
         .ok_or(CudaError::new(-1, "vision repack staging overflow"))
@@ -73,11 +78,11 @@ fn repack_bytes(raw: &RawLinearHost) -> Result<usize> {
 /// execution scratch. Width rounding covers both N and K Marlin tile geometry.
 pub(super) fn projection_scratch_bytes(rows: usize, max_width: usize) -> Result<usize> {
     max_width
-        .checked_add(127)
-        .map(|v| v / 128 * 128)
+        .checked_add(MARLIN_TILE_K_W4 - 1)
+        .map(|v| v / MARLIN_TILE_K_W4 * MARLIN_TILE_K_W4)
         .and_then(|w| rows.checked_mul(w))
         .and_then(|v| v.checked_mul(4))
-        .and_then(|v| v.checked_add(512))
+        .and_then(|v| v.checked_add(2 * DEVICE_SCRATCH_ALIGNMENT_BYTES))
         .ok_or(CudaError::new(-1, "vision projection scratch overflow"))
 }
 

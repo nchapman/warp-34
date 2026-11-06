@@ -18,8 +18,8 @@ use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives};
 use crate::loader::{ModelConfig, SafetensorsArchive};
 use crate::model::{
     FfnBlockWeights, FinalResidual, FullAttentionLayerWeights, LayerResidual, LinearProj,
-    Qwen3_5ModelRank, RawLinearHost, load_hc_block_weights, load_moe_layer_weights,
-    load_qsa_indexer_weights, loader_err,
+    MARLIN_TILE_K_W4, MARLIN_TILE_N, Qwen3_5ModelRank, RawLinearHost, load_hc_block_weights,
+    load_moe_layer_weights, load_qsa_indexer_weights, loader_err,
 };
 use std::path::Path;
 use w34_kernels::ffi::{self, W34_KV_NAMESPACE_MTP_FULL_ATTN};
@@ -320,10 +320,13 @@ impl Qwen3_5MtpRank {
             + ffn_weight_bytes
             + capacity.div_ceil(16) * 4
             + 32 * 1024 * 1024;
+        const MTP_MIN_REPACK_STAGING_BYTES: usize = 64 * 1024 * 1024;
         let mut weights = DeviceArena::new(target.device.device_id, bytes)?;
-        let gate_up_staging_bytes =
-            ((2 * (i / tp).div_ceil(64) * 64) * (h.div_ceil(128) * 128) * c.quant.bits()) / 8;
-        let staging_bytes = (64 * 1024 * 1024).max(gate_up_staging_bytes);
+        let gate_up_staging_bytes = ((2 * (i / tp).div_ceil(MARLIN_TILE_N) * MARLIN_TILE_N)
+            * (h.div_ceil(MARLIN_TILE_K_W4) * MARLIN_TILE_K_W4)
+            * c.quant.bits())
+            / 8;
+        let staging_bytes = MTP_MIN_REPACK_STAGING_BYTES.max(gate_up_staging_bytes);
         let staging = DeviceBuffer::alloc(target.device.device_id, staging_bytes)?;
         let load = |name: &str, n: usize, k: usize| -> Result<RawLinearHost> {
             let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), &c.quant)?;

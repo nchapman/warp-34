@@ -864,7 +864,10 @@ impl LayerBlockWeights {
         h_dim: usize,
         is_single_stream: bool,
     ) -> [u64; 2] {
-        if !is_single_stream || h_dim > 6144 || !h_dim.is_multiple_of(64) {
+        if !is_single_stream
+            || h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            || !h_dim.is_multiple_of(HADAMARD_BLOCK_64)
+        {
             return [normed_buf, 0];
         }
         match self {

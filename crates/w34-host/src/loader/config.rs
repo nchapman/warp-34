@@ -2,7 +2,10 @@ use super::*;
 
 #[path = "config_rules.rs"]
 mod config_rules;
-pub use config_rules::CompressedTensorRules;
+pub use config_rules::{
+    CompressedTensorRules, HADAMARD_BLOCK_16, HADAMARD_BLOCK_64, SUPPORTED_HADAMARD_BLOCKS,
+    SUPPORTED_MARLIN_U4_GROUP_SIZES,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QuantScheme {
@@ -1470,16 +1473,31 @@ impl ModelConfig {
         self.ple_embed_dim > 0 && !self.ple_layer_ids.is_empty()
     }
 
+    /// Resolves the effective `QuantScheme` for routed MoE experts (`mlp.experts.0.gate_proj`).
+    pub fn routed_expert_quant_scheme(&self) -> QuantScheme {
+        for candidate in [
+            "model.language_model.layers.0.mlp.experts.0.gate_proj",
+            "model.layers.0.mlp.experts.0.gate_proj",
+        ] {
+            if let Ok(resolved) = self.quant.for_linear(candidate)
+                && resolved != QuantScheme::Unquantized
+            {
+                return resolved;
+            }
+        }
+        self.quant.clone()
+    }
+
     /// Returns the `ExpertPackLayout` if this model's MoE geometry supports host/VRAM
     /// tiered `U4B8` expert storage.
     pub fn moe_expert_pack_layout(&self) -> Option<crate::moe_offload::ExpertPackLayout> {
         if self.num_experts == 0 {
             return None;
         }
-        let group_size = self
-            .quant
+        let expert_quant = self.routed_expert_quant_scheme();
+        let group_size = expert_quant
             .symmetric_gptq_u4_group_size()
-            .unwrap_or_else(|| self.quant.group_size_or(32));
+            .unwrap_or_else(|| expert_quant.group_size_or(32));
         crate::moe_offload::ExpertPackLayout::new(
             self.moe_intermediate_size,
             self.hidden_size,
@@ -1507,10 +1525,14 @@ impl ModelConfig {
         // symmetric U4B8 expert layout and either:
         // - the total routed-expert footprint exceeds a single 24 GiB GPU budget (> 20 GiB), or
         // - the model uses the Qwen4 high-expert-count architecture (including small synthetic test fixtures).
+        const TIERED_MOE_MIN_TOTAL_EXPERT_BYTES: usize = 20 * 1024 * 1024 * 1024;
         self.mlp_only_layers.is_empty()
             && self.moe_expert_pack_layout().is_some()
-            && ((self.quant.symmetric_gptq_u4_group_size().is_some()
-                && self.routed_expert_total_bytes() > 20 * 1024 * 1024 * 1024)
+            && ((self
+                .routed_expert_quant_scheme()
+                .symmetric_gptq_u4_group_size()
+                .is_some()
+                && self.routed_expert_total_bytes() > TIERED_MOE_MIN_TOTAL_EXPERT_BYTES)
                 || self.is_qwen4_exp())
     }
 

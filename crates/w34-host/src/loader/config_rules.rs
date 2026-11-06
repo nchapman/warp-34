@@ -2,6 +2,18 @@
 use super::*;
 use fancy_regex::{Regex, RegexBuilder};
 
+pub const HADAMARD_BLOCK_16: usize = 16;
+pub const HADAMARD_BLOCK_64: usize = 64;
+pub const SUPPORTED_HADAMARD_BLOCKS: [usize; 2] = [HADAMARD_BLOCK_16, HADAMARD_BLOCK_64];
+pub const SUPPORTED_MARLIN_U4_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
+
+const MAX_REGEX_PATTERN_BYTES: usize = 8 * 1024;
+const REGEX_BACKTRACK_LIMIT: usize = 100_000;
+const MAX_COMPRESSED_TENSORS_PATTERNS: usize = 64;
+const MAX_COMPRESSED_TENSORS_GROUPS: usize = 32;
+const MAX_TENSOR_NAME_BYTES: usize = 16 * 1024;
+const COMPRESSED_TENSORS_U4_BITS: usize = 4;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompressedTensorRules {
     ignore: Vec<CompiledPattern>,
@@ -48,17 +60,17 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 fn regex(pattern: &str) -> io::Result<Regex> {
-    if pattern.len() > 8192 {
+    if pattern.len() > MAX_REGEX_PATTERN_BYTES {
         return Err(invalid("HGPTQ regex exceeds size limit"));
     }
     RegexBuilder::new(&format!(r"\A(?:{pattern})"))
-        .backtrack_limit(100_000)
+        .backtrack_limit(REGEX_BACKTRACK_LIMIT)
         .build()
         .map_err(|e| invalid(format!("invalid HGPTQ regex: {e}")))
 }
 
 fn compile_pattern(s: &str) -> io::Result<CompiledPattern> {
-    if s.is_empty() || s.len() > 8192 {
+    if s.is_empty() || s.len() > MAX_REGEX_PATTERN_BYTES {
         return Err(invalid("HGPTQ pattern must be a bounded nonempty string"));
     }
     if let Some(p) = s.strip_prefix("re:") {
@@ -85,7 +97,7 @@ fn patterns(value: Option<&Json>, required: bool) -> io::Result<Vec<CompiledPatt
     if required && array.is_empty() {
         return Err(invalid("empty HGPTQ targets"));
     }
-    if array.len() > 64 {
+    if array.len() > MAX_COMPRESSED_TENSORS_PATTERNS {
         return Err(invalid("HGPTQ targets/ignore exceeds pattern count limit"));
     }
     array
@@ -100,7 +112,7 @@ fn patterns(value: Option<&Json>, required: bool) -> io::Result<Vec<CompiledPatt
 }
 
 fn matches(patterns: &[CompiledPattern], name: &str) -> io::Result<bool> {
-    if name.len() > 16384 {
+    if name.len() > MAX_TENSOR_NAME_BYTES {
         return Err(invalid("HGPTQ tensor name exceeds size limit"));
     }
     // Python re.match semantics: expressions are anchored at the start, not searched.
@@ -146,7 +158,7 @@ impl CompressedTensorRules {
         if groups.is_empty() {
             return Ok(None);
         }
-        if groups.len() > 32 {
+        if groups.len() > MAX_COMPRESSED_TENSORS_GROUPS {
             return Err(invalid("transform config_groups exceeds group count limit"));
         }
         let ignore = patterns(q.get("ignore"), false)?;
@@ -176,7 +188,7 @@ impl CompressedTensorRules {
                 .and_then(Json::as_u64)
                 .ok_or_else(|| invalid("missing Hadamard head_dim"))?
                 as usize;
-            if ![16, 64].contains(&head_dim) {
+            if !SUPPORTED_HADAMARD_BLOCKS.contains(&head_dim) {
                 return Err(invalid("unsupported Hadamard head_dim"));
             }
             let apply = group
@@ -219,7 +231,7 @@ impl CompressedTensorRules {
             .get("config_groups")
             .and_then(Json::as_object)
             .ok_or_else(|| invalid("missing quantization groups"))?;
-        if quant_map.len() > 32 {
+        if quant_map.len() > MAX_COMPRESSED_TENSORS_GROUPS {
             return Err(invalid(
                 "quantization config_groups exceeds group count limit",
             ));
@@ -228,16 +240,16 @@ impl CompressedTensorRules {
             let (bits, group_size, symmetric, _) =
                 ModelConfig::parse_compressed_tensors_group(key, group)?;
             let w = &group["weights"];
-            if bits != 4
+            if bits != COMPRESSED_TENSORS_U4_BITS
                 || !symmetric
-                || ![0, 64].contains(&group_size)
+                || !SUPPORTED_MARLIN_U4_GROUP_SIZES.contains(&group_size)
                 || w.get("dynamic").is_some_and(|v| v != false)
                 || (group_size == 0
                     && (w.get("strategy").and_then(Json::as_str) != Some("channel")
                         || w.get("group_size").is_some_and(|v| !v.is_null())))
             {
                 return Err(invalid(
-                    "HGPTQ requires static symmetric W4 g64 or channel weights",
+                    "HGPTQ requires static symmetric W4 (g32/g64/g128 or channel) weights",
                 ));
             }
             quant_groups.push(QuantRule {

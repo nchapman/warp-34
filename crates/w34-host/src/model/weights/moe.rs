@@ -62,8 +62,8 @@ impl FfnBlockWeights {
         is_single_stream: bool,
     ) -> [u64; 2] {
         if is_single_stream
-            && h_dim <= 6144
-            && h_dim.is_multiple_of(64)
+            && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
             && matches!(self, Self::Dense { gate_up_proj, .. } if gate_up_proj.can_fuse_h64_from_producer())
         {
             [0, normed_buf]
@@ -238,10 +238,12 @@ impl FfnBlockWeights {
                         // `n0 <= 256` runs across all `num_tokens`; `256 < n0 <= 512` (512-expert router)
                         // runs for decode and speculative verify (`num_tokens <= 16`) so `M = 1` and
                         // `M <= 16` verify are 0-ULP identical while `m > 16` prefill uses Tensor Cores.
-                    ) if (*n0 <= 256 || (*n0 <= 512 && num_tokens <= 16))
-                        && *n1 <= 256
+                    ) if (*n0 <= SMALL_N_GEMM_ALWAYS_MAX_N
+                        || (*n0 <= SMALL_N_GEMM_ROUTER_512_MAX_N
+                            && num_tokens <= SMALL_N_GEMM_DECODE_MAX_M))
+                        && *n1 <= SMALL_N_GEMM_ALWAYS_MAX_N
                         && *k0 == *k1
-                        && k0.is_multiple_of(8) =>
+                        && k0.is_multiple_of(SMALL_N_GEMM_K_ALIGN) =>
                     {
                         Some((*w0, *n0, *w1, *n1, *k0))
                     }
@@ -311,12 +313,18 @@ impl FfnBlockWeights {
                         moe_sh_gu_buf,
                         num_tokens,
                     )?;
+                    let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
+                    let sh_silu_fn = if fuse_sh_down_h64 {
+                        ffi::w34_silu_and_mul_hadamard_f16
+                    } else {
+                        ffi::w34_silu_and_mul_f16
+                    };
                     check_rc(
                         // SAFETY: the shared projection just produced [M,2*shared]
                         // gate/up; model scratch reserves [M,shared] activation.
                         // Both regions are distinct within the FFN phase.
                         unsafe {
-                            ffi::w34_silu_and_mul_f16(
+                            sh_silu_fn(
                                 ex,
                                 moe_sh_gu_buf as *const c_void,
                                 moe_sh_act_buf as *mut c_void,
@@ -327,15 +335,27 @@ impl FfnBlockWeights {
                         },
                         "w34_silu_and_mul_f16 (shared_expert)",
                     )?;
-                    sh_dn.forward(
-                        ex,
-                        cublas,
-                        marlin_ws_ptr,
-                        marlin_ws_ints,
-                        moe_sh_act_buf,
-                        moe_sh_out_buf,
-                        num_tokens,
-                    )?;
+                    if fuse_sh_down_h64 {
+                        sh_dn.forward_prerotated(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            moe_sh_act_buf,
+                            moe_sh_out_buf,
+                            num_tokens,
+                        )?;
+                    } else {
+                        sh_dn.forward(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            moe_sh_act_buf,
+                            moe_sh_out_buf,
+                            num_tokens,
+                        )?;
+                    }
                     let sg_ptr = if let Some(sh_gate) = &moe.shared_expert_gate {
                         if fused_dual_small_n.is_none() {
                             sh_gate.forward(

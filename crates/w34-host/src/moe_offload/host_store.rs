@@ -133,16 +133,48 @@ impl HostExpertStore {
                 && num_experts.is_multiple_of(ep_size),
             "invalid expert parallel partition",
         )?;
-        require(
-            quant.symmetric_gptq_u4_group_size() == Some(layout.group_size),
-            "host expert store requires symmetric 4-bit GPTQ/AutoRound W4A16",
-        )?;
         // Revalidate public geometry before using it to size or address unsafe storage.
         require(
             layout == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?,
             "inconsistent expert pack layout",
         )?;
         let count = num_experts / ep_size;
+        let expert_ids = ep_rank * count..(ep_rank + 1) * count;
+        let first_id = expert_ids.start;
+        let (resolved_prefix, is_compressed_tensors) = if let Some(real_wp) = archive.resolve_name(
+            &format!("{experts_prefix}.{first_id}.gate_proj.weight_packed"),
+        ) {
+            let pfx = real_wp
+                .strip_suffix(&format!(".{first_id}.gate_proj.weight_packed"))
+                .unwrap_or(experts_prefix)
+                .to_string();
+            (pfx, true)
+        } else if let Some(real_qw) =
+            archive.resolve_name(&format!("{experts_prefix}.{first_id}.gate_proj.qweight"))
+        {
+            let pfx = real_qw
+                .strip_suffix(&format!(".{first_id}.gate_proj.qweight"))
+                .unwrap_or(experts_prefix)
+                .to_string();
+            (pfx, false)
+        } else {
+            (experts_prefix.to_string(), false)
+        };
+        let resolved_prefix_ref = resolved_prefix.as_str();
+        let first_gate_name = format!("{resolved_prefix_ref}.{first_id}.gate_proj");
+        require(
+            quant.input_hadamard(&first_gate_name)?.is_none(),
+            "Hadamard routed MoE experts are not supported in tiered host expert store",
+        )?;
+        let expert_quant = quant
+            .for_linear(&first_gate_name)
+            .ok()
+            .filter(|q| *q != QuantScheme::Unquantized)
+            .unwrap_or_else(|| quant.clone());
+        require(
+            expert_quant.symmetric_gptq_u4_group_size() == Some(layout.group_size),
+            "host expert store requires symmetric 4-bit GPTQ/AutoRound/CompressedTensors W4A16",
+        )?;
         let bytes = layout
             .stride
             .checked_mul(count)
@@ -151,7 +183,6 @@ impl HostExpertStore {
             bytes <= max_pinned_bytes,
             format!("expert store needs {bytes} pinned bytes, budget is {max_pinned_bytes}"),
         )?;
-        let expert_ids = ep_rank * count..(ep_rank + 1) * count;
         let mut storage = HostPackStorage::alloc(bytes, prefer_mapped)?;
         let dst = storage.as_mut_slice();
 
@@ -182,30 +213,6 @@ impl HostExpertStore {
                 }
             }
         }
-
-        // Resolve the canonical prefix (`model.layers...` vs `model.language_model.layers...`)
-        // and packing format (`weight_packed` vs `qweight`) once per layer rather than 6x per expert.
-        let first_id = expert_ids.start;
-        let (resolved_prefix, is_compressed_tensors) = if let Some(real_wp) = archive.resolve_name(
-            &format!("{experts_prefix}.{first_id}.gate_proj.weight_packed"),
-        ) {
-            let pfx = real_wp
-                .strip_suffix(&format!(".{first_id}.gate_proj.weight_packed"))
-                .unwrap_or(experts_prefix)
-                .to_string();
-            (pfx, true)
-        } else if let Some(real_qw) =
-            archive.resolve_name(&format!("{experts_prefix}.{first_id}.gate_proj.qweight"))
-        {
-            let pfx = real_qw
-                .strip_suffix(&format!(".{first_id}.gate_proj.qweight"))
-                .unwrap_or(experts_prefix)
-                .to_string();
-            (pfx, false)
-        } else {
-            (experts_prefix.to_string(), false)
-        };
-        let resolved_prefix_ref = resolved_prefix.as_str();
 
         let num_threads = std::thread::available_parallelism()
             .map(|n| (n.get() / ep_size.max(1)).clamp(1, 16))

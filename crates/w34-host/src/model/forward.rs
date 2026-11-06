@@ -920,9 +920,9 @@ impl Qwen3_5ModelRank {
                 let vd = self.cfg.linear_value_head_dim;
                 let cd = 2 * kh * kd + vh * vd;
                 let stride = (cd + vh * vd) as i32;
-                // cuBLAS uses the main stream, so only the custom small-N/Marlin paths may fork.
-                let fork = !matches!(gdn.in_proj_ba, LinearProj::DenseF16 { size_n, size_k, .. }
-                    if size_n > 256 || !size_k.is_multiple_of(8));
+                // cuBLAS uses the main stream and Hadamard uses ex.scratch_ptr, so only custom
+                // non-Hadamard small-N/Marlin projections may fork onto aux_stream.
+                let fork = gdn.in_proj_ba.can_fork_on_aux_stream();
                 if fork {
                     self.aux_fork_event.record_in_current_ctx(&self.stream)?;
                     self.aux_stream.wait_event(&self.aux_fork_event)?;
@@ -1021,8 +1021,10 @@ impl Qwen3_5ModelRank {
                     },
                     "w34_gdn_recurrent_strided_f16",
                 )?;
-                let fuse_out_h64 =
-                    vd == 128 && stride % 4 == 0 && gdn.out_proj.can_fuse_h64_from_producer();
+                const GDN_FUSED_GATED_NORM_HEAD_DIM: usize = 128;
+                let fuse_out_h64 = vd == GDN_FUSED_GATED_NORM_HEAD_DIM
+                    && stride % 4 == 0
+                    && gdn.out_proj.can_fuse_h64_from_producer();
                 let gated_norm = match (
                     self.cfg.output_gate_type.eq_ignore_ascii_case("sigmoid"),
                     fuse_out_h64,

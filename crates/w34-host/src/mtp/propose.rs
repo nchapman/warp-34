@@ -3,7 +3,8 @@ use w34_kernels::ffi::{self, W34_ATTN_MASK_CAUSAL, W34AttentionBatch, W34Exec};
 
 use crate::cuda::{CudaGraph, Result, Tp2Collectives, check_rc};
 use crate::model::{
-    FfnBlockWeights, HcStepContext, LinearProj, Qwen3_5ModelRank, TapExport, loader_err,
+    FfnBlockWeights, HADAMARD_BLOCK_64, HcStepContext, LinearProj,
+    PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE, Qwen3_5ModelRank, TapExport, loader_err,
 };
 
 use super::{MtpInputFusion, Qwen3_5MtpRank};
@@ -230,8 +231,8 @@ impl Qwen3_5MtpRank {
             Self::project(self.concat_fc()?, &ex, t, concat, residual_buf, 1)?;
             let fa = &self.fa;
             let fuse_qkv_h64 = fa.qsa_indexer.is_none()
-                && h_dim <= 6144
-                && h_dim.is_multiple_of(64)
+                && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+                && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
                 && fa.qkv_proj.can_fuse_h64_from_producer();
             let [qkv_norm_out, qkv_norm_had64] = if fuse_qkv_h64 {
                 [0, normed_buf]
@@ -1162,8 +1163,8 @@ impl Qwen3_5MtpRank {
         let is_single_stream = self.residual.is_single_stream();
         let fuse_qkv_h64 = is_single_stream
             && fa.qsa_indexer.is_none()
-            && h_dim <= 6144
-            && h_dim.is_multiple_of(64)
+            && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
             && fa.qkv_proj.can_fuse_h64_from_producer();
         let pre_attn_targets = if fuse_qkv_h64 {
             [0, normed_buf]
