@@ -233,11 +233,14 @@ impl LinearProj {
                 // Small-N projections:
                 // - `size_n <= 256` (GDN `in_proj_ba`, 256-expert `router_gate`, etc.) uses the
                 //   batch-size-invariant warp-reduction kernel across all `m` for 0-ULP prefill/decode parity.
-                // - `256 < size_n <= 512` (`hc_lowrank = 320`, 512-expert `router_gate`) uses the
+                // - `size_n <= 2048 && size_k <= 2048` (`hc_lowrank = 320`, 512-expert `router_gate`,
+                //   and unquantized HGPTQ MoE `shared_expert` `gate_up`/`down` projections) uses the
                 //   warp-reduction kernel for decode and speculative verify (`m <= 16`, guaranteeing
                 //   0-ULP parity between `M = 1` decode and `M <= 16` MTP/DFlash2 verify) while keeping
                 //   `m > 16` chunked prefill on cuBLAS Tensor Cores.
-                if (size_n <= 256 || (size_n <= 512 && m <= 16)) && size_k.is_multiple_of(8) {
+                if (size_n <= 256 || (size_n <= 2048 && size_k <= 2048 && m <= 16))
+                    && size_k.is_multiple_of(8)
+                {
                     check_rc(
                         // SAFETY: this branch enforces the small-N and K alignment
                         // specialization. The loaded weight is NxK FP16; input and

@@ -72,7 +72,7 @@ fn pinned_hgptq_text_graph_mtp_and_tp2() {
     for rel_dir in [
         "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
         "models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
-        "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
+        "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2",
     ] {
         let dir = cache.join(rel_dir);
         assert!(
@@ -109,7 +109,7 @@ fn pinned_hgptq_vision_matches_vllm_and_tp2() {
     );
     let images = [image];
 
-    let cases: [(&str, &str, &[i32]); 3] = [
+    let cases: [(&str, &str, &[i32]); 4] = [
         (
             "2B",
             "models--nchapman--Qwen3.5-2B-W4A16-HGPTQ/snapshots/0fbb9a38f631ea63678f4b51a491e7ecb26c681c",
@@ -126,11 +126,18 @@ fn pinned_hgptq_vision_matches_vllm_and_tp2() {
         ),
         (
             "27B",
-            "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
+            "models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2",
             &[
                 8771, 18833, 513, 20479, 383, 264, 17676, 36781, 440, 1330, 8434, 11241, 13, 3648,
                 7993, 369, 264, 74035, 11, 321, 279, 975, 369, 449, 6474, 13, 561, 74035, 369, 383,
                 279, 2047,
+            ],
+        ),
+        (
+            "35B-A3B",
+            "models--nchapman--Qwen3.6-35B-A3B-W4A16-HGPTQ/snapshots/8aeeacaf9ba943fb45b5e27de6655a633de58767",
+            &[
+                8771, 18833, 513, 20479, 383, 264, 17676, 25313, 440, 1330, 8434, 11241, 13, 248044,
             ],
         ),
     ];
@@ -230,6 +237,65 @@ fn pinned_hgptq_dflash2_lossless_and_tp2() {
         assert!(
             accepted >= 16,
             "expected strong acceptance on TP={tp}, got {accepted}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires pinned HGPTQ 35B-A3B MoE checkpoint and two free CUDA GPUs"]
+fn pinned_hgptq_moe_35b_text_vision_mtp_and_tp2() {
+    let cache = std::env::var_os("HF_HUB_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
+        });
+    let dir = cache
+        .join("models--nchapman--Qwen3.6-35B-A3B-W4A16-HGPTQ/snapshots/8aeeacaf9ba943fb45b5e27de6655a633de58767");
+    assert!(
+        dir.join("model_mtp.safetensors").exists(),
+        "missing pinned 35B-A3B HGPTQ checkpoint at {}",
+        dir.display()
+    );
+    let tp1 = qualify_model(&dir, 1);
+    let tp2 = qualify_model(&dir, 2);
+    assert_eq!(&tp1[..10], &tp2[..10], "35B-A3B TP=1 vs TP=2 prefix");
+
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/oracle/fixtures/coco_sample.png");
+    let (rgb, h, w) = vision::load_cli_image_with_policy(fixture.to_str().unwrap(), false).unwrap();
+    let image = vision::preprocess_rgb_image(&rgb, h, w, 16, 2, 2, 1024, 1048576);
+    let expanded = "<|vision_start|><|image_pad|><|vision_end|>Describe this image.".replace(
+        "<|image_pad|>",
+        &"<|image_pad|>".repeat(image.num_merged_tokens(2)),
+    );
+    let images = [image];
+    let expected_vllm_ids = [
+        8771, 18833, 513, 20479, 383, 264, 17676, 25313, 440, 1330, 8434, 11241, 13, 248044,
+    ];
+    for tp in [1usize, 2usize] {
+        let mut engine = Qwen3_5Engine::load(
+            dir.to_str().unwrap(),
+            tp,
+            KvFormatPolicy::Fp16,
+            Some(32),
+            true,
+        )
+        .unwrap();
+        let prompt = engine.encode(&expanded).unwrap();
+        assert_eq!(prompt.len(), 306);
+        let got = engine
+            .generate_multimodal_with_radix_cache(
+                &prompt,
+                &images,
+                expected_vllm_ids.len(),
+                64,
+                false,
+            )
+            .unwrap()
+            .generated_token_ids;
+        assert_eq!(
+            got, expected_vllm_ids,
+            "35B-A3B TP={tp} vision greedy vs vLLM 0.31.0"
         );
     }
 }

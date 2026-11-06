@@ -156,3 +156,162 @@ fn legacy_unchanged_and_regex_is_bounded() {
         .is_err()
     );
 }
+
+#[test]
+fn moe_35b_rules_resolve_experts_shared_and_vision_fc2() {
+    let q = serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "ignore": [
+            "lm_head",
+            "re:.*linear_attn\\.in_proj_a$",
+            "re:.*linear_attn\\.in_proj_b$",
+            "re:.*mlp\\.gate$",
+            "re:.*mlp\\.shared_expert.*"
+        ],
+        "config_groups": {
+            "group_0": {
+                "format": "pack-quantized",
+                "targets": [
+                    "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp(?:\\.experts\\.\\d+)?)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+                    "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp(?:\\.experts\\.\\d+)?)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                    "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
+                ],
+                "weights": {
+                    "actorder": "static",
+                    "dynamic": false,
+                    "group_size": 64,
+                    "num_bits": 4,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            },
+            "vision_fc2_channel": {
+                "format": "pack-quantized",
+                "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"],
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": null,
+                    "num_bits": 4,
+                    "strategy": "channel",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            }
+        },
+        "transform_config": {
+            "config_groups": {
+                "v": {
+                    "head_dim": 64,
+                    "precision": "torch.float32",
+                    "randomize": false,
+                    "requires_grad": false,
+                    "type": "hadamard",
+                    "apply": [
+                        {
+                            "ignore": [
+                                "lm_head",
+                                "re:.*linear_attn\\.in_proj_a$",
+                                "re:.*linear_attn\\.in_proj_b$",
+                                "re:.*mlp\\.gate$",
+                                "re:.*mlp\\.shared_expert.*"
+                            ],
+                            "inverse": true,
+                            "location": "weight_input",
+                            "targets": [
+                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
+                            ]
+                        },
+                        {
+                            "ignore": [
+                                "lm_head",
+                                "re:.*linear_attn\\.in_proj_a$",
+                                "re:.*linear_attn\\.in_proj_b$",
+                                "re:.*mlp\\.gate$",
+                                "re:.*mlp\\.shared_expert.*"
+                            ],
+                            "inverse": false,
+                            "location": "input",
+                            "targets": [
+                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
+                            ]
+                        }
+                    ]
+                },
+                "v_vision_fc2": {
+                    "head_dim": 16,
+                    "precision": "torch.float32",
+                    "randomize": false,
+                    "requires_grad": false,
+                    "type": "hadamard",
+                    "apply": [
+                        {
+                            "ignore": [],
+                            "inverse": true,
+                            "location": "weight_input",
+                            "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"]
+                        },
+                        {
+                            "ignore": [],
+                            "inverse": false,
+                            "location": "input",
+                            "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"]
+                        }
+                    ]
+                }
+            }
+        }
+    });
+    let scheme = parse(&q).unwrap();
+    for name in [
+        "model.language_model.layers.0.linear_attn.in_proj_qkv",
+        "model.language_model.layers.0.linear_attn.out_proj",
+        "model.language_model.layers.3.self_attn.q_proj",
+        "mtp.layers.0.self_attn.o_proj",
+        "model.visual.blocks.0.attn.qkv",
+    ] {
+        assert_eq!(
+            scheme.for_linear(name).unwrap().raw_group_size(),
+            64,
+            "{name}"
+        );
+        assert_eq!(scheme.input_hadamard(name).unwrap(), Some(64), "{name}");
+    }
+    for name in [
+        "model.language_model.layers.0.mlp.experts.0.gate_proj",
+        "model.language_model.layers.39.mlp.experts.255.down_proj",
+        "mtp.layers.0.mlp.experts.0.up_proj",
+    ] {
+        assert_eq!(
+            scheme.for_linear(name).unwrap().raw_group_size(),
+            64,
+            "{name}"
+        );
+        assert_eq!(scheme.input_hadamard(name).unwrap(), None, "{name}");
+    }
+    for name in [
+        "lm_head",
+        "mtp.fc",
+        "model.language_model.layers.0.linear_attn.in_proj_a",
+        "model.language_model.layers.0.mlp.gate",
+        "model.language_model.layers.0.mlp.shared_expert.gate_proj",
+        "model.language_model.layers.0.mlp.shared_expert_gate",
+        "mtp.layers.0.mlp.shared_expert.down_proj",
+    ] {
+        assert_eq!(
+            scheme.for_linear(name).unwrap(),
+            QuantScheme::Unquantized,
+            "{name}"
+        );
+        assert_eq!(scheme.input_hadamard(name).unwrap(), None, "{name}");
+    }
+    let fc2 = "model.visual.blocks.26.mlp.linear_fc2";
+    assert_eq!(scheme.for_linear(fc2).unwrap().raw_group_size(), 0);
+    assert_eq!(scheme.input_hadamard(fc2).unwrap(), Some(16));
+}

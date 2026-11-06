@@ -2,13 +2,14 @@
 
 ## Status
 
-**Complete and verified end-to-end** against `vLLM 0.31.0` across all three flagship HGPTQ target models and the quantized `DFlash2` drafter:
+**Complete and verified end-to-end** against `vLLM 0.31.0` across all four flagship HGPTQ target models and the quantized `DFlash2` drafter:
 - **`nchapman/Qwen3.5-2B-W4A16-HGPTQ`** (`0fbb9a38f631ea63678f4b51a491e7ecb26c681c`)
 - **`nchapman/Qwen3.5-9B-W4A16-HGPTQ`** (`7b2e48b7e7e8ee38925f5337c66feed22d3b031b`)
 - **`nchapman/Qwen3.8-27B-W4A16-HGPTQ`** (`1de743eedefdb7422e6b171174c7080204f5b005` / `ae51987e3339a2a70070702548571e10fe8bcbc2`)
 - **`nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ`** (`46b87ea125d24924affa8da9c3e981a937aab216`, `2.16 GiB` vs `4.81 GiB` for `incoai/Qwen3.8-27B-DFlash2`)
+- **`nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ`** (`8aeeacaf9ba943fb45b5e27de6655a633de58767`, `19.4 GiB`, 256-expert MoE + Vision + MTP)
 
-Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `DFlash2` (`M=8` lossless, both `BF16` and `W4A16-HGPTQ`), Vision (`coco_sample.png`, including 9B/27B `b=16` channelwise `K/N=4304`), CUDA Graphs, and `TP=1 == TP=2`.
+Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `DFlash2` (`M=8` lossless, both `BF16` and `W4A16-HGPTQ`), Vision (`coco_sample.png`, including 9B/27B/35B-A3B `b=16` channelwise `K/N=4304`), CUDA Graphs, and `TP=1 == TP=2`.
 
 ## Pinned checkpoint inventory
 
@@ -21,6 +22,10 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
    - **64 text layers + 27 vision blocks + 1 MTP layer** (`K/N=4304` vision MLP with `group_1` channelwise `strategy="channel", b=16` on `blocks.*.mlp.linear_fc2`).
 4. **`nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ`** (`46b87ea125d24924affa8da9c3e981a937aab216`):
    - **5 DFlash2 layers + `fc` (`[5120, 25600]`)** quantized with symmetric INT4 (`U4B8`), `group_size=64`, and online `H_64` block-Hadamard rotation (`2.16 GiB` total vs `4.81 GiB` unquantized `BF16`, saving `2.65 GiB` VRAM while preserving native `BF16` activations, `BF16` norms, `BF16` grouped convolutions, and `BF16` selector heads).
+5. **`nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ`** (`8aeeacaf9ba943fb45b5e27de6655a633de58767`):
+   - **40 MoE layers (`30` GDN + `10` full attention, `256` routed experts, `top_k=8`, `moe_intermediate_size=512`, `shared_expert_intermediate_size=512`) + 27 vision blocks + 1 MoE MTP layer** (`19.4 GiB`).
+   - Attention (`self_attn`, `linear_attn`, `mtp.layers.0.self_attn`) and Vision (`visual.blocks.*.attn`, `mlp.linear_fc1`, `merger`) use `U4B8` `group_size=64` with `H_64`; `visual.blocks.*.mlp.linear_fc2` (`K/N=4304`) uses channelwise `U4B8` (`strategy="channel"`) with `H_16`; all `256` routed experts per layer (`mlp.experts.*` and `mtp.layers.0.mlp.experts.*`) use `U4B8` `group_size=64` (`hadamard=None`); and `mlp.shared_expert.*`, `mlp.gate`, `in_proj_a/b`, `mtp.fc`, and `lm_head` remain unquantized `FP16`.
+   - Unquantized `DenseF16` MoE `shared_expert` projections (`size_n <= 2048, size_k <= 2048, m <= 16`) route through the batch-size-invariant `w34_small_n_gemm_f16` warp-reduction kernel (`crates/w34-host/src/model/weights.rs`), guaranteeing `0-ULP` parity between `M = 1` plain decode and `M <= 16` `MTP` verification across both `TP=1` and `TP=2`.
 - Target rules use negative lookbehind (`re:.*(?<!mtp\.)model\.layers\.\d+\.mlp\.(gate|up|down)_proj$`) and explicit `ignore` lists (`lm_head`, `patch_embed.proj`, `mtp.fc`, `in_proj_a`, `in_proj_b`), resolved via bounded `fancy-regex` in `crates/w34-host/src/loader/config_rules.rs`.
 
 ## Architecture, kernel contracts & bug fixes
@@ -81,6 +86,8 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
 | **9B HGPTQ** | Vision (`280` tensors) | `0.008970` / `0.999960` | `0.023136` (`match=true`) | **10/10 (100.0%)** | `TP=1 == TP=2 == vLLM` exact |
 | **27B HGPTQ** | Text (`65` tensors) | `0.001938` / `0.999998` | `0.003472` (`match=true`) | **128/128 (100.0%)** | `MTP k=1..3` (`tau = 1.91x / 2.58x / 3.18x`) & `DFlash2` (`tau = 3.88x`, `draft_exact = 7/7`) **4/4 lossless** |
 | **27B HGPTQ** | Vision (`312` tensors) | `0.011096` / `0.999938` | `0.013295` (`match=true`) | **32/32 (100.0%)** | `TP=1 == TP=2 == vLLM` exact |
+| **35B-A3B HGPTQ** | Text (`41` tensors) | `0.048726` / `0.994578` (`7.25e-4` L0..10) | `0.028963` (`match=true`) | **127/128 (99.2%)** (`4/4` adjudicated, `gap=0.0156`) | `MTP k=1..3` (`tau = 1.82x / 2.48x / 2.88x`, `draft_exact = 3/3`) **4/4 lossless & radix-warm** |
+| **35B-A3B HGPTQ** | Vision (`288` tensors) | `0.007034` ViT / `0.2729` L39 (`0.999975` / `0.9553`) | `0.157357` (`match=true`) | **14/14 (100.0%)** | `TP=1 == TP=2 == vLLM` exact |
 
 ### 3. Comprehensive Benchmark Suite (`1–2× RTX 3090 Ti`, `TQ4` KV, CUDA Graphs Enabled)
 
@@ -100,6 +107,10 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
 | **27B HGPTQ** | `TP=2` | Plain | `1,644` / **85.4** | — | — | `300.8 ms` / **77.9 tok/s** | **`1.96×`** | `96.8%` of GPTQ (`88.2`) |
 | **27B HGPTQ** | `TP=2` | `MTP-3` | `1,628` / **252.1** (`3.88x`) | `1,848` / **235.6** (`3.63x`) | `1,822` / **213.2** (`3.44x`) | — | **`5.80×`** | **`+3.8%`** vs GPTQ (`242.9`) |
 | **27B HGPTQ** | `TP=2` | `DFlash2-W4` | `1,545` / **351.0** (`6.20x`) | `1,826` / **365.1** (`6.68x`) | — | — | **`8.39×`** (`512:128`) | **`+8.3%`** vs `BF16` DFlash2 (`337.1`), `17.66 ms/round` |
+| **35B-A3B HGPTQ** | `TP=1` | Plain | `2,554` / **206.9** | `5,729` / **204.2** | — | `304.2 ms` / **190.4 tok/s** | `vLLM` OOMs on 1× 24 GB (`TP=1`) | **`+10.9%`** vs GPTQ (`186.5`) |
+| **35B-A3B HGPTQ** | `TP=1` | `MTP-3` | `2,589` / **432.2** (`3.88x`) | `4,627` / **404.5** (`3.63x`) | `4,698` / **415.2** (`3.88x`) | — | Fits 1× 24 GB with `MTP-3` + Vision | **`2.32×`** vs GPTQ `TP=1` (`186.5`) |
+| **35B-A3B HGPTQ** | `TP=2` | Plain | `3,229` / **267.6** | `5,623` / **269.5** | — | `226.3 ms` / **235.9 tok/s** | **`1.40×`** (vs `191.4 tok/s`) | **`+6.7%`** vs GPTQ (`250.7`) |
+| **35B-A3B HGPTQ** | `TP=2` | `MTP-3` | `3,467` / **562.2** (`3.88x`) | `5,300` / **460.5** (`3.10x`) | `5,433` / **509.3** (`3.88x`) | — | **`2.94×`** (vs `191.4 tok/s`) | **`+44.1%`–`+75.9%`** vs GPTQ `MTP` (`319.6`) |
 
 ## Reproducing checks
 

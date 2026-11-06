@@ -231,12 +231,17 @@ def main():
             save_file({k: v for k, v in tensors.items() if k == 'visual_embeddings' or k == 'final_norm' or k.endswith('_hidden_after') or k.startswith('vision_trace.')}, str(out / 'golden.safetensors'))
             request = json.loads((capture_dir / 'request.json').read_text())
             generation = json.loads((capture_dir / 'generation.json').read_text())
-            (out / 'greedy.json').write_text(json.dumps({'prompts': [dict(prompt_token_ids=request['prompt_token_ids'], generated_token_ids=generation['token_ids'])]}, indent=2) + '\n')
+            gen_ids = list(generation['token_ids'])
+            for eos_id in (248044, 151645):
+                if eos_id in gen_ids:
+                    gen_ids = gen_ids[:gen_ids.index(eos_id) + 1]
+            (out / 'greedy.json').write_text(json.dumps({'prompts': [dict(prompt_token_ids=request['prompt_token_ids'], generated_token_ids=gen_ids)]}, indent=2) + '\n')
             manifest.update(status='complete', vision_request=request)
             return
         options = dict(model=str(model), tokenizer=str(model), dtype='float16', tensor_parallel_size=1,
                        distributed_executor_backend='uni', enforce_eager=not args.graph_mode, seed=0,
                        max_model_len=args.max_len, max_num_seqs=1, gpu_memory_utilization=args.gpu_memory_utilization,
+                       limit_mm_per_prompt={"image": 0, "video": 0},
                        enable_prefix_caching=False, enable_chunked_prefill=True)
         manifest['llm_options'] = options
         record()
@@ -282,7 +287,7 @@ def main():
                                 text=output.text, token_ids=list(output.token_ids), finish_reason=output.finish_reason,
                                 logprobs=[{str(k): dict(logprob=v.logprob, rank=v.rank) for k, v in step.items()} for step in output.logprobs]))
             (out / 'generations.json').write_text(json.dumps(results, indent=2) + '\n')
-        (out / 'greedy.json').write_text(json.dumps({'prompts': [dict(prompt_token_ids=r['prompt_token_ids'], generated_token_ids=r['token_ids']) for r in results]}, indent=2) + '\n')
+        (out / 'greedy.json').write_text(json.dumps({'prompts': [dict(prompt_token_ids=r['prompt_token_ids'], generated_token_ids=r['token_ids'], top5=[[[int(k), v['logprob']] for k, v in sorted(step.items(), key=lambda kv: kv[1]['rank'])] for step in r['logprobs']]) for r in results]}, indent=2) + '\n')
         manifest.update(status='complete', sampling=dict(temperature=0, max_tokens=args.tokens, ignore_eos=True, logprobs=5, seed=0), batch_shape='one prompt per generate, sequential', chat_template=False)
         if args.capture_layers and not (out / 'text_prefill.safetensors').exists():
             raise RuntimeError('Missing requested prefill capture')

@@ -523,4 +523,31 @@ fn kv_policy_parsing_and_tensor_diff_metrics() {
         evaluate_golden_tensor_diff("final_norm", &[3, 2], &bad_mid_row, &ref_vals, true).is_err()
     );
     assert!(evaluate_golden_tensor_diff("final_norm", &[2, 2], &mm_ok, &ref_vals, true).is_err());
+
+    assert!(
+        evaluate_moe_or_golden_tensor_diff("final_norm", &[3, 2], &mm_ok, &ref_vals, false, true)
+            .is_ok()
+    );
+    assert!(
+        evaluate_moe_or_golden_tensor_diff(
+            "layer_0_hidden_after",
+            &[3, 2],
+            &mm_ok,
+            &ref_vals,
+            false,
+            true,
+        )
+        .is_err()
+    );
+    assert!(
+        evaluate_moe_or_golden_tensor_diff(
+            "final_norm",
+            &[3, 2],
+            &bad_mid_row,
+            &ref_vals,
+            true,
+            true,
+        )
+        .is_err()
+    );
 }
