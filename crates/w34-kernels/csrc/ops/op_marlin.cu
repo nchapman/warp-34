@@ -176,6 +176,98 @@ __global__ void zero_ints_kernel(int32_t* p, int64_t n) {
     if (i < n) p[i] = 0;
 }
 
+// Online weight-only FP16 -> Marlin U4B8 quantizer + tile repacker (`group_size` in {32, 64, 128}).
+// Donor: vLLM PR #59973 (`vllm/model_executor/layers/quantization/online/lm_head.py`:
+// `quantized_lm_head_copy`), adapted to sm_86/sm_89 Marlin U4B8 (`w34_marlin_gemm_f16u4`).
+// Quantizes an N-major `[size_n, size_k]` FP16 weight matrix directly into:
+//   - `dst_marlin`: `[size_k / 16, (size_n / 64) * 128]` uint32_t Marlin U4B8 tiles
+//   - `dst_scales_perm`: `[size_k / group_size, size_n]` FP16 Marlin-permuted scales
+// without allocating any intermediate FP16 or N-major packed staging buffer.
+__global__ void marlin_quantize_f16_u4b8_kernel(
+    half const* __restrict__ src_f16,
+    uint32_t* __restrict__ dst_marlin,
+    half* __restrict__ dst_scales_perm,
+    int size_k,
+    int size_n,
+    int group_size) {
+    constexpr int kTileN = 64;
+    constexpr int kTileK = 16;
+    const int n_tiles = size_n / kTileN;
+    const int num_groups = size_k / group_size;
+    const int total_tiles = n_tiles * num_groups;
+    const int sub_tiles = group_size / kTileK;
+
+    __shared__ uint8_t sh_q[kTileN][kTileK];
+
+    const int r = threadIdx.x >> 1;
+    const int sub_t = threadIdx.x & 1;
+    const int warp_id = threadIdx.x >> 5;
+    const int th_id = threadIdx.x & 31;
+    const int tc_col = th_id >> 2;
+    const int tc_row = (th_id & 3) * 2;
+    constexpr int tc_offsets[4] = {0, 1, 8, 9};
+    const int cur_n = warp_id * 16 + tc_col;
+
+    for (int tile_idx = blockIdx.x; tile_idx < total_tiles; tile_idx += gridDim.x) {
+        const int n_tile_id = tile_idx % n_tiles;
+        const int group_id = tile_idx / n_tiles;
+        const int first_n = n_tile_id * kTileN;
+        const int first_k = group_id * group_size;
+        half const* row_ptr = src_f16 + (size_t)(first_n + r) * size_k + first_k;
+
+        float max_abs = 0.0f;
+        for (int c = sub_t * 8; c < group_size; c += 16) {
+            int4 vec = *reinterpret_cast<int4 const*>(row_ptr + c);
+            half const* h = reinterpret_cast<half const*>(&vec);
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                max_abs = fmaxf(max_abs, fabsf(__half2float(h[b])));
+            }
+        }
+        max_abs = fmaxf(max_abs, __shfl_xor_sync(0xffffffffu, max_abs, 1));
+
+        half scale_h = __float2half(max_abs / 7.0f);
+        float scale_f = __half2float(scale_h);
+        float inv_scale = (scale_f > 0.0f) ? (1.0f / scale_f) : 0.0f;
+
+        if (sub_t == 0) {
+            size_t scale_base = (size_t)group_id * size_n + (size_t)n_tile_id * kTileN;
+            dst_scales_perm[scale_base + (r & 7) * 8 + (r >> 3)] = scale_h;
+        }
+
+        for (int sub_k = 0; sub_k < sub_tiles; ++sub_k) {
+            int4 vec = *reinterpret_cast<int4 const*>(row_ptr + sub_k * kTileK + sub_t * 8);
+            half const* h = reinterpret_cast<half const*>(&vec);
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                float w = __half2float(h[b]);
+                int q = __float2int_rn(w * inv_scale) + 8;
+                q = max(0, min(15, q));
+                sh_q[r][sub_t * 8 + b] = (uint8_t)q;
+            }
+            __syncthreads();
+
+            uint32_t vals[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int cur_elem = tc_row + tc_offsets[i];
+                vals[i] = sh_q[cur_n][cur_elem];
+                vals[4 + i] = sh_q[cur_n + 8][cur_elem];
+            }
+            constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+            uint32_t res = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                res |= vals[pack_idx[i]] << (i * 4);
+            }
+            int k_tile_id = group_id * sub_tiles + sub_k;
+            size_t out_offset = ((size_t)k_tile_id * n_tiles + n_tile_id) * 128;
+            dst_marlin[out_offset + th_id * 4 + warp_id] = res;
+            __syncthreads();
+        }
+    }
+}
+
 typedef struct {
     int thread_k;
     int thread_n;
@@ -554,6 +646,33 @@ extern "C" int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_
     w34_marlin::gptq_marlin_repack_n_major_kernel<w34_marlin::repack_threads, 8>
         <<<(unsigned)blocks, w34_marlin::repack_threads, smem, (cudaStream_t)ex->stream>>>(
             src_n_major, dst_marlin, (int)k, (int)n);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_marlin_quantize_f16_u4b8(
+    const w34_exec* ex, const void* src_f16, uint32_t* dst_marlin,
+    void* dst_scales_perm, int64_t k, int64_t n, int group_size) {
+    if (ex == nullptr || src_f16 == nullptr || dst_marlin == nullptr ||
+        dst_scales_perm == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (k <= 0 || n <= 0 || (k % 32) != 0 || (n % 64) != 0 ||
+        (group_size != 32 && group_size != 64 && group_size != 128) ||
+        (k % group_size) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if ((((uintptr_t)src_f16) & 15u) != 0u) {
+        return (int)cudaErrorInvalidValue;
+    }
+    w34_device_props dev_props{};
+    int props_rc = w34_get_current_device_props(&dev_props);
+    if (props_rc != 0) return props_rc;
+    int64_t total_tiles = (n / 64) * (k / group_size);
+    int blocks = (int)std::min<int64_t>(total_tiles, (int64_t)dev_props.multi_processor_count * 8);
+    if (blocks < 1) blocks = 1;
+    w34_marlin::marlin_quantize_f16_u4b8_kernel<<<(unsigned)blocks, 128, 0, (cudaStream_t)ex->stream>>>(
+        reinterpret_cast<half const*>(src_f16), dst_marlin,
+        reinterpret_cast<half*>(dst_scales_perm), (int)k, (int)n, group_size);
     return (int)cudaGetLastError();
 }
 

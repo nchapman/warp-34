@@ -44,27 +44,7 @@ fn cached_4b_mtp_k123() {
     };
     let before = snapshot();
     let mut mtp = Qwen3_5MtpRank::load(target, &engine.model_dir, 64).unwrap();
-    assert_eq!(mtp.kv_layout().namespace_id, W34_KV_NAMESPACE_MTP_FULL_ATTN);
-    assert_eq!(
-        target.kv_pool.layers[0].layout.namespace_id,
-        W34_KV_NAMESPACE_TARGET_FULL_ATTN
-    );
-    assert_ne!(
-        mtp.kv_layout().k_base,
-        target.kv_pool.layers[0].layout.k_base
-    );
-    assert!(validate_geometry(&engine.cfg, 0, 3).is_err());
-    let mut bad = engine.cfg.clone();
-    bad.num_key_value_heads = 1;
-    assert!(validate_geometry(&bad, 0, 2).is_err());
-    for (bad_tokens, bad_hidden) in [
-        (&[anchor; 65][..], hidden),
-        (&[-1][..], hidden),
-        (&[anchor][..], 0),
-        (&[anchor][..], u64::MAX - 1),
-    ] {
-        assert!(mtp.ingest(target, bad_tokens, bad_hidden, None).is_err());
-    }
+    check_mtp_input_validation(&engine, &mut mtp, anchor, hidden);
     assert!(mtp.is_empty());
     mtp.ingest(target, &[], 0, None).unwrap();
     mtp.ingest(target, &tokens[1..], hidden, None).unwrap();
@@ -110,6 +90,40 @@ fn cached_4b_mtp_k123() {
     check_lossless_rounds(&mut engine, &mut mtp, &tokens, 2);
     check_lossless_rounds(&mut engine, &mut mtp, &tokens, 12);
     check_vllm_hidden_replay(&engine, &mut mtp);
+}
+
+fn check_mtp_input_validation(
+    engine: &Qwen3_5Engine,
+    mtp: &mut Qwen3_5MtpRank,
+    anchor: i32,
+    hidden: u64,
+) {
+    let target = &engine.ranks[0];
+    assert!(
+        mtp.has_quantized_draft_lm_head(),
+        "4B DenseF16 target.lm_head with ample free VRAM must enable quantized MarlinW4A16 draft_lm_head"
+    );
+    assert_eq!(mtp.kv_layout().namespace_id, W34_KV_NAMESPACE_MTP_FULL_ATTN);
+    assert_eq!(
+        target.kv_pool.layers[0].layout.namespace_id,
+        W34_KV_NAMESPACE_TARGET_FULL_ATTN
+    );
+    assert_ne!(
+        mtp.kv_layout().k_base,
+        target.kv_pool.layers[0].layout.k_base
+    );
+    assert!(validate_geometry(&engine.cfg, 0, 3).is_err());
+    let mut bad = engine.cfg.clone();
+    bad.num_key_value_heads = 1;
+    assert!(validate_geometry(&bad, 0, 2).is_err());
+    for (bad_tokens, bad_hidden) in [
+        (&[anchor; 65][..], hidden),
+        (&[-1][..], hidden),
+        (&[anchor][..], 0),
+        (&[anchor][..], u64::MAX - 1),
+    ] {
+        assert!(mtp.ingest(target, bad_tokens, bad_hidden, None).is_err());
+    }
 }
 
 fn check_vllm_hidden_replay(engine: &Qwen3_5Engine, mtp: &mut Qwen3_5MtpRank) {

@@ -32,6 +32,58 @@ const MTP_MOE_STAGE_CAPACITY: usize = 32;
 /// Minimum batch token capacity (`64` rows) allocated for the `MTP` tiered-MoE workspace.
 const MTP_MOE_MIN_WORKSPACE_BATCH_ROWS: usize = 64;
 
+/// Group size (`64`, `0.5625 B/weight`) used when online-quantizing a `DenseF16` `target.lm_head`
+/// into a private `MarlinW4A16` (`U4B8`) proposal head for `MTP` (`vLLM` PR #59973
+/// `vllm/model_executor/layers/quantization/online/lm_head.py`: `quantized_lm_head_copy`).
+pub(crate) const MTP_DRAFT_LM_HEAD_GROUP_SIZE: usize = 64;
+
+/// Alignment slack (`4 KiB`) added to the `MTP` `draft_lm_head` `DeviceArena` for 256-byte
+/// aligned `b_q_weight` and `b_scales` sub-allocations.
+pub(crate) const MTP_DRAFT_LM_HEAD_ARENA_SLACK_BYTES: usize = 4 * 1024;
+
+/// Minimum free VRAM (`256 MiB`) that must remain after allocating all `MTP` weights, hot
+/// experts, KV pool, scratch arenas, and the quantized `draft_lm_head` copy.
+pub(crate) const MTP_DRAFT_LM_HEAD_POST_HEADROOM_BYTES: usize = 256 * 1024 * 1024;
+
+/// Pure hardware-aware planner for an online-quantized `MarlinW4A16` copy of `target.lm_head`
+/// (`vLLM` PR #59973 `quantized_lm_head_copy`).
+///
+/// Returns `Some((qweight_bytes, scales_bytes, arena_bytes))` when:
+/// 1. `target_lm_head` is unquantized `LinearProj::DenseF16 { size_n, size_k, .. }`
+///    (already-quantized `MarlinW4A16` / `MarlinW8A16` heads are shared at `0 B` extra VRAM),
+/// 2. `(size_n, size_k)` satisfies Marlin's `U4B8` `group_size = 64` tile alignment
+///    (`size_n % 64 == 0 && size_k % 128 == 0`), and
+/// 3. `free_vram_after_mtp_init >= arena_bytes + MTP_DRAFT_LM_HEAD_POST_HEADROOM_BYTES`.
+pub(crate) fn plan_mtp_draft_lm_head_bytes(
+    target_lm_head: &LinearProj,
+    free_vram_after_mtp_init: usize,
+) -> Option<(usize, usize, usize)> {
+    let LinearProj::DenseF16 { size_n, size_k, .. } = *target_lm_head else {
+        return None;
+    };
+    if size_n == 0
+        || size_k == 0
+        || !size_n.is_multiple_of(64)
+        || !size_k.is_multiple_of(128)
+        || !size_k.is_multiple_of(MTP_DRAFT_LM_HEAD_GROUP_SIZE)
+    {
+        return None;
+    }
+    let qweight_bytes = (size_n / 2).checked_mul(size_k)?;
+    let scales_bytes = size_n
+        .checked_mul(size_k / MTP_DRAFT_LM_HEAD_GROUP_SIZE)?
+        .checked_mul(2)?;
+    let arena_bytes = qweight_bytes
+        .checked_add(scales_bytes)?
+        .checked_add(MTP_DRAFT_LM_HEAD_ARENA_SLACK_BYTES)?;
+    let required_vram = arena_bytes.checked_add(MTP_DRAFT_LM_HEAD_POST_HEADROOM_BYTES)?;
+    if free_vram_after_mtp_init >= required_vram {
+        Some((qweight_bytes, scales_bytes, arena_bytes))
+    } else {
+        None
+    }
+}
+
 /// Validate before slicing weights: both dense (`Qwen3_5MTP`) and MoE (`Qwen3_5MoeMTP`) geometries are checked explicitly.
 pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> {
     let ffn_ok = if c.num_experts == 0 {
@@ -136,6 +188,8 @@ pub struct Qwen3_5MtpRank {
     norms: [u64; 2],
     tiered_moe: Option<MtpTieredMoe>,
     qsa: Option<MtpQsaWorkspace>,
+    _draft_lm_head_arena: Option<DeviceArena>,
+    draft_lm_head: Option<LinearProj>,
     /// Recurrent proposal input: final-normalized for single-stream residuals,
     /// or the uncollapsed multi-stream residual for HyperConnection fusion.
     pub hidden: DeviceBuffer,
@@ -152,6 +206,18 @@ impl Qwen3_5MtpRank {
                 Err(loader_err("MTP concat fusion required"))
             }
         }
+    }
+
+    /// Returns the online-quantized `MarlinW4A16` `draft_lm_head` copy when enabled, or
+    /// falls back to borrowing `target.lm_head` (`vLLM` PR #59973 `quantized_lm_head_copy`).
+    #[inline]
+    pub(crate) fn lm_head<'a>(&'a self, target: &'a Qwen3_5ModelRank) -> &'a LinearProj {
+        self.draft_lm_head.as_ref().unwrap_or(&target.lm_head)
+    }
+
+    /// Returns `true` when this `MTP` rank owns an online-quantized `MarlinW4A16` copy of `target.lm_head`.
+    pub fn has_quantized_draft_lm_head(&self) -> bool {
+        self.draft_lm_head.is_some()
     }
 
     pub fn supports_cuda_graph(&self) -> bool {
@@ -394,107 +460,6 @@ impl Qwen3_5MtpRank {
                 FinalResidual::SingleStream { norm_ptr: norms[4] },
             )
         };
-        let tiered_moe = if is_tiered_moe_mtp {
-            let (group_size, mtp_quant) = if let Some(ws_key) =
-                archive.resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_scale")
-                && let Ok(ws_info) = archive.tensor_info(&ws_key)
-                && ws_info.shape.len() == 2
-                && ws_info.shape[1] > 0
-                && h.is_multiple_of(ws_info.shape[1])
-            {
-                let gs = h / ws_info.shape[1];
-                (
-                    gs,
-                    crate::loader::QuantScheme::CompressedTensors {
-                        num_bits: 4,
-                        group_size: gs,
-                        symmetric: true,
-                        ignore: Vec::new(),
-                    },
-                )
-            } else if let Some(sc_key) =
-                archive.resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.scales")
-                && let Ok(sc_info) = archive.tensor_info(&sc_key)
-                && sc_info.shape.len() == 2
-                && sc_info.shape[0] > 0
-                && h.is_multiple_of(sc_info.shape[0])
-            {
-                let gs = h / sc_info.shape[0];
-                (
-                    gs,
-                    crate::loader::QuantScheme::AutoRound {
-                        bits: 4,
-                        group_size: gs,
-                        sym: true,
-                        awq_packing: false,
-                    },
-                )
-            } else {
-                (c.quant.group_size_or(128), c.quant.clone())
-            };
-            let layout =
-                crate::moe_offload::ExpertPackLayout::new(c.moe_intermediate_size, h, group_size)
-                    .map_err(|e| {
-                    crate::cuda::CudaError::with_detail(
-                        -1,
-                        "MTP ExpertPackLayout::new",
-                        e.to_string(),
-                    )
-                })?;
-            let local_experts = c.num_experts / tp;
-            let free_vram = target.device.mem_info().map_or(0, |(free, _)| free);
-            let k_hot = crate::model::plan_mtp_tiered_moe_hot_experts(
-                tp,
-                local_experts,
-                layout.stride,
-                free_vram,
-            );
-            let fully_resident = k_hot >= local_experts;
-            let stage_cap = MTP_MOE_STAGE_CAPACITY.min(local_experts).max(1);
-            let mut ws = crate::moe_offload::TieredMoeWorkspace::new(
-                target.device.device_id,
-                layout.clone(),
-                stage_cap,
-                max_batch_rows.max(MTP_MOE_MIN_WORKSPACE_BATCH_ROWS),
-                c.num_experts_per_tok.max(1),
-            )?;
-            let mut store = crate::moe_offload::HostExpertStore::load_with_pin(
-                &archive,
-                "mtp.layers.0.mlp.experts",
-                &mtp_quant,
-                layout.clone(),
-                c.num_experts,
-                r,
-                tp,
-                usize::MAX,
-                !fully_resident,
-            )
-            .map_err(|e| {
-                crate::cuda::CudaError::with_detail(-1, "MTP HostExpertStore::load", e.to_string())
-            })?;
-            let mut cache = crate::moe_offload::HotExpertCache::new(
-                target.device.device_id,
-                k_hot,
-                store.expert_ids(),
-                layout,
-            )?;
-            let initial =
-                crate::moe_offload::HotExpertRankings::from_model_dir(dir).and_then(|rk| {
-                    rk.select_for_layer(
-                        c.num_hidden_layers.saturating_sub(1),
-                        store.expert_ids(),
-                        k_hot,
-                    )
-                });
-            cache.populate_initial(&store, initial.as_deref(), &mut ws, &target.stream)?;
-            if fully_resident {
-                target.stream.synchronize()?;
-                store.release_host_storage();
-            }
-            Some((store, cache, ws))
-        } else {
-            None
-        };
         let qsa = if qsa_indexer.is_some() {
             let max_select_groups =
                 (c.indexer_budget / c.indexer_compress_ratio.max(1)).clamp(1, 512) + 1;
@@ -570,15 +535,17 @@ impl Qwen3_5MtpRank {
             + 8 * q / tp
             + 6 * local_kv
             + 2 * (c.indexer_n_heads + c.indexer_kv_heads) * c.indexer_head_dim
-            + ffn_row_elements
-            + target.local_vocab_size;
+            + ffn_row_elements;
+        let single_row_logits_bytes = target.local_vocab_size * 2;
         let scratch_bytes = max_batch_rows
             .checked_mul(row_elements)
             .and_then(|n| n.checked_mul(2))
+            .and_then(|n| n.checked_add(single_row_logits_bytes))
             .and_then(|n| n.checked_add(2 * 1024 * 1024 + 131072 + capacity.div_ceil(16) * 4))
             .ok_or_else(|| loader_err("MTP scratch size overflow"))?;
         let propose_arena_bytes = row_elements
             .checked_mul(2)
+            .and_then(|n| n.checked_add(single_row_logits_bytes))
             .and_then(|n| n.checked_add(2 * 1024 * 1024 + 131072))
             .ok_or_else(|| loader_err("MTP propose arena overflow"))?;
         let graph_io = MtpGraphIo {
@@ -586,6 +553,158 @@ impl Qwen3_5MtpRank {
             propose_arena: DeviceArena::new(target.device.device_id, propose_arena_bytes)?,
             meta_dev: DeviceBuffer::alloc(target.device.device_id, 16 * 4)?,
             out_ids_dev: DeviceBuffer::alloc(target.device.device_id, 4 * 4)?,
+        };
+        let scratch = DeviceArena::new(target.device.device_id, scratch_bytes)?;
+        let hidden = DeviceBuffer::alloc(target.device.device_id, mtp_row_elems * 2)?;
+        let batch_hidden =
+            DeviceBuffer::alloc(target.device.device_id, max_batch_rows * mtp_row_elems * 2)?;
+        let tiered_moe = if is_tiered_moe_mtp {
+            let (group_size, mtp_quant) = if let Some(ws_key) =
+                archive.resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_scale")
+                && let Ok(ws_info) = archive.tensor_info(&ws_key)
+                && ws_info.shape.len() == 2
+                && ws_info.shape[1] > 0
+                && h.is_multiple_of(ws_info.shape[1])
+            {
+                let gs = h / ws_info.shape[1];
+                (
+                    gs,
+                    crate::loader::QuantScheme::CompressedTensors {
+                        num_bits: 4,
+                        group_size: gs,
+                        symmetric: true,
+                        ignore: Vec::new(),
+                    },
+                )
+            } else if let Some(sc_key) =
+                archive.resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.scales")
+                && let Ok(sc_info) = archive.tensor_info(&sc_key)
+                && sc_info.shape.len() == 2
+                && sc_info.shape[0] > 0
+                && h.is_multiple_of(sc_info.shape[0])
+            {
+                let gs = h / sc_info.shape[0];
+                (
+                    gs,
+                    crate::loader::QuantScheme::AutoRound {
+                        bits: 4,
+                        group_size: gs,
+                        sym: true,
+                        awq_packing: false,
+                    },
+                )
+            } else {
+                (c.quant.group_size_or(128), c.quant.clone())
+            };
+            let layout =
+                crate::moe_offload::ExpertPackLayout::new(c.moe_intermediate_size, h, group_size)
+                    .map_err(|e| {
+                    crate::cuda::CudaError::with_detail(
+                        -1,
+                        "MTP ExpertPackLayout::new",
+                        e.to_string(),
+                    )
+                })?;
+            let local_experts = c.num_experts / tp;
+            let stage_cap = MTP_MOE_STAGE_CAPACITY.min(local_experts).max(1);
+            let mut ws = crate::moe_offload::TieredMoeWorkspace::new(
+                target.device.device_id,
+                layout.clone(),
+                stage_cap,
+                max_batch_rows.max(MTP_MOE_MIN_WORKSPACE_BATCH_ROWS),
+                c.num_experts_per_tok.max(1),
+            )?;
+            let free_vram = target.device.mem_info().map_or(0, |(free, _)| free);
+            let k_hot = crate::model::plan_mtp_tiered_moe_hot_experts(
+                tp,
+                local_experts,
+                layout.stride,
+                free_vram,
+            );
+            let fully_resident = k_hot >= local_experts;
+            let mut store = crate::moe_offload::HostExpertStore::load_with_pin(
+                &archive,
+                "mtp.layers.0.mlp.experts",
+                &mtp_quant,
+                layout.clone(),
+                c.num_experts,
+                r,
+                tp,
+                usize::MAX,
+                !fully_resident,
+            )
+            .map_err(|e| {
+                crate::cuda::CudaError::with_detail(-1, "MTP HostExpertStore::load", e.to_string())
+            })?;
+            let mut cache = crate::moe_offload::HotExpertCache::new(
+                target.device.device_id,
+                k_hot,
+                store.expert_ids(),
+                layout,
+            )?;
+            let initial =
+                crate::moe_offload::HotExpertRankings::from_model_dir(dir).and_then(|rk| {
+                    rk.select_for_layer(
+                        c.num_hidden_layers.saturating_sub(1),
+                        store.expert_ids(),
+                        k_hot,
+                    )
+                });
+            cache.populate_initial(&store, initial.as_deref(), &mut ws, &target.stream)?;
+            if fully_resident {
+                target.stream.synchronize()?;
+                store.release_host_storage();
+            }
+            Some((store, cache, ws))
+        } else {
+            None
+        };
+        let free_vram_post_mtp = target.device.mem_info().map_or(0, |(free, _)| free);
+        let (_draft_lm_head_arena, draft_lm_head) = if let LinearProj::DenseF16 {
+            weight_ptr,
+            size_n,
+            size_k,
+        } = target.lm_head
+            && let Some((qweight_bytes, scales_bytes, arena_bytes)) =
+                plan_mtp_draft_lm_head_bytes(&target.lm_head, free_vram_post_mtp)
+            && let Ok(mut arena) = DeviceArena::new(target.device.device_id, arena_bytes)
+            && let Ok(b_q_weight_ptr) = arena.alloc_aligned(qweight_bytes)
+            && let Ok(b_scales_ptr) = arena.alloc_aligned(scales_bytes)
+        {
+            let ex = target.stream.exec(0, 0);
+            // SAFETY: `weight_ptr` holds `size_n * size_k` FP16 elements on `target.device`,
+            // and `b_q_weight_ptr` / `b_scales_ptr` are freshly allocated in `arena` with
+            // `qweight_bytes` and `scales_bytes` capacity on `target.stream`.
+            let rc = unsafe {
+                ffi::w34_marlin_quantize_f16_u4b8(
+                    &ex,
+                    weight_ptr as *const core::ffi::c_void,
+                    b_q_weight_ptr as *mut u32,
+                    b_scales_ptr as *mut core::ffi::c_void,
+                    size_k as i64,
+                    size_n as i64,
+                    MTP_DRAFT_LM_HEAD_GROUP_SIZE as i32,
+                )
+            };
+            if rc == 0 {
+                (
+                    Some(arena),
+                    Some(LinearProj::MarlinW4A16 {
+                        b_q_weight_ptr,
+                        b_scales_ptr,
+                        size_n,
+                        size_k,
+                        group_blocks: (MTP_DRAFT_LM_HEAD_GROUP_SIZE / 16) as i32,
+                    }),
+                )
+            } else if rc < 0 {
+                (None, None)
+            } else {
+                crate::cuda::check_rc(rc, "w34_marlin_quantize_f16_u4b8 (MTP draft_lm_head)")?;
+                unreachable!()
+            }
+        } else {
+            (None, None)
         };
         target.stream.synchronize()?;
         let all_pages = pages.clone();
@@ -597,7 +716,7 @@ impl Qwen3_5MtpRank {
             total_capacity: capacity,
             graph_io,
             _weights: weights,
-            scratch: DeviceArena::new(target.device.device_id, scratch_bytes)?,
+            scratch,
             kv,
             all_pages,
             all_pages_dev: pages_dev,
@@ -616,11 +735,10 @@ impl Qwen3_5MtpRank {
             norms: [norms[0], norms[1]],
             tiered_moe,
             qsa,
-            hidden: DeviceBuffer::alloc(target.device.device_id, mtp_row_elems * 2)?,
-            batch_hidden: DeviceBuffer::alloc(
-                target.device.device_id,
-                max_batch_rows * mtp_row_elems * 2,
-            )?,
+            _draft_lm_head_arena,
+            draft_lm_head,
+            hidden,
+            batch_hidden,
             batch_hidden_rows: 0,
             max_batch_rows,
         })

@@ -1369,6 +1369,8 @@ impl Qwen3_5ModelRank {
                 MIN_ACTIVE_STATE_SLOTS,
                 PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS,
             )
+        } else if tp_size >= 2 {
+            requested_state_slots
         } else {
             requested_state_slots.min(PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS / 2)
         };

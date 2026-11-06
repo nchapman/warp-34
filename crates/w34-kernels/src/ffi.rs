@@ -533,6 +533,15 @@ unsafe extern "C" {
         k: i64,
         n: i64,
     ) -> i32;
+    pub fn w34_marlin_quantize_f16_u4b8(
+        ex: *const W34Exec,
+        src_f16: *const c_void,
+        dst_marlin: *mut u32,
+        dst_scales_perm: *mut c_void,
+        k: i64,
+        n: i64,
+        group_size: i32,
+    ) -> i32;
     pub fn w34_marlin_gemm_f16u4(
         ex: *const W34Exec,
         a: *const c_void,

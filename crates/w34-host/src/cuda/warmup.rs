@@ -190,6 +190,18 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ffi::w34_marlin_repack_int8(&ex, buf_a as *const u32, buf_b as *mut u32, 128, 64),
         "warmup w34_marlin_repack_int8"
     )?;
+    warmup_ffi!(
+        ffi::w34_marlin_quantize_f16_u4b8(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *mut u32,
+            buf_c as *mut c_void,
+            128,
+            64,
+            64,
+        ),
+        "warmup w34_marlin_quantize_f16_u4b8"
+    )?;
     for m_warm in [1i64, 16, 40, 64] {
         for group_blocks in [8i32, 4, 2] {
             warmup_ffi!(

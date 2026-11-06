@@ -466,7 +466,7 @@ impl Qwen3_5MtpRank {
                     "MTP batch hidden tail",
                 )?;
             }
-            Self::project(&t.lm_head, &ex, t, self.hidden.addr(), logits_buf, 1)?;
+            Self::project(self.lm_head(t), &ex, t, self.hidden.addr(), logits_buf, 1)?;
             check_rc(
                 // SAFETY: logits_buf contains local_vocab_size valid half logits, output pointers have capacity for argmax results.
                 unsafe {
@@ -891,6 +891,17 @@ impl Qwen3_5MtpRank {
         );
         meta.extend_from_slice(&[0i32, num_tokens as i32, (self.len + num_tokens) as i32]);
         let meta_base = self.scratch.upload_slice(&meta, &t.stream)?;
+        let (logits_buf, out_id, local_id, local_val, global_val) = if sample_last {
+            (
+                self.scratch.alloc_aligned(t.local_vocab_size * 2)?,
+                self.scratch.alloc_aligned(4)?,
+                self.scratch.alloc_aligned(4)?,
+                self.scratch.alloc_aligned(4)?,
+                self.scratch.alloc_aligned(4)?,
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
         let (ws_ptr, ws_cap) = self.scratch.remaining_workspace();
         let ex = t.stream.exec(ws_ptr, ws_cap);
         let token_ids_ptr = meta_base;
@@ -1446,17 +1457,12 @@ impl Qwen3_5MtpRank {
             final_hc_ctx.num_tokens = 1;
             self.final_residual
                 .finish_stack(&final_hc_ctx, &t.stream, normed_buf, None)?;
-            let logits_buf = self.scratch.alloc_aligned(t.local_vocab_size * 2)?;
             let lm_input = if self.final_residual.is_hyper_connection() {
                 normed_buf
             } else {
                 last_multi_ptr
             };
-            Self::project(&t.lm_head, &ex, t, lm_input, logits_buf, 1)?;
-            let out_id = self.scratch.alloc_aligned(4)?;
-            let local_id = self.scratch.alloc_aligned(4)?;
-            let local_val = self.scratch.alloc_aligned(4)?;
-            let global_val = self.scratch.alloc_aligned(4)?;
+            Self::project(self.lm_head(t), &ex, t, lm_input, logits_buf, 1)?;
             check_rc(
                 // SAFETY: `logits_buf` holds `local_vocab_size` FP16 elements and `out_id`/
                 // `local_id`/`local_val` are 4-byte device allocations.

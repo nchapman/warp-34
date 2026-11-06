@@ -285,4 +285,63 @@ mod serving_capacity_tests {
             crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
         );
     }
+
+    #[test]
+    fn plan_mtp_draft_lm_head_bytes_respects_quantization_geometry_and_headroom() {
+        use crate::mtp::{
+            MTP_DRAFT_LM_HEAD_ARENA_SLACK_BYTES, MTP_DRAFT_LM_HEAD_GROUP_SIZE,
+            MTP_DRAFT_LM_HEAD_POST_HEADROOM_BYTES, plan_mtp_draft_lm_head_bytes,
+        };
+
+        // 1. Already-quantized target `lm_head` -> never duplicated (`None`).
+        let already_w4 = LinearProj::MarlinW4A16 {
+            b_q_weight_ptr: 0x1000,
+            b_scales_ptr: 0x2000,
+            size_n: 124_160,
+            size_k: 2_560,
+            group_blocks: 8,
+        };
+        assert_eq!(
+            plan_mtp_draft_lm_head_bytes(&already_w4, 4 * 1024 * 1024 * 1024),
+            None
+        );
+
+        // 2. Unaligned `DenseF16` dimensions -> `None`.
+        let unaligned_n = LinearProj::DenseF16 {
+            weight_ptr: 0x1000,
+            size_n: 124_160 + 32,
+            size_k: 2_560,
+        };
+        assert_eq!(
+            plan_mtp_draft_lm_head_bytes(&unaligned_n, 4 * 1024 * 1024 * 1024),
+            None
+        );
+
+        // 3. `Qwen3.8-Flash-Next` TP=2 (`124,160 x 2,560` per rank):
+        //    `qweight = 158,924,800 B` (151.56 MiB), `scales = 9,932,800 B` (9.47 MiB),
+        //    total `168,857,600 B` (161.04 MiB vs 606.25 MiB DenseF16 = 3.76x smaller).
+        let tp2_dense = LinearProj::DenseF16 {
+            weight_ptr: 0x1000,
+            size_n: 124_160,
+            size_k: 2_560,
+        };
+        let expected_qw = (124_160 / 2) * 2_560;
+        let expected_sc = 124_160 * (2_560 / MTP_DRAFT_LM_HEAD_GROUP_SIZE) * 2;
+        let expected_arena = expected_qw + expected_sc + MTP_DRAFT_LM_HEAD_ARENA_SLACK_BYTES;
+        assert_eq!(
+            plan_mtp_draft_lm_head_bytes(
+                &tp2_dense,
+                expected_arena + MTP_DRAFT_LM_HEAD_POST_HEADROOM_BYTES - 1
+            ),
+            None,
+            "must decline when post-MTP free VRAM cannot preserve headroom"
+        );
+        assert_eq!(
+            plan_mtp_draft_lm_head_bytes(
+                &tp2_dense,
+                expected_arena + MTP_DRAFT_LM_HEAD_POST_HEADROOM_BYTES
+            ),
+            Some((expected_qw, expected_sc, expected_arena))
+        );
+    }
 }

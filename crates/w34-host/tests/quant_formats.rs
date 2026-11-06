@@ -511,3 +511,167 @@ fn asymmetric_moe_gemv_and_grouped_mma_match_scalar_reference() {
         }
     }
 }
+
+#[test]
+fn online_marlin_quantize_f16_u4b8_matches_cpu_reference_and_tracks_fp16_logits() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let (n, k) = (256usize, 256usize);
+    let src_f16: Vec<u16> = (0..n * k)
+        .map(|i| {
+            let row = i / k;
+            let col = i % k;
+            let v = (((row * 37 + col * 13) % 101) as f32 - 50.0) * 0.015;
+            f32_to_f16(v)
+        })
+        .collect();
+    let src_dev = upload(&src_f16, &stream);
+    let workspace = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+
+    for group_size in [32usize, 64, 128] {
+        // 1. CPU reference quantization (`U4B8` N-major + scale permute + Marlin repack).
+        let num_groups = k / group_size;
+        let words_per_row = k / 8;
+        let mut cpu_packed = vec![0u32; n * words_per_row];
+        let mut cpu_scales_n_major = vec![0u16; n * num_groups];
+        let mut dequant_ref = vec![0.0f32; n * k];
+        for r in 0..n {
+            for g in 0..num_groups {
+                let slice = &src_f16[r * k + g * group_size..r * k + (g + 1) * group_size];
+                let max_abs = slice
+                    .iter()
+                    .map(|&bits| f16_to_f32(bits).abs())
+                    .fold(0.0f32, f32::max);
+                let scale_h = f32_to_f16(max_abs / 7.0);
+                let scale_f = f16_to_f32(scale_h);
+                let inv_scale = if scale_f > 0.0 { 1.0 / scale_f } else { 0.0 };
+                cpu_scales_n_major[r * num_groups + g] = scale_h;
+                for (c, &bits) in slice.iter().enumerate() {
+                    let k_col = g * group_size + c;
+                    let w = f16_to_f32(bits);
+                    let q = ((w * inv_scale).round_ties_even() as i32 + 8).clamp(0, 15) as u32;
+                    cpu_packed[r * words_per_row + k_col / 8] |= q << ((k_col % 8) * 4);
+                    dequant_ref[r * k + k_col] = (q as i32 - 8) as f32 * scale_f;
+                }
+            }
+        }
+        let cpu_perm_scales =
+            marlin_permute_scales_from_n_major(&cpu_scales_n_major, k, n, group_size);
+        let packed_dev = upload(&cpu_packed, &stream);
+        let ref_repacked_dev = DeviceBuffer::alloc(0, cpu_packed.len() * 4).unwrap();
+        // SAFETY: `packed_dev` and `ref_repacked_dev` have capacity for `n * (k / 8)` u32 elements.
+        let rc = unsafe {
+            ffi::w34_marlin_repack_int4(
+                &ex,
+                packed_dev.addr() as *const u32,
+                ref_repacked_dev.addr() as *mut u32,
+                k as i64,
+                n as i64,
+            )
+        };
+        assert_eq!(rc, 0);
+
+        // 2. Online GPU quantization (`w34_marlin_quantize_f16_u4b8`).
+        let gpu_repacked_dev = DeviceBuffer::alloc(0, cpu_packed.len() * 4).unwrap();
+        let gpu_scales_dev = DeviceBuffer::alloc(0, cpu_perm_scales.len() * 2).unwrap();
+        // SAFETY: `src_dev`, `gpu_repacked_dev`, and `gpu_scales_dev` match `(k, n, group_size)`.
+        let rc = unsafe {
+            ffi::w34_marlin_quantize_f16_u4b8(
+                &ex,
+                src_dev.addr() as *const c_void,
+                gpu_repacked_dev.addr() as *mut u32,
+                gpu_scales_dev.addr() as *mut c_void,
+                k as i64,
+                n as i64,
+                group_size as i32,
+            )
+        };
+        assert_eq!(rc, 0, "group_size={group_size}");
+
+        let mut ref_repacked = vec![0u32; cpu_packed.len()];
+        let mut gpu_repacked = vec![0u32; cpu_packed.len()];
+        let mut gpu_scales = vec![0u16; cpu_perm_scales.len()];
+        ref_repacked_dev
+            .copy_to_host(&mut ref_repacked, &stream)
+            .unwrap();
+        gpu_repacked_dev
+            .copy_to_host(&mut gpu_repacked, &stream)
+            .unwrap();
+        gpu_scales_dev
+            .copy_to_host(&mut gpu_scales, &stream)
+            .unwrap();
+        assert_eq!(
+            gpu_scales, cpu_perm_scales,
+            "scales mismatch at group_size={group_size}"
+        );
+        assert_eq!(
+            gpu_repacked, ref_repacked,
+            "repacked U4B8 mismatch at group_size={group_size}"
+        );
+
+        // 3. Verify `w34_marlin_gemm_f16u4` matches the dequantized reference and tracks FP16 argmax.
+        let m = 16usize;
+        let x: Vec<u16> = (0..m * k)
+            .map(|i| {
+                let row = i / k;
+                let col = i % k;
+                let base = (((i * 23 + row * 7) % 67) as f32 - 33.0) * 0.01;
+                let signal = f16_to_f32(src_f16[(row * 5 + 4) * k + col]);
+                f32_to_f16(base + signal)
+            })
+            .collect();
+        let x_dev = upload(&x, &stream);
+        let out_dev = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        workspace.zero_async(&stream).unwrap();
+        // SAFETY: `x_dev`, `gpu_repacked_dev`, `gpu_scales_dev`, `out_dev`, and `workspace` match `(m, n, k)`.
+        let rc = unsafe {
+            ffi::w34_marlin_gemm_f16u4(
+                &ex,
+                x_dev.addr() as *const c_void,
+                gpu_repacked_dev.addr() as *const c_void,
+                gpu_scales_dev.addr() as *const c_void,
+                out_dev.addr() as *mut c_void,
+                workspace.addr() as *mut i32,
+                m as i64,
+                n as i64,
+                k as i64,
+                65536,
+                (group_size / 16) as i32,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut got = vec![0u16; m * n];
+        out_dev.copy_to_host(&mut got, &stream).unwrap();
+        let mut expected_dequant = vec![0.0f32; m * n];
+        let mut expected_fp16 = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                expected_dequant[row * n + col] = (0..k)
+                    .map(|j| f16_to_f32(x[row * k + j]) * dequant_ref[col * k + j])
+                    .sum();
+                expected_fp16[row * n + col] = (0..k)
+                    .map(|j| f16_to_f32(x[row * k + j]) * f16_to_f32(src_f16[col * k + j]))
+                    .sum();
+            }
+            let got_argmax = (0..n)
+                .max_by(|&a, &b| {
+                    f16_to_f32(got[row * n + a]).total_cmp(&f16_to_f32(got[row * n + b]))
+                })
+                .unwrap();
+            let fp16_argmax = (0..n)
+                .max_by(|&a, &b| expected_fp16[row * n + a].total_cmp(&expected_fp16[row * n + b]))
+                .unwrap();
+            assert_eq!(
+                got_argmax, fp16_argmax,
+                "row {row} argmax mismatch vs FP16 at group_size={group_size}"
+            );
+        }
+        assert_close(
+            &got,
+            &expected_dequant,
+            &format!("online quantize gemm group_size={group_size}"),
+        );
+    }
+}
