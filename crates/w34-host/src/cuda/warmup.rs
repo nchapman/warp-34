@@ -12,6 +12,71 @@ use super::*;
 /// separate storage. These owners remain live through the final `dev.synchronize()`.
 /// Keep fixture dimensions and capacities in sync when adding a specialization.
 #[cfg(feature = "cuda")]
+fn warmup_norms(
+    ex: &W34Exec,
+    buf_a: u64,
+    buf_b: u64,
+    buf_c: u64,
+    buf_d: u64,
+    buf_ws: u64,
+) -> Result<()> {
+    for hs in [128i32, 3072, 5120, 6144, 10240] {
+        for byte_off in [0u64, 4u64] {
+            let out_had = if byte_off == 0 && hs <= 6144 {
+                buf_d as *mut c_void
+            } else {
+                core::ptr::null_mut()
+            };
+            check_rc(
+                // SAFETY: Warmup arena buffers are sized for this launch and remain live until `dev.synchronize()`.
+                unsafe {
+                    ffi::w34_gemma_rms_norm_hadamard_f16(
+                        ex,
+                        (buf_a + byte_off) as *const c_void,
+                        (buf_b + byte_off) as *const c_void,
+                        (buf_c + byte_off) as *mut c_void,
+                        out_had,
+                        core::ptr::null(),
+                        1,
+                        hs,
+                        1e-6,
+                    )
+                },
+                "warmup w34_gemma_rms_norm_hadamard_f16",
+            )?;
+            if hs <= 6144 {
+                check_rc(
+                    // SAFETY: Warmup arena buffers are sized for this launch and remain live until `dev.synchronize()`.
+                    unsafe {
+                        ffi::w34_fused_add_gemma_rms_norm_tap_hadamard_f16(
+                            ex,
+                            (buf_a + byte_off) as *const c_void,
+                            (buf_b + byte_off) as *mut c_void,
+                            (buf_c + byte_off) as *const c_void,
+                            (buf_d + byte_off) as *mut c_void,
+                            if byte_off == 0 {
+                                buf_ws as *mut c_void
+                            } else {
+                                core::ptr::null_mut()
+                            },
+                            core::ptr::null_mut(),
+                            core::ptr::null(),
+                            1,
+                            hs,
+                            1e-6,
+                            0,
+                            0,
+                        )
+                    },
+                    "warmup w34_fused_add_gemma_rms_norm_tap_hadamard_f16",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let dev = CudaDevice::set_current(device_id)?;
     let dev_props = dev.props()?;
@@ -79,39 +144,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup w34_embed_lookup_f16"
     )?;
-    for hs in [128i32, 3072, 5120, 6144, 10240] {
-        for byte_off in [0u64, 4u64] {
-            warmup_ffi!(
-                ffi::w34_gemma_rms_norm_f16(
-                    &ex,
-                    (buf_a + byte_off) as *const c_void,
-                    (buf_b + byte_off) as *const c_void,
-                    (buf_c + byte_off) as *mut c_void,
-                    core::ptr::null(),
-                    1,
-                    hs,
-                    1e-6,
-                ),
-                "warmup w34_gemma_rms_norm_f16"
-            )?;
-            if hs <= 6144 {
-                warmup_ffi!(
-                    ffi::w34_fused_add_gemma_rms_norm_f16(
-                        &ex,
-                        (buf_a + byte_off) as *const c_void,
-                        (buf_b + byte_off) as *mut c_void,
-                        (buf_c + byte_off) as *const c_void,
-                        (buf_d + byte_off) as *mut c_void,
-                        core::ptr::null(),
-                        1,
-                        hs,
-                        1e-6,
-                    ),
-                    "warmup w34_fused_add_gemma_rms_norm_f16"
-                )?;
-            }
-        }
-    }
+    warmup_norms(&ex, buf_a, buf_b, buf_c, buf_d, buf_ws)?;
     warmup_ffi!(
         ffi::w34_rms_norm_gated_silu_f16(
             &ex,
@@ -127,38 +160,29 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup w34_rms_norm_gated_silu_f16"
     )?;
-    warmup_ffi!(
-        ffi::w34_rms_norm_gated_silu_strided_f16(
-            &ex,
-            buf_a as *const c_void,
-            buf_b as *const c_void,
-            buf_c as *const c_void,
-            buf_d as *mut c_void,
-            core::ptr::null(),
-            1,
-            2,
-            128,
-            256,
-            1e-6,
-        ),
-        "warmup w34_rms_norm_gated_silu_strided_f16"
-    )?;
-    warmup_ffi!(
-        ffi::w34_rms_norm_gated_sigmoid_strided_f16(
-            &ex,
-            buf_a as *const c_void,
-            buf_b as *const c_void,
-            buf_c as *const c_void,
-            buf_d as *mut c_void,
-            core::ptr::null(),
-            1,
-            2,
-            128,
-            256,
-            1e-6,
-        ),
-        "warmup w34_rms_norm_gated_sigmoid_strided_f16"
-    )?;
+    for gated_fn in [
+        ffi::w34_rms_norm_gated_silu_strided_f16,
+        ffi::w34_rms_norm_gated_sigmoid_strided_f16,
+        ffi::w34_rms_norm_gated_silu_strided_hadamard_f16,
+        ffi::w34_rms_norm_gated_sigmoid_strided_hadamard_f16,
+    ] {
+        warmup_ffi!(
+            gated_fn(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                core::ptr::null(),
+                1,
+                2,
+                128,
+                256,
+                1e-6,
+            ),
+            "warmup w34_rms_norm_gated_strided_f16"
+        )?;
+    }
     warmup_ffi!(
         ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
             &ex,
@@ -199,17 +223,33 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         )?;
     }
     warmup_ffi!(
-        ffi::w34_apply_attn_output_gate_f16(
+        ffi::w34_silu_and_mul_hadamard_f16(
             &ex,
             buf_a as *const c_void,
-            buf_b as *const c_void,
             buf_c as *mut c_void,
             core::ptr::null(),
             1,
-            256,
+            128,
         ),
-        "warmup w34_apply_attn_output_gate_f16"
+        "warmup w34_silu_and_mul_hadamard_f16"
     )?;
+    for gate_fn in [
+        ffi::w34_apply_attn_output_gate_f16,
+        ffi::w34_apply_attn_output_gate_hadamard_f16,
+    ] {
+        warmup_ffi!(
+            gate_fn(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *const c_void,
+                buf_c as *mut c_void,
+                core::ptr::null(),
+                1,
+                256,
+            ),
+            "warmup w34_apply_attn_output_gate_f16"
+        )?;
+    }
 
     // 2. Marlin repack & GEMM + cuBLAS GEMM
     warmup_ffi!(
@@ -333,12 +373,13 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         fake_sig[3] = 1;
         let sig_dev = arena.upload_slice(&fake_sig, &stream)?;
         warmup_ffi!(
-            ffi::w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
+            ffi::w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
                 &ex,
                 buf_a as *const c_void,
                 core::ptr::null_mut(),
                 buf_b as *mut c_void,
                 buf_c as *const c_void,
+                buf_d as *mut c_void,
                 buf_d as *mut c_void,
                 core::ptr::null_mut(),
                 buf_ws as *mut c_void,
@@ -352,7 +393,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 0,
                 0,
             ),
-            "warmup w34_tp2_all_reduce_residual_gemma_rms_norm_f16"
+            "warmup w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16"
         )?;
         let mut fake_sig4 = vec![0u32; sig_u32_len.max(1216)];
         fake_sig4[1] = 1;
@@ -360,12 +401,13 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         fake_sig4[3] = 1;
         let sig4_dev = arena.upload_slice(&fake_sig4, &stream)?;
         warmup_ffi!(
-            ffi::w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
+            ffi::w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
                 &ex,
                 buf_a as *const c_void,
                 core::ptr::null_mut(),
                 buf_b as *mut c_void,
                 buf_c as *const c_void,
+                buf_d as *mut c_void,
                 buf_d as *mut c_void,
                 core::ptr::null_mut(),
                 buf_ws as *mut c_void,
@@ -383,7 +425,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 0,
                 0,
             ),
-            "warmup w34_tp4_all_reduce_residual_gemma_rms_norm_f16"
+            "warmup w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16"
         )?;
     }
 

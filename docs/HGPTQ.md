@@ -37,8 +37,19 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
 4. **Upstream `vLLM 0.31.0` Oracle Patches (`tools/oracle/hgptq_oracle.py`):**
    - Patched `HadamardTransform.forward` to pad non-multiple-of-32 block counts (e.g., `1200 * (4304 / 16) = 322,800` blocks in 9B/27B Vision `linear_fc2`, where `322,800 % 32 = 16`) to a multiple of 32 before `ops.hadacore_transform`, avoiding `hadacore`'s upstream tail-tile corruption on the final 16 blocks.
    - Patched `MarlinLinearKernel.apply_weights` for `group_size == -1` with an exact `2^-3` / `2^+3` (`0.125` / `8.0`) exponent shift so `vLLM`'s unscaled `FP16` cast does not overflow to `NaN` on 9B Vision `blocks.26.mlp.linear_fc2`.
-5. **Cold-start TP warmup (`crates/w34-host/src/cuda/warmup.rs`):**
-   - Pre-warms `w34_block_hadamard_f16` (`B=16` and `B=64`), `w34_linear_epilogue_f16`, and channelwise `w34_marlin_gemm_f16u4(..., -1)` in `prepare_execution_plan()`.
+5. **Producer-Fused In-Register `H_64` Rotation (`hadamard_inline.cuh`, `op_norms_rope_act.cu`, `op_collectives.cu`, `layers.rs`, `moe.rs`, `forward.rs`, `mtp/propose.rs`):**
+   - Eliminates **100% of standalone `w34_block_hadamard_f16` kernel launches** (`96` per 2B step, `128` per 9B step, `256` per 27B step, plus `4` per MTP draft step) in the 2B, 9B, and 27B target backbone and MTP drafter by fusing `H_64` in registers into every producer kernel:
+     - `w34_gemma_rms_norm_hadamard_f16` (`gemma_rms_norm_vec8_f16_kernel<R, true>`),
+     - `w34_fused_add_gemma_rms_norm_tap_hadamard_f16` (`fused_add_gemma_rms_norm_vec8_f16_kernel<R, true>`),
+     - `w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16` (`tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<BlockThreads, R>`),
+     - `w34_rms_norm_gated_{silu,sigmoid}_strided_hadamard_f16` (`rms_norm_gated_d128_warp_f16_kernel<IsSigmoid, true>`),
+     - `w34_apply_attn_output_gate_hadamard_f16` (`apply_attn_output_gate_hadamard_f16_kernel`),
+     - `w34_silu_and_mul_hadamard_f16` (`silu_and_mul_hadamard_f16_kernel`).
+   - **0-ULP bit-for-bit parity:** `w34::hadamard64_vec8_f16` (8-lane subgroup, 8 halves/lane, 3 `__shfl_xor_sync` stages) and `w34::hadamard64_vec4_f16` (16-lane subgroup, 4 halves/lane) round the producer output to `__half` before executing the bit-order `FP32` butterfly and `* 0.125f` RN rounding, matching standalone `w34_block_hadamard_f16(..., 64)` with **0 ULP** (`producer_fused_hadamard64_matches_standalone_0_ulp` & `tp2_all_reduce_residual_gemma_rms_norm_hadamard64_matches_standalone_0_ulp`).
+   - **Dual-output norm for GDN shared input:** On GDN layers where `in_proj_ba` (`DenseF16`) needs unrotated `s.normed` and `in_proj_qkvz` (`Hadamard` `B=64`) needs `H_64(s.normed)`, `LayerBlockWeights::pre_attn_norm_targets` returns `[s.normed, ex.scratch_ptr]` so the norm kernel writes both unrotated `s.normed` and rotated `ex.scratch_ptr` in a single pass; on FullAttention (`qkv_proj`) and Dense FFN (`gate_up_proj`), it returns `[0, s.normed]` so only the rotated buffer is written.
+   - **Verified with `nsys`:** Across 2B, 9B, and 27B (`TP=1` & `TP=2`, `MTP-3`), `block_hadamard_f16<64>` executes only once per rank during `prepare_execution_plan()` warmup and **0 times** during prefill, decode, or MTP drafting.
+6. **Cold-start TP warmup (`crates/w34-host/src/cuda/warmup.rs`):**
+   - Pre-warms `w34_block_hadamard_f16` (`B=16` and `B=64`), all 7 producer-fused `H_64` entrypoints across all `hidden_size` template regimes (`<=2560, <=4096, <=5120, <=6144`), `w34_linear_epilogue_f16`, and channelwise `w34_marlin_gemm_f16u4(..., -1)` in `prepare_execution_plan()`.
 
 ## Verification & benchmarks on 1–2× RTX 3090 Ti (`sm_86`)
 
@@ -69,20 +80,20 @@ Verified across Text (`dump-diff` & `greedy-diff`), `MTP` (`k=1..3` lossless), `
 
 | Model | TP | Mode | `128:32` Prefill / Decode (`tok/s`) | `512:128` Prefill / Decode (`tok/s`) | `2048:32` Prefill / Decode (`tok/s`) | Vision `308:32` TTFT / Decode | vs `vLLM 0.31.0` Graph (`128:32`) | vs Standard W4A16 GPTQ (`128:32`) |
 |---|---:|---|---:|---:|---:|---:|---:|---:|
-| **2B HGPTQ** | `TP=1` | Plain | `12,763` / **339.9** | — | — | `79.6 ms` / **301.7 tok/s** | **`1.24×`** (vs `274.7 tok/s`) | — |
-| **2B HGPTQ** | `TP=1` | `MTP-3` | `12,749` / **842.1** (`3.88x`) | `16,968` / **824.6** (`3.85x`) | `15,856` / **713.5** (`3.44x`) | — | **`3.07×`** | — |
-| **2B HGPTQ** | `TP=2` | Plain | `11,809` / **459.1** | — | — | `81.2 ms` / **390.7 tok/s** | **`1.67×`** | — |
-| **2B HGPTQ** | `TP=2` | `MTP-3` | `11,780` / **1,087.5** (`3.88x`) | `15,375` / **1,080.3** (`3.85x`) | `14,325` / **884.9** (`3.44x`) | — | **`3.96×`** | — |
-| **9B HGPTQ** | `TP=1` | Plain | `3,978` / **131.1** | — | — | `161.7 ms` / **124.6 tok/s** | **`1.16×`** (vs `112.7 tok/s`) | `96.0%` of GPTQ (`136.6`) |
-| **9B HGPTQ** | `TP=1` | `MTP-3` | `3,737` / **356.2** (`3.88x`) | `4,384` / **354.9** (`3.85x`) | `4,521` / **339.7** (`3.88x`) | — | **`3.16×`** | **`+6.7%`** vs GPTQ (`333.8`) |
-| **9B HGPTQ** | `TP=2` | Plain | `4,366` / **207.6** | — | — | `152.6 ms` / **185.9 tok/s** | **`1.84×`** | `95.1%` of GPTQ (`218.4`) |
-| **9B HGPTQ** | `TP=2` | `MTP-3` | `4,311` / **531.3** (`3.88x`) | `5,043` / **530.7** (`3.85x`) | `4,935` / **493.8** (`3.88x`) | — | **`4.71×`** | **`+4.8%`** vs GPTQ (`507.2`) |
-| **27B HGPTQ** | `TP=1` | Plain | `1,319` / **51.3** | — | — | `344.4 ms` / **49.3 tok/s** | **`1.18×`** (vs `43.5 tok/s`) | `96.6%` of GPTQ (`53.1`) |
-| **27B HGPTQ** | `TP=1` | `MTP-3` | `1,313` / **107.9** (`2.58x`) | `1,437` / **149.3** (`3.63x`) | `1,409` / **137.8** (`3.44x`) | — | **`3.43×`** (`512:128`) | `162.0 tok/s` on `greedy-diff` |
-| **27B HGPTQ** | `TP=1` | `DFlash2` | `1,314` / **96.2** (`2.82x`) | `1,436` / **223.6** (`6.68x`) | — | — | **`5.14×`** (`512:128`) | `153.9 tok/s` on `greedy-diff` |
-| **27B HGPTQ** | `TP=2` | Plain | `1,619` / **84.4** | — | — | `300.8 ms` / **77.9 tok/s** | **`1.94×`** | `95.7%` of GPTQ (`88.2`) |
-| **27B HGPTQ** | `TP=2` | `MTP-3` | `1,594` / **250.7** (`3.88x`) | `1,811` / **233.6** (`3.63x`) | `1,799` / **210.5** (`3.44x`) | — | **`5.76×`** | **`+3.2%`** vs GPTQ (`242.9`) |
-| **27B HGPTQ** | `TP=2` | `DFlash2` | `1,548` / **320.3** (`6.20x`) | `1,826` / **334.2** (`6.68x`) | — | — | **`7.68×`** (`512:128`) | `334.2 tok/s` (`6.68x` tau) |
+| **2B HGPTQ** | `TP=1` | Plain | `12,213` / **343.2** | — | — | `79.6 ms` / **301.7 tok/s** | **`1.25×`** (vs `274.7 tok/s`) | — |
+| **2B HGPTQ** | `TP=1` | `MTP-3` | `13,010` / **851.6** (`3.88x`) | `17,381` / **848.4** (`3.85x`) | `16,100` / **716.4** (`3.44x`) | — | **`3.10×`** | — |
+| **2B HGPTQ** | `TP=2` | Plain | `12,088` / **478.8** | — | — | `81.2 ms` / **390.7 tok/s** | **`1.74×`** | — |
+| **2B HGPTQ** | `TP=2` | `MTP-3` | `12,049` / **1,131.3** (`3.88x`) | `15,764` / **1,119.6** (`3.85x`) | `14,602` / **931.8** (`3.44x`) | — | **`4.12×`** | — |
+| **9B HGPTQ** | `TP=1` | Plain | `4,160` / **133.2** | — | — | `161.7 ms` / **124.6 tok/s** | **`1.18×`** (vs `112.7 tok/s`) | `97.5%` of GPTQ (`136.6`) |
+| **9B HGPTQ** | `TP=1` | `MTP-3` | `3,948` / **356.9** (`3.88x`) | `4,404` / **356.4** (`3.85x`) | `4,505` / **344.6** (`3.88x`) | — | **`3.17×`** | **`+6.9%`** vs GPTQ (`333.8`) |
+| **9B HGPTQ** | `TP=2` | Plain | `4,455` / **213.3** | — | — | `152.6 ms` / **185.9 tok/s** | **`1.89×`** | `97.7%` of GPTQ (`218.4`) |
+| **9B HGPTQ** | `TP=2` | `MTP-3` | `4,401` / **540.1** (`3.88x`) | `5,231` / **545.9** (`3.85x`) | `5,060` / **507.0** (`3.88x`) | — | **`4.79×`** | **`+6.5%`** vs GPTQ (`507.2`) |
+| **27B HGPTQ** | `TP=1` | Plain | `1,331` / **51.8** | — | — | `344.4 ms` / **49.3 tok/s** | **`1.19×`** (vs `43.5 tok/s`) | `97.6%` of GPTQ (`53.1`) |
+| **27B HGPTQ** | `TP=1` | `MTP-3` | `1,314` / **108.7** (`2.58x`) | `1,450` / **150.1** (`3.63x`) | `1,418` / **139.3** (`3.44x`) | — | **`3.45×`** (`512:128`) | `162.9 tok/s` on `greedy-diff` |
+| **27B HGPTQ** | `TP=1` | `DFlash2` | `1,331` / **96.5** (`2.82x`) | `1,449` / **224.1** (`6.68x`) | — | — | **`5.15×`** (`512:128`) | `154.9 tok/s` on `greedy-diff` |
+| **27B HGPTQ** | `TP=2` | Plain | `1,644` / **85.4** | — | — | `300.8 ms` / **77.9 tok/s** | **`1.96×`** | `96.8%` of GPTQ (`88.2`) |
+| **27B HGPTQ** | `TP=2` | `MTP-3` | `1,628` / **252.1** (`3.88x`) | `1,848` / **235.6** (`3.63x`) | `1,822` / **213.2** (`3.44x`) | — | **`5.80×`** | **`+3.8%`** vs GPTQ (`242.9`) |
+| **27B HGPTQ** | `TP=2` | `DFlash2` | `1,594` / **324.9** (`6.20x`) | `1,834` / **337.1** (`6.68x`) | — | — | **`7.75×`** (`512:128`) | `337.1 tok/s` (`6.68x` tau) |
 
 ## Reproducing checks
 

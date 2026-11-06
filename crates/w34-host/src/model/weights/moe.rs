@@ -54,6 +54,24 @@ pub enum FfnBlockWeights {
 
 #[cfg(feature = "cuda")]
 impl FfnBlockWeights {
+    #[inline]
+    pub fn pre_mlp_norm_targets(
+        &self,
+        normed_buf: u64,
+        h_dim: usize,
+        is_single_stream: bool,
+    ) -> [u64; 2] {
+        if is_single_stream
+            && h_dim <= 6144
+            && h_dim.is_multiple_of(64)
+            && matches!(self, Self::Dense { gate_up_proj, .. } if gate_up_proj.can_fuse_h64_from_producer())
+        {
+            [0, normed_buf]
+        } else {
+            [normed_buf, 0]
+        }
+    }
+
     /// Enqueue the loaded FFN using the model's phase-local scratch layout.
     /// Raw buffer extents, device affinity, and ordering are caller obligations;
     /// accepting u64 addresses here does not validate arbitrary allocations.
@@ -80,27 +98,93 @@ impl FfnBlockWeights {
         moe_sh_out_buf: u64,
         moe_sh_gate_buf: u64,
     ) -> Result<()> {
+        self.forward_with_prerotated_input(
+            ex,
+            cublas,
+            marlin_ws_ptr,
+            marlin_ws_ints,
+            normed_buf,
+            mlp_out_buf,
+            num_tokens,
+            h_dim,
+            local_interm,
+            gate_up_buf,
+            act_buf,
+            moe_router_logits_buf,
+            moe_topk_weights_buf,
+            moe_topk_ids_buf,
+            moe_interm_buf,
+            moe_sh_gu_buf,
+            moe_sh_act_buf,
+            moe_sh_out_buf,
+            moe_sh_gate_buf,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_prerotated_input(
+        &self,
+        ex: &W34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        num_tokens: usize,
+        h_dim: usize,
+        local_interm: usize,
+        gate_up_buf: u64,
+        act_buf: u64,
+        moe_router_logits_buf: u64,
+        moe_topk_weights_buf: u64,
+        moe_topk_ids_buf: u64,
+        moe_interm_buf: u64,
+        moe_sh_gu_buf: u64,
+        moe_sh_act_buf: u64,
+        moe_sh_out_buf: u64,
+        moe_sh_gate_buf: u64,
+        input_prerotated: bool,
+    ) -> Result<()> {
         match self {
             Self::Dense {
                 gate_up_proj,
                 down_proj,
             } => {
-                gate_up_proj.forward(
-                    ex,
-                    cublas,
-                    marlin_ws_ptr,
-                    marlin_ws_ints,
-                    normed_buf,
-                    gate_up_buf,
-                    num_tokens,
-                )?;
+                if input_prerotated {
+                    gate_up_proj.forward_prerotated(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        gate_up_buf,
+                        num_tokens,
+                    )?;
+                } else {
+                    gate_up_proj.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        gate_up_buf,
+                        num_tokens,
+                    )?;
+                }
+                let fuse_down_h64 = down_proj.can_fuse_h64_from_producer();
+                let silu_fn = if fuse_down_h64 {
+                    ffi::w34_silu_and_mul_hadamard_f16
+                } else {
+                    ffi::w34_silu_and_mul_f16
+                };
                 check_rc(
                     // SAFETY: the model's dense FFN phase reserves [M,2*interm]
                     // gate/up and [M,interm] activation regions. The projection
                     // precedes this launch on ex.stream; these addresses are supplied
                     // by the caller rather than capacity-checked by this method.
                     unsafe {
-                        ffi::w34_silu_and_mul_f16(
+                        silu_fn(
                             ex,
                             gate_up_buf as *const c_void,
                             act_buf as *mut c_void,
@@ -111,15 +195,27 @@ impl FfnBlockWeights {
                     },
                     "w34_silu_and_mul_f16",
                 )?;
-                down_proj.forward(
-                    ex,
-                    cublas,
-                    marlin_ws_ptr,
-                    marlin_ws_ints,
-                    act_buf,
-                    mlp_out_buf,
-                    num_tokens,
-                )
+                if fuse_down_h64 {
+                    down_proj.forward_prerotated(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        act_buf,
+                        mlp_out_buf,
+                        num_tokens,
+                    )
+                } else {
+                    down_proj.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        act_buf,
+                        mlp_out_buf,
+                        num_tokens,
+                    )
+                }
             }
             Self::Moe(moe) => {
                 let fused_dual_small_n = match (

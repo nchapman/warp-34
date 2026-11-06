@@ -1,4 +1,5 @@
 #include "../w34_cuda.h"
+#include "hadamard_inline.cuh"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>

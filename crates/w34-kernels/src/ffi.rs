@@ -1775,6 +1775,127 @@ unsafe extern "C" {
         num_tokens: i32,
         k_hidden: i32,
     ) -> i32;
+
+    pub fn w34_gemma_rms_norm_hadamard_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had64: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_fused_add_gemma_rms_norm_tap_hadamard_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had64: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> i32;
+
+    pub fn w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+        ex: *const W34Exec,
+        local_in: *const c_void,
+        ar_out: *mut c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had64: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        rank: i32,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> i32;
+
+    pub fn w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+        ex: *const W34Exec,
+        local_in: *const c_void,
+        ar_out: *mut c_void,
+        residual: *mut c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        out_had64: *mut c_void,
+        tap_dst_bf16: *mut c_void,
+        stage0: *mut c_void,
+        stage1: *mut c_void,
+        stage2: *mut c_void,
+        stage3: *mut c_void,
+        sig0: *mut c_void,
+        sig1: *mut c_void,
+        sig2: *mut c_void,
+        sig3: *mut c_void,
+        rank: i32,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> i32;
+
+    pub fn w34_rms_norm_gated_silu_strided_hadamard_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        z: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        num_v_heads: i32,
+        head_dim: i32,
+        z_token_stride: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_rms_norm_gated_sigmoid_strided_hadamard_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        z: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        num_v_heads: i32,
+        head_dim: i32,
+        z_token_stride: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn w34_silu_and_mul_hadamard_f16(
+        ex: *const W34Exec,
+        gate_up: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        intermediate_size: i32,
+    ) -> i32;
+
+    pub fn w34_apply_attn_output_gate_hadamard_f16(
+        ex: *const W34Exec,
+        attn_out: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        total_dim: i32,
+    ) -> i32;
 }
 
 /// Returns the linked cuBLAS runtime version (`major * 10000 + minor * 100 + patch`).

@@ -2,7 +2,8 @@
 
 use std::ffi::c_void;
 use w34_host::cuda::{
-    CudaDevice, CudaEvent, CudaGraph, CudaStream, DeviceBuffer, f16_to_f32, f32_to_f16,
+    CudaDevice, CudaEvent, CudaGraph, CudaStream, DeviceBuffer, Tp2Collectives, f16_to_f32,
+    f32_to_f16,
 };
 use w34_kernels::ffi;
 
@@ -204,6 +205,499 @@ fn block_hadamard_rejects_invalid_geometry_and_aliasing() {
         },
         0
     );
+}
+
+fn verify_gemma_norms_hadamard64(
+    stream: &CudaStream,
+    ex: &w34_kernels::ffi::W34Exec,
+    hs: usize,
+    rows: usize,
+) {
+    let x_host: Vec<u16> = (0..rows * hs)
+        .map(|i| f32_to_f16(((i * 37 + 19) % 251) as f32 / 64.0 - 2.0))
+        .collect();
+    let res_host: Vec<u16> = (0..rows * hs)
+        .map(|i| f32_to_f16(((i * 53 + 7) % 199) as f32 / 64.0 - 1.5))
+        .collect();
+    let w_host: Vec<u16> = (0..hs)
+        .map(|i| f32_to_f16(((i * 17 + 3) % 97) as f32 / 128.0 - 0.25))
+        .collect();
+    let d_x = upload(&x_host, stream);
+    let d_w = upload(&w_host, stream);
+    let d_ref_norm = upload(&vec![0; rows * hs], stream);
+    let d_ref_had = upload(&vec![0; rows * hs], stream);
+    let d_fused_norm = upload(&vec![0; rows * hs], stream);
+    let d_fused_had = upload(&vec![0; rows * hs], stream);
+    let d_fused_had_only = upload(&vec![0; rows * hs], stream);
+
+    // SAFETY: test device buffers are sized for [rows, hs].
+    unsafe {
+        assert_eq!(
+            ffi::w34_gemma_rms_norm_f16(
+                ex,
+                d_x.addr() as *const c_void,
+                d_w.addr() as *const c_void,
+                d_ref_norm.addr() as *mut c_void,
+                std::ptr::null(),
+                rows as i32,
+                hs as i32,
+                1e-6,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_block_hadamard_f16(
+                ex,
+                d_ref_norm.addr() as *const c_void,
+                d_ref_had.addr() as *mut c_void,
+                rows as i32,
+                hs as i32,
+                hs as i32,
+                64,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_gemma_rms_norm_hadamard_f16(
+                ex,
+                d_x.addr() as *const c_void,
+                d_w.addr() as *const c_void,
+                d_fused_norm.addr() as *mut c_void,
+                d_fused_had.addr() as *mut c_void,
+                std::ptr::null(),
+                rows as i32,
+                hs as i32,
+                1e-6,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_gemma_rms_norm_hadamard_f16(
+                ex,
+                d_x.addr() as *const c_void,
+                d_w.addr() as *const c_void,
+                std::ptr::null_mut(),
+                d_fused_had_only.addr() as *mut c_void,
+                std::ptr::null(),
+                rows as i32,
+                hs as i32,
+                1e-6,
+            ),
+            0
+        );
+    }
+    let mut ref_norm = vec![0u16; rows * hs];
+    let mut ref_had = vec![0u16; rows * hs];
+    let mut got_norm = vec![0u16; rows * hs];
+    let mut got_had = vec![0u16; rows * hs];
+    let mut got_had_only = vec![0u16; rows * hs];
+    d_ref_norm.copy_to_host(&mut ref_norm, stream).unwrap();
+    d_ref_had.copy_to_host(&mut ref_had, stream).unwrap();
+    d_fused_norm.copy_to_host(&mut got_norm, stream).unwrap();
+    d_fused_had.copy_to_host(&mut got_had, stream).unwrap();
+    d_fused_had_only
+        .copy_to_host(&mut got_had_only, stream)
+        .unwrap();
+    assert_eq!(got_norm, ref_norm, "GemmaRMSNorm unrotated hs={hs}");
+    assert_eq!(got_had, ref_had, "GemmaRMSNorm dual H64 hs={hs}");
+    assert_eq!(got_had_only, ref_had, "GemmaRMSNorm had-only H64 hs={hs}");
+
+    let d_res_ref = upload(&res_host, stream);
+    let d_res_fused = upload(&res_host, stream);
+    // SAFETY: test device buffers are sized for [rows, hs].
+    unsafe {
+        assert_eq!(
+            ffi::w34_fused_add_gemma_rms_norm_f16(
+                ex,
+                d_x.addr() as *const c_void,
+                d_res_ref.addr() as *mut c_void,
+                d_w.addr() as *const c_void,
+                d_ref_norm.addr() as *mut c_void,
+                std::ptr::null(),
+                rows as i32,
+                hs as i32,
+                1e-6,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_block_hadamard_f16(
+                ex,
+                d_ref_norm.addr() as *const c_void,
+                d_ref_had.addr() as *mut c_void,
+                rows as i32,
+                hs as i32,
+                hs as i32,
+                64,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_fused_add_gemma_rms_norm_tap_hadamard_f16(
+                ex,
+                d_x.addr() as *const c_void,
+                d_res_fused.addr() as *mut c_void,
+                d_w.addr() as *const c_void,
+                d_fused_norm.addr() as *mut c_void,
+                d_fused_had.addr() as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                rows as i32,
+                hs as i32,
+                1e-6,
+                0,
+                0,
+            ),
+            0
+        );
+    }
+    d_ref_norm.copy_to_host(&mut ref_norm, stream).unwrap();
+    d_ref_had.copy_to_host(&mut ref_had, stream).unwrap();
+    d_fused_norm.copy_to_host(&mut got_norm, stream).unwrap();
+    d_fused_had.copy_to_host(&mut got_had, stream).unwrap();
+    assert_eq!(got_norm, ref_norm, "FusedAddGemmaRMSNorm unrotated hs={hs}");
+    assert_eq!(got_had, ref_had, "FusedAddGemmaRMSNorm H64 hs={hs}");
+}
+
+#[test]
+fn producer_fused_hadamard64_matches_standalone_0_ulp() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+
+    // 1. GemmaRMSNorm + FusedAddGemmaRMSNorm across all 4 hidden_size template regimes
+    for hs in [128usize, 2048, 3072, 4096, 5120, 6144] {
+        for rows in [1usize, 5] {
+            verify_gemma_norms_hadamard64(&stream, &ex, hs, rows);
+        }
+    }
+
+    // 2. GatedRMSNorm (SiLU and Sigmoid), SiluAndMul, and ApplyAttnOutputGate
+    let rows = 4usize;
+    let vh = 8usize;
+    let vd = 128usize;
+    let total_dim = vh * vd;
+    let x_host: Vec<u16> = (0..rows * total_dim)
+        .map(|i| f32_to_f16(((i * 41 + 11) % 211) as f32 / 64.0 - 1.5))
+        .collect();
+    let z_host: Vec<u16> = (0..rows * total_dim * 2)
+        .map(|i| f32_to_f16(((i * 29 + 5) % 181) as f32 / 64.0 - 1.25))
+        .collect();
+    let w_host: Vec<u16> = (0..vd)
+        .map(|i| f32_to_f16(((i * 13 + 7) % 89) as f32 / 64.0 + 0.5))
+        .collect();
+    let d_x = upload(&x_host, &stream);
+    let d_z = upload(&z_host, &stream);
+    let d_w = upload(&w_host, &stream);
+    let d_ref = upload(&vec![0; rows * total_dim], &stream);
+    let d_ref_had = upload(&vec![0; rows * total_dim], &stream);
+    let d_fused = upload(&vec![0; rows * total_dim], &stream);
+
+    for (ref_fn, fused_fn) in [
+        (
+            ffi::w34_rms_norm_gated_silu_strided_f16
+                as unsafe extern "C" fn(
+                    *const w34_kernels::ffi::W34Exec,
+                    *const c_void,
+                    *const c_void,
+                    *const c_void,
+                    *mut c_void,
+                    *const u8,
+                    i32,
+                    i32,
+                    i32,
+                    i32,
+                    f32,
+                ) -> i32,
+            ffi::w34_rms_norm_gated_silu_strided_hadamard_f16
+                as unsafe extern "C" fn(
+                    *const w34_kernels::ffi::W34Exec,
+                    *const c_void,
+                    *const c_void,
+                    *const c_void,
+                    *mut c_void,
+                    *const u8,
+                    i32,
+                    i32,
+                    i32,
+                    i32,
+                    f32,
+                ) -> i32,
+        ),
+        (
+            ffi::w34_rms_norm_gated_sigmoid_strided_f16,
+            ffi::w34_rms_norm_gated_sigmoid_strided_hadamard_f16,
+        ),
+    ] {
+        // SAFETY: buffers are sized for [rows, vh * vd] with z stride 2 * total_dim.
+        unsafe {
+            assert_eq!(
+                ref_fn(
+                    &ex,
+                    d_x.addr() as *const c_void,
+                    d_z.addr() as *const c_void,
+                    d_w.addr() as *const c_void,
+                    d_ref.addr() as *mut c_void,
+                    std::ptr::null(),
+                    rows as i32,
+                    vh as i32,
+                    vd as i32,
+                    (total_dim * 2) as i32,
+                    1e-6,
+                ),
+                0
+            );
+            assert_eq!(
+                ffi::w34_block_hadamard_f16(
+                    &ex,
+                    d_ref.addr() as *const c_void,
+                    d_ref_had.addr() as *mut c_void,
+                    rows as i32,
+                    total_dim as i32,
+                    total_dim as i32,
+                    64,
+                ),
+                0
+            );
+            assert_eq!(
+                fused_fn(
+                    &ex,
+                    d_x.addr() as *const c_void,
+                    d_z.addr() as *const c_void,
+                    d_w.addr() as *const c_void,
+                    d_fused.addr() as *mut c_void,
+                    std::ptr::null(),
+                    rows as i32,
+                    vh as i32,
+                    vd as i32,
+                    (total_dim * 2) as i32,
+                    1e-6,
+                ),
+                0
+            );
+        }
+        let mut ref_had = vec![0u16; rows * total_dim];
+        let mut got_had = vec![0u16; rows * total_dim];
+        d_ref_had.copy_to_host(&mut ref_had, &stream).unwrap();
+        d_fused.copy_to_host(&mut got_had, &stream).unwrap();
+        assert_eq!(got_had, ref_had, "GatedRMSNorm H64 0-ULP mismatch");
+    }
+
+    // SiluAndMul
+    // SAFETY: d_z has [rows, 2 * total_dim] elements; d_ref / d_fused have [rows, total_dim].
+    unsafe {
+        assert_eq!(
+            ffi::w34_silu_and_mul_f16(
+                &ex,
+                d_z.addr() as *const c_void,
+                d_ref.addr() as *mut c_void,
+                std::ptr::null(),
+                rows as i32,
+                total_dim as i32,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_block_hadamard_f16(
+                &ex,
+                d_ref.addr() as *const c_void,
+                d_ref_had.addr() as *mut c_void,
+                rows as i32,
+                total_dim as i32,
+                total_dim as i32,
+                64,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_silu_and_mul_hadamard_f16(
+                &ex,
+                d_z.addr() as *const c_void,
+                d_fused.addr() as *mut c_void,
+                std::ptr::null(),
+                rows as i32,
+                total_dim as i32,
+            ),
+            0
+        );
+    }
+    let mut ref_had = vec![0u16; rows * total_dim];
+    let mut got_had = vec![0u16; rows * total_dim];
+    d_ref_had.copy_to_host(&mut ref_had, &stream).unwrap();
+    d_fused.copy_to_host(&mut got_had, &stream).unwrap();
+    assert_eq!(got_had, ref_had, "SiluAndMul H64 0-ULP mismatch");
+
+    // ApplyAttnOutputGate
+    // SAFETY: d_x, d_z, d_ref, d_fused have >= [rows, total_dim] elements.
+    unsafe {
+        assert_eq!(
+            ffi::w34_apply_attn_output_gate_f16(
+                &ex,
+                d_x.addr() as *const c_void,
+                d_z.addr() as *const c_void,
+                d_ref.addr() as *mut c_void,
+                std::ptr::null(),
+                rows as i32,
+                total_dim as i32,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_block_hadamard_f16(
+                &ex,
+                d_ref.addr() as *const c_void,
+                d_ref_had.addr() as *mut c_void,
+                rows as i32,
+                total_dim as i32,
+                total_dim as i32,
+                64,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_apply_attn_output_gate_hadamard_f16(
+                &ex,
+                d_x.addr() as *const c_void,
+                d_z.addr() as *const c_void,
+                d_fused.addr() as *mut c_void,
+                std::ptr::null(),
+                rows as i32,
+                total_dim as i32,
+            ),
+            0
+        );
+    }
+    d_ref_had.copy_to_host(&mut ref_had, &stream).unwrap();
+    d_fused.copy_to_host(&mut got_had, &stream).unwrap();
+    assert_eq!(got_had, ref_had, "ApplyAttnOutputGate H64 0-ULP mismatch");
+}
+
+#[test]
+fn tp2_all_reduce_residual_gemma_rms_norm_hadamard64_matches_standalone_0_ulp() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if CudaDevice::count().unwrap_or(0) < 2 {
+        return;
+    }
+    let comm = Tp2Collectives::new(12288 * 2).unwrap();
+    let _d0 = CudaDevice::set_current(0).unwrap();
+    let s0 = CudaStream::new(0).unwrap();
+    let _d1 = CudaDevice::set_current(1).unwrap();
+    let s1 = CudaStream::new(1).unwrap();
+
+    for hidden in [128usize, 2560, 4096, 5120, 6144] {
+        let in0_h: Vec<u16> = (0..hidden)
+            .map(|i| f32_to_f16(((i * 31 + 11) % 197) as f32 / 64.0 - 1.5))
+            .collect();
+        let in1_h: Vec<u16> = (0..hidden)
+            .map(|i| f32_to_f16(((i * 43 + 7) % 193) as f32 / 64.0 - 1.25))
+            .collect();
+        let res_h: Vec<u16> = (0..hidden)
+            .map(|i| f32_to_f16(((i * 19 + 5) % 179) as f32 / 64.0 - 1.0))
+            .collect();
+        let w_h: Vec<u16> = (0..hidden)
+            .map(|i| f32_to_f16(((i * 13 + 3) % 89) as f32 / 128.0 - 0.25))
+            .collect();
+
+        let _d0 = CudaDevice::set_current(0).unwrap();
+        let d0_in = DeviceBuffer::alloc(0, hidden * 2).unwrap();
+        let d0_res = DeviceBuffer::alloc(0, hidden * 2).unwrap();
+        let d0_w = DeviceBuffer::alloc(0, hidden * 2).unwrap();
+        let d0_out = DeviceBuffer::alloc(0, hidden * 2).unwrap();
+        let d0_had = DeviceBuffer::alloc(0, hidden * 2).unwrap();
+        let d0_ref_had = DeviceBuffer::alloc(0, hidden * 2).unwrap();
+        d0_in.copy_from_host(&in0_h, &s0).unwrap();
+        d0_res.copy_from_host(&res_h, &s0).unwrap();
+        d0_w.copy_from_host(&w_h, &s0).unwrap();
+
+        let _d1 = CudaDevice::set_current(1).unwrap();
+        let d1_in = DeviceBuffer::alloc(1, hidden * 2).unwrap();
+        let d1_res = DeviceBuffer::alloc(1, hidden * 2).unwrap();
+        let d1_w = DeviceBuffer::alloc(1, hidden * 2).unwrap();
+        let d1_out = DeviceBuffer::alloc(1, hidden * 2).unwrap();
+        let d1_had = DeviceBuffer::alloc(1, hidden * 2).unwrap();
+        d1_in.copy_from_host(&in1_h, &s1).unwrap();
+        d1_res.copy_from_host(&res_h, &s1).unwrap();
+        d1_w.copy_from_host(&w_h, &s1).unwrap();
+        s0.synchronize().unwrap();
+        s1.synchronize().unwrap();
+
+        let (comm, s0_ref, s1_ref) = (&comm, &s0, &s1);
+        std::thread::scope(|scope| {
+            let (in0, res0, w0, out0, had0) = (
+                d0_in.addr(),
+                d0_res.addr(),
+                d0_w.addr(),
+                d0_out.addr(),
+                d0_had.addr(),
+            );
+            let (in1, res1, w1, out1, had1) = (
+                d1_in.addr(),
+                d1_res.addr(),
+                d1_w.addr(),
+                d1_out.addr(),
+                d1_had.addr(),
+            );
+            let t0 = scope.spawn(move || {
+                let _dev = CudaDevice::set_current(0).unwrap();
+                let ex0 = s0_ref.exec(0, 0);
+                comm.all_reduce_residual_gemma_rms_norm_hadamard_f16(
+                    &ex0,
+                    in0,
+                    0,
+                    res0,
+                    w0,
+                    out0,
+                    had0,
+                    0,
+                    0,
+                    1,
+                    hidden as i32,
+                    1e-6,
+                    0,
+                    0,
+                )
+                .unwrap();
+                s0_ref.synchronize().unwrap();
+            });
+            let t1 = scope.spawn(move || {
+                let _dev = CudaDevice::set_current(1).unwrap();
+                let ex1 = s1_ref.exec(0, 0);
+                comm.all_reduce_residual_gemma_rms_norm_hadamard_f16(
+                    &ex1,
+                    in1,
+                    0,
+                    res1,
+                    w1,
+                    out1,
+                    had1,
+                    0,
+                    1,
+                    1,
+                    hidden as i32,
+                    1e-6,
+                    0,
+                    0,
+                )
+                .unwrap();
+                s1_ref.synchronize().unwrap();
+            });
+            t0.join().unwrap();
+            t1.join().unwrap();
+        });
+
+        let _d0 = CudaDevice::set_current(0).unwrap();
+        launch(&s0, &d0_out, &d0_ref_had, 1, hidden, hidden, 64);
+        let mut got0 = vec![0u16; hidden];
+        let mut ref0 = vec![0u16; hidden];
+        d0_had.copy_to_host(&mut got0, &s0).unwrap();
+        d0_ref_had.copy_to_host(&mut ref0, &s0).unwrap();
+        let _d1 = CudaDevice::set_current(1).unwrap();
+        let mut got1 = vec![0u16; hidden];
+        d1_had.copy_to_host(&mut got1, &s1).unwrap();
+        assert_eq!(got0, ref0, "TP=2 rank 0 H64 0-ULP mismatch hidden={hidden}");
+        assert_eq!(got1, ref0, "TP=2 rank 1 H64 0-ULP mismatch hidden={hidden}");
+    }
 }
 
 #[test]

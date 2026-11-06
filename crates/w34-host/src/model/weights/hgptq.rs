@@ -199,6 +199,64 @@ impl LinearProj {
         }
     }
 
+    /// Whether this projection is a `B == 64` Hadamard projection with unpadded `K` and `N`,
+    /// allowing its producer kernel to emit `H_64`-rotated activations directly.
+    #[inline]
+    pub fn can_fuse_h64_from_producer(&self) -> bool {
+        matches!(
+            self,
+            Self::Hadamard {
+                inner,
+                size_n,
+                size_k,
+                block_size: 64,
+            } if *size_k == inner.size_k()
+                && *size_n == inner.size_n()
+                && size_k.is_multiple_of(64)
+        )
+    }
+
+    /// Executes the underlying GEMM directly when `input` has already been rotated by a
+    /// producer-fused `H_64` kernel, or falls back to `forward` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub fn forward_prerotated(
+        &self,
+        ex: &W34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        input: u64,
+        output: u64,
+        rows: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Hadamard {
+                inner,
+                size_n,
+                size_k,
+                block_size: 64,
+            } if *size_k == inner.size_k() && *size_n == inner.size_n() => inner.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                input,
+                output,
+                rows,
+            ),
+            _ => self.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                input,
+                output,
+                rows,
+            ),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_hadamard(
         inner: &Self,

@@ -765,6 +765,39 @@ int w34_moe_gpu_lru_update_and_pull(
     int local_num_experts, int k_hot, int max_misses,
     size_t pack_stride_bytes, int n_interm, int k_hidden, int group_size);
 
+int w34_gemma_rms_norm_hadamard_f16(
+    const w34_exec* ex, const void* x, const void* weight, void* out, void* out_had64,
+    const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);
+int w34_fused_add_gemma_rms_norm_tap_hadamard_f16(
+    const w34_exec* ex, const void* x, void* residual, const void* weight, void* out,
+    void* out_had64, void* tap_dst_bf16, const uint8_t* valid_token_mask,
+    int num_tokens, int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int w34_rms_norm_gated_silu_strided_hadamard_f16(
+    const w34_exec* ex, const void* x, const void* z, const void* weight, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int num_v_heads, int head_dim,
+    int z_token_stride, float eps);
+int w34_rms_norm_gated_sigmoid_strided_hadamard_f16(
+    const w34_exec* ex, const void* x, const void* z, const void* weight, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int num_v_heads, int head_dim,
+    int z_token_stride, float eps);
+int w34_silu_and_mul_hadamard_f16(
+    const w34_exec* ex, const void* gate_up, void* out, const uint8_t* valid_token_mask,
+    int num_tokens, int intermediate_size);
+int w34_apply_attn_output_gate_hadamard_f16(
+    const w34_exec* ex, const void* attn_out, const void* gate, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int total_dim);
+
 #ifdef __cplusplus
 }
 #endif
