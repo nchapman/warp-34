@@ -4,6 +4,13 @@ use super::*;
 
 #[cfg(feature = "cuda")]
 pub enum LinearProj {
+    /// Logical projection backed by padded Marlin weights in the Hadamard basis.
+    Hadamard {
+        inner: Box<LinearProj>,
+        size_n: usize,
+        size_k: usize,
+        block_size: usize,
+    },
     MarlinW4A16 {
         b_q_weight_ptr: u64,
         b_scales_ptr: u64,
@@ -37,7 +44,8 @@ pub enum LinearProj {
 impl LinearProj {
     pub fn size_n(&self) -> usize {
         match self {
-            Self::MarlinW4A16 { size_n, .. }
+            Self::Hadamard { size_n, .. }
+            | Self::MarlinW4A16 { size_n, .. }
             | Self::MarlinW4A16Zp { size_n, .. }
             | Self::MarlinW8A16 { size_n, .. }
             | Self::DenseF16 { size_n, .. } => *size_n,
@@ -46,7 +54,8 @@ impl LinearProj {
 
     pub fn size_k(&self) -> usize {
         match self {
-            Self::MarlinW4A16 { size_k, .. }
+            Self::Hadamard { size_k, .. }
+            | Self::MarlinW4A16 { size_k, .. }
             | Self::MarlinW4A16Zp { size_k, .. }
             | Self::MarlinW8A16 { size_k, .. }
             | Self::DenseF16 { size_k, .. } => *size_k,
@@ -55,14 +64,19 @@ impl LinearProj {
 
     pub fn byte_footprint(&self) -> usize {
         match self {
+            Self::Hadamard { inner, .. } => inner.byte_footprint(),
             Self::MarlinW4A16 {
                 size_n,
                 size_k,
                 group_blocks,
                 ..
             } => {
-                let g = (*group_blocks as usize) * 16;
-                (size_n * size_k / 2) + (size_n * (size_k / g) * 2)
+                let groups = if *group_blocks < 0 {
+                    1
+                } else {
+                    size_k / (*group_blocks as usize * 16)
+                };
+                (size_n * size_k / 2) + (size_n * groups * 2)
             }
             Self::MarlinW4A16Zp {
                 size_n,
@@ -105,7 +119,29 @@ impl LinearProj {
         out_ptr: u64,
         m: usize,
     ) -> Result<()> {
+        if let Self::Hadamard {
+            inner,
+            size_n,
+            size_k,
+            block_size,
+        } = self
+        {
+            return Self::forward_hadamard(
+                inner,
+                *size_n,
+                *size_k,
+                *block_size,
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                x_ptr,
+                out_ptr,
+                m,
+            );
+        }
         match *self {
+            Self::Hadamard { .. } => unreachable!("handled above"),
             Self::MarlinW4A16 {
                 b_q_weight_ptr,
                 b_scales_ptr,
@@ -236,6 +272,10 @@ impl LinearProj {
 
 /// Raw host representation of a linear weight before sharding/uploading.
 pub(crate) enum RawLinearHost {
+    Hadamard {
+        inner: Box<RawLinearHost>,
+        block_size: usize,
+    },
     U4B8NMajor {
         packed: Vec<u32>,
         scales: Vec<u16>,
@@ -270,6 +310,7 @@ pub(crate) enum RawLinearHost {
 impl RawLinearHost {
     pub(crate) fn dims(&self) -> (usize, usize) {
         match self {
+            Self::Hadamard { inner, .. } => inner.dims(),
             Self::U4B8NMajor { n, k, .. }
             | Self::U4ZpNMajor { n, k, .. }
             | Self::U8B128NMajor { n, k, .. }
@@ -279,6 +320,7 @@ impl RawLinearHost {
 
     pub(crate) fn to_f16_vec(&self) -> Vec<u16> {
         match self {
+            Self::Hadamard { inner, block_size } => hgptq::unrotate_weights(inner, *block_size),
             Self::DenseF16 { weight, .. } => weight.clone(),
             Self::U4B8NMajor {
                 packed,
@@ -307,6 +349,14 @@ impl RawLinearHost {
     }
 
     pub(crate) fn load(
+        archive: &SafetensorsArchive,
+        base_prefix: &str,
+        quant: &QuantScheme,
+    ) -> Result<Self> {
+        Self::load_with_transform(archive, base_prefix, quant)
+    }
+
+    fn load_untransformed(
         archive: &SafetensorsArchive,
         base_prefix: &str,
         quant: &QuantScheme,
@@ -839,6 +889,10 @@ impl RawLinearHost {
     pub(crate) fn slice_rows(&self, row_start: usize, row_end: usize) -> Self {
         let out_n = row_end - row_start;
         match self {
+            Self::Hadamard { inner, block_size } => Self::Hadamard {
+                inner: Box::new(inner.slice_rows(row_start, row_end)),
+                block_size: *block_size,
+            },
             Self::U4B8NMajor {
                 packed,
                 scales,
@@ -914,9 +968,25 @@ impl RawLinearHost {
         }
     }
 
-    pub(crate) fn slice_cols(&self, col_start: usize, col_end: usize) -> Self {
+    pub(crate) fn slice_cols(&self, col_start: usize, col_end: usize) -> Result<Self> {
+        if col_start >= col_end || col_end > self.dims().1 {
+            return Err(loader_err("invalid linear K shard"));
+        }
+        if let Self::Hadamard { block_size, .. } = self
+            && (!col_start.is_multiple_of(*block_size) || !col_end.is_multiple_of(*block_size))
+        {
+            return Err(loader_err("K shard splits a Hadamard block"));
+        }
+        Ok(self.slice_cols_inner(col_start, col_end))
+    }
+
+    fn slice_cols_inner(&self, col_start: usize, col_end: usize) -> Self {
         let out_k = col_end - col_start;
         match self {
+            Self::Hadamard { inner, block_size } => Self::Hadamard {
+                inner: Box::new(inner.slice_cols_inner(col_start, col_end)),
+                block_size: *block_size,
+            },
             Self::U4B8NMajor {
                 packed,
                 scales,
@@ -924,10 +994,12 @@ impl RawLinearHost {
                 k,
                 group_size,
             } => {
+                let channelwise = *group_size == *k && *group_size > 128;
                 if !col_start.is_multiple_of(8)
                     || !out_k.is_multiple_of(8)
-                    || !col_start.is_multiple_of(*group_size)
-                    || !out_k.is_multiple_of(*group_size)
+                    || (!channelwise
+                        && (!col_start.is_multiple_of(*group_size)
+                            || !out_k.is_multiple_of(*group_size)))
                 {
                     let dense = self.to_f16_vec();
                     let col_major: Vec<u16> = dense
@@ -944,8 +1016,12 @@ impl RawLinearHost {
                 let out_words = out_k / 8;
                 let w_start = col_start / 8;
                 let in_groups = k / group_size;
-                let out_groups = out_k / group_size;
-                let g_start = col_start / group_size;
+                let out_groups = if channelwise { 1 } else { out_k / group_size };
+                let g_start = if channelwise {
+                    0
+                } else {
+                    col_start / group_size
+                };
                 let mut new_packed = vec![0u32; n * out_words];
                 let mut new_scales = vec![0u16; n * out_groups];
                 for r in 0..*n {
@@ -961,7 +1037,7 @@ impl RawLinearHost {
                     scales: new_scales,
                     n: *n,
                     k: out_k,
-                    group_size: *group_size,
+                    group_size: if channelwise { out_k } else { *group_size },
                 }
             }
             Self::U4ZpNMajor {
@@ -1099,6 +1175,13 @@ impl RawLinearHost {
     }
 
     pub(crate) fn concat_rows(parts: &[Self]) -> Result<Self> {
+        Self::concat_row_refs(&parts.iter().collect::<Vec<_>>())
+    }
+
+    fn concat_row_refs(parts: &[&Self]) -> Result<Self> {
+        if parts.iter().any(|p| matches!(p, Self::Hadamard { .. })) {
+            return Self::concat_transformed_rows(parts);
+        }
         if parts.is_empty() {
             return Err(loader_err_msg("concat_rows called with empty parts"));
         }
@@ -1293,6 +1376,9 @@ impl RawLinearHost {
                 || (n.is_multiple_of(128) && k.is_multiple_of(64))
         };
         match self {
+            Self::Hadamard { inner, block_size } => {
+                inner.upload_hadamard(*block_size, arena, stream, repack_staging)
+            }
             Self::U4B8NMajor {
                 packed,
                 scales,
@@ -1300,7 +1386,8 @@ impl RawLinearHost {
                 k,
                 group_size,
             } => {
-                if marlin_geom_ok(*n, *k) && matches!(*group_size, 32 | 64 | 128) {
+                let channelwise = *group_size == *k && *group_size > 128;
+                if marlin_geom_ok(*n, *k) && (channelwise || matches!(*group_size, 32 | 64 | 128)) {
                     let b_q_weight_ptr = Self::repack_with_staging(
                         packed,
                         *n,
@@ -1310,15 +1397,23 @@ impl RawLinearHost {
                         stream,
                         repack_staging,
                     )?;
-                    let perm_scales =
-                        marlin_permute_scales_from_n_major(scales, *k, *n, *group_size);
+                    let perm_scales = marlin_permute_scales_from_n_major(
+                        scales,
+                        *k,
+                        *n,
+                        if channelwise { 0 } else { *group_size },
+                    );
                     let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
                     Ok(LinearProj::MarlinW4A16 {
                         b_q_weight_ptr,
                         b_scales_ptr,
                         size_n: *n,
                         size_k: *k,
-                        group_blocks: (*group_size / 16) as i32,
+                        group_blocks: if channelwise {
+                            -1
+                        } else {
+                            (*group_size / 16) as i32
+                        },
                     })
                 } else {
                     let f16_w = dequant_u4b8_n_major_to_f16(packed, scales, *n, *k, *group_size);
@@ -1435,6 +1530,8 @@ impl RawLinearHost {
         self.dims().0
     }
 }
+
+mod hgptq;
 
 mod layers;
 pub use layers::*;

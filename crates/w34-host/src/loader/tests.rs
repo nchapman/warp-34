@@ -249,6 +249,7 @@ fn test_parse_quant_supported_schemes() {
                     group_size: gs,
                     symmetric: sym,
                     ignore: vec!["lm_head".into()],
+                    rules: None,
                 }
             );
             assert_eq!(q.expects_zero_points(), !sym);

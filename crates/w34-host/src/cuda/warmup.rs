@@ -52,6 +52,19 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         )?;
     }
 
+    warmup_ffi!(
+        ffi::w34_linear_epilogue_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_c as *const c_void,
+            buf_b as *mut c_void,
+            2,
+            64,
+            128,
+        ),
+        "warmup w34_linear_epilogue_f16"
+    )?;
+
     // 1. Norms, RoPE, activations
     warmup_ffi!(
         ffi::w34_embed_lookup_f16(
@@ -220,7 +233,7 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup w34_marlin_quantize_f16_u4b8"
     )?;
     for m_warm in [1i64, 16, 40, 64] {
-        for group_blocks in [8i32, 4, 2] {
+        for group_blocks in [8i32, 4, 2, -1] {
             warmup_ffi!(
                 ffi::w34_marlin_gemm_f16u4(
                     &ex,
@@ -237,6 +250,9 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 ),
                 "warmup w34_marlin_gemm_f16u4"
             )?;
+            if group_blocks == -1 {
+                continue;
+            }
             warmup_ffi!(
                 ffi::w34_marlin_gemm_f16u4_zp(
                     &ex,

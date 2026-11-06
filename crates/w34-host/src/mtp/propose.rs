@@ -683,7 +683,8 @@ impl Qwen3_5MtpRank {
                 size_n as i32,
                 size_k as i32,
             ),
-            LinearProj::MarlinW4A16 { .. }
+            LinearProj::Hadamard { .. }
+            | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }
             | LinearProj::MarlinW8A16 { .. } => proj.forward(
                 ex,

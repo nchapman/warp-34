@@ -632,7 +632,7 @@ pub(crate) fn load_moe_layer_weights(
             let rg = rg_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
             let ru = ru_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
             let gu = RawLinearHost::concat_rows(&[rg, ru])?;
-            let rd = rd_full.slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+            let rd = rd_full.slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm)?;
             Ok((gu, rd))
         };
 
@@ -850,6 +850,9 @@ pub(crate) fn load_moe_layer_weights(
                     group_size,
                 }
             }
+            RawLinearHost::Hadamard { .. } => {
+                return Err(loader_err("Hadamard routed MoE experts are not supported"));
+            }
             RawLinearHost::U8B128NMajor { .. } => unreachable!(),
             RawLinearHost::DenseF16 { .. } => {
                 let mut all_gu_f16 = Vec::with_capacity(num_exp * 2 * local_moe_interm * h);
@@ -942,7 +945,7 @@ pub(crate) fn load_moe_layer_weights(
             )));
         }
         let s_dn = s_dn_full
-            .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
+            .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)?
             .upload(weight_arena, stream, repack_staging)?;
         let s_eg = if archive
             .resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight"))

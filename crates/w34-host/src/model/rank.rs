@@ -135,10 +135,8 @@ fn prepare_layer_linear_shards(
                 )
             });
             let down_h = s.spawn(move || -> Result<RawLinearHost> {
-                Ok(
-                    RawLinearHost::load(archive, &format!("{pfx_ref}.mlp.down_proj"), &cfg.quant)?
-                        .slice_cols(rank * local_interm, (rank + 1) * local_interm),
-                )
+                RawLinearHost::load(archive, &format!("{pfx_ref}.mlp.down_proj"), &cfg.quant)?
+                    .slice_cols(rank * local_interm, (rank + 1) * local_interm)
             });
             (gate_h, up_h, down_h)
         });
@@ -172,12 +170,12 @@ fn prepare_layer_linear_shards(
                 });
                 let o_cols = local_q_heads * cfg.head_dim;
                 let o_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load(
                         archive,
                         &format!("{pfx_ref}.self_attn.o_proj"),
                         &cfg.quant,
                     )?
-                    .slice_cols(rank * o_cols, (rank + 1) * o_cols))
+                    .slice_cols(rank * o_cols, (rank + 1) * o_cols)
                 });
                 let q_shard = q_h
                     .join()
@@ -240,12 +238,12 @@ fn prepare_layer_linear_shards(
                     .slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads))
                 });
                 let out_h = s.spawn(move || -> Result<RawLinearHost> {
-                    Ok(RawLinearHost::load(
+                    RawLinearHost::load(
                         archive,
                         &format!("{pfx_ref}.linear_attn.out_proj"),
                         &cfg.quant,
                     )?
-                    .slice_cols(rank * gdn_v_local, (rank + 1) * gdn_v_local))
+                    .slice_cols(rank * gdn_v_local, (rank + 1) * gdn_v_local)
                 });
                 let (q_part, k_part, v_part) = qkv_h
                     .join()
@@ -920,6 +918,7 @@ impl Qwen3_5ModelRank {
                         group_size: cfg.quant.raw_group_size(),
                         symmetric: true,
                         ignore: Vec::new(),
+                        rules: None,
                     };
                 } else if p_info.shape[1].saturating_mul(8) == cfg.hidden_size {
                     embed_quant = crate::loader::QuantScheme::CompressedTensors {
@@ -927,6 +926,7 @@ impl Qwen3_5ModelRank {
                         group_size: cfg.quant.raw_group_size(),
                         symmetric: !has_zp,
                         ignore: Vec::new(),
+                        rules: None,
                     };
                 }
             }
@@ -1819,7 +1819,31 @@ impl Qwen3_5ModelRank {
                 };
                 layer_scratch_layout(&self.cfg, self.tp_size, tokens)
                     .ok()
-                    .map(|l| l.0.saturating_add(hc_extra))
+                    .map(|l| {
+                        let transform = if matches!(
+                            self.cfg.quant,
+                            QuantScheme::CompressedTensors { rules: Some(_), .. }
+                        ) {
+                            let max_dim = self
+                                .cfg
+                                .hidden_size
+                                .max(self.cfg.intermediate_size)
+                                .max(self.cfg.num_attention_heads * self.cfg.head_dim)
+                                .max(
+                                    self.cfg.linear_num_value_heads
+                                        * self.cfg.linear_value_head_dim,
+                                )
+                                .div_ceil(128)
+                                * 128;
+                            tokens
+                                .saturating_mul(max_dim)
+                                .saturating_mul(4)
+                                .saturating_add(512)
+                        } else {
+                            0
+                        };
+                        l.0.saturating_add(hc_extra).saturating_add(transform)
+                    })
             },
         )
         .ok_or_else(|| loader_err("scratch cannot fit one 64-token prefill chunk"))

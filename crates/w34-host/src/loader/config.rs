@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "config_rules.rs"]
+mod config_rules;
+pub use config_rules::CompressedTensorRules;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QuantScheme {
     Unquantized,
@@ -9,6 +13,7 @@ pub enum QuantScheme {
         group_size: usize,
         symmetric: bool,
         ignore: Vec<String>,
+        rules: Option<Box<CompressedTensorRules>>,
     },
     Gptq {
         bits: usize,
@@ -973,6 +978,7 @@ impl ModelConfig {
             ));
         }
 
+        let rules = CompressedTensorRules::parse(q)?;
         let mut chosen_linear: Option<(usize, usize, bool)> = None;
         let mut fallback_group: Option<(usize, usize, bool)> = None;
         let mut group_keys: Vec<&String> = groups_obj.keys().collect();
@@ -983,7 +989,9 @@ impl ModelConfig {
                 Self::parse_compressed_tensors_group(gk, grp)?;
             if !is_embedding_only {
                 if let Some((prev_b, prev_g, prev_s)) = chosen_linear {
-                    if (prev_b, prev_g, prev_s) != (num_bits, group_size, symmetric) {
+                    if rules.is_none()
+                        && (prev_b, prev_g, prev_s) != (num_bits, group_size, symmetric)
+                    {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
@@ -1020,6 +1028,7 @@ impl ModelConfig {
             group_size,
             symmetric,
             ignore,
+            rules: rules.map(Box::new),
         })
     }
 
@@ -1124,7 +1133,9 @@ impl ModelConfig {
                 ),
             ));
         }
-        Self::validate_bits_and_group_size("compressed-tensors", num_bits, group_size, true)?;
+        if !(num_bits == 4 && group_size == 0 && strategy == "channel" && symmetric) {
+            Self::validate_bits_and_group_size("compressed-tensors", num_bits, group_size, true)?;
+        }
         let is_embedding_only = grp
             .get("targets")
             .and_then(|v| v.as_array())

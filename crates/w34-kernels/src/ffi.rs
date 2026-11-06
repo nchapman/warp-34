@@ -307,6 +307,18 @@ unsafe extern "C" {
         vocab_size: i32,
     ) -> i32;
 
+    /// Crop FP16 physical rows to logical width, optionally adding FP16 bias
+    /// in FP32 before FP16 rounding. In-place requires equal widths.
+    pub fn w34_linear_epilogue_f16(
+        ex: *const W34Exec,
+        src: *const c_void,
+        bias: *const c_void,
+        dst: *mut c_void,
+        rows: i32,
+        logical_n: i32,
+        physical_n: i32,
+    ) -> i32;
+
     /// Out-of-place normalized Sylvester H16/H64: FP16 `[rows, k]` to
     /// `[rows, padded_k]`, with a zero-filled tail. Widths must be block-aligned;
     /// source and destination ranges must not overlap. Uses FP32 butterflies.

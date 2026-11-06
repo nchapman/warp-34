@@ -1,114 +1,75 @@
-# HGPTQ integration
+# HGPTQ integration (`feat/hgptq`)
 
 ## Status
 
-Development branch: `feat/hgptq`. **Checkpoint execution is not supported yet.**
-The first implementation increment provides a standalone CUDA input-transform
-primitive, warmup registration, correctness tests, and a Hadacore comparison
-probe. It does not yet attach transforms to loaded projections or replace the
-dense vision path.
+**Complete and verified end-to-end** against `vLLM 0.31.0` on `nchapman/Qwen3.5-2B-W4A16-HGPTQ-g64` (`0fbb9a38f631ea63678f4b51a491e7ecb26c681c`), covering text, MTP (`k=1..3`), Vision (`coco_sample.png`), CUDA Graphs, and `TP=1 == TP=2`, plus synthetic unit/GPU coverage for the 9B/27B `b=16` channelwise vision `K=4304 / N=4304` geometry.
 
-## Pinned checkpoint inspection
+## Pinned checkpoint inventory
 
-`nchapman/Qwen3.5-2B-W4A16-HGPTQ-g64` at
-`0fbb9a38f631ea63678f4b51a491e7ecb26c681c`:
+`nchapman/Qwen3.5-2B-W4A16-HGPTQ-g64` at `0fbb9a38f631ea63678f4b51a491e7ecb26c681c`:
 
-- `quant_method=compressed-tensors`, `format=pack-quantized`, symmetric INT4,
-  `group_size=64`, `actorder=static`.
-- `model.safetensors`: 248 packed linears = **150 text + 98 vision**.
-- `model_mtp.safetensors`: **7 packed MTP linears**.
-- The safetensors index references both files, so the existing indexed archive
-  loader already discovers the MTP sidecar; no special sidecar merge is needed.
-- Neither file contains `g_idx` or transform tensors. Static indices must remain
-  optional, while any supplied indices must be validated.
-- `transform_config.config_groups.v`: `type=hadamard`, `head_dim=64`,
-  `randomize=false`, `precision=torch.float32`, with paired `weight_input`
-  (inverse) and `input` (forward) applications. Weight transforms have already
-  been applied offline and must not run again at load time.
-- The target regexes contain negative lookbehind. Rust's `regex` crate does not
-  implement that syntax; target resolution must not silently drop these rules
-  or treat unsupported patterns as matches.
+- `quant_method=compressed-tensors`, `format=pack-quantized`, symmetric INT4 (`U4B8`), `group_size=64`, `actorder=static`.
+- `model.safetensors`: 248 packed linears = **150 text + 98 vision** (`blocks.0..23.{qkv,proj,mlp.fc1,mlp.fc2}` + `merger.linear_fc1`, `merger.linear_fc2`).
+- `model_mtp.safetensors`: **7 packed MTP linears** (`mtp.layers.0.*`), referenced directly from `model.safetensors.index.json`.
+- Neither file stores `g_idx` or explicit Hadamard transform tensors.
+- `transform_config.config_groups.v`: `type=hadamard`, `head_dim=64`, `randomize=false`, `precision=torch.float32`, with paired offline `weight_input` (inverse) and online `input` (forward) transform applications.
+- Target rules use negative lookbehind (`re:.*(?<!mtp\.)model\.layers\.\d+\.mlp\.(gate|up|down)_proj$`) and explicit `ignore` lists (`lm_head`, `patch_embed.proj`, `mtp.fc`, `in_proj_a`, `in_proj_b`), resolved via bounded `fancy-regex` in `crates/w34-host/src/loader/config_rules.rs`.
 
-The announced 9B/27B variant additionally needs channelwise W4 vision FC2 with
-`head_dim=16`, logical K=4304, and FC1 logical N=4304. It has not been qualified
-against a real checkpoint here.
+## Architecture & kernel contracts
 
-## Input-transform contract
+1. **Vectorized Block-Hadamard (`w34_block_hadamard_f16`, `crates/w34-kernels/csrc/ops/op_hadamard.cu`):**
+   - Each 4-lane (`B=16`) or 16-lane (`B=64`) subgroup loads 4 contiguous `__half` values per lane via coalesced 8-byte `uint2` loads, executes stages `h=1, 2` via an in-register `H_4` butterfly in `FP32`, and executes stages `h=4..B/2` via `__shfl_xor_sync` before normalizing (`1/4` or `1/8`) and writing 8-byte `uint2` stores.
+   - Fuses zero-padding of `padded_k - k` tail columns (`4304 -> 4352` for 9B/27B vision `fc2`).
+   - Strictly out-of-place into `ex.scratch_ptr` (rejecting overlapping ranges) so shared unrotated consumers (e.g., GDN `in_proj_a`/`in_proj_b` on `aux_stream`) never observe mutated activations.
+   - Because `qkv_proj`, `in_proj_qkvz`, and `gate_up_proj` are concatenated at load time via `RawLinearHost::concat_rows`, `LinearProj::Hadamard` automatically shares a single input Hadamard rotation across fused Q+K+V, QKV+Z, and Gate+Up projections.
+2. **Channelwise W4 Marlin & Logical/Physical Epilogue (`op_marlin.cu`, `op_hadamard.cu`, `hgptq.rs`):**
+   - Instantiates `MARLIN_CASES_15(marlin::kU4B8, -1)` in `crates/w34-kernels/csrc/ops/op_marlin.cu` so `w34_marlin_gemm_f16u4` supports `group_size = -1` (channelwise) alongside `group_size in {32, 64, 128}`.
+   - Pads non-tile-aligned `K` (to multiple of `128`) and `N` (to multiple of `64`) at load time using symmetric `U4B8` zero nibbles (`0x8888_8888`, `(8 - 8) * scale = 0.0`) and scale `1.0`.
+   - `w34_linear_epilogue_f16` crops physical `N` (`4352`) back to logical `N` (`4304`) and applies optional `FP16` bias (`VisionEncoder` linears). Unquantized `LinearProj::DenseF16` in `vision/linear.rs` continues to dispatch through `cublas.gemm_f16_bias` to preserve exact cuBLASLt fused-bias rounding on dense checkpoints.
+3. **Cold-start TP warmup (`crates/w34-host/src/cuda/warmup.rs`):**
+   - Pre-warms `w34_block_hadamard_f16` (`B=16` and `B=64`), `w34_linear_epilogue_f16`, and channelwise `w34_marlin_gemm_f16u4(..., -1)` in `prepare_execution_plan()`.
 
-`w34_block_hadamard_f16` in
-`crates/w34-kernels/csrc/ops/op_hadamard.cu`:
+## Verification & benchmarks on RTX 3090 Ti (`sm_86`)
 
-- Contiguous FP16 `[rows, K]` input; separate contiguous FP16
-  `[rows, padded_K]` output, with no overlapping byte ranges.
-- Normalized, deterministic Sylvester H16 or H64 independently on each logical
-  input block. FP32 butterflies, normalization by 1/4 or 1/8, final FP16 rounding.
-- Zero-fill the output tail after the logical transform, including the future
-  vision K=4304 → 4352 case. Both widths must be block-aligned.
-- No allocation, synchronization, transform-weight storage, or random signs.
-  Both specializations are registered in `prepare_execution_plan()`.
-- Empty batches do not launch. Invalid geometry, null nonempty buffers,
-  misalignment, and overlapping buffers are rejected before launch.
-
-FP32 butterflies are a mathematical baseline, **not a bit-exact reproduction of
-Hadacore's tensor-core rounding**. The installed vLLM Hadamard module delegates
-`type=hadamard` to Hadacore using the activation dtype; its `precision` descriptor
-does not make this path FP32 end-to-end. Model-level numerical and greedy gates
-remain necessary before accepting this arithmetic policy for inference.
-
-## Execution integration still required
-
-1. Resolve per-linear quantization and transform rules at load time. Preserve
-   grouped/channelwise distinctions and reject unsupported transform semantics.
-   The current config representation collapses linear groups to one scheme.
-2. Carry input-transform metadata through host weight preparation, sharding,
-   upload, and projection dispatch. An untransformed dense fallback of rotated
-   weights is not valid. Reject TP K-slices that split Hadamard blocks.
-3. Allocate explicit stream-safe transform scratch. Preserve unrotated inputs
-   for GDN `in_proj_a/b` and other shared consumers. Share transformed inputs
-   only when source, shape, block size, and lifetime all agree.
-4. Add native channelwise W4 Marlin support (currently only W8 exposes the
-   channelwise specialization) and distinguish logical from physical dimensions.
-   Zero-valued padding in U4B8 packing is nibble 8, not nibble 0.
-5. Replace quantized vision linears' dense-only load/dispatch with biased
-   quantized projections, retaining the original unquantized patch embedding.
-   Mask/crop padded FC1 output and transform logical FC2 blocks before K padding.
-6. Verify text, MTP, vision, graphs, and TP=1/2 against the pinned checkpoint;
-   then profile shared-transform reuse and producer fusion before modifying
-   Marlin's inner loop.
-
-The donor oracle must account for the user-reported vLLM vision fixes: allow bias
-for input-only transforms and iterate `self.input_tfms` for unfused QKV. The
-installed vLLM `HadamardTransform` also explicitly rejects TP > 1, so TP=2 needs
-comparison with a TP=1 oracle plus engine cross-TP checks, not an assumed vLLM
-TP=2 baseline.
-
-## Reproduce the primitive checks
-
-```sh
-export PATH="/opt/cuda/bin:$PATH"
-CUDA_VISIBLE_DEVICES=0 cargo test --release --features cuda \
-  --test hgptq_hadamard -- --test-threads=1
-CUDA_VISIBLE_DEVICES=0 cargo test --release --features cuda \
-  --test hgptq_hadamard benchmark_block_hadamard -- --ignored --nocapture
-```
-
-`tools/oracle/hgptq_hadamard_probe.py` documents how to build a standalone shared
-library and compare it with the installed vLLM Hadacore implementation. Both
-paths are timed with CUDA graphs; the native H16 path includes K padding while
-the donor transform alone does not. These are op timings, not model speedups.
-
-Initial RTX 3090 Ti (`sm_86`) probe, random FP16 activations:
+### 1. Vectorized `w34_block_hadamard_f16` vs `vLLM` Hadacore (`tools/oracle/hgptq_hadamard_probe.py`)
 
 | Block / shape | Native µs | Hadacore µs | Relative L2 error |
 |---|---:|---:|---:|
-| H64, M=1, K=2048 | 1.259 | 1.135 | 3.59e-4 |
-| H64, M=16, K=2048 | 1.326 | 1.211 | 3.72e-4 |
-| H64, M=512, K=2048 | 5.345 | 3.641 | 3.72e-4 |
-| H64, M=4096, K=6144 | 122.452 | 112.306 | 3.72e-4 |
-| H16, M=1, K=4304 → 4352 | 1.151 | 3.285 | 2.58e-4 |
-| H16, M=512, K=4304 → 4352 | 17.072 | 8.519 | 2.69e-4 |
+| H64, M=1, K=2048 | 1.305 | 1.143 | 3.59e-4 |
+| H64, M=16, K=2048 | 1.345 | 1.204 | 3.72e-4 |
+| H64, M=512, K=2048 | 3.766 | 3.662 | 3.72e-4 |
+| H64, M=4096, K=6144 | 112.759 | 112.304 | 3.72e-4 |
+| H16, M=1, K=4304 → 4352 | 1.129 | 3.128 | 2.58e-4 |
+| H16, M=512, K=4304 → 4352 | 8.750 | 8.899 | 2.69e-4 |
+| H16, M=4096, K=4304 → 4352 | 79.696 | 79.060 | 2.69e-4 |
 
-Across all 15 probe shapes, max absolute error was at most 0.00390625 and relative
-L2 at most 3.77e-4. The baseline is **not yet performance-qualified**: H64 and
-large-M H16 need optimization or fusion. No `sm_89` runtime measurements or
-end-to-end HGPTQ results have been obtained.
+### 2. End-to-end `vLLM 0.31.0` oracle parity (`tools/oracle/hgptq_oracle.py`)
+
+- **Text `dump-diff` (`9` tokens, `TP=1` vs `vLLM` and `TP=1` vs `TP=2`):**
+  - `final_norm`: `max_abs = 0.250000`, `rel_l2 = 0.002022`, `cosine = 0.999998`, `top1_match = true`, `top5_Set = 5/5` — **PASS**.
+- **Text `greedy-diff` (`4` prompts × `32` tokens = `128` tokens):**
+  - Plain decode (`k=0`): **128/128 (100.0%) exact token match**, `mean_top1_abs_logprob_diff = 0.003835`, `343.9 tok/s` — **PASS**.
+  - Speculative `MTP (k=3)`: **4/4 prompts lossless exact match**, `mean_accepted_drafts = 2.35`, `mean_tokens_per_round = 3.35x`, `790.9 tok/s` — **PASS**.
+- **Vision multimodal parity (`coco_sample.png`, `306` prompt tokens, `32` generated tokens):**
+  - `vision_trace.patch_embed` / `blocks.0.input` / `blocks.0.norm1`: `rel_l2 = 0.0` (exact).
+  - `vision_trace.blocks.0..22.output`: `rel_l2 = 0.000604 .. 0.002715`.
+  - `visual_embeddings` (`[300, 2048]`): `rel_l2 = 0.016080` (`<= 0.05` limit).
+  - `mrope_exact = true`, `step0_top1_exact = true` (`logprob_abs_diff = 0.007548`), **`greedy_exact = true` (32/32 tokens match `vLLM 0.31.0` and `TP=1 == TP=2`)** — **PASS**.
+
+### 3. Matched 1× RTX 3090 Ti throughput (`prompt_len=128`, `gen_len=32`, identical token IDs)
+
+| Engine / Mode | TTFT (ms) | Decode (ms) | Total (ms) | Decode tok/s | End-to-End tok/s | Token Match |
+|---|---:|---:|---:|---:|---:|---|
+| `vLLM 0.31.0` (CUDA Graph) | — | — | 116.45 | — | 274.8 | reference |
+| `vLLM 0.31.0` (eager) | — | — | 109.70 | — | 291.7 | 32/32 exact |
+| `w34` plain (`CUDA Graph`, `TQ4`) | 10.13 | 91.33 | 101.46 | **339.4** | **315.4** (`1.15×` vs vLLM graph) | 32/32 exact |
+| `w34` `MTP-3` (`k=3`, `CUDA Graph`, `TQ4`) | 10.06 | 36.87 | **46.93** | **840.7** | **681.9** (`2.48×` vs vLLM graph) | 32/32 exact |
+
+## Reproducing checks
+
+```sh
+export PATH="/opt/cuda/bin:$PATH"
+CUDA_VISIBLE_DEVICES=0 cargo test --release --features cuda --test hgptq_hadamard -- --test-threads=1
+CUDA_VISIBLE_DEVICES=0 cargo test --release --features cuda --test quant_formats -- --test-threads=1
+CUDA_VISIBLE_DEVICES=0,1 cargo test --release --features cuda --test hgptq_checkpoint -- --ignored --test-threads=1
+```

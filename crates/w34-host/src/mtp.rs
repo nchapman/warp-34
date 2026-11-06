@@ -364,7 +364,7 @@ impl Qwen3_5MtpRank {
             &staging,
         )?;
         let o_proj = load("layers.0.self_attn.o_proj", h, q)?
-            .slice_cols(r * q / tp, (r + 1) * q / tp)
+            .slice_cols(r * q / tp, (r + 1) * q / tp)?
             .upload(&mut weights, &target.stream, &staging)?;
         let ffn = if is_moe_mtp {
             FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
@@ -385,7 +385,7 @@ impl Qwen3_5MtpRank {
                 &staging,
             )?;
             let down_proj = load("layers.0.mlp.down_proj", h, i)?
-                .slice_cols(r * i / tp, (r + 1) * i / tp)
+                .slice_cols(r * i / tp, (r + 1) * i / tp)?
                 .upload(&mut weights, &target.stream, &staging)?;
             FfnBlockWeights::Dense {
                 gate_up_proj,
@@ -587,6 +587,7 @@ impl Qwen3_5MtpRank {
                         group_size: gs,
                         symmetric: true,
                         ignore: Vec::new(),
+                        rules: None,
                     },
                 )
             } else if let Some(sc_key) =

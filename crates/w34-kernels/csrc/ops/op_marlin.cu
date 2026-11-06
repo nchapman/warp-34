@@ -364,6 +364,10 @@ static MarlinFuncPtr get_marlin_kernel_f16u4(thread_config_t const& th_config,
                                              int thread_m_blocks,
                                              bool m_block_size_8,
                                              int group_blocks) {
+    if (group_blocks == -1) {
+        MARLIN_CASES_15(marlin::kU4B8, -1)
+        return nullptr;
+    }
     if (group_blocks == 2) {
         MARLIN_CASES_15(marlin::kU4B8, 2)
         return nullptr;
@@ -490,7 +494,7 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
 
     int prob_m = (int)m, prob_n = (int)n, prob_k = (int)k;
     const bool valid_gb = (group_blocks == 2 || group_blocks == 4 || group_blocks == 8) ||
-                          (num_bits == 8 && !has_zp && group_blocks == -1);
+                          (!has_zp && group_blocks == -1);
     if (prob_m <= 0 || prob_n <= 0 || prob_k <= 0 || (prob_k % 32) != 0 ||
         (prob_n % 64) != 0 || !valid_gb ||
         (group_blocks > 0 && (prob_k % (group_blocks * 16)) != 0)) {

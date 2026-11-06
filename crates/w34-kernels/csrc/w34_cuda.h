@@ -181,6 +181,11 @@ int w34_embed_lookup_f16(const w34_exec* ex, const int32_t* token_ids,
 // Out-of-place normalized Sylvester H16/H64 on contiguous FP16 [rows,k].
 // Writes contiguous [rows,padded_k], zero-filling the tail after transforming
 // logical blocks. Both widths must be multiples of block_size. No aliasing.
+// FP16 crop with optional FP32 bias add. In-place only for equal widths.
+int w34_linear_epilogue_f16(const w34_exec* ex, const void* src,
+                            const void* bias, void* dst, int rows,
+                            int logical_n, int physical_n);
+
 int w34_block_hadamard_f16(const w34_exec* ex, const void* src, void* dst,
                            int rows, int k, int padded_k, int block_size);
 

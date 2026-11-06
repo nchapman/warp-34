@@ -1,0 +1,90 @@
+{
+  "config_groups": {
+    "group_0": {
+      "format": "pack-quantized",
+      "input_activations": null,
+      "output_activations": null,
+      "targets": [
+        "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+        "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+        "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$",
+        "re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"
+      ],
+      "weights": {
+        "actorder": "static",
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": 64,
+        "num_bits": 4,
+        "observer": "memoryless_minmax",
+        "observer_kwargs": {},
+        "scale_dtype": null,
+        "strategy": "group",
+        "symmetric": true,
+        "type": "int",
+        "zp_dtype": null
+      }
+    }
+  },
+  "format": "pack-quantized",
+  "global_compression_ratio": null,
+  "ignore": [
+    "lm_head",
+    "re:.*linear_attn\\.in_proj_a$",
+    "re:.*linear_attn\\.in_proj_b$",
+    "re:.*mlp\\.gate$",
+    "re:.*mlp\\.shared_expert_gate$"
+  ],
+  "kv_cache_scheme": null,
+  "quant_method": "compressed-tensors",
+  "quantization_status": "compressed",
+  "sparsity_config": {},
+  "transform_config": {
+    "config_groups": {
+      "v": {
+        "apply": [
+          {
+            "ignore": [
+              "lm_head",
+              "re:.*linear_attn\\.in_proj_a$",
+              "re:.*linear_attn\\.in_proj_b$",
+              "re:.*mlp\\.gate$",
+              "re:.*mlp\\.shared_expert_gate$"
+            ],
+            "inverse": true,
+            "location": "weight_input",
+            "targets": [
+              "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+              "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+              "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$",
+              "re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"
+            ]
+          },
+          {
+            "ignore": [
+              "lm_head",
+              "re:.*linear_attn\\.in_proj_a$",
+              "re:.*linear_attn\\.in_proj_b$",
+              "re:.*mlp\\.gate$",
+              "re:.*mlp\\.shared_expert_gate$"
+            ],
+            "inverse": false,
+            "location": "input",
+            "targets": [
+              "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+              "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+              "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$",
+              "re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"
+            ]
+          }
+        ],
+        "head_dim": 64,
+        "precision": "torch.float32",
+        "randomize": false,
+        "requires_grad": false,
+        "type": "hadamard"
+      }
+    }
+  },
+  "version": "0.19.1a20261003"
+}
