@@ -35,6 +35,23 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
     let buf_d = arena.alloc_aligned(64 * 1024)?;
     let buf_ws = arena.alloc_aligned((64 * 1024).max(dev_props.marlin_workspace_bytes()))?;
 
+    // HGPTQ input transforms are independent of GEMM and must be resident before
+    // any rank enters graph capture or a collective warmup barrier.
+    for block_size in [16, 64] {
+        warmup_ffi!(
+            ffi::w34_block_hadamard_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                2,
+                128,
+                192,
+                block_size,
+            ),
+            "warmup w34_block_hadamard_f16"
+        )?;
+    }
+
     // 1. Norms, RoPE, activations
     warmup_ffi!(
         ffi::w34_embed_lookup_f16(

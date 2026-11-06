@@ -178,6 +178,12 @@ int w34_embed_lookup_f16(const w34_exec* ex, const int32_t* token_ids,
                          const uint8_t* valid_token_mask,
                          int num_tokens, int hidden_size, int vocab_size);
 
+// Out-of-place normalized Sylvester H16/H64 on contiguous FP16 [rows,k].
+// Writes contiguous [rows,padded_k], zero-filling the tail after transforming
+// logical blocks. Both widths must be multiples of block_size. No aliasing.
+int w34_block_hadamard_f16(const w34_exec* ex, const void* src, void* dst,
+                           int rows, int k, int padded_k, int block_size);
+
 int w34_copy_masked_rows_f16(const w34_exec* ex, const void* src, void* dst,
                              const uint8_t* valid_token_mask,
                              int num_tokens, int row_elems);

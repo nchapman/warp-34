@@ -307,6 +307,19 @@ unsafe extern "C" {
         vocab_size: i32,
     ) -> i32;
 
+    /// Out-of-place normalized Sylvester H16/H64: FP16 `[rows, k]` to
+    /// `[rows, padded_k]`, with a zero-filled tail. Widths must be block-aligned;
+    /// source and destination ranges must not overlap. Uses FP32 butterflies.
+    pub fn w34_block_hadamard_f16(
+        ex: *const W34Exec,
+        src: *const c_void,
+        dst: *mut c_void,
+        rows: i32,
+        k: i32,
+        padded_k: i32,
+        block_size: i32,
+    ) -> i32;
+
     pub fn w34_copy_masked_rows_f16(
         ex: *const W34Exec,
         src: *const c_void,

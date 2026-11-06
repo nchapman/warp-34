@@ -1,5 +1,15 @@
 # warp-34 — Session Orientation & Current State
 
+## HGPTQ Native Input-Transform Foundation (`feat/hgptq`, integration in progress)
+
+- **Scope:** First increment only; **HGPTQ checkpoint execution is not supported yet**. See [`HGPTQ.md`](HGPTQ.md) for the pinned checkpoint inventory, runtime integration plan, and reproducible Hadacore probe.
+- **Native primitive:** Added `w34_block_hadamard_f16` (`op_hadamard.cu`, C/Rust FFI, `prepare_execution_plan` warmup): out-of-place normalized Sylvester H16/H64, FP32 butterflies with FP16 I/O, fused zero-padding (including logical K=4304 → physical K=4352), and geometry/alias validation. No allocation, synchronization, or transform tensors.
+- **Verification:** Four focused CUDA tests pass on RTX 3090 Ti, covering independent dense Sylvester parity, basis vectors, large intermediate sums, subnormals, preserved inputs, padding/canaries, invalid geometry/aliasing, and graph replay with updated inputs. Compute Sanitizer memcheck: **0 errors**. Initial review: no actionable findings. **`mise run check` PASS** after correcting safety-comment placement in three new test assertions: formatting, Clippy with/without CUDA, rustdoc, full release tests, oracle/performance harness checks, and dashboard checks.
+- **Measured baseline, not a performance win:** 15-shape vLLM Hadacore probe passes with relative L2 ≤ `3.77e-4` and max absolute difference ≤ `0.00390625`; the FP32 butterfly baseline is not bit-identical to Hadacore. H64 `M=1,K=2048`: **1.259 µs native vs 1.135 µs Hadacore**; H16 `M=512,K=4304→4352`: **17.072 vs 8.519 µs** (native includes padding). Model-level numerical/greedy acceptance and optimization remain pending.
+- **Next:** Resolve per-linear transform and quantization groups; attach metadata through sharding/upload/dispatch with dedicated scratch; add channelwise W4 Marlin and logical/physical dimension handling; replace quantized vision's dense-only path; qualify text/MTP/vision and TP=1/2 before fusion work. Checkpoint revision `0fbb9a38f631ea63678f4b51a491e7ecb26c681c` contains **150 text + 98 vision + 7 MTP** packed linears, no stored `g_idx`, and an index that already includes the MTP sidecar.
+
+---
+
 ## Online `MarlinW4A16` `MTP` `draft_lm_head` & Full Correctness Test Audit (completed & verified)
 
 - **Online `MarlinW4A16` (`group_size = 64`) `MTP` `draft_lm_head` (`crates/w34-kernels/csrc/ops/op_marlin.cu`, `crates/w34-host/src/mtp.rs`, `crates/w34-host/src/model/rank.rs`):**
