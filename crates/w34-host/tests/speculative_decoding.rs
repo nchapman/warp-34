@@ -8,19 +8,26 @@ use w34_host::{
 static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lossless_cold_and_warm(kind: SpeculativeKind, tp: usize, large: bool) {
-    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut engine = Qwen3_5Engine::load(
-        if large {
-            "nchapman/Qwen3.8-27B-W4A16-GPTQ"
+    let model = if large {
+        "nchapman/Qwen3.8-27B-W4A16-GPTQ"
+    } else {
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ"
+    };
+    if common::require_or_skip_cached_model(model, "lossless_cold_and_warm").is_none() {
+        return;
+    }
+    if kind == SpeculativeKind::DFlash2 {
+        let draft = if large {
+            "incoai/Qwen3.8-27B-DFlash2"
         } else {
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ"
-        },
-        tp,
-        KvFormatPolicy::Fp16,
-        Some(16),
-        false,
-    )
-    .unwrap();
+            "nchapman/Qwen3.5-4B-DFlash2"
+        };
+        if common::require_or_skip_cached_model(draft, "lossless_cold_and_warm").is_none() {
+            return;
+        }
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut engine = Qwen3_5Engine::load(model, tp, KvFormatPolicy::Fp16, Some(16), false).unwrap();
     let seed = engine.encode("The capital of France is").unwrap();
     let mut prompt = Vec::new();
     while prompt.len() < 130 {
@@ -238,6 +245,14 @@ fn exercise_http(engine: Qwen3_5Engine) {
 
 #[test]
 fn native_processed_sampling_and_grammar() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "native_processed_sampling_and_grammar",
+    )
+    .is_none()
+    {
+        return;
+    }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use w34_host::parser::{SamplingParams, TokenBitmaskConstraint};
     let mut engine = Qwen3_5Engine::load(
@@ -529,6 +544,14 @@ fn sglang_dflash2_fixtures_operator_dump_diff_parity() {
 
 #[test]
 fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "speculative_verify_cuda_graph_matches_eager_and_sampled",
+    )
+    .is_none()
+    {
+        return;
+    }
     use w34_host::parser::SamplingParams;
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let spec = SpeculativeConfig {
@@ -599,6 +622,19 @@ fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
 
 #[test]
 fn dflash_and_tp2_proposer_cuda_graphs_match_eager() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "dflash_and_tp2_proposer_cuda_graphs_match_eager",
+    )
+    .is_none()
+        || common::require_or_skip_cached_model(
+            "nchapman/Qwen3.5-4B-DFlash2",
+            "dflash_and_tp2_proposer_cuda_graphs_match_eager",
+        )
+        .is_none()
+    {
+        return;
+    }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dflash_spec = SpeculativeConfig {
         kind: SpeculativeKind::DFlash2,

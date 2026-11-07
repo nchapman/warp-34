@@ -1,4 +1,5 @@
 #![cfg(feature = "cuda")]
+mod common;
 
 use std::{sync::atomic::Ordering, time::Duration};
 use w34_host::{
@@ -12,6 +13,14 @@ use w34_host::{
 // Run under flock /tmp/w34-gpu1.lock with CUDA_VISIBLE_DEVICES=1.
 #[test]
 fn serving_sixteen_requests_reach_b16() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "serving_sixteen_requests_reach_b16",
+    )
+    .is_none()
+    {
+        return;
+    }
     let worker = EngineWorker::from_loader(|| {
         let engine = Qwen3_5Engine::load_for_serving("nchapman/Qwen3.5-4B-W4A16-GPTQ", 1, KvFormatPolicy::Tq4, Some(256), true, 16)
             .map_err(|e| e.to_string())?;

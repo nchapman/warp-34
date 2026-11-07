@@ -30,9 +30,11 @@ pub fn require_or_skip_cached_model(repo_id: &str, test_name: &str) -> Option<Pa
         Err(err) => {
             assert!(
                 !strict_test_env(),
-                "[{test_name}] required cached HF checkpoint '{repo_id}' missing in strict/CI mode: {err}"
+                "[{test_name}] required cached HF checkpoint '{repo_id}' missing in strict/CI mode ({err}); run `mise run test-prep` or `mise run test-prep-all`"
             );
-            eprintln!("[SKIP {test_name}] cached HF checkpoint '{repo_id}' unavailable: {err}");
+            eprintln!(
+                "[SKIP {test_name}] cached HF checkpoint '{repo_id}' unavailable ({err}); run `mise run test-prep` or `mise run test-prep-all`"
+            );
             None
         }
     }

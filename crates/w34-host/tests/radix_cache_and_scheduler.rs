@@ -197,6 +197,14 @@ static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(feature = "cuda")]
 #[test]
 fn test_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "test_warm_prefix_hit_speculation_and_cross_boundary_rejection",
+    )
+    .is_none()
+    {
+        return;
+    }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
@@ -382,6 +390,14 @@ fn test_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
 #[cfg(feature = "cuda")]
 #[test]
 fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server",
+    )
+    .is_none()
+    {
+        return;
+    }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",

@@ -1,5 +1,6 @@
 #![cfg(feature = "cuda")]
 
+mod common;
 use serde_json::{Value, json};
 use std::io::Cursor;
 use w34_host::{
@@ -65,6 +66,14 @@ fn parse_sse_frames(raw: &str) -> Vec<(String, Value)> {
 
 #[test]
 fn live_responses_anthropic_messages_and_token_count_endpoints() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "live_responses_anthropic_messages_and_token_count_endpoints",
+    )
+    .is_none()
+    {
+        return;
+    }
     let _gpu = GPU_LOCK.lock().unwrap();
     let state = OpenAiServerState::from_loader("Qwen3.5-4B-W4A16-GPTQ".into(), false, || {
         Qwen3_5Engine::load(

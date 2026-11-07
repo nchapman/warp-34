@@ -1,4 +1,5 @@
 #![cfg(feature = "cuda")]
+mod common;
 
 use serde_json::{Value, json};
 use std::{sync::atomic::Ordering, time::Duration};
@@ -36,6 +37,14 @@ fn invalid_options_do_not_load_model() {
 
 #[test]
 fn authenticated_serving_alias_context_and_concurrency() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "authenticated_serving_alias_context_and_concurrency",
+    )
+    .is_none()
+    {
+        return;
+    }
     let options = ServeOptions {
         api_key: Some(ApiKey::new("deployment-test-key".into()).unwrap()),
         max_num_seqs: 2,

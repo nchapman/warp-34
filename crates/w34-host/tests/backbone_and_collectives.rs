@@ -1,7 +1,8 @@
+mod common;
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
 use w34_host::cuda::CapacityPlanner;
-use w34_host::loader::{ModelConfig, SafetensorsArchive, resolve_hf_model_dir};
+use w34_host::loader::{ModelConfig, SafetensorsArchive};
 
 #[cfg(feature = "cuda")]
 static GPU_LOCK: Mutex<()> = Mutex::new(());
@@ -43,8 +44,12 @@ fn test_loader_all_five_cached_checkpoints() {
     ];
 
     for (repo_id, expected_layers, expected_hidden, tp) in models {
-        let dir = resolve_hf_model_dir(repo_id)
-            .unwrap_or_else(|e| panic!("failed to resolve {repo_id}: {e}"));
+        let Some(dir) = common::require_or_skip_cached_model(
+            repo_id,
+            "test_loader_all_five_cached_checkpoints",
+        ) else {
+            continue;
+        };
         // This fixture is a drafter, not a target engine: select the windowed
         // parser explicitly rather than weakening target-model validation.
         let cfg = if repo_id == "incoai/Qwen3.8-27B-DFlash2" {

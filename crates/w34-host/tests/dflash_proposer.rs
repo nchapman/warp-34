@@ -1,8 +1,8 @@
 #![cfg(feature = "cuda")]
+mod common;
 use w34_host::{
     cache::KvFormatPolicy,
     dflash::{DFlash2Config, DFlash2Rank, DraftCandidates},
-    loader::resolve_hf_model_dir,
     model::Qwen3_5Engine,
 };
 use w34_kernels::ffi::{W34_KV_FORMAT_BF16, W34_KV_NAMESPACE_DFLASH_DRAFT_CTX};
@@ -12,14 +12,20 @@ fn cached_dflash_configs_and_candidate_merge() {
         ("nchapman/Qwen3.5-4B-DFlash2", 16, vec![1, 9, 16, 23, 28]),
         ("incoai/Qwen3.8-27B-DFlash2", 8, vec![5, 19, 33, 47, 61]),
     ] {
-        let dir = resolve_hf_model_dir(repo).unwrap();
+        let Some(dir) =
+            common::require_or_skip_cached_model(repo, "cached_dflash_configs_and_candidate_merge")
+        else {
+            continue;
+        };
         let cfg = DFlash2Config::load(&dir).unwrap();
         assert_eq!(cfg.block_size, block);
         assert_eq!(cfg.target_layers, taps);
     }
-    if let Ok(dir) = resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ") {
+    if let Ok(dir) =
+        w34_host::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ")
+    {
         let cfg = DFlash2Config::load(&dir).unwrap();
-        assert_eq!(cfg.block_size, 8);
+        assert_eq!(cfg.block_size, block_size_expected());
         assert_eq!(cfg.target_layers, vec![5, 15, 25, 35, 45]);
         assert_eq!(cfg.model.hidden_size, 2560);
         assert_eq!(cfg.model.head_dim, 128);
@@ -40,9 +46,19 @@ fn cached_dflash_configs_and_candidate_merge() {
     assert_eq!(global.ids, [4, 0, 2, 6]);
     assert_eq!(global.scores, [9., 8., 9., 9.]);
 }
+#[inline]
+fn block_size_expected() -> usize {
+    8
+}
+
 #[test]
 fn rejects_selector_top_k_beyond_native_topk_limit() {
-    let source = resolve_hf_model_dir("nchapman/Qwen3.5-4B-DFlash2").unwrap();
+    let Some(source) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-DFlash2",
+        "rejects_selector_top_k_beyond_native_topk_limit",
+    ) else {
+        return;
+    };
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(source.join("config.json")).unwrap()).unwrap();
     let temp = std::env::temp_dir().join(format!("w34-dflash-topk-{}", std::process::id()));
@@ -99,10 +115,11 @@ fn assert_4b_tap_parity(target_dir: &std::path::Path, rel: f64, energy: f64) {
     }
 }
 
-fn resolve_4b_target_dir(strict_parity: bool) -> std::path::PathBuf {
-    let resolved = resolve_hf_model_dir("nchapman/Qwen3.5-4B-W4A16-GPTQ").unwrap();
+fn resolve_4b_target_dir(strict_parity: bool) -> Option<std::path::PathBuf> {
+    let resolved =
+        common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-W4A16-GPTQ", "run_4b")?;
     if !strict_parity {
-        return resolved;
+        return Some(resolved);
     }
     let provenance_snap = resolved
         .parent()
@@ -110,17 +127,22 @@ fn resolve_4b_target_dir(strict_parity: bool) -> std::path::PathBuf {
         .expect("HF snapshot parent dir must exist");
     assert!(
         provenance_snap.join("model.safetensors").exists(),
-        "missing 4B provenance snapshot d5874365f7093b28b69379722d2f45d660fcbca6 at {}",
+        "missing 4B provenance snapshot d5874365f7093b28b69379722d2f45d660fcbca6 at {}; run `mise run test-prep`",
         provenance_snap.display()
     );
-    provenance_snap
+    Some(provenance_snap)
 }
 
 fn run_4b(strict_parity: bool) {
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = resolve_hf_model_dir("nchapman/Qwen3.5-4B-DFlash2").unwrap();
+    let Some(dir) = common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-DFlash2", "run_4b")
+    else {
+        return;
+    };
     let cfg = DFlash2Config::load(&dir).unwrap();
-    let target_dir = resolve_4b_target_dir(strict_parity);
+    let Some(target_dir) = resolve_4b_target_dir(strict_parity) else {
+        return;
+    };
     let mut engine = Qwen3_5Engine::load(
         target_dir.to_str().unwrap(),
         1,
@@ -816,7 +838,12 @@ fn real_shape_layer0_gemms_match_actual_sglang() {
             .unwrap();
     let provenance_gpu = provenance["gpu"].as_str().unwrap_or("");
     let ops = SafetensorsArchive::open(&root.join("sglang_dflash_model_4b.safetensors")).unwrap();
-    let weights_dir = resolve_hf_model_dir("nchapman/Qwen3.5-4B-DFlash2").unwrap();
+    let Some(weights_dir) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-DFlash2",
+        "real_shape_layer0_gemms_match_actual_sglang",
+    ) else {
+        return;
+    };
     let weights = SafetensorsArchive::open(&weights_dir).unwrap();
     let upload = |bytes: &[u8]| {
         let b = DeviceBuffer::alloc(0, bytes.len()).unwrap();

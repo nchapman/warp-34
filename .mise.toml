@@ -88,6 +88,14 @@ description = "Generate HTML coverage report for lib with CUDA"
 depends = ["dashboard-build"]
 run = "cargo llvm-cov --features cuda --lib --html"
 
+[tasks."test-prep"]
+description = "Verify and download pinned core test checkpoints (4B GPTQ, 4B DFlash2, clef-flash tokenizer)"
+run = "python3 tools/prep_test_models.py"
+
+[tasks."test-prep-all"]
+description = "Verify and download all pinned test and qualification checkpoints (2B, 4B, 9B, 27B, 35B-A3B, Flash-Next)"
+run = "python3 tools/prep_test_models.py --all"
+
 [tasks.test]
 description = "Full release test suite with CUDA"
 depends = ["dashboard-build"]

@@ -1,5 +1,6 @@
 #[cfg(feature = "cuda")]
 use core::ffi::c_void;
+mod common;
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
 #[cfg(feature = "cuda")]
@@ -314,6 +315,14 @@ fn test_cuda_graph_spec_rollback_and_tp2_collectives() {
         layer_ids: vec![5, 19, 31],
     };
     assert_eq!(taps.layer_ids.len(), 3);
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "test_cuda_graph_spec_rollback_and_tp2_collectives",
+    )
+    .is_none()
+    {
+        return;
+    }
 
     let mut eng_graph = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",

@@ -1,5 +1,6 @@
 //! Padded multi-request decode graph replay versus eager execution.
 #![cfg(feature = "cuda")]
+mod common;
 
 use std::sync::Mutex;
 
@@ -12,6 +13,14 @@ static GPU_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn decode_buckets_replay_mutated_requests_match_eager() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "decode_buckets_replay_mutated_requests_match_eager",
+    )
+    .is_none()
+    {
+        return;
+    }
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for tp in [1, 2] {
         let mut engine = Qwen3_5Engine::load(
@@ -118,6 +127,14 @@ fn pipelined_fast_greedy_burst_matches_single_and_handles_staggered_finish_and_c
         vec![760, 1143, 279, 810, 419],
     ];
     let lengths = [12usize, 70, 25, 70];
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "pipelined_fast_greedy_burst_matches_single_and_handles_staggered_finish_and_chunk_boundary",
+    )
+    .is_none()
+    {
+        return;
+    }
 
     let mut ref_engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
