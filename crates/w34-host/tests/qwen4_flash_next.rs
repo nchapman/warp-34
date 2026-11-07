@@ -1170,11 +1170,9 @@ fn verify_qwen4_exp_dflash2_lossless(
     let _draft_dir =
         w34_host::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ")
             .expect("resolve Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ checkpoint");
-    engine.speculative = None;
-    for r in &mut engine.ranks {
-        r.configure_speculative_taps(&[], false, 0)
-            .expect("reset speculative taps before enabling DFlash2");
-    }
+    engine
+        .disable_speculative()
+        .expect("disable prior speculative proposer before enabling DFlash2");
     engine
         .enable_speculative(&w34_host::proposer::SpeculativeConfig {
             kind: w34_host::proposer::SpeculativeKind::DFlash2,

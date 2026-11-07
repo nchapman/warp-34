@@ -184,6 +184,25 @@ impl Qwen3_5Engine {
         self.speculative = Some(crate::proposer::NativeProposer::load(self, config)?);
         Ok(())
     }
+
+    /// Tear down the active speculative drafter (`MTP` or `DFlash2`) and release all
+    /// drafter-owned device buffers (`tap_aux_bf16`, `speculative_logits`, and target
+    /// decode/verify CUDA graphs) so at most one draft model ever occupies VRAM.
+    pub fn disable_speculative(&mut self) -> Result<()> {
+        for rank in &self.ranks {
+            rank.device.make_current()?;
+            rank.stream.synchronize()?;
+        }
+        self.speculative = None;
+        for rank in &mut self.ranks {
+            rank.device.make_current()?;
+            rank.decode_graph = None;
+            rank.spec_verify_graph = None;
+            rank.batched_decode_graphs.clear();
+            rank.configure_speculative_taps(&[], false, 0)?;
+        }
+        Ok(())
+    }
     pub(super) fn generate_native_speculative(
         &mut self,
         prompt: &[i32],

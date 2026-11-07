@@ -941,16 +941,16 @@ impl HotExpertCache {
         if !self.device_lru_dirty {
             return Ok(());
         }
-        let mut slot_i32 = vec![0i32; self.slots.capacity];
         let mut step_arr = [0u64; 1];
         self.d_expert_to_slot
             .copy_to_host(&mut self.expert_to_slot, stream)?;
-        self.d_slot_to_expert.copy_to_host(&mut slot_i32, stream)?;
+        self.d_slot_to_expert
+            .copy_to_host(&mut self.slot_to_expert_i32, stream)?;
         self.d_slot_last_used
             .copy_to_host(&mut self.slot_last_used, stream)?;
         self.d_step_counter.copy_to_host(&mut step_arr, stream)?;
         stream.synchronize()?;
-        for (dst, &src) in self.slot_to_expert.iter_mut().zip(&slot_i32) {
+        for (dst, &src) in self.slot_to_expert.iter_mut().zip(&self.slot_to_expert_i32) {
             *dst = if src < 0 { usize::MAX } else { src as usize };
         }
         self.step_clock = step_arr[0].max(1);

@@ -535,14 +535,25 @@ impl TieredMoeEngine {
                 let mut promote_victim_slots: Vec<i32> = Vec::new();
                 let mut promote_new_ges: Vec<usize> = Vec::new();
 
-                if cache.bridge_layer_id.is_some()
+                let local_start = cache.expert_ids.start;
+                let local_len = cache.expert_ids.len();
+                let adapt_end = if cache.bridge_layer_id.is_some() {
+                    cache.k_static
+                } else {
+                    cache.slots.capacity
+                };
+                let use_cpu_bridge = cache.bridge_layer_id.is_some()
                     && num_tokens <= ws.max_tokens
-                    && h_topk_weights.len() == num_tokens * top_k
-                    && !misses_in_step.is_empty()
-                {
-                    let local_start = cache.expert_ids.start;
-                    let local_len = cache.expert_ids.len();
-                    let mut exp_toks: Vec<Vec<(i32, f32)>> = vec![Vec::new(); local_len];
+                    && h_topk_weights.len() == num_tokens * top_k;
+                let want_freq_stats = use_cpu_bridge || (num_tokens >= 1024 && adapt_end >= 64);
+
+                if want_freq_stats && !misses_in_step.is_empty() {
+                    let mut exp_toks: Vec<Vec<(i32, f32)>> = if use_cpu_bridge {
+                        vec![Vec::new(); local_len]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut miss_freq: Vec<usize> = vec![0; local_len];
                     let mut hit_freq: Vec<usize> = vec![0; local_len];
                     for (pair_idx, &raw_id) in h_topk_ids.iter().enumerate() {
                         if raw_id < 0 {
@@ -552,15 +563,18 @@ impl TieredMoeEngine {
                         let le = ge.wrapping_sub(local_start);
                         if le < local_len {
                             if cache.expert_to_slot[le] < 0 {
-                                let tok = (pair_idx / top_k) as i32;
-                                let wt = h_topk_weights[pair_idx];
-                                let list = &mut exp_toks[le];
-                                if let Some(last) = list.last_mut()
-                                    && last.0 == tok
-                                {
-                                    last.1 += wt;
-                                } else {
-                                    list.push((tok, wt));
+                                miss_freq[le] += 1;
+                                if use_cpu_bridge {
+                                    let tok = (pair_idx / top_k) as i32;
+                                    let wt = h_topk_weights[pair_idx];
+                                    let list = &mut exp_toks[le];
+                                    if let Some(last) = list.last_mut()
+                                        && last.0 == tok
+                                    {
+                                        last.1 += wt;
+                                    } else {
+                                        list.push((tok, wt));
+                                    }
                                 }
                             } else {
                                 hit_freq[le] += 1;
@@ -568,64 +582,69 @@ impl TieredMoeEngine {
                         }
                     }
 
-                    // Rank cold experts with `1..=max_tok_per_job` routed tokens by token count ascending
-                    // so the sparsest tail experts go to the CPU DDR5 pool (where row pairs are
-                    // unpacked once and FMA-accumulated across all routed tokens) and the densest
-                    // cold experts fit in at most 1 GPU chunk (`<= 384` tokens) or 2 GPU chunks (`> 384` tokens).
-                    let (target_gpu_misses, cpu_share_pct, max_tok_per_job) = if num_tokens <= 384 {
-                        (ws.stage_capacity, 70usize, 8usize)
-                    } else {
-                        (2 * ws.stage_capacity, 58usize, 96usize)
-                    };
-                    let max_cpu_jobs = misses_in_step
-                        .len()
-                        .saturating_sub(target_gpu_misses)
-                        .max((misses_in_step.len() * cpu_share_pct) / 100);
-                    let mut light_candidates: Vec<(usize, usize)> = misses_in_step
-                        .iter()
-                        .copied()
-                        .filter_map(|ge| {
-                            let cnt = exp_toks[ge - local_start].len();
-                            (1..=max_tok_per_job).contains(&cnt).then_some((cnt, ge))
-                        })
-                        .collect();
-                    light_candidates.sort_unstable();
-                    light_candidates.truncate(max_cpu_jobs);
-                    // Schedule heaviest CPU jobs first (Longest-Processing-Time-First)
-                    // so 1-token tail jobs fill in across all 16 worker threads at the end.
-                    light_candidates.reverse();
-
-                    let mut is_cpu_le = vec![false; local_len];
-                    for &(_, ge) in &light_candidates {
-                        let le = ge - local_start;
-                        is_cpu_le[le] = true;
-                        let list = &exp_toks[le];
-                        cpu_job_le.push(le as i32);
-                        cpu_job_n.push(list.len() as i32);
-                        for s in 0..96 {
-                            if s < list.len() {
-                                cpu_job_toks.push(list[s].0);
-                                cpu_job_wts.push(list[s].1);
+                    if use_cpu_bridge {
+                        // Rank cold experts with `1..=max_tok_per_job` routed tokens by token count ascending
+                        // so the sparsest tail experts go to the CPU DDR5 pool (where row pairs are
+                        // unpacked once and FMA-accumulated across all routed tokens) and the densest
+                        // cold experts fit in at most 1 GPU chunk (`<= 384` tokens) or 2 GPU chunks (`> 384` tokens).
+                        let (target_gpu_misses, cpu_share_pct, max_tok_per_job) =
+                            if num_tokens <= 384 {
+                                (ws.stage_capacity, 70usize, 8usize)
                             } else {
-                                cpu_job_toks.push(0);
-                                cpu_job_wts.push(0.0);
+                                (2 * ws.stage_capacity, 58usize, 96usize)
+                            };
+                        let max_cpu_jobs = misses_in_step
+                            .len()
+                            .saturating_sub(target_gpu_misses)
+                            .max((misses_in_step.len() * cpu_share_pct) / 100);
+                        let mut light_candidates: Vec<(usize, usize)> = misses_in_step
+                            .iter()
+                            .copied()
+                            .filter_map(|ge| {
+                                let cnt = exp_toks[ge - local_start].len();
+                                (1..=max_tok_per_job).contains(&cnt).then_some((cnt, ge))
+                            })
+                            .collect();
+                        light_candidates.sort_unstable();
+                        light_candidates.truncate(max_cpu_jobs);
+                        // Schedule heaviest CPU jobs first (Longest-Processing-Time-First)
+                        // so 1-token tail jobs fill in across all 16 worker threads at the end.
+                        light_candidates.reverse();
+
+                        let mut is_cpu_le = vec![false; local_len];
+                        for &(_, ge) in &light_candidates {
+                            let le = ge - local_start;
+                            is_cpu_le[le] = true;
+                            let list = &exp_toks[le];
+                            cpu_job_le.push(le as i32);
+                            cpu_job_n.push(list.len() as i32);
+                            for s in 0..96 {
+                                if s < list.len() {
+                                    cpu_job_toks.push(list[s].0);
+                                    cpu_job_wts.push(list[s].1);
+                                } else {
+                                    cpu_job_toks.push(0);
+                                    cpu_job_wts.push(0.0);
+                                }
                             }
                         }
-                    }
-                    for &ge in &misses_in_step {
-                        if !is_cpu_le[ge - local_start] {
-                            gpu_misses.push(ge);
+                        for &ge in &misses_in_step {
+                            if !is_cpu_le[ge - local_start] {
+                                gpu_misses.push(ge);
+                            }
                         }
+                    } else {
+                        gpu_misses.clone_from(&misses_in_step);
                     }
 
-                    // On long prompts (`num_tokens >= 1024`), adapt the bottom 20 slots of
-                    // `0..k_static` (`slots[k_static - 20 .. k_static]`) by promoting up to 16
-                    // cold experts from `gpu_misses` that are >= 3x more frequent in this prompt
-                    // than the lowest-frequency resident slots, unpacking them directly from
-                    // `ws.d_stage_packs[0]` during Chunk 0 at zero extra PCIe cost.
-                    if num_tokens >= 1024 && cache.k_static >= 64 && !gpu_misses.is_empty() {
-                        let adapt_start = cache.k_static - 20;
-                        let mut victim_cands: Vec<(usize, usize)> = (adapt_start..cache.k_static)
+                    // On long prompts (`num_tokens >= 1024`, both `TP=1` and `TP=2 / EP=2`), adapt
+                    // the bottom 20 slots of `0..adapt_end` by promoting up to 16 cold experts
+                    // from `gpu_misses` that are >= 3x more frequent in this prompt than the
+                    // lowest-frequency resident tail slots, unpacking them directly from
+                    // `ws.d_stage_packs[0]` during Chunk 0 at zero extra PCIe DMA cost.
+                    if num_tokens >= 1024 && adapt_end >= 64 && !gpu_misses.is_empty() {
+                        let adapt_start = adapt_end - 20;
+                        let mut victim_cands: Vec<(usize, usize)> = (adapt_start..adapt_end)
                             .map(|slot| {
                                 let ge = cache.slot_to_expert[slot];
                                 let freq = if ge < usize::MAX && cache.expert_ids.contains(&ge) {
@@ -641,7 +660,7 @@ impl TieredMoeEngine {
                         let mut heavy_cands: Vec<(usize, usize)> = gpu_misses
                             .iter()
                             .copied()
-                            .map(|ge| (exp_toks[ge - local_start].len(), ge))
+                            .map(|ge| (miss_freq[ge - local_start], ge))
                             .collect();
                         heavy_cands.sort_unstable_by(|a, b| b.cmp(a));
 
@@ -787,6 +806,8 @@ impl TieredMoeEngine {
                             ws.d_miss_victim_slots.addr(),
                             promote_victim_slots.len(),
                         )?;
+                        cache.step_clock += 8;
+                        let promoted_ts = cache.step_clock;
                         for (&new_ge, &slot_i32) in
                             promote_new_ges.iter().zip(&promote_victim_slots)
                         {
@@ -799,6 +820,7 @@ impl TieredMoeEngine {
                             cache.expert_to_slot[new_ge - local_start] = slot_i32;
                             cache.slot_to_expert[slot] = new_ge;
                             cache.slot_to_expert_i32[slot] = new_ge as i32;
+                            cache.slot_last_used[slot] = promoted_ts;
                         }
                         cache
                             .d_expert_to_slot
@@ -806,6 +828,12 @@ impl TieredMoeEngine {
                         cache
                             .d_slot_to_expert
                             .copy_from_host(&cache.slot_to_expert_i32, compute_stream)?;
+                        cache
+                            .d_slot_last_used
+                            .copy_from_host(&cache.slot_last_used, compute_stream)?;
+                        cache
+                            .d_step_counter
+                            .copy_from_host(&[cache.step_clock], compute_stream)?;
                     }
                     ws.compute_done_events[buf_idx].record(compute_stream)?;
 

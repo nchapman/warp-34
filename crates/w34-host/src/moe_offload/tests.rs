@@ -1198,4 +1198,168 @@ mod cuda_tests {
             );
         }
     }
+
+    #[test]
+    fn speculative_lru_bip_and_streamed_prefill_promotion() {
+        use super::super::{
+            ExpertPackLayout, HostExpertStore, HotExpertCache, MoeOffloadMode, TieredMoeEngine,
+            TieredMoeWorkspace,
+        };
+        use crate::cuda::f32_to_f16;
+
+        let _device = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+
+        let num_experts = 80usize;
+        let k_hot = 64usize;
+        let n_interm = 128usize;
+        let k_hidden = 128usize;
+        let group_size = 32usize;
+        let top_k = 10usize;
+        let m_verify = 8usize;
+        let layout = ExpertPackLayout::new(n_interm, k_hidden, group_size).unwrap();
+
+        let raw_packs = vec![0u8; num_experts * layout.stride];
+        let full_store = HostExpertStore::from_raw_packs(
+            layout.clone(),
+            0..num_experts,
+            &raw_packs,
+            num_experts * layout.stride,
+        )
+        .unwrap();
+        let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 32, 1024, top_k).unwrap();
+        let mut cache = HotExpertCache::new(0, k_hot, 0..num_experts, layout.clone()).unwrap();
+        cache
+            .populate_initial(&full_store, None, &mut ws, &stream)
+            .unwrap();
+
+        // Step 1: M=4 verify batch (`total_pairs = 40`, `k_protected = k_hot - 40 = 24`)
+        // followed by M=8 verify batch (`total_pairs = 80`).
+        let mut h_topk_m4: Vec<i32> = (0..4 * top_k).map(|i| (i % 10) as i32).collect();
+        h_topk_m4[0] = 64;
+        h_topk_m4[20] = 65;
+        h_topk_m4[21] = 68;
+        h_topk_m4[22] = 69;
+        h_topk_m4[30] = 65;
+        let h_wts = vec![0.1f32; 1024 * top_k];
+        let h_x = vec![f32_to_f16(0.1); 1024 * k_hidden];
+        let d_x = upload(&h_x, &stream);
+        let d_topk_m4 = upload(&h_topk_m4, &stream);
+        let d_wts = upload(&h_wts, &stream);
+        let d_out = DeviceBuffer::alloc(0, 1024 * k_hidden * 2).unwrap();
+
+        TieredMoeEngine::execute_layer_device_lru(
+            &full_store,
+            &mut cache,
+            &ws,
+            &stream,
+            d_x.addr(),
+            d_topk_m4.addr(),
+            d_wts.addr(),
+            0,
+            0,
+            d_out.addr(),
+            4,
+            top_k,
+        )
+        .unwrap();
+        cache.sync_from_device_if_dirty(&stream).unwrap();
+
+        // Protected prefix `0..24` (`k_hot - 40`) must remain untouched (`slot_to_expert[s] == s`).
+        for s in 0..24 {
+            assert_eq!(cache.slot_to_expert[s], s, "protected slot {s} was evicted");
+        }
+        let slot_64 = cache.slot_of(64).expect("anchor cold expert 64 loaded") as usize;
+        let slot_65 = cache
+            .slot_of(65)
+            .expect("multi-token cold expert 65 loaded") as usize;
+        let slot_68 = cache.slot_of(68).expect("tail cold expert 68 loaded") as usize;
+        let slot_69 = cache.slot_of(69).expect("tail cold expert 69 loaded") as usize;
+        assert_ne!(slot_68, slot_69);
+        for s in [slot_64, slot_65, slot_68, slot_69] {
+            assert!(
+                cache.slot_last_used[s] > k_hot as u64,
+                "loaded miss must get updated step timestamp"
+            );
+        }
+
+        // Step 2: M=8 verify batch (`total_pairs = 80`) with cold misses `66` and `67`.
+        let mut h_topk_s2: Vec<i32> = (0..m_verify * top_k).map(|i| (i % 10) as i32).collect();
+        h_topk_s2[60] = 66;
+        h_topk_s2[70] = 67;
+        let d_topk_s2 = upload(&h_topk_s2, &stream);
+        TieredMoeEngine::execute_layer_device_lru(
+            &full_store,
+            &mut cache,
+            &ws,
+            &stream,
+            d_x.addr(),
+            d_topk_s2.addr(),
+            d_wts.addr(),
+            0,
+            0,
+            d_out.addr(),
+            m_verify,
+            top_k,
+        )
+        .unwrap();
+        cache.sync_from_device_if_dirty(&stream).unwrap();
+        assert!(cache.slot_of(66).is_some());
+        assert!(cache.slot_of(67).is_some());
+        assert_ne!(cache.slot_of(66), cache.slot_of(67));
+        assert!(
+            cache.slot_of(64).is_some(),
+            "anchor expert 64 must remain resident"
+        );
+        assert!(
+            cache.slot_of(65).is_some(),
+            "multi-token expert 65 must remain resident"
+        );
+
+        // Step 3: Verify `StreamedPrefill` (`num_tokens = 1024`, `bridge_layer_id == None`)
+        // promotes a cold expert (`70`) routed 32 times in the prompt into `cache.slots`.
+        let m_prefill = 1024usize;
+        let mut h_topk_pf: Vec<i32> = (0..m_prefill * top_k).map(|i| (i % 10) as i32).collect();
+        for tok in 0..32 {
+            h_topk_pf[tok * top_k] = 70;
+        }
+        let d_topk_pf = upload(&h_topk_pf, &stream);
+        TieredMoeEngine::execute_layer(
+            MoeOffloadMode::StreamedPrefill,
+            &full_store,
+            &mut cache,
+            &mut ws,
+            &stream,
+            d_x.addr(),
+            d_topk_pf.addr(),
+            d_wts.addr(),
+            &h_topk_pf,
+            &h_wts,
+            0,
+            0,
+            d_out.addr(),
+            m_prefill,
+            top_k,
+        )
+        .unwrap();
+        let slot_70 = cache
+            .slot_of(70)
+            .expect("prompt-frequent cold expert 70 must be promoted during StreamedPrefill")
+            as usize;
+        assert_eq!(
+            cache.slot_last_used[slot_70], cache.step_clock,
+            "promoted prompt expert must have updated slot_last_used"
+        );
+        for s in 0..k_hot {
+            assert_eq!(
+                cache.slot_to_expert_i32[s], cache.slot_to_expert[s] as i32,
+                "slot_to_expert_i32[{s}] drifted from slot_to_expert[{s}]"
+            );
+            let ge = cache.slot_to_expert[s];
+            assert_eq!(
+                cache.expert_to_slot[ge], s as i32,
+                "expert_to_slot[{ge}] != {s} after StreamedPrefill promotion"
+            );
+        }
+    }
 }
