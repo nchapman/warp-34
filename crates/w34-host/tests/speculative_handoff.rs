@@ -1,4 +1,5 @@
 #![cfg(feature = "cuda")]
+mod common;
 
 use std::{sync::atomic::Ordering, time::Duration};
 use w34_host::{
@@ -75,6 +76,19 @@ static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // Run with flock /tmp/w34-gpu1.lock and CUDA_VISIBLE_DEVICES=1.
 #[test]
 fn native_speculation_yields_to_late_peer_losslessly() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "native_speculation_yields_to_late_peer_losslessly",
+    )
+    .is_none()
+        || common::require_or_skip_cached_model(
+            "nchapman/Qwen3.5-4B-DFlash2",
+            "native_speculation_yields_to_late_peer_losslessly",
+        )
+        .is_none()
+    {
+        return;
+    }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -144,6 +158,14 @@ fn native_speculation_yields_to_late_peer_losslessly() {
 
 #[test]
 fn batched_mtp_b4_matches_single_stream_losslessly() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "batched_mtp_b4_matches_single_stream_losslessly",
+    )
+    .is_none()
+    {
+        return;
+    }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

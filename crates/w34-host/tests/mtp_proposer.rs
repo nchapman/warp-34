@@ -1,4 +1,5 @@
 #![cfg(feature = "cuda")]
+mod common;
 use w34_host::{
     cache::KvFormatPolicy,
     model::Qwen3_5Engine,
@@ -9,6 +10,11 @@ use w34_kernels::ffi::{W34_KV_NAMESPACE_MTP_FULL_ATTN, W34_KV_NAMESPACE_TARGET_F
 /// Real cached checkpoint, physical GPU chosen by CUDA_VISIBLE_DEVICES.
 #[test]
 fn cached_4b_mtp_k123() {
+    if common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-W4A16-GPTQ", "cached_4b_mtp_k123")
+        .is_none()
+    {
+        return;
+    }
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
         1,

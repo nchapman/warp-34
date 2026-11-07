@@ -96,6 +96,13 @@ fn verify_speculative_telemetry(state: &OpenAiServerState, kind: SpeculativeKind
 }
 
 fn exercise(kind: SpeculativeKind) {
+    if common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-W4A16-GPTQ", "exercise").is_none()
+        || (kind == SpeculativeKind::DFlash2
+            && common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-DFlash2", "exercise")
+                .is_none())
+    {
+        return;
+    }
     let mut engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
         1,
@@ -320,6 +327,14 @@ fn exercise(kind: SpeculativeKind) {
 
 #[test]
 fn non_speculative_and_multimodal_mandatory_constraints_are_enforced() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "non_speculative_and_multimodal_mandatory_constraints_are_enforced",
+    )
+    .is_none()
+    {
+        return;
+    }
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let engine = Qwen3_5Engine::load(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
