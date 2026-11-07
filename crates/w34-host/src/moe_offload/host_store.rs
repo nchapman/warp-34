@@ -133,16 +133,63 @@ impl HostExpertStore {
                 && num_experts.is_multiple_of(ep_size),
             "invalid expert parallel partition",
         )?;
-        require(
-            quant.symmetric_gptq_u4_group_size() == Some(layout.group_size),
-            "host expert store requires symmetric 4-bit GPTQ/AutoRound W4A16",
-        )?;
         // Revalidate public geometry before using it to size or address unsafe storage.
         require(
-            layout == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?,
+            layout
+                == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?
+                    .with_down_hadamard(layout.down_hadamard_block_size)?,
             "inconsistent expert pack layout",
         )?;
         let count = num_experts / ep_size;
+        let expert_ids = ep_rank * count..(ep_rank + 1) * count;
+        let first_id = expert_ids.start;
+        let (resolved_prefix, is_compressed_tensors) = if let Some(real_wp) = archive.resolve_name(
+            &format!("{experts_prefix}.{first_id}.gate_proj.weight_packed"),
+        ) {
+            let pfx = real_wp
+                .strip_suffix(&format!(".{first_id}.gate_proj.weight_packed"))
+                .unwrap_or(experts_prefix)
+                .to_string();
+            (pfx, true)
+        } else if let Some(real_qw) =
+            archive.resolve_name(&format!("{experts_prefix}.{first_id}.gate_proj.qweight"))
+        {
+            let pfx = real_qw
+                .strip_suffix(&format!(".{first_id}.gate_proj.qweight"))
+                .unwrap_or(experts_prefix)
+                .to_string();
+            (pfx, false)
+        } else {
+            (experts_prefix.to_string(), false)
+        };
+        let resolved_prefix_ref = resolved_prefix.as_str();
+        let first_gate_name = format!("{resolved_prefix_ref}.{first_id}.gate_proj");
+        let first_up_name = format!("{resolved_prefix_ref}.{first_id}.up_proj");
+        let first_down_name = format!("{resolved_prefix_ref}.{first_id}.down_proj");
+        let gate_had = quant.input_hadamard(&first_gate_name)?.unwrap_or(0);
+        let up_had = quant.input_hadamard(&first_up_name)?.unwrap_or(0);
+        let down_had = quant.input_hadamard(&first_down_name)?.unwrap_or(0);
+        require(
+            gate_had == up_had
+                && crate::loader::is_valid_hadamard_block_for_dim(gate_had, layout.hidden),
+            "inconsistent or unsupported input Hadamard block size on routed MoE gate_proj/up_proj",
+        )?;
+        require(
+            crate::loader::is_valid_hadamard_block_for_dim(down_had, layout.intermediate)
+                && (layout.down_hadamard_block_size == 0
+                    || layout.down_hadamard_block_size == down_had),
+            "inconsistent or unsupported input Hadamard block size on routed MoE down_proj",
+        )?;
+        let layout = layout.with_down_hadamard(down_had)?;
+        let expert_quant = quant
+            .for_linear(&first_gate_name)
+            .ok()
+            .filter(|q| *q != QuantScheme::Unquantized)
+            .unwrap_or_else(|| quant.clone());
+        require(
+            expert_quant.symmetric_gptq_u4_group_size() == Some(layout.group_size),
+            "host expert store requires symmetric 4-bit GPTQ/AutoRound/CompressedTensors W4A16",
+        )?;
         let bytes = layout
             .stride
             .checked_mul(count)
@@ -151,7 +198,6 @@ impl HostExpertStore {
             bytes <= max_pinned_bytes,
             format!("expert store needs {bytes} pinned bytes, budget is {max_pinned_bytes}"),
         )?;
-        let expert_ids = ep_rank * count..(ep_rank + 1) * count;
         let mut storage = HostPackStorage::alloc(bytes, prefer_mapped)?;
         let dst = storage.as_mut_slice();
 
@@ -182,30 +228,6 @@ impl HostExpertStore {
                 }
             }
         }
-
-        // Resolve the canonical prefix (`model.layers...` vs `model.language_model.layers...`)
-        // and packing format (`weight_packed` vs `qweight`) once per layer rather than 6x per expert.
-        let first_id = expert_ids.start;
-        let (resolved_prefix, is_compressed_tensors) = if let Some(real_wp) = archive.resolve_name(
-            &format!("{experts_prefix}.{first_id}.gate_proj.weight_packed"),
-        ) {
-            let pfx = real_wp
-                .strip_suffix(&format!(".{first_id}.gate_proj.weight_packed"))
-                .unwrap_or(experts_prefix)
-                .to_string();
-            (pfx, true)
-        } else if let Some(real_qw) =
-            archive.resolve_name(&format!("{experts_prefix}.{first_id}.gate_proj.qweight"))
-        {
-            let pfx = real_qw
-                .strip_suffix(&format!(".{first_id}.gate_proj.qweight"))
-                .unwrap_or(experts_prefix)
-                .to_string();
-            (pfx, false)
-        } else {
-            (experts_prefix.to_string(), false)
-        };
-        let resolved_prefix_ref = resolved_prefix.as_str();
 
         let num_threads = std::thread::available_parallelism()
             .map(|n| (n.get() / ep_size.max(1)).clamp(1, 16))
@@ -406,7 +428,9 @@ impl HostExpertStore {
         max_pinned_bytes: usize,
     ) -> Result<Self> {
         require(
-            layout == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?,
+            layout
+                == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?
+                    .with_down_hadamard(layout.down_hadamard_block_size)?,
             "inconsistent expert pack layout",
         )?;
         let count = expert_ids.len();
@@ -682,7 +706,7 @@ impl DeviceExpertSlotTable {
         crate::cuda::check_rc(
             // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
             unsafe {
-                w34_kernels::ffi::w34_moe_w4a16_mlp_f16(
+                w34_kernels::ffi::w34_moe_w4a16_mlp_ex_f16(
                     ex,
                     x_addr as *const core::ffi::c_void,
                     self.gate_up_packed.addr() as *const u32,
@@ -701,9 +725,10 @@ impl DeviceExpertSlotTable {
                     self.layout.intermediate as i32,
                     self.layout.hidden as i32,
                     self.layout.group_size as i32,
+                    self.layout.down_hadamard_block_size as i32,
                 )
             },
-            "w34_moe_w4a16_mlp_f16 (tiered)",
+            "w34_moe_w4a16_mlp_ex_f16 (tiered)",
         )
     }
 }
@@ -916,16 +941,16 @@ impl HotExpertCache {
         if !self.device_lru_dirty {
             return Ok(());
         }
-        let mut slot_i32 = vec![0i32; self.slots.capacity];
         let mut step_arr = [0u64; 1];
         self.d_expert_to_slot
             .copy_to_host(&mut self.expert_to_slot, stream)?;
-        self.d_slot_to_expert.copy_to_host(&mut slot_i32, stream)?;
+        self.d_slot_to_expert
+            .copy_to_host(&mut self.slot_to_expert_i32, stream)?;
         self.d_slot_last_used
             .copy_to_host(&mut self.slot_last_used, stream)?;
         self.d_step_counter.copy_to_host(&mut step_arr, stream)?;
         stream.synchronize()?;
-        for (dst, &src) in self.slot_to_expert.iter_mut().zip(&slot_i32) {
+        for (dst, &src) in self.slot_to_expert.iter_mut().zip(&self.slot_to_expert_i32) {
             *dst = if src < 0 { usize::MAX } else { src as usize };
         }
         self.step_clock = step_arr[0].max(1);

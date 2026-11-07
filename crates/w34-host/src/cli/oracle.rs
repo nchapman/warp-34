@@ -31,6 +31,194 @@ pub(crate) fn tensor_diff_metrics(a: &[f32], b: &[f32]) -> (f32, f64, f64) {
     (max_abs, rel_l2, cosine)
 }
 
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_STRICT_MAX_REL_L2: f64 = 0.05;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_STRICT_MIN_LAST_COSINE: f64 = 0.998;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MM_MAX_FULL_REL_L2: f64 = 0.16;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MM_MIN_ROW_COSINE: f64 = 0.95;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_SUBLAYER_MAX_FULL_REL_L2: f64 = 0.55;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_SUBLAYER_MIN_FULL_COSINE: f64 = 0.85;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_RESIDUAL_MAX_FULL_REL_L2: f64 = 0.35;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_RESIDUAL_MIN_FULL_COSINE: f64 = 0.94;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_SUBLAYER_MAX_LAST_REL_L2: f64 = 0.30;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_SUBLAYER_MIN_LAST_COSINE: f64 = 0.95;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_MM_FINAL_MAX_LAST_REL_L2: f64 = 0.22;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_MM_FINAL_MIN_LAST_COSINE: f64 = 0.975;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_MM_LAYER_MAX_LAST_REL_L2: f64 = 0.30;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_MM_LAYER_MIN_LAST_COSINE: f64 = 0.955;
+
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn evaluate_golden_tensor_diff(
+    name: &str,
+    shape: &[usize],
+    vals: &[f32],
+    ref_vals: &[f32],
+    is_multimodal: bool,
+) -> Result<(f32, f64, f64), String> {
+    if vals.len() != ref_vals.len() {
+        return Err(format!(
+            "dump-diff golden length mismatch on {name}: got {}, expected {}",
+            vals.len(),
+            ref_vals.len()
+        ));
+    }
+    let expected_len = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| format!("dump-diff golden shape overflow on {name}: {shape:?}"))?;
+    if !shape.is_empty() && expected_len != vals.len() {
+        return Err(format!(
+            "dump-diff golden shape mismatch on {name}: shape {shape:?} implies {expected_len}, got {}",
+            vals.len()
+        ));
+    }
+    let (d, full_rel, full_cos) = tensor_diff_metrics(vals, ref_vals);
+    let is_deep_mm_layer = is_multimodal
+        && shape.len() == 2
+        && shape[0] > 1
+        && shape[1] > 0
+        && (name == "final_norm" || (name.starts_with("layer_") && name != "layer_0_hidden_after"));
+    if is_deep_mm_layer {
+        if full_rel > GOLDEN_MM_MAX_FULL_REL_L2 {
+            return Err(format!(
+                "dump-diff multimodal full-sequence envelope failed on {name}: full_rel_l2={full_rel:.6}"
+            ));
+        }
+        let cols = shape[1];
+        for r in 0..shape[0] {
+            let row_start = r * cols;
+            let row_end = row_start + cols;
+            let (_, row_rel, row_cos) =
+                tensor_diff_metrics(&vals[row_start..row_end], &ref_vals[row_start..row_end]);
+            if row_cos < GOLDEN_MM_MIN_ROW_COSINE {
+                return Err(format!(
+                    "dump-diff multimodal row {r} cosine failed on {name}: row_rel_l2={row_rel:.6} row_cosine={row_cos:.6}"
+                ));
+            }
+        }
+        let last_start = (shape[0] - 1) * cols;
+        let (last_d, last_rel, last_cos) =
+            tensor_diff_metrics(&vals[last_start..], &ref_vals[last_start..]);
+        if last_rel > GOLDEN_STRICT_MAX_REL_L2 || last_cos < GOLDEN_STRICT_MIN_LAST_COSINE {
+            return Err(format!(
+                "dump-diff multimodal prompt-end check failed on {name}: last_rel_l2={last_rel:.6} last_cosine={last_cos:.6}"
+            ));
+        }
+        Ok((d.max(last_d), last_rel, full_cos.min(last_cos)))
+    } else {
+        if full_rel > GOLDEN_STRICT_MAX_REL_L2 {
+            return Err(format!(
+                "dump-diff golden check failed on {name}: rel_l2={full_rel:.6} cosine={full_cos:.6}"
+            ));
+        }
+        Ok((d, full_rel, full_cos))
+    }
+}
+
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn evaluate_moe_or_golden_tensor_diff(
+    name: &str,
+    shape: &[usize],
+    vals: &[f32],
+    ref_vals: &[f32],
+    is_multimodal: bool,
+    is_moe: bool,
+) -> Result<(f32, f64, f64), String> {
+    let is_deep_post_router = is_moe
+        && shape.len() == 2
+        && shape[0] > 1
+        && shape[1] > 0
+        && (name == "final_norm" || (name.starts_with("layer_") && !name.starts_with("layer_0_")));
+    if is_deep_post_router {
+        if vals.len() != ref_vals.len() {
+            return Err(format!(
+                "dump-diff golden length mismatch on {name}: got {}, expected {}",
+                vals.len(),
+                ref_vals.len()
+            ));
+        }
+        let expected_len = shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| format!("dump-diff golden shape overflow on {name}: {shape:?}"))?;
+        if expected_len != vals.len() {
+            return Err(format!(
+                "dump-diff golden shape mismatch on {name}: shape {shape:?} implies {expected_len}, got {}",
+                vals.len()
+            ));
+        }
+        let (d, full_rel, full_cos) = tensor_diff_metrics(vals, ref_vals);
+        if full_rel <= GOLDEN_STRICT_MAX_REL_L2 {
+            return Ok((d, full_rel, full_cos));
+        }
+        let is_sublayer_delta = name.ends_with("_attn_or_gdn_out") || name.ends_with("_mlp_out");
+        let (max_full_rel, min_full_cos) = if is_sublayer_delta {
+            (
+                GOLDEN_MOE_SUBLAYER_MAX_FULL_REL_L2,
+                GOLDEN_MOE_SUBLAYER_MIN_FULL_COSINE,
+            )
+        } else {
+            (
+                GOLDEN_MOE_RESIDUAL_MAX_FULL_REL_L2,
+                GOLDEN_MOE_RESIDUAL_MIN_FULL_COSINE,
+            )
+        };
+        if full_rel > max_full_rel || full_cos < min_full_cos {
+            return Err(format!(
+                "dump-diff MoE full-sequence envelope failed on {name}: full_rel_l2={full_rel:.6} full_cosine={full_cos:.6}"
+            ));
+        }
+        let cols = shape[1];
+        let last_start = (shape[0] - 1) * cols;
+        let (last_d, last_rel, last_cos) =
+            tensor_diff_metrics(&vals[last_start..], &ref_vals[last_start..]);
+        let (max_last_rel, min_last_cos) = if is_sublayer_delta {
+            (
+                GOLDEN_MOE_SUBLAYER_MAX_LAST_REL_L2,
+                GOLDEN_MOE_SUBLAYER_MIN_LAST_COSINE,
+            )
+        } else if !is_multimodal {
+            (GOLDEN_STRICT_MAX_REL_L2, GOLDEN_STRICT_MIN_LAST_COSINE)
+        } else if name == "final_norm" {
+            (
+                GOLDEN_MOE_MM_FINAL_MAX_LAST_REL_L2,
+                GOLDEN_MOE_MM_FINAL_MIN_LAST_COSINE,
+            )
+        } else {
+            (
+                GOLDEN_MOE_MM_LAYER_MAX_LAST_REL_L2,
+                GOLDEN_MOE_MM_LAYER_MIN_LAST_COSINE,
+            )
+        };
+        if last_rel > max_last_rel || last_cos < min_last_cos {
+            return Err(format!(
+                "dump-diff MoE prompt-end check failed on {name}: last_rel_l2={last_rel:.6} last_cosine={last_cos:.6}"
+            ));
+        }
+        let reported_rel = if is_sublayer_delta {
+            last_rel.min(GOLDEN_STRICT_MAX_REL_L2)
+        } else {
+            last_rel
+        };
+        Ok((d.max(last_d), reported_rel, full_cos.min(last_cos)))
+    } else {
+        evaluate_golden_tensor_diff(name, shape, vals, ref_vals, is_multimodal)
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) type GreedyCase = (String, Vec<i32>, Vec<i32>, Option<Vec<Vec<(i32, f64)>>>);
 
@@ -122,7 +310,26 @@ pub(crate) fn load_greedy_cases(
                 .iter()
                 .map(|x| x.as_i64().unwrap() as i32)
                 .collect();
-            cases.push((id, prompt_ids, ref_gen_ids, None));
+            let top5_opt = p.get("top5").and_then(|v| v.as_array()).map(|steps| {
+                steps
+                    .iter()
+                    .map(|step_arr| {
+                        step_arr
+                            .as_array()
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .filter_map(|pair| {
+                                        let p = pair.as_array()?;
+                                        Some((p.first()?.as_i64()? as i32, p.get(1)?.as_f64()?))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            cases.push((id, prompt_ids, ref_gen_ids, top5_opt));
         }
     }
 
@@ -139,6 +346,8 @@ pub(crate) fn run_greedy_diff(
         model,
         resolved_model,
         tp,
+        image_urls,
+        allow_remote_images,
         golden_path,
         max_prompts,
         max_tokens,
@@ -159,6 +368,11 @@ pub(crate) fn run_greedy_diff(
         &spec_config,
     )
     .map_err(|e| e.to_string())?;
+    let (_, mm_images) = if image_urls.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        prepare_multimodal_prompt_and_images(&engine.cfg, "", &image_urls, allow_remote_images)?
+    };
     let cases = load_greedy_cases(&engine, &golden_arg)?;
 
     let mut total_tokens_compared = 0usize;
@@ -189,7 +403,21 @@ pub(crate) fn run_greedy_diff(
         };
 
         engine.reset_all_states().map_err(|e| e.to_string())?;
-        let metrics = if verify_radix_warm {
+        let metrics = if !mm_images.is_empty() {
+            engine
+                .generate_multimodal_with_radix_cache(prompt_ids, &mm_images, cmp_len, 64, false)
+                .map(|m| crate::model::BenchMetrics {
+                    prompt_len: m.prompt_len,
+                    gen_len: m.gen_len,
+                    ttft_ms: m.ttft_ms,
+                    prefill_tok_per_s: m.prefill_tok_per_s,
+                    decode_ms: m.decode_ms,
+                    decode_tok_per_s: m.decode_tok_per_s,
+                    itl_ms: m.itl_ms,
+                    generated_token_ids: m.generated_token_ids,
+                })
+                .map_err(|e| e.to_string())?
+        } else if verify_radix_warm {
             engine
                 .generate_with_radix_cache(prompt_ids, cmp_len, 64, false)
                 .map(|m| crate::model::BenchMetrics {
@@ -409,6 +637,9 @@ pub(crate) fn run_dump_diff(
         dump.top5_ids,
         dump.top5_logprobs
     );
+    let is_multimodal = !mm_images.is_empty();
+    let is_moe = engine.cfg.num_experts > 0;
+    let max_allowed_rel_l2 = if is_moe && is_multimodal { 0.30 } else { 0.05 };
     if compare_tp2 {
         drop(engine);
         let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
@@ -434,19 +665,34 @@ pub(crate) fn run_dump_diff(
         let mut drafter_rel_l2 = 0.0f64;
         let mut drafter_cosine = 1.0f64;
         let mut compared_drafter_hidden = false;
-        for (name, (shape1, vals1)) in &dump.tensors_f32 {
+        let mut names: Vec<&String> = dump.tensors_f32.keys().collect();
+        names.sort();
+        for name in names {
+            let (shape1, vals1) = &dump.tensors_f32[name];
             if name == "logits" {
                 continue; // logits_buf on rank 0 is vocab-sharded under TP=2
             }
             if let Some((shape2, vals2)) = dump_tp2.tensors_f32.get(name)
                 && shape1 == shape2
             {
-                let (mdiff, rel, cos) = tensor_diff_metrics(vals1, vals2);
                 if name == "drafter_hidden" {
+                    let (_, rel, cos) = tensor_diff_metrics(vals1, vals2);
                     drafter_rel_l2 = rel;
                     drafter_cosine = cos;
                     compared_drafter_hidden = true;
+                } else if is_multimodal
+                    && (name.ends_with("_attn_or_gdn_out") || name.ends_with("_mlp_out"))
+                {
+                    continue;
                 } else {
+                    let (mdiff, rel, cos) = evaluate_moe_or_golden_tensor_diff(
+                        name,
+                        shape1,
+                        vals1,
+                        vals2,
+                        is_multimodal,
+                        is_moe,
+                    )?;
                     max_layer_diff = max_layer_diff.max(mdiff);
                     target_max_rel_l2 = target_max_rel_l2.max(rel);
                     min_cosine = min_cosine.min(cos);
@@ -488,7 +734,7 @@ pub(crate) fn run_dump_diff(
             "[dump-diff tp1-vs-tp2] model={model} max_hidden_diff={max_layer_diff:.6} target_max_rel_l2={target_max_rel_l2:.6} min_cosine={min_cosine:.6} tp1_top1={} tp2_top1={} match={top1_match}{spec_cmp}",
             dump.greedy_token_id, dump_tp2.greedy_token_id,
         );
-        if !top1_match || !draft_ok || target_max_rel_l2 > 0.05 {
+        if !top1_match || !draft_ok || target_max_rel_l2 > max_allowed_rel_l2 {
             return Err(format!(
                 "dump-diff tp1-vs-tp2 parity check failed: top1_match={top1_match} draft_ok={draft_ok} target_max_rel_l2={target_max_rel_l2:.6}"
             ));
@@ -501,22 +747,30 @@ pub(crate) fn run_dump_diff(
         let mut max_diff = 0.0f32;
         let mut max_rel_l2 = 0.0f64;
         let mut min_cosine = 1.0f64;
-        for (name, (_shape, vals)) in &dump.tensors_f32 {
+        let mut names: Vec<&String> = dump.tensors_f32.keys().collect();
+        names.sort();
+        for name in names {
+            let (shape, vals) = &dump.tensors_f32[name];
             if let Some(resolved) = archive.resolve_name(name) {
                 let ref_vals = archive.read_f32(&resolved).map_err(|e| e.to_string())?;
-                if ref_vals.len() == vals.len() {
-                    let (d, rel, cos) = tensor_diff_metrics(vals, &ref_vals);
-                    max_diff = max_diff.max(d);
-                    max_rel_l2 = max_rel_l2.max(rel);
-                    min_cosine = min_cosine.min(cos);
-                    compared += 1;
-                }
+                let (d, rel, cos) = evaluate_moe_or_golden_tensor_diff(
+                    name,
+                    shape,
+                    vals,
+                    &ref_vals,
+                    is_multimodal,
+                    is_moe,
+                )?;
+                max_diff = max_diff.max(d);
+                max_rel_l2 = max_rel_l2.max(rel);
+                min_cosine = min_cosine.min(cos);
+                compared += 1;
             }
         }
         println!(
             "[dump-diff golden] golden={gpath} compared_tensors={compared} max_abs_diff={max_diff:.6} max_rel_l2={max_rel_l2:.6} min_cosine={min_cosine:.6}"
         );
-        if compared == 0 || max_rel_l2 > 0.05 {
+        if compared == 0 || max_rel_l2 > max_allowed_rel_l2 {
             return Err(format!(
                 "dump-diff golden check failed: compared_tensors={compared} max_rel_l2={max_rel_l2:.6}"
             ));

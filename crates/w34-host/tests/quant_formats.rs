@@ -155,7 +155,7 @@ fn marlin_w4_symmetric_asymmetric_and_w8_match_scalar_reference() {
     let (n, k) = (256usize, 256usize);
     let workspace = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
     for (bits, asymmetric) in [(4, false), (4, true), (8, false)] {
-        let groups: &[usize] = if bits == 8 {
+        let groups: &[usize] = if !asymmetric {
             &[32, 64, 128, 256]
         } else {
             &[32, 64, 128]
@@ -739,5 +739,216 @@ fn online_marlin_quantize_f16_u4b8_matches_cpu_reference_and_tracks_fp16_logits(
             )
         };
         assert_ne!(rc, 0, "expected error for ({bad_k}, {bad_n}, {bad_gs})");
+    }
+}
+
+#[test]
+fn hgptq_channelwise_w4_padded_k_matches_scalar() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    for (k, logical_k, n) in [(256usize, 256usize, 256usize), (4352, 4304, 1152)] {
+        let mut w = weights(n, k, k, 4, false, 3);
+        for col in 0..n {
+            for j in logical_k..k {
+                let word = &mut w.packed[col * (k / 8) + j / 8];
+                *word = (*word & !(15 << ((j % 8) * 4))) | (8 << ((j % 8) * 4));
+                w.dense[col * k + j] = 0.0;
+            }
+        }
+        let packed = upload(&w.packed, &stream);
+        let repacked = DeviceBuffer::alloc(0, w.packed.len() * 4).unwrap();
+        let scales = upload(
+            &marlin_permute_scales_from_n_major(&w.scales, k, n, 0),
+            &stream,
+        );
+        let workspace = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+        assert_eq!(
+            // SAFETY: device allocations match the packed matrix dimensions.
+            unsafe {
+                ffi::w34_marlin_repack_int4(
+                    &ex,
+                    packed.addr() as *const u32,
+                    repacked.addr() as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
+            },
+            0
+        );
+        for m in [1usize, 8, 16, 40, 64] {
+            let a: Vec<u16> = (0..m * k)
+                .map(|i| {
+                    f32_to_f16(if i % k >= logical_k {
+                        0.0
+                    } else {
+                        ((i * 17 + i / k * 7) % 47) as f32 / 64.0 - 0.359375
+                    })
+                })
+                .collect();
+            let input = upload(&a, &stream);
+            let output = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+            workspace.zero_async(&stream).unwrap();
+            assert_eq!(
+                // SAFETY: all live buffers have the documented extents and scales are channelwise.
+                unsafe {
+                    ffi::w34_marlin_gemm_f16u4(
+                        &ex,
+                        input.addr() as *const c_void,
+                        repacked.addr() as *const c_void,
+                        scales.addr() as *const c_void,
+                        output.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        -1,
+                    )
+                },
+                0
+            );
+            let reference: Vec<f32> = (0..m * n)
+                .map(|i| {
+                    (0..logical_k)
+                        .map(|j| f16_to_f32(a[i / n * k + j]) * w.dense[i % n * k + j])
+                        .sum()
+                })
+                .collect();
+            let mut got = vec![0u16; m * n];
+            output.copy_to_host(&mut got, &stream).unwrap();
+            assert_close(
+                &got,
+                &reference,
+                &format!("channelwise W4 M={m} K={k} N={n}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn linear_epilogue_crop_bias_in_place_and_validation() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    for (rows, logical, physical) in [(3usize, 5usize, 8usize), (17, 4304, 4352), (2, 64, 64)] {
+        let values: Vec<u16> = (0..rows * physical)
+            .map(|i| f32_to_f16((i % 71) as f32 / 32.0 - 1.0))
+            .collect();
+        let bias: Vec<u16> = (0..logical)
+            .map(|i| f32_to_f16((i % 13) as f32 / 17.0))
+            .collect();
+        let b = upload(&bias, &stream);
+        for biased in [false, true] {
+            let src = upload(&values, &stream);
+            let dst = upload(&vec![0x7bffu16; rows * logical + 16], &stream);
+            let bp = if biased {
+                b.addr() as *const c_void
+            } else {
+                std::ptr::null()
+            };
+            assert_eq!(
+                // SAFETY: buffers are disjoint and sized for the supplied geometry.
+                unsafe {
+                    ffi::w34_linear_epilogue_f16(
+                        &ex,
+                        src.addr() as *const c_void,
+                        bp,
+                        dst.addr() as *mut c_void,
+                        rows as i32,
+                        logical as i32,
+                        physical as i32,
+                    )
+                },
+                0
+            );
+            stream.synchronize().unwrap();
+            let graph = w34_host::cuda::CudaGraph::capture(&stream, || {
+                assert_eq!(
+                    // SAFETY: same live disjoint buffers and geometry as the eager launch.
+                    unsafe {
+                        ffi::w34_linear_epilogue_f16(
+                            &ex,
+                            src.addr() as *const c_void,
+                            bp,
+                            dst.addr() as *mut c_void,
+                            rows as i32,
+                            logical as i32,
+                            physical as i32,
+                        )
+                    },
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+            graph.launch(&stream).unwrap();
+            graph.launch(&stream).unwrap();
+            let expected: Vec<u16> = (0..rows * logical)
+                .map(|i| {
+                    let v = values[i / logical * physical + i % logical];
+                    if biased {
+                        f32_to_f16(f16_to_f32(v) + f16_to_f32(bias[i % logical]))
+                    } else {
+                        v
+                    }
+                })
+                .collect();
+            let mut got = vec![0u16; rows * logical + 16];
+            dst.copy_to_host(&mut got, &stream).unwrap();
+            assert_eq!(&got[..rows * logical], expected);
+            assert_eq!(&got[rows * logical..], &[0x7bff; 16]);
+            // SAFETY: equal widths allow aliasing; unequal widths must be rejected before launch.
+            let rc = unsafe {
+                ffi::w34_linear_epilogue_f16(
+                    &ex,
+                    src.addr() as *const c_void,
+                    bp,
+                    src.addr() as *mut c_void,
+                    rows as i32,
+                    logical as i32,
+                    physical as i32,
+                )
+            };
+            if logical == physical {
+                assert_eq!(rc, 0);
+                let mut got = vec![0u16; rows * logical];
+                src.copy_to_host(&mut got, &stream).unwrap();
+                assert_eq!(got, expected);
+            } else {
+                assert_ne!(rc, 0);
+            }
+        }
+    }
+    // SAFETY: empty work permits null pointers; invalid inputs must not launch.
+    unsafe {
+        assert_eq!(
+            ffi::w34_linear_epilogue_f16(
+                &ex,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                5,
+                8
+            ),
+            0
+        );
+        for (rows, logical, physical) in [(1, 5, 8), (-1, 5, 8), (0, 9, 8), (0, 0, 8)] {
+            assert_ne!(
+                ffi::w34_linear_epilogue_f16(
+                    &ex,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    rows,
+                    logical,
+                    physical
+                ),
+                0
+            );
+        }
     }
 }

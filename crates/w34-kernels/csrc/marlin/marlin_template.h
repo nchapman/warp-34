@@ -1727,18 +1727,6 @@ __global__ void Marlin(
       c_scalar_t2 res =
           Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));
 
-      // For per-column quantization we finally apply the scale here (only for
-      // 4-bit)
-      if constexpr (!has_act_order && group_blocks == -1 && !is_a_8bit &&
-                    b_type.size_bits() == 4 &&
-                    (has_zp && dequant_skip_flop || !has_zp)) {
-        c_scalar_t2 tmp_scale = s[0];
-        if constexpr (m_block_size_8) {
-          tmp_scale = Cdtype::num2num2(
-              reinterpret_cast<scalar_t*>(&s[0])[(threadIdx.x % 8) / 4]);
-        }
-        res = __hmul2(res, tmp_scale);
-      }
       if (has_bias && last) {
         c_scalar_t2 tmp_bias = b_bias[0];
         if constexpr (m_block_size_8) {
@@ -1987,16 +1975,15 @@ __global__ void Marlin(
 
       cp_async_wait<0>();
       bool last = slice_idx == slice_count - 1;
-      // For per-column scales, we only fetch them here in the final step before
-      // write-out
+      // For per-column scales, we fetch and apply them in FP32 before
+      // global_reduce_fp16 / write-out so unscaled 4-bit/8-bit channelwise
+      // accumulators never overflow FP16 before scaling.
       if constexpr (!has_act_order && group_blocks == -1 &&
                     (has_zp && dequant_skip_flop || !has_zp)) {
-        if (b_type.size_bits() == 8 || (last || use_atomic_add) || is_a_8bit) {
-          if (s_sh_wr_pred) {
-            cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
-          }
-          cp_async_fence();
+        if (s_sh_wr_pred) {
+          cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
         }
+        cp_async_fence();
       }
 
       thread_block_reduce();
@@ -2016,7 +2003,7 @@ __global__ void Marlin(
           if (threadIdx.x / 32 < tb_n_warps) {
             reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
           }
-        } else if (b_type.size_bits() == 8 || (last || use_atomic_add)) {
+        } else {
           cp_async_wait<0>();
           __syncthreads();
           if (threadIdx.x / 32 < tb_n_warps) {
@@ -2036,9 +2023,9 @@ __global__ void Marlin(
         }
       }
 
-      // For 8-bit channelwise, we apply the scale before the global reduction
-      // that converts the fp32 results to fp16 (so that we avoid possible
-      // overflow in fp16)
+      // For 4-bit and 8-bit channelwise, we apply the scale before the global
+      // reduction and write-out that convert the fp32 results to fp16 (so that
+      // we avoid possible overflow in fp16 when sum(x * (q - zp)) > 65504).
       // NOTE: int8 8-row (m_block_size_8) is only validated for the GROUPED
       // (group_blocks != -1) path. The per-channel (group_blocks == -1) 8-row
       // case below is NOT 8-row-transposed-aware and is left unsupported; if
@@ -2068,7 +2055,7 @@ __global__ void Marlin(
           }
         }
       } else if (!has_act_order && group_blocks == -1 &&
-                 b_type.size_bits() == 8 &&
+                 (b_type.size_bits() == 4 || b_type.size_bits() == 8) &&
                  (has_zp && dequant_skip_flop || !has_zp)) {
         if (threadIdx.x / 32 < tb_n_warps) {
   #pragma unroll

@@ -138,7 +138,16 @@ def install_hook(worker, out_dir, override_visual=None, capture_layers=False, ca
         visual = result[0].detach().cpu().contiguous().clone()
         validate_shape(visual.shape, grid.tolist(), model.config.text_config.hidden_size)
         if visual.dtype != torch.float16 or not torch.isfinite(visual).all():
-            raise RuntimeError("expected finite FP16 visual output")
+            bad_traces = [
+                f"{k}(nan={int(torch.isnan(v).sum())},inf={int(torch.isinf(v).sum())})"
+                for k, v in vision_tensors.items()
+                if not torch.isfinite(v).all()
+            ]
+            raise RuntimeError(
+                f"expected finite FP16 visual output (dtype={visual.dtype}, "
+                f"nan={int(torch.isnan(visual).sum())}, inf={int(torch.isinf(visual).sum())}, "
+                f"bad_traces={bad_traces[:6]})"
+            )
         # w34 dump stores FP16 values widened to F32; preserve exact native FP16 too.
         tensors = {"visual_embeddings": visual.float(), "visual_embeddings_fp16": visual,
                    "pixel_values": pixels, "image_grid_thw": grid}
@@ -201,6 +210,7 @@ def main():
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--tokens", type=int, default=8)
     ap.add_argument("--max-len", type=int, default=4096)
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     ap.add_argument("--diagnostic-override-visual", help="Diagnostic only: replace native visual outputs with explicit JSON values; never a canonical oracle")
     ap.add_argument("--capture-layers", action="store_true", help="Also capture every decoder layer's post-MLP residual sum")
     ap.add_argument("--capture-vision-layers", action="store_true", help="Diagnostic TP=1 first/middle/last vision rows")
@@ -245,6 +255,7 @@ def main():
     settings = dict(temperature=0, max_tokens=args.tokens, ignore_eos=True, logprobs=5, seed=0)
     engine = dict(dtype="float16", tensor_parallel_size=args.tp, enforce_eager=True,
                   max_model_len=args.max_len, max_num_seqs=1,
+                  gpu_memory_utilization=args.gpu_memory_utilization,
                   enable_prefix_caching=False, enable_chunked_prefill=False,
                   max_num_batched_tokens=args.max_len, mm_processor_cache_gb=0,
                   mm_encoder_tp_mode="weights", limit_mm_per_prompt={"image": 1, "video": 0},

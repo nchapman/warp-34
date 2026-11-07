@@ -20,6 +20,35 @@ pub struct FullAttentionLayerWeights {
 
 #[cfg(feature = "cuda")]
 impl FullAttentionLayerWeights {
+    /// Returns `[unrotated_out, had64_out]` targets for the pre-attention norm / stream mixer.
+    #[inline]
+    pub fn pre_attn_norm_targets(
+        &self,
+        normed_buf: u64,
+        ex: &W34Exec,
+        rows: usize,
+        h_dim: usize,
+    ) -> [u64; 2] {
+        if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            || !h_dim.is_multiple_of(HADAMARD_BLOCK_64)
+            || !self.qkv_proj.can_fuse_h64_from_producer()
+        {
+            return [normed_buf, 0];
+        }
+        if self.qsa_indexer.is_none() {
+            [0, normed_buf]
+        } else if ex.scratch_ptr != 0
+            && ex
+                .scratch_ptr
+                .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
+            && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(FP16_ELEM_BYTES)
+        {
+            [normed_buf, ex.scratch_ptr]
+        } else {
+            [normed_buf, 0]
+        }
+    }
+
     /// Runs QSA pre-indexer norm+RoPE, updates raw/compressed indexer key caches,
     /// optionally selects top-k sparse blocks, and executes sparse paged GQA + sigmoid output gate.
     #[allow(clippy::too_many_arguments)]
@@ -52,6 +81,7 @@ impl FullAttentionLayerWeights {
         num_tokens: usize,
         local_q_heads: usize,
         skip_topk: bool,
+        fuse_o_h64: bool,
     ) -> Result<()> {
         let kv_bufs = &kv_pool.layers[self.kv_layer_ordinal];
         qsa_idx.index_qk_proj.forward(
@@ -131,7 +161,12 @@ impl FullAttentionLayerWeights {
                 0,
             )?;
         }
-        crate::ple::gpu_ops::qsa_sparse_paged_attn_f16(
+        let attn_fn = if fuse_o_h64 {
+            crate::ple::gpu_ops::qsa_sparse_paged_attn_hadamard_f16
+        } else {
+            crate::ple::gpu_ops::qsa_sparse_paged_attn_f16
+        };
+        attn_fn(
             ex,
             q_buf,
             gate_buf,
@@ -190,6 +225,14 @@ pub struct TapExport {
 #[cfg(feature = "cuda")]
 impl HcBlockWeights {
     pub fn forward_mix(&self, ctx: &HcStepContext<'_>, out_mixed_buf: u64) -> Result<()> {
+        self.forward_mix_with_targets(ctx, [out_mixed_buf, 0])
+    }
+
+    pub fn forward_mix_with_targets(
+        &self,
+        ctx: &HcStepContext<'_>,
+        [out_mixed_buf, out_had64_buf]: [u64; 2],
+    ) -> Result<()> {
         let ex = ctx.ex;
         let cublas = ctx.cublas;
         let marlin_ws_ptr = ctx.marlin_ws_ptr;
@@ -236,7 +279,11 @@ impl HcBlockWeights {
                     size_k: k1,
                 }),
                 true,
-            ) if *n0 <= 512 && *n1 <= 256 && *k0 == *k1 && k0.is_multiple_of(8) => {
+            ) if *n0 <= SMALL_N_GEMM_ROUTER_512_MAX_N
+                && *n1 <= SMALL_N_GEMM_ALWAYS_MAX_N
+                && *k0 == *k1
+                && k0.is_multiple_of(SMALL_N_GEMM_K_ALIGN) =>
+            {
                 Some((*w0, *n0, *w1, *n1, *k0))
             }
             _ => None,
@@ -307,11 +354,12 @@ impl HcBlockWeights {
             ple_buf_b,
             num_tokens,
         )?;
-        crate::ple::gpu_ops::hc_mix_streams_f16(
+        crate::ple::gpu_ops::hc_mix_streams_hadamard_f16(
             ex,
             ple_buf_a,
             ple_buf_b,
             out_mixed_buf,
+            out_had64_buf,
             0,
             num_tokens,
             hc_count,
@@ -320,17 +368,29 @@ impl HcBlockWeights {
     }
 
     pub fn forward_combine(&self, ctx: &HcStepContext<'_>, block_out_buf: u64) -> Result<()> {
-        crate::ple::gpu_ops::hc_combine_f16(
+        self.forward_combine_with_tap(ctx, block_out_buf, TapExport::default())
+    }
+
+    pub fn forward_combine_with_tap(
+        &self,
+        ctx: &HcStepContext<'_>,
+        block_out_buf: u64,
+        tap: TapExport,
+    ) -> Result<()> {
+        crate::ple::gpu_ops::hc_combine_tap_f16(
             ctx.ex,
             ctx.hc_residual_buf,
             block_out_buf,
             ctx.hc_inj_weights_buf,
             0,
             ctx.hc_residual_buf,
+            tap.dst,
             0,
             ctx.num_tokens,
             ctx.hc_count,
             ctx.h_dim,
+            tap.stride,
+            tap.offset,
         )
     }
 }
@@ -374,6 +434,10 @@ impl LayerResidual {
         }
     }
 
+    pub fn is_single_stream(&self) -> bool {
+        matches!(self, Self::SingleStream { .. })
+    }
+
     /// Runs the pre-attention normalization / stream mixing step.
     /// On `SingleStream`, `layer_idx > 0` is a no-op because the preceding layer's
     /// `post_mlp` fused the residual addition with this layer's `input_layernorm`.
@@ -383,6 +447,15 @@ impl LayerResidual {
         ctx: &HcStepContext<'_>,
         normed_buf: u64,
     ) -> Result<()> {
+        self.pre_attn_with_targets(layer_idx, ctx, [normed_buf, 0])
+    }
+
+    pub fn pre_attn_with_targets(
+        &self,
+        layer_idx: usize,
+        ctx: &HcStepContext<'_>,
+        [norm_out, norm_had64]: [u64; 2],
+    ) -> Result<()> {
         match self {
             Self::SingleStream {
                 input_layernorm_ptr,
@@ -390,26 +463,29 @@ impl LayerResidual {
             } => {
                 if layer_idx == 0 {
                     check_rc(
-                        // SAFETY: `residual_buf` and `normed_buf` are disjoint `num_tokens * h_dim`
-                        // FP16 buffers; `input_layernorm_ptr` holds `h_dim` FP16 elements.
+                        // SAFETY: `residual_buf`, `norm_out`, and `norm_had64` are disjoint
+                        // `num_tokens * h_dim` FP16 buffers; `input_layernorm_ptr` holds `h_dim` FP16 elements.
                         unsafe {
-                            ffi::w34_gemma_rms_norm_f16(
+                            ffi::w34_gemma_rms_norm_hadamard_f16(
                                 ctx.ex,
                                 ctx.residual_buf as *const c_void,
                                 *input_layernorm_ptr as *const c_void,
-                                normed_buf as *mut c_void,
+                                norm_out as *mut c_void,
+                                norm_had64 as *mut c_void,
                                 core::ptr::null(),
                                 ctx.num_tokens as i32,
                                 ctx.h_dim as i32,
                                 ctx.eps,
                             )
                         },
-                        "w34_gemma_rms_norm_f16",
+                        "w34_gemma_rms_norm_hadamard_f16",
                     )?;
                 }
                 Ok(())
             }
-            Self::HyperConnection { attn_hc, .. } => attn_hc.forward_mix(ctx, normed_buf),
+            Self::HyperConnection { attn_hc, .. } => {
+                attn_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
+            }
         }
     }
 
@@ -423,6 +499,25 @@ impl LayerResidual {
         normed_buf: u64,
         preserve_block_out_on_tp2: bool,
     ) -> Result<()> {
+        self.post_attn_pre_mlp_with_targets(
+            ctx,
+            tp2,
+            rank,
+            block_out_buf,
+            [normed_buf, 0],
+            preserve_block_out_on_tp2,
+        )
+    }
+
+    pub fn post_attn_pre_mlp_with_targets(
+        &self,
+        ctx: &HcStepContext<'_>,
+        tp2: Option<&Tp2Collectives>,
+        rank: usize,
+        block_out_buf: u64,
+        [norm_out, norm_had64]: [u64; 2],
+        preserve_block_out_on_tp2: bool,
+    ) -> Result<()> {
         match self {
             Self::SingleStream {
                 post_attention_layernorm_ptr,
@@ -434,13 +529,14 @@ impl LayerResidual {
                     } else {
                         0
                     };
-                    comm.all_reduce_residual_gemma_rms_norm_f16(
+                    comm.all_reduce_residual_gemma_rms_norm_hadamard_f16(
                         ctx.ex,
                         block_out_buf,
                         ar_out,
                         ctx.residual_buf,
                         *post_attention_layernorm_ptr,
-                        normed_buf,
+                        norm_out,
+                        norm_had64,
                         0,
                         rank as i32,
                         ctx.num_tokens as i32,
@@ -451,22 +547,26 @@ impl LayerResidual {
                     )
                 } else {
                     check_rc(
-                        // SAFETY: `block_out_buf`, `residual_buf`, and `normed_buf` each hold
+                        // SAFETY: `block_out_buf`, `residual_buf`, `norm_out`, and `norm_had64` each hold
                         // `num_tokens * h_dim` FP16 elements.
                         unsafe {
-                            ffi::w34_fused_add_gemma_rms_norm_f16(
+                            ffi::w34_fused_add_gemma_rms_norm_tap_hadamard_f16(
                                 ctx.ex,
                                 block_out_buf as *const c_void,
                                 ctx.residual_buf as *mut c_void,
                                 *post_attention_layernorm_ptr as *const c_void,
-                                normed_buf as *mut c_void,
+                                norm_out as *mut c_void,
+                                norm_had64 as *mut c_void,
+                                core::ptr::null_mut(),
                                 core::ptr::null(),
                                 ctx.num_tokens as i32,
                                 ctx.h_dim as i32,
                                 ctx.eps,
+                                0,
+                                0,
                             )
                         },
-                        "w34_fused_add_gemma_rms_norm_f16 (post_attn)",
+                        "w34_fused_add_gemma_rms_norm_tap_hadamard_f16 (post_attn)",
                     )
                 }
             }
@@ -481,7 +581,7 @@ impl LayerResidual {
                     )?;
                 }
                 attn_hc.forward_combine(ctx, block_out_buf)?;
-                mlp_hc.forward_mix(ctx, normed_buf)
+                mlp_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
             }
         }
     }
@@ -496,16 +596,36 @@ impl LayerResidual {
         [next_norm_weight, next_norm_out]: [u64; 2],
         tap: TapExport,
     ) -> Result<()> {
+        self.post_mlp_with_targets(
+            ctx,
+            tp2,
+            rank,
+            mlp_out_buf,
+            [next_norm_weight, next_norm_out, 0],
+            tap,
+        )
+    }
+
+    pub fn post_mlp_with_targets(
+        &self,
+        ctx: &HcStepContext<'_>,
+        tp2: Option<&Tp2Collectives>,
+        rank: usize,
+        mlp_out_buf: u64,
+        [next_norm_weight, next_norm_out, next_norm_had64]: [u64; 3],
+        tap: TapExport,
+    ) -> Result<()> {
         match self {
             Self::SingleStream { .. } => {
                 if let Some(comm) = tp2 {
-                    comm.all_reduce_residual_gemma_rms_norm_f16(
+                    comm.all_reduce_residual_gemma_rms_norm_hadamard_f16(
                         ctx.ex,
                         mlp_out_buf,
                         0,
                         ctx.residual_buf,
                         next_norm_weight,
                         next_norm_out,
+                        next_norm_had64,
                         tap.dst,
                         rank as i32,
                         ctx.num_tokens as i32,
@@ -516,15 +636,16 @@ impl LayerResidual {
                     )
                 } else {
                     check_rc(
-                        // SAFETY: `mlp_out_buf`, `residual_buf`, and `next_norm_out` hold
+                        // SAFETY: `mlp_out_buf`, `residual_buf`, `next_norm_out`, and `next_norm_had64` hold
                         // `num_tokens * h_dim` FP16 elements; `tap.dst` is 0 or a validated BF16 tap buffer.
                         unsafe {
-                            ffi::w34_fused_add_gemma_rms_norm_tap_f16(
+                            ffi::w34_fused_add_gemma_rms_norm_tap_hadamard_f16(
                                 ctx.ex,
                                 mlp_out_buf as *const c_void,
                                 ctx.residual_buf as *mut c_void,
                                 next_norm_weight as *const c_void,
                                 next_norm_out as *mut c_void,
+                                next_norm_had64 as *mut c_void,
                                 tap.dst as *mut c_void,
                                 core::ptr::null(),
                                 ctx.num_tokens as i32,
@@ -534,7 +655,7 @@ impl LayerResidual {
                                 tap.offset,
                             )
                         },
-                        "w34_fused_add_gemma_rms_norm_tap_f16 (post_mlp)",
+                        "w34_fused_add_gemma_rms_norm_tap_hadamard_f16 (post_mlp)",
                     )
                 }
             }
@@ -548,7 +669,7 @@ impl LayerResidual {
                         (ctx.num_tokens * ctx.h_dim) as i32,
                     )?;
                 }
-                mlp_hc.forward_combine(ctx, mlp_out_buf)
+                mlp_hc.forward_combine_with_tap(ctx, mlp_out_buf, tap)
             }
         }
     }
@@ -649,6 +770,9 @@ pub struct PleLayerWeights {
     pub norm_conv_ptr: u64,
     pub conv1d_weight_ptr: u64,
     pub weight_scale: f32,
+    pub lut4_ptr: u64,
+    pub lut4_group_size: usize,
+    pub ngram_heads: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -675,33 +799,83 @@ impl PleLayerWeights {
     ) -> Result<()> {
         let total_dim = hc_count * h_dim;
         let ple_embed_dim = self.key_proj.size_k();
-        crate::ple::gpu_ops::ple_dequant_f8_to_f16(
-            ex,
-            ple_f8_staging_ptr,
-            ple_val_buf,
-            0,
-            num_tokens,
-            ple_embed_dim,
-            self.weight_scale,
-        )?;
-        self.key_proj.forward(
-            ex,
-            cublas,
-            marlin_ws_ptr,
-            marlin_ws_ints,
-            ple_val_buf,
-            ple_buf_a,
-            num_tokens,
-        )?;
-        self.value_proj.forward(
-            ex,
-            cublas,
-            marlin_ws_ptr,
-            marlin_ws_ints,
-            ple_val_buf,
-            normed_buf,
-            num_tokens,
-        )?;
+        let fuse_ple_in_h64 = ple_embed_dim.is_multiple_of(HADAMARD_BLOCK_64)
+            && self.key_proj.can_fuse_h64_from_producer()
+            && self.value_proj.can_fuse_h64_from_producer();
+        if self.lut4_ptr != 0 {
+            let num_heads = self.ngram_heads.max(1);
+            let head_dim = ple_embed_dim / num_heads;
+            let dequant_lut4 = if fuse_ple_in_h64 {
+                crate::ple::gpu_ops::ple_dequant_lut4_hadamard_to_f16
+            } else {
+                crate::ple::gpu_ops::ple_dequant_lut4_to_f16
+            };
+            dequant_lut4(
+                ex,
+                ple_f8_staging_ptr,
+                self.lut4_ptr,
+                ple_val_buf,
+                0,
+                num_tokens,
+                num_heads,
+                head_dim,
+                self.lut4_group_size,
+            )?;
+        } else {
+            let dequant_f8 = if fuse_ple_in_h64 {
+                crate::ple::gpu_ops::ple_dequant_f8_hadamard_to_f16
+            } else {
+                crate::ple::gpu_ops::ple_dequant_f8_to_f16
+            };
+            dequant_f8(
+                ex,
+                ple_f8_staging_ptr,
+                ple_val_buf,
+                0,
+                num_tokens,
+                ple_embed_dim,
+                self.weight_scale,
+            )?;
+        }
+        if fuse_ple_in_h64 {
+            self.key_proj.forward_prerotated(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_val_buf,
+                ple_buf_a,
+                num_tokens,
+            )?;
+            self.value_proj.forward_prerotated(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_val_buf,
+                normed_buf,
+                num_tokens,
+            )?;
+        } else {
+            self.key_proj.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_val_buf,
+                ple_buf_a,
+                num_tokens,
+            )?;
+            self.value_proj.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_val_buf,
+                normed_buf,
+                num_tokens,
+            )?;
+        }
         crate::ple::gpu_ops::hc_rmsnorm_f16(
             ex,
             ple_buf_a,
@@ -724,52 +898,31 @@ impl PleLayerWeights {
             h_dim,
             eps,
         )?;
-        crate::ple::gpu_ops::ple_signed_sqrt_gate_f16(
-            ex, ple_buf_b, ple_buf_a, normed_buf, ple_buf_a, 0, num_tokens, hc_count, h_dim, 1e-6,
-        )?;
-        check_rc(
-            // SAFETY: hc_residual_buf and ple_buf_a each hold num_tokens * total_dim FP16 elements.
-            unsafe {
-                ffi::w34_add_inplace_f16(
-                    ex,
-                    hc_residual_buf as *mut c_void,
-                    ple_buf_a as *const c_void,
-                    (num_tokens * total_dim) as i64,
-                )
-            },
-            "w34_add_inplace_f16 (ple gated_value)",
-        )?;
-        crate::ple::gpu_ops::hc_rmsnorm_f16(
+        crate::ple::gpu_ops::ple_signed_sqrt_gate_norm_add_f16(
             ex,
+            ple_buf_b,
             ple_buf_a,
+            normed_buf,
+            0,
+            hc_residual_buf,
             self.norm_conv_ptr,
             ple_buf_b,
             0,
             num_tokens,
             hc_count,
             h_dim,
+            crate::ple::PLE_SIGNED_SQRT_GATE_EPS,
             eps,
         )?;
-        crate::ple::gpu_ops::ple_dilated_conv1d_f16(
+        crate::ple::gpu_ops::ple_dilated_conv1d_add_f16(
             ex,
             ple_buf_b,
             self.conv1d_weight_ptr,
             ple_conv_state_ptr,
-            ple_buf_a,
+            0,
+            hc_residual_buf,
             gdn_batch,
             total_dim,
-        )?;
-        check_rc(
-            // SAFETY: hc_residual_buf and ple_buf_a each hold num_tokens * total_dim FP16 elements.
-            unsafe {
-                ffi::w34_add_inplace_f16(
-                    ex,
-                    hc_residual_buf as *mut c_void,
-                    ple_buf_a as *const c_void,
-                    (num_tokens * total_dim) as i64,
-                )
-            },
-            "w34_add_inplace_f16 (ple conv_out)",
         )
     }
 }
@@ -791,4 +944,36 @@ pub struct GdnLayerWeights {
 pub enum LayerBlockWeights {
     FullAttention(FullAttentionLayerWeights),
     LinearAttention(GdnLayerWeights),
+}
+
+#[cfg(feature = "cuda")]
+impl LayerBlockWeights {
+    /// Returns `[unrotated_out, had64_out]` targets for the pre-attention norm / stream mixer.
+    #[inline]
+    pub fn pre_attn_norm_targets(
+        &self,
+        normed_buf: u64,
+        ex: &W34Exec,
+        rows: usize,
+        h_dim: usize,
+    ) -> [u64; 2] {
+        match self {
+            Self::FullAttention(fa) => fa.pre_attn_norm_targets(normed_buf, ex, rows, h_dim),
+            Self::LinearAttention(gdn) => {
+                if h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+                    && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
+                    && gdn.in_proj_qkvz.can_fuse_h64_from_producer()
+                    && ex.scratch_ptr != 0
+                    && ex
+                        .scratch_ptr
+                        .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
+                    && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(FP16_ELEM_BYTES)
+                {
+                    [normed_buf, ex.scratch_ptr]
+                } else {
+                    [normed_buf, 0]
+                }
+            }
+        }
+    }
 }

@@ -16,6 +16,8 @@ pub(super) enum EvalError {
 pub(super) struct ExpertLayout<'a> {
     pub hidden: usize,
     pub intermediate: usize,
+    pub group_size: usize,
+    pub down_hadamard: usize,
     pub gate_up_words: &'a [u32],
     pub gate_up_scales: &'a [u16],
     pub down_words: &'a [u32],
@@ -120,9 +122,116 @@ pub(super) fn f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
     }
 }
 
+/// Transpose each 128-column block from [16 words][8 nibbles] to [8][16] and compute
+/// sequential group sums for `group_size` in `{64, 128}`.
+pub(super) fn prepare_x_perm_grouped(
+    x: &[f32],
+    group_size: usize,
+    xp: &mut [f32],
+    xg: &mut [f32],
+) -> Result<(), EvalError> {
+    match group_size {
+        128 => prepare_x_perm(x, xp, xg),
+        64 => {
+            if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 64 {
+                return Err(EvalError::InvalidShape);
+            }
+            for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
+                let mut sum_lo = 0.0f32;
+                for l in 0..8 {
+                    for b in 0..8 {
+                        let v = src[l * 8 + b];
+                        xp[g * 128 + b * 16 + l] = v;
+                        sum_lo += v;
+                    }
+                }
+                let mut sum_hi = 0.0f32;
+                for l in 8..16 {
+                    for b in 0..8 {
+                        let v = src[l * 8 + b];
+                        xp[g * 128 + b * 16 + l] = v;
+                        sum_hi += v;
+                    }
+                }
+                xg[2 * g] = sum_lo;
+                xg[2 * g + 1] = sum_hi;
+            }
+            Ok(())
+        }
+        _ => Err(EvalError::InvalidLayout),
+    }
+}
+
+/// Prepare FP16 input directly for `group_size` in `{64, 128}`.
+pub(super) fn prepare_x_perm_f16_grouped(
+    x: &[u16],
+    group_size: usize,
+    xp: &mut [f32],
+    xg: &mut [f32],
+) -> Result<(), EvalError> {
+    match group_size {
+        128 => prepare_x_perm_f16(x, xp, xg),
+        64 => {
+            if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 64 {
+                return Err(EvalError::InvalidShape);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if supported() {
+                // SAFETY: runtime ISA guard and slice bounds checked above.
+                unsafe {
+                    simd::prepare_x_perm_f16c_g64(x, xp, xg);
+                }
+                return Ok(());
+            }
+            for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
+                let mut sum_lo = 0.0f32;
+                for l in 0..8 {
+                    for b in 0..8 {
+                        let v = crate::cuda::f16_to_f32(src[l * 8 + b]);
+                        xp[g * 128 + b * 16 + l] = v;
+                        sum_lo += v;
+                    }
+                }
+                let mut sum_hi = 0.0f32;
+                for l in 8..16 {
+                    for b in 0..8 {
+                        let v = crate::cuda::f16_to_f32(src[l * 8 + b]);
+                        xp[g * 128 + b * 16 + l] = v;
+                        sum_hi += v;
+                    }
+                }
+                xg[2 * g] = sum_lo;
+                xg[2 * g + 1] = sum_hi;
+            }
+            Ok(())
+        }
+        _ => Err(EvalError::InvalidLayout),
+    }
+}
+
+fn hadamard64_f32_inplace(slice: &mut [f32]) {
+    for blk in slice.as_chunks_mut::<64>().0 {
+        let mut h = 1usize;
+        while h < 64 {
+            for i in (0..64).step_by(h * 2) {
+                for j in i..(i + h) {
+                    let x = blk[j];
+                    let y = blk[j + h];
+                    blk[j] = x + y;
+                    blk[j + h] = x - y;
+                }
+            }
+            h *= 2;
+        }
+        for v in blk.iter_mut() {
+            *v *= 0.125f32;
+        }
+    }
+}
+
 /// Required caller-owned scratch in f32 elements: act, permuted act, group sums.
 pub(super) fn scratch_len(tokens: usize, slice_groups: usize) -> Option<usize> {
-    tokens.checked_mul(slice_groups)?.checked_mul(257)
+    tokens.checked_mul(slice_groups)?.checked_mul(258)
 }
 
 fn validate(
@@ -136,18 +245,26 @@ fn validate(
 ) -> Result<(), EvalError> {
     let h = d.hidden;
     let i = d.intermediate;
-    if h == 0 || i == 0 || !h.is_multiple_of(128) || !i.is_multiple_of(128) {
+    let gs = d.group_size;
+    if h == 0
+        || i == 0
+        || !h.is_multiple_of(128)
+        || !i.is_multiple_of(128)
+        || !matches!(gs, 64 | 128)
+        || !matches!(d.down_hadamard, 0 | 64)
+    {
         return Err(EvalError::InvalidLayout);
     }
+    let words_per_group = gs / 8;
     let gu = i
         .checked_mul(2)
         .and_then(|v| v.checked_mul(h / 8))
         .ok_or(EvalError::InvalidLayout)?;
     let dn = h.checked_mul(i / 8).ok_or(EvalError::InvalidLayout)?;
     if d.gate_up_words.len() < gu
-        || d.gate_up_scales.len() < gu / 16
+        || d.gate_up_scales.len() < gu / words_per_group
         || d.down_words.len() < dn
-        || d.down_scales.len() < dn / 16
+        || d.down_scales.len() < dn / words_per_group
     {
         return Err(EvalError::InvalidLayout);
     }
@@ -157,17 +274,23 @@ fn validate(
     }
     let nh = t.checked_mul(h).ok_or(EvalError::InvalidShape)?;
     let ns = scratch_len(t, groups.end - groups.start).ok_or(EvalError::InvalidShape)?;
-    if xp.len() < nh || xg.len() < nh / 128 || out.len() < nh || scratch.len() < ns {
+    if xp.len() < nh || xg.len() < nh / gs || out.len() < nh || scratch.len() < ns {
         return Err(EvalError::InvalidShape);
     }
     Ok(())
 }
 
-fn row_portable(w: &[u32], s: &[u16], xp_t: &[f32], xg_t: &[f32], groups: usize) -> f32 {
+fn row_portable(
+    w: &[u32],
+    s: &[u16],
+    xp_t: &[f32],
+    xg_t: &[f32],
+    groups: usize,
+    group_size: usize,
+) -> f32 {
     let mut total = [0.0f32; 16];
     let mut bias = 0.0f32;
     for g in 0..groups {
-        let scale = crate::cuda::f16_to_f32(s[g]);
         let mut acc = [0.0f32; 16];
         let wg = &w[g * 16..(g + 1) * 16];
         let xpg = &xp_t[g * 128..(g + 1) * 128];
@@ -178,10 +301,23 @@ fn row_portable(w: &[u32], s: &[u16], xp_t: &[f32], xg_t: &[f32], groups: usize)
                 acc[l] = nib.mul_add(xb[l], acc[l]);
             }
         }
-        for l in 0..16 {
-            total[l] = acc[l].mul_add(scale, total[l]);
+        if group_size == 64 {
+            let scale_lo = crate::cuda::f16_to_f32(s[2 * g]);
+            let scale_hi = crate::cuda::f16_to_f32(s[2 * g + 1]);
+            for l in 0..8 {
+                total[l] = acc[l].mul_add(scale_lo, total[l]);
+            }
+            for l in 8..16 {
+                total[l] = acc[l].mul_add(scale_hi, total[l]);
+            }
+            bias = scale_hi.mul_add(xg_t[2 * g + 1], scale_lo.mul_add(xg_t[2 * g], bias));
+        } else {
+            let scale = crate::cuda::f16_to_f32(s[g]);
+            for l in 0..16 {
+                total[l] = acc[l].mul_add(scale, total[l]);
+            }
+            bias = scale.mul_add(xg_t[g], bias);
         }
-        bias = scale.mul_add(xg_t[g], bias);
     }
     let mut s8 = [0.0f32; 8];
     for i in 0..8 {
@@ -207,6 +343,8 @@ fn expert_portable(
 ) {
     let h = d.hidden;
     let i = d.intermediate;
+    let gs_len = d.group_size;
+    let g_per_128 = 128 / gs_len;
     let n = wt.len();
     let g_in = h / 128;
     let sg = range.end - range.start;
@@ -214,7 +352,7 @@ fn expert_portable(
     let (act, rest) = scratch.split_at_mut(n * cols);
     let (ap, ag) = rest.split_at_mut(n * cols);
     let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
-    let gs = |r: usize| &d.gate_up_scales[r * g_in..];
+    let gs = |r: usize| &d.gate_up_scales[r * (h / gs_len)..];
     for c in 0..cols {
         let r = range.start * 128 + c;
         let w_gate = gw(r);
@@ -223,29 +361,33 @@ fn expert_portable(
         let s_up = gs(i + r);
         for t in 0..n {
             let xp_t = &xp[t * h..(t + 1) * h];
-            let xg_t = &xg[t * g_in..(t + 1) * g_in];
-            let g = row_portable(w_gate, s_gate, xp_t, xg_t, g_in);
-            let u = row_portable(w_up, s_up, xp_t, xg_t, g_in);
+            let xg_t = &xg[t * (h / gs_len)..(t + 1) * (h / gs_len)];
+            let g = row_portable(w_gate, s_gate, xp_t, xg_t, g_in, gs_len);
+            let u = row_portable(w_up, s_up, xp_t, xg_t, g_in, gs_len);
             act[t * cols + c] = (g / (1.0f32 + (-g).exp())) * u;
         }
     }
+    if d.down_hadamard == 64 {
+        hadamard64_f32_inplace(act);
+    }
     for t in 0..n {
-        prepare_x_perm(
+        prepare_x_perm_grouped(
             &act[t * cols..(t + 1) * cols],
+            gs_len,
             &mut ap[t * cols..(t + 1) * cols],
-            &mut ag[t * sg..(t + 1) * sg],
+            &mut ag[t * sg * g_per_128..(t + 1) * sg * g_per_128],
         )
         .unwrap();
     }
     let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
-    let ds = |r: usize| &d.down_scales[r * (i / 128) + range.start..];
+    let ds = |r: usize| &d.down_scales[r * (i / gs_len) + range.start * g_per_128..];
     for r in 0..h {
         let w_dn = dw(r);
         let s_dn = ds(r);
         for (t, &w_tok) in wt.iter().enumerate() {
             let ap_t = &ap[t * cols..(t + 1) * cols];
-            let ag_t = &ag[t * sg..(t + 1) * sg];
-            out[t * h + r] = w_tok * row_portable(w_dn, s_dn, ap_t, ag_t, sg);
+            let ag_t = &ag[t * sg * g_per_128..(t + 1) * sg * g_per_128];
+            out[t * h + r] = w_tok * row_portable(w_dn, s_dn, ap_t, ag_t, sg, gs_len);
         }
     }
 }
@@ -335,6 +477,36 @@ mod simd {
         }
     }
 
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub(super) unsafe fn prepare_x_perm_f16c_g64(x: &[u16], xp: &mut [f32], xg: &mut [f32]) {
+        let mut group = [0.0f32; 128];
+        for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
+            for k in (0..128).step_by(8) {
+                let vh = _mm_loadu_si128(src.as_ptr().add(k).cast());
+                _mm256_storeu_ps(group.as_mut_ptr().add(k), _mm256_cvtph_ps(vh));
+            }
+            let dst = &mut xp[g * 128..(g + 1) * 128];
+            let mut sum_lo = 0.0f32;
+            for l in 0..8 {
+                for b in 0..8 {
+                    let v = group[l * 8 + b];
+                    dst[b * 16 + l] = v;
+                    sum_lo += v;
+                }
+            }
+            let mut sum_hi = 0.0f32;
+            for l in 8..16 {
+                for b in 0..8 {
+                    let v = group[l * 8 + b];
+                    dst[b * 16 + l] = v;
+                    sum_hi += v;
+                }
+            }
+            xg[2 * g] = sum_lo;
+            xg[2 * g + 1] = sum_hi;
+        }
+    }
+
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn add_assign_avx2(dst: &mut [f32], src: &[f32]) {
         let n = dst.len();
@@ -388,7 +560,7 @@ mod simd {
     // identical FMA and reduction tree to `row_tile` (0 ULP bit-identical output).
     #[target_feature(enable = "avx2,fma,f16c")]
     #[allow(clippy::cognitive_complexity, clippy::needless_range_loop)]
-    unsafe fn row_tile_avx2<const R: usize, const T: usize>(
+    unsafe fn row_tile_avx2<const R: usize, const T: usize, const G64: bool>(
         w: [&[u32]; R],
         s: [&[u16]; R],
         xp: &[f32],
@@ -411,13 +583,27 @@ mod simd {
                     _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
                 }
             }
-            let mut scale = [0.0; R];
-            let mut vscale = [z; R];
+            let mut scale_lo = [0.0; R];
+            let mut scale_hi = [0.0; R];
+            let mut vscale_lo = [z; R];
+            let mut vscale_hi = [z; R];
             for r in 0..R {
-                scale[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
-                    *s[r].get_unchecked(g) as i32
-                )));
-                vscale[r] = _mm256_set1_ps(scale[r]);
+                if G64 {
+                    scale_lo[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                        *s[r].get_unchecked(2 * g) as i32,
+                    )));
+                    scale_hi[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                        *s[r].get_unchecked(2 * g + 1) as i32,
+                    )));
+                } else {
+                    let sc = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                        *s[r].get_unchecked(g) as i32
+                    )));
+                    scale_lo[r] = sc;
+                    scale_hi[r] = sc;
+                }
+                vscale_lo[r] = _mm256_set1_ps(scale_lo[r]);
+                vscale_hi[r] = _mm256_set1_ps(scale_hi[r]);
             }
             let mut acc_lo = [[z; R]; T];
             let mut acc_hi = [[z; R]; T];
@@ -451,11 +637,18 @@ mod simd {
             nib256!(6);
             nib256!(7);
             for t in 0..T {
-                let xgv = *xg.get_unchecked(t * groups + g);
                 for r in 0..R {
-                    total_lo[t][r] = _mm256_fmadd_ps(acc_lo[t][r], vscale[r], total_lo[t][r]);
-                    total_hi[t][r] = _mm256_fmadd_ps(acc_hi[t][r], vscale[r], total_hi[t][r]);
-                    bias[t][r] = scale[r].mul_add(xgv, bias[t][r]);
+                    total_lo[t][r] = _mm256_fmadd_ps(acc_lo[t][r], vscale_lo[r], total_lo[t][r]);
+                    total_hi[t][r] = _mm256_fmadd_ps(acc_hi[t][r], vscale_hi[r], total_hi[t][r]);
+                    if G64 {
+                        let xg_lo = *xg.get_unchecked(t * 2 * groups + 2 * g);
+                        let xg_hi = *xg.get_unchecked(t * 2 * groups + 2 * g + 1);
+                        bias[t][r] =
+                            scale_hi[r].mul_add(xg_hi, scale_lo[r].mul_add(xg_lo, bias[t][r]));
+                    } else {
+                        let xgv = *xg.get_unchecked(t * groups + g);
+                        bias[t][r] = scale_lo[r].mul_add(xgv, bias[t][r]);
+                    }
                 }
             }
         }
@@ -468,6 +661,7 @@ mod simd {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn rows_avx2<const R: usize>(
         w: [&[u32]; R],
@@ -475,22 +669,55 @@ mod simd {
         xp: &[f32],
         xg: &[f32],
         groups: usize,
+        group_size: usize,
         n: usize,
         mut emit: impl FnMut(usize, [f32; R]),
     ) {
         let xp_stride = groups * 128;
+        let xg_stride = groups * (128 / group_size);
         let mut t = 0;
         if R <= 2 {
             while t + 2 <= n {
-                let v =
-                    row_tile_avx2::<R, 2>(w, s, &xp[t * xp_stride..], &xg[t * groups..], groups);
+                let v = if group_size == 64 {
+                    row_tile_avx2::<R, 2, true>(
+                        w,
+                        s,
+                        &xp[t * xp_stride..],
+                        &xg[t * xg_stride..],
+                        groups,
+                    )
+                } else {
+                    row_tile_avx2::<R, 2, false>(
+                        w,
+                        s,
+                        &xp[t * xp_stride..],
+                        &xg[t * xg_stride..],
+                        groups,
+                    )
+                };
                 emit(t, v[0]);
                 emit(t + 1, v[1]);
                 t += 2;
             }
         }
         while t < n {
-            let v = row_tile_avx2::<R, 1>(w, s, &xp[t * xp_stride..], &xg[t * groups..], groups);
+            let v = if group_size == 64 {
+                row_tile_avx2::<R, 1, true>(
+                    w,
+                    s,
+                    &xp[t * xp_stride..],
+                    &xg[t * xg_stride..],
+                    groups,
+                )
+            } else {
+                row_tile_avx2::<R, 1, false>(
+                    w,
+                    s,
+                    &xp[t * xp_stride..],
+                    &xg[t * xg_stride..],
+                    groups,
+                )
+            };
             emit(t, v[0]);
             t += 1;
         }
@@ -503,7 +730,7 @@ mod simd {
     // keeping `R * T <= 8` (`<= 30` ZMM registers) 100% register-resident with zero spills.
     #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
     #[allow(clippy::cognitive_complexity, clippy::needless_range_loop)]
-    unsafe fn row_tile<const R: usize, const T: usize>(
+    unsafe fn row_tile<const R: usize, const T: usize, const G64: bool>(
         w: [&[u32]; R],
         s: [&[u16]; R],
         xp: &[f32],
@@ -521,13 +748,28 @@ mod simd {
                     _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
                 }
             }
-            let mut scale = [0.0; R];
+            let mut scale_lo = [0.0; R];
+            let mut scale_hi = [0.0; R];
             let mut vscale = [z; R];
             for r in 0..R {
-                scale[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
-                    *s[r].get_unchecked(g) as i32
-                )));
-                vscale[r] = _mm512_set1_ps(scale[r]);
+                if G64 {
+                    scale_lo[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                        *s[r].get_unchecked(2 * g) as i32,
+                    )));
+                    scale_hi[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                        *s[r].get_unchecked(2 * g + 1) as i32,
+                    )));
+                    vscale[r] = _mm512_insertf32x8::<1>(
+                        _mm512_castps256_ps512(_mm256_set1_ps(scale_lo[r])),
+                        _mm256_set1_ps(scale_hi[r]),
+                    );
+                } else {
+                    scale_lo[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                        *s[r].get_unchecked(g) as i32,
+                    )));
+                    scale_hi[r] = scale_lo[r];
+                    vscale[r] = _mm512_set1_ps(scale_lo[r]);
+                }
             }
             let mut acc = [[z; R]; T];
             macro_rules! nib {
@@ -557,11 +799,18 @@ mod simd {
             nib!(6);
             nib!(7);
             for t in 0..T {
-                let xgv = *xg.get_unchecked(t * groups + g);
                 for r in 0..R {
                     total[t][r] = _mm512_fmadd_ps(acc[t][r], vscale[r], total[t][r]);
                     // Match the original host compiler's contracted scalar bias update.
-                    bias[t][r] = scale[r].mul_add(xgv, bias[t][r]);
+                    if G64 {
+                        let xg_lo = *xg.get_unchecked(t * 2 * groups + 2 * g);
+                        let xg_hi = *xg.get_unchecked(t * 2 * groups + 2 * g + 1);
+                        bias[t][r] =
+                            scale_hi[r].mul_add(xg_hi, scale_lo[r].mul_add(xg_lo, bias[t][r]));
+                    } else {
+                        let xgv = *xg.get_unchecked(t * groups + g);
+                        bias[t][r] = scale_lo[r].mul_add(xgv, bias[t][r]);
+                    }
                 }
             }
         }
@@ -574,6 +823,7 @@ mod simd {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
     unsafe fn rows<const R: usize>(
         w: [&[u32]; R],
@@ -581,14 +831,26 @@ mod simd {
         xp: &[f32],
         xg: &[f32],
         groups: usize,
+        group_size: usize,
         n: usize,
         mut emit: impl FnMut(usize, [f32; R]),
     ) {
         let xp_stride = groups * 128;
+        let xg_stride = groups * (128 / group_size);
         let mut t = 0;
         if R <= 2 {
             while t + 4 <= n {
-                let v = row_tile::<R, 4>(w, s, &xp[t * xp_stride..], &xg[t * groups..], groups);
+                let v = if group_size == 64 {
+                    row_tile::<R, 4, true>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+                } else {
+                    row_tile::<R, 4, false>(
+                        w,
+                        s,
+                        &xp[t * xp_stride..],
+                        &xg[t * xg_stride..],
+                        groups,
+                    )
+                };
                 for (dt, row) in v.into_iter().enumerate() {
                     emit(t + dt, row);
                 }
@@ -596,13 +858,21 @@ mod simd {
             }
         }
         while t + 2 <= n {
-            let v = row_tile::<R, 2>(w, s, &xp[t * xp_stride..], &xg[t * groups..], groups);
+            let v = if group_size == 64 {
+                row_tile::<R, 2, true>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+            } else {
+                row_tile::<R, 2, false>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+            };
             emit(t, v[0]);
             emit(t + 1, v[1]);
             t += 2;
         }
         if t < n {
-            let v = row_tile::<R, 1>(w, s, &xp[t * xp_stride..], &xg[t * groups..], groups);
+            let v = if group_size == 64 {
+                row_tile::<R, 1, true>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+            } else {
+                row_tile::<R, 1, false>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+            };
             emit(t, v[0]);
         }
     }
@@ -634,13 +904,15 @@ mod simd {
     ) {
         let h = d.hidden;
         let i = d.intermediate;
+        let gs_len = d.group_size;
+        let g_per_128 = 128 / gs_len;
         let n = wt.len();
         let sg = range.end - range.start;
         let cols = sg * 128;
         let (act, rest) = scratch.split_at_mut(n * cols);
         let (ap, ag) = rest.split_at_mut(n * cols);
         let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
-        let gs = |r: usize| &d.gate_up_scales[r * (h / 128)..];
+        let gs = |r: usize| &d.gate_up_scales[r * (h / gs_len)..];
         let mut c = 0;
         while c < cols {
             let r = range.start * 128 + c;
@@ -650,6 +922,7 @@ mod simd {
                 xp,
                 xg,
                 h / 128,
+                gs_len,
                 n,
                 |t, v| {
                     let g = v[0];
@@ -658,16 +931,20 @@ mod simd {
             );
             c += 1;
         }
+        if d.down_hadamard == 64 {
+            hadamard64_f32_inplace(act);
+        }
         for t in 0..n {
-            prepare_x_perm(
+            prepare_x_perm_grouped(
                 &act[t * cols..(t + 1) * cols],
+                gs_len,
                 &mut ap[t * cols..(t + 1) * cols],
-                &mut ag[t * sg..(t + 1) * sg],
+                &mut ag[t * sg * g_per_128..(t + 1) * sg * g_per_128],
             )
             .unwrap();
         }
         let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
-        let ds = |r: usize| &d.down_scales[r * (i / 128) + range.start..];
+        let ds = |r: usize| &d.down_scales[r * (i / gs_len) + range.start * g_per_128..];
         let mut r = 0;
         while r + 2 <= h {
             rows_avx2::<2>(
@@ -676,6 +953,7 @@ mod simd {
                 ap,
                 ag,
                 sg,
+                gs_len,
                 n,
                 |t, v| {
                     for j in 0..2 {
@@ -686,7 +964,7 @@ mod simd {
             r += 2;
         }
         while r < h {
-            rows_avx2::<1>([dw(r)], [ds(r)], ap, ag, sg, n, |t, v| {
+            rows_avx2::<1>([dw(r)], [ds(r)], ap, ag, sg, gs_len, n, |t, v| {
                 out[t * h + r] = wt[t] * v[0];
             });
             r += 1;
@@ -705,13 +983,15 @@ mod simd {
     ) {
         let h = d.hidden;
         let i = d.intermediate;
+        let gs_len = d.group_size;
+        let g_per_128 = 128 / gs_len;
         let n = wt.len();
         let sg = range.end - range.start;
         let cols = sg * 128;
         let (act, rest) = scratch.split_at_mut(n * cols);
         let (ap, ag) = rest.split_at_mut(n * cols);
         let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
-        let gs = |r: usize| &d.gate_up_scales[r * (h / 128)..];
+        let gs = |r: usize| &d.gate_up_scales[r * (h / gs_len)..];
         let mut c = 0;
         while c < cols {
             let r = range.start * 128 + c;
@@ -722,6 +1002,7 @@ mod simd {
                     xp,
                     xg,
                     h / 128,
+                    gs_len,
                     n,
                     |t, v| {
                         for j in 0..2 {
@@ -739,6 +1020,7 @@ mod simd {
                     xp,
                     xg,
                     h / 128,
+                    gs_len,
                     n,
                     |t, v| {
                         let g = v[0];
@@ -748,16 +1030,20 @@ mod simd {
                 c += 1;
             }
         }
+        if d.down_hadamard == 64 {
+            hadamard64_f32_inplace(act);
+        }
         for t in 0..n {
-            prepare_x_perm(
+            prepare_x_perm_grouped(
                 &act[t * cols..(t + 1) * cols],
+                gs_len,
                 &mut ap[t * cols..(t + 1) * cols],
-                &mut ag[t * sg..(t + 1) * sg],
+                &mut ag[t * sg * g_per_128..(t + 1) * sg * g_per_128],
             )
             .unwrap();
         }
         let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
-        let ds = |r: usize| &d.down_scales[r * (i / 128) + range.start..];
+        let ds = |r: usize| &d.down_scales[r * (i / gs_len) + range.start * g_per_128..];
         let mut r = 0;
         if tile {
             while r + 4 <= h {
@@ -767,6 +1053,7 @@ mod simd {
                     ap,
                     ag,
                     sg,
+                    gs_len,
                     n,
                     |t, v| {
                         for j in 0..4 {
@@ -784,6 +1071,7 @@ mod simd {
                 ap,
                 ag,
                 sg,
+                gs_len,
                 n,
                 |t, v| {
                     for j in 0..2 {
@@ -794,7 +1082,7 @@ mod simd {
             r += 2;
         }
         while r < h {
-            rows::<1>([dw(r)], [ds(r)], ap, ag, sg, n, |t, v| {
+            rows::<1>([dw(r)], [ds(r)], ap, ag, sg, gs_len, n, |t, v| {
                 out[t * h + r] = wt[t] * v[0];
             });
             r += 1;
@@ -882,6 +1170,8 @@ mod tests {
         let d = ExpertLayout {
             hidden: h,
             intermediate: i,
+            group_size: 128,
+            down_hadamard: 0,
             gate_up_words: &gu,
             gate_up_scales: &gs,
             down_words: &dn,
@@ -983,5 +1273,120 @@ mod tests {
             eval_expert_slice(d, 0..2, &[], &[], &[1.0], &mut out, &mut []),
             Err(EvalError::InvalidShape)
         );
+    }
+
+    #[test]
+    fn expert_g64_hadamard64_scalar_and_tile_agreement() {
+        let h = 256;
+        let i = 256;
+        let gu = words(2 * i * h / 8, 11);
+        let dn = words(h * i / 8, 29);
+        let gs: Vec<u16> = (0..(2 * i * h / 64))
+            .map(|k| if k % 2 == 0 { 0x2000 } else { 0x2400 })
+            .collect();
+        let ds: Vec<u16> = (0..(h * i / 64))
+            .map(|k| if k % 2 == 0 { 0x2000 } else { 0x1c00 })
+            .collect();
+        let d = ExpertLayout {
+            hidden: h,
+            intermediate: i,
+            group_size: 64,
+            down_hadamard: 64,
+            gate_up_words: &gu,
+            gate_up_scales: &gs,
+            down_words: &dn,
+            down_scales: &ds,
+        };
+        let dot_g64 = |w: &[u32], s: &[u16], x: &[f32]| -> f32 {
+            x.iter()
+                .enumerate()
+                .map(|(c, v)| {
+                    let scale = crate::cuda::f16_to_f32(s[c / 64]);
+                    (((w[c / 8] >> (4 * (c % 8))) & 15) as f32 - 8.0) * scale * v
+                })
+                .sum()
+        };
+        for nt in [1, 2, 3, 4, 8, 17, 32] {
+            let x_f16: Vec<u16> = (0..nt * h)
+                .map(|j| crate::cuda::f32_to_f16(((j * 17 % 101) as f32 - 50.0) / 100.0))
+                .collect();
+            let x: Vec<f32> = x_f16.iter().map(|&b| crate::cuda::f16_to_f32(b)).collect();
+            let wt: Vec<_> = (0..nt)
+                .map(|t| if t % 2 == 0 { 0.7 } else { -0.2 })
+                .collect();
+            let mut xp = vec![0.0; nt * h];
+            let mut xg = vec![0.0; nt * h / 64];
+            let mut xp_f16 = vec![0.0; nt * h];
+            let mut xg_f16 = vec![0.0; nt * h / 64];
+            for t in 0..nt {
+                prepare_x_perm_grouped(
+                    &x[t * h..(t + 1) * h],
+                    64,
+                    &mut xp[t * h..(t + 1) * h],
+                    &mut xg[t * h / 64..(t + 1) * h / 64],
+                )
+                .unwrap();
+                prepare_x_perm_f16_grouped(
+                    &x_f16[t * h..(t + 1) * h],
+                    64,
+                    &mut xp_f16[t * h..(t + 1) * h],
+                    &mut xg_f16[t * h / 64..(t + 1) * h / 64],
+                )
+                .unwrap();
+            }
+            assert_eq!(xp, xp_f16);
+            assert_eq!(xg, xg_f16);
+            let mut out = vec![0.0; nt * h];
+            let mut scratch = vec![0.0; scratch_len(nt, 2).unwrap()];
+            eval_expert_prefill(d, &xp, &xg, &wt, &mut out, &mut scratch).unwrap();
+            let mut out_portable = vec![0.0; nt * h];
+            expert_portable(d, 0..2, &xp, &xg, &wt, &mut out_portable, &mut scratch);
+            assert_eq!(
+                out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                out_portable.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "g64+had64 portable and SIMD prefill diverged at nt={nt}"
+            );
+            #[cfg(target_arch = "x86_64")]
+            if supported() {
+                let mut out_avx2 = vec![0.0; nt * h];
+                // SAFETY: `supported()` verified AVX2 + FMA + F16C and buffer bounds above.
+                unsafe {
+                    simd::expert_avx2(d, 0..2, [&xp, &xg], &wt, &mut out_avx2, &mut scratch);
+                }
+                assert_eq!(
+                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    out_avx2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "g64+had64 AVX2 and AVX512 diverged at nt={nt}"
+                );
+            }
+            for t in 0..nt {
+                let mut act: Vec<_> = (0..i)
+                    .map(|r| {
+                        let g =
+                            dot_g64(&gu[r * h / 8..], &gs[r * h / 64..], &x[t * h..(t + 1) * h]);
+                        let u = dot_g64(
+                            &gu[(i + r) * h / 8..],
+                            &gs[(i + r) * h / 64..],
+                            &x[t * h..(t + 1) * h],
+                        );
+                        (g / (1.0 + (-g).exp())) * u
+                    })
+                    .collect();
+                hadamard64_f32_inplace(&mut act);
+                for r in 0..h {
+                    let expected = wt[t] * dot_g64(&dn[r * i / 8..], &ds[r * i / 64..], &act);
+                    assert!((out[t * h + r] - expected).abs() < 4e-5, "t={t}, r={r}");
+                }
+            }
+            if nt <= 4 {
+                let mut a = vec![0.0; nt * h];
+                let mut b = a.clone();
+                eval_expert_slice(d, 0..1, &xp, &xg, &wt, &mut a, &mut scratch).unwrap();
+                eval_expert_slice(d, 1..2, &xp, &xg, &wt, &mut b, &mut scratch).unwrap();
+                for j in 0..out.len() {
+                    assert!((a[j] + b[j] - out[j]).abs() < 4e-5);
+                }
+            }
+        }
     }
 }

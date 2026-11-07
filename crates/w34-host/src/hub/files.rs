@@ -136,21 +136,32 @@ pub(super) fn validate_config(dir: &Path, role: ModelRole) -> io::Result<()> {
         }
         ModelRole::Draft => {
             let body = root.get("transformer_layer_config").unwrap_or(&root);
-            let config = ModelConfig::from_drafter_json(body)?;
-            if config.quant != QuantScheme::Unquantized
-                || root
+            let mut config = ModelConfig::from_drafter_json(body)?;
+            if config.quant == QuantScheme::Unquantized
+                && root
                     .get("quantization_config")
                     .is_some_and(|v| !v.is_null())
-                || [
-                    "quantize_config.json",
-                    "quant_config.json",
-                    "quantization_config.json",
-                ]
-                .iter()
-                .any(|name| dir.join(name).exists())
+            {
+                config.quant = ModelConfig::parse_quant(root.get("quantization_config"))?;
+            }
+            if !matches!(
+                config.quant,
+                QuantScheme::Unquantized
+                    | QuantScheme::CompressedTensors {
+                        num_bits: 4,
+                        symmetric: true,
+                        ..
+                    }
+            ) || [
+                "quantize_config.json",
+                "quant_config.json",
+                "quantization_config.json",
+            ]
+            .iter()
+            .any(|name| dir.join(name).exists())
             {
                 return Err(invalid(
-                    "quantized DFlash2 drafters are not supported; use native BF16/FP16 drafter weights",
+                    "unsupported quantized DFlash2 drafter; only compressed-tensors W4A16 / W4A16-HGPTQ or unquantized BF16/FP16 drafter weights are supported",
                 ));
             }
             if !root["architectures"]

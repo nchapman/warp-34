@@ -7,6 +7,7 @@
 //     with causal boundary masking & optional sigmoid output gate
 #include "../w34_cuda.h"
 #include "../tq/tq4_codebook.cuh"
+#include "hadamard_inline.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -662,10 +663,27 @@ __global__ void qsa_select_blocks_f16_kernel(
 }
 
 // GQA-grouped + Split-K Sparse Paged Attention over the selected 4-token groups per token for
+template <bool APPLY_HAD64 = false>
+__device__ __forceinline__ void qsa_store_head256_warp(
+    __half* __restrict__ dst_head,
+    __half* __restrict__ s_head,
+    int lane) {
+    if constexpr (APPLY_HAD64) {
+        __syncwarp();
+#pragma unroll
+        for (int blk = 0; blk < 2; ++blk) {
+            const int idx4 = blk * 32 + lane;
+            const uint2 v = reinterpret_cast<const uint2*>(s_head)[idx4];
+            reinterpret_cast<uint2*>(dst_head)[idx4] = hadamard64_vec4_f16(v);
+        }
+    }
+}
+
 // FP16, Q8_0, and TQ4 KV caches (head_dim == 256, 1 <= q_group_size <= 6).
 // All `q_group_size` Q heads in the sub-group share the same `kv_head` and run in the same CTA so
 // each selected KV row is fetched and dequantized once instead of `q_group_size` times.
 // Grid: (num_tokens, local_q_heads / q_group_size, num_splits), Block: 128 (4 warps).
+template <bool APPLY_HAD64 = false>
 __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ gate,
@@ -967,6 +985,9 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
                     ? (gate + ((size_t)tok * local_q_heads + q_head) * 256)
                     : nullptr;
                 __half* dst_head = out + ((size_t)tok * local_q_heads + q_head) * 256;
+                __half* s_head = APPLY_HAD64
+                    ? reinterpret_cast<__half*>(s_work[wid][0])
+                    : dst_head;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     const int col = lane + 32 * j;
@@ -975,8 +996,9 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
                         const float g = __half2float(gate_head[col]);
                         val *= (1.0f / (1.0f + expf(-g)));
                     }
-                    dst_head[col] = __float2half(val);
+                    s_head[col] = __float2half(val);
                 }
+                qsa_store_head256_warp<APPLY_HAD64>(dst_head, s_head, lane);
             }
         }
     }
@@ -984,6 +1006,7 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
 
 // 1-warp Split-K reduction kernel for `qsa_sparse_paged_attn_gqa_f16_kernel` (`num_splits` in 2..=32).
 // Grid: (num_tokens, local_q_heads), Block: 32.
+template <bool APPLY_HAD64 = false>
 __global__ void qsa_sparse_paged_attn_merge_f16_kernel(
     const float* __restrict__ partial_m,
     const float* __restrict__ partial_d,
@@ -1049,6 +1072,8 @@ __global__ void qsa_sparse_paged_attn_merge_f16_kernel(
     const __half* gate_head = (gate != nullptr)
         ? (gate + ((size_t)tok * local_q_heads + q_head) * 256)
         : nullptr;
+    __shared__ __align__(16) __half s_head_buf[256];
+    __half* s_head = APPLY_HAD64 ? s_head_buf : dst_head;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int col = lane + 32 * j;
@@ -1057,14 +1082,16 @@ __global__ void qsa_sparse_paged_attn_merge_f16_kernel(
             const float g = __half2float(gate_head[col]);
             val *= (1.0f / (1.0f + expf(-g)));
         }
-        dst_head[col] = __float2half(val);
+        s_head[col] = __float2half(val);
     }
+    qsa_store_head256_warp<APPLY_HAD64>(dst_head, s_head, lane);
 }
 
 // Generic Sparse Paged GQA fallback (used when `local_kv_heads == 0`, `local_q_heads` is not
 // divisible by `local_kv_heads`, or `head_dim != 256`; divisible GQA with `head_dim == 256`
 // uses `qsa_sparse_paged_attn_gqa_f16_kernel` with `q_group_size` in `1..=6`).
 // Grid: (num_tokens, local_q_heads), Block: 128 (4 warps, 8 dims per lane of head_dim=256).
+template <bool APPLY_HAD64 = false>
 __global__ void qsa_sparse_paged_attn_f16_kernel(
     const __half* __restrict__ q,
     const __half* __restrict__ gate,
@@ -1280,6 +1307,7 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
                 out_v[j] = sum_v * inv_d;
             }
             qsa_wht256_warp(out_v, lane);
+            __half* s_head = APPLY_HAD64 ? reinterpret_cast<__half*>(s_acc[0]) : dst_head;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int col = lane + 32 * j;
@@ -1288,12 +1316,15 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
                     const float g = __half2float(gate_head[col]);
                     val *= (1.0f / (1.0f + expf(-g)));
                 }
-                dst_head[col] = __float2half(val);
+                s_head[col] = __float2half(val);
             }
+            qsa_store_head256_warp<APPLY_HAD64>(dst_head, s_head, lane);
         }
         return;
     }
 
+    __shared__ __align__(16) __half s_head_fallback[256];
+    __half* s_head = APPLY_HAD64 ? s_head_fallback : dst_head;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float sum_v = 0.0f;
 #pragma unroll
@@ -1305,8 +1336,131 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
             const float g = __half2float(gate_head[d]);
             val *= (1.0f / (1.0f + expf(-g)));
         }
-        dst_head[d] = __float2half(val);
+        s_head[d] = __float2half(val);
     }
+    if constexpr (APPLY_HAD64) {
+        __syncthreads();
+        if (wid == 0) {
+            qsa_store_head256_warp<true>(dst_head, s_head, lane);
+        }
+    }
+}
+
+template <bool APPLY_HAD64 = false>
+static int launch_qsa_sparse_paged_attn_f16(
+    const w34_exec* ex,
+    const void* q,
+    const void* gate,
+    const w34_kv_layer_layout* kv_layout,
+    const int32_t* selected_phys_blocks,
+    const int32_t* selected_logical_blocks,
+    const int32_t* num_selected_blocks,
+    const int32_t* token_seq_pos,
+    const uint8_t* valid_token_mask,
+    void* out,
+    int num_tokens,
+    int local_q_heads,
+    int select_k_blocks,
+    float sm_scale) {
+    if (!ex || !q || !kv_layout || !selected_phys_blocks || !selected_logical_blocks ||
+        !num_selected_blocks || !token_seq_pos || !out || num_tokens < 0 || local_q_heads <= 0 ||
+        kv_layout->head_dim != 256) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    const int local_kv_heads = kv_layout->local_kv_heads;
+    int q_group_size = 0;
+    if (local_kv_heads > 0 && (local_q_heads % local_kv_heads) == 0) {
+        const int full_gqa = local_q_heads / local_kv_heads;
+        for (int cand = 6; cand >= 1; --cand) {
+            if ((full_gqa % cand) == 0) {
+                q_group_size = cand;
+                break;
+            }
+        }
+    }
+    if (q_group_size >= 1 && q_group_size <= 6 && select_k_blocks > 0) {
+        const int num_q_groups = local_q_heads / q_group_size;
+        const int base_ctas = num_tokens * num_q_groups;
+        int target_splits = 1;
+        if (base_ctas <= 4) {
+            target_splits = 16;
+        } else if (base_ctas <= 16) {
+            target_splits = 8;
+        } else if (base_ctas <= 64) {
+            target_splits = 4;
+        } else if (base_ctas <= 128) {
+            target_splits = 2;
+        }
+        const int max_by_blocks = select_k_blocks >> 1;
+        if (target_splits > max_by_blocks) {
+            target_splits = (max_by_blocks >= 1) ? max_by_blocks : 1;
+        }
+        const size_t total_splits = (size_t)num_tokens * local_q_heads * target_splits;
+        const size_t needed_bytes = total_splits * 258 * sizeof(float);
+        const int num_splits =
+            (target_splits > 1 && ex->scratch_ptr != 0 && ex->scratch_size >= needed_bytes)
+                ? target_splits
+                : 1;
+        float* partial_m =
+            (num_splits > 1) ? reinterpret_cast<float*>((uintptr_t)ex->scratch_ptr) : nullptr;
+        float* partial_d = (num_splits > 1) ? (partial_m + total_splits) : nullptr;
+        float* partial_acc = (num_splits > 1) ? (partial_d + total_splits) : nullptr;
+
+        dim3 grid(num_tokens, num_q_groups, num_splits);
+        qsa_sparse_paged_attn_gqa_f16_kernel<APPLY_HAD64><<<grid, 128, 0, stream>>>(
+            static_cast<const __half*>(q),
+            static_cast<const __half*>(gate),
+            *kv_layout,
+            selected_phys_blocks,
+            selected_logical_blocks,
+            num_selected_blocks,
+            token_seq_pos,
+            valid_token_mask,
+            static_cast<__half*>(out),
+            partial_m,
+            partial_d,
+            partial_acc,
+            num_tokens,
+            local_q_heads,
+            q_group_size,
+            select_k_blocks,
+            num_splits,
+            sm_scale);
+        if (num_splits > 1) {
+            dim3 merge_grid(num_tokens, local_q_heads);
+            qsa_sparse_paged_attn_merge_f16_kernel<APPLY_HAD64><<<merge_grid, 32, 0, stream>>>(
+                partial_m,
+                partial_d,
+                partial_acc,
+                static_cast<const __half*>(gate),
+                valid_token_mask,
+                static_cast<__half*>(out),
+                num_tokens,
+                local_q_heads,
+                num_splits,
+                kv_layout->v_transform);
+        }
+        return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+    }
+
+    dim3 grid(num_tokens, local_q_heads);
+    qsa_sparse_paged_attn_f16_kernel<APPLY_HAD64><<<grid, 128, 0, stream>>>(
+        static_cast<const __half*>(q),
+        static_cast<const __half*>(gate),
+        *kv_layout,
+        selected_phys_blocks,
+        selected_logical_blocks,
+        num_selected_blocks,
+        token_seq_pos,
+        valid_token_mask,
+        static_cast<__half*>(out),
+        num_tokens,
+        local_q_heads,
+        select_k_blocks,
+        sm_scale);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
 }
 
 } // namespace w34
@@ -1464,105 +1618,31 @@ int w34_qsa_sparse_paged_attn_f16(
     int local_q_heads,
     int select_k_blocks,
     float sm_scale) {
-    if (!ex || !q || !kv_layout || !selected_phys_blocks || !selected_logical_blocks ||
-        !num_selected_blocks || !token_seq_pos || !out || num_tokens < 0 || local_q_heads <= 0 ||
-        kv_layout->head_dim != 256) {
-        return -1;
-    }
-    if (num_tokens == 0) return 0;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    const int local_kv_heads = kv_layout->local_kv_heads;
-    int q_group_size = 0;
-    if (local_kv_heads > 0 && (local_q_heads % local_kv_heads) == 0) {
-        const int full_gqa = local_q_heads / local_kv_heads;
-        for (int cand = 6; cand >= 1; --cand) {
-            if ((full_gqa % cand) == 0) {
-                q_group_size = cand;
-                break;
-            }
-        }
-    }
-    if (q_group_size >= 1 && q_group_size <= 6 && select_k_blocks > 0) {
-        const int num_q_groups = local_q_heads / q_group_size;
-        const int base_ctas = num_tokens * num_q_groups;
-        int target_splits = 1;
-        if (base_ctas <= 4) {
-            target_splits = 16;
-        } else if (base_ctas <= 16) {
-            target_splits = 8;
-        } else if (base_ctas <= 64) {
-            target_splits = 4;
-        } else if (base_ctas <= 128) {
-            target_splits = 2;
-        }
-        const int max_by_blocks = select_k_blocks >> 1;
-        if (target_splits > max_by_blocks) {
-            target_splits = (max_by_blocks >= 1) ? max_by_blocks : 1;
-        }
-        const size_t total_splits = (size_t)num_tokens * local_q_heads * target_splits;
-        const size_t needed_bytes = total_splits * 258 * sizeof(float);
-        const int num_splits =
-            (target_splits > 1 && ex->scratch_ptr != 0 && ex->scratch_size >= needed_bytes)
-                ? target_splits
-                : 1;
-        float* partial_m =
-            (num_splits > 1) ? reinterpret_cast<float*>((uintptr_t)ex->scratch_ptr) : nullptr;
-        float* partial_d = (num_splits > 1) ? (partial_m + total_splits) : nullptr;
-        float* partial_acc = (num_splits > 1) ? (partial_d + total_splits) : nullptr;
+    return w34::launch_qsa_sparse_paged_attn_f16<false>(
+        ex, q, gate, kv_layout, selected_phys_blocks, selected_logical_blocks,
+        num_selected_blocks, token_seq_pos, valid_token_mask, out, num_tokens,
+        local_q_heads, select_k_blocks, sm_scale);
+}
 
-        dim3 grid(num_tokens, num_q_groups, num_splits);
-        w34::qsa_sparse_paged_attn_gqa_f16_kernel<<<grid, 128, 0, stream>>>(
-            static_cast<const __half*>(q),
-            static_cast<const __half*>(gate),
-            *kv_layout,
-            selected_phys_blocks,
-            selected_logical_blocks,
-            num_selected_blocks,
-            token_seq_pos,
-            valid_token_mask,
-            static_cast<__half*>(out),
-            partial_m,
-            partial_d,
-            partial_acc,
-            num_tokens,
-            local_q_heads,
-            q_group_size,
-            select_k_blocks,
-            num_splits,
-            sm_scale);
-        if (num_splits > 1) {
-            dim3 merge_grid(num_tokens, local_q_heads);
-            w34::qsa_sparse_paged_attn_merge_f16_kernel<<<merge_grid, 32, 0, stream>>>(
-                partial_m,
-                partial_d,
-                partial_acc,
-                static_cast<const __half*>(gate),
-                valid_token_mask,
-                static_cast<__half*>(out),
-                num_tokens,
-                local_q_heads,
-                num_splits,
-                kv_layout->v_transform);
-        }
-        return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
-    }
-
-    dim3 grid(num_tokens, local_q_heads);
-    w34::qsa_sparse_paged_attn_f16_kernel<<<grid, 128, 0, stream>>>(
-        static_cast<const __half*>(q),
-        static_cast<const __half*>(gate),
-        *kv_layout,
-        selected_phys_blocks,
-        selected_logical_blocks,
-        num_selected_blocks,
-        token_seq_pos,
-        valid_token_mask,
-        static_cast<__half*>(out),
-        num_tokens,
-        local_q_heads,
-        select_k_blocks,
-        sm_scale);
-    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+int w34_qsa_sparse_paged_attn_hadamard_f16(
+    const w34_exec* ex,
+    const void* q,
+    const void* gate,
+    const w34_kv_layer_layout* kv_layout,
+    const int32_t* selected_phys_blocks,
+    const int32_t* selected_logical_blocks,
+    const int32_t* num_selected_blocks,
+    const int32_t* token_seq_pos,
+    const uint8_t* valid_token_mask,
+    void* out,
+    int num_tokens,
+    int local_q_heads,
+    int select_k_blocks,
+    float sm_scale) {
+    return w34::launch_qsa_sparse_paged_attn_f16<true>(
+        ex, q, gate, kv_layout, selected_phys_blocks, selected_logical_blocks,
+        num_selected_blocks, token_seq_pos, valid_token_mask, out, num_tokens,
+        local_q_heads, select_k_blocks, sm_scale);
 }
 
 } // extern "C"

@@ -501,4 +501,53 @@ fn kv_policy_parsing_and_tensor_diff_metrics() {
     assert_eq!(cos_z, 1.0);
     let (_, _, cos_one_zero) = tensor_diff_metrics(&[0.0, 0.0], &[1.0, 1.0]);
     assert_eq!(cos_one_zero, 0.0);
+
+    let ref_vals = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let mut mm_ok = ref_vals.clone();
+    mm_ok[0] = 1.6;
+    mm_ok[1] = 2.6;
+    mm_ok[4] = 5.05;
+    let (_, last_rel, min_cos) =
+        evaluate_golden_tensor_diff("final_norm", &[3, 2], &mm_ok, &ref_vals, true).unwrap();
+    assert!(last_rel < 0.05);
+    assert!(min_cos > 0.99);
+    assert!(evaluate_golden_tensor_diff("final_norm", &[3, 2], &mm_ok, &ref_vals, false).is_err());
+    assert!(
+        evaluate_golden_tensor_diff("layer_0_hidden_after", &[3, 2], &mm_ok, &ref_vals, true)
+            .is_err()
+    );
+    let mut bad_mid_row = ref_vals.clone();
+    bad_mid_row[2] = -3.0;
+    bad_mid_row[3] = -4.0;
+    assert!(
+        evaluate_golden_tensor_diff("final_norm", &[3, 2], &bad_mid_row, &ref_vals, true).is_err()
+    );
+    assert!(evaluate_golden_tensor_diff("final_norm", &[2, 2], &mm_ok, &ref_vals, true).is_err());
+
+    assert!(
+        evaluate_moe_or_golden_tensor_diff("final_norm", &[3, 2], &mm_ok, &ref_vals, false, true)
+            .is_ok()
+    );
+    assert!(
+        evaluate_moe_or_golden_tensor_diff(
+            "layer_0_hidden_after",
+            &[3, 2],
+            &mm_ok,
+            &ref_vals,
+            false,
+            true,
+        )
+        .is_err()
+    );
+    assert!(
+        evaluate_moe_or_golden_tensor_diff(
+            "final_norm",
+            &[3, 2],
+            &bad_mid_row,
+            &ref_vals,
+            true,
+            true,
+        )
+        .is_err()
+    );
 }

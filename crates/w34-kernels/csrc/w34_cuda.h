@@ -178,6 +178,21 @@ int w34_embed_lookup_f16(const w34_exec* ex, const int32_t* token_ids,
                          const uint8_t* valid_token_mask,
                          int num_tokens, int hidden_size, int vocab_size);
 
+// Out-of-place normalized Sylvester H16/H64 on contiguous FP16 [rows,k].
+// Writes contiguous [rows,padded_k], zero-filling the tail after transforming
+// logical blocks. Both widths must be multiples of block_size. No aliasing.
+// FP16 crop with optional FP32 bias add. In-place only for equal widths.
+int w34_linear_epilogue_f16(const w34_exec* ex, const void* src,
+                            const void* bias, void* dst, int rows,
+                            int logical_n, int physical_n);
+
+int w34_block_hadamard_f16(const w34_exec* ex, const void* src, void* dst,
+                           int rows, int k, int padded_k, int block_size);
+int w34_block_hadamard_inplace_f16(const w34_exec* ex, void* buf,
+                                   int rows, int k, int block_size);
+int w34_block_hadamard_bf16(const w34_exec* ex, const void* src, void* dst,
+                            int rows, int k, int padded_k, int block_size);
+
 int w34_copy_masked_rows_f16(const w34_exec* ex, const void* src, void* dst,
                              const uint8_t* valid_token_mask,
                              int num_tokens, int row_elems);
@@ -297,6 +312,10 @@ int w34_marlin_gemm_f16u4(const w34_exec* ex, const void* a, const void* b,
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
                           int64_t workspace_ints, int group_blocks);
+int w34_marlin_gemm_bf16u4(const w34_exec* ex, const void* a, const void* b,
+                           const void* scales, void* c, int32_t* workspace,
+                           int64_t m, int64_t n, int64_t k,
+                           int64_t workspace_ints, int group_blocks);
 int w34_marlin_gemm_f16u4_zp(const w34_exec* ex, const void* a, const void* b,
                              const void* scales, const void* zeros, void* c,
                              int32_t* workspace, int64_t m, int64_t n, int64_t k,
@@ -604,6 +623,16 @@ int w34_moe_w4a16_mlp_f16(const w34_exec* ex, const void* x,
                           void* interm_buf, void* out,
                           int num_tokens, int top_k, int num_experts,
                           int n_interm, int k_hidden, int group_size);
+int w34_moe_w4a16_mlp_ex_f16(const w34_exec* ex, const void* x,
+                             const uint32_t* gate_up_packed, const void* gate_up_scales,
+                             const uint32_t* down_packed, const void* down_scales,
+                             const int32_t* topk_ids, const float* topk_weights,
+                             const void* shared_expert_out,
+                             const void* shared_expert_gate_logits,
+                             void* interm_buf, void* out,
+                             int num_tokens, int top_k, int num_experts,
+                             int n_interm, int k_hidden, int group_size,
+                             int down_hadamard_block_size);
 int w34_moe_w4a16_mlp_zp_f16(const w34_exec* ex, const void* x,
                              const uint32_t* gate_up_packed, const void* gate_up_scales,
                              const uint32_t* gate_up_qzeros,
@@ -615,6 +644,18 @@ int w34_moe_w4a16_mlp_zp_f16(const w34_exec* ex, const void* x,
                              void* interm_buf, void* out,
                              int num_tokens, int top_k, int num_experts,
                              int n_interm, int k_hidden, int group_size);
+int w34_moe_w4a16_mlp_zp_ex_f16(const w34_exec* ex, const void* x,
+                                const uint32_t* gate_up_packed, const void* gate_up_scales,
+                                const uint32_t* gate_up_qzeros,
+                                const uint32_t* down_packed, const void* down_scales,
+                                const uint32_t* down_qzeros,
+                                const int32_t* topk_ids, const float* topk_weights,
+                                const void* shared_expert_out,
+                                const void* shared_expert_gate_logits,
+                                void* interm_buf, void* out,
+                                int num_tokens, int top_k, int num_experts,
+                                int n_interm, int k_hidden, int group_size,
+                                int down_hadamard_block_size);
 int w34_moe_f16_gate_up_silu(const w34_exec* ex, const void* x, const void* gate_up_w,
                              const int32_t* topk_ids, void* interm_out,
                              int num_tokens, int top_k, int num_experts,
@@ -667,10 +708,20 @@ int w34_hc_down_silu_inject_f16(const w34_exec* ex, const void* down_in, void* d
 int w34_hc_mix_streams_f16(const w34_exec* ex, const void* residual_in, const void* up_raw_in,
                            void* mixed_out, const uint8_t* valid_token_mask,
                            int num_tokens, int hc_count, int hidden_size);
+int w34_hc_mix_streams_hadamard_f16(const w34_exec* ex, const void* residual_in,
+                                    const void* up_raw_in, void* mixed_out, void* had64_out,
+                                    const uint8_t* valid_token_mask, int num_tokens,
+                                    int hc_count, int hidden_size);
 int w34_hc_combine_f16(const w34_exec* ex, const void* residual_in, const void* block_out,
                        const float* inject_weights, const void* ple_delta,
                        void* residual_out, const uint8_t* valid_token_mask,
                        int num_tokens, int hc_count, int hidden_size);
+int w34_hc_combine_tap_f16(const w34_exec* ex, const void* residual_in, const void* block_out,
+                           const float* inject_weights, const void* ple_delta,
+                           void* residual_out, void* tap_bf16_out,
+                           const uint8_t* valid_token_mask, int num_tokens,
+                           int hc_count, int hidden_size, int tap_stride_elems,
+                           int tap_offset_elems);
 int w34_qwen4_mtp_broadcast_add_f16(const w34_exec* ex, const void* fc_embed,
                                     const void* fc_hidden, void* out_multi_hidden,
                                     int num_tokens, int hc_count, int hidden_size);
@@ -678,13 +729,32 @@ int w34_qwen4_mtp_broadcast_add_f16(const w34_exec* ex, const void* fc_embed,
 int w34_ple_dequant_f8_to_f16(const w34_exec* ex, const uint8_t* f8_in, void* f16_out,
                               const uint8_t* valid_token_mask, int num_tokens,
                               int embed_dim, float weight_scale);
+int w34_ple_dequant_f8_hadamard_to_f16(const w34_exec* ex, const uint8_t* f8_in, void* f16_out,
+                                       const uint8_t* valid_token_mask, int num_tokens,
+                                       int embed_dim, float weight_scale);
+int w34_ple_dequant_lut4_to_f16(const w34_exec* ex, const uint8_t* raw_in, const float* lut16,
+                                void* f16_out, const uint8_t* valid_token_mask, int num_tokens,
+                                int num_heads, int head_dim, int group_size);
+int w34_ple_dequant_lut4_hadamard_to_f16(const w34_exec* ex, const uint8_t* raw_in,
+                                         const float* lut16, void* f16_out,
+                                         const uint8_t* valid_token_mask, int num_tokens,
+                                         int num_heads, int head_dim, int group_size);
 int w34_ple_dilated_conv1d_f16(const w34_exec* ex, const void* key_in, const void* conv_weight,
                                void* conv_state_pool, void* key_out,
                                const w34_gdn_batch* batch, int conv_dim);
+int w34_ple_dilated_conv1d_add_f16(const w34_exec* ex, const void* key_in,
+                                   const void* conv_weight, void* conv_state_pool,
+                                   void* key_out, void* residual_inout,
+                                   const w34_gdn_batch* batch, int conv_dim);
 int w34_ple_signed_sqrt_gate_f16(const w34_exec* ex, const void* norm_query,
                                  const void* norm_key, const void* value_in,
                                  void* ple_delta_out, const uint8_t* valid_token_mask,
                                  int num_tokens, int hc_count, int embed_dim, float eps);
+int w34_ple_signed_sqrt_gate_norm_add_f16(
+    const w34_exec* ex, const void* norm_query, const void* norm_key, const void* value_in,
+    void* ple_delta_out, void* residual_inout, const void* norm_conv_weight,
+    void* norm_conv_out, const uint8_t* valid_token_mask, int num_tokens, int hc_count,
+    int embed_dim, float eps, float norm_eps);
 
 int w34_qsa_indexer_norm_rope_f16(const w34_exec* ex, const void* qk_in,
                                   const void* q_norm_weight, const void* k_norm_weight,
@@ -719,6 +789,12 @@ int w34_qsa_sparse_paged_attn_f16(const w34_exec* ex, const void* q, const void*
                                   const uint8_t* valid_token_mask,
                                   void* out, int num_tokens, int local_q_heads,
                                   int select_k_blocks, float sm_scale);
+int w34_qsa_sparse_paged_attn_hadamard_f16(
+    const w34_exec* ex, const void* q, const void* gate,
+    const w34_kv_layer_layout* kv_layout, const int32_t* selected_phys_blocks,
+    const int32_t* selected_logical_blocks, const int32_t* num_selected_blocks,
+    const int32_t* token_seq_pos, const uint8_t* valid_token_mask, void* out,
+    int num_tokens, int local_q_heads, int select_k_blocks, float sm_scale);
 
 // Pack and destination bases must be 16-byte aligned. Four destinations each
 // contain dst_capacity expert regions; nonnegative dst_slots must be unique.
@@ -753,6 +829,39 @@ int w34_moe_gpu_lru_update_and_pull(
     void* down_scales_base, int total_pairs, int global_expert_offset,
     int local_num_experts, int k_hot, int max_misses,
     size_t pack_stride_bytes, int n_interm, int k_hidden, int group_size);
+
+int w34_gemma_rms_norm_hadamard_f16(
+    const w34_exec* ex, const void* x, const void* weight, void* out, void* out_had64,
+    const uint8_t* valid_token_mask, int num_tokens, int hidden_size, float eps);
+int w34_fused_add_gemma_rms_norm_tap_hadamard_f16(
+    const w34_exec* ex, const void* x, void* residual, const void* weight, void* out,
+    void* out_had64, void* tap_dst_bf16, const uint8_t* valid_token_mask,
+    int num_tokens, int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset);
+int w34_rms_norm_gated_silu_strided_hadamard_f16(
+    const w34_exec* ex, const void* x, const void* z, const void* weight, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int num_v_heads, int head_dim,
+    int z_token_stride, float eps);
+int w34_rms_norm_gated_sigmoid_strided_hadamard_f16(
+    const w34_exec* ex, const void* x, const void* z, const void* weight, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int num_v_heads, int head_dim,
+    int z_token_stride, float eps);
+int w34_silu_and_mul_hadamard_f16(
+    const w34_exec* ex, const void* gate_up, void* out, const uint8_t* valid_token_mask,
+    int num_tokens, int intermediate_size);
+int w34_apply_attn_output_gate_hadamard_f16(
+    const w34_exec* ex, const void* attn_out, const void* gate, void* out,
+    const uint8_t* valid_token_mask, int num_tokens, int total_dim);
 
 #ifdef __cplusplus
 }

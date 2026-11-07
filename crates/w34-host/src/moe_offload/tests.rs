@@ -807,4 +807,559 @@ mod cuda_tests {
         }
         let _ = DeviceExpertSlotTable::alloc;
     }
+
+    #[test]
+    fn h64_g64_routed_moe_all_regimes_and_tiered_parity() {
+        use super::super::{
+            ExpertPackLayout, HostExpertStore, HotExpertCache, MoeOffloadMode, TieredMoeEngine,
+            TieredMoeWorkspace,
+        };
+        use crate::cuda::{f16_to_f32, f32_to_f16};
+
+        let _device = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let ex0 = stream.exec(0, 0);
+
+        // 1. Verify `w34_block_hadamard_inplace_f16` matches `w34_block_hadamard_f16` 0-ULP for B=16 and B=64.
+        let rows = 6usize;
+        let cols = 128usize;
+        let h_in: Vec<u16> = (0..rows * cols)
+            .map(|i| f32_to_f16(((i as f32 * 0.19).sin()) * 0.7))
+            .collect();
+        for block_size in [16i32, 64] {
+            let d_src = upload(&h_in, &stream);
+            let d_dst = DeviceBuffer::alloc(0, rows * cols * 2).unwrap();
+            let d_inp = upload(&h_in, &stream);
+            // SAFETY: `d_src` and `d_dst` are disjoint `rows * cols` FP16 buffers; `d_inp` is in-place.
+            unsafe {
+                assert_eq!(
+                    ffi::w34_block_hadamard_f16(
+                        &ex0,
+                        d_src.addr() as *const _,
+                        d_dst.addr() as *mut _,
+                        rows as i32,
+                        cols as i32,
+                        cols as i32,
+                        block_size,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    ffi::w34_block_hadamard_inplace_f16(
+                        &ex0,
+                        d_inp.addr() as *mut _,
+                        rows as i32,
+                        cols as i32,
+                        block_size,
+                    ),
+                    0
+                );
+            }
+            let mut h_oop = vec![0u16; rows * cols];
+            let mut h_inp = vec![0u16; rows * cols];
+            d_dst.copy_to_host(&mut h_oop, &stream).unwrap();
+            d_inp.copy_to_host(&mut h_inp, &stream).unwrap();
+            assert_eq!(
+                h_oop, h_inp,
+                "inplace vs out-of-place mismatch for B={block_size}"
+            );
+        }
+
+        // 2. Verify `group_size = 64` + `down_hadamard_block_size = 64` across all MoE regimes
+        //    (`M = 1` GEMV, `M = 4` sparse_vec4, `M = 8` sparse_mma, `M = 20` chunked prefill)
+        //    plus `CpuHybrid` and `StreamedPrefill`.
+        let num_experts = 16usize;
+        let n_interm = 640usize;
+        let k_hidden = 128usize;
+        let group_size = 64usize;
+        let top_k = 2usize;
+        let max_m = 20usize;
+        let layout = ExpertPackLayout::new(n_interm, k_hidden, group_size)
+            .unwrap()
+            .with_down_hadamard(64)
+            .unwrap();
+
+        let gu_words_per_exp = (2 * n_interm) * (k_hidden / 8);
+        let gu_scales_per_exp = (2 * n_interm) * (k_hidden / group_size);
+        let dn_words_per_exp = k_hidden * (n_interm / 8);
+        let dn_scales_per_exp = k_hidden * (n_interm / group_size);
+
+        let mut raw_packs = vec![0u8; num_experts * layout.stride];
+        for e in 0..num_experts {
+            let gu_p: Vec<u32> = (0..gu_words_per_exp)
+                .map(|i| {
+                    let mut w = 0u32;
+                    for b in 0..8 {
+                        let nib = (((e * 17 + i * 11 + b * 5) % 15) as u32) & 0xF;
+                        w |= nib << (b * 4);
+                    }
+                    w
+                })
+                .collect();
+            let gu_s: Vec<u16> = (0..gu_scales_per_exp)
+                .map(|i| f32_to_f16(0.014 + 0.0018 * (((e * 7 + i) % 9) as f32)))
+                .collect();
+            let dn_p: Vec<u32> = (0..dn_words_per_exp)
+                .map(|i| {
+                    let mut w = 0u32;
+                    for b in 0..8 {
+                        let nib = (((e * 19 + i * 3 + b * 7) % 15) as u32) & 0xF;
+                        w |= nib << (b * 4);
+                    }
+                    w
+                })
+                .collect();
+            let dn_s: Vec<u16> = (0..dn_scales_per_exp)
+                .map(|i| f32_to_f16(0.011 + 0.0014 * (((e * 5 + i) % 11) as f32)))
+                .collect();
+            layout
+                .write_pack(
+                    &gu_p,
+                    &gu_s,
+                    &dn_p,
+                    &dn_s,
+                    &mut raw_packs[e * layout.stride..(e + 1) * layout.stride],
+                )
+                .unwrap();
+        }
+
+        let h_x: Vec<u16> = (0..max_m * k_hidden)
+            .map(|i| f32_to_f16(((i as f32 * 0.11).cos()) * 0.45))
+            .collect();
+        let h_topk_ids: Vec<i32> = (0..max_m)
+            .flat_map(|t| {
+                [
+                    (t * 3 % num_experts) as i32,
+                    ((t * 5 + 1) % num_experts) as i32,
+                ]
+            })
+            .collect();
+        let h_topk_weights: Vec<f32> = (0..max_m * top_k)
+            .map(|i| if i % 2 == 0 { 0.65 } else { 0.35 })
+            .collect();
+
+        let d_x = upload(&h_x, &stream);
+        let d_topk_ids = upload(&h_topk_ids, &stream);
+        let d_topk_weights = upload(&h_topk_weights, &stream);
+
+        let full_store = HostExpertStore::from_raw_packs(
+            layout.clone(),
+            0..num_experts,
+            &raw_packs,
+            num_experts * layout.stride,
+        )
+        .unwrap();
+        let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 8, max_m, top_k).unwrap();
+        let mut full_cache =
+            HotExpertCache::new(0, num_experts, 0..num_experts, layout.clone()).unwrap();
+        full_cache
+            .populate_initial(&full_store, None, &mut ws, &stream)
+            .unwrap();
+
+        for m in [1usize, 4, 8, 20] {
+            let mut tasks = Vec::with_capacity(m * top_k);
+            for tok in 0..m {
+                for k in 0..top_k {
+                    let idx = tok * top_k + k;
+                    tasks.push((tok, h_topk_ids[idx] as usize, h_topk_weights[idx]));
+                }
+            }
+            let h_cpu = full_store.eval_cold_tasks_cpu(&h_x[..m * k_hidden], m, &tasks);
+            let d_out = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+            TieredMoeEngine::execute_layer_device_lru(
+                &full_store,
+                &mut full_cache,
+                &ws,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                0,
+                0,
+                d_out.addr(),
+                m,
+                top_k,
+            )
+            .unwrap();
+            let mut h_gpu = vec![0u16; m * k_hidden];
+            d_out.copy_to_host(&mut h_gpu, &stream).unwrap();
+            let max_diff = h_gpu
+                .iter()
+                .zip(&h_cpu)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1.6e-2,
+                "H64+g64 MoE M={m} max_abs_diff={max_diff} exceeds 1.6e-2"
+            );
+
+            // Also verify 0-ULP bit-identity of epilogue-fused H_64 (`down_hadamard_block_size = 64`)
+            // in `d_interm` vs unfused Stage-1 (`down_hadamard_block_size = 0`) + standalone
+            // `w34_block_hadamard_inplace_f16(..., 64)` across all 4 regimes (`M = 1, 4, 8, 16`):
+            let chunk_m = m.min(16);
+            let d_interm_fused = DeviceBuffer::alloc(0, chunk_m * top_k * n_interm * 2).unwrap();
+            let d_interm_unfused = DeviceBuffer::alloc(0, chunk_m * top_k * n_interm * 2).unwrap();
+            let d_out_tmp = DeviceBuffer::alloc(0, chunk_m * k_hidden * 2).unwrap();
+            let ex_ws = stream.exec(ws.d_scratch.addr(), ws.d_scratch.len_bytes);
+            // SAFETY: All device pointers match `full_cache` and `ws` dimensions for `chunk_m`.
+            unsafe {
+                assert_eq!(
+                    ffi::w34_moe_w4a16_mlp_ex_f16(
+                        &ex_ws,
+                        d_x.addr() as *const _,
+                        full_cache.slots.gate_up_packed.addr() as *const _,
+                        full_cache.slots.gate_up_scales.addr() as *const _,
+                        full_cache.slots.down_packed.addr() as *const _,
+                        full_cache.slots.down_scales.addr() as *const _,
+                        d_topk_ids.addr() as *const _,
+                        d_topk_weights.addr() as *const _,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        d_interm_fused.addr() as *mut _,
+                        d_out_tmp.addr() as *mut _,
+                        chunk_m as i32,
+                        top_k as i32,
+                        num_experts as i32,
+                        n_interm as i32,
+                        k_hidden as i32,
+                        group_size as i32,
+                        64,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    ffi::w34_moe_w4a16_mlp_ex_f16(
+                        &ex_ws,
+                        d_x.addr() as *const _,
+                        full_cache.slots.gate_up_packed.addr() as *const _,
+                        full_cache.slots.gate_up_scales.addr() as *const _,
+                        full_cache.slots.down_packed.addr() as *const _,
+                        full_cache.slots.down_scales.addr() as *const _,
+                        d_topk_ids.addr() as *const _,
+                        d_topk_weights.addr() as *const _,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        d_interm_unfused.addr() as *mut _,
+                        d_out_tmp.addr() as *mut _,
+                        chunk_m as i32,
+                        top_k as i32,
+                        num_experts as i32,
+                        n_interm as i32,
+                        k_hidden as i32,
+                        group_size as i32,
+                        0,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    ffi::w34_block_hadamard_inplace_f16(
+                        &ex0,
+                        d_interm_unfused.addr() as *mut _,
+                        (chunk_m * top_k) as i32,
+                        n_interm as i32,
+                        64,
+                    ),
+                    0
+                );
+            }
+            let mut h_interm_fused = vec![0u16; chunk_m * top_k * n_interm];
+            let mut h_interm_unfused = vec![0u16; chunk_m * top_k * n_interm];
+            d_interm_fused
+                .copy_to_host(&mut h_interm_fused, &stream)
+                .unwrap();
+            d_interm_unfused
+                .copy_to_host(&mut h_interm_unfused, &stream)
+                .unwrap();
+            assert_eq!(
+                h_interm_fused, h_interm_unfused,
+                "epilogue-fused H_64 interm_buf 0-ULP mismatch at chunk_m={chunk_m}"
+            );
+        }
+
+        // Also verify `CpuHybrid` and `StreamedPrefill` with `k_hot = 4` on `m = 6`.
+        let m = 6usize;
+        let mut tasks = Vec::with_capacity(m * top_k);
+        for tok in 0..m {
+            for k in 0..top_k {
+                let idx = tok * top_k + k;
+                tasks.push((tok, h_topk_ids[idx] as usize, h_topk_weights[idx]));
+            }
+        }
+        let h_cpu = full_store.eval_cold_tasks_cpu(&h_x[..m * k_hidden], m, &tasks);
+        for mode in [
+            MoeOffloadMode::CpuHybrid { gpu_pcie_budget: 1 },
+            MoeOffloadMode::StreamedPrefill,
+        ] {
+            let mut cache = HotExpertCache::new(0, 4, 0..num_experts, layout.clone()).unwrap();
+            let mut ws_small = TieredMoeWorkspace::new(0, layout.clone(), 3, m, top_k).unwrap();
+            cache
+                .populate_initial(&full_store, Some(&[0, 1, 2, 3]), &mut ws_small, &stream)
+                .unwrap();
+            let d_out = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+            TieredMoeEngine::execute_layer(
+                mode,
+                &full_store,
+                &mut cache,
+                &mut ws_small,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids[..m * top_k],
+                &h_topk_weights[..m * top_k],
+                0,
+                0,
+                d_out.addr(),
+                m,
+                top_k,
+            )
+            .unwrap();
+            let mut h_gpu = vec![0u16; m * k_hidden];
+            d_out.copy_to_host(&mut h_gpu, &stream).unwrap();
+            let max_diff = h_gpu
+                .iter()
+                .zip(&h_cpu)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1.6e-2,
+                "H64+g64 MoE {mode:?} max_abs_diff={max_diff} exceeds 1.6e-2"
+            );
+        }
+
+        // Also verify the CUDA-Graph-safe CPU+GPU Hybrid Bridge (`register_cpu_bridge`) with
+        // `group_size = 64` and `down_hadamard = 64` across `m = 4` (mailbox) and `m = 6` (prefill).
+        assert!(HotExpertCache::cpu_bridge_supported());
+        for (m_bridge, use_prefill) in [(4usize, false), (6usize, true)] {
+            let mut tasks_b = Vec::with_capacity(m_bridge * top_k);
+            for tok in 0..m_bridge {
+                for k in 0..top_k {
+                    let idx = tok * top_k + k;
+                    tasks_b.push((tok, h_topk_ids[idx] as usize, h_topk_weights[idx]));
+                }
+            }
+            let h_cpu_b =
+                full_store.eval_cold_tasks_cpu(&h_x[..m_bridge * k_hidden], m_bridge, &tasks_b);
+            let mut cache = HotExpertCache::new(0, 6, 0..num_experts, layout.clone()).unwrap();
+            let mut ws_b = TieredMoeWorkspace::new(0, layout.clone(), 3, m_bridge, top_k).unwrap();
+            cache
+                .populate_initial(&full_store, Some(&[0, 1, 2, 3, 4, 5]), &mut ws_b, &stream)
+                .unwrap();
+            cache
+                .register_cpu_bridge(0, &full_store, 4, &stream)
+                .unwrap();
+            let d_out = DeviceBuffer::alloc(0, m_bridge * k_hidden * 2).unwrap();
+            if use_prefill {
+                TieredMoeEngine::execute_layer(
+                    MoeOffloadMode::StreamedPrefill,
+                    &full_store,
+                    &mut cache,
+                    &mut ws_b,
+                    &stream,
+                    d_x.addr(),
+                    d_topk_ids.addr(),
+                    d_topk_weights.addr(),
+                    &h_topk_ids[..m_bridge * top_k],
+                    &h_topk_weights[..m_bridge * top_k],
+                    0,
+                    0,
+                    d_out.addr(),
+                    m_bridge,
+                    top_k,
+                )
+                .unwrap();
+            } else {
+                TieredMoeEngine::execute_layer_device_lru(
+                    &full_store,
+                    &mut cache,
+                    &ws_b,
+                    &stream,
+                    d_x.addr(),
+                    d_topk_ids.addr(),
+                    d_topk_weights.addr(),
+                    0,
+                    0,
+                    d_out.addr(),
+                    m_bridge,
+                    top_k,
+                )
+                .unwrap();
+            }
+            let mut h_gpu = vec![0u16; m_bridge * k_hidden];
+            d_out.copy_to_host(&mut h_gpu, &stream).unwrap();
+            let max_diff = h_gpu
+                .iter()
+                .zip(&h_cpu_b)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1.6e-2,
+                "H64+g64 MoE bridge m={m_bridge} max_abs_diff={max_diff} exceeds 1.6e-2"
+            );
+        }
+    }
+
+    #[test]
+    fn speculative_lru_bip_and_streamed_prefill_promotion() {
+        use super::super::{
+            ExpertPackLayout, HostExpertStore, HotExpertCache, MoeOffloadMode, TieredMoeEngine,
+            TieredMoeWorkspace,
+        };
+        use crate::cuda::f32_to_f16;
+
+        let _device = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+
+        let num_experts = 80usize;
+        let k_hot = 64usize;
+        let n_interm = 128usize;
+        let k_hidden = 128usize;
+        let group_size = 32usize;
+        let top_k = 10usize;
+        let m_verify = 8usize;
+        let layout = ExpertPackLayout::new(n_interm, k_hidden, group_size).unwrap();
+
+        let raw_packs = vec![0u8; num_experts * layout.stride];
+        let full_store = HostExpertStore::from_raw_packs(
+            layout.clone(),
+            0..num_experts,
+            &raw_packs,
+            num_experts * layout.stride,
+        )
+        .unwrap();
+        let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 32, 1024, top_k).unwrap();
+        let mut cache = HotExpertCache::new(0, k_hot, 0..num_experts, layout.clone()).unwrap();
+        cache
+            .populate_initial(&full_store, None, &mut ws, &stream)
+            .unwrap();
+
+        // Step 1: M=4 verify batch (`total_pairs = 40`, `k_protected = k_hot - 40 = 24`)
+        // followed by M=8 verify batch (`total_pairs = 80`).
+        let mut h_topk_m4: Vec<i32> = (0..4 * top_k).map(|i| (i % 10) as i32).collect();
+        h_topk_m4[0] = 64;
+        h_topk_m4[20] = 65;
+        h_topk_m4[21] = 68;
+        h_topk_m4[22] = 69;
+        h_topk_m4[30] = 65;
+        let h_wts = vec![0.1f32; 1024 * top_k];
+        let h_x = vec![f32_to_f16(0.1); 1024 * k_hidden];
+        let d_x = upload(&h_x, &stream);
+        let d_topk_m4 = upload(&h_topk_m4, &stream);
+        let d_wts = upload(&h_wts, &stream);
+        let d_out = DeviceBuffer::alloc(0, 1024 * k_hidden * 2).unwrap();
+
+        TieredMoeEngine::execute_layer_device_lru(
+            &full_store,
+            &mut cache,
+            &ws,
+            &stream,
+            d_x.addr(),
+            d_topk_m4.addr(),
+            d_wts.addr(),
+            0,
+            0,
+            d_out.addr(),
+            4,
+            top_k,
+        )
+        .unwrap();
+        cache.sync_from_device_if_dirty(&stream).unwrap();
+
+        // Protected prefix `0..24` (`k_hot - 40`) must remain untouched (`slot_to_expert[s] == s`).
+        for s in 0..24 {
+            assert_eq!(cache.slot_to_expert[s], s, "protected slot {s} was evicted");
+        }
+        let slot_64 = cache.slot_of(64).expect("anchor cold expert 64 loaded") as usize;
+        let slot_65 = cache
+            .slot_of(65)
+            .expect("multi-token cold expert 65 loaded") as usize;
+        let slot_68 = cache.slot_of(68).expect("tail cold expert 68 loaded") as usize;
+        let slot_69 = cache.slot_of(69).expect("tail cold expert 69 loaded") as usize;
+        assert_ne!(slot_68, slot_69);
+        for s in [slot_64, slot_65, slot_68, slot_69] {
+            assert!(
+                cache.slot_last_used[s] > k_hot as u64,
+                "loaded miss must get updated step timestamp"
+            );
+        }
+
+        // Step 2: M=8 verify batch (`total_pairs = 80`) with cold misses `66` and `67`.
+        let mut h_topk_s2: Vec<i32> = (0..m_verify * top_k).map(|i| (i % 10) as i32).collect();
+        h_topk_s2[60] = 66;
+        h_topk_s2[70] = 67;
+        let d_topk_s2 = upload(&h_topk_s2, &stream);
+        TieredMoeEngine::execute_layer_device_lru(
+            &full_store,
+            &mut cache,
+            &ws,
+            &stream,
+            d_x.addr(),
+            d_topk_s2.addr(),
+            d_wts.addr(),
+            0,
+            0,
+            d_out.addr(),
+            m_verify,
+            top_k,
+        )
+        .unwrap();
+        cache.sync_from_device_if_dirty(&stream).unwrap();
+        assert!(cache.slot_of(66).is_some());
+        assert!(cache.slot_of(67).is_some());
+        assert_ne!(cache.slot_of(66), cache.slot_of(67));
+        assert!(
+            cache.slot_of(64).is_some(),
+            "anchor expert 64 must remain resident"
+        );
+        assert!(
+            cache.slot_of(65).is_some(),
+            "multi-token expert 65 must remain resident"
+        );
+
+        // Step 3: Verify `StreamedPrefill` (`num_tokens = 1024`, `bridge_layer_id == None`)
+        // promotes a cold expert (`70`) routed 32 times in the prompt into `cache.slots`.
+        let m_prefill = 1024usize;
+        let mut h_topk_pf: Vec<i32> = (0..m_prefill * top_k).map(|i| (i % 10) as i32).collect();
+        for tok in 0..32 {
+            h_topk_pf[tok * top_k] = 70;
+        }
+        let d_topk_pf = upload(&h_topk_pf, &stream);
+        TieredMoeEngine::execute_layer(
+            MoeOffloadMode::StreamedPrefill,
+            &full_store,
+            &mut cache,
+            &mut ws,
+            &stream,
+            d_x.addr(),
+            d_topk_pf.addr(),
+            d_wts.addr(),
+            &h_topk_pf,
+            &h_wts,
+            0,
+            0,
+            d_out.addr(),
+            m_prefill,
+            top_k,
+        )
+        .unwrap();
+        let slot_70 = cache
+            .slot_of(70)
+            .expect("prompt-frequent cold expert 70 must be promoted during StreamedPrefill")
+            as usize;
+        assert_eq!(
+            cache.slot_last_used[slot_70], cache.step_clock,
+            "promoted prompt expert must have updated slot_last_used"
+        );
+        for s in 0..k_hot {
+            assert_eq!(
+                cache.slot_to_expert_i32[s], cache.slot_to_expert[s] as i32,
+                "slot_to_expert_i32[{s}] drifted from slot_to_expert[{s}]"
+            );
+            let ge = cache.slot_to_expert[s];
+            assert_eq!(
+                cache.expert_to_slot[ge], s as i32,
+                "expert_to_slot[{ge}] != {s} after StreamedPrefill promotion"
+            );
+        }
+    }
 }

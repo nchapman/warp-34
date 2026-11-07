@@ -17,6 +17,13 @@ fn cached_dflash_configs_and_candidate_merge() {
         assert_eq!(cfg.block_size, block);
         assert_eq!(cfg.target_layers, taps);
     }
+    if let Ok(dir) = resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ") {
+        let cfg = DFlash2Config::load(&dir).unwrap();
+        assert_eq!(cfg.block_size, 8);
+        assert_eq!(cfg.target_layers, vec![5, 15, 25, 35, 45]);
+        assert_eq!(cfg.model.hidden_size, 2560);
+        assert_eq!(cfg.model.head_dim, 128);
+    }
     let a = DraftCandidates {
         ids: vec![0, 1, 2, 3],
         scores: vec![8., 3., 9., 5.],

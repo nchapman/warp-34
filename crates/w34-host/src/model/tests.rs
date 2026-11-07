@@ -344,4 +344,285 @@ mod serving_capacity_tests {
             Some((expected_qw, expected_sc, expected_arena))
         );
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn estimate_weight_arena_bytes_excludes_tied_lm_head_and_lut4_ple_scales() {
+        // 1. Always-run synthetic safetensors archive covering tied `lm_head.weight`
+        //    and multi-element `ple_embedding.weight_scale` vs scalar `ple_embedding.weight_scale`.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("w34_est_weight_arena_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let lm_bytes = 64 * 1024 * 1024usize;
+        let lut4_scale_bytes = 32 * 1024 * 1024usize;
+        let header = serde_json::json!({
+            "lm_head.weight": {
+                "dtype": "BF16",
+                "shape": [16384, 2048],
+                "data_offsets": [0, lm_bytes]
+            },
+            "model.layers.5.ple.ple_embedding.shard_00.weight_scale": {
+                "dtype": "F16",
+                "shape": [3355443, 5],
+                "data_offsets": [lm_bytes, lm_bytes + lut4_scale_bytes]
+            },
+            "model.layers.11.ple.ple_embedding.weight_scale": {
+                "dtype": "F16",
+                "shape": [1],
+                "data_offsets": [lm_bytes + lut4_scale_bytes, lm_bytes + lut4_scale_bytes + 2]
+            }
+        })
+        .to_string();
+        let st_path = tmp_dir.join("model.safetensors");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&st_path).unwrap();
+            f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(header.as_bytes()).unwrap();
+            f.set_len((8 + header.len() + lm_bytes + lut4_scale_bytes + 2) as u64)
+                .unwrap();
+        }
+        let synth_archive = crate::loader::SafetensorsArchive::open(&tmp_dir).unwrap();
+        let mut synth_cfg = sample_qwen4_exp_config();
+        synth_cfg.vocab_size = 16384;
+        synth_cfg.hidden_size = 2048;
+        synth_cfg.tie_word_embeddings = false;
+        let synth_untied =
+            Qwen3_5ModelRank::estimate_weight_arena_bytes(&synth_cfg, &synth_archive, 1, Some(128));
+        synth_cfg.tie_word_embeddings = true;
+        let synth_tied =
+            Qwen3_5ModelRank::estimate_weight_arena_bytes(&synth_cfg, &synth_archive, 1, Some(128));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        assert_eq!(
+            synth_untied - synth_tied,
+            lm_bytes,
+            "tied config must exclude redundant lm_head.weight (untied={synth_untied}, tied={synth_tied})"
+        );
+        // `synth_tied` only has `embed_tokens` (64 MiB) + 1-element FP8 PLE scale (256 B) + 96 MiB margin,
+        // rounded up to 16 MiB alignment = 162 MiB (multi-element 32 MiB lut4-gptq `shard_00.weight_scale` is excluded).
+        assert_eq!(synth_tied, 162 * 1024 * 1024);
+
+        // 2. Real checkpoint check when `nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ` is cached locally.
+        let Ok(dir) =
+            crate::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ")
+        else {
+            eprintln!(
+                "Skipping real-snapshot check in estimate_weight_arena_bytes_excludes_tied_lm_head_and_lut4_ple_scales: checkpoint not cached"
+            );
+            return;
+        };
+        let cfg = ModelConfig::from_dir(&dir).expect("parse config.json");
+        let archive = crate::loader::SafetensorsArchive::open(&dir).expect("open archive");
+        let tp1_bytes = Qwen3_5ModelRank::estimate_weight_arena_bytes(&cfg, &archive, 1, Some(128));
+        let tp2_bytes = Qwen3_5ModelRank::estimate_weight_arena_bytes(&cfg, &archive, 2, Some(128));
+        // Host-mmapped lut4-gptq ple_embedding.shard_*.weight_scale (~3.05 GiB across 128 shards) is excluded,
+        // keeping TP=1 < 5.6 GiB (vs ~8.6 GiB without exclusion) and TP=2 < 4.3 GiB/rank (vs ~7.2 GiB).
+        assert!(
+            tp1_bytes < 5600 * 1024 * 1024,
+            "unexpectedly large TP=1 weight_arena estimate: {} MiB",
+            tp1_bytes / (1024 * 1024)
+        );
+        assert!(
+            tp2_bytes < 4300 * 1024 * 1024,
+            "unexpectedly large TP=2 weight_arena estimate: {} MiB",
+            tp2_bytes / (1024 * 1024)
+        );
+
+        let mut tied_cfg = cfg.clone();
+        tied_cfg.tie_word_embeddings = true;
+        let tp1_tied =
+            Qwen3_5ModelRank::estimate_weight_arena_bytes(&tied_cfg, &archive, 1, Some(128));
+        assert!(
+            tp1_bytes.saturating_sub(tp1_tied) >= 1200 * 1024 * 1024,
+            "expected tied_cfg to save >= 1.2 GiB for redundant lm_head.weight on TP=1 (untied={} MiB, tied={} MiB)",
+            tp1_bytes / (1024 * 1024),
+            tp1_tied / (1024 * 1024),
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pre_mlp_norm_targets_and_tiered_prerotated_scratch_reservation_preserve_0_ulp() {
+        use crate::cuda::{CublasHandle, CudaStream, DeviceBuffer, f32_to_f16};
+        use crate::model::weights::{
+            FfnBlockWeights, LinearProj, MoeExpertStorage, MoeLayerWeights,
+        };
+        use w34_kernels::ffi;
+
+        let Ok(stream) = CudaStream::new(0) else {
+            return;
+        };
+        let cublas = CublasHandle::new(&stream).unwrap();
+        let rows = 5usize;
+        let h_dim = 256usize;
+        let sh_interm = 320usize; // not divisible by 128 -> padded inner.size_k() = 384 (TP=2 geometry)
+        let sh_interm_padded = 384usize;
+        let num_experts = 16usize;
+        let top_k = 4usize;
+
+        let d_router_w = DeviceBuffer::alloc(0, num_experts * h_dim * 2).unwrap();
+        let d_sh_gate_w = DeviceBuffer::alloc(0, h_dim * 2).unwrap();
+        let d_sh_gu_q = DeviceBuffer::alloc(0, (2 * sh_interm) * (h_dim / 8) * 4).unwrap();
+        let d_sh_gu_s = DeviceBuffer::alloc(0, (2 * sh_interm) * (h_dim / 64) * 2).unwrap();
+        let d_sh_dn_q = DeviceBuffer::alloc(0, h_dim * (sh_interm_padded / 8) * 4).unwrap();
+        let d_sh_dn_s = DeviceBuffer::alloc(0, h_dim * (sh_interm_padded / 64) * 2).unwrap();
+        d_router_w
+            .copy_from_host(&vec![0x3000u16; num_experts * h_dim], &stream)
+            .unwrap();
+        d_sh_gate_w
+            .copy_from_host(&vec![0x3400u16; h_dim], &stream)
+            .unwrap();
+        d_sh_gu_q
+            .copy_from_host(
+                &vec![0x9876_5432u32; (2 * sh_interm) * (h_dim / 8)],
+                &stream,
+            )
+            .unwrap();
+        d_sh_gu_s
+            .copy_from_host(&vec![0x3400u16; (2 * sh_interm) * (h_dim / 64)], &stream)
+            .unwrap();
+        d_sh_dn_q
+            .copy_from_host(
+                &vec![0x8888_8888u32; h_dim * (sh_interm_padded / 8)],
+                &stream,
+            )
+            .unwrap();
+        d_sh_dn_s
+            .copy_from_host(&vec![0x3400u16; h_dim * (sh_interm_padded / 64)], &stream)
+            .unwrap();
+
+        let make_moe = |experts: MoeExpertStorage| {
+            FfnBlockWeights::Moe(Box::new(MoeLayerWeights {
+                router_gate: LinearProj::DenseF16 {
+                    weight_ptr: d_router_w.addr(),
+                    size_n: num_experts,
+                    size_k: h_dim,
+                },
+                num_experts,
+                top_k,
+                norm_topk_prob: true,
+                scoring_func: 0,
+                local_moe_interm: 128,
+                routed_input_hadamard: 64,
+                routed_down_hadamard: 64,
+                experts,
+                local_shared_interm: sh_interm,
+                shared_gate_up_proj: Some(LinearProj::Hadamard {
+                    inner: Box::new(LinearProj::MarlinW4A16 {
+                        b_q_weight_ptr: d_sh_gu_q.addr(),
+                        b_scales_ptr: d_sh_gu_s.addr(),
+                        size_n: 2 * sh_interm,
+                        size_k: h_dim,
+                        group_blocks: 4,
+                    }),
+                    size_n: 2 * sh_interm,
+                    size_k: h_dim,
+                    block_size: 64,
+                }),
+                shared_down_proj: Some(LinearProj::Hadamard {
+                    inner: Box::new(LinearProj::MarlinW4A16 {
+                        b_q_weight_ptr: d_sh_dn_q.addr(),
+                        b_scales_ptr: d_sh_dn_s.addr(),
+                        size_n: h_dim,
+                        size_k: sh_interm_padded,
+                        group_blocks: 4,
+                    }),
+                    size_n: h_dim,
+                    size_k: sh_interm,
+                    block_size: 64,
+                }),
+                shared_expert_gate: Some(LinearProj::DenseF16 {
+                    weight_ptr: d_sh_gate_w.addr(),
+                    size_n: 1,
+                    size_k: h_dim,
+                }),
+            }))
+        };
+
+        let ffn_tiered = make_moe(MoeExpertStorage::Tiered { layer_id: 0 });
+        let d_normed = DeviceBuffer::alloc(0, rows * h_dim * 2).unwrap();
+        let d_mlp_out = DeviceBuffer::alloc(0, rows * h_dim * 2).unwrap();
+        let d_scratch = DeviceBuffer::alloc(0, 64 * 1024).unwrap();
+        let ex_small = stream.exec(d_scratch.addr(), rows * h_dim * 2);
+        // Insufficient scratch for both prerotated input and padded shared_down_proj workspace -> fallback [normed, 0]
+        assert_eq!(
+            ffn_tiered.pre_mlp_norm_targets(
+                d_normed.addr(),
+                d_mlp_out.addr(),
+                &ex_small,
+                rows,
+                h_dim,
+            ),
+            [d_normed.addr(), 0]
+        );
+        let ex_ok = stream.exec(d_scratch.addr(), d_scratch.len_bytes);
+        assert_eq!(
+            ffn_tiered.pre_mlp_norm_targets(d_normed.addr(), d_mlp_out.addr(), &ex_ok, rows, h_dim),
+            [d_normed.addr(), d_scratch.addr()]
+        );
+
+        let h_in: Vec<u16> = (0..rows * h_dim)
+            .map(|i| f32_to_f16(((i % 29) as f32 - 14.0) * 0.05))
+            .collect();
+        d_normed.copy_from_host(&h_in, &stream).unwrap();
+        // SAFETY: `d_normed` and `d_scratch` are live disjoint device buffers of size `>= rows * h_dim * 2` bytes.
+        let rc = unsafe {
+            ffi::w34_block_hadamard_f16(
+                &ex_ok,
+                d_normed.addr() as *const std::ffi::c_void,
+                d_scratch.addr() as *mut std::ffi::c_void,
+                rows as i32,
+                h_dim as i32,
+                h_dim as i32,
+                64,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut h_prerot_before = vec![0u16; rows * h_dim];
+        d_scratch
+            .copy_to_host(&mut h_prerot_before, &stream)
+            .unwrap();
+
+        let d_marlin_ws = DeviceBuffer::alloc(0, 4096).unwrap();
+        let d_router = DeviceBuffer::alloc(0, rows * num_experts * 2).unwrap();
+        let d_topw = DeviceBuffer::alloc(0, rows * top_k * 4).unwrap();
+        let d_topids = DeviceBuffer::alloc(0, rows * top_k * 4).unwrap();
+        let d_shgu = DeviceBuffer::alloc(0, rows * 2 * sh_interm * 2).unwrap();
+        let d_shact = DeviceBuffer::alloc(0, rows * sh_interm * 2).unwrap();
+        let d_shout = DeviceBuffer::alloc(0, rows * h_dim * 2).unwrap();
+        let d_shgate = DeviceBuffer::alloc(0, rows * 2).unwrap();
+
+        ffn_tiered
+            .forward_with_prerotated_input(
+                &ex_ok,
+                &cublas,
+                d_marlin_ws.addr(),
+                d_marlin_ws.len_bytes / 4,
+                d_normed.addr(),
+                d_mlp_out.addr(),
+                rows,
+                h_dim,
+                128,
+                0,
+                0,
+                d_router.addr(),
+                d_topw.addr(),
+                d_topids.addr(),
+                0,
+                d_shgu.addr(),
+                d_shact.addr(),
+                d_shout.addr(),
+                d_shgate.addr(),
+                d_scratch.addr(),
+            )
+            .unwrap();
+
+        // Verify the prerotated input stored at `d_scratch.addr()` was not overwritten by `shared_down_proj.forward`.
+        let mut h_prerot_after = vec![0u16; rows * h_dim];
+        d_scratch
+            .copy_to_host(&mut h_prerot_after, &stream)
+            .unwrap();
+        assert_eq!(h_prerot_after, h_prerot_before);
+    }
 }

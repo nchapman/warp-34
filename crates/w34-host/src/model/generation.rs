@@ -291,9 +291,14 @@ impl Qwen3_5Engine {
                 .map_err(|_| loader_err("SafetensorsArchive::open for vision_encoder"))?;
             let r0 = &self.ranks[0];
             r0.device.make_current()?;
-            let enc =
-                crate::vision::Qwen3VisionEncoder::try_load(&archive, vcfg, 0, &r0.stream)?
-                    .ok_or_else(|| loader_err("vision weights not found in safetensors archive"))?;
+            let enc = crate::vision::Qwen3VisionEncoder::try_load(
+                &archive,
+                vcfg,
+                &self.cfg.quant,
+                0,
+                &r0.stream,
+            )?
+            .ok_or_else(|| loader_err("vision weights not found in safetensors archive"))?;
             self.vision_encoder = Some(enc);
         }
         Ok(())

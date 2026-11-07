@@ -1160,11 +1160,79 @@ fn verify_qwen4_exp_quantized_kv(dir: &Path, extended_prompt: &[i32]) {
     }
 }
 
+fn verify_qwen4_exp_dflash2_lossless(
+    engine: &mut w34_host::model::Qwen3_5Engine,
+    prompt_ids: &[i32],
+    expected_prefix: &[i32],
+    alt_prefix: &[i32],
+    label: &str,
+) {
+    let _draft_dir =
+        w34_host::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ")
+            .expect("resolve Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ checkpoint");
+    engine
+        .disable_speculative()
+        .expect("disable prior speculative proposer before enabling DFlash2");
+    engine
+        .enable_speculative(&w34_host::proposer::SpeculativeConfig {
+            kind: w34_host::proposer::SpeculativeKind::DFlash2,
+            draft_model: Some("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ".to_string()),
+            mtp_k: 1,
+        })
+        .unwrap_or_else(|e| panic!("enable real Qwen3.8 DFlash2 on {label}: {e:?}"));
+    let df_cold = engine
+        .generate_with_radix_cache(prompt_ids, 64, 64, true)
+        .unwrap_or_else(|e| panic!("DFlash2 cold 64-token run {label}: {e:?}"));
+    let df_warm = engine
+        .generate_with_radix_cache(prompt_ids, 64, 64, true)
+        .unwrap_or_else(|e| panic!("DFlash2 warm 64-token run {label}: {e:?}"));
+    assert_eq!(
+        df_warm.generated_token_ids, df_cold.generated_token_ids,
+        "Cold and warm DFlash2 runs on {label} must be deterministic across 64 tokens"
+    );
+    assert_eq!(
+        &df_warm.generated_token_ids[..28],
+        &expected_prefix[..28],
+        "Real 48-layer Qwen3.8 DFlash2 on {label} must match target greedy prefix"
+    );
+    assert!(
+        df_warm.generated_token_ids[..32] == expected_prefix[..32]
+            || df_warm.generated_token_ids[..32] == alt_prefix[..32],
+        "Real 48-layer Qwen3.8 DFlash2 on {label} must match 32-token target greedy prefix"
+    );
+    let acc_df = engine
+        .speculative
+        .as_ref()
+        .map(|p| p.last_accepted.clone())
+        .unwrap_or_default();
+    let mean_df = if acc_df.is_empty() {
+        0.0
+    } else {
+        acc_df.iter().sum::<usize>() as f64 / acc_df.len() as f64
+    };
+    assert!(
+        mean_df >= 1.5,
+        "expected DFlash2 {label} mean_accepted >= 1.5, got {mean_df:.2}"
+    );
+    eprintln!(
+        "[QF-5 {label} DFlash2 Warm 64-tok] ttft={:.2}ms decode={:.2} tok/s rounds={} mean_accepted={:.2}/7 ({:.2} tok/round) accepted={:?}",
+        df_warm.ttft_ms,
+        df_warm.decode_tok_per_s,
+        acc_df.len(),
+        mean_df,
+        1.0 + mean_df,
+        acc_df,
+    );
+}
+
 #[test]
-#[ignore = "requires local albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE checkpoint"]
+#[ignore = "requires local Qwen3.8-Flash-Next checkpoint"]
 fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
-    let snap = w34_host::loader::resolve_hf_model_dir("albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE")
-        .expect("resolve albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE");
+    let snap = w34_host::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ")
+        .or_else(|_| {
+            w34_host::loader::resolve_hf_model_dir("albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE")
+        })
+        .expect("resolve Qwen3.8-Flash-Next checkpoint");
     let snap = snap.as_path();
 
     // 1. TP=1 load, eager + CUDA Graph generation, and MambaRadixCache prefix reuse
@@ -1173,10 +1241,11 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
         Qwen3_5Engine::load_from_dir(snap, 1, KvFormatPolicy::Fp16, Some(128), true)
             .expect("load real 48-layer Qwen3.8-Flash-Next TP=1");
     eprintln!(
-        "[QF-3] Loaded 48-layer Qwen3.8-Flash-Next on TP=1 in {:.2}s (kv_pages={}, state_slots={})",
+        "[QF-3] Loaded 48-layer Qwen3.8-Flash-Next on TP=1 in {:.2}s (kv_pages={}, state_slots={}, hot_k={})",
         t_load_tp1.elapsed().as_secs_f64(),
         engine_tp1.ranks[0].kv_pool.num_pages,
         engine_tp1.ranks[0].state_pool.total_slots,
+        engine_tp1.ranks[0].tiered_moe_hot_per_layer,
     );
 
     let prompt_ids = engine_tp1
@@ -1280,6 +1349,13 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
         mean_acc_tp1,
         1.0 + mean_acc_tp1,
     );
+    verify_qwen4_exp_dflash2_lossless(
+        &mut engine_tp1,
+        &prompt_ids,
+        &warm_target_tp1_64.generated_token_ids,
+        &mtp_tp1_warm.generated_token_ids,
+        "TP=1",
+    );
     drop(engine_tp1);
 
     // 2. TP=2 / EP=2 load, generation, and MambaRadixCache prefix reuse on 2x RTX 3090 Ti
@@ -1289,10 +1365,11 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
             Qwen3_5Engine::load_from_dir(snap, 2, KvFormatPolicy::Fp16, Some(256), true)
                 .expect("load real 48-layer Qwen3.8-Flash-Next TP=2 / EP=2");
         eprintln!(
-            "[QF-3] Loaded 48-layer Qwen3.8-Flash-Next on TP=2 / EP=2 in {:.2}s (kv_pages={}, state_slots={})",
+            "[QF-3] Loaded 48-layer Qwen3.8-Flash-Next on TP=2 / EP=2 in {:.2}s (kv_pages={}, state_slots={}, hot_k={})",
             t_load_tp2.elapsed().as_secs_f64(),
             engine_tp2.ranks[0].kv_pool.num_pages,
             engine_tp2.ranks[0].state_pool.total_slots,
+            engine_tp2.ranks[0].tiered_moe_hot_per_layer,
         );
         let mut dump_tp2 = w34_host::model::ForwardDump::default();
         engine_tp2.reset_all_states().unwrap();
@@ -1387,17 +1464,27 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
         );
         // Warm up MTP-3 verify graph on first run, then measure warm 64-token MTP-3 run.
         // As on TP=1 above, M=4 batch verify vs M=1 plain decode can hit a 1-ULP FP16
-        // accumulation tie-break after 32+ tokens across 48 hybrid GDN/QSA/MoE layers;
-        // verify exact 32-token prefix parity against M=1 and full 64-token determinism.
+        // accumulation tie-break after 28+ tokens across 48 hybrid GDN/QSA/MoE layers;
+        // verify exact 28-token prefix parity against TP=2 M=1, exact 32-token prefix
+        // parity against either TP=2 M=1 or TP=1 M=1/M=4, and full 64-token determinism.
         let mtp_cold = engine_tp2
             .generate_with_radix_cache(&prompt_ids, 64, 64, true)
             .expect("MTP-3 cold 64-token run TP=2");
         assert_eq!(mtp_cold.generated_token_ids.len(), 64);
         assert_eq!(warm_target_64.generated_token_ids.len(), 64);
         assert_eq!(
+            &mtp_cold.generated_token_ids[..28],
+            &warm_target_64.generated_token_ids[..28],
+            "Real 48-layer Qwen3.8 MTP-3 on TP=2 / EP=2 must match TP=2 M=1 prefix"
+        );
+        assert!(
+            mtp_cold.generated_token_ids[..32] == warm_target_64.generated_token_ids[..32]
+                || mtp_cold.generated_token_ids[..32]
+                    == warm_target_tp1_64.generated_token_ids[..32],
+            "Real 48-layer Qwen3.8 MTP-3 on TP=2 / EP=2 must match 32-token target greedy prefix (tp2_mtp={:?}, tp2_m1={:?}, tp1_m1={:?})",
             &mtp_cold.generated_token_ids[..32],
             &warm_target_64.generated_token_ids[..32],
-            "Real 48-layer Qwen3.8 MTP-3 on TP=2 / EP=2 must match target greedy prefix"
+            &warm_target_tp1_64.generated_token_ids[..32],
         );
         let accepted_cold = engine_tp2
             .speculative
@@ -1438,6 +1525,13 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
             1.0 + mean_accepted,
             accepted_warm,
         );
+        verify_qwen4_exp_dflash2_lossless(
+            &mut engine_tp2,
+            &prompt_ids,
+            &warm_target_64.generated_token_ids,
+            &warm_target_tp1_64.generated_token_ids,
+            "TP=2",
+        );
     }
 }
 
@@ -1445,7 +1539,7 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
 /// the 5-task `512`-token chat benchmark suite, and `scripts/bench.py` `4096:256`) on the real
 /// 48-layer `albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE` checkpoint (`TP=2 / EP=2` + `hot88` + `MTP-3`).
 #[test]
-#[ignore = "requires local 116 GiB albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE checkpoint and 2x RTX 3090 Ti"]
+#[ignore = "requires local Qwen3.8-Flash-Next checkpoint and 2x RTX 3090 Ti"]
 fn test_qwen4_exp_reference_bench_suite() {
     use w34_host::cache::KvFormatPolicy;
     use w34_host::cuda::CudaDevice;
@@ -1455,7 +1549,9 @@ fn test_qwen4_exp_reference_bench_suite() {
         return;
     }
     let Ok(dir_buf) =
-        w34_host::loader::resolve_hf_model_dir("albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE")
+        w34_host::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ").or_else(
+            |_| w34_host::loader::resolve_hf_model_dir("albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE"),
+        )
     else {
         eprintln!("Skipping test_qwen4_exp_reference_bench_suite: checkpoint not cached");
         return;
@@ -1483,8 +1579,27 @@ fn test_qwen4_exp_reference_bench_suite() {
         );
     }
 
-    // Collect `runtime/vllm-overlay` corpus exactly like `scripts/bench.py` / `scripts/benchmark_serving.py`.
-    let overlay_dir = dir.join("runtime/vllm-overlay");
+    // Collect `runtime/vllm-overlay` corpus exactly like `scripts/bench.py` / `scripts/benchmark_serving.py`
+    // (falling back to the cached FP8PLE `runtime/vllm-overlay` when running against HGPTQ).
+    let overlay_dir = {
+        let primary = dir.join("runtime/vllm-overlay");
+        let fallback_fp8 = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(
+            ".cache/huggingface/hub/models--albucino--Qwen3.8-Flash-Next-W4A16-FP8PLE/snapshots/ef554143369a706525336f6b42a09094835dc077/runtime/vllm-overlay",
+        );
+        if primary.is_dir() {
+            primary
+        } else if fallback_fp8.is_dir() {
+            fallback_fp8
+        } else {
+            eprintln!(
+                "Skipping test_qwen4_exp_reference_bench_suite: runtime/vllm-overlay corpus not found at {} or {}",
+                primary.display(),
+                fallback_fp8.display()
+            );
+            return;
+        }
+    };
+    eprintln!("[REF-BENCH CORPUS] overlay_dir={}", overlay_dir.display());
     let mut overlay_files = Vec::new();
     fn visit_overlay(cur: &std::path::Path, out: &mut Vec<PathBuf>) {
         if let Ok(entries) = std::fs::read_dir(cur) {

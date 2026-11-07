@@ -17,6 +17,7 @@ default = []
 cuda = ["w34-kernels/cuda"]
 
 [dependencies]
+fancy-regex = "0.14"
 libc = "0.2"
 w34-kernels = { path = "../w34-kernels" }
 serde = { version = "1", features = ["derive"] }

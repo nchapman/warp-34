@@ -178,6 +178,42 @@ impl Tp2Collectives {
         tap_row_stride: i32,
         tap_col_offset: i32,
     ) -> Result<()> {
+        self.all_reduce_residual_gemma_rms_norm_hadamard_f16(
+            ex,
+            local_in_ptr,
+            ar_out_ptr,
+            residual_ptr,
+            weight_ptr,
+            out_ptr,
+            0,
+            tap_dst_bf16_ptr,
+            rank,
+            num_tokens,
+            hidden_size,
+            eps,
+            tap_row_stride,
+            tap_col_offset,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn all_reduce_residual_gemma_rms_norm_hadamard_f16(
+        &self,
+        ex: &W34Exec,
+        local_in_ptr: u64,
+        ar_out_ptr: u64,
+        residual_ptr: u64,
+        weight_ptr: u64,
+        out_ptr: u64,
+        out_had64_ptr: u64,
+        tap_dst_bf16_ptr: u64,
+        rank: i32,
+        num_tokens: i32,
+        hidden_size: i32,
+        eps: f32,
+        tap_row_stride: i32,
+        tap_col_offset: i32,
+    ) -> Result<()> {
         let num_elems = (num_tokens as usize) * (hidden_size as usize);
         assert!(
             num_elems * 2 <= self.max_stage_bytes_per_epoch,
@@ -188,13 +224,14 @@ impl Tp2Collectives {
                 // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
                 // buffers owned by `self`, and caller guarantees valid device pointers for `[num_tokens, hidden_size]`.
                 unsafe {
-                    ffi::w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
+                    ffi::w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
                         ex,
                         local_in_ptr as *const c_void,
                         ar_out_ptr as *mut c_void,
                         residual_ptr as *mut c_void,
                         weight_ptr as *const c_void,
                         out_ptr as *mut c_void,
+                        out_had64_ptr as *mut c_void,
                         tap_dst_bf16_ptr as *mut c_void,
                         self.stages[0].dev_ptr(),
                         self.stages[1].dev_ptr(),
@@ -212,20 +249,21 @@ impl Tp2Collectives {
                         tap_col_offset,
                     )
                 },
-                "w34_tp4_all_reduce_residual_gemma_rms_norm_f16",
+                "w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16",
             );
         }
         check_rc(
             // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
             // buffers owned by `self`, and caller guarantees valid device pointers for `[num_tokens, hidden_size]`.
             unsafe {
-                ffi::w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
+                ffi::w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
                     ex,
                     local_in_ptr as *const c_void,
                     ar_out_ptr as *mut c_void,
                     residual_ptr as *mut c_void,
                     weight_ptr as *const c_void,
                     out_ptr as *mut c_void,
+                    out_had64_ptr as *mut c_void,
                     tap_dst_bf16_ptr as *mut c_void,
                     self.stages[0].dev_ptr(),
                     self.stages[1].dev_ptr(),

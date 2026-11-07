@@ -37,6 +37,8 @@ pub struct MoeLayerWeights {
     pub norm_topk_prob: bool,
     pub scoring_func: i32,
     pub local_moe_interm: usize,
+    pub routed_input_hadamard: usize,
+    pub routed_down_hadamard: usize,
     pub shared_gate_up_proj: Option<LinearProj>,
     pub shared_down_proj: Option<LinearProj>,
     pub shared_expert_gate: Option<LinearProj>,
@@ -54,6 +56,62 @@ pub enum FfnBlockWeights {
 
 #[cfg(feature = "cuda")]
 impl FfnBlockWeights {
+    #[inline]
+    pub fn pre_mlp_norm_targets(
+        &self,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        ex: &W34Exec,
+        rows: usize,
+        h_dim: usize,
+    ) -> [u64; 2] {
+        if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE || !h_dim.is_multiple_of(HADAMARD_BLOCK_64) {
+            return [normed_buf, 0];
+        }
+        match self {
+            Self::Dense { gate_up_proj, .. } if gate_up_proj.can_fuse_h64_from_producer() => {
+                [0, normed_buf]
+            }
+            Self::Moe(moe)
+                if moe.routed_input_hadamard == HADAMARD_BLOCK_64
+                    && moe
+                        .shared_gate_up_proj
+                        .as_ref()
+                        .is_none_or(LinearProj::can_fuse_h64_from_producer) =>
+            {
+                match &moe.experts {
+                    MoeExpertStorage::W4A16 { .. } | MoeExpertStorage::W4A16Zp { .. }
+                        if mlp_out_buf != 0 && mlp_out_buf != normed_buf =>
+                    {
+                        [normed_buf, mlp_out_buf]
+                    }
+                    MoeExpertStorage::Tiered { .. } => {
+                        let reserved = align_up_hadamard_workspace(
+                            rows.saturating_mul(h_dim).saturating_mul(FP16_ELEM_BYTES),
+                        );
+                        let extra_ws = moe
+                            .shared_down_proj
+                            .as_ref()
+                            .and_then(|p| p.input_transform_workspace_bytes(rows))
+                            .unwrap_or(0);
+                        if ex.scratch_ptr != 0
+                            && ex
+                                .scratch_ptr
+                                .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
+                            && ex.scratch_size >= reserved.saturating_add(extra_ws)
+                        {
+                            [normed_buf, ex.scratch_ptr]
+                        } else {
+                            [normed_buf, 0]
+                        }
+                    }
+                    _ => [normed_buf, 0],
+                }
+            }
+            _ => [normed_buf, 0],
+        }
+    }
+
     /// Enqueue the loaded FFN using the model's phase-local scratch layout.
     /// Raw buffer extents, device affinity, and ordering are caller obligations;
     /// accepting u64 addresses here does not validate arbitrary allocations.
@@ -80,27 +138,112 @@ impl FfnBlockWeights {
         moe_sh_out_buf: u64,
         moe_sh_gate_buf: u64,
     ) -> Result<()> {
+        self.forward_with_prerotated_input(
+            ex,
+            cublas,
+            marlin_ws_ptr,
+            marlin_ws_ints,
+            normed_buf,
+            mlp_out_buf,
+            num_tokens,
+            h_dim,
+            local_interm,
+            gate_up_buf,
+            act_buf,
+            moe_router_logits_buf,
+            moe_topk_weights_buf,
+            moe_topk_ids_buf,
+            moe_interm_buf,
+            moe_sh_gu_buf,
+            moe_sh_act_buf,
+            moe_sh_out_buf,
+            moe_sh_gate_buf,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_prerotated_input(
+        &self,
+        ex: &W34Exec,
+        cublas: &CublasHandle,
+        marlin_ws_ptr: u64,
+        marlin_ws_ints: usize,
+        normed_buf: u64,
+        mlp_out_buf: u64,
+        num_tokens: usize,
+        h_dim: usize,
+        local_interm: usize,
+        gate_up_buf: u64,
+        act_buf: u64,
+        moe_router_logits_buf: u64,
+        moe_topk_weights_buf: u64,
+        moe_topk_ids_buf: u64,
+        moe_interm_buf: u64,
+        moe_sh_gu_buf: u64,
+        moe_sh_act_buf: u64,
+        moe_sh_out_buf: u64,
+        moe_sh_gate_buf: u64,
+        prerotated_input_buf: u64,
+    ) -> Result<()> {
+        let input_prerotated = prerotated_input_buf != 0;
+        let reserved_prerot = align_up_hadamard_workspace(
+            num_tokens
+                .saturating_mul(h_dim)
+                .saturating_mul(FP16_ELEM_BYTES),
+        );
+        let sub_ex = if input_prerotated
+            && prerotated_input_buf == ex.scratch_ptr
+            && ex.scratch_size >= reserved_prerot
+        {
+            W34Exec {
+                stream: ex.stream,
+                scratch_ptr: ex.scratch_ptr + reserved_prerot as u64,
+                scratch_size: ex.scratch_size - reserved_prerot,
+            }
+        } else {
+            *ex
+        };
+        let ex = &sub_ex;
         match self {
             Self::Dense {
                 gate_up_proj,
                 down_proj,
             } => {
-                gate_up_proj.forward(
-                    ex,
-                    cublas,
-                    marlin_ws_ptr,
-                    marlin_ws_ints,
-                    normed_buf,
-                    gate_up_buf,
-                    num_tokens,
-                )?;
+                if input_prerotated {
+                    gate_up_proj.forward_prerotated(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        prerotated_input_buf,
+                        gate_up_buf,
+                        num_tokens,
+                    )?;
+                } else {
+                    gate_up_proj.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        normed_buf,
+                        gate_up_buf,
+                        num_tokens,
+                    )?;
+                }
+                let fuse_down_h64 = down_proj.can_fuse_h64_from_producer();
+                let silu_fn = if fuse_down_h64 {
+                    ffi::w34_silu_and_mul_hadamard_f16
+                } else {
+                    ffi::w34_silu_and_mul_f16
+                };
                 check_rc(
                     // SAFETY: the model's dense FFN phase reserves [M,2*interm]
                     // gate/up and [M,interm] activation regions. The projection
                     // precedes this launch on ex.stream; these addresses are supplied
                     // by the caller rather than capacity-checked by this method.
                     unsafe {
-                        ffi::w34_silu_and_mul_f16(
+                        silu_fn(
                             ex,
                             gate_up_buf as *const c_void,
                             act_buf as *mut c_void,
@@ -111,15 +254,27 @@ impl FfnBlockWeights {
                     },
                     "w34_silu_and_mul_f16",
                 )?;
-                down_proj.forward(
-                    ex,
-                    cublas,
-                    marlin_ws_ptr,
-                    marlin_ws_ints,
-                    act_buf,
-                    mlp_out_buf,
-                    num_tokens,
-                )
+                if fuse_down_h64 {
+                    down_proj.forward_prerotated(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        act_buf,
+                        mlp_out_buf,
+                        num_tokens,
+                    )
+                } else {
+                    down_proj.forward(
+                        ex,
+                        cublas,
+                        marlin_ws_ptr,
+                        marlin_ws_ints,
+                        act_buf,
+                        mlp_out_buf,
+                        num_tokens,
+                    )
+                }
             }
             Self::Moe(moe) => {
                 let fused_dual_small_n = match (
@@ -142,10 +297,12 @@ impl FfnBlockWeights {
                         // `n0 <= 256` runs across all `num_tokens`; `256 < n0 <= 512` (512-expert router)
                         // runs for decode and speculative verify (`num_tokens <= 16`) so `M = 1` and
                         // `M <= 16` verify are 0-ULP identical while `m > 16` prefill uses Tensor Cores.
-                    ) if (*n0 <= 256 || (*n0 <= 512 && num_tokens <= 16))
-                        && *n1 <= 256
+                    ) if (*n0 <= SMALL_N_GEMM_ALWAYS_MAX_N
+                        || (*n0 <= SMALL_N_GEMM_ROUTER_512_MAX_N
+                            && num_tokens <= SMALL_N_GEMM_DECODE_MAX_M))
+                        && *n1 <= SMALL_N_GEMM_ALWAYS_MAX_N
                         && *k0 == *k1
-                        && k0.is_multiple_of(8) =>
+                        && k0.is_multiple_of(SMALL_N_GEMM_K_ALIGN) =>
                     {
                         Some((*w0, *n0, *w1, *n1, *k0))
                     }
@@ -182,6 +339,20 @@ impl FfnBlockWeights {
                         moe_router_logits_buf,
                         num_tokens,
                     )?;
+                    if moe.shared_gate_up_proj.is_some()
+                        && moe.shared_down_proj.is_some()
+                        && let Some(sh_gate) = &moe.shared_expert_gate
+                    {
+                        sh_gate.forward(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            normed_buf,
+                            moe_sh_gate_buf,
+                            num_tokens,
+                        )?;
+                    }
                 }
                 check_rc(
                     // SAFETY: router projection precedes this on ex.stream.
@@ -203,24 +374,71 @@ impl FfnBlockWeights {
                     "w34_moe_topk_router_f16",
                 )?;
 
+                let fuse_shared_and_routed_in_h64 = !input_prerotated
+                    && moe.routed_input_hadamard == HADAMARD_BLOCK_64
+                    && moe
+                        .shared_gate_up_proj
+                        .as_ref()
+                        .is_some_and(LinearProj::can_fuse_h64_from_producer);
+                if fuse_shared_and_routed_in_h64 {
+                    check_rc(
+                        // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements with `h_dim`
+                        // divisible by `HADAMARD_BLOCK_64`; router_gate and shared_expert_gate have
+                        // already consumed the unrotated input on `ex.stream`.
+                        unsafe {
+                            ffi::w34_block_hadamard_inplace_f16(
+                                ex,
+                                normed_buf as *mut c_void,
+                                num_tokens as i32,
+                                h_dim as i32,
+                                HADAMARD_BLOCK_64 as i32,
+                            )
+                        },
+                        "w34_block_hadamard_inplace_f16 (moe shared+routed input)",
+                    )?;
+                }
+                let rotated_input_buf = if input_prerotated {
+                    prerotated_input_buf
+                } else {
+                    normed_buf
+                };
+
                 let (sh_out_ptr, sh_gate_ptr) = if let (Some(sh_gu), Some(sh_dn)) =
                     (&moe.shared_gate_up_proj, &moe.shared_down_proj)
                 {
-                    sh_gu.forward(
-                        ex,
-                        cublas,
-                        marlin_ws_ptr,
-                        marlin_ws_ints,
-                        normed_buf,
-                        moe_sh_gu_buf,
-                        num_tokens,
-                    )?;
+                    if input_prerotated || fuse_shared_and_routed_in_h64 {
+                        sh_gu.forward_prerotated(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            rotated_input_buf,
+                            moe_sh_gu_buf,
+                            num_tokens,
+                        )?;
+                    } else {
+                        sh_gu.forward(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            normed_buf,
+                            moe_sh_gu_buf,
+                            num_tokens,
+                        )?;
+                    }
+                    let fuse_sh_down_h64 = sh_dn.can_fuse_h64_from_producer();
+                    let sh_silu_fn = if fuse_sh_down_h64 {
+                        ffi::w34_silu_and_mul_hadamard_f16
+                    } else {
+                        ffi::w34_silu_and_mul_f16
+                    };
                     check_rc(
                         // SAFETY: the shared projection just produced [M,2*shared]
                         // gate/up; model scratch reserves [M,shared] activation.
                         // Both regions are distinct within the FFN phase.
                         unsafe {
-                            ffi::w34_silu_and_mul_f16(
+                            sh_silu_fn(
                                 ex,
                                 moe_sh_gu_buf as *const c_void,
                                 moe_sh_act_buf as *mut c_void,
@@ -231,27 +449,28 @@ impl FfnBlockWeights {
                         },
                         "w34_silu_and_mul_f16 (shared_expert)",
                     )?;
-                    sh_dn.forward(
-                        ex,
-                        cublas,
-                        marlin_ws_ptr,
-                        marlin_ws_ints,
-                        moe_sh_act_buf,
-                        moe_sh_out_buf,
-                        num_tokens,
-                    )?;
-                    let sg_ptr = if let Some(sh_gate) = &moe.shared_expert_gate {
-                        if fused_dual_small_n.is_none() {
-                            sh_gate.forward(
-                                ex,
-                                cublas,
-                                marlin_ws_ptr,
-                                marlin_ws_ints,
-                                normed_buf,
-                                moe_sh_gate_buf,
-                                num_tokens,
-                            )?;
-                        }
+                    if fuse_sh_down_h64 {
+                        sh_dn.forward_prerotated(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            moe_sh_act_buf,
+                            moe_sh_out_buf,
+                            num_tokens,
+                        )?;
+                    } else {
+                        sh_dn.forward(
+                            ex,
+                            cublas,
+                            marlin_ws_ptr,
+                            marlin_ws_ints,
+                            moe_sh_act_buf,
+                            moe_sh_out_buf,
+                            num_tokens,
+                        )?;
+                    }
+                    let sg_ptr = if moe.shared_expert_gate.is_some() {
                         moe_sh_gate_buf as *const c_void
                     } else {
                         core::ptr::null()
@@ -260,6 +479,27 @@ impl FfnBlockWeights {
                 } else {
                     (core::ptr::null(), core::ptr::null())
                 };
+
+                if moe.routed_input_hadamard > 0
+                    && !input_prerotated
+                    && !fuse_shared_and_routed_in_h64
+                {
+                    check_rc(
+                        // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements with `h_dim`
+                        // divisible by `moe.routed_input_hadamard`; router_gate, shared_expert_gate,
+                        // and shared_gate_up_proj have already consumed the unrotated input on `ex.stream`.
+                        unsafe {
+                            ffi::w34_block_hadamard_inplace_f16(
+                                ex,
+                                normed_buf as *mut c_void,
+                                num_tokens as i32,
+                                h_dim as i32,
+                                moe.routed_input_hadamard as i32,
+                            )
+                        },
+                        "w34_block_hadamard_inplace_f16 (moe routed input)",
+                    )?;
+                }
 
                 match &moe.experts {
                     MoeExpertStorage::W4A16 {
@@ -274,9 +514,9 @@ impl FfnBlockWeights {
                         // produced above; model scratch reserves routed intermediate
                         // and output rows. Shared inputs are null when absent.
                         unsafe {
-                            ffi::w34_moe_w4a16_mlp_f16(
+                            ffi::w34_moe_w4a16_mlp_ex_f16(
                                 ex,
-                                normed_buf as *const c_void,
+                                rotated_input_buf as *const c_void,
                                 *gate_up_packed_ptr as *const u32,
                                 *gate_up_scales_ptr as *const c_void,
                                 *down_packed_ptr as *const u32,
@@ -293,9 +533,10 @@ impl FfnBlockWeights {
                                 moe.local_moe_interm as i32,
                                 h_dim as i32,
                                 *group_size as i32,
+                                moe.routed_down_hadamard as i32,
                             )
                         },
-                        "w34_moe_w4a16_mlp_f16",
+                        "w34_moe_w4a16_mlp_ex_f16",
                     ),
                     MoeExpertStorage::W4A16Zp {
                         gate_up_packed_ptr,
@@ -311,9 +552,9 @@ impl FfnBlockWeights {
                         // precede this on ex.stream; model scratch supplies separate
                         // routed intermediates/output, with null shared inputs allowed.
                         unsafe {
-                            ffi::w34_moe_w4a16_mlp_zp_f16(
+                            ffi::w34_moe_w4a16_mlp_zp_ex_f16(
                                 ex,
-                                normed_buf as *const c_void,
+                                rotated_input_buf as *const c_void,
                                 *gate_up_packed_ptr as *const u32,
                                 *gate_up_scales_ptr as *const c_void,
                                 *gate_up_qzeros_ptr as *const u32,
@@ -332,9 +573,10 @@ impl FfnBlockWeights {
                                 moe.local_moe_interm as i32,
                                 h_dim as i32,
                                 *group_size as i32,
+                                moe.routed_down_hadamard as i32,
                             )
                         },
-                        "w34_moe_w4a16_mlp_zp_f16",
+                        "w34_moe_w4a16_mlp_zp_ex_f16",
                     ),
                     MoeExpertStorage::DenseF16 {
                         gate_up_ptr,
@@ -361,6 +603,22 @@ impl FfnBlockWeights {
                             },
                             "w34_moe_f16_gate_up_silu",
                         )?;
+                        if moe.routed_down_hadamard > 0 {
+                            check_rc(
+                                // SAFETY: `moe_interm_buf` holds `num_tokens * moe.top_k * moe.local_moe_interm`
+                                // FP16 elements with `local_moe_interm` divisible by `moe.routed_down_hadamard`.
+                                unsafe {
+                                    ffi::w34_block_hadamard_inplace_f16(
+                                        ex,
+                                        moe_interm_buf as *mut c_void,
+                                        (num_tokens * moe.top_k) as i32,
+                                        moe.local_moe_interm as i32,
+                                        moe.routed_down_hadamard as i32,
+                                    )
+                                },
+                                "w34_block_hadamard_inplace_f16 (moe dense down)",
+                            )?;
+                        }
                         check_rc(
                             // SAFETY: gate/up above produced routed intermediates;
                             // down weights use the matching expert geometry and
@@ -503,8 +761,45 @@ pub(crate) fn load_moe_layer_weights(
         .resolve_name(&format!("{pfx}.mlp.experts.down_proj"))
         .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.experts.down_proj.weight")));
 
-    let experts = if let Some(layer_id) = tiered_layer_id {
-        MoeExpertStorage::Tiered { layer_id }
+    let resolve_expert0_hadamard_blocks = || -> Result<(usize, usize)> {
+        let resolve_proj = |proj: &str, k_dim: usize| -> Result<usize> {
+            let cand = format!("{pfx}.mlp.experts.0.{proj}");
+            let name = ["weight_packed", "qweight", "weight"]
+                .into_iter()
+                .find_map(|suffix| {
+                    archive
+                        .resolve_name(&format!("{cand}.{suffix}"))
+                        .and_then(|s| s.strip_suffix(&format!(".{suffix}")).map(str::to_owned))
+                })
+                .unwrap_or(cand);
+            let b = cfg
+                .quant
+                .input_hadamard(&name)
+                .map_err(|e| loader_err_msg(e.to_string()))?
+                .unwrap_or(0);
+            if !is_valid_hadamard_block_for_dim(b, k_dim) {
+                return Err(loader_err_msg(format!(
+                    "invalid MoE Hadamard block_size={b} for K={k_dim} at '{name}'"
+                )));
+            }
+            Ok(b)
+        };
+        let gate_had = resolve_proj("gate_proj", h)?;
+        let up_had = resolve_proj("up_proj", h)?;
+        if gate_had != up_had {
+            return Err(loader_err_msg(format!(
+                "mismatched Hadamard block sizes on MoE gate_proj ({gate_had}) vs up_proj ({up_had}) at '{pfx}'"
+            )));
+        }
+        let down_had = resolve_proj("down_proj", local_moe_interm)?;
+        Ok((gate_had, down_had))
+    };
+
+    let (experts, routed_input_hadamard, routed_down_hadamard) = if let Some(layer_id) =
+        tiered_layer_id
+    {
+        let (gate_had, down_had) = resolve_expert0_hadamard_blocks()?;
+        (MoeExpertStorage::Tiered { layer_id }, gate_had, down_had)
     } else if let (Some(gu_key), Some(dn_key)) = (fused_gu_key, fused_dn_key) {
         if archive
             .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj_scale_inv"))
@@ -590,10 +885,14 @@ pub(crate) fn load_moe_layer_weights(
         drop(dn_all);
         let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
         let down_ptr = weight_arena.upload_slice(&all_dn_f16, stream)?;
-        MoeExpertStorage::DenseF16 {
-            gate_up_ptr,
-            down_ptr,
-        }
+        (
+            MoeExpertStorage::DenseF16 {
+                gate_up_ptr,
+                down_ptr,
+            },
+            0,
+            0,
+        )
     } else {
         if archive
             .resolve_name(&format!("{pfx}.mlp.experts.gate_up_proj_blocks"))
@@ -606,6 +905,8 @@ pub(crate) fn load_moe_layer_weights(
                 "unsupported fused 3D quantized MoE expert layout on '{pfx}' (expected per-expert W4A16 or 3D BF16/FP16)"
             )));
         }
+        let (exp0_in_had, exp0_dn_had) = resolve_expert0_hadamard_blocks()?;
+
         let load_expert_parts = |e: usize| -> Result<(RawLinearHost, RawLinearHost)> {
             let epfx = format!("{pfx}.mlp.experts.{e}");
             let rg_full = RawLinearHost::load(archive, &format!("{epfx}.gate_proj"), &cfg.quant)?;
@@ -631,17 +932,25 @@ pub(crate) fn load_moe_layer_weights(
             }
             let rg = rg_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
             let ru = ru_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-            let gu = RawLinearHost::concat_rows(&[rg, ru])?;
-            let rd = rd_full.slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+            let (gu, gu_had) = RawLinearHost::concat_rows(&[rg, ru])?.unwrap_hadamard();
+            let (rd, rd_had) = rd_full
+                .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm)?
+                .unwrap_hadamard();
+            if gu_had != exp0_in_had || rd_had != exp0_dn_had {
+                return Err(loader_err_msg(format!(
+                    "inconsistent MoE Hadamard block sizes at '{epfx}' (expected in={exp0_in_had}, down={exp0_dn_had}; got in={gu_had}, down={rd_had})"
+                )));
+            }
             Ok((gu, rd))
         };
 
         // Probe expert 0 to determine W4A16 vs W4A16Zp vs DenseF16 storage
-        let exp0_gate = RawLinearHost::load(
+        let (exp0_gate, _) = RawLinearHost::load(
             archive,
             &format!("{pfx}.mlp.experts.0.gate_proj"),
             &cfg.quant,
-        )?;
+        )?
+        .unwrap_hadamard();
         if matches!(exp0_gate, RawLinearHost::U8B128NMajor { .. }) {
             return Err(loader_err_msg(format!(
                 "unsupported 8-bit W8A16 routed MoE experts at '{pfx}' (sm_86/sm_89 MoE supports 4-bit W4A16 or FP16/BF16 experts)"
@@ -755,13 +1064,17 @@ pub(crate) fn load_moe_layer_weights(
                 let gate_up_scales_ptr = weight_arena.upload_slice(&all_gu_scales, stream)?;
                 let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
                 let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
-                MoeExpertStorage::W4A16 {
-                    gate_up_packed_ptr,
-                    gate_up_scales_ptr,
-                    down_packed_ptr,
-                    down_scales_ptr,
-                    group_size,
-                }
+                (
+                    MoeExpertStorage::W4A16 {
+                        gate_up_packed_ptr,
+                        gate_up_scales_ptr,
+                        down_packed_ptr,
+                        down_scales_ptr,
+                        group_size,
+                    },
+                    exp0_in_had,
+                    exp0_dn_had,
+                )
             }
             RawLinearHost::U4ZpNMajor { group_size, .. } => {
                 if !h.is_multiple_of(8)
@@ -840,17 +1153,21 @@ pub(crate) fn load_moe_layer_weights(
                 let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
                 let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
                 let down_qzeros_ptr = weight_arena.upload_slice(&all_dn_qzeros, stream)?;
-                MoeExpertStorage::W4A16Zp {
-                    gate_up_packed_ptr,
-                    gate_up_scales_ptr,
-                    gate_up_qzeros_ptr,
-                    down_packed_ptr,
-                    down_scales_ptr,
-                    down_qzeros_ptr,
-                    group_size,
-                }
+                (
+                    MoeExpertStorage::W4A16Zp {
+                        gate_up_packed_ptr,
+                        gate_up_scales_ptr,
+                        gate_up_qzeros_ptr,
+                        down_packed_ptr,
+                        down_scales_ptr,
+                        down_qzeros_ptr,
+                        group_size,
+                    },
+                    exp0_in_had,
+                    exp0_dn_had,
+                )
             }
-            RawLinearHost::U8B128NMajor { .. } => unreachable!(),
+            RawLinearHost::Hadamard { .. } | RawLinearHost::U8B128NMajor { .. } => unreachable!(),
             RawLinearHost::DenseF16 { .. } => {
                 let mut all_gu_f16 = Vec::with_capacity(num_exp * 2 * local_moe_interm * h);
                 let mut all_dn_f16 = Vec::with_capacity(num_exp * h * local_moe_interm);
@@ -880,10 +1197,14 @@ pub(crate) fn load_moe_layer_weights(
                 }
                 let gate_up_ptr = weight_arena.upload_slice(&all_gu_f16, stream)?;
                 let down_ptr = weight_arena.upload_slice(&all_dn_f16, stream)?;
-                MoeExpertStorage::DenseF16 {
-                    gate_up_ptr,
-                    down_ptr,
-                }
+                (
+                    MoeExpertStorage::DenseF16 {
+                        gate_up_ptr,
+                        down_ptr,
+                    },
+                    exp0_in_had,
+                    exp0_dn_had,
+                )
             }
         }
     };
@@ -942,7 +1263,7 @@ pub(crate) fn load_moe_layer_weights(
             )));
         }
         let s_dn = s_dn_full
-            .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)
+            .slice_cols(rank * local_shared_interm, (rank + 1) * local_shared_interm)?
             .upload(weight_arena, stream, repack_staging)?;
         let s_eg = if archive
             .resolve_name(&format!("{pfx}.mlp.shared_expert_gate.weight"))
@@ -980,6 +1301,8 @@ pub(crate) fn load_moe_layer_weights(
         norm_topk_prob: cfg.norm_topk_prob,
         scoring_func,
         local_moe_interm,
+        routed_input_hadamard,
+        routed_down_hadamard,
         shared_gate_up_proj,
         shared_down_proj,
         shared_expert_gate,
@@ -1193,21 +1516,61 @@ pub(crate) fn load_ple_layer_weights(
     }
     let conv1d_weight_ptr = weight_arena.upload_slice(&conv_bits, stream)?;
 
-    let scale_key = archive
-        .resolve_name(&format!(
-            "{ple_pfx}.ple_embedding.ngram_embedding.weight_scale"
-        ))
-        .ok_or_else(|| {
-            loader_err_msg(format!(
-                "missing '{ple_pfx}.ple_embedding.ngram_embedding.weight_scale'"
-            ))
-        })?;
-    let scale_vals = archive
-        .read_f32(&scale_key)
-        .map_err(|e| loader_err_msg(format!("read '{scale_key}': {e}")))?;
-    let weight_scale = *scale_vals
-        .first()
-        .ok_or_else(|| loader_err_msg(format!("empty '{scale_key}'")))?;
+    let ngram_heads = (cfg.heads_per_ngram * cfg.ngram_size.saturating_sub(1)).max(1);
+    if cfg.ple_embed_dim == 0 || !cfg.ple_embed_dim.is_multiple_of(ngram_heads) {
+        return Err(loader_err_msg(format!(
+            "'{ple_pfx}' ple_embed_dim ({}) is not a positive multiple of ngram_heads ({ngram_heads})",
+            cfg.ple_embed_dim
+        )));
+    }
+    let head_dim = cfg.ple_embed_dim / ngram_heads;
+    let emb_pfx = format!("{ple_pfx}.ple_embedding.ngram_embedding");
+    let (weight_scale, lut4_ptr, lut4_group_size) = if archive
+        .resolve_name(&format!("{emb_pfx}.shard_0.weight_packed"))
+        .is_some()
+    {
+        let lut_key = archive
+            .resolve_name(&format!("{emb_pfx}.shard_0.weight_lut"))
+            .ok_or_else(|| loader_err_msg(format!("missing '{emb_pfx}.shard_0.weight_lut'")))?;
+        let lut_vals = archive
+            .read_f32(&lut_key)
+            .map_err(|e| loader_err_msg(format!("read '{lut_key}': {e}")))?;
+        if lut_vals.len() != 16 {
+            return Err(loader_err_msg(format!(
+                "'{lut_key}' len {} != 16",
+                lut_vals.len()
+            )));
+        }
+        let scale_key = archive
+            .resolve_name(&format!("{emb_pfx}.shard_0.weight_scale"))
+            .ok_or_else(|| loader_err_msg(format!("missing '{emb_pfx}.shard_0.weight_scale'")))?;
+        let scale_info = archive
+            .tensor_info(&scale_key)
+            .map_err(|e| loader_err_msg(format!("info '{scale_key}': {e}")))?;
+        if scale_info.shape.len() != 2
+            || scale_info.shape[1] == 0
+            || !head_dim.is_multiple_of(scale_info.shape[1])
+        {
+            return Err(loader_err_msg(format!(
+                "'{scale_key}' invalid shape {:?} for head_dim={head_dim}",
+                scale_info.shape
+            )));
+        }
+        let group_size = head_dim / scale_info.shape[1];
+        let lut_ptr = weight_arena.upload_slice(&lut_vals, stream)?;
+        (1.0f32, lut_ptr, group_size)
+    } else {
+        let scale_key = archive
+            .resolve_name(&format!("{emb_pfx}.weight_scale"))
+            .ok_or_else(|| loader_err_msg(format!("missing '{emb_pfx}.weight_scale'")))?;
+        let scale_vals = archive
+            .read_f32(&scale_key)
+            .map_err(|e| loader_err_msg(format!("read '{scale_key}': {e}")))?;
+        let ws = *scale_vals
+            .first()
+            .ok_or_else(|| loader_err_msg(format!("empty '{scale_key}'")))?;
+        (ws, 0u64, 0usize)
+    };
 
     Ok(PleLayerWeights {
         key_proj,
@@ -1217,6 +1580,9 @@ pub(crate) fn load_ple_layer_weights(
         norm_conv_ptr,
         conv1d_weight_ptr,
         weight_scale,
+        lut4_ptr,
+        lut4_group_size,
+        ngram_heads,
     })
 }
 

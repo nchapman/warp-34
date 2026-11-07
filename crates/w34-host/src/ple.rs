@@ -478,10 +478,35 @@ impl Drop for MmapRegion {
 struct ShardView {
     mmap_idx: usize,
     offset_bytes: usize,
+    scale_offset_bytes: usize,
     rows: usize,
 }
 
-/// Zero-copy read-only `mmap` table over the 128 `F8_E4M3` PLE n-gram embedding shards.
+/// Number of entries in a 4-bit `lut4-gptq` PLE codebook (`weight_lut`).
+pub const PLE_LUT4_CODEBOOK_LEN: usize = 16;
+/// Signed-sqrt clamp epsilon for PLE attention gating (`sgn(dot) * sqrt(max(|dot|, eps))`).
+pub const PLE_SIGNED_SQRT_GATE_EPS: f32 = 1e-6;
+/// Minimum batch of n-gram IDs before issuing coalesced `MADV_WILLNEED` prefaulting.
+const PLE_MMAP_PREFAULT_MIN_IDS: usize = 64;
+/// Standard OS virtual memory page size in bytes used for `madvise` alignment.
+const PLE_OS_PAGE_BYTES: usize = 4096;
+
+/// On-disk storage format of a PLE n-gram embedding table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PleTableFormat {
+    /// `F8_E4M3` (`shard_{part}.weight` `U8 [rows, head_dim]` + scalar `weight_scale`).
+    F8E4m3,
+    /// 4-bit LUT-GPTQ (`shard_{part}.weight_packed` `U8 [rows, head_dim / 2]` +
+    /// `shard_{part}.weight_scale` `F16 [rows, head_dim / group_size]` +
+    /// `shard_{part}.weight_lut` `F32 [16]`).
+    Lut4Gptq {
+        group_size: usize,
+        lut_f32: [f32; PLE_LUT4_CODEBOOK_LEN],
+    },
+}
+
+/// Zero-copy read-only `mmap` table over the 128 PLE n-gram embedding shards
+/// (`F8_E4M3` or 4-bit `lut4-gptq`).
 ///
 /// Consumes `0 B` of anonymous system RAM and `0 B` of GPU VRAM: the OS page cache serves hot
 /// n-gram pages directly from NVMe with `MADV_RANDOM` + coalesced `MADV_WILLNEED` prefaulting.
@@ -491,9 +516,53 @@ pub struct PleMmapTable {
     pub shard_rows: usize,
     pub head_dim: usize,
     pub lut: F8E4m3ScaleLut,
+    pub format: PleTableFormat,
 }
 
 impl PleMmapTable {
+    fn ensure_mmap(
+        archive: &SafetensorsArchive,
+        shard_file: &str,
+        file_to_mmap: &mut HashMap<String, usize>,
+        mmaps: &mut Vec<MmapRegion>,
+    ) -> io::Result<usize> {
+        if let Some(&idx) = file_to_mmap.get(shard_file) {
+            return Ok(idx);
+        }
+        let file = archive.shard_file(shard_file).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing safetensors file for shard_file={shard_file}"),
+            )
+        })?;
+        let file_len = file.metadata()?.len() as usize;
+        let fd = file.as_raw_fd();
+        // SAFETY: Valid file descriptor and length; `PROT_READ` + `MAP_PRIVATE` is read-only.
+        let raw_ptr = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                file_len,
+                PROT_READ,
+                MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        if raw_ptr as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw_ptr` is a valid non-null mapping of `file_len` bytes.
+        unsafe {
+            let _ = madvise(raw_ptr, file_len, MADV_RANDOM);
+        }
+        let ptr = NonNull::new(raw_ptr.cast::<u8>())
+            .ok_or_else(|| io::Error::other("mmap returned null pointer"))?;
+        let idx = mmaps.len();
+        mmaps.push(MmapRegion { ptr, len: file_len });
+        file_to_mmap.insert(shard_file.to_owned(), idx);
+        Ok(idx)
+    }
+
     pub fn open(
         archive: &SafetensorsArchive,
         cfg: &ModelConfig,
@@ -504,6 +573,14 @@ impl PleMmapTable {
         let head_dim = cfg.ple_embed_dim / ngram_heads;
         let prefix =
             format!("model.language_model.layers.{ple_layer_id}.ple.ple_embedding.ngram_embedding");
+
+        if archive
+            .resolve_name(&format!("{prefix}.shard_0.weight_packed"))
+            .is_some()
+        {
+            return Self::open_lut4_gptq(archive, &prefix, split_parts, head_dim);
+        }
+
         let scale_name = format!("{prefix}.weight_scale");
         let weight_scale = if let Ok(info) = archive.tensor_info(&scale_name) {
             let raw = archive.read_bytes(&scale_name)?;
@@ -558,49 +635,19 @@ impl PleMmapTable {
                     ),
                 ));
             }
-            let mmap_idx = if let Some(&idx) = file_to_mmap.get(&info.shard_file) {
-                idx
-            } else {
-                let file = archive.shard_file(&info.shard_file).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "missing safetensors file for shard_file={}",
-                            info.shard_file
-                        ),
-                    )
-                })?;
-                let file_len = file.metadata()?.len() as usize;
-                let fd = file.as_raw_fd();
-                // SAFETY: Valid file descriptor and length; `PROT_READ` + `MAP_PRIVATE` is read-only.
-                let raw_ptr = unsafe {
-                    mmap(
-                        core::ptr::null_mut(),
-                        file_len,
-                        PROT_READ,
-                        MAP_PRIVATE,
-                        fd,
-                        0,
-                    )
-                };
-                if raw_ptr as isize == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                // SAFETY: `raw_ptr` is a valid non-null mapping of `file_len` bytes.
-                unsafe {
-                    let _ = madvise(raw_ptr, file_len, MADV_RANDOM);
-                }
-                let ptr = NonNull::new(raw_ptr.cast::<u8>())
-                    .ok_or_else(|| io::Error::other("mmap returned null pointer"))?;
-                let idx = mmaps.len();
-                mmaps.push(MmapRegion { ptr, len: file_len });
-                file_to_mmap.insert(info.shard_file.clone(), idx);
-                idx
-            };
-
+            let mmap_idx =
+                Self::ensure_mmap(archive, &info.shard_file, &mut file_to_mmap, &mut mmaps)?;
+            let offset_bytes = info.offset as usize;
+            if offset_bytes.saturating_add(rows.saturating_mul(head_dim)) > mmaps[mmap_idx].len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("PLE shard {tname} exceeds mmap file bounds"),
+                ));
+            }
             shards.push(ShardView {
                 mmap_idx,
-                offset_bytes: info.offset as usize,
+                offset_bytes,
+                scale_offset_bytes: 0,
                 rows,
             });
         }
@@ -611,26 +658,218 @@ impl PleMmapTable {
             shard_rows,
             head_dim,
             lut: F8E4m3ScaleLut::new(weight_scale),
+            format: PleTableFormat::F8E4m3,
         })
     }
 
-    /// Gathers raw `F8_E4M3` bytes (`[ids.len(), head_dim]`) with coalesced `MADV_WILLNEED`
-    /// prefaulting for batches of `>= 64` row lookups.
+    fn open_lut4_gptq(
+        archive: &SafetensorsArchive,
+        prefix: &str,
+        split_parts: usize,
+        head_dim: usize,
+    ) -> io::Result<Self> {
+        if !head_dim.is_multiple_of(2) || head_dim == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("lut4-gptq PLE requires even non-zero head_dim, got {head_dim}"),
+            ));
+        }
+        let packed_cols = head_dim / 2;
+        let lut0_name = format!("{prefix}.shard_0.weight_lut");
+        let lut0_vec = archive.read_f32(&lut0_name)?;
+        if lut0_vec.len() != PLE_LUT4_CODEBOOK_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected {PLE_LUT4_CODEBOOK_LEN}-entry weight_lut for {lut0_name}, got len={}",
+                    lut0_vec.len()
+                ),
+            ));
+        }
+        let mut lut_f32 = [0.0f32; PLE_LUT4_CODEBOOK_LEN];
+        lut_f32.copy_from_slice(&lut0_vec);
+
+        let mut file_to_mmap: HashMap<String, usize> = HashMap::new();
+        let mut mmaps: Vec<MmapRegion> = Vec::new();
+        let mut shards: Vec<ShardView> = Vec::with_capacity(split_parts);
+        let mut shard_rows = 0usize;
+        let mut group_size = 0usize;
+
+        for part in 0..split_parts {
+            let s_pfx = format!("{prefix}.shard_{part}");
+            let packed_name = format!("{s_pfx}.weight_packed");
+            let scale_name = format!("{s_pfx}.weight_scale");
+            let lut_name = format!("{s_pfx}.weight_lut");
+
+            let lut_vec = archive.read_f32(&lut_name)?;
+            if lut_vec != lut0_vec {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("inconsistent PLE weight_lut in {lut_name} vs shard_0"),
+                ));
+            }
+
+            let packed_info = archive.tensor_info(&packed_name)?;
+            if packed_info.dtype != "U8" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected U8 for {packed_name}, got {}", packed_info.dtype),
+                ));
+            }
+            if packed_info.shape.len() != 2 || packed_info.shape[1] != packed_cols {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected PLE lut4 packed shape {:?} for {packed_name} (expected [rows, {packed_cols}])",
+                        packed_info.shape
+                    ),
+                ));
+            }
+            let rows = packed_info.shape[0];
+            if part == 0 {
+                shard_rows = rows;
+            } else if rows != shard_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "inconsistent PLE shard rows: shard_0={shard_rows}, shard_{part}={rows}"
+                    ),
+                ));
+            }
+
+            let scale_info = archive.tensor_info(&scale_name)?;
+            if scale_info.dtype != "F16" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected F16 for {scale_name}, got {}", scale_info.dtype),
+                ));
+            }
+            if scale_info.shape.len() != 2
+                || scale_info.shape[0] != rows
+                || scale_info.shape[1] == 0
+                || !head_dim.is_multiple_of(scale_info.shape[1])
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "unexpected PLE lut4 scale shape {:?} for {scale_name} (rows={rows}, head_dim={head_dim})",
+                        scale_info.shape
+                    ),
+                ));
+            }
+            let num_groups = scale_info.shape[1];
+            let part_group_size = head_dim / num_groups;
+            if part == 0 {
+                group_size = part_group_size;
+            } else if part_group_size != group_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "inconsistent PLE lut4 group_size: shard_0={group_size}, shard_{part}={part_group_size}"
+                    ),
+                ));
+            }
+
+            let packed_mmap_idx = Self::ensure_mmap(
+                archive,
+                &packed_info.shard_file,
+                &mut file_to_mmap,
+                &mut mmaps,
+            )?;
+            let scale_mmap_idx = Self::ensure_mmap(
+                archive,
+                &scale_info.shard_file,
+                &mut file_to_mmap,
+                &mut mmaps,
+            )?;
+            if packed_mmap_idx != scale_mmap_idx {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "PLE lut4 shard_{part} weight_packed and weight_scale must reside in the same shard file"
+                    ),
+                ));
+            }
+            let offset_bytes = packed_info.offset as usize;
+            let scale_offset_bytes = scale_info.offset as usize;
+            let scale_row_bytes = num_groups * 2;
+            let region_len = mmaps[packed_mmap_idx].len;
+            if offset_bytes.saturating_add(rows.saturating_mul(packed_cols)) > region_len
+                || scale_offset_bytes.saturating_add(rows.saturating_mul(scale_row_bytes))
+                    > region_len
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("PLE lut4 shard_{part} exceeds mmap file bounds"),
+                ));
+            }
+
+            shards.push(ShardView {
+                mmap_idx: packed_mmap_idx,
+                offset_bytes,
+                scale_offset_bytes,
+                rows,
+            });
+        }
+
+        Ok(Self {
+            mmaps,
+            shards,
+            shard_rows,
+            head_dim,
+            lut: F8E4m3ScaleLut::new(1.0),
+            format: PleTableFormat::Lut4Gptq {
+                group_size,
+                lut_f32,
+            },
+        })
+    }
+
+    /// Number of staged bytes gathered per n-gram head lookup (`160 B` for `F8_E4M3`,
+    /// `90 B` = `80 B` packed nibbles + `10 B` FP16 scales for `lut4-gptq` with `head_dim=160, g=32`).
+    #[inline]
+    pub fn staged_bytes_per_head(&self) -> usize {
+        match self.format {
+            PleTableFormat::F8E4m3 => self.head_dim,
+            PleTableFormat::Lut4Gptq { group_size, .. } => {
+                (self.head_dim / 2) + (self.head_dim / group_size) * 2
+            }
+        }
+    }
+
+    /// Gathers raw staged PLE bytes (`[ids.len(), staged_bytes_per_head()]`) with coalesced
+    /// `MADV_WILLNEED` prefaulting for batches of `>= 64` row lookups.
     pub fn gather_f8(&self, ids: &[i64], out_f8: &mut [u8]) {
-        assert_eq!(out_f8.len(), ids.len() * self.head_dim);
+        let head_stride = self.staged_bytes_per_head();
+        assert_eq!(out_f8.len(), ids.len() * head_stride);
         if ids.is_empty() {
             return;
         }
-        const PAGE_SIZE: usize = 4096;
-        if ids.len() >= 64 {
-            let mut page_keys: Vec<(usize, usize)> = Vec::with_capacity(ids.len());
+        if ids.len() >= PLE_MMAP_PREFAULT_MIN_IDS {
+            let cap = match self.format {
+                PleTableFormat::F8E4m3 => ids.len(),
+                PleTableFormat::Lut4Gptq { .. } => ids.len() * 2,
+            };
+            let mut page_keys: Vec<(usize, usize)> = Vec::with_capacity(cap);
             for &id in ids {
                 let uid = id.max(0) as usize;
                 let shard_idx = (uid / self.shard_rows).min(self.shards.len() - 1);
                 let local_row = (uid % self.shard_rows).min(self.shards[shard_idx].rows - 1);
                 let view = self.shards[shard_idx];
-                let byte_off = view.offset_bytes + local_row * self.head_dim;
-                page_keys.push((view.mmap_idx, byte_off / PAGE_SIZE));
+                match self.format {
+                    PleTableFormat::F8E4m3 => {
+                        let byte_off = view.offset_bytes + local_row * self.head_dim;
+                        page_keys.push((view.mmap_idx, byte_off / PLE_OS_PAGE_BYTES));
+                    }
+                    PleTableFormat::Lut4Gptq { group_size, .. } => {
+                        let packed_bytes = self.head_dim / 2;
+                        let scale_bytes = (self.head_dim / group_size) * 2;
+                        let p_off = view.offset_bytes + local_row * packed_bytes;
+                        let s_off = view.scale_offset_bytes + local_row * scale_bytes;
+                        page_keys.push((view.mmap_idx, p_off / PLE_OS_PAGE_BYTES));
+                        page_keys.push((view.mmap_idx, s_off / PLE_OS_PAGE_BYTES));
+                    }
+                }
             }
             page_keys.sort_unstable();
             page_keys.dedup();
@@ -647,9 +886,9 @@ impl PleMmapTable {
                     idx += 1;
                 }
                 let region = &self.mmaps[mmap_idx];
-                let adv_off = start_page * PAGE_SIZE;
-                let adv_len =
-                    ((end_page - start_page) * PAGE_SIZE).min(region.len.saturating_sub(adv_off));
+                let adv_off = start_page * PLE_OS_PAGE_BYTES;
+                let adv_len = ((end_page - start_page) * PLE_OS_PAGE_BYTES)
+                    .min(region.len.saturating_sub(adv_off));
                 if adv_len > 0 {
                     // SAFETY: `adv_off..adv_off + adv_len` is page-aligned and within `region`.
                     unsafe {
@@ -663,38 +902,127 @@ impl PleMmapTable {
             }
         }
 
-        for (i, &id) in ids.iter().enumerate() {
-            let uid = id.max(0) as usize;
-            let shard_idx = (uid / self.shard_rows).min(self.shards.len() - 1);
-            let local_row = (uid % self.shard_rows).min(self.shards[shard_idx].rows - 1);
-            let view = self.shards[shard_idx];
-            let region = &self.mmaps[view.mmap_idx];
-            let byte_off = view.offset_bytes + local_row * self.head_dim;
-            // SAFETY: Bounds checked at `PleMmapTable::open` (`offset + rows * head_dim <= region.len`).
-            let src = unsafe {
-                core::slice::from_raw_parts(region.ptr.as_ptr().add(byte_off), self.head_dim)
-            };
-            out_f8[i * self.head_dim..(i + 1) * self.head_dim].copy_from_slice(src);
+        match self.format {
+            PleTableFormat::F8E4m3 => {
+                for (i, &id) in ids.iter().enumerate() {
+                    let uid = id.max(0) as usize;
+                    let shard_idx = (uid / self.shard_rows).min(self.shards.len() - 1);
+                    let local_row = (uid % self.shard_rows).min(self.shards[shard_idx].rows - 1);
+                    let view = self.shards[shard_idx];
+                    let region = &self.mmaps[view.mmap_idx];
+                    let byte_off = view.offset_bytes + local_row * self.head_dim;
+                    // SAFETY: Bounds checked at `PleMmapTable::open` (`offset + rows * head_dim <= region.len`).
+                    let src = unsafe {
+                        core::slice::from_raw_parts(
+                            region.ptr.as_ptr().add(byte_off),
+                            self.head_dim,
+                        )
+                    };
+                    out_f8[i * self.head_dim..(i + 1) * self.head_dim].copy_from_slice(src);
+                }
+            }
+            PleTableFormat::Lut4Gptq { group_size, .. } => {
+                let packed_bytes = self.head_dim / 2;
+                let scale_bytes = (self.head_dim / group_size) * 2;
+                for (i, &id) in ids.iter().enumerate() {
+                    let uid = id.max(0) as usize;
+                    let shard_idx = (uid / self.shard_rows).min(self.shards.len() - 1);
+                    let local_row = (uid % self.shard_rows).min(self.shards[shard_idx].rows - 1);
+                    let view = self.shards[shard_idx];
+                    let region = &self.mmaps[view.mmap_idx];
+                    let p_off = view.offset_bytes + local_row * packed_bytes;
+                    let s_off = view.scale_offset_bytes + local_row * scale_bytes;
+                    // SAFETY: Bounds checked at `PleMmapTable::open_lut4_gptq`.
+                    let src_packed = unsafe {
+                        core::slice::from_raw_parts(region.ptr.as_ptr().add(p_off), packed_bytes)
+                    };
+                    // SAFETY: Bounds checked at `PleMmapTable::open_lut4_gptq`.
+                    let src_scale = unsafe {
+                        core::slice::from_raw_parts(region.ptr.as_ptr().add(s_off), scale_bytes)
+                    };
+                    let dst = &mut out_f8[i * head_stride..(i + 1) * head_stride];
+                    dst[..packed_bytes].copy_from_slice(src_packed);
+                    dst[packed_bytes..].copy_from_slice(src_scale);
+                }
+            }
         }
     }
 
-    /// Gathers and dequantizes rows into `FP16` (`u16` bits) via the 256-entry L1 LUT.
+    /// Gathers and dequantizes rows into `FP16` (`u16` bits).
     pub fn gather_dequant_f16(&self, ids: &[i64], out_f16: &mut [u16]) {
         assert_eq!(out_f16.len(), ids.len() * self.head_dim);
-        let mut raw = vec![0u8; ids.len() * self.head_dim];
-        self.gather_f8(ids, &mut raw);
-        for (dst, &b) in out_f16.iter_mut().zip(raw.iter()) {
-            *dst = self.lut.f16_lut[b as usize];
+        let head_stride = self.staged_bytes_per_head();
+        let mut staged = vec![0u8; ids.len() * head_stride];
+        self.gather_f8(ids, &mut staged);
+        match self.format {
+            PleTableFormat::F8E4m3 => {
+                for (dst, &b) in out_f16.iter_mut().zip(staged.iter()) {
+                    *dst = self.lut.f16_lut[b as usize];
+                }
+            }
+            PleTableFormat::Lut4Gptq {
+                group_size,
+                lut_f32,
+            } => {
+                let packed_bytes = self.head_dim / 2;
+                for i in 0..ids.len() {
+                    let head_raw = &staged[i * head_stride..(i + 1) * head_stride];
+                    let dst_head = &mut out_f16[i * self.head_dim..(i + 1) * self.head_dim];
+                    for (col, dst) in dst_head.iter_mut().enumerate() {
+                        let byte = head_raw[col >> 1];
+                        let nibble = if (col & 1) != 0 {
+                            (byte >> 4) & 0x0F
+                        } else {
+                            byte & 0x0F
+                        } as usize;
+                        let sb_off = packed_bytes + (col / group_size) * 2;
+                        let scale = crate::cuda::f16_to_f32(u16::from_le_bytes([
+                            head_raw[sb_off],
+                            head_raw[sb_off + 1],
+                        ]));
+                        *dst = crate::cuda::f32_to_f16(lut_f32[nibble] * scale);
+                    }
+                }
+            }
         }
     }
 
-    /// Gathers and dequantizes rows into `f32` via the 256-entry L1 LUT.
+    /// Gathers and dequantizes rows into `f32`.
     pub fn gather_dequant_f32(&self, ids: &[i64], out_f32: &mut [f32]) {
         assert_eq!(out_f32.len(), ids.len() * self.head_dim);
-        let mut raw = vec![0u8; ids.len() * self.head_dim];
-        self.gather_f8(ids, &mut raw);
-        for (dst, &b) in out_f32.iter_mut().zip(raw.iter()) {
-            *dst = self.lut.f32_lut[b as usize];
+        let head_stride = self.staged_bytes_per_head();
+        let mut staged = vec![0u8; ids.len() * head_stride];
+        self.gather_f8(ids, &mut staged);
+        match self.format {
+            PleTableFormat::F8E4m3 => {
+                for (dst, &b) in out_f32.iter_mut().zip(staged.iter()) {
+                    *dst = self.lut.f32_lut[b as usize];
+                }
+            }
+            PleTableFormat::Lut4Gptq {
+                group_size,
+                lut_f32,
+            } => {
+                let packed_bytes = self.head_dim / 2;
+                for i in 0..ids.len() {
+                    let head_raw = &staged[i * head_stride..(i + 1) * head_stride];
+                    let dst_head = &mut out_f32[i * self.head_dim..(i + 1) * self.head_dim];
+                    for (col, dst) in dst_head.iter_mut().enumerate() {
+                        let byte = head_raw[col >> 1];
+                        let nibble = if (col & 1) != 0 {
+                            (byte >> 4) & 0x0F
+                        } else {
+                            byte & 0x0F
+                        } as usize;
+                        let sb_off = packed_bytes + (col / group_size) * 2;
+                        let scale = crate::cuda::f16_to_f32(u16::from_le_bytes([
+                            head_raw[sb_off],
+                            head_raw[sb_off + 1],
+                        ]));
+                        *dst = lut_f32[nibble] * scale;
+                    }
+                }
+            }
         }
     }
 }
@@ -1029,6 +1357,35 @@ pub mod gpu_ops {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn hc_mix_streams_hadamard_f16(
+        ex: &W34Exec,
+        residual_in: u64,
+        up_raw_in: u64,
+        mixed_out: u64,
+        had64_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_hc_mix_streams_hadamard_f16(
+                ex,
+                residual_in as usize as *const c_void,
+                up_raw_in as usize as *const c_void,
+                mixed_out as usize as *mut c_void,
+                had64_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                hidden_size as i32,
+            )
+        };
+        check(rc, "w34_hc_mix_streams_hadamard_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn hc_combine_f16(
         ex: &W34Exec,
         residual_in: u64,
@@ -1059,6 +1416,43 @@ pub mod gpu_ops {
         check(rc, "w34_hc_combine_f16")
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_combine_tap_f16(
+        ex: &W34Exec,
+        residual_in: u64,
+        block_out: u64,
+        inject_weights: u64,
+        ple_delta: u64,
+        residual_out: u64,
+        tap_bf16_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        hidden_size: usize,
+        tap_stride_elems: i32,
+        tap_offset_elems: i32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_hc_combine_tap_f16(
+                ex,
+                residual_in as usize as *const c_void,
+                block_out as usize as *const c_void,
+                inject_weights as usize as *const f32,
+                ple_delta as usize as *const c_void,
+                residual_out as usize as *mut c_void,
+                tap_bf16_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                hidden_size as i32,
+                tap_stride_elems,
+                tap_offset_elems,
+            )
+        };
+        check(rc, "w34_hc_combine_tap_f16")
+    }
+
     pub fn ple_dequant_f8_to_f16(
         ex: &W34Exec,
         f8_in: u64,
@@ -1083,6 +1477,88 @@ pub mod gpu_ops {
         check(rc, "w34_ple_dequant_f8_to_f16")
     }
 
+    pub fn ple_dequant_f8_hadamard_to_f16(
+        ex: &W34Exec,
+        f8_in: u64,
+        f16_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        embed_dim: usize,
+        weight_scale: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dequant_f8_hadamard_to_f16(
+                ex,
+                f8_in as usize as *const u8,
+                f16_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                embed_dim as i32,
+                weight_scale,
+            )
+        };
+        check(rc, "w34_ple_dequant_f8_hadamard_to_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_dequant_lut4_to_f16(
+        ex: &W34Exec,
+        raw_in: u64,
+        lut16: u64,
+        f16_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        num_heads: usize,
+        head_dim: usize,
+        group_size: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dequant_lut4_to_f16(
+                ex,
+                raw_in as usize as *const u8,
+                lut16 as usize as *const f32,
+                f16_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                num_heads as i32,
+                head_dim as i32,
+                group_size as i32,
+            )
+        };
+        check(rc, "w34_ple_dequant_lut4_to_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_dequant_lut4_hadamard_to_f16(
+        ex: &W34Exec,
+        raw_in: u64,
+        lut16: u64,
+        f16_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        num_heads: usize,
+        head_dim: usize,
+        group_size: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dequant_lut4_hadamard_to_f16(
+                ex,
+                raw_in as usize as *const u8,
+                lut16 as usize as *const f32,
+                f16_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                num_heads as i32,
+                head_dim as i32,
+                group_size as i32,
+            )
+        };
+        check(rc, "w34_ple_dequant_lut4_hadamard_to_f16")
+    }
+
     pub fn ple_dilated_conv1d_f16(
         ex: &W34Exec,
         key_in: u64,
@@ -1105,6 +1581,33 @@ pub mod gpu_ops {
             )
         };
         check(rc, "w34_ple_dilated_conv1d_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_dilated_conv1d_add_f16(
+        ex: &W34Exec,
+        key_in: u64,
+        conv_weight: u64,
+        conv_state_pool: u64,
+        key_out: u64,
+        residual_inout: u64,
+        batch: &W34GdnBatch,
+        conv_dim: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers and `batch` metadata are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dilated_conv1d_add_f16(
+                ex,
+                key_in as usize as *const c_void,
+                conv_weight as usize as *const c_void,
+                conv_state_pool as usize as *mut c_void,
+                key_out as usize as *mut c_void,
+                residual_inout as usize as *mut c_void,
+                batch,
+                conv_dim as i32,
+            )
+        };
+        check(rc, "w34_ple_dilated_conv1d_add_f16")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1136,6 +1639,45 @@ pub mod gpu_ops {
             )
         };
         check(rc, "w34_ple_signed_sqrt_gate_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_signed_sqrt_gate_norm_add_f16(
+        ex: &W34Exec,
+        norm_query: u64,
+        norm_key: u64,
+        value_in: u64,
+        ple_delta_out: u64,
+        residual_inout: u64,
+        norm_conv_weight: u64,
+        norm_conv_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        embed_dim: usize,
+        eps: f32,
+        norm_eps: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_signed_sqrt_gate_norm_add_f16(
+                ex,
+                norm_query as usize as *const c_void,
+                norm_key as usize as *const c_void,
+                value_in as usize as *const c_void,
+                ple_delta_out as usize as *mut c_void,
+                residual_inout as usize as *mut c_void,
+                norm_conv_weight as usize as *const c_void,
+                norm_conv_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                embed_dim as i32,
+                eps,
+                norm_eps,
+            )
+        };
+        check(rc, "w34_ple_signed_sqrt_gate_norm_add_f16")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1304,6 +1846,45 @@ pub mod gpu_ops {
             )
         };
         check(rc, "w34_qsa_sparse_paged_attn_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_sparse_paged_attn_hadamard_f16(
+        ex: &W34Exec,
+        q: u64,
+        gate: u64,
+        kv_layout: &W34KvLayerLayout,
+        selected_phys_blocks: u64,
+        selected_logical_blocks: u64,
+        num_selected_blocks: u64,
+        token_seq_pos: u64,
+        valid_token_mask: u64,
+        out: u64,
+        num_tokens: usize,
+        local_q_heads: usize,
+        select_k_blocks: usize,
+        sm_scale: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers and `kv_layout` are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_qsa_sparse_paged_attn_hadamard_f16(
+                ex,
+                q as usize as *const c_void,
+                gate as usize as *const c_void,
+                kv_layout,
+                selected_phys_blocks as usize as *const i32,
+                selected_logical_blocks as usize as *const i32,
+                num_selected_blocks as usize as *const i32,
+                token_seq_pos as usize as *const i32,
+                valid_token_mask as usize as *const u8,
+                out as usize as *mut c_void,
+                num_tokens as i32,
+                local_q_heads as i32,
+                select_k_blocks as i32,
+                sm_scale,
+            )
+        };
+        check(rc, "w34_qsa_sparse_paged_attn_hadamard_f16")
     }
 }
 
