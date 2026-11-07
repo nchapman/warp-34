@@ -542,7 +542,7 @@ impl TieredMoeEngine {
                 } else {
                     cache.slots.capacity
                 };
-                let use_cpu_bridge = cache.bridge_layer_id.is_some()
+                let use_cpu_bridge = cache.bridge_runtime.is_some()
                     && num_tokens <= ws.max_tokens
                     && h_topk_weights.len() == num_tokens * top_k;
                 let want_freq_stats = use_cpu_bridge || (num_tokens >= 1024 && adapt_end >= 64);
@@ -587,16 +587,32 @@ impl TieredMoeEngine {
                         // so the sparsest tail experts go to the CPU DDR5 pool (where row pairs are
                         // unpacked once and FMA-accumulated across all routed tokens) and the densest
                         // cold experts fit in at most 1 GPU chunk (`<= 384` tokens) or 2 GPU chunks (`> 384` tokens).
-                        let (target_gpu_misses, cpu_share_pct, max_tok_per_job) =
-                            if num_tokens <= 384 {
-                                (ws.stage_capacity, 70usize, 8usize)
-                            } else {
-                                (2 * ws.stage_capacity, 58usize, 96usize)
-                            };
-                        let max_cpu_jobs = misses_in_step
-                            .len()
-                            .saturating_sub(target_gpu_misses)
-                            .max((misses_in_step.len() * cpu_share_pct) / 100);
+                        let (max_cpu_jobs, max_tok_per_job) = if cache.bridge_layer_id.is_some() {
+                            let (target_gpu_misses, cpu_share_pct, max_tok_per_job) =
+                                if num_tokens <= 384 {
+                                    (ws.stage_capacity, 70usize, 8usize)
+                                } else {
+                                    (2 * ws.stage_capacity, 58usize, 96usize)
+                                };
+                            let jobs = misses_in_step
+                                .len()
+                                .saturating_sub(target_gpu_misses)
+                                .max((misses_in_step.len() * cpu_share_pct) / 100);
+                            (jobs, max_tok_per_job)
+                        } else if num_tokens <= 384 {
+                            let jobs = misses_in_step
+                                .len()
+                                .saturating_sub(ws.stage_capacity)
+                                .max(misses_in_step.len() / 5)
+                                .min(24);
+                            (jobs, 6usize)
+                        } else {
+                            let jobs = misses_in_step
+                                .len()
+                                .saturating_sub(2 * ws.stage_capacity)
+                                .min(20);
+                            (jobs, 24usize)
+                        };
                         let mut light_candidates: Vec<(usize, usize)> = misses_in_step
                             .iter()
                             .copied()
@@ -886,13 +902,13 @@ impl TieredMoeEngine {
                 // `ws.d2h_done_event` (which was recorded before Pass 0!) and evaluate `cpu_job_le`
                 // across the 16-core AVX2/FMA worker pool in DDR5 RAM!
                 if !cpu_job_le.is_empty()
-                    && let Some(_layer_id) = cache.bridge_layer_id
+                    && let Some(ref runtime) = cache.bridge_runtime
                 {
                     ws.d2h_done_event.synchronize()?;
                     cache.cpu_cold_evals += cpu_job_le.len() as u64;
                     // SAFETY: event completed D2H; these pinned buffers cover the batch and are exclusively used here.
                     unsafe {
-                        cache.bridge_runtime.as_ref().unwrap().prefill(
+                        runtime.prefill(
                             store,
                             std::slice::from_raw_parts(
                                 ws.h_prefill_x.host_ptr.cast::<u16>(),
@@ -1007,8 +1023,7 @@ impl RankTieredMoe {
             if fully_resident {
                 stream.synchronize()?;
                 store.release_host_storage();
-            } else if ep_size == 1
-                && k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
+            } else if k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
                 && cfg.num_hidden_layers <= TIERED_MOE_CPU_BRIDGE_MAX_LAYERS
                 && cfg
                     .hidden_size
@@ -1026,12 +1041,21 @@ impl RankTieredMoe {
                 )
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
-                let k_static = k_hot;
-                if bridge_runtime.is_none() {
-                    bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
+                if ep_size == 1 {
+                    let k_static = k_hot;
+                    if bridge_runtime.is_none() {
+                        bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
+                    }
+                    cache.bridge_runtime = bridge_runtime.clone();
+                    cache.register_cpu_bridge(layer_id, &store, k_static, stream)?;
+                } else {
+                    if bridge_runtime.is_none() {
+                        bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new_prefill_only(
+                            device_id, ep_rank, ep_size,
+                        )?);
+                    }
+                    cache.bridge_runtime = bridge_runtime.clone();
                 }
-                cache.bridge_runtime = bridge_runtime.clone();
-                cache.register_cpu_bridge(layer_id, &store, k_static, stream)?;
             }
             stores.push(store);
             caches.push(cache);

@@ -1,6 +1,6 @@
 use super::*;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 pub(crate) fn tensor_diff_metrics(a: &[f32], b: &[f32]) -> (f32, f64, f64) {
     let mut max_abs = 0.0f32;
     let mut err_sq = 0.0f64;
@@ -209,6 +209,88 @@ pub(crate) fn evaluate_moe_or_golden_tensor_diff(
     } else {
         evaluate_golden_tensor_diff(name, shape, vals, ref_vals, is_multimodal)
     }
+}
+
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) struct Tp1VsTp2Summary {
+    pub max_layer_diff: f32,
+    pub target_max_rel_l2: f64,
+    pub min_cosine: f64,
+    pub drafter_rel_l2: f64,
+    pub drafter_cosine: f64,
+    pub compared_drafter_hidden: bool,
+}
+
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) fn compare_tp1_vs_tp2_tensors(
+    tp1_tensors: &std::collections::HashMap<String, (Vec<usize>, Vec<f32>)>,
+    tp2_tensors: &std::collections::HashMap<String, (Vec<usize>, Vec<f32>)>,
+    is_multimodal: bool,
+    is_moe: bool,
+) -> Result<Tp1VsTp2Summary, String> {
+    let mut max_layer_diff = 0.0f32;
+    let mut target_max_rel_l2 = 0.0f64;
+    let mut min_cosine = 1.0f64;
+    let mut drafter_rel_l2 = 0.0f64;
+    let mut drafter_cosine = 1.0f64;
+    let mut compared_drafter_hidden = false;
+    let mut names: Vec<&String> = tp1_tensors.keys().collect();
+    names.sort();
+    for name in names {
+        let (shape1, vals1) = &tp1_tensors[name];
+        if name == "logits" {
+            continue; // logits_buf on rank 0 is vocab-sharded under TP=2
+        }
+        let (shape2, vals2) = tp2_tensors
+            .get(name)
+            .ok_or_else(|| format!("dump-diff tp1-vs-tp2 missing tensor on TP=2: {name}"))?;
+        if shape1 != shape2 || vals1.len() != vals2.len() {
+            return Err(format!(
+                "dump-diff tp1-vs-tp2 shape/length mismatch on {name}: tp1={shape1:?} (len={}), tp2={shape2:?} (len={})",
+                vals1.len(),
+                vals2.len()
+            ));
+        }
+        if name == "drafter_hidden" {
+            let (_, rel, cos) = tensor_diff_metrics(vals1, vals2);
+            drafter_rel_l2 = rel;
+            drafter_cosine = cos;
+            compared_drafter_hidden = true;
+        } else if is_multimodal
+            && (name.ends_with("_attn_or_gdn_out") || name.ends_with("_mlp_out"))
+        {
+            continue;
+        } else {
+            let (mdiff, rel, cos) = evaluate_moe_or_golden_tensor_diff(
+                name,
+                shape1,
+                vals1,
+                vals2,
+                is_multimodal,
+                is_moe,
+            )?;
+            max_layer_diff = max_layer_diff.max(mdiff);
+            target_max_rel_l2 = target_max_rel_l2.max(rel);
+            min_cosine = min_cosine.min(cos);
+        }
+    }
+    let mut tp2_names: Vec<&String> = tp2_tensors.keys().collect();
+    tp2_names.sort();
+    for name in tp2_names {
+        if name != "logits" && !tp1_tensors.contains_key(name) {
+            return Err(format!(
+                "dump-diff tp1-vs-tp2 missing tensor on TP=1: {name}"
+            ));
+        }
+    }
+    Ok(Tp1VsTp2Summary {
+        max_layer_diff,
+        target_max_rel_l2,
+        min_cosine,
+        drafter_rel_l2,
+        drafter_cosine,
+        compared_drafter_hidden,
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -662,46 +744,19 @@ pub(crate) fn run_dump_diff(
                 .dump_multimodal_prompt(&prompt_ids, &mm_images)
                 .map_err(|e| e.to_string())?
         };
-        let mut max_layer_diff = 0.0f32;
-        let mut target_max_rel_l2 = 0.0f64;
-        let mut min_cosine = 1.0f64;
-        let mut drafter_rel_l2 = 0.0f64;
-        let mut drafter_cosine = 1.0f64;
-        let mut compared_drafter_hidden = false;
-        let mut names: Vec<&String> = dump.tensors_f32.keys().collect();
-        names.sort();
-        for name in names {
-            let (shape1, vals1) = &dump.tensors_f32[name];
-            if name == "logits" {
-                continue; // logits_buf on rank 0 is vocab-sharded under TP=2
-            }
-            if let Some((shape2, vals2)) = dump_tp2.tensors_f32.get(name)
-                && shape1 == shape2
-            {
-                if name == "drafter_hidden" {
-                    let (_, rel, cos) = tensor_diff_metrics(vals1, vals2);
-                    drafter_rel_l2 = rel;
-                    drafter_cosine = cos;
-                    compared_drafter_hidden = true;
-                } else if is_multimodal
-                    && (name.ends_with("_attn_or_gdn_out") || name.ends_with("_mlp_out"))
-                {
-                    continue;
-                } else {
-                    let (mdiff, rel, cos) = evaluate_moe_or_golden_tensor_diff(
-                        name,
-                        shape1,
-                        vals1,
-                        vals2,
-                        is_multimodal,
-                        is_moe,
-                    )?;
-                    max_layer_diff = max_layer_diff.max(mdiff);
-                    target_max_rel_l2 = target_max_rel_l2.max(rel);
-                    min_cosine = min_cosine.min(cos);
-                }
-            }
-        }
+        let Tp1VsTp2Summary {
+            max_layer_diff,
+            target_max_rel_l2,
+            min_cosine,
+            drafter_rel_l2,
+            drafter_cosine,
+            compared_drafter_hidden,
+        } = compare_tp1_vs_tp2_tensors(
+            &dump.tensors_f32,
+            &dump_tp2.tensors_f32,
+            is_multimodal,
+            is_moe,
+        )?;
         let top1_match = dump.greedy_token_id == dump_tp2.greedy_token_id;
         let draft_prefix_match = dump
             .draft_proposal_ids
@@ -747,6 +802,7 @@ pub(crate) fn run_dump_diff(
         let archive = crate::loader::SafetensorsArchive::open(Path::new(&gpath))
             .map_err(|e| e.to_string())?;
         let mut compared = 0usize;
+        let mut skipped = 0usize;
         let mut max_diff = 0.0f32;
         let mut max_rel_l2 = 0.0f64;
         let mut min_cosine = 1.0f64;
@@ -768,10 +824,12 @@ pub(crate) fn run_dump_diff(
                 max_rel_l2 = max_rel_l2.max(rel);
                 min_cosine = min_cosine.min(cos);
                 compared += 1;
+            } else {
+                skipped += 1;
             }
         }
         println!(
-            "[dump-diff golden] golden={gpath} compared_tensors={compared} max_abs_diff={max_diff:.6} max_rel_l2={max_rel_l2:.6} min_cosine={min_cosine:.6}"
+            "[dump-diff golden] golden={gpath} compared_tensors={compared} skipped_tensors={skipped} max_abs_diff={max_diff:.6} max_rel_l2={max_rel_l2:.6} min_cosine={min_cosine:.6}"
         );
         if compared == 0 || max_rel_l2 > max_allowed_rel_l2 {
             return Err(format!(
