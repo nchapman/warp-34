@@ -18,7 +18,7 @@ pub struct ScheduledVision {
     visual_indices: Vec<Option<(usize, usize)>>,
     images: Vec<PreprocessedImage>,
     visual_counts: Vec<usize>,
-    host_embeds: Vec<Option<Vec<u16>>>,
+    rank_device_embeds: Vec<Option<Vec<DeviceBuffer>>>,
     hidden_size: usize,
     valid: bool,
 }
@@ -30,17 +30,24 @@ impl ScheduledVision {
         prompt: &[i32],
         images: Vec<PreprocessedImage>,
     ) -> Result<Self, String> {
-        let config = engine
-            .cfg
-            .vision_config
-            .as_ref()
-            .ok_or("model does not support images")?;
-        let (merge, image_token) = engine
-            .cfg
-            .vision_config
-            .as_ref()
-            .map(|v| (v.spatial_merge_size, v.image_token_id))
-            .unwrap_or((2, 248056));
+        Self::from_vision_config(
+            engine.cfg.vision_config.as_ref(),
+            engine.cfg.hidden_size,
+            prompt,
+            images,
+        )
+    }
+
+    /// Validate client-owned geometry using `VisionConfig` and `hidden_size` without requiring
+    /// `&Qwen3_5Engine` (callable off the CUDA worker thread during request ingress).
+    pub fn from_vision_config(
+        vision_config: Option<&crate::vision::VisionConfig>,
+        hidden_size: usize,
+        prompt: &[i32],
+        images: Vec<PreprocessedImage>,
+    ) -> Result<Self, String> {
+        let config = vision_config.ok_or("model does not support images")?;
+        let (merge, image_token) = (config.spatial_merge_size, config.image_token_id);
         let mut valid = merge > 0 && !prompt.is_empty() && prompt.len() <= i32::MAX as usize;
         let mut visual_counts = Vec::with_capacity(images.len());
         for image in &images {
@@ -103,10 +110,10 @@ impl ScheduledVision {
             prompt: prompt.to_vec(),
             mrope_planes,
             visual_indices,
-            host_embeds: vec![None; images.len()],
+            rank_device_embeds: (0..images.len()).map(|_| None).collect(),
             images,
             visual_counts,
-            hidden_size: engine.cfg.hidden_size,
+            hidden_size,
             valid,
         })
     }
@@ -166,58 +173,103 @@ impl ScheduledVision {
             positions.extend_from_slice(&plane[start..end]);
         }
         let mut indices = Vec::<i32>::new();
-        let mut embeds = Vec::<u16>::new();
+        // Contiguous spans `(image_idx, start_row, row_count)` within this prefill chunk.
+        let mut spans = Vec::<(usize, usize, usize)>::new();
         for (local, visual) in self.visual_indices[start..end].iter().enumerate() {
             let Some((image, row)) = *visual else {
                 continue;
             };
-            if self.host_embeds[image].is_none() {
+            if self.rank_device_embeds[image].is_none() {
                 engine.ensure_vision_encoder()?;
-                let rank = &engine.ranks[0];
-                rank.device.make_current()?;
-                let device = engine
+                let rank0 = &engine.ranks[0];
+                rank0.device.make_current()?;
+                let dev0 = engine
                     .vision_encoder
                     .as_ref()
                     .ok_or_else(|| loader_err("vision encoder unavailable"))?
                     .encode_images(
                         std::slice::from_ref(&self.images[image]),
-                        &rank.cublas,
-                        &rank.stream,
+                        &rank0.cublas,
+                        &rank0.stream,
                     )?;
                 let count = self.visual_counts[image]
                     .checked_mul(self.hidden_size)
                     .ok_or_else(|| loader_err("visual embedding size overflow"))?;
-                if count.checked_mul(2) != Some(device.len_bytes) {
+                if count.checked_mul(2) != Some(dev0.len_bytes) {
                     return Err(loader_err("visual token embedding count mismatch"));
                 }
-                let mut host = vec![0u16; count];
-                device.copy_to_host(&mut host, &rank.stream)?;
-                rank.stream.synchronize()?;
-                self.host_embeds[image] = Some(host);
+                let mut rank_bufs = Vec::with_capacity(engine.ranks.len());
+                if engine.ranks.len() == 1 {
+                    rank_bufs.push(dev0);
+                } else {
+                    let mut host = vec![0u16; count];
+                    dev0.copy_to_host(&mut host, &rank0.stream)?;
+                    rank_bufs.push(dev0);
+                    for peer in &engine.ranks[1..] {
+                        peer.device.make_current()?;
+                        let dev_peer = DeviceBuffer::alloc(peer.device.device_id, count * 2)?;
+                        dev_peer.copy_from_host(&host, &peer.stream)?;
+                        rank_bufs.push(dev_peer);
+                    }
+                }
+                self.rank_device_embeds[image] = Some(rank_bufs);
             }
-            let host = self.host_embeds[image].as_ref().unwrap();
-            let offset = row * self.hidden_size;
-            let embedding = host
-                .get(offset..offset + self.hidden_size)
-                .ok_or_else(|| loader_err("missing visual token embedding"))?;
+            if row >= self.visual_counts[image] {
+                return Err(loader_err("missing visual token embedding"));
+            }
             indices.push(local as i32);
-            embeds.extend_from_slice(embedding);
+            if let Some(last) = spans.last_mut()
+                && last.0 == image
+                && last.1 + last.2 == row
+            {
+                last.2 += 1;
+            } else {
+                spans.push((image, row, 1));
+            }
         }
-        // Keep uploads alive through the forward and stream completion, including
-        // error paths. No device pointer is retained in request state.
+        // Keep per-chunk index/concat buffers alive through forward and stream completion.
         let mut buffers = Vec::new();
         let mut pointers = Vec::new();
-        for rank in &engine.ranks {
+        let row_bytes = self.hidden_size * 2;
+        for (rank_idx, rank) in engine.ranks.iter().enumerate() {
             if indices.is_empty() {
                 break;
             }
             rank.device.make_current()?;
-            let emb = DeviceBuffer::alloc(rank.device.device_id, embeds.len() * 2)?;
             let idx = DeviceBuffer::alloc(rank.device.device_id, indices.len() * 4)?;
-            emb.copy_from_host(&embeds, &rank.stream)?;
             idx.copy_from_host(&indices, &rank.stream)?;
-            pointers.push((emb.addr(), idx.addr(), indices.len()));
-            buffers.push((emb, idx));
+            let emb_addr = if spans.len() == 1 {
+                let (image, start_row, _) = spans[0];
+                let dev_buf = &self.rank_device_embeds[image].as_ref().unwrap()[rank_idx];
+                dev_buf.addr() + (start_row * row_bytes) as u64
+            } else {
+                let emb = DeviceBuffer::alloc(rank.device.device_id, indices.len() * row_bytes)?;
+                let mut dst_off = 0usize;
+                for &(image, start_row, row_count) in &spans {
+                    let dev_buf = &self.rank_device_embeds[image].as_ref().unwrap()[rank_idx];
+                    let src_ptr = dev_buf.addr() + (start_row * row_bytes) as u64;
+                    let dst_ptr = emb.addr() + (dst_off * row_bytes) as u64;
+                    let copy_bytes = row_count * row_bytes;
+                    cuda::check_rc(
+                        // SAFETY: `src_ptr` and `dst_ptr` are valid non-overlapping device spans of `copy_bytes`.
+                        unsafe {
+                            w34_kernels::ffi::w34_memcpy_d2d_async(
+                                dst_ptr as *mut core::ffi::c_void,
+                                src_ptr as *const core::ffi::c_void,
+                                copy_bytes,
+                                rank.stream.handle,
+                            )
+                        },
+                        "ScheduledVision multi-image D2D splice",
+                    )?;
+                    dst_off += row_count;
+                }
+                let addr = emb.addr();
+                buffers.push(emb);
+                addr
+            };
+            pointers.push((emb_addr, idx.addr(), indices.len()));
+            buffers.push(idx);
         }
         let checkpoints: Vec<_> = slice
             .planned_checkpoints
@@ -256,6 +308,9 @@ impl ScheduledVision {
             }
         }
         drop(buffers);
+        if slice.is_final_prefill_chunk {
+            self.rank_device_embeds.clear();
+        }
         let token = result?;
         sync_result?;
         Ok((token, slice))

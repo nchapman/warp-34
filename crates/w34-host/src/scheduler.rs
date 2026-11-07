@@ -312,30 +312,35 @@ impl SchedulerV1 {
     {
         let evictions = Vec::new();
         while self.active.len() < self.cfg.max_num_seqs {
-            let Some(w) = self.waiting.front().cloned() else {
-                break;
+            let (lookup_len, raw_hit, allow_hit, pinned_hit) = {
+                let Some(w) = self.waiting.front() else {
+                    break;
+                };
+                // Match up to `radix_key_tokens.len() - 1` so at least the final prompt token is
+                // evaluated through `lm_head` to produce the first output token.
+                // Pin any warm prefix hit BEFORE `alloc_three_state_slots` so tight Mamba pools
+                // (e.g. 262K single-GPU serving) never evict the checkpoint this request itself
+                // is about to resume from; release the pin immediately and fall back to cold
+                // eviction only when a minimal 3-slot pool has no fourth slot.
+                let default_lookup = w.radix_key_tokens.len().saturating_sub(1);
+                let lookup_len = w
+                    .max_prefix_lookup_len
+                    .map_or(default_lookup, |cap| cap.min(default_lookup));
+                let raw_hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
+                let allow_hit = raw_hit.matched_tokens == 0
+                    || allow_prefix_hit(w.req_id, &w.prompt_tokens, raw_hit.matched_tokens);
+                let pinned_hit =
+                    allow_hit && raw_hit.matched_tokens > 0 && raw_hit.mamba_slot.is_some();
+                (lookup_len, raw_hit, allow_hit, pinned_hit)
             };
-            // Match up to `radix_key_tokens.len() - 1` so at least the final prompt token is
-            // evaluated through `lm_head` to produce the first output token.
-            // Pin any warm prefix hit BEFORE `alloc_three_state_slots` so tight Mamba pools
-            // (e.g. 262K single-GPU serving) never evict the checkpoint this request itself
-            // is about to resume from; release the pin immediately and fall back to cold
-            // eviction only when a minimal 3-slot pool has no fourth slot.
-            let default_lookup = w.radix_key_tokens.len().saturating_sub(1);
-            let lookup_len = w
-                .max_prefix_lookup_len
-                .map_or(default_lookup, |cap| cap.min(default_lookup));
-            let raw_hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
-            let mut match_res = if raw_hit.matched_tokens > 0
-                && !allow_prefix_hit(w.req_id, &w.prompt_tokens, raw_hit.matched_tokens)
-            {
+            let _ = lookup_len;
+            let mut match_res = if !allow_hit {
                 let mut cold = self.radix.match_prefix(&[]);
                 cold.mamba_branching_seqlen = raw_hit.mamba_branching_seqlen;
                 cold
             } else {
                 raw_hit
             };
-            let pinned_hit = match_res.matched_tokens > 0 && match_res.mamba_slot.is_some();
             if pinned_hit {
                 self.radix.inc_lock_ref(match_res.last_node);
             }
@@ -354,7 +359,7 @@ impl SchedulerV1 {
                 }
                 None => break,
             };
-            self.waiting.pop_front();
+            let w = self.waiting.pop_front().expect("checked waiting.front()");
 
             let mut radix_state = ReqRadixState::new(
                 self.cfg.page_size,

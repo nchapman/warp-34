@@ -517,6 +517,7 @@ pub struct PleMmapTable {
     pub head_dim: usize,
     pub lut: F8E4m3ScaleLut,
     pub format: PleTableFormat,
+    gather_cache: std::sync::Mutex<(Vec<i64>, Vec<u8>)>,
 }
 
 impl PleMmapTable {
@@ -659,6 +660,7 @@ impl PleMmapTable {
             head_dim,
             lut: F8E4m3ScaleLut::new(weight_scale),
             format: PleTableFormat::F8E4m3,
+            gather_cache: std::sync::Mutex::new((Vec::new(), Vec::new())),
         })
     }
 
@@ -822,6 +824,7 @@ impl PleMmapTable {
                 group_size,
                 lut_f32,
             },
+            gather_cache: std::sync::Mutex::new((Vec::new(), Vec::new())),
         })
     }
 
@@ -838,13 +841,31 @@ impl PleMmapTable {
     }
 
     /// Gathers raw staged PLE bytes (`[ids.len(), staged_bytes_per_head()]`) with coalesced
-    /// `MADV_WILLNEED` prefaulting for batches of `>= 64` row lookups.
+    /// `MADV_WILLNEED` prefaulting for batches of `>= 64` row lookups and cross-rank caching
+    /// when `TP > 1` ranks gather identical `ids`.
     pub fn gather_f8(&self, ids: &[i64], out_f8: &mut [u8]) {
         let head_stride = self.staged_bytes_per_head();
         assert_eq!(out_f8.len(), ids.len() * head_stride);
         if ids.is_empty() {
             return;
         }
+        if let Ok(mut cache) = self.gather_cache.lock() {
+            if cache.0.as_slice() == ids && cache.1.len() == out_f8.len() {
+                out_f8.copy_from_slice(&cache.1);
+                return;
+            }
+            self.gather_f8_uncached(ids, out_f8);
+            cache.0.clear();
+            cache.0.extend_from_slice(ids);
+            cache.1.clear();
+            cache.1.extend_from_slice(out_f8);
+            return;
+        }
+        self.gather_f8_uncached(ids, out_f8);
+    }
+
+    fn gather_f8_uncached(&self, ids: &[i64], out_f8: &mut [u8]) {
+        let head_stride = self.staged_bytes_per_head();
         if ids.len() >= PLE_MMAP_PREFAULT_MIN_IDS {
             let cap = match self.format {
                 PleTableFormat::F8E4m3 => ids.len(),

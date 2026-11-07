@@ -532,6 +532,102 @@ __global__ void __launch_bounds__(256, 1) tp2_all_gather_top1_f32_i32_kernel(
     }
 }
 
+__global__ void __launch_bounds__(256, 1) tp2_all_gather_topk_f32_i32_kernel(
+    const float* local_vals, const int32_t* local_ids,
+    float* global_vals, int32_t* global_ids,
+    Top1Pair* s0, Top1Pair* s1, Signal* sig0, Signal* sig1,
+    int rank, int num_rows, int k) {
+    const int num_elems = num_rows * k;
+    Signal* self_sg = (rank == 0) ? sig0 : sig1;
+    bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
+    Top1Pair* base0 = (num_elems <= 576) ? reinterpret_cast<Top1Pair*>(&sig0->end[0][0]) : s0;
+    Top1Pair* base1 = (num_elems <= 576) ? reinterpret_cast<Top1Pair*>(&sig1->end[0][0]) : s1;
+    Top1Pair* s0_buf = odd ? (base0 + num_elems) : base0;
+    Top1Pair* s1_buf = odd ? (base1 + num_elems) : base1;
+    Top1Pair* my_s = (rank == 0) ? s0_buf : s1_buf;
+    for (int i = threadIdx.x; i < num_elems; i += blockDim.x) {
+        my_s[i] = Top1Pair{local_vals[i], local_ids[i]};
+    }
+    uint32_t epoch = 0;
+    barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+    for (int row = threadIdx.x; row < num_rows; row += blockDim.x) {
+        const Top1Pair* r0 = s0_buf + (size_t)row * k;
+        const Top1Pair* r1 = s1_buf + (size_t)row * k;
+        float* out_v = global_vals + (size_t)row * k;
+        int32_t* out_i = global_ids + (size_t)row * k;
+        int i0 = 0, i1 = 0;
+        for (int j = 0; j < k; ++j) {
+            const Top1Pair p0 = r0[i0];
+            const Top1Pair p1 = r1[i1];
+            if (!isfinite(p0.val) || !isfinite(p1.val) || p0.id < 0 || p1.id < 0) {
+                out_v[j] = NAN;
+                out_i[j] = -1;
+                continue;
+            }
+            const bool take0 = (p0.val > p1.val) || (p0.val == p1.val && p0.id <= p1.id);
+            out_v[j] = take0 ? p0.val : p1.val;
+            out_i[j] = take0 ? p0.id : p1.id;
+            if (take0) ++i0; else ++i1;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256, 1) tp2_all_reduce_hc_combine_tap_f16_kernel(
+    const __half* residual_in, const __half* local_in, __half* ar_out,
+    const float* inject_weights, const __half* ple_delta, __half* residual_out,
+    __nv_bfloat16* tap_bf16_out, const uint8_t* valid_token_mask,
+    __half* s0, __half* s1, Signal* sig0, Signal* sig1,
+    int rank, int num_tokens, int hc_count, int hidden_size,
+    int tap_stride_elems, int tap_offset_elems) {
+    const int num_elems = num_tokens * hidden_size;
+    Signal* self_sg = (rank == 0) ? sig0 : sig1;
+    bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
+    __half* s0_buf = odd ? (s0 + num_elems) : s0;
+    __half* s1_buf = odd ? (s1 + num_elems) : s1;
+    __half* my_s = (rank == 0) ? s0_buf : s1_buf;
+    const __half* peer_s = (rank == 0) ? s1_buf : s0_buf;
+    for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
+        const size_t roff = (size_t)tok * hidden_size;
+        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+            my_s[roff + d] = local_in[roff + d];
+        }
+    }
+    uint32_t epoch = 0;
+    barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+    const float inv_hc = 1.0f / static_cast<float>(hc_count);
+    for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
+        if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) continue;
+        const size_t base = (size_t)tok * hc_count * hidden_size;
+        const __half* res_in_tok = residual_in + base;
+        __half* res_out_tok = residual_out + base;
+        const __half* ple_tok = (ple_delta != nullptr) ? (ple_delta + base) : nullptr;
+        const float* inj_tok = inject_weights + (size_t)tok * hc_count;
+        const __half* loc_row = local_in + (size_t)tok * hidden_size;
+        const __half* peer_row = peer_s + (size_t)tok * hidden_size;
+        __half* ar_row = (ar_out != nullptr) ? (ar_out + (size_t)tok * hidden_size) : nullptr;
+        __nv_bfloat16* tap_row = (tap_bf16_out != nullptr)
+            ? (tap_bf16_out + (size_t)tok * tap_stride_elems + tap_offset_elems)
+            : nullptr;
+        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+            const float lf = __half2float(loc_row[d]);
+            const float pf = __half2float(peer_row[d]);
+            const __half ar_h = __float2half((rank == 0) ? (lf + pf) : (pf + lf));
+            if (ar_row != nullptr) ar_row[d] = ar_h;
+            const float y = __half2float(ar_h);
+            float tap_sum = 0.0f;
+            for (int s = 0; s < hc_count; ++s) {
+                const size_t idx = (size_t)s * hidden_size + d;
+                float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
+                if (ple_tok != nullptr) val += __half2float(ple_tok[idx]);
+                const __half out_h = __float2half(val);
+                res_out_tok[idx] = out_h;
+                if (tap_row != nullptr) tap_sum += __half2float(out_h);
+            }
+            if (tap_row != nullptr) tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
+        }
+    }
+}
+
 __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
     const __half* __restrict__ local_in,
     __half* __restrict__ rank0_full_out,
@@ -1069,6 +1165,117 @@ __global__ void __launch_bounds__(256, 1) tp4_all_gather_top1_f32_i32_kernel(
     }
 }
 
+__global__ void __launch_bounds__(256, 1) tp4_all_gather_topk_f32_i32_kernel(
+    const float* local_vals, const int32_t* local_ids,
+    float* global_vals, int32_t* global_ids,
+    Tp4Ptrs ptrs, int rank, int num_rows, int k) {
+    const int num_elems = num_rows * k;
+    Signal* self_sg = ptrs.sig[rank];
+    bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
+    Top1Pair* s_buf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        Top1Pair* base = (num_elems <= 576)
+            ? reinterpret_cast<Top1Pair*>(&ptrs.sig[r]->end[0][0])
+            : reinterpret_cast<Top1Pair*>(ptrs.s[r]);
+        s_buf[r] = odd ? (base + num_elems) : base;
+    }
+    for (int i = threadIdx.x; i < num_elems; i += blockDim.x) {
+        s_buf[rank][i] = Top1Pair{local_vals[i], local_ids[i]};
+    }
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+    for (int row = threadIdx.x; row < num_rows; row += blockDim.x) {
+        float* out_v = global_vals + (size_t)row * k;
+        int32_t* out_i = global_ids + (size_t)row * k;
+        int cur[4] = {0, 0, 0, 0};
+        for (int j = 0; j < k; ++j) {
+            int best_r = -1;
+            Top1Pair best{-INFINITY, -1};
+            bool bad = false;
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                if (cur[r] < k) {
+                    const Top1Pair cand = s_buf[r][(size_t)row * k + cur[r]];
+                    if (!isfinite(cand.val) || cand.id < 0) { bad = true; break; }
+                    if (best_r < 0 || cand.val > best.val || (cand.val == best.val && cand.id < best.id)) {
+                        best = cand;
+                        best_r = r;
+                    }
+                }
+            }
+            if (bad || best_r < 0) {
+                out_v[j] = NAN;
+                out_i[j] = -1;
+            } else {
+                out_v[j] = best.val;
+                out_i[j] = best.id;
+                ++cur[best_r];
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256, 1) tp4_all_reduce_hc_combine_tap_f16_kernel(
+    const __half* residual_in, const __half* local_in, __half* ar_out,
+    const float* inject_weights, const __half* ple_delta, __half* residual_out,
+    __nv_bfloat16* tap_bf16_out, const uint8_t* valid_token_mask,
+    Tp4Ptrs ptrs, int rank, int num_tokens, int hc_count, int hidden_size,
+    int tap_stride_elems, int tap_offset_elems) {
+    const int num_elems = num_tokens * hidden_size;
+    Signal* self_sg = ptrs.sig[rank];
+    bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
+    __half* s_buf[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        __half* base = reinterpret_cast<__half*>(ptrs.s[r]);
+        s_buf[r] = odd ? (base + num_elems) : base;
+    }
+    for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
+        const size_t roff = (size_t)tok * hidden_size;
+        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+            s_buf[rank][roff + d] = local_in[roff + d];
+        }
+    }
+    uint32_t epoch = 0;
+    barrier_tp4_epoch_release(ptrs, self_sg, rank, &epoch);
+    const float inv_hc = 1.0f / static_cast<float>(hc_count);
+    for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
+        if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) continue;
+        const size_t base = (size_t)tok * hc_count * hidden_size;
+        const __half* res_in_tok = residual_in + base;
+        __half* res_out_tok = residual_out + base;
+        const __half* ple_tok = (ple_delta != nullptr) ? (ple_delta + base) : nullptr;
+        const float* inj_tok = inject_weights + (size_t)tok * hc_count;
+        const __half* loc_row = local_in + (size_t)tok * hidden_size;
+        __half* ar_row = (ar_out != nullptr) ? (ar_out + (size_t)tok * hidden_size) : nullptr;
+        __nv_bfloat16* tap_row = (tap_bf16_out != nullptr)
+            ? (tap_bf16_out + (size_t)tok * tap_stride_elems + tap_offset_elems)
+            : nullptr;
+        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+            const size_t roff = (size_t)tok * hidden_size + d;
+            const float lf = __half2float(loc_row[d]);
+            const float f0 = (rank == 0) ? lf : __half2float(s_buf[0][roff]);
+            const float f1 = (rank == 1) ? lf : __half2float(s_buf[1][roff]);
+            const float f2 = (rank == 2) ? lf : __half2float(s_buf[2][roff]);
+            const float f3 = (rank == 3) ? lf : __half2float(s_buf[3][roff]);
+            const __half ar_h = __float2half((f0 + f1) + (f2 + f3));
+            if (ar_row != nullptr) ar_row[d] = ar_h;
+            const float y = __half2float(ar_h);
+            float tap_sum = 0.0f;
+            for (int s = 0; s < hc_count; ++s) {
+                const size_t idx = (size_t)s * hidden_size + d;
+                float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
+                if (ple_tok != nullptr) val += __half2float(ple_tok[idx]);
+                const __half out_h = __float2half(val);
+                res_out_tok[idx] = out_h;
+                if (tap_row != nullptr) tap_sum += __half2float(out_h);
+            }
+            if (tap_row != nullptr) tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
+        }
+    }
+}
+
 __global__ void __launch_bounds__(512, 1) tp4_gather_vocab_f16_kernel(
     const __half* __restrict__ local_in,
     __half* __restrict__ rank0_full_out,
@@ -1186,24 +1393,10 @@ extern "C" int w34_tp2_all_reduce_f16(const w34_exec* ex, const void* local_in, 
 }
 
 extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
-    const w34_exec* ex,
-    const void* local_in,
-    void* ar_out,
-    void* residual,
-    const void* weight,
-    void* out,
-    void* out_had64,
-    void* tap_dst_bf16,
-    void* stage0,
-    void* stage1,
-    void* sig0,
-    void* sig1,
-    int rank,
-    int num_tokens,
-    int hidden_size,
-    float eps,
-    int tap_row_stride,
-    int tap_col_offset) {
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset) {
     if (ex == nullptr || local_in == nullptr || residual == nullptr ||
         weight == nullptr || (out == nullptr && out_had64 == nullptr) ||
         stage0 == nullptr || stage1 == nullptr || sig0 == nullptr || sig1 == nullptr ||
@@ -1267,23 +1460,10 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
 }
 
 extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
-    const w34_exec* ex,
-    const void* local_in,
-    void* ar_out,
-    void* residual,
-    const void* weight,
-    void* out,
-    void* tap_dst_bf16,
-    void* stage0,
-    void* stage1,
-    void* sig0,
-    void* sig1,
-    int rank,
-    int num_tokens,
-    int hidden_size,
-    float eps,
-    int tap_row_stride,
-    int tap_col_offset) {
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset) {
     if (out == nullptr) return (int)cudaErrorInvalidValue;
     return w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
         ex, local_in, ar_out, residual, weight, out, nullptr, tap_dst_bf16,
@@ -1354,17 +1534,9 @@ extern "C" int w34_tp2_broadcast_i32(const w34_exec* ex, const int32_t* src_rank
 }
 
 extern "C" int w34_tp2_all_gather_top1_f32_i32(
-    const w34_exec* ex,
-    const float* local_max_val,
-    const int32_t* local_max_id,
-    float* global_max_val,
-    int32_t* global_max_id,
-    void* stage0,
-    void* stage1,
-    void* sig0,
-    void* sig1,
-    int rank,
-    int num_rows) {
+    const w34_exec* ex, const float* local_max_val, const int32_t* local_max_id,
+    float* global_max_val, int32_t* global_max_id, void* stage0, void* stage1,
+    void* sig0, void* sig1, int rank, int num_rows) {
     if (ex == nullptr || local_max_val == nullptr || local_max_id == nullptr ||
         global_max_val == nullptr || global_max_id == nullptr ||
         stage0 == nullptr || stage1 == nullptr || sig0 == nullptr || sig1 == nullptr ||
@@ -1380,16 +1552,8 @@ extern "C" int w34_tp2_all_gather_top1_f32_i32(
 }
 
 extern "C" int w34_tp2_gather_vocab_f16(
-    const w34_exec* ex,
-    const void* local_logits_f16,
-    void* rank0_full_logits_f16,
-    void* stage0,
-    void* stage1,
-    void* sig0,
-    void* sig1,
-    int rank,
-    int num_rows,
-    int local_vocab_size) {
+    const w34_exec* ex, const void* local_logits_f16, void* rank0_full_logits_f16,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_rows, int local_vocab_size) {
     (void)stage0;
     if (ex == nullptr || local_logits_f16 == nullptr ||
         (rank == 0 && rank0_full_logits_f16 == nullptr) ||
@@ -1403,14 +1567,8 @@ extern "C" int w34_tp2_gather_vocab_f16(
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)local_logits_f16,
-        (__half*)rank0_full_logits_f16,
-        (__half*)stage1,
-        (w34_comm::Signal*)sig0,
-        (w34_comm::Signal*)sig1,
-        rank,
-        num_rows,
-        local_vocab_size);
+        (const __half*)local_logits_f16, (__half*)rank0_full_logits_f16, (__half*)stage1,
+        (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, rank, num_rows, local_vocab_size);
     return (int)cudaGetLastError();
 }
 
@@ -1471,19 +1629,9 @@ extern "C" int w34_device_can_enable_p2p(int dev_a, int dev_b, int require_nativ
 }
 
 extern "C" int w34_tp4_all_reduce_f16(
-    const w34_exec* ex,
-    const void* local_in,
-    void* out,
-    void* stage0,
-    void* stage1,
-    void* stage2,
-    void* stage3,
-    void* sig0,
-    void* sig1,
-    void* sig2,
-    void* sig3,
-    int rank,
-    int num_elems) {
+    const w34_exec* ex, const void* local_in, void* out,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_elems) {
     if (ex == nullptr || local_in == nullptr || out == nullptr ||
         stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
         sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
@@ -1508,28 +1656,11 @@ extern "C" int w34_tp4_all_reduce_f16(
 }
 
 extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
-    const w34_exec* ex,
-    const void* local_in,
-    void* ar_out,
-    void* residual,
-    const void* weight,
-    void* out,
-    void* out_had64,
-    void* tap_dst_bf16,
-    void* stage0,
-    void* stage1,
-    void* stage2,
-    void* stage3,
-    void* sig0,
-    void* sig1,
-    void* sig2,
-    void* sig3,
-    int rank,
-    int num_tokens,
-    int hidden_size,
-    float eps,
-    int tap_row_stride,
-    int tap_col_offset) {
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* out_had64, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset) {
     if (ex == nullptr || local_in == nullptr || residual == nullptr ||
         weight == nullptr || (out == nullptr && out_had64 == nullptr) ||
         stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
@@ -1592,27 +1723,11 @@ extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
 }
 
 extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
-    const w34_exec* ex,
-    const void* local_in,
-    void* ar_out,
-    void* residual,
-    const void* weight,
-    void* out,
-    void* tap_dst_bf16,
-    void* stage0,
-    void* stage1,
-    void* stage2,
-    void* stage3,
-    void* sig0,
-    void* sig1,
-    void* sig2,
-    void* sig3,
-    int rank,
-    int num_tokens,
-    int hidden_size,
-    float eps,
-    int tap_row_stride,
-    int tap_col_offset) {
+    const w34_exec* ex, const void* local_in, void* ar_out, void* residual,
+    const void* weight, void* out, void* tap_dst_bf16,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_tokens,
+    int hidden_size, float eps, int tap_row_stride, int tap_col_offset) {
     if (out == nullptr) return (int)cudaErrorInvalidValue;
     return w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
         ex, local_in, ar_out, residual, weight, out, nullptr, tap_dst_bf16,
@@ -1621,19 +1736,9 @@ extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
 }
 
 extern "C" int w34_tp4_all_reduce_bf16(
-    const w34_exec* ex,
-    const void* local_in,
-    void* out,
-    void* stage0,
-    void* stage1,
-    void* stage2,
-    void* stage3,
-    void* sig0,
-    void* sig1,
-    void* sig2,
-    void* sig3,
-    int rank,
-    int num_elems) {
+    const w34_exec* ex, const void* local_in, void* out,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_elems) {
     if (ex == nullptr || local_in == nullptr || out == nullptr ||
         stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
         sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
@@ -1658,19 +1763,9 @@ extern "C" int w34_tp4_all_reduce_bf16(
 }
 
 extern "C" int w34_tp4_all_reduce_f32(
-    const w34_exec* ex,
-    const float* local_in,
-    float* out,
-    float* stage0,
-    float* stage1,
-    float* stage2,
-    float* stage3,
-    void* sig0,
-    void* sig1,
-    void* sig2,
-    void* sig3,
-    int rank,
-    int num_elems) {
+    const w34_exec* ex, const float* local_in, float* out,
+    float* stage0, float* stage1, float* stage2, float* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_elems) {
     if (ex == nullptr || local_in == nullptr || out == nullptr ||
         stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
         sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
@@ -1695,19 +1790,9 @@ extern "C" int w34_tp4_all_reduce_f32(
 }
 
 extern "C" int w34_tp4_broadcast_i32(
-    const w34_exec* ex,
-    const int32_t* src_rank0,
-    int32_t* out,
-    int32_t* stage0,
-    int32_t* stage1,
-    int32_t* stage2,
-    int32_t* stage3,
-    void* sig0,
-    void* sig1,
-    void* sig2,
-    void* sig3,
-    int rank,
-    int num_elems) {
+    const w34_exec* ex, const int32_t* src_rank0, int32_t* out,
+    int32_t* stage0, int32_t* stage1, int32_t* stage2, int32_t* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_elems) {
     if (ex == nullptr || (rank == 0 && src_rank0 == nullptr) || out == nullptr ||
         stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
         sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
@@ -1724,21 +1809,10 @@ extern "C" int w34_tp4_broadcast_i32(
 }
 
 extern "C" int w34_tp4_all_gather_top1_f32_i32(
-    const w34_exec* ex,
-    const float* local_max_val,
-    const int32_t* local_max_id,
-    float* global_max_val,
-    int32_t* global_max_id,
-    void* stage0,
-    void* stage1,
-    void* stage2,
-    void* stage3,
-    void* sig0,
-    void* sig1,
-    void* sig2,
-    void* sig3,
-    int rank,
-    int num_rows) {
+    const w34_exec* ex, const float* local_max_val, const int32_t* local_max_id,
+    float* global_max_val, int32_t* global_max_id,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_rows) {
     if (ex == nullptr || local_max_val == nullptr || local_max_id == nullptr ||
         global_max_val == nullptr || global_max_id == nullptr ||
         stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
@@ -1756,20 +1830,9 @@ extern "C" int w34_tp4_all_gather_top1_f32_i32(
 }
 
 extern "C" int w34_tp4_gather_vocab_f16(
-    const w34_exec* ex,
-    const void* local_logits_f16,
-    void* rank0_full_logits_f16,
-    void* stage0,
-    void* stage1,
-    void* stage2,
-    void* stage3,
-    void* sig0,
-    void* sig1,
-    void* sig2,
-    void* sig3,
-    int rank,
-    int num_rows,
-    int local_vocab_size) {
+    const w34_exec* ex, const void* local_logits_f16, void* rank0_full_logits_f16,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_rows, int local_vocab_size) {
     if (ex == nullptr || local_logits_f16 == nullptr ||
         (rank == 0 && rank0_full_logits_f16 == nullptr) ||
         stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
@@ -1787,59 +1850,128 @@ extern "C" int w34_tp4_gather_vocab_f16(
         {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
     };
     w34_comm::tp4_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
-        (const __half*)local_logits_f16,
-        (__half*)rank0_full_logits_f16,
-        ptrs,
-        rank,
-        num_rows,
-        local_vocab_size);
+        (const __half*)local_logits_f16, (__half*)rank0_full_logits_f16, ptrs, rank, num_rows, local_vocab_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp2_all_gather_topk_f32_i32(
+    const w34_exec* ex, const float* local_vals, const int32_t* local_ids,
+    float* global_vals, int32_t* global_ids, void* stage0, void* stage1,
+    void* sig0, void* sig1, int rank, int num_rows, int top_k) {
+    if (!ex || !local_vals || !local_ids || !global_vals || !global_ids ||
+        !stage0 || !stage1 || !sig0 || !sig1 || (rank != 0 && rank != 1) ||
+        num_rows <= 0 || top_k <= 0 || top_k > 32 ||
+        (int64_t)num_rows * top_k > 65536) {
+        return (int)cudaErrorInvalidValue;
+    }
+    w34_comm::tp2_all_gather_topk_f32_i32_kernel<<<1, 256, 0, (cudaStream_t)ex->stream>>>(
+        local_vals, local_ids, global_vals, global_ids,
+        (w34_comm::Top1Pair*)stage0, (w34_comm::Top1Pair*)stage1,
+        (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, rank, num_rows, top_k);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp4_all_gather_topk_f32_i32(
+    const w34_exec* ex, const float* local_vals, const int32_t* local_ids,
+    float* global_vals, int32_t* global_ids, void* stage0, void* stage1,
+    void* stage2, void* stage3, void* sig0, void* sig1, void* sig2, void* sig3,
+    int rank, int num_rows, int top_k) {
+    if (!ex || !local_vals || !local_ids || !global_vals || !global_ids ||
+        !stage0 || !stage1 || !stage2 || !stage3 || !sig0 || !sig1 || !sig2 || !sig3 ||
+        rank < 0 || rank >= 4 || num_rows <= 0 || top_k <= 0 || top_k > 32 ||
+        (int64_t)num_rows * top_k > 65536) {
+        return (int)cudaErrorInvalidValue;
+    }
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    w34_comm::tp4_all_gather_topk_f32_i32_kernel<<<1, 256, 0, (cudaStream_t)ex->stream>>>(
+        local_vals, local_ids, global_vals, global_ids, ptrs, rank, num_rows, top_k);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp2_all_reduce_hc_combine_tap_f16(
+    const w34_exec* ex, const void* residual_in, const void* local_block_out,
+    void* ar_out, const float* inject_weights, const void* ple_delta,
+    void* residual_out, void* tap_bf16_out, const uint8_t* valid_token_mask,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
+    int hc_count, int hidden_size, int tap_stride_elems, int tap_offset_elems) {
+    if (!ex || !residual_in || !local_block_out || !inject_weights || !residual_out ||
+        !stage0 || !stage1 || !sig0 || !sig1 || (rank != 0 && rank != 1) ||
+        num_tokens <= 0 || hc_count <= 0 || hc_count > 8 || hidden_size <= 0 || hidden_size > 6144 ||
+        (int64_t)num_tokens * hidden_size > (INT32_MAX / 2) ||
+        (tap_bf16_out != nullptr && (tap_offset_elems < 0 || tap_stride_elems < tap_offset_elems + hidden_size))) {
+        return (int)cudaErrorInvalidValue;
+    }
+    int blocks = num_tokens;
+    int cap = w34_comm::tp2_block_cap(num_tokens * hidden_size <= 36 * 5120);
+    if (num_tokens * hidden_size <= 36 * 5120 && cap > 16) cap = 16;
+    if (blocks > cap) blocks = cap;
+    w34_comm::tp2_all_reduce_hc_combine_tap_f16_kernel<<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)residual_in, (const __half*)local_block_out, (__half*)ar_out,
+        inject_weights, (const __half*)ple_delta, (__half*)residual_out,
+        (__nv_bfloat16*)tap_bf16_out, valid_token_mask,
+        (__half*)stage0, (__half*)stage1, (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
+        rank, num_tokens, hc_count, hidden_size, tap_stride_elems, tap_offset_elems);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp4_all_reduce_hc_combine_tap_f16(
+    const w34_exec* ex, const void* residual_in, const void* local_block_out,
+    void* ar_out, const float* inject_weights, const void* ple_delta,
+    void* residual_out, void* tap_bf16_out, const uint8_t* valid_token_mask,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_tokens,
+    int hc_count, int hidden_size, int tap_stride_elems, int tap_offset_elems) {
+    if (!ex || !residual_in || !local_block_out || !inject_weights || !residual_out ||
+        !stage0 || !stage1 || !stage2 || !stage3 || !sig0 || !sig1 || !sig2 || !sig3 ||
+        rank < 0 || rank >= 4 || num_tokens <= 0 || hc_count <= 0 || hc_count > 8 ||
+        hidden_size <= 0 || hidden_size > 6144 || (int64_t)num_tokens * hidden_size > (INT32_MAX / 2) ||
+        (tap_bf16_out != nullptr && (tap_offset_elems < 0 || tap_stride_elems < tap_offset_elems + hidden_size))) {
+        return (int)cudaErrorInvalidValue;
+    }
+    int blocks = num_tokens;
+    int cap = w34_comm::tp2_block_cap(num_tokens * hidden_size <= 36 * 5120);
+    if (num_tokens * hidden_size <= 36 * 5120 && cap > 16) cap = 16;
+    if (blocks > cap) blocks = cap;
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    w34_comm::tp4_all_reduce_hc_combine_tap_f16_kernel<<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+        (const __half*)residual_in, (const __half*)local_block_out, (__half*)ar_out,
+        inject_weights, (const __half*)ple_delta, (__half*)residual_out,
+        (__nv_bfloat16*)tap_bf16_out, valid_token_mask, ptrs,
+        rank, num_tokens, hc_count, hidden_size, tap_stride_elems, tap_offset_elems);
     return (int)cudaGetLastError();
 }
 
 extern "C" int w34_tp2_warmup(void) {
     cudaFuncAttributes attr;
-    cudaError_t err = cudaFuncGetAttributes(&attr, w34_comm::tp2_all_reduce_f16_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(
-        &attr, w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(
-        &attr, w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(
-        &attr, w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(
-        &attr, w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp2_all_gather_top1_f32_i32_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp2_gather_vocab_f16_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp2_broadcast_i32_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_all_reduce_f16_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(
-        &attr, w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(
-        &attr, w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(
-        &attr, w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(
-        &attr, w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_all_reduce_bf16_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_all_reduce_f32_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_all_gather_top1_f32_i32_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_gather_vocab_f16_kernel);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaFuncGetAttributes(&attr, w34_comm::tp4_broadcast_i32_kernel);
-    return (int)err;
+    #define WARM(fn) do { cudaError_t err = cudaFuncGetAttributes(&attr, (fn)); if (err != cudaSuccess) return (int)err; } while (0)
+    WARM(w34_comm::tp2_all_reduce_f16_kernel);
+    WARM((w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>));
+    WARM((w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>));
+    WARM((w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>));
+    WARM((w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>));
+    WARM(w34_comm::tp2_all_gather_top1_f32_i32_kernel);
+    WARM(w34_comm::tp2_gather_vocab_f16_kernel);
+    WARM(w34_comm::tp2_broadcast_i32_kernel);
+    WARM(w34_comm::tp4_all_reduce_f16_kernel);
+    WARM((w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>));
+    WARM((w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>));
+    WARM((w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>));
+    WARM((w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>));
+    WARM(w34_comm::tp4_all_reduce_bf16_kernel);
+    WARM(w34_comm::tp4_all_reduce_f32_kernel);
+    WARM(w34_comm::tp4_all_gather_top1_f32_i32_kernel);
+    WARM(w34_comm::tp4_gather_vocab_f16_kernel);
+    WARM(w34_comm::tp4_broadcast_i32_kernel);
+    WARM(w34_comm::tp2_all_gather_topk_f32_i32_kernel);
+    WARM(w34_comm::tp4_all_gather_topk_f32_i32_kernel);
+    WARM(w34_comm::tp2_all_reduce_hc_combine_tap_f16_kernel);
+    WARM(w34_comm::tp4_all_reduce_hc_combine_tap_f16_kernel);
+    #undef WARM
+    return (int)cudaSuccess;
 }

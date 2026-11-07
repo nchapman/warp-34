@@ -82,15 +82,15 @@ impl Qwen3_5ModelRank {
             .ple_embed_dim
             .max(self.cfg.hidden_size)
             .max(staged_row_bytes);
-        let f8_staging_dev = DeviceBuffer::alloc(
-            self.device.device_id,
-            max_ple_tokens * ple_row_bytes.max(MIN_PLE_ROW_STAGING_BYTES),
-        )?;
+        let staging_cap = max_ple_tokens * ple_row_bytes.max(MIN_PLE_ROW_STAGING_BYTES);
+        let f8_staging_dev = DeviceBuffer::alloc(self.device.device_id, staging_cap)?;
+        let f8_host_scratch = crate::cuda::MappedHostBuffer::alloc(2 * staging_cap)?;
         self.ple_runtime = Some(PleRankRuntime {
             hasher: ple_hasher,
             mmap_table: ple_mmap_table,
             f8_staging_dev,
-            f8_host_scratch: Vec::new(),
+            f8_host_scratch,
+            f8_host_slot: 0,
             ids_scratch: Vec::new(),
         });
         Ok(())
@@ -142,12 +142,20 @@ impl Qwen3_5ModelRank {
             &mut self.state_pool.ple_ngram_context,
             &mut ple.ids_scratch,
         );
-        ple.f8_host_scratch.resize(num_tokens * ple_row_bytes, 0);
-        ple.mmap_table
-            .gather_f8(&ple.ids_scratch, &mut ple.f8_host_scratch);
+        let byte_len = num_tokens * ple_row_bytes;
+        let slot_cap = ple.f8_staging_dev.len_bytes;
+        let slot_offset = (ple.f8_host_slot & 1) * slot_cap;
+        ple.f8_host_slot = ple.f8_host_slot.wrapping_add(1);
+        // SAFETY: `f8_host_scratch` owns `2 * slot_cap` pinned bytes and `byte_len <= slot_cap`.
+        let host_slice = unsafe {
+            core::slice::from_raw_parts_mut(
+                ple.f8_host_scratch.host_ptr.cast::<u8>().add(slot_offset),
+                byte_len,
+            )
+        };
+        ple.mmap_table.gather_f8(&ple.ids_scratch, host_slice);
         self.device.make_current()?;
-        ple.f8_staging_dev
-            .copy_from_host(&ple.f8_host_scratch, &self.stream)
+        ple.f8_staging_dev.copy_from_host(host_slice, &self.stream)
     }
 
     pub(super) fn stage_ple_f8_for_decode_slices(

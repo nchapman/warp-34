@@ -19,10 +19,10 @@ struct Request {
     hidden: i32,
     intermediate: i32,
     experts: i32,
-    pad: [i32; 5],
+    pad: [i32; 7],
     ids: [i32; 64],
     weights: [f32; 64],
-    x: [f32; 16384],
+    x: [u16; 16384],
 }
 #[repr(C, align(64))]
 struct Response {
@@ -395,7 +395,7 @@ impl Runtime {
                                     evaluate_into(
                                         &p,
                                         &m.store,
-                                        Input::F32(&r.x[..elems]),
+                                        Input::F16(&r.x[..elems]),
                                         r.tokens as usize,
                                         &tasks[..n_tasks],
                                         Output::F32(&mut (&mut (*rs).y)[..elems]),
@@ -817,12 +817,14 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
     }
 }
 enum Input<'a> {
+    #[cfg(test)]
     F32(&'a [f32]),
     F16(&'a [u16]),
 }
 impl Input<'_> {
     fn len(&self) -> usize {
         match self {
+            #[cfg(test)]
             Self::F32(x) => x.len(),
             Self::F16(x) => x.len(),
         }
@@ -837,6 +839,7 @@ impl Input<'_> {
     ) -> Result<(), eval::EvalError> {
         let range = tok * h..(tok + 1) * h;
         match self {
+            #[cfg(test)]
             Self::F32(x) => eval::prepare_x_perm_grouped(&x[range], group_size, xp, xg),
             Self::F16(x) => eval::prepare_x_perm_f16_grouped(&x[range], group_size, xp, xg),
         }
@@ -1080,9 +1083,9 @@ mod tests {
     use super::*;
     #[test]
     fn mailbox_abi() {
-        assert_eq!(std::mem::offset_of!(Request, ids), 56);
-        assert_eq!(std::mem::offset_of!(Request, x), 568);
-        assert_eq!(std::mem::size_of::<Request>(), 66112);
+        assert_eq!(std::mem::offset_of!(Request, ids), 64);
+        assert_eq!(std::mem::offset_of!(Request, x), 576);
+        assert_eq!(std::mem::size_of::<Request>(), 33344);
         assert_eq!(std::mem::offset_of!(Response, status), 8);
         assert_eq!(std::mem::offset_of!(Response, y), 64);
         assert_eq!(std::mem::size_of::<Response>(), 65600);

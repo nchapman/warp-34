@@ -862,6 +862,28 @@ int w34_silu_and_mul_hadamard_f16(
 int w34_apply_attn_output_gate_hadamard_f16(
     const w34_exec* ex, const void* attn_out, const void* gate, void* out,
     const uint8_t* valid_token_mask, int num_tokens, int total_dim);
+int w34_tp2_all_gather_topk_f32_i32(
+    const w34_exec* ex, const float* local_vals, const int32_t* local_ids,
+    float* global_vals, int32_t* global_ids, void* stage0, void* stage1,
+    void* sig0, void* sig1, int rank, int num_rows, int top_k);
+int w34_tp4_all_gather_topk_f32_i32(
+    const w34_exec* ex, const float* local_vals, const int32_t* local_ids,
+    float* global_vals, int32_t* global_ids, void* stage0, void* stage1,
+    void* stage2, void* stage3, void* sig0, void* sig1, void* sig2, void* sig3,
+    int rank, int num_rows, int top_k);
+int w34_tp2_all_reduce_hc_combine_tap_f16(
+    const w34_exec* ex, const void* residual_in, const void* local_block_out,
+    void* ar_out, const float* inject_weights, const void* ple_delta,
+    void* residual_out, void* tap_bf16_out, const uint8_t* valid_token_mask,
+    void* stage0, void* stage1, void* sig0, void* sig1, int rank, int num_tokens,
+    int hc_count, int hidden_size, int tap_stride_elems, int tap_offset_elems);
+int w34_tp4_all_reduce_hc_combine_tap_f16(
+    const w34_exec* ex, const void* residual_in, const void* local_block_out,
+    void* ar_out, const float* inject_weights, const void* ple_delta,
+    void* residual_out, void* tap_bf16_out, const uint8_t* valid_token_mask,
+    void* stage0, void* stage1, void* stage2, void* stage3,
+    void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_tokens,
+    int hc_count, int hidden_size, int tap_stride_elems, int tap_offset_elems);
 
 #ifdef __cplusplus
 }
