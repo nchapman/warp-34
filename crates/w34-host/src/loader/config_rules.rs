@@ -7,6 +7,17 @@ pub const HADAMARD_BLOCK_64: usize = 64;
 pub const SUPPORTED_HADAMARD_BLOCKS: [usize; 2] = [HADAMARD_BLOCK_16, HADAMARD_BLOCK_64];
 pub const SUPPORTED_MARLIN_U4_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 
+/// Returns `true` when `block` is either disabled (`0`) or a supported Hadamard block size
+/// (`HADAMARD_BLOCK_16` or `HADAMARD_BLOCK_64`) that evenly divides non-zero `dim`.
+#[inline]
+pub const fn is_valid_hadamard_block_for_dim(block: usize, dim: usize) -> bool {
+    match block {
+        0 => true,
+        HADAMARD_BLOCK_16 | HADAMARD_BLOCK_64 => dim != 0 && dim.is_multiple_of(block),
+        _ => false,
+    }
+}
+
 const MAX_REGEX_PATTERN_BYTES: usize = 8 * 1024;
 const REGEX_BACKTRACK_LIMIT: usize = 100_000;
 const MAX_COMPRESSED_TENSORS_PATTERNS: usize = 64;

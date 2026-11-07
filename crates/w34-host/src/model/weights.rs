@@ -1,8 +1,13 @@
 //! Host quantization, weight loading, and device linear/FFN projections.
 
 use super::*;
-pub use crate::loader::{HADAMARD_BLOCK_16, HADAMARD_BLOCK_64, SUPPORTED_HADAMARD_BLOCKS};
+pub use crate::loader::{
+    HADAMARD_BLOCK_16, HADAMARD_BLOCK_64, SUPPORTED_HADAMARD_BLOCKS,
+    is_valid_hadamard_block_for_dim,
+};
 
+pub const FP16_ELEM_BYTES: usize = 2;
+pub const HADAMARD_WORKSPACE_ALIGN_BYTES: usize = 16;
 pub const PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE: usize = 6144;
 pub const MARLIN_TILE_N: usize = 64;
 pub const MARLIN_TILE_K_W4: usize = 128;
@@ -17,6 +22,12 @@ pub const SMALL_N_GEMM_ROUTER_512_MAX_N: usize = 512;
 pub const SMALL_N_GEMM_DECODE_MAX_DIM: usize = 2048;
 pub const SMALL_N_GEMM_DECODE_MAX_M: usize = 16;
 pub const SMALL_N_GEMM_K_ALIGN: usize = 8;
+
+#[inline]
+pub const fn align_up_hadamard_workspace(bytes: usize) -> usize {
+    let mask = HADAMARD_WORKSPACE_ALIGN_BYTES - 1;
+    bytes.saturating_add(mask) & !mask
+}
 
 #[inline]
 pub const fn align_up_scratch(bytes: usize) -> Option<usize> {

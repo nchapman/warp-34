@@ -553,20 +553,12 @@ mod serving_capacity_tests {
                 &ex_small,
                 rows,
                 h_dim,
-                false
             ),
             [d_normed.addr(), 0]
         );
         let ex_ok = stream.exec(d_scratch.addr(), d_scratch.len_bytes);
         assert_eq!(
-            ffn_tiered.pre_mlp_norm_targets(
-                d_normed.addr(),
-                d_mlp_out.addr(),
-                &ex_ok,
-                rows,
-                h_dim,
-                false
-            ),
+            ffn_tiered.pre_mlp_norm_targets(d_normed.addr(), d_mlp_out.addr(), &ex_ok, rows, h_dim),
             [d_normed.addr(), d_scratch.addr()]
         );
 

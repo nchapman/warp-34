@@ -482,6 +482,15 @@ struct ShardView {
     rows: usize,
 }
 
+/// Number of entries in a 4-bit `lut4-gptq` PLE codebook (`weight_lut`).
+pub const PLE_LUT4_CODEBOOK_LEN: usize = 16;
+/// Signed-sqrt clamp epsilon for PLE attention gating (`sgn(dot) * sqrt(max(|dot|, eps))`).
+pub const PLE_SIGNED_SQRT_GATE_EPS: f32 = 1e-6;
+/// Minimum batch of n-gram IDs before issuing coalesced `MADV_WILLNEED` prefaulting.
+const PLE_MMAP_PREFAULT_MIN_IDS: usize = 64;
+/// Standard OS virtual memory page size in bytes used for `madvise` alignment.
+const PLE_OS_PAGE_BYTES: usize = 4096;
+
 /// On-disk storage format of a PLE n-gram embedding table.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PleTableFormat {
@@ -492,7 +501,7 @@ pub enum PleTableFormat {
     /// `shard_{part}.weight_lut` `F32 [16]`).
     Lut4Gptq {
         group_size: usize,
-        lut_f32: [f32; 16],
+        lut_f32: [f32; PLE_LUT4_CODEBOOK_LEN],
     },
 }
 
@@ -668,16 +677,16 @@ impl PleMmapTable {
         let packed_cols = head_dim / 2;
         let lut0_name = format!("{prefix}.shard_0.weight_lut");
         let lut0_vec = archive.read_f32(&lut0_name)?;
-        if lut0_vec.len() != 16 {
+        if lut0_vec.len() != PLE_LUT4_CODEBOOK_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "expected 16-entry weight_lut for {lut0_name}, got len={}",
+                    "expected {PLE_LUT4_CODEBOOK_LEN}-entry weight_lut for {lut0_name}, got len={}",
                     lut0_vec.len()
                 ),
             ));
         }
-        let mut lut_f32 = [0.0f32; 16];
+        let mut lut_f32 = [0.0f32; PLE_LUT4_CODEBOOK_LEN];
         lut_f32.copy_from_slice(&lut0_vec);
 
         let mut file_to_mmap: HashMap<String, usize> = HashMap::new();
@@ -836,8 +845,7 @@ impl PleMmapTable {
         if ids.is_empty() {
             return;
         }
-        const PAGE_SIZE: usize = 4096;
-        if ids.len() >= 64 {
+        if ids.len() >= PLE_MMAP_PREFAULT_MIN_IDS {
             let cap = match self.format {
                 PleTableFormat::F8E4m3 => ids.len(),
                 PleTableFormat::Lut4Gptq { .. } => ids.len() * 2,
@@ -851,15 +859,15 @@ impl PleMmapTable {
                 match self.format {
                     PleTableFormat::F8E4m3 => {
                         let byte_off = view.offset_bytes + local_row * self.head_dim;
-                        page_keys.push((view.mmap_idx, byte_off / PAGE_SIZE));
+                        page_keys.push((view.mmap_idx, byte_off / PLE_OS_PAGE_BYTES));
                     }
                     PleTableFormat::Lut4Gptq { group_size, .. } => {
                         let packed_bytes = self.head_dim / 2;
                         let scale_bytes = (self.head_dim / group_size) * 2;
                         let p_off = view.offset_bytes + local_row * packed_bytes;
                         let s_off = view.scale_offset_bytes + local_row * scale_bytes;
-                        page_keys.push((view.mmap_idx, p_off / PAGE_SIZE));
-                        page_keys.push((view.mmap_idx, s_off / PAGE_SIZE));
+                        page_keys.push((view.mmap_idx, p_off / PLE_OS_PAGE_BYTES));
+                        page_keys.push((view.mmap_idx, s_off / PLE_OS_PAGE_BYTES));
                     }
                 }
             }
@@ -878,9 +886,9 @@ impl PleMmapTable {
                     idx += 1;
                 }
                 let region = &self.mmaps[mmap_idx];
-                let adv_off = start_page * PAGE_SIZE;
-                let adv_len =
-                    ((end_page - start_page) * PAGE_SIZE).min(region.len.saturating_sub(adv_off));
+                let adv_off = start_page * PLE_OS_PAGE_BYTES;
+                let adv_len = ((end_page - start_page) * PLE_OS_PAGE_BYTES)
+                    .min(region.len.saturating_sub(adv_off));
                 if adv_len > 0 {
                     // SAFETY: `adv_off..adv_off + adv_len` is page-aligned and within `region`.
                     unsafe {

@@ -596,11 +596,7 @@ impl Qwen3_5ModelRank {
                 h_dim: h,
                 eps,
             };
-            let is_single_stream = layer.residual.is_single_stream();
-            let pre_attn_targets =
-                layer
-                    .block
-                    .pre_attn_norm_targets(s.normed, ex, rows, h, is_single_stream);
+            let pre_attn_targets = layer.block.pre_attn_norm_targets(s.normed, ex, rows, h);
             layer
                 .residual
                 .pre_attn_with_targets(norm_layer_idx, &hc_ctx, pre_attn_targets)?;
@@ -614,10 +610,7 @@ impl Qwen3_5ModelRank {
                 s,
                 pre_attn_targets,
             )?;
-            let pre_mlp_targets =
-                layer
-                    .ffn
-                    .pre_mlp_norm_targets(s.normed, s.mlp, ex, rows, h, is_single_stream);
+            let pre_mlp_targets = layer.ffn.pre_mlp_norm_targets(s.normed, s.mlp, ex, rows, h);
             layer.residual.post_attn_pre_mlp_with_targets(
                 &hc_ctx,
                 tp2,
@@ -677,13 +670,7 @@ impl Qwen3_5ModelRank {
                     let [no, nh] = if next.ple.is_some() {
                         [s.normed, 0]
                     } else {
-                        next.block.pre_attn_norm_targets(
-                            s.normed,
-                            ex,
-                            rows,
-                            h,
-                            next.residual.is_single_stream(),
-                        )
+                        next.block.pre_attn_norm_targets(s.normed, ex, rows, h)
                     };
                     [w, no, nh]
                 } else {

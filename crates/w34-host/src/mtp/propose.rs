@@ -3,8 +3,7 @@ use w34_kernels::ffi::{self, W34_ATTN_MASK_CAUSAL, W34AttentionBatch, W34Exec};
 
 use crate::cuda::{CudaGraph, Result, Tp2Collectives, check_rc};
 use crate::model::{
-    FfnBlockWeights, HADAMARD_BLOCK_64, HcStepContext, LinearProj,
-    PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE, Qwen3_5ModelRank, TapExport, loader_err,
+    FfnBlockWeights, HcStepContext, LinearProj, Qwen3_5ModelRank, TapExport, loader_err,
 };
 
 use super::{MtpInputFusion, Qwen3_5MtpRank};
@@ -230,15 +229,9 @@ impl Qwen3_5MtpRank {
             }
             Self::project(self.concat_fc()?, &ex, t, concat, residual_buf, 1)?;
             let fa = &self.fa;
-            let fuse_qkv_h64 = fa.qsa_indexer.is_none()
-                && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
-                && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
-                && fa.qkv_proj.can_fuse_h64_from_producer();
-            let [qkv_norm_out, qkv_norm_had64] = if fuse_qkv_h64 {
-                [0, normed_buf]
-            } else {
-                [normed_buf, 0]
-            };
+            let [qkv_norm_out, qkv_norm_had64] =
+                fa.pre_attn_norm_targets(normed_buf, &ex, 1, h_dim);
+            let fuse_qkv_h64 = qkv_norm_had64 != 0;
             check_rc(
                 // SAFETY: residual_buf and normed_buf are valid device buffers for h_dim half elements,
                 // input_layernorm_ptr is valid norm weight on active stream.
@@ -366,7 +359,7 @@ impl Qwen3_5MtpRank {
                 .ok_or_else(|| loader_err("MTP graph requires single-stream residual"))?;
             let [mlp_norm_out, mlp_norm_had64] =
                 self.ffn
-                    .pre_mlp_norm_targets(normed_buf, mlp_out_buf, &ex, 1, h_dim, true);
+                    .pre_mlp_norm_targets(normed_buf, mlp_out_buf, &ex, 1, h_dim);
             if let Some(comm) = tp2 {
                 comm.all_reduce_residual_gemma_rms_norm_hadamard_f16(
                     &ex,
@@ -1162,23 +1155,8 @@ impl Qwen3_5MtpRank {
             eps: t.cfg.rms_norm_eps,
         };
         let fa = &self.fa;
-        let is_single_stream = self.residual.is_single_stream();
-        let can_use_scratch = ex.scratch_ptr != 0
-            && ex.scratch_ptr.is_multiple_of(16)
-            && ex.scratch_size >= num_tokens.saturating_mul(h_dim).saturating_mul(2);
-        let fuse_qkv_h64 = h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
-            && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
-            && fa.qkv_proj.can_fuse_h64_from_producer()
-            && (fa.qsa_indexer.is_none() || can_use_scratch);
-        let pre_attn_targets = if fuse_qkv_h64 {
-            if fa.qsa_indexer.is_none() {
-                [0, normed_buf]
-            } else {
-                [normed_buf, ex.scratch_ptr]
-            }
-        } else {
-            [normed_buf, 0]
-        };
+        let pre_attn_targets = fa.pre_attn_norm_targets(normed_buf, &ex, num_tokens, h_dim);
+        let fuse_qkv_h64 = pre_attn_targets[1] != 0;
         self.residual
             .pre_attn_with_targets(0, &hc_ctx, pre_attn_targets)?;
 
@@ -1421,14 +1399,9 @@ impl Qwen3_5MtpRank {
             block_out_buf,
             num_tokens,
         )?;
-        let pre_mlp_targets = self.ffn.pre_mlp_norm_targets(
-            normed_buf,
-            mlp_out_buf,
-            &ex,
-            num_tokens,
-            h_dim,
-            is_single_stream,
-        );
+        let pre_mlp_targets =
+            self.ffn
+                .pre_mlp_norm_targets(normed_buf, mlp_out_buf, &ex, num_tokens, h_dim);
         self.residual.post_attn_pre_mlp_with_targets(
             &hc_ctx,
             tp2,

@@ -171,13 +171,11 @@ impl HostExpertStore {
         let down_had = quant.input_hadamard(&first_down_name)?.unwrap_or(0);
         require(
             gate_had == up_had
-                && matches!(gate_had, 0 | 16 | 64)
-                && (gate_had == 0 || layout.hidden.is_multiple_of(gate_had)),
+                && crate::loader::is_valid_hadamard_block_for_dim(gate_had, layout.hidden),
             "inconsistent or unsupported input Hadamard block size on routed MoE gate_proj/up_proj",
         )?;
         require(
-            matches!(down_had, 0 | 16 | 64)
-                && (down_had == 0 || layout.intermediate.is_multiple_of(down_had))
+            crate::loader::is_valid_hadamard_block_for_dim(down_had, layout.intermediate)
                 && (layout.down_hadamard_block_size == 0
                     || layout.down_hadamard_block_size == down_had),
             "inconsistent or unsupported input Hadamard block size on routed MoE down_proj",

@@ -74,9 +74,7 @@ impl ExpertPackLayout {
 
     /// Configures the optional pre-`down_proj` Hadamard block size (`0`, `16`, or `64`).
     pub fn with_down_hadamard(mut self, block_size: usize) -> io::Result<Self> {
-        if !matches!(block_size, 0 | 16 | 64)
-            || (block_size > 0 && !self.intermediate.is_multiple_of(block_size))
-        {
+        if !crate::loader::is_valid_hadamard_block_for_dim(block_size, self.intermediate) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid down_proj Hadamard block size for ExpertPackLayout",

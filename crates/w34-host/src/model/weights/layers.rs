@@ -20,6 +20,35 @@ pub struct FullAttentionLayerWeights {
 
 #[cfg(feature = "cuda")]
 impl FullAttentionLayerWeights {
+    /// Returns `[unrotated_out, had64_out]` targets for the pre-attention norm / stream mixer.
+    #[inline]
+    pub fn pre_attn_norm_targets(
+        &self,
+        normed_buf: u64,
+        ex: &W34Exec,
+        rows: usize,
+        h_dim: usize,
+    ) -> [u64; 2] {
+        if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            || !h_dim.is_multiple_of(HADAMARD_BLOCK_64)
+            || !self.qkv_proj.can_fuse_h64_from_producer()
+        {
+            return [normed_buf, 0];
+        }
+        if self.qsa_indexer.is_none() {
+            [0, normed_buf]
+        } else if ex.scratch_ptr != 0
+            && ex
+                .scratch_ptr
+                .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
+            && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(FP16_ELEM_BYTES)
+        {
+            [normed_buf, ex.scratch_ptr]
+        } else {
+            [normed_buf, 0]
+        }
+    }
+
     /// Runs QSA pre-indexer norm+RoPE, updates raw/compressed indexer key caches,
     /// optionally selects top-k sparse blocks, and executes sparse paged GQA + sigmoid output gate.
     #[allow(clippy::too_many_arguments)]
@@ -250,7 +279,11 @@ impl HcBlockWeights {
                     size_k: k1,
                 }),
                 true,
-            ) if *n0 <= 512 && *n1 <= 256 && *k0 == *k1 && k0.is_multiple_of(8) => {
+            ) if *n0 <= SMALL_N_GEMM_ROUTER_512_MAX_N
+                && *n1 <= SMALL_N_GEMM_ALWAYS_MAX_N
+                && *k0 == *k1
+                && k0.is_multiple_of(SMALL_N_GEMM_K_ALIGN) =>
+            {
                 Some((*w0, *n0, *w1, *n1, *k0))
             }
             _ => None,
@@ -866,7 +899,7 @@ impl PleLayerWeights {
             num_tokens,
             hc_count,
             h_dim,
-            1e-6,
+            crate::ple::PLE_SIGNED_SQRT_GATE_EPS,
             eps,
         )?;
         crate::ple::gpu_ops::ple_dilated_conv1d_add_f16(
@@ -911,30 +944,24 @@ impl LayerBlockWeights {
         ex: &W34Exec,
         rows: usize,
         h_dim: usize,
-        _is_single_stream: bool,
     ) -> [u64; 2] {
-        if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE || !h_dim.is_multiple_of(HADAMARD_BLOCK_64) {
-            return [normed_buf, 0];
-        }
-        let can_use_scratch = ex.scratch_ptr != 0
-            && ex.scratch_ptr.is_multiple_of(16)
-            && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(2);
         match self {
-            Self::FullAttention(fa) if fa.qkv_proj.can_fuse_h64_from_producer() => {
-                if fa.qsa_indexer.is_none() {
-                    [0, normed_buf]
-                } else if can_use_scratch {
+            Self::FullAttention(fa) => fa.pre_attn_norm_targets(normed_buf, ex, rows, h_dim),
+            Self::LinearAttention(gdn) => {
+                if h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+                    && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
+                    && gdn.in_proj_qkvz.can_fuse_h64_from_producer()
+                    && ex.scratch_ptr != 0
+                    && ex
+                        .scratch_ptr
+                        .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
+                    && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(FP16_ELEM_BYTES)
+                {
                     [normed_buf, ex.scratch_ptr]
                 } else {
                     [normed_buf, 0]
                 }
             }
-            Self::LinearAttention(gdn)
-                if gdn.in_proj_qkvz.can_fuse_h64_from_producer() && can_use_scratch =>
-            {
-                [normed_buf, ex.scratch_ptr]
-            }
-            _ => [normed_buf, 0],
         }
     }
 }

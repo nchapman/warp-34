@@ -4,7 +4,7 @@ use super::*;
 mod config_rules;
 pub use config_rules::{
     CompressedTensorRules, HADAMARD_BLOCK_16, HADAMARD_BLOCK_64, SUPPORTED_HADAMARD_BLOCKS,
-    SUPPORTED_MARLIN_U4_GROUP_SIZES,
+    SUPPORTED_MARLIN_U4_GROUP_SIZES, is_valid_hadamard_block_for_dim,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,5 +1,10 @@
 use super::*;
-use crate::loader::SafetensorsArchive;
+use crate::loader::{HADAMARD_BLOCK_64, SafetensorsArchive};
+
+/// Maximum batch token count for `MoeOffloadMode::Auto` to select `GpuLru` when misses fit in staging.
+const TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS: usize = 32;
+/// Alternate symmetric 4-bit GPTQ group size supported by the AVX2/FMA CPU bridge (`64` in addition to `128`).
+const TIERED_MOE_CPU_BRIDGE_ALT_GROUP_SIZE: usize = 64;
 
 /// Executes a tiered 512-expert MoE layer across `TP=1` or `TP=2 / EP=2` in `GpuLru`,
 /// `CpuHybrid`, or double-buffered `StreamedPrefill` mode.
@@ -250,7 +255,7 @@ impl TieredMoeEngine {
         } else {
             match mode {
                 MoeOffloadMode::Auto => {
-                    if num_tokens <= 32
+                    if num_tokens <= TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS
                         && active_local.len() <= cache.slots.capacity
                         && misses_in_step.len() <= ws.stage_capacity
                     {
@@ -982,8 +987,14 @@ impl RankTieredMoe {
             } else if ep_size == 1
                 && k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
                 && cfg.num_hidden_layers <= TIERED_MOE_CPU_BRIDGE_MAX_LAYERS
-                && matches!(group_size, 64 | TIERED_MOE_CPU_BRIDGE_GROUP_SIZE)
-                && matches!(store.layout().down_hadamard_block_size, 0 | 64)
+                && matches!(
+                    group_size,
+                    TIERED_MOE_CPU_BRIDGE_ALT_GROUP_SIZE | TIERED_MOE_CPU_BRIDGE_GROUP_SIZE
+                )
+                && matches!(
+                    store.layout().down_hadamard_block_size,
+                    0 | HADAMARD_BLOCK_64
+                )
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 let k_static = k_hot;

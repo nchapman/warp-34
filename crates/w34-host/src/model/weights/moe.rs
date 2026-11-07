@@ -64,7 +64,6 @@ impl FfnBlockWeights {
         ex: &W34Exec,
         rows: usize,
         h_dim: usize,
-        _is_single_stream: bool,
     ) -> [u64; 2] {
         if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE || !h_dim.is_multiple_of(HADAMARD_BLOCK_64) {
             return [normed_buf, 0];
@@ -87,14 +86,18 @@ impl FfnBlockWeights {
                         [normed_buf, mlp_out_buf]
                     }
                     MoeExpertStorage::Tiered { .. } => {
-                        let reserved = (rows.saturating_mul(h_dim).saturating_mul(2) + 15) & !15;
+                        let reserved = align_up_hadamard_workspace(
+                            rows.saturating_mul(h_dim).saturating_mul(FP16_ELEM_BYTES),
+                        );
                         let extra_ws = moe
                             .shared_down_proj
                             .as_ref()
                             .and_then(|p| p.input_transform_workspace_bytes(rows))
                             .unwrap_or(0);
                         if ex.scratch_ptr != 0
-                            && ex.scratch_ptr.is_multiple_of(16)
+                            && ex
+                                .scratch_ptr
+                                .is_multiple_of(HADAMARD_WORKSPACE_ALIGN_BYTES as u64)
                             && ex.scratch_size >= reserved.saturating_add(extra_ws)
                         {
                             [normed_buf, ex.scratch_ptr]
@@ -184,7 +187,11 @@ impl FfnBlockWeights {
         prerotated_input_buf: u64,
     ) -> Result<()> {
         let input_prerotated = prerotated_input_buf != 0;
-        let reserved_prerot = (num_tokens.saturating_mul(h_dim).saturating_mul(2) + 15) & !15;
+        let reserved_prerot = align_up_hadamard_workspace(
+            num_tokens
+                .saturating_mul(h_dim)
+                .saturating_mul(FP16_ELEM_BYTES),
+        );
         let sub_ex = if input_prerotated
             && prerotated_input_buf == ex.scratch_ptr
             && ex.scratch_size >= reserved_prerot
@@ -754,10 +761,8 @@ pub(crate) fn load_moe_layer_weights(
         .resolve_name(&format!("{pfx}.mlp.experts.down_proj"))
         .or_else(|| archive.resolve_name(&format!("{pfx}.mlp.experts.down_proj.weight")));
 
-    let (experts, routed_input_hadamard, routed_down_hadamard) = if let Some(layer_id) =
-        tiered_layer_id
-    {
-        let resolve_expert0_had = |proj: &str, k_dim: usize| -> Result<usize> {
+    let resolve_expert0_hadamard_blocks = || -> Result<(usize, usize)> {
+        let resolve_proj = |proj: &str, k_dim: usize| -> Result<usize> {
             let cand = format!("{pfx}.mlp.experts.0.{proj}");
             let name = ["weight_packed", "qweight", "weight"]
                 .into_iter()
@@ -772,21 +777,28 @@ pub(crate) fn load_moe_layer_weights(
                 .input_hadamard(&name)
                 .map_err(|e| loader_err_msg(e.to_string()))?
                 .unwrap_or(0);
-            if !matches!(b, 0 | 16 | 64) || (b > 0 && !k_dim.is_multiple_of(b)) {
+            if !is_valid_hadamard_block_for_dim(b, k_dim) {
                 return Err(loader_err_msg(format!(
                     "invalid MoE Hadamard block_size={b} for K={k_dim} at '{name}'"
                 )));
             }
             Ok(b)
         };
-        let gate_had = resolve_expert0_had("gate_proj", h)?;
-        let up_had = resolve_expert0_had("up_proj", h)?;
+        let gate_had = resolve_proj("gate_proj", h)?;
+        let up_had = resolve_proj("up_proj", h)?;
         if gate_had != up_had {
             return Err(loader_err_msg(format!(
                 "mismatched Hadamard block sizes on MoE gate_proj ({gate_had}) vs up_proj ({up_had}) at '{pfx}'"
             )));
         }
-        let down_had = resolve_expert0_had("down_proj", local_moe_interm)?;
+        let down_had = resolve_proj("down_proj", local_moe_interm)?;
+        Ok((gate_had, down_had))
+    };
+
+    let (experts, routed_input_hadamard, routed_down_hadamard) = if let Some(layer_id) =
+        tiered_layer_id
+    {
+        let (gate_had, down_had) = resolve_expert0_hadamard_blocks()?;
         (MoeExpertStorage::Tiered { layer_id }, gate_had, down_had)
     } else if let (Some(gu_key), Some(dn_key)) = (fused_gu_key, fused_dn_key) {
         if archive
@@ -893,35 +905,7 @@ pub(crate) fn load_moe_layer_weights(
                 "unsupported fused 3D quantized MoE expert layout on '{pfx}' (expected per-expert W4A16 or 3D BF16/FP16)"
             )));
         }
-        let (_, exp0_in_had) = RawLinearHost::load(
-            archive,
-            &format!("{pfx}.mlp.experts.0.gate_proj"),
-            &cfg.quant,
-        )?
-        .unwrap_hadamard();
-        let (_, exp0_up_had) =
-            RawLinearHost::load(archive, &format!("{pfx}.mlp.experts.0.up_proj"), &cfg.quant)?
-                .unwrap_hadamard();
-        if exp0_in_had != exp0_up_had {
-            return Err(loader_err_msg(format!(
-                "mismatched Hadamard block sizes on MoE gate_proj ({exp0_in_had}) vs up_proj ({exp0_up_had}) at '{pfx}'"
-            )));
-        }
-        let (_, exp0_dn_had) = RawLinearHost::load(
-            archive,
-            &format!("{pfx}.mlp.experts.0.down_proj"),
-            &cfg.quant,
-        )?
-        .unwrap_hadamard();
-        if !matches!(exp0_in_had, 0 | 16 | 64)
-            || !matches!(exp0_dn_had, 0 | 16 | 64)
-            || (exp0_in_had > 0 && !h.is_multiple_of(exp0_in_had))
-            || (exp0_dn_had > 0 && !local_moe_interm.is_multiple_of(exp0_dn_had))
-        {
-            return Err(loader_err_msg(format!(
-                "invalid MoE Hadamard block sizes at '{pfx}': in={exp0_in_had} (K={h}), down={exp0_dn_had} (K={local_moe_interm})"
-            )));
-        }
+        let (exp0_in_had, exp0_dn_had) = resolve_expert0_hadamard_blocks()?;
 
         let load_expert_parts = |e: usize| -> Result<(RawLinearHost, RawLinearHost)> {
             let epfx = format!("{pfx}.mlp.experts.{e}");
