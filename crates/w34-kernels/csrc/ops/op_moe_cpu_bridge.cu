@@ -38,14 +38,14 @@ struct alignas(64) MoeBridgeReqSlot {
     int32_t hidden;
     int32_t intermediate;
     int32_t local_num_experts;
-    int32_t _pad0[5];
+    int32_t _pad0[7];
     int32_t local_expert_ids[kMaxPairs];
     float topk_weights[kMaxPairs];
-    float x_f32[kMaxTokens * kMaxHidden];
+    uint16_t x_f16[kMaxTokens * kMaxHidden];
 };
 
-static_assert(offsetof(MoeBridgeReqSlot, x_f32) == 568);
-static_assert(sizeof(MoeBridgeReqSlot) == 66112);
+static_assert(offsetof(MoeBridgeReqSlot, x_f16) == 576);
+static_assert(sizeof(MoeBridgeReqSlot) == 33344);
 
 struct alignas(64) MoeBridgeRespSlot {
     int64_t seq;
@@ -164,8 +164,18 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     }
 
     const int total_elems = num_tokens * hidden;
-    for (int i = threadIdx.x; i < total_elems; i += blockDim.x) {
-        req_slot->x_f32[i] = __half2float(x_f16[i]);
+    if (((total_elems & 7) == 0) && ((((uintptr_t)x_f16 | (uintptr_t)req_slot->x_f16) & 15u) == 0)) {
+        const int vec_elems = total_elems >> 3;
+        const uint4* src_v = reinterpret_cast<const uint4*>(x_f16);
+        uint4* dst_v = reinterpret_cast<uint4*>(req_slot->x_f16);
+        for (int i = threadIdx.x; i < vec_elems; i += blockDim.x) {
+            dst_v[i] = src_v[i];
+        }
+    } else {
+        const uint16_t* src_u16 = reinterpret_cast<const uint16_t*>(x_f16);
+        for (int i = threadIdx.x; i < total_elems; i += blockDim.x) {
+            req_slot->x_f16[i] = src_u16[i];
+        }
     }
     __threadfence_system();
     __syncthreads();

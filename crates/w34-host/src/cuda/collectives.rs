@@ -512,6 +512,160 @@ impl Tp2Collectives {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn all_gather_topk_f32_i32(
+        &self,
+        ex: &W34Exec,
+        local_vals_ptr: u64,
+        local_ids_ptr: u64,
+        global_vals_ptr: u64,
+        global_ids_ptr: u64,
+        rank: i32,
+        num_rows: i32,
+        top_k: i32,
+    ) -> Result<()> {
+        assert!(
+            (num_rows as usize) * (top_k as usize) * 8 <= self.max_stage_bytes_per_epoch,
+            "all_gather_topk_f32_i32 exceeds max_stage_bytes_per_epoch"
+        );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid `(f32, i32)` buffers for `num_rows * top_k`.
+                unsafe {
+                    ffi::w34_tp4_all_gather_topk_f32_i32(
+                        ex,
+                        local_vals_ptr as *const f32,
+                        local_ids_ptr as *const i32,
+                        global_vals_ptr as *mut f32,
+                        global_ids_ptr as *mut i32,
+                        self.stages[0].dev_ptr(),
+                        self.stages[1].dev_ptr(),
+                        self.stages[2].dev_ptr(),
+                        self.stages[3].dev_ptr(),
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_rows,
+                        top_k,
+                    )
+                },
+                "w34_tp4_all_gather_topk_f32_i32",
+            );
+        }
+        check_rc(
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
+            // buffers owned by `self`, and caller guarantees valid `(f32, i32)` buffers for `num_rows * top_k`.
+            unsafe {
+                ffi::w34_tp2_all_gather_topk_f32_i32(
+                    ex,
+                    local_vals_ptr as *const f32,
+                    local_ids_ptr as *const i32,
+                    global_vals_ptr as *mut f32,
+                    global_ids_ptr as *mut i32,
+                    self.stages[0].dev_ptr(),
+                    self.stages[1].dev_ptr(),
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
+                    rank,
+                    num_rows,
+                    top_k,
+                )
+            },
+            "w34_tp2_all_gather_topk_f32_i32",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn all_reduce_hc_combine_tap_f16(
+        &self,
+        ex: &W34Exec,
+        residual_in_ptr: u64,
+        local_block_out_ptr: u64,
+        ar_out_ptr: u64,
+        inject_weights_ptr: u64,
+        ple_delta_ptr: u64,
+        residual_out_ptr: u64,
+        tap_bf16_out_ptr: u64,
+        valid_token_mask_ptr: u64,
+        rank: i32,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+        tap_stride_elems: i32,
+        tap_offset_elems: i32,
+    ) -> Result<()> {
+        let num_elems = (num_tokens as usize) * (hidden_size as usize);
+        assert!(
+            num_elems * 2 <= self.max_stage_bytes_per_epoch,
+            "all_reduce_hc_combine_tap_f16 exceeds max_stage_bytes_per_epoch"
+        );
+        if self.tp_size == 4 {
+            return check_rc(
+                // SAFETY: staging capacity is asserted above; `stages[0..4]` and `sigs[0..4]` are live
+                // buffers owned by `self`, and caller guarantees valid device buffers for `num_tokens`.
+                unsafe {
+                    ffi::w34_tp4_all_reduce_hc_combine_tap_f16(
+                        ex,
+                        residual_in_ptr as *const c_void,
+                        local_block_out_ptr as *const c_void,
+                        ar_out_ptr as *mut c_void,
+                        inject_weights_ptr as *const f32,
+                        ple_delta_ptr as *const c_void,
+                        residual_out_ptr as *mut c_void,
+                        tap_bf16_out_ptr as *mut c_void,
+                        valid_token_mask_ptr as *const u8,
+                        self.stages[0].dev_ptr(),
+                        self.stages[1].dev_ptr(),
+                        self.stages[2].dev_ptr(),
+                        self.stages[3].dev_ptr(),
+                        self.sigs[0].dev_ptr(),
+                        self.sigs[1].dev_ptr(),
+                        self.sigs[2].dev_ptr(),
+                        self.sigs[3].dev_ptr(),
+                        rank,
+                        num_tokens,
+                        hc_count,
+                        hidden_size,
+                        tap_stride_elems,
+                        tap_offset_elems,
+                    )
+                },
+                "w34_tp4_all_reduce_hc_combine_tap_f16",
+            );
+        }
+        check_rc(
+            // SAFETY: staging capacity is asserted above; `stages[0..2]` and `sigs[0..2]` are live
+            // buffers owned by `self`, and caller guarantees valid device buffers for `num_tokens`.
+            unsafe {
+                ffi::w34_tp2_all_reduce_hc_combine_tap_f16(
+                    ex,
+                    residual_in_ptr as *const c_void,
+                    local_block_out_ptr as *const c_void,
+                    ar_out_ptr as *mut c_void,
+                    inject_weights_ptr as *const f32,
+                    ple_delta_ptr as *const c_void,
+                    residual_out_ptr as *mut c_void,
+                    tap_bf16_out_ptr as *mut c_void,
+                    valid_token_mask_ptr as *const u8,
+                    self.stages[0].dev_ptr(),
+                    self.stages[1].dev_ptr(),
+                    self.sigs[0].dev_ptr(),
+                    self.sigs[1].dev_ptr(),
+                    rank,
+                    num_tokens,
+                    hc_count,
+                    hidden_size,
+                    tap_stride_elems,
+                    tap_offset_elems,
+                )
+            },
+            "w34_tp2_all_reduce_hc_combine_tap_f16",
+        )
+    }
+
     pub fn gather_vocab_f16(
         &self,
         ex: &W34Exec,

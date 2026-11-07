@@ -877,24 +877,12 @@ impl TieredMoeEngine {
                         x_addr,
                         ws.d_remapped_topk_ids[buf_idx].addr(),
                         d_topk_weights_addr,
-                        0,
+                        out_addr,
                         0,
                         ws.d_interm_buf.addr(),
-                        ws.d_chunk_out.addr(),
+                        out_addr,
                         num_tokens,
                         top_k,
-                    )?;
-                    crate::cuda::check_rc(
-                        // SAFETY: `out_addr` and `ws.d_chunk_out` are disjoint 4-byte-aligned FP16 buffers.
-                        unsafe {
-                            w34_kernels::ffi::w34_add_inplace_f16(
-                                &ex,
-                                out_addr as *mut core::ffi::c_void,
-                                ws.d_chunk_out.addr() as *const core::ffi::c_void,
-                                (num_tokens * ws.layout.hidden) as i64,
-                            )
-                        },
-                        "w34_add_inplace_f16 (StreamedPrefill)",
                     )?;
                 }
 

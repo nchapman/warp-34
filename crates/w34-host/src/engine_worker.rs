@@ -255,6 +255,7 @@ pub struct EngineWorker {
     pub decision_profile: crate::decision::DecisionModelProfile,
     pub vision_config: Option<crate::vision::VisionConfig>,
     pub has_vision_weights: bool,
+    pub hidden_size: usize,
     pub kv_token_capacity: usize,
     max_model_len: Option<usize>,
 }
@@ -350,6 +351,7 @@ impl EngineWorker {
                         engine.decision_profile.clone(),
                         engine.cfg.vision_config.clone(),
                         engine.has_vision_weights,
+                        engine.cfg.hidden_size,
                         kv_token_capacity,
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
@@ -377,6 +379,7 @@ impl EngineWorker {
             decision_profile,
             vision_config,
             has_vision_weights,
+            hidden_size,
             kv_token_capacity,
         ) = match ready_rx.recv() {
             Ok(Ok(info)) => info,
@@ -403,6 +406,7 @@ impl EngineWorker {
             decision_profile,
             vision_config,
             has_vision_weights,
+            hidden_size,
             kv_token_capacity,
             max_model_len: None,
         })
@@ -459,6 +463,21 @@ impl EngineWorker {
             req.sampler.params.max_tokens,
             self.max_model_len(),
         )?;
+        if !req.images.is_empty() && req.vision.is_none() {
+            let images = std::mem::take(&mut req.images);
+            match crate::scheduled_vision::ScheduledVision::from_vision_config(
+                self.vision_config.as_ref(),
+                self.hidden_size,
+                &req.prompt,
+                images,
+            ) {
+                Ok(vision) => req.vision = Some(vision),
+                Err(error) => {
+                    notify_request_error(req, WorkerError::invalid_request(error));
+                    return Ok(());
+                }
+            }
+        }
         let guard = self.sender.lock().unwrap_or_else(|e| e.into_inner());
         let Some(sender) = guard.as_ref() else {
             return if self.is_panicked() {
@@ -829,12 +848,13 @@ fn enqueue(
             }
         }
     }
+    let prompt_tokens = std::mem::take(&mut request.prompt);
     let key = request
         .vision
         .as_ref()
-        .map_or_else(|| request.prompt.clone(), |v| v.radix_key.clone());
+        .map_or_else(|| prompt_tokens.clone(), |v| v.radix_key.clone());
     let id = sched.submit_request_with_prefix_options(
-        request.prompt.clone(),
+        prompt_tokens,
         key,
         p.max_tokens,
         p.min_tokens,

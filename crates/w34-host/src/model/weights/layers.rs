@@ -572,15 +572,31 @@ impl LayerResidual {
             }
             Self::HyperConnection { attn_hc, mlp_hc } => {
                 if let Some(comm) = tp2 {
-                    comm.all_reduce_f16(
+                    let ar_out = if preserve_block_out_on_tp2 {
+                        block_out_buf
+                    } else {
+                        0
+                    };
+                    comm.all_reduce_hc_combine_tap_f16(
                         ctx.ex,
+                        ctx.hc_residual_buf,
                         block_out_buf,
-                        block_out_buf,
+                        ar_out,
+                        ctx.hc_inj_weights_buf,
+                        0,
+                        ctx.hc_residual_buf,
+                        0,
+                        0,
                         rank as i32,
-                        (ctx.num_tokens * ctx.h_dim) as i32,
+                        ctx.num_tokens as i32,
+                        ctx.hc_count as i32,
+                        ctx.h_dim as i32,
+                        0,
+                        0,
                     )?;
+                } else {
+                    attn_hc.forward_combine(ctx, block_out_buf)?;
                 }
-                attn_hc.forward_combine(ctx, block_out_buf)?;
                 mlp_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
             }
         }
@@ -661,15 +677,26 @@ impl LayerResidual {
             }
             Self::HyperConnection { mlp_hc, .. } => {
                 if let Some(comm) = tp2 {
-                    comm.all_reduce_f16(
+                    comm.all_reduce_hc_combine_tap_f16(
                         ctx.ex,
+                        ctx.hc_residual_buf,
                         mlp_out_buf,
-                        mlp_out_buf,
+                        0,
+                        ctx.hc_inj_weights_buf,
+                        0,
+                        ctx.hc_residual_buf,
+                        tap.dst,
+                        0,
                         rank as i32,
-                        (ctx.num_tokens * ctx.h_dim) as i32,
-                    )?;
+                        ctx.num_tokens as i32,
+                        ctx.hc_count as i32,
+                        ctx.h_dim as i32,
+                        tap.stride,
+                        tap.offset,
+                    )
+                } else {
+                    mlp_hc.forward_combine_with_tap(ctx, mlp_out_buf, tap)
                 }
-                mlp_hc.forward_combine_with_tap(ctx, mlp_out_buf, tap)
             }
         }
     }

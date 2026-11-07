@@ -1408,12 +1408,16 @@ impl DFlash2Rank {
         Ok(())
     }
 
-    fn can_capture_select_greedy(&self) -> bool {
+    pub fn can_capture_select_greedy(&self) -> bool {
         let (k, n) = (self.cfg.block_size - 1, self.cfg.top_k);
-        self.tp == 1 && self.cfg.selector_rank <= 256 && n <= 32 && k <= 16
+        self.cfg.selector_rank <= 256 && n <= 32 && k <= 16
     }
 
-    fn ensure_select_greedy_graph(&mut self, t: &Qwen3_5ModelRank) -> Result<()> {
+    pub fn ensure_select_greedy_graph(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<()> {
         if self.graph_io.select_greedy_graph.is_some() {
             return Ok(());
         }
@@ -1427,14 +1431,28 @@ impl DFlash2Rank {
         let succ = self.succ;
         let selector_rank = self.cfg.selector_rank as i32;
         let vocab_size = self.cfg.model.vocab_size as i32;
+        let rank_i32 = self.rank as i32;
         t.stream.synchronize()?;
         let graph = CudaGraph::capture(&t.stream, || {
-            self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, None)?;
+            self.enqueue_forward_device_topk(t, &batch, ids_ptr, pos_ptr, comm)?;
+            let ex = t.stream.exec(0, 0);
+            if let Some(comm) = comm {
+                comm.all_gather_topk_f32_i32(
+                    &ex,
+                    topk_scores,
+                    topk_ids,
+                    topk_scores,
+                    topk_ids,
+                    rank_i32,
+                    k as i32,
+                    n as i32,
+                )?;
+            }
             check_rc(
                 // SAFETY: device arrays topk_ids, topk_scores, projected, pred, succ, out_path, and ids_ptr are valid and sized for k proposals and n candidates.
                 unsafe {
                     ffi::w34_dflash_select_greedy_dev_anchor_bf16(
-                        &t.stream.exec(0, 0),
+                        &ex,
                         topk_ids as *const i32,
                         topk_scores as *const f32,
                         projected as *const c_void,
@@ -1453,6 +1471,45 @@ impl DFlash2Rank {
         })?;
         self.graph_io.select_greedy_graph = Some(graph);
         Ok(())
+    }
+
+    pub fn prepare_select_greedy_graph_inputs_async(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        anchor: i32,
+    ) -> Result<()> {
+        self.validate_target(t)?;
+        if anchor < 0 || anchor as usize >= self.cfg.model.vocab_size {
+            return Err(loader_err("invalid DFlash forward"));
+        }
+        self.proposal_anchor = None;
+        self.upload_forward_meta(t, anchor)
+    }
+
+    pub fn replay_select_greedy_graph_async(&self, t: &Qwen3_5ModelRank) -> Result<()> {
+        let graph = self
+            .graph_io
+            .select_greedy_graph
+            .as_ref()
+            .ok_or_else(|| loader_err("DFlash select_greedy graph not captured"))?;
+        graph.launch(&t.stream)
+    }
+
+    pub fn collect_select_greedy_host(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        anchor: i32,
+    ) -> Result<Vec<i32>> {
+        let k = self.cfg.block_size - 1;
+        let mut path = vec![0i32; k];
+        self.graph_io
+            .out_path_dev
+            .copy_to_host(&mut path, &t.stream)?;
+        if path.first().is_some_and(|&id| id < 0) {
+            return Err(loader_err("nonfinite DFlash edges"));
+        }
+        self.proposal_anchor = Some(anchor);
+        Ok(path)
     }
 
     pub fn launch_forward_graph_async(&mut self, t: &Qwen3_5ModelRank, anchor: i32) -> Result<()> {
@@ -1563,31 +1620,40 @@ impl DFlash2Rank {
         if self.tp != 1 {
             return Err(loader_err("forward_select_greedy requires TP=1"));
         }
-        if self.use_cuda_graph && self.can_capture_select_greedy() {
-            self.validate_target(t)?;
-            if anchor < 0 || anchor as usize >= self.cfg.model.vocab_size {
-                return Err(loader_err("invalid DFlash forward"));
-            }
-            self.proposal_anchor = None;
-            self.upload_forward_meta(t, anchor)?;
-            self.ensure_select_greedy_graph(t)?;
-            self.graph_io
-                .select_greedy_graph
-                .as_ref()
-                .unwrap()
-                .launch(&t.stream)?;
-            let k = self.cfg.block_size - 1;
-            let mut path = vec![0i32; k];
-            self.graph_io
-                .out_path_dev
-                .copy_to_host(&mut path, &t.stream)?;
-            if path.first().is_some_and(|&id| id < 0) {
-                return Err(loader_err("nonfinite DFlash edges"));
-            }
-            self.proposal_anchor = Some(anchor);
-            return Ok(path);
+        self.forward_select_greedy_tp(t, anchor, None)
+    }
+
+    /// Fused forward + (optional TP top-k merge) + greedy selection on device without
+    /// intermediate `DraftCandidates` D2H/H2D round-trips.
+    pub fn forward_select_greedy_tp(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        anchor: i32,
+        comm: Option<&Tp2Collectives>,
+    ) -> Result<Vec<i32>> {
+        if (self.tp > 1) != comm.is_some() {
+            return Err(loader_err("invalid DFlash forward"));
         }
-        let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, None)?;
+        if self.use_cuda_graph && self.can_capture_select_greedy() {
+            self.prepare_select_greedy_graph_inputs_async(t, anchor)?;
+            self.ensure_select_greedy_graph(t, comm)?;
+            self.replay_select_greedy_graph_async(t)?;
+            return self.collect_select_greedy_host(t, anchor);
+        }
+        let (ids_dev, scores_dev) = self.forward_device_topk(t, anchor, comm)?;
+        if let Some(comm) = comm {
+            let (k, n) = (self.cfg.block_size - 1, self.cfg.top_k);
+            comm.all_gather_topk_f32_i32(
+                &t.stream.exec(0, 0),
+                scores_dev,
+                ids_dev,
+                scores_dev,
+                ids_dev,
+                self.rank as i32,
+                k as i32,
+                n as i32,
+            )?;
+        }
         self.proposal_anchor = Some(anchor);
         self.select_greedy_from_device(t, anchor, ids_dev, scores_dev)
     }

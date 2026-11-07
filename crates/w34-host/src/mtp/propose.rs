@@ -685,35 +685,61 @@ impl Qwen3_5MtpRank {
         if !(1..=3).contains(&k) || self.len != self.committed || self.len + k > self.capacity {
             return Err(loader_err("invalid MTP proposal state or k"));
         }
+        self.validate_propose_args(target, anchor, target_hidden, k, Some(tp2.is_some()))?;
         if self.use_cuda_graph && self.supports_cuda_graph() {
-            self.validate_propose_args(target, anchor, target_hidden, k, Some(tp2.is_some()))?;
             self.ensure_propose_graph(target, k, tp2)?;
             self.launch_propose_graph_async(target, anchor, target_hidden, k)?;
             return self.collect_propose_host(target, k);
         }
-        let mut token = anchor;
-        let mut hidden = target_hidden;
-        let mut out = Vec::with_capacity(k);
+        self.prepare_propose_graph_inputs_async(target, anchor, target_hidden, k)?;
         let step0_group = self.len / 4;
+        let meta_base = self.graph_io.meta_dev.addr();
+        let out_ids_base = self.graph_io.out_ids_dev.addr();
         for step in 0..k {
             if let Some(qsa_ws) = &mut self.qsa {
                 qsa_ws.step0_page_idx = step0_group;
                 qsa_ws.skip_topk = step > 0;
             }
-            let res = self.forward(target, &[token], hidden, tp2);
+            let token_ids_ptr = if step == 0 {
+                meta_base
+            } else {
+                out_ids_base + ((step - 1) * 4) as u64
+            };
+            let positions_ptr = meta_base + ((1 + 3 * step) * 4) as u64;
+            let slot_ptr = meta_base + ((2 + 3 * step) * 4) as u64;
+            let after_ptr = meta_base + ((3 + 3 * step) * 4) as u64;
+            let qs_ptr = meta_base + 40;
+            let out_id_ptr = out_ids_base + (step * 4) as u64;
+            let res = self.forward_inner_with_device_step(
+                target,
+                &[],
+                self.hidden.addr(),
+                tp2,
+                true,
+                false,
+                false,
+                Some((
+                    token_ids_ptr,
+                    positions_ptr,
+                    slot_ptr,
+                    qs_ptr,
+                    after_ptr,
+                    out_id_ptr,
+                )),
+            );
             if let Some(qsa_ws) = &mut self.qsa {
                 qsa_ws.skip_topk = false;
             }
-            token = match res {
-                Ok(token) => token,
-                Err(error) => {
-                    self.len = self.committed;
-                    return Err(error);
-                }
-            };
-            out.push(token);
-            hidden = self.hidden.addr();
+            if let Err(error) = res {
+                self.len = self.committed;
+                return Err(error);
+            }
         }
+        let mut out = vec![0i32; k];
+        self.graph_io
+            .out_ids_dev
+            .copy_to_host(&mut out, &target.stream)?;
+        self.batch_hidden_rows = 1;
         Ok(out)
     }
 
@@ -785,18 +811,7 @@ impl Qwen3_5MtpRank {
         }
     }
 
-    fn forward(
-        &mut self,
-        target: &Qwen3_5ModelRank,
-        tokens: &[i32],
-        input_hidden: u64,
-        tp2: Option<&Tp2Collectives>,
-    ) -> Result<i32> {
-        self.forward_inner(target, tokens, input_hidden, tp2, true, true, false)?
-            .ok_or_else(|| loader_err("MTP forward did not sample token"))
-    }
-
-    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_inner(
         &mut self,
         target: &Qwen3_5ModelRank,
@@ -807,20 +822,49 @@ impl Qwen3_5MtpRank {
         sync_stream: bool,
         kv_only: bool,
     ) -> Result<Option<i32>> {
+        self.forward_inner_with_device_step(
+            target,
+            tokens,
+            input_hidden,
+            tp2,
+            sample_last,
+            sync_stream,
+            kv_only,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
+    fn forward_inner_with_device_step(
+        &mut self,
+        target: &Qwen3_5ModelRank,
+        tokens: &[i32],
+        input_hidden: u64,
+        tp2: Option<&Tp2Collectives>,
+        sample_last: bool,
+        sync_stream: bool,
+        kv_only: bool,
+        device_step_io: Option<(u64, u64, u64, u64, u64, u64)>,
+    ) -> Result<Option<i32>> {
         let t = target;
         if t.embed_tokens_ptr != self.target_embedding {
             return Err(loader_err("MTP target rank mismatch"));
         }
-        let num_tokens = tokens.len();
+        let num_tokens = if device_step_io.is_some() {
+            1
+        } else {
+            tokens.len()
+        };
         let span = num_tokens
             .checked_mul(self.hidden_size)
             .and_then(|n| n.checked_mul(2));
         if num_tokens == 0
             || num_tokens > self.max_batch_rows
             || num_tokens > self.capacity - self.len
-            || tokens
-                .iter()
-                .any(|&id| id < 0 || id as usize >= t.cfg.vocab_size)
+            || (device_step_io.is_none()
+                && tokens
+                    .iter()
+                    .any(|&id| id < 0 || id as usize >= t.cfg.vocab_size))
             || input_hidden == 0
             || !input_hidden.is_multiple_of(2)
             || span
@@ -971,18 +1015,33 @@ impl Qwen3_5MtpRank {
             }
         };
 
-        let mut meta = Vec::with_capacity(3 * num_tokens + 3);
-        meta.extend_from_slice(tokens);
-        meta.extend((self.len..self.len + num_tokens).map(|p| p as i32));
-        meta.extend(
-            (self.len..self.len + num_tokens).map(|p| self.pages[p / 16] * 16 + (p % 16) as i32),
-        );
-        meta.extend_from_slice(&[0i32, num_tokens as i32, (self.len + num_tokens) as i32]);
-        let meta_base = self.scratch.upload_slice(&meta, &t.stream)?;
+        let (token_ids_ptr, positions_ptr, slot, qs, after, step_out_id_override) =
+            if let Some((tok_p, pos_p, slot_p, qs_p, after_p, out_p)) = device_step_io {
+                (tok_p, pos_p, slot_p, qs_p, after_p, Some(out_p))
+            } else {
+                let mut meta = Vec::with_capacity(3 * num_tokens + 3);
+                meta.extend_from_slice(tokens);
+                meta.extend((self.len..self.len + num_tokens).map(|p| p as i32));
+                meta.extend(
+                    (self.len..self.len + num_tokens)
+                        .map(|p| self.pages[p / 16] * 16 + (p % 16) as i32),
+                );
+                meta.extend_from_slice(&[0i32, num_tokens as i32, (self.len + num_tokens) as i32]);
+                let meta_base = self.scratch.upload_slice(&meta, &t.stream)?;
+                let tok_p = meta_base;
+                let pos_p = tok_p + (num_tokens * 4) as u64;
+                let slot_p = pos_p + (num_tokens * 4) as u64;
+                let qs_p = slot_p + (num_tokens * 4) as u64;
+                let after_p = qs_p + 8;
+                (tok_p, pos_p, slot_p, qs_p, after_p, None)
+            };
         let (logits_buf, out_id, local_id, local_val, global_val) = if sample_last {
             (
                 self.scratch.alloc_aligned(t.local_vocab_size * 2)?,
-                self.scratch.alloc_aligned(4)?,
+                match step_out_id_override {
+                    Some(ptr) => ptr,
+                    None => self.scratch.alloc_aligned(4)?,
+                },
                 self.scratch.alloc_aligned(4)?,
                 self.scratch.alloc_aligned(4)?,
                 self.scratch.alloc_aligned(4)?,
@@ -992,11 +1051,6 @@ impl Qwen3_5MtpRank {
         };
         let (ws_ptr, ws_cap) = self.scratch.remaining_workspace();
         let ex = t.stream.exec(ws_ptr, ws_cap);
-        let token_ids_ptr = meta_base;
-        let positions_ptr = token_ids_ptr + (num_tokens * 4) as u64;
-        let slot = positions_ptr + (num_tokens * 4) as u64;
-        let qs = slot + (num_tokens * 4) as u64;
-        let after = qs + 8;
         let attn_batch = &W34AttentionBatch {
             query_start_loc: qs as *const i32,
             context_lens_before: positions_ptr as *const i32,
@@ -1647,21 +1701,25 @@ impl Qwen3_5MtpRank {
                     1,
                 )?;
             }
-            let mut out = [0i32];
-            check_rc(
-                // SAFETY: `out` and `out_id` hold 4 bytes and the stream is synchronized next.
-                unsafe {
-                    ffi::w34_memcpy_d2h_async(
-                        out.as_mut_ptr().cast(),
-                        out_id as *const c_void,
-                        4,
-                        t.stream.handle,
-                    )
-                },
-                "MTP greedy copy",
-            )?;
-            t.stream.synchronize()?;
-            Some(out[0])
+            if sync_stream {
+                let mut out = [0i32];
+                check_rc(
+                    // SAFETY: `out` and `out_id` hold 4 bytes and the stream is synchronized next.
+                    unsafe {
+                        ffi::w34_memcpy_d2h_async(
+                            out.as_mut_ptr().cast(),
+                            out_id as *const c_void,
+                            4,
+                            t.stream.handle,
+                        )
+                    },
+                    "MTP greedy copy",
+                )?;
+                t.stream.synchronize()?;
+                Some(out[0])
+            } else {
+                None
+            }
         } else {
             if sync_stream {
                 t.stream.synchronize()?;

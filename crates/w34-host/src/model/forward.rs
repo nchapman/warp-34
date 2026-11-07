@@ -302,6 +302,45 @@ impl Qwen3_5ModelRank {
         tp2: Option<&Tp2Collectives>,
         selected_rows: &[usize],
     ) -> Result<Vec<i32>> {
+        self.forward_selected_rows_maybe_skip_greedy(
+            token_ids_ptr,
+            positions_ptr,
+            num_tokens,
+            attn_batch,
+            gdn_batch,
+            tp2,
+            selected_rows,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_selected_rows_maybe_skip_greedy(
+        &mut self,
+        token_ids_ptr: u64,
+        positions_ptr: u64,
+        num_tokens: usize,
+        attn_batch: &W34AttentionBatch,
+        gdn_batch: &W34GdnBatch,
+        tp2: Option<&Tp2Collectives>,
+        selected_rows: &[usize],
+        skip_host_greedy: bool,
+    ) -> Result<Vec<i32>> {
+        if skip_host_greedy && !selected_rows.is_empty() {
+            let (_, use_spec) = self.forward_selected_rows_device(
+                token_ids_ptr,
+                positions_ptr,
+                num_tokens,
+                attn_batch,
+                gdn_batch,
+                tp2,
+                selected_rows,
+                None,
+                false,
+            )?;
+            self.speculative_logits_rows = if use_spec { selected_rows.len() } else { 0 };
+            return Ok(Vec::new());
+        }
         let (out, use_spec) = self.forward_selected_rows_device(
             token_ids_ptr,
             positions_ptr,

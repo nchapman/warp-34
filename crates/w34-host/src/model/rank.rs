@@ -8,7 +8,8 @@ pub struct PleRankRuntime {
     pub hasher: Arc<crate::ple::PleNgramHasher>,
     pub mmap_table: Arc<crate::ple::PleMmapTable>,
     pub f8_staging_dev: DeviceBuffer,
-    pub f8_host_scratch: Vec<u8>,
+    pub f8_host_scratch: crate::cuda::MappedHostBuffer,
+    pub f8_host_slot: usize,
     pub ids_scratch: Vec<i64>,
 }
 
