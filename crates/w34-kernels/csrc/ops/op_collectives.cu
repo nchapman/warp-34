@@ -29,6 +29,23 @@ struct Signal {
 };
 static_assert(sizeof(Signal) == 19072, "Signal ABI size mismatch");
 
+template <typename T>
+__device__ __forceinline__ T* stage_epoch_ptr(T* base, const Signal* sig, bool odd, size_t fallback_elems) {
+    if (!odd) return base;
+    size_t cap_bytes = (size_t)sig->end[128][0] & ~15ULL;
+    size_t min_bytes = fallback_elems * sizeof(T);
+    size_t off_bytes = (cap_bytes >= min_bytes) ? cap_bytes : min_bytes;
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + off_bytes);
+}
+
+template <typename T>
+__device__ __forceinline__ T* small_epoch_ptr(T* fallback_base, Signal* sig, bool odd, size_t num_elems) {
+    if (num_elems * sizeof(T) <= 4096) {
+        return reinterpret_cast<T*>(odd ? &sig->end[64][0] : &sig->end[0][0]);
+    }
+    return stage_epoch_ptr(fallback_base, sig, odd, num_elems);
+}
+
 inline int tp2_block_cap(bool is_small) {
     int min_sms = 84;
     if (w34_get_tp2_min_sm_count(&min_sms) != 0 || min_sms < 1) {
@@ -120,8 +137,8 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    __half* s0_buf = odd ? (s0 + num_elems) : s0;
-    __half* s1_buf = odd ? (s1 + num_elems) : s1;
+    __half* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __half* __restrict__ my_s = (rank == 0) ? s0_buf : s1_buf;
     const __half* __restrict__ peer_s = (rank == 0) ? s1_buf : s0_buf;
 
@@ -196,8 +213,8 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    __half* s0_buf = odd ? (s0 + num_elems) : s0;
-    __half* s1_buf = odd ? (s1 + num_elems) : s1;
+    __half* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __half* __restrict__ my_s = (rank == 0) ? s0_buf : s1_buf;
     const __half* __restrict__ peer_s = (rank == 0) ? s1_buf : s0_buf;
 
@@ -412,8 +429,8 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_bf16_kernel(
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    __nv_bfloat16* s0_buf = odd ? (s0 + num_elems) : s0;
-    __nv_bfloat16* s1_buf = odd ? (s1 + num_elems) : s1;
+    __nv_bfloat16* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    __nv_bfloat16* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __nv_bfloat16* __restrict__ my_s = (rank == 0) ? s0_buf : s1_buf;
     const __nv_bfloat16* __restrict__ peer_s = (rank == 0) ? s1_buf : s0_buf;
 
@@ -444,8 +461,8 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f32_kernel(
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    float* s0_buf = odd ? (s0 + num_elems) : s0;
-    float* s1_buf = odd ? (s1 + num_elems) : s1;
+    float* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    float* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
     float* my_s = (rank == 0) ? s0_buf : s1_buf;
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
@@ -475,7 +492,7 @@ __global__ void __launch_bounds__(256, 1) tp2_broadcast_i32_kernel(
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
-    int32_t* s0_buf = odd ? (s0 + num_elems) : s0;
+    int32_t* s0_buf = small_epoch_ptr(s0, sig0, odd, num_elems);
 
     if (rank == 0) {
         for (int i = threadIdx.x; i < num_elems; i += blockDim.x) {
@@ -511,8 +528,8 @@ __global__ void __launch_bounds__(256, 1) tp2_all_gather_top1_f32_i32_kernel(
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    Top1Pair* s0_buf = odd ? (s0 + num_rows) : s0;
-    Top1Pair* s1_buf = odd ? (s1 + num_rows) : s1;
+    Top1Pair* s0_buf = small_epoch_ptr(s0, sig0, odd, num_rows);
+    Top1Pair* s1_buf = small_epoch_ptr(s1, sig1, odd, num_rows);
     Top1Pair* my_s = (rank == 0) ? s0_buf : s1_buf;
 
     for (int i = threadIdx.x; i < num_rows; i += blockDim.x) {
@@ -540,10 +557,8 @@ __global__ void __launch_bounds__(256, 1) tp2_all_gather_topk_f32_i32_kernel(
     const int num_elems = num_rows * k;
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
-    Top1Pair* base0 = (num_elems <= 576) ? reinterpret_cast<Top1Pair*>(&sig0->end[0][0]) : s0;
-    Top1Pair* base1 = (num_elems <= 576) ? reinterpret_cast<Top1Pair*>(&sig1->end[0][0]) : s1;
-    Top1Pair* s0_buf = odd ? (base0 + num_elems) : base0;
-    Top1Pair* s1_buf = odd ? (base1 + num_elems) : base1;
+    Top1Pair* s0_buf = small_epoch_ptr(s0, sig0, odd, num_elems);
+    Top1Pair* s1_buf = small_epoch_ptr(s1, sig1, odd, num_elems);
     Top1Pair* my_s = (rank == 0) ? s0_buf : s1_buf;
     for (int i = threadIdx.x; i < num_elems; i += blockDim.x) {
         my_s[i] = Top1Pair{local_vals[i], local_ids[i]};
@@ -582,8 +597,8 @@ __global__ void __launch_bounds__(256, 1) tp2_all_reduce_hc_combine_tap_f16_kern
     const int num_elems = num_tokens * hidden_size;
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
-    __half* s0_buf = odd ? (s0 + num_elems) : s0;
-    __half* s1_buf = odd ? (s1 + num_elems) : s1;
+    __half* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __half* my_s = (rank == 0) ? s0_buf : s1_buf;
     const __half* peer_s = (rank == 0) ? s1_buf : s0_buf;
     for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
@@ -641,7 +656,7 @@ __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
-    __half* s1_buf = odd ? (s1 + num_elems) : s1;
+    __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
     const int full_vocab = local_vocab_size * 2;
 
     const bool vec8 = ((local_vocab_size & 7) == 0) &&
@@ -748,7 +763,7 @@ __global__ void __launch_bounds__(512, 1) tp4_all_reduce_f16_kernel(
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         __half* base = reinterpret_cast<__half*>(ptrs.s[r]);
-        s_buf[r] = odd ? (base + num_elems) : base;
+        s_buf[r] = stage_epoch_ptr(base, self_sg, odd, num_elems);
     }
     __half* __restrict__ my_s = s_buf[rank];
 
@@ -838,7 +853,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp4_all_reduce_residual_gemma_rms_
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         __half* base = reinterpret_cast<__half*>(ptrs.s[r]);
-        s_buf[r] = odd ? (base + num_elems) : base;
+        s_buf[r] = stage_epoch_ptr(base, self_sg, odd, num_elems);
     }
     __half* __restrict__ my_s = s_buf[rank];
 
@@ -1044,7 +1059,7 @@ __global__ void __launch_bounds__(512, 1) tp4_all_reduce_bf16_kernel(
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         __nv_bfloat16* base = reinterpret_cast<__nv_bfloat16*>(ptrs.s[r]);
-        s_buf[r] = odd ? (base + num_elems) : base;
+        s_buf[r] = stage_epoch_ptr(base, self_sg, odd, num_elems);
     }
     __nv_bfloat16* __restrict__ my_s = s_buf[rank];
 
@@ -1079,7 +1094,7 @@ __global__ void __launch_bounds__(512, 1) tp4_all_reduce_f32_kernel(
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         float* base = reinterpret_cast<float*>(ptrs.s[r]);
-        s_buf[r] = odd ? (base + num_elems) : base;
+        s_buf[r] = stage_epoch_ptr(base, self_sg, odd, num_elems);
     }
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
@@ -1109,7 +1124,7 @@ __global__ void __launch_bounds__(256, 1) tp4_broadcast_i32_kernel(
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
     int32_t* s0_base = reinterpret_cast<int32_t*>(ptrs.s[0]);
-    int32_t* s0_buf = odd ? (s0_base + num_elems) : s0_base;
+    int32_t* s0_buf = small_epoch_ptr(s0_base, ptrs.sig[0], odd, num_elems);
 
     if (rank == 0) {
         for (int i = threadIdx.x; i < num_elems; i += blockDim.x) {
@@ -1141,7 +1156,7 @@ __global__ void __launch_bounds__(256, 1) tp4_all_gather_top1_f32_i32_kernel(
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         Top1Pair* base = reinterpret_cast<Top1Pair*>(ptrs.s[r]);
-        s_buf[r] = odd ? (base + num_rows) : base;
+        s_buf[r] = small_epoch_ptr(base, ptrs.sig[r], odd, num_rows);
     }
 
     for (int i = threadIdx.x; i < num_rows; i += blockDim.x) {
@@ -1175,10 +1190,8 @@ __global__ void __launch_bounds__(256, 1) tp4_all_gather_topk_f32_i32_kernel(
     Top1Pair* s_buf[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-        Top1Pair* base = (num_elems <= 576)
-            ? reinterpret_cast<Top1Pair*>(&ptrs.sig[r]->end[0][0])
-            : reinterpret_cast<Top1Pair*>(ptrs.s[r]);
-        s_buf[r] = odd ? (base + num_elems) : base;
+        Top1Pair* base = reinterpret_cast<Top1Pair*>(ptrs.s[r]);
+        s_buf[r] = small_epoch_ptr(base, ptrs.sig[r], odd, num_elems);
     }
     for (int i = threadIdx.x; i < num_elems; i += blockDim.x) {
         s_buf[rank][i] = Top1Pair{local_vals[i], local_ids[i]};
@@ -1229,7 +1242,7 @@ __global__ void __launch_bounds__(256, 1) tp4_all_reduce_hc_combine_tap_f16_kern
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         __half* base = reinterpret_cast<__half*>(ptrs.s[r]);
-        s_buf[r] = odd ? (base + num_elems) : base;
+        s_buf[r] = stage_epoch_ptr(base, self_sg, odd, num_elems);
     }
     for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
         const size_t roff = (size_t)tok * hidden_size;
@@ -1292,7 +1305,7 @@ __global__ void __launch_bounds__(512, 1) tp4_gather_vocab_f16_kernel(
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
         __half* base = reinterpret_cast<__half*>(ptrs.s[r]);
-        s_buf[r] = odd ? (base + num_elems) : base;
+        s_buf[r] = stage_epoch_ptr(base, self_sg, odd, num_elems);
     }
     const int full_vocab = local_vocab_size * 4;
 

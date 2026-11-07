@@ -47,7 +47,6 @@ fn main() {
     sources.sort();
     headers.sort();
 
-    let header_epoch = newest_mtime(&headers).unwrap_or(0);
     let arch_spec = var("W34_ARCH").unwrap_or_else(|_| "sm_86,sm_89".into());
     let gencode_flags = build_gencode_flags(&arch_spec);
 
@@ -65,13 +64,14 @@ fn main() {
         let stem = src.file_stem().unwrap().to_str().unwrap();
         let obj = out.join(format!("{stem}.o"));
         let stamp = stamps.join(format!("{stem}.stamp"));
+        let header_digest = per_source_header_digest(&csrc, src);
         let dependency_epoch = if matches!(stem, "op_vision_fa2" | "op_paged_fa2") {
             vendor_epoch
         } else {
             0
         };
         let content = format!(
-            "{flags}\n{}\n{header_epoch}\n{dependency_epoch}\n",
+            "{flags}\n{}\n{header_digest:016x}\n{dependency_epoch}\n",
             mtime(src).unwrap_or(0)
         );
         let up_to_date = obj.exists()
@@ -250,6 +250,119 @@ fn mtime(p: &Path) -> Option<u64> {
 
 fn newest_mtime(paths: &[PathBuf]) -> Option<u64> {
     paths.iter().filter_map(|p| mtime(p)).max()
+}
+
+fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Computes a per-`.cu` transitive `#include "..."` digest so:
+/// 1. Modifying a local header (e.g. `moe_sparse_inline.cuh`, `hadamard_inline.cuh`, `marlin/*.h`)
+///    only invalidates translation units that transitively include it.
+/// 2. Adding or modifying an unrelated `w34_*` function prototype in `w34_cuda.h` only invalidates
+///    translation units that reference that symbol, while shared struct/enum/`static_assert` edits
+///    in `w34_cuda.h` invalidate all translation units that include `w34_cuda.h`.
+fn per_source_header_digest(csrc: &Path, src: &Path) -> u64 {
+    let mut visited = Vec::new();
+    let mut queue = vec![src.to_path_buf()];
+    let mut combined_tu_text = fs::read_to_string(src).unwrap_or_default();
+    let mut includes_w34_cuda_h = false;
+    let w34_cuda_h = csrc.join("w34_cuda.h").canonicalize().ok();
+
+    while let Some(cur) = queue.pop() {
+        let Ok(text) = fs::read_to_string(&cur) else {
+            continue;
+        };
+        let cur_dir = cur.parent().unwrap_or(csrc);
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("#include") else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(quoted) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let Some((rel, _)) = quoted.split_once('"') else {
+                continue;
+            };
+            let resolved = cur_dir
+                .join(rel)
+                .canonicalize()
+                .or_else(|_| csrc.join(rel).canonicalize());
+            let Ok(hdr) = resolved else {
+                continue;
+            };
+            if w34_cuda_h.as_ref() == Some(&hdr) {
+                includes_w34_cuda_h = true;
+                continue;
+            }
+            if !visited.contains(&hdr) {
+                if let Ok(hdr_text) = fs::read_to_string(&hdr) {
+                    combined_tu_text.push('\n');
+                    combined_tu_text.push_str(&hdr_text);
+                }
+                visited.push(hdr.clone());
+                queue.push(hdr);
+            }
+        }
+    }
+    visited.sort();
+    let mut digest = 0xcbf29ce484222325u64;
+    for hdr in &visited {
+        digest = fnv1a_update(digest, hdr.to_string_lossy().as_bytes());
+        if let Ok(bytes) = fs::read(hdr) {
+            digest = fnv1a_update(digest, &bytes);
+        }
+    }
+    if includes_w34_cuda_h
+        && let Some(w34_path) = w34_cuda_h
+        && let Ok(w34_text) = fs::read_to_string(&w34_path)
+    {
+        for stmt in w34_text.split(';') {
+            if let Some(fn_name) = extract_w34_fn_prototype_name(stmt) {
+                if contains_ident(&combined_tu_text, fn_name) {
+                    digest = fnv1a_update(digest, stmt.as_bytes());
+                    digest = fnv1a_update(digest, b";");
+                }
+            } else {
+                digest = fnv1a_update(digest, stmt.as_bytes());
+                digest = fnv1a_update(digest, b";");
+            }
+        }
+    }
+    digest
+}
+
+fn extract_w34_fn_prototype_name(stmt: &str) -> Option<&str> {
+    if stmt.contains("typedef") || stmt.contains("struct ") || stmt.contains("enum ") {
+        return None;
+    }
+    let open_paren = stmt.find('(')?;
+    let prefix = stmt[..open_paren].trim_end();
+    let name_start = prefix
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |idx| idx + 1);
+    let name = &prefix[name_start..];
+    name.starts_with("w34_").then_some(name)
+}
+
+fn contains_ident(haystack: &str, ident: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for (idx, _) in haystack.match_indices(ident) {
+        let prev_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+        let end = idx + ident.len();
+        let next_ok = end == bytes.len() || !is_ident_byte(bytes[end]);
+        if prev_ok && next_ok {
+            return true;
+        }
+    }
+    false
 }
 
 fn walk_vendor(dir: &Path, headers: &mut Vec<PathBuf>) {
