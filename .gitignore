@@ -5,6 +5,8 @@
 /vendor/
 /models/
 /benchmarks/perf/results/
+/benchmarks/quality/.venv/
+/benchmarks/quality/results/
 *.nsys-rep
 *.sqlite
 __pycache__/

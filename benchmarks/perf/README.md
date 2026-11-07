@@ -55,6 +55,15 @@ A zero exit does **not** mean the run is publication-ready. Unknown provenance,
 quality evidence, failures, and release-audit requirements are visible in reports.
 No engine has been automatically installed, modified, or tuned.
 
+## Upstream quality evaluations
+
+The separate [`../quality/`](../quality/README.md) environment invokes pinned
+upstream `lm-eval` directly for full IFEval and GSM8K, without modifying tasks,
+prompts or scoring. It is independent of this suite's small functional quality
+fixtures and Python standard-library client. Native lm-eval results can be
+retained as evidence, but are not automatically interpreted by `w34perf`'s
+fixture-specific quality gate or used to clear its publication blockers.
+
 ## Flash-Next HGPTQ refresh
 
 [Qualification outcome and retained evidence](campaigns/flash-next-hgptq.md):

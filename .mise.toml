@@ -101,6 +101,10 @@ depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "test", "oracle-che
 description = "CPU-only tests and manifest validation for the independent performance suite"
 run = "cd benchmarks/perf && python3 -m unittest discover -s tests -v && python3 -m w34perf validate suite.toml"
 
+[tasks."quality-check"]
+description = "CPU-only upstream lm-eval configuration checks (install benchmarks/quality environment first)"
+run = "benchmarks/quality/.venv/bin/python -m unittest discover -s benchmarks/quality/tests -v"
+
 [tasks."oracle-check"]
 description = "Host-only validation of real-image oracle and long-context gate harnesses"
 run = "python3 -m unittest discover -s tools/oracle -p 'test_*.py' -v"
