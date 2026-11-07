@@ -585,6 +585,43 @@ fn kv_policy_parsing_and_tensor_diff_metrics() {
 
 #[cfg(feature = "cuda")]
 #[test]
+fn compare_tp1_vs_tp2_tensors_enforces_presence_and_shapes() {
+    let mut tp1_map = std::collections::HashMap::new();
+    tp1_map.insert(
+        "final_norm".to_string(),
+        (vec![1, 4], vec![1.0f32, 2.0, 3.0, 4.0]),
+    );
+    tp1_map.insert("logits".to_string(), (vec![1, 8], vec![0.0f32; 8]));
+    let mut tp2_map = std::collections::HashMap::new();
+    tp2_map.insert(
+        "final_norm".to_string(),
+        (vec![1, 4], vec![1.0f32, 2.0, 3.0, 4.0]),
+    );
+    tp2_map.insert("logits".to_string(), (vec![1, 4], vec![0.0f32; 4]));
+    let summary = compare_tp1_vs_tp2_tensors(&tp1_map, &tp2_map, false, false).unwrap();
+    assert_eq!(summary.max_layer_diff, 0.0);
+
+    let mut tp2_missing = tp2_map.clone();
+    tp2_missing.remove("final_norm");
+    assert!(compare_tp1_vs_tp2_tensors(&tp1_map, &tp2_missing, false, false).is_err());
+
+    let mut tp2_extra = tp2_map.clone();
+    tp2_extra.insert(
+        "layer_0_hidden_after".to_string(),
+        (vec![1, 4], vec![1.0f32; 4]),
+    );
+    assert!(compare_tp1_vs_tp2_tensors(&tp1_map, &tp2_extra, false, false).is_err());
+
+    let mut tp2_bad_shape = tp2_map;
+    tp2_bad_shape.insert(
+        "final_norm".to_string(),
+        (vec![2, 2], vec![1.0f32, 2.0, 3.0, 4.0]),
+    );
+    assert!(compare_tp1_vs_tp2_tensors(&tp1_map, &tp2_bad_shape, false, false).is_err());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
 fn greedy_diff_image_rejects_speculation() {
     let err = prepare_cuda_cli(
         &args(&[

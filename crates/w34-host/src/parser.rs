@@ -432,79 +432,109 @@ impl SamplerV1 {
         let has_bans = self.params.ignore_eos || under_min;
 
         if has_rep || has_freq_pres || !self.params.logit_bias.is_empty() || has_bans {
-            let mut merged: BTreeMap<i32, w34_kernels::ffi::W34SamplerSparseEntry> =
-                BTreeMap::new();
-            if has_rep {
-                for (&tid, &cnt) in &self.prompt_counts {
-                    if cnt > 0 && tid >= 0 && (tid as usize) < vocab_size {
-                        merged
-                            .entry(tid)
-                            .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
-                                token_id: tid,
-                                ..Default::default()
-                            })
-                            .in_prompt = 1;
+            let vocab_i32 = i32::try_from(vocab_size).unwrap_or(i32::MAX);
+            let mut p_iter = self
+                .prompt_counts
+                .iter()
+                .filter(|&(&tid, &cnt)| has_rep && cnt > 0 && tid >= 0 && tid < vocab_i32)
+                .peekable();
+            let mut o_iter = self
+                .output_counts
+                .iter()
+                .filter(|&(&tid, &cnt)| {
+                    (has_rep || has_freq_pres) && cnt > 0 && tid >= 0 && tid < vocab_i32
+                })
+                .peekable();
+            sparse_out.reserve(
+                (if has_rep { self.prompt_counts.len() } else { 0 })
+                    + (if has_rep || has_freq_pres {
+                        self.output_counts.len()
+                    } else {
+                        0
+                    }),
+            );
+            loop {
+                match (p_iter.peek(), o_iter.peek()) {
+                    (Some(&(&p_tid, _)), Some(&(&o_tid, &o_cnt))) if p_tid == o_tid => {
+                        p_iter.next();
+                        o_iter.next();
+                        sparse_out.push(w34_kernels::ffi::W34SamplerSparseEntry {
+                            token_id: p_tid,
+                            output_count: o_cnt,
+                            in_prompt: 1,
+                            ..Default::default()
+                        });
                     }
-                }
-            }
-            if has_rep || has_freq_pres {
-                for (&tid, &cnt) in &self.output_counts {
-                    if cnt > 0 && tid >= 0 && (tid as usize) < vocab_size {
-                        merged
-                            .entry(tid)
-                            .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
-                                token_id: tid,
-                                ..Default::default()
-                            })
-                            .output_count = cnt;
+                    (Some(&(&p_tid, _)), Some(&(&o_tid, _))) if p_tid < o_tid => {
+                        p_iter.next();
+                        sparse_out.push(w34_kernels::ffi::W34SamplerSparseEntry {
+                            token_id: p_tid,
+                            in_prompt: 1,
+                            ..Default::default()
+                        });
                     }
+                    (Some(&(&p_tid, _)), None) => {
+                        p_iter.next();
+                        sparse_out.push(w34_kernels::ffi::W34SamplerSparseEntry {
+                            token_id: p_tid,
+                            in_prompt: 1,
+                            ..Default::default()
+                        });
+                    }
+                    (_, Some(&(&o_tid, &o_cnt))) => {
+                        o_iter.next();
+                        sparse_out.push(w34_kernels::ffi::W34SamplerSparseEntry {
+                            token_id: o_tid,
+                            output_count: o_cnt,
+                            ..Default::default()
+                        });
+                    }
+                    (None, None) => break,
                 }
             }
             for (&tid, &bias) in &self.params.logit_bias {
-                if tid >= 0 && (tid as usize) < vocab_size {
-                    merged
-                        .entry(tid)
-                        .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
-                            token_id: tid,
-                            ..Default::default()
-                        })
-                        .logit_bias = bias;
+                if tid >= 0 && tid < vocab_i32 {
+                    match sparse_out[sparse_start..].binary_search_by_key(&tid, |e| e.token_id) {
+                        Ok(idx) => sparse_out[sparse_start + idx].logit_bias = bias,
+                        Err(idx) => sparse_out.insert(
+                            sparse_start + idx,
+                            w34_kernels::ffi::W34SamplerSparseEntry {
+                                token_id: tid,
+                                logit_bias: bias,
+                                ..Default::default()
+                            },
+                        ),
+                    }
                 }
             }
             if has_bans {
                 let iter_eos = model_eos
                     .iter()
                     .chain(self.params.eos_token_ids.iter())
-                    .copied();
-                for tid in iter_eos {
-                    if tid >= 0
-                        && (tid as usize) < vocab_size
-                        && self.is_token_soft_banned(tid, model_eos)
-                    {
-                        merged
-                            .entry(tid)
-                            .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
+                    .copied()
+                    .filter(|&tid| {
+                        tid >= 0 && tid < vocab_i32 && self.is_token_soft_banned(tid, model_eos)
+                    });
+                let iter_stop = self
+                    .params
+                    .stop_token_ids
+                    .iter()
+                    .copied()
+                    .filter(|&tid| under_min && tid >= 0 && tid < vocab_i32);
+                for tid in iter_eos.chain(iter_stop) {
+                    match sparse_out[sparse_start..].binary_search_by_key(&tid, |e| e.token_id) {
+                        Ok(idx) => sparse_out[sparse_start + idx].banned = 1,
+                        Err(idx) => sparse_out.insert(
+                            sparse_start + idx,
+                            w34_kernels::ffi::W34SamplerSparseEntry {
                                 token_id: tid,
+                                banned: 1,
                                 ..Default::default()
-                            })
-                            .banned = 1;
-                    }
-                }
-                if under_min {
-                    for &tid in &self.params.stop_token_ids {
-                        if tid >= 0 && (tid as usize) < vocab_size {
-                            merged
-                                .entry(tid)
-                                .or_insert_with(|| w34_kernels::ffi::W34SamplerSparseEntry {
-                                    token_id: tid,
-                                    ..Default::default()
-                                })
-                                .banned = 1;
-                        }
+                            },
+                        ),
                     }
                 }
             }
-            sparse_out.extend(merged.into_values());
         }
         let sparse_count = sparse_out.len() - sparse_start;
         let top_logprobs_k = if self.params.logprobs {

@@ -319,12 +319,15 @@ __global__ void moe_sparse_mma_kernel(
     const int pair = __ldg(&pairs[blockIdx.y * 8 + r]);
     const int out_p0 = __ldg(&pairs[blockIdx.y * 8 + c * 2]);
     const int out_p1 = __ldg(&pairs[blockIdx.y * 8 + c * 2 + 1]);
+    const __half out_tw0 = (!GATE && out_p0 >= 0) ? __float2half_rn(__ldg(&tw[out_p0])) : __float2half_rn(0.0f);
+    const __half out_tw1 = (!GATE && out_p1 >= 0) ? __float2half_rn(__ldg(&tw[out_p1])) : __float2half_rn(0.0f);
     const int xr = GATE ? (pair >= 0 ? pair / top_k : -1) : pair;
     const int rows = GATE ? N * 2 : N;
-    __shared__ float partial[4][GATE ? 8 : 4][32];
+    __shared__ float partial[APPLY_HAD64 ? 2 : 1][4][GATE ? 8 : 4][32];
     __shared__ __align__(16) __half s_had[8][64];
 
     for (int st_idx = 0; st_idx < SUB_TILES; ++st_idx) {
+        const int buf = APPLY_HAD64 ? (st_idx & 1) : 0;
         const int base = (APPLY_HAD64 ? ((int)blockIdx.x * 4 + st_idx)
                                       : ((int)blockIdx.x * ROW_TILES + tile_m)) * 16;
         const int nr = base + r;
@@ -387,48 +390,42 @@ __global__ void moe_sparse_mma_kernel(
         }
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            partial[wid][j][lane] = acc[j];
+            partial[buf][wid][j][lane] = acc[j];
             if (GATE)
-                partial[wid][j + 4][lane] = up[j];
+                partial[buf][wid][j + 4][lane] = up[j];
         }
         __syncthreads();
-        if (warp_k == 0) {
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                if (GATE) {
-                    acc[j] = (partial[0][j][lane] + partial[1][j][lane]) +
-                             (partial[2][j][lane] + partial[3][j][lane]);
-                    up[j] = (partial[0][j + 4][lane] + partial[1][j + 4][lane]) +
-                            (partial[2][j + 4][lane] + partial[3][j + 4][lane]);
-                } else {
-                    const int w0 = tile_m * 2;
-                    acc[j] = partial[w0][j][lane] + partial[w0 + 1][j][lane];
+        if constexpr (GATE) {
+            const int j = wid;
+            const float a = (partial[buf][0][j][lane] + partial[buf][1][j][lane]) +
+                            (partial[buf][2][j][lane] + partial[buf][3][j][lane]);
+            const float u = (partial[buf][0][j + 4][lane] + partial[buf][1][j + 4][lane]) +
+                            (partial[buf][2][j + 4][lane] + partial[buf][3][j + 4][lane]);
+            if constexpr (APPLY_HAD64) {
+                const int slot = c * 2 + (j & 1);
+                const int col_in_64 = st_idx * 16 + r + (j / 2) * 8;
+                s_had[slot][col_in_64] =
+                    marlin_silu_and_mul_f16(__float2half_rn(a), __float2half_rn(u));
+            } else {
+                const int p = (j & 1) ? out_p1 : out_p0;
+                const int row = nr + (j / 2) * 8;
+                if (p >= 0) {
+                    intermediate[(size_t)p * N + row] =
+                        marlin_silu_and_mul_f16(__float2half_rn(a), __float2half_rn(u));
                 }
             }
+        } else {
+            const int w0 = tile_m * 2;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                if constexpr (APPLY_HAD64) {
-                    const int slot = c * 2 + (j & 1);
-                    const int col_in_64 = st_idx * 16 + r + (j / 2) * 8;
-                    s_had[slot][col_in_64] =
-                        marlin_silu_and_mul_f16(__float2half_rn(acc[j]), __float2half_rn(up[j]));
-                } else {
-                    const int p = (j & 1) ? out_p1 : out_p0;
-                    const int row = nr + (j / 2) * 8;
-                    if (p >= 0) {
-                        if (GATE)
-                            intermediate[(size_t)p * N + row] =
-                                marlin_silu_and_mul_f16(__float2half_rn(acc[j]), __float2half_rn(up[j]));
-                        else
-                            down[(size_t)p * N + row] =
-                                __hmul(__float2half_rn(acc[j]), __float2half_rn(__ldg(&tw[p])));
-                    }
+            for (int jj = 0; jj < 2; ++jj) {
+                const int j = warp_k * 2 + jj;
+                const float a = partial[0][w0][j][lane] + partial[0][w0 + 1][j][lane];
+                const int p = (j & 1) ? out_p1 : out_p0;
+                const __half tw_val = (j & 1) ? out_tw1 : out_tw0;
+                const int row = nr + (j / 2) * 8;
+                if (p >= 0) {
+                    down[(size_t)p * N + row] = __hmul(__float2half_rn(a), tw_val);
                 }
-            }
-        }
-        if constexpr (APPLY_HAD64) {
-            if (st_idx + 1 < SUB_TILES) {
-                __syncthreads();
             }
         }
     }

@@ -19,10 +19,10 @@ struct Request {
     hidden: i32,
     intermediate: i32,
     experts: i32,
-    pad: [i32; 5],
+    pad: [i32; 7],
     ids: [i32; 64],
     weights: [f32; 64],
-    x: [f32; 16384],
+    x: [u16; 16384],
 }
 #[repr(C, align(64))]
 struct Response {
@@ -168,7 +168,10 @@ struct Pool {
 }
 impl Pool {
     fn new() -> crate::cuda::Result<Self> {
-        let cpus = detect_worker_cpus();
+        Self::new_with_cpus(detect_worker_cpus())
+    }
+    fn new_with_cpus(cpus: Vec<usize>) -> crate::cuda::Result<Self> {
+        let cpus = if cpus.is_empty() { vec![0] } else { cpus };
         let mut pool = Self {
             state: Arc::new((Mutex::new(Dispatch::default()), Wake::default())),
             cpus,
@@ -392,7 +395,7 @@ impl Runtime {
                                     evaluate_into(
                                         &p,
                                         &m.store,
-                                        Input::F32(&r.x[..elems]),
+                                        Input::F16(&r.x[..elems]),
                                         r.tokens as usize,
                                         &tasks[..n_tasks],
                                         Output::F32(&mut (&mut (*rs).y)[..elems]),
@@ -424,6 +427,39 @@ impl Runtime {
             prefill_active,
             prefill_park,
             server: Some(server),
+            device,
+        }))
+    }
+    /// Creates a prefill-only worker pool for `EP >= 2` rank `ep_rank` without spawning
+    /// a spinning decode responder thread or allocating mapped decode mailboxes.
+    /// Physical worker cores are partitioned disjointly across `ep_size` ranks so
+    /// concurrent `TP=2 / EP=2` prefill ranks never contend on the same CPU cores.
+    pub fn new_prefill_only(
+        device: i32,
+        ep_rank: usize,
+        ep_size: usize,
+    ) -> crate::cuda::Result<Arc<Self>> {
+        let all_cpus = detect_worker_cpus();
+        let ep_size = ep_size.max(1);
+        let ep_rank = ep_rank.min(ep_size - 1);
+        let rank_cpus = if all_cpus.len() >= ep_size {
+            let base = all_cpus.len() / ep_size;
+            let rem = all_cpus.len() % ep_size;
+            let start = ep_rank * base + ep_rank.min(rem);
+            let len = base + usize::from(ep_rank < rem);
+            all_cpus[start..start + len].to_vec()
+        } else {
+            vec![all_cpus[ep_rank % all_cpus.len()]]
+        };
+        let pool = Arc::new(Pool::new_with_cpus(rank_cpus)?);
+        Ok(Arc::new(Self {
+            pool,
+            layers: Arc::new(Mutex::new(Vec::new())),
+            layer_count: Arc::new(AtomicUsize::new(0)),
+            stop: Arc::new(AtomicBool::new(false)),
+            prefill_active: Arc::new(AtomicBool::new(false)),
+            prefill_park: Arc::new((Mutex::new(()), Condvar::new())),
+            server: None,
             device,
         }))
     }
@@ -781,12 +817,14 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
     }
 }
 enum Input<'a> {
+    #[cfg(test)]
     F32(&'a [f32]),
     F16(&'a [u16]),
 }
 impl Input<'_> {
     fn len(&self) -> usize {
         match self {
+            #[cfg(test)]
             Self::F32(x) => x.len(),
             Self::F16(x) => x.len(),
         }
@@ -801,6 +839,7 @@ impl Input<'_> {
     ) -> Result<(), eval::EvalError> {
         let range = tok * h..(tok + 1) * h;
         match self {
+            #[cfg(test)]
             Self::F32(x) => eval::prepare_x_perm_grouped(&x[range], group_size, xp, xg),
             Self::F16(x) => eval::prepare_x_perm_f16_grouped(&x[range], group_size, xp, xg),
         }
@@ -1044,12 +1083,45 @@ mod tests {
     use super::*;
     #[test]
     fn mailbox_abi() {
-        assert_eq!(std::mem::offset_of!(Request, ids), 56);
-        assert_eq!(std::mem::offset_of!(Request, x), 568);
-        assert_eq!(std::mem::size_of::<Request>(), 66112);
+        assert_eq!(std::mem::offset_of!(Request, ids), 64);
+        assert_eq!(std::mem::offset_of!(Request, x), 576);
+        assert_eq!(std::mem::size_of::<Request>(), 33344);
         assert_eq!(std::mem::offset_of!(Response, status), 8);
         assert_eq!(std::mem::offset_of!(Response, y), 64);
         assert_eq!(std::mem::size_of::<Response>(), 65600);
+    }
+    #[test]
+    fn new_prefill_only_partitions_ep_cpus_and_matches_prefill_output() {
+        let _device = CudaDevice::set_current(0).unwrap();
+        let r0 = Runtime::new_prefill_only(0, 0, 2).unwrap();
+        let r1 = Runtime::new_prefill_only(0, 1, 2).unwrap();
+        assert!(r0.server.is_none());
+        assert!(r1.server.is_none());
+        assert!(!r0.pool.cpus.is_empty());
+        assert!(!r1.pool.cpus.is_empty());
+        if detect_worker_cpus().len() >= 2 {
+            for c in &r0.pool.cpus {
+                assert!(
+                    !r1.pool.cpus.contains(c),
+                    "EP=2 prefill-only worker pools must use disjoint physical CPU sets"
+                );
+            }
+        }
+        let store = zero_store();
+        let x = vec![0x3c00u16; 2 * 128];
+        let mut out0 = vec![0u16; 2 * 128];
+        let mut out1 = vec![0u16; 2 * 128];
+        let mut toks = vec![0i32; 96];
+        let mut wts = vec![0.0f32; 96];
+        toks[0] = 0;
+        toks[1] = 1;
+        wts[0] = 0.5;
+        wts[1] = 0.5;
+        r0.prefill(&store, &x, 2, &[0], &[2], &toks, &wts, &mut out0)
+            .unwrap();
+        r1.prefill(&store, &x, 2, &[0], &[2], &toks, &wts, &mut out1)
+            .unwrap();
+        assert_eq!(out0, out1);
     }
     #[test]
     fn mailbox_retains_store_and_responds_until_joined_shutdown() {

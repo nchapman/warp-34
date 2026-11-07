@@ -862,7 +862,7 @@ impl Qwen3_5Engine {
                 max_verify_tokens,
                 max_checkpoints_per_req,
             )?;
-            r0.forward_selected_rows(
+            r0.forward_selected_rows_maybe_skip_greedy(
                 tok_ptr,
                 pos_ptr,
                 total_tokens,
@@ -870,6 +870,7 @@ impl Qwen3_5Engine {
                 &gdn_batch,
                 None,
                 &selected_rows,
+                skip_host_greedy,
             )?
         } else {
             let comm = self.tp2_comm.as_ref().unwrap().clone();
@@ -924,7 +925,7 @@ impl Qwen3_5Engine {
                         max_verify_tokens,
                         max_checkpoints_per_req,
                     )?;
-                    r0.forward_selected_rows(
+                    r0.forward_selected_rows_maybe_skip_greedy(
                         tok_ptr,
                         pos_ptr,
                         total_tokens,
@@ -932,6 +933,7 @@ impl Qwen3_5Engine {
                         &gdn_batch,
                         Some(&c0),
                         sr_ref,
+                        skip_host_greedy,
                     )
                 });
 
@@ -961,7 +963,7 @@ impl Qwen3_5Engine {
                             max_verify_tokens,
                             max_checkpoints_per_req,
                         )?;
-                        let _ = r_peer.forward_selected_rows(
+                        let _ = r_peer.forward_selected_rows_maybe_skip_greedy(
                             tok_ptr,
                             pos_ptr,
                             total_tokens,
@@ -969,6 +971,7 @@ impl Qwen3_5Engine {
                             &gdn_batch,
                             Some(&cp),
                             sr_ref,
+                            skip_host_greedy,
                         )?;
                         Ok(())
                     }));

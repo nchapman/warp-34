@@ -5,7 +5,7 @@
 use crate::{
     cache::StateTx,
     cuda::{DeviceBuffer, Result, check_rc, f16_to_f32},
-    dflash::{DFLASH2_MAX_BATCH_ROWS, DFlash2Rank, DraftCandidates},
+    dflash::{DFLASH2_MAX_BATCH_ROWS, DFlash2Rank},
     loader::resolve_hf_model_dir,
     model::{EngineBatchSlice, Qwen3_5Engine, RadixBenchMetrics, loader_err},
     mtp::{MAX_MTP_BATCH_SLOTS, Qwen3_5MtpRank},
@@ -559,7 +559,7 @@ impl NativeProposer {
                                 }
                                 (tokens, shifted.addr())
                             };
-                            r.ingest_kv_only(t, ids, input, comm)?;
+                            r.ingest_kv_only_no_sync(t, ids, input, comm)?;
                             check_rc(
                                 // SAFETY: tokens is nonempty and ptr spans every captured row;
                                 // tail owns exactly one MTP hidden row and survives synchronization.
@@ -641,21 +641,40 @@ impl NativeProposer {
                     return Ok(ids);
                 }
                 let comm = engine.tp2_comm.as_deref();
-                let candidates = if use_graph && rs.iter().all(|r| r.has_forward_graph()) {
-                    let enqueue_res: Result<()> = (|| {
-                        for ((r, t), &ptr) in rs.iter_mut().zip(&engine.ranks).zip(features) {
-                            r.ingest_no_sync(t, ptr, n)?;
-                            r.launch_forward_graph_async(t, anchor)?;
+                let dflash_graph =
+                    use_graph && rs.iter().all(DFlash2Rank::can_capture_select_greedy);
+                let outputs_res: Result<Vec<Vec<i32>>> = if dflash_graph {
+                    use crate::coordinated::{ReplayPhase, replay_ranks};
+                    let replay_res = replay_ranks(rs.len(), |phase, rank| {
+                        let r = &mut rs[rank];
+                        let t = &engine.ranks[rank];
+                        let ptr = features[rank];
+                        t.device.make_current()?;
+                        match phase {
+                            ReplayPhase::Upload => {
+                                r.ingest_no_sync(t, ptr, n)?;
+                                r.prepare_select_greedy_graph_inputs_async(t, anchor)
+                            }
+                            ReplayPhase::Capture => r.ensure_select_greedy_graph(t, comm),
+                            ReplayPhase::Launch => r.replay_select_greedy_graph_async(t),
                         }
-                        Ok(())
-                    })();
-                    match enqueue_res {
+                    });
+                    match replay_res {
                         Ok(()) => rs
                             .iter_mut()
                             .zip(&engine.ranks)
-                            .map(|(r, t)| r.collect_forward_topk_host(t, anchor))
+                            .map(|(r, t)| r.collect_select_greedy_host(t, anchor))
                             .collect::<Result<Vec<_>>>(),
-                        Err(e) => Err(e),
+                        Err(error) => {
+                            if error.partial_launch {
+                                eprintln!(
+                                    "[w34] fatal: asymmetric DFlash TP graph launch failure: {}",
+                                    error.source
+                                );
+                                std::process::abort();
+                            }
+                            Err(error.source)
+                        }
                     }
                 } else {
                     std::thread::scope(|scope| {
@@ -664,9 +683,9 @@ impl NativeProposer {
                             .zip(&mut engine.ranks)
                             .zip(features)
                             .map(|((r, t), &ptr)| {
-                                scope.spawn(move || -> Result<DraftCandidates> {
+                                scope.spawn(move || -> Result<Vec<i32>> {
                                     r.ingest_no_sync(t, ptr, n)?;
-                                    r.forward(t, anchor, comm)
+                                    r.forward_select_greedy_tp(t, anchor, comm)
                                 })
                             })
                             .collect();
@@ -678,8 +697,8 @@ impl NativeProposer {
                             .collect::<Result<Vec<_>>>()
                     })
                 };
-                let candidates = match candidates {
-                    Ok(c) => c,
+                let mut outputs = match outputs_res {
+                    Ok(o) => o,
                     Err(e) => {
                         for t in &engine.ranks {
                             let _ = t.device.make_current();
@@ -688,22 +707,60 @@ impl NativeProposer {
                         return Err(e);
                     }
                 };
+                if outputs.windows(2).any(|p| p[0] != p[1]) {
+                    return Err(loader_err("DFlash TP token disagreement"));
+                }
                 self.resident_tokens.extend_from_slice(tokens);
                 self.processed += tokens.len();
-                let merged = DraftCandidates::merge(&candidates)?;
-                let mut ids = rs[0].select_greedy(&engine.ranks[0], anchor, &merged)?;
+                let mut ids = outputs.swap_remove(0);
                 ids.truncate(k);
                 Ok(ids)
             }
             Ranks::Mtp(rs) => {
-                if self.current.is_none()
-                    && engine.use_cuda_graph
-                    && rs.iter().all(Qwen3_5MtpRank::supports_cuda_graph)
+                if tokens.len() > self.max_rows.min(MTP_STAGE_ROWS) {
+                    self.ingest(engine, tokens, features)?;
+                    return self.propose(engine, anchor, k);
+                }
+                if let Some(memo) = &self.current
+                    && (memo.tokens.len() + tokens.len()) * self.row_bytes > MEMO_BUDGET
                 {
+                    self.current = None;
+                }
+                let memo_prev_lens = self
+                    .current
+                    .as_ref()
+                    .map(|m| (m.tokens.len(), m.features.len()));
+                if let Some(memo) = &mut self.current {
+                    let t0 = &engine.ranks[0];
+                    t0.device.make_current()?;
+                    let len_bytes = tokens.len() * self.row_bytes;
+                    let old_len = memo.features.len();
+                    memo.features.resize(old_len + len_bytes, 0);
+                    check_rc(
+                        // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
+                        // rank 0's stream is synchronized before ingest_and_propose returns below.
+                        unsafe {
+                            ffi::w34_memcpy_d2h_async(
+                                memo.features[old_len..].as_mut_ptr().cast(),
+                                features[0] as *const _,
+                                len_bytes,
+                                t0.stream.handle,
+                            )
+                        },
+                        "proposer memo copy",
+                    )?;
+                    memo.tokens.extend_from_slice(tokens);
+                }
+                let use_graph = engine.use_cuda_graph;
+                for r in rs.iter_mut() {
+                    r.use_cuda_graph = use_graph && r.supports_cuda_graph();
+                }
+                let mtp_graph = use_graph && rs.iter().all(Qwen3_5MtpRank::supports_cuda_graph);
+                let row_bytes = self.row_bytes;
+                let before = self.processed;
+                let comm = engine.tp2_comm.as_deref();
+                let outputs_res: Result<Vec<Vec<i32>>> = if mtp_graph {
                     use crate::coordinated::{ReplayPhase, replay_ranks};
-                    let row_bytes = self.row_bytes;
-                    let before = self.processed;
-                    let comm = engine.tp2_comm.as_deref();
                     let replay_res = replay_ranks(rs.len(), |phase, rank| {
                         let r = &mut rs[rank];
                         let t = &engine.ranks[rank];
@@ -767,46 +824,117 @@ impl NativeProposer {
                             ReplayPhase::Launch => r.replay_propose_graph_async(t, k),
                         }
                     });
-                    if let Err(error) = replay_res {
-                        if error.partial_launch {
-                            eprintln!(
-                                "[w34] fatal: asymmetric MTP TP graph launch failure: {}",
-                                error.source
-                            );
-                            std::process::abort();
+                    match replay_res {
+                        Ok(()) => rs
+                            .iter_mut()
+                            .zip(&engine.ranks)
+                            .map(|(r, t)| r.collect_propose_host(t, k))
+                            .collect::<Result<Vec<_>>>(),
+                        Err(error) => {
+                            if error.partial_launch {
+                                eprintln!(
+                                    "[w34] fatal: asymmetric MTP TP graph launch failure: {}",
+                                    error.source
+                                );
+                                std::process::abort();
+                            }
+                            Err(error.source)
                         }
+                    }
+                } else {
+                    std::thread::scope(|scope| {
+                        let mut jobs = Vec::new();
+                        for ((((r, t), tail), shifted), &ptr) in rs
+                            .iter_mut()
+                            .zip(&mut engine.ranks)
+                            .zip(&self.tail)
+                            .zip(&self.shifted)
+                            .zip(features)
+                        {
+                            jobs.push(scope.spawn(move || -> Result<Vec<i32>> {
+                                t.device.make_current()?;
+                                r.truncate(before.saturating_sub(1))?;
+                                let (ids, input) = if before == 0 {
+                                    (&tokens[1..], ptr)
+                                } else {
+                                    check_rc(
+                                        // SAFETY: both resident buffers hold at least one MTP hidden row.
+                                        unsafe {
+                                            ffi::w34_memcpy_d2d_async(
+                                                shifted.addr() as *mut _,
+                                                tail.addr() as *const _,
+                                                row_bytes,
+                                                t.stream.handle,
+                                            )
+                                        },
+                                        "MTP preceding hidden",
+                                    )?;
+                                    if tokens.len() > 1 {
+                                        check_rc(
+                                            // SAFETY: rows<=max_rows and the final shifted row fits;
+                                            // source is the owned live capture for this whole batch.
+                                            unsafe {
+                                                ffi::w34_memcpy_d2d_async(
+                                                    (shifted.addr() + row_bytes as u64) as *mut _,
+                                                    ptr as *const _,
+                                                    (tokens.len() - 1) * row_bytes,
+                                                    t.stream.handle,
+                                                )
+                                            },
+                                            "MTP shifted hidden",
+                                        )?;
+                                    }
+                                    (tokens, shifted.addr())
+                                };
+                                r.ingest_kv_only_no_sync(t, ids, input, comm)?;
+                                check_rc(
+                                    // SAFETY: tokens is nonempty and ptr spans every captured row;
+                                    // tail owns exactly one MTP hidden row on this device.
+                                    unsafe {
+                                        ffi::w34_memcpy_d2d_async(
+                                            tail.addr() as *mut _,
+                                            (ptr + ((tokens.len() - 1) * row_bytes) as u64)
+                                                as *const _,
+                                            row_bytes,
+                                            t.stream.handle,
+                                        )
+                                    },
+                                    "MTP tail hidden",
+                                )?;
+                                r.propose(t, anchor, tail.addr(), k, comm)
+                            }));
+                        }
+                        jobs.into_iter()
+                            .map(|j| {
+                                j.join()
+                                    .map_err(|_| loader_err("MTP ingest+proposal rank panic"))?
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                };
+                let outputs = match outputs_res {
+                    Ok(o) => o,
+                    Err(e) => {
                         for (r, t) in rs.iter_mut().zip(&engine.ranks) {
                             let _ = t.device.make_current();
                             let _ = t.stream.synchronize();
                             let _ = r.truncate(before.saturating_sub(1));
                         }
-                        return Err(error.source);
-                    }
-                    let outputs = match rs
-                        .iter_mut()
-                        .zip(&engine.ranks)
-                        .map(|(r, t)| r.collect_propose_host(t, k))
-                        .collect::<Result<Vec<_>>>()
-                    {
-                        Ok(o) => o,
-                        Err(e) => {
-                            for (r, t) in rs.iter_mut().zip(&engine.ranks) {
-                                let _ = t.device.make_current();
-                                let _ = t.stream.synchronize();
-                                let _ = r.truncate(before.saturating_sub(1));
-                            }
-                            return Err(e);
+                        if let Some((prev_tok_len, prev_feat_len)) = memo_prev_lens
+                            && let Some(memo) = &mut self.current
+                        {
+                            memo.tokens.truncate(prev_tok_len);
+                            memo.features.truncate(prev_feat_len);
                         }
-                    };
-                    if outputs.windows(2).any(|p| p[0] != p[1]) {
-                        return Err(loader_err("MTP TP token disagreement"));
+                        return Err(e);
                     }
-                    self.resident_tokens.extend_from_slice(tokens);
-                    self.processed += tokens.len();
-                    return Ok(outputs.into_iter().next().unwrap());
+                };
+                if outputs.windows(2).any(|p| p[0] != p[1]) {
+                    return Err(loader_err("MTP TP token disagreement"));
                 }
-                self.ingest(engine, tokens, features)?;
-                self.propose(engine, anchor, k)
+                self.resident_tokens.extend_from_slice(tokens);
+                self.processed += tokens.len();
+                Ok(outputs.into_iter().next().unwrap())
             }
         }
     }
@@ -884,20 +1012,44 @@ impl NativeProposer {
                     ids.truncate(k);
                     return Ok(ids);
                 }
-                let candidates = if use_graph && rs.iter().all(|r| r.has_forward_graph()) {
-                    for (r, t) in rs.iter_mut().zip(&engine.ranks) {
-                        r.launch_forward_graph_async(t, anchor)?;
+                let dflash_graph =
+                    use_graph && rs.iter().all(DFlash2Rank::can_capture_select_greedy);
+                let mut outputs = if dflash_graph {
+                    use crate::coordinated::{ReplayPhase, replay_ranks};
+                    let replay_res = replay_ranks(rs.len(), |phase, rank| {
+                        let r = &mut rs[rank];
+                        let t = &engine.ranks[rank];
+                        t.device.make_current()?;
+                        match phase {
+                            ReplayPhase::Upload => {
+                                r.prepare_select_greedy_graph_inputs_async(t, anchor)
+                            }
+                            ReplayPhase::Capture => r.ensure_select_greedy_graph(t, comm),
+                            ReplayPhase::Launch => r.replay_select_greedy_graph_async(t),
+                        }
+                    });
+                    if let Err(error) = replay_res {
+                        if error.partial_launch {
+                            eprintln!(
+                                "[w34] fatal: asymmetric DFlash TP graph launch failure: {}",
+                                error.source
+                            );
+                            std::process::abort();
+                        }
+                        return Err(error.source);
                     }
                     rs.iter_mut()
                         .zip(&engine.ranks)
-                        .map(|(r, t)| r.collect_forward_topk_host(t, anchor))
+                        .map(|(r, t)| r.collect_select_greedy_host(t, anchor))
                         .collect::<Result<Vec<_>>>()?
                 } else {
                     std::thread::scope(|scope| {
                         let jobs: Vec<_> = rs
                             .iter_mut()
                             .zip(&mut engine.ranks)
-                            .map(|(r, t)| scope.spawn(move || r.forward(t, anchor, comm)))
+                            .map(|(r, t)| {
+                                scope.spawn(move || r.forward_select_greedy_tp(t, anchor, comm))
+                            })
                             .collect();
                         jobs.into_iter()
                             .map(|j| {
@@ -907,8 +1059,10 @@ impl NativeProposer {
                             .collect::<Result<Vec<_>>>()
                     })?
                 };
-                let merged = DraftCandidates::merge(&candidates)?;
-                let mut ids = rs[0].select_greedy(&engine.ranks[0], anchor, &merged)?;
+                if outputs.windows(2).any(|p| p[0] != p[1]) {
+                    return Err(loader_err("DFlash TP token disagreement"));
+                }
+                let mut ids = outputs.swap_remove(0);
                 ids.truncate(k);
                 Ok(ids)
             }

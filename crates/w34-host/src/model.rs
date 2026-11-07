@@ -36,6 +36,7 @@ mod generation;
 mod graph_io;
 mod graphs;
 mod rank;
+mod rank_runtime;
 mod sampling;
 pub(crate) mod weights;
 

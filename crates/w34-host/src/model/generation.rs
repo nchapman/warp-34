@@ -152,7 +152,7 @@ impl Qwen3_5Engine {
                     }],
                     None,
                     Some(&[is_final_chunk]),
-                    is_final_chunk && use_gpu_sampler,
+                    is_final_chunk && use_gpu_sampler && max_new_tokens > 0,
                 )?;
                 if is_final_chunk && !use_gpu_sampler {
                     first_tok = batch_out[0][0];
