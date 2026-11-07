@@ -614,9 +614,10 @@ impl Qwen3_5ModelRank {
                 s,
                 pre_attn_targets,
             )?;
-            let pre_mlp_targets = layer
-                .ffn
-                .pre_mlp_norm_targets(s.normed, h, is_single_stream);
+            let pre_mlp_targets =
+                layer
+                    .ffn
+                    .pre_mlp_norm_targets(s.normed, s.mlp, h, is_single_stream);
             layer.residual.post_attn_pre_mlp_with_targets(
                 &hc_ctx,
                 tp2,

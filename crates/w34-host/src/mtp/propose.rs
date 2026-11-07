@@ -365,7 +365,8 @@ impl Qwen3_5MtpRank {
                 .single_stream_post_attn_norm_ptr()
                 .ok_or_else(|| loader_err("MTP graph requires single-stream residual"))?;
             let [mlp_norm_out, mlp_norm_had64] =
-                self.ffn.pre_mlp_norm_targets(normed_buf, h_dim, true);
+                self.ffn
+                    .pre_mlp_norm_targets(normed_buf, mlp_out_buf, h_dim, true);
             if let Some(comm) = tp2 {
                 comm.all_reduce_residual_gemma_rms_norm_hadamard_f16(
                     &ex,
@@ -451,7 +452,7 @@ impl Qwen3_5MtpRank {
                     )?;
                 }
                 FfnBlockWeights::Moe(_) => {
-                    self.ffn.forward(
+                    self.ffn.forward_with_prerotated_input(
                         &ex,
                         &t.cublas,
                         t.marlin_ws.addr(),
@@ -471,6 +472,7 @@ impl Qwen3_5MtpRank {
                         moe_sh_act_buf,
                         moe_sh_out_buf,
                         moe_sh_gate_buf,
+                        mlp_norm_had64 != 0,
                     )?;
                 }
             }
@@ -1404,9 +1406,9 @@ impl Qwen3_5MtpRank {
             block_out_buf,
             num_tokens,
         )?;
-        let pre_mlp_targets = self
-            .ffn
-            .pre_mlp_norm_targets(normed_buf, h_dim, is_single_stream);
+        let pre_mlp_targets =
+            self.ffn
+                .pre_mlp_norm_targets(normed_buf, mlp_out_buf, h_dim, is_single_stream);
         self.residual.post_attn_pre_mlp_with_targets(
             &hc_ctx,
             tp2,

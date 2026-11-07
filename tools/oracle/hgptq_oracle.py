@@ -106,6 +106,70 @@ def patch_transforms():
         original_sha256=hashlib.sha256(orig_marlin_src.encode()).hexdigest(),
         patched_sha256=hashlib.sha256(textwrap.dedent(inspect.getsource(patched_marlin_apply)).encode()).hexdigest(),
     ))
+    # Patch CompressedTensorsMoEMethod.get_moe_method and MarlinExperts so
+    # transform_config online input Hadamard rotations targeting
+    # mlp.experts.\d+.(gate_proj|up_proj|down_proj) are applied to w13 input
+    # and w2 intermediate activations (upstream vLLM 0.31.0 only checks
+    # transform_config on LinearBase and ignores RoutedExperts).
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+        compressed_tensors_moe as ct_moe,
+        compressed_tensors_moe_wna16 as ct_moe_wna16,
+    )
+    from vllm.model_executor.layers.fused_moe.experts import marlin_moe
+    def _hadacore_pad32(x, ws):
+        orig_shape = x.shape
+        flat = x.reshape(-1, ws)
+        rem = flat.shape[0] % 32
+        if rem != 0:
+            flat = tfm_module.torch.nn.functional.pad(flat, (0, 0, 0, 32 - rem))
+        out = tfm_module.ops.hadacore_transform(flat, inplace=False)
+        if rem != 0:
+            out = out[:flat.shape[0] - (32 - rem)]
+        return out.reshape(orig_shape)
+    orig_get_moe = ct_moe.CompressedTensorsMoEMethod.get_moe_method
+    orig_get_moe_src = textwrap.dedent(inspect.getsource(orig_get_moe))
+    def patched_get_moe(quant_config, layer, layer_name):
+        method = orig_get_moe(quant_config, layer, layer_name)
+        tc = getattr(quant_config, 'transform_config', None)
+        if tc is not None:
+            in_gate, _ = linear.get_linear_transform_schemes(layer, f'{layer_name}.0.gate_proj', tc, {})
+            in_up, _ = linear.get_linear_transform_schemes(layer, f'{layer_name}.0.up_proj', tc, {})
+            in_down, _ = linear.get_linear_transform_schemes(layer, f'{layer_name}.0.down_proj', tc, {})
+            if in_gate != in_up:
+                raise ValueError(f'Mismatched MoE gate/up transform schemes on {layer_name}')
+            method._w13_hadamard_dim = in_gate[0].scheme.head_dim if 0 in in_gate and in_gate[0].scheme.type == 'hadamard' else 0
+            method._w2_hadamard_dim = in_down[0].scheme.head_dim if 0 in in_down and in_down[0].scheme.type == 'hadamard' else 0
+        return method
+    ct_moe.CompressedTensorsMoEMethod.get_moe_method = staticmethod(patched_get_moe)
+    orig_setup_kernel = ct_moe_wna16.CompressedTensorsWNA16MoEMethod._setup_kernel
+    def patched_setup_kernel(self, layer):
+        orig_setup_kernel(self, layer)
+        if getattr(self, 'moe_kernel', None) is not None and hasattr(self.moe_kernel, 'fused_experts'):
+            fe = self.moe_kernel.fused_experts
+            fe._w13_hadamard_dim = getattr(self, '_w13_hadamard_dim', 0)
+            fe._w2_hadamard_dim = getattr(self, '_w2_hadamard_dim', 0)
+    ct_moe_wna16.CompressedTensorsWNA16MoEMethod._setup_kernel = patched_setup_kernel
+    orig_marlin_moe_apply = marlin_moe.MarlinExperts.apply
+    orig_marlin_moe_act = marlin_moe.MarlinExperts.activation
+    def patched_marlin_moe_apply(self, output, hidden_states, *args, **kwargs):
+        w13_hd = getattr(self, '_w13_hadamard_dim', 0)
+        if w13_hd:
+            hidden_states = _hadacore_pad32(hidden_states, w13_hd)
+        return orig_marlin_moe_apply(self, output, hidden_states, *args, **kwargs)
+    def patched_marlin_moe_act(self, act_enum, act_output, act_input, **kwargs):
+        orig_marlin_moe_act(self, act_enum, act_output, act_input, **kwargs)
+        w2_hd = getattr(self, '_w2_hadamard_dim', 0)
+        if w2_hd:
+            act_output.copy_(_hadacore_pad32(act_output, w2_hd))
+    marlin_moe.MarlinExperts.apply = patched_marlin_moe_apply
+    marlin_moe.MarlinExperts.activation = patched_marlin_moe_act
+    records.append(dict(
+        method='CompressedTensorsMoEMethod.get_moe_method+MarlinExperts',
+        module=ct_moe.__file__,
+        module_sha256=sha(ct_moe.__file__),
+        original_sha256=hashlib.sha256(orig_get_moe_src.encode()).hexdigest(),
+        patched_sha256=hashlib.sha256(textwrap.dedent(inspect.getsource(patched_get_moe)).encode()).hexdigest(),
+    ))
     return dict(path=linear.__file__, file_sha256=sha(linear.__file__), patches=records)
 
 

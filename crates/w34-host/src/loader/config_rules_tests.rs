@@ -167,14 +167,14 @@ fn moe_35b_rules_resolve_experts_shared_and_vision_fc2() {
             "re:.*linear_attn\\.in_proj_a$",
             "re:.*linear_attn\\.in_proj_b$",
             "re:.*mlp\\.gate$",
-            "re:.*mlp\\.shared_expert.*"
+            "re:.*mlp\\.shared_expert_gate$"
         ],
         "config_groups": {
             "group_0": {
                 "format": "pack-quantized",
                 "targets": [
-                    "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp(?:\\.experts\\.\\d+)?)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
-                    "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp(?:\\.experts\\.\\d+)?)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                    "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+                    "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
                     "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
                 ],
                 "weights": {
@@ -216,13 +216,13 @@ fn moe_35b_rules_resolve_experts_shared_and_vision_fc2() {
                                 "re:.*linear_attn\\.in_proj_a$",
                                 "re:.*linear_attn\\.in_proj_b$",
                                 "re:.*mlp\\.gate$",
-                                "re:.*mlp\\.shared_expert.*"
+                                "re:.*mlp\\.shared_expert_gate$"
                             ],
                             "inverse": true,
                             "location": "weight_input",
                             "targets": [
-                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
-                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
                                 "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
                             ]
                         },
@@ -232,13 +232,13 @@ fn moe_35b_rules_resolve_experts_shared_and_vision_fc2() {
                                 "re:.*linear_attn\\.in_proj_a$",
                                 "re:.*linear_attn\\.in_proj_b$",
                                 "re:.*mlp\\.gate$",
-                                "re:.*mlp\\.shared_expert.*"
+                                "re:.*mlp\\.shared_expert_gate$"
                             ],
                             "inverse": false,
                             "location": "input",
                             "targets": [
-                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
-                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
                                 "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
                             ]
                         }
@@ -273,7 +273,13 @@ fn moe_35b_rules_resolve_experts_shared_and_vision_fc2() {
         "model.language_model.layers.0.linear_attn.in_proj_qkv",
         "model.language_model.layers.0.linear_attn.out_proj",
         "model.language_model.layers.3.self_attn.q_proj",
+        "model.language_model.layers.0.mlp.experts.0.gate_proj",
+        "model.language_model.layers.39.mlp.experts.255.down_proj",
+        "model.language_model.layers.0.mlp.shared_expert.gate_proj",
+        "model.language_model.layers.0.mlp.shared_expert.down_proj",
         "mtp.layers.0.self_attn.o_proj",
+        "mtp.layers.0.mlp.experts.0.up_proj",
+        "mtp.layers.0.mlp.shared_expert.down_proj",
         "model.visual.blocks.0.attn.qkv",
     ] {
         assert_eq!(
@@ -284,25 +290,11 @@ fn moe_35b_rules_resolve_experts_shared_and_vision_fc2() {
         assert_eq!(scheme.input_hadamard(name).unwrap(), Some(64), "{name}");
     }
     for name in [
-        "model.language_model.layers.0.mlp.experts.0.gate_proj",
-        "model.language_model.layers.39.mlp.experts.255.down_proj",
-        "mtp.layers.0.mlp.experts.0.up_proj",
-    ] {
-        assert_eq!(
-            scheme.for_linear(name).unwrap().raw_group_size(),
-            64,
-            "{name}"
-        );
-        assert_eq!(scheme.input_hadamard(name).unwrap(), None, "{name}");
-    }
-    for name in [
         "lm_head",
         "mtp.fc",
         "model.language_model.layers.0.linear_attn.in_proj_a",
         "model.language_model.layers.0.mlp.gate",
-        "model.language_model.layers.0.mlp.shared_expert.gate_proj",
         "model.language_model.layers.0.mlp.shared_expert_gate",
-        "mtp.layers.0.mlp.shared_expert.down_proj",
     ] {
         assert_eq!(
             scheme.for_linear(name).unwrap(),

@@ -645,4 +645,79 @@ fn h64_moe_ffn_block_shares_input_rotation_and_matches_reference() {
     }
     stream.synchronize().unwrap();
     assert_eq!(actual, expected);
+
+    // Also verify `pre_mlp_norm_targets` dual-output contract + guard fallbacks,
+    // and verify `forward_with_prerotated_input(..., input_prerotated = true)` when
+    // `d_normed` holds unrotated `h_x` and `d_out` starts with pre-rotated `h_x_rot`.
+    assert_eq!(
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, h_dim, true),
+        [d_normed, d_out]
+    );
+    assert_eq!(
+        ffn_h64.pre_mlp_norm_targets(d_normed, 0, h_dim, true),
+        [d_normed, 0]
+    );
+    assert_eq!(
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_normed, h_dim, true),
+        [d_normed, 0]
+    );
+    assert_eq!(
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, h_dim, false),
+        [d_normed, 0]
+    );
+    assert_eq!(
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, h_dim + 16, true),
+        [d_normed, 0]
+    );
+    assert_eq!(
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, 6208, true),
+        [d_normed, 0]
+    );
+
+    let d_normed_prerot = arena.upload_slice(&h_x, &stream).unwrap();
+    let d_out_prerot = arena.upload_slice(&h_x_rot, &stream).unwrap();
+    ffn_h64
+        .forward_with_prerotated_input(
+            &ex,
+            &cublas,
+            locks.addr(),
+            65536,
+            d_normed_prerot,
+            d_out_prerot,
+            m,
+            h_dim,
+            n_interm,
+            0,
+            0,
+            d_router_logits,
+            d_topk_w,
+            d_topk_i,
+            d_interm,
+            d_sh_gu,
+            d_sh_act,
+            d_sh_out,
+            d_sh_gate,
+            true,
+        )
+        .unwrap();
+    let mut actual_prerot = vec![0u16; m * h_dim];
+    let mut normed_prerot_after = vec![0u16; m * h_dim];
+    // SAFETY: `d_out_prerot` and `d_normed_prerot` each hold `m * h_dim` FP16 elements.
+    unsafe {
+        ffi::w34_memcpy_d2h_async(
+            actual_prerot.as_mut_ptr().cast(),
+            d_out_prerot as *const _,
+            m * h_dim * 2,
+            stream.handle,
+        );
+        ffi::w34_memcpy_d2h_async(
+            normed_prerot_after.as_mut_ptr().cast(),
+            d_normed_prerot as *const _,
+            m * h_dim * 2,
+            stream.handle,
+        );
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(normed_prerot_after, h_x);
+    assert_eq!(actual_prerot, expected);
 }

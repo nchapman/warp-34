@@ -60,17 +60,36 @@ impl FfnBlockWeights {
     pub fn pre_mlp_norm_targets(
         &self,
         normed_buf: u64,
+        mlp_out_buf: u64,
         h_dim: usize,
         is_single_stream: bool,
     ) -> [u64; 2] {
-        if is_single_stream
-            && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
-            && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
-            && matches!(self, Self::Dense { gate_up_proj, .. } if gate_up_proj.can_fuse_h64_from_producer())
+        if !is_single_stream
+            || h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+            || !h_dim.is_multiple_of(HADAMARD_BLOCK_64)
         {
-            [0, normed_buf]
-        } else {
-            [normed_buf, 0]
+            return [normed_buf, 0];
+        }
+        match self {
+            Self::Dense { gate_up_proj, .. } if gate_up_proj.can_fuse_h64_from_producer() => {
+                [0, normed_buf]
+            }
+            Self::Moe(moe)
+                if mlp_out_buf != 0
+                    && mlp_out_buf != normed_buf
+                    && moe.routed_input_hadamard == HADAMARD_BLOCK_64
+                    && matches!(
+                        moe.experts,
+                        MoeExpertStorage::W4A16 { .. } | MoeExpertStorage::W4A16Zp { .. }
+                    )
+                    && moe
+                        .shared_gate_up_proj
+                        .as_ref()
+                        .is_none_or(LinearProj::can_fuse_h64_from_producer) =>
+            {
+                [normed_buf, mlp_out_buf]
+            }
+            _ => [normed_buf, 0],
         }
     }
 
@@ -317,7 +336,8 @@ impl FfnBlockWeights {
                     "w34_moe_topk_router_f16",
                 )?;
 
-                let fuse_shared_and_routed_in_h64 = moe.routed_input_hadamard == HADAMARD_BLOCK_64
+                let fuse_shared_and_routed_in_h64 = !input_prerotated
+                    && moe.routed_input_hadamard == HADAMARD_BLOCK_64
                     && moe
                         .shared_gate_up_proj
                         .as_ref()
@@ -339,17 +359,22 @@ impl FfnBlockWeights {
                         "w34_block_hadamard_inplace_f16 (moe shared+routed input)",
                     )?;
                 }
+                let rotated_input_buf = if input_prerotated {
+                    mlp_out_buf
+                } else {
+                    normed_buf
+                };
 
                 let (sh_out_ptr, sh_gate_ptr) = if let (Some(sh_gu), Some(sh_dn)) =
                     (&moe.shared_gate_up_proj, &moe.shared_down_proj)
                 {
-                    if fuse_shared_and_routed_in_h64 {
+                    if input_prerotated || fuse_shared_and_routed_in_h64 {
                         sh_gu.forward_prerotated(
                             ex,
                             cublas,
                             marlin_ws_ptr,
                             marlin_ws_ints,
-                            normed_buf,
+                            rotated_input_buf,
                             moe_sh_gu_buf,
                             num_tokens,
                         )?;
@@ -417,7 +442,10 @@ impl FfnBlockWeights {
                     (core::ptr::null(), core::ptr::null())
                 };
 
-                if moe.routed_input_hadamard > 0 && !fuse_shared_and_routed_in_h64 {
+                if moe.routed_input_hadamard > 0
+                    && !input_prerotated
+                    && !fuse_shared_and_routed_in_h64
+                {
                     check_rc(
                         // SAFETY: `normed_buf` holds `num_tokens * h_dim` FP16 elements with `h_dim`
                         // divisible by `moe.routed_input_hadamard`; router_gate, shared_expert_gate,
@@ -450,7 +478,7 @@ impl FfnBlockWeights {
                         unsafe {
                             ffi::w34_moe_w4a16_mlp_ex_f16(
                                 ex,
-                                normed_buf as *const c_void,
+                                rotated_input_buf as *const c_void,
                                 *gate_up_packed_ptr as *const u32,
                                 *gate_up_scales_ptr as *const c_void,
                                 *down_packed_ptr as *const u32,
@@ -488,7 +516,7 @@ impl FfnBlockWeights {
                         unsafe {
                             ffi::w34_moe_w4a16_mlp_zp_ex_f16(
                                 ex,
-                                normed_buf as *const c_void,
+                                rotated_input_buf as *const c_void,
                                 *gate_up_packed_ptr as *const u32,
                                 *gate_up_scales_ptr as *const c_void,
                                 *gate_up_qzeros_ptr as *const u32,

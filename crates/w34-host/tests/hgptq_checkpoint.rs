@@ -135,7 +135,7 @@ fn pinned_hgptq_vision_matches_vllm_and_tp2() {
         ),
         (
             "35B-A3B",
-            "models--nchapman--Qwen3.6-35B-A3B-W4A16-HGPTQ/snapshots/8aeeacaf9ba943fb45b5e27de6655a633de58767",
+            "models--nchapman--Qwen3.6-35B-A3B-W4A16-HGPTQ/snapshots/4f5de21c886d79e17af5b8a4bfc625e226703fb6",
             &[
                 8771, 18833, 513, 20479, 383, 264, 17676, 25313, 440, 1330, 8434, 11241, 13, 248044,
             ],
@@ -250,7 +250,7 @@ fn pinned_hgptq_moe_35b_text_vision_mtp_and_tp2() {
             PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/huggingface/hub")
         });
     let dir = cache
-        .join("models--nchapman--Qwen3.6-35B-A3B-W4A16-HGPTQ/snapshots/8aeeacaf9ba943fb45b5e27de6655a633de58767");
+        .join("models--nchapman--Qwen3.6-35B-A3B-W4A16-HGPTQ/snapshots/4f5de21c886d79e17af5b8a4bfc625e226703fb6");
     assert!(
         dir.join("model_mtp.safetensors").exists(),
         "missing pinned 35B-A3B HGPTQ checkpoint at {}",
@@ -258,7 +258,7 @@ fn pinned_hgptq_moe_35b_text_vision_mtp_and_tp2() {
     );
     let tp1 = qualify_model(&dir, 1);
     let tp2 = qualify_model(&dir, 2);
-    assert_eq!(&tp1[..10], &tp2[..10], "35B-A3B TP=1 vs TP=2 prefix");
+    assert_eq!(tp1, tp2, "35B-A3B TP=1 vs TP=2 greedy continuation");
 
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tools/oracle/fixtures/coco_sample.png");
