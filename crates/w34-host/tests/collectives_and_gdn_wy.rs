@@ -591,6 +591,18 @@ fn test_tp2_and_tp4_all_gather_topk_and_hc_combine() {
                 handles.push(scope.spawn(move || {
                     let _dev = CudaDevice::set_current(0).unwrap();
                     let ex = s.exec(0, 0);
+                    c.all_gather_top1_f32_i32(
+                        &ex,
+                        dv.addr(),
+                        di.addr(),
+                        dv.addr(),
+                        di.addr(),
+                        r as i32,
+                        1,
+                    )
+                    .unwrap();
+                    c.broadcast_i32(&ex, di.addr(), di.addr(), r as i32, 1)
+                        .unwrap();
                     c.all_gather_topk_f32_i32(
                         &ex,
                         dv.addr(),
@@ -602,6 +614,11 @@ fn test_tp2_and_tp4_all_gather_topk_and_hc_combine() {
                         k as i32,
                     )
                     .unwrap();
+                    // Variable-size all_reduce_f16 back-to-back (large 128 elems -> small 32 elems)
+                    c.all_reduce_f16(&ex, dr.addr(), dt.addr(), r as i32, 128)
+                        .unwrap();
+                    c.all_reduce_f16(&ex, db.addr(), dt.addr(), r as i32, 32)
+                        .unwrap();
                     c.all_reduce_hc_combine_tap_f16(
                         &ex,
                         dr.addr(),

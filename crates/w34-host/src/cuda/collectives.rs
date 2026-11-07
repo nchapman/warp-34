@@ -54,7 +54,13 @@ impl Tp2Collectives {
         }
         // SAFETY: `w34_tp2_signal_bytes` is a pure `sizeof(W34Tp2Signal)` query with no preconditions.
         let sig_bytes = unsafe { ffi::w34_tp2_signal_bytes() };
+        let max_stage_bytes_per_epoch = max_stage_bytes_per_epoch.saturating_add(15) & !15;
         let stage_bytes = max_stage_bytes_per_epoch.saturating_mul(2).max(4096);
+        // `Signal::end[128][0]` (u32 offset `144 * 16 + 128 * 16 = 4352`) stores the
+        // per-epoch byte stride so `odd` and `even` staging halves are disjoint across
+        // variable-size back-to-back collectives.
+        const SIG_EPOCH_CAP_U32_IDX: usize = 144 * 16 + 128 * 16;
+        let cap_u32 = u32::try_from(max_stage_bytes_per_epoch).unwrap_or(!15u32);
 
         let mut all_p2p = allow_p2p;
         if all_p2p {
@@ -79,10 +85,16 @@ impl Tp2Collectives {
         let mut sigs = Vec::with_capacity(tp_size);
         let mut stages = Vec::with_capacity(tp_size);
         if all_p2p {
+            let mut sig_init = vec![0u32; sig_bytes / 4];
+            if let Some(slot) = sig_init.get_mut(SIG_EPOCH_CAP_U32_IDX) {
+                *slot = cap_u32;
+            }
             for r in 0..tp_size {
-                sigs.push(CommBuffer::DeviceVram(DeviceBuffer::alloc(
-                    r as i32, sig_bytes,
-                )?));
+                let sig = DeviceBuffer::alloc(r as i32, sig_bytes)?;
+                let stream = super::CudaStream::new(r as i32)?;
+                sig.copy_from_host(&sig_init, &stream)?;
+                stream.synchronize()?;
+                sigs.push(CommBuffer::DeviceVram(sig));
                 stages.push(CommBuffer::DeviceVram(DeviceBuffer::alloc(
                     r as i32,
                     stage_bytes,
@@ -90,7 +102,18 @@ impl Tp2Collectives {
             }
         } else {
             for _ in 0..tp_size {
-                sigs.push(CommBuffer::MappedHost(MappedHostBuffer::alloc(sig_bytes)?));
+                let sig = MappedHostBuffer::alloc(sig_bytes)?;
+                if SIG_EPOCH_CAP_U32_IDX * 4 + 4 <= sig.len_bytes {
+                    // SAFETY: `sig.host_ptr` is 128B-aligned mapped host memory of size `sig.len_bytes`,
+                    // and `SIG_EPOCH_CAP_U32_IDX * 4 + 4 <= sig.len_bytes`.
+                    unsafe {
+                        sig.host_ptr
+                            .cast::<u32>()
+                            .add(SIG_EPOCH_CAP_U32_IDX)
+                            .write(cap_u32);
+                    }
+                }
+                sigs.push(CommBuffer::MappedHost(sig));
                 stages.push(CommBuffer::MappedHost(MappedHostBuffer::alloc(
                     stage_bytes,
                 )?));
