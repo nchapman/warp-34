@@ -1044,5 +1044,76 @@ mod cuda_tests {
                 "H64+g64 MoE {mode:?} max_abs_diff={max_diff} exceeds 1.6e-2"
             );
         }
+
+        // Also verify the CUDA-Graph-safe CPU+GPU Hybrid Bridge (`register_cpu_bridge`) with
+        // `group_size = 64` and `down_hadamard = 64` across `m = 4` (mailbox) and `m = 6` (prefill).
+        assert!(HotExpertCache::cpu_bridge_supported());
+        for (m_bridge, use_prefill) in [(4usize, false), (6usize, true)] {
+            let mut tasks_b = Vec::with_capacity(m_bridge * top_k);
+            for tok in 0..m_bridge {
+                for k in 0..top_k {
+                    let idx = tok * top_k + k;
+                    tasks_b.push((tok, h_topk_ids[idx] as usize, h_topk_weights[idx]));
+                }
+            }
+            let h_cpu_b =
+                full_store.eval_cold_tasks_cpu(&h_x[..m_bridge * k_hidden], m_bridge, &tasks_b);
+            let mut cache = HotExpertCache::new(0, 6, 0..num_experts, layout.clone()).unwrap();
+            let mut ws_b = TieredMoeWorkspace::new(0, layout.clone(), 3, m_bridge, top_k).unwrap();
+            cache
+                .populate_initial(&full_store, Some(&[0, 1, 2, 3, 4, 5]), &mut ws_b, &stream)
+                .unwrap();
+            cache
+                .register_cpu_bridge(0, &full_store, 4, &stream)
+                .unwrap();
+            let d_out = DeviceBuffer::alloc(0, m_bridge * k_hidden * 2).unwrap();
+            if use_prefill {
+                TieredMoeEngine::execute_layer(
+                    MoeOffloadMode::StreamedPrefill,
+                    &full_store,
+                    &mut cache,
+                    &mut ws_b,
+                    &stream,
+                    d_x.addr(),
+                    d_topk_ids.addr(),
+                    d_topk_weights.addr(),
+                    &h_topk_ids[..m_bridge * top_k],
+                    &h_topk_weights[..m_bridge * top_k],
+                    0,
+                    0,
+                    d_out.addr(),
+                    m_bridge,
+                    top_k,
+                )
+                .unwrap();
+            } else {
+                TieredMoeEngine::execute_layer_device_lru(
+                    &full_store,
+                    &mut cache,
+                    &ws_b,
+                    &stream,
+                    d_x.addr(),
+                    d_topk_ids.addr(),
+                    d_topk_weights.addr(),
+                    0,
+                    0,
+                    d_out.addr(),
+                    m_bridge,
+                    top_k,
+                )
+                .unwrap();
+            }
+            let mut h_gpu = vec![0u16; m_bridge * k_hidden];
+            d_out.copy_to_host(&mut h_gpu, &stream).unwrap();
+            let max_diff = h_gpu
+                .iter()
+                .zip(&h_cpu_b)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1.6e-2,
+                "H64+g64 MoE bridge m={m_bridge} max_abs_diff={max_diff} exceeds 1.6e-2"
+            );
+        }
     }
 }

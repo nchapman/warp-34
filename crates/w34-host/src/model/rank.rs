@@ -741,7 +741,7 @@ impl Qwen3_5ModelRank {
         Ok(())
     }
 
-    fn estimate_weight_arena_bytes(
+    pub(super) fn estimate_weight_arena_bytes(
         cfg: &ModelConfig,
         archive: &SafetensorsArchive,
         tp_size: usize,
@@ -773,12 +773,15 @@ impl Qwen3_5ModelRank {
                 || name.starts_with("mtp.")
                 || name.contains(".mtp.")
                 || name.contains("embed_tokens.")
+                || (cfg.tie_word_embeddings
+                    && (name.starts_with("lm_head.") || name.contains(".lm_head.")))
                 || name.ends_with(".g_idx")
                 || name.ends_with(".weight_g_idx")
                 || name.ends_with(".weight_shape")
                 || (name.ends_with(".qzeros") && !cfg.quant.expects_zero_points())
                 || (cfg.uses_tiered_moe() && name.contains(".experts."))
-                || (name.contains(".ple_embedding.") && !name.ends_with(".weight_scale"))
+                || (name.contains(".ple_embedding.")
+                    && (!name.ends_with(".weight_scale") || info.num_elems() > 1))
             {
                 continue;
             }
@@ -977,7 +980,11 @@ impl Qwen3_5ModelRank {
             Self::estimate_weight_arena_bytes(cfg, archive, tp_size, requested_kv_pages);
         let max_packed_tensor_bytes = archive
             .iter_entries()
-            .filter(|(_, info)| matches!(info.dtype.as_str(), "I32" | "U32"))
+            .filter(|(name, info)| {
+                matches!(info.dtype.as_str(), "I32" | "U32")
+                    && !name.contains(".ple_embedding.")
+                    && !(cfg.uses_tiered_moe() && name.contains(".experts."))
+            })
             .map(|(_, info)| info.len_bytes as usize)
             .max()
             .unwrap_or(0);

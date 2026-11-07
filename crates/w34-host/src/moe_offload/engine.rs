@@ -250,7 +250,7 @@ impl TieredMoeEngine {
         } else {
             match mode {
                 MoeOffloadMode::Auto => {
-                    if num_tokens <= 16
+                    if num_tokens <= 32
                         && active_local.len() <= cache.slots.capacity
                         && misses_in_step.len() <= ws.stage_capacity
                     {
@@ -982,8 +982,8 @@ impl RankTieredMoe {
             } else if ep_size == 1
                 && k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
                 && cfg.num_hidden_layers <= TIERED_MOE_CPU_BRIDGE_MAX_LAYERS
-                && group_size == TIERED_MOE_CPU_BRIDGE_GROUP_SIZE
-                && store.layout().down_hadamard_block_size == 0
+                && matches!(group_size, 64 | TIERED_MOE_CPU_BRIDGE_GROUP_SIZE)
+                && matches!(store.layout().down_hadamard_block_size, 0 | 64)
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 let k_static = k_hot;

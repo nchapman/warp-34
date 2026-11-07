@@ -344,4 +344,100 @@ mod serving_capacity_tests {
             Some((expected_qw, expected_sc, expected_arena))
         );
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn estimate_weight_arena_bytes_excludes_tied_lm_head_and_lut4_ple_scales() {
+        // 1. Always-run synthetic safetensors archive covering tied `lm_head.weight`
+        //    and multi-element `ple_embedding.weight_scale` vs scalar `ple_embedding.weight_scale`.
+        let tmp_dir =
+            std::env::temp_dir().join(format!("w34_est_weight_arena_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let lm_bytes = 64 * 1024 * 1024usize;
+        let lut4_scale_bytes = 32 * 1024 * 1024usize;
+        let header = serde_json::json!({
+            "lm_head.weight": {
+                "dtype": "BF16",
+                "shape": [16384, 2048],
+                "data_offsets": [0, lm_bytes]
+            },
+            "model.layers.5.ple.ple_embedding.shard_00.weight_scale": {
+                "dtype": "F16",
+                "shape": [3355443, 5],
+                "data_offsets": [lm_bytes, lm_bytes + lut4_scale_bytes]
+            },
+            "model.layers.11.ple.ple_embedding.weight_scale": {
+                "dtype": "F16",
+                "shape": [1],
+                "data_offsets": [lm_bytes + lut4_scale_bytes, lm_bytes + lut4_scale_bytes + 2]
+            }
+        })
+        .to_string();
+        let st_path = tmp_dir.join("model.safetensors");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&st_path).unwrap();
+            f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(header.as_bytes()).unwrap();
+            f.set_len((8 + header.len() + lm_bytes + lut4_scale_bytes + 2) as u64)
+                .unwrap();
+        }
+        let synth_archive = crate::loader::SafetensorsArchive::open(&tmp_dir).unwrap();
+        let mut synth_cfg = sample_qwen4_exp_config();
+        synth_cfg.vocab_size = 16384;
+        synth_cfg.hidden_size = 2048;
+        synth_cfg.tie_word_embeddings = false;
+        let synth_untied =
+            Qwen3_5ModelRank::estimate_weight_arena_bytes(&synth_cfg, &synth_archive, 1, Some(128));
+        synth_cfg.tie_word_embeddings = true;
+        let synth_tied =
+            Qwen3_5ModelRank::estimate_weight_arena_bytes(&synth_cfg, &synth_archive, 1, Some(128));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        assert_eq!(
+            synth_untied - synth_tied,
+            lm_bytes,
+            "tied config must exclude redundant lm_head.weight (untied={synth_untied}, tied={synth_tied})"
+        );
+        // `synth_tied` only has `embed_tokens` (64 MiB) + 1-element FP8 PLE scale (256 B) + 96 MiB margin,
+        // rounded up to 16 MiB alignment = 162 MiB (multi-element 32 MiB lut4-gptq `shard_00.weight_scale` is excluded).
+        assert_eq!(synth_tied, 162 * 1024 * 1024);
+
+        // 2. Real checkpoint check when `nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ` is cached locally.
+        let Ok(dir) =
+            crate::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ")
+        else {
+            eprintln!(
+                "Skipping real-snapshot check in estimate_weight_arena_bytes_excludes_tied_lm_head_and_lut4_ple_scales: checkpoint not cached"
+            );
+            return;
+        };
+        let cfg = ModelConfig::from_dir(&dir).expect("parse config.json");
+        let archive = crate::loader::SafetensorsArchive::open(&dir).expect("open archive");
+        let tp1_bytes = Qwen3_5ModelRank::estimate_weight_arena_bytes(&cfg, &archive, 1, Some(128));
+        let tp2_bytes = Qwen3_5ModelRank::estimate_weight_arena_bytes(&cfg, &archive, 2, Some(128));
+        // Host-mmapped lut4-gptq ple_embedding.shard_*.weight_scale (~3.05 GiB across 128 shards) is excluded,
+        // keeping TP=1 < 5.6 GiB (vs ~8.6 GiB without exclusion) and TP=2 < 4.3 GiB/rank (vs ~7.2 GiB).
+        assert!(
+            tp1_bytes < 5600 * 1024 * 1024,
+            "unexpectedly large TP=1 weight_arena estimate: {} MiB",
+            tp1_bytes / (1024 * 1024)
+        );
+        assert!(
+            tp2_bytes < 4300 * 1024 * 1024,
+            "unexpectedly large TP=2 weight_arena estimate: {} MiB",
+            tp2_bytes / (1024 * 1024)
+        );
+
+        let mut tied_cfg = cfg.clone();
+        tied_cfg.tie_word_embeddings = true;
+        let tp1_tied =
+            Qwen3_5ModelRank::estimate_weight_arena_bytes(&tied_cfg, &archive, 1, Some(128));
+        assert!(
+            tp1_bytes.saturating_sub(tp1_tied) >= 1200 * 1024 * 1024,
+            "expected tied_cfg to save >= 1.2 GiB for redundant lm_head.weight on TP=1 (untied={} MiB, tied={} MiB)",
+            tp1_bytes / (1024 * 1024),
+            tp1_tied / (1024 * 1024),
+        );
+    }
 }

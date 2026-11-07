@@ -429,11 +429,15 @@ impl Runtime {
     }
     pub fn register(&self, store: &HostExpertStore) -> crate::cuda::Result<Arc<Mailbox>> {
         let layout = store.layout();
-        if layout.hidden > 4096 || layout.intermediate > 2048 || layout.group_size != 128 {
+        if layout.hidden > 4096
+            || layout.intermediate > 2048
+            || !matches!(layout.group_size, 64 | 128)
+            || !matches!(layout.down_hadamard_block_size, 0 | 64)
+        {
             return Err(crate::cuda::CudaError::with_detail(
                 -1,
                 "CPU bridge geometry",
-                "requires hidden <= 4096, intermediate <= 2048, group size 128",
+                "requires hidden <= 4096, intermediate <= 2048, group size 64 or 128, down Hadamard 0 or 64",
             ));
         }
         let req = MappedHostBuffer::alloc(std::mem::size_of::<Request>())?;
@@ -693,8 +697,10 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
     let job = &batch.jobs[index / batch.slices];
     let store = &batch.store;
     let expert = job.expert;
-    let h = store.layout().hidden;
-    let groups = store.layout().intermediate / 128;
+    let layout = store.layout();
+    let h = layout.hidden;
+    let gs = layout.group_size;
+    let groups = layout.intermediate / 128;
     let n = job.rows.len();
     scratch.xp.clear();
     scratch.xg.clear();
@@ -705,12 +711,11 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
             .extend_from_slice(&batch.xp[tok * h..(tok + 1) * h]);
         scratch
             .xg
-            .extend_from_slice(&batch.xg[tok * h / 128..(tok + 1) * h / 128]);
+            .extend_from_slice(&batch.xg[tok * (h / gs)..(tok + 1) * (h / gs)]);
         scratch.weights.push(weight);
     }
     let mut output = batch.outputs[index].lock().unwrap();
     output.resize(n * h, 0.);
-    let layout = store.layout();
     let pack = store
         .expert_pack(store.expert_ids().start + expert)
         .unwrap();
@@ -728,6 +733,8 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
         eval::ExpertLayout {
             hidden: h,
             intermediate: layout.intermediate,
+            group_size: gs,
+            down_hadamard: layout.down_hadamard_block_size,
             gate_up_words: words(layout.gate_up_packed.clone()),
             gate_up_scales: scales(layout.gate_up_scales.clone()),
             down_words: words(layout.down_packed.clone()),
@@ -788,13 +795,14 @@ impl Input<'_> {
         &self,
         tok: usize,
         h: usize,
+        group_size: usize,
         xp: &mut [f32],
         xg: &mut [f32],
     ) -> Result<(), eval::EvalError> {
         let range = tok * h..(tok + 1) * h;
         match self {
-            Self::F32(x) => eval::prepare_x_perm(&x[range], xp, xg),
-            Self::F16(x) => eval::prepare_x_perm_f16(&x[range], xp, xg),
+            Self::F32(x) => eval::prepare_x_perm_grouped(&x[range], group_size, xp, xg),
+            Self::F16(x) => eval::prepare_x_perm_f16_grouped(&x[range], group_size, xp, xg),
         }
     }
 }
@@ -919,7 +927,8 @@ fn evaluate_into(
         1
     };
     let n_act = routing.active_toks.len();
-    let h_groups = h / 128;
+    let gs = store.layout().group_size;
+    let h_groups = h / gs;
     let (mut xp, mut xg) = std::mem::take(&mut *pool.spare_inputs.lock().unwrap());
     xp.resize(n_act * h, 0.);
     xg.resize(n_act * h_groups, 0.);
@@ -927,6 +936,7 @@ fn evaluate_into(
         if let Err(e) = x.prepare_row(
             tok,
             h,
+            gs,
             &mut xp[c * h..(c + 1) * h],
             &mut xg[c * h_groups..(c + 1) * h_groups],
         ) {

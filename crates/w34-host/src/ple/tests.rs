@@ -482,6 +482,34 @@ fn test_ple_mmap_table_lut4_gptq() {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    if let Ok(snap) = crate::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ")
+    {
+        let cfg = ModelConfig::from_dir(&snap).unwrap();
+        let archive = SafetensorsArchive::open(&snap).unwrap();
+        let hasher = PleNgramHasher::from_archive(&archive, &cfg, 1, 0).unwrap();
+        let table = PleMmapTable::open(&archive, &cfg, 1).unwrap();
+        assert_eq!(table.shard_rows, 2_500_012);
+        assert_eq!(table.head_dim, 160);
+        assert!(matches!(
+            table.format,
+            PleTableFormat::Lut4Gptq { group_size: 32, .. }
+        ));
+
+        let eos = hasher.eos_token_id;
+        let mut ctx = [[eos, eos]];
+        let tokens = [151644, 872, 198, 3838];
+        let mut ids = vec![0i64; tokens.len() * 16];
+        hasher.compute_ngram_ids(&tokens, &[0, tokens.len() as i32], &mut ctx, &mut ids);
+        let mut out_f32 = vec![0.0f32; tokens.len() * 2560];
+        table.gather_dequant_f32(&ids, &mut out_f32);
+        assert!(out_f32.iter().all(|v| v.is_finite()));
+        assert!(out_f32.iter().any(|&v| v != 0.0));
+    } else {
+        eprintln!(
+            "Skipping real-snapshot check in test_ple_mmap_table_lut4_gptq: nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ not cached"
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]
