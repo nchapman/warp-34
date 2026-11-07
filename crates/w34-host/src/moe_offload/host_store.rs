@@ -135,7 +135,9 @@ impl HostExpertStore {
         )?;
         // Revalidate public geometry before using it to size or address unsafe storage.
         require(
-            layout == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?,
+            layout
+                == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?
+                    .with_down_hadamard(layout.down_hadamard_block_size)?,
             "inconsistent expert pack layout",
         )?;
         let count = num_experts / ep_size;
@@ -162,10 +164,25 @@ impl HostExpertStore {
         };
         let resolved_prefix_ref = resolved_prefix.as_str();
         let first_gate_name = format!("{resolved_prefix_ref}.{first_id}.gate_proj");
+        let first_up_name = format!("{resolved_prefix_ref}.{first_id}.up_proj");
+        let first_down_name = format!("{resolved_prefix_ref}.{first_id}.down_proj");
+        let gate_had = quant.input_hadamard(&first_gate_name)?.unwrap_or(0);
+        let up_had = quant.input_hadamard(&first_up_name)?.unwrap_or(0);
+        let down_had = quant.input_hadamard(&first_down_name)?.unwrap_or(0);
         require(
-            quant.input_hadamard(&first_gate_name)?.is_none(),
-            "Hadamard routed MoE experts are not supported in tiered host expert store",
+            gate_had == up_had
+                && matches!(gate_had, 0 | 16 | 64)
+                && (gate_had == 0 || layout.hidden.is_multiple_of(gate_had)),
+            "inconsistent or unsupported input Hadamard block size on routed MoE gate_proj/up_proj",
         )?;
+        require(
+            matches!(down_had, 0 | 16 | 64)
+                && (down_had == 0 || layout.intermediate.is_multiple_of(down_had))
+                && (layout.down_hadamard_block_size == 0
+                    || layout.down_hadamard_block_size == down_had),
+            "inconsistent or unsupported input Hadamard block size on routed MoE down_proj",
+        )?;
+        let layout = layout.with_down_hadamard(down_had)?;
         let expert_quant = quant
             .for_linear(&first_gate_name)
             .ok()
@@ -413,7 +430,9 @@ impl HostExpertStore {
         max_pinned_bytes: usize,
     ) -> Result<Self> {
         require(
-            layout == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?,
+            layout
+                == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?
+                    .with_down_hadamard(layout.down_hadamard_block_size)?,
             "inconsistent expert pack layout",
         )?;
         let count = expert_ids.len();
@@ -689,7 +708,7 @@ impl DeviceExpertSlotTable {
         crate::cuda::check_rc(
             // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
             unsafe {
-                w34_kernels::ffi::w34_moe_w4a16_mlp_f16(
+                w34_kernels::ffi::w34_moe_w4a16_mlp_ex_f16(
                     ex,
                     x_addr as *const core::ffi::c_void,
                     self.gate_up_packed.addr() as *const u32,
@@ -708,9 +727,10 @@ impl DeviceExpertSlotTable {
                     self.layout.intermediate as i32,
                     self.layout.hidden as i32,
                     self.layout.group_size as i32,
+                    self.layout.down_hadamard_block_size as i32,
                 )
             },
-            "w34_moe_w4a16_mlp_f16 (tiered)",
+            "w34_moe_w4a16_mlp_ex_f16 (tiered)",
         )
     }
 }

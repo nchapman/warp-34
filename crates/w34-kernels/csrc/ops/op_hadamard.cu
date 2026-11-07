@@ -170,6 +170,34 @@ extern "C" int w34_block_hadamard_f16(const w34_exec* ex, const void* src,
     return launch_block_hadamard<__half>(ex, src, dst, rows, k, padded_k, block_size);
 }
 
+extern "C" int w34_block_hadamard_inplace_f16(const w34_exec* ex, void* buf,
+                                              int rows, int k, int block_size) {
+    if (!ex || rows < 0 || k <= 0 ||
+        (block_size != 16 && block_size != 64) ||
+        k % block_size != 0) {
+        return int(cudaErrorInvalidValue);
+    }
+    if (rows == 0) return int(cudaSuccess);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(buf);
+    const uint64_t bytes = uint64_t(rows) * k * sizeof(__half);
+    if (!b || b % alignof(__half) || b > UINTPTR_MAX - bytes) {
+        return int(cudaErrorInvalidValue);
+    }
+    const int64_t groups = int64_t(rows) * (k / block_size);
+    const int groups_per_cta = 256 / (block_size / 4);
+    const int64_t needed = (groups + groups_per_cta - 1) / groups_per_cta;
+    const int grid = int(needed < 65535 ? needed : 65535);
+    const auto stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    if (block_size == 16) {
+        block_hadamard_16bit<__half, 16><<<grid, 256, 0, stream>>>(
+            static_cast<const __half*>(buf), static_cast<__half*>(buf), k, k, groups);
+    } else {
+        block_hadamard_16bit<__half, 64><<<grid, 256, 0, stream>>>(
+            static_cast<const __half*>(buf), static_cast<__half*>(buf), k, k, groups);
+    }
+    return int(cudaGetLastError());
+}
+
 extern "C" int w34_block_hadamard_bf16(const w34_exec* ex, const void* src,
                                        void* dst, int rows, int k, int padded_k,
                                        int block_size) {

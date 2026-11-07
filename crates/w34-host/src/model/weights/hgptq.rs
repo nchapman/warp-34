@@ -149,6 +149,13 @@ impl RawLinearHost {
             group_size: if channelwise { pk } else { *group_size },
         })
     }
+
+    pub(crate) fn unwrap_hadamard(self) -> (Self, usize) {
+        match self {
+            Self::Hadamard { inner, block_size } => (*inner, block_size),
+            other => (other, 0),
+        }
+    }
 }
 
 /// Materializing a logical weight must undo its offline basis change too.

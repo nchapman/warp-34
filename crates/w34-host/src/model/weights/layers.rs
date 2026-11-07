@@ -708,6 +708,9 @@ pub struct PleLayerWeights {
     pub norm_conv_ptr: u64,
     pub conv1d_weight_ptr: u64,
     pub weight_scale: f32,
+    pub lut4_ptr: u64,
+    pub lut4_group_size: usize,
+    pub ngram_heads: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -734,15 +737,31 @@ impl PleLayerWeights {
     ) -> Result<()> {
         let total_dim = hc_count * h_dim;
         let ple_embed_dim = self.key_proj.size_k();
-        crate::ple::gpu_ops::ple_dequant_f8_to_f16(
-            ex,
-            ple_f8_staging_ptr,
-            ple_val_buf,
-            0,
-            num_tokens,
-            ple_embed_dim,
-            self.weight_scale,
-        )?;
+        if self.lut4_ptr != 0 {
+            let num_heads = self.ngram_heads.max(1);
+            let head_dim = ple_embed_dim / num_heads;
+            crate::ple::gpu_ops::ple_dequant_lut4_to_f16(
+                ex,
+                ple_f8_staging_ptr,
+                self.lut4_ptr,
+                ple_val_buf,
+                0,
+                num_tokens,
+                num_heads,
+                head_dim,
+                self.lut4_group_size,
+            )?;
+        } else {
+            crate::ple::gpu_ops::ple_dequant_f8_to_f16(
+                ex,
+                ple_f8_staging_ptr,
+                ple_val_buf,
+                0,
+                num_tokens,
+                ple_embed_dim,
+                self.weight_scale,
+            )?;
+        }
         self.key_proj.forward(
             ex,
             cublas,

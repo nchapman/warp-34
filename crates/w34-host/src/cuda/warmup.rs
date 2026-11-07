@@ -121,6 +121,10 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
                 "warmup w34_block_hadamard"
             )?;
         }
+        warmup_ffi!(
+            ffi::w34_block_hadamard_inplace_f16(&ex, buf_b as *mut c_void, 2, 128, block_size),
+            "warmup w34_block_hadamard_inplace_f16"
+        )?;
     }
 
     warmup_ffi!(

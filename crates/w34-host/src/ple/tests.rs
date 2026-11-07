@@ -361,6 +361,129 @@ fn test_ple_mmap_table_against_real_snapshot_if_present() {
     assert!(out_f32.iter().any(|&v| v != 0.0));
 }
 
+#[test]
+fn test_ple_mmap_table_lut4_gptq() {
+    let mut synth_cfg = sample_qwen4_exp_cfg();
+    synth_cfg.hidden_size = 64;
+    synth_cfg.ple_embed_dim = 64;
+    synth_cfg.heads_per_ngram = 1;
+    synth_cfg.ngram_size = 2;
+    synth_cfg.ngram_vocab_size_base = 64;
+    synth_cfg.make_ngram_vocab_size_divisible_by = 16;
+    synth_cfg.split_ngram_parts = 4;
+
+    let tmp_dir = std::env::temp_dir().join(format!("w34_ple_lut4_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let synth_hasher = PleNgramHasher::from_config(&synth_cfg, 1, 0);
+    let shard_rows = synth_hasher.shard_rows;
+    let head_dim = synth_hasher.head_dim; // 64
+    let group_size = 32usize;
+    let num_groups = head_dim / group_size; // 2
+    let packed_cols = head_dim / 2; // 32
+    let lut_f32: [f32; 16] = [
+        -1.0, -0.8128, -0.6546, -0.5151, -0.3918, -0.2808, -0.1791, -0.0834, 0.0105, 0.1048,
+        0.2023, 0.306, 0.4208, 0.5524, 0.714, 0.9487,
+    ];
+
+    let mut header_entries = Vec::new();
+    let mut data_blob = Vec::new();
+    for s in 0..4usize {
+        let pfx =
+            format!("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{s}");
+        let lut_name = format!("{pfx}.weight_lut");
+        let l_start = data_blob.len();
+        for &v in &lut_f32 {
+            data_blob.extend_from_slice(&v.to_le_bytes());
+        }
+        let l_end = data_blob.len();
+        header_entries.push(format!(
+            "\"{lut_name}\":{{\"dtype\":\"F32\",\"shape\":[16],\"data_offsets\":[{l_start},{l_end}]}}"
+        ));
+
+        let p_name = format!("{pfx}.weight_packed");
+        let p_start = data_blob.len();
+        for r in 0..shard_rows {
+            for j in 0..packed_cols {
+                let lo = ((s * 7 + r * 3 + j * 5 + 1) & 0x0F) as u8;
+                let hi = ((s * 11 + r * 5 + j * 9 + 2) & 0x0F) as u8;
+                data_blob.push(lo | (hi << 4));
+            }
+        }
+        let p_end = data_blob.len();
+        header_entries.push(format!(
+            "\"{p_name}\":{{\"dtype\":\"U8\",\"shape\":[{shard_rows},{packed_cols}],\"data_offsets\":[{p_start},{p_end}]}}"
+        ));
+
+        let sc_name = format!("{pfx}.weight_scale");
+        let sc_start = data_blob.len();
+        for r in 0..shard_rows {
+            for g in 0..num_groups {
+                let sc_bits = f32_to_f16(((s + r + g + 1) as f32) * 0.0625);
+                data_blob.extend_from_slice(&sc_bits.to_le_bytes());
+            }
+        }
+        let sc_end = data_blob.len();
+        header_entries.push(format!(
+            "\"{sc_name}\":{{\"dtype\":\"F16\",\"shape\":[{shard_rows},{num_groups}],\"data_offsets\":[{sc_start},{sc_end}]}}"
+        ));
+    }
+    let header_json = format!("{{{}}}", header_entries.join(","));
+    let header_bytes = header_json.as_bytes();
+    let mut file_bytes = Vec::with_capacity(8 + header_bytes.len() + data_blob.len());
+    file_bytes.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    file_bytes.extend_from_slice(header_bytes);
+    file_bytes.extend_from_slice(&data_blob);
+    std::fs::write(tmp_dir.join("model.safetensors"), &file_bytes).unwrap();
+
+    let synth_archive = SafetensorsArchive::open(&tmp_dir).unwrap();
+    let synth_table = PleMmapTable::open(&synth_archive, &synth_cfg, 1).unwrap();
+    assert_eq!(synth_table.shard_rows, shard_rows);
+    assert_eq!(synth_table.head_dim, head_dim);
+    assert_eq!(
+        synth_table.format,
+        PleTableFormat::Lut4Gptq {
+            group_size,
+            lut_f32
+        }
+    );
+    assert_eq!(
+        synth_table.staged_bytes_per_head(),
+        packed_cols + num_groups * 2
+    );
+
+    let test_ids: Vec<i64> = (0..66)
+        .map(|i| match i {
+            0 => -3,
+            65 => 999_999,
+            _ => ((i * 7) % (4 * shard_rows)) as i64,
+        })
+        .collect();
+    let mut out_f16 = vec![0u16; test_ids.len() * head_dim];
+    let mut out_f32 = vec![0.0f32; test_ids.len() * head_dim];
+    synth_table.gather_dequant_f16(&test_ids, &mut out_f16);
+    synth_table.gather_dequant_f32(&test_ids, &mut out_f32);
+    for (idx, &raw_id) in test_ids.iter().enumerate() {
+        let clamped = raw_id.max(0) as usize;
+        let s = (clamped / shard_rows).min(3);
+        let r = (clamped % shard_rows).min(shard_rows - 1);
+        for c in 0..head_dim {
+            let j = c >> 1;
+            let nib = if (c & 1) == 0 {
+                (s * 7 + r * 3 + j * 5 + 1) & 0x0F
+            } else {
+                (s * 11 + r * 5 + j * 9 + 2) & 0x0F
+            };
+            let g = c / group_size;
+            let sc = crate::cuda::f16_to_f32(f32_to_f16(((s + r + g + 1) as f32) * 0.0625));
+            let expected_f32 = lut_f32[nib] * sc;
+            assert_eq!(out_f32[idx * head_dim + c], expected_f32);
+            assert_eq!(out_f16[idx * head_dim + c], f32_to_f16(expected_f32));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 #[allow(clippy::cognitive_complexity)]
@@ -576,6 +699,63 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
     let h_ple_emb: Vec<u16> = dev_to_vec(&d_ple_emb, m * hidden, &stream);
     for (i, &b) in f8_bytes.iter().enumerate() {
         assert_eq!(h_ple_emb[i], lut.f16_lut[b as usize]);
+    }
+
+    // Verify ple_dequant_lut4_to_f16 (4-bit LUT + FP16 group scales):
+    let lut4_heads = 2usize;
+    let lut4_head_dim = hidden / lut4_heads; // 32
+    let lut4_group_size = 16usize;
+    let lut4_groups = lut4_head_dim / lut4_group_size; // 2
+    let lut4_packed_bytes = lut4_head_dim / 2; // 16
+    let lut4_head_stride = lut4_packed_bytes + lut4_groups * 2; // 20
+    let lut16: [f32; 16] = [
+        -1.0, -0.8128, -0.6546, -0.5151, -0.3918, -0.2808, -0.1791, -0.0834, 0.0105, 0.1048,
+        0.2023, 0.306, 0.4208, 0.5524, 0.714, 0.9487,
+    ];
+    let mut lut4_raw = vec![0u8; m * lut4_heads * lut4_head_stride];
+    for h_idx in 0..m * lut4_heads {
+        let base = h_idx * lut4_head_stride;
+        for j in 0..lut4_packed_bytes {
+            let lo = ((h_idx * 5 + j * 3 + 1) & 0x0F) as u8;
+            let hi = ((h_idx * 7 + j * 11 + 2) & 0x0F) as u8;
+            lut4_raw[base + j] = lo | (hi << 4);
+        }
+        for g in 0..lut4_groups {
+            let sc_bits = f32_to_f16(((h_idx + g + 1) as f32) * 0.125);
+            let sc_le = sc_bits.to_le_bytes();
+            lut4_raw[base + lut4_packed_bytes + g * 2] = sc_le[0];
+            lut4_raw[base + lut4_packed_bytes + g * 2 + 1] = sc_le[1];
+        }
+    }
+    let d_lut4_raw = dev_from_slice(&lut4_raw, &stream);
+    let d_lut16 = dev_from_slice(&lut16, &stream);
+    let d_lut4_out = DeviceBuffer::alloc(0, m * hidden * 2).unwrap();
+    gpu_ops::ple_dequant_lut4_to_f16(
+        &ex,
+        d_lut4_raw.addr(),
+        d_lut16.addr(),
+        d_lut4_out.addr(),
+        0,
+        m,
+        lut4_heads,
+        lut4_head_dim,
+        lut4_group_size,
+    )
+    .unwrap();
+    let h_lut4_out: Vec<u16> = dev_to_vec(&d_lut4_out, m * hidden, &stream);
+    for h_idx in 0..m * lut4_heads {
+        for col in 0..lut4_head_dim {
+            let j = col >> 1;
+            let nib = if (col & 1) == 0 {
+                (h_idx * 5 + j * 3 + 1) & 0x0F
+            } else {
+                (h_idx * 7 + j * 11 + 2) & 0x0F
+            };
+            let g = col / lut4_group_size;
+            let sc = f16_to_f32(f32_to_f16(((h_idx + g + 1) as f32) * 0.125));
+            let expected = f32_to_f16(lut16[nib] * sc);
+            assert_eq!(h_lut4_out[h_idx * lut4_head_dim + col], expected);
+        }
     }
 
     // Verify PLE signed-sqrt sigmoid gate (including exact 0.0 sign preservation):

@@ -807,4 +807,242 @@ mod cuda_tests {
         }
         let _ = DeviceExpertSlotTable::alloc;
     }
+
+    #[test]
+    fn h64_g64_routed_moe_all_regimes_and_tiered_parity() {
+        use super::super::{
+            ExpertPackLayout, HostExpertStore, HotExpertCache, MoeOffloadMode, TieredMoeEngine,
+            TieredMoeWorkspace,
+        };
+        use crate::cuda::{f16_to_f32, f32_to_f16};
+
+        let _device = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let ex0 = stream.exec(0, 0);
+
+        // 1. Verify `w34_block_hadamard_inplace_f16` matches `w34_block_hadamard_f16` 0-ULP for B=16 and B=64.
+        let rows = 6usize;
+        let cols = 128usize;
+        let h_in: Vec<u16> = (0..rows * cols)
+            .map(|i| f32_to_f16(((i as f32 * 0.19).sin()) * 0.7))
+            .collect();
+        for block_size in [16i32, 64] {
+            let d_src = upload(&h_in, &stream);
+            let d_dst = DeviceBuffer::alloc(0, rows * cols * 2).unwrap();
+            let d_inp = upload(&h_in, &stream);
+            // SAFETY: `d_src` and `d_dst` are disjoint `rows * cols` FP16 buffers; `d_inp` is in-place.
+            unsafe {
+                assert_eq!(
+                    ffi::w34_block_hadamard_f16(
+                        &ex0,
+                        d_src.addr() as *const _,
+                        d_dst.addr() as *mut _,
+                        rows as i32,
+                        cols as i32,
+                        cols as i32,
+                        block_size,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    ffi::w34_block_hadamard_inplace_f16(
+                        &ex0,
+                        d_inp.addr() as *mut _,
+                        rows as i32,
+                        cols as i32,
+                        block_size,
+                    ),
+                    0
+                );
+            }
+            let mut h_oop = vec![0u16; rows * cols];
+            let mut h_inp = vec![0u16; rows * cols];
+            d_dst.copy_to_host(&mut h_oop, &stream).unwrap();
+            d_inp.copy_to_host(&mut h_inp, &stream).unwrap();
+            assert_eq!(
+                h_oop, h_inp,
+                "inplace vs out-of-place mismatch for B={block_size}"
+            );
+        }
+
+        // 2. Verify `group_size = 64` + `down_hadamard_block_size = 64` across all MoE regimes
+        //    (`M = 1` GEMV, `M = 4` sparse_vec4, `M = 8` sparse_mma, `M = 20` chunked prefill)
+        //    plus `CpuHybrid` and `StreamedPrefill`.
+        let num_experts = 16usize;
+        let n_interm = 640usize;
+        let k_hidden = 128usize;
+        let group_size = 64usize;
+        let top_k = 2usize;
+        let max_m = 20usize;
+        let layout = ExpertPackLayout::new(n_interm, k_hidden, group_size)
+            .unwrap()
+            .with_down_hadamard(64)
+            .unwrap();
+
+        let gu_words_per_exp = (2 * n_interm) * (k_hidden / 8);
+        let gu_scales_per_exp = (2 * n_interm) * (k_hidden / group_size);
+        let dn_words_per_exp = k_hidden * (n_interm / 8);
+        let dn_scales_per_exp = k_hidden * (n_interm / group_size);
+
+        let mut raw_packs = vec![0u8; num_experts * layout.stride];
+        for e in 0..num_experts {
+            let gu_p: Vec<u32> = (0..gu_words_per_exp)
+                .map(|i| {
+                    let mut w = 0u32;
+                    for b in 0..8 {
+                        let nib = (((e * 17 + i * 11 + b * 5) % 15) as u32) & 0xF;
+                        w |= nib << (b * 4);
+                    }
+                    w
+                })
+                .collect();
+            let gu_s: Vec<u16> = (0..gu_scales_per_exp)
+                .map(|i| f32_to_f16(0.014 + 0.0018 * (((e * 7 + i) % 9) as f32)))
+                .collect();
+            let dn_p: Vec<u32> = (0..dn_words_per_exp)
+                .map(|i| {
+                    let mut w = 0u32;
+                    for b in 0..8 {
+                        let nib = (((e * 19 + i * 3 + b * 7) % 15) as u32) & 0xF;
+                        w |= nib << (b * 4);
+                    }
+                    w
+                })
+                .collect();
+            let dn_s: Vec<u16> = (0..dn_scales_per_exp)
+                .map(|i| f32_to_f16(0.011 + 0.0014 * (((e * 5 + i) % 11) as f32)))
+                .collect();
+            layout
+                .write_pack(
+                    &gu_p,
+                    &gu_s,
+                    &dn_p,
+                    &dn_s,
+                    &mut raw_packs[e * layout.stride..(e + 1) * layout.stride],
+                )
+                .unwrap();
+        }
+
+        let h_x: Vec<u16> = (0..max_m * k_hidden)
+            .map(|i| f32_to_f16(((i as f32 * 0.11).cos()) * 0.45))
+            .collect();
+        let h_topk_ids: Vec<i32> = (0..max_m)
+            .flat_map(|t| {
+                [
+                    (t * 3 % num_experts) as i32,
+                    ((t * 5 + 1) % num_experts) as i32,
+                ]
+            })
+            .collect();
+        let h_topk_weights: Vec<f32> = (0..max_m * top_k)
+            .map(|i| if i % 2 == 0 { 0.65 } else { 0.35 })
+            .collect();
+
+        let d_x = upload(&h_x, &stream);
+        let d_topk_ids = upload(&h_topk_ids, &stream);
+        let d_topk_weights = upload(&h_topk_weights, &stream);
+
+        let full_store = HostExpertStore::from_raw_packs(
+            layout.clone(),
+            0..num_experts,
+            &raw_packs,
+            num_experts * layout.stride,
+        )
+        .unwrap();
+        let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 8, max_m, top_k).unwrap();
+        let mut full_cache =
+            HotExpertCache::new(0, num_experts, 0..num_experts, layout.clone()).unwrap();
+        full_cache
+            .populate_initial(&full_store, None, &mut ws, &stream)
+            .unwrap();
+
+        for m in [1usize, 4, 8, 20] {
+            let mut tasks = Vec::with_capacity(m * top_k);
+            for tok in 0..m {
+                for k in 0..top_k {
+                    let idx = tok * top_k + k;
+                    tasks.push((tok, h_topk_ids[idx] as usize, h_topk_weights[idx]));
+                }
+            }
+            let h_cpu = full_store.eval_cold_tasks_cpu(&h_x[..m * k_hidden], m, &tasks);
+            let d_out = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+            TieredMoeEngine::execute_layer_device_lru(
+                &full_store,
+                &mut full_cache,
+                &ws,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                0,
+                0,
+                d_out.addr(),
+                m,
+                top_k,
+            )
+            .unwrap();
+            let mut h_gpu = vec![0u16; m * k_hidden];
+            d_out.copy_to_host(&mut h_gpu, &stream).unwrap();
+            let max_diff = h_gpu
+                .iter()
+                .zip(&h_cpu)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1.6e-2,
+                "H64+g64 MoE M={m} max_abs_diff={max_diff} exceeds 1.6e-2"
+            );
+        }
+
+        // Also verify `CpuHybrid` and `StreamedPrefill` with `k_hot = 4` on `m = 6`.
+        let m = 6usize;
+        let mut tasks = Vec::with_capacity(m * top_k);
+        for tok in 0..m {
+            for k in 0..top_k {
+                let idx = tok * top_k + k;
+                tasks.push((tok, h_topk_ids[idx] as usize, h_topk_weights[idx]));
+            }
+        }
+        let h_cpu = full_store.eval_cold_tasks_cpu(&h_x[..m * k_hidden], m, &tasks);
+        for mode in [
+            MoeOffloadMode::CpuHybrid { gpu_pcie_budget: 1 },
+            MoeOffloadMode::StreamedPrefill,
+        ] {
+            let mut cache = HotExpertCache::new(0, 4, 0..num_experts, layout.clone()).unwrap();
+            let mut ws_small = TieredMoeWorkspace::new(0, layout.clone(), 3, m, top_k).unwrap();
+            cache
+                .populate_initial(&full_store, Some(&[0, 1, 2, 3]), &mut ws_small, &stream)
+                .unwrap();
+            let d_out = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+            TieredMoeEngine::execute_layer(
+                mode,
+                &full_store,
+                &mut cache,
+                &mut ws_small,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids[..m * top_k],
+                &h_topk_weights[..m * top_k],
+                0,
+                0,
+                d_out.addr(),
+                m,
+                top_k,
+            )
+            .unwrap();
+            let mut h_gpu = vec![0u16; m * k_hidden];
+            d_out.copy_to_host(&mut h_gpu, &stream).unwrap();
+            let max_diff = h_gpu
+                .iter()
+                .zip(&h_cpu)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff <= 1.6e-2,
+                "H64+g64 MoE {mode:?} max_abs_diff={max_diff} exceeds 1.6e-2"
+            );
+        }
+    }
 }

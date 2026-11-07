@@ -10,6 +10,7 @@ pub struct ExpertPackLayout {
     pub intermediate: usize,
     pub hidden: usize,
     pub group_size: usize,
+    pub down_hadamard_block_size: usize,
     pub gate_up_packed: Range<usize>,
     pub gate_up_scales: Range<usize>,
     pub down_packed: Range<usize>,
@@ -62,12 +63,27 @@ impl ExpertPackLayout {
             intermediate,
             hidden,
             group_size,
+            down_hadamard_block_size: 0,
             gate_up_packed: regions[0].clone(),
             gate_up_scales: regions[1].clone(),
             down_packed: regions[2].clone(),
             down_scales: regions[3].clone(),
             stride,
         })
+    }
+
+    /// Configures the optional pre-`down_proj` Hadamard block size (`0`, `16`, or `64`).
+    pub fn with_down_hadamard(mut self, block_size: usize) -> io::Result<Self> {
+        if !matches!(block_size, 0 | 16 | 64)
+            || (block_size > 0 && !self.intermediate.is_multiple_of(block_size))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid down_proj Hadamard block size for ExpertPackLayout",
+            ));
+        }
+        self.down_hadamard_block_size = block_size;
+        Ok(self)
     }
 
     /// Packs a single expert's N-major `U4B8` weights and `FP16` scales into a `stride`-byte slot.
@@ -202,6 +218,32 @@ impl ExpertPackLayout {
             let up_h = f16_to_f32(f32_to_f16(up_acc));
             let silu_h = f16_to_f32(f32_to_f16(gate_h / (1.0f32 + (-gate_h).exp())));
             *dst_interm = f32_to_f16(silu_h * up_h);
+        }
+
+        if self.down_hadamard_block_size > 0 {
+            let block = self.down_hadamard_block_size;
+            let norm = 1.0f32 / (block as f32).sqrt();
+            let mut values = vec![0.0f32; block];
+            for chunk in interm_f16.chunks_exact_mut(block) {
+                for (v, &bits) in values.iter_mut().zip(chunk.iter()) {
+                    *v = f16_to_f32(bits);
+                }
+                let mut step = 1;
+                while step < block {
+                    for base in (0..block).step_by(2 * step) {
+                        for i in 0..step {
+                            let a = values[base + i];
+                            let b = values[base + i + step];
+                            values[base + i] = a + b;
+                            values[base + i + step] = a - b;
+                        }
+                    }
+                    step *= 2;
+                }
+                for (bits, &v) in chunk.iter_mut().zip(&values) {
+                    *bits = f32_to_f16(v * norm);
+                }
+            }
         }
 
         // 2. Down projection + Top-K weight scaling

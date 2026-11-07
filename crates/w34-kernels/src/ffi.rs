@@ -340,6 +340,13 @@ unsafe extern "C" {
         padded_k: i32,
         block_size: i32,
     ) -> i32;
+    pub fn w34_block_hadamard_inplace_f16(
+        ex: *const W34Exec,
+        buf: *mut c_void,
+        rows: i32,
+        k: i32,
+        block_size: i32,
+    ) -> i32;
 
     pub fn w34_copy_masked_rows_f16(
         ex: *const W34Exec,
@@ -1375,6 +1382,27 @@ unsafe extern "C" {
         k_hidden: i32,
         group_size: i32,
     ) -> i32;
+    pub fn w34_moe_w4a16_mlp_ex_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        shared_expert_out: *const c_void,
+        shared_expert_gate_logits: *const c_void,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+        down_hadamard_block_size: i32,
+    ) -> i32;
 
     pub fn w34_moe_w4a16_mlp_zp_f16(
         ex: *const W34Exec,
@@ -1397,6 +1425,29 @@ unsafe extern "C" {
         n_interm: i32,
         k_hidden: i32,
         group_size: i32,
+    ) -> i32;
+    pub fn w34_moe_w4a16_mlp_zp_ex_f16(
+        ex: *const W34Exec,
+        x: *const c_void,
+        gate_up_packed: *const u32,
+        gate_up_scales: *const c_void,
+        gate_up_qzeros: *const u32,
+        down_packed: *const u32,
+        down_scales: *const c_void,
+        down_qzeros: *const u32,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        shared_expert_out: *const c_void,
+        shared_expert_gate_logits: *const c_void,
+        interm_buf: *mut c_void,
+        out: *mut c_void,
+        num_tokens: i32,
+        top_k: i32,
+        num_experts: i32,
+        n_interm: i32,
+        k_hidden: i32,
+        group_size: i32,
+        down_hadamard_block_size: i32,
     ) -> i32;
 
     pub fn w34_moe_f16_gate_up_silu(
@@ -1581,6 +1632,18 @@ unsafe extern "C" {
         num_tokens: i32,
         embed_dim: i32,
         weight_scale: f32,
+    ) -> i32;
+
+    pub fn w34_ple_dequant_lut4_to_f16(
+        ex: *const W34Exec,
+        raw_in: *const u8,
+        lut16: *const f32,
+        f16_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        num_heads: i32,
+        head_dim: i32,
+        group_size: i32,
     ) -> i32;
 
     pub fn w34_ple_dilated_conv1d_f16(

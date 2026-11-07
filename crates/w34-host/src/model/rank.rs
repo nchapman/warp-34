@@ -1618,7 +1618,14 @@ impl Qwen3_5ModelRank {
         } else {
             crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
         };
-        let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
+        let staged_row_bytes = ple_hasher
+            .ngram_heads
+            .saturating_mul(ple_mmap_table.staged_bytes_per_head());
+        let ple_row_bytes = self
+            .cfg
+            .ple_embed_dim
+            .max(self.cfg.hidden_size)
+            .max(staged_row_bytes);
         let f8_staging_dev = DeviceBuffer::alloc(
             self.device.device_id,
             max_ple_tokens * ple_row_bytes.max(MIN_PLE_ROW_STAGING_BYTES),
@@ -1657,13 +1664,13 @@ impl Qwen3_5ModelRank {
             return Ok(());
         }
         let num_tokens = input_ids.len();
-        let ple_row_bytes = self.cfg.ple_embed_dim.max(self.cfg.hidden_size);
+        let num_heads = ple.hasher.ngram_heads;
+        let ple_row_bytes = num_heads * ple.mmap_table.staged_bytes_per_head();
         if num_tokens * ple_row_bytes > ple.f8_staging_dev.len_bytes {
             return Err(loader_err(
                 "PLE batch token count exceeds staging buffer capacity",
             ));
         }
-        let num_heads = ple.hasher.ngram_heads;
         ple.ids_scratch.resize(num_tokens * num_heads, 0);
         ple.hasher.compute_ngram_ids_for_slots(
             input_ids,

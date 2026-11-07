@@ -927,8 +927,15 @@ impl RankTieredMoe {
         stage_capacity: usize,
         stream: &crate::cuda::CudaStream,
     ) -> crate::cuda::Result<Self> {
-        let group_size = cfg.quant.group_size_or(128);
+        let group_size = cfg.routed_expert_quant_scheme().group_size_or(128);
+        let down_hadamard = cfg
+            .quant
+            .input_hadamard("model.layers.0.mlp.experts.0.down_proj")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
         let layout = ExpertPackLayout::new(cfg.moe_intermediate_size, cfg.hidden_size, group_size)
+            .and_then(|l| l.with_down_hadamard(down_hadamard))
             .map_err(|e| {
                 crate::cuda::CudaError::with_detail(-1, "ExpertPackLayout::new", e.to_string())
             })?;
@@ -964,7 +971,7 @@ impl RankTieredMoe {
                 crate::cuda::CudaError::with_detail(-1, "HostExpertStore::load", e.to_string())
             })?;
             let mut cache =
-                HotExpertCache::new(device_id, k_hot, store.expert_ids(), layout.clone())?;
+                HotExpertCache::new(device_id, k_hot, store.expert_ids(), store.layout().clone())?;
             let initial = rankings
                 .as_ref()
                 .and_then(|r| r.select_for_layer(layer_id, store.expert_ids(), k_hot));
@@ -976,6 +983,7 @@ impl RankTieredMoe {
                 && k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
                 && cfg.num_hidden_layers <= TIERED_MOE_CPU_BRIDGE_MAX_LAYERS
                 && group_size == TIERED_MOE_CPU_BRIDGE_GROUP_SIZE
+                && store.layout().down_hadamard_block_size == 0
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 let k_static = k_hot;

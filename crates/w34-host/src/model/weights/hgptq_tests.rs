@@ -359,3 +359,290 @@ fn channelwise_hadamard_k4304_does_not_overflow_fp16_before_scale() {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn h64_moe_ffn_block_shares_input_rotation_and_matches_reference() {
+    let _device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let cublas = CublasHandle::new(&stream).unwrap();
+    let staging = DeviceBuffer::alloc(0, 16 * 1024 * 1024).unwrap();
+    let locks = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    locks.copy_from_host(&vec![0i32; 65536], &stream).unwrap();
+
+    let m = 4usize;
+    let h_dim = 128usize;
+    let n_interm = 128usize;
+    let sh_interm = 128usize;
+    let num_experts = 4usize;
+    let top_k = 2usize;
+    let group_size = 64usize;
+
+    let mut arena = DeviceArena::new(0, 32 * 1024 * 1024).unwrap();
+
+    // Unrotated router_gate [num_experts, h_dim] and shared_expert_gate [1, h_dim].
+    let router_w: Vec<u16> = (0..num_experts * h_dim)
+        .map(|i| f32_to_f16(((i as f32 * 0.17).sin()) * 0.2))
+        .collect();
+    let sh_gate_w: Vec<u16> = (0..h_dim)
+        .map(|i| f32_to_f16(((i as f32 * 0.23).cos()) * 0.2))
+        .collect();
+    let router_ptr = arena.upload_slice(&router_w, &stream).unwrap();
+    let sh_gate_ptr = arena.upload_slice(&sh_gate_w, &stream).unwrap();
+
+    // Shared expert gate_up [2*sh_interm, h_dim] and down [h_dim, sh_interm]:
+    // build both an H_64-wrapped version and an unwrapped version for the step-by-step reference.
+    let sh_gu_had = RawLinearHost::Hadamard {
+        inner: Box::new(raw(2 * sh_interm, h_dim, group_size)),
+        block_size: 64,
+    }
+    .upload(&mut arena, &stream, &staging)
+    .unwrap();
+    let sh_dn_had = RawLinearHost::Hadamard {
+        inner: Box::new(raw(h_dim, sh_interm, group_size)),
+        block_size: 64,
+    }
+    .upload(&mut arena, &stream, &staging)
+    .unwrap();
+    let sh_gu_unrot = raw(2 * sh_interm, h_dim, group_size)
+        .upload(&mut arena, &stream, &staging)
+        .unwrap();
+    let sh_dn_unrot = raw(h_dim, sh_interm, group_size)
+        .upload(&mut arena, &stream, &staging)
+        .unwrap();
+
+    // Routed experts: 4 experts of gate_up [2*n_interm, h_dim] and down [h_dim, n_interm].
+    let mut gu_packed = Vec::new();
+    let mut gu_scales = Vec::new();
+    let mut dn_packed = Vec::new();
+    let mut dn_scales = Vec::new();
+    for _e in 0..num_experts {
+        let RawLinearHost::U4B8NMajor {
+            packed: gp,
+            scales: gs,
+            ..
+        } = raw(2 * n_interm, h_dim, group_size)
+        else {
+            unreachable!()
+        };
+        let RawLinearHost::U4B8NMajor {
+            packed: dp,
+            scales: ds,
+            ..
+        } = raw(h_dim, n_interm, group_size)
+        else {
+            unreachable!()
+        };
+        gu_packed.extend_from_slice(&gp);
+        gu_scales.extend_from_slice(&gs);
+        dn_packed.extend_from_slice(&dp);
+        dn_scales.extend_from_slice(&ds);
+    }
+    let gu_p_ptr = arena.upload_slice(&gu_packed, &stream).unwrap();
+    let gu_s_ptr = arena.upload_slice(&gu_scales, &stream).unwrap();
+    let dn_p_ptr = arena.upload_slice(&dn_packed, &stream).unwrap();
+    let dn_s_ptr = arena.upload_slice(&dn_scales, &stream).unwrap();
+
+    let ffn_h64 = FfnBlockWeights::Moe(Box::new(MoeLayerWeights {
+        router_gate: LinearProj::DenseF16 {
+            weight_ptr: router_ptr,
+            size_n: num_experts,
+            size_k: h_dim,
+        },
+        experts: MoeExpertStorage::W4A16 {
+            gate_up_packed_ptr: gu_p_ptr,
+            gate_up_scales_ptr: gu_s_ptr,
+            down_packed_ptr: dn_p_ptr,
+            down_scales_ptr: dn_s_ptr,
+            group_size,
+        },
+        num_experts,
+        top_k,
+        norm_topk_prob: true,
+        scoring_func: 0,
+        local_moe_interm: n_interm,
+        routed_input_hadamard: 64,
+        routed_down_hadamard: 64,
+        shared_gate_up_proj: Some(sh_gu_had),
+        shared_down_proj: Some(sh_dn_had),
+        shared_expert_gate: Some(LinearProj::DenseF16 {
+            weight_ptr: sh_gate_ptr,
+            size_n: 1,
+            size_k: h_dim,
+        }),
+        local_shared_interm: sh_interm,
+    }));
+
+    let h_x: Vec<u16> = (0..m * h_dim)
+        .map(|i| f32_to_f16(((i as f32 * 0.13).sin()) * 0.5))
+        .collect();
+    let h_x_rot = rotate(&h_x, 64);
+
+    let d_normed = arena.upload_slice(&h_x, &stream).unwrap();
+    let d_out = arena.alloc_aligned(m * h_dim * 2).unwrap();
+    let d_router_logits = arena.alloc_aligned(m * num_experts * 2).unwrap();
+    let d_topk_w = arena.alloc_aligned(m * top_k * 4).unwrap();
+    let d_topk_i = arena.alloc_aligned(m * top_k * 4).unwrap();
+    let d_interm = arena.alloc_aligned(m * top_k * n_interm * 2).unwrap();
+    let d_sh_gu = arena.alloc_aligned(m * 2 * sh_interm * 2).unwrap();
+    let d_sh_act = arena.alloc_aligned(m * sh_interm * 2).unwrap();
+    let d_sh_out = arena.alloc_aligned(m * h_dim * 2).unwrap();
+    let d_sh_gate = arena.alloc_aligned(m * 2).unwrap();
+    let d_ws = arena.alloc_aligned(256 * 1024).unwrap();
+    let ex = stream.exec(d_ws, 256 * 1024);
+
+    ffn_h64
+        .forward(
+            &ex,
+            &cublas,
+            locks.addr(),
+            65536,
+            d_normed,
+            d_out,
+            m,
+            h_dim,
+            n_interm,
+            0,
+            0,
+            d_router_logits,
+            d_topk_w,
+            d_topk_i,
+            d_interm,
+            d_sh_gu,
+            d_sh_act,
+            d_sh_out,
+            d_sh_gate,
+        )
+        .unwrap();
+    let mut actual = vec![0u16; m * h_dim];
+    // SAFETY: `d_out` holds `m * h_dim` FP16 elements.
+    unsafe {
+        ffi::w34_memcpy_d2h_async(
+            actual.as_mut_ptr().cast(),
+            d_out as *const _,
+            m * h_dim * 2,
+            stream.handle,
+        );
+    }
+    stream.synchronize().unwrap();
+
+    // Verify `d_normed` was rotated in-place to `h_x_rot`, while router/shared_expert_gate
+    // ran BEFORE the in-place rotation, by running the reference with pre-computed `d_topk_i`/`d_topk_w`/`d_sh_gate`
+    // and feeding `h_x_rot` directly to `sh_gu_unrot` and `w34_moe_w4a16_mlp_ex_f16(..., 64)`.
+    let mut normed_after = vec![0u16; m * h_dim];
+    // SAFETY: `d_normed` holds `m * h_dim` FP16 elements.
+    unsafe {
+        ffi::w34_memcpy_d2h_async(
+            normed_after.as_mut_ptr().cast(),
+            d_normed as *const _,
+            m * h_dim * 2,
+            stream.handle,
+        );
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(normed_after, h_x_rot);
+
+    // Reference: compute `router_logits` and `sh_gate` from unrotated `h_x` explicitly,
+    // and run `sh_gu_unrot` + `sh_dn_unrot` + `w34_moe_w4a16_mlp_ex_f16` on `h_x_rot`.
+    let d_x_unrot = arena.upload_slice(&h_x, &stream).unwrap();
+    let d_x_rot = arena.upload_slice(&h_x_rot, &stream).unwrap();
+    let d_ref_out = arena.alloc_aligned(m * h_dim * 2).unwrap();
+    LinearProj::DenseF16 {
+        weight_ptr: router_ptr,
+        size_n: num_experts,
+        size_k: h_dim,
+    }
+    .forward(
+        &ex,
+        &cublas,
+        locks.addr(),
+        65536,
+        d_x_unrot,
+        d_router_logits,
+        m,
+    )
+    .unwrap();
+    LinearProj::DenseF16 {
+        weight_ptr: sh_gate_ptr,
+        size_n: 1,
+        size_k: h_dim,
+    }
+    .forward(&ex, &cublas, locks.addr(), 65536, d_x_unrot, d_sh_gate, m)
+    .unwrap();
+    // SAFETY: `d_router_logits`, `d_topk_w`, `d_topk_i` are sized for `m`, `num_experts`, `top_k`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_moe_topk_router_f16(
+                &ex,
+                d_router_logits as *const _,
+                d_topk_w as *mut f32,
+                d_topk_i as *mut i32,
+                m as i32,
+                num_experts as i32,
+                top_k as i32,
+                1,
+                0,
+            ),
+            0
+        );
+    }
+    sh_gu_unrot
+        .forward(&ex, &cublas, locks.addr(), 65536, d_x_rot, d_sh_gu, m)
+        .unwrap();
+    // SAFETY: `d_sh_gu` and `d_sh_act` are sized for `m * 2 * sh_interm` and `m * sh_interm`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_silu_and_mul_hadamard_f16(
+                &ex,
+                d_sh_gu as *const _,
+                d_sh_act as *mut _,
+                core::ptr::null(),
+                m as i32,
+                sh_interm as i32,
+            ),
+            0
+        );
+    }
+    sh_dn_unrot
+        .forward(&ex, &cublas, locks.addr(), 65536, d_sh_act, d_sh_out, m)
+        .unwrap();
+    // SAFETY: all pointers are valid allocations from `arena`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_moe_w4a16_mlp_ex_f16(
+                &ex,
+                d_x_rot as *const _,
+                gu_p_ptr as *const u32,
+                gu_s_ptr as *const _,
+                dn_p_ptr as *const u32,
+                dn_s_ptr as *const _,
+                d_topk_i as *const i32,
+                d_topk_w as *const f32,
+                d_sh_out as *const _,
+                d_sh_gate as *const _,
+                d_interm as *mut _,
+                d_ref_out as *mut _,
+                m as i32,
+                top_k as i32,
+                num_experts as i32,
+                n_interm as i32,
+                h_dim as i32,
+                group_size as i32,
+                64,
+            ),
+            0
+        );
+    }
+    let mut expected = vec![0u16; m * h_dim];
+    // SAFETY: `d_ref_out` holds `m * h_dim` FP16 elements.
+    unsafe {
+        ffi::w34_memcpy_d2h_async(
+            expected.as_mut_ptr().cast(),
+            d_ref_out as *const _,
+            m * h_dim * 2,
+            stream.handle,
+        );
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(actual, expected);
+}

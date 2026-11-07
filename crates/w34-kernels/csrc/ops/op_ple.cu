@@ -52,6 +52,50 @@ __global__ void ple_dequant_f8_to_f16_kernel(
     }
 }
 
+__global__ void ple_dequant_lut4_to_f16_kernel(
+    const uint8_t* __restrict__ raw_in,
+    const float* __restrict__ lut16,
+    __half* __restrict__ f16_out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    int group_size) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+    const int embed_dim = num_heads * head_dim;
+    __half* dst = f16_out + (size_t)tok * embed_dim;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+            dst[d] = __float2half(0.0f);
+        }
+        return;
+    }
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) {
+        s_lut[threadIdx.x] = lut16[threadIdx.x];
+    }
+    __syncthreads();
+
+    const int packed_bytes = head_dim / 2;
+    const int num_groups = head_dim / group_size;
+    const int head_stride = packed_bytes + num_groups * 2;
+    const uint8_t* tok_src = raw_in + (size_t)tok * num_heads * head_stride;
+
+    for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+        const int h = d / head_dim;
+        const int col = d - h * head_dim;
+        const uint8_t* head_ptr = tok_src + (size_t)h * head_stride;
+        const uint8_t packed_byte = head_ptr[col >> 1];
+        const uint32_t nibble = (col & 1) ? ((packed_byte >> 4) & 0x0fu) : (packed_byte & 0x0fu);
+        const int grp = col / group_size;
+        const uint8_t* scale_bytes = head_ptr + packed_bytes + grp * 2;
+        const uint16_t scale_bits = (uint16_t)scale_bytes[0] | ((uint16_t)scale_bytes[1] << 8);
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+        dst[d] = __float2half(s_lut[nibble] * scale);
+    }
+}
+
 // Causal dilated 1D depthwise convolution with kernel_size=4, dilation=3 (span=9 taps).
 // Grid: (conv_dim + 255) / 256, Block: 256, Y-grid: num_reqs.
 __global__ void ple_dilated_conv1d_f16_kernel(
@@ -278,6 +322,35 @@ int w34_ple_dequant_f8_to_f16(
         num_tokens,
         embed_dim,
         weight_scale);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
+int w34_ple_dequant_lut4_to_f16(
+    const w34_exec* ex,
+    const uint8_t* raw_in,
+    const float* lut16,
+    void* f16_out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    int group_size) {
+    if (!ex || !raw_in || !lut16 || !f16_out || num_tokens < 0 ||
+        num_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0 ||
+        group_size <= 0 || (head_dim % group_size) != 0) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    w34::ple_dequant_lut4_to_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+        raw_in,
+        lut16,
+        static_cast<__half*>(f16_out),
+        valid_token_mask,
+        num_tokens,
+        num_heads,
+        head_dim,
+        group_size);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
 }
 

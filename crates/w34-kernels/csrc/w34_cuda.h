@@ -188,6 +188,8 @@ int w34_linear_epilogue_f16(const w34_exec* ex, const void* src,
 
 int w34_block_hadamard_f16(const w34_exec* ex, const void* src, void* dst,
                            int rows, int k, int padded_k, int block_size);
+int w34_block_hadamard_inplace_f16(const w34_exec* ex, void* buf,
+                                   int rows, int k, int block_size);
 int w34_block_hadamard_bf16(const w34_exec* ex, const void* src, void* dst,
                             int rows, int k, int padded_k, int block_size);
 
@@ -621,6 +623,16 @@ int w34_moe_w4a16_mlp_f16(const w34_exec* ex, const void* x,
                           void* interm_buf, void* out,
                           int num_tokens, int top_k, int num_experts,
                           int n_interm, int k_hidden, int group_size);
+int w34_moe_w4a16_mlp_ex_f16(const w34_exec* ex, const void* x,
+                             const uint32_t* gate_up_packed, const void* gate_up_scales,
+                             const uint32_t* down_packed, const void* down_scales,
+                             const int32_t* topk_ids, const float* topk_weights,
+                             const void* shared_expert_out,
+                             const void* shared_expert_gate_logits,
+                             void* interm_buf, void* out,
+                             int num_tokens, int top_k, int num_experts,
+                             int n_interm, int k_hidden, int group_size,
+                             int down_hadamard_block_size);
 int w34_moe_w4a16_mlp_zp_f16(const w34_exec* ex, const void* x,
                              const uint32_t* gate_up_packed, const void* gate_up_scales,
                              const uint32_t* gate_up_qzeros,
@@ -632,6 +644,18 @@ int w34_moe_w4a16_mlp_zp_f16(const w34_exec* ex, const void* x,
                              void* interm_buf, void* out,
                              int num_tokens, int top_k, int num_experts,
                              int n_interm, int k_hidden, int group_size);
+int w34_moe_w4a16_mlp_zp_ex_f16(const w34_exec* ex, const void* x,
+                                const uint32_t* gate_up_packed, const void* gate_up_scales,
+                                const uint32_t* gate_up_qzeros,
+                                const uint32_t* down_packed, const void* down_scales,
+                                const uint32_t* down_qzeros,
+                                const int32_t* topk_ids, const float* topk_weights,
+                                const void* shared_expert_out,
+                                const void* shared_expert_gate_logits,
+                                void* interm_buf, void* out,
+                                int num_tokens, int top_k, int num_experts,
+                                int n_interm, int k_hidden, int group_size,
+                                int down_hadamard_block_size);
 int w34_moe_f16_gate_up_silu(const w34_exec* ex, const void* x, const void* gate_up_w,
                              const int32_t* topk_ids, void* interm_out,
                              int num_tokens, int top_k, int num_experts,
@@ -695,6 +719,9 @@ int w34_qwen4_mtp_broadcast_add_f16(const w34_exec* ex, const void* fc_embed,
 int w34_ple_dequant_f8_to_f16(const w34_exec* ex, const uint8_t* f8_in, void* f16_out,
                               const uint8_t* valid_token_mask, int num_tokens,
                               int embed_dim, float weight_scale);
+int w34_ple_dequant_lut4_to_f16(const w34_exec* ex, const uint8_t* raw_in, const float* lut16,
+                                void* f16_out, const uint8_t* valid_token_mask, int num_tokens,
+                                int num_heads, int head_dim, int group_size);
 int w34_ple_dilated_conv1d_f16(const w34_exec* ex, const void* key_in, const void* conv_weight,
                                void* conv_state_pool, void* key_out,
                                const w34_gdn_batch* batch, int conv_dim);
