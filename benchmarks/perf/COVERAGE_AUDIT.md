@@ -1,6 +1,8 @@
 # Standalone performance coverage audit
 
-Audit baseline: `496d1a1` (post-HGPTQ merge). Scope: the standalone HTTP
+Audit baseline: `496d1a1` (post-HGPTQ merge). Inventory below describes that
+baseline; the follow-up Flash-Next campaign is `campaigns/flash-next-hgptq.toml`.
+Scope: the standalone HTTP
 `w34perf` suite, not internal `w34 bench`, oracle parity, kernel profiling, or
 model-quality evaluation. No GPU benchmarks or server qualification were run
 for this audit. Configured coverage is not evidence of successful execution.
@@ -50,13 +52,14 @@ Maintain two distinct comparison tracks:
    checkpoints for now. Match source model, tokenizer/template, workload,
    hardware and precision controls; label remaining differences. Compare
    plain decoding first, then explicitly labeled speculation/KV sweeps.
-2. **Best-supported deployment comparison:** HGPTQ on warp-34 versus a popular,
-   natively supported third-party approximately 4-bit checkpoint on competitors.
-   This measures the whole deployment, not an isolated engine advantage. Do not
-   silently pool it with track 1 or infer quality equivalence from bit width.
+2. **Warp-34 quant comparison:** HGPTQ versus the existing plain quant on
+   warp-34, holding hardware, workloads and decoding mode constant. This is not
+   a second cross-engine campaign. For Flash-Next the existing reference is
+   AutoRound W4A16 with FP8 PLE, not plain GPTQ; label that distinction and do not
+   infer quality equivalence from bit width.
 
-Third-party selection is **pending**, not a claim that a particular publisher is
-popular or equivalent. Require the same underlying model/version (not a
+Third-party replacement selection is **deferred**; it is not needed for this
+refresh and no publisher is being declared popular or equivalent. Require the same underlying model/version (not a
 fine-tune, uncensored derivative, or similarly named predecessor), pinned
 revision, quantization coverage/group sizes, tensor exclusions, tokenizer and
 chat template. For Flash-Next explicitly record PLE representation and size;
@@ -109,9 +112,10 @@ this core is working.
 Start with the existing 27B plain-GPTQ common checkpoint on all three engines,
 TP1/TP2, plain decode and then qualified speculative modes. Extend the common
 checkpoint lane to the other model families where available. Qualify Flash-Next
-stock-engine support separately from custom overlays. Add third-party practical
-comparisons after selecting artifacts; retain the old FP8-PLE Flash-Next lane as
-a labeled reference, not an equivalent HGPTQ artifact.
+stock-engine support separately from custom overlays. Do not expand this refresh into third-party practical comparisons. Retain the
+old FP8-PLE Flash-Next lane as a labeled warp-34 reference, not an equivalent
+HGPTQ artifact; historical runs on different hardware are not controlled quant
+comparisons.
 
 For KV, first establish a common supported precision where capacity allows,
 then compare best-supported policies at a declared memory/context budget. An
@@ -215,8 +219,8 @@ CUDA project check was not run for this documentation-only audit.
   refresh launch metadata without overwriting historical campaigns.
 - **P0:** Define representative decode cases and state protocols; qualify serving
   profiles on the pod. No new performance claims before this step.
-- **P1:** Add drafter comparison controls and explicitly labeled practical
-  cross-quant reporting; select third-party checkpoints with provenance review.
+- **P1:** Add drafter comparison controls and explicitly labeled within-warp-34
+  quant reporting. Third-party checkpoint replacement is deferred.
 - **P1:** Expand concurrency, long-context and offered-load coverage; capture
   optional speculative/residency diagnostics.
 - **P2:** Multimodal cases and wider tuning sweeps.

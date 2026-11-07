@@ -1,0 +1,155 @@
+# HGPTQ refresh; historical flash-next-serving.toml remains separate.
+# Pod binary built from b7f5fdd; measured artifact hashes and full serving qualification.
+# See flash-next-hgptq.md: qualification only, not a locked performance baseline.
+# Drafter pin is the validated local-cache revision, NOT current HF main.
+# Standalone HTTP campaign; launch one profile manually, never concurrently.
+# Supported means tested on this pinned pod deployment, not quality certification.
+# Original run manifests retain their pre-qualification unverified status.
+# max-num-seqs=4 requests 16 serving state slots; seq1's 8 slots fail DFlash2.
+# Workload concurrency remains one, with the same capacity setting for all modes.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 3
+warmup_requests = 1
+max_inflight = 1
+timeout_s = 1800
+
+[presets.quick]
+cases = ["short-chat", "coding-agent-replay"]
+repetitions = 1
+[presets.full]
+cases = ["short-chat", "prefill-context-r16", "code-context-r64", "prefix-primed-r16", "coding-agent-replay"]
+repetitions = 3
+[presets.release]
+cases = ["short-chat", "prefill-context-r16", "code-context-r64", "prefix-primed-r16", "coding-agent-replay"]
+repetitions = 5
+
+[engine_defaults]
+support = "supported"
+cohort = "flash-next-hgptq-serving"
+engine = "warp-34"
+version = "b7f5fdd"
+binary_sha256 = "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1"
+base_url = "http://127.0.0.1:18034/v1"
+model = "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b"
+model_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
+source_model_revision = "unknown"
+artifact_sha256 = "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56"
+tokenizer_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
+chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+weight_format = "HGPTQ-W4A16"
+quantization_details = "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "tq4"
+cache_config = "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured"
+request_overrides = {temperature = 0, chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-flash-hgptq-tp1-target"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "TP=1; routed EP=1"
+speculation = "none"
+launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-flash-hgptq-tp1-mtp3"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "TP=1; routed EP=1"
+speculation = "mtp-k3"
+launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
+
+[[engines]]
+id = "warp34-flash-hgptq-tp1-dflash2"
+gpu_count = 1
+gpu_ids = "0"
+parallelism = "TP=1; routed EP=1"
+speculation = "dflash2"
+draft_model = "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8"
+draft_model_revision = "24a62babba3b54387b3ea73f5599e5de83029dd8"
+draft_artifact_sha256 = "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed"
+draft_activation_dtype = "bfloat16"
+draft_block_size = 8
+launch_command = "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8"
+
+[[engines]]
+id = "warp34-flash-hgptq-tp2-target"
+gpu_count = 2
+gpu_ids = "0,1"
+parallelism = "TP=2; routed EP=2"
+speculation = "none"
+launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-flash-hgptq-tp2-mtp3"
+gpu_count = 2
+gpu_ids = "0,1"
+parallelism = "TP=2; routed EP=2"
+speculation = "mtp-k3"
+launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3"
+
+[[engines]]
+id = "warp34-flash-hgptq-tp2-dflash2"
+gpu_count = 2
+gpu_ids = "0,1"
+parallelism = "TP=2; routed EP=2"
+speculation = "dflash2"
+draft_model = "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8"
+draft_model_revision = "24a62babba3b54387b3ea73f5599e5de83029dd8"
+draft_artifact_sha256 = "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed"
+draft_activation_dtype = "bfloat16"
+draft_block_size = 8
+launch_command = "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8"
+
+# Repetitions of fixture context are NOT calibrated token buckets.
+[[cases]]
+id = "short-chat"
+fixture = "../fixtures/text.json"
+context_repetitions = 1
+cache = "unique"
+requests = 4
+concurrency = 1
+max_tokens = 256
+
+# Repetitions of fixture context are NOT calibrated token buckets.
+[[cases]]
+id = "prefill-context-r16"
+fixture = "../fixtures/text.json"
+context_repetitions = 16
+cache = "unique"
+requests = 4
+concurrency = 1
+max_tokens = 64
+
+# Repetitions of fixture context are NOT calibrated token buckets.
+[[cases]]
+id = "code-context-r64"
+fixture = "../fixtures/text.json"
+context_repetitions = 64
+cache = "unique"
+requests = 4
+concurrency = 1
+max_tokens = 256
+
+# Repetitions of fixture context are NOT calibrated token buckets.
+[[cases]]
+id = "prefix-primed-r16"
+fixture = "../fixtures/text.json"
+context_repetitions = 16
+cache = "primed"
+requests = 4
+concurrency = 1
+max_tokens = 64
+
+[[cases]]
+id = "coding-agent-replay"
+kind = "agent_replay"
+fixture = "../fixtures/coding_agent.json"
+cache = "natural"
+requests = 2
+concurrency = 1
+max_tokens = 128

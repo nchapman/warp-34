@@ -55,6 +55,33 @@ A zero exit does **not** mean the run is publication-ready. Unknown provenance,
 quality evidence, failures, and release-audit requirements are visible in reports.
 No engine has been automatically installed, modified, or tuned.
 
+## Flash-Next HGPTQ refresh
+
+[Qualification outcome and retained evidence](campaigns/flash-next-hgptq.md):
+all six profiles completed the full campaign (90 trials, 432 measured requests).
+These are working-harness checks, **not locked performance baselines**; incorporate
+ongoing engine improvements before locking numbers.
+
+`campaigns/flash-next-hgptq.toml` adds six warp-34 profiles: TP1/TP2 with plain
+decode, MTP-k3, and quantized DFlash2. It pins the HGPTQ target and drafter
+independently, uses an 8K target KV pool (512 pages), and reuses the existing
+five Flash-Next workloads; no additional agentic fixtures are introduced.
+Paths and launch commands target the user-provided dual-3090 pod under
+`/workspace`. All six profiles use `--max-num-seqs 4` for a larger serving state
+pool: the initial seq1 pool failed DFlash2 verification with insufficient state
+slots. Workload concurrency remains one; this is not a C4 throughput test.
+Run one server at a time. Unknown provenance remains explicit,
+and offline validation does not qualify a serving profile.
+
+```sh
+python3 -m w34perf plan campaigns/flash-next-hgptq.toml --preset quick
+```
+
+The two-track plan is now shared plain-GPTQ cross-engine baselines, followed by
+HGPTQ versus the existing quant **within warp-34**. Flash-Next's older quant is
+AutoRound W4A16 with FP8 PLE, not plain GPTQ. Keep historical campaigns intact;
+results from a different GPU/CPU/topology are not a controlled quant comparison.
+
 ## Completion campaigns, quality and retained evidence
 
 The [completion ledger](COMPLETION_PLAN.md) tracks current 27B and Flash Next

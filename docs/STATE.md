@@ -1,9 +1,17 @@
 # warp-34 — Session Orientation & Current State
 
+## Flash-Next standalone benchmark qualification (completed; performance numbers provisional)
+
+- Added `benchmarks/perf/campaigns/flash-next-hgptq.toml`: six pinned HGPTQ profiles (TP1/TP2 × plain/MTP-3/DFlash2), reusing the five existing workloads. New agentic workloads remain deferred. Cross-engine comparisons retain common plain GPTQ; the second track is HGPTQ versus the existing quant within warp-34, not another third-party comparison campaign.
+- On the user-provided 2× RTX 3090 NVLink / EPYC 7R13 AVX2 pod, source `b7f5fdd` completed **90/90 full qualification trials, 432/432 measured requests, 648/648 requests including warmup/priming**, with complete token accounting. This qualifies execution/measurement only; ongoing engine improvements must be incorporated before locking performance numbers. No standings updated.
+- Initial DFlash2 probes failed with `no speculative verification state slots`: serving `--max-num-seqs 1` requests only eight slots. All six profiles now use `--max-num-seqs 4` (requesting 16 slots), while workload concurrency remains one. This is a campaign capacity workaround, not an engine fix; original failure evidence is preserved.
+- Results/limitations: [`flash-next-hgptq.md`](../benchmarks/perf/campaigns/flash-next-hgptq.md), with a tracked machine-readable report. Raw evidence copied locally to `benchmarks/perf/results/flash-hgptq-pod-001/`; 126 bundle hashes verified. `mise run perf-check`: 91 tests passed. Remote CUDA release build passed; full project CUDA tests were not run. Benchmark servers stopped, GPUs idle; pod remains available.
+
+
 ## Standalone performance coverage audit (post-HGPTQ; no new GPU measurements)
 
 - Audited `benchmarks/perf/` against the current HGPTQ, Flash-Next and DFlash2 capabilities. Existing HTTP infrastructure is reusable, but campaign TOMLs have no HGPTQ profiles; Flash-Next lacks DFlash2 profiles and 27B DFlash2 uses the older BF16 drafter.
-- Recorded the proposed 22-profile HGPTQ TP1/TP2 core limited to mainstream, unmodified 9B, 27B, 35B-A3B and Flash-Next (no 2B/4B or heretic derivatives), workload/state gaps, separate matched-GPTQ versus practical cross-quant comparison tracks, and pod handoff requirements in [`benchmarks/perf/COVERAGE_AUDIT.md`](../benchmarks/perf/COVERAGE_AUDIT.md). Third-party checkpoint selection and new profiles remain pending; historical campaigns/results were not relabeled.
+- Recorded the proposed 22-profile HGPTQ TP1/TP2 core limited to mainstream, unmodified 9B, 27B, 35B-A3B and Flash-Next (no 2B/4B or heretic derivatives), workload/state gaps, separate matched-GPTQ cross-engine versus within-warp-34 quant comparison tracks, and pod handoff requirements in [`benchmarks/perf/COVERAGE_AUDIT.md`](../benchmarks/perf/COVERAGE_AUDIT.md). Third-party checkpoint selection and new profiles remain pending; historical campaigns/results were not relabeled.
 - This was a coverage/documentation audit only. No local GPU benchmarks, downloads or server launches; execution awaits the user-provided pod.
 
 
