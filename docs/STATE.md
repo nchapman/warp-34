@@ -1,5 +1,12 @@
 # warp-34 — Session Orientation & Current State
 
+## Standalone performance coverage audit (post-HGPTQ; no new GPU measurements)
+
+- Audited `benchmarks/perf/` against the current HGPTQ, Flash-Next and DFlash2 capabilities. Existing HTTP infrastructure is reusable, but campaign TOMLs have no HGPTQ profiles; Flash-Next lacks DFlash2 profiles and 27B DFlash2 uses the older BF16 drafter.
+- Recorded the proposed 26-profile HGPTQ TP1/TP2 core, workload/state gaps, separate matched-GPTQ versus practical cross-quant comparison tracks, and pod handoff requirements in [`benchmarks/perf/COVERAGE_AUDIT.md`](../benchmarks/perf/COVERAGE_AUDIT.md). Third-party checkpoint selection and new profiles remain pending; historical campaigns/results were not relabeled.
+- This was a coverage/documentation audit only. No local GPU benchmarks, downloads or server launches; execution awaits the user-provided pod.
+
+
 ## HGPTQ Native W4 + Online Block-Hadamard Support Across 2B, 9B, 27B (+ DFlash2), 35B-A3B MoE, and Flash-Next (`feat/hgptq`, completed & verified)
 
 - **Scope:** End-to-end native support for **HGPTQ** (`quant_method=compressed-tensors`, `format=pack-quantized`, symmetric `U4B8` W4 + online block-Hadamard `b=64` / `b=16` input rotations), qualified across all five flagship target models (`nchapman/Qwen3.5-2B-W4A16-HGPTQ`, `nchapman/Qwen3.5-9B-W4A16-HGPTQ`, `nchapman/Qwen3.8-27B-W4A16-HGPTQ`, `nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ`, and `nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ`) and the quantized `DFlash2` drafters (`nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ` at `2.16 GiB` and `nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ` at `719 MiB`) covering Text, 256-expert & 512-expert MoE, 4-bit `lut4-gptq` `PLE`, `MTP` (`k=1..3`), `DFlash2` (`M=8`), Vision (`coco_sample.png`, including 9B/27B/35B-A3B/Flash-Next `b=16` channelwise `K/N=4304`), CUDA Graphs, and `TP=1 == TP=2`. See [`HGPTQ.md`](HGPTQ.md).
