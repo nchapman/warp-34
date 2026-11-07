@@ -708,6 +708,10 @@ int w34_hc_down_silu_inject_f16(const w34_exec* ex, const void* down_in, void* d
 int w34_hc_mix_streams_f16(const w34_exec* ex, const void* residual_in, const void* up_raw_in,
                            void* mixed_out, const uint8_t* valid_token_mask,
                            int num_tokens, int hc_count, int hidden_size);
+int w34_hc_mix_streams_hadamard_f16(const w34_exec* ex, const void* residual_in,
+                                    const void* up_raw_in, void* mixed_out, void* had64_out,
+                                    const uint8_t* valid_token_mask, int num_tokens,
+                                    int hc_count, int hidden_size);
 int w34_hc_combine_f16(const w34_exec* ex, const void* residual_in, const void* block_out,
                        const float* inject_weights, const void* ple_delta,
                        void* residual_out, const uint8_t* valid_token_mask,
@@ -719,16 +723,32 @@ int w34_qwen4_mtp_broadcast_add_f16(const w34_exec* ex, const void* fc_embed,
 int w34_ple_dequant_f8_to_f16(const w34_exec* ex, const uint8_t* f8_in, void* f16_out,
                               const uint8_t* valid_token_mask, int num_tokens,
                               int embed_dim, float weight_scale);
+int w34_ple_dequant_f8_hadamard_to_f16(const w34_exec* ex, const uint8_t* f8_in, void* f16_out,
+                                       const uint8_t* valid_token_mask, int num_tokens,
+                                       int embed_dim, float weight_scale);
 int w34_ple_dequant_lut4_to_f16(const w34_exec* ex, const uint8_t* raw_in, const float* lut16,
                                 void* f16_out, const uint8_t* valid_token_mask, int num_tokens,
                                 int num_heads, int head_dim, int group_size);
+int w34_ple_dequant_lut4_hadamard_to_f16(const w34_exec* ex, const uint8_t* raw_in,
+                                         const float* lut16, void* f16_out,
+                                         const uint8_t* valid_token_mask, int num_tokens,
+                                         int num_heads, int head_dim, int group_size);
 int w34_ple_dilated_conv1d_f16(const w34_exec* ex, const void* key_in, const void* conv_weight,
                                void* conv_state_pool, void* key_out,
                                const w34_gdn_batch* batch, int conv_dim);
+int w34_ple_dilated_conv1d_add_f16(const w34_exec* ex, const void* key_in,
+                                   const void* conv_weight, void* conv_state_pool,
+                                   void* key_out, void* residual_inout,
+                                   const w34_gdn_batch* batch, int conv_dim);
 int w34_ple_signed_sqrt_gate_f16(const w34_exec* ex, const void* norm_query,
                                  const void* norm_key, const void* value_in,
                                  void* ple_delta_out, const uint8_t* valid_token_mask,
                                  int num_tokens, int hc_count, int embed_dim, float eps);
+int w34_ple_signed_sqrt_gate_norm_add_f16(
+    const w34_exec* ex, const void* norm_query, const void* norm_key, const void* value_in,
+    void* ple_delta_out, void* residual_inout, const void* norm_conv_weight,
+    void* norm_conv_out, const uint8_t* valid_token_mask, int num_tokens, int hc_count,
+    int embed_dim, float eps, float norm_eps);
 
 int w34_qsa_indexer_norm_rope_f16(const w34_exec* ex, const void* qk_in,
                                   const void* q_norm_weight, const void* k_norm_weight,
@@ -763,6 +783,12 @@ int w34_qsa_sparse_paged_attn_f16(const w34_exec* ex, const void* q, const void*
                                   const uint8_t* valid_token_mask,
                                   void* out, int num_tokens, int local_q_heads,
                                   int select_k_blocks, float sm_scale);
+int w34_qsa_sparse_paged_attn_hadamard_f16(
+    const w34_exec* ex, const void* q, const void* gate,
+    const w34_kv_layer_layout* kv_layout, const int32_t* selected_phys_blocks,
+    const int32_t* selected_logical_blocks, const int32_t* num_selected_blocks,
+    const int32_t* token_seq_pos, const uint8_t* valid_token_mask, void* out,
+    int num_tokens, int local_q_heads, int select_k_blocks, float sm_scale);
 
 // Pack and destination bases must be 16-byte aligned. Four destinations each
 // contain dst_capacity expert regions; nonnegative dst_slots must be unique.

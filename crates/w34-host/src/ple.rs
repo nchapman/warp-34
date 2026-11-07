@@ -1349,6 +1349,35 @@ pub mod gpu_ops {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn hc_mix_streams_hadamard_f16(
+        ex: &W34Exec,
+        residual_in: u64,
+        up_raw_in: u64,
+        mixed_out: u64,
+        had64_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_hc_mix_streams_hadamard_f16(
+                ex,
+                residual_in as usize as *const c_void,
+                up_raw_in as usize as *const c_void,
+                mixed_out as usize as *mut c_void,
+                had64_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                hidden_size as i32,
+            )
+        };
+        check(rc, "w34_hc_mix_streams_hadamard_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn hc_combine_f16(
         ex: &W34Exec,
         residual_in: u64,
@@ -1403,6 +1432,30 @@ pub mod gpu_ops {
         check(rc, "w34_ple_dequant_f8_to_f16")
     }
 
+    pub fn ple_dequant_f8_hadamard_to_f16(
+        ex: &W34Exec,
+        f8_in: u64,
+        f16_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        embed_dim: usize,
+        weight_scale: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dequant_f8_hadamard_to_f16(
+                ex,
+                f8_in as usize as *const u8,
+                f16_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                embed_dim as i32,
+                weight_scale,
+            )
+        };
+        check(rc, "w34_ple_dequant_f8_hadamard_to_f16")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn ple_dequant_lut4_to_f16(
         ex: &W34Exec,
@@ -1432,6 +1485,35 @@ pub mod gpu_ops {
         check(rc, "w34_ple_dequant_lut4_to_f16")
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_dequant_lut4_hadamard_to_f16(
+        ex: &W34Exec,
+        raw_in: u64,
+        lut16: u64,
+        f16_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        num_heads: usize,
+        head_dim: usize,
+        group_size: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dequant_lut4_hadamard_to_f16(
+                ex,
+                raw_in as usize as *const u8,
+                lut16 as usize as *const f32,
+                f16_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                num_heads as i32,
+                head_dim as i32,
+                group_size as i32,
+            )
+        };
+        check(rc, "w34_ple_dequant_lut4_hadamard_to_f16")
+    }
+
     pub fn ple_dilated_conv1d_f16(
         ex: &W34Exec,
         key_in: u64,
@@ -1454,6 +1536,33 @@ pub mod gpu_ops {
             )
         };
         check(rc, "w34_ple_dilated_conv1d_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_dilated_conv1d_add_f16(
+        ex: &W34Exec,
+        key_in: u64,
+        conv_weight: u64,
+        conv_state_pool: u64,
+        key_out: u64,
+        residual_inout: u64,
+        batch: &W34GdnBatch,
+        conv_dim: usize,
+    ) -> Result<()> {
+        // SAFETY: Device pointers and `batch` metadata are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_dilated_conv1d_add_f16(
+                ex,
+                key_in as usize as *const c_void,
+                conv_weight as usize as *const c_void,
+                conv_state_pool as usize as *mut c_void,
+                key_out as usize as *mut c_void,
+                residual_inout as usize as *mut c_void,
+                batch,
+                conv_dim as i32,
+            )
+        };
+        check(rc, "w34_ple_dilated_conv1d_add_f16")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1485,6 +1594,45 @@ pub mod gpu_ops {
             )
         };
         check(rc, "w34_ple_signed_sqrt_gate_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_signed_sqrt_gate_norm_add_f16(
+        ex: &W34Exec,
+        norm_query: u64,
+        norm_key: u64,
+        value_in: u64,
+        ple_delta_out: u64,
+        residual_inout: u64,
+        norm_conv_weight: u64,
+        norm_conv_out: u64,
+        valid_token_mask: u64,
+        num_tokens: usize,
+        hc_count: usize,
+        embed_dim: usize,
+        eps: f32,
+        norm_eps: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_ple_signed_sqrt_gate_norm_add_f16(
+                ex,
+                norm_query as usize as *const c_void,
+                norm_key as usize as *const c_void,
+                value_in as usize as *const c_void,
+                ple_delta_out as usize as *mut c_void,
+                residual_inout as usize as *mut c_void,
+                norm_conv_weight as usize as *const c_void,
+                norm_conv_out as usize as *mut c_void,
+                valid_token_mask as usize as *const u8,
+                num_tokens as i32,
+                hc_count as i32,
+                embed_dim as i32,
+                eps,
+                norm_eps,
+            )
+        };
+        check(rc, "w34_ple_signed_sqrt_gate_norm_add_f16")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1653,6 +1801,45 @@ pub mod gpu_ops {
             )
         };
         check(rc, "w34_qsa_sparse_paged_attn_f16")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qsa_sparse_paged_attn_hadamard_f16(
+        ex: &W34Exec,
+        q: u64,
+        gate: u64,
+        kv_layout: &W34KvLayerLayout,
+        selected_phys_blocks: u64,
+        selected_logical_blocks: u64,
+        num_selected_blocks: u64,
+        token_seq_pos: u64,
+        valid_token_mask: u64,
+        out: u64,
+        num_tokens: usize,
+        local_q_heads: usize,
+        select_k_blocks: usize,
+        sm_scale: f32,
+    ) -> Result<()> {
+        // SAFETY: Device pointers and `kv_layout` are validated by the caller.
+        let rc = unsafe {
+            ffi::w34_qsa_sparse_paged_attn_hadamard_f16(
+                ex,
+                q as usize as *const c_void,
+                gate as usize as *const c_void,
+                kv_layout,
+                selected_phys_blocks as usize as *const i32,
+                selected_logical_blocks as usize as *const i32,
+                num_selected_blocks as usize as *const i32,
+                token_seq_pos as usize as *const i32,
+                valid_token_mask as usize as *const u8,
+                out as usize as *mut c_void,
+                num_tokens as i32,
+                local_q_heads as i32,
+                select_k_blocks as i32,
+                sm_scale,
+            )
+        };
+        check(rc, "w34_qsa_sparse_paged_attn_hadamard_f16")
     }
 }
 

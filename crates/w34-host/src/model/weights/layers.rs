@@ -52,6 +52,7 @@ impl FullAttentionLayerWeights {
         num_tokens: usize,
         local_q_heads: usize,
         skip_topk: bool,
+        fuse_o_h64: bool,
     ) -> Result<()> {
         let kv_bufs = &kv_pool.layers[self.kv_layer_ordinal];
         qsa_idx.index_qk_proj.forward(
@@ -131,7 +132,12 @@ impl FullAttentionLayerWeights {
                 0,
             )?;
         }
-        crate::ple::gpu_ops::qsa_sparse_paged_attn_f16(
+        let attn_fn = if fuse_o_h64 {
+            crate::ple::gpu_ops::qsa_sparse_paged_attn_hadamard_f16
+        } else {
+            crate::ple::gpu_ops::qsa_sparse_paged_attn_f16
+        };
+        attn_fn(
             ex,
             q_buf,
             gate_buf,
@@ -190,6 +196,14 @@ pub struct TapExport {
 #[cfg(feature = "cuda")]
 impl HcBlockWeights {
     pub fn forward_mix(&self, ctx: &HcStepContext<'_>, out_mixed_buf: u64) -> Result<()> {
+        self.forward_mix_with_targets(ctx, [out_mixed_buf, 0])
+    }
+
+    pub fn forward_mix_with_targets(
+        &self,
+        ctx: &HcStepContext<'_>,
+        [out_mixed_buf, out_had64_buf]: [u64; 2],
+    ) -> Result<()> {
         let ex = ctx.ex;
         let cublas = ctx.cublas;
         let marlin_ws_ptr = ctx.marlin_ws_ptr;
@@ -307,11 +321,12 @@ impl HcBlockWeights {
             ple_buf_b,
             num_tokens,
         )?;
-        crate::ple::gpu_ops::hc_mix_streams_f16(
+        crate::ple::gpu_ops::hc_mix_streams_hadamard_f16(
             ex,
             ple_buf_a,
             ple_buf_b,
             out_mixed_buf,
+            out_had64_buf,
             0,
             num_tokens,
             hc_count,
@@ -423,7 +438,9 @@ impl LayerResidual {
                 }
                 Ok(())
             }
-            Self::HyperConnection { attn_hc, .. } => attn_hc.forward_mix(ctx, norm_out),
+            Self::HyperConnection { attn_hc, .. } => {
+                attn_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
+            }
         }
     }
 
@@ -519,7 +536,7 @@ impl LayerResidual {
                     )?;
                 }
                 attn_hc.forward_combine(ctx, block_out_buf)?;
-                mlp_hc.forward_mix(ctx, norm_out)
+                mlp_hc.forward_mix_with_targets(ctx, [norm_out, norm_had64])
             }
         }
     }
@@ -737,10 +754,18 @@ impl PleLayerWeights {
     ) -> Result<()> {
         let total_dim = hc_count * h_dim;
         let ple_embed_dim = self.key_proj.size_k();
+        let fuse_ple_in_h64 = ple_embed_dim.is_multiple_of(HADAMARD_BLOCK_64)
+            && self.key_proj.can_fuse_h64_from_producer()
+            && self.value_proj.can_fuse_h64_from_producer();
         if self.lut4_ptr != 0 {
             let num_heads = self.ngram_heads.max(1);
             let head_dim = ple_embed_dim / num_heads;
-            crate::ple::gpu_ops::ple_dequant_lut4_to_f16(
+            let dequant_lut4 = if fuse_ple_in_h64 {
+                crate::ple::gpu_ops::ple_dequant_lut4_hadamard_to_f16
+            } else {
+                crate::ple::gpu_ops::ple_dequant_lut4_to_f16
+            };
+            dequant_lut4(
                 ex,
                 ple_f8_staging_ptr,
                 self.lut4_ptr,
@@ -752,7 +777,12 @@ impl PleLayerWeights {
                 self.lut4_group_size,
             )?;
         } else {
-            crate::ple::gpu_ops::ple_dequant_f8_to_f16(
+            let dequant_f8 = if fuse_ple_in_h64 {
+                crate::ple::gpu_ops::ple_dequant_f8_hadamard_to_f16
+            } else {
+                crate::ple::gpu_ops::ple_dequant_f8_to_f16
+            };
+            dequant_f8(
                 ex,
                 ple_f8_staging_ptr,
                 ple_val_buf,
@@ -762,24 +792,45 @@ impl PleLayerWeights {
                 self.weight_scale,
             )?;
         }
-        self.key_proj.forward(
-            ex,
-            cublas,
-            marlin_ws_ptr,
-            marlin_ws_ints,
-            ple_val_buf,
-            ple_buf_a,
-            num_tokens,
-        )?;
-        self.value_proj.forward(
-            ex,
-            cublas,
-            marlin_ws_ptr,
-            marlin_ws_ints,
-            ple_val_buf,
-            normed_buf,
-            num_tokens,
-        )?;
+        if fuse_ple_in_h64 {
+            self.key_proj.forward_prerotated(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_val_buf,
+                ple_buf_a,
+                num_tokens,
+            )?;
+            self.value_proj.forward_prerotated(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_val_buf,
+                normed_buf,
+                num_tokens,
+            )?;
+        } else {
+            self.key_proj.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_val_buf,
+                ple_buf_a,
+                num_tokens,
+            )?;
+            self.value_proj.forward(
+                ex,
+                cublas,
+                marlin_ws_ptr,
+                marlin_ws_ints,
+                ple_val_buf,
+                normed_buf,
+                num_tokens,
+            )?;
+        }
         crate::ple::gpu_ops::hc_rmsnorm_f16(
             ex,
             ple_buf_a,
@@ -802,52 +853,31 @@ impl PleLayerWeights {
             h_dim,
             eps,
         )?;
-        crate::ple::gpu_ops::ple_signed_sqrt_gate_f16(
-            ex, ple_buf_b, ple_buf_a, normed_buf, ple_buf_a, 0, num_tokens, hc_count, h_dim, 1e-6,
-        )?;
-        check_rc(
-            // SAFETY: hc_residual_buf and ple_buf_a each hold num_tokens * total_dim FP16 elements.
-            unsafe {
-                ffi::w34_add_inplace_f16(
-                    ex,
-                    hc_residual_buf as *mut c_void,
-                    ple_buf_a as *const c_void,
-                    (num_tokens * total_dim) as i64,
-                )
-            },
-            "w34_add_inplace_f16 (ple gated_value)",
-        )?;
-        crate::ple::gpu_ops::hc_rmsnorm_f16(
+        crate::ple::gpu_ops::ple_signed_sqrt_gate_norm_add_f16(
             ex,
+            ple_buf_b,
             ple_buf_a,
+            normed_buf,
+            0,
+            hc_residual_buf,
             self.norm_conv_ptr,
             ple_buf_b,
             0,
             num_tokens,
             hc_count,
             h_dim,
+            1e-6,
             eps,
         )?;
-        crate::ple::gpu_ops::ple_dilated_conv1d_f16(
+        crate::ple::gpu_ops::ple_dilated_conv1d_add_f16(
             ex,
             ple_buf_b,
             self.conv1d_weight_ptr,
             ple_conv_state_ptr,
-            ple_buf_a,
+            0,
+            hc_residual_buf,
             gdn_batch,
             total_dim,
-        )?;
-        check_rc(
-            // SAFETY: hc_residual_buf and ple_buf_a each hold num_tokens * total_dim FP16 elements.
-            unsafe {
-                ffi::w34_add_inplace_f16(
-                    ex,
-                    hc_residual_buf as *mut c_void,
-                    ple_buf_a as *const c_void,
-                    (num_tokens * total_dim) as i64,
-                )
-            },
-            "w34_add_inplace_f16 (ple conv_out)",
         )
     }
 }
@@ -873,7 +903,7 @@ pub enum LayerBlockWeights {
 
 #[cfg(feature = "cuda")]
 impl LayerBlockWeights {
-    /// Returns `[unrotated_out, had64_out]` targets for the single-stream pre-attention norm.
+    /// Returns `[unrotated_out, had64_out]` targets for the pre-attention norm / stream mixer.
     #[inline]
     pub fn pre_attn_norm_targets(
         &self,
@@ -881,25 +911,26 @@ impl LayerBlockWeights {
         ex: &W34Exec,
         rows: usize,
         h_dim: usize,
-        is_single_stream: bool,
+        _is_single_stream: bool,
     ) -> [u64; 2] {
-        if !is_single_stream
-            || h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
-            || !h_dim.is_multiple_of(HADAMARD_BLOCK_64)
-        {
+        if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE || !h_dim.is_multiple_of(HADAMARD_BLOCK_64) {
             return [normed_buf, 0];
         }
+        let can_use_scratch = ex.scratch_ptr != 0
+            && ex.scratch_ptr.is_multiple_of(16)
+            && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(2);
         match self {
-            Self::FullAttention(fa)
-                if fa.qsa_indexer.is_none() && fa.qkv_proj.can_fuse_h64_from_producer() =>
-            {
-                [0, normed_buf]
+            Self::FullAttention(fa) if fa.qkv_proj.can_fuse_h64_from_producer() => {
+                if fa.qsa_indexer.is_none() {
+                    [0, normed_buf]
+                } else if can_use_scratch {
+                    [normed_buf, ex.scratch_ptr]
+                } else {
+                    [normed_buf, 0]
+                }
             }
             Self::LinearAttention(gdn)
-                if gdn.in_proj_qkvz.can_fuse_h64_from_producer()
-                    && ex.scratch_ptr != 0
-                    && ex.scratch_ptr.is_multiple_of(16)
-                    && ex.scratch_size >= rows.saturating_mul(h_dim).saturating_mul(2) =>
+                if gdn.in_proj_qkvz.can_fuse_h64_from_producer() && can_use_scratch =>
             {
                 [normed_buf, ex.scratch_ptr]
             }

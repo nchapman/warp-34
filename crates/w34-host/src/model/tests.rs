@@ -440,4 +440,197 @@ mod serving_capacity_tests {
             tp1_tied / (1024 * 1024),
         );
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn pre_mlp_norm_targets_and_tiered_prerotated_scratch_reservation_preserve_0_ulp() {
+        use crate::cuda::{CublasHandle, CudaStream, DeviceBuffer, f32_to_f16};
+        use crate::model::weights::{
+            FfnBlockWeights, LinearProj, MoeExpertStorage, MoeLayerWeights,
+        };
+        use w34_kernels::ffi;
+
+        let Ok(stream) = CudaStream::new(0) else {
+            return;
+        };
+        let cublas = CublasHandle::new(&stream).unwrap();
+        let rows = 5usize;
+        let h_dim = 256usize;
+        let sh_interm = 320usize; // not divisible by 128 -> padded inner.size_k() = 384 (TP=2 geometry)
+        let sh_interm_padded = 384usize;
+        let num_experts = 16usize;
+        let top_k = 4usize;
+
+        let d_router_w = DeviceBuffer::alloc(0, num_experts * h_dim * 2).unwrap();
+        let d_sh_gate_w = DeviceBuffer::alloc(0, h_dim * 2).unwrap();
+        let d_sh_gu_q = DeviceBuffer::alloc(0, (2 * sh_interm) * (h_dim / 8) * 4).unwrap();
+        let d_sh_gu_s = DeviceBuffer::alloc(0, (2 * sh_interm) * (h_dim / 64) * 2).unwrap();
+        let d_sh_dn_q = DeviceBuffer::alloc(0, h_dim * (sh_interm_padded / 8) * 4).unwrap();
+        let d_sh_dn_s = DeviceBuffer::alloc(0, h_dim * (sh_interm_padded / 64) * 2).unwrap();
+        d_router_w
+            .copy_from_host(&vec![0x3000u16; num_experts * h_dim], &stream)
+            .unwrap();
+        d_sh_gate_w
+            .copy_from_host(&vec![0x3400u16; h_dim], &stream)
+            .unwrap();
+        d_sh_gu_q
+            .copy_from_host(
+                &vec![0x9876_5432u32; (2 * sh_interm) * (h_dim / 8)],
+                &stream,
+            )
+            .unwrap();
+        d_sh_gu_s
+            .copy_from_host(&vec![0x3400u16; (2 * sh_interm) * (h_dim / 64)], &stream)
+            .unwrap();
+        d_sh_dn_q
+            .copy_from_host(
+                &vec![0x8888_8888u32; h_dim * (sh_interm_padded / 8)],
+                &stream,
+            )
+            .unwrap();
+        d_sh_dn_s
+            .copy_from_host(&vec![0x3400u16; h_dim * (sh_interm_padded / 64)], &stream)
+            .unwrap();
+
+        let make_moe = |experts: MoeExpertStorage| {
+            FfnBlockWeights::Moe(Box::new(MoeLayerWeights {
+                router_gate: LinearProj::DenseF16 {
+                    weight_ptr: d_router_w.addr(),
+                    size_n: num_experts,
+                    size_k: h_dim,
+                },
+                num_experts,
+                top_k,
+                norm_topk_prob: true,
+                scoring_func: 0,
+                local_moe_interm: 128,
+                routed_input_hadamard: 64,
+                routed_down_hadamard: 64,
+                experts,
+                local_shared_interm: sh_interm,
+                shared_gate_up_proj: Some(LinearProj::Hadamard {
+                    inner: Box::new(LinearProj::MarlinW4A16 {
+                        b_q_weight_ptr: d_sh_gu_q.addr(),
+                        b_scales_ptr: d_sh_gu_s.addr(),
+                        size_n: 2 * sh_interm,
+                        size_k: h_dim,
+                        group_blocks: 4,
+                    }),
+                    size_n: 2 * sh_interm,
+                    size_k: h_dim,
+                    block_size: 64,
+                }),
+                shared_down_proj: Some(LinearProj::Hadamard {
+                    inner: Box::new(LinearProj::MarlinW4A16 {
+                        b_q_weight_ptr: d_sh_dn_q.addr(),
+                        b_scales_ptr: d_sh_dn_s.addr(),
+                        size_n: h_dim,
+                        size_k: sh_interm_padded,
+                        group_blocks: 4,
+                    }),
+                    size_n: h_dim,
+                    size_k: sh_interm,
+                    block_size: 64,
+                }),
+                shared_expert_gate: Some(LinearProj::DenseF16 {
+                    weight_ptr: d_sh_gate_w.addr(),
+                    size_n: 1,
+                    size_k: h_dim,
+                }),
+            }))
+        };
+
+        let ffn_tiered = make_moe(MoeExpertStorage::Tiered { layer_id: 0 });
+        let d_normed = DeviceBuffer::alloc(0, rows * h_dim * 2).unwrap();
+        let d_mlp_out = DeviceBuffer::alloc(0, rows * h_dim * 2).unwrap();
+        let d_scratch = DeviceBuffer::alloc(0, 64 * 1024).unwrap();
+        let ex_small = stream.exec(d_scratch.addr(), rows * h_dim * 2);
+        // Insufficient scratch for both prerotated input and padded shared_down_proj workspace -> fallback [normed, 0]
+        assert_eq!(
+            ffn_tiered.pre_mlp_norm_targets(
+                d_normed.addr(),
+                d_mlp_out.addr(),
+                &ex_small,
+                rows,
+                h_dim,
+                false
+            ),
+            [d_normed.addr(), 0]
+        );
+        let ex_ok = stream.exec(d_scratch.addr(), d_scratch.len_bytes);
+        assert_eq!(
+            ffn_tiered.pre_mlp_norm_targets(
+                d_normed.addr(),
+                d_mlp_out.addr(),
+                &ex_ok,
+                rows,
+                h_dim,
+                false
+            ),
+            [d_normed.addr(), d_scratch.addr()]
+        );
+
+        let h_in: Vec<u16> = (0..rows * h_dim)
+            .map(|i| f32_to_f16(((i % 29) as f32 - 14.0) * 0.05))
+            .collect();
+        d_normed.copy_from_host(&h_in, &stream).unwrap();
+        // SAFETY: `d_normed` and `d_scratch` are live disjoint device buffers of size `>= rows * h_dim * 2` bytes.
+        let rc = unsafe {
+            ffi::w34_block_hadamard_f16(
+                &ex_ok,
+                d_normed.addr() as *const std::ffi::c_void,
+                d_scratch.addr() as *mut std::ffi::c_void,
+                rows as i32,
+                h_dim as i32,
+                h_dim as i32,
+                64,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut h_prerot_before = vec![0u16; rows * h_dim];
+        d_scratch
+            .copy_to_host(&mut h_prerot_before, &stream)
+            .unwrap();
+
+        let d_marlin_ws = DeviceBuffer::alloc(0, 4096).unwrap();
+        let d_router = DeviceBuffer::alloc(0, rows * num_experts * 2).unwrap();
+        let d_topw = DeviceBuffer::alloc(0, rows * top_k * 4).unwrap();
+        let d_topids = DeviceBuffer::alloc(0, rows * top_k * 4).unwrap();
+        let d_shgu = DeviceBuffer::alloc(0, rows * 2 * sh_interm * 2).unwrap();
+        let d_shact = DeviceBuffer::alloc(0, rows * sh_interm * 2).unwrap();
+        let d_shout = DeviceBuffer::alloc(0, rows * h_dim * 2).unwrap();
+        let d_shgate = DeviceBuffer::alloc(0, rows * 2).unwrap();
+
+        ffn_tiered
+            .forward_with_prerotated_input(
+                &ex_ok,
+                &cublas,
+                d_marlin_ws.addr(),
+                d_marlin_ws.len_bytes / 4,
+                d_normed.addr(),
+                d_mlp_out.addr(),
+                rows,
+                h_dim,
+                128,
+                0,
+                0,
+                d_router.addr(),
+                d_topw.addr(),
+                d_topids.addr(),
+                0,
+                d_shgu.addr(),
+                d_shact.addr(),
+                d_shout.addr(),
+                d_shgate.addr(),
+                d_scratch.addr(),
+            )
+            .unwrap();
+
+        // Verify the prerotated input stored at `d_scratch.addr()` was not overwritten by `shared_down_proj.forward`.
+        let mut h_prerot_after = vec![0u16; rows * h_dim];
+        d_scratch
+            .copy_to_host(&mut h_prerot_after, &stream)
+            .unwrap();
+        assert_eq!(h_prerot_after, h_prerot_before);
+    }
 }

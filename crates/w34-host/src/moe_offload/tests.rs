@@ -992,6 +992,88 @@ mod cuda_tests {
                 max_diff <= 1.6e-2,
                 "H64+g64 MoE M={m} max_abs_diff={max_diff} exceeds 1.6e-2"
             );
+
+            // Also verify 0-ULP bit-identity of epilogue-fused H_64 (`down_hadamard_block_size = 64`)
+            // in `d_interm` vs unfused Stage-1 (`down_hadamard_block_size = 0`) + standalone
+            // `w34_block_hadamard_inplace_f16(..., 64)` across all 4 regimes (`M = 1, 4, 8, 16`):
+            let chunk_m = m.min(16);
+            let d_interm_fused = DeviceBuffer::alloc(0, chunk_m * top_k * n_interm * 2).unwrap();
+            let d_interm_unfused = DeviceBuffer::alloc(0, chunk_m * top_k * n_interm * 2).unwrap();
+            let d_out_tmp = DeviceBuffer::alloc(0, chunk_m * k_hidden * 2).unwrap();
+            let ex_ws = stream.exec(ws.d_scratch.addr(), ws.d_scratch.len_bytes);
+            // SAFETY: All device pointers match `full_cache` and `ws` dimensions for `chunk_m`.
+            unsafe {
+                assert_eq!(
+                    ffi::w34_moe_w4a16_mlp_ex_f16(
+                        &ex_ws,
+                        d_x.addr() as *const _,
+                        full_cache.slots.gate_up_packed.addr() as *const _,
+                        full_cache.slots.gate_up_scales.addr() as *const _,
+                        full_cache.slots.down_packed.addr() as *const _,
+                        full_cache.slots.down_scales.addr() as *const _,
+                        d_topk_ids.addr() as *const _,
+                        d_topk_weights.addr() as *const _,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        d_interm_fused.addr() as *mut _,
+                        d_out_tmp.addr() as *mut _,
+                        chunk_m as i32,
+                        top_k as i32,
+                        num_experts as i32,
+                        n_interm as i32,
+                        k_hidden as i32,
+                        group_size as i32,
+                        64,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    ffi::w34_moe_w4a16_mlp_ex_f16(
+                        &ex_ws,
+                        d_x.addr() as *const _,
+                        full_cache.slots.gate_up_packed.addr() as *const _,
+                        full_cache.slots.gate_up_scales.addr() as *const _,
+                        full_cache.slots.down_packed.addr() as *const _,
+                        full_cache.slots.down_scales.addr() as *const _,
+                        d_topk_ids.addr() as *const _,
+                        d_topk_weights.addr() as *const _,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        d_interm_unfused.addr() as *mut _,
+                        d_out_tmp.addr() as *mut _,
+                        chunk_m as i32,
+                        top_k as i32,
+                        num_experts as i32,
+                        n_interm as i32,
+                        k_hidden as i32,
+                        group_size as i32,
+                        0,
+                    ),
+                    0
+                );
+                assert_eq!(
+                    ffi::w34_block_hadamard_inplace_f16(
+                        &ex0,
+                        d_interm_unfused.addr() as *mut _,
+                        (chunk_m * top_k) as i32,
+                        n_interm as i32,
+                        64,
+                    ),
+                    0
+                );
+            }
+            let mut h_interm_fused = vec![0u16; chunk_m * top_k * n_interm];
+            let mut h_interm_unfused = vec![0u16; chunk_m * top_k * n_interm];
+            d_interm_fused
+                .copy_to_host(&mut h_interm_fused, &stream)
+                .unwrap();
+            d_interm_unfused
+                .copy_to_host(&mut h_interm_unfused, &stream)
+                .unwrap();
+            assert_eq!(
+                h_interm_fused, h_interm_unfused,
+                "epilogue-fused H_64 interm_buf 0-ULP mismatch at chunk_m={chunk_m}"
+            );
         }
 
         // Also verify `CpuHybrid` and `StreamedPrefill` with `k_hot = 4` on `m = 6`.

@@ -2,45 +2,16 @@ use super::*;
 
 fn sample_qwen4_exp_cfg() -> ModelConfig {
     let root: serde_json::Value = serde_json::from_str(
-        r#"{
-          "architectures": ["Qwen4ExpForConditionalGeneration"],
-          "model_type": "qwen4_exp",
-          "text_config": {
-            "model_type": "qwen4_exp_text",
-            "hidden_size": 2560,
-            "num_hidden_layers": 48,
-            "num_attention_heads": 24,
-            "num_key_value_heads": 2,
-            "head_dim": 256,
-            "vocab_size": 248320,
-            "eos_token_id": 248044,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 48,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "num_experts": 512,
-            "num_experts_per_tok": 10,
-            "moe_intermediate_size": 640,
-            "shared_expert_intermediate_size": 640,
-            "hc_count": 4,
-            "hc_lowrank": 80,
-            "ple_embed_dim": 2560,
-            "ple_conv_kernel_size": 4,
-            "ple_layer_ids": [2],
-            "ple_seed": 20260202,
-            "ngram_size": 3,
-            "heads_per_ngram": 8,
-            "ngram_vocab_size_base": 20000000,
-            "make_ngram_vocab_size_divisible_by": 128,
-            "split_ngram_parts": 128,
-            "indexer_head_dim": 128,
-            "indexer_n_heads": 4,
-            "indexer_kv_heads": 1,
-            "indexer_budget": 1024,
-            "indexer_compress_ratio": 4
-          }
-        }"#,
+        r#"{"architectures":["Qwen4ExpForConditionalGeneration"],"model_type":"qwen4_exp","text_config":{
+            "model_type":"qwen4_exp_text","hidden_size":2560,"num_hidden_layers":48,
+            "num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"vocab_size":248320,"eos_token_id":248044,
+            "linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,
+            "linear_conv_kernel_dim":4,"num_experts":512,"num_experts_per_tok":10,"moe_intermediate_size":640,
+            "shared_expert_intermediate_size":640,"hc_count":4,"hc_lowrank":80,"ple_embed_dim":2560,
+            "ple_conv_kernel_size":4,"ple_layer_ids":[2],"ple_seed":20260202,"ngram_size":3,"heads_per_ngram":8,
+            "ngram_vocab_size_base":20000000,"make_ngram_vocab_size_divisible_by":128,"split_ngram_parts":128,
+            "indexer_head_dim":128,"indexer_n_heads":4,"indexer_kv_heads":1,"indexer_budget":1024,"indexer_compress_ratio":4
+        }}"#,
     )
     .unwrap();
     ModelConfig::from_json(&root).unwrap()
@@ -1771,16 +1742,11 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
         v_page_stride_bytes: (block_size * 132) as u64,
         v_head_stride_bytes: (block_size * 132) as u64,
         v_token_stride_bytes: 132,
-        namespace_id: W34_KV_NAMESPACE_TARGET_FULL_ATTN,
-        layer_id: 3,
-        local_kv_heads: 1,
-        head_dim: head_dim as i32,
-        block_size: block_size as i32,
         k_format: W34_KV_FORMAT_TQ4,
         v_format: W34_KV_FORMAT_TQ4,
         k_transform: W34_KV_TRANSFORM_RADEMACHER_WHT256,
         v_transform: W34_KV_TRANSFORM_RADEMACHER_WHT256,
-        reserved: 0,
+        ..kv_layout
     };
     // SAFETY: `d_kc6`, `d_vc6`, `d_nu_k_in`, and `d_nu_v_in` are valid device allocations matching `layout6` and `write_batch`.
     unsafe {
@@ -1806,40 +1772,25 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
     let mut ex_nosplit = ex;
     ex_nosplit.scratch_ptr = 0;
     ex_nosplit.scratch_size = 0;
-    gpu_ops::qsa_sparse_paged_attn_f16(
-        &ex_nosplit,
-        d_gqa6_q.addr(),
-        d_gqa6_gate.addr(),
-        &layout6,
-        d_nu_sel_phys.addr(),
-        d_nu_sel_log.addr(),
-        d_nu_num_sel.addr(),
-        d_nu_seq_pos.addr(),
-        0,
-        d_out_nosplit.addr(),
-        1,
-        gqa6_heads,
-        nu_select_k,
-        nu_attn_batch.sm_scale,
-    )
-    .unwrap();
-    gpu_ops::qsa_sparse_paged_attn_f16(
-        &ex_splitk,
-        d_gqa6_q.addr(),
-        d_gqa6_gate.addr(),
-        &layout6,
-        d_nu_sel_phys.addr(),
-        d_nu_sel_log.addr(),
-        d_nu_num_sel.addr(),
-        d_nu_seq_pos.addr(),
-        0,
-        d_out_splitk.addr(),
-        1,
-        gqa6_heads,
-        nu_select_k,
-        nu_attn_batch.sm_scale,
-    )
-    .unwrap();
+    for (exec_ref, out_buf) in [(&ex_nosplit, &d_out_nosplit), (&ex_splitk, &d_out_splitk)] {
+        gpu_ops::qsa_sparse_paged_attn_f16(
+            exec_ref,
+            d_gqa6_q.addr(),
+            d_gqa6_gate.addr(),
+            &layout6,
+            d_nu_sel_phys.addr(),
+            d_nu_sel_log.addr(),
+            d_nu_num_sel.addr(),
+            d_nu_seq_pos.addr(),
+            0,
+            out_buf.addr(),
+            1,
+            gqa6_heads,
+            nu_select_k,
+            nu_attn_batch.sm_scale,
+        )
+        .unwrap();
+    }
     let h_out_nosplit: Vec<u16> = dev_to_vec(&d_out_nosplit, gqa6_heads * head_dim, &stream);
     let h_out_splitk: Vec<u16> = dev_to_vec(&d_out_splitk, gqa6_heads * head_dim, &stream);
     let max_split_diff = h_out_nosplit
@@ -1851,4 +1802,196 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
         max_split_diff < 1e-3,
         "GQA-6 Split-K vs no-split mismatch: max_split_diff={max_split_diff}"
     );
+
+    // 7. Verify 0-ULP bit-identity of all producer-fused H_64 and residual-add kernels:
+    let had64_ref = |src: &DeviceBuffer, rows: usize, cols: usize| -> Vec<u16> {
+        let dst = DeviceBuffer::alloc(0, rows * cols * 2).unwrap();
+        // SAFETY: `src` and `dst` hold `rows * cols` FP16 elements with `cols % 64 == 0`.
+        unsafe {
+            assert_eq!(
+                w34_kernels::ffi::w34_block_hadamard_f16(
+                    &ex,
+                    src.addr() as *const c_void,
+                    dst.addr() as *mut c_void,
+                    rows as i32,
+                    cols as i32,
+                    cols as i32,
+                    64,
+                ),
+                0
+            );
+        }
+        dev_to_vec(&dst, rows * cols, &stream)
+    };
+    let add_ref = |init: &[u16], delta: &DeviceBuffer| -> Vec<u16> {
+        let dst = dev_from_slice(init, &stream);
+        // SAFETY: `dst` and `delta` hold `init.len()` FP16 elements.
+        unsafe {
+            assert_eq!(
+                w34_kernels::ffi::w34_add_inplace_f16(
+                    &ex,
+                    dst.addr() as *mut c_void,
+                    delta.addr() as *const c_void,
+                    init.len() as i64,
+                ),
+                0
+            );
+        }
+        dev_to_vec(&dst, init.len(), &stream)
+    };
+    let d_mix_f_out = DeviceBuffer::alloc(0, m * hidden * 2).unwrap();
+    let d_mix_f_had = DeviceBuffer::alloc(0, m * hidden * 2).unwrap();
+    gpu_ops::hc_mix_streams_hadamard_f16(
+        &ex,
+        d_res.addr(),
+        d_up_in.addr(),
+        d_mix_f_out.addr(),
+        d_mix_f_had.addr(),
+        0,
+        m,
+        hc_count,
+        hidden,
+    )
+    .unwrap();
+    assert_eq!(
+        dev_to_vec::<u16>(&d_mix_f_out, m * hidden, &stream),
+        h_mixed
+    );
+    assert_eq!(
+        dev_to_vec::<u16>(&d_mix_f_had, m * hidden, &stream),
+        had64_ref(&d_mixed, m, hidden)
+    );
+
+    let d_f8_f_had = DeviceBuffer::alloc(0, m * hidden * 2).unwrap();
+    gpu_ops::ple_dequant_f8_hadamard_to_f16(
+        &ex,
+        d_f8.addr(),
+        d_f8_f_had.addr(),
+        0,
+        m,
+        hidden,
+        scale,
+    )
+    .unwrap();
+    assert_eq!(
+        dev_to_vec::<u16>(&d_f8_f_had, m * hidden, &stream),
+        had64_ref(&d_ple_emb, m, hidden)
+    );
+
+    let d_lut4_f_had = DeviceBuffer::alloc(0, m * hidden * 2).unwrap();
+    gpu_ops::ple_dequant_lut4_hadamard_to_f16(
+        &ex,
+        d_lut4_raw.addr(),
+        d_lut16.addr(),
+        d_lut4_f_had.addr(),
+        0,
+        m,
+        lut4_heads,
+        lut4_head_dim,
+        lut4_group_size,
+    )
+    .unwrap();
+    assert_eq!(
+        dev_to_vec::<u16>(&d_lut4_f_had, m * hidden, &stream),
+        had64_ref(&d_lut4_out, m, hidden)
+    );
+
+    let n_res = m * hc_count * hidden;
+    let d_res_fused = dev_from_slice(&ple_delta_f16, &stream);
+    let d_norm_conv_ref = DeviceBuffer::alloc(0, n_res * 2).unwrap();
+    let d_norm_conv_fused = DeviceBuffer::alloc(0, n_res * 2).unwrap();
+    let d_delta_fused = DeviceBuffer::alloc(0, n_res * 2).unwrap();
+    gpu_ops::hc_rmsnorm_f16(
+        &ex,
+        d_gout.addr(),
+        d_norm_w.addr(),
+        d_norm_conv_ref.addr(),
+        0,
+        m,
+        hc_count,
+        hidden,
+        eps,
+    )
+    .unwrap();
+    gpu_ops::ple_signed_sqrt_gate_norm_add_f16(
+        &ex,
+        d_qg.addr(),
+        d_kg.addr(),
+        d_vg.addr(),
+        d_delta_fused.addr(),
+        d_res_fused.addr(),
+        d_norm_w.addr(),
+        d_norm_conv_fused.addr(),
+        0,
+        m,
+        hc_count,
+        hidden,
+        1e-6,
+        eps,
+    )
+    .unwrap();
+    assert_eq!(dev_to_vec::<u16>(&d_delta_fused, n_res, &stream), h_gout);
+    assert_eq!(
+        dev_to_vec::<u16>(&d_res_fused, n_res, &stream),
+        add_ref(&ple_delta_f16, &d_gout)
+    );
+    assert_eq!(
+        dev_to_vec::<u16>(&d_norm_conv_fused, n_res, &stream),
+        dev_to_vec::<u16>(&d_norm_conv_ref, n_res, &stream)
+    );
+
+    let conv_res_init: Vec<u16> = (0..seq_total * conv_dim)
+        .map(|i| f32_to_f16((((i * 23 + 9) % 53) as f32 - 26.0) * 0.04))
+        .collect();
+    let d_conv_res_fused = dev_from_slice(&conv_res_init, &stream);
+    let d_state_fused = DeviceBuffer::alloc(0, 2 * conv_dim * 9 * 2).unwrap();
+    let d_out_conv_fused = DeviceBuffer::alloc(0, seq_total * conv_dim * 2).unwrap();
+    gpu_ops::ple_dilated_conv1d_add_f16(
+        &ex,
+        d_key_full.addr(),
+        d_conv_w.addr(),
+        d_state_fused.addr(),
+        d_out_conv_fused.addr(),
+        d_conv_res_fused.addr(),
+        &batch_full,
+        conv_dim,
+    )
+    .unwrap();
+    assert_eq!(
+        dev_to_vec::<u16>(&d_out_conv_fused, seq_total * conv_dim, &stream),
+        h_out_full
+    );
+    assert_eq!(
+        dev_to_vec::<u16>(&d_conv_res_fused, seq_total * conv_dim, &stream),
+        add_ref(&conv_res_init, &d_out_full)
+    );
+    assert_eq!(
+        dev_to_vec::<u16>(&d_state_fused, conv_dim * 9, &stream),
+        dev_to_vec::<u16>(&d_state_full, conv_dim * 9, &stream)
+    );
+
+    for (exec_ref, ref_buf) in [(&ex_nosplit, &d_out_nosplit), (&ex_splitk, &d_out_splitk)] {
+        let d_qsa_f_had = DeviceBuffer::alloc(0, gqa6_heads * head_dim * 2).unwrap();
+        gpu_ops::qsa_sparse_paged_attn_hadamard_f16(
+            exec_ref,
+            d_gqa6_q.addr(),
+            d_gqa6_gate.addr(),
+            &layout6,
+            d_nu_sel_phys.addr(),
+            d_nu_sel_log.addr(),
+            d_nu_num_sel.addr(),
+            d_nu_seq_pos.addr(),
+            0,
+            d_qsa_f_had.addr(),
+            1,
+            gqa6_heads,
+            nu_select_k,
+            nu_attn_batch.sm_scale,
+        )
+        .unwrap();
+        assert_eq!(
+            dev_to_vec::<u16>(&d_qsa_f_had, gqa6_heads * head_dim, &stream),
+            had64_ref(ref_buf, 1, gqa6_heads * head_dim)
+        );
+    }
 }

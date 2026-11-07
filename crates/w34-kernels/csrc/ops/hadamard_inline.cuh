@@ -8,7 +8,7 @@ namespace w34 {
 
 // In-register H_64 butterfly over a 16-lane subgroup (4 contiguous __half values per lane).
 // Preserves exact bit-order FP32 summation and * 0.125f RN rounding matching w34_block_hadamard_f16.
-__device__ __forceinline__ uint2 hadamard64_vec4_f16(uint2 raw, int lane) {
+__device__ __forceinline__ uint2 hadamard64_vec4_f16(uint2 raw, int lane = (int)(threadIdx.x & 31)) {
     const __half2 h01 = *reinterpret_cast<const __half2*>(&raw.x);
     const __half2 h23 = *reinterpret_cast<const __half2*>(&raw.y);
     const float2 f01 = __half22float2(h01);

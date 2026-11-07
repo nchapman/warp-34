@@ -61,13 +61,12 @@ impl FfnBlockWeights {
         &self,
         normed_buf: u64,
         mlp_out_buf: u64,
+        ex: &W34Exec,
+        rows: usize,
         h_dim: usize,
-        is_single_stream: bool,
+        _is_single_stream: bool,
     ) -> [u64; 2] {
-        if !is_single_stream
-            || h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
-            || !h_dim.is_multiple_of(HADAMARD_BLOCK_64)
-        {
+        if h_dim > PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE || !h_dim.is_multiple_of(HADAMARD_BLOCK_64) {
             return [normed_buf, 0];
         }
         match self {
@@ -75,19 +74,36 @@ impl FfnBlockWeights {
                 [0, normed_buf]
             }
             Self::Moe(moe)
-                if mlp_out_buf != 0
-                    && mlp_out_buf != normed_buf
-                    && moe.routed_input_hadamard == HADAMARD_BLOCK_64
-                    && matches!(
-                        moe.experts,
-                        MoeExpertStorage::W4A16 { .. } | MoeExpertStorage::W4A16Zp { .. }
-                    )
+                if moe.routed_input_hadamard == HADAMARD_BLOCK_64
                     && moe
                         .shared_gate_up_proj
                         .as_ref()
                         .is_none_or(LinearProj::can_fuse_h64_from_producer) =>
             {
-                [normed_buf, mlp_out_buf]
+                match &moe.experts {
+                    MoeExpertStorage::W4A16 { .. } | MoeExpertStorage::W4A16Zp { .. }
+                        if mlp_out_buf != 0 && mlp_out_buf != normed_buf =>
+                    {
+                        [normed_buf, mlp_out_buf]
+                    }
+                    MoeExpertStorage::Tiered { .. } => {
+                        let reserved = (rows.saturating_mul(h_dim).saturating_mul(2) + 15) & !15;
+                        let extra_ws = moe
+                            .shared_down_proj
+                            .as_ref()
+                            .and_then(|p| p.input_transform_workspace_bytes(rows))
+                            .unwrap_or(0);
+                        if ex.scratch_ptr != 0
+                            && ex.scratch_ptr.is_multiple_of(16)
+                            && ex.scratch_size >= reserved.saturating_add(extra_ws)
+                        {
+                            [normed_buf, ex.scratch_ptr]
+                        } else {
+                            [normed_buf, 0]
+                        }
+                    }
+                    _ => [normed_buf, 0],
+                }
             }
             _ => [normed_buf, 0],
         }
@@ -139,7 +155,7 @@ impl FfnBlockWeights {
             moe_sh_act_buf,
             moe_sh_out_buf,
             moe_sh_gate_buf,
-            false,
+            0,
         )
     }
 
@@ -165,8 +181,23 @@ impl FfnBlockWeights {
         moe_sh_act_buf: u64,
         moe_sh_out_buf: u64,
         moe_sh_gate_buf: u64,
-        input_prerotated: bool,
+        prerotated_input_buf: u64,
     ) -> Result<()> {
+        let input_prerotated = prerotated_input_buf != 0;
+        let reserved_prerot = (num_tokens.saturating_mul(h_dim).saturating_mul(2) + 15) & !15;
+        let sub_ex = if input_prerotated
+            && prerotated_input_buf == ex.scratch_ptr
+            && ex.scratch_size >= reserved_prerot
+        {
+            W34Exec {
+                stream: ex.stream,
+                scratch_ptr: ex.scratch_ptr + reserved_prerot as u64,
+                scratch_size: ex.scratch_size - reserved_prerot,
+            }
+        } else {
+            *ex
+        };
+        let ex = &sub_ex;
         match self {
             Self::Dense {
                 gate_up_proj,
@@ -178,7 +209,7 @@ impl FfnBlockWeights {
                         cublas,
                         marlin_ws_ptr,
                         marlin_ws_ints,
-                        normed_buf,
+                        prerotated_input_buf,
                         gate_up_buf,
                         num_tokens,
                     )?;
@@ -360,7 +391,7 @@ impl FfnBlockWeights {
                     )?;
                 }
                 let rotated_input_buf = if input_prerotated {
-                    mlp_out_buf
+                    prerotated_input_buf
                 } else {
                     normed_buf
                 };

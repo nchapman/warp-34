@@ -6,6 +6,7 @@
 //   - Stream mixing: sum_{s=0..3} (sigmoid(up[m, s, d]) / 4.0) * residual[m, s, d] -> [M, 2560]
 //   - Stream combine: residual[m, s, d] += inject_w[m, s] * block_out[m, d] (+ ple_delta[m, s, d])
 #include "../w34_cuda.h"
+#include "hadamard_inline.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -184,6 +185,60 @@ __global__ void hc_mix_streams_f16_kernel(
     }
 }
 
+__global__ void hc_mix_streams_hadamard_f16_kernel(
+    const __half* __restrict__ residual_in,
+    const __half* __restrict__ up_raw_in,
+    __half* __restrict__ mixed_out,
+    __half* __restrict__ had64_out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int num_tokens,
+    int hc_count,
+    int hidden_size) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+    __half* dst = (mixed_out != nullptr) ? (mixed_out + (size_t)tok * hidden_size) : nullptr;
+    __half* dst_had = (had64_out != nullptr) ? (had64_out + (size_t)tok * hidden_size) : nullptr;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+            if (dst != nullptr) dst[d] = __float2half(0.0f);
+            if (dst_had != nullptr) dst_had[d] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    const size_t base = (size_t)tok * hc_count * hidden_size;
+    const __half* res_tok = residual_in + base;
+    const __half* up_tok = up_raw_in + base;
+    const float inv_hc = 1.0f / (float)hc_count;
+
+    for (int base_col = 0; base_col < hidden_size; base_col += (int)blockDim.x * 4) {
+        const int col0 = base_col + (int)threadIdx.x * 4;
+        if (col0 < hidden_size) {
+            __half h[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int d = col0 + j;
+                float acc = 0.0f;
+                for (int s = 0; s < hc_count; ++s) {
+                    const size_t idx = (size_t)s * hidden_size + d;
+                    const float u = __half2float(up_tok[idx]);
+                    const float gate = inv_hc / (1.0f + expf(-u));
+                    const float r = __half2float(res_tok[idx]);
+                    acc += gate * r;
+                }
+                h[j] = __float2half(acc);
+            }
+            const uint2 v = *reinterpret_cast<const uint2*>(h);
+            if (dst != nullptr) {
+                *reinterpret_cast<uint2*>(&dst[col0]) = v;
+            }
+            if (dst_had != nullptr) {
+                *reinterpret_cast<uint2*>(&dst_had[col0]) = hadamard64_vec4_f16(v);
+            }
+        }
+    }
+}
+
 // Combines block output [num_tokens, hidden_size] (and optional PLE delta [num_tokens, hc_count, hidden_size])
 // back into the hc_count-stream residual state [num_tokens, hc_count, hidden_size]:
 //   residual_out[tok, s, d] = residual_in[tok, s, d] + inject_w[tok, s] * block_out[tok, d] (+ ple_delta[tok, s, d])
@@ -325,6 +380,39 @@ int w34_hc_mix_streams_f16(
         static_cast<const __half*>(residual_in),
         static_cast<const __half*>(up_raw_in),
         static_cast<__half*>(mixed_out),
+        valid_token_mask,
+        num_tokens,
+        hc_count,
+        hidden_size);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
+int w34_hc_mix_streams_hadamard_f16(
+    const w34_exec* ex,
+    const void* residual_in,
+    const void* up_raw_in,
+    void* mixed_out,
+    void* had64_out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int hc_count,
+    int hidden_size) {
+    if (!had64_out) {
+        return w34_hc_mix_streams_f16(
+            ex, residual_in, up_raw_in, mixed_out, valid_token_mask,
+            num_tokens, hc_count, hidden_size);
+    }
+    if (!ex || !residual_in || !up_raw_in || num_tokens < 0 || hc_count <= 0 ||
+        hidden_size <= 0 || hc_count > 8 || (hidden_size & 63) != 0) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    w34::hc_mix_streams_hadamard_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+        static_cast<const __half*>(residual_in),
+        static_cast<const __half*>(up_raw_in),
+        static_cast<__half*>(mixed_out),
+        static_cast<__half*>(had64_out),
         valid_token_mask,
         num_tokens,
         hc_count,

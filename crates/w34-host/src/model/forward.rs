@@ -617,7 +617,7 @@ impl Qwen3_5ModelRank {
             let pre_mlp_targets =
                 layer
                     .ffn
-                    .pre_mlp_norm_targets(s.normed, s.mlp, h, is_single_stream);
+                    .pre_mlp_norm_targets(s.normed, s.mlp, ex, rows, h, is_single_stream);
             layer.residual.post_attn_pre_mlp_with_targets(
                 &hc_ctx,
                 tp2,
@@ -657,13 +657,17 @@ impl Qwen3_5ModelRank {
                 shact,
                 shout,
                 shgate,
-                pre_mlp_targets[1] != 0,
+                pre_mlp_targets[1],
             )?;
             layer.ffn.execute_tiered(
                 self.tiered_moe.as_mut(),
                 &self.stream,
                 self.is_capturing_graph,
-                s.normed,
+                if pre_mlp_targets[1] != 0 {
+                    pre_mlp_targets[1]
+                } else {
+                    s.normed
+                },
                 [topids, topw, shout, shgate, s.mlp],
                 rows,
             )?;
@@ -836,6 +840,7 @@ impl Qwen3_5ModelRank {
                     },
                     "w34_kv_cache_write_strided",
                 )?;
+                let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
                 if let Some(indexer) = &fa.qsa_indexer {
                     fa.forward_qsa_attention(
                         indexer,
@@ -857,6 +862,7 @@ impl Qwen3_5ModelRank {
                         rows,
                         qh,
                         false,
+                        fuse_o_h64,
                     )?;
                 } else {
                     check_rc(
@@ -873,7 +879,6 @@ impl Qwen3_5ModelRank {
                         },
                         "w34_paged_attention_f16",
                     )?;
-                    let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
                     let gate_fn = if fuse_o_h64 {
                         ffi::w34_apply_attn_output_gate_hadamard_f16
                     } else {
@@ -894,24 +899,14 @@ impl Qwen3_5ModelRank {
                         },
                         "w34_apply_attn_output_gate_f16",
                     )?;
-                    if fuse_o_h64 {
-                        fa.o_proj.forward_prerotated(
-                            ex,
-                            &self.cublas,
-                            mw,
-                            mi,
-                            gated,
-                            s.block,
-                            rows,
-                        )?;
-                    } else {
-                        fa.o_proj
-                            .forward(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
-                    }
-                    return Ok(());
                 }
-                fa.o_proj
-                    .forward(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
+                if fuse_o_h64 {
+                    fa.o_proj
+                        .forward_prerotated(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
+                } else {
+                    fa.o_proj
+                        .forward(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
+                }
             }
             LayerBlockWeights::LinearAttention(gdn) => {
                 let [qkvz, ba, conv, raw, normed] = s.gdn;

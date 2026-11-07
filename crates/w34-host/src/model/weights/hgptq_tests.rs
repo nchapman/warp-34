@@ -650,27 +650,27 @@ fn h64_moe_ffn_block_shares_input_rotation_and_matches_reference() {
     // and verify `forward_with_prerotated_input(..., input_prerotated = true)` when
     // `d_normed` holds unrotated `h_x` and `d_out` starts with pre-rotated `h_x_rot`.
     assert_eq!(
-        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, h_dim, true),
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, &ex, m, h_dim, true),
         [d_normed, d_out]
     );
     assert_eq!(
-        ffn_h64.pre_mlp_norm_targets(d_normed, 0, h_dim, true),
+        ffn_h64.pre_mlp_norm_targets(d_normed, 0, &ex, m, h_dim, true),
         [d_normed, 0]
     );
     assert_eq!(
-        ffn_h64.pre_mlp_norm_targets(d_normed, d_normed, h_dim, true),
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_normed, &ex, m, h_dim, true),
         [d_normed, 0]
     );
     assert_eq!(
-        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, h_dim, false),
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, &ex, m, h_dim, false),
+        [d_normed, d_out]
+    );
+    assert_eq!(
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, &ex, m, h_dim + 16, true),
         [d_normed, 0]
     );
     assert_eq!(
-        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, h_dim + 16, true),
-        [d_normed, 0]
-    );
-    assert_eq!(
-        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, 6208, true),
+        ffn_h64.pre_mlp_norm_targets(d_normed, d_out, &ex, m, 6208, true),
         [d_normed, 0]
     );
 
@@ -697,7 +697,7 @@ fn h64_moe_ffn_block_shares_input_rotation_and_matches_reference() {
             d_sh_act,
             d_sh_out,
             d_sh_gate,
-            true,
+            d_out_prerot,
         )
         .unwrap();
     let mut actual_prerot = vec![0u16; m * h_dim];

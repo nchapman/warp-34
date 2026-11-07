@@ -366,7 +366,7 @@ impl Qwen3_5MtpRank {
                 .ok_or_else(|| loader_err("MTP graph requires single-stream residual"))?;
             let [mlp_norm_out, mlp_norm_had64] =
                 self.ffn
-                    .pre_mlp_norm_targets(normed_buf, mlp_out_buf, h_dim, true);
+                    .pre_mlp_norm_targets(normed_buf, mlp_out_buf, &ex, 1, h_dim, true);
             if let Some(comm) = tp2 {
                 comm.all_reduce_residual_gemma_rms_norm_hadamard_f16(
                     &ex,
@@ -472,7 +472,7 @@ impl Qwen3_5MtpRank {
                         moe_sh_act_buf,
                         moe_sh_out_buf,
                         moe_sh_gate_buf,
-                        mlp_norm_had64 != 0,
+                        mlp_norm_had64,
                     )?;
                 }
             }
@@ -1163,13 +1163,19 @@ impl Qwen3_5MtpRank {
         };
         let fa = &self.fa;
         let is_single_stream = self.residual.is_single_stream();
-        let fuse_qkv_h64 = is_single_stream
-            && fa.qsa_indexer.is_none()
-            && h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
+        let can_use_scratch = ex.scratch_ptr != 0
+            && ex.scratch_ptr.is_multiple_of(16)
+            && ex.scratch_size >= num_tokens.saturating_mul(h_dim).saturating_mul(2);
+        let fuse_qkv_h64 = h_dim <= PRODUCER_FUSED_H64_MAX_HIDDEN_SIZE
             && h_dim.is_multiple_of(HADAMARD_BLOCK_64)
-            && fa.qkv_proj.can_fuse_h64_from_producer();
+            && fa.qkv_proj.can_fuse_h64_from_producer()
+            && (fa.qsa_indexer.is_none() || can_use_scratch);
         let pre_attn_targets = if fuse_qkv_h64 {
-            [0, normed_buf]
+            if fa.qsa_indexer.is_none() {
+                [0, normed_buf]
+            } else {
+                [normed_buf, ex.scratch_ptr]
+            }
         } else {
             [normed_buf, 0]
         };
@@ -1182,7 +1188,11 @@ impl Qwen3_5MtpRank {
             fuse_qkv_h64,
             &ex,
             t,
-            normed_buf,
+            if pre_attn_targets[1] != 0 {
+                pre_attn_targets[1]
+            } else {
+                normed_buf
+            },
             qkv_proj_buf,
             num_tokens,
         )?;
@@ -1332,7 +1342,7 @@ impl Qwen3_5MtpRank {
             self.len += num_tokens;
             return Ok(None);
         }
-        let fuse_o_h64 = fa.qsa_indexer.is_none() && fa.o_proj.can_fuse_h64_from_producer();
+        let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
         if fa.qsa_indexer.is_some() {
             let qsa_ws = self
                 .qsa
@@ -1343,7 +1353,12 @@ impl Qwen3_5MtpRank {
             } else {
                 qsa_ws.qsa_seq_pos_buf.addr()
             };
-            crate::ple::gpu_ops::qsa_sparse_paged_attn_f16(
+            let attn_fn = if fuse_o_h64 {
+                crate::ple::gpu_ops::qsa_sparse_paged_attn_hadamard_f16
+            } else {
+                crate::ple::gpu_ops::qsa_sparse_paged_attn_f16
+            };
+            attn_fn(
                 &ex,
                 q_buf,
                 gate_buf,
@@ -1406,9 +1421,14 @@ impl Qwen3_5MtpRank {
             block_out_buf,
             num_tokens,
         )?;
-        let pre_mlp_targets =
-            self.ffn
-                .pre_mlp_norm_targets(normed_buf, mlp_out_buf, h_dim, is_single_stream);
+        let pre_mlp_targets = self.ffn.pre_mlp_norm_targets(
+            normed_buf,
+            mlp_out_buf,
+            &ex,
+            num_tokens,
+            h_dim,
+            is_single_stream,
+        );
         self.residual.post_attn_pre_mlp_with_targets(
             &hc_ctx,
             tp2,
@@ -1484,7 +1504,7 @@ impl Qwen3_5MtpRank {
                 moe_sh_act_buf,
                 moe_sh_out_buf,
                 moe_sh_gate_buf,
-                pre_mlp_targets[1] != 0,
+                pre_mlp_targets[1],
             )?;
         }
         let tiered_info = match &self.ffn {
@@ -1510,6 +1530,11 @@ impl Qwen3_5MtpRank {
         if let Some((top_k, sh_out_ptr, sh_gate_ptr)) = tiered_info
             && let Some((store, cache, ws)) = &mut self.tiered_moe
         {
+            let tiered_input_buf = if pre_mlp_targets[1] != 0 {
+                pre_mlp_targets[1]
+            } else {
+                normed_buf
+            };
             if cache.slots.capacity >= cache.expert_ids.len()
                 || (num_tokens * top_k <= cache.slots.capacity && store.mapped_dev_ptr() != 0)
             {
@@ -1518,7 +1543,7 @@ impl Qwen3_5MtpRank {
                     cache,
                     ws,
                     &t.stream,
-                    normed_buf,
+                    tiered_input_buf,
                     moe_topk_ids_buf,
                     moe_topk_weights_buf,
                     sh_out_ptr,
@@ -1549,7 +1574,7 @@ impl Qwen3_5MtpRank {
                     cache,
                     ws,
                     &t.stream,
-                    normed_buf,
+                    tiered_input_buf,
                     moe_topk_ids_buf,
                     moe_topk_weights_buf,
                     &h_ids,
