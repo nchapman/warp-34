@@ -1526,3 +1526,111 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
         );
     }
 }
+
+#[test]
+fn test_gpu_hc_combine_tap_f16_parity() {
+    use crate::cuda::{CudaDevice, CudaStream, DeviceBuffer, f32_to_bf16};
+
+    let _dev = CudaDevice::set_current(0).expect("CUDA device 0");
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+
+    let num_tokens = 3usize;
+    let hc_count = 4usize;
+    let hidden_size = 128usize;
+    let num_taps = 5usize;
+    let tap_stride = (num_taps * hidden_size) as i32;
+    let tap_slot = 2usize;
+    let tap_offset = (tap_slot * hidden_size) as i32;
+
+    let res_in: Vec<u16> = (0..num_tokens * hc_count * hidden_size)
+        .map(|i| f32_to_f16((((i * 19 + 7) % 67) as f32 - 33.0) * 0.05))
+        .collect();
+    let block_out: Vec<u16> = (0..num_tokens * hidden_size)
+        .map(|i| f32_to_f16((((i * 31 + 11) % 73) as f32 - 36.0) * 0.04))
+        .collect();
+    let inj_w: Vec<f32> = (0..num_tokens * hc_count)
+        .map(|i| 0.5 + (i as f32) * 0.125)
+        .collect();
+
+    let d_res_ref = dev_from_slice(&res_in, &stream);
+    let d_res_tap = dev_from_slice(&res_in, &stream);
+    let d_blk = dev_from_slice(&block_out, &stream);
+    let d_inj = dev_from_slice(&inj_w, &stream);
+    let d_tap = DeviceBuffer::alloc(0, num_tokens * num_taps * hidden_size * 2).unwrap();
+    d_tap.zero_async(&stream).unwrap();
+
+    gpu_ops::hc_combine_f16(
+        &ex,
+        d_res_ref.addr(),
+        d_blk.addr(),
+        d_inj.addr(),
+        0,
+        d_res_ref.addr(),
+        0,
+        num_tokens,
+        hc_count,
+        hidden_size,
+    )
+    .unwrap();
+
+    gpu_ops::hc_combine_tap_f16(
+        &ex,
+        d_res_tap.addr(),
+        d_blk.addr(),
+        d_inj.addr(),
+        0,
+        d_res_tap.addr(),
+        d_tap.addr(),
+        0,
+        num_tokens,
+        hc_count,
+        hidden_size,
+        tap_stride,
+        tap_offset,
+    )
+    .unwrap();
+
+    let h_res_ref = dev_to_vec::<u16>(&d_res_ref, res_in.len(), &stream);
+    let h_res_tap = dev_to_vec::<u16>(&d_res_tap, res_in.len(), &stream);
+    assert_eq!(h_res_tap, h_res_ref);
+
+    let h_tap = dev_to_vec::<u16>(&d_tap, num_tokens * num_taps * hidden_size, &stream);
+    for tok in 0..num_tokens {
+        for slot in 0..num_taps {
+            for d in 0..hidden_size {
+                let got = h_tap[(tok * num_taps + slot) * hidden_size + d];
+                if slot != tap_slot {
+                    assert_eq!(got, 0);
+                } else {
+                    let mut sum = 0.0f32;
+                    for s in 0..hc_count {
+                        let idx = (tok * hc_count + s) * hidden_size + d;
+                        sum += f16_to_f32(h_res_ref[idx]);
+                    }
+                    let want = f32_to_bf16(sum / (hc_count as f32));
+                    assert_eq!(got, want, "tap mismatch at tok={tok} d={d}");
+                }
+            }
+        }
+    }
+
+    assert!(
+        gpu_ops::hc_combine_tap_f16(
+            &ex,
+            d_res_tap.addr(),
+            d_blk.addr(),
+            d_inj.addr(),
+            0,
+            d_res_tap.addr(),
+            d_tap.addr(),
+            0,
+            num_tokens,
+            hc_count,
+            hidden_size,
+            (hidden_size - 1) as i32,
+            0,
+        )
+        .is_err()
+    );
+}

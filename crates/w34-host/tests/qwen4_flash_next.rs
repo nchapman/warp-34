@@ -1160,6 +1160,73 @@ fn verify_qwen4_exp_quantized_kv(dir: &Path, extended_prompt: &[i32]) {
     }
 }
 
+fn verify_qwen4_exp_dflash2_lossless(
+    engine: &mut w34_host::model::Qwen3_5Engine,
+    prompt_ids: &[i32],
+    expected_prefix: &[i32],
+    alt_prefix: &[i32],
+    label: &str,
+) {
+    let _draft_dir =
+        w34_host::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ")
+            .expect("resolve Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ checkpoint");
+    engine.speculative = None;
+    for r in &mut engine.ranks {
+        r.configure_speculative_taps(&[], false, 0)
+            .expect("reset speculative taps before enabling DFlash2");
+    }
+    engine
+        .enable_speculative(&w34_host::proposer::SpeculativeConfig {
+            kind: w34_host::proposer::SpeculativeKind::DFlash2,
+            draft_model: Some("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ".to_string()),
+            mtp_k: 1,
+        })
+        .unwrap_or_else(|e| panic!("enable real Qwen3.8 DFlash2 on {label}: {e:?}"));
+    let df_cold = engine
+        .generate_with_radix_cache(prompt_ids, 64, 64, true)
+        .unwrap_or_else(|e| panic!("DFlash2 cold 64-token run {label}: {e:?}"));
+    let df_warm = engine
+        .generate_with_radix_cache(prompt_ids, 64, 64, true)
+        .unwrap_or_else(|e| panic!("DFlash2 warm 64-token run {label}: {e:?}"));
+    assert_eq!(
+        df_warm.generated_token_ids, df_cold.generated_token_ids,
+        "Cold and warm DFlash2 runs on {label} must be deterministic across 64 tokens"
+    );
+    assert_eq!(
+        &df_warm.generated_token_ids[..28],
+        &expected_prefix[..28],
+        "Real 48-layer Qwen3.8 DFlash2 on {label} must match target greedy prefix"
+    );
+    assert!(
+        df_warm.generated_token_ids[..32] == expected_prefix[..32]
+            || df_warm.generated_token_ids[..32] == alt_prefix[..32],
+        "Real 48-layer Qwen3.8 DFlash2 on {label} must match 32-token target greedy prefix"
+    );
+    let acc_df = engine
+        .speculative
+        .as_ref()
+        .map(|p| p.last_accepted.clone())
+        .unwrap_or_default();
+    let mean_df = if acc_df.is_empty() {
+        0.0
+    } else {
+        acc_df.iter().sum::<usize>() as f64 / acc_df.len() as f64
+    };
+    assert!(
+        mean_df >= 1.5,
+        "expected DFlash2 {label} mean_accepted >= 1.5, got {mean_df:.2}"
+    );
+    eprintln!(
+        "[QF-5 {label} DFlash2 Warm 64-tok] ttft={:.2}ms decode={:.2} tok/s rounds={} mean_accepted={:.2}/7 ({:.2} tok/round) accepted={:?}",
+        df_warm.ttft_ms,
+        df_warm.decode_tok_per_s,
+        acc_df.len(),
+        mean_df,
+        1.0 + mean_df,
+        acc_df,
+    );
+}
+
 #[test]
 #[ignore = "requires local Qwen3.8-Flash-Next checkpoint"]
 fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
@@ -1283,6 +1350,13 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
         accepted_tp1_warm.len(),
         mean_acc_tp1,
         1.0 + mean_acc_tp1,
+    );
+    verify_qwen4_exp_dflash2_lossless(
+        &mut engine_tp1,
+        &prompt_ids,
+        &warm_target_tp1_64.generated_token_ids,
+        &mtp_tp1_warm.generated_token_ids,
+        "TP=1",
     );
     drop(engine_tp1);
 
@@ -1452,6 +1526,13 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
             mean_accepted,
             1.0 + mean_accepted,
             accepted_warm,
+        );
+        verify_qwen4_exp_dflash2_lossless(
+            &mut engine_tp2,
+            &prompt_ids,
+            &warm_target_64.generated_token_ids,
+            &warm_target_tp1_64.generated_token_ids,
+            "TP=2",
         );
     }
 }

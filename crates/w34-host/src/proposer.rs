@@ -5,7 +5,7 @@
 use crate::{
     cache::StateTx,
     cuda::{DeviceBuffer, Result, check_rc, f16_to_f32},
-    dflash::{DFlash2Rank, DraftCandidates},
+    dflash::{DFLASH2_MAX_BATCH_ROWS, DFlash2Rank, DraftCandidates},
     loader::resolve_hf_model_dir,
     model::{EngineBatchSlice, Qwen3_5Engine, RadixBenchMetrics, loader_err},
     mtp::{MAX_MTP_BATCH_SLOTS, Qwen3_5MtpRank},
@@ -68,6 +68,8 @@ pub struct NativeProposer {
 const MEMO_BUDGET: usize = 256 * 1024 * 1024;
 const MAX_MEMO_ENTRIES: usize = 16;
 const MTP_STAGE_ROWS: usize = 256;
+const TIERED_MOE_MTP_MAX_TAP_ROWS: usize = 6144;
+const TIERED_MOE_DFLASH2_MAX_TAP_ROWS: usize = 2048;
 impl NativeProposer {
     pub fn set_mtp_k(&mut self, k: usize) -> Result<()> {
         if !matches!(self.ranks, Ranks::Mtp(_)) || !(1..=self.max_k).contains(&k) {
@@ -93,10 +95,13 @@ impl NativeProposer {
             ));
         }
         let capacity = engine.ranks[0].kv_pool.num_pages * 16;
-        let max_rows = if config.kind == SpeculativeKind::Mtp && engine.cfg.uses_tiered_moe() {
-            capacity.min(6144)
+        let max_rows = if engine.cfg.uses_tiered_moe() {
+            match config.kind {
+                SpeculativeKind::Mtp => capacity.min(TIERED_MOE_MTP_MAX_TAP_ROWS),
+                SpeculativeKind::DFlash2 => capacity.min(TIERED_MOE_DFLASH2_MAX_TAP_ROWS),
+            }
         } else {
-            capacity.min(256)
+            capacity.min(DFLASH2_MAX_BATCH_ROWS)
         };
         if max_rows < 16 {
             return Err(loader_err("insufficient speculative context capacity"));
@@ -149,12 +154,13 @@ impl NativeProposer {
                     .ok_or_else(|| loader_err("DFlash2 requires --draft-model"))?;
                 let dir = resolve_hf_model_dir(name)
                     .map_err(|_| loader_err("resolve DFlash2 checkpoint"))?;
+                let dflash_max_rows = max_rows.min(DFLASH2_MAX_BATCH_ROWS);
                 let ranks = if engine.ranks.len() <= 1 {
                     engine
                         .ranks
                         .iter()
                         .map(|t| {
-                            let mut r = DFlash2Rank::load(t, &dir, capacity, max_rows)?;
+                            let mut r = DFlash2Rank::load(t, &dir, capacity, dflash_max_rows)?;
                             r.use_cuda_graph = use_graph;
                             Ok(r)
                         })
@@ -167,7 +173,8 @@ impl NativeProposer {
                             .iter()
                             .map(|t| {
                                 s.spawn(move || {
-                                    let mut r = DFlash2Rank::load(t, dir_ref, capacity, max_rows)?;
+                                    let mut r =
+                                        DFlash2Rank::load(t, dir_ref, capacity, dflash_max_rows)?;
                                     r.use_cuda_graph = use_graph;
                                     Ok(r)
                                 })

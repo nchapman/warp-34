@@ -8,6 +8,7 @@
 #include "../w34_cuda.h"
 #include "hadamard_inline.cuh"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
@@ -242,16 +243,22 @@ __global__ void hc_mix_streams_hadamard_f16_kernel(
 // Combines block output [num_tokens, hidden_size] (and optional PLE delta [num_tokens, hc_count, hidden_size])
 // back into the hc_count-stream residual state [num_tokens, hc_count, hidden_size]:
 //   residual_out[tok, s, d] = residual_in[tok, s, d] + inject_w[tok, s] * block_out[tok, d] (+ ple_delta[tok, s, d])
+// When `tap_bf16_out != nullptr`, also writes the completed layer's stream average:
+//   tap_bf16_out[tok * tap_stride_elems + tap_offset_elems + d] =
+//       bf16_rn((1 / hc_count) * sum_{s=0..hc_count-1} f32(residual_out[tok, s, d]))
 __global__ void hc_combine_f16_kernel(
     const __half* __restrict__ residual_in,
     const __half* __restrict__ block_out,
     const float* __restrict__ inject_weights,
     const __half* __restrict__ ple_delta,
     __half* __restrict__ residual_out,
+    __nv_bfloat16* __restrict__ tap_bf16_out,
     const uint8_t* __restrict__ valid_token_mask,
     int num_tokens,
     int hc_count,
-    int hidden_size) {
+    int hidden_size,
+    int tap_stride_elems,
+    int tap_offset_elems) {
     const int tok = blockIdx.x;
     if (tok >= num_tokens) return;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
@@ -264,16 +271,29 @@ __global__ void hc_combine_f16_kernel(
     const __half* blk_tok = block_out + (size_t)tok * hidden_size;
     const __half* ple_tok = (ple_delta != nullptr) ? (ple_delta + base) : nullptr;
     const float* inj_tok = inject_weights + (size_t)tok * hc_count;
+    __nv_bfloat16* tap_row =
+        (tap_bf16_out != nullptr)
+            ? (tap_bf16_out + (size_t)tok * tap_stride_elems + tap_offset_elems)
+            : nullptr;
+    const float inv_hc = 1.0f / static_cast<float>(hc_count);
 
     for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
         const float y = __half2float(blk_tok[d]);
+        float tap_sum = 0.0f;
         for (int s = 0; s < hc_count; ++s) {
             const size_t idx = (size_t)s * hidden_size + d;
             float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
             if (ple_tok != nullptr) {
                 val += __half2float(ple_tok[idx]);
             }
-            res_out_tok[idx] = __float2half(val);
+            const __half out_h = __float2half(val);
+            res_out_tok[idx] = out_h;
+            if (tap_row != nullptr) {
+                tap_sum += __half2float(out_h);
+            }
+        }
+        if (tap_row != nullptr) {
+            tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
         }
     }
 }
@@ -420,6 +440,46 @@ int w34_hc_mix_streams_hadamard_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
 }
 
+int w34_hc_combine_tap_f16(
+    const w34_exec* ex,
+    const void* residual_in,
+    const void* block_out,
+    const float* inject_weights,
+    const void* ple_delta,
+    void* residual_out,
+    void* tap_bf16_out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int hc_count,
+    int hidden_size,
+    int tap_stride_elems,
+    int tap_offset_elems) {
+    if (!ex || !residual_in || !block_out || !inject_weights || !residual_out || num_tokens < 0 ||
+        hc_count <= 0 || hidden_size <= 0 || hc_count > 8) {
+        return -1;
+    }
+    if (tap_bf16_out != nullptr &&
+        (tap_offset_elems < 0 || tap_stride_elems < tap_offset_elems + hidden_size)) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    w34::hc_combine_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+        static_cast<const __half*>(residual_in),
+        static_cast<const __half*>(block_out),
+        inject_weights,
+        static_cast<const __half*>(ple_delta),
+        static_cast<__half*>(residual_out),
+        static_cast<__nv_bfloat16*>(tap_bf16_out),
+        valid_token_mask,
+        num_tokens,
+        hc_count,
+        hidden_size,
+        tap_stride_elems,
+        tap_offset_elems);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
 int w34_hc_combine_f16(
     const w34_exec* ex,
     const void* residual_in,
@@ -431,23 +491,20 @@ int w34_hc_combine_f16(
     int num_tokens,
     int hc_count,
     int hidden_size) {
-    if (!ex || !residual_in || !block_out || !inject_weights || !residual_out || num_tokens < 0 ||
-        hc_count <= 0 || hidden_size <= 0 || hc_count > 8) {
-        return -1;
-    }
-    if (num_tokens == 0) return 0;
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::hc_combine_f16_kernel<<<num_tokens, 256, 0, stream>>>(
-        static_cast<const __half*>(residual_in),
-        static_cast<const __half*>(block_out),
+    return w34_hc_combine_tap_f16(
+        ex,
+        residual_in,
+        block_out,
         inject_weights,
-        static_cast<const __half*>(ple_delta),
-        static_cast<__half*>(residual_out),
+        ple_delta,
+        residual_out,
+        nullptr,
         valid_token_mask,
         num_tokens,
         hc_count,
-        hidden_size);
-    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+        hidden_size,
+        0,
+        0);
 }
 
 __global__ void qwen4_mtp_broadcast_add_f16_kernel(

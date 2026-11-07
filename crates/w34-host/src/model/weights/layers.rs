@@ -368,17 +368,29 @@ impl HcBlockWeights {
     }
 
     pub fn forward_combine(&self, ctx: &HcStepContext<'_>, block_out_buf: u64) -> Result<()> {
-        crate::ple::gpu_ops::hc_combine_f16(
+        self.forward_combine_with_tap(ctx, block_out_buf, TapExport::default())
+    }
+
+    pub fn forward_combine_with_tap(
+        &self,
+        ctx: &HcStepContext<'_>,
+        block_out_buf: u64,
+        tap: TapExport,
+    ) -> Result<()> {
+        crate::ple::gpu_ops::hc_combine_tap_f16(
             ctx.ex,
             ctx.hc_residual_buf,
             block_out_buf,
             ctx.hc_inj_weights_buf,
             0,
             ctx.hc_residual_buf,
+            tap.dst,
             0,
             ctx.num_tokens,
             ctx.hc_count,
             ctx.h_dim,
+            tap.stride,
+            tap.offset,
         )
     }
 }
@@ -657,7 +669,7 @@ impl LayerResidual {
                         (ctx.num_tokens * ctx.h_dim) as i32,
                     )?;
                 }
-                mlp_hc.forward_combine(ctx, mlp_out_buf)
+                mlp_hc.forward_combine_with_tap(ctx, mlp_out_buf, tap)
             }
         }
     }

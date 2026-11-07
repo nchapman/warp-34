@@ -373,6 +373,22 @@ unsafe extern "C" {
         hidden_size: i32,
     ) -> i32;
 
+    pub fn w34_hc_combine_tap_f16(
+        ex: *const W34Exec,
+        residual_in: *const c_void,
+        block_out: *const c_void,
+        inject_weights: *const f32,
+        ple_delta: *const c_void,
+        residual_out: *mut c_void,
+        tap_bf16_out: *mut c_void,
+        valid_token_mask: *const u8,
+        num_tokens: i32,
+        hc_count: i32,
+        hidden_size: i32,
+        tap_stride_elems: i32,
+        tap_offset_elems: i32,
+    ) -> i32;
+
     pub fn w34_qwen4_mtp_broadcast_add_f16(
         ex: *const W34Exec,
         fc_embed: *const c_void,
