@@ -83,22 +83,26 @@ skip/failure/capacity outcomes rather than dropping unsuccessful profiles.
 
 ### Tier 1: current warp-34 capability coverage
 
+Scope is limited to four mainstream, unmodified model families: **9B, 27B,
+35B-A3B, and Flash-Next**. Exclude uncensored/heretic derivatives. Do not add 2B
+or legacy 4B to this refreshed campaign; their inventory entries above describe
+historical coverage only.
+
 All rows use HGPTQ, the same recorded KV policy initially (TQ4), and TP1 and TP2.
 Every enabled serving profile must be qualified on the pod before being labeled
 supported. MTP-k3 is the initial common comparison, not a claim that k3 is optimal.
 
 | Target | Decode modes | Initial profile count |
 |---|---|---:|
-| 2B | Plain, MTP-k3 | 4 |
 | 9B | Plain, MTP-k3 | 4 |
 | 27B | Plain, MTP-k3, DFlash2 with native BF16 drafter, DFlash2 with HGPTQ drafter | 8 |
 | 35B-A3B | Plain, MTP-k3 | 4 |
 | Flash-Next | Plain, MTP-k3, DFlash2 with HGPTQ drafter | 6 |
 
-These **26 candidate profiles** establish coverage, not all performance tuning.
-Retain legacy 4B/DFlash2 as a secondary regression lane if it remains supported;
-do not silently remove it merely because the flagship set changed. Probe other
-MTP depths / DFlash2 block sizes only after this core is working.
+These **22 candidate profiles across four model families** establish coverage,
+not all performance tuning. Historical 2B/4B evidence stays intact but is outside
+the refreshed campaign. Probe other MTP depths / DFlash2 block sizes only after
+this core is working.
 
 ### Tier 2: cross-engine comparisons
 

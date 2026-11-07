@@ -3,7 +3,7 @@
 ## Standalone performance coverage audit (post-HGPTQ; no new GPU measurements)
 
 - Audited `benchmarks/perf/` against the current HGPTQ, Flash-Next and DFlash2 capabilities. Existing HTTP infrastructure is reusable, but campaign TOMLs have no HGPTQ profiles; Flash-Next lacks DFlash2 profiles and 27B DFlash2 uses the older BF16 drafter.
-- Recorded the proposed 26-profile HGPTQ TP1/TP2 core, workload/state gaps, separate matched-GPTQ versus practical cross-quant comparison tracks, and pod handoff requirements in [`benchmarks/perf/COVERAGE_AUDIT.md`](../benchmarks/perf/COVERAGE_AUDIT.md). Third-party checkpoint selection and new profiles remain pending; historical campaigns/results were not relabeled.
+- Recorded the proposed 22-profile HGPTQ TP1/TP2 core limited to mainstream, unmodified 9B, 27B, 35B-A3B and Flash-Next (no 2B/4B or heretic derivatives), workload/state gaps, separate matched-GPTQ versus practical cross-quant comparison tracks, and pod handoff requirements in [`benchmarks/perf/COVERAGE_AUDIT.md`](../benchmarks/perf/COVERAGE_AUDIT.md). Third-party checkpoint selection and new profiles remain pending; historical campaigns/results were not relabeled.
 - This was a coverage/documentation audit only. No local GPU benchmarks, downloads or server launches; execution awaits the user-provided pod.
 
 
