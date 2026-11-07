@@ -328,6 +328,9 @@ static bool is_valid_config(thread_config_t const& th_config, int thread_m_block
     if (th_config.thread_n < marlin::min_thread_n || th_config.thread_k < marlin::min_thread_k) {
         return false;
     }
+    if (group_size == -1 && prob_n >= 128 && th_config.thread_n < 128) {
+        return false;
+    }
     int cache_size = get_kernel_cache_size(
         th_config, thread_m_blocks, num_bits, group_size, has_zp, stages);
     return cache_size <= max_shared_mem;
@@ -471,9 +474,13 @@ static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
                                             int thread_m_blocks, bool m_block_size_8,
                                             int group_blocks, int num_bits, bool has_zp,
                                             int stages, int max_shared_mem,
-                                            int sms) {
+                                            int sms, bool is_bf16 = false) {
     thread_config_t* table = thread_m_blocks > 1 ? large_batch_thread_configs : small_batch_thread_configs;
     int groupsize = (group_blocks == -1) ? -1 : (group_blocks * 16);
+    auto has_kernel = [&](const thread_config_t& cfg) {
+        return is_bf16 ? (get_marlin_kernel_bf16u4(cfg, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
+                       : (get_marlin_kernel_f16(cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr);
+    };
     if (thread_m_blocks > 1) {
         const int m_tiles = div_ceil(prob_m, thread_m_blocks * 16);
         int want = -1;
@@ -488,14 +495,14 @@ static thread_config_t choose_thread_config(int prob_m, int prob_n, int prob_k,
         if (want >= 0 &&
             is_valid_config(table[want], thread_m_blocks, prob_m, prob_n, prob_k,
                             num_bits, groupsize, has_zp, stages, max_shared_mem - 512) &&
-            get_marlin_kernel_f16(table[want], num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
+            has_kernel(table[want])) {
             return table[want];
         }
     }
     for (int i = 0; i < 3; i++) {
         if (is_valid_config(table[i], thread_m_blocks, prob_m, prob_n, prob_k,
                             num_bits, groupsize, has_zp, stages, max_shared_mem - 512) &&
-            get_marlin_kernel_f16(table[i], num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
+            has_kernel(table[i])) {
             return table[i];
         }
     }
@@ -544,10 +551,11 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     // Keep `N = 2560, K <= 4096` on 1-slice `{128, 64, 128}` so 4B golden parity is preserved
     // across 84-SM (3090 Ti) and 128-SM (4090) GPUs while unlocking `N = 3072, K >= 2560`
     // (e.g. 9B TP=2 `qkv` / `in_z` on 128 SMs).
-    const bool keep_2560_1slice = (prob_n == 2560 && prob_k <= 4096);
+    const bool keep_2560_1slice = !is_bf16 && (prob_n == 2560 && prob_k <= 4096);
     const bool enable_m_invariant_split_k =
-        (prob_m <= 16) && !keep_2560_1slice &&
-        (((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
+        (prob_m <= 16) && (group_blocks > 0) && !keep_2560_1slice &&
+        ((is_bf16 && ((prob_n / 64) * 2 <= sms) && (prob_k >= 1024)) ||
+         ((prob_n >= 2048) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 4608)) ||
          ((prob_n == 3072) && ((prob_n / 64) * 2 <= sms) && (prob_k >= 2560)) ||
          ((prob_n >= 512) && (prob_n <= 2048) && (prob_k >= 1024) && (prob_k <= 2048)));
     // Scale wide-N (N > 4096) M-parallelism directly from the card's reported L2 cache size:
@@ -567,7 +575,7 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
 
         thread_config_t th_cfg = choose_thread_config(
             prob_m_split, prob_n, prob_k, thread_m_blocks, m_block_size_8,
-            group_blocks, num_bits, has_zp, stages, max_shared_mem, sms);
+            group_blocks, num_bits, has_zp, stages, max_shared_mem, sms, is_bf16);
         if (th_cfg.thread_n != -1) {
             const int cur_mn_tiles =
                 (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
@@ -575,9 +583,12 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
                 (prob_m_split <= 64 && cur_mn_tiles < sms && (prob_n / 64) * 2 > sms) ||
                 cur_mn_tiles * 4 <= sms) {
                 thread_config_t cfg128 = {128, 64, 128};
+                const bool cfg128_has_kernel =
+                    is_bf16 ? (get_marlin_kernel_bf16u4(cfg128, thread_m_blocks, m_block_size_8, group_blocks) != nullptr)
+                            : (get_marlin_kernel_f16(cfg128, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr);
                 if (is_valid_config(cfg128, thread_m_blocks, prob_m_split, prob_n, prob_k,
                                     num_bits, groupsize, has_zp, stages, max_shared_mem) &&
-                    get_marlin_kernel_f16(cfg128, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks) != nullptr) {
+                    cfg128_has_kernel) {
                     th_cfg = cfg128;
                 }
             }

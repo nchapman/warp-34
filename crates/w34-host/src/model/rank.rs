@@ -403,9 +403,9 @@ pub const TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT: usize = 96;
 /// Auto-tuned `TP=1` per-layer GPU hot expert ceiling for larger serving KV budgets (`> 1.5 GiB`).
 pub const TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT: usize = 88;
 
-/// Auto-tuned `TP=2` per-rank GPU hot expert ceiling (`224 / 512` experts across 2 GPUs),
-/// leaving room for `100%` VRAM-resident `MTP` (`256 / 256` local experts) plus `>= 2 GiB` headroom.
-pub const TIERED_MOE_TP2_DEFAULT_HOT: usize = 112;
+/// Auto-tuned `TP=2` per-rank GPU hot expert ceiling (`240 / 512` experts across 2 GPUs),
+/// leaving room for `100%` VRAM-resident `MTP` (`256 / 256` local experts) plus `>= 1.4 GiB` headroom.
+pub const TIERED_MOE_TP2_DEFAULT_HOT: usize = 120;
 
 /// Extra expert-stride slots (`512`) reserved on `TP=1` / `TP=2` for `TieredMoeWorkspace` staging
 /// and downstream `MTP` expert cache allocation.
