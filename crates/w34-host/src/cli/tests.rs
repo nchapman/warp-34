@@ -501,4 +501,104 @@ fn kv_policy_parsing_and_tensor_diff_metrics() {
     assert_eq!(cos_z, 1.0);
     let (_, _, cos_one_zero) = tensor_diff_metrics(&[0.0, 0.0], &[1.0, 1.0]);
     assert_eq!(cos_one_zero, 0.0);
+
+    let ref_vals = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let mut mm_ok = ref_vals.clone();
+    mm_ok[0] = 1.6;
+    mm_ok[1] = 2.6;
+    mm_ok[4] = 5.05;
+    let (_, last_rel, min_cos) =
+        evaluate_golden_tensor_diff("final_norm", &[3, 2], &mm_ok, &ref_vals, true).unwrap();
+    assert!(last_rel < 0.05);
+    assert!(min_cos > 0.99);
+    assert!(evaluate_golden_tensor_diff("final_norm", &[3, 2], &mm_ok, &ref_vals, false).is_err());
+    assert!(
+        evaluate_golden_tensor_diff("layer_0_hidden_after", &[3, 2], &mm_ok, &ref_vals, true)
+            .is_err()
+    );
+    let mut bad_mid_row = ref_vals.clone();
+    bad_mid_row[2] = -3.0;
+    bad_mid_row[3] = -4.0;
+    assert!(
+        evaluate_golden_tensor_diff("final_norm", &[3, 2], &bad_mid_row, &ref_vals, true).is_err()
+    );
+    assert!(evaluate_golden_tensor_diff("final_norm", &[2, 2], &mm_ok, &ref_vals, true).is_err());
+
+    assert!(
+        evaluate_moe_or_golden_tensor_diff("final_norm", &[3, 2], &mm_ok, &ref_vals, false, true)
+            .is_ok()
+    );
+    assert!(
+        evaluate_moe_or_golden_tensor_diff(
+            "layer_0_hidden_after",
+            &[3, 2],
+            &mm_ok,
+            &ref_vals,
+            false,
+            true,
+        )
+        .is_err()
+    );
+    assert!(
+        evaluate_moe_or_golden_tensor_diff(
+            "final_norm",
+            &[3, 2],
+            &bad_mid_row,
+            &ref_vals,
+            true,
+            true,
+        )
+        .is_err()
+    );
+
+    // Even when full_rel_l2 <= 0.05 across a long sequence, a corrupted final row must fail.
+    let long_ref = vec![1.0f32; 512 * 2];
+    let mut zeroed_last_row = long_ref.clone();
+    zeroed_last_row[511 * 2] = 0.0;
+    zeroed_last_row[511 * 2 + 1] = 0.0;
+    assert!(
+        evaluate_moe_or_golden_tensor_diff(
+            "final_norm",
+            &[512, 2],
+            &zeroed_last_row,
+            &long_ref,
+            true,
+            true,
+        )
+        .is_err()
+    );
+
+    // Sublayer deltas return the actual measured last-row relative L2 error without clipping to 0.05.
+    let sub_ref = vec![1.0f32, 2.0, 3.0, 4.0];
+    let sub_vals = vec![1.0f32, 2.0, 3.6, 4.8]; // last row scaled by 1.2 -> last_rel_l2 = 0.20
+    let (_, reported_sub_rel, _) = evaluate_moe_or_golden_tensor_diff(
+        "layer_1_mlp_out",
+        &[2, 2],
+        &sub_vals,
+        &sub_ref,
+        false,
+        true,
+    )
+    .unwrap();
+    assert!((reported_sub_rel - 0.20).abs() < 1e-6);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn greedy_diff_image_rejects_speculation() {
+    let err = prepare_cuda_cli(
+        &args(&[
+            "greedy-diff",
+            "--golden",
+            "gold",
+            "--image",
+            "rgb://64x64/128,128,128",
+            "--speculative",
+            "mtp",
+        ]),
+        |_, _, _| panic!("greedy-diff --image --speculative must fail before download"),
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("--image does not support --speculative"));
 }

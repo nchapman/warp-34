@@ -249,6 +249,7 @@ fn test_parse_quant_supported_schemes() {
                     group_size: gs,
                     symmetric: sym,
                     ignore: vec!["lm_head".into()],
+                    rules: None,
                 }
             );
             assert_eq!(q.expects_zero_points(), !sym);
@@ -902,6 +903,81 @@ fn test_qwen4_exp_flash_next_config_and_validation() {
     let mut bad_qsa = qfn_json.clone();
     bad_qsa["text_config"]["indexer_compress_ratio"] = serde_json::json!(3);
     assert!(ModelConfig::from_json(&bad_qsa).is_err());
+
+    verify_qwen4_exp_hgptq_config(&qfn_json);
+}
+
+fn verify_qwen4_exp_hgptq_config(qfn_json: &Json) {
+    // Verify Qwen3.8-Flash-Next (qwen4_exp) W4A16-HGPTQ compressed-tensors config with
+    // H_64 + g64 on attention/GDN and g32 on routed MoE experts resolves tiered MoE layout.
+    let mut qfn_hgptq = qfn_json.clone();
+    qfn_hgptq["quantization_config"] = serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "ignore": [
+            "lm_head",
+            "re:.*mlp\\.gate$",
+            "re:.*mlp\\.shared_expert_gate$",
+            "re:.*indexer\\..*",
+            "re:.*hyper_connection.*"
+        ],
+        "config_groups": {
+            "group_0": {
+                "targets": ["re:.*self_attn\\..*", "re:.*linear_attn\\.in_proj_qkv$", "re:.*linear_attn\\.in_proj_z$", "re:.*linear_attn\\.out_proj$"],
+                "weights": { "num_bits": 4, "type": "int", "symmetric": true, "strategy": "group", "group_size": 64, "dynamic": false }
+            },
+            "group_1": {
+                "targets": ["re:.*mlp\\.experts\\..*", "re:.*mlp\\.shared_expert\\..*"],
+                "weights": { "num_bits": 4, "type": "int", "symmetric": true, "strategy": "group", "group_size": 32, "dynamic": false }
+            }
+        },
+        "transform_config": {
+            "config_groups": {
+                "h64": {
+                    "type": "hadamard",
+                    "head_dim": 64,
+                    "randomize": false,
+                    "apply": [
+                        {
+                            "location": "input",
+                            "inverse": false,
+                            "targets": ["re:.*self_attn\\..*", "re:.*linear_attn\\.in_proj_qkv$", "re:.*linear_attn\\.in_proj_z$", "re:.*linear_attn\\.out_proj$"],
+                            "ignore": []
+                        },
+                        {
+                            "location": "weight_input",
+                            "inverse": true,
+                            "targets": ["re:.*self_attn\\..*", "re:.*linear_attn\\.in_proj_qkv$", "re:.*linear_attn\\.in_proj_z$", "re:.*linear_attn\\.out_proj$"],
+                            "ignore": []
+                        }
+                    ]
+                }
+            }
+        }
+    });
+    let cfg_hgptq = ModelConfig::from_json(&qfn_hgptq).unwrap();
+    assert_eq!(
+        cfg_hgptq
+            .routed_expert_quant_scheme()
+            .symmetric_gptq_u4_group_size(),
+        Some(32)
+    );
+    assert_eq!(cfg_hgptq.moe_expert_pack_layout().unwrap().group_size, 32);
+    assert!(cfg_hgptq.uses_tiered_moe());
+    assert_eq!(
+        cfg_hgptq
+            .quant
+            .input_hadamard("model.language_model.layers.0.linear_attn.in_proj_qkv")
+            .unwrap(),
+        Some(64)
+    );
+    assert_eq!(
+        cfg_hgptq
+            .quant
+            .input_hadamard("model.language_model.layers.0.mlp.experts.0.gate_proj")
+            .unwrap(),
+        None
+    );
 }
 
 #[test]

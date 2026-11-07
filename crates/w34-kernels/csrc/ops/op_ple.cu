@@ -7,6 +7,7 @@
 //       gate = sigmoid(sign(q * k) * sqrt(|q * k| + 1e-6))
 //       ple_delta[tok, s, d] = gate[tok, s, d] * value[tok, d]
 #include "../w34_cuda.h"
+#include "hadamard_inline.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -52,6 +53,139 @@ __global__ void ple_dequant_f8_to_f16_kernel(
     }
 }
 
+__global__ void ple_dequant_lut4_to_f16_kernel(
+    const uint8_t* __restrict__ raw_in,
+    const float* __restrict__ lut16,
+    __half* __restrict__ f16_out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    int group_size) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+    const int embed_dim = num_heads * head_dim;
+    __half* dst = f16_out + (size_t)tok * embed_dim;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+            dst[d] = __float2half(0.0f);
+        }
+        return;
+    }
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) {
+        s_lut[threadIdx.x] = lut16[threadIdx.x];
+    }
+    __syncthreads();
+
+    const int packed_bytes = head_dim / 2;
+    const int num_groups = head_dim / group_size;
+    const int head_stride = packed_bytes + num_groups * 2;
+    const uint8_t* tok_src = raw_in + (size_t)tok * num_heads * head_stride;
+
+    for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+        const int h = d / head_dim;
+        const int col = d - h * head_dim;
+        const uint8_t* head_ptr = tok_src + (size_t)h * head_stride;
+        const uint8_t packed_byte = head_ptr[col >> 1];
+        const uint32_t nibble = (col & 1) ? ((packed_byte >> 4) & 0x0fu) : (packed_byte & 0x0fu);
+        const int grp = col / group_size;
+        const uint8_t* scale_bytes = head_ptr + packed_bytes + grp * 2;
+        const uint16_t scale_bits = (uint16_t)scale_bytes[0] | ((uint16_t)scale_bytes[1] << 8);
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+        dst[d] = __float2half(s_lut[nibble] * scale);
+    }
+}
+
+__global__ void ple_dequant_f8_hadamard_to_f16_kernel(
+    const uint8_t* __restrict__ f8_in,
+    __half* __restrict__ f16_out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int num_tokens,
+    int embed_dim,
+    float weight_scale) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+    const size_t base = (size_t)tok * embed_dim;
+    __half* dst = f16_out + base;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+            dst[d] = __float2half(0.0f);
+        }
+        return;
+    }
+    const uint8_t* src = f8_in + base;
+    for (int base_col = 0; base_col < embed_dim; base_col += (int)blockDim.x * 4) {
+        const int col0 = base_col + (int)threadIdx.x * 4;
+        if (col0 < embed_dim) {
+            __half h[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float val = ple_f8_e4m3_to_f32(src[col0 + j]) * weight_scale;
+                h[j] = __float2half(val);
+            }
+            const uint2 v = *reinterpret_cast<const uint2*>(h);
+            *reinterpret_cast<uint2*>(&dst[col0]) = hadamard64_vec4_f16(v);
+        }
+    }
+}
+
+__global__ void ple_dequant_lut4_hadamard_to_f16_kernel(
+    const uint8_t* __restrict__ raw_in,
+    const float* __restrict__ lut16,
+    __half* __restrict__ f16_out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    int group_size) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+    const int embed_dim = num_heads * head_dim;
+    __half* dst = f16_out + (size_t)tok * embed_dim;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+            dst[d] = __float2half(0.0f);
+        }
+        return;
+    }
+    __shared__ float s_lut[16];
+    if (threadIdx.x < 16) {
+        s_lut[threadIdx.x] = lut16[threadIdx.x];
+    }
+    __syncthreads();
+
+    const int packed_bytes = head_dim / 2;
+    const int num_groups = head_dim / group_size;
+    const int head_stride = packed_bytes + num_groups * 2;
+    const uint8_t* tok_src = raw_in + (size_t)tok * num_heads * head_stride;
+
+    for (int base_col = 0; base_col < embed_dim; base_col += (int)blockDim.x * 4) {
+        const int col0 = base_col + (int)threadIdx.x * 4;
+        if (col0 < embed_dim) {
+            __half h[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int d = col0 + j;
+                const int head = d / head_dim;
+                const int col = d - head * head_dim;
+                const uint8_t* head_ptr = tok_src + (size_t)head * head_stride;
+                const uint8_t packed_byte = head_ptr[col >> 1];
+                const uint32_t nibble =
+                    (col & 1) ? ((packed_byte >> 4) & 0x0fu) : (packed_byte & 0x0fu);
+                const int grp = col / group_size;
+                const uint8_t* scale_bytes = head_ptr + packed_bytes + grp * 2;
+                const uint16_t scale_bits =
+                    (uint16_t)scale_bytes[0] | ((uint16_t)scale_bytes[1] << 8);
+                const float scale = __half2float(__ushort_as_half(scale_bits));
+                h[j] = __float2half(s_lut[nibble] * scale);
+            }
+            const uint2 v = *reinterpret_cast<const uint2*>(h);
+            *reinterpret_cast<uint2*>(&dst[col0]) = hadamard64_vec4_f16(v);
+        }
+    }
+}
+
 // Causal dilated 1D depthwise convolution with kernel_size=4, dilation=3 (span=9 taps).
 // Grid: (conv_dim + 255) / 256, Block: 256, Y-grid: num_reqs.
 __global__ void ple_dilated_conv1d_f16_kernel(
@@ -59,6 +193,7 @@ __global__ void ple_dilated_conv1d_f16_kernel(
     const __half* __restrict__ conv_weight,
     __half* __restrict__ conv_state_pool,
     __half* __restrict__ key_out,
+    __half* __restrict__ residual_inout,
     w34_gdn_batch batch,
     int conv_dim) {
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
@@ -108,7 +243,14 @@ __global__ void ple_dilated_conv1d_f16_kernel(
 
         const float acc = w0 * v_lag9 + w1 * v_lag6 + w2 * v_lag3 + w3 * v_lag0;
         const float silu_acc = acc / (1.0f + expf(-acc));
-        key_out[(size_t)(q_start + t) * conv_dim + d] = __float2half(silu_acc);
+        const size_t out_idx = (size_t)(q_start + t) * conv_dim + d;
+        const __half out_h = __float2half(silu_acc);
+        if (key_out != nullptr) {
+            key_out[out_idx] = out_h;
+        }
+        if (residual_inout != nullptr) {
+            residual_inout[out_idx] = __hadd(residual_inout[out_idx], out_h);
+        }
 
         if (batch.spec_state_indices != nullptr && batch.max_verify_tokens > 0 &&
             t < batch.max_verify_tokens && conv_state_pool != nullptr) {
@@ -254,6 +396,159 @@ __global__ void ple_signed_sqrt_gate_f16_kernel(
     }
 }
 
+__global__ void ple_signed_sqrt_gate_norm_add_f16_kernel(
+    const __half* __restrict__ norm_query,
+    const __half* __restrict__ norm_key,
+    const __half* __restrict__ value_in,
+    __half* __restrict__ ple_delta_out,
+    __half* __restrict__ residual_inout,
+    const __half* __restrict__ norm_conv_weight,
+    __half* __restrict__ norm_conv_out,
+    const uint8_t* __restrict__ valid_token_mask,
+    int num_tokens,
+    int hc_count,
+    int embed_dim,
+    float eps,
+    float norm_eps) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+
+    const size_t stream_base = (size_t)tok * hc_count * embed_dim;
+    __half* dst_tok = (ple_delta_out != nullptr) ? (ple_delta_out + stream_base) : nullptr;
+    __half* res_tok = (residual_inout != nullptr) ? (residual_inout + stream_base) : nullptr;
+    __half* norm_tok = (norm_conv_out != nullptr) ? (norm_conv_out + stream_base) : nullptr;
+    if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
+        for (int i = threadIdx.x; i < hc_count * embed_dim; i += blockDim.x) {
+            if (dst_tok != nullptr) dst_tok[i] = __float2half(0.0f);
+            if (norm_tok != nullptr) norm_tok[i] = __float2half(0.0f);
+        }
+        return;
+    }
+
+    const __half* q_tok = norm_query + stream_base;
+    const __half* k_tok = norm_key + stream_base;
+    const __half* v_tok = value_in + (size_t)tok * embed_dim;
+
+    constexpr int MAX_HC = 8;
+    float dot_s[MAX_HC] = {0.0f};
+    for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+#pragma unroll
+        for (int s = 0; s < MAX_HC; ++s) {
+            if (s < hc_count) {
+                const size_t idx = (size_t)s * embed_dim + d;
+                dot_s[s] += __half2float(q_tok[idx]) * __half2float(k_tok[idx]);
+            }
+        }
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int num_warps = blockDim.x >> 5;
+    __shared__ float s_warp[8][MAX_HC];
+    __shared__ float s_gate[MAX_HC];
+    __shared__ float s_inv_rms[MAX_HC];
+
+#pragma unroll
+    for (int s = 0; s < MAX_HC; ++s) {
+        float v = dot_s[s];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            v += __shfl_xor_sync(0xffffffffu, v, offset);
+        }
+        if (lane == 0) {
+            s_warp[wid][s] = v;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x < MAX_HC) {
+        const int s = threadIdx.x;
+        if (s < hc_count) {
+            float sum = 0.0f;
+            for (int w = 0; w < num_warps; ++w) {
+                sum += s_warp[w][s];
+            }
+            const float dot = sum * rsqrtf((float)embed_dim);
+            const float sign_d = (dot > 0.0f) ? 1.0f : ((dot < 0.0f) ? -1.0f : 0.0f);
+            const float clamped = fmaxf(fabsf(dot), eps);
+            const float logit = sign_d * sqrtf(clamped);
+            s_gate[s] = 1.0f / (1.0f + expf(-logit));
+        } else {
+            s_gate[s] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float sum_sq_s[MAX_HC] = {0.0f};
+    const bool do_norm = (norm_conv_weight != nullptr && norm_tok != nullptr);
+    for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+        const float val = __half2float(v_tok[d]);
+#pragma unroll
+        for (int s = 0; s < MAX_HC; ++s) {
+            if (s < hc_count) {
+                const size_t idx = (size_t)s * embed_dim + d;
+                const __half delta_h = __float2half(s_gate[s] * val);
+                if (dst_tok != nullptr) {
+                    dst_tok[idx] = delta_h;
+                }
+                if (res_tok != nullptr) {
+                    res_tok[idx] = __hadd(res_tok[idx], delta_h);
+                }
+                if (do_norm) {
+                    const float df = __half2float(delta_h);
+                    sum_sq_s[s] += df * df;
+                }
+            }
+        }
+    }
+
+    if (do_norm) {
+#pragma unroll
+        for (int s = 0; s < MAX_HC; ++s) {
+            float v = sum_sq_s[s];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                v += __shfl_xor_sync(0xffffffffu, v, offset);
+            }
+            if (lane == 0) {
+                s_warp[wid][s] = v;
+            }
+        }
+        __syncthreads();
+
+        if (wid == 0) {
+#pragma unroll
+            for (int s = 0; s < MAX_HC; ++s) {
+                if (s < hc_count) {
+                    float v = (lane < num_warps) ? s_warp[lane][s] : 0.0f;
+#pragma unroll
+                    for (int offset = 16; offset > 0; offset >>= 1) {
+                        v += __shfl_xor_sync(0xffffffffu, v, offset);
+                    }
+                    if (lane == 0) {
+                        s_inv_rms[s] = rsqrtf(v / (float)embed_dim + norm_eps);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+            const float val = __half2float(v_tok[d]);
+#pragma unroll
+            for (int s = 0; s < MAX_HC; ++s) {
+                if (s < hc_count) {
+                    const size_t idx = (size_t)s * embed_dim + d;
+                    const __half delta_h = __float2half(s_gate[s] * val);
+                    const float v = __half2float(delta_h) * s_inv_rms[s];
+                    const float wf = 1.0f + __half2float(norm_conv_weight[idx]);
+                    norm_tok[idx] = __float2half(v * wf);
+                }
+            }
+        }
+    }
+}
+
 } // namespace w34
 
 extern "C" {
@@ -281,6 +576,88 @@ int w34_ple_dequant_f8_to_f16(
     return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
 }
 
+int w34_ple_dequant_f8_hadamard_to_f16(
+    const w34_exec* ex,
+    const uint8_t* f8_in,
+    void* f16_out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int embed_dim,
+    float weight_scale) {
+    if (!ex || !f8_in || !f16_out || num_tokens < 0 || embed_dim <= 0 || (embed_dim & 63) != 0) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    w34::ple_dequant_f8_hadamard_to_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+        f8_in,
+        static_cast<__half*>(f16_out),
+        valid_token_mask,
+        num_tokens,
+        embed_dim,
+        weight_scale);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
+int w34_ple_dequant_lut4_to_f16(
+    const w34_exec* ex,
+    const uint8_t* raw_in,
+    const float* lut16,
+    void* f16_out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    int group_size) {
+    if (!ex || !raw_in || !lut16 || !f16_out || num_tokens < 0 ||
+        num_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0 ||
+        group_size <= 0 || (head_dim % group_size) != 0) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    w34::ple_dequant_lut4_to_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+        raw_in,
+        lut16,
+        static_cast<__half*>(f16_out),
+        valid_token_mask,
+        num_tokens,
+        num_heads,
+        head_dim,
+        group_size);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
+int w34_ple_dequant_lut4_hadamard_to_f16(
+    const w34_exec* ex,
+    const uint8_t* raw_in,
+    const float* lut16,
+    void* f16_out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    int group_size) {
+    if (!ex || !raw_in || !lut16 || !f16_out || num_tokens < 0 ||
+        num_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0 ||
+        group_size <= 0 || (head_dim % group_size) != 0 ||
+        ((num_heads * head_dim) & 63) != 0) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    w34::ple_dequant_lut4_hadamard_to_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+        raw_in,
+        lut16,
+        static_cast<__half*>(f16_out),
+        valid_token_mask,
+        num_tokens,
+        num_heads,
+        head_dim,
+        group_size);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
 int w34_ple_dilated_conv1d_f16(
     const w34_exec* ex,
     const void* key_in,
@@ -289,7 +666,20 @@ int w34_ple_dilated_conv1d_f16(
     void* key_out,
     const w34_gdn_batch* batch,
     int conv_dim) {
-    if (!ex || !key_in || !conv_weight || !key_out || !batch || conv_dim <= 0) {
+    return w34_ple_dilated_conv1d_add_f16(
+        ex, key_in, conv_weight, conv_state_pool, key_out, nullptr, batch, conv_dim);
+}
+
+int w34_ple_dilated_conv1d_add_f16(
+    const w34_exec* ex,
+    const void* key_in,
+    const void* conv_weight,
+    void* conv_state_pool,
+    void* key_out,
+    void* residual_inout,
+    const w34_gdn_batch* batch,
+    int conv_dim) {
+    if (!ex || !key_in || !conv_weight || (!key_out && !residual_inout) || !batch || conv_dim <= 0) {
         return -1;
     }
     if (batch->num_reqs <= 0 || batch->total_tokens <= 0) return 0;
@@ -300,6 +690,7 @@ int w34_ple_dilated_conv1d_f16(
         static_cast<const __half*>(conv_weight),
         static_cast<__half*>(conv_state_pool),
         static_cast<__half*>(key_out),
+        static_cast<__half*>(residual_inout),
         *batch,
         conv_dim);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
@@ -332,6 +723,46 @@ int w34_ple_signed_sqrt_gate_f16(
         hc_count,
         embed_dim,
         eps);
+    return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
+}
+
+int w34_ple_signed_sqrt_gate_norm_add_f16(
+    const w34_exec* ex,
+    const void* norm_query,
+    const void* norm_key,
+    const void* value_in,
+    void* ple_delta_out,
+    void* residual_inout,
+    const void* norm_conv_weight,
+    void* norm_conv_out,
+    const uint8_t* valid_token_mask,
+    int num_tokens,
+    int hc_count,
+    int embed_dim,
+    float eps,
+    float norm_eps) {
+    if (!ex || !norm_query || !norm_key || !value_in ||
+        (!ple_delta_out && !residual_inout && !norm_conv_out) ||
+        ((norm_conv_out == nullptr) != (norm_conv_weight == nullptr)) ||
+        num_tokens < 0 || hc_count <= 0 || embed_dim <= 0 || hc_count > 8) {
+        return -1;
+    }
+    if (num_tokens == 0) return 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
+    w34::ple_signed_sqrt_gate_norm_add_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+        static_cast<const __half*>(norm_query),
+        static_cast<const __half*>(norm_key),
+        static_cast<const __half*>(value_in),
+        static_cast<__half*>(ple_delta_out),
+        static_cast<__half*>(residual_inout),
+        static_cast<const __half*>(norm_conv_weight),
+        static_cast<__half*>(norm_conv_out),
+        valid_token_mask,
+        num_tokens,
+        hc_count,
+        embed_dim,
+        eps,
+        norm_eps);
     return (cudaGetLastError() == cudaSuccess) ? 0 : -2;
 }
 

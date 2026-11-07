@@ -67,6 +67,7 @@ fn ct(bits: usize, group_size: usize, symmetric: bool) -> QuantScheme {
         group_size,
         symmetric,
         ignore: vec![],
+        rules: None,
     }
 }
 
@@ -144,6 +145,7 @@ fn compressed_tensors_loading_and_tp_slicing_preserve_weights() {
                     assert_eq!(
                         loaded
                             .slice_cols(rank * k / 2, (rank + 1) * k / 2)
+                            .unwrap()
                             .to_f16_vec(),
                         column_reference
                     );

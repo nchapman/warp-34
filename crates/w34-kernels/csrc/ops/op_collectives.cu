@@ -8,6 +8,7 @@
 // - Distinct typed entrypoints for FP16, BF16, FP32, INT32, and (FP32, INT32) top-1 argmax
 //   (never casting token IDs or integer counters through FP16).
 #include "../w34_cuda.h"
+#include "hadamard_inline.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -178,6 +179,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
     __half* __restrict__ residual,
     const __half* __restrict__ weight,
     __half* __restrict__ out,
+    __half* __restrict__ out_had64,
     __nv_bfloat16* __restrict__ tap_dst_bf16,
     __half* __restrict__ s0,
     __half* __restrict__ s1,
@@ -203,7 +205,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
     const bool vec8 = ((hidden_size & 7) == 0) &&
                       ((((uintptr_t)local_in | (uintptr_t)my_s | (uintptr_t)peer_s |
                          (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)out |
-                         (uintptr_t)ar_out) & 15u) == 0);
+                         (uintptr_t)out_had64 | (uintptr_t)ar_out) & 15u) == 0);
     // Odd stage count (1, 3, or 5) overlaps PCIe Gen4 x8 TX and RX in full duplex across
     // disjoint row slices on large-M prefill while guaranteeing `self_sg->flag[blockIdx.x]`
     // flips odd/even double-buffer parity on every kernel invocation (CUDA Graph safe).
@@ -269,7 +271,12 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
                     ? reinterpret_cast<uint4*>(ar_out + (size_t)row * hidden_size)
                     : nullptr;
                 uint4* res_v = reinterpret_cast<uint4*>(residual + (size_t)row * hidden_size);
-                uint4* out_v = reinterpret_cast<uint4*>(out + (size_t)row * hidden_size);
+                uint4* out_v = (out != nullptr)
+                    ? reinterpret_cast<uint4*>(out + (size_t)row * hidden_size)
+                    : nullptr;
+                uint4* out_had64_v = (out_had64 != nullptr)
+                    ? reinterpret_cast<uint4*>(out_had64 + (size_t)row * hidden_size)
+                    : nullptr;
                 __nv_bfloat16* tap_row = (tap_dst_bf16 != nullptr)
                     ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
                     : nullptr;
@@ -331,7 +338,12 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
                             const float w = 1.0f + __half2float(wh[d]);
                             oh[d] = __float2half(v * w);
                         }
-                        out_v[c] = ov;
+                        if (out_v != nullptr) {
+                            out_v[c] = ov;
+                        }
+                        if (out_had64_v != nullptr) {
+                            out_had64_v[c] = w34::hadamard64_vec8_f16(ov, (int)threadIdx.x);
+                        }
                     }
                 }
             }
@@ -712,6 +724,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp4_all_reduce_residual_gemma_rms_
     __half* __restrict__ residual,
     const __half* __restrict__ weight,
     __half* __restrict__ out,
+    __half* __restrict__ out_had64,
     __nv_bfloat16* __restrict__ tap_dst_bf16,
     Tp4Ptrs ptrs,
     int rank,
@@ -738,7 +751,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp4_all_reduce_residual_gemma_rms_
                       ((((uintptr_t)local_in | (uintptr_t)s_buf[0] | (uintptr_t)s_buf[1] |
                          (uintptr_t)s_buf[2] | (uintptr_t)s_buf[3] |
                          (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)out |
-                         (uintptr_t)ar_out) & 15u) == 0);
+                         (uintptr_t)out_had64 | (uintptr_t)ar_out) & 15u) == 0);
 
     __shared__ float s_warp[32];
 
@@ -781,7 +794,12 @@ __global__ void __launch_bounds__(THREADS, 2) tp4_all_reduce_residual_gemma_rms_
                 ? reinterpret_cast<uint4*>(ar_out + (size_t)row * hidden_size)
                 : nullptr;
             uint4* res_v = reinterpret_cast<uint4*>(residual + (size_t)row * hidden_size);
-            uint4* out_v = reinterpret_cast<uint4*>(out + (size_t)row * hidden_size);
+            uint4* out_v = (out != nullptr)
+                ? reinterpret_cast<uint4*>(out + (size_t)row * hidden_size)
+                : nullptr;
+            uint4* out_had_v = (out_had64 != nullptr)
+                ? reinterpret_cast<uint4*>(out_had64 + (size_t)row * hidden_size)
+                : nullptr;
             __nv_bfloat16* tap_row = (tap_dst_bf16 != nullptr)
                 ? (tap_dst_bf16 + (size_t)row * tap_row_stride + tap_col_offset)
                 : nullptr;
@@ -850,7 +868,12 @@ __global__ void __launch_bounds__(THREADS, 2) tp4_all_reduce_residual_gemma_rms_
                         const float w = 1.0f + __half2float(wh[d]);
                         oh[d] = __float2half(v * w);
                     }
-                    out_v[c] = ov;
+                    if (out_v != nullptr) {
+                        out_v[c] = ov;
+                    }
+                    if (out_had_v != nullptr) {
+                        out_had_v[c] = w34::hadamard64_vec8_f16(ov, (int)threadIdx.x & 7);
+                    }
                 }
             }
         }
@@ -1162,13 +1185,14 @@ extern "C" int w34_tp2_all_reduce_f16(const w34_exec* ex, const void* local_in, 
     return (int)cudaGetLastError();
 }
 
-extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
+extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     const w34_exec* ex,
     const void* local_in,
     void* ar_out,
     void* residual,
     const void* weight,
     void* out,
+    void* out_had64,
     void* tap_dst_bf16,
     void* stage0,
     void* stage1,
@@ -1181,10 +1205,17 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
     int tap_row_stride,
     int tap_col_offset) {
     if (ex == nullptr || local_in == nullptr || residual == nullptr ||
-        weight == nullptr || out == nullptr || stage0 == nullptr ||
-        stage1 == nullptr || sig0 == nullptr || sig1 == nullptr ||
+        weight == nullptr || (out == nullptr && out_had64 == nullptr) ||
+        stage0 == nullptr || stage1 == nullptr || sig0 == nullptr || sig1 == nullptr ||
         (rank != 0 && rank != 1) || num_tokens < 0 || hidden_size <= 0 ||
         hidden_size > 6144) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (out_had64 != nullptr &&
+        ((hidden_size & 63) != 0 ||
+         ((((uintptr_t)local_in | (uintptr_t)stage0 | (uintptr_t)stage1 |
+            (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)out |
+            (uintptr_t)out_had64 | (uintptr_t)ar_out) & 15u) != 0))) {
         return (int)cudaErrorInvalidValue;
     }
     if (tap_dst_bf16 != nullptr &&
@@ -1203,7 +1234,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>
             <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)local_in, (__half*)ar_out, (__half*)residual,
-                (const __half*)weight, (__half*)out,
+                (const __half*)weight, (__half*)out, (__half*)out_had64,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
                 rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
@@ -1211,7 +1242,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>
             <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)local_in, (__half*)ar_out, (__half*)residual,
-                (const __half*)weight, (__half*)out,
+                (const __half*)weight, (__half*)out, (__half*)out_had64,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
                 rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
@@ -1219,7 +1250,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>
             <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)local_in, (__half*)ar_out, (__half*)residual,
-                (const __half*)weight, (__half*)out,
+                (const __half*)weight, (__half*)out, (__half*)out_had64,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
                 rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
@@ -1227,12 +1258,37 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>
             <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)local_in, (__half*)ar_out, (__half*)residual,
-                (const __half*)weight, (__half*)out,
+                (const __half*)weight, (__half*)out, (__half*)out_had64,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
                 rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
     }
     return (int)cudaGetLastError();
+}
+
+extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_f16(
+    const w34_exec* ex,
+    const void* local_in,
+    void* ar_out,
+    void* residual,
+    const void* weight,
+    void* out,
+    void* tap_dst_bf16,
+    void* stage0,
+    void* stage1,
+    void* sig0,
+    void* sig1,
+    int rank,
+    int num_tokens,
+    int hidden_size,
+    float eps,
+    int tap_row_stride,
+    int tap_col_offset) {
+    if (out == nullptr) return (int)cudaErrorInvalidValue;
+    return w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+        ex, local_in, ar_out, residual, weight, out, nullptr, tap_dst_bf16,
+        stage0, stage1, sig0, sig1, rank, num_tokens, hidden_size, eps,
+        tap_row_stride, tap_col_offset);
 }
 
 extern "C" int w34_tp2_all_reduce_bf16(const w34_exec* ex, const void* local_in, void* out,
@@ -1451,6 +1507,90 @@ extern "C" int w34_tp4_all_reduce_f16(
     return (int)cudaGetLastError();
 }
 
+extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+    const w34_exec* ex,
+    const void* local_in,
+    void* ar_out,
+    void* residual,
+    const void* weight,
+    void* out,
+    void* out_had64,
+    void* tap_dst_bf16,
+    void* stage0,
+    void* stage1,
+    void* stage2,
+    void* stage3,
+    void* sig0,
+    void* sig1,
+    void* sig2,
+    void* sig3,
+    int rank,
+    int num_tokens,
+    int hidden_size,
+    float eps,
+    int tap_row_stride,
+    int tap_col_offset) {
+    if (ex == nullptr || local_in == nullptr || residual == nullptr ||
+        weight == nullptr || (out == nullptr && out_had64 == nullptr) ||
+        stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
+        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
+        rank < 0 || rank >= 4 || num_tokens < 0 || hidden_size <= 0 || hidden_size > 6144) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (out_had64 != nullptr &&
+        ((hidden_size & 63) != 0 ||
+         ((((uintptr_t)local_in | (uintptr_t)stage0 | (uintptr_t)stage1 |
+            (uintptr_t)stage2 | (uintptr_t)stage3 | (uintptr_t)residual |
+            (uintptr_t)weight | (uintptr_t)out | (uintptr_t)out_had64 |
+            (uintptr_t)ar_out) & 15u) != 0))) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (tap_dst_bf16 != nullptr &&
+        (tap_col_offset < 0 || tap_row_stride < hidden_size ||
+         tap_col_offset > tap_row_stride - hidden_size)) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_tokens == 0) return 0;
+    int blocks = num_tokens;
+    int cap = w34_comm::tp2_block_cap(true);
+    if (cap > 16) cap = 16;
+    if (blocks > cap) blocks = cap;
+    w34_comm::Tp4Ptrs ptrs{
+        {stage0, stage1, stage2, stage3},
+        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
+    };
+    if (hidden_size <= 2560) {
+        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>
+            <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
+                (const __half*)weight, (__half*)out, (__half*)out_had64,
+                (__nv_bfloat16*)tap_dst_bf16, ptrs,
+                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+    } else if (hidden_size <= 4096) {
+        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>
+            <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
+                (const __half*)weight, (__half*)out, (__half*)out_had64,
+                (__nv_bfloat16*)tap_dst_bf16, ptrs,
+                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+    } else if (hidden_size <= 5120) {
+        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>
+            <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
+                (const __half*)weight, (__half*)out, (__half*)out_had64,
+                (__nv_bfloat16*)tap_dst_bf16, ptrs,
+                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+    } else {
+        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>
+            <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
+                (const __half*)weight, (__half*)out, (__half*)out_had64,
+                (__nv_bfloat16*)tap_dst_bf16, ptrs,
+                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+    }
+    return (int)cudaGetLastError();
+}
+
 extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
     const w34_exec* ex,
     const void* local_in,
@@ -1473,57 +1613,11 @@ extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_f16(
     float eps,
     int tap_row_stride,
     int tap_col_offset) {
-    if (ex == nullptr || local_in == nullptr || residual == nullptr ||
-        weight == nullptr || out == nullptr ||
-        stage0 == nullptr || stage1 == nullptr || stage2 == nullptr || stage3 == nullptr ||
-        sig0 == nullptr || sig1 == nullptr || sig2 == nullptr || sig3 == nullptr ||
-        rank < 0 || rank >= 4 || num_tokens < 0 || hidden_size <= 0 || hidden_size > 6144) {
-        return (int)cudaErrorInvalidValue;
-    }
-    if (tap_dst_bf16 != nullptr &&
-        (tap_col_offset < 0 || tap_row_stride < hidden_size ||
-         tap_col_offset > tap_row_stride - hidden_size)) {
-        return (int)cudaErrorInvalidValue;
-    }
-    if (num_tokens == 0) return 0;
-    int blocks = num_tokens;
-    int cap = w34_comm::tp2_block_cap(true);
-    if (cap > 16) cap = 16;
-    if (blocks > cap) blocks = cap;
-    w34_comm::Tp4Ptrs ptrs{
-        {stage0, stage1, stage2, stage3},
-        {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
-    };
-    if (hidden_size <= 2560) {
-        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>
-            <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
-                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
-                (const __half*)weight, (__half*)out,
-                (__nv_bfloat16*)tap_dst_bf16, ptrs,
-                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
-    } else if (hidden_size <= 4096) {
-        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>
-            <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
-                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
-                (const __half*)weight, (__half*)out,
-                (__nv_bfloat16*)tap_dst_bf16, ptrs,
-                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
-    } else if (hidden_size <= 5120) {
-        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>
-            <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
-                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
-                (const __half*)weight, (__half*)out,
-                (__nv_bfloat16*)tap_dst_bf16, ptrs,
-                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
-    } else {
-        w34_comm::tp4_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>
-            <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
-                (const __half*)local_in, (__half*)ar_out, (__half*)residual,
-                (const __half*)weight, (__half*)out,
-                (__nv_bfloat16*)tap_dst_bf16, ptrs,
-                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
-    }
-    return (int)cudaGetLastError();
+    if (out == nullptr) return (int)cudaErrorInvalidValue;
+    return w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
+        ex, local_in, ar_out, residual, weight, out, nullptr, tap_dst_bf16,
+        stage0, stage1, stage2, stage3, sig0, sig1, sig2, sig3,
+        rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
 }
 
 extern "C" int w34_tp4_all_reduce_bf16(

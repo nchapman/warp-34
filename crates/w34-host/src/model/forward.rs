@@ -596,14 +596,27 @@ impl Qwen3_5ModelRank {
                 h_dim: h,
                 eps,
             };
-            layer.residual.pre_attn(norm_layer_idx, &hc_ctx, s.normed)?;
-            self.run_attention_block(ex, layer_idx, positions, rows, attn, gdn_batch, s)?;
-            layer.residual.post_attn_pre_mlp(
+            let pre_attn_targets = layer.block.pre_attn_norm_targets(s.normed, ex, rows, h);
+            layer
+                .residual
+                .pre_attn_with_targets(norm_layer_idx, &hc_ctx, pre_attn_targets)?;
+            self.run_attention_block(
+                ex,
+                layer_idx,
+                positions,
+                rows,
+                attn,
+                gdn_batch,
+                s,
+                pre_attn_targets,
+            )?;
+            let pre_mlp_targets = layer.ffn.pre_mlp_norm_targets(s.normed, s.mlp, ex, rows, h);
+            layer.residual.post_attn_pre_mlp_with_targets(
                 &hc_ctx,
                 tp2,
                 self.rank,
                 s.block,
-                s.normed,
+                pre_mlp_targets,
                 dump_out.is_some(),
             )?;
             if let Some(dump) = dump_out.as_deref_mut()
@@ -617,7 +630,7 @@ impl Qwen3_5ModelRank {
                     dump,
                 )?;
             }
-            layer.ffn.forward(
+            layer.ffn.forward_with_prerotated_input(
                 ex,
                 &self.cublas,
                 mw,
@@ -637,33 +650,43 @@ impl Qwen3_5ModelRank {
                 shact,
                 shout,
                 shgate,
+                pre_mlp_targets[1],
             )?;
             layer.ffn.execute_tiered(
                 self.tiered_moe.as_mut(),
                 &self.stream,
                 self.is_capturing_graph,
-                s.normed,
+                if pre_mlp_targets[1] != 0 {
+                    pre_mlp_targets[1]
+                } else {
+                    s.normed
+                },
                 [topids, topw, shout, shgate, s.mlp],
                 rows,
             )?;
-            let (next_weight, next_out) = if let Some(next) = self.layers.get(layer_idx + 1) {
-                (
-                    next.residual.single_stream_input_norm_ptr().unwrap_or(0),
-                    s.normed,
-                )
-            } else {
-                (
-                    self.final_residual.single_stream_norm_ptr().unwrap_or(0),
-                    final_out,
-                )
-            };
+            let [next_weight, next_out, next_had64] =
+                if let Some(next) = self.layers.get(layer_idx + 1) {
+                    let w = next.residual.single_stream_input_norm_ptr().unwrap_or(0);
+                    let [no, nh] = if next.ple.is_some() {
+                        [s.normed, 0]
+                    } else {
+                        next.block.pre_attn_norm_targets(s.normed, ex, rows, h)
+                    };
+                    [w, no, nh]
+                } else {
+                    [
+                        self.final_residual.single_stream_norm_ptr().unwrap_or(0),
+                        final_out,
+                        0,
+                    ]
+                };
             let (dst, stride, offset) = self.layer_tap_target(layer_idx, rows, h);
-            self.layers[layer_idx].residual.post_mlp(
+            self.layers[layer_idx].residual.post_mlp_with_targets(
                 &hc_ctx,
                 tp2,
                 self.rank,
                 s.mlp,
-                [next_weight, next_out],
+                [next_weight, next_out, next_had64],
                 super::TapExport {
                     dst,
                     stride,
@@ -728,6 +751,7 @@ impl Qwen3_5ModelRank {
         attn: &W34AttentionBatch,
         batch: &W34GdnBatch,
         s: &ForwardScratch,
+        [_pre_attn_out, pre_attn_had64]: [u64; 2],
     ) -> Result<()> {
         let mw = self.marlin_ws.addr();
         let mi = self.marlin_ws.len_bytes / 4;
@@ -741,8 +765,20 @@ impl Qwen3_5ModelRank {
                 let qgd = qh * hd * 2;
                 let kd = kh * hd;
                 let stride = (qgd + 2 * kd) as i32;
-                fa.qkv_proj
-                    .forward(ex, &self.cublas, mw, mi, s.normed, qkv, rows)?;
+                if pre_attn_had64 != 0 {
+                    fa.qkv_proj.forward_prerotated(
+                        ex,
+                        &self.cublas,
+                        mw,
+                        mi,
+                        pre_attn_had64,
+                        qkv,
+                        rows,
+                    )?;
+                } else {
+                    fa.qkv_proj
+                        .forward(ex, &self.cublas, mw, mi, s.normed, qkv, rows)?;
+                }
                 check_rc(
                     // SAFETY: packed QKV and separate Q/K/gate buffers match the local head geometry.
                     // Caller supplies position planes according to current_pos_plane_stride.
@@ -791,6 +827,7 @@ impl Qwen3_5ModelRank {
                     },
                     "w34_kv_cache_write_strided",
                 )?;
+                let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
                 if let Some(indexer) = &fa.qsa_indexer {
                     fa.forward_qsa_attention(
                         indexer,
@@ -812,6 +849,7 @@ impl Qwen3_5ModelRank {
                         rows,
                         qh,
                         false,
+                        fuse_o_h64,
                     )?;
                 } else {
                     check_rc(
@@ -828,10 +866,15 @@ impl Qwen3_5ModelRank {
                         },
                         "w34_paged_attention_f16",
                     )?;
+                    let gate_fn = if fuse_o_h64 {
+                        ffi::w34_apply_attn_output_gate_hadamard_f16
+                    } else {
+                        ffi::w34_apply_attn_output_gate_f16
+                    };
                     check_rc(
                         // SAFETY: attention, gate and destination are distinct local-Q-sized overlay buffers.
                         unsafe {
-                            ffi::w34_apply_attn_output_gate_f16(
+                            gate_fn(
                                 ex,
                                 out as *const c_void,
                                 gate as *const c_void,
@@ -844,8 +887,13 @@ impl Qwen3_5ModelRank {
                         "w34_apply_attn_output_gate_f16",
                     )?;
                 }
-                fa.o_proj
-                    .forward(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
+                if fuse_o_h64 {
+                    fa.o_proj
+                        .forward_prerotated(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
+                } else {
+                    fa.o_proj
+                        .forward(ex, &self.cublas, mw, mi, gated, s.block, rows)?;
+                }
             }
             LayerBlockWeights::LinearAttention(gdn) => {
                 let [qkvz, ba, conv, raw, normed] = s.gdn;
@@ -855,9 +903,9 @@ impl Qwen3_5ModelRank {
                 let vd = self.cfg.linear_value_head_dim;
                 let cd = 2 * kh * kd + vh * vd;
                 let stride = (cd + vh * vd) as i32;
-                // cuBLAS uses the main stream, so only the custom small-N/Marlin paths may fork.
-                let fork = !matches!(gdn.in_proj_ba, LinearProj::DenseF16 { size_n, size_k, .. }
-                    if size_n > 256 || !size_k.is_multiple_of(8));
+                // cuBLAS uses the main stream and Hadamard uses ex.scratch_ptr, so only custom
+                // non-Hadamard small-N/Marlin projections may fork onto aux_stream.
+                let fork = gdn.in_proj_ba.can_fork_on_aux_stream();
                 if fork {
                     self.aux_fork_event.record_in_current_ctx(&self.stream)?;
                     self.aux_stream.wait_event(&self.aux_fork_event)?;
@@ -874,8 +922,20 @@ impl Qwen3_5ModelRank {
                     self.aux_join_event
                         .record_in_current_ctx(&self.aux_stream)?;
                 }
-                gdn.in_proj_qkvz
-                    .forward(ex, &self.cublas, mw, mi, s.normed, qkvz, rows)?;
+                if pre_attn_had64 != 0 {
+                    gdn.in_proj_qkvz.forward_prerotated(
+                        ex,
+                        &self.cublas,
+                        mw,
+                        mi,
+                        pre_attn_had64,
+                        qkvz,
+                        rows,
+                    )?;
+                } else {
+                    gdn.in_proj_qkvz
+                        .forward(ex, &self.cublas, mw, mi, s.normed, qkvz, rows)?;
+                }
                 if !fork {
                     gdn.in_proj_ba
                         .forward(ex, &self.cublas, mw, mi, s.normed, ba, rows)?;
@@ -944,10 +1004,18 @@ impl Qwen3_5ModelRank {
                     },
                     "w34_gdn_recurrent_strided_f16",
                 )?;
-                let gated_norm = if self.cfg.output_gate_type.eq_ignore_ascii_case("sigmoid") {
-                    ffi::w34_rms_norm_gated_sigmoid_strided_f16
-                } else {
-                    ffi::w34_rms_norm_gated_silu_strided_f16
+                const GDN_FUSED_GATED_NORM_HEAD_DIM: usize = 128;
+                let fuse_out_h64 = vd == GDN_FUSED_GATED_NORM_HEAD_DIM
+                    && stride % 4 == 0
+                    && gdn.out_proj.can_fuse_h64_from_producer();
+                let gated_norm = match (
+                    self.cfg.output_gate_type.eq_ignore_ascii_case("sigmoid"),
+                    fuse_out_h64,
+                ) {
+                    (true, true) => ffi::w34_rms_norm_gated_sigmoid_strided_hadamard_f16,
+                    (true, false) => ffi::w34_rms_norm_gated_sigmoid_strided_f16,
+                    (false, true) => ffi::w34_rms_norm_gated_silu_strided_hadamard_f16,
+                    (false, false) => ffi::w34_rms_norm_gated_silu_strided_f16,
                 };
                 check_rc(
                     // SAFETY: Z is the suffix of QKVZ; raw/normed contain rows * vh * vd elements.
@@ -968,8 +1036,20 @@ impl Qwen3_5ModelRank {
                     },
                     "w34_rms_norm_gated_strided_f16",
                 )?;
-                gdn.out_proj
-                    .forward(ex, &self.cublas, mw, mi, normed, s.block, rows)?;
+                if fuse_out_h64 {
+                    gdn.out_proj.forward_prerotated(
+                        ex,
+                        &self.cublas,
+                        mw,
+                        mi,
+                        normed,
+                        s.block,
+                        rows,
+                    )?;
+                } else {
+                    gdn.out_proj
+                        .forward(ex, &self.cublas, mw, mi, normed, s.block, rows)?;
+                }
             }
         }
         Ok(())

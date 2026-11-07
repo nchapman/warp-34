@@ -228,10 +228,15 @@ impl Qwen3_5MtpRank {
                 )?;
             }
             Self::project(self.concat_fc()?, &ex, t, concat, residual_buf, 1)?;
+            let fa = &self.fa;
+            let [qkv_norm_out, qkv_norm_had64] =
+                fa.pre_attn_norm_targets(normed_buf, &ex, 1, h_dim);
+            let fuse_qkv_h64 = qkv_norm_had64 != 0;
             check_rc(
-                // SAFETY: residual_buf and normed_buf are valid device allocations for h_dim half elements, weight is valid norm weight.
+                // SAFETY: residual_buf and normed_buf are valid device buffers for h_dim half elements,
+                // input_layernorm_ptr is valid norm weight on active stream.
                 unsafe {
-                    ffi::w34_gemma_rms_norm_f16(
+                    ffi::w34_gemma_rms_norm_hadamard_f16(
                         &ex,
                         residual_buf as *const c_void,
                         self.residual
@@ -239,7 +244,8 @@ impl Qwen3_5MtpRank {
                             .ok_or_else(|| {
                                 loader_err("MTP graph requires single-stream residual")
                             })? as *const c_void,
-                        normed_buf as *mut c_void,
+                        qkv_norm_out as *mut c_void,
+                        qkv_norm_had64 as *mut c_void,
                         core::ptr::null(),
                         1,
                         h_dim as i32,
@@ -248,8 +254,15 @@ impl Qwen3_5MtpRank {
                 },
                 "MTP input norm",
             )?;
-            let fa = &self.fa;
-            Self::project(&fa.qkv_proj, &ex, t, normed_buf, qkv_proj_buf, 1)?;
+            Self::project_maybe_prerotated(
+                &fa.qkv_proj,
+                fuse_qkv_h64,
+                &ex,
+                t,
+                normed_buf,
+                qkv_proj_buf,
+                1,
+            )?;
             check_rc(
                 // SAFETY: q_gate_ptr, k_raw_ptr, and output buffers are valid strided device buffers for 1 token, positions_ptr contains valid position on t.stream.
                 unsafe {
@@ -310,10 +323,16 @@ impl Qwen3_5MtpRank {
                 },
                 "w34_paged_attention_f16",
             )?;
+            let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
+            let gate_fn = if fuse_o_h64 {
+                ffi::w34_apply_attn_output_gate_hadamard_f16
+            } else {
+                ffi::w34_apply_attn_output_gate_f16
+            };
             check_rc(
                 // SAFETY: attn_out_buf and gate_buf are valid device buffers of local_q_heads * head_dim half elements, gated_attn_buf has equal capacity.
                 unsafe {
-                    ffi::w34_apply_attn_output_gate_f16(
+                    gate_fn(
                         &ex,
                         attn_out_buf as *const c_void,
                         gate_buf as *const c_void,
@@ -325,19 +344,31 @@ impl Qwen3_5MtpRank {
                 },
                 "w34_apply_attn_output_gate_f16",
             )?;
-            Self::project(&fa.o_proj, &ex, t, gated_attn_buf, block_out_buf, 1)?;
+            Self::project_maybe_prerotated(
+                &fa.o_proj,
+                fuse_o_h64,
+                &ex,
+                t,
+                gated_attn_buf,
+                block_out_buf,
+                1,
+            )?;
             let post_ln_ptr = self
                 .residual
                 .single_stream_post_attn_norm_ptr()
                 .ok_or_else(|| loader_err("MTP graph requires single-stream residual"))?;
+            let [mlp_norm_out, mlp_norm_had64] =
+                self.ffn
+                    .pre_mlp_norm_targets(normed_buf, mlp_out_buf, &ex, 1, h_dim);
             if let Some(comm) = tp2 {
-                comm.all_reduce_residual_gemma_rms_norm_f16(
+                comm.all_reduce_residual_gemma_rms_norm_hadamard_f16(
                     &ex,
                     block_out_buf,
                     0,
                     residual_buf,
                     post_ln_ptr,
-                    normed_buf,
+                    mlp_norm_out,
+                    mlp_norm_had64,
                     0,
                     t.rank as i32,
                     1,
@@ -350,19 +381,23 @@ impl Qwen3_5MtpRank {
                 check_rc(
                     // SAFETY: block_out_buf and residual_buf are valid device buffers for h_dim half elements, post_ln_ptr is valid norm weight, normed_buf has capacity for h_dim half elements.
                     unsafe {
-                        ffi::w34_fused_add_gemma_rms_norm_f16(
+                        ffi::w34_fused_add_gemma_rms_norm_tap_hadamard_f16(
                             &ex,
                             block_out_buf as *const c_void,
                             residual_buf as *mut c_void,
                             post_ln_ptr as *const c_void,
-                            normed_buf as *mut c_void,
+                            mlp_norm_out as *mut c_void,
+                            mlp_norm_had64 as *mut c_void,
+                            core::ptr::null_mut(),
                             core::ptr::null(),
                             1,
                             h_dim as i32,
                             t.cfg.rms_norm_eps,
+                            0,
+                            0,
                         )
                     },
-                    "w34_fused_add_gemma_rms_norm_f16 (post_attn)",
+                    "w34_fused_add_gemma_rms_norm_tap_hadamard_f16 (post_attn)",
                 )?;
             }
             match &self.ffn {
@@ -370,11 +405,25 @@ impl Qwen3_5MtpRank {
                     gate_up_proj,
                     down_proj,
                 } => {
-                    Self::project(gate_up_proj, &ex, t, normed_buf, gate_up_buf, 1)?;
+                    Self::project_maybe_prerotated(
+                        gate_up_proj,
+                        mlp_norm_had64 != 0,
+                        &ex,
+                        t,
+                        normed_buf,
+                        gate_up_buf,
+                        1,
+                    )?;
+                    let fuse_down_h64 = down_proj.can_fuse_h64_from_producer();
+                    let silu_fn = if fuse_down_h64 {
+                        ffi::w34_silu_and_mul_hadamard_f16
+                    } else {
+                        ffi::w34_silu_and_mul_f16
+                    };
                     check_rc(
                         // SAFETY: gate_up_buf and act_buf are valid device buffers for 1 row of local_interm elements on active stream.
                         unsafe {
-                            ffi::w34_silu_and_mul_f16(
+                            silu_fn(
                                 &ex,
                                 gate_up_buf as *const c_void,
                                 act_buf as *mut c_void,
@@ -385,10 +434,18 @@ impl Qwen3_5MtpRank {
                         },
                         "w34_silu_and_mul_f16",
                     )?;
-                    Self::project(down_proj, &ex, t, act_buf, mlp_out_buf, 1)?;
+                    Self::project_maybe_prerotated(
+                        down_proj,
+                        fuse_down_h64,
+                        &ex,
+                        t,
+                        act_buf,
+                        mlp_out_buf,
+                        1,
+                    )?;
                 }
                 FfnBlockWeights::Moe(_) => {
-                    self.ffn.forward(
+                    self.ffn.forward_with_prerotated_input(
                         &ex,
                         &t.cublas,
                         t.marlin_ws.addr(),
@@ -408,6 +465,7 @@ impl Qwen3_5MtpRank {
                         moe_sh_act_buf,
                         moe_sh_out_buf,
                         moe_sh_gate_buf,
+                        mlp_norm_had64,
                     )?;
                 }
             }
@@ -683,9 +741,39 @@ impl Qwen3_5MtpRank {
                 size_n as i32,
                 size_k as i32,
             ),
-            LinearProj::MarlinW4A16 { .. }
+            LinearProj::Hadamard { .. }
+            | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }
             | LinearProj::MarlinW8A16 { .. } => proj.forward(
+                ex,
+                &t.cublas,
+                t.marlin_ws.addr(),
+                t.marlin_ws.len_bytes / 4,
+                input,
+                output,
+                rows,
+            ),
+        }
+    }
+
+    fn project_maybe_prerotated(
+        proj: &LinearProj,
+        prerotated: bool,
+        ex: &W34Exec,
+        t: &Qwen3_5ModelRank,
+        input: u64,
+        output: u64,
+        rows: usize,
+    ) -> Result<()> {
+        if !prerotated {
+            return Self::project(proj, ex, t, input, output, rows);
+        }
+        match *proj {
+            LinearProj::DenseF16 { .. } => Self::project(proj, ex, t, input, output, rows),
+            LinearProj::Hadamard { .. }
+            | LinearProj::MarlinW4A16 { .. }
+            | LinearProj::MarlinW4A16Zp { .. }
+            | LinearProj::MarlinW8A16 { .. } => proj.forward_prerotated(
                 ex,
                 &t.cublas,
                 t.marlin_ws.addr(),
@@ -1066,11 +1154,26 @@ impl Qwen3_5MtpRank {
             h_dim,
             eps: t.cfg.rms_norm_eps,
         };
-        self.residual.pre_attn(0, &hc_ctx, normed_buf)?;
+        let fa = &self.fa;
+        let pre_attn_targets = fa.pre_attn_norm_targets(normed_buf, &ex, num_tokens, h_dim);
+        let fuse_qkv_h64 = pre_attn_targets[1] != 0;
+        self.residual
+            .pre_attn_with_targets(0, &hc_ctx, pre_attn_targets)?;
 
         // Full attention, with optional QSA indexing and block selection.
-        let fa = &self.fa;
-        Self::project(&fa.qkv_proj, &ex, t, normed_buf, qkv_proj_buf, num_tokens)?;
+        Self::project_maybe_prerotated(
+            &fa.qkv_proj,
+            fuse_qkv_h64,
+            &ex,
+            t,
+            if pre_attn_targets[1] != 0 {
+                pre_attn_targets[1]
+            } else {
+                normed_buf
+            },
+            qkv_proj_buf,
+            num_tokens,
+        )?;
         let qkv_row_stride = (q_gate_dim + 2 * kv_dim) as i32;
         let q_gate_ptr = qkv_proj_buf;
         let k_raw_ptr = qkv_proj_buf + (q_gate_dim * 2) as u64;
@@ -1217,6 +1320,7 @@ impl Qwen3_5MtpRank {
             self.len += num_tokens;
             return Ok(None);
         }
+        let fuse_o_h64 = fa.o_proj.can_fuse_h64_from_producer();
         if fa.qsa_indexer.is_some() {
             let qsa_ws = self
                 .qsa
@@ -1227,7 +1331,12 @@ impl Qwen3_5MtpRank {
             } else {
                 qsa_ws.qsa_seq_pos_buf.addr()
             };
-            crate::ple::gpu_ops::qsa_sparse_paged_attn_f16(
+            let attn_fn = if fuse_o_h64 {
+                crate::ple::gpu_ops::qsa_sparse_paged_attn_hadamard_f16
+            } else {
+                crate::ple::gpu_ops::qsa_sparse_paged_attn_f16
+            };
+            attn_fn(
                 &ex,
                 q_buf,
                 gate_buf,
@@ -1259,11 +1368,16 @@ impl Qwen3_5MtpRank {
                 },
                 "w34_paged_attention_f16 (MTP)",
             )?;
+            let gate_fn = if fuse_o_h64 {
+                ffi::w34_apply_attn_output_gate_hadamard_f16
+            } else {
+                ffi::w34_apply_attn_output_gate_f16
+            };
             check_rc(
                 // SAFETY: `attn_out_buf`, `gate_buf`, and `gated_attn_buf` are valid device
                 // buffers for `num_tokens * local_q_heads * head_dim` FP16 elements.
                 unsafe {
-                    ffi::w34_apply_attn_output_gate_f16(
+                    gate_fn(
                         &ex,
                         attn_out_buf as *const c_void,
                         gate_buf as *const c_void,
@@ -1276,16 +1390,26 @@ impl Qwen3_5MtpRank {
                 "w34_apply_attn_output_gate_f16 (MTP)",
             )?;
         }
-        Self::project(
+        Self::project_maybe_prerotated(
             &fa.o_proj,
+            fuse_o_h64,
             &ex,
             t,
             gated_attn_buf,
             block_out_buf,
             num_tokens,
         )?;
-        self.residual
-            .post_attn_pre_mlp(&hc_ctx, tp2, t.rank, block_out_buf, normed_buf, false)?;
+        let pre_mlp_targets =
+            self.ffn
+                .pre_mlp_norm_targets(normed_buf, mlp_out_buf, &ex, num_tokens, h_dim);
+        self.residual.post_attn_pre_mlp_with_targets(
+            &hc_ctx,
+            tp2,
+            t.rank,
+            block_out_buf,
+            pre_mlp_targets,
+            false,
+        )?;
 
         // Keep the concat predictor's donor-compatible cuBLAS dense FFN path.
         if let FfnBlockWeights::Dense {
@@ -1294,11 +1418,25 @@ impl Qwen3_5MtpRank {
         } = &self.ffn
             && matches!(self.input_fusion, MtpInputFusion::ConcatLinear { .. })
         {
-            Self::project(gate_up_proj, &ex, t, normed_buf, gate_up_buf, num_tokens)?;
+            Self::project_maybe_prerotated(
+                gate_up_proj,
+                pre_mlp_targets[1] != 0,
+                &ex,
+                t,
+                normed_buf,
+                gate_up_buf,
+                num_tokens,
+            )?;
+            let fuse_down_h64 = down_proj.can_fuse_h64_from_producer();
+            let silu_fn = if fuse_down_h64 {
+                ffi::w34_silu_and_mul_hadamard_f16
+            } else {
+                ffi::w34_silu_and_mul_f16
+            };
             check_rc(
                 // SAFETY: gate_up_buf and act_buf contain num_tokens rows of 2*local_interm and local_interm FP16 elements.
                 unsafe {
-                    ffi::w34_silu_and_mul_f16(
+                    silu_fn(
                         &ex,
                         gate_up_buf as *const c_void,
                         act_buf as *mut c_void,
@@ -1309,9 +1447,17 @@ impl Qwen3_5MtpRank {
                 },
                 "w34_silu_and_mul_f16",
             )?;
-            Self::project(down_proj, &ex, t, act_buf, mlp_out_buf, num_tokens)?;
+            Self::project_maybe_prerotated(
+                down_proj,
+                fuse_down_h64,
+                &ex,
+                t,
+                act_buf,
+                mlp_out_buf,
+                num_tokens,
+            )?;
         } else {
-            self.ffn.forward(
+            self.ffn.forward_with_prerotated_input(
                 &ex,
                 &t.cublas,
                 marlin_ws_ptr,
@@ -1331,6 +1477,7 @@ impl Qwen3_5MtpRank {
                 moe_sh_act_buf,
                 moe_sh_out_buf,
                 moe_sh_gate_buf,
+                pre_mlp_targets[1],
             )?;
         }
         let tiered_info = match &self.ffn {
@@ -1356,6 +1503,11 @@ impl Qwen3_5MtpRank {
         if let Some((top_k, sh_out_ptr, sh_gate_ptr)) = tiered_info
             && let Some((store, cache, ws)) = &mut self.tiered_moe
         {
+            let tiered_input_buf = if pre_mlp_targets[1] != 0 {
+                pre_mlp_targets[1]
+            } else {
+                normed_buf
+            };
             if cache.slots.capacity >= cache.expert_ids.len()
                 || (num_tokens * top_k <= cache.slots.capacity && store.mapped_dev_ptr() != 0)
             {
@@ -1364,7 +1516,7 @@ impl Qwen3_5MtpRank {
                     cache,
                     ws,
                     &t.stream,
-                    normed_buf,
+                    tiered_input_buf,
                     moe_topk_ids_buf,
                     moe_topk_weights_buf,
                     sh_out_ptr,
@@ -1395,7 +1547,7 @@ impl Qwen3_5MtpRank {
                     cache,
                     ws,
                     &t.stream,
-                    normed_buf,
+                    tiered_input_buf,
                     moe_topk_ids_buf,
                     moe_topk_weights_buf,
                     &h_ids,

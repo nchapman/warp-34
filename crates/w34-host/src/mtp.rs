@@ -18,8 +18,8 @@ use crate::cuda::{CudaGraph, DeviceArena, DeviceBuffer, Result, Tp2Collectives};
 use crate::loader::{ModelConfig, SafetensorsArchive};
 use crate::model::{
     FfnBlockWeights, FinalResidual, FullAttentionLayerWeights, LayerResidual, LinearProj,
-    Qwen3_5ModelRank, RawLinearHost, load_hc_block_weights, load_moe_layer_weights,
-    load_qsa_indexer_weights, loader_err,
+    MARLIN_TILE_K_W4, MARLIN_TILE_N, Qwen3_5ModelRank, RawLinearHost, load_hc_block_weights,
+    load_moe_layer_weights, load_qsa_indexer_weights, loader_err,
 };
 use std::path::Path;
 use w34_kernels::ffi::{self, W34_KV_NAMESPACE_MTP_FULL_ATTN};
@@ -320,8 +320,14 @@ impl Qwen3_5MtpRank {
             + ffn_weight_bytes
             + capacity.div_ceil(16) * 4
             + 32 * 1024 * 1024;
+        const MTP_MIN_REPACK_STAGING_BYTES: usize = 64 * 1024 * 1024;
         let mut weights = DeviceArena::new(target.device.device_id, bytes)?;
-        let staging = DeviceBuffer::alloc(target.device.device_id, 64 * 1024 * 1024)?;
+        let gate_up_staging_bytes = ((2 * (i / tp).div_ceil(MARLIN_TILE_N) * MARLIN_TILE_N)
+            * (h.div_ceil(MARLIN_TILE_K_W4) * MARLIN_TILE_K_W4)
+            * c.quant.bits())
+            / 8;
+        let staging_bytes = MTP_MIN_REPACK_STAGING_BYTES.max(gate_up_staging_bytes);
+        let staging = DeviceBuffer::alloc(target.device.device_id, staging_bytes)?;
         let load = |name: &str, n: usize, k: usize| -> Result<RawLinearHost> {
             let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), &c.quant)?;
             if raw.dims() == (n, k) {
@@ -364,7 +370,7 @@ impl Qwen3_5MtpRank {
             &staging,
         )?;
         let o_proj = load("layers.0.self_attn.o_proj", h, q)?
-            .slice_cols(r * q / tp, (r + 1) * q / tp)
+            .slice_cols(r * q / tp, (r + 1) * q / tp)?
             .upload(&mut weights, &target.stream, &staging)?;
         let ffn = if is_moe_mtp {
             FfnBlockWeights::Moe(Box::new(load_moe_layer_weights(
@@ -385,7 +391,7 @@ impl Qwen3_5MtpRank {
                 &staging,
             )?;
             let down_proj = load("layers.0.mlp.down_proj", h, i)?
-                .slice_cols(r * i / tp, (r + 1) * i / tp)
+                .slice_cols(r * i / tp, (r + 1) * i / tp)?
                 .upload(&mut weights, &target.stream, &staging)?;
             FfnBlockWeights::Dense {
                 gate_up_proj,
@@ -580,13 +586,20 @@ impl Qwen3_5MtpRank {
                 && h.is_multiple_of(ws_info.shape[1])
             {
                 let gs = h / ws_info.shape[1];
+                let (ignore, rules) = match &c.quant {
+                    crate::loader::QuantScheme::CompressedTensors { ignore, rules, .. } => {
+                        (ignore.clone(), rules.clone())
+                    }
+                    _ => (Vec::new(), None),
+                };
                 (
                     gs,
                     crate::loader::QuantScheme::CompressedTensors {
                         num_bits: 4,
                         group_size: gs,
                         symmetric: true,
-                        ignore: Vec::new(),
+                        ignore,
+                        rules,
                     },
                 )
             } else if let Some(sc_key) =
@@ -607,17 +620,39 @@ impl Qwen3_5MtpRank {
                     },
                 )
             } else {
-                (c.quant.group_size_or(128), c.quant.clone())
+                (
+                    c.routed_expert_quant_scheme().group_size_or(128),
+                    c.quant.clone(),
+                )
             };
+            let down_had = archive
+                .resolve_name("mtp.layers.0.mlp.experts.0.down_proj.weight_packed")
+                .and_then(|k| k.strip_suffix(".weight_packed").map(str::to_owned))
+                .or_else(|| {
+                    archive
+                        .resolve_name("mtp.layers.0.mlp.experts.0.down_proj.qweight")
+                        .and_then(|k| k.strip_suffix(".qweight").map(str::to_owned))
+                })
+                .map_or_else(
+                    || {
+                        mtp_quant
+                            .input_hadamard("mtp.layers.0.mlp.experts.0.down_proj")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0)
+                    },
+                    |name| mtp_quant.input_hadamard(&name).ok().flatten().unwrap_or(0),
+                );
             let layout =
                 crate::moe_offload::ExpertPackLayout::new(c.moe_intermediate_size, h, group_size)
+                    .and_then(|l| l.with_down_hadamard(down_had))
                     .map_err(|e| {
-                    crate::cuda::CudaError::with_detail(
-                        -1,
-                        "MTP ExpertPackLayout::new",
-                        e.to_string(),
-                    )
-                })?;
+                        crate::cuda::CudaError::with_detail(
+                            -1,
+                            "MTP ExpertPackLayout::new",
+                            e.to_string(),
+                        )
+                    })?;
             let local_experts = c.num_experts / tp;
             let stage_cap = MTP_MOE_STAGE_CAPACITY.min(local_experts).max(1);
             let mut ws = crate::moe_offload::TieredMoeWorkspace::new(

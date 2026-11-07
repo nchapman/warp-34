@@ -3612,6 +3612,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",
+ "fancy-regex",
  "hf-hub",
  "image",
  "include_dir",

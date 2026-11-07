@@ -11,7 +11,14 @@ use crate::cuda::{
     f16_to_f32, f32_to_f16,
 };
 #[cfg(feature = "cuda")]
-use crate::loader::SafetensorsArchive;
+use crate::loader::{QuantScheme, SafetensorsArchive};
+#[cfg(feature = "cuda")]
+#[path = "vision/linear.rs"]
+mod linear;
+#[cfg(feature = "cuda")]
+use crate::model::weights::LinearProj;
+#[cfg(feature = "cuda")]
+use linear::{forward_bias, load_projection, projection_scratch_bytes};
 
 /// Bounded diagnostic samples keyed by vision stage: shape and host FP32 values.
 #[cfg(feature = "cuda")]
@@ -901,15 +908,15 @@ pub fn compute_multimodal_radix_key(
 struct VisionBlockGpu {
     norm1_w: u64,
     norm1_b: u64,
-    qkv_w: u64,
+    qkv_w: LinearProj,
     qkv_b: u64,
-    proj_w: u64,
+    proj_w: LinearProj,
     proj_b: u64,
     norm2_w: u64,
     norm2_b: u64,
-    fc1_w: u64,
+    fc1_w: LinearProj,
     fc1_b: u64,
-    fc2_w: u64,
+    fc2_w: LinearProj,
     fc2_b: u64,
 }
 
@@ -924,9 +931,9 @@ pub struct Qwen3VisionEncoder {
     blocks: Vec<VisionBlockGpu>,
     merger_norm_w: u64,
     merger_norm_b: u64,
-    merger_fc1_w: u64,
+    merger_fc1_w: LinearProj,
     merger_fc1_b: u64,
-    merger_fc2_w: u64,
+    merger_fc2_w: LinearProj,
     merger_fc2_b: u64,
 }
 
@@ -935,6 +942,7 @@ impl Qwen3VisionEncoder {
     pub fn try_load(
         archive: &SafetensorsArchive,
         cfg: &VisionConfig,
+        quant: &QuantScheme,
         device_id: i32,
         stream: &CudaStream,
     ) -> Result<Option<Self>> {
@@ -963,6 +971,21 @@ impl Qwen3VisionEncoder {
         let est_bytes = 1280 * 1024 * 1024;
         let mut arena = DeviceArena::new(device_id, est_bytes)?;
 
+        let hidden = cfg.hidden_size;
+        let merger_hidden = hidden * cfg.spatial_merge_size * cfg.spatial_merge_size;
+        let mut repack_staging = None;
+        let mut load_linear = |arena: &mut DeviceArena, prefix: &str, n, k| {
+            load_projection(
+                archive,
+                prefix,
+                quant,
+                n,
+                k,
+                arena,
+                stream,
+                &mut repack_staging,
+            )
+        };
         let upload_f16 = |arena: &mut DeviceArena, name: &str| -> Result<u64> {
             let key = archive
                 .resolve_name(name)
@@ -990,24 +1013,44 @@ impl Qwen3VisionEncoder {
             blocks.push(VisionBlockGpu {
                 norm1_w: upload_f16(&mut arena, &format!("{bp}.norm1.weight"))?,
                 norm1_b: upload_f16(&mut arena, &format!("{bp}.norm1.bias"))?,
-                qkv_w: upload_f16(&mut arena, &format!("{bp}.attn.qkv.weight"))?,
+                qkv_w: load_linear(&mut arena, &format!("{bp}.attn.qkv"), 3 * hidden, hidden)?,
                 qkv_b: upload_f16(&mut arena, &format!("{bp}.attn.qkv.bias"))?,
-                proj_w: upload_f16(&mut arena, &format!("{bp}.attn.proj.weight"))?,
+                proj_w: load_linear(&mut arena, &format!("{bp}.attn.proj"), hidden, hidden)?,
                 proj_b: upload_f16(&mut arena, &format!("{bp}.attn.proj.bias"))?,
                 norm2_w: upload_f16(&mut arena, &format!("{bp}.norm2.weight"))?,
                 norm2_b: upload_f16(&mut arena, &format!("{bp}.norm2.bias"))?,
-                fc1_w: upload_f16(&mut arena, &format!("{bp}.mlp.linear_fc1.weight"))?,
+                fc1_w: load_linear(
+                    &mut arena,
+                    &format!("{bp}.mlp.linear_fc1"),
+                    cfg.intermediate_size,
+                    hidden,
+                )?,
                 fc1_b: upload_f16(&mut arena, &format!("{bp}.mlp.linear_fc1.bias"))?,
-                fc2_w: upload_f16(&mut arena, &format!("{bp}.mlp.linear_fc2.weight"))?,
+                fc2_w: load_linear(
+                    &mut arena,
+                    &format!("{bp}.mlp.linear_fc2"),
+                    hidden,
+                    cfg.intermediate_size,
+                )?,
                 fc2_b: upload_f16(&mut arena, &format!("{bp}.mlp.linear_fc2.bias"))?,
             });
         }
 
         let merger_norm_w = upload_f16(&mut arena, &format!("{pfx}.merger.norm.weight"))?;
         let merger_norm_b = upload_f16(&mut arena, &format!("{pfx}.merger.norm.bias"))?;
-        let merger_fc1_w = upload_f16(&mut arena, &format!("{pfx}.merger.linear_fc1.weight"))?;
+        let merger_fc1_w = load_linear(
+            &mut arena,
+            &format!("{pfx}.merger.linear_fc1"),
+            merger_hidden,
+            merger_hidden,
+        )?;
         let merger_fc1_b = upload_f16(&mut arena, &format!("{pfx}.merger.linear_fc1.bias"))?;
-        let merger_fc2_w = upload_f16(&mut arena, &format!("{pfx}.merger.linear_fc2.weight"))?;
+        let merger_fc2_w = load_linear(
+            &mut arena,
+            &format!("{pfx}.merger.linear_fc2"),
+            cfg.out_hidden_size,
+            merger_hidden,
+        )?;
         let merger_fc2_b = upload_f16(&mut arena, &format!("{pfx}.merger.linear_fc2.bias"))?;
 
         stream.synchronize()?;
@@ -1087,9 +1130,28 @@ impl Qwen3VisionEncoder {
             .checked_mul(num_heads)
             .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
             .ok_or(CudaError::new(-1, "vision attention scratch overflow"))?;
-        let attention_scratch =
-            DeviceBuffer::alloc(self.device_id, attention_scratch_bytes.max(4))?;
-        let ex = stream.exec(attention_scratch.addr(), attention_scratch_bytes.max(4));
+        // Sequential attention/projections share one execution scratch buffer.
+        // Marlin currently uses only separate SM-count locks, not ex scratch.
+        let max_width = (3 * hidden).max(interm).max(merger_hidden).max(out_hidden);
+        let has_transform = self.blocks.iter().any(|block| {
+            [&block.qkv_w, &block.proj_w, &block.fc1_w, &block.fc2_w]
+                .iter()
+                .any(|p| matches!(p, LinearProj::Hadamard { .. }))
+        }) || matches!(self.merger_fc1_w, LinearProj::Hadamard { .. })
+            || matches!(self.merger_fc2_w, LinearProj::Hadamard { .. });
+        let transform_scratch = if has_transform {
+            projection_scratch_bytes(total_patches, max_width)?
+        } else {
+            0
+        };
+        let scratch_bytes = attention_scratch_bytes.max(transform_scratch);
+        let marlin_ws_ints = CudaDevice::props_for(self.device_id)?
+            .multi_processor_count
+            .max(1) as usize;
+        let marlin_ws = DeviceBuffer::alloc(self.device_id, marlin_ws_ints * 4)?;
+        marlin_ws.zero_async(stream)?;
+        let attention_scratch = DeviceBuffer::alloc(self.device_id, scratch_bytes.max(4))?;
+        let ex = stream.exec(attention_scratch.addr(), scratch_bytes.max(4));
 
         let mut patches_f16 = Vec::with_capacity(total_patches * patch_dim);
         for img in images {
@@ -1180,14 +1242,16 @@ impl Qwen3VisionEncoder {
                 hidden
             );
 
-            cublas.gemm_f16_bias(
+            forward_bias(
+                &blk.qkv_w,
+                &ex,
+                cublas,
+                marlin_ws.addr(),
+                marlin_ws_ints,
                 d_norm.addr(),
-                blk.qkv_w,
                 blk.qkv_b,
                 d_qkv.addr(),
-                total_patches as i32,
-                (3 * hidden) as i32,
-                hidden as i32,
+                total_patches,
             )?;
             sample!(
                 format!("blocks.{index}.qkv"),
@@ -1223,14 +1287,16 @@ impl Qwen3VisionEncoder {
                 hidden
             );
 
-            cublas.gemm_f16_bias(
+            forward_bias(
+                &blk.proj_w,
+                &ex,
+                cublas,
+                marlin_ws.addr(),
+                marlin_ws_ints,
                 d_attn_out.addr(),
-                blk.proj_w,
                 blk.proj_b,
                 d_proj_out.addr(),
-                total_patches as i32,
-                hidden as i32,
-                hidden as i32,
+                total_patches,
             )?;
             sample!(
                 format!("blocks.{index}.proj"),
@@ -1280,14 +1346,16 @@ impl Qwen3VisionEncoder {
                 hidden
             );
 
-            cublas.gemm_f16_bias(
+            forward_bias(
+                &blk.fc1_w,
+                &ex,
+                cublas,
+                marlin_ws.addr(),
+                marlin_ws_ints,
                 d_norm.addr(),
-                blk.fc1_w,
                 blk.fc1_b,
                 d_mlp_interm.addr(),
-                total_patches as i32,
-                interm as i32,
-                hidden as i32,
+                total_patches,
             )?;
             sample!(
                 format!("blocks.{index}.fc1"),
@@ -1313,14 +1381,16 @@ impl Qwen3VisionEncoder {
                 "w34_vision_bias_gelu_f16(mlp.fc1)",
             )?;
 
-            cublas.gemm_f16_bias(
+            forward_bias(
+                &blk.fc2_w,
+                &ex,
+                cublas,
+                marlin_ws.addr(),
+                marlin_ws_ints,
                 d_mlp_interm.addr(),
-                blk.fc2_w,
                 blk.fc2_b,
                 d_proj_out.addr(),
-                total_patches as i32,
-                hidden as i32,
-                interm as i32,
+                total_patches,
             )?;
             sample!(
                 format!("blocks.{index}.fc2"),
@@ -1372,14 +1442,16 @@ impl Qwen3VisionEncoder {
         let d_merger_mid = DeviceBuffer::alloc(self.device_id, total_merged * merger_hidden * 2)?;
         let d_visual_out = DeviceBuffer::alloc(self.device_id, total_merged * out_hidden * 2)?;
 
-        cublas.gemm_f16_bias(
+        forward_bias(
+            &self.merger_fc1_w,
+            &ex,
+            cublas,
+            marlin_ws.addr(),
+            marlin_ws_ints,
             d_norm.addr(),
-            self.merger_fc1_w,
             self.merger_fc1_b,
             d_merger_mid.addr(),
-            total_merged as i32,
-            merger_hidden as i32,
-            merger_hidden as i32,
+            total_merged,
         )?;
 
         check_rc(
@@ -1399,14 +1471,16 @@ impl Qwen3VisionEncoder {
             "w34_vision_bias_gelu_f16(merger.fc1)",
         )?;
 
-        cublas.gemm_f16_bias(
+        forward_bias(
+            &self.merger_fc2_w,
+            &ex,
+            cublas,
+            marlin_ws.addr(),
+            marlin_ws_ints,
             d_merger_mid.addr(),
-            self.merger_fc2_w,
             self.merger_fc2_b,
             d_visual_out.addr(),
-            total_merged as i32,
-            out_hidden as i32,
-            merger_hidden as i32,
+            total_merged,
         )?;
 
         sample!("merger.output", d_visual_out, total_merged, out_hidden);
