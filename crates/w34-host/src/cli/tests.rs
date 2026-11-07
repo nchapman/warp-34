@@ -550,4 +550,55 @@ fn kv_policy_parsing_and_tensor_diff_metrics() {
         )
         .is_err()
     );
+
+    // Even when full_rel_l2 <= 0.05 across a long sequence, a corrupted final row must fail.
+    let long_ref = vec![1.0f32; 512 * 2];
+    let mut zeroed_last_row = long_ref.clone();
+    zeroed_last_row[511 * 2] = 0.0;
+    zeroed_last_row[511 * 2 + 1] = 0.0;
+    assert!(
+        evaluate_moe_or_golden_tensor_diff(
+            "final_norm",
+            &[512, 2],
+            &zeroed_last_row,
+            &long_ref,
+            true,
+            true,
+        )
+        .is_err()
+    );
+
+    // Sublayer deltas return the actual measured last-row relative L2 error without clipping to 0.05.
+    let sub_ref = vec![1.0f32, 2.0, 3.0, 4.0];
+    let sub_vals = vec![1.0f32, 2.0, 3.6, 4.8]; // last row scaled by 1.2 -> last_rel_l2 = 0.20
+    let (_, reported_sub_rel, _) = evaluate_moe_or_golden_tensor_diff(
+        "layer_1_mlp_out",
+        &[2, 2],
+        &sub_vals,
+        &sub_ref,
+        false,
+        true,
+    )
+    .unwrap();
+    assert!((reported_sub_rel - 0.20).abs() < 1e-6);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn greedy_diff_image_rejects_speculation() {
+    let err = prepare_cuda_cli(
+        &args(&[
+            "greedy-diff",
+            "--golden",
+            "gold",
+            "--image",
+            "rgb://64x64/128,128,128",
+            "--speculative",
+            "mtp",
+        ]),
+        |_, _, _| panic!("greedy-diff --image --speculative must fail before download"),
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("--image does not support --speculative"));
 }

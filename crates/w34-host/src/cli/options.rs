@@ -489,6 +489,14 @@ pub(crate) fn validate_cuda_command(options: &CudaCliOptions, sub: &str) -> Resu
     if sub == "greedy-diff" && options.golden_path.is_none() {
         return Err("--golden <dir-or-json> is required".into());
     }
+    if sub == "greedy-diff"
+        && !options.image_urls.is_empty()
+        && (options.speculative_kind.is_some() || options.verify_lossless)
+    {
+        return Err(
+            "greedy-diff with --image does not support --speculative or --verify-lossless".into(),
+        );
+    }
     if options.draft_revision.is_some() && options.draft_model.is_none() {
         return Err("--draft-revision requires --draft-model".into());
     }

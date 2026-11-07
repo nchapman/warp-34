@@ -1803,6 +1803,11 @@ impl Qwen3_5ModelRank {
         self.max_tap_rows = max_tap_rows;
         self.tap_aux_bf16 = tap_aux_bf16;
         self.last_final_hidden_f16 = last_final_hidden_f16;
+        if tap_layer_ids.is_empty() && !export_final_hidden && max_tap_rows == 0 {
+            self.captured_spec_logits_ptr = 0;
+            self.speculative_logits_rows = 0;
+            self.speculative_logits = None;
+        }
         Ok(())
     }
 

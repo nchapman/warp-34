@@ -180,6 +180,29 @@ impl HostExpertStore {
                     || layout.down_hadamard_block_size == down_had),
             "inconsistent or unsupported input Hadamard block size on routed MoE down_proj",
         )?;
+        let mut check_name = String::with_capacity(resolved_prefix_ref.len() + 24);
+        for expert_id in 0..num_experts {
+            use std::fmt::Write as _;
+            check_name.clear();
+            let _ = write!(
+                &mut check_name,
+                "{resolved_prefix_ref}.{expert_id}.gate_proj"
+            );
+            let e_gate = quant.input_hadamard(&check_name)?.unwrap_or(0);
+            check_name.clear();
+            let _ = write!(&mut check_name, "{resolved_prefix_ref}.{expert_id}.up_proj");
+            let e_up = quant.input_hadamard(&check_name)?.unwrap_or(0);
+            check_name.clear();
+            let _ = write!(
+                &mut check_name,
+                "{resolved_prefix_ref}.{expert_id}.down_proj"
+            );
+            let e_down = quant.input_hadamard(&check_name)?.unwrap_or(0);
+            require(
+                e_gate == gate_had && e_up == up_had && e_down == down_had,
+                "routed MoE experts within a layer must share uniform input Hadamard transforms",
+            )?;
+        }
         let layout = layout.with_down_hadamard(down_had)?;
         let expert_quant = quant
             .for_linear(&first_gate_name)
@@ -909,6 +932,14 @@ impl HotExpertCache {
         let k_static = k_static.clamp(1, k_hot);
         if !Self::cpu_bridge_supported() {
             return Ok(());
+        }
+        if !store.layout.hidden.is_multiple_of(128)
+            || !store.layout.intermediate.is_multiple_of(128)
+        {
+            return Err(crate::cuda::CudaError::new(
+                -1,
+                "CPU MoE bridge requires hidden and intermediate dimensions divisible by 128",
+            ));
         }
         for slot in k_static..k_hot {
             let ge = self.slot_to_expert[slot];

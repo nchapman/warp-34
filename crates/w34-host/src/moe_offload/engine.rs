@@ -854,6 +854,8 @@ impl TieredMoeEngine {
                         },
                         "w34_moe_remap_topk_ids_i32 (StreamedPrefill chunk)",
                     )?;
+                    ws.stage_tables[buf_idx].layout.down_hadamard_block_size =
+                        store.layout().down_hadamard_block_size;
                     ws.stage_tables[buf_idx].launch_moe_w4a16(
                         &ex,
                         x_addr,
@@ -961,20 +963,13 @@ impl RankTieredMoe {
         stream: &crate::cuda::CudaStream,
     ) -> crate::cuda::Result<Self> {
         let group_size = cfg.routed_expert_quant_scheme().group_size_or(128);
-        let down_hadamard = cfg
-            .quant
-            .input_hadamard("model.layers.0.mlp.experts.0.down_proj")
-            .ok()
-            .flatten()
-            .unwrap_or(0);
-        let layout = ExpertPackLayout::new(cfg.moe_intermediate_size, cfg.hidden_size, group_size)
-            .and_then(|l| l.with_down_hadamard(down_hadamard))
-            .map_err(|e| {
-                crate::cuda::CudaError::with_detail(-1, "ExpertPackLayout::new", e.to_string())
-            })?;
+        let base_layout =
+            ExpertPackLayout::new(cfg.moe_intermediate_size, cfg.hidden_size, group_size).map_err(
+                |e| crate::cuda::CudaError::with_detail(-1, "ExpertPackLayout::new", e.to_string()),
+            )?;
         let mut ws = TieredMoeWorkspace::new(
             device_id,
-            layout.clone(),
+            base_layout.clone(),
             stage_capacity,
             TIERED_MOE_MAX_BATCH_TOKENS,
             cfg.num_experts_per_tok.max(1),
@@ -993,7 +988,7 @@ impl RankTieredMoe {
                 archive,
                 &prefix,
                 &cfg.quant,
-                layout.clone(),
+                base_layout.clone(),
                 cfg.num_experts,
                 ep_rank,
                 ep_size,
@@ -1015,6 +1010,12 @@ impl RankTieredMoe {
             } else if ep_size == 1
                 && k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
                 && cfg.num_hidden_layers <= TIERED_MOE_CPU_BRIDGE_MAX_LAYERS
+                && cfg
+                    .hidden_size
+                    .is_multiple_of(TIERED_MOE_CPU_BRIDGE_GROUP_SIZE)
+                && cfg
+                    .moe_intermediate_size
+                    .is_multiple_of(TIERED_MOE_CPU_BRIDGE_GROUP_SIZE)
                 && matches!(
                     group_size,
                     TIERED_MOE_CPU_BRIDGE_ALT_GROUP_SIZE | TIERED_MOE_CPU_BRIDGE_GROUP_SIZE

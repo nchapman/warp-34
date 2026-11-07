@@ -161,9 +161,6 @@ pub(crate) fn evaluate_moe_or_golden_tensor_diff(
             ));
         }
         let (d, full_rel, full_cos) = tensor_diff_metrics(vals, ref_vals);
-        if full_rel <= GOLDEN_STRICT_MAX_REL_L2 {
-            return Ok((d, full_rel, full_cos));
-        }
         let is_sublayer_delta = name.ends_with("_attn_or_gdn_out") || name.ends_with("_mlp_out");
         let (max_full_rel, min_full_cos) = if is_sublayer_delta {
             (
@@ -208,12 +205,7 @@ pub(crate) fn evaluate_moe_or_golden_tensor_diff(
                 "dump-diff MoE prompt-end check failed on {name}: last_rel_l2={last_rel:.6} last_cosine={last_cos:.6}"
             ));
         }
-        let reported_rel = if is_sublayer_delta {
-            last_rel.min(GOLDEN_STRICT_MAX_REL_L2)
-        } else {
-            last_rel
-        };
-        Ok((d.max(last_d), reported_rel, full_cos.min(last_cos)))
+        Ok((d.max(last_d), last_rel, full_cos.min(last_cos)))
     } else {
         evaluate_golden_tensor_diff(name, shape, vals, ref_vals, is_multimodal)
     }
@@ -337,6 +329,24 @@ pub(crate) fn load_greedy_cases(
 }
 
 #[cfg(feature = "cuda")]
+fn generate_radix_or_multimodal(
+    engine: &mut Qwen3_5Engine,
+    prompt_ids: &[i32],
+    mm_images: &[crate::vision::PreprocessedImage],
+    cmp_len: usize,
+) -> Result<crate::model::RadixBenchMetrics, String> {
+    if !mm_images.is_empty() {
+        engine
+            .generate_multimodal_with_radix_cache(prompt_ids, mm_images, cmp_len, 64, false)
+            .map_err(|e| e.to_string())
+    } else {
+        engine
+            .generate_with_radix_cache(prompt_ids, cmp_len, 64, false)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn run_greedy_diff(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
@@ -359,6 +369,11 @@ pub(crate) fn run_greedy_diff(
         ..
     } = options;
     let golden_arg = golden_path.ok_or("--golden <dir-or-json> is required")?;
+    if !image_urls.is_empty() && (spec_config.is_some() || verify_lossless) {
+        return Err(
+            "greedy-diff with --image does not support --speculative or --verify-lossless".into(),
+        );
+    }
     let mut engine = load_cli_engine(
         &resolved_model,
         tp,
@@ -393,20 +408,20 @@ pub(crate) fn run_greedy_diff(
         let plain_ref_ids = if verify_lossless && engine.speculative.is_some() {
             let saved_spec = engine.speculative.take();
             engine.reset_all_states().map_err(|e| e.to_string())?;
-            let plain_m = engine
+            let plain_ids = engine
                 .generate_tokens(prompt_ids, cmp_len, false)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .generated_token_ids;
             engine.speculative = saved_spec;
-            Some(plain_m.generated_token_ids)
+            Some(plain_ids)
         } else {
             None
         };
 
         engine.reset_all_states().map_err(|e| e.to_string())?;
-        let metrics = if !mm_images.is_empty() {
-            engine
-                .generate_multimodal_with_radix_cache(prompt_ids, &mm_images, cmp_len, 64, false)
-                .map(|m| crate::model::BenchMetrics {
+        let metrics = if !mm_images.is_empty() || verify_radix_warm {
+            generate_radix_or_multimodal(&mut engine, prompt_ids, &mm_images, cmp_len).map(|m| {
+                crate::model::BenchMetrics {
                     prompt_len: m.prompt_len,
                     gen_len: m.gen_len,
                     ttft_ms: m.ttft_ms,
@@ -415,22 +430,8 @@ pub(crate) fn run_greedy_diff(
                     decode_tok_per_s: m.decode_tok_per_s,
                     itl_ms: m.itl_ms,
                     generated_token_ids: m.generated_token_ids,
-                })
-                .map_err(|e| e.to_string())?
-        } else if verify_radix_warm {
-            engine
-                .generate_with_radix_cache(prompt_ids, cmp_len, 64, false)
-                .map(|m| crate::model::BenchMetrics {
-                    prompt_len: m.prompt_len,
-                    gen_len: m.gen_len,
-                    ttft_ms: m.ttft_ms,
-                    prefill_tok_per_s: m.prefill_tok_per_s,
-                    decode_ms: m.decode_ms,
-                    decode_tok_per_s: m.decode_tok_per_s,
-                    itl_ms: m.itl_ms,
-                    generated_token_ids: m.generated_token_ids,
-                })
-                .map_err(|e| e.to_string())?
+                }
+            })?
         } else {
             engine
                 .generate_tokens(prompt_ids, cmp_len, false)
@@ -464,9 +465,7 @@ pub(crate) fn run_greedy_diff(
         }
 
         if verify_radix_warm {
-            let warm = engine
-                .generate_with_radix_cache(prompt_ids, cmp_len, 64, false)
-                .map_err(|e| e.to_string())?;
+            let warm = generate_radix_or_multimodal(&mut engine, prompt_ids, &mm_images, cmp_len)?;
             if warm.generated_token_ids == metrics.generated_token_ids {
                 radix_warm_passes += 1;
                 spec_info.push_str(&format!(
@@ -639,7 +638,11 @@ pub(crate) fn run_dump_diff(
     );
     let is_multimodal = !mm_images.is_empty();
     let is_moe = engine.cfg.num_experts > 0;
-    let max_allowed_rel_l2 = if is_moe && is_multimodal { 0.30 } else { 0.05 };
+    let max_allowed_rel_l2 = if is_moe {
+        GOLDEN_MOE_SUBLAYER_MAX_LAST_REL_L2
+    } else {
+        GOLDEN_STRICT_MAX_REL_L2
+    };
     if compare_tp2 {
         drop(engine);
         let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));

@@ -199,6 +199,9 @@ impl Qwen3_5Engine {
             rank.decode_graph = None;
             rank.spec_verify_graph = None;
             rank.batched_decode_graphs.clear();
+            rank.captured_spec_logits_ptr = 0;
+            rank.speculative_logits_rows = 0;
+            rank.speculative_logits = None;
             rank.configure_speculative_taps(&[], false, 0)?;
         }
         Ok(())
