@@ -1,4 +1,9 @@
-# Server recipes for short tooling checks
+# Historical TP2 server recipes for short tooling checks
+
+The primary user-facing recipes are now [single-GPU 27B](single-gpu.md).
+This page preserves the earlier TP2 setups. Their archived run configurations
+record an 8K client context; the shared YAML now records 4K for the new single-GPU
+checks. Use the archived configuration to reproduce an old receipt exactly.
 
 Use the same native `lm-eval.yaml` and `--limit 10` client command in the
 [README](README.md) for every server. Launch one server at a time on the pod,

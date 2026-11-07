@@ -1,0 +1,139 @@
+{
+  "purpose": "Short cross-server/model tooling qualification, not quality measurement",
+  "engine_source": "f6ab96e (engine tree, merged into benchmark at 9b04799)",
+  "server_command": [
+    "/workspace/warp-34/target/release/w34",
+    "serve",
+    "--model",
+    "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
+    "--offline",
+    "--tp",
+    "1",
+    "--kv-format",
+    "tq4",
+    "--kv-pages",
+    "256",
+    "--max-num-seqs",
+    "4",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18034",
+    "--served-model-name",
+    "warp34-quality",
+    "--speculative",
+    "mtp",
+    "--mtp-k",
+    "3"
+  ],
+  "binary_sha256": "a17a7d1717e7429db0e84b44312c4a316396f8a0f50d762ad7da0b2113279d1f",
+  "model_revision": "1de743eedefdb7422e6b171174c7080204f5b005",
+  "target_inventory": {
+    "schema_version": 1,
+    "created_utc": "2026-11-07T22:06:03.678883+00:00",
+    "root": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005",
+    "include": [],
+    "files": {
+      "README.md": {
+        "bytes": 5117,
+        "sha256": "4507bb8aa80666bba1658323c95099ed65b0656fbce92323c6af60e4815f69a2"
+      },
+      "SHA256SUMS": {
+        "bytes": 1202,
+        "sha256": "93dbc233703d9993423a2ad04522ed665a34c4c3149ca9a7cd66123eeec9d5c5"
+      },
+      "chat_template.jinja": {
+        "bytes": 28234,
+        "sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+      },
+      "config.json": {
+        "bytes": 8295,
+        "sha256": "3aafda4557ad0693418fd51373a86fdbc718b86cd934f3a64ef09549f41e2b87"
+      },
+      "generation_config.json": {
+        "bytes": 178,
+        "sha256": "66ed81797ea05a14a2983b5ea2ff474fbead24f60df0c57e9424aadf620c7318"
+      },
+      "model.safetensors": {
+        "bytes": 18309800016,
+        "sha256": "426d329d16c2477fae433f475273471c0c4d481fe87c2eb2fb755447c9bcb336"
+      },
+      "model.safetensors.index.json": {
+        "bytes": 186818,
+        "sha256": "551fc553b21729baa6a189eaf43b71c43bdab12ee6478a826359689cc5b42c9a"
+      },
+      "model_mtp.safetensors": {
+        "bytes": 302667928,
+        "sha256": "e0638ba2b1c3271aedc8a923888bb6b97c242ebd11697cb13fe39f912a5e611e"
+      },
+      "preprocessor_config.json": {
+        "bytes": 390,
+        "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+      },
+      "processor_config.json": {
+        "bytes": 1220,
+        "sha256": "bfbc24af59a3e73a9cd0653b8d4ae758dfaec4e3e6c15dfb1c6c8ee8d5683c85"
+      },
+      "recipe.yaml": {
+        "bytes": 2637,
+        "sha256": "74aa20b3c0142d3a3aff4dc15b2dfba7946982cb7faade81c2fb047fdd874a89"
+      },
+      "rot_receipt.json": {
+        "bytes": 615,
+        "sha256": "26680bf79014212ade56d35089d3bf0bcfec23e45d8e47806fac09cbbfb763c7"
+      },
+      "tokenizer.json": {
+        "bytes": 19989339,
+        "sha256": "a5cd9732badce41de57e6efce8302930ded1c1188c5f81feb2bd6c24c4a1941f"
+      },
+      "tokenizer_config.json": {
+        "bytes": 1506,
+        "sha256": "44d30b6b485384681a21b3de5073e58439aab66cb650f30f2d3d1073da429af0"
+      },
+      "video_preprocessor_config.json": {
+        "bytes": 385,
+        "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+      }
+    },
+    "total_bytes": 18632693880,
+    "inventory_sha256": "684ca68925c14c31ccd99cbbbfe9e393e1f34153d0002a3dee9b3143d2faf9e1"
+  },
+  "inputs_sha256": {
+    "requirements.in": "e2b4b7f1005e49d179d8ba7aacdcbfc03b8505805011bd9e8d41a45700e39f28",
+    "requirements.lock": "0163804080f90167ec6f0651919fcb75ad0bac677c680449ad2c61538e521420",
+    "lm-eval.yaml": "0e363527f4d8ccfdf77ab2adb74d81af3a8c31a54c9ce625e8a166af6fdd5746"
+  },
+  "hf_dataset_refs": {
+    "/workspace/.hf_home/hub/datasets--google--IFEval/refs/main": "966cd89545d6b6acfd7638bc708b98261ca58e84",
+    "/workspace/.hf_home/hub/datasets--openai--gsm8k/refs/main": "740312add88f781978c0658806c59bc2815b9866"
+  },
+  "commands": [
+    [
+      "/workspace/quality-venv/bin/lm-eval",
+      "run",
+      "--config",
+      "/workspace/quality-27b-single-mtp3-smoke10-001/lm-eval.yaml",
+      "--tasks",
+      "ifeval",
+      "--limit",
+      "10",
+      "--output_path",
+      "/workspace/quality-27b-single-mtp3-smoke10-001/ifeval"
+    ],
+    [
+      "/workspace/quality-venv/bin/lm-eval",
+      "run",
+      "--config",
+      "/workspace/quality-27b-single-mtp3-smoke10-001/lm-eval.yaml",
+      "--tasks",
+      "gsm8k",
+      "--limit",
+      "10",
+      "--output_path",
+      "/workspace/quality-27b-single-mtp3-smoke10-001/gsm8k"
+    ]
+  ],
+  "status": "complete",
+  "effective_config_sha256": "8d4b47199ad4500d4916fc25850aa6bbdf54840c5278d9b0a213ed24a1c0e9c3",
+  "server_exit": 0
+}

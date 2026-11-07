@@ -13,9 +13,9 @@ across deployments, larger evaluations can support specific quality comparisons.
 Quality and performance runs are separate; do not run them concurrently on the
 same server/GPU. Full evaluations require an explicit decision, not this setup pass.
 
-See [completed tooling qualification](QUALIFICATION.md) for checked deployments
-and limitations, and [server recipes](servers.md) for vLLM/SGLang and the shared short client
-command. Server setup is separate from evaluation; no custom evaluator adapter
+See [single-GPU recipes](single-gpu.md) for the primary 27B setup across
+warp-34, llama.cpp/Unsloth, vLLM and SGLang. Earlier [TP2 qualification](QUALIFICATION.md)
+and [TP2 recipes](servers.md) remain separate historical records. Server setup is separate from evaluation; no custom evaluator adapter
 is needed.
 
 ## Exact evaluator and tasks
@@ -80,8 +80,8 @@ uv pip compile benchmarks/quality/requirements.in --python-version 3.12 \
 
 ## Start a server, then invoke the upstream CLI
 
-Launch exactly one server in a separate terminal. The initial pass uses
-**Qwen3.8-27B HGPTQ, MTP-3, TP2 and TQ4**. MTP-3 is the common quality-run
+Launch exactly one server in a separate terminal. The primary user-facing setup uses
+**Qwen3.8-27B HGPTQ, MTP-3, one GPU and TQ4**, with a 4K context. MTP-3 is the common quality-run
 configuration across our four model families; it uses the checkpoint's built-in
 MTP weights rather than a separately selected DFlash2 drafter.
 
@@ -90,9 +90,9 @@ export PATH="/opt/cuda/bin:/usr/local/cuda/bin:$PATH"
 # Initial pin: nchapman/Qwen3.8-27B-W4A16-HGPTQ
 # revision 1de743eedefdb7422e6b171174c7080204f5b005
 export MODEL=/absolute/path/to/pinned/model/snapshot
-CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve \
-  --model "$MODEL" --offline --tp 2 \
-  --kv-format tq4 --kv-pages 512 --max-num-seqs 4 \
+CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
+  --model "$MODEL" --offline --tp 1 \
+  --kv-format tq4 --kv-pages 256 --max-num-seqs 4 \
   --speculative mtp --mtp-k 3 \
   --served-model-name warp34-quality --host 127.0.0.1 --port 18034
 ```
@@ -109,7 +109,7 @@ In the client terminal, from the repository root:
 
 ```sh
 export NLTK_DATA="$HOME/nltk_data"
-OUT="benchmarks/quality/results/$(date -u +%Y%m%dT%H%M%SZ)-27b-tp2-mtp3-smoke10"
+OUT="benchmarks/quality/results/$(date -u +%Y%m%dT%H%M%SZ)-27b-single-mtp3-smoke10"
 # Never reuse an existing run directory.
 test ! -e "$OUT" && mkdir -p "$OUT" || exit 1
 cp benchmarks/quality/lm-eval.yaml "$OUT/"
@@ -133,7 +133,7 @@ Use upstream lm-eval's native `--limit 50` to evaluate **50 examples per task**
 (100 total), leaving the shared configuration and upstream scoring unchanged:
 
 ```sh
-OUT="benchmarks/quality/results/$(date -u +%Y%m%dT%H%M%SZ)-27b-tp2-mtp3-smoke50"
+OUT="benchmarks/quality/results/$(date -u +%Y%m%dT%H%M%SZ)-27b-single-mtp3-smoke50"
 test ! -e "$OUT" && mkdir -p "$OUT" || exit 1
 benchmarks/quality/.venv/bin/lm-eval run \
   --config benchmarks/quality/lm-eval.yaml --limit 50 \
@@ -176,7 +176,7 @@ comparisons; these are not thinking-enabled scores. The pinned upstream adapter
 forwards this parameter while preserving the tasks' generation settings.
 
 The client is sequential (`num_concurrent=1`), with a 1,800-second HTTP timeout.
-The server example has an 8K total context pool. `max_length=8192` records the
+The server example has a 4K total context pool. `max_length=4096` records the
 intended client configuration, but with no client tokenizer it is **not** proof
 that inputs fit or that tokens were counted. Preserve any capacity failure;
 do not silently trim prompts, lower output budgets or discard examples.

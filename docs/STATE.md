@@ -1,5 +1,11 @@
 # warp-34 — Session Orientation & Current State
 
+## Single-GPU 27B tooling qualification (completed; not quality rankings)
+
+- Primary user-facing target: one 24GB RTX 3090, 4K context, sequential requests and native `--limit 10` for each upstream task. Includes warp-34, llama.cpp, vLLM and SGLang. The llama.cpp reference is the user-selected mainstream **Unsloth UD-Q4_K_XL**, not ggml-org's GGUF.
+- Updated warp-34 (`9b04799` merged branch, engine tree `f6ab96e`) passed 20 requests with MTP-3/TQ4; vLLM 0.31.0 passed 20 with MTP-3 after increasing GPU utilization from 0.90 to 0.95. The initial vLLM KV-budget failure is preserved. SGLang 0.5.19 native MTP did not fit at 0.95; its explicitly plain fallback passed 20 requests. llama.cpp v0.9.0 / pinned Unsloth UD-Q4_K_XL + native MTP passed 20. All **80 evaluated requests** produced nonempty responses and eight native result bundles. Observed GPU allocations: warp-34 21.6 GiB, llama.cpp 17.8 GiB, vLLM 22.5 GiB, SGLang plain 23.1 GiB (snapshots, not peaks or efficiency rankings). llama.cpp's verbose startup check confirmed all reported layers on GPU and separately recorded its normal CPU-mapped model buffers. No transformer-layer CPU offload or second GPU was used to hide fit failures. All servers stopped; pod GPUs idle.
+- The shared native run YAML now records 4K; historical TP2 outputs/configurations remain unchanged. See [`single-gpu.md`](../benchmarks/quality/single-gpu.md) for exact pins, launch recipes, fit failures, telemetry caveats and shutdown warnings. Eight unchanged native results, six run receipts and 82 raw-evidence hashes are tracked. Quality configuration (4 tests) and performance tooling (91 tests plus template validation) pass; review found no actionable issues. No engine changes in this qualification follow-up.
+
 ## Benchmark branch integration with main
 
 - Integrated `origin/main` at `f6ab96e` (pipeline hand-offs, EP=2 prefill CPU MoE, sparse MoE MMA, BF16 Marlin Split-K, hot-cache changes and file organization) into `benchmark`. The only merge conflict was this status document; both branches' records are preserved. Engine sources match `main` exactly.

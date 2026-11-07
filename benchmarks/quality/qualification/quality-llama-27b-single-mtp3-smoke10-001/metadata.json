@@ -1,0 +1,73 @@
+{
+  "purpose": "Single-GPU tooling qualification, 10 examples per task; not quality or performance ranking",
+  "server_command": [
+    "/workspace/llama.cpp-quality/build/bin/llama-server",
+    "--model",
+    "/workspace/.hf_home/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+    "--alias",
+    "warp34-quality",
+    "--ctx-size",
+    "4096",
+    "--parallel",
+    "1",
+    "--n-gpu-layers",
+    "all",
+    "--split-mode",
+    "none",
+    "--fit",
+    "off",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18034",
+    "--metrics",
+    "--jinja",
+    "--threads",
+    "16",
+    "--spec-type",
+    "draft-mtp",
+    "--spec-draft-model",
+    "/workspace/.hf_home/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
+    "--spec-draft-ngl",
+    "all",
+    "--spec-draft-n-max",
+    "3"
+  ],
+  "engine_release": "v0.9.0",
+  "engine_commit": "cd959bae99ff4bed22bef2604f45241c09bbb8c8",
+  "model_repo": "unsloth/Qwen3.8-27B-GGUF",
+  "model_revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+  "status": "complete",
+  "commands": [
+    [
+      "/workspace/quality-venv/bin/lm-eval",
+      "run",
+      "--config",
+      "/workspace/quality-llama-27b-single-mtp3-smoke10-001/lm-eval.yaml",
+      "--tasks",
+      "ifeval",
+      "--limit",
+      "10",
+      "--output_path",
+      "/workspace/quality-llama-27b-single-mtp3-smoke10-001/ifeval"
+    ],
+    [
+      "/workspace/quality-venv/bin/lm-eval",
+      "run",
+      "--config",
+      "/workspace/quality-llama-27b-single-mtp3-smoke10-001/lm-eval.yaml",
+      "--tasks",
+      "gsm8k",
+      "--limit",
+      "10",
+      "--output_path",
+      "/workspace/quality-llama-27b-single-mtp3-smoke10-001/gsm8k"
+    ]
+  ],
+  "artifact_sha256": {
+    "/workspace/.hf_home/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+    "/workspace/.hf_home/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/MTP/mtp-Qwen3.8-27B-Q4_0.gguf": "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
+    "/workspace/llama.cpp-quality/build/bin/llama-server": "3060f585b318d0964c2f01b1558f577eb70954c20aa5b2f8d4e5bb76ae9eabfb"
+  },
+  "server_exit": 0
+}

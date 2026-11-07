@@ -7,7 +7,7 @@ model_args:
   tokenizer_backend: null
   num_concurrent: 1
   timeout: 1800
-  max_length: 8192
+  max_length: 4096
 tasks:
   - ifeval
   - gsm8k

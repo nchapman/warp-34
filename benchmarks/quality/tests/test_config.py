@@ -43,6 +43,7 @@ class UpstreamConfigTests(unittest.TestCase):
         self.assertEqual(self.config.model, 'local-chat-completions')
         self.assertTrue(self.config.apply_chat_template)
         self.assertIsNone(self.config.model_args['tokenizer_backend'])
+        self.assertEqual(self.config.model_args['max_length'], 4096)
         model = LocalChatCompletion(**self.config.model_args)
         messages = [{'role': 'user', 'content': 'An unchanged task prompt.'}]
         self.assertEqual(json.loads(model.apply_chat_template(messages).prompt), messages)
