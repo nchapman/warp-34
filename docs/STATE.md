@@ -1,5 +1,16 @@
 # warp-34 — Session Orientation & Current State
 
+## AVX2 CPU MoE Evaluator Optimization (`moe_cpu_bridge::eval`, completed & verified)
+
+- **Scope:** Audited and optimized the AVX2 + FMA + F16C path in `crates/w34-host/src/moe_cpu_bridge/eval.rs` on AMD EPYC 7R13 (`Zen 3`, `avx2,fma,f16c`, no AVX-512) while preserving 0-ULP bit-for-bit parity (`to_bits()`) against `expert_portable` and `expert_avx512`.
+- **Key Optimizations:**
+  - **0-ULP AVX2 in-register `H_64` block-Hadamard (`hadamard64_f32_avx2`):** Replaced scalar `hadamard64_f32_inplace` on `x86_64` (`supported()`) with an 8-register `__m256` butterfly using `_mm256_permute_ps` + `_mm256_fmadd_ps` (`h = 1, 2`), `_mm256_permute2f128_ps` + `_mm256_fmadd_ps` (`h = 4`), and vertical `__m256` add/sub stages (`h = 8, 16, 32`), cutting 96×1024 `H_64` time on Zen 3 from `90.0 µs` to **`18.8 µs`** (`4.8×` faster) with 0-ULP parity.
+  - **AVX2 8×8 matrix transpose in `prepare_x_perm*` (`transpose_8x8_avx2`):** Replaced scalar 16×8 scatter stores in `prepare_x_perm`, `prepare_x_perm_grouped`, `prepare_x_perm_f16c`, and `prepare_x_perm_f16c_g64` with contiguous 256-bit loads/stores via `_mm256_unpacklo/hi_ps`, `_mm256_shuffle_ps`, and `_mm256_permute2f128_ps` while keeping sequential group-sum accumulation in original input order (`56.0 µs -> 33.9 µs` at `g=64`, `53.2 µs -> 31.4 µs` at `g=128`).
+  - **Register-pressure-aware `row_tile_avx2` & `T=4` prefill tiling (`rows_avx2`):** Kept interleaved `(lo, hi)` nibble accumulation for `R * T <= 2` (`nt = 1` decode) and split `acc_lo` / `acc_hi` accumulation within each `g` iteration for `R * T > 2` (`T in {2, 4}` with `R = 2`) so `R = 2, T = 2` fits inside the 16 architectural `ymm` registers without inner-loop stack spills, and enabled `T = 4` token tiling in `rows_avx2`.
+- **Verification & Benchmarks (EPYC 7R13 Zen 3):**
+  - Single-expert `expert_avx2` (`g=64, hadamard=64`): Flash-Next (`2560×640`) `nt=1: 283.9 µs`, `nt=2: 416.2 -> 402.5 µs` (`-3.3%`), `nt=4: 814.8 -> 713.8 µs` (`-12.4%`), `nt=12: 2415.6 -> 2115.2 µs` (`-12.4%`); 35B-A3B (`4096×1024`) `nt=1: 699.6 µs`, `nt=2: 1026.1 -> 1004.8 µs` (`-2.1%`), `nt=4: 2013.1 -> 1773.7 µs` (`-11.9%`), `nt=12: 5988.5 -> 5339.1 µs` (`-10.8%`).
+  - `benchmark_flash_next_pool` (on clean physical cores `0-15,32-47`, avoiding shared-host noisy neighbors on `cpu16`/`cpu24`): `pool tokens=1 median=244.7 µs (p90=273.3 µs)`, `tokens=4 median=528.7 µs (p90=565.1 µs)`, `tokens=16 median=1497.2 µs (p90=1515.8 µs)` (down from `2212.6 µs`, **`-32.3%`**), `prefill 16×12 median=6174.1 µs` (down from `8318.3 µs`, **`-25.8%`**), `prefill 220×5 median=14753.6 µs`.
+
 ## Automated FP16-KV quality suite (completed)
 
 - Added checked-in `benchmarks/quality/run_suite.py` and `suite.toml`, exposed through `mise run quality-run -- --output-dir ...`. Runs warp-34, vLLM, llama.cpp/Unsloth and SGLang sequentially on one GPU, with FP16 attention KV and 4K context throughout. Defaults to native `--limit 10`; full evaluation requires `--full`. No evaluator adapter, prompt/scoring changes, precision fallback, second GPU or automatic CPU-layer offload. SGLang remains explicitly plain; the other three use native MTP-3.
