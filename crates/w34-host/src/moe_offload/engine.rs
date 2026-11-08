@@ -211,6 +211,9 @@ impl TieredMoeEngine {
             return Ok(());
         }
         cache.sync_from_device_if_dirty(compute_stream)?;
+        if num_tokens < 1024 && cache.adapted_slots_dirty {
+            cache.restore_initial_if_adapted(store, ws, compute_stream)?;
+        }
         assert_eq!(h_topk_ids.len(), num_tokens * top_k);
         if matches!(mode, MoeOffloadMode::CpuHybrid { .. }) {
             assert_eq!(h_topk_weights.len(), num_tokens * top_k);
@@ -292,13 +295,15 @@ impl TieredMoeEngine {
         match effective_mode {
             MoeOffloadMode::GpuLru => {
                 if !misses_in_step.is_empty() {
+                    let lru_start = if cache.slots.capacity > 64 { 48 } else { 0 };
                     let mut victim_slots = Vec::with_capacity(misses_in_step.len());
                     for &ge in &misses_in_step {
-                        // Choose the slot with the smallest `slot_last_used` timestamp.
+                        // Choose the non-pinned slot with the smallest `slot_last_used` timestamp.
                         let (victim_slot, _) = cache
                             .slot_last_used
                             .iter()
                             .enumerate()
+                            .skip(lru_start)
                             .min_by_key(|&(_, &ts)| ts)
                             .unwrap();
                         let old_ge = cache.slot_to_expert[victim_slot];
@@ -384,6 +389,7 @@ impl TieredMoeEngine {
                     .min(ws.stage_capacity)
                     .min(cache.slots.capacity.saturating_sub(hits_in_step.len()));
                 if gpu_promote > 0 {
+                    let lru_start = if cache.slots.capacity > 64 { 48 } else { 0 };
                     let promoted = &misses_in_step[..gpu_promote];
                     let mut victim_slots = Vec::with_capacity(gpu_promote);
                     for &ge in promoted {
@@ -391,6 +397,7 @@ impl TieredMoeEngine {
                             .slot_last_used
                             .iter()
                             .enumerate()
+                            .skip(lru_start)
                             .min_by_key(|&(_, &ts)| ts)
                             .unwrap();
                         let old_ge = cache.slot_to_expert[victim_slot];
@@ -823,6 +830,7 @@ impl TieredMoeEngine {
                             promote_victim_slots.len(),
                         )?;
                         cache.step_clock += 8;
+                        cache.adapted_slots_dirty = true;
                         let promoted_ts = cache.step_clock;
                         for (&new_ge, &slot_i32) in
                             promote_new_ges.iter().zip(&promote_victim_slots)

@@ -1361,5 +1361,34 @@ mod cuda_tests {
                 "expert_to_slot[{ge}] != {s} after StreamedPrefill promotion"
             );
         }
+        assert!(
+            cache.adapted_slots_dirty,
+            "StreamedPrefill promotion must mark adapted_slots_dirty"
+        );
+
+        // Step 4: A subsequent short prompt (`num_tokens = 128 < 1024`) must restore
+        // `0..k_static` back to `initial_slot_to_expert` so long-prompt / needle promotions
+        // do not permanently displace general-purpose ranked experts.
+        let m_short = 128usize;
+        TieredMoeEngine::execute_layer(
+            MoeOffloadMode::StreamedPrefill,
+            &full_store,
+            &mut cache,
+            &mut ws,
+            &stream,
+            d_x.addr(),
+            d_topk_pf.addr(),
+            d_wts.addr(),
+            &h_topk_pf[..m_short * top_k],
+            &h_wts[..m_short * top_k],
+            0,
+            0,
+            d_out.addr(),
+            m_short,
+            top_k,
+        )
+        .unwrap();
+        assert!(!cache.adapted_slots_dirty);
+        assert_eq!(cache.slot_to_expert, (0..k_hot).collect::<Vec<_>>());
     }
 }

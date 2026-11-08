@@ -773,6 +773,8 @@ pub struct HotExpertCache {
     pub(super) bridge_runtime: Option<std::sync::Arc<crate::moe_cpu_bridge::Runtime>>,
     pub(super) bridge_mailbox: Option<std::sync::Arc<crate::moe_cpu_bridge::Mailbox>>,
     pub k_static: usize,
+    pub initial_slot_to_expert: Vec<usize>,
+    pub adapted_slots_dirty: bool,
     pub device_lru_dirty: bool,
     pub step_clock: u64,
     pub hits: u64,
@@ -821,6 +823,8 @@ impl HotExpertCache {
             bridge_runtime: None,
             bridge_mailbox: None,
             k_static: k_hot,
+            initial_slot_to_expert: Vec::new(),
+            adapted_slots_dirty: false,
             device_lru_dirty: false,
             step_clock: 1,
             hits: 0,
@@ -852,6 +856,8 @@ impl HotExpertCache {
             }
             None => self.expert_ids.clone().take(k_hot).collect(),
         };
+        self.initial_slot_to_expert.clone_from(&chosen);
+        self.adapted_slots_dirty = false;
         self.expert_to_slot.fill(-1);
         for (slot, &ge) in chosen.iter().enumerate() {
             let le = ge - self.expert_ids.start;
@@ -986,6 +992,75 @@ impl HotExpertCache {
         }
         self.step_clock = step_arr[0].max(1);
         self.device_lru_dirty = false;
+        Ok(())
+    }
+
+    /// Restores any static hot slots (`0..k_static`) that were temporarily adapted for a
+    /// long prompt (`num_tokens >= 1024`) back to `initial_slot_to_expert` when a subsequent
+    /// normal/short prompt (`num_tokens < 1024`) arrives.
+    pub fn restore_initial_if_adapted(
+        &mut self,
+        store: &HostExpertStore,
+        ws: &mut TieredMoeWorkspace,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<()> {
+        if !self.adapted_slots_dirty {
+            return Ok(());
+        }
+        let restore_limit = self.k_static.min(self.initial_slot_to_expert.len());
+        let local_start = self.expert_ids.start;
+        let mut restore_ges = Vec::new();
+        let mut restore_slots = Vec::new();
+        for slot in 0..restore_limit {
+            let init_ge = self.initial_slot_to_expert[slot];
+            if self.slot_to_expert[slot] != init_ge {
+                let old_ge = self.slot_to_expert[slot];
+                if old_ge < usize::MAX && self.expert_ids.contains(&old_ge) {
+                    let old_le = old_ge - local_start;
+                    if self.expert_to_slot[old_le] == slot as i32 {
+                        self.expert_to_slot[old_le] = -1;
+                    }
+                }
+                restore_ges.push(init_ge);
+                restore_slots.push(slot as i32);
+            }
+        }
+        if !restore_ges.is_empty() {
+            let k_hot = self.slots.capacity;
+            for (&init_ge, &slot_i32) in restore_ges.iter().zip(&restore_slots) {
+                let slot = slot_i32 as usize;
+                let prev_slot = self.expert_to_slot[init_ge - local_start];
+                if prev_slot >= 0 && (prev_slot as usize) != slot {
+                    let ps = prev_slot as usize;
+                    self.slot_to_expert[ps] = usize::MAX;
+                    self.slot_to_expert_i32[ps] = -1;
+                    self.slot_last_used[ps] = 0;
+                }
+                self.expert_to_slot[init_ge - local_start] = slot_i32;
+                self.slot_to_expert[slot] = init_ge;
+                self.slot_to_expert_i32[slot] = init_ge as i32;
+                self.slot_last_used[slot] = self.step_clock + (k_hot - slot) as u64;
+            }
+            self.step_clock += (k_hot as u64) + 1;
+            self.dma_experts_loaded += restore_ges.len() as u64;
+            for (g_chunk, s_chunk) in restore_ges
+                .chunks(ws.stage_capacity)
+                .zip(restore_slots.chunks(ws.stage_capacity))
+            {
+                ws.stage_experts_to_slots(0, store, g_chunk, s_chunk, &self.slots, stream)?;
+            }
+            ws.compute_done_events[0].record(stream)?;
+            self.d_expert_to_slot
+                .copy_from_host(&self.expert_to_slot, stream)?;
+            self.d_slot_to_expert
+                .copy_from_host(&self.slot_to_expert_i32, stream)?;
+            self.d_slot_last_used
+                .copy_from_host(&self.slot_last_used, stream)?;
+            self.step_clock_buf[0] = self.step_clock;
+            self.d_step_counter
+                .copy_from_host(&self.step_clock_buf, stream)?;
+        }
+        self.adapted_slots_dirty = false;
         Ok(())
     }
 
