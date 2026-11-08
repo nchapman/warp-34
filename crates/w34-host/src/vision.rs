@@ -987,8 +987,26 @@ impl Qwen3VisionEncoder {
         };
 
         let _dev = CudaDevice::set_current(device_id)?;
-        // Estimate weight arena bytes (~1.2 GB max for 27-layer FP16 ViT)
-        let est_bytes = 1280 * 1024 * 1024;
+        let visual_prefix = format!("{pfx}.");
+        let raw_visual_bytes: usize = archive
+            .iter_entries()
+            .filter(|(name, _)| name.starts_with(&visual_prefix))
+            .map(|(_, info)| {
+                let bytes = info.len_bytes as usize;
+                if matches!(info.dtype.as_str(), "I32" | "U32") {
+                    bytes.saturating_mul(2)
+                } else {
+                    bytes
+                }
+            })
+            .sum();
+        let est_bytes = if raw_visual_bytes > 0 {
+            raw_visual_bytes
+                .saturating_add(64 * 1024 * 1024)
+                .clamp(64 * 1024 * 1024, 1280 * 1024 * 1024)
+        } else {
+            1280 * 1024 * 1024
+        };
         let mut arena = DeviceArena::new(device_id, est_bytes)?;
 
         let hidden = cfg.hidden_size;

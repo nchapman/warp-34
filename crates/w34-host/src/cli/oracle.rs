@@ -238,7 +238,7 @@ pub(crate) fn compare_tp1_vs_tp2_tensors(
     names.sort();
     for name in names {
         let (shape1, vals1) = &tp1_tensors[name];
-        if name == "logits" {
+        if matches!(name.as_str(), "logits" | "logits_last") {
             continue; // logits_buf on rank 0 is vocab-sharded under TP=2
         }
         let (shape2, vals2) = tp2_tensors
@@ -277,7 +277,7 @@ pub(crate) fn compare_tp1_vs_tp2_tensors(
     let mut tp2_names: Vec<&String> = tp2_tensors.keys().collect();
     tp2_names.sort();
     for name in tp2_names {
-        if name != "logits" && !tp1_tensors.contains_key(name) {
+        if !matches!(name.as_str(), "logits" | "logits_last") && !tp1_tensors.contains_key(name) {
             return Err(format!(
                 "dump-diff tp1-vs-tp2 missing tensor on TP=1: {name}"
             ));
@@ -948,5 +948,34 @@ pub(crate) fn run_profile_diff(options: CudaCliOptions) -> Result<ExitCode, Stri
         Ok(ExitCode::SUCCESS)
     } else {
         Err("profile_diff.py exited with non-zero status".to_string())
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::compare_tp1_vs_tp2_tensors;
+    use std::collections::HashMap;
+
+    #[test]
+    fn compare_tp1_vs_tp2_skips_vocab_sharded_logits_and_logits_last() {
+        let mut tp1 = HashMap::new();
+        tp1.insert(
+            "final_norm".to_string(),
+            (vec![1usize, 4usize], vec![1.0f32, 2.0, 3.0, 4.0]),
+        );
+        tp1.insert("logits".to_string(), (vec![1, 8], vec![0.1; 8]));
+        tp1.insert("logits_last".to_string(), (vec![8], vec![0.1; 8]));
+
+        let mut tp2 = HashMap::new();
+        tp2.insert(
+            "final_norm".to_string(),
+            (vec![1, 4], vec![1.0, 2.0, 3.0, 4.0]),
+        );
+        tp2.insert("logits".to_string(), (vec![1, 4], vec![0.1; 4]));
+        tp2.insert("logits_last".to_string(), (vec![4], vec![0.1; 4]));
+
+        let summary = compare_tp1_vs_tp2_tensors(&tp1, &tp2, false, false).unwrap();
+        assert_eq!(summary.max_layer_diff, 0.0);
+        assert_eq!(summary.target_max_rel_l2, 0.0);
     }
 }

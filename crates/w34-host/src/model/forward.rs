@@ -153,7 +153,6 @@ impl Qwen3_5ModelRank {
         out_top5_logprobs_ptr: u64,
         mut dump_out: Option<&mut ForwardDump>,
     ) -> Result<i32> {
-        self.validate_tap_rows(num_tokens)?;
         self.device.make_current()?;
         self.scratch_arena.reset();
         let s = self.alloc_forward_scratch(num_tokens)?;
@@ -386,18 +385,6 @@ impl Qwen3_5ModelRank {
         out_greedy_ids_override: Option<u64>,
         emit_device_greedy: bool,
     ) -> Result<(u64, bool)> {
-        if attn_batch.num_reqs <= 1 {
-            self.validate_tap_rows(num_tokens)?;
-            if self
-                .speculative_logits
-                .as_ref()
-                .is_some_and(|b| selected_rows.len() > b.len_bytes / (self.local_vocab_size * 2))
-            {
-                return Err(loader_err(
-                    "selected rows exceed speculative logits capacity",
-                ));
-            }
-        }
         if selected_rows.iter().any(|&r| r >= num_tokens) {
             return Err(loader_err("selected row outside token batch"));
         }

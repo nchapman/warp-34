@@ -1444,16 +1444,14 @@ impl Qwen3_5ModelRank {
                         .resolve_name("visual.patch_embed.proj.weight")
                         .is_some());
             let base_reserved = required_headroom.saturating_add(req_kv_bytes);
-            let desired_state_bytes = bytes_per_state_slot.saturating_mul(requested_state_slots);
+            let min_state_bytes = bytes_per_state_slot.saturating_mul(min_state_slots_for_moe);
             let vision_reserve = if rank == 0
                 && archive_has_vision
                 && default_pages.unwrap_or(0) < EXTREME_LONGCTX_MIN_PAGES
-                && available
-                    >= base_reserved
-                        .saturating_add(desired_state_bytes)
-                        .saturating_add(VISION_ENCODER_LAZY_RESERVE_BYTES)
             {
-                VISION_ENCODER_LAZY_RESERVE_BYTES
+                available
+                    .saturating_sub(base_reserved.saturating_add(min_state_bytes))
+                    .min(VISION_ENCODER_LAZY_RESERVE_BYTES)
             } else {
                 0
             };
