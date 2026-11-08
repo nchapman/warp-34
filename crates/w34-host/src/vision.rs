@@ -8,8 +8,10 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use crate::cuda::{
     CublasHandle, CudaDevice, CudaError, CudaStream, DeviceArena, DeviceBuffer, Result, check_rc,
-    f16_to_f32, f32_to_f16,
+    f16_to_f32_slice, f32_to_f16_slice,
 };
+#[cfg(all(feature = "cuda", test))]
+use crate::cuda::{f16_to_f32, f32_to_f16};
 #[cfg(feature = "cuda")]
 use crate::loader::{QuantScheme, SafetensorsArchive};
 #[cfg(feature = "cuda")]
@@ -258,33 +260,51 @@ pub fn preprocess_rgb_image(
     let scale_y = height as f32 / out_h as f32;
     let scale_x = width as f32 / out_w as f32;
 
+    let x_table: Vec<([usize; 4], [f32; 4])> = (0..out_w)
+        .map(|ox| {
+            let sx = (ox as f32 + 0.5) * scale_x - 0.5;
+            let ix0 = sx.floor() as isize;
+            let x_off3 = [
+                (ix0 - 1).clamp(0, width as isize - 1) as usize * 3,
+                ix0.clamp(0, width as isize - 1) as usize * 3,
+                (ix0 + 1).clamp(0, width as isize - 1) as usize * 3,
+                (ix0 + 2).clamp(0, width as isize - 1) as usize * 3,
+            ];
+            let wx = [
+                cubic_weight(sx - (ix0 - 1) as f32),
+                cubic_weight(sx - ix0 as f32),
+                cubic_weight(sx - (ix0 + 1) as f32),
+                cubic_weight(sx - (ix0 + 2) as f32),
+            ];
+            (x_off3, wx)
+        })
+        .collect();
+
+    let row_stride = width * 3;
     for oy in 0..out_h {
         let sy = (oy as f32 + 0.5) * scale_y - 0.5;
         let iy0 = sy.floor() as isize;
+        let y_row_off = [
+            (iy0 - 1).clamp(0, height as isize - 1) as usize * row_stride,
+            iy0.clamp(0, height as isize - 1) as usize * row_stride,
+            (iy0 + 1).clamp(0, height as isize - 1) as usize * row_stride,
+            (iy0 + 2).clamp(0, height as isize - 1) as usize * row_stride,
+        ];
         let wy: [f32; 4] = [
             cubic_weight(sy - (iy0 - 1) as f32),
             cubic_weight(sy - iy0 as f32),
             cubic_weight(sy - (iy0 + 1) as f32),
             cubic_weight(sy - (iy0 + 2) as f32),
         ];
-        for ox in 0..out_w {
-            let sx = (ox as f32 + 0.5) * scale_x - 0.5;
-            let ix0 = sx.floor() as isize;
-            let wx: [f32; 4] = [
-                cubic_weight(sx - (ix0 - 1) as f32),
-                cubic_weight(sx - ix0 as f32),
-                cubic_weight(sx - (ix0 + 1) as f32),
-                cubic_weight(sx - (ix0 + 2) as f32),
-            ];
+        for (ox, &(x_off3, wx)) in x_table.iter().enumerate() {
             for c in 0..3 {
                 let mut acc = 0.0f32;
                 let mut w_sum = 0.0f32;
                 for (dy, &wy_val) in wy.iter().enumerate() {
-                    let y = (iy0 - 1 + dy as isize).clamp(0, height as isize - 1) as usize;
+                    let row_base = y_row_off[dy] + c;
                     for (dx, &wx_val) in wx.iter().enumerate() {
-                        let x = (ix0 - 1 + dx as isize).clamp(0, width as isize - 1) as usize;
                         let w = wy_val * wx_val;
-                        acc += w * (rgb[(y * width + x) * 3 + c] as f32);
+                        acc += w * (rgb[row_base + x_off3[dx]] as f32);
                         w_sum += w;
                     }
                 }
@@ -1005,7 +1025,8 @@ impl Qwen3VisionEncoder {
         let pos_f16 = archive
             .read_f16_bits(&pos_key)
             .map_err(|e| CudaError::with_detail(-10, "read pos_embed.weight", e.to_string()))?;
-        let pos_embed_f32: Vec<f32> = pos_f16.iter().copied().map(f16_to_f32).collect();
+        let mut pos_embed_f32 = vec![0.0f32; pos_f16.len()];
+        f16_to_f32_slice(&pos_f16, &mut pos_embed_f32);
 
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
@@ -1153,11 +1174,15 @@ impl Qwen3VisionEncoder {
         let attention_scratch = DeviceBuffer::alloc(self.device_id, scratch_bytes.max(4))?;
         let ex = stream.exec(attention_scratch.addr(), scratch_bytes.max(4));
 
-        let mut patches_f16 = Vec::with_capacity(total_patches * patch_dim);
+        let mut patches_f16 = vec![0u16; total_patches * patch_dim];
+        let mut patch_off = 0usize;
         for img in images {
-            for &v in img.patches_f32.iter() {
-                patches_f16.push(f32_to_f16(v));
-            }
+            let len = img.patches_f32.len();
+            f32_to_f16_slice(
+                &img.patches_f32,
+                &mut patches_f16[patch_off..patch_off + len],
+            );
+            patch_off += len;
         }
 
         let (pos_interp_f32, pos_hw, cu_seqlens) = interpolate_pos_embed_and_rot_ids(
@@ -1167,7 +1192,8 @@ impl Qwen3VisionEncoder {
             self.cfg.spatial_merge_size,
             &grid_thw_list,
         );
-        let pos_interp_f16: Vec<u16> = pos_interp_f32.iter().copied().map(f32_to_f16).collect();
+        let mut pos_interp_f16 = vec![0u16; pos_interp_f32.len()];
+        f32_to_f16_slice(&pos_interp_f32, &mut pos_interp_f16);
 
         let d_patches = DeviceBuffer::alloc(self.device_id, patches_f16.len() * 2)?;
         let d_pos_interp = DeviceBuffer::alloc(self.device_id, pos_interp_f16.len() * 2)?;
@@ -1515,7 +1541,9 @@ impl Qwen3VisionEncoder {
                 "vision trace row",
             )?;
             stream.synchronize()?;
-            data.extend(host.into_iter().map(f16_to_f32));
+            let mut host_f32 = vec![0.0f32; host.len()];
+            f16_to_f32_slice(&host, &mut host_f32);
+            data.extend(host_f32);
         }
         trace.insert(key.to_string(), (vec![3, cols], data));
         Ok(())

@@ -42,6 +42,32 @@ fn test_bf16_f32_conversions() {
     let big_bf16 = f32_to_bf16(big);
     let roundtrip = bf16_to_f32(big_bf16);
     assert!((roundtrip - big).abs() / big < 0.01);
+
+    // Verify SIMD slice conversions (`f16_to_f32_slice`, `f32_to_f16_slice`,
+    // `bf16_to_f16_slice_inplace`) match scalar conversions across all finite values
+    // plus unaligned tail lengths.
+    let finite_f16: Vec<u16> = (0..=u16::MAX)
+        .filter(|&v| v & 0x7c00 != 0x7c00 || v & 0x03ff == 0)
+        .collect();
+    let mut f32_simd = vec![0.0f32; finite_f16.len()];
+    f16_to_f32_slice(&finite_f16, &mut f32_simd);
+    let f32_scalar: Vec<f32> = finite_f16.iter().copied().map(f16_to_f32).collect();
+    assert_eq!(
+        f32_simd.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        f32_scalar.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+
+    let mut f16_roundtrip = vec![0u16; f32_simd.len()];
+    f32_to_f16_slice(&f32_simd, &mut f16_roundtrip);
+    assert_eq!(f16_roundtrip, finite_f16);
+
+    let finite_bf16: Vec<u16> = (0..=u16::MAX)
+        .filter(|&v| v & 0x7f80 != 0x7f80 || v & 0x007f == 0)
+        .collect();
+    let mut bf16_simd = finite_bf16.clone();
+    bf16_to_f16_slice_inplace(&mut bf16_simd);
+    let bf16_scalar: Vec<u16> = finite_bf16.iter().copied().map(bf16_to_f16).collect();
+    assert_eq!(bf16_simd, bf16_scalar);
 }
 
 #[test]
