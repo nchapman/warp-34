@@ -1,5 +1,33 @@
 # warp-34 — Session Orientation & Current State
 
+## Hybrid GPU-LRU + CPU-Bridge MoE Decode, Zero-Copy `host_embed_tokens`, & `w34perf` / `lm-eval` Competitor Verification (`68f375a`, completed & verified)
+
+- **Scope:** Implemented hybrid GPU-LRU + CPU-bridge MoE decode (`CpuHybrid` with GPU expert cache), zero-copy `host_embed_tokens`, PLE OS page-cache retention, and 0-ULP 16-value warp butterfly reduction in `small_n_gemm_{4x4,dual_4x4}_f16_kernel`, then re-benchmarked `w34perf` and upstream `lm-eval==0.4.13` (`--limit 50` on `ifeval` + `gsm8k`) across `Qwen3.8-27B`, `Qwen3.6-35B-A3B`, and `Qwen3.8-Flash-Next` against `vLLM 0.31.0`, `SGLang v0.5.19`, `llama.cpp`, `Strata`, and `qfn-3090` on Ryzen 9 7950X3D + 2× RTX 3090 Ti.
+- **Engine Optimizations (`68f375a`):**
+  - **Hybrid GPU-LRU + CPU-Bridge MoE Decode (`op_moe_cpu_bridge.cu`, `moe_cpu_bridge.rs`, `moe_offload/engine.rs`, `layers.rs`):** Added `w34_moe_cpu_bridge_hybrid_partition_i32` and `w34_moe_cpu_bridge_submit_hybrid_f16` so `CpuHybrid` serves GPU-cached experts (`hit_pairs`) directly on GPU via `moe_w4a16_down_accum_f16` while dispatching only cache-miss `(token, expert)` pairs to the AVX-512/AVX2 CPU thread pool over the `FP16` pinned mailbox (`~71.3%` GPU cache hit rate on `TP=1` with `3,264` total slots = `68.00/layer`; `~85.4%` on `TP=2` with `9,216` total slots across 2 ranks = `192.00/layer` total / `96.00/layer/rank`).
+  - **Zero-Copy `HostEmbedTable` & PLE Page-Cache Retention (`host_embed.rs`, `safetensors.rs`):** Replaced the `2.00 GiB` heap-copied `embed_tokens` `Vec<u16>` on PLE models with a zero-copy `Arc<Mmap>` view (`HostEmbedTable`), and skipped dropping OS page cache on PLE safetensor shards (`contains_ple_tensors`) so hot PLE rows stay warm in Linux page cache without triggering `kswapd` during `66.7 GiB` `cudaHostRegister` pinning.
+  - **0-ULP 16-Value Warp Butterfly Reduction (`op_marlin.cu`):** Replaced the 5-loop scalar shuffle reduction (`80` `__shfl_down_sync` ops) in `small_n_gemm_4x4_f16_kernel` and `small_n_gemm_dual_4x4_f16_kernel` with an in-register 4×4 transpose + 2-stage warp butterfly (`16` `__shfl_xor_sync` ops) preserving the exact IEEE-754 addition tree (`radix lossless_parity: true`).
+- **Verified `w34perf` Results (`6/6` quality checks passed on every profile):**
+  - **`Qwen3.8-Flash-Next` (`MTP-3`, `TQ4` KV):**
+    - **`TP=1` (`3,264` total GPU expert slots = `68.00/layer`):** **`42.43 tok/s`** `short-chat`, **`35.01 tok/s`** `coding-agent-replay` — beating `Strata` lossless (`STRATA_ROUTE_TAIL_SKIP=0`: `36.34–37.50` / `33.58–33.70 tok/s`), `Strata` default lossy (`STRATA_ROUTE_TAIL_SKIP=7`: `39.21` / `34.94 tok/s`), and `qfn-3090-mtp3` (`30.82` / `14.37 tok/s`).
+    - **`TP=2` (`9,216` total GPU expert slots = `192.00/layer` total):** **`71.92 tok/s`** `short-chat`, **`55.59–56.13 tok/s`** `coding-agent-replay` (vs `qfn-2x3090-mtp3` `40.42` / `18.30 tok/s`).
+  - **`Qwen3.8-27B` (`W4A16-GPTQ`):** `TP=1 FP16` **`52.12 tok/s`** `decode-c1` / **`311.75 tok/s`** `throughput-c8`; `TP=2 FP16` **`82.97 tok/s`** plain / **`146.36 tok/s`** `MTP-2` / **`157.31 tok/s`** `DFlash2`, **`405.82 tok/s`** `throughput-c8`.
+  - **`Qwen3.6-35B-A3B`:** `TP=2 FP16` **`261.21 tok/s`** plain / **`389.60 tok/s`** `MTP-2` (`decode-c1`), **`1,019.54 tok/s`** `throughput-c8`; `TP=1 TQ4` **`196.83 tok/s`** `decode-c1`, **`729.10 tok/s`** `throughput-c8`.
+- **Verified Upstream `lm-eval==0.4.13` (`--limit 50` on `ifeval` + `gsm8k` = `1,000` total requests across 10 runs, `0` errors):**
+  - **`Qwen3.8-27B` (`TP=1`, `FP16` KV):**
+    - **`warp-34` (`nchapman/Qwen3.8-27B-W4A16-HGPTQ@1de743ee`, `MTP-3`):** `ifeval` **`0.9000 / 0.9079 / 0.9000 / 0.9211`** (`157.2s`), `gsm8k` **`0.9200 / 0.9200`** (`92.2s`), total **`249.3s`**.
+    - **`vLLM 0.31.0` (`nchapman/Qwen3.8-27B-W4A16-GPTQ@0df81ead`, Plain):** `ifeval` `0.8800 / 0.9211 / 0.8800 / 0.9211` (`317.1s`), `gsm8k` `0.8800 / 0.9000` (`190.4s`), total `507.4s` (`2.04×` slower).
+    - **`SGLang v0.5.19` (`nchapman/Qwen3.8-27B-W4A16-GPTQ@0df81ead`, Plain):** `ifeval` `0.8800 / 0.9211 / 0.8800 / 0.9211` (`308.6s`), `gsm8k` `0.8800 / 0.9000` (`189.2s`), total `497.8s` (`2.00×` slower).
+    - **`llama.cpp` (`unsloth/Qwen3.8-27B-GGUF@4ca72078` `UD-Q4_K_M`, Plain):** `ifeval` `0.8800 / 0.9079 / 0.8800 / 0.9211` (`353.7s`), `gsm8k` `0.9400 / 0.9400` (`220.6s`), total `574.3s` (`2.30×` slower).
+  - **`Qwen3.6-35B-A3B` (`TP=2`, `FP16` KV):**
+    - **`warp-34` (`nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ@4f5de21c`, `MTP-3`):** `ifeval` **`0.9000 / 0.9342 / 0.8800 / 0.9211`** (`53.8s`), `gsm8k` **`0.9000 / 0.9000`** (`30.3s`), total **`84.1s`**.
+    - **`vLLM 0.31.0` (`llmfan46/Qwen3.6-35B-A3B-...-GPTQ-Int4@fb685a84`, Plain):** `ifeval` `0.8800 / 0.9211 / 0.8800 / 0.9211` (`80.8s`), `gsm8k` `0.8600 / 0.8600` (`48.3s`), total `129.1s` (`1.54×` slower).
+  - **`Qwen3.8-Flash-Next` (`FP16` KV):**
+    - **`warp-34` (`nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ@6ee06d29`, `TP=2`, `MTP-3`):** `ifeval` `0.9200 / 0.9342 / 0.9400 / 0.9605` (`232.7s`), `gsm8k` **`0.9400 / 0.9400`** (`146.3s`), total **`379.0s`**.
+    - **`warp-34` (`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE@ef554143`, `TP=2`, `MTP-3`):** `ifeval` `0.9200 / 0.9474 / 0.9400 / 0.9605` (`246.5s`), `gsm8k` `0.9200 / 0.9400` (`174.4s`), total `420.9s`.
+    - **`Strata` (`unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee` `UD-IQ4_XS`, `TP=1`, `Spec-4`, `STRATA_ROUTE_TAIL_SKIP=7`):** `ifeval` `0.9400 / 0.9605 / 0.9600 / 0.9737` (`260.5s`), `gsm8k` `0.9200 / 0.9200` (`206.9s`), total `467.4s` (`1.23×` slower).
+    - **`qfn-3090` (`albucino/Qwen3.8-Flash-Next-W4A16-FP8PLE`, `TP=1`, `MTP-3`):** `ifeval` `0.8800 / 0.9211 / 0.9000 / 0.9342` (`689.5s`), `gsm8k` `0.8800 / 0.8800` (`437.8s`), total `1127.4s` (`2.97×` slower).
+
 ## AVX2 CPU MoE Evaluator Optimization (`moe_cpu_bridge::eval`, completed & verified)
 
 - **Scope:** Audited and optimized the AVX2 + FMA + F16C path in `crates/w34-host/src/moe_cpu_bridge/eval.rs` on AMD EPYC 7R13 (`Zen 3`, `avx2,fma,f16c`, no AVX-512) while preserving 0-ULP bit-for-bit parity (`to_bits()`) against `expert_portable` and `expert_avx512`.
