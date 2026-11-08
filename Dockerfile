@@ -21,15 +21,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake nasm curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
-# EXPERIMENT: keep every cuBLAS minor architecture needed by sm_86/sm_89,
-# plus the older PTX fallback shipped in cuBLASLt. Never prune shared libraries.
-RUN set -eu; mkdir /opt/cublas-pruned \
-    && for lib in cublas cublasLt; do \
-        nvprune --generate-code code=sm_80 --generate-code code=sm_86 \
-            --generate-code code=sm_89 --generate-code code=compute_75 \
-            /usr/local/cuda/lib64/lib${lib}_static.a \
-            -o /opt/cublas-pruned/lib${lib}_static.a; \
-    done
 WORKDIR /src
 # Frontend sources are not Rust build inputs; only the built assets are embedded.
 COPY Cargo.toml Cargo.lock ./
@@ -42,11 +33,8 @@ ARG W34_ARCH=sm_86,sm_89
 # Compress the embedded device code, not the executable with a runtime packer.
 # Keep native SASS for both GPU generations and the existing PTX fallback.
 ARG W34_NVCC_EXTRA=--compress-mode=size
-# Override with /usr/local/cuda/lib64 to measure unpruned static linkage.
-ARG W34_CUBLAS_STATIC_DIR=/opt/cublas-pruned
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    W34_CUBLAS_STATIC_DIR=${W34_CUBLAS_STATIC_DIR} \
     W34_ARCH=${W34_ARCH} W34_NVCC_JOBS=${W34_NVCC_JOBS} W34_NVCC_EXTRA=${W34_NVCC_EXTRA} \
     cargo build --locked --release --features cuda --bin w34 \
     && cp target/release/w34 /w34
@@ -59,9 +47,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /home/w34 w34 \
     && install -d -o w34 -g w34 /home/w34/.cache/huggingface/hub
-# cuBLAS is statically linked from architecture-pruned archives in this experiment.
-# Keep cudart shared to isolate the cuBLAS packaging change.
-COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13 /usr/local/cuda/lib64/
+# Keep CUDA libraries in a separate layer so app updates can reuse the download.
+# COPY dereferences SONAME symlinks; also copying versioned files duplicates them.
+COPY --from=build /usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.13 \
+    /usr/local/cuda/targets/x86_64-linux/lib/libcublas.so.13 \
+    /usr/local/cuda/targets/x86_64-linux/lib/libcublasLt.so.13 \
+    /usr/local/cuda/lib64/
 RUN echo /usr/local/cuda/lib64 > /etc/ld.so.conf.d/cuda.conf && ldconfig
 COPY --from=build /w34 /usr/local/bin/w34
 ENV HOME=/home/w34 \

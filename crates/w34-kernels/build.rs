@@ -125,34 +125,13 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=w34_kernels");
-    let cublas_static_dir = var("W34_CUBLAS_STATIC_DIR").ok();
-    if let Some(dir) = &cublas_static_dir {
-        for name in ["libcublas_static.a", "libcublasLt_static.a"] {
-            let archive = Path::new(dir).join(name);
-            assert!(
-                archive.is_file(),
-                "missing static archive {}",
-                archive.display()
-            );
-            println!("cargo:rerun-if-changed={}", archive.display());
-        }
-        // Search the pruned archives before the toolkit's full archives.
-        println!("cargo:rustc-link-search=native={dir}");
-    }
     println!(
         "cargo:rustc-link-search=native={}",
         cuda_home.join("lib64").display()
     );
     println!("cargo:rustc-link-lib=cudart");
-    // Opt-in for the Docker size experiment; normal builds retain shared cuBLAS.
-    if cublas_static_dir.is_some() {
-        println!("cargo:rustc-link-lib=static=cublas_static");
-        println!("cargo:rustc-link-lib=static=cublasLt_static");
-        println!("cargo:rustc-link-lib=static=culibos");
-    } else {
-        println!("cargo:rustc-link-lib=cublas");
-        println!("cargo:rustc-link-lib=cublasLt");
-    }
+    println!("cargo:rustc-link-lib=cublas");
+    println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cuda");
     println!("cargo:rustc-link-lib=stdc++");
 
@@ -169,7 +148,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=W34_ARCH");
     println!("cargo:rerun-if-env-changed=W34_NVCC_JOBS");
     println!("cargo:rerun-if-env-changed=W34_NVCC_EXTRA");
-    println!("cargo:rerun-if-env-changed=W34_CUBLAS_STATIC_DIR");
 }
 
 fn build_gencode_flags(arch_spec: &str) -> String {

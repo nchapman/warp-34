@@ -1,5 +1,10 @@
 # warp-34 — Session Orientation & Current State
 
+## Docker Packaging Decision: Shared cuBLAS (verified)
+
+- User selected shared cuBLAS as the default: routine updates can reuse the large CUDA-library layer rather than downloading a new ~442 MB static executable layer. Removed experimental pruning/static-link build configuration; retained CUDA device-code compression, pnpm/Cargo caching improvements, pinned Ubuntu, driver guard, and model-cache fixes. Ubuntu remains unchanged. Historical static measurements and the decision are preserved in [`CUBLAS_PACKAGING_EXPERIMENT.md`](CUBLAS_PACKAGING_EXPERIMENT.md); RTX 4090 qualification should now test the shared image.
+- Rebuilt `warp-34:shared-cublas-final`: shared cuBLAS/cuBLASLt linkage and CLI startup passed; executable is **39,615,656 bytes**. First five filesystem layer digests match the earlier shared image, including the CUDA-library layer; only the final executable layer changed. Shared `check-quick`, full test compilation, and review passed. Full `mise run check` passed formatting, both Clippy modes, docs, dashboard, oracle, and performance tooling, but GPU execution stopped in `collectives_and_gdn_wy`: another worktree's 27B `greedy-diff` process started during the run and used ~19.6 GiB on GPU 0. The 4B loader reported only 1.08 GiB free (3.64 GiB required), followed by a poisoned-mutex failure. No engine/test code changed in this shared-link restoration. The earlier merged static suite passed 441 tests. An uncontended retry of the full shared-library `mise run check`, using both GPUs with PTX JIT disabled, subsequently passed: **441 Rust tests passed, 0 failed, 11 ignored**, plus all non-GPU checks. The contention failure is resolved; shared packaging is verified on Ampere and ready for the PR update.
+
 ## Docker Branch Main Integration (`d9ecc01`; verified)
 
 - Merged main's serving vision/speculative edge-case fixes, corrected TP=2 dump-diff comparison, and hot-cache test expectation into the Docker branch without conflicts. Preserved pruned static cuBLAS packaging.
