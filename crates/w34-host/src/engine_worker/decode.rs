@@ -144,6 +144,80 @@ fn capture_decision_tap(
     }
 }
 
+const MAX_JUMP_FORWARD_TOKENS: usize = 16;
+
+fn fast_forward_forced_tokens(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &mut HashMap<u64, Request>,
+    req_id: u64,
+) {
+    let min_ff = if engine.use_cuda_graph { 2 } else { 1 };
+    let commit_err = {
+        let Some(seq) = sched
+            .active
+            .iter_mut()
+            .find(|s| s.req_id == req_id && !s.finished && s.is_prefill_complete())
+        else {
+            return;
+        };
+        let Some(r) = requests.get_mut(&req_id) else {
+            return;
+        };
+        if r.sampler.constraint.is_none()
+            || r.sampler.params.logprobs
+            || !r.sampler.params.stop_strings.is_empty()
+            || r.decision_tap.is_some()
+            || r.cancelled.load(Ordering::Acquire)
+        {
+            return;
+        }
+        // Leave at least 1 token before `max_new_tokens` so the coalesced jump-forward
+        // slice `[tok_0, ff_1, ..., ff_k]` is still forwarded into `radix_state` before
+        // the final token / EOS finishes the sequence.
+        let rem_budget = seq
+            .max_new_tokens
+            .saturating_sub(seq.generated_tokens.len() + 1)
+            .min(MAX_JUMP_FORWARD_TOKENS);
+        if rem_budget == 0 {
+            r.sampler.materialize_pending_constraint().err()
+        } else {
+            match r.sampler.collect_forced_drafts(
+                rem_budget,
+                seq.generated_tokens.len(),
+                &engine.cfg.eos_token_ids,
+            ) {
+                Ok((forced, _)) if forced.len() >= min_ff => {
+                    let mut err = None;
+                    for tok in forced {
+                        if let Err(e) = r.sampler.try_commit_token(tok) {
+                            err = Some(e);
+                            break;
+                        }
+                        emit(r, tok, None);
+                        seq.generated_tokens.push(tok);
+                        if r.cancelled.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                    err
+                }
+                Ok(_) => None,
+                Err(e) => Some(e),
+            }
+        }
+    };
+    if let Some(error) = commit_err {
+        fail_request(
+            engine,
+            sched,
+            requests,
+            req_id,
+            WorkerError::invalid_request(error),
+        );
+    }
+}
+
 fn record_computed_prefill(slices: &[ScheduledReqSlice], requests: &HashMap<u64, Request>) {
     for s in slices {
         if s.is_prefill_chunk {
@@ -152,14 +226,11 @@ fn record_computed_prefill(slices: &[ScheduledReqSlice], requests: &HashMap<u64,
     }
 }
 
-pub(super) fn step_plain(
+fn step_vision_prefills(
     engine: &mut Qwen3_5Engine,
     sched: &mut SchedulerV1,
     requests: &mut HashMap<u64, Request>,
-    receiver: &Receiver<Request>,
-    shutdown: &AtomicBool,
 ) -> Result<(), WorkerError> {
-    let _batch_range = crate::profiling::Range::new(c"w34.serve.batch");
     // Vision prefill uses the same scheduler commit seam, but its 3-plane embedding
     // splice cannot share an ordinary text prefill batch. Decode can share batches.
     let vision_ids: Vec<_> = sched
@@ -230,7 +301,22 @@ pub(super) fn step_plain(
         if let Some(slot) = replacement {
             engine.free_state_slots(&[slot]);
         }
+        if slice.is_final_prefill_chunk {
+            fast_forward_forced_tokens(engine, sched, requests, id);
+        }
     }
+    Ok(())
+}
+
+pub(super) fn step_plain(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &mut HashMap<u64, Request>,
+    receiver: &Receiver<Request>,
+    shutdown: &AtomicBool,
+) -> Result<(), WorkerError> {
+    let _batch_range = crate::profiling::Range::new(c"w34.serve.batch");
+    step_vision_prefills(engine, sched, requests)?;
     let slices = sched.schedule_step();
     if slices.is_empty() {
         return Ok(());
@@ -473,6 +559,8 @@ pub(super) fn step_plain(
             .is_some_and(|c| c.is_terminal_eos())
         {
             release(engine, sched.finish_request_early(s.req_id));
+        } else if emit_mask[i] {
+            fast_forward_forced_tokens(engine, sched, requests, s.req_id);
         }
     }
     Ok(())

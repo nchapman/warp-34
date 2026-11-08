@@ -624,6 +624,182 @@ impl SamplerV1 {
         }
         Ok(())
     }
+
+    /// Returns the unique token forced by the active grammar constraint at `pos_before`
+    /// when `popcount(mask) == 1` and the token is neither soft-banned by `min_tokens` nor
+    /// hard-banned by `logit_bias == -100`.
+    pub fn next_forced_token(
+        &mut self,
+        model_eos_ids: &[i32],
+        pos_before: usize,
+    ) -> Result<Option<i32>, String> {
+        self.materialize_pending_constraint()?;
+        let Some(tok) = self
+            .constraint
+            .as_ref()
+            .and_then(|c| c.single_allowed_token())
+        else {
+            return Ok(None);
+        };
+        if pos_before < self.params.min_tokens && self.is_token_soft_banned(tok, model_eos_ids) {
+            return Ok(None);
+        }
+        if self
+            .params
+            .logit_bias
+            .get(&tok)
+            .is_some_and(|&b| b <= -100.0)
+        {
+            return Ok(None);
+        }
+        Ok(Some(tok))
+    }
+
+    /// Returns a grammar-valid non-stop, non-EOS draft token at `pos_before` if one exists.
+    pub fn first_allowed_draft_token(
+        &mut self,
+        model_eos_ids: &[i32],
+        pos_before: usize,
+    ) -> Result<Option<i32>, String> {
+        self.materialize_pending_constraint()?;
+        let Some(c) = self.constraint.as_ref() else {
+            return Ok(None);
+        };
+        for (word_idx, &word) in c.mask_words().iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let id = word_idx * 32 + bit;
+                let tok = id as i32;
+                if !c.is_token_allowed(tok) {
+                    return Ok(None);
+                }
+                let banned = if pos_before < self.params.min_tokens {
+                    self.is_token_soft_banned(tok, model_eos_ids)
+                } else {
+                    self.params.is_stop_or_eos(tok, model_eos_ids)
+                } || c.eos_ids().contains(&tok)
+                    || self
+                        .params
+                        .logit_bias
+                        .get(&tok)
+                        .is_some_and(|&b| b <= -100.0);
+                if !banned {
+                    return Ok(Some(tok));
+                }
+                w &= w - 1;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Collects up to `k_budget` consecutive deterministic grammar-forced draft tokens starting
+    /// from the current sampler state. Returns `(forced_drafts, stops_after_forced)`, where
+    /// `stops_after_forced` is `true` if the token immediately following `forced_drafts` is a
+    /// forced stop/EOS token (so no further draft tokens can follow in this round).
+    pub fn collect_forced_drafts(
+        &mut self,
+        k_budget: usize,
+        start_pos: usize,
+        model_eos_ids: &[i32],
+    ) -> Result<(Vec<i32>, bool), String> {
+        if k_budget == 0 || self.constraint.is_none() {
+            return Ok((Vec::new(), false));
+        }
+        self.materialize_pending_constraint()?;
+        if self.next_forced_token(model_eos_ids, start_pos)?.is_none() {
+            return Ok((Vec::new(), false));
+        }
+        let mut probe = self.clone();
+        let mut forced = Vec::with_capacity(k_budget);
+        for idx in 0..k_budget {
+            let pos_before = start_pos + idx;
+            let Some(tok) = probe.next_forced_token(model_eos_ids, pos_before)? else {
+                return Ok((forced, false));
+            };
+            let is_stop = probe.params.is_stop_or_eos(tok, model_eos_ids)
+                || probe
+                    .constraint
+                    .as_ref()
+                    .is_some_and(|c| c.eos_ids().contains(&tok));
+            if is_stop {
+                return Ok((forced, true));
+            }
+            probe.try_commit_token(tok)?;
+            forced.push(tok);
+            if probe
+                .constraint
+                .as_ref()
+                .is_some_and(|c| c.is_terminal_eos())
+            {
+                return Ok((forced, true));
+            }
+        }
+        Ok((forced, false))
+    }
+
+    /// Repairs a speculative draft vector against the active grammar constraint and injects
+    /// grammar-forced tokens (`single_allowed_token`) at every deterministic position up to `k_budget`.
+    /// When a draft token violates the grammar at a non-deterministic branch, substitutes a valid
+    /// non-EOS token if available so the verification batch length `1 + k_budget` stays on the
+    /// captured `spec_verify_graph` CUDA Graph.
+    pub fn repair_and_force_drafts(
+        &self,
+        drafts: &mut Vec<i32>,
+        k_budget: usize,
+        start_pos: usize,
+        model_eos_ids: &[i32],
+    ) -> Result<(), String> {
+        let mut probe = self.clone();
+        let mut out = Vec::with_capacity(k_budget);
+        for idx in 0..k_budget {
+            probe.materialize_pending_constraint()?;
+            if probe
+                .constraint
+                .as_ref()
+                .is_some_and(|c| c.is_terminal_eos())
+            {
+                break;
+            }
+            let pos_before = start_pos + idx;
+            if let Some(forced_tok) = probe.next_forced_token(model_eos_ids, pos_before)? {
+                let is_stop = probe.params.is_stop_or_eos(forced_tok, model_eos_ids)
+                    || probe
+                        .constraint
+                        .as_ref()
+                        .is_some_and(|c| c.eos_ids().contains(&forced_tok));
+                if is_stop {
+                    break;
+                }
+                probe.try_commit_token(forced_tok)?;
+                out.push(forced_tok);
+                continue;
+            }
+            if let Some(&cand) = drafts.get(idx) {
+                let stop_or_banned = if pos_before < probe.params.min_tokens {
+                    probe.is_token_soft_banned(cand, model_eos_ids)
+                } else {
+                    probe.params.is_stop_or_eos(cand, model_eos_ids)
+                } || probe
+                    .constraint
+                    .as_ref()
+                    .is_some_and(|c| c.eos_ids().contains(&cand) || !c.is_token_allowed(cand));
+                if !stop_or_banned {
+                    probe.try_commit_token(cand)?;
+                    out.push(cand);
+                    continue;
+                }
+            }
+            if let Some(sub_tok) = probe.first_allowed_draft_token(model_eos_ids, pos_before)? {
+                probe.try_commit_token(sub_tok)?;
+                out.push(sub_tok);
+            } else {
+                break;
+            }
+        }
+        *drafts = out;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

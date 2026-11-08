@@ -348,6 +348,11 @@ impl TokenBitmaskConstraint {
     }
 
     #[inline]
+    pub fn eos_ids(&self) -> &[i32] {
+        &self.eos_ids
+    }
+
+    #[inline]
     pub fn has_pending(&self) -> bool {
         self.pending_token.is_some()
     }
@@ -359,6 +364,85 @@ impl TokenBitmaskConstraint {
 
     pub fn committed_len(&self) -> usize {
         self.committed
+    }
+
+    /// Returns `Some(token_id)` when the active bitmask allows **exactly one** token across
+    /// the entire vocabulary (`popcount == 1`). Runs in $O(1)$ on non-singleton masks by
+    /// short-circuiting on the first word with $\ge 2$ bits set.
+    pub fn single_allowed_token(&self) -> Option<i32> {
+        debug_assert!(
+            self.pending_token.is_none(),
+            "materialize_pending() must run before checking single_allowed_token()"
+        );
+        let mut found = None;
+        for (word_idx, &word) in self.mask.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+            if !word.is_power_of_two() || found.is_some() {
+                return None;
+            }
+            let id = word_idx * 32 + word.trailing_zeros() as usize;
+            if id >= self.vocab_size {
+                return None;
+            }
+            found = Some(id as i32);
+        }
+        found
+    }
+
+    /// Returns the lowest-numbered grammar-allowed non-EOS token, if any.
+    pub fn first_allowed_non_eos_token(&self) -> Option<i32> {
+        debug_assert!(
+            self.pending_token.is_none(),
+            "materialize_pending() must run before checking first_allowed_non_eos_token()"
+        );
+        for (word_idx, &word) in self.mask.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let id = word_idx * 32 + bit;
+                if id >= self.vocab_size {
+                    return None;
+                }
+                let tok = id as i32;
+                if !self.eos_ids.contains(&tok) {
+                    return Some(tok);
+                }
+                w &= w - 1;
+            }
+        }
+        None
+    }
+
+    /// Computes the deterministic fast-forward ("jump-forward") non-EOS token sequence forced
+    /// by the grammar at the current state without mutating committed tokens.
+    pub fn compute_ff_tokens(&mut self) -> Result<Vec<i32>, String> {
+        self.materialize_pending()?;
+        if self.terminal_eos {
+            return Ok(Vec::new());
+        }
+        if let Some(matcher) = &mut self.matcher {
+            let raw = matcher.compute_ff_tokens();
+            if !raw.is_empty() {
+                let mut out = Vec::with_capacity(raw.len());
+                for id in raw {
+                    let tok = id as i32;
+                    if (id as usize) >= self.vocab_size || self.eos_ids.contains(&tok) {
+                        break;
+                    }
+                    out.push(tok);
+                }
+                if !out.is_empty() {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(self
+            .single_allowed_token()
+            .filter(|tok| !self.eos_ids.contains(tok))
+            .into_iter()
+            .collect())
     }
 
     pub fn current_bitmask(&self) -> Vec<u32> {

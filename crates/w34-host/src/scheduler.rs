@@ -399,7 +399,7 @@ impl SchedulerV1 {
         let mut batch = Vec::new();
         let mut budget = self.cfg.max_num_batched_tokens;
 
-        // 1. Prioritize decode steps (1 token per active post-prefill request).
+        // 1. Prioritize decode steps (1 token, or 1 + jump-forward forced tokens, per active post-prefill request).
         for seq in &self.active {
             if seq.finished || !seq.is_prefill_complete() {
                 continue;
@@ -411,19 +411,31 @@ impl SchedulerV1 {
                 continue;
             };
             let ctx_before = seq.radix_state.token_ids.len();
-            let planned = seq.radix_state.plan_checkpoints(1);
+            let total_emitted = seq.prompt_tokens.len() + seq.generated_tokens.len();
+            let unforwarded = total_emitted
+                .saturating_sub(ctx_before)
+                .clamp(1, seq.generated_tokens.len());
+            if unforwarded > budget {
+                break;
+            }
+            let query_tokens = if unforwarded == 1 {
+                vec![last_tok]
+            } else {
+                seq.generated_tokens[seq.generated_tokens.len() - unforwarded..].to_vec()
+            };
+            let planned = seq.radix_state.plan_checkpoints(query_tokens.len());
+            budget -= query_tokens.len();
             batch.push(ScheduledReqSlice {
                 req_id: seq.req_id,
                 is_prefill_chunk: false,
                 is_final_prefill_chunk: false,
                 ctx_len_before: ctx_before,
-                query_tokens: vec![last_tok],
+                query_tokens,
                 state_in_slot: seq.radix_state.current_state_in_slot(),
                 state_out_slot: seq.radix_state.active_state_slot,
                 has_initial_state: seq.radix_state.has_initial_state,
                 planned_checkpoints: planned,
             });
-            budget -= 1;
         }
 
         // 2. Schedule chunked prefill slices aligned to `mamba_chunk_size = 64`.
@@ -1082,5 +1094,47 @@ mod tests {
         assert!(sched.active.is_empty());
         assert_eq!(sched.radix.mamba_evictable_slots(), 1);
         assert_eq!(tiny_pool, vec![50]);
+    }
+
+    #[test]
+    fn test_scheduler_jump_forward_multi_token_decode_slice() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        let prompt: Vec<i32> = (0..62).collect();
+        sched.submit_request(prompt, 32, vec![]);
+        sched.admit_waiting(|_| Some((1, [2, 3])));
+        sched.active[0].radix_state.kv_pages = vec![0, 1, 2, 3, 4, 5];
+
+        // Prefill 62 prompt tokens and emit tok_0 = 500.
+        let pf = sched.schedule_step();
+        assert_eq!(pf.len(), 1);
+        assert!(pf[0].is_final_prefill_chunk);
+        sched.commit_slice(&pf[0], Some(500), || None);
+        assert_eq!(sched.active[0].radix_state.token_ids.len(), 62);
+        assert_eq!(sched.active[0].generated_tokens, vec![500]);
+
+        // Simulate jump-forward emitting 3 forced tokens [501, 502, 503] after 500.
+        sched.active[0].generated_tokens.extend([501, 502, 503]);
+
+        // Next schedule_step must coalesce all 4 un-forwarded tokens [500, 501, 502, 503]
+        // into a single decode slice (crossing the 64-token Mamba checkpoint at offset 2!).
+        let dec1 = sched.schedule_step();
+        assert_eq!(dec1.len(), 1);
+        assert!(!dec1[0].is_prefill_chunk);
+        assert_eq!(dec1[0].ctx_len_before, 62);
+        assert_eq!(dec1[0].query_tokens, vec![500, 501, 502, 503]);
+        assert_eq!(dec1[0].planned_checkpoints.len(), 1);
+        assert_eq!(dec1[0].planned_checkpoints[0].trigger_offset_1based, 2);
+        assert_eq!(dec1[0].planned_checkpoints[0].abs_seq_len, 64);
+
+        // Commit the 4-token slice and emit next sampled token 504.
+        sched.commit_slice(&dec1[0], Some(504), || None);
+        assert_eq!(sched.active[0].radix_state.token_ids.len(), 66);
+        assert_eq!(sched.active[0].radix_state.last_track_seqlen, Some(64));
+
+        // Next decode step without jump-forward schedules only [504].
+        let dec2 = sched.schedule_step();
+        assert_eq!(dec2.len(), 1);
+        assert_eq!(dec2[0].ctx_len_before, 66);
+        assert_eq!(dec2[0].query_tokens, vec![504]);
     }
 }

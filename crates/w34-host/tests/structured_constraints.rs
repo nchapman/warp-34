@@ -903,3 +903,155 @@ fn donor_qwen_xml_and_hermes_tool_oracle_parity() {
         );
     }
 }
+
+#[test]
+fn jump_forward_ff_tokens_and_speculative_draft_repair() {
+    use serde_json::json;
+    use w34_host::{
+        parser::{SamplerV1, SamplingParams},
+        tool_constraints::{ToolChoice, ToolFormat},
+    };
+    let (tok, factory) = setup();
+
+    // 1. JSON Schema property key & const value jump-forward (plus compact whitespace_flexible=false)
+    let const_schema = json!({
+        "type": "object",
+        "properties": {
+            "customer_status": { "const": "verified_active" }
+        },
+        "required": ["customer_status"],
+        "additionalProperties": false
+    });
+    let c_const = factory.json_schema(const_schema, false).unwrap();
+    let mut sampler_const = SamplerV1::new(SamplingParams::default(), &[], Some(c_const));
+    // Commit `{"` so the grammar enters the required property key `"customer_status"`
+    for &id in tok.encode("{\"", false).unwrap().get_ids() {
+        sampler_const.try_commit_token(id as i32).unwrap();
+    }
+    let (forced_key, stops) = sampler_const.collect_forced_drafts(64, 2, &[EOS]).unwrap();
+    assert!(!stops);
+    let key_str = tok
+        .decode(
+            &forced_key.iter().map(|&id| id as u32).collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(key_str, "customer_status\"");
+    for &id in &forced_key {
+        sampler_const.try_commit_token(id).unwrap();
+    }
+    // Commit `:"` to enter the const value `"verified_active"`
+    for &id in tok.encode(":\"", false).unwrap().get_ids() {
+        sampler_const.try_commit_token(id as i32).unwrap();
+    }
+    let (forced_val, _) = sampler_const.collect_forced_drafts(64, 20, &[EOS]).unwrap();
+    let val_str = tok
+        .decode(
+            &forced_val.iter().map(|&id| id as u32).collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(val_str, "verified_active\"");
+
+    // Also verify `compute_ff_tokens()` on a single-choice / deterministic literal constraint
+    let mut c_choice = factory
+        .choice(&["deterministic-output-token-span".into()], false)
+        .unwrap();
+    let ff = c_choice.compute_ff_tokens().unwrap();
+    assert_eq!(
+        tok.decode(&ff.iter().map(|&id| id as u32).collect::<Vec<_>>(), false)
+            .unwrap(),
+        "deterministic-output-token-span"
+    );
+
+    // 2. QwenXml tool call: forced prefix -> choice ("Paris" | "Rome") -> forced middle -> repair_and_force_drafts
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "forecast",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string", "enum": ["Paris", "Rome"] },
+                    "days": { "type": "integer", "minimum": 1, "maximum": 7 }
+                },
+                "required": ["city", "days"],
+                "additionalProperties": false
+            }
+        }
+    }]);
+    let c_xml = factory
+        .tools_with_options(
+            &tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml,
+            false,
+            false,
+        )
+        .unwrap();
+    let mut sampler = SamplerV1::new(SamplingParams::default(), &[], Some(c_xml));
+
+    // Commit `<tool_call>` (token 259) and `\n` so the grammar enters `<function=forecast>`
+    let open_ids = tok
+        .encode("<tool_call>\n<", false)
+        .unwrap()
+        .get_ids()
+        .to_vec();
+    for &id in &open_ids {
+        sampler.try_commit_token(id as i32).unwrap();
+    }
+    // Now `function=forecast>` is 100% forced!
+    let (forced_fn, stops) = sampler
+        .collect_forced_drafts(32, open_ids.len(), &[EOS])
+        .unwrap();
+    assert!(!stops);
+    let forced_fn_str = tok
+        .decode(
+            &forced_fn.iter().map(|&id| id as u32).collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(forced_fn_str, "function=forecast>");
+    for &id in &forced_fn {
+        sampler.try_commit_token(id).unwrap();
+    }
+
+    // Feed `\n<parameter=city>\n` so we are right at the `city` value (`Paris` | `Rome`)
+    for &id in tok.encode("\n<parameter=city>\n", false).unwrap().get_ids() {
+        sampler.try_commit_token(id as i32).unwrap();
+    }
+    // At the start of `city`, multiple options exist (`"Paris"`, `"Rome"`, `Paris`, `Rome`), so not forced
+    assert!(sampler.next_forced_token(&[EOS], 30).unwrap().is_none());
+
+    // Suppose the drafter proposes `Paris\n<` followed by garbage tokens `[0, 0, 0, 0]`:
+    // `repair_and_force_drafts` must keep `Paris\n<` and overwrite the garbage suffix
+    // with the forced closing tag `/parameter>`!
+    let mut drafts: Vec<i32> = tok
+        .encode("Paris\n<", false)
+        .unwrap()
+        .get_ids()
+        .iter()
+        .map(|&id| id as i32)
+        .collect();
+    let valid_prefix_len = drafts.len();
+    drafts.extend([0; 11]);
+    let k_budget = drafts.len();
+    sampler
+        .repair_and_force_drafts(&mut drafts, k_budget, 30, &[EOS])
+        .unwrap();
+    assert_eq!(
+        drafts.len(),
+        k_budget,
+        "repair_and_force_drafts must preserve full k_budget length for CUDA Graph verify"
+    );
+    let repaired_suffix = tok
+        .decode(
+            &drafts[valid_prefix_len..]
+                .iter()
+                .map(|&id| id as u32)
+                .collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap();
+    assert_eq!(repaired_suffix, "/parameter>");
+}

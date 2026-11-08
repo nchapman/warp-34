@@ -55,9 +55,14 @@ fn exercise_tool_choices(state: &Arc<OpenAiServerState>, kind: SpeculativeKind, 
                 _ => panic!("unexpected tool {call}"),
             }
         }
+        let snap = state.metrics.snapshot();
         println!(
-            "{kind:?}: tool_choice={choice}, schema-valid calls={}",
-            calls.len()
+            "{kind:?}: tool_choice={choice}, schema-valid calls={}, rounds={}, accepted={}/{:?}, gen_tokens={}",
+            calls.len(),
+            snap.speculation.rounds,
+            snap.speculation.accepted_tokens,
+            snap.speculation.draft_tokens,
+            snap.tokens.generated
         );
     }
 }

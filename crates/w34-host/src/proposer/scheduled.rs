@@ -176,53 +176,60 @@ impl NativeProposer {
             seq.max_new_tokens
                 .saturating_sub(seq.generated_tokens.len() + 1),
         );
-        let mut drafts = if pending_ingest.is_empty() {
-            self.propose(engine, anchor, k_budget)?
+        let (forced_drafts, stops_after_forced) = if use_gpu_sampler {
+            sampler
+                .collect_forced_drafts(
+                    k_budget,
+                    seq.generated_tokens.len(),
+                    &engine.cfg.eos_token_ids,
+                )
+                .map_err(|_| loader_err("forced draft grammar commit failed"))?
         } else {
-            let features = self.captured(engine)?;
-            let out =
-                self.ingest_and_propose(engine, pending_ingest, &features, anchor, k_budget)?;
-            pending_ingest.clear();
-            out
+            (Vec::new(), false)
         };
-        if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
-            let pos_before = seq.generated_tokens.len() + idx;
-            if pos_before < sampler.params.min_tokens {
-                sampler.is_token_soft_banned(*id, &engine.cfg.eos_token_ids)
+        let drafts = if use_gpu_sampler
+            && sampler.constraint.is_some()
+            && (forced_drafts.len() == k_budget || stops_after_forced)
+        {
+            if !pending_ingest.is_empty() {
+                let features = self.captured(engine)?;
+                self.ingest(engine, pending_ingest, &features)?;
+                pending_ingest.clear();
+            }
+            forced_drafts
+        } else {
+            let mut raw = if pending_ingest.is_empty() {
+                self.propose(engine, anchor, k_budget)?
             } else {
+                let features = self.captured(engine)?;
+                let out =
+                    self.ingest_and_propose(engine, pending_ingest, &features, anchor, k_budget)?;
+                pending_ingest.clear();
+                out
+            };
+            if use_gpu_sampler && sampler.constraint.is_some() {
                 sampler
-                    .params
-                    .is_stop_or_eos(*id, &engine.cfg.eos_token_ids)
-            }
-        }) {
-            drafts.truncate(eos);
-        }
-        if use_gpu_sampler {
-            let mut hypothetical = sampler.clone();
-            let mut valid = 0;
-            for &id in &drafts {
-                if hypothetical.materialize_pending_constraint().is_err()
-                    || hypothetical
-                        .constraint
-                        .as_ref()
-                        .is_some_and(|c| c.is_terminal_eos() || !c.is_token_allowed(id))
-                {
-                    break;
-                }
-                hypothetical
-                    .try_commit_token(id)
+                    .repair_and_force_drafts(
+                        &mut raw,
+                        k_budget,
+                        seq.generated_tokens.len(),
+                        &engine.cfg.eos_token_ids,
+                    )
                     .map_err(|_| loader_err("draft grammar commit failed"))?;
-                if hypothetical
-                    .constraint
-                    .as_ref()
-                    .is_some_and(|c| c.is_terminal_eos())
-                {
-                    break;
+            } else if let Some(eos) = raw.iter().enumerate().position(|(idx, id)| {
+                let pos_before = seq.generated_tokens.len() + idx;
+                if pos_before < sampler.params.min_tokens {
+                    sampler.is_token_soft_banned(*id, &engine.cfg.eos_token_ids)
+                } else {
+                    sampler
+                        .params
+                        .is_stop_or_eos(*id, &engine.cfg.eos_token_ids)
                 }
-                valid += 1;
+            }) {
+                raw.truncate(eos);
             }
-            drafts.truncate(valid);
-        }
+            raw
+        };
         let k = drafts.len();
         let mut verify = vec![anchor];
         verify.extend_from_slice(&drafts);
