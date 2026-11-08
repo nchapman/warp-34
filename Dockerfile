@@ -11,7 +11,7 @@ COPY dashboard/ ./
 RUN pnpm build
 
 # Keep the toolkit/cuBLAS version aligned with the proven warp3090 image.
-FROM nvidia/cuda:13.4.1-devel-ubuntu24.04@sha256:a3f014424ccc86cf66c84d700d2896491424205dd9457e3116ed4f0e96381311 AS build
+FROM nvidia/cuda:13.4.1-devel-ubuntu26.04@sha256:fe678162c7114158e170f2f727a7582162a3a55d7090ed31fac04f2dbc173378 AS build
 ENV CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:/root/.cargo/bin:$PATH \
     # Link against the driver stub without requiring a GPU during the build.
@@ -33,7 +33,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
 # Do not ship the multi-GB CUDA runtime image, toolkit, or driver stubs.
 # The host driver is injected by NVIDIA Container Toolkit with --gpus.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libstdc++6 curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \

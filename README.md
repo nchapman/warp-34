@@ -262,7 +262,7 @@ Clients can authenticate with either `Authorization: Bearer <key>` or `x-api-key
 
 ## Docker
 
-Images are built and published to GHCR on every push to `main` (`ghcr.io/nchapman/warp-34:dev` and `:sha-<commit>`) and on `v*` release tags (`:latest`, `:X.Y.Z`, `:X.Y`), or you can build locally (`~1.22 GB` runtime image containing only `w34`, `libcudart`, `libcublas`, and `libcublasLt` on Ubuntu 24.04—no Python, CUDA toolkit, or model weights bundled):
+Images are built and published to GHCR on every push to `main` (`ghcr.io/nchapman/warp-34:dev` and `:sha-<commit>`) and on `v*` release tags (`:latest`, `:X.Y.Z`, `:X.Y`), or you can build locally (`~1.22 GB` runtime image containing only `w34`, `libcudart`, `libcublas`, and `libcublasLt` on Ubuntu 26.04—no Python, CUDA toolkit, or model weights bundled):
 
 ```sh
 docker pull ghcr.io/nchapman/warp-34:dev
