@@ -533,14 +533,14 @@ pub(super) fn eval_expert_prefill(
 
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_op_in_unsafe_fn)]
-mod simd {
+pub(crate) mod simd {
     use super::*;
     use std::arch::x86_64::*;
 
     #[target_feature(enable = "avx2")]
     #[inline]
     #[allow(clippy::too_many_arguments, clippy::identity_op, clippy::erasing_op)]
-    unsafe fn transpose_8x8_avx2(
+    pub(crate) unsafe fn transpose_8x8_avx2(
         r0: __m256,
         r1: __m256,
         r2: __m256,
@@ -604,7 +604,7 @@ mod simd {
     }
 
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn prepare_x_perm_avx2(x: &[f32], xp: &mut [f32], xg: &mut [f32]) {
+    pub(crate) unsafe fn prepare_x_perm_avx2(x: &[f32], xp: &mut [f32], xg: &mut [f32]) {
         for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
             let p = src.as_ptr();
             let d = xp.as_mut_ptr().add(g * 128);
@@ -639,7 +639,7 @@ mod simd {
     }
 
     #[target_feature(enable = "avx2")]
-    pub(super) unsafe fn prepare_x_perm_avx2_g64(x: &[f32], xp: &mut [f32], xg: &mut [f32]) {
+    pub(crate) unsafe fn prepare_x_perm_avx2_g64(x: &[f32], xp: &mut [f32], xg: &mut [f32]) {
         for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
             let p = src.as_ptr();
             let d = xp.as_mut_ptr().add(g * 128);
@@ -678,113 +678,114 @@ mod simd {
         }
     }
 
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn sum8_seq_avx2(mut acc: f32, v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps::<1>(v);
+        acc += _mm_cvtss_f32(lo);
+        acc += _mm_cvtss_f32(_mm_shuffle_ps::<0x55>(lo, lo));
+        acc += _mm_cvtss_f32(_mm_movehl_ps(lo, lo));
+        acc += _mm_cvtss_f32(_mm_shuffle_ps::<0xff>(lo, lo));
+        acc += _mm_cvtss_f32(hi);
+        acc += _mm_cvtss_f32(_mm_shuffle_ps::<0x55>(hi, hi));
+        acc += _mm_cvtss_f32(_mm_movehl_ps(hi, hi));
+        acc += _mm_cvtss_f32(_mm_shuffle_ps::<0xff>(hi, hi));
+        acc
+    }
+
     #[target_feature(enable = "avx2,fma,f16c")]
-    pub(super) unsafe fn prepare_x_perm_f16c(x: &[u16], xp: &mut [f32], xg: &mut [f32]) {
-        let mut group = [0.0f32; 128];
+    pub(crate) unsafe fn prepare_x_perm_f16c(x: &[u16], xp: &mut [f32], xg: &mut [f32]) {
         for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
             let p = src.as_ptr();
             let d = xp.as_mut_ptr().add(g * 128);
-            let r0 = _mm256_cvtph_ps(_mm_loadu_si128(p.cast()));
-            let r1 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(8).cast()));
-            let r2 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(16).cast()));
-            let r3 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(24).cast()));
-            let r4 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(32).cast()));
-            let r5 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(40).cast()));
-            let r6 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(48).cast()));
-            let r7 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(56).cast()));
-            _mm256_storeu_ps(group.as_mut_ptr(), r0);
-            _mm256_storeu_ps(group.as_mut_ptr().add(8), r1);
-            _mm256_storeu_ps(group.as_mut_ptr().add(16), r2);
-            _mm256_storeu_ps(group.as_mut_ptr().add(24), r3);
-            _mm256_storeu_ps(group.as_mut_ptr().add(32), r4);
-            _mm256_storeu_ps(group.as_mut_ptr().add(40), r5);
-            _mm256_storeu_ps(group.as_mut_ptr().add(48), r6);
-            _mm256_storeu_ps(group.as_mut_ptr().add(56), r7);
-            transpose_8x8_avx2(r0, r1, r2, r3, r4, r5, r6, r7, d);
-
-            let r8 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(64).cast()));
-            let r9 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(72).cast()));
-            let r10 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(80).cast()));
-            let r11 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(88).cast()));
-            let r12 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(96).cast()));
-            let r13 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(104).cast()));
-            let r14 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(112).cast()));
-            let r15 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(120).cast()));
-            _mm256_storeu_ps(group.as_mut_ptr().add(64), r8);
-            _mm256_storeu_ps(group.as_mut_ptr().add(72), r9);
-            _mm256_storeu_ps(group.as_mut_ptr().add(80), r10);
-            _mm256_storeu_ps(group.as_mut_ptr().add(88), r11);
-            _mm256_storeu_ps(group.as_mut_ptr().add(96), r12);
-            _mm256_storeu_ps(group.as_mut_ptr().add(104), r13);
-            _mm256_storeu_ps(group.as_mut_ptr().add(112), r14);
-            _mm256_storeu_ps(group.as_mut_ptr().add(120), r15);
-            transpose_8x8_avx2(r8, r9, r10, r11, r12, r13, r14, r15, d.add(8));
-
+            transpose_8x8_avx2(
+                _mm256_cvtph_ps(_mm_loadu_si128(p.cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(8).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(16).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(24).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(32).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(40).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(48).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(56).cast())),
+                d,
+            );
+            transpose_8x8_avx2(
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(64).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(72).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(80).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(88).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(96).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(104).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(112).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(120).cast())),
+                d.add(8),
+            );
             let mut sum = 0.0f32;
-            for v in group {
-                sum += v;
+            for half in 0..2 {
+                let mut off = half * 64;
+                core::arch::asm!(
+                    "/* {0} */",
+                    inout(reg) off,
+                    options(nomem, nostack, preserves_flags),
+                );
+                let hp = p.add(off);
+                for i in 0..8 {
+                    sum =
+                        sum8_seq_avx2(sum, _mm256_cvtph_ps(_mm_loadu_si128(hp.add(i * 8).cast())));
+                }
             }
             *xg.get_unchecked_mut(g) = sum;
         }
     }
 
     #[target_feature(enable = "avx2,fma,f16c")]
-    pub(super) unsafe fn prepare_x_perm_f16c_g64(x: &[u16], xp: &mut [f32], xg: &mut [f32]) {
-        let mut group = [0.0f32; 128];
+    pub(crate) unsafe fn prepare_x_perm_f16c_g64(x: &[u16], xp: &mut [f32], xg: &mut [f32]) {
         for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
             let p = src.as_ptr();
             let d = xp.as_mut_ptr().add(g * 128);
-            let r0 = _mm256_cvtph_ps(_mm_loadu_si128(p.cast()));
-            let r1 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(8).cast()));
-            let r2 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(16).cast()));
-            let r3 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(24).cast()));
-            let r4 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(32).cast()));
-            let r5 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(40).cast()));
-            let r6 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(48).cast()));
-            let r7 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(56).cast()));
-            _mm256_storeu_ps(group.as_mut_ptr(), r0);
-            _mm256_storeu_ps(group.as_mut_ptr().add(8), r1);
-            _mm256_storeu_ps(group.as_mut_ptr().add(16), r2);
-            _mm256_storeu_ps(group.as_mut_ptr().add(24), r3);
-            _mm256_storeu_ps(group.as_mut_ptr().add(32), r4);
-            _mm256_storeu_ps(group.as_mut_ptr().add(40), r5);
-            _mm256_storeu_ps(group.as_mut_ptr().add(48), r6);
-            _mm256_storeu_ps(group.as_mut_ptr().add(56), r7);
-            transpose_8x8_avx2(r0, r1, r2, r3, r4, r5, r6, r7, d);
-
-            let r8 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(64).cast()));
-            let r9 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(72).cast()));
-            let r10 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(80).cast()));
-            let r11 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(88).cast()));
-            let r12 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(96).cast()));
-            let r13 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(104).cast()));
-            let r14 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(112).cast()));
-            let r15 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(120).cast()));
-            _mm256_storeu_ps(group.as_mut_ptr().add(64), r8);
-            _mm256_storeu_ps(group.as_mut_ptr().add(72), r9);
-            _mm256_storeu_ps(group.as_mut_ptr().add(80), r10);
-            _mm256_storeu_ps(group.as_mut_ptr().add(88), r11);
-            _mm256_storeu_ps(group.as_mut_ptr().add(96), r12);
-            _mm256_storeu_ps(group.as_mut_ptr().add(104), r13);
-            _mm256_storeu_ps(group.as_mut_ptr().add(112), r14);
-            _mm256_storeu_ps(group.as_mut_ptr().add(120), r15);
-            transpose_8x8_avx2(r8, r9, r10, r11, r12, r13, r14, r15, d.add(8));
-
-            let mut sum_lo = 0.0f32;
-            for &v in &group[..64] {
-                sum_lo += v;
+            transpose_8x8_avx2(
+                _mm256_cvtph_ps(_mm_loadu_si128(p.cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(8).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(16).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(24).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(32).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(40).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(48).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(56).cast())),
+                d,
+            );
+            transpose_8x8_avx2(
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(64).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(72).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(80).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(88).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(96).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(104).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(112).cast())),
+                _mm256_cvtph_ps(_mm_loadu_si128(p.add(120).cast())),
+                d.add(8),
+            );
+            for half in 0..2 {
+                let mut off = half * 64;
+                core::arch::asm!(
+                    "/* {0} */",
+                    inout(reg) off,
+                    options(nomem, nostack, preserves_flags),
+                );
+                let hp = p.add(off);
+                let mut sum = 0.0f32;
+                for i in 0..8 {
+                    sum =
+                        sum8_seq_avx2(sum, _mm256_cvtph_ps(_mm_loadu_si128(hp.add(i * 8).cast())));
+                }
+                *xg.get_unchecked_mut(2 * g + half) = sum;
             }
-            let mut sum_hi = 0.0f32;
-            for &v in &group[64..] {
-                sum_hi += v;
-            }
-            *xg.get_unchecked_mut(2 * g) = sum_lo;
-            *xg.get_unchecked_mut(2 * g + 1) = sum_hi;
         }
     }
 
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn hadamard64_f32_avx2(slice: &mut [f32]) {
+    pub(crate) unsafe fn hadamard64_f32_avx2(slice: &mut [f32]) {
         let sign_h1 = _mm256_setr_ps(1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0);
         let sign_h2 = _mm256_setr_ps(1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0);
         let sign_h4 = _mm256_setr_ps(1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0);
@@ -881,7 +882,7 @@ mod simd {
     // before `acc_hi` so the working set stays within the 16 YMM architectural registers.
     #[target_feature(enable = "avx2,fma,f16c")]
     #[allow(clippy::cognitive_complexity, clippy::needless_range_loop)]
-    unsafe fn row_tile_avx2<const R: usize, const T: usize, const G64: bool>(
+    pub(crate) unsafe fn row_tile_avx2<const R: usize, const T: usize, const G64: bool>(
         w: [&[u32]; R],
         s: [&[u16]; R],
         xp: &[f32],
@@ -1184,7 +1185,7 @@ mod simd {
     // keeping `R * T <= 8` (`<= 30` ZMM registers) 100% register-resident with zero spills.
     #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
     #[allow(clippy::cognitive_complexity, clippy::needless_range_loop)]
-    unsafe fn row_tile<const R: usize, const T: usize, const G64: bool>(
+    pub(crate) unsafe fn row_tile<const R: usize, const T: usize, const G64: bool>(
         w: [&[u32]; R],
         s: [&[u16]; R],
         xp: &[f32],
@@ -1213,10 +1214,10 @@ mod simd {
                     scale_hi[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
                         *s[r].get_unchecked(2 * g + 1) as i32,
                     )));
-                    vscale[r] = _mm512_insertf32x8::<1>(
-                        _mm512_castps256_ps512(_mm256_set1_ps(scale_lo[r])),
-                        _mm256_set1_ps(scale_hi[r]),
-                    );
+                    vscale[r] = _mm512_castpd_ps(_mm512_insertf64x4::<1>(
+                        _mm512_castps_pd(_mm512_castps256_ps512(_mm256_set1_ps(scale_lo[r]))),
+                        _mm256_castps_pd(_mm256_set1_ps(scale_hi[r])),
+                    ));
                 } else {
                     scale_lo[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
                         *s[r].get_unchecked(g) as i32,
@@ -1348,7 +1349,7 @@ mod simd {
     }
 
     #[target_feature(enable = "avx2,fma,f16c")]
-    pub(super) unsafe fn expert_avx2(
+    pub(crate) unsafe fn expert_avx2(
         d: ExpertLayout<'_>,
         range: Range<usize>,
         [xp, xg]: [&[f32]; 2],
@@ -1427,7 +1428,7 @@ mod simd {
     }
 
     #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
-    pub(super) unsafe fn expert_avx512(
+    pub(crate) unsafe fn expert_avx512(
         d: ExpertLayout<'_>,
         range: Range<usize>,
         [xp, xg]: [&[f32]; 2],
@@ -1547,378 +1548,5 @@ mod simd {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn permutation_and_sequential_sum() {
-        let mut x = [1.0f32; 256];
-        x[0] = 1e20;
-        x[1] = -1e20;
-        let mut xp = [0.0; 256];
-        let mut xg = [0.0; 2];
-        prepare_x_perm(&x, &mut xp, &mut xg).unwrap();
-        assert_eq!(xg, [126.0, 128.0]);
-        let mut xp_port = [0.0; 256];
-        let mut xg_port = [0.0; 2];
-        prepare_x_perm_portable(&x, &mut xp_port, &mut xg_port).unwrap();
-        assert_eq!(xp, xp_port);
-        assert_eq!(xg, xg_port);
-        let mut xp_g64 = [0.0; 256];
-        let mut xg_g64 = [0.0; 4];
-        let mut xp_g64_port = [0.0; 256];
-        let mut xg_g64_port = [0.0; 4];
-        prepare_x_perm_grouped(&x, 64, &mut xp_g64, &mut xg_g64).unwrap();
-        prepare_x_perm_grouped_portable(&x, 64, &mut xp_g64_port, &mut xg_g64_port).unwrap();
-        assert_eq!(xp_g64, xp_g64_port);
-        assert_eq!(xg_g64, xg_g64_port);
-        let mut had_simd: Vec<f32> = (0..128)
-            .map(|k| ((k * 37 % 103) as f32 - 51.0) / 16.0)
-            .collect();
-        let mut had_port = had_simd.clone();
-        hadamard64_f32_inplace(&mut had_simd);
-        hadamard64_f32_portable(&mut had_port);
-        assert_eq!(
-            had_simd.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            had_port.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        for g in 0..2 {
-            for l in 0..16 {
-                for b in 0..8 {
-                    assert_eq!(xp[g * 128 + b * 16 + l], x[g * 128 + l * 8 + b]);
-                }
-            }
-        }
-        assert_eq!(
-            prepare_x_perm(&x[..127], &mut xp, &mut xg),
-            Err(EvalError::InvalidShape)
-        );
-        assert_eq!(scratch_len(usize::MAX, 2), None);
-    }
-
-    #[test]
-    fn direct_fp16_preparation_matches_fp32_for_all_finite_half_values() {
-        let input = (0..=u16::MAX)
-            .filter(|v| v & 0x7c00 != 0x7c00)
-            .collect::<Vec<_>>();
-        let x = input
-            .iter()
-            .map(|&v| crate::cuda::f16_to_f32(v))
-            .collect::<Vec<_>>();
-        let mut xp = vec![0.; x.len()];
-        let mut xg = vec![0.; x.len() / 128];
-        prepare_x_perm(&x, &mut xp, &mut xg).unwrap();
-        let mut hp = vec![0.; x.len()];
-        let mut hg = vec![0.; x.len() / 128];
-        prepare_x_perm_f16(&input, &mut hp, &mut hg).unwrap();
-        let mut hp_port = vec![0.; x.len()];
-        let mut hg_port = vec![0.; x.len() / 128];
-        prepare_x_perm_f16_portable(&input, &mut hp_port, &mut hg_port).unwrap();
-        assert_eq!(
-            xp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            hp.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            hp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            hp_port.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(xg, hg);
-        assert_eq!(hg, hg_port);
-        let mut hp_g64 = vec![0.; x.len()];
-        let mut hg_g64 = vec![0.; x.len() / 64];
-        let mut hp_g64_port = vec![0.; x.len()];
-        let mut hg_g64_port = vec![0.; x.len() / 64];
-        prepare_x_perm_f16_grouped(&input, 64, &mut hp_g64, &mut hg_g64).unwrap();
-        prepare_x_perm_f16_grouped_portable(&input, 64, &mut hp_g64_port, &mut hg_g64_port)
-            .unwrap();
-        assert_eq!(
-            hp_g64.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            hp_g64_port.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        assert_eq!(hg_g64, hg_g64_port);
-        assert_eq!(
-            prepare_x_perm_f16(&input[..127], &mut hp, &mut hg),
-            Err(EvalError::InvalidShape)
-        );
-    }
-
-    fn words(n: usize, seed: u32) -> Vec<u32> {
-        let mut state = seed;
-        (0..n)
-            .map(|_| {
-                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                state
-            })
-            .collect()
-    }
-    // Independent ordinary dequantized dot product; fixtures use scale=2^-7.
-    fn dot(w: &[u32], x: &[f32]) -> f32 {
-        x.iter()
-            .enumerate()
-            .map(|(c, v)| (((w[c / 8] >> (4 * (c % 8))) & 15) as f32 - 8.0) * (1.0 / 128.0) * v)
-            .sum()
-    }
-    #[test]
-    fn expert_scalar_and_tile_agreement() {
-        let h = 256;
-        let i = 256;
-        let gu = words(2 * i * h / 8, 5);
-        let dn = words(h * i / 8, 19);
-        let gs = vec![0x2000; 2 * i * h / 128];
-        let ds = vec![0x2000; h * i / 128];
-        let d = ExpertLayout {
-            hidden: h,
-            intermediate: i,
-            group_size: 128,
-            down_hadamard: 0,
-            gate_up_words: &gu,
-            gate_up_scales: &gs,
-            down_words: &dn,
-            down_scales: &ds,
-        };
-        for nt in [1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 96] {
-            let x: Vec<_> = (0..nt * h)
-                .map(|j| ((j * 17 % 101) as f32 - 50.0) / 100.0)
-                .collect();
-            let wt: Vec<_> = (0..nt)
-                .map(|t| if t % 2 == 0 { 0.7 } else { -0.2 })
-                .collect();
-            let mut xp = vec![0.0; nt * h];
-            let mut xg = vec![0.0; nt * h / 128];
-            for t in 0..nt {
-                prepare_x_perm(
-                    &x[t * h..(t + 1) * h],
-                    &mut xp[t * h..(t + 1) * h],
-                    &mut xg[t * h / 128..(t + 1) * h / 128],
-                )
-                .unwrap();
-            }
-            let mut out = vec![0.0; nt * h];
-            let mut scratch = vec![0.0; scratch_len(nt, 2).unwrap()];
-            eval_expert_prefill(d, &xp, &xg, &wt, &mut out, &mut scratch).unwrap();
-            let mut out_portable = vec![0.0; nt * h];
-            expert_portable(d, 0..2, &xp, &xg, &wt, &mut out_portable, &mut scratch);
-            assert_eq!(
-                out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                out_portable.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "portable and SIMD prefill diverged at nt={nt}"
-            );
-            #[cfg(target_arch = "x86_64")]
-            if supported() {
-                let mut out_avx2 = vec![0.0; nt * h];
-                // SAFETY: `supported()` verified AVX2 + FMA + F16C and buffer bounds above.
-                unsafe {
-                    simd::expert_avx2(d, 0..2, [&xp, &xg], &wt, &mut out_avx2, &mut scratch);
-                }
-                assert_eq!(
-                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    out_avx2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    "AVX2 and AVX512 (tile=true) diverged at nt={nt}"
-                );
-                if nt <= 4
-                    && std::is_x86_feature_detected!("avx512f")
-                    && std::is_x86_feature_detected!("avx512vl")
-                {
-                    let mut slice_avx512 = vec![0.0; nt * h];
-                    let mut slice_avx2 = vec![0.0; nt * h];
-                    // SAFETY: runtime AVX-512 + AVX2 guards and buffer bounds verified above.
-                    unsafe {
-                        simd::expert_avx512(
-                            d,
-                            0..2,
-                            [&xp, &xg],
-                            &wt,
-                            &mut slice_avx512,
-                            &mut scratch,
-                            false,
-                        );
-                        simd::expert_avx2(d, 0..2, [&xp, &xg], &wt, &mut slice_avx2, &mut scratch);
-                    }
-                    assert_eq!(
-                        slice_avx512.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        slice_avx2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        "AVX2 and AVX512 (tile=false) diverged at nt={nt}"
-                    );
-                }
-            }
-            for t in 0..nt {
-                let act: Vec<_> = (0..i)
-                    .map(|r| {
-                        let g = dot(&gu[r * h / 8..], &x[t * h..(t + 1) * h]);
-                        let u = dot(&gu[(i + r) * h / 8..], &x[t * h..(t + 1) * h]);
-                        (g / (1.0 + (-g).exp())) * u
-                    })
-                    .collect();
-                for r in 0..h {
-                    let expected = wt[t] * dot(&dn[r * i / 8..], &act);
-                    assert!((out[t * h + r] - expected).abs() < 2e-5, "t={t}, r={r}");
-                }
-            }
-            if nt <= 4 {
-                let mut full = vec![0.0; nt * h];
-                eval_expert_slice(d, 0..2, &xp, &xg, &wt, &mut full, &mut scratch).unwrap();
-                assert_eq!(full, out);
-                let mut a = vec![0.0; nt * h];
-                let mut b = a.clone();
-                eval_expert_slice(d, 0..1, &xp, &xg, &wt, &mut a, &mut scratch).unwrap();
-                eval_expert_slice(d, 1..2, &xp, &xg, &wt, &mut b, &mut scratch).unwrap();
-                for j in 0..out.len() {
-                    assert!((a[j] + b[j] - out[j]).abs() < 2e-5);
-                }
-            }
-        }
-        let mut out = [0.0; 256];
-        assert_eq!(
-            eval_expert_slice(d, 0..2, &[], &[], &[1.0], &mut out, &mut []),
-            Err(EvalError::InvalidShape)
-        );
-    }
-
-    #[test]
-    fn expert_g64_hadamard64_scalar_and_tile_agreement() {
-        let h = 256;
-        let i = 256;
-        let gu = words(2 * i * h / 8, 11);
-        let dn = words(h * i / 8, 29);
-        let gs: Vec<u16> = (0..(2 * i * h / 64))
-            .map(|k| if k % 2 == 0 { 0x2000 } else { 0x2400 })
-            .collect();
-        let ds: Vec<u16> = (0..(h * i / 64))
-            .map(|k| if k % 2 == 0 { 0x2000 } else { 0x1c00 })
-            .collect();
-        let dot_g64 = |w: &[u32], s: &[u16], x: &[f32]| -> f32 {
-            x.iter()
-                .enumerate()
-                .map(|(c, v)| {
-                    let scale = crate::cuda::f16_to_f32(s[c / 64]);
-                    (((w[c / 8] >> (4 * (c % 8))) & 15) as f32 - 8.0) * scale * v
-                })
-                .sum()
-        };
-        for (group_size, down_hadamard) in [(64, 64), (64, 0), (128, 64)] {
-            let d = ExpertLayout {
-                hidden: h,
-                intermediate: i,
-                group_size,
-                down_hadamard,
-                gate_up_words: &gu,
-                gate_up_scales: &gs,
-                down_words: &dn,
-                down_scales: &ds,
-            };
-            for nt in [1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 96] {
-                let x_f16: Vec<u16> = (0..nt * h)
-                    .map(|j| crate::cuda::f32_to_f16(((j * 17 % 101) as f32 - 50.0) / 100.0))
-                    .collect();
-                let x: Vec<f32> = x_f16.iter().map(|&b| crate::cuda::f16_to_f32(b)).collect();
-                let wt: Vec<_> = (0..nt)
-                    .map(|t| if t % 2 == 0 { 0.7 } else { -0.2 })
-                    .collect();
-                let mut xp = vec![0.0; nt * h];
-                let mut xg = vec![0.0; nt * h / group_size];
-                let mut xp_f16 = vec![0.0; nt * h];
-                let mut xg_f16 = vec![0.0; nt * h / group_size];
-                for t in 0..nt {
-                    prepare_x_perm_grouped(
-                        &x[t * h..(t + 1) * h],
-                        group_size,
-                        &mut xp[t * h..(t + 1) * h],
-                        &mut xg[t * h / group_size..(t + 1) * h / group_size],
-                    )
-                    .unwrap();
-                    prepare_x_perm_f16_grouped(
-                        &x_f16[t * h..(t + 1) * h],
-                        group_size,
-                        &mut xp_f16[t * h..(t + 1) * h],
-                        &mut xg_f16[t * h / group_size..(t + 1) * h / group_size],
-                    )
-                    .unwrap();
-                }
-                assert_eq!(xp, xp_f16);
-                assert_eq!(xg, xg_f16);
-                let mut out = vec![0.0; nt * h];
-                let mut scratch = vec![0.0; scratch_len(nt, 2).unwrap()];
-                eval_expert_prefill(d, &xp, &xg, &wt, &mut out, &mut scratch).unwrap();
-                let mut out_portable = vec![0.0; nt * h];
-                expert_portable(d, 0..2, &xp, &xg, &wt, &mut out_portable, &mut scratch);
-                let ref_bits: Vec<u32> = out_portable.iter().map(|v| v.to_bits()).collect();
-                assert_eq!(
-                    out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    ref_bits,
-                    "gs={group_size} had={down_hadamard} portable and SIMD prefill diverged at nt={nt}"
-                );
-                #[cfg(target_arch = "x86_64")]
-                if supported() {
-                    let mut out_avx2 = vec![0.0; nt * h];
-                    // SAFETY: `supported()` verified AVX2 + FMA + F16C and buffer bounds above.
-                    unsafe {
-                        simd::expert_avx2(d, 0..2, [&xp, &xg], &wt, &mut out_avx2, &mut scratch);
-                    }
-                    assert_eq!(
-                        out_avx2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                        ref_bits,
-                        "gs={group_size} had={down_hadamard} AVX2 diverged at nt={nt}"
-                    );
-                    if std::is_x86_feature_detected!("avx512f")
-                        && std::is_x86_feature_detected!("avx512vl")
-                    {
-                        for tile in [false, true] {
-                            let mut out_512 = vec![0.0; nt * h];
-                            // SAFETY: runtime AVX-512 guards and buffer bounds verified above.
-                            unsafe {
-                                simd::expert_avx512(
-                                    d,
-                                    0..2,
-                                    [&xp, &xg],
-                                    &wt,
-                                    &mut out_512,
-                                    &mut scratch,
-                                    tile,
-                                );
-                            }
-                            assert_eq!(
-                                out_512.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                                ref_bits,
-                                "gs={group_size} had={down_hadamard} AVX512 tile={tile} diverged at nt={nt}"
-                            );
-                        }
-                    }
-                }
-                if group_size == 64 && down_hadamard == 64 && nt <= 32 {
-                    for t in 0..nt {
-                        let mut act: Vec<_> = (0..i)
-                            .map(|r| {
-                                let g = dot_g64(
-                                    &gu[r * h / 8..],
-                                    &gs[r * h / 64..],
-                                    &x[t * h..(t + 1) * h],
-                                );
-                                let u = dot_g64(
-                                    &gu[(i + r) * h / 8..],
-                                    &gs[(i + r) * h / 64..],
-                                    &x[t * h..(t + 1) * h],
-                                );
-                                (g / (1.0 + (-g).exp())) * u
-                            })
-                            .collect();
-                        hadamard64_f32_inplace(&mut act);
-                        for r in 0..h {
-                            let expected =
-                                wt[t] * dot_g64(&dn[r * i / 8..], &ds[r * i / 64..], &act);
-                            assert!((out[t * h + r] - expected).abs() < 4e-5, "t={t}, r={r}");
-                        }
-                    }
-                }
-                if nt <= 4 {
-                    let mut a = vec![0.0; nt * h];
-                    let mut b = a.clone();
-                    eval_expert_slice(d, 0..1, &xp, &xg, &wt, &mut a, &mut scratch).unwrap();
-                    eval_expert_slice(d, 1..2, &xp, &xg, &wt, &mut b, &mut scratch).unwrap();
-                    for j in 0..out.len() {
-                        assert!((a[j] + b[j] - out[j]).abs() < 4e-5);
-                    }
-                }
-            }
-        }
-    }
-}
+#[path = "eval_tests.rs"]
+mod tests;
