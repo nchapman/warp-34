@@ -42,6 +42,34 @@ pub struct SafetensorsArchive {
 }
 
 impl SafetensorsArchive {
+    /// Advises the OS kernel that cached file pages for non-PLE `.safetensors`
+    /// shards are no longer needed (`POSIX_FADV_DONTNEED`), preventing 60+ GiB of
+    /// one-shot expert/backbone reads from evicting live host expert tables or
+    /// memory-mapped PLE shards (`model-ple*`).
+    pub fn drop_page_cache(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            for (name, file) in &self.files {
+                if name.contains("ple")
+                    || self.entries.values().any(|info| {
+                        info.shard_file == *name
+                            && info
+                                .name
+                                .contains(".ple.ple_embedding.ngram_embedding.shard_")
+                    })
+                {
+                    continue;
+                }
+                // SAFETY: `file.as_raw_fd()` is a valid open file descriptor owned by `self`,
+                // and `POSIX_FADV_DONTNEED` with offset=0, len=0 is a safe non-destructive hint.
+                unsafe {
+                    let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+                }
+            }
+        }
+    }
+
     /// Directory containing this archive, if opened from a path on disk.
     pub fn base_dir(&self) -> Option<&Path> {
         self.base_dir.as_deref()

@@ -61,7 +61,10 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     const __half* __restrict__ x_f16,
     const int32_t* __restrict__ global_topk_ids,
     const float* __restrict__ topk_weights,
-    const int32_t* __restrict__ expert_to_slot,
+    int32_t* __restrict__ expert_to_slot,
+    int32_t* __restrict__ slot_to_expert,
+    uint64_t* __restrict__ slot_last_used,
+    uint64_t* __restrict__ step_counter,
     int32_t* __restrict__ remapped_topk_ids,
     int32_t* __restrict__ miss_local_experts,
     int32_t* __restrict__ miss_victim_slots,
@@ -82,7 +85,13 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
 
     const int total_pairs = num_tokens * top_k;
     if (threadIdx.x == 0) {
+        const uint64_t step = (*step_counter) + 1;
+        *step_counter = step;
+
         int32_t distinct_cold[kMaxPairs];
+        int32_t distinct_ge[kMaxPairs];
+        int32_t cold_hits[kMaxPairs];
+        int32_t cold_score[kMaxPairs];
         int n_cold = 0;
 
         for (int p = 0; p < total_pairs; ++p) {
@@ -95,31 +104,93 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             }
             const int le = (int)le64;
             const int slot = expert_to_slot[le];
-            if (slot >= 0 && slot < k_static) {
+            if (slot >= 0 && slot < k_hot) {
                 remapped_topk_ids[p] = slot;
+                if (slot >= k_static) {
+                    slot_last_used[slot] = step;
+                }
                 s_cpu_le[p] = -1;
             } else {
                 int c_idx = 0;
                 while (c_idx < n_cold && distinct_cold[c_idx] != le) ++c_idx;
                 if (c_idx == n_cold) {
-                    distinct_cold[n_cold++] = le;
+                    distinct_cold[n_cold] = le;
+                    distinct_ge[n_cold] = ge;
+                    cold_hits[n_cold] = 0;
+                    cold_score[n_cold] = 0;
+                    n_cold++;
                 }
+                cold_hits[c_idx] += 1;
+                cold_score[c_idx] += (p < top_k) ? 4 : 2;
                 // Temporarily store `-2 - c_idx` to mark the cold rank `c_idx`.
                 remapped_topk_ids[p] = -2 - c_idx;
             }
         }
 
         const int max_gpu_stage = (k_hot > k_static) ? (k_hot - k_static) : 0;
-        int n_gpu_cold = (n_cold >= 7) ? (int)(n_cold * gpu_share_frac) : 0;
-        if (n_gpu_cold > 2) n_gpu_cold = 2;
-        if (n_gpu_cold > max_gpu_stage) n_gpu_cold = max_gpu_stage;
-        if (n_gpu_cold > n_cold) n_gpu_cold = n_cold;
-        const int n_cpu_cold = n_cold - n_gpu_cold;
-
-        for (int m = 0; m < n_gpu_cold; ++m) {
-            miss_local_experts[m] = distinct_cold[m];
-            miss_victim_slots[m] = k_static + m;
+        const int max_pull = (max_gpu_stage < 2) ? max_gpu_stage : 2;
+        int want_gpu_cold = 0;
+        if (max_pull > 0 && gpu_share_frac > 0.0f) {
+            if (n_cold >= 7) {
+                want_gpu_cold = 2;
+            } else if (n_cold >= 4) {
+                want_gpu_cold = 1;
+            } else {
+                for (int c = 0; c < n_cold; ++c) {
+                    if (cold_hits[c] >= 2) {
+                        want_gpu_cold++;
+                    }
+                }
+            }
+            if (want_gpu_cold > max_pull) want_gpu_cold = max_pull;
+            if (want_gpu_cold > n_cold) want_gpu_cold = n_cold;
         }
+
+        int32_t cold_assigned_slot[kMaxPairs];
+        for (int c = 0; c < n_cold; ++c) {
+            cold_assigned_slot[c] = -1;
+        }
+
+        int n_gpu_cold = 0;
+        for (int m = 0; m < want_gpu_cold; ++m) {
+            int best_c = -1;
+            int best_score = -1;
+            for (int c = 0; c < n_cold; ++c) {
+                if (cold_assigned_slot[c] < 0 && cold_score[c] > best_score) {
+                    best_score = cold_score[c];
+                    best_c = c;
+                }
+            }
+            if (best_c < 0) break;
+
+            uint64_t best_ts = step;
+            int victim_slot = -1;
+            for (int s = k_static; s < k_hot; ++s) {
+                const uint64_t ts = slot_last_used[s];
+                if (ts < best_ts) {
+                    best_ts = ts;
+                    victim_slot = s;
+                }
+            }
+            if (victim_slot < 0) break;
+
+            const int le = distinct_cold[best_c];
+            const int ge = distinct_ge[best_c];
+            const int old_ge = slot_to_expert[victim_slot];
+            const int64_t old_le = (int64_t)old_ge - global_expert_offset;
+            if (old_le >= 0 && old_le < local_num_experts) {
+                expert_to_slot[old_le] = -1;
+            }
+            expert_to_slot[le] = victim_slot;
+            slot_to_expert[victim_slot] = ge;
+            slot_last_used[victim_slot] = step;
+            cold_assigned_slot[best_c] = victim_slot;
+            miss_local_experts[n_gpu_cold] = le;
+            miss_victim_slots[n_gpu_cold] = victim_slot;
+            n_gpu_cold++;
+        }
+
+        const int n_cpu_cold = n_cold - n_gpu_cold;
         num_misses_out[0] = n_gpu_cold;
         num_misses_out[1] = n_cpu_cold;
         s_n_cpu_cold = n_cpu_cold;
@@ -128,8 +199,9 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             const int r = remapped_topk_ids[p];
             if (r <= -2) {
                 const int c_idx = -2 - r;
-                if (c_idx < n_gpu_cold) {
-                    remapped_topk_ids[p] = k_static + c_idx;
+                const int v_slot = cold_assigned_slot[c_idx];
+                if (v_slot >= 0) {
+                    remapped_topk_ids[p] = v_slot;
                     s_cpu_le[p] = -1;
                 } else {
                     remapped_topk_ids[p] = -1;
@@ -297,7 +369,10 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     const void* x_f16,
     const int32_t* global_topk_ids,
     const float* topk_weights,
-    const int32_t* expert_to_slot,
+    int32_t* expert_to_slot,
+    int32_t* slot_to_expert,
+    uint64_t* slot_last_used,
+    uint64_t* step_counter,
     int32_t* remapped_topk_ids,
     int32_t* miss_local_experts,
     int32_t* miss_victim_slots,
@@ -319,8 +394,9 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     int group_size,
     float gpu_share_frac) {
     if (!ex || layer_id < 0 || !d_req_slot || !x_f16 || !global_topk_ids || !topk_weights ||
-        !expert_to_slot || !remapped_topk_ids || !miss_local_experts || !miss_victim_slots ||
-        !num_misses_buf || !mapped_host_packs || !gate_up_packed_base || !gate_up_scales_base ||
+        !expert_to_slot || !slot_to_expert || !slot_last_used || !step_counter ||
+        !remapped_topk_ids || !miss_local_experts || !miss_victim_slots ||
+        !num_misses_buf || !gate_up_packed_base || !gate_up_scales_base ||
         !down_packed_base || !down_scales_base || num_tokens <= 0 ||
         num_tokens > w34_moe_bridge::kMaxTokens || top_k <= 0 ||
         top_k > w34_moe_bridge::kMaxTopK || k_static <= 0 || k_hot < k_static || k_hidden <= 0 ||
@@ -328,12 +404,16 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
         return (int)cudaErrorInvalidValue;
     }
 
+    const float effective_gpu_share = (mapped_host_packs != nullptr) ? gpu_share_frac : 0.0f;
     cudaStream_t stream = (cudaStream_t)ex->stream;
     w34_moe_bridge::moe_hybrid_plan_and_submit_kernel<<<1, 256, 0, stream>>>(
         static_cast<const __half*>(x_f16),
         global_topk_ids,
         topk_weights,
         expert_to_slot,
+        slot_to_expert,
+        slot_last_used,
+        step_counter,
         remapped_topk_ids,
         miss_local_experts,
         miss_victim_slots,
@@ -348,12 +428,13 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
         k_static,
         k_hot,
         layer_id,
-        gpu_share_frac);
+        effective_gpu_share);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return (int)err;
 
     const int max_gpu_stage = k_hot - k_static;
-    if (max_gpu_stage > 0) {
+    const int max_pull = (max_gpu_stage < 2) ? max_gpu_stage : 2;
+    if (max_pull > 0 && mapped_host_packs != nullptr && effective_gpu_share > 0.0f) {
         const size_t gu_packed_bytes =
             (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
         const size_t gu_scales_bytes =
@@ -362,7 +443,7 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
             (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
         const size_t dn_scales_bytes =
             (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
-        dim3 grid(64, (unsigned)max_gpu_stage);
+        dim3 grid(64, (unsigned)max_pull);
         w34_moe_bridge::moe_hybrid_pull_mapped_experts_kernel<<<grid, 256, 0, stream>>>(
             static_cast<const uint8_t*>(mapped_host_packs),
             miss_local_experts,

@@ -4,14 +4,18 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <shared_mutex>
+#include <unordered_set>
 
 namespace {
 constexpr int kMaxCachedDevices = 32;
 std::mutex g_device_props_mutex;
+std::mutex g_registered_host_ptrs_mutex;
+std::unordered_set<void*> g_registered_host_ptrs;
 std::shared_mutex g_capture_sync_mutex;
 thread_local uintptr_t tls_capturing_stream = 0;
 
@@ -226,19 +230,56 @@ extern "C" int w34_host_alloc_mapped(void** out_host_ptr, void** out_dev_ptr, si
     if (out_host_ptr == nullptr || out_dev_ptr == nullptr) return (int)cudaErrorInvalidValue;
     auto lock = acquire_device_sync_lock();
     cudaError_t err = cudaHostAlloc(out_host_ptr, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
-    if (err != cudaSuccess) return (int)err;
-    err = cudaHostGetDevicePointer(out_dev_ptr, *out_host_ptr, 0);
-    if (err != cudaSuccess) {
+    if (err == cudaSuccess) {
+        err = cudaHostGetDevicePointer(out_dev_ptr, *out_host_ptr, 0);
+        if (err == cudaSuccess) {
+            return 0;
+        }
         cudaFreeHost(*out_host_ptr);
         *out_host_ptr = nullptr;
         return (int)err;
     }
+    (void)cudaGetLastError();
+    const size_t page_aligned = (bytes + 4095u) & ~size_t(4095u);
+    void* p = nullptr;
+    if (posix_memalign(&p, 4096u, page_aligned) != 0 || p == nullptr) {
+        return (int)cudaErrorMemoryAllocation;
+    }
+    std::memset(p, 0, page_aligned);
+    err = cudaHostRegister(p, page_aligned, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        std::free(p);
+        return (int)err;
+    }
+    err = cudaHostGetDevicePointer(out_dev_ptr, p, 0);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaHostUnregister(p);
+        std::free(p);
+        return (int)err;
+    }
+    {
+        std::lock_guard<std::mutex> g(g_registered_host_ptrs_mutex);
+        g_registered_host_ptrs.insert(p);
+    }
+    *out_host_ptr = p;
     return 0;
 }
 
 extern "C" int w34_host_free(void* host_ptr) {
     if (host_ptr == nullptr) return 0;
     auto lock = acquire_device_sync_lock();
+    {
+        std::lock_guard<std::mutex> g(g_registered_host_ptrs_mutex);
+        auto it = g_registered_host_ptrs.find(host_ptr);
+        if (it != g_registered_host_ptrs.end()) {
+            g_registered_host_ptrs.erase(it);
+            cudaError_t err = cudaHostUnregister(host_ptr);
+            std::free(host_ptr);
+            return (int)err;
+        }
+    }
     return (int)cudaFreeHost(host_ptr);
 }
 

@@ -240,6 +240,7 @@ impl Qwen3_5MtpRank {
             && self.tiered_moe.is_none()
     }
 
+    #[allow(clippy::cognitive_complexity)]
     pub fn load(target: &Qwen3_5ModelRank, dir: &Path, capacity: usize) -> Result<Self> {
         let c = &target.cfg;
         validate_geometry(c, target.rank, target.tp_size)?;
@@ -702,6 +703,14 @@ impl Qwen3_5MtpRank {
             if fully_resident {
                 target.stream.synchronize()?;
                 store.release_host_storage();
+            } else if tp == 1
+                && matches!(store.layout().group_size, 64 | 128)
+                && let Some(ref tmoe) = target.tiered_moe
+                && let Some(rt) = tmoe.bridge_runtime()
+            {
+                let k_static = if k_hot >= 64 { k_hot - 24 } else { k_hot };
+                cache.bridge_runtime = Some(rt);
+                cache.register_cpu_bridge(c.num_hidden_layers, &store, k_static, &target.stream)?;
             }
             Some((store, cache, ws))
         } else {

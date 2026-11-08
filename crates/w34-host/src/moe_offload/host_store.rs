@@ -31,7 +31,7 @@ impl Drop for HostPackStorage {
 
 impl HostPackStorage {
     fn alloc(bytes: usize, prefer_mapped: bool) -> Result<Self> {
-        const MAX_PROCESS_PINNED_BYTES: usize = 64 * 1024 * 1024 * 1024;
+        const MAX_PROCESS_PINNED_BYTES: usize = 80 * 1024 * 1024 * 1024;
         let cur = TOTAL_PINNED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
         if prefer_mapped
             && cur.saturating_add(bytes) <= MAX_PROCESS_PINNED_BYTES
@@ -436,6 +436,7 @@ impl HostExpertStore {
             }
             Ok(())
         })?;
+        archive.drop_page_cache();
         Ok(Self {
             storage: std::sync::Arc::new(storage),
             layout,
@@ -770,8 +771,8 @@ pub struct HotExpertCache {
     pub d_slot_last_used: crate::cuda::DeviceBuffer,
     pub d_step_counter: crate::cuda::DeviceBuffer,
     pub bridge_layer_id: Option<usize>,
-    pub(super) bridge_runtime: Option<std::sync::Arc<crate::moe_cpu_bridge::Runtime>>,
-    pub(super) bridge_mailbox: Option<std::sync::Arc<crate::moe_cpu_bridge::Mailbox>>,
+    pub(crate) bridge_runtime: Option<std::sync::Arc<crate::moe_cpu_bridge::Runtime>>,
+    pub(crate) bridge_mailbox: Option<std::sync::Arc<crate::moe_cpu_bridge::Mailbox>>,
     pub k_static: usize,
     pub initial_slot_to_expert: Vec<usize>,
     pub adapted_slots_dirty: bool,
@@ -905,23 +906,11 @@ impl HotExpertCache {
         crate::moe_cpu_bridge::supported()
     }
 
-    /// Whether `RankTieredMoe::load_for_rank` should enable the static-slot CPU MoE bridge
-    /// by default on `TP=1`. Requires AVX-512 (`avx512f` + `avx512vl`), where 512-bit CPU SIMD
-    /// outruns PCIe GPU LRU staging; on AVX2-only hosts with PCIe 4.0 x16 GPUs, dynamic
-    /// `GpuLru` is faster by default while `register_cpu_bridge` remains available via
-    /// `cpu_bridge_supported()`.
+    /// Whether `RankTieredMoe::load_for_rank` should enable the hybrid CPU+GPU MoE bridge
+    /// by default (`avx2 + fma + f16c` or `avx512` on `x86_64`).
     #[inline]
     pub fn auto_cpu_bridge_preferred() -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            Self::cpu_bridge_supported()
-                && std::arch::is_x86_feature_detected!("avx512f")
-                && std::arch::is_x86_feature_detected!("avx512vl")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
+        Self::cpu_bridge_supported()
     }
 
     /// Registers this layer with the owned Rust SIMD CPU+GPU hybrid cold-expert bridge and reserves the top `k_hot - k_static`
@@ -947,19 +936,6 @@ impl HotExpertCache {
                 "CPU MoE bridge requires hidden and intermediate dimensions divisible by 128",
             ));
         }
-        for slot in k_static..k_hot {
-            let ge = self.slot_to_expert[slot];
-            if ge != usize::MAX && self.expert_ids.contains(&ge) {
-                self.expert_to_slot[ge - self.expert_ids.start] = -1;
-            }
-            self.slot_to_expert[slot] = usize::MAX;
-            self.slot_to_expert_i32[slot] = -1;
-        }
-        self.d_expert_to_slot
-            .copy_from_host(&self.expert_to_slot, stream)?;
-        self.d_slot_to_expert
-            .copy_from_host(&self.slot_to_expert_i32, stream)?;
-        stream.synchronize()?;
         if self.bridge_runtime.is_none() {
             self.bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
         }

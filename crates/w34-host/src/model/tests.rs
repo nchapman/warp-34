@@ -114,8 +114,8 @@ mod serving_capacity_tests {
             (0, 0)
         );
 
-        // TP=1 (<=1.5 GiB base+KV) and TP=2 with ample VRAM preserve default_hot (96 and 120),
-        // while TP=1 with 4096-page KV reserve uses 88 so MTP-3 keeps k_hot = 192 in VRAM.
+        // TP=1 (<=1.5 GiB base+KV) and TP=2 with ample VRAM preserve default_hot (104 and 128),
+        // while TP=1 with 4096-page KV reserve uses 96 so MTP-3 keeps k_hot = 192 in VRAM.
         let (hot_tp1_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             1,
@@ -123,7 +123,7 @@ mod serving_capacity_tests {
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp1_default, 96);
+        assert_eq!(hot_tp1_default, 104);
         let (hot_tp1_4k_kv, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             1,
@@ -131,16 +131,16 @@ mod serving_capacity_tests {
             2 * gib,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp1_4k_kv, 88);
+        assert_eq!(hot_tp1_4k_kv, 96);
 
         let (hot_tp2_default, _) = plan_tiered_moe_hot_per_layer(
             &cfg,
             2,
-            19_600 * 1024 * 1024,
+            20_800 * 1024 * 1024,
             gib + 38 * 1024 * 1024,
             450 * 1024 * 1024,
         );
-        assert_eq!(hot_tp2_default, 120);
+        assert_eq!(hot_tp2_default, 128);
 
         // TP=2 at 12288 pages + MTP reserve (~4.3 GiB base+KV+MTP) and 1.2 GiB state pool:
         // exact 8-aligned hot_per_layer = 104, fitting within 19_600 MiB.
@@ -387,6 +387,16 @@ mod serving_capacity_tests {
         let mut synth_cfg = sample_qwen4_exp_config();
         synth_cfg.vocab_size = 16384;
         synth_cfg.hidden_size = 2048;
+        // Tiered-MoE with untied embeddings hosts `embed_tokens` in `MappedHostBuffer`,
+        // leaving only `lm_head.weight` (64 MiB) + 1-element FP8 PLE scale (256 B) + 96 MiB margin = 162 MiB.
+        synth_cfg.tie_word_embeddings = false;
+        let synth_tiered_untied =
+            Qwen3_5ModelRank::estimate_weight_arena_bytes(&synth_cfg, &synth_archive, 1, Some(128));
+        assert_eq!(synth_tiered_untied, 162 * 1024 * 1024);
+
+        // With `embed_tokens` in `weight_arena` (`num_experts = 0`), untied includes both
+        // `embed_tokens` (64 MiB) and `lm_head.weight` (64 MiB), while tied excludes `lm_head.weight`.
+        synth_cfg.num_experts = 0;
         synth_cfg.tie_word_embeddings = false;
         let synth_untied =
             Qwen3_5ModelRank::estimate_weight_arena_bytes(&synth_cfg, &synth_archive, 1, Some(128));
@@ -400,7 +410,7 @@ mod serving_capacity_tests {
             "tied config must exclude redundant lm_head.weight (untied={synth_untied}, tied={synth_tied})"
         );
         // `synth_tied` only has `embed_tokens` (64 MiB) + 1-element FP8 PLE scale (256 B) + 96 MiB margin,
-        // rounded up to 16 MiB alignment = 162 MiB (multi-element 32 MiB lut4-gptq `shard_00.weight_scale` is excluded).
+        // rounded up to 2 MiB alignment = 162 MiB (multi-element 32 MiB lut4-gptq `shard_00.weight_scale` is excluded).
         assert_eq!(synth_tied, 162 * 1024 * 1024);
 
         // 2. Real checkpoint check when `nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ` is cached locally.
@@ -429,15 +439,21 @@ mod serving_capacity_tests {
             tp2_bytes / (1024 * 1024)
         );
 
+        // Both untied tiered-MoE (`embed_tokens` in `MappedHostBuffer`, `lm_head.weight` in `weight_arena`)
+        // and tied (`embed_tokens` in `weight_arena`, redundant `lm_head.weight` excluded) avoid duplicating
+        // two 1.21 GiB vocab tables in GPU `weight_arena` (~4,246 MiB vs ~5,482 MiB if both were in VRAM).
+        assert!(
+            tp1_bytes < 4400 * 1024 * 1024,
+            "expected untied tiered-MoE host_embed_tokens to keep TP=1 weight_arena < 4400 MiB (got {} MiB)",
+            tp1_bytes / (1024 * 1024)
+        );
         let mut tied_cfg = cfg.clone();
         tied_cfg.tie_word_embeddings = true;
         let tp1_tied =
             Qwen3_5ModelRank::estimate_weight_arena_bytes(&tied_cfg, &archive, 1, Some(128));
-        assert!(
-            tp1_bytes.saturating_sub(tp1_tied) >= 1200 * 1024 * 1024,
-            "expected tied_cfg to save >= 1.2 GiB for redundant lm_head.weight on TP=1 (untied={} MiB, tied={} MiB)",
-            tp1_bytes / (1024 * 1024),
-            tp1_tied / (1024 * 1024),
+        assert_eq!(
+            tp1_bytes, tp1_tied,
+            "untied (host_embed_tokens + GPU lm_head.weight) and tied (GPU embed_tokens) must use identical weight_arena bytes"
         );
     }
 

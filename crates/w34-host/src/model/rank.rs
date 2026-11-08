@@ -27,6 +27,7 @@ pub struct Qwen3_5ModelRank {
     pub batch_meta_arena: DeviceArena,
     pub marlin_ws: DeviceBuffer,
     pub embed_tokens_ptr: u64,
+    pub host_embed_tokens: Option<crate::cuda::MappedHostBuffer>,
     pub final_residual: FinalResidual,
     pub lm_head: LinearProj,
     pub local_vocab_size: usize,
@@ -399,14 +400,14 @@ pub const TIERED_MOE_TP1_COMPACT_KV_THRESHOLD_BYTES: usize = 1536 * 1024 * 1024;
 
 /// Auto-tuned `TP=1` per-layer GPU hot expert ceiling for compact KV budgets (`<= 1.5 GiB`),
 /// leaving `>= 1.35 GiB` post-target VRAM for `MTP` (`k_hot = 192`) and CUDA graphs on 24 GiB cards.
-pub const TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT: usize = 96;
+pub const TIERED_MOE_TP1_COMPACT_KV_DEFAULT_HOT: usize = 104;
 
 /// Auto-tuned `TP=1` per-layer GPU hot expert ceiling for larger serving KV budgets (`> 1.5 GiB`).
-pub const TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT: usize = 88;
+pub const TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT: usize = 96;
 
-/// Auto-tuned `TP=2` per-rank GPU hot expert ceiling (`240 / 512` experts across 2 GPUs),
+/// Auto-tuned `TP=2` per-rank GPU hot expert ceiling (`256 / 512` experts across 2 GPUs),
 /// leaving room for `100%` VRAM-resident `MTP` (`256 / 256` local experts) plus `>= 1.4 GiB` headroom.
-pub const TIERED_MOE_TP2_DEFAULT_HOT: usize = 120;
+pub const TIERED_MOE_TP2_DEFAULT_HOT: usize = 128;
 
 /// Extra expert-stride slots (`512`) reserved on `TP=1` / `TP=2` for `TieredMoeWorkspace` staging
 /// and downstream `MTP` expert cache allocation.
@@ -754,7 +755,11 @@ impl Qwen3_5ModelRank {
             .saturating_mul(2))
         .saturating_add(255)
             & !255;
-        let mut replicated_bytes = embed_fp16_aligned;
+        let mut replicated_bytes = if cfg.uses_tiered_moe() && !cfg.tie_word_embeddings {
+            0
+        } else {
+            embed_fp16_aligned
+        };
         let mut sharded_bytes = 0usize;
         if cfg.tie_word_embeddings && tp_size > 1 {
             let lm_shard = ((cfg.vocab_size / tp_size)
@@ -1040,7 +1045,22 @@ impl Qwen3_5ModelRank {
                 owned_vocab = Self::load_embed_tokens_f16(archive, cfg)?;
                 (owned_vocab.as_slice(), None)
             };
-        let embed_tokens_ptr = weight_arena.upload_slice(embed_f16, &stream)?;
+        let (embed_tokens_ptr, host_embed_tokens) =
+            if cfg.uses_tiered_moe() && !cfg.tie_word_embeddings {
+                let bytes = core::mem::size_of_val(embed_f16);
+                let buf = crate::cuda::MappedHostBuffer::alloc(bytes)?;
+                // SAFETY: `buf.host_ptr` is a freshly allocated pinned buffer of `bytes` bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        embed_f16.as_ptr().cast::<u8>(),
+                        buf.host_ptr.cast::<u8>(),
+                        bytes,
+                    );
+                }
+                (buf.dev_ptr as u64, Some(buf))
+            } else {
+                (weight_arena.upload_slice(embed_f16, &stream)?, None)
+            };
 
         // 2. final norm or multi-stream HyperConnection mixer
         let final_residual = if cfg.uses_hyper_connection() {
@@ -1523,6 +1543,7 @@ impl Qwen3_5ModelRank {
             batch_meta_arena,
             marlin_ws,
             embed_tokens_ptr,
+            host_embed_tokens,
             final_residual,
             lm_head,
             local_vocab_size,

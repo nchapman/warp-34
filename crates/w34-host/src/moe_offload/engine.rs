@@ -69,8 +69,10 @@ impl TieredMoeEngine {
         if let Some(layer_id) = cache.bridge_layer_id
             && num_tokens <= TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
             && top_k <= TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
-            && store.mapped_dev_ptr() != 0
         {
+            if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
+                cache.device_lru_dirty = true;
+            }
             crate::cuda::check_rc(
                 // SAFETY: device pointers and capacities are owned and validated by `cache` and `ws`.
                 unsafe {
@@ -81,7 +83,10 @@ impl TieredMoeEngine {
                         x_addr as *const core::ffi::c_void,
                         d_topk_ids_addr as *const i32,
                         d_topk_weights_addr as *const f32,
-                        cache.d_expert_to_slot.addr() as *const i32,
+                        cache.d_expert_to_slot.addr() as *mut i32,
+                        cache.d_slot_to_expert.addr() as *mut i32,
+                        cache.d_slot_last_used.addr() as *mut u64,
+                        cache.d_step_counter.addr() as *mut u64,
                         ws.d_remapped_topk_ids[0].addr() as *mut i32,
                         ws.d_miss_local_experts.addr() as *mut i32,
                         ws.d_miss_victim_slots.addr() as *mut i32,
@@ -101,7 +106,7 @@ impl TieredMoeEngine {
                         store.layout().intermediate as i32,
                         store.layout().hidden as i32,
                         store.layout().group_size as i32,
-                        if cache.k_static < k_hot {
+                        if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
                             TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
                         } else {
                             0.0f32
@@ -211,7 +216,7 @@ impl TieredMoeEngine {
             return Ok(());
         }
         cache.sync_from_device_if_dirty(compute_stream)?;
-        if num_tokens < 1024 && cache.adapted_slots_dirty {
+        if (8..1024).contains(&num_tokens) && cache.adapted_slots_dirty {
             cache.restore_initial_if_adapted(store, ws, compute_stream)?;
         }
         assert_eq!(h_topk_ids.len(), num_tokens * top_k);
@@ -1038,7 +1043,7 @@ impl RankTieredMoe {
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 if ep_size == 1 {
-                    let k_static = k_hot;
+                    let k_static = if k_hot >= 64 { k_hot - 24 } else { k_hot };
                     if bridge_runtime.is_none() {
                         bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
                     }
@@ -1068,6 +1073,18 @@ impl RankTieredMoe {
         self.stores
             .get(layer_idx)
             .is_some_and(|s| s.mapped_dev_ptr() != 0)
+    }
+
+    pub fn layer_has_cpu_bridge(&self, layer_idx: usize) -> bool {
+        self.caches
+            .get(layer_idx)
+            .is_some_and(|c| c.bridge_layer_id.is_some())
+    }
+
+    pub(crate) fn bridge_runtime(&self) -> Option<std::sync::Arc<crate::moe_cpu_bridge::Runtime>> {
+        self.caches
+            .first()
+            .and_then(|c| c.bridge_runtime.as_ref().cloned())
     }
 
     pub fn layer_is_fully_resident(&self, layer_idx: usize) -> bool {

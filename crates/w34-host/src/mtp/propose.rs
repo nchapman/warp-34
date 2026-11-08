@@ -1564,6 +1564,9 @@ impl Qwen3_5MtpRank {
             };
             if cache.slots.capacity >= cache.expert_ids.len()
                 || (num_tokens * top_k <= cache.slots.capacity && store.mapped_dev_ptr() != 0)
+                || (num_tokens <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
+                    && top_k <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
+                    && cache.bridge_layer_id.is_some())
             {
                 crate::moe_offload::TieredMoeEngine::execute_layer_device_lru(
                     store,
@@ -1594,6 +1597,22 @@ impl Qwen3_5MtpRank {
                     },
                     "MTP h_ids",
                 )?;
+                let mut h_weights = Vec::new();
+                if cache.bridge_layer_id.is_some() {
+                    h_weights.resize(pairs, 0.0f32);
+                    check_rc(
+                        // SAFETY: `h_weights` and `moe_topk_weights_buf` hold `pairs` f32 elements.
+                        unsafe {
+                            ffi::w34_memcpy_d2h_async(
+                                h_weights.as_mut_ptr().cast(),
+                                moe_topk_weights_buf as *const c_void,
+                                pairs * 4,
+                                t.stream.handle,
+                            )
+                        },
+                        "MTP h_weights",
+                    )?;
+                }
                 t.stream.synchronize()?;
                 crate::moe_offload::TieredMoeEngine::execute_layer(
                     crate::moe_offload::MoeOffloadMode::Auto,
@@ -1605,7 +1624,7 @@ impl Qwen3_5MtpRank {
                     moe_topk_ids_buf,
                     moe_topk_weights_buf,
                     &h_ids,
-                    &[],
+                    &h_weights,
                     sh_out_ptr,
                     sh_gate_ptr,
                     mlp_out_buf,
