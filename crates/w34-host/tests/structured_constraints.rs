@@ -721,3 +721,185 @@ fn choice_constraint_enforces_exact_literals_and_rollback() {
     assert!(c.is_token_allowed(EOS));
     assert!(feed(&mut c, &tok, "_extra").is_err());
 }
+
+#[test]
+fn xml_pydantic_anyof_nullable_strings_and_string_int_unions() {
+    use serde_json::Value;
+    use w34_host::{
+        parser::Qwen3Parser,
+        tool_constraints::{ToolChoice, ToolFormat},
+    };
+    let (tok, factory) = setup();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "configure",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "note": {
+                        "anyOf": [
+                            { "type": "string" },
+                            { "type": "null" }
+                        ]
+                    },
+                    "budget": {
+                        "anyOf": [
+                            { "type": "string", "enum": ["auto", "unlimited"] },
+                            { "type": "integer", "minimum": 1, "maximum": 100 }
+                        ]
+                    }
+                },
+                "required": ["title", "note", "budget"],
+                "additionalProperties": false
+            }
+        }
+    }]);
+
+    // 1. Unquoted string for `title` + unquoted string for `note` + unquoted enum `"auto"` for `budget`
+    let mut c1 = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    let call_str = "<tool_call>\n<function=configure>\n<parameter=title>\nprod\n</parameter>\n<parameter=note>\nhello world\n</parameter>\n<parameter=budget>\nauto\n</parameter>\n</function>\n</tool_call>";
+    feed(&mut c1, &tok, call_str).unwrap();
+    assert!(c1.is_token_allowed(EOS));
+    let p1 = Qwen3Parser::parse_complete_with_tools(call_str, false, Some(&tools));
+    assert_eq!(
+        serde_json::from_str::<Value>(&p1.tool_calls[0].function.arguments).unwrap(),
+        json!({"title": "prod", "note": "hello world", "budget": "auto"})
+    );
+
+    // 2. Unquoted string for `title` + JSON `null` for `note` + integer `50` for `budget`
+    let mut c2 = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    let call_null_int = "<tool_call>\n<function=configure>\n<parameter=title>\nstage\n</parameter>\n<parameter=note>\nnull\n</parameter>\n<parameter=budget>\n50\n</parameter>\n</function>\n</tool_call>";
+    feed(&mut c2, &tok, call_null_int).unwrap();
+    assert!(c2.is_token_allowed(EOS));
+    let p2 = Qwen3Parser::parse_complete_with_tools(call_null_int, false, Some(&tools));
+    assert_eq!(
+        serde_json::from_str::<Value>(&p2.tool_calls[0].function.arguments).unwrap(),
+        json!({"title": "stage", "note": null, "budget": 50})
+    );
+
+    // 3. Bare `null` for non-nullable `title` is rejected
+    let mut c3 = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    let res3 = feed(
+        &mut c3,
+        &tok,
+        "<tool_call>\n<function=configure>\n<parameter=title>\nnull\n</parameter>",
+    );
+    assert!(
+        res3.is_err(),
+        "grammar:\n{}",
+        w34_host::tool_constraints::tool_grammar(
+            &tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn donor_qwen_xml_and_hermes_tool_oracle_parity() {
+    use serde_json::Value;
+    use w34_host::{
+        parser::Qwen3Parser,
+        tool_constraints::{ToolChoice, ToolFormat},
+    };
+    let (tok, factory) = setup();
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../tools/oracle/goldens/qwen_xml_tool_calls.json"
+    ))
+    .unwrap();
+    let tools = &fixture["tools"];
+
+    for case in fixture["valid_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let format = match case["format"].as_str().unwrap() {
+            "xml" => ToolFormat::QwenXml,
+            "json" => ToolFormat::HermesJson,
+            other => panic!("unknown format {other}"),
+        };
+        let choice = ToolChoice::parse(&case["tool_choice"]).unwrap();
+        let parallel = case["parallel_tool_calls"].as_bool().unwrap();
+        let thinking = case["enable_thinking"].as_bool().unwrap();
+        let raw = case["raw"].as_str().unwrap();
+
+        let mut c = factory
+            .tools_with_options(tools, &choice, format, parallel, thinking)
+            .unwrap();
+        let ids: Vec<i32> = tok
+            .encode(raw, false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect();
+        let mid = ids.len() / 2;
+        for &id in &ids[..mid] {
+            c.advance(id).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        let mid_mask = c.current_bitmask();
+        for &id in &ids[mid..] {
+            c.advance(id).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        assert!(c.is_token_allowed(EOS), "{name}: EOS not allowed at end");
+        // Verify speculative rollback from completion back to midpoint
+        c.rollback(ids.len() - mid).unwrap();
+        assert_eq!(c.current_bitmask(), mid_mask, "{name}: rollback mismatch");
+        for &id in &ids[mid..] {
+            c.advance(id).unwrap();
+        }
+        assert!(c.is_token_allowed(EOS), "{name}: EOS after replay");
+
+        let parsed = Qwen3Parser::parse_complete_with_tools(raw, thinking, Some(tools));
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            case["expected_reasoning"].as_str(),
+            "{name}: reasoning mismatch"
+        );
+        assert_eq!(
+            parsed.content.as_deref(),
+            case["expected_content"].as_str(),
+            "{name}: content mismatch"
+        );
+        let expected_calls = case["expected_calls"].as_array().unwrap();
+        assert_eq!(
+            parsed.tool_calls.len(),
+            expected_calls.len(),
+            "{name}: tool call count"
+        );
+        for (actual, expected) in parsed.tool_calls.iter().zip(expected_calls.iter()) {
+            assert_eq!(actual.function.name, expected["name"].as_str().unwrap());
+            let actual_args: Value = serde_json::from_str(&actual.function.arguments).unwrap();
+            assert_eq!(&actual_args, &expected["arguments"], "{name}: args");
+        }
+    }
+
+    for case in fixture["invalid_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let format = match case["format"].as_str().unwrap() {
+            "xml" => ToolFormat::QwenXml,
+            "json" => ToolFormat::HermesJson,
+            other => panic!("unknown format {other}"),
+        };
+        let choice = ToolChoice::parse(&case["tool_choice"]).unwrap();
+        let parallel = case["parallel_tool_calls"].as_bool().unwrap();
+        let thinking = case["enable_thinking"].as_bool().unwrap();
+        let raw = case["raw"].as_str().unwrap();
+
+        let mut c = factory
+            .tools_with_options(tools, &choice, format, parallel, thinking)
+            .unwrap();
+        let accepted = feed(&mut c, &tok, raw).is_ok() && c.is_token_allowed(EOS);
+        assert!(
+            !accepted,
+            "{name}: invalid tool call was accepted through EOS: {raw}"
+        );
+    }
+}

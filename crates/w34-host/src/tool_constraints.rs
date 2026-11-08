@@ -82,22 +82,32 @@ fn attach_root_defs(value_schema: &Value, root_schema: &serde_json::Map<String, 
     Value::Object(cloned)
 }
 
-fn xml_param_rule(
-    rule: &str,
-    key: &str,
-    value_schema: &Value,
-    root_schema: &serde_json::Map<String, Value>,
-    uses_unquoted_str: &mut bool,
-) -> String {
-    let open_tag = literal(&format!("<parameter={key}>"));
-    let close_tag = literal("</parameter>");
-    let schema_with_defs = attach_root_defs(value_schema, root_schema);
-    let json_branch = format!("%json {schema_with_defs}");
-    let default_rule = format!("{rule}: {open_tag} WS {json_branch} WS {close_tag} WS\n");
-    let Some(obj) = value_schema.as_object() else {
-        return default_rule;
-    };
+#[derive(Default)]
+struct UnquotedXmlBranches {
+    has_plain_string: bool,
+    has_null: bool,
+    only_string_and_null: bool,
+    literals: Vec<String>,
+}
 
+fn collect_unquoted_xml_string_branches(schema: &Value) -> UnquotedXmlBranches {
+    let mut out = UnquotedXmlBranches {
+        only_string_and_null: true,
+        ..Default::default()
+    };
+    collect_unquoted_xml_inner(schema, 0, &mut out);
+    out
+}
+
+fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXmlBranches) {
+    if depth > 8 {
+        out.only_string_and_null = false;
+        return;
+    }
+    let Some(obj) = schema.as_object() else {
+        out.only_string_and_null = false;
+        return;
+    };
     let only_meta_or = |allowed: &[&str]| {
         obj.keys().all(|k| {
             matches!(
@@ -112,56 +122,125 @@ fn xml_param_rule(
             ) || allowed.contains(&k.as_str())
         })
     };
-
+    for comb in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(items)) = obj.get(comb)
+            && only_meta_or(&[comb])
+        {
+            for sub in items {
+                collect_unquoted_xml_inner(sub, depth + 1, out);
+            }
+            return;
+        }
+    }
+    if obj.get("type").and_then(Value::as_str) == Some("null") && only_meta_or(&["type"]) {
+        out.has_null = true;
+        return;
+    }
     let type_allows_string = match obj.get("type") {
         None => true,
         Some(Value::String(t)) => t == "string",
-        Some(Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some("string")),
+        Some(Value::Array(arr)) => {
+            if arr
+                .iter()
+                .all(|v| matches!(v.as_str(), Some("string" | "null")))
+            {
+                if arr.iter().any(|v| v.as_str() == Some("null")) {
+                    out.has_null = true;
+                }
+            } else {
+                out.only_string_and_null = false;
+            }
+            arr.iter().any(|v| v.as_str() == Some("string"))
+        }
         _ => false,
     };
     if !type_allows_string {
-        return default_rule;
+        out.only_string_and_null = false;
+        return;
     }
-
     if let Some(Value::String(s)) = obj.get("const")
         && only_meta_or(&["type", "const"])
         && is_safe_unquoted_xml_string(s)
     {
-        let val_expr = format!("({json_branch} | {})", literal(s));
-        return format!("{rule}: {open_tag} WS {val_expr} WS {close_tag} WS\n");
+        let lit = literal(s);
+        if !out.literals.contains(&lit) {
+            out.literals.push(lit);
+        }
+        return;
     }
-
     if let Some(Value::Array(items)) = obj.get("enum")
         && only_meta_or(&["type", "enum"])
     {
-        let mut unquoted = Vec::new();
         for item in items {
             if let Value::String(s) = item
                 && is_safe_unquoted_xml_string(s)
             {
                 let lit = literal(s);
-                if !unquoted.contains(&lit) {
-                    unquoted.push(lit);
+                if !out.literals.contains(&lit) {
+                    out.literals.push(lit);
                 }
+            } else if item.is_null() {
+                out.has_null = true;
+            } else {
+                out.only_string_and_null = false;
             }
         }
-        if !unquoted.is_empty() {
-            let val_expr = format!("({json_branch} | {})", unquoted.join(" | "));
-            return format!("{rule}: {open_tag} WS {val_expr} WS {close_tag} WS\n");
-        }
+        return;
     }
-
-    let is_plain_string = obj.get("type").and_then(Value::as_str) == Some("string")
+    let explicit_string_type = match obj.get("type") {
+        Some(Value::String(t)) => t == "string",
+        Some(Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some("string")),
+        _ => false,
+    };
+    if explicit_string_type
         && only_meta_or(&["type", "minLength"])
         && obj
             .get("minLength")
             .and_then(Value::as_u64)
-            .is_none_or(|n| n <= 1);
-    if is_plain_string {
+            .is_none_or(|n| n <= 1)
+    {
+        out.has_plain_string = true;
+    } else {
+        out.only_string_and_null = false;
+    }
+}
+
+fn xml_param_rule(
+    rule: &str,
+    key: &str,
+    value_schema: &Value,
+    root_schema: &serde_json::Map<String, Value>,
+    uses_unquoted_str: &mut bool,
+    uses_unquoted_nullable_str: &mut bool,
+) -> String {
+    let open_tag = literal(&format!("<parameter={key}>"));
+    let close_tag = literal("</parameter>");
+    let schema_with_defs = attach_root_defs(value_schema, root_schema);
+    let json_branch = format!("%json {schema_with_defs}");
+    let default_rule = format!("{rule}: {open_tag} WS {json_branch} WS {close_tag} WS\n");
+    if !value_schema.is_object() {
+        return default_rule;
+    }
+
+    let branches = collect_unquoted_xml_string_branches(value_schema);
+
+    if branches.has_plain_string && branches.only_string_and_null && branches.literals.is_empty() {
+        let str_json = "%json {\"type\":\"string\"}";
+        if branches.has_null {
+            *uses_unquoted_str = true;
+            *uses_unquoted_nullable_str = true;
+            return format!(
+                "{rule}: {open_tag} WS ({str_json} WS {close_tag} | unquoted_xml_param_end | unquoted_xml_null_end) WS\n"
+            );
+        }
         *uses_unquoted_str = true;
         return format!(
-            "{rule}: {open_tag} WS ({json_branch} WS {close_tag} | unquoted_xml_param_end) WS\n"
+            "{rule}: {open_tag} WS ({str_json} WS {close_tag} | unquoted_xml_param_end) WS\n"
         );
+    }
+    if !branches.literals.is_empty() && !branches.has_plain_string {
+        let val_expr = format!("({json_branch} | {})", branches.literals.join(" | "));
+        return format!("{rule}: {open_tag} WS {val_expr} WS {close_tag} WS\n");
     }
 
     default_rule
@@ -196,6 +275,7 @@ pub fn tool_grammar_with_options(
     let mut bodies = Vec::new();
     let mut definitions = String::new();
     let mut uses_unquoted_str = false;
+    let mut uses_unquoted_nullable_str = false;
     let mut names = std::collections::HashSet::new();
     for (index, tool) in tools.iter().enumerate() {
         if tool["type"] != "function" {
@@ -218,10 +298,13 @@ pub fn tool_grammar_with_options(
         let schema = function.get("parameters").unwrap_or(&empty);
         let body = match format {
             ToolFormat::HermesJson => {
-                let schema = json!({"type":"object","properties":{
+                let mut wrapper = json!({"type":"object","properties":{
                     "name":{"const":name},"arguments":schema
                 },"required":["name","arguments"],"additionalProperties":false});
-                format!("%json {schema}")
+                if let Some(schema_obj) = schema.as_object() {
+                    wrapper = attach_root_defs(&wrapper, schema_obj);
+                }
+                format!("%json {wrapper}")
             }
             ToolFormat::QwenXml => {
                 if schema["type"] != "object" {
@@ -284,6 +367,7 @@ pub fn tool_grammar_with_options(
                         value_schema,
                         schema_obj,
                         &mut uses_unquoted_str,
+                        &mut uses_unquoted_nullable_str,
                     ));
                 }
                 let num_props = prop_entries.len();
@@ -370,8 +454,12 @@ pub fn tool_grammar_with_options(
     };
     if uses_unquoted_str {
         grammar.push_str(
-            "unquoted_xml_param_end[lazy]: UNQUOTED_XML_BODY \"</parameter>\"\nUNQUOTED_XML_BODY: (/[^ \\t\\r\\n\"\\[{](?s:.*[^ \\t\\r\\n])?/ & ~(\"true\" | \"false\" | \"null\" | /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/ | /(?s:.*)(<\\/tool_call>|<\\/function>|<parameter=|<function=|<tool_call>)(?s:.*)/)) /[ \\t\\r\\n]*/\n",
+            "unquoted_xml_param_end[lazy]: UNQUOTED_XML_BODY \"</parameter>\"\nUNQUOTED_XML_BODY: (/[^ \\t\\r\\n\"\\[{](?s:.*[^ \\t\\r\\n])?/ & ~(\"true\" | \"false\" | \"null\" | /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/ | /(?s:.*)(<\\/parameter>|<\\/tool_call>|<\\/function>|<parameter=|<function=|<tool_call>)(?s:.*)/)) /[ \\t\\r\\n]*/\n",
         );
+    }
+    if uses_unquoted_nullable_str {
+        grammar
+            .push_str("unquoted_xml_null_end[lazy]: \"null\" /[ \\t\\r\\n]*/ \"</parameter>\"\n");
     }
     grammar.push_str(&definitions);
     Ok(grammar)

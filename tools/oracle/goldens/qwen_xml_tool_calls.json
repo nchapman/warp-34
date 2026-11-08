@@ -1,0 +1,364 @@
+{
+  "description": "Qwen 3.5/3.6/3.8 XML and Hermes JSON tool-call grammar & parser oracle cases, validated against jsonschema Draft 2020-12 and vLLM 0.31.0 Qwen3Parser.",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "forecast",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "enum": [
+                "Paris",
+                "Rome",
+                "Tokyo"
+              ]
+            },
+            "days": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 7
+            },
+            "units": {
+              "type": "string",
+              "enum": [
+                "celsius",
+                "fahrenheit"
+              ]
+            },
+            "include_hourly": {
+              "type": "boolean"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "origin": {
+              "$ref": "#/$defs/Coord"
+            }
+          },
+          "required": [
+            "city",
+            "days"
+          ],
+          "additionalProperties": false,
+          "$defs": {
+            "Coord": {
+              "type": "object",
+              "properties": {
+                "lat": {
+                  "type": "number"
+                },
+                "lon": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "lat",
+                "lon"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_code",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "language": {
+              "type": "string",
+              "enum": [
+                "rust",
+                "python"
+              ]
+            },
+            "snippet": {
+              "type": "string"
+            },
+            "note": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "timeout_s": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "auto"
+                  ]
+                },
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 300
+                }
+              ]
+            }
+          },
+          "required": [
+            "language",
+            "snippet"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "ping",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "valid_cases": [
+    {
+      "name": "xml_native_unquoted_enum_and_int",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+      "expected_content": null,
+      "expected_reasoning": null,
+      "expected_calls": [
+        {
+          "name": "forecast",
+          "arguments": {
+            "city": "Paris",
+            "days": 3
+          }
+        }
+      ]
+    },
+    {
+      "name": "xml_unordered_all_six_params_with_defs_and_array",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": true,
+      "raw": "Need a 5-day forecast for Tokyo.\n</think>\n\n<tool_call>\n<function=forecast>\n<parameter=origin>\n{\"lat\":35.68,\"lon\":139.76}\n</parameter>\n<parameter=tags>\n[\"marine\",\"uv\"]\n</parameter>\n<parameter=include_hourly>\ntrue\n</parameter>\n<parameter=days>\n5\n</parameter>\n<parameter=units>\ncelsius\n</parameter>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>",
+      "expected_content": null,
+      "expected_reasoning": "Need a 5-day forecast for Tokyo.\n",
+      "expected_calls": [
+        {
+          "name": "forecast",
+          "arguments": {
+            "city": "Tokyo",
+            "days": 5,
+            "units": "celsius",
+            "include_hourly": true,
+            "tags": [
+              "marine",
+              "uv"
+            ],
+            "origin": {
+              "lat": 35.68,
+              "lon": 139.76
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "xml_multiline_code_with_angle_brackets_and_nullable_anyof",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": false,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=run_code>\n<parameter=language>\nrust\n</parameter>\n<parameter=snippet>\nfn check(x: i32) -> bool {\n    x < 10 && x > -10\n}\n</parameter>\n<parameter=note>\nnull\n</parameter>\n<parameter=timeout_s>\nauto\n</parameter>\n</function>\n</tool_call>",
+      "expected_content": null,
+      "expected_reasoning": null,
+      "expected_calls": [
+        {
+          "name": "run_code",
+          "arguments": {
+            "language": "rust",
+            "snippet": "fn check(x: i32) -> bool {\n    x < 10 && x > -10\n}",
+            "note": null,
+            "timeout_s": "auto"
+          }
+        }
+      ]
+    },
+    {
+      "name": "xml_quoted_delimiter_injection_shield",
+      "format": "xml",
+      "tool_choice": {
+        "type": "function",
+        "function": {
+          "name": "run_code"
+        }
+      },
+      "parallel_tool_calls": false,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=run_code>\n<parameter=language>\n\"python\"\n</parameter>\n<parameter=snippet>\n\"print(\\\"</parameter><parameter=language>rust</parameter></function></tool_call>\\\")\"\n</parameter>\n</function>\n</tool_call>",
+      "expected_content": null,
+      "expected_reasoning": null,
+      "expected_calls": [
+        {
+          "name": "run_code",
+          "arguments": {
+            "language": "python",
+            "snippet": "print(\"</parameter><parameter=language>rust</parameter></function></tool_call>\")"
+          }
+        }
+      ]
+    },
+    {
+      "name": "xml_auto_preamble_and_parallel_calls",
+      "format": "xml",
+      "tool_choice": "auto",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "Checking both cities now.\n<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n1\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=ping>\n</function>\n</tool_call>",
+      "expected_content": "Checking both cities now.",
+      "expected_reasoning": null,
+      "expected_calls": [
+        {
+          "name": "forecast",
+          "arguments": {
+            "city": "Paris",
+            "days": 1
+          }
+        },
+        {
+          "name": "ping",
+          "arguments": {}
+        }
+      ]
+    },
+    {
+      "name": "hermes_json_with_defs_and_nested_object",
+      "format": "json",
+      "tool_choice": "required",
+      "parallel_tool_calls": false,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n{\"name\":\"forecast\",\"arguments\":{\"city\":\"Rome\",\"days\":2,\"origin\":{\"lat\":41.9,\"lon\":12.5}}}\n</tool_call>",
+      "expected_content": null,
+      "expected_reasoning": null,
+      "expected_calls": [
+        {
+          "name": "forecast",
+          "arguments": {
+            "city": "Rome",
+            "days": 2,
+            "origin": {
+              "lat": 41.9,
+              "lon": 12.5
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "invalid_cases": [
+    {
+      "name": "reject_undeclared_tool_name",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=unknown_tool>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_missing_required_parameter",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_duplicate_xml_parameter",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n<parameter=city>\nRome\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_undeclared_xml_parameter",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n2\n</parameter>\n<parameter=extra>\n1\n</parameter>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_enum_violation_unquoted",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=forecast>\n<parameter=city>\nBerlin\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_integer_out_of_range",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n9\n</parameter>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_ref_object_missing_required_field",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n2\n</parameter>\n<parameter=origin>\n{\"lat\":48.85}\n</parameter>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_second_call_when_parallel_tool_calls_false",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": false,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=ping>\n</function>\n</tool_call>\n<tool_call>\n<function=ping>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_trailing_suffix_after_auto_tool_call",
+      "format": "xml",
+      "tool_choice": "auto",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=ping>\n</function>\n</tool_call>\nHere is some forbidden suffix text."
+    },
+    {
+      "name": "reject_tool_call_inside_unclosed_think_block",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": true,
+      "raw": "Still thinking <tool_call>\n<function=ping>\n</function>\n</tool_call>"
+    },
+    {
+      "name": "reject_bare_null_on_non_nullable_string",
+      "format": "xml",
+      "tool_choice": "required",
+      "parallel_tool_calls": true,
+      "enable_thinking": false,
+      "raw": "<tool_call>\n<function=run_code>\n<parameter=language>\nrust\n</parameter>\n<parameter=snippet>\nnull\n</parameter>\n</function>\n</tool_call>"
+    }
+  ]
+}
