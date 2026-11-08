@@ -95,6 +95,79 @@ fn verify_speculative_telemetry(state: &OpenAiServerState, kind: SpeculativeKind
     );
 }
 
+fn exercise_completions_and_hermes_tools(state: &Arc<OpenAiServerState>) {
+    let (head, body) = request_endpoint(
+        state,
+        "/v1/completions",
+        json!({"prompt":"Result: ","max_tokens":16,"structured_outputs":{"grammar":"start: \"PASS\" | \"OK\""}}),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let gtext = body["choices"][0]["text"].as_str().unwrap();
+    assert!(
+        matches!(gtext, "PASS" | "OK"),
+        "unexpected grammar completion: {gtext:?}"
+    );
+
+    let (head, body) = request_endpoint(
+        state,
+        "/v1/completions",
+        json!({"prompt":"Answer code: ","max_tokens":16,"structured_outputs":{"regex":"OK-[0-9]{2}"}}),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let text = body["choices"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("OK-") && text.len() == 5 && text[3..].chars().all(|c| c.is_ascii_digit()),
+        "unexpected regex completion: {text}"
+    );
+
+    let (head, body) = request_endpoint(
+        state,
+        "/v1/completions",
+        json!({"prompt":"Verdict: ","max_tokens":16,"structured_outputs":{"choice":["APPROVED","REJECTED"]}}),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let ctext = body["choices"][0]["text"].as_str().unwrap();
+    assert!(
+        matches!(ctext, "APPROVED" | "REJECTED"),
+        "unexpected choice completion: {ctext:?}"
+    );
+
+    let hermes_tools = json!([{
+        "type":"function",
+        "function":{
+            "name":"dispatch",
+            "parameters":{
+                "type":"object",
+                "anyOf":[
+                    {"properties":{"mode":{"const":"fast"}},"required":["mode"],"additionalProperties":false}
+                ]
+            }
+        }
+    }]);
+    let (head, body) = request(
+        state,
+        json!({
+            "messages":[{"role":"user","content":"Dispatch in fast mode."}],
+            "tools":hermes_tools,
+            "tool_choice":"required",
+            "parallel_tool_calls":false,
+            "max_tokens":96,
+            "chat_template_kwargs":{"enable_thinking":false,"tool_call_format":"json"}
+        }),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    let hcalls = body["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(hcalls.len(), 1, "{body}");
+    assert_eq!(hcalls[0]["function"]["name"], "dispatch");
+    assert_eq!(
+        serde_json::from_str::<Value>(hcalls[0]["function"]["arguments"].as_str().unwrap())
+            .unwrap(),
+        json!({"mode":"fast"})
+    );
+}
+
 fn exercise(kind: SpeculativeKind) {
     if common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-W4A16-GPTQ", "exercise").is_none()
         || (kind == SpeculativeKind::DFlash2
@@ -251,29 +324,7 @@ fn exercise(kind: SpeculativeKind) {
         "expected JSON object, got {obj_str:?}"
     );
 
-    let (head, body) = request_endpoint(
-        &state,
-        "/v1/completions",
-        json!({"prompt":"Result: ","max_tokens":16,"structured_outputs":{"grammar":"start: \"PASS\" | \"OK\""}}),
-    );
-    assert!(head.contains("200 OK"), "{head} {body}");
-    let gtext = body["choices"][0]["text"].as_str().unwrap();
-    assert!(
-        matches!(gtext, "PASS" | "OK"),
-        "unexpected grammar completion: {gtext:?}"
-    );
-
-    let (head, body) = request_endpoint(
-        &state,
-        "/v1/completions",
-        json!({"prompt":"Answer code: ","max_tokens":16,"structured_outputs":{"regex":"OK-[0-9]{2}"}}),
-    );
-    assert!(head.contains("200 OK"), "{head} {body}");
-    let text = body["choices"][0]["text"].as_str().unwrap();
-    assert!(
-        text.starts_with("OK-") && text.len() == 5 && text[3..].chars().all(|c| c.is_ascii_digit()),
-        "unexpected regex completion: {text}"
-    );
+    exercise_completions_and_hermes_tools(&state);
 
     for bad in [
         json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"unknown"}}),

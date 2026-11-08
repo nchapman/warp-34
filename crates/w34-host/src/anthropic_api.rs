@@ -471,6 +471,56 @@ fn convert_messages(
     Ok(out)
 }
 
+fn parse_anthropic_tool_choice(
+    obj: &Map<String, Value>,
+) -> Result<(Option<Value>, bool, bool), AnthropicApiError> {
+    let Some(tc_val) = obj.get("tool_choice").filter(|v| !v.is_null()) else {
+        return Ok((None, false, false));
+    };
+    let tc_obj = tc_val
+        .as_object()
+        .ok_or_else(|| AnthropicApiError::bad_request("'tool_choice' must be an object"))?;
+    let disable_parallel = match tc_obj
+        .get("disable_parallel_tool_use")
+        .filter(|v| !v.is_null())
+    {
+        None => false,
+        Some(v) => v.as_bool().ok_or_else(|| {
+            AnthropicApiError::bad_request(
+                "'tool_choice.disable_parallel_tool_use' must be a boolean",
+            )
+        })?,
+    };
+    let tc_type = tc_obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AnthropicApiError::bad_request("tool_choice missing string 'type'"))?;
+    match tc_type {
+        "auto" => Ok((Some(json!("auto")), false, disable_parallel)),
+        "none" => Ok((Some(json!("none")), false, disable_parallel)),
+        "any" => Ok((Some(json!("required")), true, disable_parallel)),
+        "tool" => {
+            let name = tc_obj
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AnthropicApiError::bad_request(
+                        "tool_choice type 'tool' requires non-empty 'name'",
+                    )
+                })?;
+            Ok((
+                Some(json!({"type": "function", "function": {"name": name}})),
+                true,
+                disable_parallel,
+            ))
+        }
+        other => Err(AnthropicApiError::bad_request(format!(
+            "unsupported tool_choice.type '{other}'"
+        ))),
+    }
+}
+
 /// Translates an Anthropic Messages API request body into `(canonical_chat_request, meta)`.
 pub fn translate_anthropic_to_chat(
     req: &Value,
@@ -557,44 +607,8 @@ pub fn translate_anthropic_to_chat(
     }
 
     // Tool choice
-    let mut is_forced_tool_choice = false;
-    let chat_tool_choice = if let Some(tc_val) = obj.get("tool_choice").filter(|v| !v.is_null()) {
-        let tc_obj = tc_val
-            .as_object()
-            .ok_or_else(|| AnthropicApiError::bad_request("'tool_choice' must be an object"))?;
-        let tc_type = tc_obj
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AnthropicApiError::bad_request("tool_choice missing string 'type'"))?;
-        match tc_type {
-            "auto" => Some(json!("auto")),
-            "none" => Some(json!("none")),
-            "any" => {
-                is_forced_tool_choice = true;
-                Some(json!("required"))
-            }
-            "tool" => {
-                is_forced_tool_choice = true;
-                let name = tc_obj
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        AnthropicApiError::bad_request(
-                            "tool_choice type 'tool' requires non-empty 'name'",
-                        )
-                    })?;
-                Some(json!({"type": "function", "function": {"name": name}}))
-            }
-            other => {
-                return Err(AnthropicApiError::bad_request(format!(
-                    "unsupported tool_choice.type '{other}'"
-                )));
-            }
-        }
-    } else {
-        None
-    };
+    let (chat_tool_choice, is_forced_tool_choice, disable_parallel_tool_use) =
+        parse_anthropic_tool_choice(obj)?;
 
     // Thinking config
     let mut enable_thinking: Option<bool> = None;
@@ -691,6 +705,9 @@ pub fn translate_anthropic_to_chat(
                         }
                     }));
                 }
+                Some("json_object") => {
+                    response_format = Some(json!({"type": "json_object"}));
+                }
                 Some("text") | None => {}
                 Some(other) => {
                     return Err(AnthropicApiError::bad_request(format!(
@@ -742,6 +759,9 @@ pub fn translate_anthropic_to_chat(
     }
     if !chat_tools.is_empty() {
         chat_req.insert("tools".into(), Value::Array(chat_tools));
+    }
+    if disable_parallel_tool_use {
+        chat_req.insert("parallel_tool_calls".into(), json!(false));
     }
     if let Some(tc) = chat_tool_choice {
         chat_req.insert("tool_choice".into(), tc);
@@ -1465,5 +1485,35 @@ mod tests {
         assert_eq!(chat["presence_penalty"], 0.25);
         assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(chat["chat_template_kwargs"]["preserve_thinking"], true);
+
+        let (chat_no_parallel, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "ping", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "any", "disable_parallel_tool_use": true}
+            }),
+            "q",
+            2,
+            true,
+        )
+        .unwrap();
+        assert_eq!(chat_no_parallel["parallel_tool_calls"], false);
+        assert_eq!(chat_no_parallel["tool_choice"], "required");
+
+        let (chat_json_obj, _) = translate_anthropic_to_chat(
+            &json!({
+                "model": "q",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hi"}],
+                "output_config": {"format": {"type": "json_object"}}
+            }),
+            "q",
+            3,
+            true,
+        )
+        .unwrap();
+        assert_eq!(chat_json_obj["response_format"]["type"], "json_object");
     }
 }

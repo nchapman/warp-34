@@ -962,11 +962,17 @@ pub fn translate_responses_to_chat(
         "logit_bias",
         "logprobs",
         "top_logprobs",
+        "tool_call_format",
+        "guided_json",
+        "guided_regex",
+        "guided_choice",
+        "guided_grammar",
     ] {
         if let Some(val) = obj.get(key).filter(|v| !v.is_null()) {
             chat_req.insert(key.into(), val.clone());
         }
     }
+    chat_req.insert("parallel_tool_calls".into(), json!(parallel_tool_calls));
     if chat_req
         .get("top_logprobs")
         .and_then(Value::as_u64)

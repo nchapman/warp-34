@@ -655,6 +655,95 @@ pub struct StreamParseDelta {
     pub completed_tool_calls: Vec<ParsedToolCall>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ParamTypeMask {
+    string: bool,
+    number: bool,
+    boolean: bool,
+    null: bool,
+    structured: bool,
+}
+
+impl ParamTypeMask {
+    fn from_schema(schema: &serde_json::Value) -> Self {
+        Self::from_schema_depth(schema, 0)
+    }
+
+    fn from_schema_depth(schema: &serde_json::Value, depth: usize) -> Self {
+        let mut mask = Self::default();
+        if depth > 16 {
+            return mask;
+        }
+        let Some(obj) = schema.as_object() else {
+            return mask;
+        };
+        let mut add_type = |t: &str| match t {
+            "string" => mask.string = true,
+            "integer" | "number" => mask.number = true,
+            "boolean" => mask.boolean = true,
+            "null" => mask.null = true,
+            "object" | "array" => mask.structured = true,
+            _ => {}
+        };
+        match obj.get("type") {
+            Some(serde_json::Value::String(t)) => add_type(t),
+            Some(serde_json::Value::Array(arr)) => {
+                for item in arr {
+                    if let Some(t) = item.as_str() {
+                        add_type(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(c) = obj.get("const") {
+            match c {
+                serde_json::Value::String(_) => mask.string = true,
+                serde_json::Value::Number(_) => mask.number = true,
+                serde_json::Value::Bool(_) => mask.boolean = true,
+                serde_json::Value::Null => mask.null = true,
+                serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                    mask.structured = true
+                }
+            }
+        }
+        if let Some(serde_json::Value::Array(items)) = obj.get("enum") {
+            for item in items {
+                match item {
+                    serde_json::Value::String(_) => mask.string = true,
+                    serde_json::Value::Number(_) => mask.number = true,
+                    serde_json::Value::Bool(_) => mask.boolean = true,
+                    serde_json::Value::Null => mask.null = true,
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        mask.structured = true
+                    }
+                }
+            }
+        }
+        for comb in ["anyOf", "oneOf", "allOf"] {
+            if let Some(serde_json::Value::Array(subschemas)) = obj.get(comb) {
+                for sub in subschemas {
+                    let sub_mask = Self::from_schema_depth(sub, depth + 1);
+                    mask.string |= sub_mask.string;
+                    mask.number |= sub_mask.number;
+                    mask.boolean |= sub_mask.boolean;
+                    mask.null |= sub_mask.null;
+                    mask.structured |= sub_mask.structured;
+                }
+            }
+        }
+        mask
+    }
+
+    fn is_strictly_string(self) -> bool {
+        self.string && !self.number && !self.boolean && !self.null && !self.structured
+    }
+
+    fn is_known_non_string(self) -> bool {
+        !self.string && (self.number || self.boolean || self.null || self.structured)
+    }
+}
+
 /// Unified Qwen 3.5 / 3.6 / 3.8 reasoning and tool parser (`vllm/parser/qwen3.py` parity).
 ///
 /// Supports:
@@ -673,6 +762,7 @@ pub struct Qwen3Parser {
     content_accum: String,
     tool_calls: Vec<ParsedToolCall>,
     next_tool_idx: usize,
+    param_types: std::collections::HashMap<(String, String), ParamTypeMask>,
 }
 
 impl Qwen3Parser {
@@ -691,7 +781,34 @@ impl Qwen3Parser {
             content_accum: String::new(),
             tool_calls: Vec::new(),
             next_tool_idx: 0,
+            param_types: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attaches declared OpenAI tool schemas so XML parameter values can be coerced
+    /// according to their declared parameter types (`vllm/parser/qwen3.py` parity).
+    pub fn with_tools(mut self, tools: Option<&serde_json::Value>) -> Self {
+        if let Some(arr) = tools.and_then(|v| v.as_array()) {
+            for tool in arr {
+                let func = tool.get("function").unwrap_or(tool);
+                let Some(fn_name) = func.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(props) = func
+                    .get("parameters")
+                    .and_then(|p| p.get("properties"))
+                    .and_then(|p| p.as_object())
+                else {
+                    continue;
+                };
+                for (param_name, schema) in props {
+                    let mask = ParamTypeMask::from_schema(schema);
+                    self.param_types
+                        .insert((fn_name.to_string(), param_name.clone()), mask);
+                }
+            }
+        }
+        self
     }
 
     fn trim_wrapping_newlines(s: &str) -> &str {
@@ -761,9 +878,60 @@ impl Qwen3Parser {
         None
     }
 
+    fn convert_xml_param_value(
+        trimmed: &str,
+        type_mask: Option<ParamTypeMask>,
+    ) -> serde_json::Value {
+        if let Some(mask) = type_mask {
+            if mask.is_strictly_string() {
+                if trimmed.starts_with('"')
+                    && let Ok(serde_json::Value::String(s)) =
+                        serde_json::from_str::<serde_json::Value>(trimmed)
+                {
+                    return serde_json::Value::String(s);
+                }
+                return serde_json::Value::String(trimmed.to_string());
+            }
+            if mask.is_known_non_string() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if let serde_json::Value::String(ref inner) = val
+                        && let Ok(coerced) = serde_json::from_str::<serde_json::Value>(inner.trim())
+                    {
+                        return coerced;
+                    }
+                    return val;
+                }
+                if mask.boolean {
+                    if trimmed.eq_ignore_ascii_case("true") {
+                        return serde_json::Value::Bool(true);
+                    }
+                    if trimmed.eq_ignore_ascii_case("false") {
+                        return serde_json::Value::Bool(false);
+                    }
+                }
+                if mask.null
+                    && (trimmed.eq_ignore_ascii_case("null")
+                        || trimmed.eq_ignore_ascii_case("none"))
+                {
+                    return serde_json::Value::Null;
+                }
+            }
+        }
+        serde_json::from_str::<serde_json::Value>(trimmed)
+            .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()))
+    }
+
     /// Parses either Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
     /// or Hermes JSON (`{"name": "...", "arguments": ...}`) inside a `<tool_call>...</tool_call>` body.
     pub fn parse_tool_body(raw_body: &str, call_idx: usize) -> Option<ParsedToolCall> {
+        Self::parse_tool_body_with_types(raw_body, call_idx, &std::collections::HashMap::new())
+    }
+
+    fn parse_tool_body_with_types(
+        raw_body: &str,
+        call_idx: usize,
+        param_types: &std::collections::HashMap<(String, String), ParamTypeMask>,
+    ) -> Option<ParsedToolCall> {
         let body = raw_body.trim();
         if body.is_empty() {
             return None;
@@ -820,10 +988,10 @@ impl Qwen3Parser {
                     (val_start, "")
                 };
                 let trimmed = Self::trim_wrapping_newlines(raw_val);
-                // Preserve structured JSON numbers/booleans/arrays/objects when valid JSON,
-                // or store string value (`_qwen3_arg_converter`).
-                let json_val = serde_json::from_str::<serde_json::Value>(trimmed)
-                    .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()));
+                let type_mask = param_types
+                    .get(&(fn_name.clone(), param_name.clone()))
+                    .copied();
+                let json_val = Self::convert_xml_param_value(trimmed, type_mask);
                 params.insert(param_name, json_val);
                 search = next_slice;
             }
@@ -894,7 +1062,11 @@ impl Qwen3Parser {
                     };
                     self.buffer.drain(..drain_end);
                     self.in_tool_call = false;
-                    if let Some(tc) = Self::parse_tool_body(&body, self.next_tool_idx) {
+                    if let Some(tc) = Self::parse_tool_body_with_types(
+                        &body,
+                        self.next_tool_idx,
+                        &self.param_types,
+                    ) {
                         self.next_tool_idx += 1;
                         self.tool_calls.push(tc.clone());
                         delta.completed_tool_calls.push(tc);
@@ -1054,7 +1226,16 @@ impl Qwen3Parser {
 
     /// One-shot helper for non-streaming completions.
     pub fn parse_complete(text: &str, enable_thinking: bool) -> ParsedAssistantTurn {
-        let mut p = Self::new(enable_thinking);
+        Self::parse_complete_with_tools(text, enable_thinking, None)
+    }
+
+    /// One-shot helper with optional declared tool schemas for parameter type coercion.
+    pub fn parse_complete_with_tools(
+        text: &str,
+        enable_thinking: bool,
+        tools: Option<&serde_json::Value>,
+    ) -> ParsedAssistantTurn {
+        let mut p = Self::new(enable_thinking).with_tools(tools);
         let _ = p.push_str(text);
         p.finish().1
     }
@@ -1241,6 +1422,35 @@ mod tests {
         let tc = &delta.completed_tool_calls[0];
         assert_eq!(tc.function.name, "search_web");
         assert!(tc.function.arguments.contains("warp-34"));
+    }
+
+    #[test]
+    fn test_qwen3_parser_schema_aware_type_coercion() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup_order",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "order_id": { "type": "string" },
+                        "flag_label": { "type": "string" },
+                        "count": { "type": "integer" },
+                        "urgent": { "type": "boolean" }
+                    },
+                    "required": ["order_id", "flag_label", "count", "urgent"]
+                }
+            }
+        }]);
+        let raw = "<tool_call>\n<function=lookup_order>\n<parameter=order_id>\n0042\n</parameter>\n<parameter=flag_label>\ntrue\n</parameter>\n<parameter=count>\n\"7\"\n</parameter>\n<parameter=urgent>\nTrue\n</parameter>\n</function>\n</tool_call>";
+        let turn = Qwen3Parser::parse_complete_with_tools(raw, false, Some(&tools));
+        assert_eq!(turn.tool_calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(args["order_id"], serde_json::json!("0042"));
+        assert_eq!(args["flag_label"], serde_json::json!("true"));
+        assert_eq!(args["count"], serde_json::json!(7));
+        assert_eq!(args["urgent"], serde_json::json!(true));
     }
 
     #[test]

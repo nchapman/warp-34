@@ -105,6 +105,8 @@ fn template_json(value: &Value) -> String {
 
 const TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
+const HERMES_TOOL_INSTRUCTIONS: &str = "\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+
 /// Formats a list of chat messages into a ChatML prompt string.
 ///
 /// # Examples
@@ -135,6 +137,22 @@ pub fn format_chatml_prompt_with_options(
     enable_thinking: bool,
     preserve_thinking: bool,
 ) -> String {
+    format_chatml_prompt_with_tool_format(
+        messages,
+        tools,
+        enable_thinking,
+        preserve_thinking,
+        crate::tool_constraints::ToolFormat::QwenXml,
+    )
+}
+
+pub fn format_chatml_prompt_with_tool_format(
+    messages: &[ChatMessage],
+    tools: Option<&Value>,
+    enable_thinking: bool,
+    preserve_thinking: bool,
+    tool_format: crate::tool_constraints::ToolFormat,
+) -> String {
     let mut out = String::new();
     let system = messages.first().filter(|m| m.role == "system");
     let tools = tools.and_then(Value::as_array).filter(|t| !t.is_empty());
@@ -147,7 +165,12 @@ pub fn format_chatml_prompt_with_options(
             out.push_str(&template_json(tool));
         }
         out.push_str("\n</tools>");
-        out.push_str(TOOL_INSTRUCTIONS);
+        match tool_format {
+            crate::tool_constraints::ToolFormat::QwenXml => out.push_str(TOOL_INSTRUCTIONS),
+            crate::tool_constraints::ToolFormat::HermesJson => {
+                out.push_str(HERMES_TOOL_INSTRUCTIONS)
+            }
+        }
         if let Some(content) = system
             .and_then(|m| m.content.as_deref())
             .map(str::trim)
@@ -209,20 +232,33 @@ pub fn format_chatml_prompt_with_options(
                     } else if !content.trim().is_empty() {
                         out.push_str("\n\n");
                     }
-                    out.push_str("<tool_call>\n<function=");
-                    out.push_str(&call.function.name);
-                    out.push_str(">\n");
-                    for (name, value) in &call.function.arguments {
-                        out.push_str("<parameter=");
-                        out.push_str(name);
-                        out.push_str(">\n");
-                        match value {
-                            Value::String(text) => out.push_str(text),
-                            _ => out.push_str(&template_json(value)),
+                    match tool_format {
+                        crate::tool_constraints::ToolFormat::QwenXml => {
+                            out.push_str("<tool_call>\n<function=");
+                            out.push_str(&call.function.name);
+                            out.push_str(">\n");
+                            for (name, value) in &call.function.arguments {
+                                out.push_str("<parameter=");
+                                out.push_str(name);
+                                out.push_str(">\n");
+                                match value {
+                                    Value::String(text) => out.push_str(text),
+                                    _ => out.push_str(&template_json(value)),
+                                }
+                                out.push_str("\n</parameter>\n");
+                            }
+                            out.push_str("</function>\n</tool_call>");
                         }
-                        out.push_str("\n</parameter>\n");
+                        crate::tool_constraints::ToolFormat::HermesJson => {
+                            out.push_str("<tool_call>\n{\"name\": ");
+                            out.push_str(&serde_json::to_string(&call.function.name).unwrap());
+                            out.push_str(", \"arguments\": ");
+                            out.push_str(&template_json(&Value::Object(
+                                call.function.arguments.clone(),
+                            )));
+                            out.push_str("}\n</tool_call>");
+                        }
                     }
-                    out.push_str("</function>\n</tool_call>");
                 }
                 out.push_str("<|im_end|>\n");
             }

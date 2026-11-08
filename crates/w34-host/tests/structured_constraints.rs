@@ -442,3 +442,282 @@ fn deferred_advance_and_rollback_match_eager_bitmasks() {
     }
     assert!(deferred.is_token_allowed(EOS));
 }
+
+#[test]
+fn xml_unquoted_and_quoted_strings_and_code_snippets_roundtrip() {
+    use serde_json::Value;
+    use w34_host::{
+        parser::Qwen3Parser,
+        tool_constraints::{ToolChoice, ToolFormat},
+    };
+    let (tok, factory) = setup();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "exec_snippet",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lang": { "enum": ["rust", "python"] },
+                    "code": { "type": "string" }
+                },
+                "required": ["lang", "code"],
+                "additionalProperties": false
+            }
+        }
+    }]);
+
+    // 1. Native unquoted enum + unquoted multi-line code containing `<` and generics
+    let mut c = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    let unquoted_call = "<tool_call>\n<function=exec_snippet>\n<parameter=lang>\nrust\n</parameter>\n<parameter=code>\nif x < 10 {\n    let v: Vec<i32> = Vec::new();\n}\n</parameter>\n</function>\n</tool_call>";
+    feed(&mut c, &tok, unquoted_call).unwrap();
+    assert!(c.is_token_allowed(EOS));
+    let parsed_unquoted =
+        Qwen3Parser::parse_complete_with_tools(unquoted_call, false, Some(&tools));
+    assert_eq!(parsed_unquoted.tool_calls.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&parsed_unquoted.tool_calls[0].function.arguments).unwrap(),
+        json!({
+            "lang": "rust",
+            "code": "if x < 10 {\n    let v: Vec<i32> = Vec::new();\n}"
+        })
+    );
+
+    // 2. JSON-quoted enum + JSON-quoted string produces the exact same parsed result
+    let mut c_quoted = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    let quoted_call = "<tool_call>\n<function=exec_snippet>\n<parameter=lang>\n\"rust\"\n</parameter>\n<parameter=code>\n\"if x < 10 {\\n    let v: Vec<i32> = Vec::new();\\n}\"\n</parameter>\n</function>\n</tool_call>";
+    feed(&mut c_quoted, &tok, quoted_call).unwrap();
+    assert!(c_quoted.is_token_allowed(EOS));
+    let parsed_quoted = Qwen3Parser::parse_complete_with_tools(quoted_call, false, Some(&tools));
+    assert_eq!(parsed_quoted.tool_calls, parsed_unquoted.tool_calls);
+
+    // 3. Invalid unquoted enum value is rejected
+    let mut c_bad = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    assert!(
+        feed(
+            &mut c_bad,
+            &tok,
+            "<tool_call>\n<function=exec_snippet>\n<parameter=lang>\ngo\n</parameter>"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn xml_unordered_parameters_and_no_duplicates() {
+    use serde_json::Value;
+    use w34_host::{
+        parser::Qwen3Parser,
+        tool_constraints::{ToolChoice, ToolFormat},
+    };
+    let (tok, factory) = setup();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "forecast",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": { "enum": ["Paris", "Rome"] },
+                    "units": { "enum": ["c", "f"] },
+                    "days": { "type": "integer", "minimum": 1, "maximum": 7 }
+                },
+                "required": ["city", "days"],
+                "additionalProperties": false
+            }
+        }
+    }]);
+
+    // Reverse order (`days`, then `units`, then `city`) is accepted
+    let mut c1 = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    let reverse_call = "<tool_call>\n<function=forecast>\n<parameter=days>\n3\n</parameter>\n<parameter=units>\nc\n</parameter>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>";
+    feed(&mut c1, &tok, reverse_call).unwrap();
+    assert!(c1.is_token_allowed(EOS));
+    let parsed = Qwen3Parser::parse_complete_with_tools(reverse_call, false, Some(&tools));
+    assert_eq!(
+        serde_json::from_str::<Value>(&parsed.tool_calls[0].function.arguments).unwrap(),
+        json!({"city": "Rome", "units": "c", "days": 3})
+    );
+
+    // Omitting optional `units` with `(days, city)` order is accepted
+    let mut c2 = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    feed(
+        &mut c2,
+        &tok,
+        "<tool_call>\n<function=forecast>\n<parameter=days>\n5\n</parameter>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+    )
+    .unwrap();
+    assert!(c2.is_token_allowed(EOS));
+
+    // Omitting required `days` is rejected at `</function>`
+    let mut c_missing = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    assert!(
+        feed(
+            &mut c_missing,
+            &tok,
+            "<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n<parameter=units>\nc\n</parameter>\n</function>"
+        )
+        .is_err()
+    );
+
+    // Duplicate parameter `<parameter=city>` is rejected
+    let mut c_dup = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    assert!(
+        feed(
+            &mut c_dup,
+            &tok,
+            "<tool_call>\n<function=forecast>\n<parameter=city>\nParis\n</parameter>\n<parameter=city>\nRome\n</parameter>"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn xml_tools_propagate_defs_to_parameter_schemas() {
+    use w34_host::tool_constraints::{ToolChoice, ToolFormat};
+    let (tok, factory) = setup();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "navigate",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "destination": { "$ref": "#/$defs/Point" }
+                },
+                "required": ["destination"],
+                "additionalProperties": false,
+                "$defs": {
+                    "Point": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "integer" },
+                            "y": { "type": "integer" }
+                        },
+                        "required": ["x", "y"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }
+    }]);
+
+    let mut c = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    feed(
+        &mut c,
+        &tok,
+        "<tool_call>\n<function=navigate>\n<parameter=destination>\n{\"x\":10,\"y\":20}\n</parameter>\n</function>\n</tool_call>",
+    )
+    .unwrap();
+    assert!(c.is_token_allowed(EOS));
+
+    let mut c_bad = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    assert!(
+        feed(
+            &mut c_bad,
+            &tok,
+            "<tool_call>\n<function=navigate>\n<parameter=destination>\n{\"x\":10,\"z\":20}\n</parameter>"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn parallel_tool_calls_and_auto_suffix_prohibition() {
+    use w34_host::tool_constraints::{ToolChoice, ToolFormat};
+    let (tok, factory) = setup();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "ping",
+            "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+        }
+    }]);
+
+    let two_calls = "<tool_call>\n<function=ping>\n</function>\n</tool_call>\n<tool_call>\n<function=ping>\n</function>\n</tool_call>";
+
+    // parallel_tool_calls = true allows two calls
+    let mut multi = factory
+        .tools_with_options(
+            &tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml,
+            true,
+            false,
+        )
+        .unwrap();
+    feed(&mut multi, &tok, two_calls).unwrap();
+    assert!(multi.is_token_allowed(EOS));
+
+    // parallel_tool_calls = false allows one call and rejects a second call
+    let mut single = factory
+        .tools_with_options(
+            &tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml,
+            false,
+            false,
+        )
+        .unwrap();
+    feed(
+        &mut single,
+        &tok,
+        "<tool_call>\n<function=ping>\n</function>\n</tool_call>",
+    )
+    .unwrap();
+    assert!(single.is_token_allowed(EOS));
+    assert!(feed(&mut single, &tok, "\n<tool_call>").is_err());
+
+    // ToolChoice::Auto with parallel_tool_calls = false rejects second call and non-whitespace suffix
+    let mut auto_single = factory
+        .tools_with_options(&tools, &ToolChoice::Auto, ToolFormat::QwenXml, false, false)
+        .unwrap();
+    feed(
+        &mut auto_single,
+        &tok,
+        "Let me check.\n<tool_call>\n<function=ping>\n</function>\n</tool_call>",
+    )
+    .unwrap();
+    assert!(auto_single.is_token_allowed(EOS));
+    assert!(feed(&mut auto_single, &tok, "\nTrailing prose is forbidden").is_err());
+}
+
+#[test]
+fn choice_constraint_enforces_exact_literals_and_rollback() {
+    let (tok, factory) = setup();
+    let mut c = factory
+        .choice(
+            &["approve".into(), "reject".into(), "needs_review".into()],
+            false,
+        )
+        .unwrap();
+    let approve_ids = tok.encode("approve", false).unwrap();
+    for &id in approve_ids.get_ids() {
+        c.advance(id as i32).unwrap();
+    }
+    assert!(c.is_token_allowed(EOS));
+
+    // Speculative rollback of all 7 tokens and switching to another valid choice succeeds
+    c.rollback(approve_ids.len()).unwrap();
+    feed(&mut c, &tok, "reject").unwrap();
+    assert!(c.is_token_allowed(EOS));
+    assert!(feed(&mut c, &tok, "_extra").is_err());
+}

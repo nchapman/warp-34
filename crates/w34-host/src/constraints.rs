@@ -88,6 +88,24 @@ impl ConstraintFactory {
         self.compile(TopLevelGrammar::from_regex(regex), thinking)
     }
 
+    pub fn choice(
+        &self,
+        choices: &[String],
+        thinking: bool,
+    ) -> Result<TokenBitmaskConstraint, String> {
+        if choices.is_empty() || choices.iter().any(String::is_empty) {
+            return Err("choice requires a non-empty array of non-empty strings".into());
+        }
+        let mut lits = Vec::with_capacity(choices.len());
+        for c in choices {
+            let lit = serde_json::to_string(c).map_err(|e| e.to_string())?;
+            if !lits.contains(&lit) {
+                lits.push(lit);
+            }
+        }
+        self.lark(&format!("start: {}\n", lits.join(" | ")), thinking)
+    }
+
     /// Lark CFG syntax, not GBNF. Token limits and hidden-stop backtracking are
     /// deliberately excluded because this parser must support arbitrary rollback.
     pub fn lark(&self, grammar: &str, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
@@ -150,6 +168,17 @@ impl ConstraintFactory {
         format: crate::tool_constraints::ToolFormat,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
+        self.tools_with_options(tools, choice, format, true, thinking)
+    }
+
+    pub fn tools_with_options(
+        &self,
+        tools: &serde_json::Value,
+        choice: &crate::tool_constraints::ToolChoice,
+        format: crate::tool_constraints::ToolFormat,
+        parallel_tool_calls: bool,
+        thinking: bool,
+    ) -> Result<TokenBitmaskConstraint, String> {
         if *choice != crate::tool_constraints::ToolChoice::None {
             for tool in tools.as_array().ok_or("tools must be an array")? {
                 if let crate::tool_constraints::ToolChoice::Named(name) = choice
@@ -164,7 +193,12 @@ impl ConstraintFactory {
                 }
             }
         }
-        let grammar = crate::tool_constraints::tool_grammar(tools, choice, format)?;
+        let grammar = crate::tool_constraints::tool_grammar_with_options(
+            tools,
+            choice,
+            format,
+            parallel_tool_calls,
+        )?;
         self.lark(
             &grammar,
             thinking && *choice != crate::tool_constraints::ToolChoice::None,

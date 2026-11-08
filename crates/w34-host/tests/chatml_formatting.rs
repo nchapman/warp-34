@@ -105,3 +105,29 @@ fn old_reasoning_is_removed_but_current_turn_reasoning_is_preserved() {
         )
     );
 }
+
+#[test]
+fn hermes_json_tool_format_prompt_and_history_serialization() {
+    use w34_host::{chatml::format_chatml_prompt_with_tool_format, tool_constraints::ToolFormat};
+    let (messages, _) = parse_openai_messages_multimodal(&json!([
+        {"role":"user","content":"Weather in Paris?"},
+        {"role":"assistant","content":null,"tool_calls":[
+            {"id":"c1","type":"function","function":{"name":"weather","arguments":{"city":"Paris","days":2}}}
+        ]},
+        {"role":"tool","tool_call_id":"c1","content":"sunny"}
+    ]))
+    .unwrap();
+    let tools = json!([{
+        "type":"function",
+        "function":{"name":"weather","parameters":{"type":"object"}}
+    }]);
+    let prompt = format_chatml_prompt_with_tool_format(
+        &messages,
+        Some(&tools),
+        false,
+        false,
+        ToolFormat::HermesJson,
+    );
+    assert!(prompt.contains("return a json object with function name and arguments within <tool_call></tool_call> XML tags"));
+    assert!(prompt.contains("<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 2}}\n</tool_call><|im_end|>\n"));
+}

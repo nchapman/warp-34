@@ -392,6 +392,7 @@ struct Prepared {
     images: Vec<crate::vision::PreprocessedImage>,
     params: SamplingParams,
     constraint: Option<crate::parser::TokenBitmaskConstraint>,
+    tools: Option<Value>,
     stream: bool,
     include_usage: bool,
     thinking: bool,
@@ -434,6 +435,7 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         false
     };
     params.enable_thinking = thinking;
+    let tools_opt = request.get("tools").filter(|v| !v.is_null()).cloned();
     let (prompt, images) = if chat {
         let (messages, images) = super::parse_openai_messages_with_image_policy(
             request.get("messages").ok_or("missing messages")?,
@@ -448,12 +450,14 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
                     .and_then(Value::as_bool)
             })
             .unwrap_or(s.worker.default_preserve_thinking);
+        let tool_format = crate::request_constraints::parse_request_tool_format(&request)?;
         (
-            super::format_chatml_prompt_with_options(
+            crate::chatml::format_chatml_prompt_with_tool_format(
                 &messages,
-                request.get("tools").filter(|v| !v.is_null()),
+                tools_opt.as_ref(),
                 thinking,
                 preserve,
+                tool_format,
             ),
             images,
         )
@@ -503,6 +507,7 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         images,
         params,
         constraint,
+        tools: tools_opt,
         stream,
         include_usage,
         thinking,
@@ -555,6 +560,7 @@ async fn generate(
         generation,
         prepared.params,
         prepared.thinking,
+        prepared.tools,
         chat,
         prompt_len,
         request_id,
@@ -704,6 +710,7 @@ fn output_stream(
     mut generation: GenerationStream,
     params: SamplingParams,
     thinking: bool,
+    tools: Option<Value>,
     chat: bool,
     prompt_len: usize,
     request_id: u64,
@@ -713,7 +720,7 @@ fn output_stream(
         let _admission = admission;
         let tokenizer = s.worker.tokenizer.as_ref().unwrap();
         let mut decoder = tokenizer.decode_stream(false);
-        let mut parser = Qwen3Parser::new(thinking);
+        let mut parser = Qwen3Parser::new(thinking).with_tools(tools.as_ref());
         let mut stops = StopBuffer::default();
         let mut text = String::new();
         let mut count = 0;
@@ -1064,12 +1071,13 @@ async fn responses_create(
     if meta.stream {
         let params = prepared.params;
         let thinking = prepared.thinking;
+        let tools = prepared.tools;
         let events = async_stream::stream! {
             let _admission = admission;
             let _active_guard = active_guard;
             let tokenizer = s.worker.tokenizer.as_ref().unwrap();
             let mut decoder = tokenizer.decode_stream(false);
-            let mut parser = Qwen3Parser::new(thinking);
+            let mut parser = Qwen3Parser::new(thinking).with_tools(tools.as_ref());
             let mut stops = StopBuffer::default();
             let mut sse = crate::responses_api::ResponsesSseFormatter::new(meta.clone());
             let mut generation = generation;
@@ -1175,7 +1183,7 @@ async fn responses_create(
         let _active_guard = active_guard;
         let tokenizer = s.worker.tokenizer.as_ref().unwrap();
         let mut decoder = tokenizer.decode_stream(false);
-        let mut parser = Qwen3Parser::new(prepared.thinking);
+        let mut parser = Qwen3Parser::new(prepared.thinking).with_tools(prepared.tools.as_ref());
         let mut stops = StopBuffer::default();
         let mut generation = generation;
         let mut count = 0usize;
@@ -1298,11 +1306,12 @@ async fn anthropic_messages(
     if meta.stream {
         let params = prepared.params;
         let thinking = prepared.thinking;
+        let tools = prepared.tools;
         let events = async_stream::stream! {
             let _admission = admission;
             let tokenizer = s.worker.tokenizer.as_ref().unwrap();
             let mut decoder = tokenizer.decode_stream(false);
-            let mut parser = Qwen3Parser::new(thinking);
+            let mut parser = Qwen3Parser::new(thinking).with_tools(tools.as_ref());
             let mut stops = StopBuffer::default();
             let mut sse = crate::anthropic_api::AnthropicSseFormatter::new(meta, prompt_len);
             let mut generation = generation;
@@ -1395,7 +1404,7 @@ async fn anthropic_messages(
         let _admission = admission;
         let tokenizer = s.worker.tokenizer.as_ref().unwrap();
         let mut decoder = tokenizer.decode_stream(false);
-        let mut parser = Qwen3Parser::new(prepared.thinking);
+        let mut parser = Qwen3Parser::new(prepared.thinking).with_tools(prepared.tools.as_ref());
         let mut stops = StopBuffer::default();
         let mut generation = generation;
         let mut count = 0usize;

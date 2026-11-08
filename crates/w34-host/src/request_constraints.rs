@@ -27,6 +27,7 @@ pub enum RequestConstraint {
     JsonObject,
     JsonSchema(Value),
     Regex(String),
+    Choice(Vec<String>),
     Grammar(String),
     StructuralTags {
         tags: Vec<StructuralTag>,
@@ -35,7 +36,47 @@ pub enum RequestConstraint {
     Tools {
         tools: Value,
         choice: ToolChoice,
+        format: ToolFormat,
+        parallel_tool_calls: bool,
     },
+}
+
+fn parse_choices(value: &Value) -> Result<Vec<String>, String> {
+    let arr = value
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or("choice must be a non-empty array of strings")?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or("choice entries must be non-empty strings")?;
+        out.push(s.to_string());
+    }
+    Ok(out)
+}
+
+pub fn parse_request_tool_format(request: &Value) -> Result<ToolFormat, String> {
+    let raw = request
+        .get("chat_template_kwargs")
+        .and_then(|v| v.get("tool_call_format"))
+        .or_else(|| request.get("tool_call_format"))
+        .filter(|v| !v.is_null());
+    match raw {
+        None => Ok(ToolFormat::QwenXml),
+        Some(Value::String(s))
+            if s.eq_ignore_ascii_case("xml") || s.eq_ignore_ascii_case("qwen_xml") =>
+        {
+            Ok(ToolFormat::QwenXml)
+        }
+        Some(Value::String(s))
+            if s.eq_ignore_ascii_case("json") || s.eq_ignore_ascii_case("hermes") =>
+        {
+            Ok(ToolFormat::HermesJson)
+        }
+        _ => Err("tool_call_format must be 'xml' or 'json'".into()),
+    }
 }
 
 impl RequestConstraint {
@@ -50,8 +91,9 @@ impl RequestConstraint {
                     let spec = format
                         .get("json_schema")
                         .ok_or("missing response_format.json_schema")?;
-                    if spec.get("strict") != Some(&Value::Bool(true)) {
-                        return Err("json_schema requires strict: true".into());
+                    match spec.get("strict") {
+                        None | Some(Value::Null) | Some(Value::Bool(true)) => {}
+                        _ => return Err("json_schema requires strict: true".into()),
                     }
                     Some(Self::JsonSchema(
                         spec.get("schema")
@@ -72,12 +114,13 @@ impl RequestConstraint {
                 .as_object()
                 .ok_or("structured_outputs must be an object")?;
             if object.len() != 1 {
-                return Err("structured_outputs requires exactly one of json, regex, grammar, structural_tag".into());
+                return Err("structured_outputs requires exactly one of json, regex, choice, grammar, structural_tag".into());
             }
             let (kind, value) = object.iter().next().unwrap();
             output = Some(match kind.as_str() {
                 "json" => Self::JsonSchema(value.clone()),
                 "regex" => Self::Regex(value.as_str().ok_or("regex must be a string")?.into()),
+                "choice" => Self::Choice(parse_choices(value)?),
                 "grammar" => Self::Grammar(
                     value
                         .as_str()
@@ -88,6 +131,46 @@ impl RequestConstraint {
                 _ => return Err("unsupported structured_outputs field".into()),
             });
         }
+        for guided_key in [
+            "guided_json",
+            "guided_regex",
+            "guided_choice",
+            "guided_grammar",
+        ] {
+            if let Some(val) = request.get(guided_key).filter(|v| !v.is_null()) {
+                check_spec_size(guided_key, val)?;
+                if output.is_some() {
+                    return Err("multiple structured output constraints cannot be combined".into());
+                }
+                output = Some(match guided_key {
+                    "guided_json" => {
+                        let schema = if let Some(s) = val.as_str() {
+                            serde_json::from_str::<Value>(s)
+                                .map_err(|e| format!("invalid guided_json string: {e}"))?
+                        } else {
+                            val.clone()
+                        };
+                        Self::JsonSchema(schema)
+                    }
+                    "guided_regex" => {
+                        Self::Regex(val.as_str().ok_or("guided_regex must be a string")?.into())
+                    }
+                    "guided_choice" => Self::Choice(parse_choices(val)?),
+                    "guided_grammar" => Self::Grammar(
+                        val.as_str()
+                            .ok_or("guided_grammar must be a Lark string")?
+                            .into(),
+                    ),
+                    _ => unreachable!(),
+                });
+            }
+        }
+        let tool_format = parse_request_tool_format(request)?;
+        let parallel_tool_calls = match request.get("parallel_tool_calls") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            _ => return Err("parallel_tool_calls must be a boolean".into()),
+        };
         let tools = match request.get("tools") {
             None | Some(Value::Null) => Vec::new(),
             Some(value) => {
@@ -122,6 +205,8 @@ impl RequestConstraint {
             output = Some(Self::Tools {
                 tools: Value::Array(tools),
                 choice,
+                format: tool_format,
+                parallel_tool_calls,
             });
         }
         Ok(output)
@@ -189,13 +274,17 @@ impl RequestConstraint {
             Self::JsonObject => factory.json_object(thinking),
             Self::JsonSchema(schema) => factory.json_schema(schema.clone(), thinking),
             Self::Regex(regex) => factory.regex(regex, thinking),
+            Self::Choice(choices) => factory.choice(choices, thinking),
             Self::Grammar(grammar) => factory.lark(grammar, thinking),
             Self::StructuralTags { tags, triggers } => {
                 factory.structural_tags(tags, triggers, thinking)
             }
-            Self::Tools { tools, choice } => {
-                factory.tools(tools, choice, ToolFormat::QwenXml, thinking)
-            }
+            Self::Tools {
+                tools,
+                choice,
+                format,
+                parallel_tool_calls,
+            } => factory.tools_with_options(tools, choice, *format, *parallel_tool_calls, thinking),
         }
     }
 }
@@ -332,6 +421,81 @@ mod tests {
             }))
             .unwrap()
             .is_some()
+        );
+
+        let js_default_strict = RequestConstraint::parse(&json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "implicit_strict",
+                    "schema": {"type": "object"}
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(js_default_strict.is_mandatory());
+
+        assert!(
+            RequestConstraint::parse(&json!({"structured_outputs": {"choice": ["yes", "no"]}}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(RequestConstraint::parse(&json!({"structured_outputs": {"choice": []}})).is_err());
+        assert!(
+            RequestConstraint::parse(&json!({"guided_json": {"type": "object"}}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({"guided_json": "{\"type\":\"object\"}"}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({"guided_regex": "[a-z]+"}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({"guided_choice": ["a", "b"]}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({"guided_grammar": "start: \"ok\""}))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({
+                "guided_json": {"type": "object"},
+                "guided_regex": "a"
+            }))
+            .is_err()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "parallel_tool_calls": false,
+                "chat_template_kwargs": {"tool_call_format": "json"}
+            }))
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "parallel_tool_calls": "no"
+            }))
+            .is_err()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "tool_call_format": "yaml"
+            }))
+            .is_err()
         );
 
         // Mutual exclusion & validation errors
