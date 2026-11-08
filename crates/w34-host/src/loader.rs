@@ -9,7 +9,9 @@
 //! - Model families: Qwen3.5 dense (`4B`, `9B`), Qwen3.8 dense (`27B`), Qwen3.6 MoE (`35B-A3B` + MTP),
 //!   and `Qwen3DFlashDraftModel` (`DFlash2`).
 
-use crate::cuda::{bf16_to_f16, bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
+use crate::cuda::{
+    bf16_to_f16_slice_inplace, bf16_to_f32, f16_to_f32, f16_to_f32_slice, f32_to_bf16, f32_to_f16,
+};
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -512,7 +514,9 @@ impl SafetensorsArchive {
             }
             "F16" => {
                 let words = self.read_le_u16_vec(name, info)?;
-                Ok(words.into_iter().map(f16_to_f32).collect())
+                let mut out = vec![0.0f32; words.len()];
+                f16_to_f32_slice(&words, &mut out);
+                Ok(out)
             }
             "BF16" => {
                 let words = self.read_le_u16_vec(name, info)?;
@@ -607,9 +611,7 @@ impl SafetensorsArchive {
             "BF16" => {
                 let mut words = self.read_le_u16_vec(name, info)?;
                 if words.len() < 4 * 1024 * 1024 {
-                    for w in &mut words {
-                        *w = bf16_to_f16(*w);
-                    }
+                    bf16_to_f16_slice_inplace(&mut words);
                 } else {
                     let num_threads = std::thread::available_parallelism()
                         .map(|n| n.get().clamp(1, 8))
@@ -618,9 +620,7 @@ impl SafetensorsArchive {
                     std::thread::scope(|s| {
                         for chunk in words.chunks_mut(chunk_elems) {
                             s.spawn(move || {
-                                for w in chunk {
-                                    *w = bf16_to_f16(*w);
-                                }
+                                bf16_to_f16_slice_inplace(chunk);
                             });
                         }
                     });
@@ -672,9 +672,7 @@ impl SafetensorsArchive {
                     *w = u16::from_le(*w);
                 }
                 if info.dtype == "BF16" {
-                    for w in dst.iter_mut() {
-                        *w = bf16_to_f16(*w);
-                    }
+                    bf16_to_f16_slice_inplace(dst);
                 }
                 Ok(())
             }

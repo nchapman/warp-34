@@ -217,6 +217,117 @@ pub fn bf16_to_f16(bits: u16) -> u16 {
     f32_to_f16(bf16_to_f32(bits))
 }
 
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+mod half_simd {
+    use std::arch::x86_64::*;
+
+    #[inline]
+    pub(super) fn supported() -> bool {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")
+    }
+
+    #[target_feature(enable = "avx2,f16c")]
+    pub(super) unsafe fn f16_to_f32_f16c(src: &[u16], dst: &mut [f32]) {
+        let n = src.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let vh = _mm_loadu_si128(src.as_ptr().add(i).cast());
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_cvtph_ps(vh));
+            i += 8;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) = super::f16_to_f32(*src.get_unchecked(i));
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2,f16c")]
+    pub(super) unsafe fn f32_to_f16_f16c(src: &[f32], dst: &mut [u16]) {
+        let n = src.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_loadu_ps(src.as_ptr().add(i));
+            let vh = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(v);
+            _mm_storeu_si128(dst.as_mut_ptr().add(i).cast(), vh);
+            i += 8;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) = super::f32_to_f16(*src.get_unchecked(i));
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2,f16c")]
+    pub(super) unsafe fn bf16_to_f16_f16c_inplace(words: &mut [u16]) {
+        let n = words.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let ptr = words.as_mut_ptr().add(i);
+            let vbf = _mm_loadu_si128(ptr.cast());
+            let vf32 = _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(vbf)));
+            let vf16 = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(vf32);
+            _mm_storeu_si128(ptr.cast(), vf16);
+            i += 8;
+        }
+        while i < n {
+            let w = *words.get_unchecked(i);
+            *words.get_unchecked_mut(i) = super::bf16_to_f16(w);
+            i += 1;
+        }
+    }
+}
+
+/// Converts a slice of IEEE-754 binary16 bits (`u16`) into `f32` (`dst`).
+/// Uses `AVX2 + F16C` (`_mm256_cvtph_ps`) on `x86_64` when available.
+pub fn f16_to_f32_slice(src: &[u16], dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if half_simd::supported() {
+        // SAFETY: runtime AVX2+F16C guard and equal slice lengths asserted above.
+        unsafe {
+            half_simd::f16_to_f32_f16c(src, dst);
+        }
+        return;
+    }
+    for (o, &b) in dst.iter_mut().zip(src) {
+        *o = f16_to_f32(b);
+    }
+}
+
+/// Converts a slice of `f32` values into IEEE-754 binary16 bits (`u16`, round-to-nearest-even).
+/// Uses `AVX2 + F16C` (`_mm256_cvtps_ph`) on `x86_64` when available.
+pub fn f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
+    assert_eq!(src.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if half_simd::supported() {
+        // SAFETY: runtime AVX2+F16C guard and equal slice lengths asserted above.
+        unsafe {
+            half_simd::f32_to_f16_f16c(src, dst);
+        }
+        return;
+    }
+    for (o, &v) in dst.iter_mut().zip(src) {
+        *o = f32_to_f16(v);
+    }
+}
+
+/// Converts a slice of `BF16` bits (`u16`) in place into IEEE-754 `FP16` bits (`u16`).
+/// Uses `AVX2 + F16C` on `x86_64` when available.
+pub fn bf16_to_f16_slice_inplace(words: &mut [u16]) {
+    #[cfg(target_arch = "x86_64")]
+    if half_simd::supported() {
+        // SAFETY: runtime AVX2+F16C guard verified above; `words` is a valid mutable slice.
+        unsafe {
+            half_simd::bf16_to_f16_f16c_inplace(words);
+        }
+        return;
+    }
+    for w in words {
+        *w = bf16_to_f16(*w);
+    }
+}
+
 /// Memory budget calculated by [`CapacityPlanner`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapacityPlan {
