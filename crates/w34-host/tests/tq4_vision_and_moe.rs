@@ -1,9 +1,9 @@
 //! TQ4 KV Cache, Multimodal Vision, and Hybrid MoE Integration Tests:
 //! - Paged `TQ4` (`132 B`/row) & `Q8_0` (`272 B`/row) KV cache with Seed-42
-//!   Rademacher + WHT-256 rotation, boundary-anchored `Tq4` (`21,376 B/token`, `3.07x`:
-//!   rotated `Q8_0` on first 2 & last 2 full-attention layers + least-squares `TQ4` interior),
-//!   uniform `Tq4All` (`16,896 B/token`, `3.88x`), 0-ULP page-table permutation invariance,
-//!   and long-context needle-in-a-haystack retrieval.
+//!   Rademacher + WHT-256 rotation, tail-anchored `Tq4` (`21,376 B/token`, `3.07x`:
+//!   unrotated `Q8_0` on last 4 full-attention layers + rotated least-squares `TQ4` on
+//!   preceding layers), uniform `Tq4All` (`16,896 B/token`, `3.88x`), 0-ULP page-table
+//!   permutation invariance, and long-context needle-in-a-haystack retrieval.
 //! - Multimodal Vision (`smart_resize`, bicubic + normalize, 3D `mRoPE`,
 //!   content-hashed `MambaRadixCache` keys, OpenAI `image_url`, `op_vision.cu` kernels,
 //!   and `Qwen3VisionEncoder` + multimodal generation).
@@ -50,7 +50,7 @@ fn test_tq4_and_q8_0_byte_budgets() {
 
     assert_eq!(fp16_bpt, 65_536);
     assert_eq!(q8_bpt, 34_816); // 1.88x raw compression (plain 8-bit K & V)
-    assert_eq!(tq4_bpt, 21_376); // 3.07x effective compression (4 rotated Q8_0 + 12 rotated TQ4)
+    assert_eq!(tq4_bpt, 21_376); // 3.07x effective compression (4 unrotated Q8_0 + 12 rotated TQ4)
     assert_eq!(tq4_all_bpt, 16_896); // 3.88x raw compression (16 rotated TQ4)
 
     assert_eq!(
@@ -65,11 +65,11 @@ fn test_tq4_and_q8_0_byte_budgets() {
 
     for ord in 0..num_full {
         let (kf, vf, kt, vt) = KvFormatPolicy::Tq4.resolve_layer(ord, num_full);
-        if ord < 2 || ord >= num_full - 2 {
+        if ord >= num_full - 4 {
             assert_eq!(kf, W34_KV_FORMAT_Q8_0);
             assert_eq!(vf, W34_KV_FORMAT_Q8_0);
-            assert_eq!(kt, W34_KV_TRANSFORM_RADEMACHER_WHT256);
-            assert_eq!(vt, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+            assert_eq!(kt, W34_KV_TRANSFORM_IDENTITY);
+            assert_eq!(vt, W34_KV_TRANSFORM_IDENTITY);
         } else {
             assert_eq!(kf, W34_KV_FORMAT_TQ4);
             assert_eq!(vf, W34_KV_FORMAT_TQ4);
@@ -96,8 +96,8 @@ fn test_wht256_outlier_protection_and_long_context_needle() {
     ] {
         let layer_ids = [3, 7, 11, 15, 19];
         let pool = KvPool::new(0, 0, &layer_ids, 2, 256, 16, 16, policy).expect("KvPool");
-        // Test interior layer (ordinal 2 -> Q8_0 or rotated TQ4)
-        let layout = pool.layers[2].layout;
+        // Test ordinal 0 (Q8_0 for Q8_0 policy, rotated TQ4 for Tq4 and Tq4All)
+        let layout = pool.layers[0].layout;
         let expected_transform = if policy == KvFormatPolicy::Q8_0 {
             W34_KV_TRANSFORM_IDENTITY
         } else {
@@ -1382,8 +1382,8 @@ fn check_gqa_split_kv_parity(seq_len: usize) {
     for (policy, layer_ord) in [
         (KvFormatPolicy::Fp16, 0usize),
         (KvFormatPolicy::Q8_0, 0usize),
-        (KvFormatPolicy::Tq4, 0usize), // rotated Q8_0 boundary
-        (KvFormatPolicy::Tq4, 2usize), // rotated TQ4 interior
+        (KvFormatPolicy::Tq4, 0usize), // rotated TQ4 layer
+        (KvFormatPolicy::Tq4, 2usize), // unrotated Q8_0 tail layer
     ] {
         let pool_contig = KvPool::new(
             0,
