@@ -55,9 +55,13 @@ description = "Check Rust documentation with warnings denied"
 depends = ["dashboard-build"]
 run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --features cuda"
 
+[tasks."simd-check"]
+description = "Static assembly & llvm-mca audit for CPU SIMD kernels across AVX2/AVX-512 microarchitectures"
+run = "python3 tools/check_cpu_simd.py"
+
 [tasks."check-quick"]
-description = "Format check, clippy (both feature states), and rustdoc check"
-depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check"]
+description = "Format check, clippy (both feature states), rustdoc check, and CPU SIMD assembly audit"
+depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "simd-check"]
 
 [tasks."test-quick"]
 description = "Unit tests only (lib target with CUDA)"
