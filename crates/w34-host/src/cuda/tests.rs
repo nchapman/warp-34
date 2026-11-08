@@ -912,6 +912,7 @@ fn test_tp2_collectives_entrypoints_and_validation() {
     assert_eq!(&vocab_out[n..], &vec![f32_to_f16(2.0); n][..]);
 
     verify_tp2_fused_residual_rms_norm_regimes(&comm, &s0, &s1);
+    verify_tp2_dma_crossover_and_graph_replay(&s0, &s1);
 }
 
 #[cfg(feature = "cuda")]
@@ -1041,6 +1042,395 @@ fn verify_tp2_fused_residual_rms_norm_regimes(
                 "norm out mismatch at hidden={hidden}: got {}",
                 f16_to_f32(v)
             );
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn verify_tp2_dma_crossover_and_graph_replay(s0: &CudaStream, s1: &CudaStream) {
+    // Exercise both forced mapped-host staging (`allow_p2p = false`) and available P2P (`allow_p2p = true`)
+    // across `< 64 KiB`, `== 64 KiB`, and `> 64 KiB` transfers, including back-to-back even-epoch
+    // large `gather_vocab_f16` followed immediately by `>= 64 KiB` DMA `all_reduce_f16` and
+    // repeated CUDA Graph replays with mutating payloads.
+    for allow_p2p in [false, true] {
+        let comm = Tp2Collectives::new_for_tp_with_p2p(2, 256 * 1024, allow_p2p).unwrap();
+
+        // 1. Threshold sweep: just below (`65,520 B`), at (`65,536 B`), and above (`98,304 B`) 64 KiB.
+        for n_f16 in [32_760usize, 32_768, 49_152] {
+            let n_f32 = n_f16 / 2;
+            let d0_f16 = DeviceBuffer::alloc(0, n_f16 * 2).unwrap();
+            let d1_f16 = DeviceBuffer::alloc(1, n_f16 * 2).unwrap();
+            let d0_bf16 = DeviceBuffer::alloc(0, n_f16 * 2).unwrap();
+            let d1_bf16 = DeviceBuffer::alloc(1, n_f16 * 2).unwrap();
+            let d0_f32 = DeviceBuffer::alloc(0, n_f32 * 4).unwrap();
+            let d1_f32 = DeviceBuffer::alloc(1, n_f32 * 4).unwrap();
+
+            d0_f16
+                .copy_from_host(&vec![f32_to_f16(1.25); n_f16], s0)
+                .unwrap();
+            d1_f16
+                .copy_from_host(&vec![f32_to_f16(2.75); n_f16], s1)
+                .unwrap();
+            d0_bf16
+                .copy_from_host(&vec![f32_to_bf16(0.5); n_f16], s0)
+                .unwrap();
+            d1_bf16
+                .copy_from_host(&vec![f32_to_bf16(1.5); n_f16], s1)
+                .unwrap();
+            d0_f32.copy_from_host(&vec![3.25f32; n_f32], s0).unwrap();
+            d1_f32.copy_from_host(&vec![4.75f32; n_f32], s1).unwrap();
+            s0.synchronize().unwrap();
+            s1.synchronize().unwrap();
+
+            std::thread::scope(|scope| {
+                let (a0_f16, a0_bf16, a0_f32) = (d0_f16.addr(), d0_bf16.addr(), d0_f32.addr());
+                let (a1_f16, a1_bf16, a1_f32) = (d1_f16.addr(), d1_bf16.addr(), d1_f32.addr());
+                let c = &comm;
+                let t0 = scope.spawn(move || {
+                    let _dev = CudaDevice::set_current(0).unwrap();
+                    let ex0 = s0.exec(0, 0);
+                    c.all_reduce_f16(&ex0, a0_f16, a0_f16, 0, n_f16 as i32)
+                        .unwrap();
+                    c.all_reduce_bf16(&ex0, a0_bf16, a0_bf16, 0, n_f16 as i32)
+                        .unwrap();
+                    c.all_reduce_f32(&ex0, a0_f32, a0_f32, 0, n_f32 as i32)
+                        .unwrap();
+                    s0.synchronize().unwrap();
+                });
+                let t1 = scope.spawn(move || {
+                    let _dev = CudaDevice::set_current(1).unwrap();
+                    let ex1 = s1.exec(0, 0);
+                    c.all_reduce_f16(&ex1, a1_f16, a1_f16, 1, n_f16 as i32)
+                        .unwrap();
+                    c.all_reduce_bf16(&ex1, a1_bf16, a1_bf16, 1, n_f16 as i32)
+                        .unwrap();
+                    c.all_reduce_f32(&ex1, a1_f32, a1_f32, 1, n_f32 as i32)
+                        .unwrap();
+                    s1.synchronize().unwrap();
+                });
+                t0.join().unwrap();
+                t1.join().unwrap();
+            });
+
+            let mut h0_f16 = vec![0u16; n_f16];
+            let mut h1_f16 = vec![0u16; n_f16];
+            let mut h0_bf16 = vec![0u16; n_f16];
+            let mut h0_f32 = vec![0.0f32; n_f32];
+            d0_f16.copy_to_host(&mut h0_f16, s0).unwrap();
+            d1_f16.copy_to_host(&mut h1_f16, s1).unwrap();
+            d0_bf16.copy_to_host(&mut h0_bf16, s0).unwrap();
+            d0_f32.copy_to_host(&mut h0_f32, s0).unwrap();
+            s0.synchronize().unwrap();
+            s1.synchronize().unwrap();
+            assert_eq!(h0_f16, vec![f32_to_f16(4.0); n_f16]);
+            assert_eq!(h1_f16, vec![f32_to_f16(4.0); n_f16]);
+            assert_eq!(h0_bf16, vec![f32_to_bf16(2.0); n_f16]);
+            assert_eq!(h0_f32, vec![8.0f32; n_f32]);
+        }
+
+        // 2. Fused residual+GemmaRMSNorm and HC-combine across `< 64 KiB` (`M=7`), `== 64 KiB` (`M=8`),
+        //    and `> 64 KiB` (`M=12`) at `hidden = 4096`.
+        let hidden = 4096usize;
+        for num_tokens in [7usize, 8, 12] {
+            let n = num_tokens * hidden;
+            let d0_in = DeviceBuffer::alloc(0, n * 2).unwrap();
+            let d1_in = DeviceBuffer::alloc(1, n * 2).unwrap();
+            let d0_res = DeviceBuffer::alloc(0, n * 2).unwrap();
+            let d1_res = DeviceBuffer::alloc(1, n * 2).unwrap();
+            let d0_w = DeviceBuffer::alloc(0, hidden * 2).unwrap();
+            let d1_w = DeviceBuffer::alloc(1, hidden * 2).unwrap();
+            let d0_out = DeviceBuffer::alloc(0, n * 2).unwrap();
+            let d1_out = DeviceBuffer::alloc(1, n * 2).unwrap();
+            let d0_hc = DeviceBuffer::alloc(0, n * 2).unwrap();
+            let d1_hc = DeviceBuffer::alloc(1, n * 2).unwrap();
+            let d0_inj = DeviceBuffer::alloc(0, num_tokens * 4).unwrap();
+            let d1_inj = DeviceBuffer::alloc(1, num_tokens * 4).unwrap();
+            d0_in.copy_from_host(&vec![f32_to_f16(1.0); n], s0).unwrap();
+            d1_in.copy_from_host(&vec![f32_to_f16(2.0); n], s1).unwrap();
+            d0_res
+                .copy_from_host(&vec![f32_to_f16(0.5); n], s0)
+                .unwrap();
+            d1_res
+                .copy_from_host(&vec![f32_to_f16(0.5); n], s1)
+                .unwrap();
+            d0_w.copy_from_host(&vec![f32_to_f16(0.25); hidden], s0)
+                .unwrap();
+            d1_w.copy_from_host(&vec![f32_to_f16(0.25); hidden], s1)
+                .unwrap();
+            d0_inj
+                .copy_from_host(&vec![1.0f32; num_tokens], s0)
+                .unwrap();
+            d1_inj
+                .copy_from_host(&vec![1.0f32; num_tokens], s1)
+                .unwrap();
+            s0.synchronize().unwrap();
+            s1.synchronize().unwrap();
+
+            std::thread::scope(|scope| {
+                let (in0, res0, w0, out0, hc0, inj0) = (
+                    d0_in.addr(),
+                    d0_res.addr(),
+                    d0_w.addr(),
+                    d0_out.addr(),
+                    d0_hc.addr(),
+                    d0_inj.addr(),
+                );
+                let (in1, res1, w1, out1, hc1, inj1) = (
+                    d1_in.addr(),
+                    d1_res.addr(),
+                    d1_w.addr(),
+                    d1_out.addr(),
+                    d1_hc.addr(),
+                    d1_inj.addr(),
+                );
+                let c = &comm;
+                let t0 = scope.spawn(move || {
+                    let _dev = CudaDevice::set_current(0).unwrap();
+                    let ex0 = s0.exec(0, 0);
+                    c.all_reduce_residual_gemma_rms_norm_f16(
+                        &ex0,
+                        in0,
+                        0,
+                        res0,
+                        w0,
+                        out0,
+                        0,
+                        0,
+                        num_tokens as i32,
+                        hidden as i32,
+                        1e-6,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                    c.all_reduce_hc_combine_tap_f16(
+                        &ex0,
+                        res0,
+                        in0,
+                        0,
+                        inj0,
+                        0,
+                        hc0,
+                        0,
+                        0,
+                        0,
+                        num_tokens as i32,
+                        1,
+                        hidden as i32,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                    s0.synchronize().unwrap();
+                });
+                let t1 = scope.spawn(move || {
+                    let _dev = CudaDevice::set_current(1).unwrap();
+                    let ex1 = s1.exec(0, 0);
+                    c.all_reduce_residual_gemma_rms_norm_f16(
+                        &ex1,
+                        in1,
+                        0,
+                        res1,
+                        w1,
+                        out1,
+                        0,
+                        1,
+                        num_tokens as i32,
+                        hidden as i32,
+                        1e-6,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                    c.all_reduce_hc_combine_tap_f16(
+                        &ex1,
+                        res1,
+                        in1,
+                        0,
+                        inj1,
+                        0,
+                        hc1,
+                        0,
+                        0,
+                        1,
+                        num_tokens as i32,
+                        1,
+                        hidden as i32,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                    s1.synchronize().unwrap();
+                });
+                t0.join().unwrap();
+                t1.join().unwrap();
+            });
+
+            let mut h_res = vec![0u16; n];
+            let mut h_hc = vec![0u16; n];
+            d0_res.copy_to_host(&mut h_res, s0).unwrap();
+            d0_hc.copy_to_host(&mut h_hc, s0).unwrap();
+            s0.synchronize().unwrap();
+            assert_eq!(h_res, vec![f32_to_f16(3.5); n]);
+            assert_eq!(h_hc, vec![f32_to_f16(6.5); n]);
+        }
+
+        // 3. Back-to-back odd-epoch + even-epoch large `gather_vocab_f16` (`81,920 B >= 64 KiB`)
+        //    followed immediately by `>= 64 KiB` DMA `all_reduce_f16` and `< 64 KiB` `all_reduce_f16`,
+        //    both eager and across repeated CUDA Graph replays with changing payloads.
+        let n_vocab_rows = 2usize;
+        let local_vocab = 20_480usize; // 2 * 20,480 * 2B = 81,920 B (>= 64 KiB)
+        let n_vocab_elems = n_vocab_rows * local_vocab;
+        let n_large = 40_960usize; // 81,920 B (>= 64 KiB DMA)
+        let n_small = 32_760usize; // 65,520 B (< 64 KiB SM WB)
+
+        let d0_vin = DeviceBuffer::alloc(0, n_vocab_elems * 2).unwrap();
+        let d1_vin = DeviceBuffer::alloc(1, n_vocab_elems * 2).unwrap();
+        let d0_vout_odd = DeviceBuffer::alloc(0, n_vocab_elems * 4).unwrap();
+        let d0_vout_even = DeviceBuffer::alloc(0, n_vocab_elems * 4).unwrap();
+        let d0_large = DeviceBuffer::alloc(0, n_large * 2).unwrap();
+        let d1_large = DeviceBuffer::alloc(1, n_large * 2).unwrap();
+        let d0_small = DeviceBuffer::alloc(0, n_small * 2).unwrap();
+        let d1_small = DeviceBuffer::alloc(1, n_small * 2).unwrap();
+
+        let (vin0, vin1, vodd0, veven0) = (
+            d0_vin.addr(),
+            d1_vin.addr(),
+            d0_vout_odd.addr(),
+            d0_vout_even.addr(),
+        );
+        let (lg0, lg1, sm0, sm1) = (
+            d0_large.addr(),
+            d1_large.addr(),
+            d0_small.addr(),
+            d1_small.addr(),
+        );
+
+        let (g0, g1) = std::thread::scope(|scope| {
+            let c = &comm;
+            let t0 = scope.spawn(move || {
+                let _dev = CudaDevice::set_current(0).unwrap();
+                let ex0 = s0.exec(0, 0);
+                super::CudaGraph::capture(s0, || {
+                    c.gather_vocab_f16(
+                        &ex0,
+                        vin0,
+                        vodd0,
+                        0,
+                        n_vocab_rows as i32,
+                        local_vocab as i32,
+                    )?;
+                    c.gather_vocab_f16(
+                        &ex0,
+                        vin0,
+                        veven0,
+                        0,
+                        n_vocab_rows as i32,
+                        local_vocab as i32,
+                    )?;
+                    c.all_reduce_f16(&ex0, lg0, lg0, 0, n_large as i32)?;
+                    c.all_reduce_f16(&ex0, sm0, sm0, 0, n_small as i32)
+                })
+                .unwrap()
+            });
+            let t1 = scope.spawn(move || {
+                let _dev = CudaDevice::set_current(1).unwrap();
+                let ex1 = s1.exec(0, 0);
+                super::CudaGraph::capture(s1, || {
+                    c.gather_vocab_f16(&ex1, vin1, 0, 1, n_vocab_rows as i32, local_vocab as i32)?;
+                    c.gather_vocab_f16(&ex1, vin1, 0, 1, n_vocab_rows as i32, local_vocab as i32)?;
+                    c.all_reduce_f16(&ex1, lg1, lg1, 1, n_large as i32)?;
+                    c.all_reduce_f16(&ex1, sm1, sm1, 1, n_small as i32)
+                })
+                .unwrap()
+            });
+            (t0.join().unwrap(), t1.join().unwrap())
+        });
+
+        for replay in 1..=3usize {
+            let v0_val = (replay as f32) * 1.5;
+            let v1_val = (replay as f32) * 2.5;
+            let lg0_val = (replay as f32) * 0.75;
+            let lg1_val = (replay as f32) * 1.25;
+            let sm0_val = (replay as f32) * 2.0;
+            let sm1_val = (replay as f32) * 3.0;
+
+            d0_vin
+                .copy_from_host(&vec![f32_to_f16(v0_val); n_vocab_elems], s0)
+                .unwrap();
+            d1_vin
+                .copy_from_host(&vec![f32_to_f16(v1_val); n_vocab_elems], s1)
+                .unwrap();
+            d0_large
+                .copy_from_host(&vec![f32_to_f16(lg0_val); n_large], s0)
+                .unwrap();
+            d1_large
+                .copy_from_host(&vec![f32_to_f16(lg1_val); n_large], s1)
+                .unwrap();
+            d0_small
+                .copy_from_host(&vec![f32_to_f16(sm0_val); n_small], s0)
+                .unwrap();
+            d1_small
+                .copy_from_host(&vec![f32_to_f16(sm1_val); n_small], s1)
+                .unwrap();
+            s0.synchronize().unwrap();
+            s1.synchronize().unwrap();
+
+            std::thread::scope(|scope| {
+                let g0_ref = &g0;
+                let g1_ref = &g1;
+                let t0 = scope.spawn(move || {
+                    let _dev = CudaDevice::set_current(0).unwrap();
+                    g0_ref.launch(s0).unwrap();
+                    s0.synchronize().unwrap();
+                });
+                let t1 = scope.spawn(move || {
+                    let _dev = CudaDevice::set_current(1).unwrap();
+                    g1_ref.launch(s1).unwrap();
+                    s1.synchronize().unwrap();
+                });
+                t0.join().unwrap();
+                t1.join().unwrap();
+            });
+
+            let mut h_vodd = vec![0u16; n_vocab_elems * 2];
+            let mut h_veven = vec![0u16; n_vocab_elems * 2];
+            let mut h_lg0 = vec![0u16; n_large];
+            let mut h_lg1 = vec![0u16; n_large];
+            let mut h_sm0 = vec![0u16; n_small];
+            let mut h_sm1 = vec![0u16; n_small];
+            d0_vout_odd.copy_to_host(&mut h_vodd, s0).unwrap();
+            d0_vout_even.copy_to_host(&mut h_veven, s0).unwrap();
+            d0_large.copy_to_host(&mut h_lg0, s0).unwrap();
+            d1_large.copy_to_host(&mut h_lg1, s1).unwrap();
+            d0_small.copy_to_host(&mut h_sm0, s0).unwrap();
+            d1_small.copy_to_host(&mut h_sm1, s1).unwrap();
+            s0.synchronize().unwrap();
+            s1.synchronize().unwrap();
+
+            for row in 0..n_vocab_rows {
+                let base = row * local_vocab * 2;
+                assert_eq!(
+                    &h_vodd[base..base + local_vocab],
+                    &vec![f32_to_f16(v0_val); local_vocab][..]
+                );
+                assert_eq!(
+                    &h_vodd[base + local_vocab..base + 2 * local_vocab],
+                    &vec![f32_to_f16(v1_val); local_vocab][..]
+                );
+                assert_eq!(
+                    &h_veven[base..base + local_vocab],
+                    &vec![f32_to_f16(v0_val); local_vocab][..]
+                );
+                assert_eq!(
+                    &h_veven[base + local_vocab..base + 2 * local_vocab],
+                    &vec![f32_to_f16(v1_val); local_vocab][..]
+                );
+            }
+            assert_eq!(h_lg0, vec![f32_to_f16(lg0_val + lg1_val); n_large]);
+            assert_eq!(h_lg1, vec![f32_to_f16(lg0_val + lg1_val); n_large]);
+            assert_eq!(h_sm0, vec![f32_to_f16(sm0_val + sm1_val); n_small]);
+            assert_eq!(h_sm1, vec![f32_to_f16(sm0_val + sm1_val); n_small]);
         }
     }
 }

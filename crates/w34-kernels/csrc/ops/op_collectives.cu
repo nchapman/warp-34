@@ -42,13 +42,15 @@ template <typename T>
 __device__ __forceinline__ T* stage_epoch_ptr(T* base, const Signal* sig, bool odd, size_t fallback_elems) {
     size_t cap_bytes = (size_t)sig->end[128][0] & ~15ULL;
     size_t min_bytes = fallback_elems * sizeof(T);
-    if (cap_bytes >= kDmaThresholdBytes && min_bytes < kDmaThresholdBytes) {
-        size_t base_off = (cap_bytes * 2u) + (odd ? kDmaThresholdBytes : 0u);
-        return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + base_off);
+    if (cap_bytes >= min_bytes && cap_bytes > 0) {
+        // `[0, cap_bytes)` is reserved exclusively for 2-barrier Copy-Engine DMA TX (`dma_tx`).
+        // All 1-barrier `stage_epoch_ptr` operations (both `< 64 KiB` and `>= 64 KiB` gathers)
+        // ping-pong across `[cap_bytes, 2 * cap_bytes)` (even) and `[2 * cap_bytes, 3 * cap_bytes)` (odd).
+        size_t off_bytes = cap_bytes * (odd ? 2u : 1u);
+        return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + off_bytes);
     }
     if (!odd) return base;
-    size_t off_bytes = (cap_bytes >= min_bytes) ? cap_bytes : min_bytes;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + off_bytes);
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + min_bytes);
 }
 
 template <typename T>
@@ -862,7 +864,7 @@ __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
         uint4* out_v = reinterpret_cast<uint4*>(rank0_full_out);
         if (rank == 1) {
             for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
-                s1_v[i] = in_v[i];
+                st_global_wb_v4(&s1_v[i], in_v[i]);
             }
         } else {
             for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
@@ -1795,8 +1797,13 @@ extern "C" int w34_tp2_gather_vocab_f16(
         return (int)cudaErrorInvalidValue;
     }
     const int num_elems = num_rows * local_vocab_size;
-    int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    const bool vec8 = ((local_vocab_size & 7) == 0) &&
+                      ((((uintptr_t)local_logits_f16 | (uintptr_t)stage1 |
+                         (uintptr_t)rank0_full_logits_f16) & 15u) == 0);
+    const int elems_per_block = vec8 ? 4096 : 512;
+    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
+    int cap = w34_comm::tp2_block_cap(true);
+    if (cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(

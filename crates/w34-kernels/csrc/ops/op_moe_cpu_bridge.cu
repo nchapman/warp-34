@@ -146,7 +146,7 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                 }
             }
             if (gpu_share_frac > 0.20f || num_tokens > 1) {
-                const float eff_frac = (gpu_share_frac > 0.20f) ? gpu_share_frac : 0.25f;
+                const float eff_frac = (gpu_share_frac > 0.20f) ? gpu_share_frac : 0.36f;
                 const int scaled = static_cast<int>(static_cast<float>(n_cold) * eff_frac + 0.5f);
                 if (scaled > want_gpu_cold) {
                     want_gpu_cold = scaled;
