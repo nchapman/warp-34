@@ -1,0 +1,47 @@
+{
+  "status": "complete",
+  "mode": "mtp3",
+  "metrics": {
+    "ifeval": {
+      "name": "ifeval",
+      "alias": "ifeval",
+      "sample_len": 10,
+      "prompt_level_strict_acc,none": 0.9,
+      "prompt_level_strict_acc_stderr,none": 0.09999999999999999,
+      "inst_level_strict_acc,none": 0.9444444444444444,
+      "inst_level_strict_acc_stderr,none": "N/A",
+      "prompt_level_loose_acc,none": 0.9,
+      "prompt_level_loose_acc_stderr,none": 0.09999999999999999,
+      "inst_level_loose_acc,none": 0.9444444444444444,
+      "inst_level_loose_acc_stderr,none": "N/A"
+    },
+    "gsm8k": {
+      "name": "gsm8k",
+      "alias": "gsm8k",
+      "sample_len": 10,
+      "exact_match,strict-match": 0.8,
+      "exact_match_stderr,strict-match": 0.13333333333333333,
+      "exact_match,flexible-extract": 0.9,
+      "exact_match_stderr,flexible-extract": 0.09999999999999999
+    }
+  },
+  "artifact_sha256": {
+    "/workspace/vllm-venv/bin/vllm": "ba6c2dee1a9f5db3be2a68ab3a64fa7b1a7c8469734ce5b30d68192fe63616b2",
+    "/workspace/quality-venv/bin/lm-eval": "9b20525c2f4ad78a637124bf09732f09be94412895546b24270eaa23b079cb31",
+    "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf/config.json": "ccaf8c6239c41f02ffb2e4921c5fc6596e3ded1395483be3f6b516d11ba0a536"
+  },
+  "gpu_uuid": "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8",
+  "cleanup_established": true,
+  "server_exit": 0,
+  "sha256": {
+    "server.log": "4c97c8057e6adc81d217b99685143f20f93ad9b3f2886cbd80a3c7e957907e7f",
+    "models.json": "486aaecc0ccd8c623b1f43ca39c98dbe31d55bde5bb18ca1d3c1d18e9905ee5b",
+    "environment.json": "96c727e781c17c0009d034b72962f9faa8bc54275ce83d4d5a29572d014a08c4",
+    "ifeval.log": "4e33e44622d913fc68566564ef39a16302ae79b411101178d036925ddfdc1eb4",
+    "gsm8k.log": "a1fdfa6f39152307a09d4af123bf46c9b2449ac7173921ee0457101e3458303d",
+    "ifeval/warp34-quality/results_2026-11-08T00-24-44.480356.json": "36bf05e138e1e862d9d02bca6c13193f6087d874ed4e417cd217a7cd32746ffa",
+    "ifeval/warp34-quality/samples_ifeval_2026-11-08T00-24-44.480356.jsonl": "43c3e3a52f725a6879f75edb5f691f26a0ba6739adae8d40121a8e3a8c50c3f0",
+    "gsm8k/warp34-quality/results_2026-11-08T00-25-17.924494.json": "960a742feeb5f4a9c4b85d9417b9920c888acd9fc4dc8034ba15fc7d23d6b601",
+    "gsm8k/warp34-quality/samples_gsm8k_2026-11-08T00-25-17.924494.jsonl": "3f1f360595e0699dc43bf88d842faa14ebc5d057f0e5a7f05b7e557ddf30bc06"
+  }
+}

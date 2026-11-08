@@ -1,0 +1,47 @@
+{
+  "status": "complete",
+  "mode": "mtp3",
+  "metrics": {
+    "ifeval": {
+      "name": "ifeval",
+      "alias": "ifeval",
+      "sample_len": 10,
+      "prompt_level_strict_acc,none": 1.0,
+      "prompt_level_strict_acc_stderr,none": 0.0,
+      "inst_level_strict_acc,none": 1.0,
+      "inst_level_strict_acc_stderr,none": "N/A",
+      "prompt_level_loose_acc,none": 1.0,
+      "prompt_level_loose_acc_stderr,none": 0.0,
+      "inst_level_loose_acc,none": 1.0,
+      "inst_level_loose_acc_stderr,none": "N/A"
+    },
+    "gsm8k": {
+      "name": "gsm8k",
+      "alias": "gsm8k",
+      "sample_len": 10,
+      "exact_match,strict-match": 0.8,
+      "exact_match_stderr,strict-match": 0.13333333333333333,
+      "exact_match,flexible-extract": 0.8,
+      "exact_match_stderr,flexible-extract": 0.13333333333333333
+    }
+  },
+  "artifact_sha256": {
+    "/workspace/warp-34/target/release/w34": "a17a7d1717e7429db0e84b44312c4a316396f8a0f50d762ad7da0b2113279d1f",
+    "/workspace/quality-venv/bin/lm-eval": "9b20525c2f4ad78a637124bf09732f09be94412895546b24270eaa23b079cb31",
+    "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/1de743eedefdb7422e6b171174c7080204f5b005/config.json": "3aafda4557ad0693418fd51373a86fdbc718b86cd934f3a64ef09549f41e2b87"
+  },
+  "gpu_uuid": "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8",
+  "cleanup_established": true,
+  "server_exit": 0,
+  "sha256": {
+    "server.log": "62011f8b5b4dda9afe45c7c82d07021015b004921ce6a059e54dbbafdcab2e0c",
+    "models.json": "659ca3d4d5d9ee49674649efc64f6abe50598d5f898b5c8526d880787fceb0ec",
+    "environment.json": "1dc1712eda0a577b9cafa09161b6e9e8fbf3ebf5db07db1dda362f95ff030169",
+    "ifeval.log": "3b689b5e374778012fc0c287a439a718d181fec80f091c3a5aeb121c70765f62",
+    "gsm8k.log": "e36f84024653c728c49b10dac886b8b0c27a28816c0929e8e0aec065ff528a22",
+    "ifeval/warp34-quality/results_2026-11-08T00-20-34.456967.json": "5f8605b931ace71fd8b011bd327f2710ccefdb29c01b0588794e2555799183a7",
+    "ifeval/warp34-quality/samples_ifeval_2026-11-08T00-20-34.456967.jsonl": "9c751688c13617a650511d888e64625b1639c18a14ba926239f3372d60e53d7c",
+    "gsm8k/warp34-quality/results_2026-11-08T00-21-03.558066.json": "59cc3e97a9b2c834628b97ed5502171e864549c04183c89b9ca7361191d237c7",
+    "gsm8k/warp34-quality/samples_gsm8k_2026-11-08T00-21-03.558066.jsonl": "fd070eae02aec8bea3c9c8c6ae42ef1032adb0b1b09d11d9ec7d860f4a6f662f"
+  }
+}

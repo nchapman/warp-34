@@ -1,4 +1,9 @@
-# Single-GPU 27B tooling checks
+# Historical mixed-KV single-GPU 27B tooling checks
+
+**Historical evidence:** these completed checks used TQ4 for warp-34. The new
+cross-engine baseline uses FP16 KV throughout; see [automation](AUTOMATION.md).
+Do not relabel the results below as FP16 results. Commands here preserve the
+original configurations.
 
 The primary user-facing configuration is **one 24GB RTX 3090, a 4K context,
 one active evaluation request, and 10 examples per task**, across warp-34,

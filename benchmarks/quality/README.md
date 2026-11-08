@@ -13,10 +13,12 @@ across deployments, larger evaluations can support specific quality comparisons.
 Quality and performance runs are separate; do not run them concurrently on the
 same server/GPU. Full evaluations require an explicit decision, not this setup pass.
 
-See [single-GPU recipes](single-gpu.md) for the primary 27B setup across
-warp-34, llama.cpp/Unsloth, vLLM and SGLang. Earlier [TP2 qualification](QUALIFICATION.md)
-and [TP2 recipes](servers.md) remain separate historical records. Server setup is separate from evaluation; no custom evaluator adapter
-is needed.
+Use the [automated FP16-KV suite](AUTOMATION.md) to run warp-34,
+llama.cpp/Unsloth, vLLM and SGLang sequentially with one command. The checked-in
+runner manages server lifecycle and invokes the unchanged upstream CLI; it is
+not an evaluator adapter. Earlier [mixed-KV single-GPU checks](single-gpu.md),
+[TP2 qualification](QUALIFICATION.md) and [TP2 recipes](servers.md) remain
+historical records, not FP16-suite results.
 
 ## Exact evaluator and tasks
 
@@ -81,7 +83,7 @@ uv pip compile benchmarks/quality/requirements.in --python-version 3.12 \
 ## Start a server, then invoke the upstream CLI
 
 Launch exactly one server in a separate terminal. The primary user-facing setup uses
-**Qwen3.8-27B HGPTQ, MTP-3, one GPU and TQ4**, with a 4K context. MTP-3 is the common quality-run
+**Qwen3.8-27B HGPTQ, MTP-3, one GPU and FP16 KV**, with a 4K context. MTP-3 is the common quality-run
 configuration across our four model families; it uses the checkpoint's built-in
 MTP weights rather than a separately selected DFlash2 drafter.
 
@@ -92,7 +94,7 @@ export PATH="/opt/cuda/bin:/usr/local/cuda/bin:$PATH"
 export MODEL=/absolute/path/to/pinned/model/snapshot
 CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
   --model "$MODEL" --offline --tp 1 \
-  --kv-format tq4 --kv-pages 256 --max-num-seqs 4 \
+  --kv-format fp16 --kv-pages 256 --max-num-seqs 4 \
   --speculative mtp --mtp-k 3 \
   --served-model-name warp34-quality --host 127.0.0.1 --port 18034
 ```
@@ -124,8 +126,9 @@ benchmarks/quality/.venv/bin/lm-eval run \
 
 This runs 10 examples from each task (20 total). For separate upstream result bundles, invoke the same
 command with `--tasks ifeval` and `--tasks gsm8k`, each with its own output path.
-No evaluation wrapper is required. The pod smoke run uses those two direct
-commands sequentially, supervised only to start/stop the server and retain logs.
+For an already running server, these direct commands are sufficient. The
+checked-in automated runner invokes the same two native task commands and adds
+server supervision, failure handling and retained evidence.
 
 ## Abbreviated smoke runs
 

@@ -1,5 +1,12 @@
 # warp-34 — Session Orientation & Current State
 
+## Automated FP16-KV quality suite (completed)
+
+- Added checked-in `benchmarks/quality/run_suite.py` and `suite.toml`, exposed through `mise run quality-run -- --output-dir ...`. Runs warp-34, vLLM, llama.cpp/Unsloth and SGLang sequentially on one GPU, with FP16 attention KV and 4K context throughout. Defaults to native `--limit 10`; full evaluation requires `--full`. No evaluator adapter, prompt/scoring changes, precision fallback, second GPU or automatic CPU-layer offload. SGLang remains explicitly plain; the other three use native MTP-3.
+- Automated pod run `quality-fp16-suite-smoke10-001` completed all four engines and eight task invocations in 10m25s: 80 evaluated requests, no empty outputs, successful cleanup. GPUs idle afterward; no local GPU use. Native smoke scores match the prior mixed-KV aggregates, which does not establish KV quality parity. Eight native results, manifest/summary, four receipts and 47 raw-evidence hashes retained; see [`AUTOMATION.md`](../benchmarks/quality/AUTOMATION.md).
+- Runner enforces fresh output directories, occupied-GPU/port guards, HTTP readiness/alias, bounded startup/client waits, owned-process-group cleanup and native sample/filter validation. Preserves partial failures and exits nonzero rather than reporting partial suites as passes. Logs whitelisted environment, package identities, binary/config hashes and native metrics without custom rescoring.
+- Verification: 17 quality configuration/lifecycle tests, 91 performance-tooling tests and 69 oracle-tooling tests pass. Review's optional-diagnostics IO failure was fixed with a regression test; malformed readiness responses intentionally remain fail-fast rather than retried. Evidence-write failures remain fatal. No Rust/CUDA engine changes; engine regression tests were not rerun (the earlier missing-4B-fixture limitation remains). The GPU receipt preserves the executed runner snapshot before the optional-diagnostics error-path fix; launch/evaluation behavior is unchanged.
+
 ## Single-GPU 27B tooling qualification (completed; not quality rankings)
 
 - Primary user-facing target: one 24GB RTX 3090, 4K context, sequential requests and native `--limit 10` for each upstream task. Includes warp-34, llama.cpp, vLLM and SGLang. The llama.cpp reference is the user-selected mainstream **Unsloth UD-Q4_K_XL**, not ggml-org's GGUF.
