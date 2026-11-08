@@ -1,5 +1,11 @@
 # warp-34 — Session Orientation & Current State
 
+## Docker Branch Main Integration (`d9ecc01`; verified)
+
+- Merged main's serving vision/speculative edge-case fixes, corrected TP=2 dump-diff comparison, and hot-cache test expectation into the Docker branch without conflicts. Preserved pruned static cuBLAS packaging.
+- Merged-tree `mise run check` with `W34_CUBLAS_STATIC_DIR=/tmp/w34-cublas-pruned`, both 3090 Ti GPUs, and `CUDA_DISABLE_PTX_JIT=1` passed: **441 Rust tests passed, 0 failed, 11 ignored**, plus formatting, both Clippy modes, rustdoc, dashboard, oracle, and performance-tooling checks. The previously documented hot-cache failure is resolved.
+- Docker rebuild and CLI startup passed. Earlier image-size/throughput measurements remain tied to the pre-merge code; they were not relabeled or rerun. Updated the RTX 4090 handoff to apply `d9ecc01` to the shared-library comparator too, keeping engine code matched. Actual Ada qualification remains pending.
+
 ## Pruned Static cuBLAS Packaging (Ampere verification completed; RTX 4090 handoff pending)
 
 - Prototyped on the existing branch; the user subsequently authorized commit, push, and PR creation with RTX 4090 qualification delegated to a separate agent. Docker now statically links copied/pruned cuBLAS/cuBLASLt archives; local Cargo builds remain shared unless `W34_CUBLAS_STATIC_DIR` is set. Preserved native `sm_80` + `sm_86` + `sm_89` and the cuBLASLt compute_75 PTX fallback, following NVIDIA's requirement to retain earlier minor architectures and Hugging Face TEI prior art. Shared cudart remains unchanged.

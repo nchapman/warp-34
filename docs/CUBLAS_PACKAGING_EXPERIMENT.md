@@ -3,9 +3,9 @@
 **Status: Ampere validation completed; RTX 4090 validation pending.** This report
 covers the proposed Docker packaging change, not full 30-/40-series release
 qualification. The Dockerfile uses pruned static cuBLAS; normal local Cargo builds
-still use the shared libraries unless `W34_CUBLAS_STATIC_DIR` is set. The user
-approved committing this change with the known unrelated test failure documented;
-a separate agent will perform the 4090 qualification.
+still use the shared libraries unless `W34_CUBLAS_STATIC_DIR` is set. A separate agent will perform the 4090 qualification. The original unrelated
+hot-cache test failure was corrected by the integration of main at `d9ecc01`;
+the merged static-link suite now passes.
 
 ## Prior art and pruning boundary
 
@@ -81,6 +81,19 @@ shared libraries. These short benchmark runs do not establish broad model
 performance coverage or Ada performance parity.
 No actual RTX 40-series or minimum-driver qualification has been performed.
 
+## Main integration verification
+
+Integrated `origin/main` at `d9ecc01` (serving vision/speculative fixes and TP=2
+dump-diff correction). On the merged tree, `mise run check` with pruned static
+cuBLAS and `CUDA_DISABLE_PTX_JIT=1` passed: **441 Rust tests passed, 0 failed,
+11 ignored**, plus formatting, both Clippy modes, rustdoc, dashboard, oracle,
+and performance-tooling checks. The merged Docker image rebuilt successfully
+and passed CLI startup. The hot-cache assertion above is historical, not a
+remaining failure.
+
+Size and throughput tables above retain their original pre-merge measurements;
+they have not been rerun or relabeled for the serving changes from main.
+
 ## Reproduce
 
 ```sh
@@ -117,8 +130,10 @@ healthcheck, model cache, and driver capability requirement unchanged.
 ## RTX 4090 handoff / remaining qualification
 
 Compare this branch's pruned image against the shared-library baseline at
-`77699cb`, built in a separate worktree with the same pinned toolchain. Do not use
-an older published image as the comparator: its engine code may differ. Record
+`77699cb`, with main's `d9ecc01` merged into that baseline in a separate worktree,
+using the same pinned toolchain. This keeps engine sources matched after the main
+integration. If further engine changes land, apply them to both comparators.
+Do not use an older published image as the comparator: its engine code may differ. Record
 GPU model, driver version, image IDs, and source commits with the results.
 
 1. Build both images and inspect `ldd` / `cuobjdump` output. The pruned executable
@@ -139,7 +154,7 @@ GPU model, driver version, image IDs, and source commits with the results.
    40-series qualification. Investigate any new numerical failures or repeatable
    regressions; do not explain them away using the unrelated hot-cache assertion.
 
-The existing hot-cache failure is expected only while its separate fix is absent.
-If integrating that fix for testing, record the resulting source revision rather
-than relabeling the original measurements. Minimum-driver qualification remains
-separate from the 4090 hardware check.
+The hot-cache assertion is fixed in the merged tree, so it is no longer an
+expected failure. Record source revisions rather than relabeling the original
+measurements. Minimum-driver qualification remains separate from the 4090
+hardware check.

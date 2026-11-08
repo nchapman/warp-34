@@ -592,12 +592,14 @@ fn compare_tp1_vs_tp2_tensors_enforces_presence_and_shapes() {
         (vec![1, 4], vec![1.0f32, 2.0, 3.0, 4.0]),
     );
     tp1_map.insert("logits".to_string(), (vec![1, 8], vec![0.0f32; 8]));
+    tp1_map.insert("logits_last".to_string(), (vec![8], vec![0.0f32; 8]));
     let mut tp2_map = std::collections::HashMap::new();
     tp2_map.insert(
         "final_norm".to_string(),
         (vec![1, 4], vec![1.0f32, 2.0, 3.0, 4.0]),
     );
     tp2_map.insert("logits".to_string(), (vec![1, 4], vec![0.0f32; 4]));
+    tp2_map.insert("logits_last".to_string(), (vec![4], vec![0.0f32; 4]));
     let summary = compare_tp1_vs_tp2_tensors(&tp1_map, &tp2_map, false, false).unwrap();
     assert_eq!(summary.max_layer_diff, 0.0);
 
@@ -638,4 +640,24 @@ fn greedy_diff_image_rejects_speculation() {
     .err()
     .unwrap();
     assert!(err.contains("--image does not support --speculative"));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn serve_state_slot_seqs_promotes_small_max_num_seqs_for_dflash2() {
+    let dflash = crate::proposer::SpeculativeConfig {
+        kind: crate::proposer::SpeculativeKind::DFlash2,
+        draft_model: Some("draft".to_string()),
+        mtp_k: 3,
+    };
+    let mtp = crate::proposer::SpeculativeConfig {
+        kind: crate::proposer::SpeculativeKind::Mtp,
+        draft_model: None,
+        mtp_k: 3,
+    };
+    assert_eq!(serve_state_slot_seqs(1, Some(&dflash)), 6);
+    assert_eq!(serve_state_slot_seqs(2, Some(&dflash)), 6);
+    assert_eq!(serve_state_slot_seqs(8, Some(&dflash)), 8);
+    assert_eq!(serve_state_slot_seqs(2, Some(&mtp)), 2);
+    assert_eq!(serve_state_slot_seqs(2, None), 2);
 }

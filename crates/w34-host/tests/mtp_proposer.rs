@@ -110,6 +110,30 @@ fn cached_4b_mtp_k123() {
     check_lossless_rounds(&mut engine, &mut mtp, &tokens, 2);
     check_lossless_rounds(&mut engine, &mut mtp, &tokens, 12);
     check_vllm_hidden_replay(&engine, &mut mtp);
+    // Regression: when speculative taps are configured with a small `max_tap_rows` (e.g. 2 rows),
+    // non-speculative forward passes (`step_tokens` / `step_batch_slices`, such as multimodal prefill
+    // chunks exceeding `max_tap_rows`) must fall back to scratch `s.normed` without failing.
+    engine.ranks[0].decode_graph = None;
+    engine.ranks[0].spec_verify_graph = None;
+    engine.ranks[0].batched_decode_graphs.clear();
+    engine.ranks[0]
+        .configure_speculative_taps(&[], true, 2)
+        .unwrap();
+    engine.reset_all_states().unwrap();
+    let fallback_page = engine.alloc_kv_page().unwrap();
+    let fallback_state = engine.alloc_state_slot().unwrap();
+    let (fallback_anchor, _, _) = engine
+        .step_tokens(
+            &tokens,
+            0,
+            &[fallback_page],
+            fallback_state,
+            fallback_state,
+            false,
+            None,
+        )
+        .unwrap();
+    assert_eq!(fallback_anchor, anchor);
 }
 
 fn check_draft_lm_head_quantized_vs_fp16_fallback(

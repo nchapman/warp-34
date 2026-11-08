@@ -498,6 +498,18 @@ pub(crate) fn run_bench(
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn serve_state_slot_seqs(
+    max_num_seqs: usize,
+    spec_config: Option<&crate::proposer::SpeculativeConfig>,
+) -> usize {
+    if spec_config.is_some_and(|c| c.kind == crate::proposer::SpeculativeKind::DFlash2) {
+        max_num_seqs.max(6)
+    } else {
+        max_num_seqs
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn run_serve(
     options: CudaCliOptions,
     policy: KvFormatPolicy,
@@ -530,13 +542,14 @@ pub(crate) fn run_serve(
         serve.options,
         move || {
             let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
+            let state_slot_seqs = serve_state_slot_seqs(max_num_seqs, spec_config.as_ref());
             let mut engine = Qwen3_5Engine::load_for_serving(
                 &worker_model,
                 tp,
                 policy,
                 pages,
                 use_cuda_graph,
-                max_num_seqs,
+                state_slot_seqs,
             )
             .map_err(|e| e.to_string())?;
             if let Some(config) = &spec_config {

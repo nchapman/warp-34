@@ -268,15 +268,6 @@ impl Qwen3_5ModelRank {
         Ok(())
     }
 
-    pub(super) fn validate_tap_rows(&self, num_tokens: usize) -> Result<()> {
-        if (!self.tap_layer_ids.is_empty() || self.last_final_hidden_f16.is_some())
-            && num_tokens > self.max_tap_rows
-        {
-            return Err(loader_err("forward rows exceed speculative tap capacity"));
-        }
-        Ok(())
-    }
-
     /// Maximum aligned ordinary prefill budget, including worst-case selected outputs.
     pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
         let max_chunks = if self.cfg.uses_tiered_moe() { 96 } else { 32 };
