@@ -262,25 +262,43 @@ Clients can authenticate with either `Authorization: Bearer <key>` or `x-api-key
 
 ## Docker
 
-Images are built and published to GHCR on every push to `main` (`ghcr.io/nchapman/warp-34:dev` and `:sha-<commit>`) and on `v*` release tags (`:latest`, `:X.Y.Z`, `:X.Y`), or you can build locally (`~1.22 GB` runtime image containing only `w34`, `libcudart`, `libcublas`, and `libcublasLt` on Ubuntu 26.04—no Python, CUDA toolkit, or model weights bundled):
+Images are built and published to GHCR on every push to `main` (`ghcr.io/nchapman/warp-34:dev` and `:sha-<commit>`) and on `v*` release tags (`:latest`, `:X.Y.Z`, `:X.Y`). The multi-stage build ships only `w34`, three CUDA libraries (`libcudart`, `libcublas`, `libcublasLt`), and a small Ubuntu 26.04 runtime with TLS certificates and a curl healthcheck—no Python, Node, CUDA toolkit, or model weights. Embedded CUDA code is size-compressed; native `sm_86` and `sm_89` kernels are included in the same image.
+
+**Host requirements:** Linux `amd64` with an x86-64-v3 CPU (AVX2/FMA), an RTX 30- or 40-series GPU with enough VRAM for the selected model, a CUDA 13-capable NVIDIA driver, and [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). CUDA 13.x minor-version compatibility starts at driver branch R580; a current driver is recommended because newer CUDA features/PTX can require newer drivers. The host does **not** need the CUDA toolkit installed. The container checks the CUDA 13 driver capability before startup.
 
 ```sh
 docker pull ghcr.io/nchapman/warp-34:dev
 # Or build locally:
-docker build -t warp-34:local .
+docker build --platform linux/amd64 -t warp-34:local .
 ```
 
 Mount your host Hugging Face cache to run offline or let it download on first use:
 
 ```sh
 docker run --rm --name w34-local --gpus '"device=0"' \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp -e HF_HUB_CACHE=/models \
   -p 127.0.0.1:8000:8000 \
-  --mount type=bind,src="$HOME/.cache/huggingface/hub",dst=/home/w34/.cache/huggingface/hub,readonly \
+  --mount type=bind,src="$HOME/.cache/huggingface/hub",dst=/models,readonly \
   warp-34:local serve \
   --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline --host 0.0.0.0
 ```
 
+For download-on-first-use, use a persistent writable named volume instead of the read-only bind mount, and omit `--offline`:
+
+```sh
+docker run --rm --name w34-local --gpus '"device=0"' \
+  -p 127.0.0.1:8000:8000 \
+  --mount type=volume,src=w34-models,dst=/home/w34/.cache/huggingface/hub \
+  --health-start-period=10m \
+  warp-34:local serve \
+  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --host 0.0.0.0
+```
+
+The image defaults to non-root `w34`. The read-only host-cache example instead uses your host UID/GID because Hub metadata can be owner-readable only; it also moves `HOME` and the cache outside `w34`'s private home directory. A new named volume inherits the image's cache-directory ownership and works with the default user. Adjust `--health-start-period` for slow downloads or large models. The default healthcheck probes port 8000; if you change the server port, also override `--health-cmd`.
+
 For two GPUs, pass `--gpus '"device=0,1"'` and `--tp 2` (because `warp-34` uses pinned memory / P2P rather than NCCL, you don't even need `--ipc=host`).
+
+Local rebuilds reuse BuildKit caches for pnpm, Cargo downloads, and compiled Rust/CUDA objects. CI exports ordinary build layers to the GitHub Actions cache; cache-mount contents are local to the builder and are not included in that export.
 
 ---
 
