@@ -1,0 +1,46 @@
+{
+  "status": "complete",
+  "mode": "mtp3",
+  "metrics": {
+    "ifeval": {
+      "name": "ifeval",
+      "alias": "ifeval",
+      "sample_len": 10,
+      "prompt_level_strict_acc,none": 1.0,
+      "prompt_level_strict_acc_stderr,none": 0.0,
+      "inst_level_strict_acc,none": 1.0,
+      "inst_level_strict_acc_stderr,none": "N/A",
+      "prompt_level_loose_acc,none": 1.0,
+      "prompt_level_loose_acc_stderr,none": 0.0,
+      "inst_level_loose_acc,none": 1.0,
+      "inst_level_loose_acc_stderr,none": "N/A"
+    },
+    "gsm8k": {
+      "name": "gsm8k",
+      "alias": "gsm8k",
+      "sample_len": 10,
+      "exact_match,strict-match": 0.9,
+      "exact_match_stderr,strict-match": 0.09999999999999999,
+      "exact_match,flexible-extract": 0.9,
+      "exact_match_stderr,flexible-extract": 0.09999999999999999
+    }
+  },
+  "artifact_sha256": {
+    "/workspace/llama.cpp-quality/build/bin/llama-server": "3060f585b318d0964c2f01b1558f577eb70954c20aa5b2f8d4e5bb76ae9eabfb",
+    "/workspace/quality-venv/bin/lm-eval": "9b20525c2f4ad78a637124bf09732f09be94412895546b24270eaa23b079cb31"
+  },
+  "gpu_uuid": "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8",
+  "cleanup_established": true,
+  "server_exit": 0,
+  "sha256": {
+    "server.log": "da1f09cf2c3ec0d088dfc72756654f8fb4e6fefa3dba8d40d338269e2ee0b571",
+    "models.json": "b641c94ae898af7cdcf39c1f3109ede0cfde4c5ea53994f39d73162adc9611de",
+    "environment.json": "d96a825ea5784a4e2a353a374bc2d32d9722886d0f3fa30cb70e889224fb4ef7",
+    "ifeval.log": "6539c7bf30eeda6091c353575b33381c1f8541e6011e0c63769fd49f23c81aa5",
+    "gsm8k.log": "a72bdd9009cfd386086f27628fb59590953828b9d92da40fd28b41df560a8999",
+    "ifeval/warp34-quality/results_2026-11-08T00-26-19.362113.json": "781f0aa3ece6efe9fb95d6f7a271f71e3f0d60434f2d03d11873bd608cf60085",
+    "ifeval/warp34-quality/samples_ifeval_2026-11-08T00-26-19.362113.jsonl": "7841300d49c70899cf7de2c3725eaaf26086447ee04ed598dcbd14d970633592",
+    "gsm8k/warp34-quality/results_2026-11-08T00-27-02.843306.json": "2b9106f68e43e53df4a804f2205b57e33799972578eb5cf1ab0c5f5ec033af88",
+    "gsm8k/warp34-quality/samples_gsm8k_2026-11-08T00-27-02.843306.jsonl": "ad33ffea071b5ebc2c82ee0fd77c001b36e3aed153366f3a7cfa4a885962e7e2"
+  }
+}

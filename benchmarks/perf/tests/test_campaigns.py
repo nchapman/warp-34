@@ -1,6 +1,7 @@
 """Frozen campaign configuration and fixture evidence consistency."""
 import hashlib
 import json
+import shlex
 from pathlib import Path
 import unittest
 
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class CampaignTests(unittest.TestCase):
     def test_completion_campaigns_and_all_presets_plan_without_network(self):
         for name in ('27b-completion', '27b-kv-spec-completion', '27b-capacity-completion',
-                     'flash-next-serving', 'flash-next-longctx'):
+                     'flash-next-serving', 'flash-next-hgptq', 'flash-next-longctx'):
             cfg = load(ROOT / 'campaigns' / (name + '.toml'))
             for tier in ('quick', 'full', 'release'):
                 with self.subTest(campaign=name, tier=tier):
@@ -51,3 +52,68 @@ class CampaignTests(unittest.TestCase):
         long = json.loads((ROOT / 'fixtures/quality-long.json').read_text())
         self.assertEqual(max(c.get('context_lines', 0) for c in short['checks']), 256)
         self.assertEqual(max(c.get('context_lines', 0) for c in long['checks']), 1200)
+
+    def test_flash_hgptq_pins_and_launch_matrix(self):
+        cfg = load(ROOT / 'campaigns/flash-next-hgptq.toml')
+        target_rev = '6ee06d2936b111f19eb5eb331044cb8b8b28562b'
+        draft_rev = '24a62babba3b54387b3ea73f5599e5de83029dd8'
+        root = '/workspace/.hf_home/hub/models--nchapman--'
+        target = root + 'Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/' + target_rev
+        draft = root + 'Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/' + draft_rev
+        self.assertEqual(len(cfg['engines']), 6)
+        self.assertEqual({(e['gpu_count'], e['speculation']) for e in cfg['engines']},
+                         {(tp, mode) for tp in (1, 2) for mode in ('none', 'mtp-k3', 'dflash2')})
+        for engine in cfg['engines']:
+            with self.subTest(engine=engine['id']):
+                self.assertEqual(engine['engine'], 'warp-34')
+                self.assertEqual(engine['version'], 'b7f5fdd')
+                self.assertEqual(engine['support'], 'supported')
+                self.assertEqual(engine['model'], target)
+                self.assertEqual(engine['model_revision'], target_rev)
+                self.assertEqual(engine['tokenizer_revision'], target_rev)
+                for key in ('artifact_sha256', 'chat_template_sha256'):
+                    self.assertRegex(engine[key], r'^[0-9a-f]{64}$')
+                self.assertRegex(engine['binary_sha256'], r'^[0-9a-f]{64}$')
+                self.assertEqual(engine['activation_dtype'], 'float16')
+                self.assertEqual(engine['base_url'], 'http://127.0.0.1:18034/v1')
+                self.assertEqual(engine['kv_format'], 'tq4')
+                args = shlex.split(engine['launch_command'])
+                self.assertIn('/workspace/warp-34/target/release/w34', args)
+                self.assertIn('--offline', args)
+                expected = {'--model': target, '--tp': str(engine['gpu_count']),
+                            '--kv-format': 'tq4', '--kv-pages': '512',
+                            '--max-num-seqs': '4', '--host': '127.0.0.1', '--port': '18034'}
+                mode = engine['speculation']
+                if mode == 'dflash2':
+                    expected.update({'--speculative': 'dflash2', '--draft-model': draft})
+                    self.assertEqual(engine['draft_model'], draft)
+                    self.assertEqual(engine['draft_model_revision'], draft_rev)
+                    self.assertRegex(engine['draft_artifact_sha256'], r'^[0-9a-f]{64}$')
+                    self.assertEqual(engine['draft_block_size'], 8)
+                    self.assertEqual(engine['draft_activation_dtype'], 'bfloat16')
+                else:
+                    self.assertNotIn('--draft-model', args)
+                    self.assertNotIn('draft_model', engine)
+                    self.assertNotIn('draft_model_revision', engine)
+                if mode == 'mtp-k3':
+                    expected.update({'--speculative': 'mtp', '--mtp-k': '3'})
+                else:
+                    self.assertNotIn('--mtp-k', args)
+                if mode == 'none':
+                    self.assertNotIn('--speculative', args)
+                for flag, value in expected.items():
+                    self.assertEqual(args.count(flag), 1)
+                    self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_flash_hgptq_reuses_historical_workloads(self):
+        cfg = load(ROOT / 'campaigns/flash-next-hgptq.toml')
+        historical = load(ROOT / 'campaigns/flash-next-serving.toml')
+        # Includes loaded fixture contents and hashes, not just workload names.
+        self.assertEqual(cfg['cases'], historical['cases'])
+        self.assertEqual(len(cfg['cases']), 5)
+        self.assertEqual(cfg['run'], historical['run'])
+        for tier, count, repetitions in (('quick', 2, 1), ('full', 5, 3), ('release', 5, 5)):
+            self.assertEqual(cfg['presets'][tier], historical['presets'][tier])
+            preset, cases = apply_preset(cfg, tier)
+            self.assertEqual(len(cases), count)
+            self.assertEqual(preset['run']['repetitions'], repetitions)

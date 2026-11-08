@@ -1,0 +1,47 @@
+{
+  "status": "complete",
+  "mode": "plain",
+  "metrics": {
+    "ifeval": {
+      "name": "ifeval",
+      "alias": "ifeval",
+      "sample_len": 10,
+      "prompt_level_strict_acc,none": 0.9,
+      "prompt_level_strict_acc_stderr,none": 0.09999999999999999,
+      "inst_level_strict_acc,none": 0.9444444444444444,
+      "inst_level_strict_acc_stderr,none": "N/A",
+      "prompt_level_loose_acc,none": 0.9,
+      "prompt_level_loose_acc_stderr,none": 0.09999999999999999,
+      "inst_level_loose_acc,none": 0.9444444444444444,
+      "inst_level_loose_acc_stderr,none": "N/A"
+    },
+    "gsm8k": {
+      "name": "gsm8k",
+      "alias": "gsm8k",
+      "sample_len": 10,
+      "exact_match,strict-match": 0.8,
+      "exact_match_stderr,strict-match": 0.13333333333333333,
+      "exact_match,flexible-extract": 0.9,
+      "exact_match_stderr,flexible-extract": 0.09999999999999999
+    }
+  },
+  "artifact_sha256": {
+    "/workspace/sglang-venv/bin/python": "6f21e31b12afd5cb7f834e39463fbbd08350b36758d49aa11f35b29c1df3047c",
+    "/workspace/quality-venv/bin/lm-eval": "9b20525c2f4ad78a637124bf09732f09be94412895546b24270eaa23b079cb31",
+    "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf/config.json": "ccaf8c6239c41f02ffb2e4921c5fc6596e3ded1395483be3f6b516d11ba0a536"
+  },
+  "gpu_uuid": "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8",
+  "cleanup_established": true,
+  "server_exit": -9,
+  "sha256": {
+    "server.log": "989e55a82b46c0d81d91327d590d4895d3ca9979b38b1df4fcce5a595ba9d647",
+    "models.json": "393bd601a43214c803c538d6473e2cce11896e1dc7900142b00034aa81546ad8",
+    "environment.json": "f11b29b258ddc55c9258c0b37542c2f79b1c0f8a89367e6c79013e0c82cd3aa6",
+    "ifeval.log": "ef38fa9ebd95feb3b8b5a96037f72336f6c889df5c68e49ef1c0468013722e4b",
+    "gsm8k.log": "f17e561ad6c314b11c14e9be16ec528451d3c0b1c309294bae77ea411a66b4de",
+    "ifeval/warp34-quality/results_2026-11-08T00-29-02.414246.json": "78efc7806224c3b6eac2948789e655901b9ad70d329dec581c834ceba110906f",
+    "ifeval/warp34-quality/samples_ifeval_2026-11-08T00-29-02.414246.jsonl": "d15be4b0aedf4bfaf4e2eb945e65400ca1ed8c0dd11ec113fe9755d757d59766",
+    "gsm8k/warp34-quality/results_2026-11-08T00-29-50.660915.json": "8cb2272de0be222929f6c4106c08a0e2a2d0cf0bc47617494444bc6bfdc190b5",
+    "gsm8k/warp34-quality/samples_gsm8k_2026-11-08T00-29-50.660915.jsonl": "d7efd0a0bd33e5d216694cf053cb64b2f148f20b8e358fe000025b2b6f0034f1"
+  }
+}

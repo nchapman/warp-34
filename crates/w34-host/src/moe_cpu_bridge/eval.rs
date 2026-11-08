@@ -37,10 +37,7 @@ pub(crate) fn supported() -> bool {
     }
 }
 
-/// Transpose each group from [16 words][8 nibbles] to [8][16]. The group
-/// sum is deliberately sequential in the ORIGINAL input order, not a SIMD reduction.
-/// This preparation is portable; evaluation requires `supported()`.
-pub(super) fn prepare_x_perm(x: &[f32], xp: &mut [f32], xg: &mut [f32]) -> Result<(), EvalError> {
+fn prepare_x_perm_portable(x: &[f32], xp: &mut [f32], xg: &mut [f32]) -> Result<(), EvalError> {
     if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 128 {
         return Err(EvalError::InvalidShape);
     }
@@ -49,6 +46,42 @@ pub(super) fn prepare_x_perm(x: &[f32], xp: &mut [f32], xg: &mut [f32]) -> Resul
         for l in 0..16 {
             for b in 0..8 {
                 let v = src[l * 8 + b];
+                xp[g * 128 + b * 16 + l] = v;
+                sum += v;
+            }
+        }
+        xg[g] = sum;
+    }
+    Ok(())
+}
+
+/// Transpose each group from [16 words][8 nibbles] to [8][16]. The group
+/// sum is deliberately sequential in the ORIGINAL input order, not a SIMD reduction.
+/// This preparation is portable; evaluation requires `supported()`.
+pub(super) fn prepare_x_perm(x: &[f32], xp: &mut [f32], xg: &mut [f32]) -> Result<(), EvalError> {
+    if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 128 {
+        return Err(EvalError::InvalidShape);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if supported() {
+        // SAFETY: runtime ISA guard and slice bounds checked above.
+        unsafe {
+            simd::prepare_x_perm_avx2(x, xp, xg);
+        }
+        return Ok(());
+    }
+    prepare_x_perm_portable(x, xp, xg)
+}
+
+fn prepare_x_perm_f16_portable(x: &[u16], xp: &mut [f32], xg: &mut [f32]) -> Result<(), EvalError> {
+    if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 128 {
+        return Err(EvalError::InvalidShape);
+    }
+    for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
+        let mut sum = 0.0f32;
+        for l in 0..16 {
+            for b in 0..8 {
+                let v = crate::cuda::f16_to_f32(src[l * 8 + b]);
                 xp[g * 128 + b * 16 + l] = v;
                 sum += v;
             }
@@ -76,18 +109,7 @@ pub(super) fn prepare_x_perm_f16(
         }
         return Ok(());
     }
-    for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
-        let mut sum = 0.0f32;
-        for l in 0..16 {
-            for b in 0..8 {
-                let v = crate::cuda::f16_to_f32(src[l * 8 + b]);
-                xp[g * 128 + b * 16 + l] = v;
-                sum += v;
-            }
-        }
-        xg[g] = sum;
-    }
-    Ok(())
+    prepare_x_perm_f16_portable(x, xp, xg)
 }
 
 /// Add `src` into `dst` elementwise (`dst[i] += src[i]`).
@@ -122,16 +144,14 @@ pub(super) fn f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
     }
 }
 
-/// Transpose each 128-column block from [16 words][8 nibbles] to [8][16] and compute
-/// sequential group sums for `group_size` in `{64, 128}`.
-pub(super) fn prepare_x_perm_grouped(
+fn prepare_x_perm_grouped_portable(
     x: &[f32],
     group_size: usize,
     xp: &mut [f32],
     xg: &mut [f32],
 ) -> Result<(), EvalError> {
     match group_size {
-        128 => prepare_x_perm(x, xp, xg),
+        128 => prepare_x_perm_portable(x, xp, xg),
         64 => {
             if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 64 {
                 return Err(EvalError::InvalidShape);
@@ -149,6 +169,72 @@ pub(super) fn prepare_x_perm_grouped(
                 for l in 8..16 {
                     for b in 0..8 {
                         let v = src[l * 8 + b];
+                        xp[g * 128 + b * 16 + l] = v;
+                        sum_hi += v;
+                    }
+                }
+                xg[2 * g] = sum_lo;
+                xg[2 * g + 1] = sum_hi;
+            }
+            Ok(())
+        }
+        _ => Err(EvalError::InvalidLayout),
+    }
+}
+
+/// Transpose each 128-column block from [16 words][8 nibbles] to [8][16] and compute
+/// sequential group sums for `group_size` in `{64, 128}`.
+pub(super) fn prepare_x_perm_grouped(
+    x: &[f32],
+    group_size: usize,
+    xp: &mut [f32],
+    xg: &mut [f32],
+) -> Result<(), EvalError> {
+    match group_size {
+        128 => prepare_x_perm(x, xp, xg),
+        64 => {
+            if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 64 {
+                return Err(EvalError::InvalidShape);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if supported() {
+                // SAFETY: runtime ISA guard and slice bounds checked above.
+                unsafe {
+                    simd::prepare_x_perm_avx2_g64(x, xp, xg);
+                }
+                return Ok(());
+            }
+            prepare_x_perm_grouped_portable(x, 64, xp, xg)
+        }
+        _ => Err(EvalError::InvalidLayout),
+    }
+}
+
+fn prepare_x_perm_f16_grouped_portable(
+    x: &[u16],
+    group_size: usize,
+    xp: &mut [f32],
+    xg: &mut [f32],
+) -> Result<(), EvalError> {
+    match group_size {
+        128 => prepare_x_perm_f16_portable(x, xp, xg),
+        64 => {
+            if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 64 {
+                return Err(EvalError::InvalidShape);
+            }
+            for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
+                let mut sum_lo = 0.0f32;
+                for l in 0..8 {
+                    for b in 0..8 {
+                        let v = crate::cuda::f16_to_f32(src[l * 8 + b]);
+                        xp[g * 128 + b * 16 + l] = v;
+                        sum_lo += v;
+                    }
+                }
+                let mut sum_hi = 0.0f32;
+                for l in 8..16 {
+                    for b in 0..8 {
+                        let v = crate::cuda::f16_to_f32(src[l * 8 + b]);
                         xp[g * 128 + b * 16 + l] = v;
                         sum_hi += v;
                     }
@@ -183,33 +269,13 @@ pub(super) fn prepare_x_perm_f16_grouped(
                 }
                 return Ok(());
             }
-            for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
-                let mut sum_lo = 0.0f32;
-                for l in 0..8 {
-                    for b in 0..8 {
-                        let v = crate::cuda::f16_to_f32(src[l * 8 + b]);
-                        xp[g * 128 + b * 16 + l] = v;
-                        sum_lo += v;
-                    }
-                }
-                let mut sum_hi = 0.0f32;
-                for l in 8..16 {
-                    for b in 0..8 {
-                        let v = crate::cuda::f16_to_f32(src[l * 8 + b]);
-                        xp[g * 128 + b * 16 + l] = v;
-                        sum_hi += v;
-                    }
-                }
-                xg[2 * g] = sum_lo;
-                xg[2 * g + 1] = sum_hi;
-            }
-            Ok(())
+            prepare_x_perm_f16_grouped_portable(x, 64, xp, xg)
         }
         _ => Err(EvalError::InvalidLayout),
     }
 }
 
-fn hadamard64_f32_inplace(slice: &mut [f32]) {
+fn hadamard64_f32_portable(slice: &mut [f32]) {
     for blk in slice.as_chunks_mut::<64>().0 {
         let mut h = 1usize;
         while h < 64 {
@@ -227,6 +293,18 @@ fn hadamard64_f32_inplace(slice: &mut [f32]) {
             *v *= 0.125f32;
         }
     }
+}
+
+fn hadamard64_f32_inplace(slice: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if supported() {
+        // SAFETY: runtime ISA guard checked above.
+        unsafe {
+            simd::hadamard64_f32_avx2(slice);
+        }
+        return;
+    }
+    hadamard64_f32_portable(slice);
 }
 
 /// Required caller-owned scratch in f32 elements: act, permuted act, group sums.
@@ -368,10 +446,10 @@ fn expert_portable(
         }
     }
     if d.down_hadamard == 64 {
-        hadamard64_f32_inplace(act);
+        hadamard64_f32_portable(act);
     }
     for t in 0..n {
-        prepare_x_perm_grouped(
+        prepare_x_perm_grouped_portable(
             &act[t * cols..(t + 1) * cols],
             gs_len,
             &mut ap[t * cols..(t + 1) * cols],
@@ -456,24 +534,194 @@ mod simd {
     use super::*;
     use std::arch::x86_64::*;
 
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    #[allow(clippy::too_many_arguments, clippy::identity_op, clippy::erasing_op)]
+    unsafe fn transpose_8x8_avx2(
+        r0: __m256,
+        r1: __m256,
+        r2: __m256,
+        r3: __m256,
+        r4: __m256,
+        r5: __m256,
+        r6: __m256,
+        r7: __m256,
+        dst_base: *mut f32,
+    ) {
+        let t0 = _mm256_unpacklo_ps(r0, r1);
+        let t1 = _mm256_unpackhi_ps(r0, r1);
+        let t2 = _mm256_unpacklo_ps(r2, r3);
+        let t3 = _mm256_unpackhi_ps(r2, r3);
+        let t4 = _mm256_unpacklo_ps(r4, r5);
+        let t5 = _mm256_unpackhi_ps(r4, r5);
+        let t6 = _mm256_unpacklo_ps(r6, r7);
+        let t7 = _mm256_unpackhi_ps(r6, r7);
+
+        let tt0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+        let tt1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+        let tt2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+        let tt3 = _mm256_shuffle_ps::<0xEE>(t1, t3);
+        let tt4 = _mm256_shuffle_ps::<0x44>(t4, t6);
+        let tt5 = _mm256_shuffle_ps::<0xEE>(t4, t6);
+        let tt6 = _mm256_shuffle_ps::<0x44>(t5, t7);
+        let tt7 = _mm256_shuffle_ps::<0xEE>(t5, t7);
+
+        _mm256_storeu_ps(
+            dst_base.add(0 * 16),
+            _mm256_permute2f128_ps::<0x20>(tt0, tt4),
+        );
+        _mm256_storeu_ps(
+            dst_base.add(1 * 16),
+            _mm256_permute2f128_ps::<0x20>(tt1, tt5),
+        );
+        _mm256_storeu_ps(
+            dst_base.add(2 * 16),
+            _mm256_permute2f128_ps::<0x20>(tt2, tt6),
+        );
+        _mm256_storeu_ps(
+            dst_base.add(3 * 16),
+            _mm256_permute2f128_ps::<0x20>(tt3, tt7),
+        );
+        _mm256_storeu_ps(
+            dst_base.add(4 * 16),
+            _mm256_permute2f128_ps::<0x31>(tt0, tt4),
+        );
+        _mm256_storeu_ps(
+            dst_base.add(5 * 16),
+            _mm256_permute2f128_ps::<0x31>(tt1, tt5),
+        );
+        _mm256_storeu_ps(
+            dst_base.add(6 * 16),
+            _mm256_permute2f128_ps::<0x31>(tt2, tt6),
+        );
+        _mm256_storeu_ps(
+            dst_base.add(7 * 16),
+            _mm256_permute2f128_ps::<0x31>(tt3, tt7),
+        );
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn prepare_x_perm_avx2(x: &[f32], xp: &mut [f32], xg: &mut [f32]) {
+        for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
+            let p = src.as_ptr();
+            let d = xp.as_mut_ptr().add(g * 128);
+            transpose_8x8_avx2(
+                _mm256_loadu_ps(p),
+                _mm256_loadu_ps(p.add(8)),
+                _mm256_loadu_ps(p.add(16)),
+                _mm256_loadu_ps(p.add(24)),
+                _mm256_loadu_ps(p.add(32)),
+                _mm256_loadu_ps(p.add(40)),
+                _mm256_loadu_ps(p.add(48)),
+                _mm256_loadu_ps(p.add(56)),
+                d,
+            );
+            transpose_8x8_avx2(
+                _mm256_loadu_ps(p.add(64)),
+                _mm256_loadu_ps(p.add(72)),
+                _mm256_loadu_ps(p.add(80)),
+                _mm256_loadu_ps(p.add(88)),
+                _mm256_loadu_ps(p.add(96)),
+                _mm256_loadu_ps(p.add(104)),
+                _mm256_loadu_ps(p.add(112)),
+                _mm256_loadu_ps(p.add(120)),
+                d.add(8),
+            );
+            let mut sum = 0.0f32;
+            for &v in src {
+                sum += v;
+            }
+            *xg.get_unchecked_mut(g) = sum;
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn prepare_x_perm_avx2_g64(x: &[f32], xp: &mut [f32], xg: &mut [f32]) {
+        for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
+            let p = src.as_ptr();
+            let d = xp.as_mut_ptr().add(g * 128);
+            transpose_8x8_avx2(
+                _mm256_loadu_ps(p),
+                _mm256_loadu_ps(p.add(8)),
+                _mm256_loadu_ps(p.add(16)),
+                _mm256_loadu_ps(p.add(24)),
+                _mm256_loadu_ps(p.add(32)),
+                _mm256_loadu_ps(p.add(40)),
+                _mm256_loadu_ps(p.add(48)),
+                _mm256_loadu_ps(p.add(56)),
+                d,
+            );
+            transpose_8x8_avx2(
+                _mm256_loadu_ps(p.add(64)),
+                _mm256_loadu_ps(p.add(72)),
+                _mm256_loadu_ps(p.add(80)),
+                _mm256_loadu_ps(p.add(88)),
+                _mm256_loadu_ps(p.add(96)),
+                _mm256_loadu_ps(p.add(104)),
+                _mm256_loadu_ps(p.add(112)),
+                _mm256_loadu_ps(p.add(120)),
+                d.add(8),
+            );
+            let mut sum_lo = 0.0f32;
+            for &v in &src[..64] {
+                sum_lo += v;
+            }
+            let mut sum_hi = 0.0f32;
+            for &v in &src[64..] {
+                sum_hi += v;
+            }
+            *xg.get_unchecked_mut(2 * g) = sum_lo;
+            *xg.get_unchecked_mut(2 * g + 1) = sum_hi;
+        }
+    }
+
     #[target_feature(enable = "avx2,fma,f16c")]
     pub(super) unsafe fn prepare_x_perm_f16c(x: &[u16], xp: &mut [f32], xg: &mut [f32]) {
         let mut group = [0.0f32; 128];
         for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
-            for k in (0..128).step_by(8) {
-                let vh = _mm_loadu_si128(src.as_ptr().add(k).cast());
-                _mm256_storeu_ps(group.as_mut_ptr().add(k), _mm256_cvtph_ps(vh));
-            }
+            let p = src.as_ptr();
+            let d = xp.as_mut_ptr().add(g * 128);
+            let r0 = _mm256_cvtph_ps(_mm_loadu_si128(p.cast()));
+            let r1 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(8).cast()));
+            let r2 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(16).cast()));
+            let r3 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(24).cast()));
+            let r4 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(32).cast()));
+            let r5 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(40).cast()));
+            let r6 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(48).cast()));
+            let r7 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(56).cast()));
+            _mm256_storeu_ps(group.as_mut_ptr(), r0);
+            _mm256_storeu_ps(group.as_mut_ptr().add(8), r1);
+            _mm256_storeu_ps(group.as_mut_ptr().add(16), r2);
+            _mm256_storeu_ps(group.as_mut_ptr().add(24), r3);
+            _mm256_storeu_ps(group.as_mut_ptr().add(32), r4);
+            _mm256_storeu_ps(group.as_mut_ptr().add(40), r5);
+            _mm256_storeu_ps(group.as_mut_ptr().add(48), r6);
+            _mm256_storeu_ps(group.as_mut_ptr().add(56), r7);
+            transpose_8x8_avx2(r0, r1, r2, r3, r4, r5, r6, r7, d);
+
+            let r8 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(64).cast()));
+            let r9 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(72).cast()));
+            let r10 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(80).cast()));
+            let r11 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(88).cast()));
+            let r12 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(96).cast()));
+            let r13 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(104).cast()));
+            let r14 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(112).cast()));
+            let r15 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(120).cast()));
+            _mm256_storeu_ps(group.as_mut_ptr().add(64), r8);
+            _mm256_storeu_ps(group.as_mut_ptr().add(72), r9);
+            _mm256_storeu_ps(group.as_mut_ptr().add(80), r10);
+            _mm256_storeu_ps(group.as_mut_ptr().add(88), r11);
+            _mm256_storeu_ps(group.as_mut_ptr().add(96), r12);
+            _mm256_storeu_ps(group.as_mut_ptr().add(104), r13);
+            _mm256_storeu_ps(group.as_mut_ptr().add(112), r14);
+            _mm256_storeu_ps(group.as_mut_ptr().add(120), r15);
+            transpose_8x8_avx2(r8, r9, r10, r11, r12, r13, r14, r15, d.add(8));
+
             let mut sum = 0.0f32;
-            let dst = &mut xp[g * 128..(g + 1) * 128];
-            for l in 0..16 {
-                for b in 0..8 {
-                    let v = group[l * 8 + b];
-                    dst[b * 16 + l] = v;
-                    sum += v;
-                }
+            for v in group {
+                sum += v;
             }
-            xg[g] = sum;
+            *xg.get_unchecked_mut(g) = sum;
         }
     }
 
@@ -481,29 +729,96 @@ mod simd {
     pub(super) unsafe fn prepare_x_perm_f16c_g64(x: &[u16], xp: &mut [f32], xg: &mut [f32]) {
         let mut group = [0.0f32; 128];
         for (g, src) in x.as_chunks::<128>().0.iter().enumerate() {
-            for k in (0..128).step_by(8) {
-                let vh = _mm_loadu_si128(src.as_ptr().add(k).cast());
-                _mm256_storeu_ps(group.as_mut_ptr().add(k), _mm256_cvtph_ps(vh));
-            }
-            let dst = &mut xp[g * 128..(g + 1) * 128];
+            let p = src.as_ptr();
+            let d = xp.as_mut_ptr().add(g * 128);
+            let r0 = _mm256_cvtph_ps(_mm_loadu_si128(p.cast()));
+            let r1 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(8).cast()));
+            let r2 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(16).cast()));
+            let r3 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(24).cast()));
+            let r4 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(32).cast()));
+            let r5 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(40).cast()));
+            let r6 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(48).cast()));
+            let r7 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(56).cast()));
+            _mm256_storeu_ps(group.as_mut_ptr(), r0);
+            _mm256_storeu_ps(group.as_mut_ptr().add(8), r1);
+            _mm256_storeu_ps(group.as_mut_ptr().add(16), r2);
+            _mm256_storeu_ps(group.as_mut_ptr().add(24), r3);
+            _mm256_storeu_ps(group.as_mut_ptr().add(32), r4);
+            _mm256_storeu_ps(group.as_mut_ptr().add(40), r5);
+            _mm256_storeu_ps(group.as_mut_ptr().add(48), r6);
+            _mm256_storeu_ps(group.as_mut_ptr().add(56), r7);
+            transpose_8x8_avx2(r0, r1, r2, r3, r4, r5, r6, r7, d);
+
+            let r8 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(64).cast()));
+            let r9 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(72).cast()));
+            let r10 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(80).cast()));
+            let r11 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(88).cast()));
+            let r12 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(96).cast()));
+            let r13 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(104).cast()));
+            let r14 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(112).cast()));
+            let r15 = _mm256_cvtph_ps(_mm_loadu_si128(p.add(120).cast()));
+            _mm256_storeu_ps(group.as_mut_ptr().add(64), r8);
+            _mm256_storeu_ps(group.as_mut_ptr().add(72), r9);
+            _mm256_storeu_ps(group.as_mut_ptr().add(80), r10);
+            _mm256_storeu_ps(group.as_mut_ptr().add(88), r11);
+            _mm256_storeu_ps(group.as_mut_ptr().add(96), r12);
+            _mm256_storeu_ps(group.as_mut_ptr().add(104), r13);
+            _mm256_storeu_ps(group.as_mut_ptr().add(112), r14);
+            _mm256_storeu_ps(group.as_mut_ptr().add(120), r15);
+            transpose_8x8_avx2(r8, r9, r10, r11, r12, r13, r14, r15, d.add(8));
+
             let mut sum_lo = 0.0f32;
-            for l in 0..8 {
-                for b in 0..8 {
-                    let v = group[l * 8 + b];
-                    dst[b * 16 + l] = v;
-                    sum_lo += v;
-                }
+            for &v in &group[..64] {
+                sum_lo += v;
             }
             let mut sum_hi = 0.0f32;
-            for l in 8..16 {
-                for b in 0..8 {
-                    let v = group[l * 8 + b];
-                    dst[b * 16 + l] = v;
-                    sum_hi += v;
-                }
+            for &v in &group[64..] {
+                sum_hi += v;
             }
-            xg[2 * g] = sum_lo;
-            xg[2 * g + 1] = sum_hi;
+            *xg.get_unchecked_mut(2 * g) = sum_lo;
+            *xg.get_unchecked_mut(2 * g + 1) = sum_hi;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn hadamard64_f32_avx2(slice: &mut [f32]) {
+        let sign_h1 = _mm256_setr_ps(1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0);
+        let sign_h2 = _mm256_setr_ps(1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0);
+        let sign_h4 = _mm256_setr_ps(1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0);
+        let scale = _mm256_set1_ps(0.125f32);
+        for blk in slice.as_chunks_mut::<64>().0 {
+            let p = blk.as_mut_ptr();
+            let mut v = [_mm256_setzero_ps(); 8];
+            for (i, vi) in v.iter_mut().enumerate() {
+                let x = _mm256_loadu_ps(p.add(i * 8));
+                let x_swap1 = _mm256_permute_ps::<0b10_11_00_01>(x);
+                let s1 = _mm256_fmadd_ps(x, sign_h1, x_swap1);
+                let s1_swap2 = _mm256_permute_ps::<0b01_00_11_10>(s1);
+                let s2 = _mm256_fmadd_ps(s1, sign_h2, s1_swap2);
+                let s2_swap4 = _mm256_permute2f128_ps::<0x01>(s2, s2);
+                *vi = _mm256_fmadd_ps(s2, sign_h4, s2_swap4);
+            }
+            for i in (0..8).step_by(2) {
+                let a = v[i];
+                let b = v[i + 1];
+                v[i] = _mm256_add_ps(a, b);
+                v[i + 1] = _mm256_sub_ps(a, b);
+            }
+            for i in [0, 1, 4, 5] {
+                let a = v[i];
+                let b = v[i + 2];
+                v[i] = _mm256_add_ps(a, b);
+                v[i + 2] = _mm256_sub_ps(a, b);
+            }
+            for i in 0..4 {
+                let a = v[i];
+                let b = v[i + 4];
+                _mm256_storeu_ps(p.add(i * 8), _mm256_mul_ps(_mm256_add_ps(a, b), scale));
+                _mm256_storeu_ps(
+                    p.add((i + 4) * 8),
+                    _mm256_mul_ps(_mm256_sub_ps(a, b), scale),
+                );
+            }
         }
     }
 
@@ -558,6 +873,9 @@ mod simd {
     // AVX2 + FMA + F16C fallback for Zen 2 / Zen 3 / Alder Lake / Raptor Lake CPUs
     // without AVX-512. Splits each 16-lane group into (lo, hi) __m256 pairs with
     // identical FMA and reduction tree to `row_tile` (0 ULP bit-identical output).
+    // For `R * T <= 2`, `lo` and `hi` are interleaved across nibbles; for `R * T > 2`
+    // (`T in {2, 4}` with `R = 2`), `acc_lo` is accumulated and folded into `total_lo`
+    // before `acc_hi` so the working set stays within the 16 YMM architectural registers.
     #[target_feature(enable = "avx2,fma,f16c")]
     #[allow(clippy::cognitive_complexity, clippy::needless_range_loop)]
     unsafe fn row_tile_avx2<const R: usize, const T: usize, const G64: bool>(
@@ -572,82 +890,192 @@ mod simd {
         let mut total_hi = [[z; R]; T];
         let mut bias = [[0.0f32; R]; T];
         let mask15 = _mm256_set1_epi32(15);
-        for g in 0..groups {
-            let mut q_lo = [_mm256_setzero_si256(); R];
-            let mut q_hi = [_mm256_setzero_si256(); R];
-            for r in 0..R {
-                let ptr = w[r].as_ptr().add(g * 16);
-                q_lo[r] = _mm256_loadu_si256(ptr.cast());
-                q_hi[r] = _mm256_loadu_si256(ptr.add(8).cast());
-                if (g + 4) * 16 < w[r].len() {
-                    _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
+        if R * T <= 2 {
+            for g in 0..groups {
+                let mut q_lo = [_mm256_setzero_si256(); R];
+                let mut q_hi = [_mm256_setzero_si256(); R];
+                for r in 0..R {
+                    let ptr = w[r].as_ptr().add(g * 16);
+                    q_lo[r] = _mm256_loadu_si256(ptr.cast());
+                    q_hi[r] = _mm256_loadu_si256(ptr.add(8).cast());
+                    if (g + 4) * 16 < w[r].len() {
+                        _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
+                    }
                 }
-            }
-            let mut scale_lo = [0.0; R];
-            let mut scale_hi = [0.0; R];
-            let mut vscale_lo = [z; R];
-            let mut vscale_hi = [z; R];
-            for r in 0..R {
-                if G64 {
-                    scale_lo[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
-                        *s[r].get_unchecked(2 * g) as i32,
-                    )));
-                    scale_hi[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
-                        *s[r].get_unchecked(2 * g + 1) as i32,
-                    )));
-                } else {
-                    let sc = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
-                        *s[r].get_unchecked(g) as i32
-                    )));
-                    scale_lo[r] = sc;
-                    scale_hi[r] = sc;
+                let mut scale_lo = [0.0; R];
+                let mut scale_hi = [0.0; R];
+                let mut vscale_lo = [z; R];
+                let mut vscale_hi = [z; R];
+                for r in 0..R {
+                    if G64 {
+                        scale_lo[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                            *s[r].get_unchecked(2 * g) as i32,
+                        )));
+                        scale_hi[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                            *s[r].get_unchecked(2 * g + 1) as i32,
+                        )));
+                    } else {
+                        let sc = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                            *s[r].get_unchecked(g) as i32,
+                        )));
+                        scale_lo[r] = sc;
+                        scale_hi[r] = sc;
+                    }
+                    vscale_lo[r] = _mm256_set1_ps(scale_lo[r]);
+                    vscale_hi[r] = _mm256_set1_ps(scale_hi[r]);
                 }
-                vscale_lo[r] = _mm256_set1_ps(scale_lo[r]);
-                vscale_hi[r] = _mm256_set1_ps(scale_hi[r]);
-            }
-            let mut acc_lo = [[z; R]; T];
-            let mut acc_hi = [[z; R]; T];
-            macro_rules! nib256 {
-                ($b:literal) => {{
+                let mut acc_lo = [[z; R]; T];
+                let mut acc_hi = [[z; R]; T];
+                macro_rules! nib256 {
+                    ($b:literal) => {{
+                        for r in 0..R {
+                            let ws_lo = _mm256_cvtepi32_ps(_mm256_and_si256(
+                                _mm256_srli_epi32::<{ 4 * $b }>(q_lo[r]),
+                                mask15,
+                            ));
+                            let ws_hi = _mm256_cvtepi32_ps(_mm256_and_si256(
+                                _mm256_srli_epi32::<{ 4 * $b }>(q_hi[r]),
+                                mask15,
+                            ));
+                            for t in 0..T {
+                                let x_ptr = xp.as_ptr().add(t * groups * 128 + g * 128 + 16 * $b);
+                                let x_lo = _mm256_loadu_ps(x_ptr);
+                                let x_hi = _mm256_loadu_ps(x_ptr.add(8));
+                                acc_lo[t][r] = _mm256_fmadd_ps(ws_lo, x_lo, acc_lo[t][r]);
+                                acc_hi[t][r] = _mm256_fmadd_ps(ws_hi, x_hi, acc_hi[t][r]);
+                            }
+                        }
+                    }};
+                }
+                nib256!(0);
+                nib256!(1);
+                nib256!(2);
+                nib256!(3);
+                nib256!(4);
+                nib256!(5);
+                nib256!(6);
+                nib256!(7);
+                for t in 0..T {
                     for r in 0..R {
-                        let ws_lo = _mm256_cvtepi32_ps(_mm256_and_si256(
-                            _mm256_srli_epi32::<{ 4 * $b }>(q_lo[r]),
-                            mask15,
-                        ));
-                        let ws_hi = _mm256_cvtepi32_ps(_mm256_and_si256(
-                            _mm256_srli_epi32::<{ 4 * $b }>(q_hi[r]),
-                            mask15,
-                        ));
-                        for t in 0..T {
-                            let x_ptr = xp.as_ptr().add(t * groups * 128 + g * 128 + 16 * $b);
-                            let x_lo = _mm256_loadu_ps(x_ptr);
-                            let x_hi = _mm256_loadu_ps(x_ptr.add(8));
-                            acc_lo[t][r] = _mm256_fmadd_ps(ws_lo, x_lo, acc_lo[t][r]);
-                            acc_hi[t][r] = _mm256_fmadd_ps(ws_hi, x_hi, acc_hi[t][r]);
+                        total_lo[t][r] =
+                            _mm256_fmadd_ps(acc_lo[t][r], vscale_lo[r], total_lo[t][r]);
+                        total_hi[t][r] =
+                            _mm256_fmadd_ps(acc_hi[t][r], vscale_hi[r], total_hi[t][r]);
+                        if G64 {
+                            let xg_lo = *xg.get_unchecked(t * 2 * groups + 2 * g);
+                            let xg_hi = *xg.get_unchecked(t * 2 * groups + 2 * g + 1);
+                            bias[t][r] =
+                                scale_hi[r].mul_add(xg_hi, scale_lo[r].mul_add(xg_lo, bias[t][r]));
+                        } else {
+                            let xgv = *xg.get_unchecked(t * groups + g);
+                            bias[t][r] = scale_lo[r].mul_add(xgv, bias[t][r]);
                         }
                     }
-                }};
+                }
             }
-            nib256!(0);
-            nib256!(1);
-            nib256!(2);
-            nib256!(3);
-            nib256!(4);
-            nib256!(5);
-            nib256!(6);
-            nib256!(7);
-            for t in 0..T {
+        } else {
+            for g in 0..groups {
+                let mut q_lo = [_mm256_setzero_si256(); R];
                 for r in 0..R {
-                    total_lo[t][r] = _mm256_fmadd_ps(acc_lo[t][r], vscale_lo[r], total_lo[t][r]);
-                    total_hi[t][r] = _mm256_fmadd_ps(acc_hi[t][r], vscale_hi[r], total_hi[t][r]);
-                    if G64 {
-                        let xg_lo = *xg.get_unchecked(t * 2 * groups + 2 * g);
-                        let xg_hi = *xg.get_unchecked(t * 2 * groups + 2 * g + 1);
-                        bias[t][r] =
-                            scale_hi[r].mul_add(xg_hi, scale_lo[r].mul_add(xg_lo, bias[t][r]));
+                    let ptr = w[r].as_ptr().add(g * 16);
+                    q_lo[r] = _mm256_loadu_si256(ptr.cast());
+                    if (g + 4) * 16 < w[r].len() {
+                        _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
+                    }
+                }
+                let mut acc_lo = [[z; R]; T];
+                macro_rules! nib_lo {
+                    ($b:literal) => {{
+                        let mut ws = [z; R];
+                        for r in 0..R {
+                            ws[r] = _mm256_cvtepi32_ps(_mm256_and_si256(
+                                _mm256_srli_epi32::<{ 4 * $b }>(q_lo[r]),
+                                mask15,
+                            ));
+                        }
+                        for t in 0..T {
+                            let x_lo = _mm256_loadu_ps(
+                                xp.as_ptr().add(t * groups * 128 + g * 128 + 16 * $b),
+                            );
+                            for r in 0..R {
+                                acc_lo[t][r] = _mm256_fmadd_ps(ws[r], x_lo, acc_lo[t][r]);
+                            }
+                        }
+                    }};
+                }
+                nib_lo!(0);
+                nib_lo!(1);
+                nib_lo!(2);
+                nib_lo!(3);
+                nib_lo!(4);
+                nib_lo!(5);
+                nib_lo!(6);
+                nib_lo!(7);
+                let mut scale_lo = [0.0; R];
+                for r in 0..R {
+                    let idx = if G64 { 2 * g } else { g };
+                    scale_lo[r] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                        *s[r].get_unchecked(idx) as i32,
+                    )));
+                    let vscale_lo = _mm256_set1_ps(scale_lo[r]);
+                    for t in 0..T {
+                        total_lo[t][r] = _mm256_fmadd_ps(acc_lo[t][r], vscale_lo, total_lo[t][r]);
+                    }
+                }
+
+                let mut q_hi = [_mm256_setzero_si256(); R];
+                for r in 0..R {
+                    let ptr = w[r].as_ptr().add(g * 16 + 8);
+                    q_hi[r] = _mm256_loadu_si256(ptr.cast());
+                }
+                let mut acc_hi = [[z; R]; T];
+                macro_rules! nib_hi {
+                    ($b:literal) => {{
+                        let mut ws = [z; R];
+                        for r in 0..R {
+                            ws[r] = _mm256_cvtepi32_ps(_mm256_and_si256(
+                                _mm256_srli_epi32::<{ 4 * $b }>(q_hi[r]),
+                                mask15,
+                            ));
+                        }
+                        for t in 0..T {
+                            let x_hi = _mm256_loadu_ps(
+                                xp.as_ptr().add(t * groups * 128 + g * 128 + 16 * $b + 8),
+                            );
+                            for r in 0..R {
+                                acc_hi[t][r] = _mm256_fmadd_ps(ws[r], x_hi, acc_hi[t][r]);
+                            }
+                        }
+                    }};
+                }
+                nib_hi!(0);
+                nib_hi!(1);
+                nib_hi!(2);
+                nib_hi!(3);
+                nib_hi!(4);
+                nib_hi!(5);
+                nib_hi!(6);
+                nib_hi!(7);
+                for r in 0..R {
+                    let scale_hi = if G64 {
+                        _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(
+                            *s[r].get_unchecked(2 * g + 1) as i32,
+                        )))
                     } else {
-                        let xgv = *xg.get_unchecked(t * groups + g);
-                        bias[t][r] = scale_lo[r].mul_add(xgv, bias[t][r]);
+                        scale_lo[r]
+                    };
+                    let vscale_hi = _mm256_set1_ps(scale_hi);
+                    for t in 0..T {
+                        total_hi[t][r] = _mm256_fmadd_ps(acc_hi[t][r], vscale_hi, total_hi[t][r]);
+                        if G64 {
+                            let xg_lo = *xg.get_unchecked(t * 2 * groups + 2 * g);
+                            let xg_hi = *xg.get_unchecked(t * 2 * groups + 2 * g + 1);
+                            bias[t][r] =
+                                scale_hi.mul_add(xg_hi, scale_lo[r].mul_add(xg_lo, bias[t][r]));
+                        } else {
+                            let xgv = *xg.get_unchecked(t * groups + g);
+                            bias[t][r] = scale_lo[r].mul_add(xgv, bias[t][r]);
+                        }
                     }
                 }
             }
@@ -677,6 +1105,29 @@ mod simd {
         let xg_stride = groups * (128 / group_size);
         let mut t = 0;
         if R <= 2 {
+            while t + 4 <= n {
+                let v = if group_size == 64 {
+                    row_tile_avx2::<R, 4, true>(
+                        w,
+                        s,
+                        &xp[t * xp_stride..],
+                        &xg[t * xg_stride..],
+                        groups,
+                    )
+                } else {
+                    row_tile_avx2::<R, 4, false>(
+                        w,
+                        s,
+                        &xp[t * xp_stride..],
+                        &xg[t * xg_stride..],
+                        groups,
+                    )
+                };
+                for (dt, row) in v.into_iter().enumerate() {
+                    emit(t + dt, row);
+                }
+                t += 4;
+            }
             while t + 2 <= n {
                 let v = if group_size == 64 {
                     row_tile_avx2::<R, 2, true>(
@@ -1103,6 +1554,29 @@ mod tests {
         let mut xg = [0.0; 2];
         prepare_x_perm(&x, &mut xp, &mut xg).unwrap();
         assert_eq!(xg, [126.0, 128.0]);
+        let mut xp_port = [0.0; 256];
+        let mut xg_port = [0.0; 2];
+        prepare_x_perm_portable(&x, &mut xp_port, &mut xg_port).unwrap();
+        assert_eq!(xp, xp_port);
+        assert_eq!(xg, xg_port);
+        let mut xp_g64 = [0.0; 256];
+        let mut xg_g64 = [0.0; 4];
+        let mut xp_g64_port = [0.0; 256];
+        let mut xg_g64_port = [0.0; 4];
+        prepare_x_perm_grouped(&x, 64, &mut xp_g64, &mut xg_g64).unwrap();
+        prepare_x_perm_grouped_portable(&x, 64, &mut xp_g64_port, &mut xg_g64_port).unwrap();
+        assert_eq!(xp_g64, xp_g64_port);
+        assert_eq!(xg_g64, xg_g64_port);
+        let mut had_simd: Vec<f32> = (0..128)
+            .map(|k| ((k * 37 % 103) as f32 - 51.0) / 16.0)
+            .collect();
+        let mut had_port = had_simd.clone();
+        hadamard64_f32_inplace(&mut had_simd);
+        hadamard64_f32_portable(&mut had_port);
+        assert_eq!(
+            had_simd.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            had_port.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
         for g in 0..2 {
             for l in 0..16 {
                 for b in 0..8 {
@@ -1132,11 +1606,31 @@ mod tests {
         let mut hp = vec![0.; x.len()];
         let mut hg = vec![0.; x.len() / 128];
         prepare_x_perm_f16(&input, &mut hp, &mut hg).unwrap();
+        let mut hp_port = vec![0.; x.len()];
+        let mut hg_port = vec![0.; x.len() / 128];
+        prepare_x_perm_f16_portable(&input, &mut hp_port, &mut hg_port).unwrap();
         assert_eq!(
             xp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             hp.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
+        assert_eq!(
+            hp.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            hp_port.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
         assert_eq!(xg, hg);
+        assert_eq!(hg, hg_port);
+        let mut hp_g64 = vec![0.; x.len()];
+        let mut hg_g64 = vec![0.; x.len() / 64];
+        let mut hp_g64_port = vec![0.; x.len()];
+        let mut hg_g64_port = vec![0.; x.len() / 64];
+        prepare_x_perm_f16_grouped(&input, 64, &mut hp_g64, &mut hg_g64).unwrap();
+        prepare_x_perm_f16_grouped_portable(&input, 64, &mut hp_g64_port, &mut hg_g64_port)
+            .unwrap();
+        assert_eq!(
+            hp_g64.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            hp_g64_port.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(hg_g64, hg_g64_port);
         assert_eq!(
             prepare_x_perm_f16(&input[..127], &mut hp, &mut hg),
             Err(EvalError::InvalidShape)

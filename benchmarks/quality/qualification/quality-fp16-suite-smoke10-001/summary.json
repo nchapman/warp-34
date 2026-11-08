@@ -1,0 +1,118 @@
+{
+  "warp": {
+    "status": "complete",
+    "mode": "mtp3",
+    "metrics": {
+      "ifeval": {
+        "name": "ifeval",
+        "alias": "ifeval",
+        "sample_len": 10,
+        "prompt_level_strict_acc,none": 1.0,
+        "prompt_level_strict_acc_stderr,none": 0.0,
+        "inst_level_strict_acc,none": 1.0,
+        "inst_level_strict_acc_stderr,none": "N/A",
+        "prompt_level_loose_acc,none": 1.0,
+        "prompt_level_loose_acc_stderr,none": 0.0,
+        "inst_level_loose_acc,none": 1.0,
+        "inst_level_loose_acc_stderr,none": "N/A"
+      },
+      "gsm8k": {
+        "name": "gsm8k",
+        "alias": "gsm8k",
+        "sample_len": 10,
+        "exact_match,strict-match": 0.8,
+        "exact_match_stderr,strict-match": 0.13333333333333333,
+        "exact_match,flexible-extract": 0.8,
+        "exact_match_stderr,flexible-extract": 0.13333333333333333
+      }
+    },
+    "cleanup_established": true
+  },
+  "vllm": {
+    "status": "complete",
+    "mode": "mtp3",
+    "metrics": {
+      "ifeval": {
+        "name": "ifeval",
+        "alias": "ifeval",
+        "sample_len": 10,
+        "prompt_level_strict_acc,none": 0.9,
+        "prompt_level_strict_acc_stderr,none": 0.09999999999999999,
+        "inst_level_strict_acc,none": 0.9444444444444444,
+        "inst_level_strict_acc_stderr,none": "N/A",
+        "prompt_level_loose_acc,none": 0.9,
+        "prompt_level_loose_acc_stderr,none": 0.09999999999999999,
+        "inst_level_loose_acc,none": 0.9444444444444444,
+        "inst_level_loose_acc_stderr,none": "N/A"
+      },
+      "gsm8k": {
+        "name": "gsm8k",
+        "alias": "gsm8k",
+        "sample_len": 10,
+        "exact_match,strict-match": 0.8,
+        "exact_match_stderr,strict-match": 0.13333333333333333,
+        "exact_match,flexible-extract": 0.9,
+        "exact_match_stderr,flexible-extract": 0.09999999999999999
+      }
+    },
+    "cleanup_established": true
+  },
+  "llama": {
+    "status": "complete",
+    "mode": "mtp3",
+    "metrics": {
+      "ifeval": {
+        "name": "ifeval",
+        "alias": "ifeval",
+        "sample_len": 10,
+        "prompt_level_strict_acc,none": 1.0,
+        "prompt_level_strict_acc_stderr,none": 0.0,
+        "inst_level_strict_acc,none": 1.0,
+        "inst_level_strict_acc_stderr,none": "N/A",
+        "prompt_level_loose_acc,none": 1.0,
+        "prompt_level_loose_acc_stderr,none": 0.0,
+        "inst_level_loose_acc,none": 1.0,
+        "inst_level_loose_acc_stderr,none": "N/A"
+      },
+      "gsm8k": {
+        "name": "gsm8k",
+        "alias": "gsm8k",
+        "sample_len": 10,
+        "exact_match,strict-match": 0.9,
+        "exact_match_stderr,strict-match": 0.09999999999999999,
+        "exact_match,flexible-extract": 0.9,
+        "exact_match_stderr,flexible-extract": 0.09999999999999999
+      }
+    },
+    "cleanup_established": true
+  },
+  "sglang": {
+    "status": "complete",
+    "mode": "plain",
+    "metrics": {
+      "ifeval": {
+        "name": "ifeval",
+        "alias": "ifeval",
+        "sample_len": 10,
+        "prompt_level_strict_acc,none": 0.9,
+        "prompt_level_strict_acc_stderr,none": 0.09999999999999999,
+        "inst_level_strict_acc,none": 0.9444444444444444,
+        "inst_level_strict_acc_stderr,none": "N/A",
+        "prompt_level_loose_acc,none": 0.9,
+        "prompt_level_loose_acc_stderr,none": 0.09999999999999999,
+        "inst_level_loose_acc,none": 0.9444444444444444,
+        "inst_level_loose_acc_stderr,none": "N/A"
+      },
+      "gsm8k": {
+        "name": "gsm8k",
+        "alias": "gsm8k",
+        "sample_len": 10,
+        "exact_match,strict-match": 0.8,
+        "exact_match_stderr,strict-match": 0.13333333333333333,
+        "exact_match,flexible-extract": 0.9,
+        "exact_match_stderr,flexible-extract": 0.09999999999999999
+      }
+    },
+    "cleanup_established": true
+  }
+}

@@ -1,0 +1,2323 @@
+{
+  "schema_version": 1,
+  "publication_ready": false,
+  "limitations": [
+    "Qualification measurements; not a winner ranking.",
+    "Different weight/KV/cohort/renderer/GPU settings are not controlled equivalents.",
+    "Repetitions within one server lifetime are not independent restart trials.",
+    "Baseline quality passes do not establish long-context quality.",
+    "Resource peaks cover whole runs including warmup and priming."
+  ],
+  "startup_outcomes": [
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp1-dflash2",
+      "engine_id": "warp34-flash-hgptq-tp1-dflash2",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp1-mtp3",
+      "engine_id": "warp34-flash-hgptq-tp1-mtp3",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp1-target",
+      "engine_id": "warp34-flash-hgptq-tp1-target",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp2-dflash2",
+      "engine_id": "warp34-flash-hgptq-tp2-dflash2",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp2-mtp3",
+      "engine_id": "warp34-flash-hgptq-tp2-mtp3",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp2-target",
+      "engine_id": "warp34-flash-hgptq-tp2-target",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp1-dflash2",
+      "engine_id": "warp34-flash-hgptq-tp1-dflash2",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "failed"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp1-mtp3",
+      "engine_id": "warp34-flash-hgptq-tp1-mtp3",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp1-target",
+      "engine_id": "warp34-flash-hgptq-tp1-target",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp2-dflash2",
+      "engine_id": "warp34-flash-hgptq-tp2-dflash2",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "failed"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp2-mtp3",
+      "engine_id": "warp34-flash-hgptq-tp2-mtp3",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp2-target",
+      "engine_id": "warp34-flash-hgptq-tp2-target",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-state-budget-002/warp34-flash-hgptq-tp1-dflash2",
+      "engine_id": "warp34-flash-hgptq-tp1-dflash2",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-state-budget-002/warp34-flash-hgptq-tp2-dflash2",
+      "engine_id": "warp34-flash-hgptq-tp2-dflash2",
+      "status": "startup_receipt_not_retained",
+      "quality_status": "missing",
+      "measurement_status": "complete"
+    }
+  ],
+  "runs": [
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp1-dflash2",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "a112a3ab7a8517ffcdc5bb07e853c1fa75e6648694d13382da184dd2387dd29b",
+        "summary.json": "dd057a256924bbddb136bf55c1ae333e72e9a18d5f03cddd7348a28ff1d25535",
+        "coverage.json": "3f6b9c4d8fd229ac832e3104fe966ec31dff70bec3bb4378c5d629711e96de2c",
+        "SHA256SUMS.json": "16575486ae5cd4fc2232f66c097d5baac865a9f0279c93cc1500297d91d07fba",
+        "telemetry.jsonl": "1a13e50845335c333deaa98430c91612af7298824fb6eb46df2a098a4673ce32"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp1-dflash2",
+          "gpu_count": 1,
+          "gpu_ids": "0",
+          "parallelism": "TP=1; routed EP=1",
+          "speculation": "dflash2",
+          "draft_model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_model_revision": "24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
+          "draft_activation_dtype": "bfloat16",
+          "draft_block_size": 8,
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp1-dflash2",
+          "case": "code-context-r64",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 19.217630835114296,
+          "peak_prompt_tokens": 5976,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-dflash2",
+          "case": "coding-agent-replay",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 29.98630831955444,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-dflash2",
+          "case": "prefill-context-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 18.43757043818328,
+          "peak_prompt_tokens": 1561,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-dflash2",
+          "case": "prefix-primed-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 27.076895221388355,
+          "peak_prompt_tokens": 1562,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-dflash2",
+          "case": "short-chat",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 36.78388373599563,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp1-dflash2": "missing"
+      },
+      "resources": {
+        "sample_count": 558,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 702879.294719292,
+          "end_s": 703466.468061396
+        },
+        "duration_s": 587.1733421040699,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 1.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 44.0,
+            "average_power_w": 27.183207885304657
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22498.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 41.0,
+            "peak_temperature_c": 77.0,
+            "average_power_w": 281.06487455197134
+          }
+        },
+        "host_peak_memory_used_kib": 211705188,
+        "pid_peak_rss_kib": {
+          "85849": 66528752
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "85849": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp1-mtp3",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "3015470d2d54936ef8ba8f234309324cac239ebaff8e8f112cb42e18a472380f",
+        "summary.json": "97186297d623cb19ba3067368e68e1c1122a1a4c85ee6240d1cbb47fdcc0ec7d",
+        "coverage.json": "d5a8195272309c244f8589c0ebc635d2b16542cdc54317fe98cbdb702389cd8d",
+        "SHA256SUMS.json": "2580dd9acc9c1a05ee421d8ee0d1a7cf5cffc3675ea06d6b0db1225b3083c416",
+        "telemetry.jsonl": "9d9cde964e1d0c73448ef238650f85c3b9f692afcfb9a7b76afcc0b7738fb7e2"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp1-mtp3",
+          "gpu_count": 1,
+          "gpu_ids": "0",
+          "parallelism": "TP=1; routed EP=1",
+          "speculation": "mtp-k3",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp1-mtp3",
+          "case": "code-context-r64",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 22.12105513696278,
+          "peak_prompt_tokens": 5976,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-mtp3",
+          "case": "coding-agent-replay",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 28.606821804333933,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-mtp3",
+          "case": "prefill-context-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 17.95771846745572,
+          "peak_prompt_tokens": 1561,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-mtp3",
+          "case": "prefix-primed-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 38.020732518713714,
+          "peak_prompt_tokens": 1562,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-mtp3",
+          "case": "short-chat",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 33.317605710283104,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp1-mtp3": "missing"
+      },
+      "resources": {
+        "sample_count": 547,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 702194.670584655,
+          "end_s": 702770.065035667
+        },
+        "duration_s": 575.39445101202,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 1.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 45.0,
+            "average_power_w": 26.93981718464351
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 23212.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 60.0,
+            "peak_temperature_c": 76.0,
+            "average_power_w": 271.34511882998174
+          }
+        },
+        "host_peak_memory_used_kib": 214060576,
+        "pid_peak_rss_kib": {
+          "72189": 67937552
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "72189": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp1-target",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "620bab2324ed598449ac34ddd9fd3311a6fcd31a619c96d9bde714f24ab2fc6d",
+        "summary.json": "93c19e06df66dcc0fa6b07b649ac08d17712655ff2fa7141fcffa28cfe2ceca2",
+        "coverage.json": "08910b88f06aed2fb14d988d87e6436c6c18417ddbca1bb9186559f21d988625",
+        "SHA256SUMS.json": "bfe1e10cf0daac6cda8306ac7373bfe212aa40c9dc6738eb3c63e63c64088106",
+        "telemetry.jsonl": "0bd4b9ab943d2b1ea9b2129972e8f0ea3941091ad621fa8d462370f186fd8e25"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp1-target",
+          "gpu_count": 1,
+          "gpu_ids": "0",
+          "parallelism": "TP=1; routed EP=1",
+          "speculation": "none",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp1-target",
+          "case": "code-context-r64",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 20.229631000484375,
+          "peak_prompt_tokens": 5976,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-target",
+          "case": "coding-agent-replay",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 25.68052649369376,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-target",
+          "case": "prefill-context-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 16.666117919184185,
+          "peak_prompt_tokens": 1561,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-target",
+          "case": "prefix-primed-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 34.48870924524113,
+          "peak_prompt_tokens": 1562,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-target",
+          "case": "short-chat",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 30.358731097879303,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp1-target": "missing"
+      },
+      "resources": {
+        "sample_count": 600,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 701456.444962056,
+          "end_s": 702085.512601365
+        },
+        "duration_s": 629.0676393089816,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 1.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 51.0,
+            "average_power_w": 26.978466666666666
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 21650.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 60.0,
+            "peak_temperature_c": 78.0,
+            "average_power_w": 277.7736666666667
+          }
+        },
+        "host_peak_memory_used_kib": 212567764,
+        "pid_peak_rss_kib": {
+          "69707": 65788460
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "69707": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp2-dflash2",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "b901fd4c4222ba42f935b80e103ceeea29e9cfa5c4b09b434b73f19a391a9ada",
+        "summary.json": "e992c95fa67527da00349290007ece45788c66f2303188169a12eb0a84a939d9",
+        "coverage.json": "bd5b083d516804b119f8949d07c2e298f9d497f9c723d48bb2a64b31192ac14a",
+        "SHA256SUMS.json": "e62c57d05e2364287c9e9a7a3470ae8cf18c7ce089a703c73ddce0d09247fff1",
+        "telemetry.jsonl": "713775f45727dab020be1c5043497eeb56254cb389d69f4a56672fadccfc315b"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp2-dflash2",
+          "gpu_count": 2,
+          "gpu_ids": "0,1",
+          "parallelism": "TP=2; routed EP=2",
+          "speculation": "dflash2",
+          "draft_model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_model_revision": "24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
+          "draft_activation_dtype": "bfloat16",
+          "draft_block_size": 8,
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp2-dflash2",
+          "case": "code-context-r64",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 42.85563782788001,
+          "peak_prompt_tokens": 5976,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-dflash2",
+          "case": "coding-agent-replay",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 86.13527365111793,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-dflash2",
+          "case": "prefill-context-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 43.49323597461722,
+          "peak_prompt_tokens": 1561,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-dflash2",
+          "case": "prefix-primed-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 68.41984672255666,
+          "peak_prompt_tokens": 1562,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-dflash2",
+          "case": "short-chat",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 95.35425327855849,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp2-dflash2": "missing"
+      },
+      "resources": {
+        "sample_count": 227,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 701107.547769645,
+          "end_s": 701343.925847627
+        },
+        "duration_s": 236.37807798199356,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22014.0,
+            "peak_utilization_gpu_percent": 99.0,
+            "peak_utilization_memory_percent": 42.0,
+            "peak_temperature_c": 73.0,
+            "average_power_w": 305.39938325991193
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22014.0,
+            "peak_utilization_gpu_percent": 99.0,
+            "peak_utilization_memory_percent": 45.0,
+            "peak_temperature_c": 82.0,
+            "average_power_w": 312.6404405286344
+          }
+        },
+        "host_peak_memory_used_kib": 212690060,
+        "pid_peak_rss_kib": {
+          "64650": 67610804
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "64650": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp2-mtp3",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "bf37ed39a0ae33b286ef34ab8f75b92a007547db1e61d3cff11c33dbea7bbef5",
+        "summary.json": "23abfb6a1ea67ede8606b68000b54c8a9f43760d061639466307ed6eb05ddf9f",
+        "coverage.json": "944f41a76029dc03f512239a7174c81e70601b59ecf338bb792e7dff3a80230a",
+        "SHA256SUMS.json": "42bcc63b4ad98fe87434096457e36fe0620e1b9a22301d642995c5f055cbc89f",
+        "telemetry.jsonl": "b4c389a19def5e86905999463a727a5abef8ab3c3b37dd434c40abe02d7c7e73"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp2-mtp3",
+          "gpu_count": 2,
+          "gpu_ids": "0,1",
+          "parallelism": "TP=2; routed EP=2",
+          "speculation": "mtp-k3",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp2-mtp3",
+          "case": "code-context-r64",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 43.78176702281753,
+          "peak_prompt_tokens": 5976,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-mtp3",
+          "case": "coding-agent-replay",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 75.97708173422086,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-mtp3",
+          "case": "prefill-context-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 39.810802464649456,
+          "peak_prompt_tokens": 1561,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-mtp3",
+          "case": "prefix-primed-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 89.82792553761998,
+          "peak_prompt_tokens": 1562,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-mtp3",
+          "case": "short-chat",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 82.1199083271338,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp2-mtp3": "missing"
+      },
+      "resources": {
+        "sample_count": 240,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 700742.517231143,
+          "end_s": 700992.262462366
+        },
+        "duration_s": 249.74523122305982,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22842.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 54.0,
+            "peak_temperature_c": 72.0,
+            "average_power_w": 283.384375
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22842.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 55.0,
+            "peak_temperature_c": 81.0,
+            "average_power_w": 293.72312500000004
+          }
+        },
+        "host_peak_memory_used_kib": 213541508,
+        "pid_peak_rss_kib": {
+          "38816": 67933336
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "38816": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-full-003/warp34-flash-hgptq-tp2-target",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "7b82cc1e10bb0f690edbf62024f45cf7bf397478a5a250a8a33db863d2b8f700",
+        "summary.json": "5577792ed5ec1855be4136828a1927fca294f4e0cd8543d8b7e061d56738fcb5",
+        "coverage.json": "9c0940f3b64fbf037a1d0c33ce92053889ec52063710ad0b16c665084b3d9b1d",
+        "SHA256SUMS.json": "a72f33613b1cd4718a7f38a73ad95660091e66295c993923f844c4f3599c4cf0",
+        "telemetry.jsonl": "c663b0c0caace37be2f01c8e5ee927e7c70e44d437faa81afce940d9b6dd4543"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp2-target",
+          "gpu_count": 2,
+          "gpu_ids": "0,1",
+          "parallelism": "TP=2; routed EP=2",
+          "speculation": "none",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp2-target",
+          "case": "code-context-r64",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 33.57062470561445,
+          "peak_prompt_tokens": 5976,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-target",
+          "case": "coding-agent-replay",
+          "trials": 3,
+          "requests": 24,
+          "success": 24,
+          "failed": 0,
+          "output_tokens_s": 49.44763528495709,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-target",
+          "case": "prefill-context-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 32.1795767025522,
+          "peak_prompt_tokens": 1561,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-target",
+          "case": "prefix-primed-r16",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 58.94417754237431,
+          "peak_prompt_tokens": 1562,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-target",
+          "case": "short-chat",
+          "trials": 3,
+          "requests": 12,
+          "success": 12,
+          "failed": 0,
+          "output_tokens_s": 53.75262382682262,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp2-target": "missing"
+      },
+      "resources": {
+        "sample_count": 333,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 700278.191827183,
+          "end_s": 700625.093528634
+        },
+        "duration_s": 346.9017014510464,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 21362.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 56.0,
+            "peak_temperature_c": 71.0,
+            "average_power_w": 276.243033033033
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 21362.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 58.0,
+            "peak_temperature_c": 81.0,
+            "average_power_w": 281.8877477477477
+          }
+        },
+        "host_peak_memory_used_kib": 212354356,
+        "pid_peak_rss_kib": {
+          "35614": 66803032
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "35614": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp1-dflash2",
+      "status": "failed",
+      "input_sha256": {
+        "manifest.json": "c8ff0b36044e9f13af90e8578d9387f14e155f87b3a61c49220a79b97bb04989",
+        "summary.json": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+        "coverage.json": "aa50563abb287b2aa7daed4146cc17c7443f013989c9ed7e81df5aec2200800a",
+        "SHA256SUMS.json": "ffcdcddb6ba763be2a4e7308d227bba03966eaa10ae0959a2a705ad14b00f079",
+        "telemetry.jsonl": "e19a30f1f4cb50439380720df32f514a103716d14fb99e4f620b15eaa4a0c41f"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp1-dflash2",
+          "gpu_count": 1,
+          "gpu_ids": "0",
+          "parallelism": "TP=1; routed EP=1",
+          "speculation": "dflash2",
+          "draft_model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_model_revision": "24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
+          "draft_activation_dtype": "bfloat16",
+          "draft_block_size": 8,
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "enabled": true
+        }
+      ],
+      "cases": [],
+      "quality": {
+        "warp34-flash-hgptq-tp1-dflash2": "missing"
+      },
+      "resources": {
+        "sample_count": 1,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 699606.151854603,
+          "end_s": 699606.151854603
+        },
+        "duration_s": null,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 1.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 47.0,
+            "average_power_w": 27.95
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 21570.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 59.0,
+            "average_power_w": 124.43
+          }
+        },
+        "host_peak_memory_used_kib": 210764388,
+        "pid_peak_rss_kib": {
+          "28336": 65131032
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "28336": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp1-mtp3",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "424a9d20f82d5ff331bcfd7da4d8a653e1ef10f35f65cf5f741628548a84e282",
+        "summary.json": "0bf42443295150689e44bdfea7082c73d648c0bc7b84187692ab412f643907bd",
+        "coverage.json": "04591c104cea19a36deb8debe9af1a89b8c83386fb9e5e2fcc911400dcf5ee3d",
+        "SHA256SUMS.json": "7e7d82cd0867e4faa7b223b36414e25dba03c28c455eafb9f73bcea1e1e27986",
+        "telemetry.jsonl": "e5d4d27a019f4c32357fab274d5664b2d12d8b19a1f09a1f864f4743141f0b2e"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp1-mtp3",
+          "gpu_count": 1,
+          "gpu_ids": "0",
+          "parallelism": "TP=1; routed EP=1",
+          "speculation": "mtp-k3",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp1-mtp3",
+          "case": "coding-agent-replay",
+          "trials": 1,
+          "requests": 8,
+          "success": 8,
+          "failed": 0,
+          "output_tokens_s": 27.304159169893627,
+          "peak_prompt_tokens": 1578,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-mtp3",
+          "case": "short-chat",
+          "trials": 1,
+          "requests": 4,
+          "success": 4,
+          "failed": 0,
+          "output_tokens_s": 32.6669649535217,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp1-mtp3": "missing"
+      },
+      "resources": {
+        "sample_count": 92,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 699401.802388046,
+          "end_s": 699497.698660073
+        },
+        "duration_s": 95.89627202693373,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 1.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 50.0,
+            "average_power_w": 27.041521739130438
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22328.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 30.0,
+            "peak_temperature_c": 71.0,
+            "average_power_w": 249.6961956521739
+          }
+        },
+        "host_peak_memory_used_kib": 212598724,
+        "pid_peak_rss_kib": {
+          "24902": 67186600
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "24902": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp1-target",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "0a67a60c8702213a6191f7ccce0eb1b049127eb8c037d8bbcc8b6f47552e71d8",
+        "summary.json": "3d97614c26000c8b075aa77486d93381a808def400fc2d547d748c6a7bac293e",
+        "coverage.json": "45efce117d8082eaf9fb968c772f81306ab3773b2218a6f97ded8e2c01406a39",
+        "SHA256SUMS.json": "86d8e7767f755ac4b01ccfe477fd2fb936c0200321e2f03c27ce5239b03deaba",
+        "telemetry.jsonl": "d9290fb06d047567880b5667b96493319ee541123cf9becd951eb1b7cd89d2a3"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp1-target",
+          "gpu_count": 1,
+          "gpu_ids": "0",
+          "parallelism": "TP=1; routed EP=1",
+          "speculation": "none",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp1-target",
+          "case": "coding-agent-replay",
+          "trials": 1,
+          "requests": 8,
+          "success": 8,
+          "failed": 0,
+          "output_tokens_s": 24.09778718550306,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-target",
+          "case": "short-chat",
+          "trials": 1,
+          "requests": 4,
+          "success": 4,
+          "failed": 0,
+          "output_tokens_s": 29.725062612273007,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp1-target": "missing"
+      },
+      "resources": {
+        "sample_count": 103,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 699188.009459891,
+          "end_s": 699295.078721947
+        },
+        "duration_s": 107.0692620560294,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 1.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 54.0,
+            "average_power_w": 26.91242718446602
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 20766.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 35.0,
+            "peak_temperature_c": 73.0,
+            "average_power_w": 257.80631067961167
+          }
+        },
+        "host_peak_memory_used_kib": 210898624,
+        "pid_peak_rss_kib": {
+          "23550": 65435744
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "23550": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp2-dflash2",
+      "status": "failed",
+      "input_sha256": {
+        "manifest.json": "e9b0a074377817a9efe4d9abc61f3435eac60f5f31d38dc6e6952fca33a60b51",
+        "summary.json": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+        "coverage.json": "7fa86d1b9fa9ab535e27ddb7a31a8d1601f82db17fe058b1656f5b6fee99d42c",
+        "SHA256SUMS.json": "8d2c2c9c6758e034e394a430a68cada49cf96c423698c7e0e54874a1d6064799",
+        "telemetry.jsonl": "2340fa34703eac60d577216c8b416b1a7f8247c7afd4168a890c3c22a7d9ae03"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp2-dflash2",
+          "gpu_count": 2,
+          "gpu_ids": "0,1",
+          "parallelism": "TP=2; routed EP=2",
+          "speculation": "dflash2",
+          "draft_model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_model_revision": "24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
+          "draft_activation_dtype": "bfloat16",
+          "draft_block_size": 8,
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "enabled": true
+        }
+      ],
+      "cases": [],
+      "quality": {
+        "warp34-flash-hgptq-tp2-dflash2": "missing"
+      },
+      "resources": {
+        "sample_count": 1,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 699082.232975536,
+          "end_s": 699082.232975536
+        },
+        "duration_s": null,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 21526.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 61.0,
+            "average_power_w": 129.65
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 21526.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 59.0,
+            "average_power_w": 125.56
+          }
+        },
+        "host_peak_memory_used_kib": 212323968,
+        "pid_peak_rss_kib": {
+          "21331": 65980556
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "21331": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp2-mtp3",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "e1ca58fe9cd893827237e2732adff6ffeb79d9be4b0e5ea722f505e876b6b545",
+        "summary.json": "3951f3657da21f3b7be879d7d55ba485237cd75732cf0da3620ea1d9176c58d7",
+        "coverage.json": "9290e7a01105211e3da6785642b0e80af51d0e91ba2c1feadafa272fe6b40124",
+        "SHA256SUMS.json": "fa48560a13d404aa0755eec664d9f12f30ae2db0440afa5fc7e0a3d5a28bc255",
+        "telemetry.jsonl": "7ad899630b3e5470ff5068a245bc728bb0dc1c712e9750fce72b1fa74aea513f"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp2-mtp3",
+          "gpu_count": 2,
+          "gpu_ids": "0,1",
+          "parallelism": "TP=2; routed EP=2",
+          "speculation": "mtp-k3",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034 --speculative mtp --mtp-k 3",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp2-mtp3",
+          "case": "coding-agent-replay",
+          "trials": 1,
+          "requests": 8,
+          "success": 8,
+          "failed": 0,
+          "output_tokens_s": 73.18979502373341,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-mtp3",
+          "case": "short-chat",
+          "trials": 1,
+          "requests": 4,
+          "success": 4,
+          "failed": 0,
+          "output_tokens_s": 80.96060629064021,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp2-mtp3": "missing"
+      },
+      "resources": {
+        "sample_count": 36,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 698928.362898658,
+          "end_s": 698964.962410798
+        },
+        "duration_s": 36.59951213991735,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22400.0,
+            "peak_utilization_gpu_percent": 99.0,
+            "peak_utilization_memory_percent": 32.0,
+            "peak_temperature_c": 68.0,
+            "average_power_w": 263.04305555555555
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22400.0,
+            "peak_utilization_gpu_percent": 99.0,
+            "peak_utilization_memory_percent": 31.0,
+            "peak_temperature_c": 72.0,
+            "average_power_w": 260.17305555555555
+          }
+        },
+        "host_peak_memory_used_kib": 212835288,
+        "pid_peak_rss_kib": {
+          "14989": 67152964
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "14989": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-quick-001/warp34-flash-hgptq-tp2-target",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "1c5e0e24d6dbf8e2f761c912600c6f5935fa1a1e4342a19f1ab2dd25827d89c0",
+        "summary.json": "23e2f671691c7b5ddc2ab11a0af96d9249484fe8d2ac3e72a2fe9020e719abb4",
+        "coverage.json": "27343cf4981b48901167ebadb5a7f097c01cea2f0697f3f1b9fe14c1c499a01f",
+        "SHA256SUMS.json": "574986d3dbb3186660289067dc35ee55403b2a162eeb7d259c59aac67efca5e9",
+        "telemetry.jsonl": "925f40fff161e970b6d28a511dcfb173f9d1077c14b759c210b218b16f4bd220"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 1; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp2-target",
+          "gpu_count": 2,
+          "gpu_ids": "0,1",
+          "parallelism": "TP=2; routed EP=2",
+          "speculation": "none",
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp2-target",
+          "case": "coding-agent-replay",
+          "trials": 1,
+          "requests": 8,
+          "success": 8,
+          "failed": 0,
+          "output_tokens_s": 47.059515338870504,
+          "peak_prompt_tokens": 1579,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-target",
+          "case": "short-chat",
+          "trials": 1,
+          "requests": 4,
+          "success": 4,
+          "failed": 0,
+          "output_tokens_s": 51.71391509600161,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp2-target": "missing"
+      },
+      "resources": {
+        "sample_count": 56,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 698753.517008425,
+          "end_s": 698810.943075716
+        },
+        "duration_s": 57.42606729106046,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 20920.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 32.0,
+            "peak_temperature_c": 67.0,
+            "average_power_w": 256.8441071428571
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 20920.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 34.0,
+            "peak_temperature_c": 73.0,
+            "average_power_w": 258.27785714285716
+          }
+        },
+        "host_peak_memory_used_kib": 212195224,
+        "pid_peak_rss_kib": {
+          "12661": 66369512
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "12661": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-state-budget-002/warp34-flash-hgptq-tp1-dflash2",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "46af44a5ef14eafaf92a2ce95aa128fc2a74632d70195cc8be1bddbd804299b9",
+        "summary.json": "57faff2576ec2ff8f8406bc25f4e565f010d363032abe58eb91a072823796053",
+        "coverage.json": "d49c015d041ecfd9a68411ae4664f5ea0ecd478e3d0eef7758295ec525d009e9",
+        "SHA256SUMS.json": "305f80ccf0c510d3a6be441a24af64b49aa415b2a3126300fc15422df3d1df2a",
+        "telemetry.jsonl": "afe3ad8be4cdb904480ba28e1fa4771392181d12f2e75bdce44801a98f80f5ce"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp1-dflash2",
+          "gpu_count": 1,
+          "gpu_ids": "0",
+          "parallelism": "TP=1; routed EP=1",
+          "speculation": "dflash2",
+          "draft_model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_model_revision": "24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
+          "draft_activation_dtype": "bfloat16",
+          "draft_block_size": 8,
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp1-dflash2",
+          "case": "coding-agent-replay",
+          "trials": 1,
+          "requests": 8,
+          "success": 8,
+          "failed": 0,
+          "output_tokens_s": 30.764401983044063,
+          "peak_prompt_tokens": 1578,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp1-dflash2",
+          "case": "short-chat",
+          "trials": 1,
+          "requests": 4,
+          "success": 4,
+          "failed": 0,
+          "output_tokens_s": 37.595193134966415,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp1-dflash2": "missing"
+      },
+      "resources": {
+        "sample_count": 80,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 700075.514980377,
+          "end_s": 700158.979473351
+        },
+        "duration_s": 83.46449297398794,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 1.0,
+            "peak_utilization_gpu_percent": 0.0,
+            "peak_utilization_memory_percent": 0.0,
+            "peak_temperature_c": 50.0,
+            "average_power_w": 26.7745
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22498.0,
+            "peak_utilization_gpu_percent": 100.0,
+            "peak_utilization_memory_percent": 40.0,
+            "peak_temperature_c": 72.0,
+            "average_power_w": 255.79025000000001
+          }
+        },
+        "host_peak_memory_used_kib": 211180936,
+        "pid_peak_rss_kib": {
+          "34235": 65641128
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "34235": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    },
+    {
+      "path": "benchmarks/perf/results/flash-hgptq-pod-001/flash-hgptq-state-budget-002/warp34-flash-hgptq-tp2-dflash2",
+      "status": "complete",
+      "input_sha256": {
+        "manifest.json": "1e8a45d43a62f68bbde0c6c17dfa2517eecb4cac04186cacc1842b00b77a9e31",
+        "summary.json": "5bc538f30de87539a94a28d2452d398f04498f265246c7f9b67a5e800f114fff",
+        "coverage.json": "89d4aedf3661dbbe53b35256ced60f42567200c79cb9ea05d2fd2357bd25b068",
+        "SHA256SUMS.json": "114946c4fa12fea932de5cfb923fe6a828ecab6d9580603bdb7e83cdc0a278f9",
+        "telemetry.jsonl": "f029298b47e02c8099a82be01ec34ffb3eb858c1d9d3d434fe7190c5d41c3757"
+      },
+      "deployments": [
+        {
+          "support": "unverified",
+          "cohort": "flash-next-hgptq-serving",
+          "engine": "warp-34",
+          "version": "b7f5fdd",
+          "binary_sha256": "20ced0713e8e64fa2092b323b7375aead7b538fb0070b4d8336208892efc33c1",
+          "base_url": "http://127.0.0.1:18034/v1",
+          "model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "model_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "source_model_revision": "unknown",
+          "artifact_sha256": "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56",
+          "tokenizer_revision": "6ee06d2936b111f19eb5eb331044cb8b8b28562b",
+          "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+          "weight_format": "HGPTQ-W4A16",
+          "quantization_details": "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE; see pinned config for tensor exclusions and vision transforms",
+          "activation_dtype": "float16",
+          "conv_state_dtype": "float16",
+          "kv_format": "tq4",
+          "cache_config": "TQ4 KV, 512 pages; max-num-seqs 4; runtime-default expert/cache settings; residency and capacity unmeasured",
+          "id": "warp34-flash-hgptq-tp2-dflash2",
+          "gpu_count": 2,
+          "gpu_ids": "0,1",
+          "parallelism": "TP=2; routed EP=2",
+          "speculation": "dflash2",
+          "draft_model": "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_model_revision": "24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "draft_artifact_sha256": "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed",
+          "draft_activation_dtype": "bfloat16",
+          "draft_block_size": 8,
+          "launch_command": "env CUDA_VISIBLE_DEVICES=0,1 HF_HOME=/workspace/.hf_home HF_HUB_OFFLINE=1 /workspace/warp-34/target/release/w34 serve --model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-W4A16-HGPTQ/snapshots/6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 512 --max-num-seqs 4 --host 127.0.0.1 --port 18034 --speculative dflash2 --draft-model /workspace/.hf_home/hub/models--nchapman--Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ/snapshots/24a62babba3b54387b3ea73f5599e5de83029dd8",
+          "enabled": true
+        }
+      ],
+      "cases": [
+        {
+          "engine": "warp34-flash-hgptq-tp2-dflash2",
+          "case": "coding-agent-replay",
+          "trials": 1,
+          "requests": 8,
+          "success": 8,
+          "failed": 0,
+          "output_tokens_s": 87.29589733639872,
+          "peak_prompt_tokens": 1577,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        },
+        {
+          "engine": "warp34-flash-hgptq-tp2-dflash2",
+          "case": "short-chat",
+          "trials": 1,
+          "requests": 4,
+          "success": 4,
+          "failed": 0,
+          "output_tokens_s": 95.85812136545444,
+          "peak_prompt_tokens": 177,
+          "publication_blockers": [
+            "deployment support has not been qualified",
+            "fewer than three repetitions",
+            "manual release audit required: hardware isolation, artifact/quality evidence, cache and template settings",
+            "no matching attached independent quality evidence for this 4-bit/KV deployment",
+            "unverified source_model_revision"
+          ]
+        }
+      ],
+      "quality": {
+        "warp34-flash-hgptq-tp2-dflash2": "missing"
+      },
+      "resources": {
+        "sample_count": 30,
+        "scope": "whole sampler window, including warmup/priming; not per-case energy",
+        "observed_interval": {
+          "clock": "monotonic",
+          "start_s": 699938.132509009,
+          "end_s": 699968.476695043
+        },
+        "duration_s": 30.344186034053564,
+        "gpus": {
+          "GPU-cf60f555-15eb-ecfb-12b1-f3396a4da894": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22012.0,
+            "peak_utilization_gpu_percent": 99.0,
+            "peak_utilization_memory_percent": 40.0,
+            "peak_temperature_c": 69.0,
+            "average_power_w": 280.92600000000004
+          },
+          "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8": {
+            "missing_counts": {
+              "memory_used_mib": 0,
+              "utilization_gpu_percent": 0,
+              "utilization_memory_percent": 0,
+              "temperature_c": 0,
+              "power_w": 0
+            },
+            "energy_j": null,
+            "energy_covered_duration_s": null,
+            "energy_interval_count": 0,
+            "peak_memory_used_mib": 22012.0,
+            "peak_utilization_gpu_percent": 99.0,
+            "peak_utilization_memory_percent": 42.0,
+            "peak_temperature_c": 75.0,
+            "average_power_w": 283.582
+          }
+        },
+        "host_peak_memory_used_kib": 212279856,
+        "pid_peak_rss_kib": {
+          "31732": 66586304
+        },
+        "missing_counts": {
+          "timestamp_monotonic_s": 0,
+          "host_memory_used": 0,
+          "gpus": 0,
+          "pid_rss_kib": {
+            "31732": 0
+          }
+        },
+        "error_count": 0,
+        "errors": [],
+        "energy_enabled": false,
+        "energy_max_gap_s": 5.0
+      }
+    }
+  ]
+}

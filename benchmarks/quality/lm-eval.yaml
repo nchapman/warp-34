@@ -1,0 +1,20 @@
+# Native upstream lm-eval EvaluateConfig, not a custom task definition.
+# Full upstream datasets and task defaults; no limit, fewshot, or scoring overrides.
+model: local-chat-completions
+model_args:
+  model: warp34-quality
+  base_url: http://127.0.0.1:18034/v1/chat/completions
+  tokenizer_backend: null
+  num_concurrent: 1
+  timeout: 1800
+  max_length: 4096
+tasks:
+  - ifeval
+  - gsm8k
+apply_chat_template: true
+log_samples: true
+# This selects the model's non-thinking mode, without changing task prompts,
+# task generation budgets, sampling settings, stop strings, or answer extraction.
+gen_kwargs:
+  chat_template_kwargs:
+    enable_thinking: false

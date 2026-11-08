@@ -6,6 +6,7 @@ run it without Cargo, CUDA libraries, engine packages, or `tools/oracle`.
 This is a black-box HTTP client, **not** an oracle, profiler, kernel microbench,
 or automatic benchmark-results claim.
 
+- **[Post-HGPTQ coverage audit and proposed refresh](COVERAGE_AUDIT.md)** — current gaps, checkpoint policy, and pod validation plan (not new results)
 - **[Where warp-34 stands: 27B and Flash Next](campaigns/standings.md)** — practical results, gaps and priorities
 - [Completed campaign evidence and limitations](campaigns/completion-results.md)
 - [Plan and persistent task list](PLAN.md)
@@ -53,6 +54,42 @@ token-accounting failures; 2 for configuration/setup errors; 130 on interrupt.
 A zero exit does **not** mean the run is publication-ready. Unknown provenance,
 quality evidence, failures, and release-audit requirements are visible in reports.
 No engine has been automatically installed, modified, or tuned.
+
+## Upstream quality evaluations
+
+The separate [`../quality/`](../quality/README.md) environment invokes pinned
+upstream `lm-eval` directly for full IFEval and GSM8K, without modifying tasks,
+prompts or scoring. It is independent of this suite's small functional quality
+fixtures and Python standard-library client. Native lm-eval results can be
+retained as evidence, but are not automatically interpreted by `w34perf`'s
+fixture-specific quality gate or used to clear its publication blockers.
+
+## Flash-Next HGPTQ refresh
+
+[Qualification outcome and retained evidence](campaigns/flash-next-hgptq.md):
+all six profiles completed the full campaign (90 trials, 432 measured requests).
+These are working-harness checks, **not locked performance baselines**; incorporate
+ongoing engine improvements before locking numbers.
+
+`campaigns/flash-next-hgptq.toml` adds six warp-34 profiles: TP1/TP2 with plain
+decode, MTP-k3, and quantized DFlash2. It pins the HGPTQ target and drafter
+independently, uses an 8K target KV pool (512 pages), and reuses the existing
+five Flash-Next workloads; no additional agentic fixtures are introduced.
+Paths and launch commands target the user-provided dual-3090 pod under
+`/workspace`. All six profiles use `--max-num-seqs 4` for a larger serving state
+pool: the initial seq1 pool failed DFlash2 verification with insufficient state
+slots. Workload concurrency remains one; this is not a C4 throughput test.
+Run one server at a time. Unknown provenance remains explicit,
+and offline validation does not qualify a serving profile.
+
+```sh
+python3 -m w34perf plan campaigns/flash-next-hgptq.toml --preset quick
+```
+
+The two-track plan is now shared plain-GPTQ cross-engine baselines, followed by
+HGPTQ versus the existing quant **within warp-34**. Flash-Next's older quant is
+AutoRound W4A16 with FP8 PLE, not plain GPTQ. Keep historical campaigns intact;
+results from a different GPU/CPU/topology are not a controlled quant comparison.
 
 ## Completion campaigns, quality and retained evidence
 

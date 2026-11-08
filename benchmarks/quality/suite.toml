@@ -1,0 +1,25 @@
+# Set executable variables and HGPTQ/GPTQ/GGUF to the pinned local snapshots.
+# SGLang is deliberately plain: native MTP did not fit. No fallback.
+evaluator = "${LM_EVAL}"
+readiness_timeout = 1200
+client_timeout = 86400
+
+[engines.warp]
+mode = "mtp3"
+revision = "1de743eedefdb7422e6b171174c7080204f5b005"
+command = ["${W34}", "serve", "--model", "${HGPTQ}", "--offline", "--tp", "1", "--kv-format", "fp16", "--kv-pages", "256", "--max-num-seqs", "4", "--speculative", "mtp", "--mtp-k", "3", "--served-model-name", "warp34-quality", "--host", "127.0.0.1", "--port", "{port}"]
+
+[engines.vllm]
+mode = "mtp3"
+revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+command = ["${VLLM}", "serve", "${GPTQ}", "--served-model-name", "warp34-quality", "--dtype", "half", "--tensor-parallel-size", "1", "--language-model-only", "--max-model-len", "4096", "--max-num-seqs", "1", "--max-num-batched-tokens", "1024", "--gpu-memory-utilization", "0.95", "--mamba-ssm-cache-dtype", "float32", "--generation-config", "vllm", "--seed", "34", "--cudagraph-capture-sizes", "1", "2", "4", "8", "--host", "127.0.0.1", "--port", "{port}", "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":3}", "--kv-cache-dtype", "float16"]
+
+[engines.llama]
+mode = "mtp3"
+revision = "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+command = ["${LLAMA_SERVER}", "--model", "${GGUF}/Qwen3.8-27B-UD-Q4_K_XL.gguf", "--alias", "warp34-quality", "--ctx-size", "4096", "--parallel", "1", "--n-gpu-layers", "all", "--split-mode", "none", "--fit", "off", "--host", "127.0.0.1", "--port", "{port}", "--metrics", "--jinja", "--threads", "16", "--spec-type", "draft-mtp", "--spec-draft-model", "${GGUF}/MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "--spec-draft-ngl", "all", "--spec-draft-n-max", "3", "--cache-type-k", "f16", "--cache-type-v", "f16", "--cache-type-k-draft", "f16", "--cache-type-v-draft", "f16", "--verbosity", "5"]
+
+[engines.sglang]
+mode = "plain"
+revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+command = ["${SGLANG_PYTHON}", "-m", "sglang.launch_server", "--model-path", "${GPTQ}", "--served-model-name", "warp34-quality", "--dtype", "float16", "--tp-size", "1", "--context-length", "4096", "--mamba-ssm-dtype", "float32", "--mem-fraction-static", "0.95", "--chunked-prefill-size", "1024", "--max-running-requests", "1", "--max-mamba-cache-size", "8", "--cuda-graph-bs-decode", "1", "2", "4", "8", "--cuda-graph-bs-prefill", "512", "1024", "--reasoning-parser", "qwen3", "--enable-cache-report", "--enable-metrics", "--random-seed", "34", "--host", "127.0.0.1", "--port", "{port}", "--kv-cache-dtype", "auto"]
