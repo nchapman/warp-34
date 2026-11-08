@@ -322,26 +322,28 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
 
             float dot = 0.0f;
 #pragma unroll
-            for (int iter = 0; iter < (FIXED_WORDS_PER_ROW / 32); ++iter) {
+            for (int iter = 0; iter < ((FIXED_WORDS_PER_ROW + 31) / 32); ++iter) {
                 const int w = lane + iter * 32;
-                const uint4 xv = __ldg(&x_vec4[w]);
-                const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
-                const uint32_t dw = __ldg(&dw_ptr[w]);
-                const int g_idx = (group_shift >= 0) ? (w >> group_shift) : (w / words_per_group);
-                const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
-                uint32_t d_zp = 8u;
-                if constexpr (HAS_ZP) {
-                    d_zp = load_zp_nibble(zp_exp, out_col, groups_per_row, g_idx);
-                }
+                if ((FIXED_WORDS_PER_ROW % 32) == 0 || w < FIXED_WORDS_PER_ROW) {
+                    const uint4 xv = __ldg(&x_vec4[w]);
+                    const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
+                    const uint32_t dw = __ldg(&dw_ptr[w]);
+                    const int g_idx = (group_shift >= 0) ? (w >> group_shift) : (w / words_per_group);
+                    const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
+                    uint32_t d_zp = 8u;
+                    if constexpr (HAS_ZP) {
+                        d_zp = load_zp_nibble(zp_exp, out_col, groups_per_row, g_idx);
+                    }
 
 #pragma unroll
-                for (int p = 0; p < 4; ++p) {
-                    const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
-                    const __half2 dwh2 = HAS_ZP
-                        ? unpack_u4_zp_pair_scaled_h2(dw, p, d_zp, ds_h2)
-                        : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
-                    dot += __low2float(dwh2) * __low2float(xh2);
-                    dot += __high2float(dwh2) * __high2float(xh2);
+                    for (int p = 0; p < 4; ++p) {
+                        const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
+                        const __half2 dwh2 = HAS_ZP
+                            ? unpack_u4_zp_pair_scaled_h2(dw, p, d_zp, ds_h2)
+                            : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
+                        dot += __low2float(dwh2) * __low2float(xh2);
+                        dot += __high2float(dwh2) * __high2float(xh2);
+                    }
                 }
             }
             dot = warp_reduce_sum(dot);
@@ -1146,6 +1148,11 @@ extern "C" int w34_moe_w4a16_down_accum_f16(
             (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
             (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
             num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else if (n_interm == 640 && top_k == 10) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 80, 10><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
     } else {
         w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
@@ -1232,7 +1239,10 @@ extern "C" int w34_moe_w4a16_mlp_ex_f16(
 
     const int regime = w34_moe_w4a16_select_regime(
         ex, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
-    const bool fuse_down_h64 = (down_hadamard_block_size == 64) && ((n_interm % 64) == 0);
+    // Keep fine-grained CTA decomposition (`n_interm / 4` in GEMV, `n_interm / 16` in
+    // `sparse_vec4` / `sparse_mma`) and apply `w34_block_hadamard_inplace_f16` (~1.1 us in L1/L2)
+    // rather than collapsing `grid.x` to `n_interm / 64` (8-16 CTAs across 84-128 SMs).
+    const bool fuse_down_h64 = false;
 
     // Coalesced sub-warp uint4 expert-grouped regime for M = 4..7 (preserving GEMV for M = 1..3).
     if (regime == 1) {
@@ -1542,6 +1552,11 @@ extern "C" int w34_moe_w4a16_mlp_ex_f16(
             (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
             (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
             num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else if (n_interm == 640 && top_k == 10) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 80, 10><<<g2, 128, 0, st>>>(
+            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
     } else {
         w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<g2, 128, 0, st>>>(
             (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
@@ -1614,7 +1629,7 @@ extern "C" int w34_moe_w4a16_mlp_zp_ex_f16(
 
     const int num_chunks = w34_moe::plan_grouped_mma_chunks(
         ex, num_tokens, top_k, num_experts, n_interm, k_hidden, group_size);
-    const bool fuse_down_h64 = (down_hadamard_block_size == 64) && ((n_interm % 64) == 0);
+    const bool fuse_down_h64 = false;
     if (num_chunks > 0) {
         uint8_t* ws = reinterpret_cast<uint8_t*>((uintptr_t)ex->scratch_ptr);
         cudaStream_t st = (cudaStream_t)ex->stream;

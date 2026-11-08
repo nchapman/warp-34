@@ -128,7 +128,10 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
         }
 
         const int max_gpu_stage = (k_hot > k_static) ? (k_hot - k_static) : 0;
-        const int max_pull = (max_gpu_stage < 2) ? max_gpu_stage : 2;
+        const int cap_stage = (max_gpu_stage < 8) ? max_gpu_stage : 8;
+        const int max_pull = (gpu_share_frac > 0.20f || num_tokens > 1)
+            ? cap_stage
+            : ((max_gpu_stage < 2) ? max_gpu_stage : 2);
         int want_gpu_cold = 0;
         if (max_pull > 0 && gpu_share_frac > 0.0f) {
             if (n_cold >= 7) {
@@ -140,6 +143,13 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                     if (cold_hits[c] >= 2) {
                         want_gpu_cold++;
                     }
+                }
+            }
+            if (gpu_share_frac > 0.20f || num_tokens > 1) {
+                const float eff_frac = (gpu_share_frac > 0.20f) ? gpu_share_frac : 0.25f;
+                const int scaled = static_cast<int>(static_cast<float>(n_cold) * eff_frac + 0.5f);
+                if (scaled > want_gpu_cold) {
+                    want_gpu_cold = scaled;
                 }
             }
             if (want_gpu_cold > max_pull) want_gpu_cold = max_pull;
@@ -433,7 +443,10 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     if (err != cudaSuccess) return (int)err;
 
     const int max_gpu_stage = k_hot - k_static;
-    const int max_pull = (max_gpu_stage < 2) ? max_gpu_stage : 2;
+    const int cap_stage = (max_gpu_stage < 8) ? max_gpu_stage : 8;
+    const int max_pull = (effective_gpu_share > 0.20f || num_tokens > 1)
+        ? cap_stage
+        : ((max_gpu_stage < 2) ? max_gpu_stage : 2);
     if (max_pull > 0 && mapped_host_packs != nullptr && effective_gpu_share > 0.0f) {
         const size_t gu_packed_bytes =
             (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);

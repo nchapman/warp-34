@@ -107,7 +107,11 @@ impl TieredMoeEngine {
                         store.layout().hidden as i32,
                         store.layout().group_size as i32,
                         if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
-                            TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
+                            if crate::moe_cpu_bridge::has_avx512() {
+                                TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
+                            } else {
+                                0.50f32
+                            }
                         } else {
                             0.0f32
                         },
@@ -600,11 +604,23 @@ impl TieredMoeEngine {
                         // unpacked once and FMA-accumulated across all routed tokens) and the densest
                         // cold experts fit in at most 1 GPU chunk (`<= 384` tokens) or 2 GPU chunks (`> 384` tokens).
                         let (max_cpu_jobs, max_tok_per_job) = if cache.bridge_layer_id.is_some() {
+                            let avx512 = crate::moe_cpu_bridge::has_avx512();
                             let (target_gpu_misses, cpu_share_pct, max_tok_per_job) =
                                 if num_tokens <= 384 {
-                                    (ws.stage_capacity, 70usize, 8usize)
+                                    let pct = if avx512 {
+                                        70usize
+                                    } else if num_tokens <= 16 {
+                                        35usize
+                                    } else {
+                                        45usize
+                                    };
+                                    (ws.stage_capacity, pct, 8usize)
                                 } else {
-                                    (2 * ws.stage_capacity, 58usize, 96usize)
+                                    (
+                                        2 * ws.stage_capacity,
+                                        if avx512 { 58usize } else { 38usize },
+                                        96usize,
+                                    )
                                 };
                             let jobs = misses_in_step
                                 .len()

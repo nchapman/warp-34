@@ -55,7 +55,13 @@ impl Tp2Collectives {
         // SAFETY: `w34_tp2_signal_bytes` is a pure `sizeof(W34Tp2Signal)` query with no preconditions.
         let sig_bytes = unsafe { ffi::w34_tp2_signal_bytes() };
         let max_stage_bytes_per_epoch = max_stage_bytes_per_epoch.saturating_add(15) & !15;
-        let stage_bytes = max_stage_bytes_per_epoch.saturating_mul(2).max(4096);
+        // Reserve `[0, max_stage_bytes_per_epoch)` for 2-barrier Copy-Engine DMA TX (`>= 64 KiB`)
+        // and `[max_stage_bytes_per_epoch, max_stage_bytes_per_epoch + 128 KiB)` for 1-barrier
+        // in-kernel SM write-back ping-pong (`< 64 KiB`).
+        let stage_bytes = max_stage_bytes_per_epoch
+            .saturating_mul(2)
+            .saturating_add(128 * 1024)
+            .max(4096);
         // `Signal::end[128][0]` (u32 offset `144 * 16 + 128 * 16 = 4352`) stores the
         // per-epoch byte stride so `odd` and `even` staging halves are disjoint across
         // variable-size back-to-back collectives.

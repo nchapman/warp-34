@@ -37,6 +37,20 @@ pub(crate) fn supported() -> bool {
     }
 }
 
+pub(crate) fn has_avx512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx512f")
+            && std::is_x86_feature_detected!("avx512bw")
+            && std::is_x86_feature_detected!("avx512vl")
+            && std::is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 fn prepare_x_perm_portable(x: &[f32], xp: &mut [f32], xg: &mut [f32]) -> Result<(), EvalError> {
     if !x.len().is_multiple_of(128) || xp.len() < x.len() || xg.len() < x.len() / 128 {
         return Err(EvalError::InvalidShape);
