@@ -267,6 +267,87 @@ fn marlin_w4_symmetric_asymmetric_and_w8_match_scalar_reference() {
     }
 }
 
+// Wide N exercises persistent whole-tile CTAs; M=8 -> 9 switches variants.
+#[test]
+fn marlin_w4_persistent_tiles_match_scalar_and_identical_rows() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+    let k = 256usize;
+    let workspace = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    let row: Vec<u16> = (0..k)
+        .map(|i| f32_to_f16(((i * 17) % 47) as f32 / 64.0 - 0.359375))
+        .collect();
+    let rows = row.repeat(16);
+    let input = upload(&rows, &stream);
+    let row_f32: Vec<f32> = row.iter().map(|&v| f16_to_f32(v)).collect();
+    for n in [6144usize, 10240, 12288, 24576] {
+        let output = DeviceBuffer::alloc(0, 16 * n * 2).unwrap();
+        for group in [64usize, 128] {
+            let w = weights(n, k, group, 4, false, 1);
+            let packed = upload(&w.packed, &stream);
+            let repacked = DeviceBuffer::alloc(0, w.packed.len() * 4).unwrap();
+            let scales = upload(
+                &marlin_permute_scales_from_n_major(&w.scales, k, n, group),
+                &stream,
+            );
+            // SAFETY: packed and repacked are device buffers sized for the K x N int4 weights.
+            let rc = unsafe {
+                ffi::w34_marlin_repack_int4(
+                    &ex,
+                    packed.addr() as *const u32,
+                    repacked.addr() as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
+            };
+            assert_eq!(rc, 0);
+            let reference: Vec<f32> = w
+                .dense
+                .chunks_exact(k)
+                .map(|weights| row_f32.iter().zip(weights).map(|(a, b)| a * b).sum())
+                .collect();
+            let mut baseline = Vec::new();
+            for m in [1usize, 4, 8, 9, 16] {
+                let label = format!("persistent W4 group={group} N={n} M={m}");
+                workspace.zero_async(&stream).unwrap();
+                // SAFETY: device tensors cover the requested dimensions (M <= 16),
+                // scales cover all quant groups, and workspace holds 65536 i32 entries.
+                let rc = unsafe {
+                    ffi::w34_marlin_gemm_f16u4(
+                        &ex,
+                        input.addr() as *const c_void,
+                        repacked.addr() as *const c_void,
+                        scales.addr() as *const c_void,
+                        output.addr() as *mut c_void,
+                        workspace.addr() as *mut i32,
+                        m as i64,
+                        n as i64,
+                        k as i64,
+                        65536,
+                        (group / 16) as i32,
+                    )
+                };
+                assert_eq!(rc, 0, "{label}");
+                let mut got = vec![0u16; m * n];
+                output.copy_to_host(&mut got, &stream).unwrap();
+                if m == 1 {
+                    assert_close(&got, &reference, &label);
+                    baseline = got;
+                } else {
+                    for (r, values) in got.chunks_exact(n).enumerate() {
+                        for (col, (&actual, &expected)) in values.iter().zip(&baseline).enumerate()
+                        {
+                            assert_eq!(actual, expected, "{label} row={r} col={col}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn marlin_gemm_k_128_group_128_and_channelwise_match_reference() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());

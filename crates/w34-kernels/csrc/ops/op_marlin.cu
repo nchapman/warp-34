@@ -615,6 +615,16 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
             // including on GPUs where `mn_tiles > sms` (1-slice CTAs have `slice_count == 1` and
             // never touch `locks`).
             blocks = mn_tiles;
+            // Whole-tile persistent CTAs can reuse the launch without changing the
+            // reduction tree: an exact divisor leaves one full K tile per tail stripe.
+            if (mn_tiles > sms) {
+                for (int candidate = sms; candidate >= (sms + 1) / 2; --candidate) {
+                    if (mn_tiles % candidate == 0) {
+                        blocks = candidate;
+                        break;
+                    }
+                }
+            }
         } else if (blocks > mn_tiles * k_tiles) {
             blocks = mn_tiles * k_tiles;
         }

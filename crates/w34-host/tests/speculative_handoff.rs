@@ -253,10 +253,9 @@ fn batched_mtp_b4_matches_single_stream_losslessly() {
     );
 
     // 2. Verify B=2 batched MTP (`M=8` CUDA Graph slot) matches single-stream B=1 bit-for-bit,
-    //    then verify B=2 GPU-resident stochastic verification (`verify_batched_speculative_gpu_steps`),
-    //    and finally verify B=5 (> MAX_MTP_BATCH_SLOTS = 4) yields cleanly to ordinary batched decode.
+    //    then verify B=2 GPU-resident stochastic verification (`verify_batched_speculative_gpu_steps`).
     let b2_worker = worker(SpeculativeKind::Mtp);
-    let (got_b2, gpu_stoch_a, gpu_stoch_b, got_b5) = rt.block_on(async {
+    let (got_b2, gpu_stoch_a, gpu_stoch_b) = rt.block_on(async {
         let mut s0 = b2_worker
             .submit(prompts[0].clone(), params(), None)
             .unwrap();
@@ -295,37 +294,8 @@ fn batched_mtp_b4_matches_single_stream_losslessly() {
             "B=2 plain-greedy path must execute speculative verify rounds"
         );
 
-        let mut f0 = b2_worker
-            .submit(prompts[0].clone(), params(), None)
-            .unwrap();
-        let mut f1 = b2_worker
-            .submit(prompts[1].clone(), params(), None)
-            .unwrap();
-        let mut f2 = b2_worker
-            .submit(prompts[2].clone(), params(), None)
-            .unwrap();
-        let mut f3 = b2_worker
-            .submit(prompts[3].clone(), params(), None)
-            .unwrap();
-        let mut f4 = b2_worker
-            .submit(prompts[0].clone(), params(), None)
-            .unwrap();
-        let got_b5 = tokio::time::timeout(Duration::from_secs(120), async {
-            let (o0, o1, o2, o3, o4) = tokio::join!(
-                collect(&mut f0, vec![]),
-                collect(&mut f1, vec![]),
-                collect(&mut f2, vec![]),
-                collect(&mut f3, vec![]),
-                collect(&mut f4, vec![]),
-            );
-            Ok::<_, String>(vec![o0?, o1?, o2?, o3?, o4?])
-        })
-        .await
-        .unwrap()
-        .unwrap();
-
         b2_worker.shutdown().await.unwrap();
-        (got_b2, gpu_stoch_a, gpu_stoch_b, got_b5)
+        (got_b2, gpu_stoch_a, gpu_stoch_b)
     });
     assert_eq!(
         &got_b2[..],
@@ -340,36 +310,81 @@ fn batched_mtp_b4_matches_single_stream_losslessly() {
         gpu_stoch_b, baselines[3],
         "B=2 plain-greedy slot 1 must match baseline[3]"
     );
-    let mut dev_props = w34_kernels::ffi::W34DeviceProps::default();
-    assert_eq!(
-        // SAFETY: `dev_props` is a valid initialized stack `W34DeviceProps`.
-        unsafe { w34_kernels::ffi::w34_get_current_device_props(&raw mut dev_props) },
-        0
-    );
-    if dev_props.compute_minor == w34_host::cuda::ADA_SM89_COMPUTE_MINOR {
-        // On Ada (`sm_89`), `B=5` (`M=5`) switches the unquantized FP16 `lm_head` in `cuBLAS`
-        // from SIMT `gemvx` (`M=1..4`) to WMMA Tensor-Core `s161616gemm_f16`, flipping 1-ULP
-        // near-tie logits at token 30 (slots 0 & 4), token 32 (slot 1), and token 24 (slot 3).
-        assert_eq!(got_b5[0].len(), 64);
-        assert_eq!(got_b5[1].len(), 64);
-        assert_eq!(got_b5[3].len(), 64);
-        assert_eq!(&got_b5[0][..30], &baselines[0][..30]);
-        assert_eq!(&got_b5[1][..32], &baselines[1][..32]);
-        assert_eq!(got_b5[2], baselines[2]);
-        assert_eq!(&got_b5[3][..24], &baselines[3][..24]);
-        assert_eq!(
-            got_b5[4], got_b5[0],
-            "5th stream must match slot 0 bit-for-bit within B=5"
+}
+
+async fn collect_b5(worker: &EngineWorker, prompts: &[Vec<i32>; 5]) -> Vec<Vec<i32>> {
+    // Submit the entire burst without awaiting; use the worker's existing coalescing.
+    let [mut s0, mut s1, mut s2, mut s3, mut s4] = prompts
+        .each_ref()
+        .map(|prompt| worker.submit(prompt.clone(), params(), None).unwrap());
+    let result = tokio::time::timeout(Duration::from_secs(120), async {
+        let (o0, o1, o2, o3, o4) = tokio::join!(
+            collect(&mut s0, vec![]),
+            collect(&mut s1, vec![]),
+            collect(&mut s2, vec![]),
+            collect(&mut s3, vec![]),
+            collect(&mut s4, vec![]),
         );
-    } else {
-        assert_eq!(
-            &got_b5[..3],
-            &baselines[..3],
-            "B=5 fallback slots 0..3 must match B=1"
-        );
-        assert_eq!(got_b5[3].len(), 64);
-        assert_eq!(&got_b5[3][..24], &baselines[3][..24]);
-        assert_eq!(got_b5[4], baselines[0], "5th stream must match baseline[0]");
+        Ok::<_, String>(vec![o0?, o1?, o2?, o3?, o4?])
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    worker.shutdown().await.unwrap();
+    let outputs = result;
+    assert_eq!(worker.stats.peak_active.load(Ordering::Relaxed), 5);
+    assert_eq!(worker.stats.verify_rounds.load(Ordering::Relaxed), 0);
+    assert_eq!(worker.stats.completed.load(Ordering::Relaxed), 5);
+    assert_eq!(worker.stats.cancelled.load(Ordering::Relaxed), 0);
+    assert_eq!(outputs[4], outputs[0], "B=5 duplicate slots must match");
+    outputs
+}
+
+#[test]
+fn batched_mtp_b5_fallback_matches_non_speculative_losslessly() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "batched_mtp_b5_fallback_matches_non_speculative_losslessly",
+    )
+    .is_none()
+    {
+        return;
     }
-    assert_eq!(b2_worker.stats.peak_active.load(Ordering::Relaxed), 5);
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fallback_worker = worker(SpeculativeKind::Mtp);
+    let prompts = [
+        "The capital of France is",
+        "In computer architecture, cache coherence ensures",
+        "Rust ownership rules guarantee memory safety by",
+        "Binary search finds an element in a sorted array in",
+        "The capital of France is",
+    ]
+    .map(|text| {
+        fallback_worker
+            .tokenizer
+            .as_ref()
+            .unwrap()
+            .encode(text, false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect()
+    });
+    // B=5 exceeds MAX_MTP_BATCH_SLOTS=4 and must use ordinary batched decode.
+    // Its oracle is fresh non-speculative B=5 with identical prompts/order, not B=1:
+    // cuBLAS can choose different reduction algorithms at different M dimensions.
+    // This avoids conflating cross-geometry numerical differences with fallback bugs;
+    // it does not establish the cause of any particular B=5 versus B=1 mismatch.
+    let fallback = rt.block_on(collect_b5(&fallback_worker, &prompts));
+    let baseline_worker = worker_with_policy(None, KvFormatPolicy::Tq4);
+    let baseline = rt.block_on(collect_b5(&baseline_worker, &prompts));
+    assert_eq!(
+        fallback, baseline,
+        "B=5 MTP fallback must match non-speculative B=5 across all five complete outputs"
+    );
 }
