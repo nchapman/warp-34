@@ -1622,7 +1622,8 @@ mod cuda_tests {
             .expect("prompt-frequent cold expert 70 must be promoted during StreamedPrefill")
             as usize;
         assert_eq!(
-            cache.slot_last_used[slot_70], cache.step_clock,
+            cache.slot_last_used[slot_70],
+            cache.step_clock - 1,
             "promoted prompt expert must have updated slot_last_used"
         );
         for s in 0..k_hot {
@@ -1720,6 +1721,10 @@ mod cuda_tests {
         // step (`M = 5`, `top_k = 10` = 50 pairs: 40 hits on `24..64` + 2 misses on `66, 67`).
         let m_spill = 5usize;
         let mut h_topk_spill = Vec::with_capacity(m_spill * top_k);
+        // Simulate a prior device-side LRU step having stamped slot 0 with `cache.step_clock`
+        // while also hitting slot 0 and all 40 tail slots (`24..64`) in the current step.
+        cache.slot_last_used[0] = cache.step_clock;
+        h_topk_spill.push(0);
         for e in 24..64 {
             h_topk_spill.push(e);
         }
@@ -1747,6 +1752,11 @@ mod cuda_tests {
             top_k,
         )
         .unwrap();
+        assert_eq!(
+            cache.slot_of(0),
+            Some(0),
+            "active protected expert 0 must not be evicted when step_clock ties with prior device LRU step"
+        );
         for (e, s) in (24usize..64).zip(24i32..64) {
             assert_eq!(
                 cache.slot_of(e),

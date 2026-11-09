@@ -330,13 +330,17 @@ impl TieredMoeEngine {
             }
         };
 
-        let step = cache.step_clock;
+        let step = cache
+            .step_clock
+            .max(cache.slot_last_used.iter().copied().max().unwrap_or(0) + 1);
+        let mut active_slot = vec![false; cache.slots.capacity];
         if !matches!(effective_mode, MoeOffloadMode::StreamedPrefill) {
             // Touch LRU timestamps on all hit slots first so they cannot be evicted this step.
-            cache.step_clock += 1;
+            cache.step_clock = step + 1;
             for &ge in &hits_in_step {
                 let slot = cache.slot_of(ge).unwrap() as usize;
                 cache.slot_last_used[slot] = step;
+                active_slot[slot] = true;
             }
         }
 
@@ -351,22 +355,25 @@ impl TieredMoeEngine {
                         .saturating_sub(TIERED_MOE_GPU_LRU_TAIL_SLOTS);
                     let mut victim_slots = Vec::with_capacity(misses_in_step.len());
                     for &ge in &misses_in_step {
-                        // Choose the non-pinned slot with the smallest `slot_last_used` timestamp,
-                        // spilling to `0..lru_start` if every tail slot is already active in this step.
-                        let (mut victim_slot, &best_ts) = cache
+                        // Choose the non-active slot with the smallest `slot_last_used` timestamp,
+                        // preferring `lru_start..k_hot` and spilling to `0..lru_start` if every
+                        // tail slot is already active in this step.
+                        let victim_slot = cache
                             .slot_last_used
                             .iter()
                             .enumerate()
                             .skip(lru_start)
+                            .filter(|&(s, _)| !active_slot[s])
                             .min_by_key(|&(_, &ts)| ts)
-                            .unwrap();
-                        if best_ts >= step && lru_start > 0 {
-                            (victim_slot, _) = cache.slot_last_used[..lru_start]
-                                .iter()
-                                .enumerate()
-                                .min_by_key(|&(_, &ts)| ts)
-                                .unwrap();
-                        }
+                            .or_else(|| {
+                                cache.slot_last_used[..lru_start]
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|&(s, _)| !active_slot[s])
+                                    .min_by_key(|&(_, &ts)| ts)
+                            })
+                            .expect("active_local.len() <= cache.slots.capacity guarantees an inactive slot")
+                            .0;
                         let old_ge = cache.slot_to_expert[victim_slot];
                         if old_ge >= 0 {
                             cache.expert_to_slot[old_ge as usize - cache.expert_ids.start] = -1;
@@ -375,6 +382,7 @@ impl TieredMoeEngine {
                         cache.expert_to_slot[ge - cache.expert_ids.start] = victim_slot as i32;
                         cache.slot_to_expert[victim_slot] = ge as i32;
                         cache.slot_last_used[victim_slot] = step;
+                        active_slot[victim_slot] = true;
                         victim_slots.push(victim_slot as i32);
                     }
                     cache.dma_experts_loaded += misses_in_step.len() as u64;
@@ -769,9 +777,10 @@ impl TieredMoeEngine {
                             ws.d_miss_victim_slots.addr(),
                             promote_victim_slots.len(),
                         )?;
-                        cache.step_clock += 8;
-                        cache.adapted_slots_dirty = true;
+                        cache.step_clock = cache.step_clock.saturating_add(7);
                         let promoted_ts = cache.step_clock;
+                        cache.step_clock = cache.step_clock.saturating_add(1);
+                        cache.adapted_slots_dirty = true;
                         for (&new_ge, &slot_i32) in
                             promote_new_ges.iter().zip(&promote_victim_slots)
                         {

@@ -858,8 +858,8 @@ impl HotExpertCache {
             .copy_from_host(&self.slot_to_expert, stream)?;
         self.d_slot_last_used
             .copy_from_host(&self.slot_last_used, stream)?;
-        let step_buf = [self.step_clock];
-        self.d_step_counter.copy_from_host(&step_buf, stream)
+        self.d_step_counter
+            .copy_from_host(std::slice::from_ref(&self.step_clock), stream)
     }
 
     /// Populates the `K_hot` VRAM slots with `initial_experts` (or the first `K_hot` local experts).
@@ -1007,7 +1007,7 @@ impl HotExpertCache {
             .copy_to_host(&mut self.slot_last_used, stream)?;
         self.d_step_counter.copy_to_host(&mut step_arr, stream)?;
         stream.synchronize()?;
-        self.step_clock = step_arr[0].max(1);
+        self.step_clock = step_arr[0].saturating_add(1).max(1);
         let check_limit = if self.has_cpu_bridge() {
             self.k_static
         } else {
