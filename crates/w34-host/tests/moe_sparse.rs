@@ -672,6 +672,28 @@ fn check_sparse(shape: SparseShape) {
     );
 }
 
+fn load_35b_tp1_or_skip_low_vram(model: &str) -> Option<Qwen3_5Engine> {
+    match Qwen3_5Engine::load(model, 1, KvFormatPolicy::Fp16, Some(32), true) {
+        Ok(engine) => Some(engine),
+        Err(err) => {
+            let total_vram_0 = CudaDevice::set_current(0)
+                .and_then(|d| d.mem_info())
+                .map(|(_, total)| total)
+                .unwrap_or(0);
+            if total_vram_0 < 20 * 1024 * 1024 * 1024
+                && err.to_string().contains("insufficient VRAM")
+            {
+                eprintln!(
+                    "[SKIP real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2] GPU 0 has {:.2} GiB VRAM ({err})",
+                    total_vram_0 as f64 / (1024.0 * 1024.0 * 1024.0)
+                );
+                return None;
+            }
+            panic!("failed to load {model} TP=1: {err}");
+        }
+    }
+}
+
 #[test]
 fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -699,8 +721,9 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
     let mut tp1_norms = Vec::new();
     let mut tp1_tokens = Vec::new();
     {
-        let mut engine =
-            Qwen3_5Engine::load(model, 1, KvFormatPolicy::Fp16, Some(32), true).unwrap();
+        let Some(mut engine) = load_35b_tp1_or_skip_low_vram(model) else {
+            return;
+        };
         {
             let ffn = engine.ranks[0]
                 .layers

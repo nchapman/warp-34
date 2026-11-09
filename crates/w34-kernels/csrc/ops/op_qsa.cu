@@ -20,19 +20,22 @@ extern "C" __device__ float __nv_powf(float, float);
 
 namespace w34 {
 
-#pragma pack(push, 1)
+// Naturally 2-byte aligned (`__half d` + 64-byte `qs`); do NOT use `#pragma pack(push, 1)`
+// here because 1-byte packing triggers a CUDA 13.0 `ptxas` peephole bug (`F2I.U8.F16.TRUNC.NTZ`)
+// when storing the low byte of `__half d`.
 struct qsa_block_tq4_0 {
     __half  d;
     uint8_t qs[64];
 };
 static_assert(sizeof(qsa_block_tq4_0) == 66, "qsa_block_tq4_0 must be 66 bytes");
+static_assert(alignof(qsa_block_tq4_0) == 2, "qsa_block_tq4_0 must be 2-byte aligned");
 
 struct qsa_block_q8_0_64 {
     float  d;
     int8_t qs[64];
 };
 static_assert(sizeof(qsa_block_q8_0_64) == 68, "qsa_block_q8_0_64 must be 68 bytes");
-#pragma pack(pop)
+static_assert(alignof(qsa_block_q8_0_64) == 4, "qsa_block_q8_0_64 must be 4-byte aligned");
 
 __device__ __forceinline__ float qsa_warp_reduce_sum(float val) {
 #pragma unroll

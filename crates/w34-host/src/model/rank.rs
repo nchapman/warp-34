@@ -348,12 +348,10 @@ pub const EXTREME_LONGCTX_MIN_LAYERS: usize = 64;
 pub const EXTREME_LONGCTX_MIN_PAGES: usize = 14_336;
 
 /// Rounding quantum (`2 MiB`) for `weight_arena` capacity estimation.
-#[cfg(feature = "cuda")]
-const WEIGHT_ARENA_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;
+pub const WEIGHT_ARENA_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Minimum `weight_arena` allocation (`128 MiB`) for tiny synthetic models.
-#[cfg(feature = "cuda")]
-const MIN_WEIGHT_ARENA_BYTES: usize = 128 * 1024 * 1024;
+pub const MIN_WEIGHT_ARENA_BYTES: usize = 128 * 1024 * 1024;
 
 /// Default alignment/padding margin (`96 MiB`) added to raw estimated weight bytes.
 #[cfg(feature = "cuda")]
@@ -372,8 +370,17 @@ const MIN_REPACK_STAGING_BYTES: usize = 128 * 1024 * 1024;
 const REPACK_STAGING_TENSOR_MULTIPLIER: usize = 3;
 
 /// Extra safety margin (`16 MiB`) checked before initial weight + scratch arena boot allocations.
-#[cfg(feature = "cuda")]
-const MIN_BOOT_MARGIN_BYTES: usize = 16 * 1024 * 1024;
+pub const MIN_BOOT_MARGIN_BYTES: usize = 16 * 1024 * 1024;
+
+/// Alignment quantum (`256 B`) for GPU tensor sub-allocations inside `DeviceArena`.
+pub const DEVICE_ARENA_TENSOR_ALIGNMENT_BYTES: usize = 256;
+
+/// Minimum post-boot VRAM slack (`2 GiB`) for `StateBundlePool`, `KvPool`, and runtime headroom
+/// required to keep untied `embed_tokens` inside GPU `weight_arena`. When keeping `embed_tokens`
+/// in GPU VRAM would leave less than this slack, `embed_tokens` is offloaded to zero-copy
+/// `MappedHostBuffer` if doing so allows the rank to fit within `free_vram` with at least
+/// [`crate::cuda::MIN_HEADROOM_BYTES`] remaining.
+pub const HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Capacity (`16 MiB`) of the per-rank `batch_meta_arena` used for batch descriptors and page tables.
 #[cfg(feature = "cuda")]
@@ -393,6 +400,24 @@ pub const TIERED_MOE_TP1_MIN_HOT_EXPERTS: usize = 16;
 
 /// Minimum per-layer GPU hot expert cache capacity per rank on `TP >= 2` under extreme KV pressure.
 pub const TIERED_MOE_TP2_MIN_HOT_EXPERTS: usize = 32;
+
+/// Maximum per-layer GPU hot expert count (`24`) in the compact `< 12 GiB` tiered-MoE regime
+/// that selects compact `32`-slot H2D staging ([`TIERED_MOE_STAGE_CAPACITY_TP4`]).
+pub const TIERED_MOE_COMPACT_MAX_HOT_EXPERTS: usize = 24;
+
+/// Double-buffered H2D expert staging reserve (`64` expert slots = `2 × 32`) for compact
+/// tiered-MoE ranks where [`TIERED_MOE_STAGE_CAPACITY_TP4`] is active.
+pub const TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS: usize = 64;
+
+/// Free VRAM threshold (`12 GiB`) below which tiered-MoE ranks select the standard
+/// `512 MiB` scratch arena ([`crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES`] instead of
+/// `1,056 MiB` [`crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES`]) and `640 MiB` runtime
+/// headroom ([`crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES`]).
+pub const TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES: usize = 12 * 1024 * 1024 * 1024;
+
+/// Minimum state slots (`8` = `1` active + `7` draft verify slots) reserved on `TP=1`
+/// when planning tiered-MoE hot experts so `DFlash2` (`M=8`) verification fits.
+pub const SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS: usize = 8;
 
 /// `base_headroom + kv_pool` threshold (`1.5 GiB`) separating compact `TP=1` KV budgets (`256` pages)
 /// from multi-thousand-page serving KV budgets (`4,096` pages).
@@ -424,12 +449,10 @@ pub const TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES: usize = 640 * 1024 * 1024;
 pub const TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Double-buffered H2D staging capacity (`96` experts) for `RankTieredMoe` on `TP=1` / `TP=2`.
-#[cfg(feature = "cuda")]
-pub(super) const TIERED_MOE_STAGE_CAPACITY_DEFAULT: usize = 96;
+pub const TIERED_MOE_STAGE_CAPACITY_DEFAULT: usize = 96;
 
-/// Double-buffered H2D staging capacity (`32` experts) for `RankTieredMoe` on `TP >= 4`.
-#[cfg(feature = "cuda")]
-pub(super) const TIERED_MOE_STAGE_CAPACITY_TP4: usize = 32;
+/// Double-buffered H2D staging capacity (`32` experts) for `RankTieredMoe` on `TP >= 4` and compact `< 12 GiB` budgets.
+pub const TIERED_MOE_STAGE_CAPACITY_TP4: usize = 32;
 
 /// Minimum per-row byte stride (`2,560 B`) for `PLE` FP8 staging buffers.
 #[cfg(feature = "cuda")]
@@ -519,6 +542,61 @@ pub fn plan_mtp_tiered_moe_hot_experts(
     }
 }
 
+/// Select the per-step `TieredMoeWorkspace` H2D staging slot capacity (`stage_cap`) for a rank.
+pub(super) fn select_tiered_moe_stage_capacity(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    hot_per_layer: usize,
+) -> usize {
+    let local_experts = (cfg.num_experts / tp_size.max(1)).max(1);
+    if tp_size >= 4
+        || (cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
+            && hot_per_layer <= TIERED_MOE_COMPACT_MAX_HOT_EXPERTS)
+    {
+        local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_TP4)
+    } else {
+        local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_DEFAULT)
+    }
+}
+
+/// Phase-1 rank state after target non-MoE weights, scratch arena, and auxiliary streams
+/// have been allocated on the GPU and temporary repack staging has been freed, prior to
+/// initializing `PleRankRuntime`, `RankTieredMoe`, `StateBundlePool`, and `KvPool`.
+#[cfg(feature = "cuda")]
+pub(super) struct PrePoolModelRank {
+    rank: usize,
+    tp_size: usize,
+    device_id: i32,
+    device: CudaDevice,
+    stream: CudaStream,
+    cublas: CublasHandle,
+    cfg: ModelConfig,
+    total_vram: usize,
+    free_vram: usize,
+    est_weight_bytes: usize,
+    local_kv_heads: usize,
+    local_v_heads: usize,
+    gdn_k_local: usize,
+    gdn_v_local: usize,
+    local_vocab_size: usize,
+    vocab_offset: usize,
+    full_attn_layer_ids: Vec<usize>,
+    gdn_layer_ids: Vec<usize>,
+    weight_arena: DeviceArena,
+    scratch_arena: DeviceArena,
+    batch_meta_arena: DeviceArena,
+    marlin_ws: DeviceBuffer,
+    embed_tokens_ptr: u64,
+    host_embed_tokens: Option<crate::cuda::MappedHostBuffer>,
+    final_residual: FinalResidual,
+    lm_head: LinearProj,
+    layers: Vec<DecoderLayerWeights>,
+    aux_stream: CudaStream,
+    aux_marlin_ws: DeviceBuffer,
+    aux_fork_event: crate::cuda::CudaEvent,
+    aux_join_event: crate::cuda::CudaEvent,
+}
+
 /// Selects the per-rank transient `scratch_arena` capacity (`336 MiB`, `384 MiB`,
 /// `512 MiB`, or `1,056 MiB`) based on model geometry, `tp_size`, estimated weight
 /// footprint, and requested KV pages.
@@ -596,6 +674,23 @@ pub fn plan_tiered_moe_hot_per_layer(
         .saturating_add(min_state_pool_bytes)
         .saturating_add(extra_reserve);
     let per_hot_step = cfg.num_hidden_layers * exp_bytes;
+    let min_standard_total = fixed_overhead.saturating_add(min_hot.saturating_mul(per_hot_step));
+    let min_base_and_state = base_headroom_plus_kv_bytes.saturating_add(min_state_pool_bytes);
+    if available_vram_after_weights_and_scratch < min_standard_total
+        && available_vram_after_weights_and_scratch > min_base_and_state
+        && per_hot_step > 0
+    {
+        // Compact 8–12 GiB GPU regime (where full 16–24 GiB `extra_reserve + min_hot` does not fit):
+        // `base_headroom` (`640 MiB`) already covers PLE/QSA/graph headroom, so reserve the 2×32
+        // double-buffered H2D staging slots (`TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS * exp_bytes`)
+        // plus `TIERED_MOE_TP1_MIN_HOT_EXPERTS` (`16`) hot experts/layer so downstream proposers
+        // (`MTP`, `DFlash2`) and CUDA graphs fit comfortably on both TP=1 and TP=2.
+        let compact_extra_reserve =
+            TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS.saturating_mul(exp_bytes);
+        let hot = TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot);
+        let reserve = (cfg.num_hidden_layers * hot) * exp_bytes + compact_extra_reserve;
+        return (hot, reserve);
+    }
     let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
         let max_affordable =
             (available_vram_after_weights_and_scratch - fixed_overhead) / per_hot_step;
@@ -607,6 +702,59 @@ pub fn plan_tiered_moe_hot_per_layer(
     };
     let reserve = (cfg.num_hidden_layers * hot) * exp_bytes + extra_reserve;
     (hot, reserve)
+}
+
+/// Determines whether untied `embed_tokens` should be placed in zero-copy `MappedHostBuffer`
+/// instead of GPU `weight_arena`, returning `(adjusted_est_weight_bytes, use_host_embed)`.
+///
+/// Tiered-MoE models with untied embeddings already exclude `embed_tokens` inside
+/// `estimate_weight_arena_bytes` and always return `(est_weight_bytes, true)`.
+/// For other untied models, `embed_tokens` stays in GPU VRAM when doing so leaves at least
+/// [`HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES`] (`2 GiB`) for state/KV pools and runtime headroom;
+/// otherwise it is offloaded to `MappedHostBuffer` if and only if doing so allows the rank to fit
+/// within `free_vram_bytes` with at least [`crate::cuda::MIN_HEADROOM_BYTES`] remaining.
+pub fn plan_host_embed_offload(
+    cfg: &ModelConfig,
+    est_weight_bytes: usize,
+    scratch_bytes: usize,
+    staging_bytes: usize,
+    free_vram_bytes: usize,
+) -> (usize, bool) {
+    if cfg.tie_word_embeddings {
+        return (est_weight_bytes, false);
+    }
+    if cfg.uses_tiered_moe() {
+        return (est_weight_bytes, true);
+    }
+    let boot_with_gpu_embed = est_weight_bytes
+        .saturating_add(scratch_bytes)
+        .saturating_add(staging_bytes)
+        .saturating_add(MIN_BOOT_MARGIN_BYTES);
+    if boot_with_gpu_embed.saturating_add(HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES)
+        <= free_vram_bytes
+    {
+        return (est_weight_bytes, false);
+    }
+    let embed_fp16_aligned = (cfg
+        .vocab_size
+        .saturating_mul(cfg.hidden_size)
+        .saturating_mul(core::mem::size_of::<u16>()))
+    .div_ceil(DEVICE_ARENA_TENSOR_ALIGNMENT_BYTES)
+    .saturating_mul(DEVICE_ARENA_TENSOR_ALIGNMENT_BYTES);
+    let est_without_embed = est_weight_bytes
+        .saturating_sub(embed_fp16_aligned)
+        .div_ceil(WEIGHT_ARENA_ALIGNMENT_BYTES)
+        .saturating_mul(WEIGHT_ARENA_ALIGNMENT_BYTES)
+        .max(MIN_WEIGHT_ARENA_BYTES);
+    let boot_without_gpu_embed = est_without_embed
+        .saturating_add(scratch_bytes)
+        .saturating_add(staging_bytes)
+        .saturating_add(MIN_BOOT_MARGIN_BYTES);
+    if boot_without_gpu_embed.saturating_add(crate::cuda::MIN_HEADROOM_BYTES) <= free_vram_bytes {
+        (est_without_embed, true)
+    } else {
+        (est_weight_bytes, false)
+    }
 }
 
 // Preserve the minimum three-slot execution budget and the existing VRAM clamp.
@@ -964,6 +1112,30 @@ impl Qwen3_5ModelRank {
         capacity: PoolCapacity,
         shared_vocab: Option<&SharedVocabHost>,
     ) -> Result<Self> {
+        let pre = Self::load_rank_pre_pool(
+            archive,
+            cfg,
+            rank,
+            tp_size,
+            device_id,
+            kv_policy,
+            capacity.kv_pages,
+            shared_vocab,
+        )?;
+        pre.finalize_runtime_and_pools(archive, kv_policy, capacity, None)
+    }
+
+    #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
+    pub(super) fn load_rank_pre_pool(
+        archive: &SafetensorsArchive,
+        cfg: &ModelConfig,
+        rank: usize,
+        tp_size: usize,
+        device_id: i32,
+        kv_policy: KvFormatPolicy,
+        requested_kv_pages: Option<usize>,
+        shared_vocab: Option<&SharedVocabHost>,
+    ) -> Result<PrePoolModelRank> {
         Self::validate_tp_geometry(cfg, tp_size)?;
         if cfg.head_dim != 256 && !matches!(kv_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16)
         {
@@ -972,7 +1144,6 @@ impl Qwen3_5ModelRank {
                 cfg.head_dim
             )));
         }
-        let requested_kv_pages = capacity.kv_pages;
         prepare_execution_plan(device_id)?;
         let device = CudaDevice::set_current(device_id)?;
         let dev_props = device.props()?;
@@ -982,7 +1153,7 @@ impl Qwen3_5ModelRank {
         let cublas = CublasHandle::new(&stream)?;
         let (free_vram, total_vram) = device.mem_info()?;
 
-        let est_weight_bytes =
+        let raw_est_weight_bytes =
             Self::estimate_weight_arena_bytes(cfg, archive, tp_size, requested_kv_pages);
         let max_packed_tensor_bytes = archive
             .iter_entries()
@@ -991,13 +1162,34 @@ impl Qwen3_5ModelRank {
                     && !name.contains(".ple_embedding.")
                     && !(cfg.uses_tiered_moe() && name.contains(".experts."))
             })
-            .map(|(_, info)| info.len_bytes as usize)
+            .map(|(name, info)| {
+                let bytes = info.len_bytes as usize;
+                if name.starts_with("lm_head.")
+                    || name.contains(".lm_head.")
+                    || name.contains(".experts.")
+                {
+                    bytes.div_ceil(tp_size)
+                } else {
+                    bytes
+                        .div_ceil(tp_size)
+                        .saturating_mul(REPACK_STAGING_TENSOR_MULTIPLIER)
+                }
+            })
             .max()
             .unwrap_or(0);
-        let staging_bytes = MIN_REPACK_STAGING_BYTES
-            .max(max_packed_tensor_bytes.saturating_mul(REPACK_STAGING_TENSOR_MULTIPLIER));
-        let scratch_bytes =
-            plan_scratch_arena_bytes(cfg, tp_size, est_weight_bytes, requested_kv_pages);
+        let staging_bytes = MIN_REPACK_STAGING_BYTES.max(max_packed_tensor_bytes);
+        let mut scratch_bytes =
+            plan_scratch_arena_bytes(cfg, tp_size, raw_est_weight_bytes, requested_kv_pages);
+        if cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
+            scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
+        }
+        let (est_weight_bytes, use_host_embed) = plan_host_embed_offload(
+            cfg,
+            raw_est_weight_bytes,
+            scratch_bytes,
+            staging_bytes,
+            free_vram,
+        );
         let min_boot_bytes = est_weight_bytes
             .saturating_add(scratch_bytes)
             .saturating_add(staging_bytes)
@@ -1045,22 +1237,21 @@ impl Qwen3_5ModelRank {
                 owned_vocab = Self::load_embed_tokens_f16(archive, cfg)?;
                 (owned_vocab.as_slice(), None)
             };
-        let (embed_tokens_ptr, host_embed_tokens) =
-            if cfg.uses_tiered_moe() && !cfg.tie_word_embeddings {
-                let bytes = core::mem::size_of_val(embed_f16);
-                let buf = crate::cuda::MappedHostBuffer::alloc(bytes)?;
-                // SAFETY: `buf.host_ptr` is a freshly allocated pinned buffer of `bytes` bytes.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        embed_f16.as_ptr().cast::<u8>(),
-                        buf.host_ptr.cast::<u8>(),
-                        bytes,
-                    );
-                }
-                (buf.dev_ptr as u64, Some(buf))
-            } else {
-                (weight_arena.upload_slice(embed_f16, &stream)?, None)
-            };
+        let (embed_tokens_ptr, host_embed_tokens) = if use_host_embed {
+            let bytes = core::mem::size_of_val(embed_f16);
+            let buf = crate::cuda::MappedHostBuffer::alloc(bytes)?;
+            // SAFETY: `buf.host_ptr` is a freshly allocated pinned buffer of `bytes` bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    embed_f16.as_ptr().cast::<u8>(),
+                    buf.host_ptr.cast::<u8>(),
+                    bytes,
+                );
+            }
+            (buf.dev_ptr as u64, Some(buf))
+        } else {
+            (weight_arena.upload_slice(embed_f16, &stream)?, None)
+        };
 
         // 2. final norm or multi-stream HyperConnection mixer
         let final_residual = if cfg.uses_hyper_connection() {
@@ -1342,9 +1533,112 @@ impl Qwen3_5ModelRank {
         }
 
         drop(repack_staging);
+        let aux_stream = CudaStream::new(device_id)?;
+        let aux_marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
+        let aux_fork_event = crate::cuda::CudaEvent::new(device_id, false)?;
+        let aux_join_event = crate::cuda::CudaEvent::new(device_id, false)?;
         stream.synchronize()?;
 
-        // 5. StateBundlePool & KvPool via CapacityPlanner
+        Ok(PrePoolModelRank {
+            rank,
+            tp_size,
+            device_id,
+            device,
+            stream,
+            cublas,
+            cfg: cfg.clone(),
+            total_vram,
+            free_vram,
+            est_weight_bytes,
+            local_kv_heads,
+            local_v_heads,
+            gdn_k_local,
+            gdn_v_local,
+            local_vocab_size,
+            vocab_offset,
+            full_attn_layer_ids,
+            gdn_layer_ids,
+            weight_arena,
+            scratch_arena,
+            batch_meta_arena,
+            marlin_ws,
+            embed_tokens_ptr,
+            host_embed_tokens,
+            final_residual,
+            lm_head,
+            layers,
+            aux_stream,
+            aux_marlin_ws,
+            aux_fork_event,
+            aux_join_event,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PrePoolModelRank {
+    /// Initializes optional `PleRankRuntime` and `RankTieredMoe` **before** sizing and
+    /// allocating `StateBundlePool` and `KvPool` so pool budgets observe live GPU free VRAM
+    /// after all model-resident caches and staging workspaces are already allocated.
+    pub(super) fn finalize_runtime_and_pools(
+        self,
+        archive: &SafetensorsArchive,
+        kv_policy: KvFormatPolicy,
+        capacity: PoolCapacity,
+        ple_shared: Option<&(
+            std::sync::Arc<crate::ple::PleNgramHasher>,
+            std::sync::Arc<crate::ple::PleMmapTable>,
+        )>,
+    ) -> Result<Qwen3_5ModelRank> {
+        let Self {
+            rank,
+            tp_size,
+            device_id,
+            device,
+            stream,
+            cublas,
+            cfg,
+            total_vram,
+            free_vram,
+            est_weight_bytes,
+            local_kv_heads,
+            local_v_heads,
+            gdn_k_local,
+            gdn_v_local,
+            local_vocab_size,
+            vocab_offset,
+            full_attn_layer_ids,
+            gdn_layer_ids,
+            weight_arena,
+            scratch_arena,
+            batch_meta_arena,
+            marlin_ws,
+            embed_tokens_ptr,
+            host_embed_tokens,
+            final_residual,
+            lm_head,
+            layers,
+            aux_stream,
+            aux_marlin_ws,
+            aux_fork_event,
+            aux_join_event,
+        } = self;
+
+        let _ = CudaDevice::set_current(device_id)?;
+
+        // 1. Allocate PLE staging buffers first so live `mem_info` accounts for them.
+        let ple_runtime = if let Some((hasher, table)) = ple_shared {
+            Some(super::rank_runtime::alloc_ple_runtime(
+                device_id,
+                &cfg,
+                std::sync::Arc::clone(hasher),
+                std::sync::Arc::clone(table),
+            )?)
+        } else {
+            None
+        };
+
+        let requested_kv_pages = capacity.kv_pages;
         let block_size = KV_PAGE_BLOCK_TOKENS;
         let mut bytes_per_kv_page_all_layers = 0usize;
         for ord in 0..full_attn_layer_ids.len() {
@@ -1379,18 +1673,19 @@ impl Qwen3_5ModelRank {
         let default_pages = requested_kv_pages.or(Some(DEFAULT_TARGET_KV_PAGES));
         let req_kv_bytes =
             default_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES) * bytes_per_kv_page_all_layers;
-        let base_headroom = if tp_size == 1
+        let base_headroom = if (tp_size == 1
             && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
-            && default_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
+            && default_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES)
+            || (cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES)
         {
             crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES
         } else {
             crate::cuda::MIN_HEADROOM_BYTES
         };
-        let post_weight_available = if capacity.state_slots.is_some() || cfg.uses_tiered_moe() {
-            device.mem_info()?.0
+        let rank0_extra_headroom = if rank == 0 {
+            capacity.rank0_extra_headroom_bytes
         } else {
-            free_vram.saturating_sub(weight_arena.used().saturating_add(scratch_arena.capacity()))
+            0
         };
         let min_state_slots_for_moe = if capacity.state_slots.is_some() {
             requested_state_slots.clamp(
@@ -1400,28 +1695,53 @@ impl Qwen3_5ModelRank {
         } else if tp_size >= 2 {
             requested_state_slots
         } else {
-            requested_state_slots.min(PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS / 2)
+            requested_state_slots.min(SINGLE_GPU_DFLASH2_MIN_STATE_SLOTS)
         };
-        let (tiered_moe_hot_per_layer, tiered_moe_reserve) = plan_tiered_moe_hot_per_layer(
-            cfg,
-            tp_size,
-            post_weight_available,
-            base_headroom
-                .saturating_add(req_kv_bytes)
-                .saturating_add(if rank == 0 {
-                    capacity.rank0_extra_headroom_bytes
-                } else {
-                    0
-                }),
-            bytes_per_state_slot.saturating_mul(min_state_slots_for_moe),
-        );
-        let required_headroom = base_headroom
-            .saturating_add(tiered_moe_reserve)
-            .saturating_add(if rank == 0 {
-                capacity.rank0_extra_headroom_bytes
+
+        // 2. Plan and allocate `RankTieredMoe` (GPU `HotExpertCache` + double-buffered H2D
+        //    staging workspace) BEFORE sizing `StateBundlePool` and `KvPool`.
+        let (tiered_moe, tiered_moe_hot_per_layer, actual_tiered_moe_bytes, post_pool_moe_reserve) =
+            if cfg.uses_tiered_moe() {
+                let post_weight_available = device.mem_info()?.0;
+                let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer(
+                    &cfg,
+                    tp_size,
+                    post_weight_available,
+                    base_headroom
+                        .saturating_add(req_kv_bytes)
+                        .saturating_add(rank0_extra_headroom),
+                    bytes_per_state_slot.saturating_mul(min_state_slots_for_moe),
+                );
+                let stage_cap = select_tiered_moe_stage_capacity(&cfg, tp_size, hot_per_layer);
+                let tm = crate::moe_offload::RankTieredMoe::load_for_rank(
+                    archive,
+                    &cfg,
+                    device_id,
+                    rank,
+                    tp_size,
+                    hot_per_layer,
+                    stage_cap,
+                    &stream,
+                )?;
+                stream.synchronize()?;
+                let available_after_moe = device.mem_info()?.0;
+                let allocated_bytes = post_weight_available.saturating_sub(available_after_moe);
+                let post_pool_reserve = total_moe_reserve.saturating_sub(allocated_bytes);
+                (Some(tm), hot_per_layer, allocated_bytes, post_pool_reserve)
             } else {
-                0
-            });
+                (None, 0, 0, 0)
+            };
+
+        // 3. Size and allocate `StateBundlePool` & `KvPool` from live post-TieredMoE free VRAM.
+        let required_headroom = base_headroom
+            .saturating_add(post_pool_moe_reserve)
+            .saturating_add(rank0_extra_headroom);
+        let use_live_pool_budget = capacity.state_slots.is_some() || cfg.uses_tiered_moe();
+        let available_for_pools = if use_live_pool_budget {
+            device.mem_info()?.0
+        } else {
+            free_vram.saturating_sub(weight_arena.used().saturating_add(scratch_arena.capacity()))
+        };
         let base_fixed = weight_arena
             .used()
             .saturating_add(scratch_arena.capacity())
@@ -1429,13 +1749,11 @@ impl Qwen3_5ModelRank {
             .saturating_add(req_kv_bytes);
         let (state_budget_free, state_budget_fixed) = if capacity.state_slots.is_some() {
             // Serving can request many more slots than single-request defaults.
-            // Account for live arena capacity (not just used weight bytes) and
-            // all auxiliary allocations before spending the remaining VRAM.
-            // Note: `Qwen3VisionEncoder` is loaded lazily on the first multimodal
-            // request (`ensure_vision_encoder_loaded`) and fits inside `MIN_HEADROOM_BYTES`
-            // (1 GiB) when needed; only reserve dedicated ViT VRAM when `vision_reserve`
-            // still leaves room for all `requested_state_slots`.
-            let available = post_weight_available;
+            // `available_for_pools` already reflects live arena capacity, `PleRankRuntime`,
+            // and `RankTieredMoe`. `Qwen3VisionEncoder` is loaded lazily on the first
+            // multimodal request (`ensure_vision_encoder_loaded`) and fits inside
+            // `MIN_HEADROOM_BYTES` (1 GiB) when needed; only reserve dedicated ViT VRAM when
+            // `vision_reserve` still leaves room for `min_state_slots_for_moe`.
             let archive_has_vision = cfg.vision_config.is_some()
                 && (archive
                     .resolve_name("model.visual.patch_embed.proj.weight")
@@ -1449,14 +1767,14 @@ impl Qwen3_5ModelRank {
                 && archive_has_vision
                 && default_pages.unwrap_or(0) < EXTREME_LONGCTX_MIN_PAGES
             {
-                available
+                available_for_pools
                     .saturating_sub(base_reserved.saturating_add(min_state_bytes))
                     .min(VISION_ENCODER_LAZY_RESERVE_BYTES)
             } else {
                 0
             };
             let reserved = base_reserved.saturating_add(vision_reserve);
-            if available
+            if available_for_pools
                 < reserved
                     .saturating_add(bytes_per_state_slot.saturating_mul(MIN_ACTIVE_STATE_SLOTS))
             {
@@ -1464,7 +1782,12 @@ impl Qwen3_5ModelRank {
                     "insufficient VRAM for serving state pool and headroom",
                 ));
             }
-            (available, reserved)
+            (available_for_pools, reserved)
+        } else if cfg.uses_tiered_moe() {
+            (
+                available_for_pools,
+                required_headroom.saturating_add(req_kv_bytes),
+            )
         } else {
             (free_vram, base_fixed)
         };
@@ -1492,10 +1815,19 @@ impl Qwen3_5ModelRank {
         }
         let state_pool_bytes = total_state_slots * bytes_per_state_slot;
 
+        let (plan_free_vram, plan_weight_bytes) = if use_live_pool_budget {
+            let resident_model_bytes = weight_arena.used().saturating_add(actual_tiered_moe_bytes);
+            let synthetic_free = available_for_pools
+                .saturating_add(resident_model_bytes)
+                .saturating_add(scratch_arena.capacity());
+            (synthetic_free, resident_model_bytes)
+        } else {
+            (free_vram, weight_arena.used())
+        };
         let capacity_plan = CapacityPlanner::plan_with_headroom(
             total_vram,
-            free_vram,
-            weight_arena.used(),
+            plan_free_vram,
+            plan_weight_bytes,
             scratch_arena.capacity(),
             state_pool_bytes,
             bytes_per_kv_page_all_layers,
@@ -1523,19 +1855,15 @@ impl Qwen3_5ModelRank {
             SpecVerifyGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         let batched_decode_io =
             BatchedDecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
-        let aux_stream = CudaStream::new(device_id)?;
-        let aux_marlin_ws = DeviceBuffer::alloc(device_id, marlin_ws_bytes)?;
-        let aux_fork_event = crate::cuda::CudaEvent::new(device_id, false)?;
-        let aux_join_event = crate::cuda::CudaEvent::new(device_id, false)?;
         device.synchronize()?;
 
-        Ok(Self {
+        Ok(Qwen3_5ModelRank {
             rank,
             tp_size,
             device,
             stream,
             cublas,
-            cfg: cfg.clone(),
+            cfg,
             weight_arena,
             scratch_arena,
             batch_meta_arena,
@@ -1574,9 +1902,9 @@ impl Qwen3_5ModelRank {
             pending_visual_splice: None,
             last_norm_hidden_ptr: 0,
             last_norm_hidden_rows: 0,
-            tiered_moe: None,
+            tiered_moe,
             tiered_moe_hot_per_layer,
-            ple_runtime: None,
+            ple_runtime,
             is_capturing_graph: false,
         })
     }

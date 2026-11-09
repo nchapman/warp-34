@@ -13,12 +13,16 @@
 namespace w34_attn {
 
 // block_tq4_0: 66 bytes per 128 elements (2 blocks = 132 B for head_dim = 256).
-#pragma pack(push, 1)
+// Naturally 2-byte aligned (`__half d` + 64-byte `qs`); do NOT use `#pragma pack(push, 1)`
+// here because 1-byte packing forces `ptxas` to split 16-bit `__half` scale stores into
+// two 8-bit stores and triggers a CUDA 13.0 `ptxas` peephole bug (`F2I.U8.F16.TRUNC.NTZ`
+// on the low byte of `d`).
 struct block_tq4_0 {
     __half  d;
     uint8_t qs[64];
 };
 static_assert(sizeof(block_tq4_0) == 66, "block_tq4_0 must be 66 bytes");
+static_assert(alignof(block_tq4_0) == 2, "block_tq4_0 must be 2-byte aligned");
 
 // block_q8_0_64: 68 bytes per 64 elements (4 blocks = 272 B for head_dim = 256).
 struct block_q8_0_64 {
@@ -26,7 +30,7 @@ struct block_q8_0_64 {
     int8_t qs[64];
 };
 static_assert(sizeof(block_q8_0_64) == 68, "block_q8_0_64 must be 68 bytes");
-#pragma pack(pop)
+static_assert(alignof(block_q8_0_64) == 4, "block_q8_0_64 must be 4-byte aligned");
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
