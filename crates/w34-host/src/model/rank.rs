@@ -409,9 +409,10 @@ pub const TIERED_MOE_COMPACT_MAX_HOT_EXPERTS: usize = 24;
 /// tiered-MoE ranks where [`TIERED_MOE_STAGE_CAPACITY_TP4`] is active.
 pub const TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS: usize = 64;
 
-/// Free VRAM threshold (`12 GiB`) below which tiered-MoE ranks select the compact
-/// `336 MiB` scratch arena (`DEFAULT_SCRATCH_ARENA_BYTES`) and `640 MiB` runtime headroom
-/// (`EXTREME_LONGCTX_HEADROOM_BYTES`).
+/// Free VRAM threshold (`12 GiB`) below which tiered-MoE ranks select the standard
+/// `512 MiB` scratch arena ([`crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES`] instead of
+/// `1,056 MiB` [`crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES`]) and `640 MiB` runtime
+/// headroom ([`crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES`]).
 pub const TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES: usize = 12 * 1024 * 1024 * 1024;
 
 /// Minimum state slots (`8` = `1` active + `7` draft verify slots) reserved on `TP=1`
