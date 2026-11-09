@@ -773,6 +773,7 @@ mod cuda_tests {
                 d_out.copy_to_host(&mut h_graph_out, &stream).unwrap();
                 let mut misses = [0i32; 2];
                 ws.d_num_misses.copy_to_host(&mut misses, &stream).unwrap();
+                cache.device_lru_dirty = true;
                 cache.sync_from_device_if_dirty(&stream).unwrap();
 
                 let (n_gpu_cold, n_cpu_cold) = (misses[0], misses[1]);
@@ -955,6 +956,7 @@ mod cuda_tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn h64_g64_routed_moe_all_regimes_and_tiered_parity() {
         use super::super::{
             ExpertPackLayout, HostExpertStore, HotExpertCache, MoeOffloadMode, TieredMoeEngine,
@@ -1341,6 +1343,154 @@ mod cuda_tests {
             assert!(
                 max_diff <= 1.6e-2,
                 "H64+g64 MoE bridge m={m_bridge} max_abs_diff={max_diff} exceeds 1.6e-2"
+            );
+        }
+
+        // Verify the `n_interm = 640, top_k = 10` (`<false, 80, 10>`) down-accum specialization
+        // across `M = 1..=3` both end-to-end (`execute_layer_device_lru`) and with `interm_in`
+        // populated exclusively in tail words `64..80` (`cols 512..639`) so omitting or
+        // misindexing the guarded third warp iteration (`iter = 2`) fails the test.
+        let top_k_10 = 10usize;
+        let max_m_10 = 3usize;
+        let h_ids_10: Vec<i32> = (0..max_m_10)
+            .flat_map(|t| (0..top_k_10).map(move |k| ((t * 3 + k) % num_experts) as i32))
+            .collect();
+        let h_wts_10: Vec<f32> = (0..max_m_10 * top_k_10)
+            .map(|i| 0.05 + 0.01 * ((i % top_k_10) as f32))
+            .collect();
+        let d_ids_10 = upload(&h_ids_10, &stream);
+        let d_wts_10 = upload(&h_wts_10, &stream);
+        let ws_10 = TieredMoeWorkspace::new(0, layout.clone(), 8, max_m_10, top_k_10).unwrap();
+        let ex_10 = stream.exec(ws_10.d_scratch.addr(), ws_10.d_scratch.len_bytes);
+
+        for m_10 in 1..=max_m_10 {
+            let mut tasks_10 = Vec::with_capacity(m_10 * top_k_10);
+            for tok in 0..m_10 {
+                for k in 0..top_k_10 {
+                    let idx = tok * top_k_10 + k;
+                    tasks_10.push((tok, h_ids_10[idx] as usize, h_wts_10[idx]));
+                }
+            }
+            let h_cpu_10 = full_store.eval_cold_tasks_cpu(&h_x[..m_10 * k_hidden], m_10, &tasks_10);
+            let d_out_10 = DeviceBuffer::alloc(0, m_10 * k_hidden * 2).unwrap();
+            TieredMoeEngine::execute_layer_device_lru(
+                &full_store,
+                &mut full_cache,
+                &ws_10,
+                &stream,
+                d_x.addr(),
+                d_ids_10.addr(),
+                d_wts_10.addr(),
+                0,
+                0,
+                d_out_10.addr(),
+                m_10,
+                top_k_10,
+            )
+            .unwrap();
+            let mut h_gpu_10 = vec![0u16; m_10 * k_hidden];
+            d_out_10.copy_to_host(&mut h_gpu_10, &stream).unwrap();
+            let max_diff_10 = h_gpu_10
+                .iter()
+                .zip(&h_cpu_10)
+                .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff_10 <= 1.6e-2,
+                "H64+g64 top_k=10 M={m_10} max_abs_diff={max_diff_10} exceeds 1.6e-2"
+            );
+
+            // Tail-only (`words 64..80` = `cols 512..639`) direct `w34_moe_w4a16_down_accum_f16` oracle:
+            let mut h_interm_tail = vec![0u16; m_10 * top_k_10 * n_interm];
+            for row in 0..(m_10 * top_k_10) {
+                for col in 512..n_interm {
+                    h_interm_tail[row * n_interm + col] =
+                        f32_to_f16(0.25 + 0.03 * (((row * 7 + col) % 13) as f32));
+                }
+            }
+            let d_interm_tail = upload(&h_interm_tail, &stream);
+            let d_tail_out = DeviceBuffer::alloc(0, m_10 * k_hidden * 2).unwrap();
+            assert_eq!(
+                // SAFETY: `d_interm_tail`, `full_cache.slots`, `d_ids_10`, `d_wts_10`, and `d_tail_out`
+                // are valid device buffers sized for `(m_10, top_k_10 = 10, n_interm = 640, k_hidden = 128)`.
+                unsafe {
+                    ffi::w34_moe_w4a16_down_accum_f16(
+                        &ex_10,
+                        d_interm_tail.addr() as *const _,
+                        full_cache.slots.down_packed.addr() as *const _,
+                        full_cache.slots.down_scales.addr() as *const _,
+                        d_ids_10.addr() as *const _,
+                        d_wts_10.addr() as *const _,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        d_tail_out.addr() as *mut _,
+                        m_10 as i32,
+                        top_k_10 as i32,
+                        num_experts as i32,
+                        k_hidden as i32,
+                        n_interm as i32,
+                        group_size as i32,
+                    )
+                },
+                0
+            );
+            let mut h_tail_gpu = vec![0u16; m_10 * k_hidden];
+            d_tail_out.copy_to_host(&mut h_tail_gpu, &stream).unwrap();
+            stream.synchronize().unwrap();
+
+            let mut h_tail_ref = vec![0.0f32; m_10 * k_hidden];
+            let words_per_interm = n_interm / 8;
+            let groups_per_interm = n_interm / group_size;
+            let words_per_group = group_size / 8;
+            for tok in 0..m_10 {
+                for k in 0..top_k_10 {
+                    let pair = tok * top_k_10 + k;
+                    let exp = h_ids_10[pair] as usize;
+                    let tw_h = f16_to_f32(f32_to_f16(h_wts_10[pair]));
+                    let pack = &raw_packs[exp * layout.stride..(exp + 1) * layout.stride];
+                    let dn_p = &pack[layout.down_packed.clone()];
+                    let dn_s = &pack[layout.down_scales.clone()];
+                    let interm_row = &h_interm_tail[pair * n_interm..(pair + 1) * n_interm];
+                    for h in 0..k_hidden {
+                        let mut dot = 0.0f32;
+                        let row_w = h * words_per_interm;
+                        let row_s = h * groups_per_interm;
+                        for g in 8..groups_per_interm {
+                            let ds_off = (row_s + g) * 2;
+                            let ds =
+                                f16_to_f32(u16::from_le_bytes([dn_s[ds_off], dn_s[ds_off + 1]]));
+                            for w in 0..words_per_group {
+                                let w_idx = g * words_per_group + w;
+                                let dw_off = (row_w + w_idx) * 4;
+                                let dw = u32::from_le_bytes([
+                                    dn_p[dw_off],
+                                    dn_p[dw_off + 1],
+                                    dn_p[dw_off + 2],
+                                    dn_p[dw_off + 3],
+                                ]);
+                                let k_base = w_idx * 8;
+                                for b in 0..8 {
+                                    let x_val = f16_to_f32(interm_row[k_base + b]);
+                                    let dnib = ((dw >> (b * 4)) & 0xF) as i32 - 8;
+                                    let dw_h = f16_to_f32(f32_to_f16((dnib as f32) * ds));
+                                    dot += dw_h * x_val;
+                                }
+                            }
+                        }
+                        h_tail_ref[tok * k_hidden + h] += dot * tw_h;
+                    }
+                }
+            }
+            let tail_norm: f32 = h_tail_ref.iter().map(|v| v.abs()).sum();
+            assert!(tail_norm > 1.0, "expected non-trivial tail contribution");
+            let tail_diff = h_tail_gpu
+                .iter()
+                .zip(&h_tail_ref)
+                .map(|(&g, &r)| (f16_to_f32(g) - f16_to_f32(f32_to_f16(r))).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                tail_diff <= 1e-2,
+                "n_interm=640 top_k=10 tail words 64..80 M={m_10} max_abs_diff={tail_diff} exceeds 1e-2"
             );
         }
     }
