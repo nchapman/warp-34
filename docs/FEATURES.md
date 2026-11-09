@@ -2,7 +2,9 @@
 
 `warp-34` is a clean-room Rust + CUDA inference engine engineered for **Qwen 3.5 / 3.6 / 3.8 hybrid models** (GDN linear attention + full attention + MoE + Vision + MTP/DFlash2 + Paged TQ4 KV) targeting **1–4× RTX 30-series (`sm_86`) and 40-series (`sm_89`) GPUs** (primary targets: RTX 3090 / 3090 Ti, RTX 4090, RTX 3060 Ti, and RTX 4060 Ti).
 
-This document provides a verified, front-to-back inventory of all implemented features, APIs, execution contracts, kernel specializations, and tooling across the entire codebase.
+This document inventories implemented capabilities, APIs, execution contracts, kernel specializations, and tooling. **Implementation is not production qualification.** Scope-specific grades, evidence, limitations, and release gates live in [`READINESS.md`](READINESS.md); the launch checklist lives in [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md).
+
+The 22 section numbers are stable inventory references. Readiness IDs group their bullets into independently assessable contracts; implementation details inherit the assessment of their owning capability, not a separate production guarantee.
 
 ---
 
@@ -15,7 +17,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
   * `greedy-diff`: Automated token-for-token validation harness against reference golden outputs (`--golden <dir|json>`) with `--verify-lossless` (speculative parity) and `--verify-radix-warm` (prefix cache parity) verification.
   * `dump-diff`: Layer-by-layer tensor inspection harness dumping per-layer inputs/outputs across norms, attention, GDN, and MLP against `vLLM` / `SGLang` Safetensors fixtures (`--compare-tp2`).
   * `profile-diff`: Side-by-side SQLite/JSON performance profiler comparing round latencies (`ms/round`) and launch counts across 7 kernel categories against `vLLM 0.31.0` and `SGLang v0.5.19`.
-  * `serve`: Production-grade HTTP server implementing OpenAI Chat, OpenAI Responses, Anthropic Messages, and TypeSafe Decision model APIs.
+  * `serve`: HTTP server implementing OpenAI Chat, OpenAI Responses, Anthropic Messages, and TypeSafe Decision model APIs.
   * `chat`: Single-turn terminal execution runner formatting ChatML prompts, evaluating reasoning and tool blocks via `Qwen3Parser`, and reporting generation statistics (prompt/cached/generated tokens, TTFT, decode tok/s) to stderr.
 * **CLI Flags & Argument Validation:**
   * **Tensor Parallelism:** `--tp 1 | 2 | 4`.
@@ -42,7 +44,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
   * Dedicated input token counting endpoint: `POST /v1/chat/completions/input_tokens` (and unversioned alias `/chat/completions/input_tokens`).
   * Legacy completions fallback: `POST /v1/completions` with parallel token/logprob arrays.
 * **OpenAI Responses API (`POST /v1/responses`):**
-  * Full implementation of the OpenAI Responses specification (`crates/w34-host/src/responses_api/`).
+  * Implementation of the Responses routes and behaviors documented in [`GENERATIVE_APIS.md`](GENERATIVE_APIS.md), not a blanket claim of upstream specification completeness (`crates/w34-host/src/responses_api/`).
   * In-memory bounded session store (`ResponseStore`, default capacity 256 responses, 64 per credential scope) partitioned by credential-derived scope and supporting request chaining via `previous_response_id`.
   * Cryptographically unguessable 128-bit response IDs (`resp_<32hex>`) generated via `/dev/urandom`.
   * Stateful lifecycle routes: `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`, and `POST /v1/responses/input_tokens`.
@@ -66,7 +68,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
 *Location: `crates/w34-host/src/decision.rs`, `crates/w34-host/src/clef.rs`*
 
 * **TypeSafe Decision Model Endpoints:**
-  * Exposes `POST /v1/systemone` (and unversioned `/systemone`) and `POST /v1/decisions` (and `/decisions`) for high-throughput zero-latency decision pipelines without modifying generative routes.
+  * Exposes `POST /v1/systemone` (and unversioned `/systemone`) and `POST /v1/decisions` (and `/decisions`) for specialized decision pipelines without modifying generative routes.
   * **Clef (`ClefModel`):** Joint schema head (`ClefJointHead` + `joint_head.safetensors`) performing multi-question joint cross-attention over document text and multimodal image tokens.
   * **Kev (`KevModel`):** Pointer head (`KevPointerHead` + `head.safetensors`) computing query-key dot-product attention over `<|box_end|>` and `<|fim_suffix|>` anchors.
   * **Nimble (`NimbleModel`):** Parallel schema prompt scoring with `SafeJson` validation and calibrated temperature across up to 26 single-letter options (`A..Z`).
@@ -79,13 +81,13 @@ This document provides a verified, front-to-back inventory of all implemented fe
 ## 4. API Authentication & Web Dashboard
 *Location: `crates/w34-host/src/api_auth.rs`, `crates/w34-host/src/dashboard.rs`*
 
-* **Zero-Leak API Credential Layer:**
+* **Digest-Based API Credential Layer:**
   * Opt-in protection for all inference, tokenization, model catalog, and response routes (while leaving health, metrics, and dashboard public).
   * `ApiKey` holds exclusively a SHA-256 fixed-length digest (`[u8; 32]`) and deliberately omits `Debug` implementations to prevent log leakage.
   * Constant-time comparison (`subtle::ConstantTimeEq`) guards against timing side-channels.
   * Accepts both RFC 6750 `Authorization: Bearer <token>` and `x-api-key` headers.
 * **Embedded Self-Contained Web Dashboard:**
-  * Zero-dependency read-only React dashboard compiled and embedded directly into the binary via `include_dir!`.
+  * Self-contained read-only React dashboard compiled and embedded directly into the binary via `include_dir!`.
   * Strict Content Security Policy (`CSP: default-src 'none'; script-src 'self'; style-src 'self' ...`), anti-sniff headers, and path traversal guards (`.` and `..` rejection).
   * Serves `GET /` (`index.html`), `GET /favicon.svg`, and immutable cached static assets (`/assets/*`).
 
@@ -278,7 +280,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
     * Stage 1: Computes intra-chunk Householder-like representation (`W` and `U` matrices).
     * Stage 2: Evaluates inter-chunk recurrent state propagation (`Delta H`).
     * Stage 3: Produces final outputs with FP32 accumulators.
-  * Guarantees 0-ULP continuation parity between one-shot prefill, chunked prefill, and speculative verification.
+  * Continuation/checkpoint tests exercise exact parity for their declared geometries; this is not a universal 0-ULP guarantee across every prefill kernel and full-model configuration.
 
 ---
 
@@ -286,11 +288,11 @@ This document provides a verified, front-to-back inventory of all implemented fe
 *Location: `crates/w34-kernels/csrc/tq/`, `op_kv_cache.cu`, `op_hadamard.cu`, `op_paged_attn.cu`, `op_paged_fa2.cu`*
 
 * **TurboQuant 4-Bit KV Cache (`TQ4`):**
-  * Pinned in-house IP delivering **`3.07×` effective KV compression** (21.37 KB/token on 27B, allowing 262k context on a single 24 GB GPU).
+  * Pinned in-house implementation with **`3.07×` effective KV compression** for the documented 27B layout (21,376 bytes/token). Historical 262k-context runs on a single 24 GB GPU are recorded in [`STATE.md`](STATE.md); capacity and quality depend on the checkpoint, other memory allocations, and workload, and require release-specific qualification.
   * `block_tq4_0`: 66 bytes per 128 elements (4.125 bpw) with independent per-128 least-squares FP16 scales.
   * Randomized orthonormal rotation: Seed-42 Rademacher + Fast Walsh-Hadamard Transform (WHT-256) eliminates outlier dimensions prior to quantization.
   * 16-centroid `Beta(256)` Lloyd-Max codebook stored in `__constant__` memory and register shuffle caches.
-  * **Boundary-Anchored KV Policy:** The last 4 full-attention layers remain in rotated `Q8_0` (272 B/row) while preceding layers use `TQ4` (132 B/row), preserving 0-loss precision.
+  * **Boundary-Anchored KV Policy:** The last 4 full-attention layers remain in unrotated `Q8_0` (272 B/row) while preceding layers use `TQ4` (132 B/row), limiting quantization error. TQ4 is lossy: historical greedy token agreement varies by model and prompt; see [`STATE.md`](STATE.md) and the quality gate in [`READINESS.md`](READINESS.md).
 * **Paged Attention & FlashAttention Kernels:**
   * Cooperative 1-warp GQA decode kernel with register-shuffled TQ4 centroid dequantization.
   * Tensor core MMA decode and prefill kernels (`mma.sync.m16n8k16`) with Split-KV grid reductions.
@@ -317,10 +319,10 @@ This document provides a verified, front-to-back inventory of all implemented fe
 
 * **High-Efficiency TP Collectives:**
   * Primary verified implementation: Pinned-sysmem TP=2 (`op_collectives.cu`) over PCIe Gen4 x8 (e.g. 2× RTX 3090 Ti / 3060 Ti / 4060 Ti / 4090).
-  * System-scope release/acquire memory fences (`st.release.sys.global` / `ld.acquire.sys.global`) with monotonic epoch parity, requiring only 1 barrier per call.
+  * System-scope release/acquire memory fences (`st.release.sys.global` / `ld.acquire.sys.global`) with monotonic epoch parity: small in-kernel transfers use one barrier; the large Copy-Engine DMA path uses two barriers.
   * Dynamic DMA cutoff (`kDmaThresholdBytes = 64 KiB`): Selects in-kernel register writeback for small transfers and asynchronous Copy-Engine DMA for bulk payloads.
   * Strictly typed collective entrypoints: Typed routines for `FP16` hidden states, `BF16` draft tokens, `FP32` reductions, and `INT32` token IDs (never casting integer tokens through float collectives).
-  * Extensible design for NVLink P2P VRAM staging and TP=4 execution plans (`crates/w34-host/src/cuda/collectives.rs`).
+  * Implemented NVLink P2P VRAM staging and TP=4 execution plans (`crates/w34-host/src/cuda/collectives.rs`), with historical 4× RTX 3090 qualification in [`STATE.md`](STATE.md). These require separate hardware/topology requalification for a release.
 
 ---
 
@@ -328,16 +330,16 @@ This document provides a verified, front-to-back inventory of all implemented fe
 *Location: `crates/w34-kernels/csrc/ops/op_sampler.cu`, `op_rejection.cu`*
 
 * **9-Step Persistent GPU Sampler:**
-  * Executes the complete sampling pipeline directly in GPU registers (1 CTA per row, 1,024 threads):
+  * GPU sampling uses device scratch buffers, reductions, and specialized fast paths; random draws are supplied by host `SamplerV1`. The policy includes:
     1. Grammar token bitmask application (`-INFINITY` masking).
     2. Logit bias adjustments.
     3. Repetition, frequency, and presence penalty applications.
     4. Temperature scaling.
     5. Min-p dynamic threshold filtering.
     6. Top-k and Top-p (nucleus) sorting and cumulative mass truncation.
-    7. Seeded parallel Philox-4x32 RNG sampling.
-    8. Fast-greedy argmax shortcut (1-cycle warp/block reduction for unpenalized greedy tokens).
-    9. FP32 Top-5 logprob extraction.
+    7. Seeded sampling using host-generated, position-keyed SplitMix64 uniform draws passed in the row configuration.
+    8. Fast-greedy argmax shortcut with warp/block reductions for eligible rows (not a one-cycle latency guarantee).
+    9. FP32 logprob extraction with configurable `top_logprobs` (up to 20 in the full sampler).
 * **GPU Speculative Rejection Sampler:**
   * Parallel verification of speculative draft tokens against target acceptance probabilities (`p / q`).
   * Supports both greedy acceptance and stochastic residual distribution sampling (`sample max(p - q, 0)`).
@@ -354,7 +356,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
   * Memory pool utilization: Tracks live capacity, active pages, cached/evictable pages, and free physical pages across KV and GDN pools.
 * **Continuous Parity Oracle Suite (`tools/oracle/`):**
   * Automated Python/Triton test harnesses running `vLLM 0.31.0` and `SGLang v0.5.19` side-by-side with `warp-34`.
-  * Verifies 0-ULP greedy token equivalence across 12 canonical multi-turn and reasoning prompts.
+  * Provides a 12-prompt canonical multi-turn/reasoning oracle suite. Exact token matches, numerical tensor tolerances, and adjudicated divergences are distinct outcomes; historical results are not a guarantee of universal token equivalence or a fresh release pass.
 
 ---
 
@@ -363,7 +365,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
 
 * **Optimized Docker Deployment:**
   * Multi-stage build process decoupling the Node/pnpm React dashboard compilation from the CUDA/Rust binary build.
-  * Lightweight runtime image based on `ubuntu:26.04` (total image size ~575–775 MB depending on static/shared linkage) without shipping multi-GB CUDA toolkits, headers, or driver stubs.
+  * Runtime image based on `ubuntu:26.04` (historical shared-link runtime filesystem size ~775.6 MB; the ~575.4 MB static variant was an experiment, not the current default; see [`CUBLAS_PACKAGING_EXPERIMENT.md`](CUBLAS_PACKAGING_EXPERIMENT.md)) without shipping multi-GB CUDA toolkits, headers, or driver stubs.
   * Shared cuBLAS dynamic linkage (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) stored in a dedicated cacheable filesystem layer.
   * Security hardening: Runs under an unprivileged system user (`w34`), mounts standard Hugging Face caches (`HF_HUB_CACHE`), and defines container health checks querying `GET /health`.
 * **Multi-Arch Fatbinary Support:**

@@ -329,6 +329,10 @@ For end-to-end HTTP load testing across single-stream decode, concurrent `C=8..1
 
 | Guide | What's Inside |
 |---|---|
+| [`docs/FEATURES.md`](docs/FEATURES.md) | Front-to-back capability inventory (implementation, not production qualification) |
+| [`docs/READINESS.md`](docs/READINESS.md) | Stable capability IDs, provisional grades, evidence, scope limits and release gates |
+| [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md) | Production qualification sequence, commands, gate tracker and release receipt |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Reproducible bug reports, regression-first fixes and PR verification requirements |
 | [`docs/MODELS.md`](docs/MODELS.md) | Model downloads, `--revision` / `--offline`, supported architectures, quantizations, and KV policies |
 | [`docs/QWEN_FLASH_NEXT.md`](docs/QWEN_FLASH_NEXT.md) | Full architecture & 3-tier offloading reference for `Qwen3.8-Flash-Next` (`qwen4_exp`) |
 | [`docs/DECISION_MODELS.md`](docs/DECISION_MODELS.md) | `/v1/systemone` and `/v1/decisions` schemas, supported profiles (`Clef`, `Kev`, `Nimble`, `Tev1`, `OpenJev`, `Lev`/`Xor`), and confidence math |
