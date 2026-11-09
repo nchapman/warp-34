@@ -912,8 +912,8 @@ impl HotExpertCache {
     pub fn prefill_hot_limit(&self) -> usize {
         if self.bridge_layer_id.is_some() {
             self.k_static
-        } else if self.slots.capacity > 40 {
-            self.slots.capacity - 40
+        } else if self.slots.capacity > TIERED_MOE_GPU_LRU_TAIL_SLOTS {
+            self.slots.capacity - TIERED_MOE_GPU_LRU_TAIL_SLOTS
         } else {
             self.slots.capacity
         }

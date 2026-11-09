@@ -1324,8 +1324,17 @@ extern "C" int w34_moe_w4a16_select_regime(
         n_interm <= 0 || k_hidden <= 0 || group_size <= 0) {
         return 0;
     }
-    const int max_vec4_tokens = (group_size == 64 && top_k >= 10) ? 8 : 7;
-    if (num_tokens >= 4 && num_tokens <= max_vec4_tokens && num_tokens * top_k <= num_experts &&
+    constexpr int kVec4MinTokens = 4;
+    constexpr int kVec4MaxTokensDefault = 7;
+    constexpr int kVec4MaxTokensWideTopK = 8;
+    constexpr int kVec4WideTopKGroupSize = 64;
+    constexpr int kVec4WideTopKMin = 10;
+    const int max_vec4_tokens =
+        (group_size == kVec4WideTopKGroupSize && top_k >= kVec4WideTopKMin)
+            ? kVec4MaxTokensWideTopK
+            : kVec4MaxTokensDefault;
+    if (num_tokens >= kVec4MinTokens && num_tokens <= max_vec4_tokens &&
+        num_tokens * top_k <= num_experts &&
         num_experts <= 1024 && n_interm % 64 == 0 && k_hidden % 64 == 0 &&
         n_interm % group_size == 0 && k_hidden % group_size == 0 &&
         (group_size == 128 || group_size == 64)) {

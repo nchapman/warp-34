@@ -1388,12 +1388,15 @@ static int launch_qsa_sparse_paged_attn_f16(
         // Choose `target_splits` from `num_tokens` (independent of `local_q_heads` and constant
         // across `M = 1..16`) so Plain (`M = 1`), `MTP-3` (`M = 4`), and `DFlash2` (`M = 8..16`)
         // as well as `TP=1` and `TP=2` execute the exact same Split-K reduction tree.
+        constexpr int kSplit8MaxTokens = 16;
+        constexpr int kSplit4MaxTokens = 64;
+        constexpr int kSplit2MaxTokens = 128;
         int target_splits = 1;
-        if (num_tokens <= 16) {
+        if (num_tokens <= kSplit8MaxTokens) {
             target_splits = 8;
-        } else if (num_tokens <= 64) {
+        } else if (num_tokens <= kSplit4MaxTokens) {
             target_splits = 4;
-        } else if (num_tokens <= 128) {
+        } else if (num_tokens <= kSplit2MaxTokens) {
             target_splits = 2;
         }
         const int max_by_blocks = select_k_blocks >> 1;

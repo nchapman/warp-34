@@ -5,6 +5,9 @@
 
 use std::ops::Range;
 
+/// Maximum prepared token count (`8`) supported by [`eval_expert_slice`].
+pub(super) const MAX_SLICE_TOKENS: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EvalError {
     InvalidLayout,
@@ -500,7 +503,15 @@ pub(super) fn eval_expert_slice(
     out: &mut [f32],
     scratch: &mut [f32],
 ) -> Result<(), EvalError> {
-    validate(d, &groups, [xp, xg], weights, out, scratch, 8)?;
+    validate(
+        d,
+        &groups,
+        [xp, xg],
+        weights,
+        out,
+        scratch,
+        MAX_SLICE_TOKENS,
+    )?;
     #[cfg(target_arch = "x86_64")]
     if supported() {
         // SAFETY: runtime ISA guard and all sizes/ranges checked above.

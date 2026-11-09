@@ -1821,13 +1821,20 @@ extern "C" int w34_small_n_gemm_f16(
     if (m <= 0 || size_n <= 0 || size_k <= 0) return 0;
     if ((size_k & 7) != 0) return (int)cudaErrorInvalidValue;
     cudaStream_t stream = (cudaStream_t)ex->stream;
-    const int tiles_m = (m + 3) / 4;
-    const int tiles_n = (size_n + 3) / 4;
-    if (m == 1 && tiles_n < 128) {
+    constexpr int kTile4 = 4;
+    constexpr int kDecodeMaxM = 16;
+    constexpr int k1xNMaxM = 2;
+    constexpr int k1xNMaxTilesMN = 64;
+    constexpr int kWide4x4MinTilesN = 128; // size_n >= 512
+    const int tiles_m = (m + kTile4 - 1) / kTile4;
+    const int tiles_n = (size_n + kTile4 - 1) / kTile4;
+    if (m == 1 && tiles_n < kWide4x4MinTilesN) {
         dim3 grid((unsigned)size_n, 1u);
         w34::small_n_gemm_f16_kernel<1, 4><<<grid, 256, 0, stream>>>(
             (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);
-    } else if (m <= 16 && (m < 3 || tiles_n * tiles_m < 64) && tiles_n < 128) {
+    } else if (m <= kDecodeMaxM &&
+               (m <= k1xNMaxM || tiles_n * tiles_m < k1xNMaxTilesMN) &&
+               tiles_n < kWide4x4MinTilesN) {
         dim3 grid((unsigned)size_n, (unsigned)tiles_m);
         w34::small_n_gemm_f16_kernel<4, 4><<<grid, 256, 0, stream>>>(
             (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);

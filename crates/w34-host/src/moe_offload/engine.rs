@@ -238,7 +238,7 @@ impl TieredMoeEngine {
             return Ok(());
         }
         cache.sync_from_device_if_dirty(compute_stream)?;
-        let use_prefill_hot_limit = num_tokens < 1024
+        let use_prefill_hot_limit = num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
             && (cache.bridge_layer_id.is_some()
                 || matches!(mode, MoeOffloadMode::StreamedPrefill)
                 || (num_tokens > TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS
@@ -246,7 +246,11 @@ impl TieredMoeEngine {
                         mode,
                         MoeOffloadMode::GpuLru | MoeOffloadMode::CpuHybrid { .. }
                     )));
-        if (use_prefill_hot_limit || (8..1024).contains(&num_tokens)) && cache.adapted_slots_dirty {
+        if (use_prefill_hot_limit
+            || (TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS..TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS)
+                .contains(&num_tokens))
+            && cache.adapted_slots_dirty
+        {
             cache.restore_initial_if_adapted(store, ws, compute_stream)?;
         }
         assert_eq!(h_topk_ids.len(), num_tokens * top_k);
@@ -611,7 +615,8 @@ impl TieredMoeEngine {
                 let use_cpu_bridge = cache.bridge_runtime.is_some()
                     && num_tokens <= ws.max_tokens
                     && h_topk_weights.len() == num_tokens * top_k;
-                let want_freq_stats = use_cpu_bridge || (num_tokens >= 1024 && adapt_end >= 64);
+                let want_freq_stats = use_cpu_bridge
+                    || (num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS && adapt_end >= 64);
 
                 if want_freq_stats && !misses_in_step.is_empty() {
                     let mut exp_toks: Vec<Vec<(i32, f32)>> = if use_cpu_bridge {
@@ -746,7 +751,10 @@ impl TieredMoeEngine {
                     // from `gpu_misses` that are >= 3x more frequent in this prompt than the
                     // lowest-frequency resident tail slots, unpacking them directly from
                     // `ws.d_stage_packs[0]` during Chunk 0 at zero extra PCIe DMA cost.
-                    if num_tokens >= 1024 && adapt_end >= 64 && !gpu_misses.is_empty() {
+                    if num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+                        && adapt_end >= 64
+                        && !gpu_misses.is_empty()
+                    {
                         let adapt_start = adapt_end - 20;
                         let mut victim_cands: Vec<(usize, usize)> = (adapt_start..adapt_end)
                             .map(|slot| {
