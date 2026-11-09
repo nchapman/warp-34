@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{
     constraints::{ConstraintFactory, TokenBitmaskConstraint},
-    tool_constraints::{ToolChoice, ToolFormat},
+    tool_constraints::ToolChoice,
 };
 
 pub const MAX_CONSTRAINT_SPEC_BYTES: usize = 64 * 1024;
@@ -216,9 +216,7 @@ impl RequestConstraint {
                 tools,
                 choice,
                 parallel,
-            } => {
-                factory.tools_with_parallel(tools, choice, ToolFormat::QwenXml, thinking, *parallel)
-            }
+            } => factory.tools_with_parallel(tools, choice, thinking, *parallel),
         }
     }
 }

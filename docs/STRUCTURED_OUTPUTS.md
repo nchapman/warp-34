@@ -13,8 +13,8 @@ architecture of vLLM 0.31.0. There is no llguidance backend or fallback.
   32-bit masks. Compilation runs through the HTTP CPU-work boundary, not on the
   GPU engine thread.
 - `tool_constraints.rs`: native XGrammar structural-tag descriptors, not a custom
-  schema-to-grammar converter. Qwen uses `json_schema` with `style: qwen_xml`;
-  Hermes uses vLLM's tagged JSON envelopes. Qwen sets the native
+  schema-to-grammar converter. Tools use `json_schema` with `style: qwen_xml`.
+  Qwen sets the native
   `max_whitespace_cnt: 1` option to prevent empty-argument calls from exhausting
   their output budget in a whitespace loop.
 - `parser.rs`: sampler integration and output extraction. Native XML parameter
@@ -66,10 +66,10 @@ whitespace-tolerant custom grammar**:
 </tool_call>
 ```
 
-Hermes uses the upstream `{"name": "weather", "arguments": ...}` prefix,
-with inline and newline-wrapped envelope variants. These are constrained-generation
-formats, not a promise to accept every spelling of an otherwise equivalent call.
-The output parser remains tolerant for existing unconstrained/history content.
+Qwen XML is the only supported tool-call envelope. Tagged JSON objects are not
+extracted as tool calls; JSON object and array values inside XML parameters
+remain supported. The output parser remains tolerant of XML whitespace for
+existing unconstrained/history content.
 
 Reasoning is not a grammar production. Before `</think>`, real vocabulary tokens
 are unconstrained by the answer grammar, including special tokens. Qwen tools also
@@ -117,9 +117,9 @@ These small measurements are not an end-to-end throughput comparison with vLLM.
 
 ## Review decisions
 
-The initial review's requested restoration of whitespace-tolerant Qwen/Hermes
+The initial review's requested restoration of whitespace-tolerant Qwen
 prefixes was declined: those prefixes intentionally follow XGrammar's Qwen
-builder and vLLM's `structural_tag_registry.py` Hermes builder. Reintroducing the
+builder. Reintroducing the
 custom language would defeat this migration. The parser metadata reference-budget
 finding was fixed: parsing metadata is constructed once before dispatch, limits
 and unresolved references return errors, and nested object/array data does not

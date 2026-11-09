@@ -17,7 +17,7 @@ fn no_tools_keeps_call_markup_as_content() {
 
 #[test]
 fn parallel_tool_calls_false_stops_after_one_call() {
-    use w34_host::tool_constraints::{ToolChoice, ToolFormat};
+    use w34_host::tool_constraints::ToolChoice;
     let fixture: Value =
         serde_json::from_str(include_str!("fixtures/xgrammar_masks.json")).unwrap();
     let tokenizer =
@@ -27,7 +27,7 @@ fn parallel_tool_calls_false_stops_after_one_call() {
     let tools = serde_json::json!([{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{},"additionalProperties":false}}}]);
     for choice in [ToolChoice::Auto, ToolChoice::Required] {
         let mut c = factory
-            .tools_with_parallel(&tools, &choice, ToolFormat::QwenXml, false, false)
+            .tools_with_parallel(&tools, &choice, false, false)
             .unwrap();
         let mut whitespace_loop = c.clone();
         let mut blocked = false;
@@ -74,7 +74,6 @@ fn masks_and_rollback_match_official_xgrammar() {
             "qwen_tools" => factory.tools(
                 &case["source"],
                 &w34_host::tool_constraints::ToolChoice::Required,
-                w34_host::tool_constraints::ToolFormat::QwenXml,
                 false,
             ),
             kind => panic!("unknown fixture kind: {kind}"),

@@ -153,23 +153,20 @@ impl ConstraintFactory {
         &self,
         tools: &Value,
         choice: &crate::tool_constraints::ToolChoice,
-        format: crate::tool_constraints::ToolFormat,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        self.tools_with_parallel(tools, choice, format, thinking, true)
+        self.tools_with_parallel(tools, choice, thinking, true)
     }
 
     pub fn tools_with_parallel(
         &self,
         tools: &Value,
         choice: &crate::tool_constraints::ToolChoice,
-        format: crate::tool_constraints::ToolFormat,
         thinking: bool,
         parallel: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        let Some(value) = crate::tool_constraints::tool_structural_tag_with_parallel(
-            tools, choice, format, parallel,
-        )?
+        let Some(value) =
+            crate::tool_constraints::tool_structural_tag_with_parallel(tools, choice, parallel)?
         else {
             let mut c = TokenBitmaskConstraint::unconstrained(self.vocab_size)
                 .with_terminal_eos_ids(self.eos_ids.clone());
@@ -182,11 +179,7 @@ impl ConstraintFactory {
             .compiler
             .compile_structural_tag(&value.to_string())
             .map_err(|e| e.to_string())?;
-        self.wrap(
-            g,
-            thinking,
-            matches!(format, crate::tool_constraints::ToolFormat::QwenXml),
-        )
+        self.wrap(g, thinking, true)
     }
     fn wrap(
         &self,

@@ -1,7 +1,7 @@
 //! `SamplerV1` (penalties, temperature, `top_k`, `top_p`, `min_p`, seeded RNG,
 //! and structured-output `TokenBitmaskConstraint` with speculative rollback) and
 //! `Qwen3Parser` (`vllm/parser/qwen3.py` parity for `<think>...</think>` reasoning and
-//! Qwen3-XML / Hermes JSON `<tool_call>` extraction).
+//! Qwen3-XML `<tool_call>` extraction).
 
 use std::collections::BTreeMap;
 
@@ -661,8 +661,7 @@ pub struct StreamParseDelta {
 /// - `enable_thinking: bool` (`<think>...</think>` extraction into `reasoning_content`)
 /// - Implicit `</think>` transition when `<tool_call>` appears directly inside reasoning
 /// - Duplicate `</think>` absorption in content state
-/// - Both **Qwen3-XML** (`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`)
-///   and **Hermes JSON** (`<tool_call>{"name": "...", "arguments": {...}}</tool_call>`) tool calls
+/// - **Qwen3-XML** (`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`)
 #[derive(Clone, Debug)]
 pub struct Qwen3Parser {
     pub enable_thinking: bool,
@@ -969,8 +968,8 @@ impl Qwen3Parser {
         None
     }
 
-    /// Parses either Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
-    /// or Hermes JSON (`{"name": "...", "arguments": ...}`) inside a `<tool_call>...</tool_call>` body.
+    /// Parses Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
+    /// inside a `<tool_call>...</tool_call>` body.
     pub fn parse_tool_body(raw_body: &str, call_idx: usize) -> Option<ParsedToolCall> {
         Self::parse_tool_body_with_tools(raw_body, call_idx, None)
     }
@@ -987,7 +986,7 @@ impl Qwen3Parser {
             return None;
         }
 
-        // 1. Check Qwen3-XML format: `<function=func_name>...`
+        // Check Qwen3-XML format: `<function=func_name>...`
         let xml_fn = if let Some(after_lt) = body.strip_prefix('<') {
             let after_func = after_lt.trim_start();
             if let Some(after_func_word) = after_func.strip_prefix("function") {
@@ -1078,25 +1077,6 @@ impl Qwen3Parser {
             });
         }
 
-        // 2. Check Hermes JSON format: `{"name": "func_name", "arguments": {...}}`
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(body)
-            && let Some(name) = val.get("name").and_then(|v| v.as_str())
-        {
-            let args_str = match val.get("arguments") {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
-                None => "{}".to_string(),
-            };
-            return Some(ParsedToolCall {
-                id: format!("call_w34_{call_idx}"),
-                call_type: "function".to_string(),
-                function: ParsedFunctionCall {
-                    name: name.to_string(),
-                    arguments: args_str,
-                },
-            });
-        }
-
         None
     }
 
@@ -1137,8 +1117,6 @@ impl Qwen3Parser {
                         Some(gt) => end_pos + gt + 1,
                         None => end_pos + Self::TOOL_END.len(),
                     };
-                    self.buffer.drain(..drain_end);
-                    self.in_tool_call = false;
                     if let Some(tc) = Self::parse_tool_body_with_tools(
                         &body,
                         self.next_tool_idx,
@@ -1147,7 +1125,14 @@ impl Qwen3Parser {
                         self.next_tool_idx += 1;
                         self.tool_calls.push(tc.clone());
                         delta.completed_tool_calls.push(tc);
+                    } else {
+                        // Unrecognized envelopes remain text rather than being dispatched or lost.
+                        let content = format!("{}{}", Self::TOOL_START, &self.buffer[..drain_end]);
+                        c_out.push_str(&content);
+                        self.content_accum.push_str(&content);
                     }
+                    self.buffer.drain(..drain_end);
+                    self.in_tool_call = false;
                     continue;
                 }
                 break;
@@ -1481,15 +1466,10 @@ mod tests {
     }
 
     #[test]
-    fn native_qwen_hermes_and_truncated_raw_string() {
+    fn native_qwen_truncated_raw_string() {
         let tools = [
             serde_json::json!({"function":{"name":"emit","parameters":{"type":"object","properties":{"label":{"type":"string"}}}}}),
         ];
-        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
-        parser.push_str(
-            r#"<tool_call>{"name":"emit","arguments":{"label":"</tool_call>"}}</tool_call>"#,
-        );
-        assert_eq!(parser.finish().1.tool_calls.len(), 1);
         let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
         parser.push_str("<tool_call><function=emit><parameter=label>\"unfinished");
         let turn = parser.finish().1;
@@ -1665,15 +1645,52 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen3_parser_hermes_tool_call_extraction() {
-        let mut parser = Qwen3Parser::new(false);
-        let stream_text = "<tool_call>{\"name\": \"search_web\", \"arguments\": {\"query\": \"warp-34\"}}</tool_call>";
-        let delta = parser.push_str(stream_text);
-
-        assert_eq!(delta.completed_tool_calls.len(), 1);
-        let tc = &delta.completed_tool_calls[0];
-        assert_eq!(tc.function.name, "search_web");
-        assert!(tc.function.arguments.contains("warp-34"));
+    fn unrecognized_tool_envelope_is_ordinary_content() {
+        let tools = [
+            serde_json::json!({"function":{"name":"search_web","parameters":{
+                "type":"object","properties":{"query":{"type":"string"}}
+            }}}),
+        ];
+        for text in [
+            "<tool_call>not a function call</tool_call>",
+            r#"<tool_call>{"name":"search_web","arguments":{"query":"warp-34"}}</tool_call>"#,
+            r#"<tool_call>{"name":"search_web","arguments":{"query":"</tool_call>"}}</tool_call>"#,
+        ] {
+            assert!(
+                Qwen3Parser::parse_tool_body(
+                    text.trim_start_matches("<tool_call>")
+                        .trim_end_matches("</tool_call>"),
+                    0
+                )
+                .is_none()
+            );
+            for native in [false, true] {
+                for split in 0..=text.len() {
+                    let mut parser = if native {
+                        Qwen3Parser::with_tools(false, &tools).unwrap()
+                    } else {
+                        Qwen3Parser::new(false)
+                    };
+                    let a = parser.push_str(&text[..split]);
+                    let b = parser.push_str(&text[split..]);
+                    let (c, turn) = parser.finish();
+                    assert!(a.completed_tool_calls.is_empty());
+                    assert!(b.completed_tool_calls.is_empty());
+                    assert!(c.completed_tool_calls.is_empty());
+                    assert!(turn.tool_calls.is_empty());
+                    assert_eq!(turn.content.as_deref(), Some(text), "split {split}");
+                    assert_eq!(
+                        format!(
+                            "{}{}{}",
+                            a.content_delta.unwrap_or_default(),
+                            b.content_delta.unwrap_or_default(),
+                            c.content_delta.unwrap_or_default()
+                        ),
+                        text
+                    );
+                }
+            }
+        }
     }
 
     #[test]
