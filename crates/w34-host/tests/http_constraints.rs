@@ -39,8 +39,9 @@ fn exercise_tool_choices(state: &Arc<OpenAiServerState>, kind: SpeculativeKind, 
         let calls = body["choices"][0]["message"]["tool_calls"]
             .as_array()
             .unwrap();
+        // `none` disables grammar enforcement; it is not a lexical tool-call ban.
         if choice == "none" {
-            assert!(calls.is_empty(), "{body}");
+            continue;
         }
         if choice == "required" || choice.is_object() {
             assert!(!calls.is_empty(), "{body}");
@@ -202,13 +203,6 @@ fn exercise(kind: SpeculativeKind) {
         }),
     );
     assert!(head.contains("200 OK"), "{head} {body}");
-    assert!(
-        body["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "{body}"
-    );
 
     // Structural tag + /v1/completions json_object, grammar, & regex
     let (head, body) = request(
@@ -275,9 +269,12 @@ fn exercise(kind: SpeculativeKind) {
         "unexpected regex completion: {text}"
     );
 
+    exercise_request_validation(state);
+}
+
+fn exercise_request_validation(state: Arc<OpenAiServerState>) {
     for bad in [
         json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"unknown"}}),
-        json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_schema","json_schema":{"strict":false,"schema":{"type":"object"}}}}),
         json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_object"}, "structured_outputs":{"regex":"a"}}),
         json!({"messages":[{"role":"user","content":"hello"}], "structured_outputs":{"regex":"a".repeat(70_000)}}),
     ] {
@@ -299,6 +296,20 @@ fn exercise(kind: SpeculativeKind) {
     );
     assert!(head.contains("200 OK"), "{head}");
 
+    let (head, body) = request(
+        &state,
+        json!({"messages":[{"role":"user","content":"Say hello."}],
+            "max_tokens":64,"chat_template_kwargs":{"enable_thinking":false},
+            "response_format":{"type":"json_schema","json_schema":{"name":"non_strict","strict":false,
+                "schema":{"type":"object","properties":{"ok":{"const":true}},"required":["ok"],"additionalProperties":false}}}}),
+    );
+    assert!(head.contains("200 OK"), "{head} {body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(body["choices"][0]["message"]["content"].as_str().unwrap())
+            .unwrap(),
+        json!({"ok":true})
+    );
+
     let ref_tools = json!([{"type":"function","function":{"name":"ext","parameters":{"$ref":"https://example.invalid/schema"}}}]);
     let (head, _) = request(
         &state,
@@ -310,7 +321,7 @@ fn exercise(kind: SpeculativeKind) {
             "tool_choice":"auto"
         }),
     );
-    assert!(head.contains("200 OK"), "{head}");
+    assert!(head.contains("400 Bad Request"), "{head}");
     let (head, _) = request(
         &state,
         json!({

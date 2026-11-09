@@ -1,245 +1,257 @@
-//! Tokenizer-aware structured decoding with cached packed-u32 masks.
+//! Native XGrammar compilation and rollback-safe sampler state.
 //!
-//! llguidance owns byte/grammar state, including the reasoning-to-answer
-//! transition. Speculative clones never reconstruct state from decoded UTF-8.
-
-use llguidance::{
-    Matcher, ParserFactory,
-    api::{GrammarWithLexer, TopLevelGrammar},
+//! Reasoning is deliberately outside the grammar. Only the bounded delimiter
+//! prefix is retained; matcher rollback counts are recorded per emitted token.
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
 };
-use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
+use xgrammar::{CompiledGrammar, GrammarCompiler, GrammarMatcher, TokenizerInfo};
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct StructuralTag {
     pub begin: String,
     pub end: String,
-    pub schema: serde_json::Value,
+    pub schema: Value,
+}
+
+// Inspect syntax only: never retry invalid EBNF as a different language.
+// Lark's native lexer recognizes double-quoted strings, /regex/, and # / // comments.
+fn has_ebnf_rule_operator(grammar: &str) -> bool {
+    let bytes = grammar.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' | b'/' => {
+                let delimiter = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(bytes.len());
+                    } else if bytes[i] == delimiter {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b':' if bytes[i..].starts_with(b"::=") => return true,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 pub struct ConstraintFactory {
-    factory: ParserFactory,
+    compiler: Arc<GrammarCompiler>,
+    bytes: Arc<Vec<Vec<u8>>>,
+    valid_mask: Arc<Vec<u32>>,
     vocab_size: usize,
     eos_ids: Vec<i32>,
 }
-
 impl ConstraintFactory {
     pub fn new(
         tokenizer: tokenizers::Tokenizer,
         vocab_size: usize,
         eos_ids: &[u32],
     ) -> Result<Self, String> {
-        let mut tokenizer = ByteTokenizer::from_tokenizer(tokenizer).map_err(|e| e.to_string())?;
-        if eos_ids.is_empty()
+        let vocab = tokenizer.get_vocab(true);
+        if vocab_size > i32::MAX as usize
+            || eos_ids.is_empty()
             || eos_ids
                 .iter()
-                .any(|&id| id >= tokenizer.tokrx_info().vocab_size)
+                .any(|id| *id as usize >= vocab_size || !vocab.values().any(|v| v == id))
         {
             return Err(
-                "grammar EOS IDs must be nonempty and inside the tokenizer vocabulary".into(),
+                "grammar EOS IDs must be nonempty and inside the tokenizer/model vocabulary".into(),
             );
         }
-        tokenizer.set_eos_tokens(eos_ids);
-        // The pinned adapter treats every <...> added token as special, even
-        // when HF marks it ordinary. Restore HF's classification for Qwen's
-        // reasoning/tool delimiters so byte grammars can consume their native IDs.
-        let ordinary_added = tokenizer
-            .hf_tokenizer
-            .get_added_tokens_decoder()
-            .into_iter()
-            .filter(|(_, token)| !token.special)
-            .map(|(id, token)| (id, token.content.into_bytes()))
-            .collect::<Vec<_>>();
-        let mut env =
-            ByteTokenizerEnv::new(tokenizer, Some(vocab_size)).map_err(|e| e.to_string())?;
-        let mut bytes = (0..env.tok_trie.info().vocab_size)
-            .map(|id| env.tok_trie.token(id).to_vec())
-            .collect::<Vec<_>>();
-        for (id, content) in ordinary_added {
+        if vocab.values().any(|id| *id as usize >= vocab_size) {
+            return Err("model vocabulary is smaller than tokenizer vocabulary".into());
+        }
+        let eos_ids: Vec<i32> = eos_ids.iter().map(|id| *id as i32).collect();
+        let info = TokenizerInfo::from_huggingface(&tokenizer, Some(vocab_size), Some(&eos_ids))?;
+        let bytes = Arc::new(info.decoded_vocab().to_vec());
+        let mut valid_mask = vec![0; vocab_size.div_ceil(32)];
+        for id in vocab.values() {
+            valid_mask[*id as usize / 32] |= 1 << (*id as usize % 32);
+        }
+        Ok(Self {
+            compiler: Arc::new(GrammarCompiler::new(info, 8, true, 512 * 1024 * 1024)),
+            bytes,
+            valid_mask: Arc::new(valid_mask),
+            vocab_size,
+            eos_ids,
+        })
+    }
+    /// Reuse compiled grammars while overriding request-specific termination IDs,
+    /// like vLLM's all_stop_token_ids. Stop tokens remain masked until completion.
+    pub fn with_stop_tokens(&self, stop_ids: &[i32]) -> Result<Self, String> {
+        let mut eos_ids = self.eos_ids.clone();
+        for &id in stop_ids {
+            if id < 0
+                || id as usize >= self.vocab_size
+                || self.valid_mask[id as usize / 32] & (1 << (id as usize % 32)) == 0
+            {
+                return Err("stop token is not in the tokenizer vocabulary".into());
+            }
             if !eos_ids.contains(&id) {
-                bytes[id as usize] = content;
+                eos_ids.push(id);
             }
         }
-        env.tok_trie = llguidance::toktrie::TokTrie::from(env.tok_trie.info(), &bytes)
-            .with_eos_tokens(eos_ids);
-        let env = env.to_env();
-        let mut factory = ParserFactory::new_simple(&env).map_err(|e| e.to_string())?;
-        factory.quiet();
         Ok(Self {
-            factory,
-            vocab_size,
-            eos_ids: eos_ids.iter().map(|&id| id as i32).collect(),
+            compiler: Arc::clone(&self.compiler),
+            bytes: Arc::clone(&self.bytes),
+            valid_mask: Arc::clone(&self.valid_mask),
+            vocab_size: self.vocab_size,
+            eos_ids,
         })
     }
 
     pub fn json_object(&self, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
-        self.json_schema(serde_json::json!({"type":"object"}), thinking)
+        self.json_schema(json!({"type":"object"}), thinking)
     }
-
     pub fn json_schema(
         &self,
-        schema: serde_json::Value,
+        schema: Value,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        validate_strict_schema_options(&schema)?;
-        self.compile(TopLevelGrammar::from_json_schema(schema), thinking)
+        validate_json_schema(&schema)?;
+        let g = self
+            .compiler
+            .compile_json_schema(&schema.to_string(), true, None, None, true, None)
+            .map_err(|e| e.to_string())?;
+        self.wrap(g, thinking, false)
     }
-
     pub fn regex(&self, regex: &str, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
-        self.compile(TopLevelGrammar::from_regex(regex), thinking)
+        if regex.contains('\0') {
+            return Err("regex must not contain NUL".into());
+        }
+        self.wrap(
+            self.compiler
+                .compile_regex(regex)
+                .map_err(|e| e.to_string())?,
+            thinking,
+            false,
+        )
     }
-
-    /// Lark CFG syntax, not GBNF. Token limits and hidden-stop backtracking are
-    /// deliberately excluded because this parser must support arbitrary rollback.
+    /// Accept native Lark (start rule) or EBNF (root rule).
     pub fn lark(&self, grammar: &str, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
-        self.compile(TopLevelGrammar::from_lark(grammar.into()), thinking)
+        let g = if has_ebnf_rule_operator(grammar) {
+            self.compiler.compile_grammar_ebnf(grammar, "root")
+        } else {
+            self.compiler.compile_lark(grammar, &[])
+        }
+        .map_err(|e| e.to_string())?;
+        self.wrap(g, thinking, false)
     }
-
-    /// llguidance StructTag's lazy-trigger construction, with ordinary byte
-    /// terminals (Qwen tool delimiters are added tokens, not special tokens).
     pub fn structural_tags(
         &self,
         tags: &[StructuralTag],
         triggers: &[String],
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        if tags.is_empty() || triggers.is_empty() || triggers.iter().any(String::is_empty) {
-            return Err("structural tags require nonempty structures and triggers".into());
+        let mut native = Vec::new();
+        for tag in tags {
+            validate_json_schema(&tag.schema)?;
+            native.push(json!({"type":"tag", "begin":tag.begin,"end":tag.end,"content":{"type":"json_schema","json_schema":tag.schema}}));
         }
-        if triggers.iter().enumerate().any(|(i, t)| {
-            triggers
-                .iter()
-                .enumerate()
-                .any(|(j, u)| i != j && t.starts_with(u))
-        }) {
-            return Err("structural triggers must not overlap".into());
-        }
-        let alternatives = (0..tags.len())
-            .map(|i| format!("tag_{i}"))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let mut lark =
-            format!("start: ({alternatives})* tag_end\ntag_end: TAG_TEXT\nTAG_TEXT: /(?s:.*)/\n");
-        for (index, tag) in tags.iter().enumerate() {
-            validate_strict_schema_options(&tag.schema)?;
-            let trigger = triggers
-                .iter()
-                .find(|trigger| tag.begin.starts_with(trigger.as_str()))
-                .ok_or("each structural begin must start with a declared trigger")?;
-            let suffix = &tag.begin[trigger.len()..];
-            lark.push_str(&format!(
-                "tag_{index}_trig[lazy]: TAG_TEXT {}\ntag_{index}: tag_{index}_trig {} %json {} {}\n",
-                serde_json::to_string(trigger).unwrap(),
-                serde_json::to_string(suffix).unwrap(),
-                tag.schema,
-                serde_json::to_string(&tag.end).unwrap(),
-            ));
-        }
-        if triggers
-            .iter()
-            .any(|trigger| !tags.iter().any(|tag| tag.begin.starts_with(trigger)))
-        {
-            return Err("every structural trigger must have at least one structure".into());
-        }
-        self.lark(&lark, thinking)
+        self.structural_tag(json!({"type":"structural_tag","format":{"type":"triggered_tags","triggers":triggers,"tags":native}}), thinking)
     }
-
-    pub fn tools(
+    pub fn structural_tag(
         &self,
-        tools: &serde_json::Value,
-        choice: &crate::tool_constraints::ToolChoice,
-        format: crate::tool_constraints::ToolFormat,
+        value: Value,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        if *choice != crate::tool_constraints::ToolChoice::None {
-            for tool in tools.as_array().ok_or("tools must be an array")? {
-                if let crate::tool_constraints::ToolChoice::Named(name) = choice
-                    && tool["function"]["name"].as_str() != Some(name.as_str())
-                {
-                    continue;
-                }
-                if let Some(schema) = tool.get("function").and_then(|f| f.get("parameters")) {
-                    // Validate complete schemas before XML lowering, including
-                    // keywords (such as additionalProperties) not emitted there.
-                    self.json_schema(schema.clone(), false)?;
-                }
-            }
-        }
-        let grammar = crate::tool_constraints::tool_grammar(tools, choice, format)?;
-        self.lark(
-            &grammar,
-            thinking && *choice != crate::tool_constraints::ToolChoice::None,
+        validate_tag_schemas(&value)?;
+        self.wrap(
+            self.compiler
+                .compile_structural_tag(&value.to_string())
+                .map_err(|e| e.to_string())?,
+            thinking,
+            false,
         )
     }
-
-    fn compile(
+    pub fn tools(
         &self,
-        mut grammar: TopLevelGrammar,
+        tools: &Value,
+        choice: &crate::tool_constraints::ToolChoice,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
-        if thinking {
-            grammar.grammars[0].name = Some("answer".into());
-            grammar.grammars.insert(
-                0,
-                GrammarWithLexer::from_lark(
-                    "start: reasoning @answer\nreasoning[suffix=\"</think>\"]: REASON_TEXT\nREASON_TEXT: /(?s:.*)/ & ~/(?s:.*)<tool_call>(?s:.*)/".into(),
-                ),
-            );
-        }
-        let parser = self
-            .factory
-            .create_parser(grammar)
+        self.tools_with_parallel(tools, choice, thinking, true)
+    }
+
+    pub fn tools_with_parallel(
+        &self,
+        tools: &Value,
+        choice: &crate::tool_constraints::ToolChoice,
+        thinking: bool,
+        parallel: bool,
+    ) -> Result<TokenBitmaskConstraint, String> {
+        let Some(value) =
+            crate::tool_constraints::tool_structural_tag_with_parallel(tools, choice, parallel)?
+        else {
+            let mut c = TokenBitmaskConstraint::unconstrained(self.vocab_size)
+                .with_terminal_eos_ids(self.eos_ids.clone());
+            c.mask = self.valid_mask.as_ref().clone();
+            c.base_mask = Arc::clone(&self.valid_mask);
+            return Ok(c);
+        };
+        validate_tag_schemas(&value)?;
+        let g = self
+            .compiler
+            .compile_structural_tag(&value.to_string())
             .map_err(|e| e.to_string())?;
-        parser
-            .parser
-            .grammar()
-            .lexer_spec()
-            .check_rollback()
-            .map_err(|e| e.to_string())?;
-        let mut matcher = Matcher::new(Ok(parser));
-        if let Some(error) = matcher.get_error() {
-            return Err(error);
-        }
-        // Never silently weaken an unsupported strict schema.
-        let warnings = matcher.grammar_warnings();
-        if !warnings.is_empty() {
-            return Err(format!("unsupported grammar: {}", warnings.join("; ")));
-        }
-        let mask = matcher
-            .compute_mask_or_eos()
-            .map_err(|e| e.to_string())?
-            .as_slice()
-            .to_vec();
-        Ok(TokenBitmaskConstraint {
-            vocab_size: self.vocab_size,
-            matcher: Some(matcher),
-            eos_ids: self.eos_ids.clone(),
-            terminal_eos: false,
-            pending_token: None,
-            pre_eos_mask: None,
-            mask,
-            committed: 0,
-        })
+        self.wrap(g, thinking, true)
+    }
+    fn wrap(
+        &self,
+        g: CompiledGrammar,
+        thinking: bool,
+        implicit_tool: bool,
+    ) -> Result<TokenBitmaskConstraint, String> {
+        let mut c = TokenBitmaskConstraint::unconstrained(self.vocab_size);
+        c.matcher = Some(
+            GrammarMatcher::with_options(&g, Some(self.eos_ids.clone()), false, None)
+                .map_err(|e| e.to_string())?,
+        );
+        c.bytes = Arc::clone(&self.bytes);
+        c.base_mask = Arc::clone(&self.valid_mask);
+        c.eos_ids = self.eos_ids.clone();
+        c.gate = thinking.then(Vec::new);
+        c.implicit_tool = implicit_tool;
+        c.refresh()?;
+        Ok(c)
     }
 }
 
-fn validate_strict_schema_options(value: &serde_json::Value) -> Result<(), String> {
-    match value {
-        serde_json::Value::Object(object) => {
-            if object
-                .get("x-guidance")
-                .and_then(|v| v.get("lenient"))
-                .and_then(|v| v.as_bool())
-                == Some(true)
-            {
-                return Err("lenient schemas are not allowed for strict constrained output".into());
-            }
-            for value in object.values() {
-                validate_strict_schema_options(value)?;
+fn validate_tag_schemas(v: &Value) -> Result<(), String> {
+    if let Some(schema) = v.get("json_schema") {
+        validate_json_schema(schema)?;
+    }
+    match v {
+        Value::Object(o) => {
+            for (k, v) in o {
+                if k != "json_schema" {
+                    validate_tag_schemas(v)?;
+                }
             }
         }
-        serde_json::Value::Array(items) => {
-            for value in items {
-                validate_strict_schema_options(value)?;
+        Value::Array(a) => {
+            for v in a {
+                validate_tag_schemas(v)?;
             }
         }
         _ => {}
@@ -247,30 +259,171 @@ fn validate_strict_schema_options(value: &serde_json::Value) -> Result<(), Strin
     Ok(())
 }
 
+/// Reject known silently weakened constraints, while leaving schema syntax and
+/// supported extensions to the native compiler. Traverse schema positions only
+/// (a property named `contains`, or an enum object, is not a keyword).
+pub(crate) fn validate_json_schema(v: &Value) -> Result<(), String> {
+    let Some(o) = v.as_object() else {
+        return Ok(());
+    };
+    if let Some(reference) = o.get("$ref").and_then(Value::as_str)
+        && reference != "#"
+        && !reference.starts_with("#/")
+    {
+        return Err("only local JSON schema references are supported".into());
+    }
+    // Native 0.2.8 otherwise warns and lowers overlapping oneOf to anyOf.
+    // Accept the common provably-disjoint primitive-type case; reject other
+    // cases conservatively rather than silently weaken exclusivity.
+    if let Some(branches) = o.get("oneOf").and_then(Value::as_array) {
+        for (i, a) in branches.iter().enumerate() {
+            for b in &branches[i + 1..] {
+                let disjoint = match (
+                    a.get("type").and_then(Value::as_str),
+                    b.get("type").and_then(Value::as_str),
+                ) {
+                    (Some(a), Some(b)) => {
+                        a != b
+                            && !(["integer", "number"].contains(&a)
+                                && ["integer", "number"].contains(&b))
+                    }
+                    _ => false,
+                };
+                if !disjoint {
+                    return Err("oneOf branches must have provably disjoint primitive types; use anyOf for overlapping alternatives".into());
+                }
+            }
+        }
+    }
+    for k in [
+        "multipleOf",
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentSchemas",
+        "dependentRequired",
+    ] {
+        if o.contains_key(k) {
+            return Err(format!("unsupported JSON schema keyword: {k}"));
+        }
+    }
+    if (o.contains_key("pattern") || o.contains_key("format"))
+        && (o.contains_key("minLength") || o.contains_key("maxLength"))
+    {
+        return Err("pattern/format combined with length bounds is unsupported".into());
+    }
+    if let Some(f) = o.get("format").and_then(Value::as_str)
+        && ![
+            "email",
+            "date",
+            "time",
+            "date-time",
+            "duration",
+            "ipv4",
+            "ipv6",
+            "hostname",
+            "uuid",
+            "uri",
+            "uri-reference",
+            "uri-template",
+            "json-pointer",
+            "relative-json-pointer",
+        ]
+        .contains(&f)
+    {
+        return Err(format!("unsupported string format: {f}"));
+    }
+    if o.contains_key("propertyNames")
+        && (o.contains_key("properties")
+            || o.contains_key("patternProperties")
+            || o.get("additionalProperties").is_some_and(Value::is_object)
+            || o.get("unevaluatedProperties")
+                .is_some_and(|v| v != &Value::Bool(true)))
+    {
+        return Err(
+            "propertyNames combined with object property constraints is unsupported".into(),
+        );
+    }
+    if let Some(p) = o.get("patternProperties").and_then(Value::as_object)
+        && (p.len() > 1 || o.contains_key("properties"))
+    {
+        return Err("overlapping patternProperties constraints are unsupported".into());
+    }
+    for k in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let Some(m) = o.get(k).and_then(Value::as_object) {
+            for v in m.values() {
+                validate_json_schema(v)?;
+            }
+        }
+    }
+    for k in [
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+    ] {
+        if let Some(v) = o.get(k) {
+            if let Some(a) = v.as_array() {
+                for v in a {
+                    validate_json_schema(v)?;
+                }
+            } else {
+                validate_json_schema(v)?;
+            }
+        }
+    }
+    for k in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(a) = o.get(k).and_then(Value::as_array) {
+            for v in a {
+                validate_json_schema(v)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct Step {
+    gate: Option<Vec<u8>>,
+    matcher_step: bool,
+    terminal: bool,
+}
+type ReasoningMasks = Arc<Mutex<HashMap<Vec<u8>, Vec<u32>>>>;
+
 #[derive(Clone)]
 pub struct TokenBitmaskConstraint {
     vocab_size: usize,
-    matcher: Option<Matcher>,
+    matcher: Option<GrammarMatcher>,
+    bytes: Arc<Vec<Vec<u8>>>,
+    base_mask: Arc<Vec<u32>>,
     eos_ids: Vec<i32>,
-    terminal_eos: bool,
+    gate: Option<Vec<u8>>,
+    implicit_tool: bool,
+    reasoning_masks: ReasoningMasks,
+    terminal: bool,
     pending_token: Option<i32>,
-    pre_eos_mask: Option<Vec<u32>>,
     mask: Vec<u32>,
-    committed: usize,
+    history: Vec<Step>,
 }
-
 impl std::fmt::Debug for TokenBitmaskConstraint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenBitmaskConstraint")
             .field("vocab_size", &self.vocab_size)
             .field("grammar", &self.matcher.is_some())
+            .field("gate", &self.gate)
+            .field("terminal", &self.terminal)
             .field("pending_token", &self.pending_token)
-            .field("committed", &self.committed)
+            .field("committed", &self.committed_len())
             .field("mask", &self.mask)
             .finish()
     }
 }
-
 impl TokenBitmaskConstraint {
     pub fn unconstrained(vocab_size: usize) -> Self {
         let mut mask = vec![u32::MAX; vocab_size.div_ceil(32)];
@@ -280,400 +433,401 @@ impl TokenBitmaskConstraint {
         Self {
             vocab_size,
             matcher: None,
+            bytes: Arc::new(Vec::new()),
+            base_mask: Arc::new(mask.clone()),
             eos_ids: Vec::new(),
-            terminal_eos: false,
+            gate: None,
+            implicit_tool: false,
+            reasoning_masks: Arc::new(Mutex::new(HashMap::new())),
+            terminal: false,
             pending_token: None,
-            pre_eos_mask: None,
             mask,
-            committed: 0,
+            history: Vec::new(),
         }
     }
-
     pub fn from_allowed_tokens(vocab_size: usize, allowed: Vec<i32>) -> Self {
-        let mut mask = vec![0; vocab_size.div_ceil(32)];
+        let mut c = Self::unconstrained(vocab_size);
+        c.mask.fill(0);
         for id in allowed {
             if id >= 0 && (id as usize) < vocab_size {
-                mask[id as usize / 32] |= 1 << (id as usize % 32);
+                c.mask[id as usize / 32] |= 1 << (id as usize % 32);
             }
         }
-        Self {
-            vocab_size,
-            matcher: None,
-            eos_ids: Vec::new(),
-            terminal_eos: false,
-            pending_token: None,
-            pre_eos_mask: None,
-            mask,
-            committed: 0,
-        }
+        c.base_mask = Arc::new(c.mask.clone());
+        c
     }
-
-    pub fn with_terminal_eos_ids(mut self, eos_ids: Vec<i32>) -> Self {
-        self.eos_ids = eos_ids;
+    pub fn with_terminal_eos_ids(mut self, ids: Vec<i32>) -> Self {
+        self.eos_ids = ids;
         self
     }
-
-    #[inline]
     pub fn has_pending(&self) -> bool {
         self.pending_token.is_some()
     }
-
-    #[inline]
     pub fn is_terminal_eos(&self) -> bool {
-        self.terminal_eos
+        self.terminal
+            || self
+                .pending_token
+                .is_some_and(|id| self.eos_ids.contains(&id))
     }
-
     pub fn committed_len(&self) -> usize {
-        self.committed
+        self.history.len() + usize::from(self.has_pending())
     }
-
     pub fn current_bitmask(&self) -> Vec<u32> {
-        debug_assert!(
-            self.pending_token.is_none(),
-            "materialize_pending() must run before reading current_bitmask()"
-        );
-        self.mask.clone()
+        self.mask_words().to_vec()
     }
-
     pub fn mask_words(&self) -> &[u32] {
-        debug_assert!(
-            self.pending_token.is_none(),
-            "materialize_pending() must run before reading mask_words()"
-        );
+        assert!(!self.has_pending(), "materialize pending mask first");
         &self.mask
     }
-
     pub fn is_token_allowed(&self, id: i32) -> bool {
-        debug_assert!(
-            self.pending_token.is_none(),
-            "materialize_pending() must run before checking is_token_allowed()"
-        );
         id >= 0
             && (id as usize) < self.vocab_size
-            && self.mask[id as usize / 32] & (1 << (id as usize % 32)) != 0
+            && self.mask_words()[id as usize / 32] & (1 << (id as usize % 32)) != 0
     }
-
-    /// Materializes a deferred `advance_deferred` token (`consume_token` + `compute_mask_or_eos`)
-    /// in-place while the next GPU forward pass is already executing on the device stream.
-    pub fn materialize_pending(&mut self) -> Result<(), String> {
-        let Some(id) = self.pending_token.take() else {
-            return Ok(());
-        };
-        if let Some(matcher) = &mut self.matcher {
-            if let Err(e) = matcher.consume_token(id as u32) {
-                self.pending_token = Some(id);
-                return Err(e.to_string());
-            }
-            match matcher.compute_mask_or_eos() {
-                Ok(mask) => {
-                    self.mask.clear();
-                    self.mask.extend_from_slice(mask.as_slice());
-                }
-                Err(e) => {
-                    let _ = matcher.rollback(1);
-                    self.pending_token = Some(id);
-                    return Err(e.to_string());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Validates `id` against the active bitmask and records it for deferred `llguidance`
-    /// materialization during the next GPU forward pass.
     pub fn advance_deferred(&mut self, id: i32) -> Result<(), String> {
         self.materialize_pending()?;
         if !self.is_token_allowed(id) {
             return Err(format!("token {id} violates grammar"));
         }
-        // `eos_ids` holds terminal EOS tokens (populated by `ConstraintFactory` or
-        // `with_terminal_eos_ids`). Save `pre_eos_mask` when matcher-less so `rollback`
-        // restores the pre-terminal bitmask.
-        if self.eos_ids.contains(&id) {
-            if self.matcher.is_none() {
-                self.pre_eos_mask = Some(self.mask.clone());
-            }
-            self.terminal_eos = true;
-            self.mask.fill(0);
-            self.committed += 1;
-            return Ok(());
-        }
-        if self.matcher.is_some() {
-            self.pending_token = Some(id);
-        }
-        self.committed += 1;
+        self.pending_token = Some(id);
         Ok(())
     }
-
-    /// Publish only after consuming and computing the successor mask succeeds.
     pub fn advance(&mut self, id: i32) -> Result<(), String> {
-        self.materialize_pending()?;
-        if !self.is_token_allowed(id) {
-            return Err(format!("token {id} violates grammar"));
+        self.advance_deferred(id)?;
+        if let Err(e) = self.materialize_pending() {
+            self.pending_token = None;
+            return Err(e);
         }
-        // EOS is an output event, not a grammar byte/token. llguidance may
-        // already be stopped at NoExtension; consuming its EOS-only mask then
-        // would error. Track EOS separately so rollback still counts emitted tokens.
-        if self.eos_ids.contains(&id) {
-            if self.matcher.is_none() {
-                self.pre_eos_mask = Some(self.mask.clone());
-            }
-            self.terminal_eos = true;
-            self.mask.fill(0);
-            self.committed += 1;
-            return Ok(());
-        }
-        if let Some(matcher) = &mut self.matcher {
-            matcher
-                .consume_token(id as u32)
-                .map_err(|e| e.to_string())?;
-            match matcher.compute_mask_or_eos() {
-                Ok(mask) => {
-                    self.mask.clear();
-                    self.mask.extend_from_slice(mask.as_slice());
-                }
-                Err(e) => {
-                    let _ = matcher.rollback(1);
-                    return Err(e.to_string());
-                }
-            }
-        }
-        self.committed += 1;
         Ok(())
     }
-
-    pub fn rollback(&mut self, count: usize) -> Result<(), String> {
-        if count > self.committed {
-            return Err("grammar rollback exceeds committed tokens".into());
-        }
-        if count == 0 {
+    pub fn materialize_pending(&mut self) -> Result<(), String> {
+        let Some(id) = self.pending_token else {
             return Ok(());
+        };
+        let step = Step {
+            gate: self.gate.clone(),
+            matcher_step: false,
+            terminal: self.terminal,
+        };
+        let mut used = false;
+        if let Some(prefix) = &self.gate {
+            if self.eos_ids.contains(&id) {
+                self.terminal = true;
+            } else {
+                let (next, answer) =
+                    gate_token(prefix, &self.bytes[id as usize], self.implicit_tool);
+                if let Some(answer) = answer
+                    && !answer.is_empty()
+                {
+                    if !self.matcher.as_mut().unwrap().accept_bytes(&answer) {
+                        return Err("reasoning boundary suffix violates grammar".into());
+                    }
+                    used = true;
+                }
+                self.gate = next;
+            }
+        } else if let Some(m) = &mut self.matcher {
+            if !m.accept_token(id) {
+                return Err(format!("native matcher rejected token {id}"));
+            }
+            used = true;
+            self.terminal = m.is_terminated();
+        } else {
+            self.terminal = self.eos_ids.contains(&id);
         }
-        let mut rem = count;
-        if self.pending_token.is_some() {
-            self.pending_token = None;
-            self.committed -= 1;
-            rem -= 1;
-            if rem == 0 {
+        if let Err(e) = self.refresh() {
+            if used {
+                self.matcher
+                    .as_mut()
+                    .unwrap()
+                    .rollback(1)
+                    .map_err(|e| e.to_string())?;
+            }
+            self.gate = step.gate;
+            self.terminal = step.terminal;
+            return Err(e);
+        }
+        self.history.push(Step {
+            matcher_step: used,
+            ..step
+        });
+        self.pending_token = None;
+        Ok(())
+    }
+    fn refresh(&mut self) -> Result<(), String> {
+        let mut mask = self.base_mask.as_ref().clone();
+        if self.terminal {
+            mask.fill(0);
+        } else if let Some(prefix) = &self.gate {
+            // The grammar has not advanced while this gate is active. Each finite
+            // delimiter-prefix state therefore has one immutable mask, reusable
+            // across reasoning tokens and speculative forks/rollbacks.
+            let mut cached = self
+                .reasoning_masks
+                .lock()
+                .map_err(|_| "reasoning mask cache poisoned")?;
+            if let Some(saved) = cached.get(prefix) {
+                self.mask.clone_from(saved);
                 return Ok(());
             }
-        }
-        if let Some(matcher) = &self.matcher {
-            let mut next = matcher.clone();
-            let grammar_count = rem - usize::from(self.terminal_eos);
-            if grammar_count > 0 {
-                next.rollback(grammar_count).map_err(|e| e.to_string())?;
+            // Only tokens that cross a boundary need a matcher fork. Ordinary
+            // reasoning tokens never clone the growing grammar parser.
+            for (id, bytes) in self.bytes.iter().enumerate() {
+                if id >= self.vocab_size || self.eos_ids.contains(&(id as i32)) {
+                    continue;
+                }
+                let (_, answer) = gate_token(prefix, bytes, self.implicit_tool);
+                if let Some(answer) = answer
+                    && !answer.is_empty()
+                    && !self.matcher.as_ref().unwrap().fork().accept_bytes(&answer)
+                {
+                    mask[id / 32] &= !(1 << (id % 32));
+                }
             }
-            let mask = next.compute_mask_or_eos().map_err(|e| e.to_string())?;
-            self.mask.clear();
-            self.mask.extend_from_slice(mask.as_slice());
-            self.matcher = Some(next);
-        } else if let Some(saved) = self.pre_eos_mask.take() {
-            self.mask = saved;
+            cached.insert(prefix.clone(), mask.clone());
+        } else if let Some(m) = &mut self.matcher {
+            let mut native = vec![0i32; mask.len()];
+            m.fill_next_token_bitmask(&mut native, &[1, mask.len() as i64], 0)
+                .map_err(|e| e.to_string())?;
+            for (word, native) in mask.iter_mut().zip(native) {
+                *word &= native as u32;
+            }
         }
-        self.terminal_eos = false;
-        self.committed -= rem;
+        self.mask = mask;
         Ok(())
     }
+    pub fn rollback(&mut self, count: usize) -> Result<(), String> {
+        if count > self.committed_len() {
+            return Err("grammar rollback exceeds committed tokens".into());
+        }
+        let mut remaining = count;
+        if remaining > 0 && self.pending_token.take().is_some() {
+            remaining -= 1;
+        }
+        if remaining == 0 {
+            return Ok(());
+        }
+        let start = self.history.len() - remaining;
+        let native = self.history[start..]
+            .iter()
+            .filter(|s| s.matcher_step)
+            .count();
+        if native > 0 {
+            self.matcher
+                .as_mut()
+                .unwrap()
+                .rollback(i32::try_from(native).map_err(|_| "rollback too large")?)
+                .map_err(|e| e.to_string())?;
+        }
+        self.gate = self.history[start].gate.clone();
+        self.terminal = self.history[start].terminal;
+        self.history.truncate(start);
+        self.refresh()
+    }
+}
+
+/// Return the next partial delimiter, or the exact grammar bytes after activation.
+fn gate_token(
+    prefix: &[u8],
+    bytes: &[u8],
+    implicit_tool: bool,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut input = prefix.to_vec();
+    input.extend_from_slice(bytes);
+    let markers: &[&[u8]] = if implicit_tool {
+        &[b"</think>", b"<tool_call>"]
+    } else {
+        &[b"</think>"]
+    };
+    let hit = markers
+        .iter()
+        .filter_map(|marker| {
+            input
+                .windows(marker.len())
+                .position(|w| w == *marker)
+                .map(|pos| (pos, *marker))
+        })
+        .min_by_key(|(pos, _)| *pos);
+    if let Some((pos, marker)) = hit {
+        let start = if marker == b"<tool_call>" {
+            pos
+        } else {
+            pos + marker.len()
+        };
+        return (None, Some(input[start..].to_vec()));
+    }
+    let keep = (1..=input.len().min(10))
+        .rev()
+        .find(|n| {
+            markers
+                .iter()
+                .any(|m| m.starts_with(&input[input.len() - n..]))
+        })
+        .unwrap_or(0);
+    (Some(input[input.len() - keep..].to_vec()), None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_token_bitmask_allowed_tokens() {
-        let mask = TokenBitmaskConstraint::from_allowed_tokens(128, vec![0, 31, 32, 63, 64]);
-        assert_eq!(mask.vocab_size, 128);
-
-        // Word 0 (tokens 0..32): bit 0 and bit 31 set
-        assert!(mask.is_token_allowed(0));
-        assert!(mask.is_token_allowed(31));
-        assert!(!mask.is_token_allowed(1));
-        assert!(!mask.is_token_allowed(30));
-
-        // Word 1 (tokens 32..64): bit 0 and bit 31 set
-        assert!(mask.is_token_allowed(32));
-        assert!(mask.is_token_allowed(63));
-        assert!(!mask.is_token_allowed(33));
-
-        // Word 2 (tokens 64..96): bit 0 set
-        assert!(mask.is_token_allowed(64));
-        assert!(!mask.is_token_allowed(65));
-
-        // Out of bounds
-        assert!(!mask.is_token_allowed(-1));
-        assert!(!mask.is_token_allowed(128));
-        assert!(!mask.is_token_allowed(200));
-    }
-
-    #[test]
-    fn test_token_bitmask_u32_slice_packing() {
-        let mask = TokenBitmaskConstraint::from_allowed_tokens(64, vec![0, 33]);
-        let slice = mask.mask_words();
-        assert_eq!(slice.len(), 2);
-        assert_eq!(slice[0], 1u32); // bit 0
-        assert_eq!(slice[1], 1u32 << 1); // bit 1 of word 1 (token 33 = 32 + 1)
-    }
-
-    #[test]
-    fn test_strict_schema_options_validation() {
-        let valid = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"}
-            }
-        });
-        assert!(validate_strict_schema_options(&valid).is_ok());
-
-        let invalid = serde_json::json!({
-            "type": "object",
-            "x-guidance": {
-                "lenient": true
-            }
-        });
-        assert!(validate_strict_schema_options(&invalid).is_err());
-    }
-
-    #[test]
-    fn test_terminal_eos_advance_and_rollback_without_matcher() {
-        let mut c = TokenBitmaskConstraint::unconstrained(64).with_terminal_eos_ids(vec![7]);
-        assert!(!c.is_terminal_eos());
-        assert!(c.is_token_allowed(3));
-        assert!(c.is_token_allowed(7));
-
-        c.advance(3).unwrap();
-        assert!(!c.is_terminal_eos());
-        assert_eq!(c.committed_len(), 1);
-
-        c.advance(7).unwrap();
-        assert!(c.is_terminal_eos());
-        assert_eq!(c.committed_len(), 2);
-        assert!(!c.is_token_allowed(3));
-        assert!(!c.is_token_allowed(7));
-
-        c.rollback(1).unwrap();
-        assert!(!c.is_terminal_eos());
-        assert_eq!(c.committed_len(), 1);
-        assert!(c.is_token_allowed(3));
-        assert!(c.is_token_allowed(7));
-    }
-
-    fn make_test_factory() -> (tokenizers::Tokenizer, ConstraintFactory) {
-        let mut alphabet: Vec<_> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
-            .into_iter()
-            .collect();
-        alphabet.sort();
-        let mut vocab = serde_json::Map::new();
-        for (id, ch) in alphabet.into_iter().enumerate() {
-            vocab.insert(ch.to_string(), serde_json::json!(id));
-        }
-        vocab.insert("<|im_end|>".into(), serde_json::json!(256));
-        vocab.insert("<think>".into(), serde_json::json!(257));
-        vocab.insert("</think>".into(), serde_json::json!(258));
-        vocab.insert("<tool_call>".into(), serde_json::json!(259));
-        vocab.insert("</tool_call>".into(), serde_json::json!(260));
-        let tok = tokenizers::Tokenizer::from_bytes(
-            serde_json::to_vec(&serde_json::json!({
-                "version": "1.0",
-                "truncation": null,
-                "padding": null,
-                "added_tokens": [
-                    {"id": 256, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
-                    {"id": 257, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false},
-                    {"id": 258, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false},
-                    {"id": 259, "content": "<tool_call>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false},
-                    {"id": 260, "content": "</tool_call>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}
-                ],
-                "normalizer": null,
-                "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
-                "post_processor": null,
-                "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false},
-                "model": {"type": "BPE", "vocab": vocab, "merges": []}
-            }))
-            .unwrap(),
+    fn factory() -> ConstraintFactory {
+        let mut bytes: Vec<Vec<u8>> = (0..=255).map(|b| vec![b]).collect();
+        bytes.extend([
+            b"</s>".to_vec(),
+            b"</think>a".to_vec(),
+            b"</think>x".to_vec(),
+            b"<tool_call>".to_vec(),
+        ]);
+        let info = TokenizerInfo::new_from_bytes(
+            &bytes,
+            xgrammar::VocabType::Raw,
+            Some(263),
+            Some(vec![256]),
+            false,
         )
         .unwrap();
-        let factory = ConstraintFactory::new(tok.clone(), 264, &[256]).unwrap();
-        (tok, factory)
+        let mut mask = vec![0; 263usize.div_ceil(32)];
+        for id in 0..bytes.len() {
+            mask[id / 32] |= 1 << (id % 32);
+        }
+        ConstraintFactory {
+            compiler: Arc::new(GrammarCompiler::new(info, 1, true, 1024 * 1024)),
+            bytes: Arc::new(bytes),
+            valid_mask: Arc::new(mask),
+            vocab_size: 263,
+            eos_ids: vec![256],
+        }
+    }
+    #[test]
+    fn grammar_operators_in_literals_and_comments() {
+        let f = factory();
+        for (grammar, output) in [
+            (r#"start: "::=""#, "::="),
+            (r#"start: /::=/"#, "::="),
+            ("// ::= ignored\nstart: \"ok\"", "ok"),
+            ("# ::= ignored\nstart: \"ok\"", "ok"),
+            (r#"start: "\"::=""#, "\"::="),
+            (r#"start: /\/::=/"#, "/::="),
+            (r##"root ::= "#""##, "#"),
+        ] {
+            let mut constraint = f
+                .lark(grammar, false)
+                .unwrap_or_else(|e| panic!("{grammar}: {e}"));
+            assert!(!constraint.is_token_allowed(b'x' as i32));
+            for byte in output.bytes() {
+                constraint.advance(byte as i32).unwrap();
+            }
+            assert!(constraint.is_token_allowed(256), "{grammar}");
+        }
+        assert!(f.lark(r#"root ::= "ok""#, false).is_ok());
+        assert!(f.lark("root ::= (", false).is_err());
+    }
+    #[test]
+    fn request_stop_tokens_are_masked_until_grammar_completion() {
+        let f = factory();
+        let request = f.with_stop_tokens(&[b'x' as i32]).unwrap();
+        let mut c = request.regex("ab", false).unwrap();
+        assert!(!c.is_token_allowed(b'x' as i32));
+        c.advance(b'a' as i32).unwrap();
+        assert!(!c.is_token_allowed(b'x' as i32));
+        c.advance(b'b' as i32).unwrap();
+        assert!(c.is_token_allowed(b'x' as i32));
+        c.advance(b'x' as i32).unwrap();
+        assert!(c.is_terminal_eos());
+        c.rollback(1).unwrap();
+        assert!(c.is_token_allowed(256));
+        assert!(f.with_stop_tokens(&[262]).is_err());
+        assert!(!f.regex("ab", false).unwrap().is_token_allowed(b'x' as i32));
     }
 
     #[test]
-    fn test_constraint_factory_grammars_advance_deferred_and_rollback() {
-        let (tok, factory) = make_test_factory();
-        assert!(ConstraintFactory::new(tok.clone(), 264, &[]).is_err());
-        assert!(ConstraintFactory::new(tok.clone(), 264, &[999]).is_err());
-
-        let mut c = factory.regex("ab", false).unwrap();
-        assert!(format!("{c:?}").contains("TokenBitmaskConstraint"));
-        assert!(!c.current_bitmask().is_empty());
-
-        let ids = tok.encode("ab", false).unwrap().get_ids().to_vec();
-        c.advance_deferred(ids[0] as i32).unwrap();
-        assert!(c.has_pending());
-        c.materialize_pending().unwrap();
-        assert!(!c.has_pending());
-
-        c.advance_deferred(ids[1] as i32).unwrap();
+    fn native_eos_deferred_clone_rollback() {
+        let f = factory();
+        let mut c = f.regex("ab", false).unwrap();
+        assert!(c.is_token_allowed(97));
+        assert!(!c.is_token_allowed(256));
+        c.advance_deferred(97).unwrap();
+        let mut branch = c.clone();
+        branch.materialize_pending().unwrap();
+        branch.advance(98).unwrap();
+        assert!(branch.is_token_allowed(256));
+        branch.advance(256).unwrap();
+        assert!(branch.is_terminal_eos());
+        assert!(branch.mask_words().iter().all(|w| *w == 0));
+        branch.rollback(1).unwrap();
+        assert!(branch.is_token_allowed(256));
+        branch.rollback(2).unwrap();
+        assert_eq!(branch.committed_len(), 0);
+        assert!(branch.is_token_allowed(97));
         c.rollback(1).unwrap();
-        assert!(!c.has_pending());
-        c.advance(ids[1] as i32).unwrap();
-        c.advance(256).unwrap();
-        assert!(c.is_terminal_eos());
-        c.rollback(2).unwrap();
-        assert!(!c.is_terminal_eos());
-        assert!(c.rollback(99).is_err());
-
-        // JSON object, thinking wrapper, structural tags, and tools
-        assert!(factory.json_object(true).is_ok());
-        let tag = StructuralTag {
-            begin: "<tool>".into(),
-            end: "</tool>".into(),
-            schema: serde_json::json!({"type": "object"}),
-        };
+        assert_eq!(c.current_bitmask(), branch.current_bitmask());
+        assert!(c.advance(98).is_err());
+        assert_eq!(c.committed_len(), 0);
+    }
+    #[test]
+    fn gate_split_transition_and_suffix_are_reversible() {
+        let f = factory();
+        let mut c = f.regex("ab", true).unwrap();
+        assert!(c.is_token_allowed(257));
+        assert!(!c.is_token_allowed(258));
+        assert!(!c.is_token_allowed(260));
+        c.advance(257).unwrap();
+        assert!(c.is_token_allowed(98));
+        c.rollback(1).unwrap();
+        assert!(c.is_token_allowed(257));
+        for b in b"reason</think>" {
+            c.advance(*b as i32).unwrap();
+        }
+        assert!(c.is_token_allowed(97));
+        assert!(!c.is_token_allowed(120));
+        c.rollback(1).unwrap();
+        assert!(c.is_token_allowed(120));
+        c.advance(b'>' as i32).unwrap();
+        c.advance(97).unwrap();
+        c.advance(98).unwrap();
+        c.rollback(3).unwrap();
+        assert!(c.is_token_allowed(120));
+    }
+    #[test]
+    fn implicit_tool_boundary_preserves_marker() {
+        let f = factory();
+        let g = f.compiler.compile_regex("<tool_call>a").unwrap();
+        let mut c = f.wrap(g, true, true).unwrap();
+        c.advance(259).unwrap();
+        assert!(c.is_token_allowed(97));
+        c.rollback(1).unwrap();
+        assert!(c.is_token_allowed(120));
+    }
+    #[test]
+    fn static_masks_and_validation() {
+        let mut c = TokenBitmaskConstraint::from_allowed_tokens(35, vec![1, 34, 35, -1])
+            .with_terminal_eos_ids(vec![34]);
+        c.advance(1).unwrap();
+        c.advance(34).unwrap();
+        c.rollback(1).unwrap();
+        assert!(c.is_token_allowed(34));
+        assert_eq!(c.mask_words()[1], 4);
         assert!(
-            factory
-                .structural_tags(std::slice::from_ref(&tag), &["<tool".into()], false)
-                .is_ok()
+            validate_json_schema(&json!({"type":"string","pattern":"a+","maxLength":3})).is_err()
         );
+        assert!(validate_json_schema(&json!({"type":"object","properties":{"contains":{"type":"string"}},"enum":[{"not":true}]})).is_ok());
+        for schema in [
+            json!({"type":"integer","multipleOf":3}),
+            json!({"type":"integer","multipleOf":3,"minimum":0,"maximum":9}),
+            json!({"type":"number","multipleOf":0.5}),
+            json!({"multipleOf":null}),
+            json!({"properties":{"value":{"multipleOf":2}}}),
+        ] {
+            assert_eq!(
+                validate_json_schema(&schema).unwrap_err(),
+                "unsupported JSON schema keyword: multipleOf"
+            );
+        }
         assert!(
-            factory
-                .structural_tags(&[], &["<tool".into()], false)
-                .is_err()
-        );
-        assert!(
-            factory
-                .structural_tags(
-                    std::slice::from_ref(&tag),
-                    &["<t".into(), "<tool".into()],
-                    false
-                )
-                .is_err()
-        );
-        assert!(
-            factory
-                .structural_tags(&[tag], &["<other".into()], false)
-                .is_err()
-        );
-
-        let tools = serde_json::json!([
-            {
-                "type": "function",
-                "function": {
-                    "name": "ping",
-                    "parameters": {"type": "object", "properties": {"x": {"type": "integer"}}}
-                }
-            }
-        ]);
-        assert!(
-            factory
-                .tools(
-                    &tools,
-                    &crate::tool_constraints::ToolChoice::Auto,
-                    crate::tool_constraints::ToolFormat::QwenXml,
-                    true,
-                )
-                .is_ok()
+            validate_json_schema(
+                &json!({"properties":{"multipleOf":{"type":"integer"}},"enum":[{"multipleOf":3}]})
+            )
+            .is_ok()
         );
     }
 }

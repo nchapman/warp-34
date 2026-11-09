@@ -132,18 +132,18 @@ fn test_qwen3_parser_and_sampler_v1_speculative_rollback() {
     );
     assert_eq!(final_turn.tool_calls, streamed_tools);
 
-    // 2. Test Hermes JSON <tool_call> and implicit </think> when <tool_call> starts inside reasoning
-    let hermes_raw = r#"Reasoning directly into tool<tool_call>{"name":"search_docs","arguments":{"query":"MambaRadixCache"}}</tool_call>"#;
-    let parsed_hermes = Qwen3Parser::parse_complete(hermes_raw, true);
+    // 2. Test Qwen XML <tool_call> and implicit </think> when <tool_call> starts inside reasoning
+    let xml_raw = r#"Reasoning directly into tool<tool_call><function=search_docs><parameter=query>MambaRadixCache</parameter></function></tool_call>"#;
+    let parsed_xml = Qwen3Parser::parse_complete(xml_raw, true);
     assert_eq!(
-        parsed_hermes.reasoning_content.as_deref(),
+        parsed_xml.reasoning_content.as_deref(),
         Some("Reasoning directly into tool")
     );
-    assert_eq!(parsed_hermes.content, None);
-    assert_eq!(parsed_hermes.tool_calls.len(), 1);
-    assert_eq!(parsed_hermes.tool_calls[0].function.name, "search_docs");
+    assert_eq!(parsed_xml.content, None);
+    assert_eq!(parsed_xml.tool_calls.len(), 1);
+    assert_eq!(parsed_xml.tool_calls[0].function.name, "search_docs");
     assert_eq!(
-        parsed_hermes.tool_calls[0].function.arguments,
+        parsed_xml.tool_calls[0].function.arguments,
         r#"{"query":"MambaRadixCache"}"#
     );
 

@@ -235,8 +235,8 @@ A single `w34 serve` instance exposes:
 ### Reasoning, tool calls, and `<think>`-aware constrained decoding
 
 - **9-step GPU sampler:** Handles repetition/presence/frequency penalties, `logit_bias`, `min_tokens`, `temperature`, `min_p`, `top_k`, `top_p`, Gumbel-max sampling, and `top_logprobs` entirely on the GPU.
-- **Reasoning & Tool Parsers:** Native support for `<think>...</think>` blocks (`enable_thinking`, `reasoning_effort` / `output_config.effort`) and both **Qwen3-XML** and **Hermes-JSON** tool call formats (`tool_choice: "auto" | "required" | {"function": ...}`).
-- **Structured Outputs (`llguidance`):** Enforces **JSON Schema**, **Regex**, **Context-Free Grammars (Lark)**, and **Structural Tags** via GPU token bitmasks. When reasoning is enabled, grammar enforcement automatically waits until `</think>` closes so the model can think freely before emitting strictly valid JSON or grammar-constrained output. And when speculative decoding rejects draft tokens, the grammar state machine rolls back in lockstep with KV and GDN state.
+- **Reasoning & Tool Parsers:** Native support for `<think>...</think>` blocks (`enable_thinking`, `reasoning_effort` / `output_config.effort`) and **Qwen3-XML** tool calls (`tool_choice: "auto" | "required" | {"function": ...}`).
+- **Structured Outputs (XGrammar):** Uses the pure-Rust **`xgrammar-rs`** compiler and matcher for **JSON Schema**, **Regex**, **Context-Free Grammars (EBNF / Lark)**, and native **Structural Tags**, including Qwen XML tools. A shared compiler cache and per-request reasoning gate follow vLLM's architecture; GPU token masks constrain the answer after reasoning ends. Speculative decoding advances private matcher state and commits only accepted output. Unsupported constraints fail explicitly rather than silently becoming unconstrained. See [Structured Outputs](docs/STRUCTURED_OUTPUTS.md).
 
 ### Authentication & concurrency controls
 
