@@ -16,6 +16,44 @@ pub struct StructuralTag {
     pub schema: Value,
 }
 
+// Inspect syntax only: never retry invalid EBNF as a different language.
+// Lark's native lexer recognizes double-quoted strings, /regex/, and # / // comments.
+fn has_ebnf_rule_operator(grammar: &str) -> bool {
+    let bytes = grammar.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' | b'/' => {
+                let delimiter = bytes[i];
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(bytes.len());
+                    } else if bytes[i] == delimiter {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b':' if bytes[i..].starts_with(b"::=") => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 pub struct ConstraintFactory {
     compiler: Arc<GrammarCompiler>,
     bytes: Arc<Vec<Vec<u8>>>,
@@ -111,10 +149,7 @@ impl ConstraintFactory {
     }
     /// Accept native Lark (start rule) or EBNF (root rule).
     pub fn lark(&self, grammar: &str, thinking: bool) -> Result<TokenBitmaskConstraint, String> {
-        let g = if grammar
-            .lines()
-            .any(|l| l.split('#').next().unwrap_or("").contains("::="))
-        {
+        let g = if has_ebnf_rule_operator(grammar) {
             self.compiler.compile_grammar_ebnf(grammar, "root")
         } else {
             self.compiler.compile_lark(grammar, &[])
@@ -662,6 +697,30 @@ mod tests {
             vocab_size: 263,
             eos_ids: vec![256],
         }
+    }
+    #[test]
+    fn grammar_operators_in_literals_and_comments() {
+        let f = factory();
+        for (grammar, output) in [
+            (r#"start: "::=""#, "::="),
+            (r#"start: /::=/"#, "::="),
+            ("// ::= ignored\nstart: \"ok\"", "ok"),
+            ("# ::= ignored\nstart: \"ok\"", "ok"),
+            (r#"start: "\"::=""#, "\"::="),
+            (r#"start: /\/::=/"#, "/::="),
+            (r##"root ::= "#""##, "#"),
+        ] {
+            let mut constraint = f
+                .lark(grammar, false)
+                .unwrap_or_else(|e| panic!("{grammar}: {e}"));
+            assert!(!constraint.is_token_allowed(b'x' as i32));
+            for byte in output.bytes() {
+                constraint.advance(byte as i32).unwrap();
+            }
+            assert!(constraint.is_token_allowed(256), "{grammar}");
+        }
+        assert!(f.lark(r#"root ::= "ok""#, false).is_ok());
+        assert!(f.lark("root ::= (", false).is_err());
     }
     #[test]
     fn request_stop_tokens_are_masked_until_grammar_completion() {

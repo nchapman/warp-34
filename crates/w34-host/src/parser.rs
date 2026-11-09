@@ -5,6 +5,10 @@
 
 use std::collections::BTreeMap;
 
+mod native_schema;
+type ParameterGrammars = BTreeMap<String, native_schema::ValueGrammar>;
+type ToolGrammars = BTreeMap<String, ParameterGrammars>;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -667,12 +671,14 @@ pub struct Qwen3Parser {
     pub enable_thinking: bool,
     in_reasoning: bool,
     in_tool_call: bool,
+    finishing: bool,
     buffer: String,
     reasoning_accum: String,
     content_accum: String,
     tool_calls: Vec<ParsedToolCall>,
     next_tool_idx: usize,
     tools: Option<Vec<serde_json::Value>>,
+    value_grammars: ToolGrammars,
 }
 
 impl Qwen3Parser {
@@ -686,26 +692,45 @@ impl Qwen3Parser {
             enable_thinking,
             in_reasoning: enable_thinking,
             in_tool_call: false,
+            finishing: false,
             buffer: String::new(),
             reasoning_accum: String::new(),
             content_accum: String::new(),
             tool_calls: Vec::new(),
             next_tool_idx: 0,
             tools: None,
+            value_grammars: ToolGrammars::new(),
         }
     }
 
     /// Parse native Qwen XML using canonical OpenAI function tool schemas.
-    /// Unlike `new`, string parameters are raw text, not JSON string literals.
+    /// Unlike `new`, only the native canonical envelope is executable and string
+    /// parameters are raw text, not JSON string literals. The active generation
+    /// grammar owns schema validation; this parser only resolves argument types.
     /// An empty tool list disables call extraction (including `tool_choice: none`).
     pub fn with_tools(enable_thinking: bool, tools: &[serde_json::Value]) -> Result<Self, String> {
         let mut parser = Self::new(enable_thinking);
         let mut metadata = tools.to_vec();
         for tool in &mut metadata {
+            let name = tool
+                .pointer("/function/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
             if let Some(parameters) = tool.pointer_mut("/function/parameters") {
                 let root = parameters.clone();
                 let mut budget = 4096;
                 *parameters = Self::resolve_local_refs(&root, &root, true, 0, &mut budget)?;
+                let mut grammars = ParameterGrammars::new();
+                if let Some(properties) = parameters
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    for (key, schema) in properties {
+                        grammars.insert(key.clone(), native_schema::compile(&root, schema)?);
+                    }
+                }
+                parser.value_grammars.insert(name, grammars);
             }
         }
         parser.tools = Some(metadata);
@@ -780,7 +805,10 @@ impl Qwen3Parser {
                         result.insert(key.clone(), resolved.into());
                     }
                 }
-                _ => {}
+                "$ref" => {}
+                _ => {
+                    result.insert(key.clone(), value.clone());
+                }
             }
         }
         Ok(result.into())
@@ -838,7 +866,11 @@ impl Qwen3Parser {
         }
     }
 
-    fn convert_arg(raw: &str, schema: Option<&serde_json::Value>) -> serde_json::Value {
+    fn convert_arg(
+        raw: &str,
+        schema: Option<&serde_json::Value>,
+        grammar: Option<&native_schema::ValueGrammar>,
+    ) -> serde_json::Value {
         let mut types = Vec::new();
         if let Some(schema) = schema {
             Self::schema_types(schema, &mut types);
@@ -852,28 +884,49 @@ impl Qwen3Parser {
                 continue;
             }
             let value = match candidate {
-                "null" if raw.eq_ignore_ascii_case("null") => Some(serde_json::Value::Null),
+                "null" if raw.trim() == "null" => Some(serde_json::Value::Null),
                 "integer" => raw
                     .trim()
                     .parse::<i64>()
                     .ok()
                     .map(Into::into)
                     .or_else(|| raw.trim().parse::<u64>().ok().map(Into::into)),
-                "number" => raw
-                    .trim()
-                    .parse::<f64>()
+                "number" => serde_json::from_str::<serde_json::Number>(raw.trim())
                     .ok()
-                    .and_then(serde_json::Number::from_f64)
                     .map(Into::into),
-                "boolean" => match raw.trim().to_ascii_lowercase().as_str() {
-                    "true" | "1" => Some(true.into()),
-                    "false" | "0" => Some(false.into()),
+                "boolean" => match raw.trim() {
+                    "true" => Some(true.into()),
+                    "false" => Some(false.into()),
                     _ => None,
                 },
-                "object" | "array" => serde_json::from_str(raw).ok(),
+                "object" => serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .filter(|v| v.is_object()),
+                "array" => serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .filter(|v| v.is_array()),
                 _ => None,
             };
-            if let Some(value) = value {
+            if let Some(value) = value
+                && native_schema::accepts(&value, grammar)
+            {
+                return value;
+            }
+        }
+        // Prefer all raw bytes for unconstrained string branches. Const/enum
+        // rules, unlike xml_string, can own one padding whitespace byte on each
+        // side (the native builder uses max_whitespace_cnt: 1).
+        let leading = raw.strip_prefix([' ', '\n', '\r', '\t']).unwrap_or(raw);
+        for candidate in [
+            raw,
+            leading,
+            raw.strip_suffix([' ', '\n', '\r', '\t']).unwrap_or(raw),
+            leading
+                .strip_suffix([' ', '\n', '\r', '\t'])
+                .unwrap_or(leading),
+        ] {
+            let value = serde_json::Value::String(candidate.to_owned());
+            if native_schema::accepts(&value, grammar) {
                 return value;
             }
         }
@@ -885,17 +938,8 @@ impl Qwen3Parser {
         s.strip_suffix('\n').unwrap_or(s)
     }
 
-    /// Locate a structural delimiter without treating JSON string contents as
-    /// markup. Incomplete JSON is held until another streaming chunk arrives.
-    /// Native XML strings instead use tag boundaries: quotes/braces are literal
-    /// text (the native grammar excludes structural delimiters from raw values).
-    /// Only structured parameter schemas retain JSON-aware delimiter skipping.
-    fn find_tool_delimiter(
-        text: &str,
-        delimiter: &str,
-        native: bool,
-        properties: Option<&serde_json::Value>,
-    ) -> Option<usize> {
+    /// Legacy tolerant parsing for `new`; server parsing uses the native scanner.
+    fn find_tool_delimiter(text: &str, delimiter: &str) -> Option<usize> {
         fn skip_json(text: &str, start: usize) -> Result<usize, ()> {
             let rest = &text[start..];
             let trimmed = rest.trim_start();
@@ -938,7 +982,7 @@ impl Qwen3Parser {
             }
             false
         }
-        let mut cursor = if native { 0 } else { skip_json(text, 0).ok()? };
+        let mut cursor = skip_json(text, 0).ok()?;
         while cursor < text.len() {
             let next = cursor + text[cursor..].find('<')?;
             let rest = &text[next..];
@@ -947,20 +991,7 @@ impl Qwen3Parser {
             }
             if match_tag(rest, "<parameter=") {
                 let value_start = next + rest.find('>')? + 1;
-                let name = rest[..rest.find('>')?]
-                    .split_once('=')
-                    .map(|(_, name)| name.trim());
-                let mut types = Vec::new();
-                if let Some(schema) = name.and_then(|n| properties.and_then(|p| p.get(n))) {
-                    Self::schema_types(schema, &mut types);
-                }
-                let structured = !types.iter().any(|t| t == "string")
-                    && (types.is_empty() || types.iter().any(|t| t == "object" || t == "array"));
-                cursor = if native && !structured {
-                    value_start
-                } else {
-                    skip_json(text, value_start).ok()?
-                };
+                cursor = skip_json(text, value_start).ok()?;
             } else {
                 cursor = next + 1;
             }
@@ -968,20 +999,137 @@ impl Qwen3Parser {
         None
     }
 
+    /// Native values own all bytes until their parameter close. Outer tags in
+    /// raw strings are data; JSON alternatives additionally shield quoted closes.
+    fn native_parameter_end(
+        text: &str,
+        schema: Option<&serde_json::Value>,
+        grammar: Option<&native_schema::ValueGrammar>,
+        finishing: bool,
+    ) -> Option<usize> {
+        let mut types = Vec::new();
+        if let Some(schema) = schema {
+            Self::schema_types(schema, &mut types);
+        }
+        if types.is_empty() || types.iter().any(|t| t == "object" || t == "array") {
+            let trimmed = text.trim_start();
+            if trimmed.starts_with(['{', '[']) {
+                let mut values =
+                    serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>();
+                match values.next() {
+                    Some(Ok(value)) if native_schema::accepts(&value, grammar) => {
+                        let end = text.len() - trimmed.len() + values.byte_offset();
+                        return text[end..].find("</parameter>").map(|n| end + n);
+                    }
+                    // A failed JSON alternative may still be a complete raw
+                    // string. Wait until EOS before choosing that interpretation;
+                    // otherwise a split inside JSON could expose quoted markup.
+                    Some(Err(_)) if !finishing => return None,
+                    _ => {}
+                }
+            }
+        }
+        // Native const/enum rules may themselves contain the parameter suffix.
+        // A boundary is usable only once the value satisfies its conversion metadata.
+        text.match_indices("</parameter>").find_map(|(end, _)| {
+            native_schema::accepts(&Self::convert_arg(&text[..end], schema, grammar), grammar)
+                .then_some(end)
+        })
+    }
+
+    fn native_tool_end(
+        text: &str,
+        properties: Option<&serde_json::Value>,
+        grammars: Option<&ParameterGrammars>,
+        finishing: bool,
+    ) -> Option<usize> {
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let next = cursor + text[cursor..].find('<')?;
+            let rest = &text[next..];
+            if rest.starts_with(Self::TOOL_END) {
+                return Some(next);
+            }
+            if let Some(header) = rest.strip_prefix("<parameter=") {
+                let angle = header.find('>')?;
+                let name = &header[..angle];
+                let start = next + "<parameter=".len() + angle + 1;
+                cursor = start
+                    + Self::native_parameter_end(
+                        &text[start..],
+                        properties.and_then(|p| p.get(name)),
+                        grammars.and_then(|g| g.get(name)),
+                        finishing,
+                    )?
+                    + "</parameter>".len();
+            } else {
+                cursor = next + 1;
+            }
+        }
+        None
+    }
+
+    fn parse_native_body(
+        body: &str,
+        call_idx: usize,
+        tools: &[serde_json::Value],
+        grammars: &ToolGrammars,
+        finishing: bool,
+    ) -> Option<ParsedToolCall> {
+        let header = body.strip_prefix("\n<function=")?;
+        let (name, rest) = header.split_once(">\n")?;
+        tools
+            .iter()
+            .find(|tool| tool.pointer("/function/name").and_then(|v| v.as_str()) == Some(name))?;
+        let properties = Self::properties(body, tools);
+        let grammars = grammars.get(name);
+        let mut rest = rest.strip_suffix("\n</function>\n")?;
+        let mut params = serde_json::Map::new();
+        while !rest.trim().is_empty() {
+            // Native parameter-list whitespace is outside the value wrapper.
+            rest = rest.trim_start_matches([' ', '\n', '\r', '\t']);
+            let header = rest.strip_prefix("<parameter=")?;
+            let (name, value) = header.split_once('>')?;
+            if name.trim() != name || params.contains_key(name) {
+                return None;
+            }
+            let schema = properties.and_then(|p| p.get(name));
+            let grammar = grammars.and_then(|g| g.get(name));
+            let end = Self::native_parameter_end(value, schema, grammar, finishing)?;
+            let converted = Self::convert_arg(&value[..end], schema, grammar);
+            if !native_schema::accepts(&converted, grammar) {
+                return None;
+            }
+            params.insert(name.to_owned(), converted);
+            rest = &value[end + "</parameter>".len()..];
+        }
+        Some(ParsedToolCall {
+            id: format!("call_w34_{call_idx}"),
+            call_type: "function".into(),
+            function: ParsedFunctionCall {
+                name: name.into(),
+                arguments: serde_json::to_string(&params).ok()?,
+            },
+        })
+    }
+
     /// Parses Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
     /// inside a `<tool_call>...</tool_call>` body.
     pub fn parse_tool_body(raw_body: &str, call_idx: usize) -> Option<ParsedToolCall> {
-        Self::parse_tool_body_with_tools(raw_body, call_idx, None)
+        Self::parse_tool_body_with_tools(raw_body, call_idx, None, &ToolGrammars::new(), false)
     }
 
     fn parse_tool_body_with_tools(
         raw_body: &str,
         call_idx: usize,
         tools: Option<&[serde_json::Value]>,
+        grammars: &ToolGrammars,
+        finishing: bool,
     ) -> Option<ParsedToolCall> {
+        if let Some(tools) = tools {
+            return Self::parse_native_body(raw_body, call_idx, tools, grammars, finishing);
+        }
         let body = raw_body.trim();
-        let native = tools.is_some();
-        let properties = tools.and_then(|tools| Self::properties(body, tools));
         if body.is_empty() {
             return None;
         }
@@ -994,11 +1142,10 @@ impl Qwen3Parser {
                     let close_angle = after_eq.find('>')?;
                     let fn_name = after_eq[..close_angle].trim().to_string();
                     let rest = &after_eq[close_angle + 1..];
-                    let fn_body =
-                        match Self::find_tool_delimiter(rest, "</function>", native, properties) {
-                            Some(end_idx) => &rest[..end_idx],
-                            None => rest,
-                        };
+                    let fn_body = match Self::find_tool_delimiter(rest, "</function>") {
+                        Some(end_idx) => &rest[..end_idx],
+                        None => rest,
+                    };
                     Some((fn_name, fn_body))
                 } else {
                     None
@@ -1013,9 +1160,7 @@ impl Qwen3Parser {
         if let Some((fn_name, fn_body)) = xml_fn {
             let mut params = serde_json::Map::new();
             let mut search = fn_body;
-            while let Some(p_start) =
-                Self::find_tool_delimiter(search, "<parameter=", native, properties)
-            {
+            while let Some(p_start) = Self::find_tool_delimiter(search, "<parameter=") {
                 let after_p = &search[p_start..];
                 let Some(p_angle) = after_p.find('>') else {
                     break;
@@ -1026,28 +1171,15 @@ impl Qwen3Parser {
                 };
                 let param_name = param_name.trim().to_string();
                 let val_start = &after_p[p_angle + 1..];
-                let (raw_val, next_slice) = if let Some(p_end) = Self::find_tool_delimiter(
-                    val_start,
-                    "</parameter>",
-                    native && {
-                        let mut types = Vec::new();
-                        if let Some(schema) = properties.and_then(|p| p.get(&param_name)) {
-                            Self::schema_types(schema, &mut types);
-                        }
-                        types.iter().any(|t| t == "string")
-                            || (!types.is_empty()
-                                && !types.iter().any(|t| t == "object" || t == "array"))
-                    },
-                    properties,
-                ) {
+                let (raw_val, next_slice) = if let Some(p_end) =
+                    Self::find_tool_delimiter(val_start, "</parameter>")
+                {
                     let after_close = match val_start[p_end..].find('>') {
                         Some(close_gt) => &val_start[p_end + close_gt + 1..],
                         None => "",
                     };
                     (&val_start[..p_end], after_close)
-                } else if let Some(next_p) =
-                    Self::find_tool_delimiter(val_start, "<parameter=", native, properties)
-                {
+                } else if let Some(next_p) = Self::find_tool_delimiter(val_start, "<parameter=") {
                     (&val_start[..next_p], &val_start[next_p..])
                 } else {
                     (val_start, "")
@@ -1055,12 +1187,8 @@ impl Qwen3Parser {
                 let trimmed = Self::trim_wrapping_newlines(raw_val);
                 // Preserve structured JSON numbers/booleans/arrays/objects when valid JSON,
                 // or store string value (`_qwen3_arg_converter`).
-                let json_val = if native {
-                    Self::convert_arg(trimmed, properties.and_then(|p| p.get(&param_name)))
-                } else {
-                    serde_json::from_str::<serde_json::Value>(trimmed)
-                        .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()))
-                };
+                let json_val = serde_json::from_str::<serde_json::Value>(trimmed)
+                    .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()));
                 params.insert(param_name, json_val);
                 search = next_slice;
             }
@@ -1104,14 +1232,24 @@ impl Qwen3Parser {
 
         loop {
             if self.in_tool_call {
-                if let Some(end_pos) = Self::find_tool_delimiter(
-                    &self.buffer,
-                    Self::TOOL_END,
-                    self.tools.is_some() && self.buffer.trim_start().starts_with('<'),
-                    self.tools
-                        .as_deref()
-                        .and_then(|tools| Self::properties(&self.buffer, tools)),
-                ) {
+                let properties = self
+                    .tools
+                    .as_deref()
+                    .and_then(|tools| Self::properties(&self.buffer, tools));
+                let end = if self.tools.is_some() {
+                    Self::native_tool_end(
+                        &self.buffer,
+                        properties,
+                        self.buffer
+                            .strip_prefix("\n<function=")
+                            .and_then(|s| s.split_once('>'))
+                            .and_then(|(name, _)| self.value_grammars.get(name)),
+                        self.finishing,
+                    )
+                } else {
+                    Self::find_tool_delimiter(&self.buffer, Self::TOOL_END)
+                };
+                if let Some(end_pos) = end {
                     let body = self.buffer[..end_pos].to_string();
                     let drain_end = match self.buffer[end_pos..].find('>') {
                         Some(gt) => end_pos + gt + 1,
@@ -1121,6 +1259,8 @@ impl Qwen3Parser {
                         &body,
                         self.next_tool_idx,
                         self.tools.as_deref(),
+                        &self.value_grammars,
+                        self.finishing,
                     ) {
                         self.next_tool_idx += 1;
                         self.tool_calls.push(tc.clone());
@@ -1260,7 +1400,8 @@ impl Qwen3Parser {
 
     /// Flushes any trailing buffered text at end-of-sequence and returns the final turn.
     pub fn finish(&mut self) -> (StreamParseDelta, ParsedAssistantTurn) {
-        let mut delta = StreamParseDelta::default();
+        self.finishing = true;
+        let mut delta = self.push_str("");
         if !self.buffer.is_empty() {
             let rem = std::mem::take(&mut self.buffer);
             if self.in_tool_call {
@@ -1268,14 +1409,17 @@ impl Qwen3Parser {
                 // delimiter inside an unfinished JSON string is not a close tag.
                 let fallback = format!("{}{rem}", Self::TOOL_START);
                 self.content_accum.push_str(&fallback);
-                delta.content_delta = Some(fallback);
+                delta
+                    .content_delta
+                    .get_or_insert_default()
+                    .push_str(&fallback);
                 self.in_tool_call = false;
             } else if self.in_reasoning {
                 self.reasoning_accum.push_str(&rem);
-                delta.reasoning_delta = Some(rem);
+                delta.reasoning_delta.get_or_insert_default().push_str(&rem);
             } else {
                 self.content_accum.push_str(&rem);
-                delta.content_delta = Some(rem);
+                delta.content_delta.get_or_insert_default().push_str(&rem);
             }
         }
 
@@ -1346,7 +1490,13 @@ mod tests {
         }}})];
         let original = tools.clone();
         let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
-        parser.push_str(r#"<tool_call><function=emit><parameter=node>{"label":"123","next":{"label":"true"}}</parameter></function></tool_call>"#);
+        parser.push_str(
+            r#"<tool_call>
+<function=emit>
+<parameter=node>{"label":"123","next":{"label":"true"}}</parameter>
+</function>
+</tool_call>"#,
+        );
         let turn = parser.finish().1;
         let args: serde_json::Value =
             serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
@@ -1375,7 +1525,7 @@ mod tests {
         let original = tools.clone();
         for label in ["true", "123"] {
             let text = format!(
-                "<tool_call><function=emit><parameter=count>123</parameter><parameter=label>{label}</parameter><parameter=data>{{\"nested\":[\"</parameter>\",\"</function>\",\"</tool_call>\",{{\"ok\":true}}]}}</parameter></function></tool_call>"
+                "<tool_call>\n<function=emit>\n<parameter=count>123</parameter><parameter=label>{label}</parameter><parameter=data>{{\"nested\":[\"</parameter>\",\"</function>\",\"</tool_call>\",{{\"ok\":true}}]}}</parameter>\n</function>\n</tool_call>"
             );
             for split in 0..=text.len() {
                 let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
@@ -1404,7 +1554,7 @@ mod tests {
             "parameters":{"type":"object","properties":{"value":{"type":"integer"}}}}}),
         ];
         let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
-        parser.push_str("<tool_call><function=emit><parameter=value>18446744073709551615</parameter></function></tool_call>");
+        parser.push_str("<tool_call>\n<function=emit>\n<parameter=value>18446744073709551615</parameter>\n</function>\n</tool_call>");
         let turn = parser.finish().1;
         let args: serde_json::Value =
             serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
@@ -1417,8 +1567,8 @@ mod tests {
         let tools = vec![json!({"type":"function", "function": {
             "name":"emit", "parameters":{"type":"object", "properties": {
                 "label":{"type":"string"}, "count":{"type":"integer"},
-                "enabled":{"type":"boolean"}, "data":{"type":"object"},
-                "items":{"type":"array"}, "maybe":{"type":["string","null"]},
+                "enabled":{"type":"boolean"}, "data":{"type":"object","additionalProperties":true},
+                "items":{"type":"array","items":true}, "maybe":{"type":["string","null"]},
                 "choice":{"enum":["true","123"]},
                 "union":{"anyOf":[{"type":"integer"},{"type":"string"}]}
             }}
@@ -1435,7 +1585,7 @@ mod tests {
             "héllo",
         ] {
             let text = format!(
-                "<tool_call><function=emit><parameter=label>{label}</parameter><parameter=count>123</parameter><parameter=enabled>true</parameter><parameter=data>{{\"nested\":[true,123,\"</tool_call>\",\"</parameter>\"]}}</parameter><parameter=items>[1,{{\"x\":false}}]</parameter><parameter=maybe>null</parameter><parameter=choice>true</parameter><parameter=union>42</parameter><parameter=unknown>123</parameter></function></tool_call>"
+                "<tool_call>\n<function=emit>\n<parameter=label>{label}</parameter><parameter=count>123</parameter><parameter=enabled>true</parameter><parameter=data>{{\"nested\":[true,123,\"</tool_call>\",\"</parameter>\"]}}</parameter><parameter=items>[1,{{\"x\":false}}]</parameter><parameter=maybe>null</parameter><parameter=choice>true</parameter><parameter=union>42</parameter><parameter=unknown>123</parameter>\n</function>\n</tool_call>"
             );
             let expected = json!({"label":label, "count":123, "enabled":true,
                 "data":{"nested":[true,123,"</tool_call>","</parameter>"]},
@@ -1471,7 +1621,7 @@ mod tests {
             serde_json::json!({"function":{"name":"emit","parameters":{"type":"object","properties":{"label":{"type":"string"}}}}}),
         ];
         let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
-        parser.push_str("<tool_call><function=emit><parameter=label>\"unfinished");
+        parser.push_str("<tool_call>\n<function=emit>\n<parameter=label>\"unfinished");
         let turn = parser.finish().1;
         assert!(turn.tool_calls.is_empty());
         assert!(turn.content.unwrap().ends_with("\"unfinished"));

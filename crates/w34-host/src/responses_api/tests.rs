@@ -364,3 +364,24 @@ fn responses_sse_fail_and_incomplete_lifecycle() {
         "max_output_tokens"
     );
 }
+
+#[test]
+fn parallel_tool_calls_survives_responses_translation() {
+    for parallel in [false, true] {
+        let request = json!({"input":"ping", "parallel_tool_calls":parallel,
+            "tools":[{"type":"function","name":"ping","parameters":{"type":"object"}}]});
+        let (chat, meta) = translate_responses_to_chat(
+            &request,
+            "test",
+            &ResponseStore::with_capacity(8),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(meta.parallel_tool_calls, parallel);
+        assert_eq!(chat["parallel_tool_calls"], json!(parallel));
+        assert!(
+            matches!(RequestConstraint::parse(&chat).unwrap(), Some(RequestConstraint::Tools { parallel: p, .. }) if p == parallel)
+        );
+    }
+}

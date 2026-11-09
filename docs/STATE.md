@@ -1,5 +1,11 @@
 # warp-34 — Session Orientation & Current State
 
+## PR #8 Copilot follow-up
+
+- Reproduced all nine review findings and added regressions before fixes. Schema-aware server parsing now requires canonical, grammar-covered envelopes; compact/altered auto-mode text is not executable. Parameter-aware scanning preserves raw outer-delimiter text and JSON shielding in mixed string/object schemas, including streaming splits and EOS-disambiguated raw values.
+- Preserve null padding semantics, exact integer-valued JSON numbers, raw string newlines, and schema-valid enum/const alternatives. Request-owned native byte grammars discriminate candidate values with full property constraints and original reference roots; additional regressions cover bounded numeric unions, literal parameter delimiters in const/pattern strings, and `$ref`-shaped literal data. No handwritten full-schema validator was added.
+- Forward `parallel_tool_calls` through Responses translation, restrict named-tool parser metadata to the selected tool, and detect EBNF operators outside quoted strings, regexes, and both comment styles. Review follow-up returned **no actionable findings**. Final exact-tree `mise run check` passed non-GPU checks and GPU coverage until the same pre-existing B=5 handoff assertion at `speculative_handoff.rs:365`. All remaining targets passed separately: **60 integration tests**, **4 kernel-library tests**, and **7 doctests**. Structured-output coverage includes **32 passing tests** plus the existing ignored benchmark; all **5 real-model generative API/HTTP tests** passed. The Anthropic exact-UTC fixture now declares its expected string as a schema const rather than relying on the removed newline trimming. The previously authorized baseline failure remains the only exception.
+
 ## Qwen XML-only tool calls
 
 - Removed the unused tagged-JSON tool generator/parser and `ToolFormat` selector; all tool constraints now directly use the Qwen XML descriptor. JSON object/array parameter values remain supported, and unrecognized tool envelopes remain ordinary content rather than being dispatched or discarded.

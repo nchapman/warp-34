@@ -500,11 +500,7 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
     Ok(Prepared {
         parser: Qwen3Parser::with_tools(
             thinking,
-            request
-                .get("tools")
-                .filter(|_| request["tool_choice"] != "none")
-                .and_then(Value::as_array)
-                .map_or(&[], Vec::as_slice),
+            &crate::request_constraints::parser_tools(&request)?,
         )?,
         prompt,
         images,

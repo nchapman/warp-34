@@ -221,6 +221,30 @@ impl RequestConstraint {
     }
 }
 
+/// Tool schemas supplied to output extraction after request validation.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn parser_tools(request: &Value) -> Result<Vec<Value>, String> {
+    let choice = request
+        .get("tool_choice")
+        .filter(|v| !v.is_null())
+        .map(ToolChoice::parse)
+        .transpose()?
+        .unwrap_or(ToolChoice::Auto);
+    let tools = request.get("tools").and_then(Value::as_array);
+    Ok(tools
+        .into_iter()
+        .flatten()
+        .filter(|tool| match &choice {
+            ToolChoice::None => false,
+            ToolChoice::Named(name) => {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some(name.as_str())
+            }
+            ToolChoice::Auto | ToolChoice::Required => true,
+        })
+        .cloned()
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +295,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn selected_parser_tools_ignore_unused_external_refs() {
+        let good = json!({"type":"function","function":{"name":"good","parameters":{"type":"object","properties":{"x":{"type":"string"}}}}});
+        let bad = json!({"type":"function","function":{"name":"bad","parameters":{"$ref":"https://example.com/schema"}}});
+        let mut request = json!({"tools":[good.clone(),bad.clone()],"tool_choice":{"type":"function","function":{"name":"good"}}});
+        assert!(RequestConstraint::parse(&request).unwrap().is_some());
+        let tools = parser_tools(&request).unwrap();
+        crate::parser::Qwen3Parser::with_tools(false, &tools).unwrap();
+        assert_eq!(tools, vec![good.clone()]);
+        request["tool_choice"] = json!("none");
+        assert!(parser_tools(&request).unwrap().is_empty());
+        for choice in ["auto", "required"] {
+            request["tool_choice"] = json!(choice);
+            assert_eq!(
+                parser_tools(&request).unwrap(),
+                vec![good.clone(), bad.clone()]
+            );
+        }
     }
 }

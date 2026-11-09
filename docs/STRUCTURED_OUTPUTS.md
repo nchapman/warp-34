@@ -68,8 +68,27 @@ whitespace-tolerant custom grammar**:
 
 Qwen XML is the only supported tool-call envelope. Tagged JSON objects are not
 extracted as tool calls; JSON object and array values inside XML parameters
-remain supported. The output parser remains tolerant of XML whitespace for
-existing unconstrained/history content.
+remain supported. Schema-aware server extraction requires the canonical envelope
+covered by the native grammar; compact or whitespace-altered envelopes in `auto`
+mode's ordinary text are not dispatched. Only the generic compatibility parser
+(`Qwen3Parser::new`) retains XML whitespace tolerance.
+
+Parameter boundaries take precedence over outer function/tool delimiters. Raw
+string values retain their whitespace and may contain outer delimiter text;
+object/array alternatives shield delimiters inside JSON strings. Ambiguous raw
+strings that look like incomplete JSON remain buffered until `finish()`, whose
+returned delta must also be consumed. Numeric conversion preserves JSON integer
+precision, and native non-string padding is not retained as value data.
+
+Ambiguous XML values are checked against request-owned, optimized native JSON
+value grammars, compiled once during parser preparation without a tokenizer.
+References retain the original tool-schema root; literal `const`/`enum` data is
+not rewritten. Non-string candidates are preferred only if accepted; exact raw
+string bytes are tried before grammar-owned padding is removed. This resolves
+mixed enum/const/bounded alternatives without a second handwritten schema
+validator. Candidate object key order is retained through `serde_json`'s
+`preserve_order` feature, so validation does not need relaxed any-order grammar
+rules. Whole-call requirements remain enforced by the generation grammar.
 
 Reasoning is not a grammar production. Before `</think>`, real vocabulary tokens
 are unconstrained by the answer grammar, including special tokens. Qwen tools also

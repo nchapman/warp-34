@@ -412,7 +412,7 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
                         "description": "Returns the current UTC timestamp",
                         "input_schema": {
                             "type": "object",
-                            "properties": {"tz": {"type": "string"}},
+                            "properties": {"tz": {"type": "string", "const": "UTC"}},
                             "required": ["tz"]
                         }
                     }],
