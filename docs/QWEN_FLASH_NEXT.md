@@ -204,17 +204,17 @@ Each of the 48 layers routes every token to `top_k = 10` of `512` experts (`gate
 - **Quad Card (`TP=4` with `EP=4` on Routed Experts):**
   - Each rank owns `128` local experts (`3.50 GiB/rank`), fitting **100% of all 512 routed experts in VRAM (`K_hot = 128`)** with zero host-memory pinning (`release_host_storage()`) and zero PCIe cold-expert transfers.
 
-#### B. Decode & Verify (`M <= 16` tokens): Adaptive Dual-Path Execution
-We support two complementary cold-expert decode mechanisms controlled by `CapacityPlanner` (and CLI flags `--moe-offload {auto,gpu-lru,cpu-hybrid}`):
-1. **Dynamic GPU LRU + PCIe Pull (`gpu-lru`, default on `TP=2` and on AVX2 + PCIe 4.0 x16 `TP=1` hosts):**
-   - Each layer maintains on-device `cache_map[512]`, `slot_global_ids[K_hot]`, and `slot_ages[K_hot]` initialized from a static popularity profile (`static_hot_cache_rankings.json`).
-   - An integer-only GPU kernel (`w34_moe_lru_update`) identifies unique local expert misses in the current step (`M = 1` or `M = 4` MTP verify), selects non-protected LRU victim slots, issues async PCIe reads from pinned `HostExpertStore` into the victim VRAM slots (overlapping down-proj transfers with gate/up compute), and runs the GPU `w34_moe_w4a16` kernel over all active experts.
-2. **CUDA-Graph-Safe Hybrid CPU AVX-512 / AVX2 + GPU PCIe Co-Execution (`cpu-hybrid`, default on `1× 3090 Ti` with AVX-512):**
-   - For each layer, the router kernel partitions selected `(token, expert)` pairs into:
-     - **Hot GPU set:** Experts resident in the GPU's `K_hot` cache.
-     - **GPU PCIe share (`gpu_share_frac`, default `0.14`):** Top-ranked cold experts read directly over PCIe into transient staging slots by a zero-copy GPU kernel while the CPU works.
-     - **CPU cold set:** Written into a fixed-address pinned request mailbox (`csrc/ops/op_moe_cpu_bridge.cu`), signaling a persistent **pinned physical-core worker pool (`src/moe_cpu_bridge.rs` & `src/moe_cpu_bridge/eval.rs`)** that computes the `W4A16` expert GEMVs in `FP32` (using 0-ULP bit-identical `AVX-512`, `AVX2+FMA+F16C`, or portable scalar kernels) straight from `HostExpertStore` and writes the partial sum back to a mapped response buffer.
-   - Because the GPU bridge uses device-side system-scope release/acquire polling on mapped pinned memory, **the entire 48-layer decode / `M=4` verify step remains inside a single captured CUDA Graph**.
+#### B. Decode & Verify (`M <= 8` tokens): Unified Device-LRU + Hybrid CPU-Bridge Execution
+`TieredMoeEngine::execute_auto` and `LayerTieredMoe` unify single-layer (`MtpTieredMoe`) and multi-layer (`RankTieredMoe`) MoE dispatch across target decode (`M=1`), `MTP-3` verify (`M=4`), `DFlash2` verify (`M=8`), and prefill (`M > 8`) behind two `MoeOffloadMode` regimes (`GpuLru` for `M <= 8` when `can_execute_device_lru(M)` holds; `StreamedPrefill` for `M > 8` or overflow):
+1. **Dynamic GPU BIP-LRU + Zero-Copy PCIe Pull (`w34_moe_lru_update` + `w34_moe_pull_mapped_experts_with_count`):**
+   - Each layer maintains unified host/device `slot_to_expert[K_hot]` (`i32`, `-1` when empty), `expert_to_slot[E]`, `d_prefill_expert_to_slot[E]`, and `slot_last_used[K_hot]` initialized from `static_hot_cache_rankings.json`.
+   - When `M <= 8` and no CPU bridge is attached (e.g. `TP=2 / EP=2` with `K_hot = 88..112` per rank, or single-layer `MTP` with `K_hot = 192`), `w34_moe_lru_update` identifies unique local expert misses on device, protects the static hot prefix (`k_protected = k_hot - tail_budget`, where `tail_budget = 40` for `total_pairs <= 40` and `min(40, k_hot / 2)` for `40 < total_pairs <= 80` so `M=8` DFlash2 verify never collapses anchor protection), selects LRU victim slots, pulls missed experts over mapped PCIe via the unified `moe_pull_mapped_experts_kernel`, and executes `w34_moe_w4a16` in-graph.
+2. **CUDA-Graph-Safe Hybrid CPU AVX-512 / AVX2 + GPU Co-Execution (`w34_moe_hybrid_submit_and_pull` + `w34_moe_hybrid_wait_and_add`):**
+   - When a `moe_cpu_bridge::Runtime` slot is attached to the layer (`TP=1` target layers), `moe_hybrid_plan_and_submit_kernel` partitions routed `(token, expert)` pairs inside the captured CUDA Graph (`M <= 8`) into:
+     - **Static hot GPU hits (`slots[0..k_static]`):** Executed on GPU without mutating static hot slots across decode/verify steps.
+     - **Transient GPU PCIe share (`slots[k_static..k_hot]` when `k_static < k_hot`):** Pulled via the unified `w34_moe_pull_mapped_experts_with_count` kernel while the CPU evaluates its share.
+     - **CPU DDR5 cold share:** Published via a dynamically allocated per-layer mailbox slot (`csrc/ops/op_moe_cpu_bridge.cu`, `src/moe_cpu_bridge.rs`) to a persistent pinned physical-core worker pool (`src/moe_cpu_bridge/eval.rs`) that computes `W4A16` (`g128` / `g64` + `H_64`) expert GEMVs in `FP32` (`AVX-512`, `AVX2+FMA+F16C`, or scalar) straight from `HostExpertStore` and writes the partial sum back to a mapped response buffer merged by `w34_moe_hybrid_wait_and_add`.
+   - Because both sub-paths run inside `TieredMoeEngine::execute_layer_device_lru` using device-side system-scope release/acquire polling on mapped pinned memory, **the entire 48-layer decode (`M=1`), `MTP-3` verify (`M=4`), and `DFlash2` verify (`M=8`) step remains inside a single captured CUDA Graph**.
 
 #### C. Chunked Prefill (`total_tokens >= 512`, e.g., `4096` or `8192` tokens): Double-Buffered GPU Streaming
 - Large prefill chunks activate nearly all 512 experts per layer, making CPU GEMM uncompetitive and making per-chunk PCIe streaming optimal (`1.31 GiB` per layer on `TP=1`, `670 MiB` per layer per rank on `TP=2`).

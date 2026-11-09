@@ -143,12 +143,6 @@ enum MtpInputFusion {
     },
 }
 
-type MtpTieredMoe = (
-    crate::moe_offload::HostExpertStore,
-    crate::moe_offload::HotExpertCache,
-    crate::moe_offload::TieredMoeWorkspace,
-);
-
 struct MtpQsaWorkspace {
     qsa_sel_phys_buf: DeviceBuffer,
     qsa_sel_log_buf: DeviceBuffer,
@@ -186,7 +180,7 @@ pub struct Qwen3_5MtpRank {
     fa: FullAttentionLayerWeights,
     ffn: FfnBlockWeights,
     norms: [u64; 2],
-    tiered_moe: Option<MtpTieredMoe>,
+    tiered_moe: Option<crate::moe_offload::LayerTieredMoe>,
     qsa: Option<MtpQsaWorkspace>,
     _draft_lm_head_arena: Option<DeviceArena>,
     draft_lm_head: Option<LinearProj>,
@@ -710,9 +704,9 @@ impl Qwen3_5MtpRank {
             {
                 let k_static = if k_hot >= 64 { k_hot - 24 } else { k_hot };
                 cache.bridge_runtime = Some(rt);
-                cache.register_cpu_bridge(c.num_hidden_layers, &store, k_static, &target.stream)?;
+                cache.register_cpu_bridge(&store, k_static, &target.stream)?;
             }
-            Some((store, cache, ws))
+            Some(crate::moe_offload::LayerTieredMoe::new(store, cache, ws))
         } else {
             None
         };

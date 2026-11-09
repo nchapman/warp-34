@@ -22,7 +22,7 @@ struct Request {
     seq: AtomicI64,
     tokens: i32,
     top_k: i32,
-    layer: i32,
+    _reserved0: i32,
     pairs: i32,
     hidden: i32,
     intermediate: i32,

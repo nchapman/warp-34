@@ -514,6 +514,7 @@ impl HostExpertStore {
     }
 
     /// Evaluates a single locally owned expert on CPU and accumulates into `out_accum_f32`.
+    #[cfg(test)]
     pub fn eval_expert_u4b8_cpu(
         &self,
         global_id: usize,
@@ -531,6 +532,7 @@ impl HostExpertStore {
 
     /// Evaluates a batch of cold `(token_idx, global_expert_id, topk_weight)` tasks in parallel
     /// across CPU threads and returns `FP16` per-token partial sums `[num_tokens, hidden]`.
+    #[cfg(test)]
     pub fn eval_cold_tasks_cpu(
         &self,
         x_f16: &[u16],
@@ -763,20 +765,18 @@ pub struct HotExpertCache {
     pub expert_ids: Range<usize>,
     pub expert_to_slot: Vec<i32>,
     pub prefill_expert_to_slot: Vec<i32>,
-    pub slot_to_expert: Vec<usize>,
-    pub slot_to_expert_i32: Vec<i32>,
+    /// Global expert ID resident in each VRAM slot (`-1` if empty).
+    pub slot_to_expert: Vec<i32>,
     pub slot_last_used: Vec<u64>,
-    pub step_clock_buf: [u64; 1],
     pub d_expert_to_slot: crate::cuda::DeviceBuffer,
     pub d_prefill_expert_to_slot: crate::cuda::DeviceBuffer,
     pub d_slot_to_expert: crate::cuda::DeviceBuffer,
     pub d_slot_last_used: crate::cuda::DeviceBuffer,
     pub d_step_counter: crate::cuda::DeviceBuffer,
-    pub bridge_layer_id: Option<usize>,
     pub(crate) bridge_runtime: Option<std::sync::Arc<crate::moe_cpu_bridge::Runtime>>,
     pub(crate) bridge_mailbox: Option<std::sync::Arc<crate::moe_cpu_bridge::Mailbox>>,
     pub k_static: usize,
-    pub initial_slot_to_expert: Vec<usize>,
+    pub initial_slot_to_expert: Vec<i32>,
     pub adapted_slots_dirty: bool,
     pub device_lru_dirty: bool,
     pub step_clock: u64,
@@ -817,16 +817,13 @@ impl HotExpertCache {
             expert_ids,
             expert_to_slot: vec![-1; local_count],
             prefill_expert_to_slot: vec![-1; local_count],
-            slot_to_expert: vec![usize::MAX; k_hot],
-            slot_to_expert_i32: vec![-1; k_hot],
+            slot_to_expert: vec![-1; k_hot],
             slot_last_used: vec![0; k_hot],
-            step_clock_buf: [1],
             d_expert_to_slot,
             d_prefill_expert_to_slot,
             d_slot_to_expert,
             d_slot_last_used,
             d_step_counter,
-            bridge_layer_id: None,
             bridge_runtime: None,
             bridge_mailbox: None,
             k_static: k_hot,
@@ -840,6 +837,29 @@ impl HotExpertCache {
             dma_experts_loaded: 0,
             cpu_cold_evals: 0,
         })
+    }
+
+    /// Whether this cache has a registered decode/verify CPU mailbox (`TP=1` hybrid bridge).
+    #[inline]
+    pub fn has_cpu_bridge(&self) -> bool {
+        self.bridge_mailbox.is_some()
+    }
+
+    /// Uploads the current host LRU metadata (`expert_to_slot`, `prefill_expert_to_slot`,
+    /// `slot_to_expert`, `slot_last_used`, and `step_clock`) to device buffers on `stream`.
+    pub fn upload_lru_metadata(
+        &mut self,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<()> {
+        self.d_expert_to_slot
+            .copy_from_host(&self.expert_to_slot, stream)?;
+        self.sync_prefill_expert_to_slot(stream)?;
+        self.d_slot_to_expert
+            .copy_from_host(&self.slot_to_expert, stream)?;
+        self.d_slot_last_used
+            .copy_from_host(&self.slot_last_used, stream)?;
+        let step_buf = [self.step_clock];
+        self.d_step_counter.copy_from_host(&step_buf, stream)
     }
 
     /// Populates the `K_hot` VRAM slots with `initial_experts` (or the first `K_hot` local experts).
@@ -863,13 +883,13 @@ impl HotExpertCache {
             }
             None => self.expert_ids.clone().take(k_hot).collect(),
         };
-        self.initial_slot_to_expert.clone_from(&chosen);
+        self.initial_slot_to_expert = chosen.iter().map(|&ge| ge as i32).collect();
         self.adapted_slots_dirty = false;
         self.expert_to_slot.fill(-1);
         for (slot, &ge) in chosen.iter().enumerate() {
             let le = ge - self.expert_ids.start;
             self.expert_to_slot[le] = slot as i32;
-            self.slot_to_expert[slot] = ge;
+            self.slot_to_expert[slot] = ge as i32;
             // Preserve ranking order so the least-hot initial slot (`k_hot - 1`) is evicted
             // before the hottest initial slot (`0`).
             self.slot_last_used[slot] = (k_hot - slot) as u64;
@@ -880,7 +900,6 @@ impl HotExpertCache {
         let chunk_cap = ws.stage_capacity;
         for chunk_start in (0..k_hot).step_by(chunk_cap) {
             let chunk_end = (chunk_start + chunk_cap).min(k_hot);
-            let num_staged = chunk_end - chunk_start;
             ws.stage_experts_to_slots(
                 0,
                 store,
@@ -889,28 +908,15 @@ impl HotExpertCache {
                 &self.slots,
                 stream,
             )?;
-            let _ = num_staged;
         }
-        self.d_expert_to_slot
-            .copy_from_host(&self.expert_to_slot, stream)?;
-        self.sync_prefill_expert_to_slot(stream)?;
-        for (dst, &e) in self.slot_to_expert_i32.iter_mut().zip(&self.slot_to_expert) {
-            *dst = if e == usize::MAX { -1 } else { e as i32 };
-        }
-        self.d_slot_to_expert
-            .copy_from_host(&self.slot_to_expert_i32, stream)?;
-        self.d_slot_last_used
-            .copy_from_host(&self.slot_last_used, stream)?;
-        self.step_clock_buf[0] = self.step_clock;
-        self.d_step_counter
-            .copy_from_host(&self.step_clock_buf, stream)?;
+        self.upload_lru_metadata(stream)?;
         self.device_lru_dirty = false;
         stream.synchronize()
     }
 
     #[inline]
     pub fn prefill_hot_limit(&self) -> usize {
-        if self.bridge_layer_id.is_some() {
+        if self.has_cpu_bridge() {
             self.k_static
         } else if self.slots.capacity > TIERED_MOE_GPU_LRU_TAIL_SLOTS {
             self.slots.capacity - TIERED_MOE_GPU_LRU_TAIL_SLOTS
@@ -956,7 +962,6 @@ impl HotExpertCache {
     /// slots `0..k_static` permanently resident in VRAM.
     pub fn register_cpu_bridge(
         &mut self,
-        layer_id: usize,
         store: &HostExpertStore,
         k_static: usize,
         stream: &crate::cuda::CudaStream,
@@ -979,7 +984,6 @@ impl HotExpertCache {
         }
         let runtime = self.bridge_runtime.as_ref().unwrap();
         self.bridge_mailbox = Some(runtime.register(store)?);
-        self.bridge_layer_id = Some(layer_id);
         self.k_static = k_static;
         self.sync_prefill_expert_to_slot(stream)?;
         stream.synchronize()?;
@@ -998,14 +1002,11 @@ impl HotExpertCache {
         self.d_expert_to_slot
             .copy_to_host(&mut self.expert_to_slot, stream)?;
         self.d_slot_to_expert
-            .copy_to_host(&mut self.slot_to_expert_i32, stream)?;
+            .copy_to_host(&mut self.slot_to_expert, stream)?;
         self.d_slot_last_used
             .copy_to_host(&mut self.slot_last_used, stream)?;
         self.d_step_counter.copy_to_host(&mut step_arr, stream)?;
         stream.synchronize()?;
-        for (dst, &src) in self.slot_to_expert.iter_mut().zip(&self.slot_to_expert_i32) {
-            *dst = if src < 0 { usize::MAX } else { src as usize };
-        }
         self.step_clock = step_arr[0].max(1);
         let check_limit = self
             .prefill_hot_limit()
@@ -1040,16 +1041,19 @@ impl HotExpertCache {
         let mut restore_ges = Vec::new();
         let mut restore_slots = Vec::new();
         for slot in 0..restore_limit {
-            let init_ge = self.initial_slot_to_expert[slot];
-            if self.slot_to_expert[slot] != init_ge {
-                let old_ge = self.slot_to_expert[slot];
-                if old_ge < usize::MAX && self.expert_ids.contains(&old_ge) {
-                    let old_le = old_ge - local_start;
-                    if self.expert_to_slot[old_le] == slot as i32 {
-                        self.expert_to_slot[old_le] = -1;
+            let init_ge_i32 = self.initial_slot_to_expert[slot];
+            if self.slot_to_expert[slot] != init_ge_i32 {
+                let old_ge_i32 = self.slot_to_expert[slot];
+                if old_ge_i32 >= 0 {
+                    let old_ge = old_ge_i32 as usize;
+                    if self.expert_ids.contains(&old_ge) {
+                        let old_le = old_ge - local_start;
+                        if self.expert_to_slot[old_le] == slot as i32 {
+                            self.expert_to_slot[old_le] = -1;
+                        }
                     }
                 }
-                restore_ges.push(init_ge);
+                restore_ges.push(init_ge_i32 as usize);
                 restore_slots.push(slot as i32);
             }
         }
@@ -1060,16 +1064,14 @@ impl HotExpertCache {
                 let prev_slot = self.expert_to_slot[init_ge - local_start];
                 if prev_slot >= 0 && (prev_slot as usize) != slot {
                     let ps = prev_slot as usize;
-                    self.slot_to_expert[ps] = usize::MAX;
-                    self.slot_to_expert_i32[ps] = -1;
+                    self.slot_to_expert[ps] = -1;
                     self.slot_last_used[ps] = 0;
                 }
                 self.expert_to_slot[init_ge - local_start] = slot_i32;
-                self.slot_to_expert[slot] = init_ge;
-                self.slot_to_expert_i32[slot] = init_ge as i32;
+                self.slot_to_expert[slot] = init_ge as i32;
             }
             for slot in 0..k_hot {
-                if self.slot_to_expert[slot] < usize::MAX {
+                if self.slot_to_expert[slot] >= 0 {
                     self.slot_last_used[slot] = self.step_clock + (k_hot - slot) as u64;
                 } else {
                     self.slot_last_used[slot] = 0;
@@ -1084,16 +1086,7 @@ impl HotExpertCache {
                 ws.stage_experts_to_slots(0, store, g_chunk, s_chunk, &self.slots, stream)?;
             }
             ws.compute_done_events[0].record(stream)?;
-            self.d_expert_to_slot
-                .copy_from_host(&self.expert_to_slot, stream)?;
-            self.sync_prefill_expert_to_slot(stream)?;
-            self.d_slot_to_expert
-                .copy_from_host(&self.slot_to_expert_i32, stream)?;
-            self.d_slot_last_used
-                .copy_from_host(&self.slot_last_used, stream)?;
-            self.step_clock_buf[0] = self.step_clock;
-            self.d_step_counter
-                .copy_from_host(&self.step_clock_buf, stream)?;
+            self.upload_lru_metadata(stream)?;
             stream.synchronize()?;
         }
         self.adapted_slots_dirty = false;

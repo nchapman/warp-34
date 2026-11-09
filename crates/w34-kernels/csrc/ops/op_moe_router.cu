@@ -521,7 +521,11 @@ __global__ void moe_gpu_lru_plan_and_remap_kernel(
     }
     __syncwarp();
 
-    const int k_protected = (k_hot > 40 && total_pairs <= 40) ? (k_hot - 40) : 0;
+    // Protect the static hot prefix of `k_hot` during decode and speculative verify (`M=1..8`):
+    // reserve up to `total_pairs` (`<= 40` for `M <= 4`, capped at `min(40, k_hot / 2)` for `M=8`)
+    // tail slots for dynamic cold misses so speculative tree misses never evict anchor slots `0..k_protected`.
+    const int tail_budget = (total_pairs <= 40) ? 40 : ((40 < (k_hot / 2)) ? 40 : (k_hot / 2));
+    const int k_protected = (k_hot > tail_budget) ? (k_hot - tail_budget) : 0;
 
     int n_miss = 0;
     for (int base = 0; base < total_pairs; base += 32) {
@@ -621,78 +625,16 @@ __global__ void moe_gpu_lru_plan_and_remap_kernel(
     }
 }
 
-__global__ void moe_gpu_lru_pull_mapped_experts_kernel(
-    const uint8_t* __restrict__ mapped_host_packs,
-    const int32_t* __restrict__ miss_local_experts,
-    const int32_t* __restrict__ miss_victim_slots,
-    const int32_t* __restrict__ num_misses_buf,
-    uint32_t* __restrict__ gate_up_packed_base,
-    uint16_t* __restrict__ gate_up_scales_base,
-    uint32_t* __restrict__ down_packed_base,
-    uint16_t* __restrict__ down_scales_base,
-    int local_num_experts,
-    int k_hot,
-    size_t pack_stride_bytes,
-    size_t gu_packed_bytes,
-    size_t gu_scales_bytes,
-    size_t dn_packed_bytes,
-    size_t dn_scales_bytes) {
-    const int m = (int)blockIdx.y;
-    const int num_misses = *num_misses_buf;
-    if (m >= num_misses) return;
-
-    const int le = miss_local_experts[m];
-    const int dst_slot = miss_victim_slots[m];
-    if (le < 0 || le >= local_num_experts || dst_slot < 0 || dst_slot >= k_hot) return;
-
-    const uint8_t* src_pack = mapped_host_packs + (size_t)le * pack_stride_bytes;
-    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x * blockDim.x;
-
-    const size_t gu_p_vec = gu_packed_bytes >> 4;
-    const uint4* src_gu_p = reinterpret_cast<const uint4*>(src_pack);
-    uint4* dst_gu_p = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(gate_up_packed_base) + (size_t)dst_slot * gu_packed_bytes);
-    for (size_t i = tid; i < gu_p_vec; i += stride) {
-        dst_gu_p[i] = src_gu_p[i];
-    }
-
-    const size_t gu_s_vec = gu_scales_bytes >> 4;
-    const uint4* src_gu_s = reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes);
-    uint4* dst_gu_s = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(gate_up_scales_base) + (size_t)dst_slot * gu_scales_bytes);
-    for (size_t i = tid; i < gu_s_vec; i += stride) {
-        dst_gu_s[i] = src_gu_s[i];
-    }
-
-    const size_t dn_p_vec = dn_packed_bytes >> 4;
-    const uint4* src_dn_p =
-        reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes + gu_scales_bytes);
-    uint4* dst_dn_p = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(down_packed_base) + (size_t)dst_slot * dn_packed_bytes);
-    for (size_t i = tid; i < dn_p_vec; i += stride) {
-        dst_dn_p[i] = src_dn_p[i];
-    }
-
-    const size_t dn_s_vec = dn_scales_bytes >> 4;
-    const uint4* src_dn_s = reinterpret_cast<const uint4*>(
-        src_pack + gu_packed_bytes + gu_scales_bytes + dn_packed_bytes);
-    uint4* dst_dn_s = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(down_scales_base) + (size_t)dst_slot * dn_scales_bytes);
-    for (size_t i = tid; i < dn_s_vec; i += stride) {
-        dst_dn_s[i] = src_dn_s[i];
-    }
-}
-
 __global__ void moe_pull_mapped_experts_kernel(
     const uint8_t* __restrict__ mapped_host_packs,
     const int32_t* __restrict__ src_local_experts,
     const int32_t* __restrict__ dst_slots,
+    const int32_t* __restrict__ num_staged_buf,
     uint32_t* __restrict__ gate_up_packed_base,
     uint16_t* __restrict__ gate_up_scales_base,
     uint32_t* __restrict__ down_packed_base,
     uint16_t* __restrict__ down_scales_base,
-    int num_staged,
+    int num_staged_imm,
     int local_num_experts,
     int dst_capacity,
     size_t pack_stride_bytes,
@@ -701,6 +643,7 @@ __global__ void moe_pull_mapped_experts_kernel(
     size_t dn_packed_bytes,
     size_t dn_scales_bytes) {
     const int s = (int)blockIdx.y;
+    const int num_staged = (num_staged_buf != nullptr) ? num_staged_buf[0] : num_staged_imm;
     if (s >= num_staged) return;
     const int le = src_local_experts[s];
     const int dst_slot = dst_slots[s];
@@ -818,6 +761,70 @@ extern "C" int w34_moe_unpack_staged_experts(
     return (int)cudaGetLastError();
 }
 
+extern "C" int w34_moe_pull_mapped_experts_with_count(
+    const w34_exec* ex,
+    const void* mapped_host_packs,
+    const int32_t* src_local_experts,
+    const int32_t* dst_slots,
+    const int32_t* num_staged_buf,
+    uint32_t* gate_up_packed_base,
+    void* gate_up_scales_base,
+    uint32_t* down_packed_base,
+    void* down_scales_base,
+    int max_staged,
+    int local_num_experts,
+    int dst_capacity,
+    size_t pack_stride_bytes,
+    int n_interm,
+    int k_hidden,
+    int group_size) {
+    if (!ex || !mapped_host_packs || !src_local_experts || !dst_slots || !gate_up_packed_base ||
+        !gate_up_scales_base || !down_packed_base || !down_scales_base || max_staged < 0 ||
+        local_num_experts <= 0 || dst_capacity <= 0 || n_interm <= 0 ||
+        (((uintptr_t)mapped_host_packs | (uintptr_t)gate_up_packed_base |
+          (uintptr_t)gate_up_scales_base | (uintptr_t)down_packed_base |
+          (uintptr_t)down_scales_base) & 15) != 0 ||
+        k_hidden <= 0 || group_size <= 0 || max_staged > 65535 ||
+        n_interm > INT_MAX / 2 || n_interm % 8 != 0 || k_hidden % 8 != 0 ||
+        n_interm % group_size != 0 || k_hidden % group_size != 0 ||
+        (pack_stride_bytes & 15) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (max_staged == 0) return 0;
+
+    const size_t gu_packed_bytes = (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
+    const size_t gu_scales_bytes =
+        (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
+    const size_t dn_packed_bytes = (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
+    const size_t dn_scales_bytes =
+        (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
+    if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
+        (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
+        pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
+        return (int)cudaErrorInvalidValue;
+    }
+
+    dim3 grid(64, (unsigned)max_staged);
+    w34_moe::moe_pull_mapped_experts_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
+        static_cast<const uint8_t*>(mapped_host_packs),
+        src_local_experts,
+        dst_slots,
+        num_staged_buf,
+        gate_up_packed_base,
+        static_cast<uint16_t*>(gate_up_scales_base),
+        down_packed_base,
+        static_cast<uint16_t*>(down_scales_base),
+        max_staged,
+        local_num_experts,
+        dst_capacity,
+        pack_stride_bytes,
+        gu_packed_bytes,
+        gu_scales_bytes,
+        dn_packed_bytes,
+        dn_scales_bytes);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int w34_moe_pull_mapped_experts(
     const w34_exec* ex,
     const void* mapped_host_packs,
@@ -834,50 +841,23 @@ extern "C" int w34_moe_pull_mapped_experts(
     int n_interm,
     int k_hidden,
     int group_size) {
-    if (!ex || !mapped_host_packs || !src_local_experts || !dst_slots || !gate_up_packed_base ||
-        !gate_up_scales_base || !down_packed_base || !down_scales_base || num_staged < 0 ||
-        local_num_experts <= 0 || dst_capacity <= 0 || n_interm <= 0 ||
-        (((uintptr_t)mapped_host_packs | (uintptr_t)gate_up_packed_base |
-          (uintptr_t)gate_up_scales_base | (uintptr_t)down_packed_base |
-          (uintptr_t)down_scales_base) & 15) != 0 ||
-        k_hidden <= 0 || group_size <= 0 || num_staged > 65535 ||
-        n_interm > INT_MAX / 2 || n_interm % 8 != 0 || k_hidden % 8 != 0 ||
-        n_interm % group_size != 0 || k_hidden % group_size != 0 ||
-        (pack_stride_bytes & 15) != 0) {
-        return (int)cudaErrorInvalidValue;
-    }
-    if (num_staged == 0) return 0;
-
-    const size_t gu_packed_bytes = (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
-    const size_t gu_scales_bytes =
-        (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
-    const size_t dn_packed_bytes = (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
-    const size_t dn_scales_bytes =
-        (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
-    if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
-        (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
-        pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
-        return (int)cudaErrorInvalidValue;
-    }
-
-    dim3 grid(64, (unsigned)num_staged);
-    w34_moe::moe_pull_mapped_experts_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
-        static_cast<const uint8_t*>(mapped_host_packs),
+    return w34_moe_pull_mapped_experts_with_count(
+        ex,
+        mapped_host_packs,
         src_local_experts,
         dst_slots,
+        nullptr,
         gate_up_packed_base,
-        static_cast<uint16_t*>(gate_up_scales_base),
+        gate_up_scales_base,
         down_packed_base,
-        static_cast<uint16_t*>(down_scales_base),
+        down_scales_base,
         num_staged,
         local_num_experts,
         dst_capacity,
         pack_stride_bytes,
-        gu_packed_bytes,
-        gu_scales_bytes,
-        dn_packed_bytes,
-        dn_scales_bytes);
-    return (int)cudaGetLastError();
+        n_interm,
+        k_hidden,
+        group_size);
 }
 
 extern "C" int w34_moe_remap_topk_ids_i32(
@@ -979,48 +959,23 @@ extern "C" int w34_moe_gpu_lru_update_and_pull(
     if (err != cudaSuccess) return (int)err;
 
     if (mapped_host_packs != nullptr && max_misses > 0) {
-        if (!gate_up_packed_base || !gate_up_scales_base || !down_packed_base || !down_scales_base ||
-            (((uintptr_t)mapped_host_packs | (uintptr_t)gate_up_packed_base |
-              (uintptr_t)gate_up_scales_base | (uintptr_t)down_packed_base |
-              (uintptr_t)down_scales_base) & 15) != 0 ||
-            n_interm <= 0 || k_hidden <= 0 || group_size <= 0 ||
-            n_interm > INT_MAX / 2 || n_interm % 8 != 0 || k_hidden % 8 != 0 ||
-            n_interm % group_size != 0 || k_hidden % group_size != 0 ||
-            (pack_stride_bytes & 15) != 0) {
-            return (int)cudaErrorInvalidValue;
-        }
-        const size_t gu_packed_bytes =
-            (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
-        const size_t gu_scales_bytes =
-            (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
-        const size_t dn_packed_bytes =
-            (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
-        const size_t dn_scales_bytes =
-            (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
-        if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
-            (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
-            pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
-            return (int)cudaErrorInvalidValue;
-        }
-        dim3 grid(64, (unsigned)max_misses);
-        w34_moe::moe_gpu_lru_pull_mapped_experts_kernel<<<grid, 256, 0, stream>>>(
-            static_cast<const uint8_t*>(mapped_host_packs),
+        return w34_moe_pull_mapped_experts_with_count(
+            ex,
+            mapped_host_packs,
             miss_local_experts,
             miss_victim_slots,
             num_misses_buf,
             gate_up_packed_base,
-            static_cast<uint16_t*>(gate_up_scales_base),
+            gate_up_scales_base,
             down_packed_base,
-            static_cast<uint16_t*>(down_scales_base),
+            down_scales_base,
+            max_misses,
             local_num_experts,
             k_hot,
             pack_stride_bytes,
-            gu_packed_bytes,
-            gu_scales_bytes,
-            dn_packed_bytes,
-            dn_scales_bytes);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) return (int)err;
+            n_interm,
+            k_hidden,
+            group_size);
     }
     return 0;
 }

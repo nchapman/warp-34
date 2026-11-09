@@ -1555,85 +1555,25 @@ impl Qwen3_5MtpRank {
             _ => None,
         };
         if let Some((top_k, sh_out_ptr, sh_gate_ptr)) = tiered_info
-            && let Some((store, cache, ws)) = &mut self.tiered_moe
+            && let Some(tiered_moe) = &mut self.tiered_moe
         {
             let tiered_input_buf = if pre_mlp_targets[1] != 0 {
                 pre_mlp_targets[1]
             } else {
                 normed_buf
             };
-            if cache.slots.capacity >= cache.expert_ids.len()
-                || (cache.bridge_layer_id.is_none()
-                    && num_tokens * top_k <= cache.slots.capacity
-                    && store.mapped_dev_ptr() != 0)
-                || (num_tokens <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
-                    && top_k <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
-                    && cache.bridge_layer_id.is_some())
-            {
-                crate::moe_offload::TieredMoeEngine::execute_layer_device_lru(
-                    store,
-                    cache,
-                    ws,
-                    &t.stream,
-                    tiered_input_buf,
-                    moe_topk_ids_buf,
-                    moe_topk_weights_buf,
-                    sh_out_ptr,
-                    sh_gate_ptr,
-                    mlp_out_buf,
-                    num_tokens,
-                    top_k,
-                )?;
-            } else {
-                let pairs = num_tokens * top_k;
-                let mut h_ids = vec![0i32; pairs];
-                check_rc(
-                    // SAFETY: `h_ids` and `moe_topk_ids_buf` hold `pairs` i32 elements.
-                    unsafe {
-                        ffi::w34_memcpy_d2h_async(
-                            h_ids.as_mut_ptr().cast(),
-                            moe_topk_ids_buf as *const c_void,
-                            pairs * 4,
-                            t.stream.handle,
-                        )
-                    },
-                    "MTP h_ids",
-                )?;
-                let mut h_weights = Vec::new();
-                if cache.bridge_layer_id.is_some() {
-                    h_weights.resize(pairs, 0.0f32);
-                    check_rc(
-                        // SAFETY: `h_weights` and `moe_topk_weights_buf` hold `pairs` f32 elements.
-                        unsafe {
-                            ffi::w34_memcpy_d2h_async(
-                                h_weights.as_mut_ptr().cast(),
-                                moe_topk_weights_buf as *const c_void,
-                                pairs * 4,
-                                t.stream.handle,
-                            )
-                        },
-                        "MTP h_weights",
-                    )?;
-                }
-                t.stream.synchronize()?;
-                crate::moe_offload::TieredMoeEngine::execute_layer(
-                    crate::moe_offload::MoeOffloadMode::Auto,
-                    store,
-                    cache,
-                    ws,
-                    &t.stream,
-                    tiered_input_buf,
-                    moe_topk_ids_buf,
-                    moe_topk_weights_buf,
-                    &h_ids,
-                    &h_weights,
-                    sh_out_ptr,
-                    sh_gate_ptr,
-                    mlp_out_buf,
-                    num_tokens,
-                    top_k,
-                )?;
-            }
+            tiered_moe.execute(
+                &t.stream,
+                false,
+                tiered_input_buf,
+                moe_topk_ids_buf,
+                moe_topk_weights_buf,
+                sh_out_ptr,
+                sh_gate_ptr,
+                mlp_out_buf,
+                num_tokens,
+                top_k,
+            )?;
         }
         self.residual.post_mlp(
             &hc_ctx,

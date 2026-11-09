@@ -665,7 +665,6 @@ unsafe extern "C" {
 
     pub fn w34_moe_hybrid_submit_and_pull(
         ex: *const W34Exec,
-        layer_id: i32,
         d_req_slot: *mut c_void,
         x_f16: *const c_void,
         global_topk_ids: *const i32,

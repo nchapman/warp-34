@@ -142,6 +142,7 @@ impl ExpertPackLayout {
 
     /// Evaluates one packed `U4B8` expert on CPU matching `op_moe.cu` (`marlin_silu_and_mul_f16`
     /// and FP16-rounded `U4B8` dequantization) and accumulates into `out_accum_f32: [hidden]`.
+    #[cfg(test)]
     pub fn eval_expert_u4b8_cpu(
         &self,
         pack: &[u8],
@@ -394,26 +395,19 @@ pub const TIERED_MOE_CPU_BRIDGE_AVX2_GPU_SHARE_FRAC: f32 = 0.50;
 /// Minimum GPU hot expert count (`16`) required before auto-enabling the `TP=1` CPU MoE bridge.
 pub const TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS: usize = 16;
 
-/// Maximum model layer count (`60`) supported by the static `TP=1` CPU MoE bridge registration.
-pub const TIERED_MOE_CPU_BRIDGE_MAX_LAYERS: usize = 60;
-
-/// Quantization group size (`128`) required by the `U4B8` CPU MoE evaluator.
-pub const TIERED_MOE_CPU_BRIDGE_GROUP_SIZE: usize = 128;
-
-/// Execution policy for tiered 512-expert MoE layers.
+/// Execution policy for tiered 512-expert MoE layers on multi-token prefill batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeOffloadMode {
-    /// Automatically selects `GpuLru` when unique active local experts fit in `K_hot`,
-    /// or `StreamedPrefill` when active local experts exceed `K_hot`.
+    /// Automatically selects `GpuLru` when unique active local experts fit in `K_hot`
+    /// and cold misses fit in `stage_capacity` for small batches (`<= 32` tokens), or
+    /// `StreamedPrefill` otherwise.
     Auto,
     /// Dynamic GPU LRU slot replacement via single-DMA H2D transfer + device unpack.
     /// Automatically falls back to `StreamedPrefill` if a batch activates `> K_hot` unique local experts.
     GpuLru,
-    /// Evaluates hot-cache hits (plus up to `gpu_pcie_budget` cold experts via DMA) on the GPU
-    /// while co-executing remaining cold experts in parallel on the CPU thread pool.
-    CpuHybrid { gpu_pcie_budget: usize },
     /// Executes hot experts in Pass 0 and streams cold experts through double-buffered
-    /// H2D + compute staging arenas (`stage_buf[0..2]`).
+    /// H2D + compute staging arenas (`stage_buf[0..2]`), co-scheduling sparse cold experts
+    /// on the SIMD CPU bridge when registered.
     StreamedPrefill,
 }
 
@@ -423,7 +417,7 @@ mod engine;
 mod host_store;
 
 #[cfg(feature = "cuda")]
-pub use engine::{RankTieredMoe, TieredMoeEngine};
+pub use engine::{LayerTieredMoe, RankTieredMoe, TieredMoeEngine};
 #[cfg(feature = "cuda")]
 pub use host_store::{DeviceExpertSlotTable, HostExpertStore, HotExpertCache, TieredMoeWorkspace};
 
