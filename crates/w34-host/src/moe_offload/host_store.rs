@@ -1069,7 +1069,11 @@ impl HotExpertCache {
                 self.slot_to_expert_i32[slot] = init_ge as i32;
             }
             for slot in 0..k_hot {
-                self.slot_last_used[slot] = self.step_clock + (k_hot - slot) as u64;
+                if self.slot_to_expert[slot] < usize::MAX {
+                    self.slot_last_used[slot] = self.step_clock + (k_hot - slot) as u64;
+                } else {
+                    self.slot_last_used[slot] = 0;
+                }
             }
             self.step_clock += (k_hot as u64) + 1;
             self.dma_experts_loaded += restore_ges.len() as u64;

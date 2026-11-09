@@ -238,7 +238,15 @@ impl TieredMoeEngine {
             return Ok(());
         }
         cache.sync_from_device_if_dirty(compute_stream)?;
-        if (8..1024).contains(&num_tokens) && cache.adapted_slots_dirty {
+        let use_prefill_hot_limit = num_tokens < 1024
+            && (cache.bridge_layer_id.is_some()
+                || matches!(mode, MoeOffloadMode::StreamedPrefill)
+                || (num_tokens > TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS
+                    && !matches!(
+                        mode,
+                        MoeOffloadMode::GpuLru | MoeOffloadMode::CpuHybrid { .. }
+                    )));
+        if (use_prefill_hot_limit || (8..1024).contains(&num_tokens)) && cache.adapted_slots_dirty {
             cache.restore_initial_if_adapted(store, ws, compute_stream)?;
         }
         assert_eq!(h_topk_ids.len(), num_tokens * top_k);
@@ -249,12 +257,7 @@ impl TieredMoeEngine {
         // Identify unique active local experts and count cache hits/misses.
         let local_start = cache.expert_ids.start;
         let local_len = cache.expert_ids.len();
-        let prefill_hot_limit = if (TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS + 1..1024)
-            .contains(&num_tokens)
-            && !matches!(
-                mode,
-                MoeOffloadMode::GpuLru | MoeOffloadMode::CpuHybrid { .. }
-            ) {
+        let prefill_hot_limit = if use_prefill_hot_limit {
             cache.prefill_hot_limit()
         } else {
             cache.slots.capacity
@@ -939,9 +942,10 @@ impl TieredMoeEngine {
                         cache
                             .d_slot_last_used
                             .copy_from_host(&cache.slot_last_used, compute_stream)?;
+                        cache.step_clock_buf[0] = cache.step_clock;
                         cache
                             .d_step_counter
-                            .copy_from_host(&[cache.step_clock], compute_stream)?;
+                            .copy_from_host(&cache.step_clock_buf, compute_stream)?;
                     }
                     ws.compute_done_events[buf_idx].record(compute_stream)?;
 

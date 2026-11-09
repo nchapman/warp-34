@@ -1563,7 +1563,9 @@ impl Qwen3_5MtpRank {
                 normed_buf
             };
             if cache.slots.capacity >= cache.expert_ids.len()
-                || (num_tokens * top_k <= cache.slots.capacity && store.mapped_dev_ptr() != 0)
+                || (cache.bridge_layer_id.is_none()
+                    && num_tokens * top_k <= cache.slots.capacity
+                    && store.mapped_dev_ptr() != 0)
                 || (num_tokens <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
                     && top_k <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
                     && cache.bridge_layer_id.is_some())

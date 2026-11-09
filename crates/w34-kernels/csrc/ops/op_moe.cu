@@ -358,7 +358,8 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
     float total_sum = 0.0f;
 
     if (!HAS_ZP && FIXED_WORDS_PER_ROW > 0 && (FIXED_WORDS_PER_ROW & 3) == 0 &&
-        FIXED_TOP_K > 0 && (words_per_group & 3) == 0) {
+        FIXED_TOP_K > 0 && (words_per_group & 3) == 0 &&
+        (((uintptr_t)down_packed) & 15u) == 0u) {
         constexpr int kU4PerRow = FIXED_WORDS_PER_ROW >> 2;
         constexpr int kLpr =
             (kU4PerRow >= 32) ? 32 : (kU4PerRow >= 16) ? 16 : (kU4PerRow >= 8) ? 8 : 4;
