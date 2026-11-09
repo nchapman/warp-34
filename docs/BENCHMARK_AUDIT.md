@@ -117,10 +117,43 @@ minimum cosine 0.999131, and matching top-1 token.
 - **Flash-Next is not qualified as lossless here.** At merged HEAD and final,
   MTP and DFlash first differ from plain at output index 15 (TP1) or 29 (TP2).
   The old build also has mismatches (TP1 MTP at 15; TP2 MTP at 29 and DFlash
-  at 15). Thus the limitation predates these merges, but this does not prove
-  the specific cause is harmless rounding. The real-model Flash tests
-  already use prefix-only allowances and do not establish full 64-token
-  plain/speculative parity. No tolerance or Flash assertion was weakened.
+  at 15). Direct `ForwardDump` inspection at those exact prefix states
+  establishes why:
+  - **Layer 0 (`embed` + `PLE` + `HyperConnection` + `GDN` conv1d/recurrent) is
+    0-ULP (`0.000000`) bit-identical across all 4 rows (`r = 0..4`) between
+    4 sequential `M=1` steps and a single `M=4` verify step.**
+  - **First nonzero difference (`1` FP16 ULP, `1.5e-5`–`2.4e-4`) originates in
+    the 512-expert tiered MoE FFN (`layer_0_hidden_after`) and QSA Split-K:**
+    - In `RankTieredMoe`, cold experts evaluated on the CPU bridge use an FP32
+      intermediate (`eval_expert_slice`), whereas hot/staged GPU experts use an
+      FP16 intermediate (`moe_w4a16_mlp_f16`). Because
+      `moe_hybrid_plan_and_submit_kernel` promotes a batch-dependent subset of
+      cold misses into the 24 dynamic GPU slots (`k_static..k_hot`), even
+      running `M=1` twice from the same `state_in_slot` changes dynamic slot
+      residency by `1` FP16 ULP (`0.000244`).
+    - Across batch sizes, `w34_moe_w4a16_mlp_f16` switches between GEMV
+      (`M=1..3`), grouped-vec (`M=4..7`), and sparse-MMA (`M>=8`), and
+      `launch_qsa_sparse_paged_attn_f16` scales Split-K `num_splits` with
+      `num_tokens` (`32` at `M=1`, `8` at `M=4`, `4` at `M=8`).
+  - **Both observed benchmark divergences occur at near-tied top-2 logits:**
+    - At **TP1 index 15** (`ctx_before = 142`, after `" user has repeated"`),
+      top-2 logits are separated by **1 FP16 ULP (`0.015625 = 2^-6`)**: token
+      `279` (`' the'`, `27.062500`) vs token `328` (`' "'`, `27.046875`). Even a
+      second `M=1` pass from the same state slot flips `279 -> 328`
+      (`27.046875` vs `27.062500`), while `M=1` vs `M=4`/`M=8` final-norm
+      cosine is `0.9999976` (`rel_l2 = 0.0022`).
+    - At **TP2 index 29** (`ctx_before = 156`, after `' dog."'` on the `279`
+      branch), top-2 logits are separated by **5 FP16 ULPs (`0.078125`)**: token
+      `28279` (`' twelve'`, `23.468750`) vs token `220` (`' '`, `23.390625`),
+      with single-step `M=1` vs `M=4`/`M=8` final-norm cosine `0.9999987`
+      (`rel_l2 = 0.0017`). Across multi-token steps, `1–2` ULP residual
+      perturbations can also flip the 10th (lowest-weight) expert at a near-tied
+      512-expert router boundary (e.g. `layer_16` on `ctx=128`, `layer_15` on
+      `ctx=131`, where top-9 experts match and expert #10 flips, shifting
+      `final_norm` `rel_l2` to `~0.05–0.07`).
+  The real-model Flash tests already use prefix-only allowances and do not
+  establish full 64-token plain/speculative parity. No tolerance or Flash
+  assertion was weakened.
 - Flash-Next's hybrid CPU/GPU execution has large timing variability. Two
   extra alternating TP2 plain repeats yielded old 67.29/67.29 versus merged
   71.48/62.94 tok/s. MTP yielded old 97.51/94.57 versus merged 93.06/92.02.
