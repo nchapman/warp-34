@@ -698,7 +698,7 @@ impl Qwen3_5MtpRank {
                 target.stream.synchronize()?;
                 store.release_host_storage();
             } else if tp == 1
-                && matches!(store.layout().group_size, 64 | 128)
+                && store.layout().supports_cpu_bridge()
                 && let Some(ref tmoe) = target.tiered_moe
                 && let Some(rt) = tmoe.bridge_runtime()
             {

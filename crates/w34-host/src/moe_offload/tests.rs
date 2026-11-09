@@ -1678,5 +1678,84 @@ mod cuda_tests {
                 "d_prefill_expert_to_slot[{le}] stale after short-prompt restoration"
             );
         }
+
+        // Step 5: Verify `can_execute_device_lru` boundary (`M <= 8` when not fully resident),
+        // fully-resident `prefill_hot_limit() == k_hot`, and host `GpuLru` spill to `0..lru_start`
+        // when all tail slots `k_hot - 40 .. k_hot` are active in the current step.
+        assert!(TieredMoeEngine::can_execute_device_lru(
+            &full_store,
+            &cache,
+            6,
+            top_k
+        ));
+        assert!(
+            !TieredMoeEngine::can_execute_device_lru(&full_store, &cache, 7, top_k),
+            "M=7 (70 pairs > k_hot=64) on non-fully-resident cache without CPU bridge must not be dispatched to execute_layer_device_lru"
+        );
+        let cache_80 = HotExpertCache::new(0, 80, 0..128, layout.clone()).unwrap();
+        assert!(TieredMoeEngine::can_execute_device_lru(
+            &full_store,
+            &cache_80,
+            8,
+            top_k
+        ));
+        assert!(
+            !TieredMoeEngine::can_execute_device_lru(&full_store, &cache_80, 9, top_k),
+            "M=9 prefill on non-fully-resident cache must not be dispatched to execute_layer_device_lru"
+        );
+        let mut full_res_cache =
+            HotExpertCache::new(0, num_experts, 0..num_experts, layout).unwrap();
+        full_res_cache
+            .populate_initial(&full_store, None, &mut ws, &stream)
+            .unwrap();
+        assert_eq!(full_res_cache.prefill_hot_limit(), num_experts);
+        assert!(TieredMoeEngine::can_execute_device_lru(
+            &full_store,
+            &full_res_cache,
+            16,
+            top_k
+        ));
+
+        // Exercise host `GpuLru` spill when all 40 tail slots (`24..64`) are hits in the current
+        // step (`M = 5`, `top_k = 10` = 50 pairs: 40 hits on `24..64` + 2 misses on `66, 67`).
+        let m_spill = 5usize;
+        let mut h_topk_spill = Vec::with_capacity(m_spill * top_k);
+        for e in 24..64 {
+            h_topk_spill.push(e);
+        }
+        h_topk_spill.push(66);
+        h_topk_spill.push(67);
+        while h_topk_spill.len() < m_spill * top_k {
+            h_topk_spill.push(24);
+        }
+        let d_topk_spill = upload(&h_topk_spill, &stream);
+        TieredMoeEngine::execute_layer(
+            MoeOffloadMode::GpuLru,
+            &full_store,
+            &mut cache,
+            &mut ws,
+            &stream,
+            d_x.addr(),
+            d_topk_spill.addr(),
+            d_wts.addr(),
+            &h_topk_spill,
+            &h_wts[..m_spill * top_k],
+            0,
+            0,
+            d_out.addr(),
+            m_spill,
+            top_k,
+        )
+        .unwrap();
+        for (e, s) in (24usize..64).zip(24i32..64) {
+            assert_eq!(
+                cache.slot_of(e),
+                Some(s),
+                "active tail expert {e} was self-evicted during host GpuLru spill"
+            );
+        }
+        assert!(cache.slot_of(66).is_some_and(|s| s < 24));
+        assert!(cache.slot_of(67).is_some_and(|s| s < 24));
+        assert_ne!(cache.slot_of(66), cache.slot_of(67));
     }
 }

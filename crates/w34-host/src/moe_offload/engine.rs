@@ -1,11 +1,8 @@
 use super::*;
-use crate::loader::{HADAMARD_BLOCK_64, SafetensorsArchive};
+use crate::loader::SafetensorsArchive;
 
 /// Maximum batch token count for `MoeOffloadMode::Auto` to select `GpuLru` when misses fit in staging.
 const TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS: usize = 32;
-/// Supported symmetric 4-bit GPTQ group sizes (`64` and `128`) for the AVX2/AVX-512 CPU bridge.
-const TIERED_MOE_CPU_BRIDGE_ALT_GROUP_SIZE: usize = 64;
-const TIERED_MOE_CPU_BRIDGE_GROUP_SIZE: usize = 128;
 /// Maximum prefill token count that fits cold-miss staging in a single GPU chunk (`<= 384` tokens).
 const TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOKENS: usize = 384;
 /// Small-batch threshold (`<= 16` tokens) for `StreamedPrefill` CPU-bridge share tuning on AVX2 hosts.
@@ -51,6 +48,12 @@ impl TieredMoeEngine {
     ) -> crate::cuda::Result<()> {
         if num_tokens == 0 {
             return Ok(());
+        }
+        if num_tokens > ws.max_tokens || top_k > ws.top_k {
+            return Err(crate::cuda::CudaError::new(
+                -1,
+                "execute_layer_device_lru batch exceeds TieredMoeWorkspace capacity",
+            ));
         }
         let k_hot = cache.slots.capacity;
         let ex = compute_stream.exec(ws.d_scratch.addr(), ws.d_scratch.len_bytes);
@@ -239,6 +242,12 @@ impl TieredMoeEngine {
         if num_tokens == 0 {
             return Ok(());
         }
+        if num_tokens > ws.max_tokens || top_k > ws.top_k {
+            return Err(crate::cuda::CudaError::new(
+                -1,
+                "execute_layer batch exceeds TieredMoeWorkspace capacity",
+            ));
+        }
         cache.sync_from_device_if_dirty(compute_stream)?;
         let use_prefill_hot_limit = num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
             && (cache.has_cpu_bridge()
@@ -336,17 +345,28 @@ impl TieredMoeEngine {
         match effective_mode {
             MoeOffloadMode::GpuLru => {
                 if !misses_in_step.is_empty() {
-                    let lru_start = if cache.slots.capacity > 64 { 48 } else { 0 };
+                    let lru_start = cache
+                        .slots
+                        .capacity
+                        .saturating_sub(TIERED_MOE_GPU_LRU_TAIL_SLOTS);
                     let mut victim_slots = Vec::with_capacity(misses_in_step.len());
                     for &ge in &misses_in_step {
-                        // Choose the non-pinned slot with the smallest `slot_last_used` timestamp.
-                        let (victim_slot, _) = cache
+                        // Choose the non-pinned slot with the smallest `slot_last_used` timestamp,
+                        // spilling to `0..lru_start` if every tail slot is already active in this step.
+                        let (mut victim_slot, &best_ts) = cache
                             .slot_last_used
                             .iter()
                             .enumerate()
                             .skip(lru_start)
                             .min_by_key(|&(_, &ts)| ts)
                             .unwrap();
+                        if best_ts >= step && lru_start > 0 {
+                            (victim_slot, _) = cache.slot_last_used[..lru_start]
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|&(_, &ts)| ts)
+                                .unwrap();
+                        }
                         let old_ge = cache.slot_to_expert[victim_slot];
                         if old_ge >= 0 {
                             cache.expert_to_slot[old_ge as usize - cache.expert_ids.start] = -1;
@@ -871,6 +891,7 @@ impl TieredMoeEngine {
     ) -> bool {
         cache.slots.capacity >= cache.expert_ids.len()
             || (!cache.has_cpu_bridge()
+                && num_tokens <= TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
                 && num_tokens * top_k <= cache.slots.capacity
                 && store.mapped_dev_ptr() != 0)
             || (num_tokens <= TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
@@ -1093,20 +1114,7 @@ impl RankTieredMoe {
                 stream.synchronize()?;
                 store.release_host_storage();
             } else if k_hot >= TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS
-                && cfg
-                    .hidden_size
-                    .is_multiple_of(TIERED_MOE_CPU_BRIDGE_GROUP_SIZE)
-                && cfg
-                    .moe_intermediate_size
-                    .is_multiple_of(TIERED_MOE_CPU_BRIDGE_GROUP_SIZE)
-                && matches!(
-                    group_size,
-                    TIERED_MOE_CPU_BRIDGE_ALT_GROUP_SIZE | TIERED_MOE_CPU_BRIDGE_GROUP_SIZE
-                )
-                && matches!(
-                    store.layout().down_hadamard_block_size,
-                    0 | HADAMARD_BLOCK_64
-                )
+                && store.layout().supports_cpu_bridge()
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 if ep_size == 1 {

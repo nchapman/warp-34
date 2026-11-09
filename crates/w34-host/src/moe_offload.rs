@@ -84,6 +84,17 @@ impl ExpertPackLayout {
         Ok(self)
     }
 
+    /// Returns whether this expert pack geometry is supported by the SIMD CPU+GPU hybrid bridge.
+    #[inline]
+    pub fn supports_cpu_bridge(&self) -> bool {
+        self.hidden <= TIERED_MOE_CPU_BRIDGE_MAX_HIDDEN
+            && self.intermediate <= TIERED_MOE_CPU_BRIDGE_MAX_INTERMEDIATE
+            && self.hidden.is_multiple_of(128)
+            && self.intermediate.is_multiple_of(128)
+            && matches!(self.group_size, 64 | 128)
+            && matches!(self.down_hadamard_block_size, 0 | 64)
+    }
+
     /// Packs a single expert's N-major `U4B8` weights and `FP16` scales into a `stride`-byte slot.
     pub fn write_pack(
         &self,
@@ -377,6 +388,9 @@ pub const TIERED_MOE_CPU_BRIDGE_MAX_TOP_K: usize = 16;
 /// Maximum hidden dimension (`4,096`) supported by the GPU+CPU hybrid MoE mailbox ABI.
 pub const TIERED_MOE_CPU_BRIDGE_MAX_HIDDEN: usize = 4096;
 
+/// Maximum per-expert intermediate dimension (`2,048`) supported by the GPU+CPU hybrid MoE mailbox ABI.
+pub const TIERED_MOE_CPU_BRIDGE_MAX_INTERMEDIATE: usize = 2048;
+
 /// Number of tail GPU hot-cache slots (`40`, matching `M = 4, top_k = 10` in `op_moe_router.cu`)
 /// reserved for dynamic decode LRU eviction while keeping `0..k_hot - 40` static for prefill.
 pub const TIERED_MOE_GPU_LRU_TAIL_SLOTS: usize = 40;
@@ -384,8 +398,8 @@ pub const TIERED_MOE_GPU_LRU_TAIL_SLOTS: usize = 40;
 /// Minimum prompt token count (`1,024`) before `StreamedPrefill` adapts tail hot-cache slots.
 pub const TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS: usize = 1024;
 
-/// Router weight threshold (`0.14`) below which cold experts are delegated to the CPU bridge
-/// when dynamic LRU slots (`k_static < k_hot`) are available on the GPU on AVX-512 hosts.
+/// Fraction (`0.14`) of distinct cold experts pulled onto GPU evictable LRU slots over PCIe DMA
+/// on AVX-512 hosts when dynamic LRU slots (`k_static < k_hot`) are available on the GPU.
 pub const TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD: f32 = 0.14;
 
 /// Fraction (`0.50`) of distinct cold experts pulled onto GPU evictable LRU slots over PCIe DMA

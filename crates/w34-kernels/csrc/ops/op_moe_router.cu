@@ -600,6 +600,11 @@ __global__ void moe_gpu_lru_plan_and_remap_kernel(
                         best_slot = other_slot;
                     }
                 }
+                best_ts = __shfl_sync(0xffffffffu, best_ts, 0);
+            }
+            if (best_ts >= step) {
+                if (lane == 0) remapped_topk_ids[i] = -1;
+                continue;
             }
 
             if (lane == 0) {
@@ -934,7 +939,7 @@ extern "C" int w34_moe_gpu_lru_update_and_pull(
     if (!ex || !global_topk_ids || !expert_to_slot || !slot_to_expert || !slot_last_used ||
         !step_counter || !remapped_topk_ids || !miss_local_experts || !miss_victim_slots ||
         !num_misses_buf || total_pairs < 0 || local_num_experts <= 0 || k_hot <= 0 ||
-        max_misses < 0 || max_misses > 65535) {
+        max_misses < 0 || max_misses > 65535 || (max_misses > 0 && mapped_host_packs == nullptr)) {
         return (int)cudaErrorInvalidValue;
     }
     if (total_pairs == 0) return 0;

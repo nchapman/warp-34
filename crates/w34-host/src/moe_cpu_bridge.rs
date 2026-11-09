@@ -473,16 +473,16 @@ impl Runtime {
         }))
     }
     pub fn register(&self, store: &HostExpertStore) -> crate::cuda::Result<Arc<Mailbox>> {
-        let layout = store.layout();
-        if layout.hidden > 4096
-            || layout.intermediate > 2048
-            || !matches!(layout.group_size, 64 | 128)
-            || !matches!(layout.down_hadamard_block_size, 0 | 64)
-        {
+        if self.server.is_none() {
+            return Err(bridge_error(
+                "cannot register decode mailbox on prefill-only CPU bridge runtime",
+            ));
+        }
+        if !store.layout().supports_cpu_bridge() {
             return Err(crate::cuda::CudaError::with_detail(
                 -1,
                 "CPU bridge geometry",
-                "requires hidden <= 4096, intermediate <= 2048, group size 64 or 128, down Hadamard 0 or 64",
+                "requires hidden <= 4096 and % 128 == 0, intermediate <= 2048 and % 128 == 0, group size 64 or 128, down Hadamard 0 or 64",
             ));
         }
         let req = MappedHostBuffer::alloc(std::mem::size_of::<Request>())?;

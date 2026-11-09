@@ -275,10 +275,10 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             req_slot->x_f16[i] = src_u16[i];
         }
     }
-    __threadfence_system();
     __syncthreads();
 
     if (threadIdx.x == 0) {
+        __threadfence_system();
         const int64_t next_seq = req_slot->seq + 1;
         asm volatile("st.release.sys.global.b64 [%0], %1;" ::"l"(&req_slot->seq), "l"(next_seq)
                      : "memory");

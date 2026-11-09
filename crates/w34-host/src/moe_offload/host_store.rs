@@ -916,7 +916,9 @@ impl HotExpertCache {
 
     #[inline]
     pub fn prefill_hot_limit(&self) -> usize {
-        if self.has_cpu_bridge() {
+        if self.slots.capacity >= self.expert_ids.len() {
+            self.slots.capacity
+        } else if self.has_cpu_bridge() {
             self.k_static
         } else if self.slots.capacity > TIERED_MOE_GPU_LRU_TAIL_SLOTS {
             self.slots.capacity - TIERED_MOE_GPU_LRU_TAIL_SLOTS
@@ -971,12 +973,10 @@ impl HotExpertCache {
         if !Self::cpu_bridge_supported() {
             return Ok(());
         }
-        if !store.layout.hidden.is_multiple_of(128)
-            || !store.layout.intermediate.is_multiple_of(128)
-        {
+        if !store.layout.supports_cpu_bridge() {
             return Err(crate::cuda::CudaError::new(
                 -1,
-                "CPU MoE bridge requires hidden and intermediate dimensions divisible by 128",
+                "CPU MoE bridge requires hidden <= 4096 and % 128 == 0, intermediate <= 2048 and % 128 == 0, group size 64 or 128, and down Hadamard 0 or 64",
             ));
         }
         if self.bridge_runtime.is_none() {
@@ -1008,9 +1008,12 @@ impl HotExpertCache {
         self.d_step_counter.copy_to_host(&mut step_arr, stream)?;
         stream.synchronize()?;
         self.step_clock = step_arr[0].max(1);
-        let check_limit = self
-            .prefill_hot_limit()
-            .min(self.initial_slot_to_expert.len());
+        let check_limit = if self.has_cpu_bridge() {
+            self.k_static
+        } else {
+            self.prefill_hot_limit()
+        }
+        .min(self.initial_slot_to_expert.len());
         if (0..check_limit).any(|s| self.slot_to_expert[s] != self.initial_slot_to_expert[s]) {
             self.adapted_slots_dirty = true;
         }
