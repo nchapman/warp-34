@@ -249,6 +249,22 @@ impl TieredMoeEngine {
         // Identify unique active local experts and count cache hits/misses.
         let local_start = cache.expert_ids.start;
         let local_len = cache.expert_ids.len();
+        let prefill_hot_limit = if (TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS + 1..1024)
+            .contains(&num_tokens)
+            && !matches!(
+                mode,
+                MoeOffloadMode::GpuLru | MoeOffloadMode::CpuHybrid { .. }
+            ) {
+            if cache.bridge_layer_id.is_some() {
+                cache.k_static
+            } else if cache.slots.capacity > 40 {
+                cache.slots.capacity - 40
+            } else {
+                cache.slots.capacity
+            }
+        } else {
+            cache.slots.capacity
+        };
         let mut seen_local = vec![false; local_len];
         let mut active_local: Vec<usize> = Vec::new();
         let mut hits_in_step: Vec<usize> = Vec::new();
@@ -263,7 +279,8 @@ impl TieredMoeEngine {
             if le >= local_len {
                 continue;
             }
-            let is_hit = cache.expert_to_slot[le] >= 0;
+            let slot = cache.expert_to_slot[le];
+            let is_hit = slot >= 0 && (slot as usize) < prefill_hot_limit;
             if is_hit {
                 cache.hits += 1;
             } else {
@@ -596,7 +613,8 @@ impl TieredMoeEngine {
                         let ge = raw_id as usize;
                         let le = ge.wrapping_sub(local_start);
                         if le < local_len {
-                            if cache.expert_to_slot[le] < 0 {
+                            let slot = cache.expert_to_slot[le];
+                            if slot < 0 || (slot as usize) >= prefill_hot_limit {
                                 miss_freq[le] += 1;
                                 if use_cpu_bridge {
                                     let tok = (pair_idx / top_k) as i32;
@@ -789,13 +807,18 @@ impl TieredMoeEngine {
                 }
 
                 // Pass 0: Execute all hot-cache hits on `compute_stream` (plus shared expert).
+                let pass0_slot_map_addr = if prefill_hot_limit < cache.slots.capacity {
+                    cache.d_prefill_expert_to_slot.addr()
+                } else {
+                    cache.d_expert_to_slot.addr()
+                };
                 crate::cuda::check_rc(
                     // SAFETY: pointers and counts match allocated device buffers.
                     unsafe {
                         w34_kernels::ffi::w34_moe_remap_topk_ids_i32(
                             &ex,
                             d_topk_ids_addr as *const i32,
-                            cache.d_expert_to_slot.addr() as *const i32,
+                            pass0_slot_map_addr as *const i32,
                             ws.d_remapped_topk_ids[0].addr() as *mut i32,
                             (num_tokens * top_k) as i32,
                             cache.expert_ids.start as i32,
@@ -1086,7 +1109,7 @@ impl RankTieredMoe {
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 if ep_size == 1 {
-                    let k_static = if k_hot >= 64 { k_hot - 24 } else { k_hot };
+                    let k_static = k_hot;
                     if bridge_runtime.is_none() {
                         bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
                     }

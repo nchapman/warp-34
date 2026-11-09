@@ -231,44 +231,86 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_gate_up_silu_f16_kernel(
     float gate_acc = 0.0f;
     float up_acc = 0.0f;
 
-#pragma unroll 4
-    for (int w = lane; w < words_per_row; w += 32) {
-        const uint4 xv = __ldg(&x_vec4[w]);
-        const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
-        const uint32_t gw = __ldg(&gate_w[w]);
-        const uint32_t uw = __ldg(&up_w[w]);
-        const int g_idx = (group_shift >= 0) ? (w >> group_shift) : (w / words_per_group);
-        const __half2 gs_h2 = __half2half2(__ldg(&gate_s[g_idx]));
-        const __half2 us_h2 = __half2half2(__ldg(&up_s[g_idx]));
-        uint32_t g_zp = 8u;
-        uint32_t u_zp = 8u;
-        if constexpr (HAS_ZP) {
-            g_zp = load_zp_nibble(zp_exp, col, groups_per_row, g_idx);
-            u_zp = load_zp_nibble(zp_exp, n_interm + col, groups_per_row, g_idx);
+    if (!HAS_ZP && (words_per_row & 3) == 0 && (words_per_group & 3) == 0 &&
+        (((uintptr_t)gate_w | (uintptr_t)up_w) & 15u) == 0u) {
+        const int k_u4_per_row = words_per_row >> 2;
+        const int w_cols_per_group = words_per_group >> 2;
+        const int lpr =
+            (k_u4_per_row >= 32) ? 32 : (k_u4_per_row >= 16) ? 16 : (k_u4_per_row >= 8) ? 8 : 4;
+        const uint4* gate_w_u4 = reinterpret_cast<const uint4*>(gate_w);
+        const uint4* up_w_u4 = reinterpret_cast<const uint4*>(up_w);
+        if (lane < lpr) {
+            for (int w_col = lane; w_col < k_u4_per_row; w_col += lpr) {
+                const int g_idx = w_col / w_cols_per_group;
+                const int x_col0 = w_col * 4;
+                const uint4 gw4 = __ldg(&gate_w_u4[w_col]);
+                const uint4 uw4 = __ldg(&up_w_u4[w_col]);
+                const __half2 gs_h2 = __half2half2(__ldg(&gate_s[g_idx]));
+                const __half2 us_h2 = __half2half2(__ldg(&up_s[g_idx]));
+                const uint32_t* gw_words = reinterpret_cast<const uint32_t*>(&gw4);
+                const uint32_t* uw_words = reinterpret_cast<const uint32_t*>(&uw4);
+#pragma unroll
+                for (int word_i = 0; word_i < 4; ++word_i) {
+                    const uint32_t gw_v = gw_words[word_i];
+                    const uint32_t uw_v = uw_words[word_i];
+                    const uint4 xv = __ldg(&x_vec4[x_col0 + word_i]);
+                    const __half2* xh2 = reinterpret_cast<const __half2*>(&xv);
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        const float x0 = __low2float(xh2[p]);
+                        const float x1 = __high2float(xh2[p]);
+                        const __half2 gd = unpack_u4b8_pair_scaled_h2(gw_v, p, gs_h2);
+                        const __half2 ud = unpack_u4b8_pair_scaled_h2(uw_v, p, us_h2);
+                        gate_acc += __low2float(gd) * x0 + __high2float(gd) * x1;
+                        up_acc += __low2float(ud) * x0 + __high2float(ud) * x1;
+                    }
+                }
+            }
         }
+        for (int off = lpr >> 1; off > 0; off >>= 1) {
+            gate_acc += __shfl_xor_sync(0xffffffffu, gate_acc, off);
+            up_acc += __shfl_xor_sync(0xffffffffu, up_acc, off);
+        }
+    } else {
+#pragma unroll 4
+        for (int w = lane; w < words_per_row; w += 32) {
+            const uint4 xv = __ldg(&x_vec4[w]);
+            const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
+            const uint32_t gw = __ldg(&gate_w[w]);
+            const uint32_t uw = __ldg(&up_w[w]);
+            const int g_idx = (group_shift >= 0) ? (w >> group_shift) : (w / words_per_group);
+            const __half2 gs_h2 = __half2half2(__ldg(&gate_s[g_idx]));
+            const __half2 us_h2 = __half2half2(__ldg(&up_s[g_idx]));
+            uint32_t g_zp = 8u;
+            uint32_t u_zp = 8u;
+            if constexpr (HAS_ZP) {
+                g_zp = load_zp_nibble(zp_exp, col, groups_per_row, g_idx);
+                u_zp = load_zp_nibble(zp_exp, n_interm + col, groups_per_row, g_idx);
+            }
 
 #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
-            const float x_lo = __low2float(xh2);
-            const float x_hi = __high2float(xh2);
+            for (int p = 0; p < 4; ++p) {
+                const __half2 xh2 = *reinterpret_cast<const __half2*>(&x2[p]);
+                const float x_lo = __low2float(xh2);
+                const float x_hi = __high2float(xh2);
 
-            const __half2 gwh2 = HAS_ZP
-                ? unpack_u4_zp_pair_scaled_h2(gw, p, g_zp, gs_h2)
-                : unpack_u4b8_pair_scaled_h2(gw, p, gs_h2);
-            gate_acc += __low2float(gwh2) * x_lo;
-            gate_acc += __high2float(gwh2) * x_hi;
+                const __half2 gwh2 = HAS_ZP
+                    ? unpack_u4_zp_pair_scaled_h2(gw, p, g_zp, gs_h2)
+                    : unpack_u4b8_pair_scaled_h2(gw, p, gs_h2);
+                gate_acc += __low2float(gwh2) * x_lo;
+                gate_acc += __high2float(gwh2) * x_hi;
 
-            const __half2 uwh2 = HAS_ZP
-                ? unpack_u4_zp_pair_scaled_h2(uw, p, u_zp, us_h2)
-                : unpack_u4b8_pair_scaled_h2(uw, p, us_h2);
-            up_acc += __low2float(uwh2) * x_lo;
-            up_acc += __high2float(uwh2) * x_hi;
+                const __half2 uwh2 = HAS_ZP
+                    ? unpack_u4_zp_pair_scaled_h2(uw, p, u_zp, us_h2)
+                    : unpack_u4b8_pair_scaled_h2(uw, p, us_h2);
+                up_acc += __low2float(uwh2) * x_lo;
+                up_acc += __high2float(uwh2) * x_hi;
+            }
         }
-    }
 
-    gate_acc = warp_reduce_sum(gate_acc);
-    up_acc = warp_reduce_sum(up_acc);
+        gate_acc = warp_reduce_sum(gate_acc);
+        up_acc = warp_reduce_sum(up_acc);
+    }
 
     if (lane == 0) {
         interm_out[(size_t)pair_idx * n_interm + col] =
@@ -315,7 +357,54 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
 
     float total_sum = 0.0f;
 
-    if constexpr (FIXED_WORDS_PER_ROW > 0 && FIXED_TOP_K > 0) {
+    if (!HAS_ZP && FIXED_WORDS_PER_ROW > 0 && (FIXED_WORDS_PER_ROW & 3) == 0 &&
+        FIXED_TOP_K > 0 && (words_per_group & 3) == 0) {
+        constexpr int kU4PerRow = FIXED_WORDS_PER_ROW >> 2;
+        constexpr int kLpr =
+            (kU4PerRow >= 32) ? 32 : (kU4PerRow >= 16) ? 16 : (kU4PerRow >= 8) ? 8 : 4;
+        const int w_cols_per_group = words_per_group >> 2;
+#pragma unroll
+        for (int slot = 0; slot < FIXED_TOP_K; ++slot) {
+            const int pair_idx = tok * FIXED_TOP_K + slot;
+            const int expert_id = __ldg(&topk_ids[pair_idx]);
+            if (expert_id < 0 || expert_id >= num_experts) continue;
+            const __half tw_h = __float2half_rn(__ldg(&topk_weights[pair_idx]));
+
+            const uint4* x_vec4 = (const uint4*)(interm_in + (size_t)pair_idx * n_interm);
+            const size_t row_idx = (size_t)expert_id * k_hidden + out_col;
+            const uint4* dw_u4 = reinterpret_cast<const uint4*>(down_packed + row_idx * FIXED_WORDS_PER_ROW);
+            const __half* ds_ptr = down_scales + row_idx * groups_per_row;
+
+            float dot = 0.0f;
+            if (lane < kLpr) {
+#pragma unroll
+                for (int w_col = lane; w_col < kU4PerRow; w_col += kLpr) {
+                    const int g_idx = w_col / w_cols_per_group;
+                    const int x_col0 = w_col * 4;
+                    const uint4 dw4 = __ldg(&dw_u4[w_col]);
+                    const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
+                    const uint32_t* dw_words = reinterpret_cast<const uint32_t*>(&dw4);
+#pragma unroll
+                    for (int word_i = 0; word_i < 4; ++word_i) {
+                        const uint32_t dw = dw_words[word_i];
+                        const uint4 xv = __ldg(&x_vec4[x_col0 + word_i]);
+                        const __half2* xh2 = reinterpret_cast<const __half2*>(&xv);
+#pragma unroll
+                        for (int p = 0; p < 4; ++p) {
+                            const __half2 dwh2 = unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
+                            dot += __low2float(dwh2) * __low2float(xh2[p]) +
+                                   __high2float(dwh2) * __high2float(xh2[p]);
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int off = kLpr >> 1; off > 0; off >>= 1) {
+                dot += __shfl_xor_sync(0xffffffffu, dot, off);
+            }
+            total_sum += __half2float(__hmul(__float2half_rn(dot), tw_h));
+        }
+    } else if constexpr (FIXED_WORDS_PER_ROW > 0 && FIXED_TOP_K > 0) {
 #pragma unroll
         for (int slot = 0; slot < FIXED_TOP_K; ++slot) {
             const int pair_idx = tok * FIXED_TOP_K + slot;
@@ -358,6 +447,50 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
                 }
             }
             dot = warp_reduce_sum(dot);
+            total_sum += __half2float(__hmul(__float2half_rn(dot), tw_h));
+        }
+    } else if (!HAS_ZP && (words_per_row & 3) == 0 && (words_per_group & 3) == 0 &&
+               (((uintptr_t)down_packed) & 15u) == 0u) {
+        const int k_u4_per_row = words_per_row >> 2;
+        const int w_cols_per_group = words_per_group >> 2;
+        const int lpr =
+            (k_u4_per_row >= 32) ? 32 : (k_u4_per_row >= 16) ? 16 : (k_u4_per_row >= 8) ? 8 : 4;
+        for (int slot = 0; slot < top_k; ++slot) {
+            const int pair_idx = tok * top_k + slot;
+            const int expert_id = __ldg(&topk_ids[pair_idx]);
+            if (expert_id < 0 || expert_id >= num_experts) continue;
+            const __half tw_h = __float2half_rn(__ldg(&topk_weights[pair_idx]));
+
+            const uint4* x_vec4 = (const uint4*)(interm_in + (size_t)pair_idx * n_interm);
+            const size_t row_idx = (size_t)expert_id * k_hidden + out_col;
+            const uint4* dw_u4 = reinterpret_cast<const uint4*>(down_packed + row_idx * words_per_row);
+            const __half* ds_ptr = down_scales + row_idx * groups_per_row;
+
+            float dot = 0.0f;
+            if (lane < lpr) {
+                for (int w_col = lane; w_col < k_u4_per_row; w_col += lpr) {
+                    const int g_idx = w_col / w_cols_per_group;
+                    const int x_col0 = w_col * 4;
+                    const uint4 dw4 = __ldg(&dw_u4[w_col]);
+                    const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
+                    const uint32_t* dw_words = reinterpret_cast<const uint32_t*>(&dw4);
+#pragma unroll
+                    for (int word_i = 0; word_i < 4; ++word_i) {
+                        const uint32_t dw = dw_words[word_i];
+                        const uint4 xv = __ldg(&x_vec4[x_col0 + word_i]);
+                        const __half2* xh2 = reinterpret_cast<const __half2*>(&xv);
+#pragma unroll
+                        for (int p = 0; p < 4; ++p) {
+                            const __half2 dwh2 = unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
+                            dot += __low2float(dwh2) * __low2float(xh2[p]) +
+                                   __high2float(dwh2) * __high2float(xh2[p]);
+                        }
+                    }
+                }
+            }
+            for (int off = lpr >> 1; off > 0; off >>= 1) {
+                dot += __shfl_xor_sync(0xffffffffu, dot, off);
+            }
             total_sum += __half2float(__hmul(__float2half_rn(dot), tw_h));
         }
     } else {
@@ -1190,7 +1323,8 @@ extern "C" int w34_moe_w4a16_select_regime(
         n_interm <= 0 || k_hidden <= 0 || group_size <= 0) {
         return 0;
     }
-    if (num_tokens >= 4 && num_tokens <= 7 && num_tokens * top_k <= num_experts &&
+    const int max_vec4_tokens = (group_size == 64 && top_k >= 10) ? 8 : 7;
+    if (num_tokens >= 4 && num_tokens <= max_vec4_tokens && num_tokens * top_k <= num_experts &&
         num_experts <= 1024 && n_interm % 64 == 0 && k_hidden % 64 == 0 &&
         n_interm % group_size == 0 && k_hidden % group_size == 0 &&
         (group_size == 128 || group_size == 64)) {

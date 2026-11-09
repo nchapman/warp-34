@@ -20,16 +20,16 @@ struct Request {
     intermediate: i32,
     experts: i32,
     pad: [i32; 7],
-    ids: [i32; 64],
-    weights: [f32; 64],
-    x: [u16; 16384],
+    ids: [i32; 128],
+    weights: [f32; 128],
+    x: [u16; 32768],
 }
 #[repr(C, align(64))]
 struct Response {
     seq: AtomicI64,
     status: i32,
     pad: [i32; 13],
-    y: [f32; 16384],
+    y: [f32; 32768],
 }
 fn bridge_error(detail: impl ToString) -> crate::cuda::CudaError {
     crate::cuda::CudaError::with_detail(-1, "CPU MoE bridge", detail.to_string())
@@ -374,12 +374,12 @@ impl Runtime {
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     let r = &*rq;
                                     assert!(
-                                        (1..=4).contains(&r.tokens) && (1..=16).contains(&r.top_k)
+                                        (1..=8).contains(&r.tokens) && (1..=16).contains(&r.top_k)
                                     );
                                     let h = m.store.layout().hidden;
                                     assert_eq!(r.hidden as usize, h);
                                     let total = r.tokens as usize * r.top_k as usize;
-                                    let mut tasks = [(0usize, 0usize, 0.0f32); 64];
+                                    let mut tasks = [(0usize, 0usize, 0.0f32); 128];
                                     let mut n_tasks = 0;
                                     for i in 0..total {
                                         if r.ids[i] >= 0 {
@@ -792,7 +792,7 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
             .eval
             .resize(eval::scratch_len(n, range.len()).unwrap(), 0.);
         let y = &mut output[..];
-        if batch.tokens <= 4 {
+        if batch.tokens <= 8 {
             eval::eval_expert_slice(
                 d,
                 range,
@@ -960,7 +960,7 @@ fn evaluate_into(
     for (j, job) in jobs.iter().enumerate() {
         routing.expert_to_job[job.expert] = j as u32;
     }
-    let slices = if tokens <= 4 && store.layout().intermediate / 128 >= 2 {
+    let slices = if tokens <= 8 && store.layout().intermediate / 128 >= 2 {
         2
     } else {
         1
@@ -1084,11 +1084,11 @@ mod tests {
     #[test]
     fn mailbox_abi() {
         assert_eq!(std::mem::offset_of!(Request, ids), 64);
-        assert_eq!(std::mem::offset_of!(Request, x), 576);
-        assert_eq!(std::mem::size_of::<Request>(), 33344);
+        assert_eq!(std::mem::offset_of!(Request, x), 1088);
+        assert_eq!(std::mem::size_of::<Request>(), 66624);
         assert_eq!(std::mem::offset_of!(Response, status), 8);
         assert_eq!(std::mem::offset_of!(Response, y), 64);
-        assert_eq!(std::mem::size_of::<Response>(), 65600);
+        assert_eq!(std::mem::size_of::<Response>(), 131136);
     }
     #[test]
     fn new_prefill_only_partitions_ep_cpus_and_matches_prefill_output() {

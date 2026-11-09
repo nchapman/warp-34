@@ -24,9 +24,9 @@
 
 namespace w34_moe_bridge {
 
-static constexpr int kMaxTokens = 4;
+static constexpr int kMaxTokens = 8;
 static constexpr int kMaxTopK = 16;
-static constexpr int kMaxPairs = kMaxTokens * kMaxTopK; // 64
+static constexpr int kMaxPairs = kMaxTokens * kMaxTopK; // 128
 static constexpr int kMaxHidden = 4096;
 static constexpr int kMaxGpuStagePull = 8;
 static constexpr int kDefaultSingleTokenMaxGpuPull = 2;
@@ -63,8 +63,8 @@ struct alignas(64) MoeBridgeReqSlot {
     uint16_t x_f16[kMaxTokens * kMaxHidden];
 };
 
-static_assert(offsetof(MoeBridgeReqSlot, x_f16) == 576);
-static_assert(sizeof(MoeBridgeReqSlot) == 33344);
+static_assert(offsetof(MoeBridgeReqSlot, x_f16) == 1088);
+static_assert(sizeof(MoeBridgeReqSlot) == 66624);
 
 struct alignas(64) MoeBridgeRespSlot {
     int64_t seq;
@@ -74,7 +74,7 @@ struct alignas(64) MoeBridgeRespSlot {
 };
 static_assert(offsetof(MoeBridgeRespSlot, status) == 8);
 static_assert(offsetof(MoeBridgeRespSlot, y_f32) == 64);
-static_assert(sizeof(MoeBridgeRespSlot) == 65600);
+static_assert(sizeof(MoeBridgeRespSlot) == 131136);
 
 __global__ void moe_hybrid_plan_and_submit_kernel(
     const __half* __restrict__ x_f16,

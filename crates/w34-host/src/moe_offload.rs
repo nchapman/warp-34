@@ -367,8 +367,8 @@ impl HotExpertRankings {
 /// Maximum token rows (`6,144`) supported in a single tiered-MoE / `PLE` batch workspace.
 pub const TIERED_MOE_MAX_BATCH_TOKENS: usize = 6144;
 
-/// Maximum decode/verify batch size (`4` tokens) eligible for zero-copy GPU+CPU hybrid MoE execution.
-pub const TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS: usize = 4;
+/// Maximum decode/verify batch size (`8` tokens) eligible for zero-copy GPU+CPU hybrid MoE execution.
+pub const TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS: usize = 8;
 
 /// Maximum routed `top_k` (`16` experts/token) supported by the GPU+CPU hybrid MoE mailbox ABI.
 pub const TIERED_MOE_CPU_BRIDGE_MAX_TOP_K: usize = 16;

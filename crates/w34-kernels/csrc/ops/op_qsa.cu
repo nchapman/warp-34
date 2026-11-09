@@ -1385,15 +1385,15 @@ static int launch_qsa_sparse_paged_attn_f16(
     }
     if (q_group_size >= 1 && q_group_size <= 6 && select_k_blocks > 0) {
         const int num_q_groups = local_q_heads / q_group_size;
-        const int base_ctas = num_tokens * num_q_groups;
+        // Choose `target_splits` from `num_tokens` (independent of `local_q_heads` and constant
+        // across `M = 1..16`) so Plain (`M = 1`), `MTP-3` (`M = 4`), and `DFlash2` (`M = 8..16`)
+        // as well as `TP=1` and `TP=2` execute the exact same Split-K reduction tree.
         int target_splits = 1;
-        if (base_ctas <= 4) {
-            target_splits = 16;
-        } else if (base_ctas <= 16) {
+        if (num_tokens <= 16) {
             target_splits = 8;
-        } else if (base_ctas <= 64) {
+        } else if (num_tokens <= 64) {
             target_splits = 4;
-        } else if (base_ctas <= 128) {
+        } else if (num_tokens <= 128) {
             target_splits = 2;
         }
         const int max_by_blocks = select_k_blocks >> 1;

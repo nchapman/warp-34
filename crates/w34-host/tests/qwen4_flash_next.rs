@@ -1534,3 +1534,72 @@ fn test_qwen4_exp_real_checkpoint_tp1_and_tp2() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires local Qwen3.8-Flash-Next checkpoint"]
+fn test_qwen4_flash_next_128tok_plain_mtp3_dflash2_exact_parity() {
+    let snap = w34_host::loader::resolve_hf_model_dir("nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ")
+        .expect("resolve Qwen3.8-Flash-Next-W4A16-HGPTQ checkpoint");
+    let snap = snap.as_path();
+
+    for tp in [1usize, 2] {
+        if tp == 2 && w34_host::cuda::CudaDevice::set_current(1).is_err() {
+            continue;
+        }
+        let mut engine =
+            Qwen3_5Engine::load_from_dir(snap, tp, KvFormatPolicy::Tq4, Some(512), true)
+                .unwrap_or_else(|e| panic!("load Flash-Next TP={tp}: {e:?}"));
+
+        let seed = engine
+            .encode("The quick brown fox jumps over the lazy dog. ")
+            .unwrap();
+        let mut prompt = Vec::with_capacity(128);
+        while prompt.len() < 128 {
+            prompt.extend_from_slice(&seed);
+        }
+        prompt.truncate(128);
+
+        let plain = engine
+            .generate_with_radix_cache(&prompt, 64, 64, false)
+            .unwrap();
+        engine
+            .enable_speculative(&w34_host::proposer::SpeculativeConfig {
+                kind: w34_host::proposer::SpeculativeKind::Mtp,
+                draft_model: None,
+                mtp_k: 3,
+            })
+            .unwrap();
+        let mtp = engine
+            .generate_with_radix_cache(&prompt, 64, 64, false)
+            .unwrap();
+        engine.disable_speculative().unwrap();
+        engine
+            .enable_speculative(&w34_host::proposer::SpeculativeConfig {
+                kind: w34_host::proposer::SpeculativeKind::DFlash2,
+                draft_model: Some("nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ".to_string()),
+                mtp_k: 1,
+            })
+            .unwrap();
+        let dflash = engine
+            .generate_with_radix_cache(&prompt, 64, 64, false)
+            .unwrap();
+
+        eprintln!(
+            "[Flash-Next 128->64 TP={tp}] plain={:.2} tok/s mtp3={:.2} tok/s dflash2={:.2} tok/s\n  plain  = {:?}\n  mtp3   = {:?}\n  dflash = {:?}",
+            plain.decode_tok_per_s,
+            mtp.decode_tok_per_s,
+            dflash.decode_tok_per_s,
+            plain.generated_token_ids,
+            mtp.generated_token_ids,
+            dflash.generated_token_ids,
+        );
+        assert_eq!(
+            mtp.generated_token_ids, plain.generated_token_ids,
+            "Flash-Next TP={tp} MTP-3 must match plain 64-token greedy output token-for-token"
+        );
+        assert_eq!(
+            dflash.generated_token_ids, plain.generated_token_ids,
+            "Flash-Next TP={tp} DFlash2 must match plain 64-token greedy output token-for-token"
+        );
+    }
+}
