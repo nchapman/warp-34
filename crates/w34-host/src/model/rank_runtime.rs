@@ -3,8 +3,8 @@
 //! prefill token capacity queries).
 
 use super::rank::{
-    MIN_PLE_ROW_STAGING_BYTES, PleRankRuntime, TIERED_MOE_STAGE_CAPACITY_DEFAULT,
-    TIERED_MOE_STAGE_CAPACITY_TP4,
+    MIN_PLE_ROW_STAGING_BYTES, PleRankRuntime, TIERED_MOE_COMPACT_MAX_HOT_EXPERTS,
+    TIERED_MOE_STAGE_CAPACITY_DEFAULT, TIERED_MOE_STAGE_CAPACITY_TP4,
 };
 use super::*;
 
@@ -34,7 +34,8 @@ impl Qwen3_5ModelRank {
             default_hot
         };
         let stage_cap = if self.tp_size >= 4
-            || (self.cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS && hot_per_layer <= 24)
+            || (self.cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
+                && hot_per_layer <= TIERED_MOE_COMPACT_MAX_HOT_EXPERTS)
         {
             local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_TP4)
         } else {
