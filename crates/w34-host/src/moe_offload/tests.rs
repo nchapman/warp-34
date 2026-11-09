@@ -1611,6 +1611,23 @@ mod cuda_tests {
             cache.slot_of(65).is_some(),
             "multi-token expert 65 must remain resident"
         );
+        let mut d_prefill_s2 = vec![0i32; num_experts];
+        cache
+            .d_prefill_expert_to_slot
+            .copy_to_host(&mut d_prefill_s2, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        for (le, &s) in cache.expert_to_slot.iter().enumerate() {
+            let expected = if s >= 0 && (s as usize) < cache.prefill_hot_limit() {
+                s
+            } else {
+                -1
+            };
+            assert_eq!(
+                d_prefill_s2[le], expected,
+                "d_prefill_expert_to_slot[{le}] stale after M=8 device-side LRU sync"
+            );
+        }
 
         // Step 3: Verify `StreamedPrefill` (`num_tokens = 1024`, `bridge_layer_id == None`)
         // promotes a cold expert (`70`) routed 32 times in the prompt into `cache.slots`.
@@ -1686,5 +1703,22 @@ mod cuda_tests {
         .unwrap();
         assert!(!cache.adapted_slots_dirty);
         assert_eq!(cache.slot_to_expert, (0..k_hot).collect::<Vec<_>>());
+        let mut d_prefill_s4 = vec![0i32; num_experts];
+        cache
+            .d_prefill_expert_to_slot
+            .copy_to_host(&mut d_prefill_s4, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        for (le, &s) in cache.expert_to_slot.iter().enumerate() {
+            let expected = if s >= 0 && (s as usize) < cache.prefill_hot_limit() {
+                s
+            } else {
+                -1
+            };
+            assert_eq!(
+                d_prefill_s4[le], expected,
+                "d_prefill_expert_to_slot[{le}] stale after short-prompt restoration"
+            );
+        }
     }
 }

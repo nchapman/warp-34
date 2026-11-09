@@ -762,6 +762,7 @@ pub struct HotExpertCache {
     pub slots: DeviceExpertSlotTable,
     pub expert_ids: Range<usize>,
     pub expert_to_slot: Vec<i32>,
+    pub prefill_expert_to_slot: Vec<i32>,
     pub slot_to_expert: Vec<usize>,
     pub slot_to_expert_i32: Vec<i32>,
     pub slot_last_used: Vec<u64>,
@@ -815,6 +816,7 @@ impl HotExpertCache {
             slots,
             expert_ids,
             expert_to_slot: vec![-1; local_count],
+            prefill_expert_to_slot: vec![-1; local_count],
             slot_to_expert: vec![usize::MAX; k_hot],
             slot_to_expert_i32: vec![-1; k_hot],
             slot_last_used: vec![0; k_hot],
@@ -891,20 +893,7 @@ impl HotExpertCache {
         }
         self.d_expert_to_slot
             .copy_from_host(&self.expert_to_slot, stream)?;
-        let prefill_cap = if k_hot > 40 { k_hot - 40 } else { k_hot };
-        let prefill_expert_to_slot: Vec<i32> = self
-            .expert_to_slot
-            .iter()
-            .map(|&s| {
-                if s >= 0 && (s as usize) < prefill_cap {
-                    s
-                } else {
-                    -1
-                }
-            })
-            .collect();
-        self.d_prefill_expert_to_slot
-            .copy_from_host(&prefill_expert_to_slot, stream)?;
+        self.sync_prefill_expert_to_slot(stream)?;
         for (dst, &e) in self.slot_to_expert_i32.iter_mut().zip(&self.slot_to_expert) {
             *dst = if e == usize::MAX { -1 } else { e as i32 };
         }
@@ -917,6 +906,37 @@ impl HotExpertCache {
             .copy_from_host(&self.step_clock_buf, stream)?;
         self.device_lru_dirty = false;
         stream.synchronize()
+    }
+
+    #[inline]
+    pub fn prefill_hot_limit(&self) -> usize {
+        if self.bridge_layer_id.is_some() {
+            self.k_static
+        } else if self.slots.capacity > 40 {
+            self.slots.capacity - 40
+        } else {
+            self.slots.capacity
+        }
+    }
+
+    pub fn sync_prefill_expert_to_slot(
+        &mut self,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<()> {
+        let prefill_cap = self.prefill_hot_limit();
+        for (dst, &s) in self
+            .prefill_expert_to_slot
+            .iter_mut()
+            .zip(&self.expert_to_slot)
+        {
+            *dst = if s >= 0 && (s as usize) < prefill_cap {
+                s
+            } else {
+                -1
+            };
+        }
+        self.d_prefill_expert_to_slot
+            .copy_from_host(&self.prefill_expert_to_slot, stream)
     }
 
     #[inline]
@@ -961,19 +981,7 @@ impl HotExpertCache {
         self.bridge_mailbox = Some(runtime.register(store)?);
         self.bridge_layer_id = Some(layer_id);
         self.k_static = k_static;
-        let prefill_expert_to_slot: Vec<i32> = self
-            .expert_to_slot
-            .iter()
-            .map(|&s| {
-                if s >= 0 && (s as usize) < k_static {
-                    s
-                } else {
-                    -1
-                }
-            })
-            .collect();
-        self.d_prefill_expert_to_slot
-            .copy_from_host(&prefill_expert_to_slot, stream)?;
+        self.sync_prefill_expert_to_slot(stream)?;
         stream.synchronize()?;
         Ok(())
     }
@@ -999,11 +1007,19 @@ impl HotExpertCache {
             *dst = if src < 0 { usize::MAX } else { src as usize };
         }
         self.step_clock = step_arr[0].max(1);
+        let check_limit = self
+            .prefill_hot_limit()
+            .min(self.initial_slot_to_expert.len());
+        if (0..check_limit).any(|s| self.slot_to_expert[s] != self.initial_slot_to_expert[s]) {
+            self.adapted_slots_dirty = true;
+        }
+        self.sync_prefill_expert_to_slot(stream)?;
+        stream.synchronize()?;
         self.device_lru_dirty = false;
         Ok(())
     }
 
-    /// Restores any static hot slots (`0..k_static`) that were temporarily adapted for a
+    /// Restores any static hot slots (`0..prefill_hot_limit()`) that were temporarily adapted for a
     /// long prompt (`num_tokens >= 1024`) or mutated by device-side LRU eviction back to
     /// `initial_slot_to_expert` when a subsequent normal/short prompt (`num_tokens < 1024`) arrives.
     pub fn restore_initial_if_adapted(
@@ -1066,26 +1082,7 @@ impl HotExpertCache {
             ws.compute_done_events[0].record(stream)?;
             self.d_expert_to_slot
                 .copy_from_host(&self.expert_to_slot, stream)?;
-            let prefill_cap = if self.bridge_layer_id.is_some() {
-                self.k_static
-            } else if k_hot > 40 {
-                k_hot - 40
-            } else {
-                k_hot
-            };
-            let prefill_expert_to_slot: Vec<i32> = self
-                .expert_to_slot
-                .iter()
-                .map(|&s| {
-                    if s >= 0 && (s as usize) < prefill_cap {
-                        s
-                    } else {
-                        -1
-                    }
-                })
-                .collect();
-            self.d_prefill_expert_to_slot
-                .copy_from_host(&prefill_expert_to_slot, stream)?;
+            self.sync_prefill_expert_to_slot(stream)?;
             self.d_slot_to_expert
                 .copy_from_host(&self.slot_to_expert_i32, stream)?;
             self.d_slot_last_used

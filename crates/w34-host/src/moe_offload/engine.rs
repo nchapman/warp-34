@@ -255,13 +255,7 @@ impl TieredMoeEngine {
                 mode,
                 MoeOffloadMode::GpuLru | MoeOffloadMode::CpuHybrid { .. }
             ) {
-            if cache.bridge_layer_id.is_some() {
-                cache.k_static
-            } else if cache.slots.capacity > 40 {
-                cache.slots.capacity - 40
-            } else {
-                cache.slots.capacity
-            }
+            cache.prefill_hot_limit()
         } else {
             cache.slots.capacity
         };
@@ -375,9 +369,18 @@ impl TieredMoeEngine {
                         )?;
                     }
                     ws.compute_done_events[0].record(compute_stream)?;
+                    let check_limit = cache
+                        .prefill_hot_limit()
+                        .min(cache.initial_slot_to_expert.len());
+                    if (0..check_limit)
+                        .any(|s| cache.slot_to_expert[s] != cache.initial_slot_to_expert[s])
+                    {
+                        cache.adapted_slots_dirty = true;
+                    }
                     cache
                         .d_expert_to_slot
                         .copy_from_host(&cache.expert_to_slot, compute_stream)?;
+                    cache.sync_prefill_expert_to_slot(compute_stream)?;
                     for (dst, &e) in cache
                         .slot_to_expert_i32
                         .iter_mut()
@@ -464,9 +467,18 @@ impl TieredMoeEngine {
                         compute_stream,
                     )?;
                     ws.compute_done_events[0].record(compute_stream)?;
+                    let check_limit = cache
+                        .prefill_hot_limit()
+                        .min(cache.initial_slot_to_expert.len());
+                    if (0..check_limit)
+                        .any(|s| cache.slot_to_expert[s] != cache.initial_slot_to_expert[s])
+                    {
+                        cache.adapted_slots_dirty = true;
+                    }
                     cache
                         .d_expert_to_slot
                         .copy_from_host(&cache.expert_to_slot, compute_stream)?;
+                    cache.sync_prefill_expert_to_slot(compute_stream)?;
                     for (dst, &e) in cache
                         .slot_to_expert_i32
                         .iter_mut()
@@ -920,6 +932,7 @@ impl TieredMoeEngine {
                         cache
                             .d_expert_to_slot
                             .copy_from_host(&cache.expert_to_slot, compute_stream)?;
+                        cache.sync_prefill_expert_to_slot(compute_stream)?;
                         cache
                             .d_slot_to_expert
                             .copy_from_host(&cache.slot_to_expert_i32, compute_stream)?;
