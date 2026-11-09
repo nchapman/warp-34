@@ -685,45 +685,19 @@ impl FfnBlockWeights {
         } else {
             0
         };
-        let device_lru_safe = tmoe_engine.layer_is_fully_resident(layer_id)
-            || (!tmoe_engine.layer_has_cpu_bridge(layer_id)
-                && num_tokens * moe.top_k <= tmoe_engine.layer_hot_k(layer_id)
-                && tmoe_engine.layer_has_mapped_store(layer_id))
-            || (num_tokens <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
-                && moe.top_k <= crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_TOP_K
-                && tmoe_engine.layer_has_cpu_bridge(layer_id));
-        if is_capturing_graph && !device_lru_safe {
-            return Err(loader_err(
-                "tiered MoE graph exceeds mapped hot-cache capacity",
-            ));
-        }
-        if device_lru_safe {
-            tmoe_engine.execute_layer_device_lru(
-                stream,
-                layer_id,
-                normed_buf,
-                moe_topk_ids_buf,
-                moe_topk_weights_buf,
-                sh_out_ptr,
-                sh_gate_ptr,
-                mlp_out_buf,
-                num_tokens,
-                moe.top_k,
-            )
-        } else {
-            tmoe_engine.execute_layer(
-                stream,
-                layer_id,
-                normed_buf,
-                moe_topk_ids_buf,
-                moe_topk_weights_buf,
-                sh_out_ptr,
-                sh_gate_ptr,
-                mlp_out_buf,
-                num_tokens,
-                moe.top_k,
-            )
-        }
+        tmoe_engine.execute_layer_auto(
+            stream,
+            is_capturing_graph,
+            layer_id,
+            normed_buf,
+            moe_topk_ids_buf,
+            moe_topk_weights_buf,
+            sh_out_ptr,
+            sh_gate_ptr,
+            mlp_out_buf,
+            num_tokens,
+            moe.top_k,
+        )
     }
 }
 

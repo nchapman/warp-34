@@ -6,8 +6,8 @@
 //        VRAM hits (`0 <= slot < k_static`), optional GPU-staged cold misses (`k_static..k_hot`),
 //        and CPU DDR5 cold misses, publishing the cold request to mapped pinned host memory
 //        (`MoeBridgeReqSlot`) via a system-scope release store (`st.release.sys.global.b64`).
-//      - `moe_hybrid_pull_mapped_experts_kernel` optionally pulls GPU-staged cold misses over
-//        zero-copy PCIe when `k_hot > k_static`.
+//      - `w34_moe_pull_mapped_experts_with_count` (`op_moe_router.cu`) optionally pulls
+//        GPU-staged cold misses over zero-copy PCIe when `k_hot > k_static`.
 //   2. `w34_moe_hybrid_wait_and_add`:
 //      - `moe_hybrid_wait_and_add_kernel` waits on the Rust host worker pool's system-scope
 //        response (`ld.acquire.sys.global.b64` on `MoeBridgeRespSlot::seq`) and adds the FP32
@@ -52,7 +52,7 @@ struct alignas(64) MoeBridgeReqSlot {
     int64_t seq;
     int32_t num_tokens;
     int32_t top_k;
-    int32_t layer_id;
+    int32_t _reserved0;
     int32_t num_cpu_pairs;
     int32_t hidden;
     int32_t intermediate;
@@ -97,7 +97,6 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     int local_num_experts,
     int k_static,
     int k_hot,
-    int layer_id,
     float gpu_share_frac) {
     __shared__ int32_t s_cpu_le[kMaxPairs];
     __shared__ int32_t s_n_cpu_cold;
@@ -240,7 +239,7 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
         if (n_cpu_cold > 0) {
             req_slot->num_tokens = num_tokens;
             req_slot->top_k = top_k;
-            req_slot->layer_id = layer_id;
+            req_slot->_reserved0 = 0;
             req_slot->num_cpu_pairs = total_pairs;
             req_slot->hidden = hidden;
             req_slot->intermediate = intermediate;
@@ -276,75 +275,13 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             req_slot->x_f16[i] = src_u16[i];
         }
     }
-    __threadfence_system();
     __syncthreads();
 
     if (threadIdx.x == 0) {
+        __threadfence_system();
         const int64_t next_seq = req_slot->seq + 1;
         asm volatile("st.release.sys.global.b64 [%0], %1;" ::"l"(&req_slot->seq), "l"(next_seq)
                      : "memory");
-    }
-}
-
-__global__ void moe_hybrid_pull_mapped_experts_kernel(
-    const uint8_t* __restrict__ mapped_host_packs,
-    const int32_t* __restrict__ src_local_experts,
-    const int32_t* __restrict__ dst_slots,
-    const int32_t* __restrict__ num_misses_buf,
-    uint32_t* __restrict__ gate_up_packed_base,
-    uint16_t* __restrict__ gate_up_scales_base,
-    uint32_t* __restrict__ down_packed_base,
-    uint16_t* __restrict__ down_scales_base,
-    int local_num_experts,
-    int dst_capacity,
-    size_t pack_stride_bytes,
-    size_t gu_packed_bytes,
-    size_t gu_scales_bytes,
-    size_t dn_packed_bytes,
-    size_t dn_scales_bytes) {
-    const int s = (int)blockIdx.y;
-    const int num_misses = num_misses_buf[0];
-    if (s >= num_misses) return;
-    const int le = src_local_experts[s];
-    const int dst_slot = dst_slots[s];
-    if (le < 0 || le >= local_num_experts || dst_slot < 0 || dst_slot >= dst_capacity) return;
-
-    const uint8_t* src_pack = mapped_host_packs + (size_t)le * pack_stride_bytes;
-    const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t stride = (size_t)gridDim.x * blockDim.x;
-
-    const size_t gu_p_vec = gu_packed_bytes >> 4;
-    const uint4* src_gu_p = reinterpret_cast<const uint4*>(src_pack);
-    uint4* dst_gu_p = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(gate_up_packed_base) + (size_t)dst_slot * gu_packed_bytes);
-    for (size_t i = tid; i < gu_p_vec; i += stride) {
-        dst_gu_p[i] = src_gu_p[i];
-    }
-
-    const size_t gu_s_vec = gu_scales_bytes >> 4;
-    const uint4* src_gu_s = reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes);
-    uint4* dst_gu_s = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(gate_up_scales_base) + (size_t)dst_slot * gu_scales_bytes);
-    for (size_t i = tid; i < gu_s_vec; i += stride) {
-        dst_gu_s[i] = src_gu_s[i];
-    }
-
-    const size_t dn_p_vec = dn_packed_bytes >> 4;
-    const uint4* src_dn_p =
-        reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes + gu_scales_bytes);
-    uint4* dst_dn_p = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(down_packed_base) + (size_t)dst_slot * dn_packed_bytes);
-    for (size_t i = tid; i < dn_p_vec; i += stride) {
-        dst_dn_p[i] = src_dn_p[i];
-    }
-
-    const size_t dn_s_vec = dn_scales_bytes >> 4;
-    const uint4* src_dn_s = reinterpret_cast<const uint4*>(
-        src_pack + gu_packed_bytes + gu_scales_bytes + dn_packed_bytes);
-    uint4* dst_dn_s = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(down_scales_base) + (size_t)dst_slot * dn_scales_bytes);
-    for (size_t i = tid; i < dn_s_vec; i += stride) {
-        dst_dn_s[i] = src_dn_s[i];
     }
 }
 
@@ -391,7 +328,6 @@ __global__ void moe_hybrid_wait_and_add_kernel(
 
 extern "C" int w34_moe_hybrid_submit_and_pull(
     const w34_exec* ex,
-    int layer_id,
     void* d_req_slot,
     const void* x_f16,
     const int32_t* global_topk_ids,
@@ -420,7 +356,7 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     int k_hidden,
     int group_size,
     float gpu_share_frac) {
-    if (!ex || layer_id < 0 || !d_req_slot || !x_f16 || !global_topk_ids || !topk_weights ||
+    if (!ex || !d_req_slot || !x_f16 || !global_topk_ids || !topk_weights ||
         !expert_to_slot || !slot_to_expert || !slot_last_used || !step_counter ||
         !remapped_topk_ids || !miss_local_experts || !miss_victim_slots ||
         !num_misses_buf || !gate_up_packed_base || !gate_up_scales_base ||
@@ -454,7 +390,6 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
         local_num_experts,
         k_static,
         k_hot,
-        layer_id,
         effective_gpu_share);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return (int)err;
@@ -462,33 +397,23 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     const int max_pull = w34_moe_bridge::hybrid_max_gpu_pull(
         k_static, k_hot, num_tokens, effective_gpu_share);
     if (max_pull > 0 && mapped_host_packs != nullptr && effective_gpu_share > 0.0f) {
-        const size_t gu_packed_bytes =
-            (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
-        const size_t gu_scales_bytes =
-            (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
-        const size_t dn_packed_bytes =
-            (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
-        const size_t dn_scales_bytes =
-            (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
-        dim3 grid(64, (unsigned)max_pull);
-        w34_moe_bridge::moe_hybrid_pull_mapped_experts_kernel<<<grid, 256, 0, stream>>>(
-            static_cast<const uint8_t*>(mapped_host_packs),
+        return w34_moe_pull_mapped_experts_with_count(
+            ex,
+            mapped_host_packs,
             miss_local_experts,
             miss_victim_slots,
             num_misses_buf,
             gate_up_packed_base,
-            static_cast<uint16_t*>(gate_up_scales_base),
+            gate_up_scales_base,
             down_packed_base,
-            static_cast<uint16_t*>(down_scales_base),
+            down_scales_base,
+            max_pull,
             local_num_experts,
             k_hot,
             pack_stride_bytes,
-            gu_packed_bytes,
-            gu_scales_bytes,
-            dn_packed_bytes,
-            dn_scales_bytes);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) return (int)err;
+            n_interm,
+            k_hidden,
+            group_size);
     }
 
     return 0;

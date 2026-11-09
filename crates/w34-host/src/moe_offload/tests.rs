@@ -420,44 +420,7 @@ mod cuda_tests {
             );
         };
 
-        // 2. Verify TP=1 `CpuHybrid { gpu_pcie_budget: 0 }` and `CpuHybrid { gpu_pcie_budget: 2 }`
-        //    with only `k_hot = 4` experts initially cached in VRAM!
-        for budget in [0usize, 2usize] {
-            let mut cache = HotExpertCache::new(0, 4, 0..num_experts, layout.clone()).unwrap();
-            let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 3, num_tokens, top_k).unwrap();
-            cache
-                .populate_initial(&full_store, Some(&[0, 1, 2, 3]), &mut ws, &stream)
-                .unwrap();
-            let d_out =
-                DeviceBuffer::alloc(0, num_tokens * k_hidden * std::mem::size_of::<u16>()).unwrap();
-            TieredMoeEngine::execute_layer(
-                MoeOffloadMode::CpuHybrid {
-                    gpu_pcie_budget: budget,
-                },
-                &full_store,
-                &mut cache,
-                &mut ws,
-                &stream,
-                d_x.addr(),
-                d_topk_ids.addr(),
-                d_topk_weights.addr(),
-                &h_topk_ids,
-                &h_topk_weights,
-                d_shared_out.addr(),
-                d_shared_gate.addr(),
-                d_out.addr(),
-                num_tokens,
-                top_k,
-            )
-            .unwrap();
-            let mut h_out = vec![0u16; num_tokens * k_hidden];
-            d_out.copy_to_host(&mut h_out, &stream).unwrap();
-            assert!(cache.cpu_cold_evals > 0);
-            assert_eq!(cache.dma_experts_loaded, budget as u64);
-            assert_close_f16(&h_out, &format!("TP=1 CpuHybrid(budget={budget})"));
-        }
-
-        // 3. Verify TP=1 `StreamedPrefill` with `k_hot = 4` and `stage_capacity = 3` (forces 4 cold chunks
+        // 2. Verify TP=1 `StreamedPrefill` with `k_hot = 4` and `stage_capacity = 3` (forces 4 cold chunks
         //    through the double-buffered `stage_tables[0..2]` pipeline!).
         {
             let mut cache = HotExpertCache::new(0, 4, 0..num_experts, layout.clone()).unwrap();
@@ -568,9 +531,7 @@ mod cuda_tests {
             cache
                 .populate_initial(&full_store, Some(&[0, 1, 2, 3, 4, 5]), &mut ws, &stream)
                 .unwrap();
-            cache
-                .register_cpu_bridge(0, &full_store, 4, &stream)
-                .unwrap();
+            cache.register_cpu_bridge(&full_store, 4, &stream).unwrap();
             let d_out =
                 DeviceBuffer::alloc(0, num_tokens * k_hidden * std::mem::size_of::<u16>()).unwrap();
             TieredMoeEngine::execute_layer_device_lru(
@@ -679,9 +640,7 @@ mod cuda_tests {
                     &stream,
                 )
                 .unwrap();
-            cache
-                .register_cpu_bridge(0, &full_store, 1, &stream)
-                .unwrap();
+            cache.register_cpu_bridge(&full_store, 1, &stream).unwrap();
             let d_out =
                 DeviceBuffer::alloc(0, t_bridge * k_hidden * std::mem::size_of::<u16>()).unwrap();
             let d_x_mut = upload(&h_x[..t_bridge * k_hidden], &stream);
@@ -808,7 +767,7 @@ mod cuda_tests {
             }
         }
 
-        // 5. Verify TP=2 / EP=2 (`Rank 0: 0..8`, `Rank 1: 8..16`) across `GpuLru`, `CpuHybrid`, and `StreamedPrefill`,
+        // 5. Verify TP=2 / EP=2 (`Rank 0: 0..8`, `Rank 1: 8..16`) across `GpuLru` and `StreamedPrefill`,
         //    including single-AllReduce fusion of EP=2 routed experts + TP=2 sharded shared_expert!
         let store_r0 = HostExpertStore::from_raw_packs(
             layout.clone(),
@@ -825,11 +784,7 @@ mod cuda_tests {
         )
         .unwrap();
 
-        for mode in [
-            MoeOffloadMode::GpuLru,
-            MoeOffloadMode::CpuHybrid { gpu_pcie_budget: 1 },
-            MoeOffloadMode::StreamedPrefill,
-        ] {
+        for mode in [MoeOffloadMode::GpuLru, MoeOffloadMode::StreamedPrefill] {
             let k_hot_ep = if matches!(mode, MoeOffloadMode::GpuLru) {
                 8
             } else {
@@ -1224,7 +1179,7 @@ mod cuda_tests {
             );
         }
 
-        // Also verify `CpuHybrid` and `StreamedPrefill` with `k_hot = 4` on `m = 6`.
+        // Also verify `GpuLru` and `StreamedPrefill` with `k_hot = 4` on `m = 6`.
         let m = 6usize;
         let mut tasks = Vec::with_capacity(m * top_k);
         for tok in 0..m {
@@ -1234,10 +1189,7 @@ mod cuda_tests {
             }
         }
         let h_cpu = full_store.eval_cold_tasks_cpu(&h_x[..m * k_hidden], m, &tasks);
-        for mode in [
-            MoeOffloadMode::CpuHybrid { gpu_pcie_budget: 1 },
-            MoeOffloadMode::StreamedPrefill,
-        ] {
+        for mode in [MoeOffloadMode::GpuLru, MoeOffloadMode::StreamedPrefill] {
             let mut cache = HotExpertCache::new(0, 4, 0..num_experts, layout.clone()).unwrap();
             let mut ws_small = TieredMoeWorkspace::new(0, layout.clone(), 3, m, top_k).unwrap();
             cache
@@ -1293,9 +1245,7 @@ mod cuda_tests {
             cache
                 .populate_initial(&full_store, Some(&[0, 1, 2, 3, 4, 5]), &mut ws_b, &stream)
                 .unwrap();
-            cache
-                .register_cpu_bridge(0, &full_store, 4, &stream)
-                .unwrap();
+            cache.register_cpu_bridge(&full_store, 4, &stream).unwrap();
             let d_out = DeviceBuffer::alloc(0, m_bridge * k_hidden * 2).unwrap();
             if use_prefill {
                 TieredMoeEngine::execute_layer(
@@ -1496,6 +1446,7 @@ mod cuda_tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn speculative_lru_bip_and_streamed_prefill_promotion() {
         use super::super::{
             ExpertPackLayout, HostExpertStore, HotExpertCache, MoeOffloadMode, TieredMoeEngine,
@@ -1563,7 +1514,10 @@ mod cuda_tests {
 
         // Protected prefix `0..24` (`k_hot - 40`) must remain untouched (`slot_to_expert[s] == s`).
         for s in 0..24 {
-            assert_eq!(cache.slot_to_expert[s], s, "protected slot {s} was evicted");
+            assert_eq!(
+                cache.slot_to_expert[s], s as i32,
+                "protected slot {s} was evicted"
+            );
         }
         let slot_64 = cache.slot_of(64).expect("anchor cold expert 64 loaded") as usize;
         let slot_65 = cache
@@ -1580,6 +1534,8 @@ mod cuda_tests {
         }
 
         // Step 2: M=8 verify batch (`total_pairs = 80`) with cold misses `66` and `67`.
+        // Even with `total_pairs = 80 > k_hot = 64`, `tail_budget = min(40, k_hot / 2) = 32`
+        // protects slots `0..32` (`k_protected = 32`) from speculative tree misses!
         let mut h_topk_s2: Vec<i32> = (0..m_verify * top_k).map(|i| (i % 10) as i32).collect();
         h_topk_s2[60] = 66;
         h_topk_s2[70] = 67;
@@ -1600,6 +1556,12 @@ mod cuda_tests {
         )
         .unwrap();
         cache.sync_from_device_if_dirty(&stream).unwrap();
+        for s in 0..32 {
+            assert_eq!(
+                cache.slot_to_expert[s], s as i32,
+                "protected slot {s} was evicted during M=8 verify when k_hot=64 < total_pairs=80"
+            );
+        }
         assert!(cache.slot_of(66).is_some());
         assert!(cache.slot_of(67).is_some());
         assert_ne!(cache.slot_of(66), cache.slot_of(67));
@@ -1629,7 +1591,7 @@ mod cuda_tests {
             );
         }
 
-        // Step 3: Verify `StreamedPrefill` (`num_tokens = 1024`, `bridge_layer_id == None`)
+        // Step 3: Verify `StreamedPrefill` (`num_tokens = 1024`, `!cache.has_cpu_bridge()`)
         // promotes a cold expert (`70`) routed 32 times in the prompt into `cache.slots`.
         let m_prefill = 1024usize;
         let mut h_topk_pf: Vec<i32> = (0..m_prefill * top_k).map(|i| (i % 10) as i32).collect();
@@ -1660,15 +1622,12 @@ mod cuda_tests {
             .expect("prompt-frequent cold expert 70 must be promoted during StreamedPrefill")
             as usize;
         assert_eq!(
-            cache.slot_last_used[slot_70], cache.step_clock,
+            cache.slot_last_used[slot_70],
+            cache.step_clock - 1,
             "promoted prompt expert must have updated slot_last_used"
         );
         for s in 0..k_hot {
-            assert_eq!(
-                cache.slot_to_expert_i32[s], cache.slot_to_expert[s] as i32,
-                "slot_to_expert_i32[{s}] drifted from slot_to_expert[{s}]"
-            );
-            let ge = cache.slot_to_expert[s];
+            let ge = cache.slot_to_expert[s] as usize;
             assert_eq!(
                 cache.expert_to_slot[ge], s as i32,
                 "expert_to_slot[{ge}] != {s} after StreamedPrefill promotion"
@@ -1702,7 +1661,7 @@ mod cuda_tests {
         )
         .unwrap();
         assert!(!cache.adapted_slots_dirty);
-        assert_eq!(cache.slot_to_expert, (0..k_hot).collect::<Vec<_>>());
+        assert_eq!(cache.slot_to_expert, (0..k_hot as i32).collect::<Vec<_>>());
         let mut d_prefill_s4 = vec![0i32; num_experts];
         cache
             .d_prefill_expert_to_slot
@@ -1720,5 +1679,93 @@ mod cuda_tests {
                 "d_prefill_expert_to_slot[{le}] stale after short-prompt restoration"
             );
         }
+
+        // Step 5: Verify `can_execute_device_lru` boundary (`M <= 8` when not fully resident),
+        // fully-resident `prefill_hot_limit() == k_hot`, and host `GpuLru` spill to `0..lru_start`
+        // when all tail slots `k_hot - 40 .. k_hot` are active in the current step.
+        assert!(TieredMoeEngine::can_execute_device_lru(
+            &full_store,
+            &cache,
+            6,
+            top_k
+        ));
+        assert!(
+            !TieredMoeEngine::can_execute_device_lru(&full_store, &cache, 7, top_k),
+            "M=7 (70 pairs > k_hot=64) on non-fully-resident cache without CPU bridge must not be dispatched to execute_layer_device_lru"
+        );
+        let cache_80 = HotExpertCache::new(0, 80, 0..128, layout.clone()).unwrap();
+        assert!(TieredMoeEngine::can_execute_device_lru(
+            &full_store,
+            &cache_80,
+            8,
+            top_k
+        ));
+        assert!(
+            !TieredMoeEngine::can_execute_device_lru(&full_store, &cache_80, 9, top_k),
+            "M=9 prefill on non-fully-resident cache must not be dispatched to execute_layer_device_lru"
+        );
+        let mut full_res_cache =
+            HotExpertCache::new(0, num_experts, 0..num_experts, layout).unwrap();
+        full_res_cache
+            .populate_initial(&full_store, None, &mut ws, &stream)
+            .unwrap();
+        assert_eq!(full_res_cache.prefill_hot_limit(), num_experts);
+        assert!(TieredMoeEngine::can_execute_device_lru(
+            &full_store,
+            &full_res_cache,
+            16,
+            top_k
+        ));
+
+        // Exercise host `GpuLru` spill when all 40 tail slots (`24..64`) are hits in the current
+        // step (`M = 5`, `top_k = 10` = 50 pairs: 40 hits on `24..64` + 2 misses on `66, 67`).
+        let m_spill = 5usize;
+        let mut h_topk_spill = Vec::with_capacity(m_spill * top_k);
+        // Simulate a prior device-side LRU step having stamped slot 0 with `cache.step_clock`
+        // while also hitting slot 0 and all 40 tail slots (`24..64`) in the current step.
+        cache.slot_last_used[0] = cache.step_clock;
+        h_topk_spill.push(0);
+        for e in 24..64 {
+            h_topk_spill.push(e);
+        }
+        h_topk_spill.push(66);
+        h_topk_spill.push(67);
+        while h_topk_spill.len() < m_spill * top_k {
+            h_topk_spill.push(24);
+        }
+        let d_topk_spill = upload(&h_topk_spill, &stream);
+        TieredMoeEngine::execute_layer(
+            MoeOffloadMode::GpuLru,
+            &full_store,
+            &mut cache,
+            &mut ws,
+            &stream,
+            d_x.addr(),
+            d_topk_spill.addr(),
+            d_wts.addr(),
+            &h_topk_spill,
+            &h_wts[..m_spill * top_k],
+            0,
+            0,
+            d_out.addr(),
+            m_spill,
+            top_k,
+        )
+        .unwrap();
+        assert_eq!(
+            cache.slot_of(0),
+            Some(0),
+            "active protected expert 0 must not be evicted when step_clock ties with prior device LRU step"
+        );
+        for (e, s) in (24usize..64).zip(24i32..64) {
+            assert_eq!(
+                cache.slot_of(e),
+                Some(s),
+                "active tail expert {e} was self-evicted during host GpuLru spill"
+            );
+        }
+        assert!(cache.slot_of(66).is_some_and(|s| s < 24));
+        assert!(cache.slot_of(67).is_some_and(|s| s < 24));
+        assert_ne!(cache.slot_of(66), cache.slot_of(67));
     }
 }

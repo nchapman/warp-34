@@ -41,12 +41,9 @@ impl Qwen3_5ModelRank {
     /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph.
     pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
         let top_k = self.cfg.num_experts_per_tok.max(1);
-        self.tiered_moe.as_ref().is_none_or(|tm| {
-            (0..self.layers.len()).all(|li| {
-                tm.layer_is_fully_resident(li)
-                    || (num_tokens * top_k <= tm.layer_hot_k(li) && tm.layer_has_mapped_store(li))
-            })
-        })
+        self.tiered_moe
+            .as_ref()
+            .is_none_or(|tm| tm.supports_cuda_graph_for_tokens(num_tokens, top_k))
     }
 
     /// Initializes expert residency independently of residual topology and PLE.
@@ -78,8 +75,13 @@ impl Qwen3_5ModelRank {
 
     pub(super) fn mark_tiered_moe_device_lru_dirty(&mut self) {
         if let Some(tm) = &mut self.tiered_moe {
-            for c in &mut tm.caches {
-                c.device_lru_dirty = true;
+            for (store, c) in tm.stores.iter().zip(&mut tm.caches) {
+                if c.slots.capacity < c.expert_ids.len()
+                    && (!c.has_cpu_bridge()
+                        || (c.k_static < c.slots.capacity && store.mapped_dev_ptr() != 0))
+                {
+                    c.device_lru_dirty = true;
+                }
             }
         }
     }
