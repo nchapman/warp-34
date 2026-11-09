@@ -802,6 +802,75 @@ fn xml_pydantic_anyof_nullable_strings_and_string_int_unions() {
         )
         .unwrap()
     );
+
+    // 4. Spaced XML delimiter variants (`< / parameter >`, `<parameter =note>`) are rejected in unquoted values
+    let mut c_spaced_delim = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    assert!(
+        feed(
+            &mut c_spaced_delim,
+            &tok,
+            "<tool_call>\n<function=configure>\n<parameter=title>\nhello < / parameter >\n</parameter>"
+        )
+        .is_err()
+    );
+
+    // 5. Quoted values with leading whitespace (`<parameter=title> "prod" </parameter>`) decode to `"prod"`,
+    // and unquoted enum values with layout whitespace canonicalize cleanly.
+    let call_ws_quoted = "<tool_call>\n<function=configure>\n<parameter=title> \"prod\" </parameter>\n<parameter=note> \" hello \" </parameter>\n<parameter=budget>\n  auto\n</parameter>\n</function>\n</tool_call>";
+    let p_ws = Qwen3Parser::parse_complete_with_tools(call_ws_quoted, false, Some(&tools));
+    assert_eq!(
+        serde_json::from_str::<Value>(&p_ws.tool_calls[0].function.arguments).unwrap(),
+        json!({"title": "prod", "note": " hello ", "budget": "auto"})
+    );
+
+    // 6. `minLength: 1` rejects empty quoted string `""` while accepting non-empty unquoted/quoted strings
+    let min_len_tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "non_empty",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 1 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }
+    }]);
+    let mut c_min_empty = factory
+        .tools(
+            &min_len_tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml,
+            false,
+        )
+        .unwrap();
+    assert!(
+        feed(
+            &mut c_min_empty,
+            &tok,
+            "<tool_call>\n<function=non_empty>\n<parameter=query>\n\"\"\n</parameter>"
+        )
+        .is_err()
+    );
+    let mut c_min_ok = factory
+        .tools(
+            &min_len_tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml,
+            false,
+        )
+        .unwrap();
+    feed(
+        &mut c_min_ok,
+        &tok,
+        "<tool_call>\n<function=non_empty>\n<parameter=query>\nrust\n</parameter>\n</function>\n</tool_call>",
+    )
+    .unwrap();
+    assert!(c_min_ok.is_token_allowed(EOS));
 }
 
 #[test]

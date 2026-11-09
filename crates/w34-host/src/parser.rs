@@ -834,6 +834,7 @@ pub struct StreamParseDelta {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ParamTypeMask {
     string: bool,
+    string_enum_or_const: bool,
     number: bool,
     boolean: bool,
     null: bool,
@@ -874,7 +875,10 @@ impl ParamTypeMask {
         }
         if let Some(c) = obj.get("const") {
             match c {
-                serde_json::Value::String(_) => mask.string = true,
+                serde_json::Value::String(_) => {
+                    mask.string = true;
+                    mask.string_enum_or_const = true;
+                }
                 serde_json::Value::Number(_) => mask.number = true,
                 serde_json::Value::Bool(_) => mask.boolean = true,
                 serde_json::Value::Null => mask.null = true,
@@ -886,7 +890,10 @@ impl ParamTypeMask {
         if let Some(serde_json::Value::Array(items)) = obj.get("enum") {
             for item in items {
                 match item {
-                    serde_json::Value::String(_) => mask.string = true,
+                    serde_json::Value::String(_) => {
+                        mask.string = true;
+                        mask.string_enum_or_const = true;
+                    }
                     serde_json::Value::Number(_) => mask.number = true,
                     serde_json::Value::Bool(_) => mask.boolean = true,
                     serde_json::Value::Null => mask.null = true,
@@ -901,6 +908,7 @@ impl ParamTypeMask {
                 for sub in subschemas {
                     let sub_mask = Self::from_schema_depth(sub, depth + 1);
                     mask.string |= sub_mask.string;
+                    mask.string_enum_or_const |= sub_mask.string_enum_or_const;
                     mask.number |= sub_mask.number;
                     mask.boolean |= sub_mask.boolean;
                     mask.null |= sub_mask.null;
@@ -1058,18 +1066,21 @@ impl Qwen3Parser {
         trimmed: &str,
         type_mask: Option<ParamTypeMask>,
     ) -> serde_json::Value {
+        let trimmed_ws = trimmed.trim();
         if let Some(mask) = type_mask {
             if mask.is_strictly_string() {
-                if trimmed.starts_with('"')
-                    && let Ok(serde_json::Value::String(s)) =
-                        serde_json::from_str::<serde_json::Value>(trimmed)
+                if let Ok(serde_json::Value::String(s)) =
+                    serde_json::from_str::<serde_json::Value>(trimmed_ws)
                 {
                     return serde_json::Value::String(s);
+                }
+                if mask.string_enum_or_const {
+                    return serde_json::Value::String(trimmed_ws.to_string());
                 }
                 return serde_json::Value::String(trimmed.to_string());
             }
             if mask.is_known_non_string() {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_ws) {
                     if let serde_json::Value::String(ref inner) = val
                         && let Ok(coerced) = serde_json::from_str::<serde_json::Value>(inner.trim())
                     {
@@ -1078,19 +1089,25 @@ impl Qwen3Parser {
                     return val;
                 }
                 if mask.boolean {
-                    if trimmed.eq_ignore_ascii_case("true") {
+                    if trimmed_ws.eq_ignore_ascii_case("true") {
                         return serde_json::Value::Bool(true);
                     }
-                    if trimmed.eq_ignore_ascii_case("false") {
+                    if trimmed_ws.eq_ignore_ascii_case("false") {
                         return serde_json::Value::Bool(false);
                     }
                 }
                 if mask.null
-                    && (trimmed.eq_ignore_ascii_case("null")
-                        || trimmed.eq_ignore_ascii_case("none"))
+                    && (trimmed_ws.eq_ignore_ascii_case("null")
+                        || trimmed_ws.eq_ignore_ascii_case("none"))
                 {
                     return serde_json::Value::Null;
                 }
+            }
+            if mask.string
+                && mask.string_enum_or_const
+                && serde_json::from_str::<serde_json::Value>(trimmed_ws).is_err()
+            {
+                return serde_json::Value::String(trimmed_ws.to_string());
             }
         }
         serde_json::from_str::<serde_json::Value>(trimmed)

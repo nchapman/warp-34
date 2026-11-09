@@ -174,11 +174,14 @@ fn fast_forward_forced_tokens(
         }
         // Leave at least 1 token before `max_new_tokens` so the coalesced jump-forward
         // slice `[tok_0, ff_1, ..., ff_k]` is still forwarded into `radix_state` before
-        // the final token / EOS finishes the sequence.
+        // the final token / EOS finishes the sequence, and cap by the scheduler's
+        // batched-token limit minus the existing unforwarded anchor token.
+        let sched_cap = sched.cfg.max_num_batched_tokens.saturating_sub(1);
         let rem_budget = seq
             .max_new_tokens
             .saturating_sub(seq.generated_tokens.len() + 1)
-            .min(MAX_JUMP_FORWARD_TOKENS);
+            .min(MAX_JUMP_FORWARD_TOKENS)
+            .min(sched_cap);
         if rem_budget == 0 {
             r.sampler.materialize_pending_constraint().err()
         } else {

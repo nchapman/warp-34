@@ -187,11 +187,6 @@ impl RequestConstraint {
             })
             .transpose()?;
         if !tools.is_empty() || choice.is_some() {
-            if output.is_some() {
-                return Err(
-                    "tool_choice/tools and output grammars cannot currently be combined".into(),
-                );
-            }
             let choice = choice.unwrap_or(ToolChoice::Auto);
             if tools.is_empty() {
                 match choice {
@@ -201,6 +196,14 @@ impl RequestConstraint {
                         return Err("tool_choice requires nonempty tools".into());
                     }
                 }
+            }
+            if output.is_some() {
+                if choice == ToolChoice::None {
+                    return Ok(output);
+                }
+                return Err(
+                    "tool_choice/tools and output grammars cannot currently be combined".into(),
+                );
             }
             output = Some(Self::Tools {
                 tools: Value::Array(tools),
@@ -442,6 +445,10 @@ mod tests {
                 .is_some()
         );
         assert!(RequestConstraint::parse(&json!({"structured_outputs": {"choice": []}})).is_err());
+    }
+
+    #[test]
+    fn parses_guided_aliases_and_mutual_exclusion() {
         assert!(
             RequestConstraint::parse(&json!({"guided_json": {"type": "object"}}))
                 .unwrap()
@@ -513,6 +520,24 @@ mod tests {
             }))
             .is_err()
         );
+        // `tool_choice: "none"` and empty `tools: []` coexist with output constraints
+        assert!(matches!(
+            RequestConstraint::parse(&json!({
+                "response_format": {"type": "json_object"},
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "tool_choice": "none"
+            }))
+            .unwrap(),
+            Some(RequestConstraint::JsonObject)
+        ));
+        assert!(matches!(
+            RequestConstraint::parse(&json!({
+                "response_format": {"type": "json_object"},
+                "tools": []
+            }))
+            .unwrap(),
+            Some(RequestConstraint::JsonObject)
+        ));
         assert!(
             RequestConstraint::parse(&json!({"tools": [], "tool_choice": "required"})).is_err()
         );

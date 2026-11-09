@@ -47,16 +47,35 @@ fn valid_name(value: &str) -> bool {
 }
 
 fn contains_xml_tool_delimiter(s: &str) -> bool {
-    [
-        "</parameter>",
-        "</tool_call>",
-        "</function>",
-        "<parameter=",
-        "<function=",
-        "<tool_call>",
-    ]
-    .iter()
-    .any(|delim| s.contains(delim))
+    let mut rest = s;
+    while let Some(idx) = rest.find('<') {
+        let after_lt = rest[idx + 1..].trim_start();
+        if let Some(after_slash) = after_lt.strip_prefix('/') {
+            let after_slash = after_slash.trim_start();
+            for tag in ["parameter", "tool_call", "function"] {
+                if let Some(after_tag) = after_slash.strip_prefix(tag)
+                    && after_tag.trim_start().starts_with('>')
+                {
+                    return true;
+                }
+            }
+        } else {
+            for tag in ["parameter", "function"] {
+                if let Some(after_tag) = after_lt.strip_prefix(tag)
+                    && after_tag.trim_start().starts_with('=')
+                {
+                    return true;
+                }
+            }
+            if let Some(after_tag) = after_lt.strip_prefix("tool_call")
+                && after_tag.trim_start().starts_with('>')
+            {
+                return true;
+            }
+        }
+        rest = &rest[idx + 1..];
+    }
+    false
 }
 
 fn is_safe_unquoted_xml_string(s: &str) -> bool {
@@ -85,6 +104,7 @@ fn attach_root_defs(value_schema: &Value, root_schema: &serde_json::Map<String, 
 #[derive(Default)]
 struct UnquotedXmlBranches {
     has_plain_string: bool,
+    plain_string_min_length: u64,
     has_null: bool,
     only_string_and_null: bool,
     literals: Vec<String>,
@@ -200,6 +220,9 @@ fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXm
             .is_none_or(|n| n <= 1)
     {
         out.has_plain_string = true;
+        if let Some(min_len) = obj.get("minLength").and_then(Value::as_u64) {
+            out.plain_string_min_length = out.plain_string_min_length.max(min_len);
+        }
     } else {
         out.only_string_and_null = false;
     }
@@ -225,7 +248,11 @@ fn xml_param_rule(
     let branches = collect_unquoted_xml_string_branches(value_schema);
 
     if branches.has_plain_string && branches.only_string_and_null && branches.literals.is_empty() {
-        let str_json = "%json {\"type\":\"string\"}";
+        let str_json = if branches.plain_string_min_length >= 1 {
+            "%json {\"type\":\"string\",\"minLength\":1}"
+        } else {
+            "%json {\"type\":\"string\"}"
+        };
         if branches.has_null {
             *uses_unquoted_str = true;
             *uses_unquoted_nullable_str = true;
@@ -239,8 +266,10 @@ fn xml_param_rule(
         );
     }
     if !branches.literals.is_empty() && !branches.has_plain_string {
-        let val_expr = format!("({json_branch} | {})", branches.literals.join(" | "));
-        return format!("{rule}: {open_tag} WS {val_expr} WS {close_tag} WS\n");
+        let lits = branches.literals.join(" | ");
+        return format!(
+            "{rule}: {open_tag} WS ({json_branch} WS {close_tag} | ({lits}) /\\r?\\n/? {close_tag}) WS\n"
+        );
     }
 
     default_rule
@@ -454,7 +483,7 @@ pub fn tool_grammar_with_options(
     };
     if uses_unquoted_str {
         grammar.push_str(
-            "unquoted_xml_param_end[lazy]: UNQUOTED_XML_BODY \"</parameter>\"\nUNQUOTED_XML_BODY: (/[^ \\t\\r\\n\"\\[{](?s:.*[^ \\t\\r\\n])?/ & ~(\"true\" | \"false\" | \"null\" | /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/ | /(?s:.*)(<\\/parameter>|<\\/tool_call>|<\\/function>|<parameter=|<function=|<tool_call>)(?s:.*)/)) /[ \\t\\r\\n]*/\n",
+            "unquoted_xml_param_end[lazy]: UNQUOTED_XML_BODY \"</parameter>\"\nUNQUOTED_XML_BODY: (/[^ \\t\\r\\n\"\\[{](?s:.*[^ \\t\\r\\n])?/ & ~(\"true\" | \"false\" | \"null\" | /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/ | /(?s:.*)(<[ \\t\\r\\n]*\\/[ \\t\\r\\n]*(parameter|tool_call|function)[ \\t\\r\\n]*>|<[ \\t\\r\\n]*(parameter|function)[ \\t\\r\\n]*=|<[ \\t\\r\\n]*tool_call[ \\t\\r\\n]*>)(?s:.*)/)) /[ \\t\\r\\n]*/\n",
         );
     }
     if uses_unquoted_nullable_str {
