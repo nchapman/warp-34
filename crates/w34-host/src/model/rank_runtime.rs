@@ -33,7 +33,9 @@ impl Qwen3_5ModelRank {
         } else {
             default_hot
         };
-        let stage_cap = if self.tp_size >= 4 {
+        let stage_cap = if self.tp_size >= 4
+            || (self.cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS && hot_per_layer <= 24)
+        {
             local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_TP4)
         } else {
             local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_DEFAULT)

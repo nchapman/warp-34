@@ -1095,7 +1095,10 @@ extern "C" int w34_gdn_recurrent_strided_f16(
                 const int bv = cand_rows * 4;
                 if (head_v_dim < bv && cand_rows != 4) continue;
                 const int v_tiles = (head_v_dim + bv - 1) / bv;
-                const int ctas = nh * v_tiles;
+                // Compute wave cost from per-request `num_v_heads * v_tiles` (not `nh = num_reqs * num_v_heads`)
+                // so the selected `ROWS` template specialization is invariant to `batch->num_reqs`
+                // while remaining identical for `num_reqs == 1`.
+                const int ctas = num_v_heads * v_tiles;
                 const int waves = (ctas + sm_count - 1) / sm_count;
                 const int cost = waves * cand_rows;
                 if (cost < best_cost || (cost == best_cost && waves < best_waves)) {

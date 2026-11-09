@@ -67,7 +67,7 @@ extern "C" int w34_paged_fa2_try(const w34_exec* ex, const w34_kv_layer_layout* 
         l->k_transform != W34_KV_TRANSFORM_IDENTITY || l->v_transform != W34_KV_TRANSFORM_IDENTITY ||
         l->head_dim != 256 || l->block_size != 16 || l->local_kv_heads <= 0 ||
         h <= 0 || h > 65535 || h % l->local_kv_heads || b->num_reqs <= 0 || b->num_reqs > 65535 ||
-        b->total_tokens <= 16 || b->max_q_len <= 0 ||
+        b->total_tokens <= 16 || b->max_q_len <= 16 ||
         (b->num_reqs == 1 && b->max_q_len < b->total_tokens) ||
         (int64_t)b->total_tokens > (int64_t)b->num_reqs * b->max_q_len ||
         b->max_q_len > INT_MAX - 127 || b->max_seq_len < b->max_q_len || b->max_seq_len > INT_MAX - 127 ||

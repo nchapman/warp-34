@@ -859,8 +859,8 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
             1.5e-3f32,
         ),
         // Per-128 post-WHT sub-block RMS normalization (`op_kv_cache.cu`) yields
-        // measured `rmse = 0.00653` and single-element `max_err = 0.02587` on the
-        // modulo-53 sawtooth fixture across 2,048 output elements (`8 * 256`).
+        // measured `rmse = 0.00653..0.00684` and single-element `max_err = 0.02587`
+        // on the modulo-53 sawtooth fixture.
         (
             W34_KV_FORMAT_TQ4,
             W34_KV_TRANSFORM_RADEMACHER_WHT256,

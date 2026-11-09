@@ -596,6 +596,32 @@ pub fn plan_tiered_moe_hot_per_layer(
         .saturating_add(min_state_pool_bytes)
         .saturating_add(extra_reserve);
     let per_hot_step = cfg.num_hidden_layers * exp_bytes;
+    let min_standard_total = fixed_overhead.saturating_add(min_hot.saturating_mul(per_hot_step));
+    let compact_threshold = min_standard_total.max(5 * 1024 * 1024 * 1024);
+    let min_base_and_state = base_headroom_plus_kv_bytes.saturating_add(min_state_pool_bytes);
+    if available_vram_after_weights_and_scratch < compact_threshold
+        && available_vram_after_weights_and_scratch > min_base_and_state
+        && per_hot_step > 0
+    {
+        // Compact 8–12 GiB GPU regime (e.g. 1–2× RTX 3060 Ti 8 GB): `base_headroom` (`640 MiB`)
+        // already covers PLE/QSA/MTP/graph headroom, so reserve the 2×32 double-buffered H2D
+        // staging slots (`64 * exp_bytes`) plus 16 hot experts/layer without affecting 16/24 GiB cards.
+        let compact_extra_reserve = 64usize.saturating_mul(exp_bytes);
+        let compact_fixed = min_base_and_state.saturating_add(compact_extra_reserve);
+        let compact_min_hot = TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot);
+        let compact_max_hot = TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot);
+        let hot = if available_vram_after_weights_and_scratch > compact_fixed {
+            let max_affordable =
+                (available_vram_after_weights_and_scratch - compact_fixed) / per_hot_step;
+            let aligned =
+                (max_affordable / TIERED_MOE_HOT_SLOT_ALIGNMENT) * TIERED_MOE_HOT_SLOT_ALIGNMENT;
+            aligned.clamp(compact_min_hot, compact_max_hot)
+        } else {
+            compact_min_hot
+        };
+        let reserve = (cfg.num_hidden_layers * hot) * exp_bytes + compact_extra_reserve;
+        return (hot, reserve);
+    }
     let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
         let max_affordable =
             (available_vram_after_weights_and_scratch - fixed_overhead) / per_hot_step;
@@ -982,7 +1008,7 @@ impl Qwen3_5ModelRank {
         let cublas = CublasHandle::new(&stream)?;
         let (free_vram, total_vram) = device.mem_info()?;
 
-        let est_weight_bytes =
+        let mut est_weight_bytes =
             Self::estimate_weight_arena_bytes(cfg, archive, tp_size, requested_kv_pages);
         let max_packed_tensor_bytes = archive
             .iter_entries()
@@ -991,13 +1017,51 @@ impl Qwen3_5ModelRank {
                     && !name.contains(".ple_embedding.")
                     && !(cfg.uses_tiered_moe() && name.contains(".experts."))
             })
-            .map(|(_, info)| info.len_bytes as usize)
+            .map(|(name, info)| {
+                let bytes = info.len_bytes as usize;
+                if name.starts_with("lm_head.")
+                    || name.contains(".lm_head.")
+                    || name.contains(".experts.")
+                {
+                    bytes.div_ceil(tp_size)
+                } else {
+                    bytes
+                        .div_ceil(tp_size)
+                        .saturating_mul(REPACK_STAGING_TENSOR_MULTIPLIER)
+                }
+            })
             .max()
             .unwrap_or(0);
-        let staging_bytes = MIN_REPACK_STAGING_BYTES
-            .max(max_packed_tensor_bytes.saturating_mul(REPACK_STAGING_TENSOR_MULTIPLIER));
-        let scratch_bytes =
+        let staging_bytes = MIN_REPACK_STAGING_BYTES.max(max_packed_tensor_bytes);
+        let mut scratch_bytes =
             plan_scratch_arena_bytes(cfg, tp_size, est_weight_bytes, requested_kv_pages);
+        if cfg.uses_tiered_moe() && free_vram < 12 * 1024 * 1024 * 1024 {
+            scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
+        }
+        let mut use_host_embed = cfg.uses_tiered_moe() && !cfg.tie_word_embeddings;
+        if !use_host_embed && !cfg.tie_word_embeddings && total_vram < 12 * 1024 * 1024 * 1024 {
+            let boot_with_gpu_embed = est_weight_bytes
+                .saturating_add(scratch_bytes)
+                .saturating_add(staging_bytes)
+                .saturating_add(MIN_BOOT_MARGIN_BYTES);
+            // On < 12 GiB GPUs (e.g. 8 GB RTX 3060 Ti running 9B TP=1), when keeping untied
+            // `embed_tokens` in GPU VRAM would exceed `free_vram` or leave `< 2.0 GiB` for
+            // StateBundlePool + KvPool + headroom, place `embed_tokens` in MappedHostBuffer.
+            if boot_with_gpu_embed.saturating_add(2 * 1024 * 1024 * 1024) > free_vram {
+                let embed_fp16_aligned = (cfg
+                    .vocab_size
+                    .saturating_mul(cfg.hidden_size)
+                    .saturating_mul(2))
+                .saturating_add(255)
+                    & !255;
+                est_weight_bytes = est_weight_bytes
+                    .saturating_sub(embed_fp16_aligned)
+                    .div_ceil(WEIGHT_ARENA_ALIGNMENT_BYTES)
+                    .saturating_mul(WEIGHT_ARENA_ALIGNMENT_BYTES)
+                    .max(MIN_WEIGHT_ARENA_BYTES);
+                use_host_embed = true;
+            }
+        }
         let min_boot_bytes = est_weight_bytes
             .saturating_add(scratch_bytes)
             .saturating_add(staging_bytes)
@@ -1045,22 +1109,21 @@ impl Qwen3_5ModelRank {
                 owned_vocab = Self::load_embed_tokens_f16(archive, cfg)?;
                 (owned_vocab.as_slice(), None)
             };
-        let (embed_tokens_ptr, host_embed_tokens) =
-            if cfg.uses_tiered_moe() && !cfg.tie_word_embeddings {
-                let bytes = core::mem::size_of_val(embed_f16);
-                let buf = crate::cuda::MappedHostBuffer::alloc(bytes)?;
-                // SAFETY: `buf.host_ptr` is a freshly allocated pinned buffer of `bytes` bytes.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        embed_f16.as_ptr().cast::<u8>(),
-                        buf.host_ptr.cast::<u8>(),
-                        bytes,
-                    );
-                }
-                (buf.dev_ptr as u64, Some(buf))
-            } else {
-                (weight_arena.upload_slice(embed_f16, &stream)?, None)
-            };
+        let (embed_tokens_ptr, host_embed_tokens) = if use_host_embed {
+            let bytes = core::mem::size_of_val(embed_f16);
+            let buf = crate::cuda::MappedHostBuffer::alloc(bytes)?;
+            // SAFETY: `buf.host_ptr` is a freshly allocated pinned buffer of `bytes` bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    embed_f16.as_ptr().cast::<u8>(),
+                    buf.host_ptr.cast::<u8>(),
+                    bytes,
+                );
+            }
+            (buf.dev_ptr as u64, Some(buf))
+        } else {
+            (weight_arena.upload_slice(embed_f16, &stream)?, None)
+        };
 
         // 2. final norm or multi-stream HyperConnection mixer
         let final_residual = if cfg.uses_hyper_connection() {
@@ -1379,9 +1442,10 @@ impl Qwen3_5ModelRank {
         let default_pages = requested_kv_pages.or(Some(DEFAULT_TARGET_KV_PAGES));
         let req_kv_bytes =
             default_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES) * bytes_per_kv_page_all_layers;
-        let base_headroom = if tp_size == 1
+        let base_headroom = if (tp_size == 1
             && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
-            && default_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
+            && default_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES)
+            || (cfg.uses_tiered_moe() && free_vram < 12 * 1024 * 1024 * 1024)
         {
             crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES
         } else {
@@ -1400,7 +1464,9 @@ impl Qwen3_5ModelRank {
         } else if tp_size >= 2 {
             requested_state_slots
         } else {
-            requested_state_slots.min(PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS / 2)
+            // Single-GPU DFlash2 verification (`M = 8` on 27B / Flash-Next) requires 1 active +
+            // 7 draft verification slots = 8 state slots.
+            requested_state_slots.min(8)
         };
         let (tiered_moe_hot_per_layer, tiered_moe_reserve) = plan_tiered_moe_hot_per_layer(
             cfg,
@@ -1465,6 +1531,11 @@ impl Qwen3_5ModelRank {
                 ));
             }
             (available, reserved)
+        } else if cfg.uses_tiered_moe() {
+            (
+                post_weight_available,
+                required_headroom.saturating_add(req_kv_bytes),
+            )
         } else {
             (free_vram, base_fixed)
         };

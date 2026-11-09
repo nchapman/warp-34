@@ -579,7 +579,7 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
         if (th_cfg.thread_n != -1) {
             const int cur_mn_tiles =
                 (prob_n / th_cfg.thread_n) * div_ceil(prob_m_split, thread_m_blocks * 16);
-            if (enable_m_invariant_split_k ||
+            if (enable_m_invariant_split_k || keep_2560_1slice ||
                 (prob_m_split <= 64 && cur_mn_tiles < sms && (prob_n / 64) * 2 > sms) ||
                 cur_mn_tiles * 4 <= sms) {
                 thread_config_t cfg128 = {128, 64, 128};
@@ -610,8 +610,10 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
             if (max_k_splits > cap_splits) max_k_splits = cap_splits;
             if (max_k_splits < 1) max_k_splits = 1;
             blocks = mn_tiles * max_k_splits;
-        } else if (prob_m <= 16 && blocks > mn_tiles) {
-            // Preserve 1-slice M=1..16 decode/verify invariance outside explicit Split-K shapes.
+        } else if (prob_m <= 16) {
+            // Preserve 1-slice M=1..16 decode/verify invariance outside explicit Split-K shapes,
+            // including on GPUs where `mn_tiles > sms` (1-slice CTAs have `slice_count == 1` and
+            // never touch `locks`).
             blocks = mn_tiles;
         } else if (blocks > mn_tiles * k_tiles) {
             blocks = mn_tiles * k_tiles;

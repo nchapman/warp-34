@@ -161,6 +161,25 @@ mod serving_capacity_tests {
         assert_eq!(hot_tp1_min, TIERED_MOE_TP1_MIN_HOT_EXPERTS);
         let (hot_tp2_min, _) = plan_tiered_moe_hot_per_layer(&cfg, 2, gib, 2 * gib, gib);
         assert_eq!(hot_tp2_min, TIERED_MOE_TP2_MIN_HOT_EXPERTS);
+
+        // Compact 8 GiB RTX 3060 Ti regime (TP=1 ~3.24 GiB post-weight, TP=2 ~4.59 GiB post-weight):
+        // selects 16 hot experts/layer while fitting within the post-weight VRAM budget
+        // (`64 * exp_bytes` double-buffered staging reserve).
+        let mib = 1024 * 1024;
+        let exp_bytes = cfg
+            .moe_expert_pack_layout()
+            .expect("qwen4_exp expert layout")
+            .stride;
+        let (hot_3060ti_tp1, reserve_3060ti_tp1) =
+            plan_tiered_moe_hot_per_layer(&cfg, 1, 3316 * mib, 584 * mib, 237 * mib);
+        assert_eq!(hot_3060ti_tp1, 16);
+        assert_eq!(reserve_3060ti_tp1, (48 * 16 + 64) * exp_bytes);
+        assert!(584 * mib + 237 * mib + reserve_3060ti_tp1 <= 3316 * mib);
+        let (hot_3060ti_tp2, reserve_3060ti_tp2) =
+            plan_tiered_moe_hot_per_layer(&cfg, 2, 4702 * mib, 548 * mib, 252 * mib);
+        assert_eq!(hot_3060ti_tp2, 16);
+        assert_eq!(reserve_3060ti_tp2, (48 * 16 + 64) * exp_bytes);
+        assert!(548 * mib + 252 * mib + reserve_3060ti_tp2 <= 4702 * mib);
     }
 
     #[test]
