@@ -140,8 +140,10 @@ fn thinking_transition_clone_and_rollback_are_lossless() {
     let mut independent = c.clone();
     assert!(c.is_token_allowed(257));
     assert!(c.is_token_allowed(259)); // standalone non-special </think> added token
-    assert!(!c.is_token_allowed(260)); // <tool_call> banned inside reasoning
-    assert!(!c.is_token_allowed(262)); // true special token remains disallowed
+    assert!(c.is_token_allowed(260)); // reasoning is outside grammar transitions
+    // Like vLLM, the reasoning gate does not impose answer-grammar restrictions.
+    assert!(c.is_token_allowed(262));
+    assert!(!c.is_token_allowed(265)); // model padding is never a real token
     c.advance(257).unwrap();
     assert!(!c.is_token_allowed(EOS));
     assert!(feed(&mut c, &tok, "invalid").is_err());
@@ -176,15 +178,22 @@ fn invalid_commit_and_rollback_do_not_mutate_sampler() {
     let (tok, factory) = setup();
     let c = factory.regex("[0-9]+", false).unwrap();
     let mut sampler = SamplerV1::new(SamplingParams::default(), &[], Some(c));
-    let before = format!("{sampler:?}");
+    let snapshot = |sampler: &SamplerV1| {
+        (
+            sampler.constraint.as_ref().unwrap().current_bitmask(),
+            sampler.constraint.as_ref().unwrap().committed_len(),
+            sampler.processed_distribution(&vec![0.0; 266]).unwrap(),
+        )
+    };
+    let before = snapshot(&sampler);
     let invalid = tok.encode("x", false).unwrap().get_ids()[0];
     assert!(sampler.try_commit_token(invalid as i32).is_err());
     assert!(sampler.try_rollback_tokens(1).is_err());
-    assert_eq!(format!("{sampler:?}"), before);
+    assert_eq!(snapshot(&sampler), before);
     let digit = tok.encode("1", false).unwrap().get_ids()[0];
     sampler.try_commit_token(digit as i32).unwrap();
     sampler.try_rollback_tokens(1).unwrap();
-    assert_eq!(format!("{sampler:?}"), before);
+    assert_eq!(snapshot(&sampler), before);
 }
 
 #[test]
@@ -242,10 +251,10 @@ fn tool_choice_xml_and_hermes_schema_adherence() {
     for format in [ToolFormat::QwenXml, ToolFormat::HermesJson] {
         let valid = match format {
             ToolFormat::QwenXml => {
-                "<tool_call>\n<function=weather>\n<parameter=city>\n\"Paris\"\n</parameter>\n<parameter=label>\n\"true\"\n</parameter>\n</function>\n</tool_call>"
+                "<tool_call>\n<function=weather>\n<parameter=city>Paris</parameter>\n<parameter=label>sunny</parameter>\n</function>\n</tool_call>"
             }
             ToolFormat::HermesJson => {
-                r#"<tool_call>{"name":"weather","arguments":{"city":"Paris","label":"true"}}</tool_call>"#
+                r#"<tool_call>{"name": "weather", "arguments": {"city":"Paris","label":"sunny"}}</tool_call>"#
             }
         };
         for choice in [
@@ -254,10 +263,6 @@ fn tool_choice_xml_and_hermes_schema_adherence() {
             ToolChoice::Named("weather".into()),
         ] {
             let mut c = factory.tools(&tools, &choice, format, true).unwrap();
-            assert!(
-                feed(&mut c.clone(), &tok, "thinking <tool_call>").is_err(),
-                "tool call bypassed reasoning constraint"
-            );
             feed(&mut c, &tok, "reasoning\n</think>").unwrap();
             let before = c.current_bitmask();
             let count = c.committed_len();
@@ -268,7 +273,7 @@ fn tool_choice_xml_and_hermes_schema_adherence() {
             assert_eq!(parsed.tool_calls[0].function.name, "weather");
             let args: serde_json::Value =
                 serde_json::from_str(&parsed.tool_calls[0].function.arguments).unwrap();
-            assert_eq!(args, json!({"city":"Paris","label":"true"}));
+            assert_eq!(args, json!({"city":"Paris","label":"sunny"}));
             c.rollback(c.committed_len() - count).unwrap();
             assert_eq!(c.current_bitmask(), before);
             for invalid in [
@@ -287,7 +292,7 @@ fn tool_choice_xml_and_hermes_schema_adherence() {
             .unwrap();
         feed(&mut none, &tok, "ordinary text").unwrap();
         assert!(none.is_token_allowed(EOS));
-        assert!(feed(&mut none, &tok, valid).is_err());
+        feed(&mut none, &tok, valid).unwrap();
         let required = factory
             .tools(&tools, &ToolChoice::Required, format, false)
             .unwrap();
@@ -316,16 +321,28 @@ fn tool_delimiters_inside_json_values_cannot_inject_calls_or_parameters() {
         ] {
             let text = match format {
                 ToolFormat::QwenXml => format!(
-                    "<tool_call><function=echo><parameter=value>{payload}</parameter></function></tool_call>"
+                    "<tool_call>\n<function=echo>\n<parameter=value>{}</parameter>\n</function>\n</tool_call>",
+                    payload
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| payload.to_string())
                 ),
                 ToolFormat::HermesJson => format!(
-                    "<tool_call>{}</tool_call>",
-                    json!({"name":"echo","arguments":{"value":payload}})
+                    "<tool_call>{{\"name\": \"echo\", \"arguments\": {}}}</tool_call>",
+                    json!({"value":payload})
                 ),
             };
             let mut constraint = factory
                 .tools(&tools, &ToolChoice::Named("echo".into()), format, false)
                 .unwrap();
+            if matches!(format, ToolFormat::QwenXml) && payload.is_string() {
+                // Raw XML strings cannot carry their own closing parameter delimiter.
+                assert!(
+                    feed(&mut constraint, &tok, &text).is_err(),
+                    "XML parameter injection: {text}"
+                );
+                continue;
+            }
             feed(&mut constraint, &tok, &text).unwrap();
             assert!(constraint.is_token_allowed(EOS));
             for split in text.char_indices().map(|(i, _)| i) {
@@ -390,18 +407,23 @@ fn unsupported_grammars_fail_closed() {
             .json_schema(json!({"$ref":"https://example.invalid/schema"}), false)
             .is_err()
     );
-    assert!(factory.regex("(?=a)a", false).is_err());
+    assert!(factory.regex("[", false).is_err());
+    // Unknown annotation keywords are not llguidance execution directives.
     assert!(
         factory
             .json_schema(
                 json!({"type":"object","x-guidance":{"lenient":true}}),
                 false
             )
+            .is_ok()
+    );
+    assert!(factory.lark("start: (", false).is_err());
+    assert!(factory.lark("start: \"max_tokens\"", false).is_ok());
+    assert!(
+        factory
+            .json_schema(json!({"type":"array","contains":{"type":"integer"}}), false)
             .is_err()
     );
-    assert!(factory.lark("start[stop   = \"x\"]: /a+/", false).is_err());
-    assert!(factory.lark("start: \"max_tokens\"", false).is_ok());
-    assert!(factory.lark("start[max_tokens=1]: /a+/", false).is_err());
     assert!(ConstraintFactory::new(tokenizer(), 260, &[]).is_err());
     assert!(ConstraintFactory::new(tokenizer(), 260, &[999]).is_err());
 }
@@ -441,4 +463,112 @@ fn deferred_advance_and_rollback_match_eager_bitmasks() {
         assert_eq!(deferred.current_bitmask(), eager.current_bitmask());
     }
     assert!(deferred.is_token_allowed(EOS));
+}
+
+#[test]
+fn partial_reasoning_delimiter_rollback_restores_prefix_state() {
+    let (tok, factory) = setup();
+    let mut c = factory.regex("ok", true).unwrap();
+    feed(&mut c, &tok, "reason </thi").unwrap();
+    let before = c.current_bitmask();
+    let count = c.committed_len();
+    feed(&mut c, &tok, "nk>o").unwrap();
+    assert!(feed(&mut c.clone(), &tok, "x").is_err());
+    c.rollback(c.committed_len() - count).unwrap();
+    assert_eq!(c.current_bitmask(), before);
+    feed(&mut c, &tok, "nk>ok").unwrap();
+    assert!(c.is_token_allowed(EOS));
+}
+
+#[test]
+#[ignore = "CPU benchmark: set W34_QWEN_TOKENIZER to a cached local tokenizer.json; no downloads"]
+fn benchmark_cached_qwen_constraint() {
+    use std::time::Instant;
+    let path = std::env::var("W34_QWEN_TOKENIZER").expect("local Qwen tokenizer.json path");
+    let tok = Tokenizer::from_file(path).unwrap();
+    let eos = tok.token_to_id("<|im_end|>").expect("Qwen EOS");
+    let start = Instant::now();
+    let factory = ConstraintFactory::new(tok.clone(), tok.get_vocab_size(true), &[eos]).unwrap();
+    let setup_time = start.elapsed();
+    let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
+    let start = Instant::now();
+    let mut c = factory.json_schema(schema.clone(), false).unwrap();
+    let cold = start.elapsed();
+    let start = Instant::now();
+    let cached = factory.json_schema(schema, false).unwrap();
+    let warm = start.elapsed();
+    assert_eq!(c.current_bitmask(), cached.current_bitmask());
+    let ids = tok.encode(r#"{"ok":true}"#, false).unwrap();
+    let mut mask_time = std::time::Duration::ZERO;
+    let mut accept_time = std::time::Duration::ZERO;
+    for &id in ids.get_ids() {
+        let start = Instant::now();
+        std::hint::black_box(c.current_bitmask());
+        mask_time += start.elapsed();
+        let start = Instant::now();
+        c.advance_deferred(id as i32).unwrap();
+        c.materialize_pending().unwrap();
+        accept_time += start.elapsed();
+    }
+    assert!(c.is_token_allowed(eos as i32));
+    eprintln!(
+        "tokenizer-info={setup_time:?} compile-cold={cold:?} compile-cache={warm:?} tokens={} mask/token={:?} accept+materialize/token={:?}",
+        ids.len(),
+        mask_time / ids.len() as u32,
+        accept_time / ids.len() as u32
+    );
+}
+
+#[test]
+fn native_ebnf_and_structural_tag_enforce_payloads() {
+    let (tok, factory) = setup();
+    let mut c = factory
+        .lark(r#"root ::= "(" root ")" | "x""#, false)
+        .unwrap();
+    feed(&mut c, &tok, "((x))").unwrap();
+    assert!(c.is_token_allowed(EOS));
+    let initial = factory
+        .structural_tag(
+            json!({"type":"structural_tag","format":{
+                "type":"tag","begin":"<answer>","end":"</answer>",
+                "content":{"type":"json_schema","json_schema":{"const":true}}
+            }}),
+            false,
+        )
+        .unwrap();
+    let mut c = initial.clone();
+    assert!(!c.is_token_allowed(EOS));
+    feed(&mut c, &tok, "<answer>true</answer>").unwrap();
+    assert!(c.is_token_allowed(EOS));
+    let mut bad = initial;
+    assert!(feed(&mut bad, &tok, "<answer>false</answer>").is_err());
+}
+
+#[test]
+fn native_qwen_raw_string_that_looks_like_json_preserves_schema_type() {
+    use w34_host::{
+        parser::Qwen3Parser,
+        tool_constraints::{ToolChoice, ToolFormat},
+    };
+    let (tok, factory) = setup();
+    let tools = json!([{"type":"function","function":{"name":"echo","parameters":{
+        "type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false
+    }}}]);
+    let text = "<tool_call>\n<function=echo>\n<parameter=value>true</parameter>\n</function>\n</tool_call>";
+    let mut c = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    feed(&mut c, &tok, text).unwrap();
+    assert!(c.is_token_allowed(EOS));
+    let mut parser = Qwen3Parser::with_tools(false, tools.as_array().unwrap()).unwrap();
+    parser.push_str(text);
+    let turn = parser.finish().1;
+    assert_eq!(turn.tool_calls.len(), 1);
+    let args: serde_json::Value =
+        serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+    assert_eq!(
+        args,
+        json!({"value":"true"}),
+        "native XML raw strings must retain their schema type"
+    );
 }

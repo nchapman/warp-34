@@ -1,7 +1,6 @@
 use super::*;
 use crate::parser::{ParsedFunctionCall, Qwen3Parser};
 use crate::request_constraints::RequestConstraint;
-use crate::tool_constraints::ToolChoice;
 
 #[test]
 fn translates_flat_tools_tool_choice_none_and_previous_response_chain() {
@@ -56,14 +55,7 @@ fn translates_flat_tools_tool_choice_none_and_previous_response_chain() {
     );
 
     // Verify stateful tool_choice="none" bitmask constraint parses identically to Chat API
-    let constraint = RequestConstraint::parse(&chat1).unwrap().unwrap();
-    assert!(matches!(
-        constraint,
-        RequestConstraint::Tools {
-            choice: ToolChoice::None,
-            ..
-        }
-    ));
+    assert!(RequestConstraint::parse(&chat1).unwrap().is_none());
 
     let turn1 = ParsedAssistantTurn {
         reasoning_content: Some("Need to call read_file".into()),

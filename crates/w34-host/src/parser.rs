@@ -587,7 +587,7 @@ impl SamplerV1 {
     }
 
     /// Commits `token_id` to `output_history` / `output_counts` immediately while deferring
-    /// `llguidance` mask materialization until the next GPU forward pass is already in flight.
+    /// `XGrammar` mask materialization until the next GPU forward pass is already in flight.
     pub fn try_commit_token_deferred(&mut self, token_id: i32) -> Result<(), String> {
         if let Some(ref mut c) = self.constraint {
             c.advance_deferred(token_id)?;
@@ -673,6 +673,7 @@ pub struct Qwen3Parser {
     content_accum: String,
     tool_calls: Vec<ParsedToolCall>,
     next_tool_idx: usize,
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 impl Qwen3Parser {
@@ -691,7 +692,193 @@ impl Qwen3Parser {
             content_accum: String::new(),
             tool_calls: Vec::new(),
             next_tool_idx: 0,
+            tools: None,
         }
+    }
+
+    /// Parse native Qwen XML using canonical OpenAI function tool schemas.
+    /// Unlike `new`, string parameters are raw text, not JSON string literals.
+    /// An empty tool list disables call extraction (including `tool_choice: none`).
+    pub fn with_tools(enable_thinking: bool, tools: &[serde_json::Value]) -> Result<Self, String> {
+        let mut parser = Self::new(enable_thinking);
+        let mut metadata = tools.to_vec();
+        for tool in &mut metadata {
+            if let Some(parameters) = tool.pointer_mut("/function/parameters") {
+                let root = parameters.clone();
+                let mut budget = 4096;
+                *parameters = Self::resolve_local_refs(&root, &root, true, 0, &mut budget)?;
+            }
+        }
+        parser.tools = Some(metadata);
+        Ok(parser)
+    }
+
+    // Resolve only metadata used for top-level XML argument conversion. Nested
+    // object properties and array items are JSON data and need no expansion.
+    fn resolve_local_refs(
+        schema: &serde_json::Value,
+        root: &serde_json::Value,
+        parameters: bool,
+        depth: usize,
+        budget: &mut usize,
+    ) -> Result<serde_json::Value, String> {
+        if depth >= 32 {
+            return Err("tool parser metadata resolution depth limit (32) exceeded".into());
+        }
+        if *budget == 0 {
+            return Err("tool parser metadata resolution budget (4096) exceeded".into());
+        }
+        *budget -= 1;
+        let Some(map) = schema.as_object() else {
+            return Ok(schema.clone());
+        };
+        let mut result = serde_json::Map::new();
+        if let Some(reference) = map.get("$ref") {
+            let pointer = reference
+                .as_str()
+                .and_then(|r| r.strip_prefix('#'))
+                .ok_or("tool parser metadata requires a local $ref")?;
+            let target = root
+                .pointer(pointer)
+                .ok_or("tool parser metadata $ref target not found")?;
+            let resolved = Self::resolve_local_refs(target, root, parameters, depth + 1, budget)?;
+            result = resolved
+                .as_object()
+                .cloned()
+                .ok_or("tool parser metadata $ref target must be an object")?;
+        }
+        for (key, value) in map {
+            match key.as_str() {
+                "type" | "const" | "enum" => {
+                    result.insert(key.clone(), value.clone());
+                }
+                "properties" if parameters => {
+                    if let Some(properties) = value.as_object() {
+                        let mut resolved = serde_json::Map::new();
+                        for (name, schema) in properties {
+                            resolved.insert(
+                                name.clone(),
+                                Self::resolve_local_refs(schema, root, false, depth + 1, budget)?,
+                            );
+                        }
+                        result.insert(key.clone(), resolved.into());
+                    }
+                }
+                "anyOf" | "oneOf" | "allOf" => {
+                    if let Some(choices) = value.as_array() {
+                        let resolved = choices
+                            .iter()
+                            .map(|choice| {
+                                Self::resolve_local_refs(
+                                    choice,
+                                    root,
+                                    parameters,
+                                    depth + 1,
+                                    budget,
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        result.insert(key.clone(), resolved.into());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(result.into())
+    }
+
+    fn properties<'a>(body: &str, tools: &'a [serde_json::Value]) -> Option<&'a serde_json::Value> {
+        let header = body
+            .trim()
+            .strip_prefix('<')?
+            .trim_start()
+            .strip_prefix("function")?
+            .trim_start()
+            .strip_prefix('=')?;
+        let name = header.split_once('>')?.0.trim();
+        tools.iter().find_map(|tool| {
+            let function = tool.get("function")?;
+            (function.get("name")?.as_str()? == name)
+                .then(|| function.pointer("/parameters/properties"))
+                .flatten()
+        })
+    }
+
+    fn schema_types(schema: &serde_json::Value, types: &mut Vec<String>) {
+        if let Some(t) = schema.get("type") {
+            if let Some(t) = t.as_str() {
+                types.push(t.to_owned());
+            }
+            if let Some(ts) = t.as_array() {
+                types.extend(ts.iter().filter_map(|t| t.as_str().map(str::to_owned)));
+            }
+        }
+        {
+            let values = schema.get("enum").and_then(|v| v.as_array());
+            for v in values.into_iter().flatten().chain(schema.get("const")) {
+                types.push(
+                    match v {
+                        serde_json::Value::Null => "null",
+                        serde_json::Value::Bool(_) => "boolean",
+                        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::String(_) => "string",
+                        serde_json::Value::Array(_) => "array",
+                        serde_json::Value::Object(_) => "object",
+                    }
+                    .to_owned(),
+                );
+            }
+        }
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(choices) = schema.get(key).and_then(|v| v.as_array()) {
+                for choice in choices {
+                    Self::schema_types(choice, types);
+                }
+            }
+        }
+    }
+
+    fn convert_arg(raw: &str, schema: Option<&serde_json::Value>) -> serde_json::Value {
+        let mut types = Vec::new();
+        if let Some(schema) = schema {
+            Self::schema_types(schema, &mut types);
+        }
+        if schema.is_some() && types.is_empty() {
+            return serde_json::from_str(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()));
+        }
+        for candidate in ["null", "integer", "number", "boolean", "object", "array"] {
+            if !types.iter().any(|t| t == candidate) {
+                continue;
+            }
+            let value = match candidate {
+                "null" if raw.eq_ignore_ascii_case("null") => Some(serde_json::Value::Null),
+                "integer" => raw
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .map(Into::into)
+                    .or_else(|| raw.trim().parse::<u64>().ok().map(Into::into)),
+                "number" => raw
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(Into::into),
+                "boolean" => match raw.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" => Some(true.into()),
+                    "false" | "0" => Some(false.into()),
+                    _ => None,
+                },
+                "object" | "array" => serde_json::from_str(raw).ok(),
+                _ => None,
+            };
+            if let Some(value) = value {
+                return value;
+            }
+        }
+        serde_json::Value::String(raw.to_owned())
     }
 
     fn trim_wrapping_newlines(s: &str) -> &str {
@@ -701,7 +888,15 @@ impl Qwen3Parser {
 
     /// Locate a structural delimiter without treating JSON string contents as
     /// markup. Incomplete JSON is held until another streaming chunk arrives.
-    fn find_tool_delimiter(text: &str, delimiter: &str) -> Option<usize> {
+    /// Native XML strings instead use tag boundaries: quotes/braces are literal
+    /// text (the native grammar excludes structural delimiters from raw values).
+    /// Only structured parameter schemas retain JSON-aware delimiter skipping.
+    fn find_tool_delimiter(
+        text: &str,
+        delimiter: &str,
+        native: bool,
+        properties: Option<&serde_json::Value>,
+    ) -> Option<usize> {
         fn skip_json(text: &str, start: usize) -> Result<usize, ()> {
             let rest = &text[start..];
             let trimmed = rest.trim_start();
@@ -744,7 +939,7 @@ impl Qwen3Parser {
             }
             false
         }
-        let mut cursor = skip_json(text, 0).ok()?;
+        let mut cursor = if native { 0 } else { skip_json(text, 0).ok()? };
         while cursor < text.len() {
             let next = cursor + text[cursor..].find('<')?;
             let rest = &text[next..];
@@ -753,7 +948,20 @@ impl Qwen3Parser {
             }
             if match_tag(rest, "<parameter=") {
                 let value_start = next + rest.find('>')? + 1;
-                cursor = skip_json(text, value_start).ok()?;
+                let name = rest[..rest.find('>')?]
+                    .split_once('=')
+                    .map(|(_, name)| name.trim());
+                let mut types = Vec::new();
+                if let Some(schema) = name.and_then(|n| properties.and_then(|p| p.get(n))) {
+                    Self::schema_types(schema, &mut types);
+                }
+                let structured = !types.iter().any(|t| t == "string")
+                    && (types.is_empty() || types.iter().any(|t| t == "object" || t == "array"));
+                cursor = if native && !structured {
+                    value_start
+                } else {
+                    skip_json(text, value_start).ok()?
+                };
             } else {
                 cursor = next + 1;
             }
@@ -764,7 +972,17 @@ impl Qwen3Parser {
     /// Parses either Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
     /// or Hermes JSON (`{"name": "...", "arguments": ...}`) inside a `<tool_call>...</tool_call>` body.
     pub fn parse_tool_body(raw_body: &str, call_idx: usize) -> Option<ParsedToolCall> {
+        Self::parse_tool_body_with_tools(raw_body, call_idx, None)
+    }
+
+    fn parse_tool_body_with_tools(
+        raw_body: &str,
+        call_idx: usize,
+        tools: Option<&[serde_json::Value]>,
+    ) -> Option<ParsedToolCall> {
         let body = raw_body.trim();
+        let native = tools.is_some();
+        let properties = tools.and_then(|tools| Self::properties(body, tools));
         if body.is_empty() {
             return None;
         }
@@ -777,10 +995,11 @@ impl Qwen3Parser {
                     let close_angle = after_eq.find('>')?;
                     let fn_name = after_eq[..close_angle].trim().to_string();
                     let rest = &after_eq[close_angle + 1..];
-                    let fn_body = match Self::find_tool_delimiter(rest, "</function>") {
-                        Some(end_idx) => &rest[..end_idx],
-                        None => rest,
-                    };
+                    let fn_body =
+                        match Self::find_tool_delimiter(rest, "</function>", native, properties) {
+                            Some(end_idx) => &rest[..end_idx],
+                            None => rest,
+                        };
                     Some((fn_name, fn_body))
                 } else {
                     None
@@ -795,7 +1014,9 @@ impl Qwen3Parser {
         if let Some((fn_name, fn_body)) = xml_fn {
             let mut params = serde_json::Map::new();
             let mut search = fn_body;
-            while let Some(p_start) = Self::find_tool_delimiter(search, "<parameter=") {
+            while let Some(p_start) =
+                Self::find_tool_delimiter(search, "<parameter=", native, properties)
+            {
                 let after_p = &search[p_start..];
                 let Some(p_angle) = after_p.find('>') else {
                     break;
@@ -806,15 +1027,28 @@ impl Qwen3Parser {
                 };
                 let param_name = param_name.trim().to_string();
                 let val_start = &after_p[p_angle + 1..];
-                let (raw_val, next_slice) = if let Some(p_end) =
-                    Self::find_tool_delimiter(val_start, "</parameter>")
-                {
+                let (raw_val, next_slice) = if let Some(p_end) = Self::find_tool_delimiter(
+                    val_start,
+                    "</parameter>",
+                    native && {
+                        let mut types = Vec::new();
+                        if let Some(schema) = properties.and_then(|p| p.get(&param_name)) {
+                            Self::schema_types(schema, &mut types);
+                        }
+                        types.iter().any(|t| t == "string")
+                            || (!types.is_empty()
+                                && !types.iter().any(|t| t == "object" || t == "array"))
+                    },
+                    properties,
+                ) {
                     let after_close = match val_start[p_end..].find('>') {
                         Some(close_gt) => &val_start[p_end + close_gt + 1..],
                         None => "",
                     };
                     (&val_start[..p_end], after_close)
-                } else if let Some(next_p) = Self::find_tool_delimiter(val_start, "<parameter=") {
+                } else if let Some(next_p) =
+                    Self::find_tool_delimiter(val_start, "<parameter=", native, properties)
+                {
                     (&val_start[..next_p], &val_start[next_p..])
                 } else {
                     (val_start, "")
@@ -822,8 +1056,12 @@ impl Qwen3Parser {
                 let trimmed = Self::trim_wrapping_newlines(raw_val);
                 // Preserve structured JSON numbers/booleans/arrays/objects when valid JSON,
                 // or store string value (`_qwen3_arg_converter`).
-                let json_val = serde_json::from_str::<serde_json::Value>(trimmed)
-                    .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()));
+                let json_val = if native {
+                    Self::convert_arg(trimmed, properties.and_then(|p| p.get(&param_name)))
+                } else {
+                    serde_json::from_str::<serde_json::Value>(trimmed)
+                        .unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()))
+                };
                 params.insert(param_name, json_val);
                 search = next_slice;
             }
@@ -886,7 +1124,14 @@ impl Qwen3Parser {
 
         loop {
             if self.in_tool_call {
-                if let Some(end_pos) = Self::find_tool_delimiter(&self.buffer, Self::TOOL_END) {
+                if let Some(end_pos) = Self::find_tool_delimiter(
+                    &self.buffer,
+                    Self::TOOL_END,
+                    self.tools.is_some() && self.buffer.trim_start().starts_with('<'),
+                    self.tools
+                        .as_deref()
+                        .and_then(|tools| Self::properties(&self.buffer, tools)),
+                ) {
                     let body = self.buffer[..end_pos].to_string();
                     let drain_end = match self.buffer[end_pos..].find('>') {
                         Some(gt) => end_pos + gt + 1,
@@ -894,7 +1139,11 @@ impl Qwen3Parser {
                     };
                     self.buffer.drain(..drain_end);
                     self.in_tool_call = false;
-                    if let Some(tc) = Self::parse_tool_body(&body, self.next_tool_idx) {
+                    if let Some(tc) = Self::parse_tool_body_with_tools(
+                        &body,
+                        self.next_tool_idx,
+                        self.tools.as_deref(),
+                    ) {
                         self.next_tool_idx += 1;
                         self.tool_calls.push(tc.clone());
                         delta.completed_tool_calls.push(tc);
@@ -909,7 +1158,12 @@ impl Qwen3Parser {
                     continue;
                 }
                 let think_end = self.buffer.find(Self::THINK_END);
-                let tool_start = self.buffer.find(Self::TOOL_START);
+                let tool_start = self
+                    .tools
+                    .as_ref()
+                    .is_none_or(|tools| !tools.is_empty())
+                    .then(|| self.buffer.find(Self::TOOL_START))
+                    .flatten();
                 match (think_end, tool_start) {
                     (Some(te), Some(ts)) if ts < te => {
                         // Implicit `</think>` on `<tool_call>` directly from reasoning
@@ -958,7 +1212,12 @@ impl Qwen3Parser {
                 // absorb duplicate `</think>`, or transition to `<tool_call>`.
                 let think_start = self.buffer.find(Self::THINK_START);
                 let dup_think_end = self.buffer.find(Self::THINK_END);
-                let tool_start = self.buffer.find(Self::TOOL_START);
+                let tool_start = self
+                    .tools
+                    .as_ref()
+                    .is_none_or(|tools| !tools.is_empty())
+                    .then(|| self.buffer.find(Self::TOOL_START))
+                    .flatten();
 
                 let earliest = [
                     think_start.map(|p| (p, 0u8)),
@@ -1063,6 +1322,180 @@ impl Qwen3Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_limits_fail_without_weakening_or_mutating_schema() {
+        use serde_json::json;
+        let mut defs = serde_json::Map::new();
+        for i in 0..40 {
+            defs.insert(
+                format!("s{i}"),
+                json!({"$ref":format!("#/$defs/s{}", i + 1)}),
+            );
+        }
+        defs.insert("s40".into(), json!({"type":"string"}));
+        let deep =
+            json!({"$defs":defs,"type":"object","properties":{"label":{"$ref":"#/$defs/s0"}}});
+        let mut properties = serde_json::Map::new();
+        for i in 0..4096 {
+            properties.insert(format!("label{i}"), json!({"type":"string"}));
+        }
+        let wide = json!({"type":"object","properties":properties});
+        for (schema, expected) in [(deep, "depth limit"), (wide, "budget")] {
+            let tools = vec![json!({"function":{"name":"emit","parameters":schema}})];
+            let original = tools.clone();
+            let error = Qwen3Parser::with_tools(false, &tools).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(tools, original);
+        }
+    }
+
+    #[test]
+    fn recursive_json_argument_preserves_nested_strings() {
+        use serde_json::json;
+        let tools = vec![json!({"function":{"name":"emit","parameters":{
+            "$defs":{"node":{"type":"object","properties":{
+                "label":{"type":"string"}, "next":{"$ref":"#/$defs/node"}
+            }}},
+            "type":"object","properties":{"node":{"$ref":"#/$defs/node"}}
+        }}})];
+        let original = tools.clone();
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        parser.push_str(r#"<tool_call><function=emit><parameter=node>{"label":"123","next":{"label":"true"}}</parameter></function></tool_call>"#);
+        let turn = parser.finish().1;
+        let args: serde_json::Value =
+            serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args,
+            json!({"node":{"label":"123","next":{"label":"true"}}})
+        );
+        assert_eq!(tools, original);
+    }
+
+    #[test]
+    fn native_refs_consts_and_untyped_json() {
+        use serde_json::json;
+        let tools = vec![json!({"function":{"name":"emit","parameters":{
+            "$defs": {
+                "count":{"const":123}, "label":{"type":"string"},
+                "loop":{"type":"object","properties":{"next":{"$ref":"#/$defs/loop"}}},
+                "props":{"type":"object","properties":{
+                    "count":{"$ref":"#/$defs/count"},
+                    "label":{"$ref":"#/$defs/label"},
+                    "data":{}, "recursive":{"$ref":"#/$defs/loop"}
+                }}
+            },
+            "$ref":"#/$defs/props"
+        }}})];
+        let original = tools.clone();
+        for label in ["true", "123"] {
+            let text = format!(
+                "<tool_call><function=emit><parameter=count>123</parameter><parameter=label>{label}</parameter><parameter=data>{{\"nested\":[\"</parameter>\",\"</function>\",\"</tool_call>\",{{\"ok\":true}}]}}</parameter></function></tool_call>"
+            );
+            for split in 0..=text.len() {
+                let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+                parser.push_str(&text[..split]);
+                parser.push_str(&text[split..]);
+                let turn = parser.finish().1;
+                assert_eq!(turn.tool_calls.len(), 1, "split {split}");
+                let args: serde_json::Value =
+                    serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+                assert_eq!(
+                    args,
+                    json!({"count":123,"label":label,"data":{
+                        "nested":["</parameter>","</function>","</tool_call>",{"ok":true}]
+                    }}),
+                    "split {split}"
+                );
+            }
+        }
+        assert_eq!(tools, original);
+    }
+
+    #[test]
+    fn native_qwen_unsigned_integer_preserves_numeric_type() {
+        let tools = [
+            serde_json::json!({"type":"function","function":{"name":"emit",
+            "parameters":{"type":"object","properties":{"value":{"type":"integer"}}}}}),
+        ];
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        parser.push_str("<tool_call><function=emit><parameter=value>18446744073709551615</parameter></function></tool_call>");
+        let turn = parser.finish().1;
+        let args: serde_json::Value =
+            serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(args["value"], serde_json::json!(u64::MAX));
+    }
+
+    #[test]
+    fn native_qwen_schema_types_and_streaming() {
+        use serde_json::json;
+        let tools = vec![json!({"type":"function", "function": {
+            "name":"emit", "parameters":{"type":"object", "properties": {
+                "label":{"type":"string"}, "count":{"type":"integer"},
+                "enabled":{"type":"boolean"}, "data":{"type":"object"},
+                "items":{"type":"array"}, "maybe":{"type":["string","null"]},
+                "choice":{"enum":["true","123"]},
+                "union":{"anyOf":[{"type":"integer"},{"type":"string"}]}
+            }}
+        }})];
+        for label in [
+            "true",
+            "123",
+            "\"quoted\"",
+            "\"unclosed",
+            "trailing\"",
+            "{not JSON",
+            "[raw",
+            "  spaced  ",
+            "héllo",
+        ] {
+            let text = format!(
+                "<tool_call><function=emit><parameter=label>{label}</parameter><parameter=count>123</parameter><parameter=enabled>true</parameter><parameter=data>{{\"nested\":[true,123,\"</tool_call>\",\"</parameter>\"]}}</parameter><parameter=items>[1,{{\"x\":false}}]</parameter><parameter=maybe>null</parameter><parameter=choice>true</parameter><parameter=union>42</parameter><parameter=unknown>123</parameter></function></tool_call>"
+            );
+            let expected = json!({"label":label, "count":123, "enabled":true,
+                "data":{"nested":[true,123,"</tool_call>","</parameter>"]},
+                "items":[1,{"x":false}], "maybe":null, "choice":"true", "union":42,
+                "unknown":"123"});
+            // Every two-chunk split, including splits in tags and raw quotes.
+            for split in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
+                let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+                let a = parser.push_str(&text[..split]);
+                let b = parser.push_str(&text[split..]);
+                assert_eq!(
+                    a.completed_tool_calls.len() + b.completed_tool_calls.len(),
+                    1,
+                    "{label:?} split {split}"
+                );
+                let turn = parser.finish().1;
+                assert_eq!(turn.content, None);
+                let args: serde_json::Value =
+                    serde_json::from_str(&turn.tool_calls[0].function.arguments).unwrap();
+                assert_eq!(args, expected, "{label:?} split {split}");
+            }
+            let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+            for c in text.chars() {
+                parser.push_str(&c.to_string());
+            }
+            assert_eq!(parser.finish().1.tool_calls.len(), 1);
+        }
+    }
+
+    #[test]
+    fn native_qwen_hermes_and_truncated_raw_string() {
+        let tools = [
+            serde_json::json!({"function":{"name":"emit","parameters":{"type":"object","properties":{"label":{"type":"string"}}}}}),
+        ];
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        parser.push_str(
+            r#"<tool_call>{"name":"emit","arguments":{"label":"</tool_call>"}}</tool_call>"#,
+        );
+        assert_eq!(parser.finish().1.tool_calls.len(), 1);
+        let mut parser = Qwen3Parser::with_tools(false, &tools).unwrap();
+        parser.push_str("<tool_call><function=emit><parameter=label>\"unfinished");
+        let turn = parser.finish().1;
+        assert!(turn.tool_calls.is_empty());
+        assert!(turn.content.unwrap().ends_with("\"unfinished"));
+    }
 
     #[test]
     fn fast_greedy_stateless_classification() {

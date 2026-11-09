@@ -1150,7 +1150,6 @@ mod tests {
     use super::*;
     use crate::parser::Qwen3Parser;
     use crate::request_constraints::RequestConstraint;
-    use crate::tool_constraints::ToolChoice;
 
     #[test]
     fn strips_claude_code_billing_cch_without_touching_body() {
@@ -1229,14 +1228,7 @@ mod tests {
         });
         let (chat, _) = translate_anthropic_to_chat(&valid, "qwen", 4, true).unwrap();
         assert_eq!(chat["tool_choice"], "none");
-        let constraint = RequestConstraint::parse(&chat).unwrap().unwrap();
-        assert!(matches!(
-            constraint,
-            RequestConstraint::Tools {
-                choice: ToolChoice::None,
-                ..
-            }
-        ));
+        assert!(RequestConstraint::parse(&chat).unwrap().is_none());
         let msgs = chat["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0]["role"], "system");
