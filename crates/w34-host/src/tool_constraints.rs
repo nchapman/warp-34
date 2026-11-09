@@ -86,25 +86,60 @@ fn is_safe_unquoted_xml_string(s: &str) -> bool {
         && serde_json::from_str::<Value>(s).is_err()
 }
 
-fn attach_root_defs(value_schema: &Value, root_schema: &serde_json::Map<String, Value>) -> Value {
+fn rewrite_local_property_refs(value: &mut Value, prop_prefix: &str) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(r)) = map.get_mut("$ref")
+                && let Some(rest) = r.strip_prefix(prop_prefix)
+            {
+                *r = format!("#/{rest}");
+            }
+            for v in map.values_mut() {
+                rewrite_local_property_refs(v, prop_prefix);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                rewrite_local_property_refs(v, prop_prefix);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn attach_root_defs(
+    prop_key: Option<&str>,
+    value_schema: &Value,
+    root_schema: &serde_json::Map<String, Value>,
+) -> Value {
     let Some(obj) = value_schema.as_object() else {
         return value_schema.clone();
     };
     let mut cloned = obj.clone();
     for def_key in ["$defs", "definitions"] {
-        if !cloned.contains_key(def_key)
-            && let Some(defs) = root_schema.get(def_key)
-        {
-            cloned.insert(def_key.to_string(), defs.clone());
+        let Some(root_defs) = root_schema.get(def_key).and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(Value::Object(local_defs)) = cloned.get_mut(def_key) {
+            for (k, v) in root_defs {
+                local_defs.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        } else if !cloned.contains_key(def_key) {
+            cloned.insert(def_key.to_string(), Value::Object(root_defs.clone()));
         }
     }
-    Value::Object(cloned)
+    let mut out = Value::Object(cloned);
+    if let Some(key) = prop_key {
+        let prefix = format!("#/properties/{key}/");
+        rewrite_local_property_refs(&mut out, &prefix);
+    }
+    out
 }
 
 #[derive(Default)]
 struct UnquotedXmlBranches {
     has_plain_string: bool,
-    plain_string_min_length: u64,
+    plain_string_min_length: Option<u64>,
     has_null: bool,
     only_string_and_null: bool,
     literals: Vec<String>,
@@ -117,6 +152,10 @@ fn collect_unquoted_xml_string_branches(schema: &Value) -> UnquotedXmlBranches {
     };
     collect_unquoted_xml_inner(schema, 0, &mut out);
     out
+}
+
+fn merge_plain_min_length(dst: &mut Option<u64>, min_len: u64) {
+    *dst = Some(dst.map_or(min_len, |prev| prev.min(min_len)));
 }
 
 fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXmlBranches) {
@@ -142,15 +181,13 @@ fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXm
             ) || allowed.contains(&k.as_str())
         })
     };
-    for comb in ["anyOf", "oneOf"] {
-        if let Some(Value::Array(items)) = obj.get(comb)
-            && only_meta_or(&[comb])
-        {
-            for sub in items {
-                collect_unquoted_xml_inner(sub, depth + 1, out);
-            }
-            return;
+    if let Some(Value::Array(items)) = obj.get("anyOf")
+        && only_meta_or(&["anyOf"])
+    {
+        for sub in items {
+            collect_unquoted_xml_inner(sub, depth + 1, out);
         }
+        return;
     }
     if obj.get("type").and_then(Value::as_str) == Some("null") && only_meta_or(&["type"]) {
         out.has_null = true;
@@ -220,9 +257,8 @@ fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXm
             .is_none_or(|n| n <= 1)
     {
         out.has_plain_string = true;
-        if let Some(min_len) = obj.get("minLength").and_then(Value::as_u64) {
-            out.plain_string_min_length = out.plain_string_min_length.max(min_len);
-        }
+        let min_len = obj.get("minLength").and_then(Value::as_u64).unwrap_or(0);
+        merge_plain_min_length(&mut out.plain_string_min_length, min_len);
     } else {
         out.only_string_and_null = false;
     }
@@ -238,7 +274,7 @@ fn xml_param_rule(
 ) -> String {
     let open_tag = literal(&format!("<parameter={key}>"));
     let close_tag = literal("</parameter>");
-    let schema_with_defs = attach_root_defs(value_schema, root_schema);
+    let schema_with_defs = attach_root_defs(Some(key), value_schema, root_schema);
     let json_branch = format!("%json {schema_with_defs}");
     let default_rule = format!("{rule}: {open_tag} WS {json_branch} WS {close_tag} WS\n");
     if !value_schema.is_object() {
@@ -248,7 +284,7 @@ fn xml_param_rule(
     let branches = collect_unquoted_xml_string_branches(value_schema);
 
     if branches.has_plain_string && branches.only_string_and_null && branches.literals.is_empty() {
-        let str_json = if branches.plain_string_min_length >= 1 {
+        let str_json = if branches.plain_string_min_length.unwrap_or(0) >= 1 {
             "%json {\"type\":\"string\",\"minLength\":1}"
         } else {
             "%json {\"type\":\"string\"}"
@@ -268,7 +304,7 @@ fn xml_param_rule(
     if !branches.literals.is_empty() && !branches.has_plain_string {
         let lits = branches.literals.join(" | ");
         return format!(
-            "{rule}: {open_tag} WS ({json_branch} WS {close_tag} | ({lits}) /\\r?\\n/? {close_tag}) WS\n"
+            "{rule}: {open_tag} /\\r?\\n/? ({json_branch} WS {close_tag} | /[ \\t\\r\\n]+/ {json_branch} WS {close_tag} | ({lits}) /\\r?\\n/? {close_tag}) WS\n"
         );
     }
 
@@ -331,7 +367,7 @@ pub fn tool_grammar_with_options(
                     "name":{"const":name},"arguments":schema
                 },"required":["name","arguments"],"additionalProperties":false});
                 if let Some(schema_obj) = schema.as_object() {
-                    wrapper = attach_root_defs(&wrapper, schema_obj);
+                    wrapper = attach_root_defs(None, &wrapper, schema_obj);
                 }
                 format!("%json {wrapper}")
             }

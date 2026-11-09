@@ -996,8 +996,13 @@ impl Qwen3Parser {
     }
 
     fn trim_wrapping_newlines(s: &str) -> &str {
-        let s = s.strip_prefix('\n').unwrap_or(s);
-        s.strip_suffix('\n').unwrap_or(s)
+        let s = s
+            .strip_prefix("\r\n")
+            .or_else(|| s.strip_prefix('\n'))
+            .unwrap_or(s);
+        s.strip_suffix("\r\n")
+            .or_else(|| s.strip_suffix('\n'))
+            .unwrap_or(s)
     }
 
     /// Locate a structural delimiter without treating JSON string contents as

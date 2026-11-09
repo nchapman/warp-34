@@ -198,12 +198,13 @@ impl RequestConstraint {
                 }
             }
             if output.is_some() {
-                if choice == ToolChoice::None {
-                    return Ok(output);
-                }
-                return Err(
-                    "tool_choice/tools and output grammars cannot currently be combined".into(),
-                );
+                return match choice {
+                    ToolChoice::Auto | ToolChoice::None => Ok(output),
+                    ToolChoice::Required | ToolChoice::Named(_) => Err(
+                        "forced tool_choice and output grammars cannot currently be combined"
+                            .into(),
+                    ),
+                };
             }
             output = Some(Self::Tools {
                 tools: Value::Array(tools),
@@ -513,14 +514,25 @@ mod tests {
             }))
             .is_err()
         );
+        // Forced tool_choice (`required` or named) + output constraint fails closed,
+        // while non-forced tool choices (`auto`, `none`, or omitted) let the output
+        // constraint take precedence.
         assert!(
+            RequestConstraint::parse(&json!({
+                "response_format": {"type": "json_object"},
+                "tools": [{"type": "function", "function": {"name": "f"}}],
+                "tool_choice": "required"
+            }))
+            .is_err()
+        );
+        assert!(matches!(
             RequestConstraint::parse(&json!({
                 "response_format": {"type": "json_object"},
                 "tools": [{"type": "function", "function": {"name": "f"}}]
             }))
-            .is_err()
-        );
-        // `tool_choice: "none"` and empty `tools: []` coexist with output constraints
+            .unwrap(),
+            Some(RequestConstraint::JsonObject)
+        ));
         assert!(matches!(
             RequestConstraint::parse(&json!({
                 "response_format": {"type": "json_object"},

@@ -189,7 +189,32 @@ impl ConstraintFactory {
                 if let Some(schema) = tool.get("function").and_then(|f| f.get("parameters")) {
                     // Validate complete schemas before XML lowering, including
                     // keywords (such as additionalProperties) not emitted there.
-                    self.json_schema(schema.clone(), false)?;
+                    let mut check_schema = schema.clone();
+                    if let Some(root_obj) = check_schema.as_object_mut()
+                        && let Some(props) = root_obj
+                            .get("properties")
+                            .and_then(serde_json::Value::as_object)
+                            .cloned()
+                    {
+                        for def_key in ["$defs", "definitions"] {
+                            for prop_val in props.values() {
+                                let Some(prop_defs) =
+                                    prop_val.get(def_key).and_then(serde_json::Value::as_object)
+                                else {
+                                    continue;
+                                };
+                                let root_defs = root_obj
+                                    .entry(def_key.to_string())
+                                    .or_insert_with(|| serde_json::json!({}));
+                                if let Some(root_defs_obj) = root_defs.as_object_mut() {
+                                    for (k, v) in prop_defs {
+                                        root_defs_obj.entry(k.clone()).or_insert_with(|| v.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.json_schema(check_schema, false)?;
                 }
             }
         }

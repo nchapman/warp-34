@@ -597,7 +597,18 @@ fn xml_tools_propagate_defs_to_parameter_schemas() {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "destination": { "$ref": "#/$defs/Point" }
+                    "destination": {
+                        "type": "object",
+                        "properties": {
+                            "point": { "$ref": "#/$defs/Point" },
+                            "label": { "$ref": "#/$defs/Label" }
+                        },
+                        "required": ["point"],
+                        "additionalProperties": false,
+                        "$defs": {
+                            "Label": { "type": "string" }
+                        }
+                    }
                 },
                 "required": ["destination"],
                 "additionalProperties": false,
@@ -622,7 +633,7 @@ fn xml_tools_propagate_defs_to_parameter_schemas() {
     feed(
         &mut c,
         &tok,
-        "<tool_call>\n<function=navigate>\n<parameter=destination>\n{\"x\":10,\"y\":20}\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=navigate>\n<parameter=destination>\n{\"point\":{\"x\":10,\"y\":20},\"label\":\"home\"}\n</parameter>\n</function>\n</tool_call>",
     )
     .unwrap();
     assert!(c.is_token_allowed(EOS));
@@ -634,7 +645,7 @@ fn xml_tools_propagate_defs_to_parameter_schemas() {
         feed(
             &mut c_bad,
             &tok,
-            "<tool_call>\n<function=navigate>\n<parameter=destination>\n{\"x\":10,\"z\":20}\n</parameter>"
+            "<tool_call>\n<function=navigate>\n<parameter=destination>\n{\"point\":{\"x\":10,\"z\":20}}\n</parameter>"
         )
         .is_err()
     );
@@ -871,6 +882,96 @@ fn xml_pydantic_anyof_nullable_strings_and_string_int_unions() {
     )
     .unwrap();
     assert!(c_min_ok.is_token_allowed(EOS));
+
+    // 7. `anyOf: [{"type": "string"}, {"type": "string", "minLength": 1}]` permits quoted empty string `""`,
+    // whereas `oneOf` is never flattened into an unquoted union.
+    let union_tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "check_unions",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "any_str": {
+                        "anyOf": [
+                            { "type": "string" },
+                            { "type": "string", "minLength": 1 }
+                        ]
+                    }
+                },
+                "required": ["any_str"],
+                "additionalProperties": false
+            }
+        }
+    }]);
+    let mut c_union_ok = factory
+        .tools(
+            &union_tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml,
+            false,
+        )
+        .unwrap();
+    feed(
+        &mut c_union_ok,
+        &tok,
+        "<tool_call>\n<function=check_unions>\n<parameter=any_str>\n\"\"\n</parameter>\n</function>\n</tool_call>",
+    )
+    .unwrap();
+    assert!(c_union_ok.is_token_allowed(EOS));
+
+    let oneof_tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "check_oneof",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "one_str": {
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "string", "minLength": 1 }
+                        ]
+                    }
+                },
+                "required": ["one_str"],
+                "additionalProperties": false
+            }
+        }
+    }]);
+    let oneof_grammar = w34_host::tool_constraints::tool_grammar(
+        &oneof_tools,
+        &ToolChoice::Required,
+        ToolFormat::QwenXml,
+    )
+    .unwrap();
+    assert!(
+        !oneof_grammar.contains("unquoted_xml_param_end"),
+        "oneOf must not be flattened into unquoted_xml_param_end: {oneof_grammar}"
+    );
+    assert!(
+        factory
+            .tools(
+                &oneof_tools,
+                &ToolChoice::Required,
+                ToolFormat::QwenXml,
+                false
+            )
+            .is_err()
+    );
+
+    // 8. Unquoted enum branch rejects horizontal padding (`\nauto \n`) while accepting `\nauto\n` and ` "auto" `
+    let mut c_enum_pad = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    assert!(
+        feed(
+            &mut c_enum_pad,
+            &tok,
+            "<tool_call>\n<function=configure>\n<parameter=title>\nprod\n</parameter>\n<parameter=note>\nok\n</parameter>\n<parameter=budget>\nauto \n</parameter>"
+        )
+        .is_err()
+    );
 }
 
 #[test]
