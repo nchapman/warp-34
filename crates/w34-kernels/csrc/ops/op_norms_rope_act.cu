@@ -1639,6 +1639,23 @@ __global__ void small_n_gemm_4x4_f16_kernel(
                 }
             }
         }
+    } else if (rows == 1 && cols == 4) {
+#pragma unroll 1
+        for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
+            const uint4 xv0 = *reinterpret_cast<const uint4*>(
+                x + (size_t)m_base * size_k + k);
+            const __half* xh = reinterpret_cast<const __half*>(&xv0);
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const uint4 wv = *reinterpret_cast<const uint4*>(
+                    w + (size_t)(n_base + c) * size_k + k);
+                const __half* wh = reinterpret_cast<const __half*>(&wv);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    acc[0][c] = fmaf(__half2float(xh[j]), __half2float(wh[j]), acc[0][c]);
+                }
+            }
+        }
     } else {
 #pragma unroll 1
         for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
@@ -1734,6 +1751,23 @@ __global__ void small_n_gemm_dual_4x4_f16_kernel(
                 }
             }
         }
+    } else if (rows == 1 && cols == 4) {
+#pragma unroll 1
+        for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
+            const uint4 xv0 = *reinterpret_cast<const uint4*>(
+                x + (size_t)m_base * size_k + k);
+            const __half* xh = reinterpret_cast<const __half*>(&xv0);
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const uint4 wv = *reinterpret_cast<const uint4*>(
+                    w + (size_t)(n_base + c) * size_k + k);
+                const __half* wh = reinterpret_cast<const __half*>(&wv);
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    acc[0][c] = fmaf(__half2float(xh[j]), __half2float(wh[j]), acc[0][c]);
+                }
+            }
+        }
     } else {
 #pragma unroll 1
         for (int k = (int)threadIdx.x * 8; k < size_k; k += 2048) {
@@ -1787,13 +1821,20 @@ extern "C" int w34_small_n_gemm_f16(
     if (m <= 0 || size_n <= 0 || size_k <= 0) return 0;
     if ((size_k & 7) != 0) return (int)cudaErrorInvalidValue;
     cudaStream_t stream = (cudaStream_t)ex->stream;
-    const int tiles_m = (m + 3) / 4;
-    const int tiles_n = (size_n + 3) / 4;
-    if (m == 1) {
+    constexpr int kTile4 = 4;
+    constexpr int kDecodeMaxM = 16;
+    constexpr int k1xNMaxM = 2;
+    constexpr int k1xNMaxTilesMN = 64;
+    constexpr int kWide4x4MinTilesN = 128; // size_n >= 512
+    const int tiles_m = (m + kTile4 - 1) / kTile4;
+    const int tiles_n = (size_n + kTile4 - 1) / kTile4;
+    if (m == 1 && tiles_n < kWide4x4MinTilesN) {
         dim3 grid((unsigned)size_n, 1u);
         w34::small_n_gemm_f16_kernel<1, 4><<<grid, 256, 0, stream>>>(
             (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);
-    } else if (m <= 16 && (m < 3 || tiles_n * tiles_m < 64)) {
+    } else if (m <= kDecodeMaxM &&
+               (m <= k1xNMaxM || tiles_n * tiles_m < k1xNMaxTilesMN) &&
+               tiles_n < kWide4x4MinTilesN) {
         dim3 grid((unsigned)size_n, (unsigned)tiles_m);
         w34::small_n_gemm_f16_kernel<4, 4><<<grid, 256, 0, stream>>>(
             (const __half*)x, (const __half*)w, (__half*)out, m, size_n, size_k);

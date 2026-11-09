@@ -9,6 +9,14 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+pub(crate) const MAX_DECODE_TOKENS: usize =
+    crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS;
+pub(crate) const MAX_TOP_K: usize = crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_TOP_K;
+pub(crate) const MAX_PAIRS: usize = MAX_DECODE_TOKENS * MAX_TOP_K;
+pub(crate) const MAX_HIDDEN: usize = crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_HIDDEN;
+pub(crate) const MAX_ELEMENTS: usize = MAX_DECODE_TOKENS * MAX_HIDDEN;
+const _: () = assert!(eval::MAX_SLICE_TOKENS == MAX_DECODE_TOKENS);
+
 #[repr(C, align(64))]
 struct Request {
     seq: AtomicI64,
@@ -20,16 +28,16 @@ struct Request {
     intermediate: i32,
     experts: i32,
     pad: [i32; 7],
-    ids: [i32; 64],
-    weights: [f32; 64],
-    x: [u16; 16384],
+    ids: [i32; MAX_PAIRS],
+    weights: [f32; MAX_PAIRS],
+    x: [u16; MAX_ELEMENTS],
 }
 #[repr(C, align(64))]
 struct Response {
     seq: AtomicI64,
     status: i32,
     pad: [i32; 13],
-    y: [f32; 16384],
+    y: [f32; MAX_ELEMENTS],
 }
 fn bridge_error(detail: impl ToString) -> crate::cuda::CudaError {
     crate::cuda::CudaError::with_detail(-1, "CPU MoE bridge", detail.to_string())
@@ -374,12 +382,13 @@ impl Runtime {
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     let r = &*rq;
                                     assert!(
-                                        (1..=4).contains(&r.tokens) && (1..=16).contains(&r.top_k)
+                                        (1..=MAX_DECODE_TOKENS as i32).contains(&r.tokens)
+                                            && (1..=MAX_TOP_K as i32).contains(&r.top_k)
                                     );
                                     let h = m.store.layout().hidden;
                                     assert_eq!(r.hidden as usize, h);
                                     let total = r.tokens as usize * r.top_k as usize;
-                                    let mut tasks = [(0usize, 0usize, 0.0f32); 64];
+                                    let mut tasks = [(0usize, 0usize, 0.0f32); MAX_PAIRS];
                                     let mut n_tasks = 0;
                                     for i in 0..total {
                                         if r.ids[i] >= 0 {
@@ -792,7 +801,7 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
             .eval
             .resize(eval::scratch_len(n, range.len()).unwrap(), 0.);
         let y = &mut output[..];
-        if batch.tokens <= 4 {
+        if batch.tokens <= MAX_DECODE_TOKENS {
             eval::eval_expert_slice(
                 d,
                 range,
@@ -960,7 +969,7 @@ fn evaluate_into(
     for (j, job) in jobs.iter().enumerate() {
         routing.expert_to_job[job.expert] = j as u32;
     }
-    let slices = if tokens <= 4 && store.layout().intermediate / 128 >= 2 {
+    let slices = if tokens <= MAX_DECODE_TOKENS && store.layout().intermediate / 128 >= 2 {
         2
     } else {
         1
@@ -1084,11 +1093,11 @@ mod tests {
     #[test]
     fn mailbox_abi() {
         assert_eq!(std::mem::offset_of!(Request, ids), 64);
-        assert_eq!(std::mem::offset_of!(Request, x), 576);
-        assert_eq!(std::mem::size_of::<Request>(), 33344);
+        assert_eq!(std::mem::offset_of!(Request, x), 1088);
+        assert_eq!(std::mem::size_of::<Request>(), 66624);
         assert_eq!(std::mem::offset_of!(Response, status), 8);
         assert_eq!(std::mem::offset_of!(Response, y), 64);
-        assert_eq!(std::mem::size_of::<Response>(), 65600);
+        assert_eq!(std::mem::size_of::<Response>(), 131136);
     }
     #[test]
     fn new_prefill_only_partitions_ep_cpus_and_matches_prefill_output() {

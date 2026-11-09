@@ -367,11 +367,21 @@ impl HotExpertRankings {
 /// Maximum token rows (`6,144`) supported in a single tiered-MoE / `PLE` batch workspace.
 pub const TIERED_MOE_MAX_BATCH_TOKENS: usize = 6144;
 
-/// Maximum decode/verify batch size (`4` tokens) eligible for zero-copy GPU+CPU hybrid MoE execution.
-pub const TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS: usize = 4;
+/// Maximum decode/verify batch size (`8` tokens) eligible for zero-copy GPU+CPU hybrid MoE execution.
+pub const TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS: usize = 8;
 
 /// Maximum routed `top_k` (`16` experts/token) supported by the GPU+CPU hybrid MoE mailbox ABI.
 pub const TIERED_MOE_CPU_BRIDGE_MAX_TOP_K: usize = 16;
+
+/// Maximum hidden dimension (`4,096`) supported by the GPU+CPU hybrid MoE mailbox ABI.
+pub const TIERED_MOE_CPU_BRIDGE_MAX_HIDDEN: usize = 4096;
+
+/// Number of tail GPU hot-cache slots (`40`, matching `M = 4, top_k = 10` in `op_moe_router.cu`)
+/// reserved for dynamic decode LRU eviction while keeping `0..k_hot - 40` static for prefill.
+pub const TIERED_MOE_GPU_LRU_TAIL_SLOTS: usize = 40;
+
+/// Minimum prompt token count (`1,024`) before `StreamedPrefill` adapts tail hot-cache slots.
+pub const TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS: usize = 1024;
 
 /// Router weight threshold (`0.14`) below which cold experts are delegated to the CPU bridge
 /// when dynamic LRU slots (`k_static < k_hot`) are available on the GPU on AVX-512 hosts.

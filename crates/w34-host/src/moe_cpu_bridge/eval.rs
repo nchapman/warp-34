@@ -5,6 +5,9 @@
 
 use std::ops::Range;
 
+/// Maximum prepared token count (`8`) supported by [`eval_expert_slice`].
+pub(super) const MAX_SLICE_TOKENS: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EvalError {
     InvalidLayout,
@@ -487,7 +490,7 @@ fn expert_portable(
     }
 }
 
-/// Evaluate 1..=4 prepared tokens over a nonempty intermediate GROUP range.
+/// Evaluate 1..=8 prepared tokens over a nonempty intermediate GROUP range.
 /// `xp`/`xg` have strides hidden and hidden/128; `weights.len()` is the token count.
 /// Writes (does not add) weights[t] * down(SiLU(gate) * up) into out[t*hidden..].
 /// Scratch must contain at least `scratch_len(weights.len(), groups.len())` floats.
@@ -500,7 +503,15 @@ pub(super) fn eval_expert_slice(
     out: &mut [f32],
     scratch: &mut [f32],
 ) -> Result<(), EvalError> {
-    validate(d, &groups, [xp, xg], weights, out, scratch, 4)?;
+    validate(
+        d,
+        &groups,
+        [xp, xg],
+        weights,
+        out,
+        scratch,
+        MAX_SLICE_TOKENS,
+    )?;
     #[cfg(target_arch = "x86_64")]
     if supported() {
         // SAFETY: runtime ISA guard and all sizes/ranges checked above.

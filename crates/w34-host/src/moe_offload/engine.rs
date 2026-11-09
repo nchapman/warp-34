@@ -238,7 +238,19 @@ impl TieredMoeEngine {
             return Ok(());
         }
         cache.sync_from_device_if_dirty(compute_stream)?;
-        if (8..1024).contains(&num_tokens) && cache.adapted_slots_dirty {
+        let use_prefill_hot_limit = num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+            && (cache.bridge_layer_id.is_some()
+                || matches!(mode, MoeOffloadMode::StreamedPrefill)
+                || (num_tokens > TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS
+                    && !matches!(
+                        mode,
+                        MoeOffloadMode::GpuLru | MoeOffloadMode::CpuHybrid { .. }
+                    )));
+        if (use_prefill_hot_limit
+            || (TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS..TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS)
+                .contains(&num_tokens))
+            && cache.adapted_slots_dirty
+        {
             cache.restore_initial_if_adapted(store, ws, compute_stream)?;
         }
         assert_eq!(h_topk_ids.len(), num_tokens * top_k);
@@ -249,6 +261,11 @@ impl TieredMoeEngine {
         // Identify unique active local experts and count cache hits/misses.
         let local_start = cache.expert_ids.start;
         let local_len = cache.expert_ids.len();
+        let prefill_hot_limit = if use_prefill_hot_limit {
+            cache.prefill_hot_limit()
+        } else {
+            cache.slots.capacity
+        };
         let mut seen_local = vec![false; local_len];
         let mut active_local: Vec<usize> = Vec::new();
         let mut hits_in_step: Vec<usize> = Vec::new();
@@ -263,7 +280,8 @@ impl TieredMoeEngine {
             if le >= local_len {
                 continue;
             }
-            let is_hit = cache.expert_to_slot[le] >= 0;
+            let slot = cache.expert_to_slot[le];
+            let is_hit = slot >= 0 && (slot as usize) < prefill_hot_limit;
             if is_hit {
                 cache.hits += 1;
             } else {
@@ -358,9 +376,18 @@ impl TieredMoeEngine {
                         )?;
                     }
                     ws.compute_done_events[0].record(compute_stream)?;
+                    let check_limit = cache
+                        .prefill_hot_limit()
+                        .min(cache.initial_slot_to_expert.len());
+                    if (0..check_limit)
+                        .any(|s| cache.slot_to_expert[s] != cache.initial_slot_to_expert[s])
+                    {
+                        cache.adapted_slots_dirty = true;
+                    }
                     cache
                         .d_expert_to_slot
                         .copy_from_host(&cache.expert_to_slot, compute_stream)?;
+                    cache.sync_prefill_expert_to_slot(compute_stream)?;
                     for (dst, &e) in cache
                         .slot_to_expert_i32
                         .iter_mut()
@@ -447,9 +474,18 @@ impl TieredMoeEngine {
                         compute_stream,
                     )?;
                     ws.compute_done_events[0].record(compute_stream)?;
+                    let check_limit = cache
+                        .prefill_hot_limit()
+                        .min(cache.initial_slot_to_expert.len());
+                    if (0..check_limit)
+                        .any(|s| cache.slot_to_expert[s] != cache.initial_slot_to_expert[s])
+                    {
+                        cache.adapted_slots_dirty = true;
+                    }
                     cache
                         .d_expert_to_slot
                         .copy_from_host(&cache.expert_to_slot, compute_stream)?;
+                    cache.sync_prefill_expert_to_slot(compute_stream)?;
                     for (dst, &e) in cache
                         .slot_to_expert_i32
                         .iter_mut()
@@ -579,7 +615,8 @@ impl TieredMoeEngine {
                 let use_cpu_bridge = cache.bridge_runtime.is_some()
                     && num_tokens <= ws.max_tokens
                     && h_topk_weights.len() == num_tokens * top_k;
-                let want_freq_stats = use_cpu_bridge || (num_tokens >= 1024 && adapt_end >= 64);
+                let want_freq_stats = use_cpu_bridge
+                    || (num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS && adapt_end >= 64);
 
                 if want_freq_stats && !misses_in_step.is_empty() {
                     let mut exp_toks: Vec<Vec<(i32, f32)>> = if use_cpu_bridge {
@@ -596,7 +633,8 @@ impl TieredMoeEngine {
                         let ge = raw_id as usize;
                         let le = ge.wrapping_sub(local_start);
                         if le < local_len {
-                            if cache.expert_to_slot[le] < 0 {
+                            let slot = cache.expert_to_slot[le];
+                            if slot < 0 || (slot as usize) >= prefill_hot_limit {
                                 miss_freq[le] += 1;
                                 if use_cpu_bridge {
                                     let tok = (pair_idx / top_k) as i32;
@@ -713,7 +751,10 @@ impl TieredMoeEngine {
                     // from `gpu_misses` that are >= 3x more frequent in this prompt than the
                     // lowest-frequency resident tail slots, unpacking them directly from
                     // `ws.d_stage_packs[0]` during Chunk 0 at zero extra PCIe DMA cost.
-                    if num_tokens >= 1024 && adapt_end >= 64 && !gpu_misses.is_empty() {
+                    if num_tokens >= TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
+                        && adapt_end >= 64
+                        && !gpu_misses.is_empty()
+                    {
                         let adapt_start = adapt_end - 20;
                         let mut victim_cands: Vec<(usize, usize)> = (adapt_start..adapt_end)
                             .map(|slot| {
@@ -789,13 +830,18 @@ impl TieredMoeEngine {
                 }
 
                 // Pass 0: Execute all hot-cache hits on `compute_stream` (plus shared expert).
+                let pass0_slot_map_addr = if prefill_hot_limit < cache.slots.capacity {
+                    cache.d_prefill_expert_to_slot.addr()
+                } else {
+                    cache.d_expert_to_slot.addr()
+                };
                 crate::cuda::check_rc(
                     // SAFETY: pointers and counts match allocated device buffers.
                     unsafe {
                         w34_kernels::ffi::w34_moe_remap_topk_ids_i32(
                             &ex,
                             d_topk_ids_addr as *const i32,
-                            cache.d_expert_to_slot.addr() as *const i32,
+                            pass0_slot_map_addr as *const i32,
                             ws.d_remapped_topk_ids[0].addr() as *mut i32,
                             (num_tokens * top_k) as i32,
                             cache.expert_ids.start as i32,
@@ -897,15 +943,17 @@ impl TieredMoeEngine {
                         cache
                             .d_expert_to_slot
                             .copy_from_host(&cache.expert_to_slot, compute_stream)?;
+                        cache.sync_prefill_expert_to_slot(compute_stream)?;
                         cache
                             .d_slot_to_expert
                             .copy_from_host(&cache.slot_to_expert_i32, compute_stream)?;
                         cache
                             .d_slot_last_used
                             .copy_from_host(&cache.slot_last_used, compute_stream)?;
+                        cache.step_clock_buf[0] = cache.step_clock;
                         cache
                             .d_step_counter
-                            .copy_from_host(&[cache.step_clock], compute_stream)?;
+                            .copy_from_host(&cache.step_clock_buf, compute_stream)?;
                     }
                     ws.compute_done_events[buf_idx].record(compute_stream)?;
 
@@ -1086,7 +1134,7 @@ impl RankTieredMoe {
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 if ep_size == 1 {
-                    let k_static = if k_hot >= 64 { k_hot - 24 } else { k_hot };
+                    let k_static = k_hot;
                     if bridge_runtime.is_none() {
                         bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
                     }

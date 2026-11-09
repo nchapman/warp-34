@@ -19,7 +19,10 @@ pub const U8_BYTES_PER_U32: usize = 4;
 pub const DEVICE_SCRATCH_ALIGNMENT_BYTES: usize = 256;
 pub const SMALL_N_GEMM_ALWAYS_MAX_N: usize = 256;
 pub const SMALL_N_GEMM_ROUTER_512_MAX_N: usize = 512;
-pub const SMALL_N_GEMM_DECODE_MAX_DIM: usize = 2048;
+pub const SMALL_N_GEMM_DECODE_MAX_N: usize = 2048;
+pub const SMALL_N_GEMM_DECODE_MAX_DIM: usize = 2560;
+pub const SMALL_N_GEMM_PLE_MAX_N: usize = 10240;
+pub const SMALL_N_GEMM_WIDE_N_MIN_K: usize = 2048;
 pub const SMALL_N_GEMM_DECODE_MAX_M: usize = 16;
 pub const SMALL_N_GEMM_K_ALIGN: usize = 8;
 
@@ -289,8 +292,10 @@ impl LinearProj {
                 //   0-ULP parity between `M = 1` decode and `M <= 16` MTP/DFlash2 verify) while keeping
                 //   `m > 16` chunked prefill on cuBLAS Tensor Cores.
                 if (size_n <= SMALL_N_GEMM_ALWAYS_MAX_N
-                    || (size_n <= SMALL_N_GEMM_DECODE_MAX_DIM
-                        && size_k <= SMALL_N_GEMM_DECODE_MAX_DIM
+                    || (size_k <= SMALL_N_GEMM_DECODE_MAX_DIM
+                        && (size_n <= SMALL_N_GEMM_DECODE_MAX_N
+                            || (size_n <= SMALL_N_GEMM_PLE_MAX_N
+                                && size_k >= SMALL_N_GEMM_WIDE_N_MIN_K))
                         && m <= SMALL_N_GEMM_DECODE_MAX_M))
                     && size_k.is_multiple_of(SMALL_N_GEMM_K_ALIGN)
                 {
