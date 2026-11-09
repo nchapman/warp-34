@@ -28,6 +28,25 @@ static constexpr int kMaxTokens = 4;
 static constexpr int kMaxTopK = 16;
 static constexpr int kMaxPairs = kMaxTokens * kMaxTopK; // 64
 static constexpr int kMaxHidden = 4096;
+static constexpr int kMaxGpuStagePull = 8;
+static constexpr int kDefaultSingleTokenMaxGpuPull = 2;
+static constexpr float kHighGpuShareThreshold = 0.20f;
+static constexpr float kMultiTokenDefaultGpuShare = 0.36f;
+
+__host__ __device__ __forceinline__ int hybrid_max_gpu_pull(
+    int k_static,
+    int k_hot,
+    int num_tokens,
+    float gpu_share_frac) {
+    const int max_gpu_stage = (k_hot > k_static) ? (k_hot - k_static) : 0;
+    const int cap_stage = (max_gpu_stage < kMaxGpuStagePull) ? max_gpu_stage : kMaxGpuStagePull;
+    if (gpu_share_frac > kHighGpuShareThreshold || num_tokens > 1) {
+        return cap_stage;
+    }
+    return (max_gpu_stage < kDefaultSingleTokenMaxGpuPull)
+        ? max_gpu_stage
+        : kDefaultSingleTokenMaxGpuPull;
+}
 
 struct alignas(64) MoeBridgeReqSlot {
     int64_t seq;
@@ -127,11 +146,7 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             }
         }
 
-        const int max_gpu_stage = (k_hot > k_static) ? (k_hot - k_static) : 0;
-        const int cap_stage = (max_gpu_stage < 8) ? max_gpu_stage : 8;
-        const int max_pull = (gpu_share_frac > 0.20f || num_tokens > 1)
-            ? cap_stage
-            : ((max_gpu_stage < 2) ? max_gpu_stage : 2);
+        const int max_pull = hybrid_max_gpu_pull(k_static, k_hot, num_tokens, gpu_share_frac);
         int want_gpu_cold = 0;
         if (max_pull > 0 && gpu_share_frac > 0.0f) {
             if (n_cold >= 7) {
@@ -145,8 +160,10 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
                     }
                 }
             }
-            if (gpu_share_frac > 0.20f || num_tokens > 1) {
-                const float eff_frac = (gpu_share_frac > 0.20f) ? gpu_share_frac : 0.36f;
+            if (gpu_share_frac > kHighGpuShareThreshold || num_tokens > 1) {
+                const float eff_frac = (gpu_share_frac > kHighGpuShareThreshold)
+                    ? gpu_share_frac
+                    : kMultiTokenDefaultGpuShare;
                 const int scaled = static_cast<int>(static_cast<float>(n_cold) * eff_frac + 0.5f);
                 if (scaled > want_gpu_cold) {
                     want_gpu_cold = scaled;
@@ -442,11 +459,8 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return (int)err;
 
-    const int max_gpu_stage = k_hot - k_static;
-    const int cap_stage = (max_gpu_stage < 8) ? max_gpu_stage : 8;
-    const int max_pull = (effective_gpu_share > 0.20f || num_tokens > 1)
-        ? cap_stage
-        : ((max_gpu_stage < 2) ? max_gpu_stage : 2);
+    const int max_pull = w34_moe_bridge::hybrid_max_gpu_pull(
+        k_static, k_hot, num_tokens, effective_gpu_share);
     if (max_pull > 0 && mapped_host_packs != nullptr && effective_gpu_share > 0.0f) {
         const size_t gu_packed_bytes =
             (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);

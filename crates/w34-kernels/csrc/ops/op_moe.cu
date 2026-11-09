@@ -16,6 +16,17 @@ extern "C" __device__ float __nv_expf(float);
 
 namespace w34_moe {
 
+static constexpr int kWarpSize = 32;
+static constexpr int kPackedU4PerWord = 8;
+static constexpr int kMoeInterm256 = 256;
+static constexpr int kMoeInterm512 = 512;
+static constexpr int kMoeInterm640 = 640;
+static constexpr int kWordsPerRow256 = kMoeInterm256 / kPackedU4PerWord;
+static constexpr int kWordsPerRow512 = kMoeInterm512 / kPackedU4PerWord;
+static constexpr int kWordsPerRow640 = kMoeInterm640 / kPackedU4PerWord;
+static constexpr int kMoeTopK8 = 8;
+static constexpr int kMoeTopK10 = 10;
+
 // Donor vLLM SiluAndMul (activation_kernels.cu): gate & up are FP16; SiLU(gate)
 // is computed in FP32 with IEEE div + __nv_expf, rounded to FP16, then multiplied
 // by up in FP16.
@@ -322,9 +333,9 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
 
             float dot = 0.0f;
 #pragma unroll
-            for (int iter = 0; iter < ((FIXED_WORDS_PER_ROW + 31) / 32); ++iter) {
-                const int w = lane + iter * 32;
-                if ((FIXED_WORDS_PER_ROW % 32) == 0 || w < FIXED_WORDS_PER_ROW) {
+            for (int iter = 0; iter < ((FIXED_WORDS_PER_ROW + kWarpSize - 1) / kWarpSize); ++iter) {
+                const int w = lane + iter * kWarpSize;
+                if ((FIXED_WORDS_PER_ROW % kWarpSize) == 0 || w < FIXED_WORDS_PER_ROW) {
                     const uint4 xv = __ldg(&x_vec4[w]);
                     const uint32_t* x2 = reinterpret_cast<const uint32_t*>(&xv);
                     const uint32_t dw = __ldg(&dw_ptr[w]);
@@ -1128,31 +1139,36 @@ extern "C" int w34_moe_w4a16_down_accum_f16(
         return (int)cudaGetLastError();
     }
     dim3 grid((unsigned)((k_hidden + 3) / 4), (unsigned)num_tokens);
-    if (n_interm == 256 && top_k == 8) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 32, 8><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else if (n_interm == 512 && top_k == 8) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 64, 8><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else if (n_interm == 256 && top_k == 10) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 32, 10><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else if (n_interm == 512 && top_k == 10) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 64, 10><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else if (n_interm == 640 && top_k == 10) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 80, 10><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
-            (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    if (n_interm == w34_moe::kMoeInterm256 && top_k == w34_moe::kMoeTopK8) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, w34_moe::kWordsPerRow256, w34_moe::kMoeTopK8>
+            <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+                (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else if (n_interm == w34_moe::kMoeInterm512 && top_k == w34_moe::kMoeTopK8) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, w34_moe::kWordsPerRow512, w34_moe::kMoeTopK8>
+            <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+                (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else if (n_interm == w34_moe::kMoeInterm256 && top_k == w34_moe::kMoeTopK10) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, w34_moe::kWordsPerRow256, w34_moe::kMoeTopK10>
+            <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+                (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else if (n_interm == w34_moe::kMoeInterm512 && top_k == w34_moe::kMoeTopK10) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, w34_moe::kWordsPerRow512, w34_moe::kMoeTopK10>
+            <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+                (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+    } else if (n_interm == w34_moe::kMoeInterm640 && top_k == w34_moe::kMoeTopK10) {
+        w34_moe::moe_w4a16_down_accum_f16_kernel<false, w34_moe::kWordsPerRow640, w34_moe::kMoeTopK10>
+            <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
+                (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
+                (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
     } else {
         w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
@@ -1531,39 +1547,10 @@ extern "C" int w34_moe_w4a16_mlp_ex_f16(
             if (rc != 0) return rc;
         }
     }
-    dim3 g2((unsigned)((k_hidden + 3) / 4), (unsigned)num_tokens);
-    if (n_interm == 256 && top_k == 8) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 32, 8><<<g2, 128, 0, st>>>(
-            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else if (n_interm == 512 && top_k == 8) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 64, 8><<<g2, 128, 0, st>>>(
-            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else if (n_interm == 256 && top_k == 10) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 32, 10><<<g2, 128, 0, st>>>(
-            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else if (n_interm == 512 && top_k == 10) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 64, 10><<<g2, 128, 0, st>>>(
-            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else if (n_interm == 640 && top_k == 10) {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false, 80, 10><<<g2, 128, 0, st>>>(
-            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    } else {
-        w34_moe::moe_w4a16_down_accum_f16_kernel<false><<<g2, 128, 0, st>>>(
-            (const __half*)interm_buf, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
-            (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
-    }
-    return (int)cudaGetLastError();
+    return w34_moe_w4a16_down_accum_f16(
+        ex, interm_buf, down_packed, down_scales, topk_ids, topk_weights,
+        shared_expert_out, shared_expert_gate_logits, out,
+        num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
 }
 
 extern "C" int w34_moe_w4a16_mlp_f16(

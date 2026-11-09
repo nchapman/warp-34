@@ -1048,22 +1048,32 @@ fn verify_tp2_fused_residual_rms_norm_regimes(
 
 #[cfg(feature = "cuda")]
 fn verify_tp2_dma_crossover_and_graph_replay(s0: &CudaStream, s1: &CudaStream) {
+    use super::collectives::TP2_DMA_THRESHOLD_BYTES;
+
+    const F16_BYTES: usize = std::mem::size_of::<u16>();
+    const F32_BYTES: usize = std::mem::size_of::<f32>();
+    const VEC8_F16_BYTES: usize = 8 * F16_BYTES;
+    const STAGE_CAP_BYTES: usize = 4 * TP2_DMA_THRESHOLD_BYTES;
+    const N_F16_BELOW: usize = (TP2_DMA_THRESHOLD_BYTES - VEC8_F16_BYTES) / F16_BYTES;
+    const N_F16_AT: usize = TP2_DMA_THRESHOLD_BYTES / F16_BYTES;
+    const N_F16_ABOVE: usize = (TP2_DMA_THRESHOLD_BYTES + TP2_DMA_THRESHOLD_BYTES / 2) / F16_BYTES;
+
     // Exercise both forced mapped-host staging (`allow_p2p = false`) and available P2P (`allow_p2p = true`)
     // across `< 64 KiB`, `== 64 KiB`, and `> 64 KiB` transfers, including back-to-back even-epoch
     // large `gather_vocab_f16` followed immediately by `>= 64 KiB` DMA `all_reduce_f16` and
     // repeated CUDA Graph replays with mutating payloads.
     for allow_p2p in [false, true] {
-        let comm = Tp2Collectives::new_for_tp_with_p2p(2, 256 * 1024, allow_p2p).unwrap();
+        let comm = Tp2Collectives::new_for_tp_with_p2p(2, STAGE_CAP_BYTES, allow_p2p).unwrap();
 
-        // 1. Threshold sweep: just below (`65,520 B`), at (`65,536 B`), and above (`98,304 B`) 64 KiB.
-        for n_f16 in [32_760usize, 32_768, 49_152] {
-            let n_f32 = n_f16 / 2;
-            let d0_f16 = DeviceBuffer::alloc(0, n_f16 * 2).unwrap();
-            let d1_f16 = DeviceBuffer::alloc(1, n_f16 * 2).unwrap();
-            let d0_bf16 = DeviceBuffer::alloc(0, n_f16 * 2).unwrap();
-            let d1_bf16 = DeviceBuffer::alloc(1, n_f16 * 2).unwrap();
-            let d0_f32 = DeviceBuffer::alloc(0, n_f32 * 4).unwrap();
-            let d1_f32 = DeviceBuffer::alloc(1, n_f32 * 4).unwrap();
+        // 1. Threshold sweep: just below (`65,520 B`), at (`65,536 B`), and above (`98,304 B`) `TP2_DMA_THRESHOLD_BYTES`.
+        for n_f16 in [N_F16_BELOW, N_F16_AT, N_F16_ABOVE] {
+            let n_f32 = (n_f16 * F16_BYTES) / F32_BYTES;
+            let d0_f16 = DeviceBuffer::alloc(0, n_f16 * F16_BYTES).unwrap();
+            let d1_f16 = DeviceBuffer::alloc(1, n_f16 * F16_BYTES).unwrap();
+            let d0_bf16 = DeviceBuffer::alloc(0, n_f16 * F16_BYTES).unwrap();
+            let d1_bf16 = DeviceBuffer::alloc(1, n_f16 * F16_BYTES).unwrap();
+            let d0_f32 = DeviceBuffer::alloc(0, n_f32 * F32_BYTES).unwrap();
+            let d1_f32 = DeviceBuffer::alloc(1, n_f32 * F32_BYTES).unwrap();
 
             d0_f16
                 .copy_from_host(&vec![f32_to_f16(1.25); n_f16], s0)
@@ -1131,20 +1141,21 @@ fn verify_tp2_dma_crossover_and_graph_replay(s0: &CudaStream, s1: &CudaStream) {
         // 2. Fused residual+GemmaRMSNorm and HC-combine across `< 64 KiB` (`M=7`), `== 64 KiB` (`M=8`),
         //    and `> 64 KiB` (`M=12`) at `hidden = 4096`.
         let hidden = 4096usize;
-        for num_tokens in [7usize, 8, 12] {
+        let tokens_at = TP2_DMA_THRESHOLD_BYTES / (hidden * F16_BYTES);
+        for num_tokens in [tokens_at - 1, tokens_at, tokens_at + (tokens_at / 2)] {
             let n = num_tokens * hidden;
-            let d0_in = DeviceBuffer::alloc(0, n * 2).unwrap();
-            let d1_in = DeviceBuffer::alloc(1, n * 2).unwrap();
-            let d0_res = DeviceBuffer::alloc(0, n * 2).unwrap();
-            let d1_res = DeviceBuffer::alloc(1, n * 2).unwrap();
-            let d0_w = DeviceBuffer::alloc(0, hidden * 2).unwrap();
-            let d1_w = DeviceBuffer::alloc(1, hidden * 2).unwrap();
-            let d0_out = DeviceBuffer::alloc(0, n * 2).unwrap();
-            let d1_out = DeviceBuffer::alloc(1, n * 2).unwrap();
-            let d0_hc = DeviceBuffer::alloc(0, n * 2).unwrap();
-            let d1_hc = DeviceBuffer::alloc(1, n * 2).unwrap();
-            let d0_inj = DeviceBuffer::alloc(0, num_tokens * 4).unwrap();
-            let d1_inj = DeviceBuffer::alloc(1, num_tokens * 4).unwrap();
+            let d0_in = DeviceBuffer::alloc(0, n * F16_BYTES).unwrap();
+            let d1_in = DeviceBuffer::alloc(1, n * F16_BYTES).unwrap();
+            let d0_res = DeviceBuffer::alloc(0, n * F16_BYTES).unwrap();
+            let d1_res = DeviceBuffer::alloc(1, n * F16_BYTES).unwrap();
+            let d0_w = DeviceBuffer::alloc(0, hidden * F16_BYTES).unwrap();
+            let d1_w = DeviceBuffer::alloc(1, hidden * F16_BYTES).unwrap();
+            let d0_out = DeviceBuffer::alloc(0, n * F16_BYTES).unwrap();
+            let d1_out = DeviceBuffer::alloc(1, n * F16_BYTES).unwrap();
+            let d0_hc = DeviceBuffer::alloc(0, n * F16_BYTES).unwrap();
+            let d1_hc = DeviceBuffer::alloc(1, n * F16_BYTES).unwrap();
+            let d0_inj = DeviceBuffer::alloc(0, num_tokens * F32_BYTES).unwrap();
+            let d1_inj = DeviceBuffer::alloc(1, num_tokens * F32_BYTES).unwrap();
             d0_in.copy_from_host(&vec![f32_to_f16(1.0); n], s0).unwrap();
             d1_in.copy_from_host(&vec![f32_to_f16(2.0); n], s1).unwrap();
             d0_res
@@ -1279,19 +1290,20 @@ fn verify_tp2_dma_crossover_and_graph_replay(s0: &CudaStream, s1: &CudaStream) {
         //    followed immediately by `>= 64 KiB` DMA `all_reduce_f16` and `< 64 KiB` `all_reduce_f16`,
         //    both eager and across repeated CUDA Graph replays with changing payloads.
         let n_vocab_rows = 2usize;
-        let local_vocab = 20_480usize; // 2 * 20,480 * 2B = 81,920 B (>= 64 KiB)
+        let local_vocab =
+            (TP2_DMA_THRESHOLD_BYTES + TP2_DMA_THRESHOLD_BYTES / 4) / (n_vocab_rows * F16_BYTES); // 20,480 elems/row -> 81,920 B (>= 64 KiB)
         let n_vocab_elems = n_vocab_rows * local_vocab;
-        let n_large = 40_960usize; // 81,920 B (>= 64 KiB DMA)
-        let n_small = 32_760usize; // 65,520 B (< 64 KiB SM WB)
+        let n_large = n_vocab_elems; // 40,960 elems -> 81,920 B (>= 64 KiB DMA)
+        let n_small = N_F16_BELOW; // 32,760 elems -> 65,520 B (< 64 KiB SM WB)
 
-        let d0_vin = DeviceBuffer::alloc(0, n_vocab_elems * 2).unwrap();
-        let d1_vin = DeviceBuffer::alloc(1, n_vocab_elems * 2).unwrap();
-        let d0_vout_odd = DeviceBuffer::alloc(0, n_vocab_elems * 4).unwrap();
-        let d0_vout_even = DeviceBuffer::alloc(0, n_vocab_elems * 4).unwrap();
-        let d0_large = DeviceBuffer::alloc(0, n_large * 2).unwrap();
-        let d1_large = DeviceBuffer::alloc(1, n_large * 2).unwrap();
-        let d0_small = DeviceBuffer::alloc(0, n_small * 2).unwrap();
-        let d1_small = DeviceBuffer::alloc(1, n_small * 2).unwrap();
+        let d0_vin = DeviceBuffer::alloc(0, n_vocab_elems * F16_BYTES).unwrap();
+        let d1_vin = DeviceBuffer::alloc(1, n_vocab_elems * F16_BYTES).unwrap();
+        let d0_vout_odd = DeviceBuffer::alloc(0, n_vocab_elems * 2 * F16_BYTES).unwrap();
+        let d0_vout_even = DeviceBuffer::alloc(0, n_vocab_elems * 2 * F16_BYTES).unwrap();
+        let d0_large = DeviceBuffer::alloc(0, n_large * F16_BYTES).unwrap();
+        let d1_large = DeviceBuffer::alloc(1, n_large * F16_BYTES).unwrap();
+        let d0_small = DeviceBuffer::alloc(0, n_small * F16_BYTES).unwrap();
+        let d1_small = DeviceBuffer::alloc(1, n_small * F16_BYTES).unwrap();
 
         let (vin0, vin1, vodd0, veven0) = (
             d0_vin.addr(),
@@ -1432,5 +1444,113 @@ fn verify_tp2_dma_crossover_and_graph_replay(s0: &CudaStream, s1: &CudaStream) {
             assert_eq!(h_sm0, vec![f32_to_f16(sm0_val + sm1_val); n_small]);
             assert_eq!(h_sm1, vec![f32_to_f16(sm0_val + sm1_val); n_small]);
         }
+
+        verify_tp2_asymmetric_alignment(&comm, s0, s1);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn verify_tp2_asymmetric_alignment(comm: &Tp2Collectives, s0: &CudaStream, s1: &CudaStream) {
+    const F16_BYTES: usize = std::mem::size_of::<u16>();
+    const F32_BYTES: usize = std::mem::size_of::<f32>();
+
+    // Asymmetric rank pointer alignment across both 1-CTA (`1,024` elems) and multi-CTA
+    // (`8,192` elems -> 2 CTAs) launches: Rank 0 uses a 2-byte-offset (4-byte-offset for f32)
+    // sub-slice (`!vec8` / `!vec4`) while Rank 1 uses 16-byte-aligned buffers (`vec8` / `vec4`,
+    // and `rank0_full_logits_f16 == 0` in `gather_vocab_f16`), verifying that launch geometry
+    // and per-CTA staging ownership remain identical across ranks.
+    for (rows, lvocab) in [(1usize, 1024usize), (2usize, 4096usize)] {
+        let n_elems = rows * lvocab;
+        let full_elems = n_elems * 2;
+        let d0_in_unaligned = DeviceBuffer::alloc(0, (n_elems + 1) * F16_BYTES).unwrap();
+        let d1_in_aligned = DeviceBuffer::alloc(1, n_elems * F16_BYTES).unwrap();
+        let d0_vout_unaligned = DeviceBuffer::alloc(0, (full_elems + 1) * F16_BYTES).unwrap();
+        let d0_ar_unaligned = DeviceBuffer::alloc(0, (n_elems + 1) * F16_BYTES).unwrap();
+        let d1_ar_aligned = DeviceBuffer::alloc(1, n_elems * F16_BYTES).unwrap();
+        let d0_f32_unaligned = DeviceBuffer::alloc(0, (n_elems + 1) * F32_BYTES).unwrap();
+        let d1_f32_aligned = DeviceBuffer::alloc(1, n_elems * F32_BYTES).unwrap();
+
+        let mut h0_in = vec![0u16; n_elems + 1];
+        let mut h1_in = vec![0u16; n_elems];
+        let mut h0_f32 = vec![0.0f32; n_elems + 1];
+        let mut h1_f32 = vec![0.0f32; n_elems];
+        for i in 0..n_elems {
+            let v0 = ((i % 23) as f32) * 0.25;
+            let v1 = (((i + 7) % 19) as f32) * 0.5;
+            h0_in[i + 1] = f32_to_f16(v0);
+            h1_in[i] = f32_to_f16(v1);
+            h0_f32[i + 1] = v0;
+            h1_f32[i] = v1;
+        }
+        d0_in_unaligned.copy_from_host(&h0_in, s0).unwrap();
+        d1_in_aligned.copy_from_host(&h1_in, s1).unwrap();
+        d0_f32_unaligned.copy_from_host(&h0_f32, s0).unwrap();
+        d1_f32_aligned.copy_from_host(&h1_f32, s1).unwrap();
+        s0.synchronize().unwrap();
+        s1.synchronize().unwrap();
+
+        let in0_off = d0_in_unaligned.addr() + (F16_BYTES as u64);
+        let in1_al = d1_in_aligned.addr();
+        let vout0_off = d0_vout_unaligned.addr() + (F16_BYTES as u64);
+        let ar0_off = d0_ar_unaligned.addr() + (F16_BYTES as u64);
+        let ar1_al = d1_ar_aligned.addr();
+        let f0_off = d0_f32_unaligned.addr() + (F32_BYTES as u64);
+        let f1_al = d1_f32_aligned.addr();
+
+        std::thread::scope(|scope| {
+            let c = comm;
+            let t0 = scope.spawn(move || {
+                let _dev = CudaDevice::set_current(0).unwrap();
+                let ex0 = s0.exec(0, 0);
+                c.gather_vocab_f16(&ex0, in0_off, vout0_off, 0, rows as i32, lvocab as i32)
+                    .unwrap();
+                c.all_reduce_f16(&ex0, in0_off, ar0_off, 0, n_elems as i32)
+                    .unwrap();
+                c.all_reduce_f32(&ex0, f0_off, f0_off, 0, n_elems as i32)
+                    .unwrap();
+                s0.synchronize().unwrap();
+            });
+            let t1 = scope.spawn(move || {
+                let _dev = CudaDevice::set_current(1).unwrap();
+                let ex1 = s1.exec(0, 0);
+                c.gather_vocab_f16(&ex1, in1_al, 0, 1, rows as i32, lvocab as i32)
+                    .unwrap();
+                c.all_reduce_f16(&ex1, in1_al, ar1_al, 1, n_elems as i32)
+                    .unwrap();
+                c.all_reduce_f32(&ex1, f1_al, f1_al, 1, n_elems as i32)
+                    .unwrap();
+                s1.synchronize().unwrap();
+            });
+            t0.join().unwrap();
+            t1.join().unwrap();
+        });
+
+        let mut h_vout = vec![0u16; full_elems + 1];
+        let mut h_ar0 = vec![0u16; n_elems + 1];
+        let mut h_ar1 = vec![0u16; n_elems];
+        let mut h_f0 = vec![0.0f32; n_elems + 1];
+        let mut h_f1 = vec![0.0f32; n_elems];
+        d0_vout_unaligned.copy_to_host(&mut h_vout, s0).unwrap();
+        d0_ar_unaligned.copy_to_host(&mut h_ar0, s0).unwrap();
+        d1_ar_aligned.copy_to_host(&mut h_ar1, s1).unwrap();
+        d0_f32_unaligned.copy_to_host(&mut h_f0, s0).unwrap();
+        d1_f32_aligned.copy_to_host(&mut h_f1, s1).unwrap();
+        s0.synchronize().unwrap();
+        s1.synchronize().unwrap();
+
+        for r in 0..rows {
+            let row_in = r * lvocab;
+            let row_out = 1 + r * lvocab * 2;
+            assert_eq!(
+                &h_vout[row_out..row_out + lvocab],
+                &h0_in[1 + row_in..1 + row_in + lvocab]
+            );
+            assert_eq!(
+                &h_vout[row_out + lvocab..row_out + 2 * lvocab],
+                &h1_in[row_in..row_in + lvocab]
+            );
+        }
+        assert_eq!(&h_ar0[1..], &h_ar1[..]);
+        assert_eq!(&h_f0[1..], &h_f1[..]);
     }
 }

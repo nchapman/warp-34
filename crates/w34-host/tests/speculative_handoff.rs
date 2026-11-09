@@ -346,7 +346,7 @@ fn batched_mtp_b4_matches_single_stream_losslessly() {
         unsafe { w34_kernels::ffi::w34_get_current_device_props(&raw mut dev_props) },
         0
     );
-    if dev_props.compute_minor == 9 {
+    if dev_props.compute_minor == w34_host::cuda::ADA_SM89_COMPUTE_MINOR {
         // On Ada (`sm_89`), `B=5` (`M=5`) switches the unquantized FP16 `lm_head` in `cuBLAS`
         // from SIMT `gemvx` (`M=1..4`) to WMMA Tensor-Core `s161616gemm_f16`, flipping 1-ULP
         // near-tie logits at token 30 (slots 0 & 4), token 32 (slot 1), and token 24 (slot 3).

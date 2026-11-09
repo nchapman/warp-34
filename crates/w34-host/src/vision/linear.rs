@@ -378,7 +378,7 @@ mod gpu_tests {
             unsafe { w34_kernels::ffi::w34_get_current_device_props(&raw mut props) },
             0
         );
-        let expected_n1 = if props.compute_minor == 9 {
+        let expected_n1 = if props.compute_minor == crate::cuda::ADA_SM89_COMPUTE_MINOR {
             f32_to_f16(1.0 - 0.00048828125)
         } else {
             f32_to_f16(1.0)
