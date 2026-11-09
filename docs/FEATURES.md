@@ -16,11 +16,11 @@ This document provides a verified, front-to-back inventory of all implemented fe
   * `dump-diff`: Layer-by-layer tensor inspection harness dumping per-layer inputs/outputs across norms, attention, GDN, and MLP against `vLLM` / `SGLang` Safetensors fixtures (`--compare-tp2`).
   * `profile-diff`: Side-by-side SQLite/JSON performance profiler comparing round latencies (`ms/round`) and launch counts across 7 kernel categories against `vLLM 0.31.0` and `SGLang v0.5.19`.
   * `serve`: Production-grade HTTP server implementing OpenAI Chat, OpenAI Responses, Anthropic Messages, and TypeSafe Decision model APIs.
-  * `chat`: Interactive terminal REPL with streaming output, markdown formatting, tool invocation display, reasoning toggle (`--no-thinking`), and real-time per-turn generation statistics (prompt/cached/generated tokens, TTFT, decode tok/s).
+  * `chat`: Single-turn terminal execution runner formatting ChatML prompts, evaluating reasoning and tool blocks via `Qwen3Parser`, and reporting generation statistics (prompt/cached/generated tokens, TTFT, decode tok/s) to stderr.
 * **CLI Flags & Argument Validation:**
   * **Tensor Parallelism:** `--tp 1 | 2 | 4`.
   * **KV Cache Formats:** `--kv-format tq4 | tq4_all | q8_0 | fp16 | bf16` (default: `tq4`).
-  * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `--kv-pages <n>` (default 256 target pages / 4,096 tokens).
+  * **Speculative Decoding:** `--speculative mtp | dflash2`, `--draft-model <id|path>`, `--mtp-k 1..3` (default 3), `--kv-pages <n>` (injects default of 256 target pages / 4,096 tokens when speculative decoding is active).
   * **Serving Options:** `--api-key <val>` or `--api-key-env <NAME>`, `--served-model-name <alias>`, `--max-num-seqs <1..16>` (default 16), `--max-model-len <positive integer>`.
   * **Model Hub & Offline Options:** `--revision <ref>`, `--draft-revision <ref>`, `--offline` (reads strictly from `HF_HUB_CACHE`).
   * **Multimodal Options:** `--image <path|url>`, `--allow-remote-images` (SSRF-protected HTTP/HTTPS retrieval).
@@ -33,17 +33,17 @@ This document provides a verified, front-to-back inventory of all implemented fe
 * **Asynchronous Axum Server Architecture:**
   * Complete decoupling of HTTP parsing, JSON serialization, and vision preprocessing onto an asynchronous CPU worker pool (`preprocessing`), protecting the bounded GPU `EngineWorker` from event-loop stalls.
   * Admission control semaphore (`admission`) limiting concurrent in-flight requests and guarding against memory exhaustion under burst traffic.
-  * Bounded payload size (`BODY_LIMIT = 16 MiB`) and body timeout (`BODY_TIMEOUT = 30s`) returning HTTP 408/413 appropriately.
+  * Bounded payload size (`BODY_LIMIT = 32 MiB`) and body timeout (`BODY_TIMEOUT = 10s`) returning HTTP 408/413 appropriately.
 * **OpenAI Chat Completions API (`POST /v1/chat/completions`):**
   * Full ChatML compatibility with non-streaming JSON responses and streaming Server-Sent Events (`SSE`, `text/event-stream`).
-  * Per-token streaming chunks with monotonic ping keep-alives and `usage` emission in final delta chunks (`stream_options.include_usage`).
+  * Per-token streaming chunks with monotonic ping keep-alives and `usage` emission (emitted as a separate chunk with `choices: [] + usage` when `stream_options.include_usage` is set).
   * `reasoning_effort` mapping (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) emitting real-time streaming `reasoning_content` deltas.
   * Parallel tool-calling support with incremental function call argument streaming.
   * Dedicated input token counting endpoint: `POST /v1/chat/completions/input_tokens` (and unversioned alias `/chat/completions/input_tokens`).
   * Legacy completions fallback: `POST /v1/completions` with parallel token/logprob arrays.
 * **OpenAI Responses API (`POST /v1/responses`):**
   * Full implementation of the OpenAI Responses specification (`crates/w34-host/src/responses_api/`).
-  * In-memory bounded session store (`ResponseStore`, default capacity 256 responses, 64 per credential scope) supporting request chaining via `previous_response_id`.
+  * In-memory bounded session store (`ResponseStore`, default capacity 256 responses, 64 per credential scope) partitioned by credential-derived scope and supporting request chaining via `previous_response_id`.
   * Cryptographically unguessable 128-bit response IDs (`resp_<32hex>`) generated via `/dev/urandom`.
   * Stateful lifecycle routes: `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`, and `POST /v1/responses/input_tokens`.
   * Specialized 0-indexed monotonic `sequence_number` SSE event streaming (`response.created`, `response.in_progress`, `response.output_item.added`, `response.output_text.delta`, `response.completed`).
@@ -101,8 +101,8 @@ This document provides a verified, front-to-back inventory of all implemented fe
   * Choice lists: Compiles arbitrary lists of strings into structural tag alternatives (`choice: [...]`).
   * Schema sanitization and validation: Rejects non-disjoint unions, unsupported `$ref` scopes, and ambiguous constraint specs before dispatching to the model.
 * **GPU Token Bitmasking & Speculative Rollback (`TokenBitmaskConstraint`):**
-  * Directly computes packed 32-bit bitmasks applied inside the GPU sampler in 1 cycle.
-  * Speculative rejection rollback: Tracks matcher token history with `rollback_tokens` capability matching `max_rollback_tokens` for MTP and DFlash2 draft validation.
+  * Directly computes packed 32-bit bitmasks (`valid_mask: Arc<Vec<u32>>`) applied inside the GPU sampler.
+  * Speculative rejection rollback: Tracks matcher token history with `try_rollback_tokens` capability to roll back grammar state on rejected speculative drafts.
   * Decoupled reasoning gate: Maintains `<think>...</think>` tokens outside grammar constraints, activating grammar enforcement only upon reasoning termination.
   * Request stop-token injection: Binds request-specific stop tokens into the grammar EOS set, masking premature EOS emission until grammar terminal states are reached.
 
@@ -114,14 +114,14 @@ This document provides a verified, front-to-back inventory of all implemented fe
 * **Qwen3 XML Structural Tool System:**
   * Canonical Qwen XML envelope representation: `<tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>`.
   * Pinned `max_whitespace_cnt: 1` in native XGrammar rules prevents infinite empty-argument whitespace loops.
-  * Independent per-parameter native schema compilation (`native_schema::compile`): Resolves local `$ref` targets (up to depth 32) and parses parameters into typed JSON arguments.
+  * Independent per-parameter native schema compilation (`native_schema::compile`): Resolves local `$ref` targets using a bounded traversal budget and compiles grammars for argument typing.
   * Supports `tool_choice`: `auto`, `none` (disables tool generation and extraction), `required` (enforces at least one tool call), and named functions (`{type: "function", function: {name: ...}}`).
   * Non-strict schema compliance: Parameters accept raw strings, numbers, booleans, and JSON objects/arrays without requiring rigid schema strictness.
 * **Streaming Parser & Reasoning State Machine (`Qwen3Parser`):**
   * Token-by-token state tracking across Reasoning (`<think>`), Content, and Tool Envelopes.
   * Emits incremental deltas (`reasoning_delta`, `content_delta`, and completed `tool_calls`).
   * Implicit `</think>` auto-transition: Automatically terminates reasoning mode when a `<tool_call>` tag appears inside the thinking block.
-  * Duplicate tag absorption: Silently absorbs duplicate `<think>` or `</think>` tags emitted in content streams.
+  * Duplicate tag absorption: Silently absorbs duplicate `</think>` tags emitted in content state.
 
 ---
 
@@ -132,7 +132,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
   * Continuous batching with unified multi-request scheduling up to `max_num_batched_tokens` (default: 2,048) and `max_num_seqs` (default: 16).
   * Chunked prefill strictly aligned to the `MambaRadixCache` checkpoint boundary (`C = k * 64` tokens).
   * Mixed-batch scheduling: Bounds prefill chunk size to `mixed_chunk_prefill_size` (default: 256 tokens) whenever active decode/speculative verify sequences are present, protecting inter-token latency (p99 ITL).
-  * Dynamic scratch-arena sizing: Automatically selects scratch allocations (`Compact 256 MiB`, `Extreme LongCtx 336 MiB`, `Large TP1 384 MiB`, `Default 512 MiB`, `Tiered MoE 1,056 MiB`).
+  * Dynamic scratch-arena sizing: Automatically selects scratch allocations (`COMPACT_SCRATCH_ARENA_MAX_BYTES` 256 MiB, `EXTREME_LONGCTX_SCRATCH_ARENA_BYTES` 336 MiB, `LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES` 384 MiB, `DEFAULT_SCRATCH_ARENA_BYTES` 512 MiB, `TIERED_MOE_SCRATCH_ARENA_BYTES` 1,056 MiB).
 * **Engine Worker & Pipeline Overlap:**
   * Lock-free bounded channel ingress with immediate cancellation on caller disconnect, avoiding head-of-line blocking.
   * Double-buffered pipelined decode loop overlapping host scheduler bookkeeping and sampling setup with GPU execution.
@@ -144,12 +144,11 @@ This document provides a verified, front-to-back inventory of all implemented fe
 *Location: `crates/w34-host/src/cuda.rs`, `crates/w34-host/src/model/rank_runtime.rs`*
 
 * **CUDA Graph Engine:**
-  * Pre-captures execution graphs for decode batch buckets `1..16` across plain decode, MTP proposal, and DFlash2 verify.
-  * Keyed by composite `GraphKey(execution_mode, req_bucket, tok_bucket, query_len_class, kv_layout_mode, tap_plan_id)`.
-  * Valid-token/valid-req masking: Padded rows write to designated scratch/sink buffers, preventing corrupted recurrent states, RNG drift, or invalid KV writes.
+  * Pre-captures execution graphs across plain decode (`decode_graph`), batched decode (`batched_decode_graphs` for batch sizes 1..16), and speculative verification (`spec_verify_graph` for M_verify 2..16).
+  * Valid-token/valid-req masking: Padded rows write to designated sink locations, preventing corrupted recurrent states, RNG drift, or invalid KV writes.
   * Cold-start warmup protocol (`prepare_execution_plan()`): Resolves all dynamic symbols and executes warmup iterations before graph capture to prevent CUDA 13 lazy-loading deadlocks.
 * **Pinned Host & Device Arenas:**
-  * `DeviceArena` and `MappedHostBuffer`: Zero-allocation runtime operations using sub-allocated contiguous memory pools.
+  * `DeviceArena` and sub-allocated buffers: Zero-allocation runtime operations using pre-allocated contiguous memory pools.
   * Zero-copy mapped-host embedding fallback (`plan_host_embed_offload`): Automatically offloads untied `embed_tokens` to pinned system memory on VRAM-constrained GPUs (e.g. 9B models on 8 GB RTX 3060 Ti) while preserving GPU execution for active layers.
 
 ---
@@ -184,7 +183,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
 *Location: `crates/w34-host/src/vision/`, `crates/w34-host/src/scheduled_vision.rs`, `crates/w34-kernels/csrc/ops/op_vision*.cu`*
 
 * **Qwen3-VL Vision Architecture:**
-  * Native implementation of `Qwen3_VisionTransformer` (24 layers, 1,024 hidden size, 4,096 intermediate size, 16 heads).
+  * Native implementation of `Qwen3_VisionTransformer` parameterized by model `VisionConfig` (e.g. 24 layers, 1,024 hidden size, 4,096 intermediate size, 16 heads on 4B/8B).
   * High-fidelity image preprocessing: `smart_resize` preserving aspect ratios up to 200:1, bicubic resampling, and normalization.
   * 2D bilinear `pos_embed` interpolation, 2D axial rotary position embeddings (RoPE), and `PatchMerger` with spatial merging.
   * 3D `mRoPE` coordinate generation across temporal, height, and width axes (`[3, N_max]`).
@@ -201,15 +200,15 @@ This document provides a verified, front-to-back inventory of all implemented fe
 *Location: `crates/w34-host/src/speculative.rs`, `crates/w34-host/src/mtp/`, `crates/w34-host/src/dflash.rs`*
 
 * **Native Multi-Token Prediction (`MTP`):**
-  * Clean-room implementation of `Qwen3_5MTP` / `Qwen3_5MoeMTP` (vLLM donor).
-  * Single-layer TP-sharded predictor with projection (`eh_proj`), gated attention, dense/MoE FFN, and borrowed target LM head.
+  * Clean-room implementation of `Qwen3_5MTP` / `Qwen3_5MoeMTP` (vLLM donor, `crates/w34-host/src/mtp.rs`).
+  * Single-layer TP-sharded predictor with projection, gated attention, dense/MoE FFN, and borrowed target LM head.
   * Online LM-head quantization: Quantizes unquantized target LM heads into a private `MarlinW4A16` (group size 64) proposal head on the fly when VRAM headroom permits.
   * Pre-captured proposal CUDA Graphs supporting up to 4 concurrent speculative slots (`MAX_MTP_BATCH_SLOTS = 4`).
 * **DFlash2 Block Speculation:**
-  * Clean-room 5-layer native BF16 speculative drafter (`DFlashWorkerV2` SGLang donor).
-  * Verifies `M = 8` proposals (1 anchor + 7 drafts) on 27B/80B models and `M = 16` on 4B models in a single batched forward pass.
+  * Clean-room 5-layer native BF16 speculative drafter (`DFLASH2_NUM_LAYERS = 5`, SGLang `DFlashWorkerV2` donor).
+  * Verifies `M = K + 1` proposals (up to 16 tokens, e.g. M=8 on 27B/80B models, M=16 on 4B models) in a single batched forward pass.
   * Projects committed target taps into an isolated, disposable `DFlashDraftContext` KV namespace (`head_dim = 128`).
-  * Low-rank candidate selector kernel (`op_dflash2.cu`) evaluating codebook projections up to rank 1,024 and top-k 16.
+  * Low-rank candidate selector kernel (`op_dflash2.cu`, `DFLASH2_MAX_TOP_K = 16`, selector rank up to 1,024).
 * **Speculative Transaction Contract & Rejection Sampling:**
   * Enforces the 4-length transactional invariant across verify rounds: `processed_len` (target consumed), `emitted_len` (caller visible), `reserved_len` (allocated headroom), and `draft_context_len` (proposer cache).
   * Speculative commit & rollback (`crates/w34-host/src/speculative.rs`): Atomically commits accepted drafts, emits bonus anchor tokens, and rolls back grammar matcher state.
@@ -222,10 +221,11 @@ This document provides a verified, front-to-back inventory of all implemented fe
 
 * **Target Model Family Implementations:**
   * **Qwen 3.5 Dense Models (0.8B, 2B, 4B, 9B, 27B):** Hybrid architecture interleaving 3× Gated DeltaNet (GDN) linear attention layers with 1× Full Attention layer.
-  * **Qwen 3.6 MoE Models (35B-A3B):** Hybrid GDN + Full Attention with 512 routed experts (top-k = 8) plus shared expert.
+  * **Qwen 3.6 MoE Models (35B-A3B):** Hybrid GDN + Full Attention with routed experts (`num_experts_per_tok = 8`) plus shared expert.
   * **Qwen 3.8-Flash-Next MoE (80B total / 3B active, `qwen4_exp`):**
+    * 512 total experts with 10 active experts per token (`num_experts_per_tok = 10`).
     * **HyperConnection (`HC`, `op_hc.cu`):** 4-stream multi-residual gating and mixing with per-stream `GemmaRMSNorm`, low-rank SiLU projections, and sigmoid stream routing.
-    * **Per-Layer Embeddings (`PLE`, `op_ple.cu`):** 128-shard zero-copy mmap F8_E4M3 embedding tables with stateful causal dilated depthwise conv1d and signed-square-root sigmoid gating.
+    * **Per-Layer Embeddings (`PLE`, `op_ple.cu`):** Sharded zero-copy mmap F8_E4M3 embedding tables with stateful causal dilated depthwise conv1d and signed-square-root sigmoid gating.
     * **Quality-Scored Sparse Attention (`QSA`, `op_qsa.cu`):** Top-64 block indexer scoring (1,024 active tokens) with ReLU-sum MQA and sparse paged GQA decode.
 * **Precision Policy Invariants:**
   * End-to-end `FP16` target model spine (hidden states, residuals, norms, attention Q/K/V/O, Marlin activations).
@@ -316,12 +316,11 @@ This document provides a verified, front-to-back inventory of all implemented fe
 *Location: `crates/w34-kernels/csrc/ops/op_collectives.cu`*
 
 * **High-Efficiency TP Collectives:**
-  * Supports TP=2 and TP=4 across dual and quad GPU topologies.
-  * **1-Hop NVLink P2P VRAM Transfers (`CommBuffer::DeviceVram`):** Direct peer-to-peer reads and writes when NVLink peer access is supported.
-  * **Pinned-Sysmem Two-Hop Transfers (`CommBuffer::MappedHost`):** Graph-capturable PCIe Gen4 host-mapped staging buffers for systems without P2P access (e.g. standard PCIe slots across separate root complexes).
+  * Primary verified implementation: Pinned-sysmem TP=2 (`op_collectives.cu`) over PCIe Gen4 x8 (e.g. 2× RTX 3090 Ti / 3060 Ti / 4060 Ti / 4090).
   * System-scope release/acquire memory fences (`st.release.sys.global` / `ld.acquire.sys.global`) with monotonic epoch parity, requiring only 1 barrier per call.
   * Dynamic DMA cutoff (`kDmaThresholdBytes = 64 KiB`): Selects in-kernel register writeback for small transfers and asynchronous Copy-Engine DMA for bulk payloads.
   * Strictly typed collective entrypoints: Typed routines for `FP16` hidden states, `BF16` draft tokens, `FP32` reductions, and `INT32` token IDs (never casting integer tokens through float collectives).
+  * Extensible design for NVLink P2P VRAM staging and TP=4 execution plans (`crates/w34-host/src/cuda/collectives.rs`).
 
 ---
 
@@ -351,7 +350,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
 * **Thread-Safe Metrics & Prometheus Monitoring:**
   * Non-blocking CPU snapshots tracking request counts (submitted, running, completed, failed, cancelled).
   * Token accounting: Separates prompt, computed, radix-cached, and generated tokens.
-  * High-resolution latency histograms: Time-To-First-Token (TTFT), Queue Wait Time, End-to-End Latency, and Inter-Token Latency (ITL).
+  * High-resolution latency histograms: Time-To-First-Token (`ttft`), Queue Wait Time (`queue`), End-to-End Latency (`e2e`), and Inter-Token Latency (`time_per_output_token`).
   * Memory pool utilization: Tracks live capacity, active pages, cached/evictable pages, and free physical pages across KV and GDN pools.
 * **Continuous Parity Oracle Suite (`tools/oracle/`):**
   * Automated Python/Triton test harnesses running `vLLM 0.31.0` and `SGLang v0.5.19` side-by-side with `warp-34`.
@@ -364,7 +363,7 @@ This document provides a verified, front-to-back inventory of all implemented fe
 
 * **Optimized Docker Deployment:**
   * Multi-stage build process decoupling the Node/pnpm React dashboard compilation from the CUDA/Rust binary build.
-  * Distroless-style slim runtime image based on `ubuntu:26.04` (total image size ~575–775 MB) without shipping multi-GB CUDA toolkits, headers, or driver stubs.
+  * Lightweight runtime image based on `ubuntu:26.04` (total image size ~575–775 MB depending on static/shared linkage) without shipping multi-GB CUDA toolkits, headers, or driver stubs.
   * Shared cuBLAS dynamic linkage (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) stored in a dedicated cacheable filesystem layer.
   * Security hardening: Runs under an unprivileged system user (`w34`), mounts standard Hugging Face caches (`HF_HUB_CACHE`), and defines container health checks querying `GET /health`.
 * **Multi-Arch Fatbinary Support:**
