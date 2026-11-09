@@ -362,7 +362,14 @@ fn json_pattern_to_lark_regex(pat: &str) -> String {
         Some(rest) => (true, rest),
         None => (false, pat),
     };
-    let anchored_end = body.ends_with('$') && !body.ends_with("\\$");
+    let anchored_end = body.ends_with('$')
+        && body[..body.len() - 1]
+            .chars()
+            .rev()
+            .take_while(|&c| c == '\\')
+            .count()
+            % 2
+            == 0;
     let core = if anchored_end {
         &body[..body.len() - 1]
     } else {
@@ -415,8 +422,31 @@ fn xml_param_rule(
     extra_defs: &mut String,
 ) -> String {
     let open_tag = literal(&format!("<parameter={key}>"));
+    xml_param_value_rule(
+        rule,
+        &open_tag,
+        Some(key),
+        value_schema,
+        root_schema,
+        uses_unquoted_str,
+        uses_unquoted_nullable_str,
+        extra_defs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn xml_param_value_rule(
+    rule: &str,
+    open_tag: &str,
+    prop_key: Option<&str>,
+    value_schema: &Value,
+    root_schema: &serde_json::Map<String, Value>,
+    uses_unquoted_str: &mut bool,
+    uses_unquoted_nullable_str: &mut bool,
+    extra_defs: &mut String,
+) -> String {
     let close_tag = literal("</parameter>");
-    let mut schema_with_defs = attach_root_defs(Some(key), value_schema, root_schema);
+    let mut schema_with_defs = attach_root_defs(prop_key, value_schema, root_schema);
     crate::constraints::normalize_schema_for_llguidance(&mut schema_with_defs);
     let json_branch = format!("%json {schema_with_defs}");
     let default_rule = format!("{rule}: {open_tag} WS {json_branch} WS {close_tag} WS\n");
@@ -497,7 +527,7 @@ fn xml_param_rule(
         let end_rule = format!("unquoted_end_{rule}");
         let body_tok = format!("UNQUOTED_BODY_{}", rule.to_uppercase());
         extra_defs.push_str(&format!(
-            "{end_rule}[lazy]: {body_tok} \"</parameter>\"\n{body_tok}: (/[^ \\t\\r\\n\"](?s:.*[^ \\t\\r\\n])?/{extra_intersects} & ~(\"null\" | {XML_DELIM_BAN_REGEX})) /[ \\t\\r\\n]*/\n"
+            "{end_rule}[lazy]: {body_tok} \"</parameter>\"\n{body_tok}: (/[^ \\t\\r\\n\"\\[{{](?s:.*[^ \\t\\r\\n])?/{extra_intersects} & ~(\"null\" | {XML_DELIM_BAN_REGEX})) /[ \\t\\r\\n]*/\n"
         ));
         return format!(
             "{rule}: {open_tag} WS ({str_json} WS {close_tag} | {end_rule}{null_alt}{empty_alt}) WS\n"
@@ -594,22 +624,16 @@ fn build_qwen_xml_tool_body(
         };
         if let Some(val_schema) = addl_schema {
             let dyn_val_rule = format!("dyn_val_{index}");
-            let mut val_with_defs = attach_root_defs(None, &val_schema, schema_obj);
-            crate::constraints::normalize_schema_for_llguidance(&mut val_with_defs);
-            let branches = collect_unquoted_xml_string_branches(&val_with_defs, &val_with_defs);
-            if branches.has_plain_string
-                && branches.only_string_and_null
-                && branches.literals.is_empty()
-            {
-                *uses_unquoted_str = true;
-                definitions.push_str(&format!(
-                    "{dyn_val_rule}: \"<parameter=\" /[a-zA-Z0-9_.\\-\\/]+/ \">\" WS (%json {{\"type\":\"string\"}} WS \"</parameter>\" | unquoted_xml_param_end) WS\n"
-                ));
-            } else {
-                definitions.push_str(&format!(
-                    "{dyn_val_rule}: \"<parameter=\" /[a-zA-Z0-9_.\\-\\/]+/ \">\" WS %json {val_with_defs} WS \"</parameter>\" WS\n"
-                ));
-            }
+            definitions.push_str(&xml_param_value_rule(
+                &dyn_val_rule,
+                "\"<parameter=\" /[a-zA-Z0-9_.\\-\\/]+/ \">\"",
+                None,
+                &val_schema,
+                schema_obj,
+                uses_unquoted_str,
+                uses_unquoted_nullable_str,
+                extra_defs,
+            ));
             body.push_str(&format!(" ({dyn_val_rule})*"));
         }
     } else if num_props <= 6 {
@@ -784,7 +808,7 @@ pub fn tool_grammar_with_options(
     };
     if uses_unquoted_str {
         grammar.push_str(&format!(
-            "unquoted_xml_param_end[lazy]: UNQUOTED_XML_BODY \"</parameter>\"\nUNQUOTED_XML_BODY: (/[^ \\t\\r\\n\"](?s:.*[^ \\t\\r\\n])?/ & ~(\"null\" | {XML_DELIM_BAN_REGEX})) /[ \\t\\r\\n]*/\n"
+            "unquoted_xml_param_end[lazy]: UNQUOTED_XML_BODY \"</parameter>\"\nUNQUOTED_XML_BODY: (/[^ \\t\\r\\n\"\\[{{](?s:.*[^ \\t\\r\\n])?/ & ~(\"null\" | {XML_DELIM_BAN_REGEX})) /[ \\t\\r\\n]*/\n"
         ));
     }
     if uses_unquoted_nullable_str {

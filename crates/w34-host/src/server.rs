@@ -484,6 +484,15 @@ pub fn parse_openai_messages_with_image_policy(
                     _ => prev.content = Some(new_c),
                 }
             }
+            if let Some(new_r) = reasoning_content.filter(|s| !s.is_empty()) {
+                match prev.reasoning_content.as_mut() {
+                    Some(existing) if !existing.is_empty() => {
+                        existing.push_str("\n\n");
+                        existing.push_str(&new_r);
+                    }
+                    _ => prev.reasoning_content = Some(new_r),
+                }
+            }
             continue;
         }
         out.push(ChatMessage {

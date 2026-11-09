@@ -454,7 +454,12 @@ fn lower_openapi_nullable(obj: &mut serde_json::Map<String, serde_json::Value>) 
         {
             arr.push(serde_json::json!({"type": "null"}));
         }
-    } else if obj.contains_key("$ref") || obj.contains_key("properties") {
+    } else if obj.contains_key("$ref")
+        || obj.contains_key("properties")
+        || obj.contains_key("additionalProperties")
+        || obj.contains_key("oneOf")
+        || obj.contains_key("allOf")
+    {
         let mut inner = serde_json::Map::new();
         let keys: Vec<String> = obj
             .keys()

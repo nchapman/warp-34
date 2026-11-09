@@ -1338,11 +1338,16 @@ fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings(
         "numeric-looking unquoted strings on string / Optional[str] / $ref string must stay JSON strings"
     );
 
-    // 2. Unquoted `[INFO] msg`, boolean string `true`, empty string `<parameter=zip></parameter>`, and bare `null` on `opt_id`
+    // 2. Boolean string `true`, JSON-quoted `"[INFO] ok"`, empty string `<parameter=zip></parameter>`, and bare `null` on `opt_id`
     for (zip_val, opt_val, expected_zip, expected_opt) in [
         ("true", "null", json!("true"), json!(null)),
-        ("[INFO] ok", "\"null\"", json!("[INFO] ok"), json!("null")),
-        ("{k: v}", "false", json!("{k: v}"), json!("false")),
+        (
+            "\"[INFO] ok\"",
+            "\"null\"",
+            json!("[INFO] ok"),
+            json!("null"),
+        ),
+        ("\"{k: v}\"", "false", json!("{k: v}"), json!("false")),
         ("", "null", json!(""), json!(null)),
     ] {
         let xml = format!(
@@ -1375,7 +1380,7 @@ fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings(
         );
     }
 
-    // 4. Open-dictionary XML tool (`additionalProperties: {"type": "string"}` without `properties`)
+    // 4. Open-dictionary XML tool (`additionalProperties: {"type": "string", "minLength": 2}` without `properties`)
     // and `"parameters": null` / `{}`
     let open_tools = json!([
         {
@@ -1384,7 +1389,7 @@ fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings(
                 "name": "set_tags",
                 "parameters": {
                     "type": "object",
-                    "additionalProperties": { "type": "string" }
+                    "additionalProperties": { "type": "string", "minLength": 2 }
                 }
             }
         },
@@ -1396,6 +1401,7 @@ fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings(
             }
         }
     ]);
+    let open_call = "<tool_call>\n<function=set_tags>\n<parameter=env>\nprod\n</parameter>\n<parameter=build>\n123\n</parameter>\n</function>\n</tool_call>";
     let mut c_open = factory
         .tools(
             &open_tools,
@@ -1404,13 +1410,30 @@ fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings(
             false,
         )
         .unwrap();
-    feed(
-        &mut c_open,
-        &tok,
-        "<tool_call>\n<function=set_tags>\n<parameter=env>\nprod\n</parameter>\n<parameter=region>\nus-east\n</parameter>\n</function>\n</tool_call>",
-    )
-    .unwrap();
+    feed(&mut c_open, &tok, open_call).unwrap();
     assert!(c_open.is_token_allowed(EOS));
+    let parsed_open = Qwen3Parser::parse_complete_with_tools(open_call, false, Some(&open_tools));
+    let args_open: serde_json::Value =
+        serde_json::from_str(&parsed_open.tool_calls[0].function.arguments).unwrap();
+    assert_eq!(args_open, json!({"env": "prod", "build": "123"}));
+
+    // Too-short open-dictionary value (`minLength: 2` violated by `"x"`) is rejected
+    let mut c_open_short = factory
+        .tools(
+            &open_tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml,
+            false,
+        )
+        .unwrap();
+    assert!(
+        feed(
+            &mut c_open_short,
+            &tok,
+            "<tool_call>\n<function=set_tags>\n<parameter=env>\nx\n</parameter>\n</function>\n</tool_call>"
+        )
+        .is_err()
+    );
 }
 
 #[test]

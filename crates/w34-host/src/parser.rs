@@ -1006,6 +1006,7 @@ pub struct Qwen3Parser {
     tool_calls: Vec<ParsedToolCall>,
     next_tool_idx: usize,
     param_types: std::collections::HashMap<(String, String), ParamTypeMask>,
+    wildcard_param_types: std::collections::HashMap<String, ParamTypeMask>,
 }
 
 impl Qwen3Parser {
@@ -1025,6 +1026,7 @@ impl Qwen3Parser {
             tool_calls: Vec::new(),
             next_tool_idx: 0,
             param_types: std::collections::HashMap::new(),
+            wildcard_param_types: std::collections::HashMap::new(),
         }
     }
 
@@ -1040,6 +1042,13 @@ impl Qwen3Parser {
                 let Some(params_schema) = func.get("parameters") else {
                     continue;
                 };
+                if let Some(addl) = params_schema
+                    .get("additionalProperties")
+                    .filter(|v| v.is_object())
+                {
+                    let mask = ParamTypeMask::from_schema_with_root(addl, params_schema);
+                    self.wildcard_param_types.insert(fn_name.to_string(), mask);
+                }
                 let Some(props) = params_schema.get("properties").and_then(|p| p.as_object())
                 else {
                     continue;
@@ -1185,9 +1194,14 @@ impl Qwen3Parser {
     /// Parses either Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
     /// or Hermes JSON (`{"name": "...", "arguments": ...}`) inside a `<tool_call>...</tool_call>` body.
     pub fn parse_tool_body(raw_body: &str, call_idx: usize) -> Option<ParsedToolCall> {
-        Self::parse_tool_bodies_with_types(raw_body, call_idx, &std::collections::HashMap::new())
-            .into_iter()
-            .next()
+        Self::parse_tool_bodies_with_types(
+            raw_body,
+            call_idx,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+        .into_iter()
+        .next()
     }
 
     fn strip_markdown_json_fence(body: &str) -> &str {
@@ -1207,6 +1221,7 @@ impl Qwen3Parser {
         raw_body: &str,
         start_idx: usize,
         param_types: &std::collections::HashMap<(String, String), ParamTypeMask>,
+        wildcard_param_types: &std::collections::HashMap<String, ParamTypeMask>,
     ) -> Vec<ParsedToolCall> {
         let body = raw_body.trim();
         if body.is_empty() {
@@ -1269,6 +1284,7 @@ impl Qwen3Parser {
                 let trimmed = Self::trim_wrapping_newlines(raw_val);
                 let type_mask = param_types
                     .get(&(fn_name.clone(), param_name.clone()))
+                    .or_else(|| wildcard_param_types.get(&fn_name))
                     .copied();
                 let json_val = Self::convert_xml_param_value(trimmed, type_mask);
                 params.insert(param_name, json_val);
@@ -1352,6 +1368,7 @@ impl Qwen3Parser {
                         &body,
                         self.next_tool_idx,
                         &self.param_types,
+                        &self.wildcard_param_types,
                     ) {
                         self.next_tool_idx += 1;
                         self.tool_calls.push(tc.clone());
