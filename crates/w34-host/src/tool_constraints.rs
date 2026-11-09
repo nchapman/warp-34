@@ -74,43 +74,11 @@ pub(crate) fn is_schema_metadata_key(key: &str) -> bool {
     ) || (key.starts_with("x-") && key != "x-guidance")
 }
 
-fn contains_xml_tool_delimiter(s: &str) -> bool {
-    let mut rest = s;
-    while let Some(idx) = rest.find('<') {
-        let after_lt = rest[idx + 1..].trim_start();
-        if let Some(after_slash) = after_lt.strip_prefix('/') {
-            let after_slash = after_slash.trim_start();
-            for tag in ["parameter", "tool_call", "function"] {
-                if let Some(after_tag) = after_slash.strip_prefix(tag)
-                    && after_tag.trim_start().starts_with('>')
-                {
-                    return true;
-                }
-            }
-        } else {
-            for tag in ["parameter", "function"] {
-                if let Some(after_tag) = after_lt.strip_prefix(tag)
-                    && after_tag.trim_start().starts_with('=')
-                {
-                    return true;
-                }
-            }
-            if let Some(after_tag) = after_lt.strip_prefix("tool_call")
-                && after_tag.trim_start().starts_with('>')
-            {
-                return true;
-            }
-        }
-        rest = &rest[idx + 1..];
-    }
-    false
-}
-
 fn is_safe_unquoted_xml_string(s: &str, allow_json_primitives: bool) -> bool {
     !s.is_empty()
         && s == s.trim()
         && s != "null"
-        && !contains_xml_tool_delimiter(s)
+        && !s.contains('<')
         && !s.starts_with('"')
         && (allow_json_primitives
             || (!s.starts_with(['{', '[']) && serde_json::from_str::<Value>(s).is_err()))
@@ -358,36 +326,19 @@ fn collect_unquoted_xml_inner(
 }
 
 fn json_pattern_to_lark_regex(pat: &str) -> String {
-    let (anchored_start, body) = match pat.strip_prefix('^') {
-        Some(rest) => (true, rest),
-        None => (false, pat),
-    };
-    let anchored_end = body.ends_with('$')
-        && body[..body.len() - 1]
-            .chars()
-            .rev()
-            .take_while(|&c| c == '\\')
-            .count()
-            % 2
-            == 0;
-    let core = if anchored_end {
-        &body[..body.len() - 1]
+    let escaped = llguidance::regex_to_lark(pat, "dw");
+    let mut rb = llguidance::derivre::RegexBuilder::new();
+    let prefix = if rb.mk_regex(&format!("(?s:.*)(?:{escaped})")).is_ok() {
+        "(?s:.*)"
     } else {
-        body
+        ""
     };
-    let mut escaped = String::with_capacity(core.len() + 16);
-    let mut prev_backslash = false;
-    for ch in core.chars() {
-        if ch == '/' && !prev_backslash {
-            escaped.push_str("\\/");
-        } else {
-            escaped.push(ch);
-        }
-        prev_backslash = ch == '\\' && !prev_backslash;
-    }
-    let prefix = if anchored_start { "" } else { "(?s:.*)" };
-    let suffix = if anchored_end { "" } else { "(?s:.*)" };
-    format!("/{prefix}({escaped}){suffix}/")
+    let suffix = if rb.mk_regex(&format!("(?:{escaped})(?s:.*)")).is_ok() {
+        "(?s:.*)"
+    } else {
+        ""
+    };
+    format!("/{prefix}(?:{escaped}){suffix}/")
 }
 
 fn format_to_lark_regex(fmt: &str) -> Option<&'static str> {

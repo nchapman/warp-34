@@ -1304,7 +1304,8 @@ fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings(
                         { "type": "null" }
                     ]
                 },
-                "slug": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
+                "slug": { "type": "string", "pattern": "^[a-z0-9_-]+$|^item/\\d+$" },
+                "sub": { "type": "string", "pattern": "ab" },
                 "code": { "type": "string", "minLength": 3, "maxLength": 5 },
                 "date": { "type": "string", "format": "date" }
             },
@@ -1316,27 +1317,33 @@ fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings(
     }]);
 
     // 1. Unquoted numeric string ("02138") on `$ref` string and ("12345") on `Optional[str]`,
-    // plus unquoted pattern, minLength/maxLength, and date format
-    let call_1 = "<tool_call>\n<function=inspect/item>\n<parameter=zip>\n02138\n</parameter>\n<parameter=opt_id>\n12345\n</parameter>\n<parameter=slug>\nmy_slug-1\n</parameter>\n<parameter=code>\nabcd\n</parameter>\n<parameter=date>\n2026-04-19\n</parameter>\n</function>\n</tool_call>";
-    let mut c1 = factory
-        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
-        .unwrap();
-    feed(&mut c1, &tok, call_1).unwrap();
-    assert!(c1.is_token_allowed(EOS));
-    let parsed_1 = Qwen3Parser::parse_complete_with_tools(call_1, false, Some(&tools));
-    let args_1: serde_json::Value =
-        serde_json::from_str(&parsed_1.tool_calls[0].function.arguments).unwrap();
-    assert_eq!(
-        args_1,
-        json!({
-            "zip": "02138",
-            "opt_id": "12345",
-            "slug": "my_slug-1",
-            "code": "abcd",
-            "date": "2026-04-19"
-        }),
-        "numeric-looking unquoted strings on string / Optional[str] / $ref string must stay JSON strings"
-    );
+    // plus unquoted pattern (both anchored alternation `^...$|^...$` and unanchored `"ab"`),
+    // minLength/maxLength, and date format
+    for (slug_val, expected_slug) in [("my_slug-1", "my_slug-1"), ("item/42", "item/42")] {
+        let call_1 = format!(
+            "<tool_call>\n<function=inspect/item>\n<parameter=zip>\n02138\n</parameter>\n<parameter=opt_id>\n12345\n</parameter>\n<parameter=slug>\n{slug_val}\n</parameter>\n<parameter=sub>\nxxabyy\n</parameter>\n<parameter=code>\nabcd\n</parameter>\n<parameter=date>\n2026-04-19\n</parameter>\n</function>\n</tool_call>"
+        );
+        let mut c1 = factory
+            .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+            .unwrap();
+        feed(&mut c1, &tok, &call_1).unwrap();
+        assert!(c1.is_token_allowed(EOS));
+        let parsed_1 = Qwen3Parser::parse_complete_with_tools(&call_1, false, Some(&tools));
+        let args_1: serde_json::Value =
+            serde_json::from_str(&parsed_1.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args_1,
+            json!({
+                "zip": "02138",
+                "opt_id": "12345",
+                "slug": expected_slug,
+                "sub": "xxabyy",
+                "code": "abcd",
+                "date": "2026-04-19"
+            }),
+            "numeric-looking unquoted strings on string / Optional[str] / $ref string must stay JSON strings"
+        );
+    }
 
     // 2. Boolean string `true`, JSON-quoted `"[INFO] ok"`, empty string `<parameter=zip></parameter>`, and bare `null` on `opt_id`
     for (zip_val, opt_val, expected_zip, expected_opt) in [
@@ -1369,6 +1376,7 @@ fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings(
         "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nnull\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n</function>\n</tool_call>",
         "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nok\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n<parameter=code>\nab\n</parameter>\n</function>\n</tool_call>",
         "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nok\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n<parameter=slug>\nBAD SLUG\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nok\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n<parameter=sub>\nxxyy\n</parameter>\n</function>\n</tool_call>",
         "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nok\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n<parameter=date>\n2026/04/19\n</parameter>\n</function>\n</tool_call>",
     ] {
         let mut c_bad = factory
