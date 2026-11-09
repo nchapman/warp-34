@@ -27,14 +27,23 @@ pub struct Tp2Collectives {
     pub max_stage_bytes_per_epoch: usize,
 }
 
+/// Byte threshold (`64 KiB`) at and above which `TP=2` collectives use Copy-Engine
+/// `cudaMemcpyAsync` TX into `[0, max_stage_bytes_per_epoch)` followed by 2-barrier SM RX.
+pub const TP2_DMA_THRESHOLD_BYTES: usize = 65_536;
+/// Number of `max_stage_bytes_per_epoch` slots allocated per rank (`[0, cap)` for 2-barrier
+/// DMA TX, `[cap, 2 * cap)` for even 1-barrier epochs, and `[2 * cap, 3 * cap)` for odd 1-barrier epochs).
+const TP2_STAGE_EPOCH_SLOTS: usize = 3;
+/// Minimum per-rank staging buffer byte allocation (`4 KiB`).
+const TP2_MIN_STAGE_BYTES: usize = 4_096;
+
 #[cfg(feature = "cuda")]
 impl Tp2Collectives {
-    /// Allocates double-buffered staging (`2 * max_stage_bytes_per_epoch`) and signal structs for `TP=2`.
+    /// Allocates 3-slot staging (`3 * max_stage_bytes_per_epoch`) and signal structs for `TP=2`.
     pub fn new(max_stage_bytes_per_epoch: usize) -> Result<Self> {
         Self::new_for_tp(2, max_stage_bytes_per_epoch)
     }
 
-    /// Allocates double-buffered staging (`2 * max_stage_bytes_per_epoch`) and signal structs for `tp_size` (`2` or `4`),
+    /// Allocates 3-slot staging (`3 * max_stage_bytes_per_epoch`) and signal structs for `tp_size` (`2` or `4`),
     /// automatically enabling P2P VRAM staging when all rank pairs have native NVLink P2P support.
     pub fn new_for_tp(tp_size: usize, max_stage_bytes_per_epoch: usize) -> Result<Self> {
         Self::new_for_tp_with_p2p(tp_size, max_stage_bytes_per_epoch, true)
@@ -55,7 +64,13 @@ impl Tp2Collectives {
         // SAFETY: `w34_tp2_signal_bytes` is a pure `sizeof(W34Tp2Signal)` query with no preconditions.
         let sig_bytes = unsafe { ffi::w34_tp2_signal_bytes() };
         let max_stage_bytes_per_epoch = max_stage_bytes_per_epoch.saturating_add(15) & !15;
-        let stage_bytes = max_stage_bytes_per_epoch.saturating_mul(2).max(4096);
+        // Reserve `[0, max_stage_bytes_per_epoch)` exclusively for 2-barrier Copy-Engine DMA TX
+        // (`>= 64 KiB`), and `[max_stage_bytes_per_epoch, 3 * max_stage_bytes_per_epoch)` for
+        // 1-barrier `stage_epoch_ptr` even/odd ping-pong transfers (both `< 64 KiB` and `>= 64 KiB`
+        // gathers) so 1-barrier and 2-barrier DMA transfers never share staging memory.
+        let stage_bytes = max_stage_bytes_per_epoch
+            .saturating_mul(TP2_STAGE_EPOCH_SLOTS)
+            .max(TP2_MIN_STAGE_BYTES);
         // `Signal::end[128][0]` (u32 offset `144 * 16 + 128 * 16 = 4352`) stores the
         // per-epoch byte stride so `odd` and `even` staging halves are disjoint across
         // variable-size back-to-back collectives.

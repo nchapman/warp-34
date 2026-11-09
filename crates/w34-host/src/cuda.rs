@@ -36,6 +36,8 @@ pub const MIN_HEADROOM_BYTES: usize = 1024 * 1024 * 1024; // 1.0 GiB
 /// and `repack_staging` is already freed. This is the planner reserve, not a guarantee
 /// of free driver memory after subsequent decode/verify graph capture.
 pub const EXTREME_LONGCTX_HEADROOM_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+/// Compute capability minor version (`9`) for Ada Lovelace (`sm_89`, RTX 40-series).
+pub const ADA_SM89_COMPUTE_MINOR: i32 = 9;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CudaError {

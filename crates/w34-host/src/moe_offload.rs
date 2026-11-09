@@ -374,8 +374,12 @@ pub const TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS: usize = 4;
 pub const TIERED_MOE_CPU_BRIDGE_MAX_TOP_K: usize = 16;
 
 /// Router weight threshold (`0.14`) below which cold experts are delegated to the CPU bridge
-/// when dynamic LRU slots (`k_static < k_hot`) are available on the GPU.
+/// when dynamic LRU slots (`k_static < k_hot`) are available on the GPU on AVX-512 hosts.
 pub const TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD: f32 = 0.14;
+
+/// Fraction (`0.50`) of distinct cold experts pulled onto GPU evictable LRU slots over PCIe DMA
+/// on AVX2/FMA hosts without AVX-512, balancing PCIe Gen4 x16 DMA against CPU evaluation.
+pub const TIERED_MOE_CPU_BRIDGE_AVX2_GPU_SHARE_FRAC: f32 = 0.50;
 
 /// Minimum GPU hot expert count (`16`) required before auto-enabling the `TP=1` CPU MoE bridge.
 pub const TIERED_MOE_CPU_BRIDGE_MIN_HOT_EXPERTS: usize = 16;

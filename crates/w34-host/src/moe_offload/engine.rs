@@ -5,6 +5,24 @@ use crate::loader::{HADAMARD_BLOCK_64, SafetensorsArchive};
 const TIERED_MOE_AUTO_GPU_LRU_MAX_TOKENS: usize = 32;
 /// Alternate symmetric 4-bit GPTQ group size supported by the AVX2/FMA CPU bridge (`64` in addition to `128`).
 const TIERED_MOE_CPU_BRIDGE_ALT_GROUP_SIZE: usize = 64;
+/// Maximum prefill token count that fits cold-miss staging in a single GPU chunk (`<= 384` tokens).
+const TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOKENS: usize = 384;
+/// Small-batch threshold (`<= 16` tokens) for `StreamedPrefill` CPU-bridge share tuning on AVX2 hosts.
+const TIERED_MOE_PREFILL_SMALL_BATCH_MAX_TOKENS: usize = 16;
+/// Percentage (`70%`) of cold misses delegated to the CPU bridge for `<= 384`-token batches on AVX-512 hosts.
+const TIERED_MOE_PREFILL_AVX512_SINGLE_CHUNK_CPU_SHARE_PCT: usize = 70;
+/// Percentage (`35%`) of cold misses delegated to the CPU bridge for `<= 16`-token batches on AVX2 hosts.
+const TIERED_MOE_PREFILL_AVX2_SMALL_CPU_SHARE_PCT: usize = 35;
+/// Percentage (`45%`) of cold misses delegated to the CPU bridge for `17..=384`-token batches on AVX2 hosts.
+const TIERED_MOE_PREFILL_AVX2_SINGLE_CHUNK_CPU_SHARE_PCT: usize = 45;
+/// Percentage (`58%`) of cold misses delegated to the CPU bridge for `> 384`-token batches on AVX-512 hosts.
+const TIERED_MOE_PREFILL_AVX512_MULTI_CHUNK_CPU_SHARE_PCT: usize = 58;
+/// Percentage (`38%`) of cold misses delegated to the CPU bridge for `> 384`-token batches on AVX2 hosts.
+const TIERED_MOE_PREFILL_AVX2_MULTI_CHUNK_CPU_SHARE_PCT: usize = 38;
+/// Maximum routed tokens per cold expert eligible for CPU evaluation in `<= 384`-token prefill batches.
+const TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOK_PER_JOB: usize = 8;
+/// Maximum routed tokens per cold expert eligible for CPU evaluation in `> 384`-token prefill batches.
+const TIERED_MOE_PREFILL_MULTI_CHUNK_MAX_TOK_PER_JOB: usize = 96;
 
 /// Executes a tiered 512-expert MoE layer across `TP=1` or `TP=2 / EP=2` in `GpuLru`,
 /// `CpuHybrid`, or double-buffered `StreamedPrefill` mode.
@@ -107,7 +125,11 @@ impl TieredMoeEngine {
                         store.layout().hidden as i32,
                         store.layout().group_size as i32,
                         if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
-                            TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
+                            if crate::moe_cpu_bridge::has_avx512() {
+                                TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
+                            } else {
+                                TIERED_MOE_CPU_BRIDGE_AVX2_GPU_SHARE_FRAC
+                            }
                         } else {
                             0.0f32
                         },
@@ -600,12 +622,33 @@ impl TieredMoeEngine {
                         // unpacked once and FMA-accumulated across all routed tokens) and the densest
                         // cold experts fit in at most 1 GPU chunk (`<= 384` tokens) or 2 GPU chunks (`> 384` tokens).
                         let (max_cpu_jobs, max_tok_per_job) = if cache.bridge_layer_id.is_some() {
-                            let (target_gpu_misses, cpu_share_pct, max_tok_per_job) =
-                                if num_tokens <= 384 {
-                                    (ws.stage_capacity, 70usize, 8usize)
+                            let avx512 = crate::moe_cpu_bridge::has_avx512();
+                            let (target_gpu_misses, cpu_share_pct, max_tok_per_job) = if num_tokens
+                                <= TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOKENS
+                            {
+                                let pct = if avx512 {
+                                    TIERED_MOE_PREFILL_AVX512_SINGLE_CHUNK_CPU_SHARE_PCT
+                                } else if num_tokens <= TIERED_MOE_PREFILL_SMALL_BATCH_MAX_TOKENS {
+                                    TIERED_MOE_PREFILL_AVX2_SMALL_CPU_SHARE_PCT
                                 } else {
-                                    (2 * ws.stage_capacity, 58usize, 96usize)
+                                    TIERED_MOE_PREFILL_AVX2_SINGLE_CHUNK_CPU_SHARE_PCT
                                 };
+                                (
+                                    ws.stage_capacity,
+                                    pct,
+                                    TIERED_MOE_PREFILL_SINGLE_CHUNK_MAX_TOK_PER_JOB,
+                                )
+                            } else {
+                                (
+                                    2 * ws.stage_capacity,
+                                    if avx512 {
+                                        TIERED_MOE_PREFILL_AVX512_MULTI_CHUNK_CPU_SHARE_PCT
+                                    } else {
+                                        TIERED_MOE_PREFILL_AVX2_MULTI_CHUNK_CPU_SHARE_PCT
+                                    },
+                                    TIERED_MOE_PREFILL_MULTI_CHUNK_MAX_TOK_PER_JOB,
+                                )
+                            };
                             let jobs = misses_in_step
                                 .len()
                                 .saturating_sub(target_gpu_misses)

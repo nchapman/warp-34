@@ -2,7 +2,7 @@ mod eval;
 // Owned CPU responders. Mailboxes are retained until GPU synchronization and joined shutdown.
 use crate::cuda::{CudaDevice, MappedHostBuffer};
 use crate::moe_offload::HostExpertStore;
-pub(crate) use eval::supported;
+pub(crate) use eval::{has_avx512, supported};
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicUsize, Ordering},

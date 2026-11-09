@@ -20,7 +20,15 @@ namespace w34_comm {
 // Sized for up to 144 SMs (covering all 30-series 28..84 SMs and 40-series 24..142 SMs).
 constexpr int kMaxBlocks = 144;
 constexpr int kSmallMaxBlocks = 36;
+constexpr int kTp2PcieBlockCap = 16;
 constexpr int kRanks = 16;
+// Crossover where Copy-Engine DMA TX (`cudaMemcpyAsync` D2H at ~20.5 GB/s) + 2-barrier SM RX
+// beats 1-barrier in-kernel SM write-back TX (`st.global.wb.v4.u32`) on PCIe Gen4 mapped sysmem.
+constexpr size_t kDmaThresholdBytes = 65536;
+constexpr size_t kEvenStageEpochSlot = 1;
+constexpr size_t kOddStageEpochSlot = 2;
+constexpr int kVec8F16ElemsPerBlock = 4096;
+constexpr int kVec4F32ElemsPerBlock = 2048;
 
 struct Signal {
     alignas(128) uint32_t start[kMaxBlocks][kRanks];
@@ -29,13 +37,25 @@ struct Signal {
 };
 static_assert(sizeof(Signal) == 19072, "Signal ABI size mismatch");
 
+__device__ __forceinline__ void st_global_wb_v4(uint4* addr, uint4 val) {
+    asm volatile("st.global.wb.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(addr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)
+                 : "memory");
+}
+
 template <typename T>
 __device__ __forceinline__ T* stage_epoch_ptr(T* base, const Signal* sig, bool odd, size_t fallback_elems) {
-    if (!odd) return base;
     size_t cap_bytes = (size_t)sig->end[128][0] & ~15ULL;
     size_t min_bytes = fallback_elems * sizeof(T);
-    size_t off_bytes = (cap_bytes >= min_bytes) ? cap_bytes : min_bytes;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + off_bytes);
+    if (cap_bytes >= min_bytes && cap_bytes > 0) {
+        // `[0, cap_bytes)` is reserved exclusively for 2-barrier Copy-Engine DMA TX (`dma_tx`).
+        // All 1-barrier `stage_epoch_ptr` operations (both `< 64 KiB` and `>= 64 KiB` gathers)
+        // ping-pong across `[cap_bytes, 2 * cap_bytes)` (even) and `[2 * cap_bytes, 3 * cap_bytes)` (odd).
+        size_t off_bytes = cap_bytes * (odd ? kOddStageEpochSlot : kEvenStageEpochSlot);
+        return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + off_bytes);
+    }
+    if (!odd) return base;
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + min_bytes);
 }
 
 template <typename T>
@@ -55,6 +75,11 @@ inline int tp2_block_cap(bool is_small) {
     if (cap > min_sms) cap = min_sms;
     if (cap < 1) cap = 1;
     return cap;
+}
+
+inline int tp2_pcie_block_cap() {
+    int cap = tp2_block_cap(true);
+    return (cap > kTp2PcieBlockCap) ? kTp2PcieBlockCap : cap;
 }
 
 __device__ __forceinline__ void st_flag_release(uint32_t* addr, uint32_t val) {
@@ -134,26 +159,36 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
     int rank,
     int num_elems) {
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
+    const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    __half* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
-    __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
+    __half* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    __half* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __half* __restrict__ my_s = (rank == 0) ? s0_buf : s1_buf;
     const __half* __restrict__ peer_s = (rank == 0) ? s1_buf : s0_buf;
 
+    const int chunk_elems = (num_elems + 7) >> 3;
     const bool vec8 = ((num_elems & 7) == 0) &&
                       ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)my_s | (uintptr_t)peer_s) & 15u) == 0);
-    if (vec8) {
-        const int vec_elems = num_elems >> 3;
-        const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
-        uint4* my_v = reinterpret_cast<uint4*>(my_s);
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
-            my_v[i] = local_v[i];
-        }
-    } else {
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-            my_s[i] = local_in[i];
+    if (!dma_tx) {
+        if (vec8) {
+            const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+            uint4* my_v = reinterpret_cast<uint4*>(my_s);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+                st_global_wb_v4(my_v + i, local_v[i]);
+            }
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+                const int base = i << 3;
+#pragma unroll
+                for (int d = 0; d < 8; ++d) {
+                    const int idx = base + d;
+                    if (idx < num_elems) {
+                        my_s[idx] = local_in[idx];
+                    }
+                }
+            }
         }
     }
 
@@ -161,11 +196,10 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
     barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
 
     if (vec8) {
-        const int vec_elems = num_elems >> 3;
         const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
         const uint4* peer_v = reinterpret_cast<const uint4*>(peer_s);
         uint4* out_v = reinterpret_cast<uint4*>(out);
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
             const uint4 lv = local_v[i];
             const uint4 pv = peer_v[i];
             const __half* lh = reinterpret_cast<const __half*>(&lv);
@@ -181,11 +215,21 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
             out_v[i] = ov;
         }
     } else {
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-            const float fl = __half2float(local_in[i]);
-            const float fp = __half2float(peer_s[i]);
-            out[i] = __float2half((rank == 0) ? (fl + fp) : (fp + fl));
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const int base = i << 3;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const int idx = base + d;
+                if (idx < num_elems) {
+                    const float fl = __half2float(local_in[idx]);
+                    const float fp = __half2float(peer_s[idx]);
+                    out[idx] = __float2half((rank == 0) ? (fl + fp) : (fp + fl));
+                }
+            }
         }
+    }
+    if (dma_tx) {
+        barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
     }
 }
 
@@ -209,12 +253,13 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
     int tap_row_stride,
     int tap_col_offset) {
     const int num_elems = num_tokens * hidden_size;
+    const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    __half* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
-    __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
+    __half* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    __half* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __half* __restrict__ my_s = (rank == 0) ? s0_buf : s1_buf;
     const __half* __restrict__ peer_s = (rank == 0) ? s1_buf : s0_buf;
 
@@ -223,12 +268,13 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
                       ((((uintptr_t)local_in | (uintptr_t)my_s | (uintptr_t)peer_s |
                          (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)out |
                          (uintptr_t)out_had64 | (uintptr_t)ar_out) & 15u) == 0);
-    // Odd stage count (1, 3, or 5) overlaps PCIe Gen4 x8 TX and RX in full duplex across
-    // disjoint row slices on large-M prefill while guaranteeing `self_sg->flag[blockIdx.x]`
-    // flips odd/even double-buffer parity on every kernel invocation (CUDA Graph safe).
-    const int num_stages = (num_tokens > (int)gridDim.x * 12)
-        ? 5
-        : ((num_tokens > (int)gridDim.x * 4) ? 3 : 1);
+    // When `dma_tx` is active (`>= 64 KiB`), Copy-Engine `cudaMemcpyAsync` has already staged
+    // all rows into `my_s`, so we run a single RX pass bracketed by two barriers.
+    const int num_stages = dma_tx
+        ? 1
+        : ((num_tokens > (int)gridDim.x * 12)
+               ? 5
+               : ((num_tokens > (int)gridDim.x * 4) ? 3 : 1));
     const int stage_rows = (num_tokens + num_stages - 1) / num_stages;
 
     __shared__ float s_warp[32];
@@ -246,7 +292,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
                 for (int k = 0; k < VEC_ITERS; ++k) {
                     const int c = threadIdx.x + k * THREADS;
                     if (c < vec_cols) {
-                        dst_v[c] = src_v[c];
+                        st_global_wb_v4(dst_v + c, src_v[c]);
                     }
                 }
             }
@@ -261,7 +307,9 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
         }
     };
 
-    tx_stage(0);
+    if (!dma_tx) {
+        tx_stage(0);
+    }
 
     for (int stage = 0; stage < num_stages; ++stage) {
         const int row_begin = stage * stage_rows;
@@ -274,7 +322,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
         // Software-pipeline TX of `stage + 1` onto PCIe Posted Write queues immediately
         // after `stage` barrier release so TX(stage + 1) overlaps in full duplex with
         // RX(stage) non-posted reads across PCIe.
-        if (stage + 1 < num_stages) {
+        if (!dma_tx && stage + 1 < num_stages) {
             tx_stage(stage + 1);
         }
 
@@ -413,6 +461,9 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
                 }
             }
         }
+        if (dma_tx) {
+            barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
+        }
     }
 }
 
@@ -426,25 +477,77 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_bf16_kernel(
     int rank,
     int num_elems) {
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
+    const bool dma_tx = ((size_t)num_elems * sizeof(__nv_bfloat16) >= kDmaThresholdBytes);
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    __nv_bfloat16* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
-    __nv_bfloat16* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
+    __nv_bfloat16* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    __nv_bfloat16* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __nv_bfloat16* __restrict__ my_s = (rank == 0) ? s0_buf : s1_buf;
     const __nv_bfloat16* __restrict__ peer_s = (rank == 0) ? s1_buf : s0_buf;
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-        my_s[i] = local_in[i];
+    const int chunk_elems = (num_elems + 7) >> 3;
+    const bool vec8 = ((num_elems & 7) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)my_s | (uintptr_t)peer_s) & 15u) == 0);
+    if (!dma_tx) {
+        if (vec8) {
+            const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+            uint4* my_v = reinterpret_cast<uint4*>(my_s);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+                st_global_wb_v4(my_v + i, local_v[i]);
+            }
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+                const int base = i << 3;
+#pragma unroll
+                for (int d = 0; d < 8; ++d) {
+                    const int idx = base + d;
+                    if (idx < num_elems) {
+                        my_s[idx] = local_in[idx];
+                    }
+                }
+            }
+        }
     }
 
     uint32_t epoch = 0;
     barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-        const float fl = __bfloat162float(local_in[i]);
-        const float fp = __bfloat162float(peer_s[i]);
-        out[i] = __float2bfloat16((rank == 0) ? (fl + fp) : (fp + fl));
+    if (vec8) {
+        const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+        const uint4* peer_v = reinterpret_cast<const uint4*>(peer_s);
+        uint4* out_v = reinterpret_cast<uint4*>(out);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const uint4 lv = local_v[i];
+            const uint4 pv = peer_v[i];
+            const __nv_bfloat16* lb = reinterpret_cast<const __nv_bfloat16*>(&lv);
+            const __nv_bfloat16* pb = reinterpret_cast<const __nv_bfloat16*>(&pv);
+            uint4 ov;
+            __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&ov);
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const float fl = __bfloat162float(lb[d]);
+                const float fp = __bfloat162float(pb[d]);
+                ob[d] = __float2bfloat16((rank == 0) ? (fl + fp) : (fp + fl));
+            }
+            out_v[i] = ov;
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const int base = i << 3;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const int idx = base + d;
+                if (idx < num_elems) {
+                    const float fl = __bfloat162float(local_in[idx]);
+                    const float fp = __bfloat162float(peer_s[idx]);
+                    out[idx] = __float2bfloat16((rank == 0) ? (fl + fp) : (fp + fl));
+                }
+            }
+        }
+    }
+    if (dma_tx) {
+        barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
     }
 }
 
@@ -458,24 +561,75 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f32_kernel(
     int rank,
     int num_elems) {
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
+    const bool dma_tx = ((size_t)num_elems * sizeof(float) >= kDmaThresholdBytes);
     uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
     bool odd = (epoch_pre & 1u) != 0;
 
-    float* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
-    float* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
+    float* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    float* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
     float* my_s = (rank == 0) ? s0_buf : s1_buf;
+    const float* peer_s = (rank == 0) ? s1_buf : s0_buf;
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-        my_s[i] = local_in[i];
+    const int chunk_elems = (num_elems + 3) >> 2;
+    const bool vec4 = ((num_elems & 3) == 0) &&
+                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)my_s | (uintptr_t)peer_s) & 15u) == 0);
+    if (!dma_tx) {
+        if (vec4) {
+            const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+            uint4* my_v = reinterpret_cast<uint4*>(my_s);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+                st_global_wb_v4(my_v + i, local_v[i]);
+            }
+        } else {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+                const int base = i << 2;
+#pragma unroll
+                for (int d = 0; d < 4; ++d) {
+                    const int idx = base + d;
+                    if (idx < num_elems) {
+                        my_s[idx] = local_in[idx];
+                    }
+                }
+            }
+        }
     }
 
     uint32_t epoch = 0;
     barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
 
-    const float* r0 = s0_buf;
-    const float* r1 = s1_buf;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-        out[i] = r0[i] + r1[i];
+    if (vec4) {
+        const uint4* local_v = reinterpret_cast<const uint4*>(local_in);
+        const uint4* peer_v = reinterpret_cast<const uint4*>(peer_s);
+        uint4* out_v = reinterpret_cast<uint4*>(out);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const uint4 lv = local_v[i];
+            const uint4 pv = peer_v[i];
+            const float* lf = reinterpret_cast<const float*>(&lv);
+            const float* pf = reinterpret_cast<const float*>(&pv);
+            uint4 ov;
+            float* of = reinterpret_cast<float*>(&ov);
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                of[d] = (rank == 0) ? (lf[d] + pf[d]) : (pf[d] + lf[d]);
+            }
+            out_v[i] = ov;
+        }
+    } else {
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const int base = i << 2;
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                const int idx = base + d;
+                if (idx < num_elems) {
+                    const float lf = local_in[idx];
+                    const float pf = peer_s[idx];
+                    out[idx] = (rank == 0) ? (lf + pf) : (pf + lf);
+                }
+            }
+        }
+    }
+    if (dma_tx) {
+        barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
     }
 }
 
@@ -595,16 +749,34 @@ __global__ void __launch_bounds__(256, 1) tp2_all_reduce_hc_combine_tap_f16_kern
     int rank, int num_tokens, int hc_count, int hidden_size,
     int tap_stride_elems, int tap_offset_elems) {
     const int num_elems = num_tokens * hidden_size;
+    const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
-    __half* s0_buf = stage_epoch_ptr(s0, self_sg, odd, num_elems);
-    __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
+    __half* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
+    __half* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __half* my_s = (rank == 0) ? s0_buf : s1_buf;
     const __half* peer_s = (rank == 0) ? s1_buf : s0_buf;
-    for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
-        const size_t roff = (size_t)tok * hidden_size;
-        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-            my_s[roff + d] = local_in[roff + d];
+    const bool vec8 = ((hidden_size & 7) == 0) &&
+                      ((((uintptr_t)residual_in | (uintptr_t)local_in | (uintptr_t)ar_out |
+                         (uintptr_t)ple_delta | (uintptr_t)residual_out | (uintptr_t)my_s |
+                         (uintptr_t)peer_s) & 15u) == 0);
+    if (!dma_tx) {
+        if (vec8) {
+            const int vec_cols = hidden_size >> 3;
+            for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
+                const uint4* src_v = reinterpret_cast<const uint4*>(local_in + (size_t)tok * hidden_size);
+                uint4* dst_v = reinterpret_cast<uint4*>(my_s + (size_t)tok * hidden_size);
+                for (int c = threadIdx.x; c < vec_cols; c += blockDim.x) {
+                    st_global_wb_v4(dst_v + c, src_v[c]);
+                }
+            }
+        } else {
+            for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
+                const size_t roff = (size_t)tok * hidden_size;
+                for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+                    my_s[roff + d] = local_in[roff + d];
+                }
+            }
         }
     }
     uint32_t epoch = 0;
@@ -623,23 +795,94 @@ __global__ void __launch_bounds__(256, 1) tp2_all_reduce_hc_combine_tap_f16_kern
         __nv_bfloat16* tap_row = (tap_bf16_out != nullptr)
             ? (tap_bf16_out + (size_t)tok * tap_stride_elems + tap_offset_elems)
             : nullptr;
-        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-            const float lf = __half2float(loc_row[d]);
-            const float pf = __half2float(peer_row[d]);
-            const __half ar_h = __float2half((rank == 0) ? (lf + pf) : (pf + lf));
-            if (ar_row != nullptr) ar_row[d] = ar_h;
-            const float y = __half2float(ar_h);
-            float tap_sum = 0.0f;
-            for (int s = 0; s < hc_count; ++s) {
-                const size_t idx = (size_t)s * hidden_size + d;
-                float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
-                if (ple_tok != nullptr) val += __half2float(ple_tok[idx]);
-                const __half out_h = __float2half(val);
-                res_out_tok[idx] = out_h;
-                if (tap_row != nullptr) tap_sum += __half2float(out_h);
+        if (vec8) {
+            const int vec_cols = hidden_size >> 3;
+            const uint4* loc_v = reinterpret_cast<const uint4*>(loc_row);
+            const uint4* peer_v = reinterpret_cast<const uint4*>(peer_row);
+            uint4* ar_v = (ar_row != nullptr) ? reinterpret_cast<uint4*>(ar_row) : nullptr;
+            const bool tap_vec8 = (tap_row != nullptr) && ((((uintptr_t)tap_row) & 15u) == 0);
+            for (int c = threadIdx.x; c < vec_cols; c += blockDim.x) {
+                const uint4 lv = loc_v[c];
+                const uint4 pv = peer_v[c];
+                const __half* lh = reinterpret_cast<const __half*>(&lv);
+                const __half* ph = reinterpret_cast<const __half*>(&pv);
+                uint4 arv;
+                __half* arh = reinterpret_cast<__half*>(&arv);
+                float y_arr[8];
+                float tap_sum[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float lf = __half2float(lh[j]);
+                    const float pf = __half2float(ph[j]);
+                    const __half ar_h = __float2half((rank == 0) ? (lf + pf) : (pf + lf));
+                    arh[j] = ar_h;
+                    y_arr[j] = __half2float(ar_h);
+                    tap_sum[j] = 0.0f;
+                }
+                if (ar_v != nullptr) ar_v[c] = arv;
+                for (int s = 0; s < hc_count; ++s) {
+                    const float inj_s = inj_tok[s];
+                    const uint4* rin_v = reinterpret_cast<const uint4*>(res_in_tok + (size_t)s * hidden_size);
+                    uint4* rout_v = reinterpret_cast<uint4*>(res_out_tok + (size_t)s * hidden_size);
+                    const uint4 rv = rin_v[c];
+                    const __half* rh = reinterpret_cast<const __half*>(&rv);
+                    uint4 pv_ple = make_uint4(0, 0, 0, 0);
+                    if (ple_tok != nullptr) {
+                        pv_ple = reinterpret_cast<const uint4*>(ple_tok + (size_t)s * hidden_size)[c];
+                    }
+                    const __half* plh = reinterpret_cast<const __half*>(&pv_ple);
+                    uint4 outv;
+                    __half* outh = reinterpret_cast<__half*>(&outv);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        float val = __half2float(rh[j]) + inj_s * y_arr[j];
+                        if (ple_tok != nullptr) val += __half2float(plh[j]);
+                        const __half out_h = __float2half(val);
+                        outh[j] = out_h;
+                        if (tap_row != nullptr) tap_sum[j] += __half2float(out_h);
+                    }
+                    rout_v[c] = outv;
+                }
+                if (tap_row != nullptr) {
+                    if (tap_vec8) {
+                        uint4 tv;
+                        __nv_bfloat16* th = reinterpret_cast<__nv_bfloat16*>(&tv);
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            th[j] = __float2bfloat16_rn(tap_sum[j] * inv_hc);
+                        }
+                        reinterpret_cast<uint4*>(tap_row)[c] = tv;
+                    } else {
+                        const int d_base = c << 3;
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            tap_row[d_base + j] = __float2bfloat16_rn(tap_sum[j] * inv_hc);
+                        }
+                    }
+                }
             }
-            if (tap_row != nullptr) tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
+        } else {
+            for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+                const float lf = __half2float(loc_row[d]);
+                const float pf = __half2float(peer_row[d]);
+                const __half ar_h = __float2half((rank == 0) ? (lf + pf) : (pf + lf));
+                if (ar_row != nullptr) ar_row[d] = ar_h;
+                const float y = __half2float(ar_h);
+                float tap_sum = 0.0f;
+                for (int s = 0; s < hc_count; ++s) {
+                    const size_t idx = (size_t)s * hidden_size + d;
+                    float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
+                    if (ple_tok != nullptr) val += __half2float(ple_tok[idx]);
+                    const __half out_h = __float2half(val);
+                    res_out_tok[idx] = out_h;
+                    if (tap_row != nullptr) tap_sum += __half2float(out_h);
+                }
+                if (tap_row != nullptr) tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
+            }
         }
+    }
+    if (dma_tx) {
+        barrier_epoch_release(sig0, sig1, self_sg, rank, &epoch);
     }
 }
 
@@ -659,35 +902,49 @@ __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
     __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
     const int full_vocab = local_vocab_size * 2;
 
+    const int chunk_elems = (num_elems + 7) >> 3;
     const bool vec8 = ((local_vocab_size & 7) == 0) &&
                       ((((uintptr_t)local_in | (uintptr_t)s1_buf | (uintptr_t)rank0_full_out) & 15u) == 0);
     if (vec8) {
         const int vec_vocab = local_vocab_size >> 3;
         const int vec_full = full_vocab >> 3;
-        const int vec_elems = num_rows * vec_vocab;
         const uint4* in_v = reinterpret_cast<const uint4*>(local_in);
         uint4* s1_v = reinterpret_cast<uint4*>(s1_buf);
         uint4* out_v = reinterpret_cast<uint4*>(rank0_full_out);
         if (rank == 1) {
-            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
-                s1_v[i] = in_v[i];
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+                st_global_wb_v4(&s1_v[i], in_v[i]);
             }
         } else {
-            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
                 const int row = i / vec_vocab;
                 const int col = i - row * vec_vocab;
                 out_v[(size_t)row * vec_full + col] = in_v[i];
             }
         }
     } else if (rank == 1) {
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-            s1_buf[i] = local_in[i];
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const int base = i << 3;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const int idx = base + d;
+                if (idx < num_elems) {
+                    s1_buf[idx] = local_in[idx];
+                }
+            }
         }
     } else {
-        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-            const int row = i / local_vocab_size;
-            const int col = i - row * local_vocab_size;
-            rank0_full_out[(size_t)row * full_vocab + col] = local_in[i];
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+            const int base = i << 3;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) {
+                const int idx = base + d;
+                if (idx < num_elems) {
+                    const int row = idx / local_vocab_size;
+                    const int col = idx - row * local_vocab_size;
+                    rank0_full_out[(size_t)row * full_vocab + col] = local_in[idx];
+                }
+            }
         }
     }
 
@@ -698,19 +955,25 @@ __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
         if (vec8) {
             const int vec_vocab = local_vocab_size >> 3;
             const int vec_full = full_vocab >> 3;
-            const int vec_elems = num_rows * vec_vocab;
             const uint4* s1_v = reinterpret_cast<const uint4*>(s1_buf);
             uint4* out_v = reinterpret_cast<uint4*>(rank0_full_out);
-            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < vec_elems; i += gridDim.x * blockDim.x) {
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
                 const int row = i / vec_vocab;
                 const int col = i - row * vec_vocab;
                 out_v[(size_t)row * vec_full + vec_vocab + col] = s1_v[i];
             }
         } else {
-            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < num_elems; i += gridDim.x * blockDim.x) {
-                const int row = i / local_vocab_size;
-                const int col = i - row * local_vocab_size;
-                rank0_full_out[(size_t)row * full_vocab + local_vocab_size + col] = s1_buf[i];
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < chunk_elems; i += gridDim.x * blockDim.x) {
+                const int base = i << 3;
+#pragma unroll
+                for (int d = 0; d < 8; ++d) {
+                    const int idx = base + d;
+                    if (idx < num_elems) {
+                        const int row = idx / local_vocab_size;
+                        const int col = idx - row * local_vocab_size;
+                        rank0_full_out[(size_t)row * full_vocab + local_vocab_size + col] = s1_buf[idx];
+                    }
+                }
             }
         }
     }
@@ -1389,12 +1652,15 @@ extern "C" int w34_tp2_all_reduce_f16(const w34_exec* ex, const void* local_in, 
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    const bool vec8 = ((num_elems & 7) == 0) &&
-                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1) & 15u) == 0);
-    const int elems_per_block = vec8 ? 4096 : 512;
-    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
-    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
-    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
+    const size_t num_bytes = (size_t)num_elems * sizeof(__half);
+    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+        cudaError_t cpy_err = cudaMemcpyAsync(
+            (rank == 0) ? stage0 : stage1, local_in, num_bytes,
+            cudaMemcpyDefault, (cudaStream_t)ex->stream);
+        if (cpy_err != cudaSuccess) return (int)cpy_err;
+    }
+    int blocks = (num_elems + w34_comm::kVec8F16ElemsPerBlock - 1) / w34_comm::kVec8F16ElemsPerBlock;
+    const int cap = w34_comm::tp2_pcie_block_cap();
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1430,11 +1696,17 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens == 0) return 0;
+    const size_t num_bytes = (size_t)num_tokens * (size_t)hidden_size * sizeof(__half);
+    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+        cudaError_t cpy_err = cudaMemcpyAsync(
+            (rank == 0) ? stage0 : stage1, local_in, num_bytes,
+            cudaMemcpyDefault, (cudaStream_t)ex->stream);
+        if (cpy_err != cudaSuccess) return (int)cpy_err;
+    }
     int blocks = num_tokens;
-    // Cap blocks at 16 (`16 * 512 = 8192` threads across 16 CTAs easily saturates PCIe Gen4
-    // x4/x8 while avoiding 36..128-CTA host cache-line polling storms across the root complex).
-    int cap = w34_comm::tp2_block_cap(true);
-    if (cap > 16) cap = 16;
+    // Cap blocks at `kTp2PcieBlockCap` (`16 * 512 = 8192` threads across 16 CTAs easily saturates PCIe Gen4
+    // x4/x8/x16 while avoiding 36..128-CTA host cache-line polling storms across the root complex).
+    const int cap = w34_comm::tp2_pcie_block_cap();
     if (blocks > cap) blocks = cap;
     if (hidden_size <= 2560) {
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>
@@ -1492,12 +1764,15 @@ extern "C" int w34_tp2_all_reduce_bf16(const w34_exec* ex, const void* local_in,
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    const bool vec8 = ((num_elems & 7) == 0) &&
-                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1) & 15u) == 0);
-    const int elems_per_block = vec8 ? 4096 : 512;
-    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
-    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
-    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
+    const size_t num_bytes = (size_t)num_elems * sizeof(__nv_bfloat16);
+    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+        cudaError_t cpy_err = cudaMemcpyAsync(
+            (rank == 0) ? stage0 : stage1, local_in, num_bytes,
+            cudaMemcpyDefault, (cudaStream_t)ex->stream);
+        if (cpy_err != cudaSuccess) return (int)cpy_err;
+    }
+    int blocks = (num_elems + w34_comm::kVec8F16ElemsPerBlock - 1) / w34_comm::kVec8F16ElemsPerBlock;
+    const int cap = w34_comm::tp2_pcie_block_cap();
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_bf16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1516,12 +1791,15 @@ extern "C" int w34_tp2_all_reduce_f32(const w34_exec* ex, const float* local_in,
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    const bool vec4 = ((num_elems & 3) == 0) &&
-                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1) & 15u) == 0);
-    const int elems_per_block = vec4 ? 2048 : 512;
-    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
-    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
-    if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
+    const size_t num_bytes = (size_t)num_elems * sizeof(float);
+    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+        cudaError_t cpy_err = cudaMemcpyAsync(
+            (rank == 0) ? stage0 : stage1, local_in, num_bytes,
+            cudaMemcpyDefault, (cudaStream_t)ex->stream);
+        if (cpy_err != cudaSuccess) return (int)cpy_err;
+    }
+    int blocks = (num_elems + w34_comm::kVec4F32ElemsPerBlock - 1) / w34_comm::kVec4F32ElemsPerBlock;
+    const int cap = w34_comm::tp2_pcie_block_cap();
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_all_reduce_f32_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1575,8 +1853,8 @@ extern "C" int w34_tp2_gather_vocab_f16(
         return (int)cudaErrorInvalidValue;
     }
     const int num_elems = num_rows * local_vocab_size;
-    int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    int blocks = (num_elems + w34_comm::kVec8F16ElemsPerBlock - 1) / w34_comm::kVec8F16ElemsPerBlock;
+    const int cap = w34_comm::tp2_pcie_block_cap();
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1696,8 +1974,7 @@ extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     }
     if (num_tokens == 0) return 0;
     int blocks = num_tokens;
-    int cap = w34_comm::tp2_block_cap(true);
-    if (cap > 16) cap = 16;
+    const int cap = w34_comm::tp2_pcie_block_cap();
     if (blocks > cap) blocks = cap;
     w34_comm::Tp4Ptrs ptrs{
         {stage0, stage1, stage2, stage3},
@@ -1917,9 +2194,15 @@ extern "C" int w34_tp2_all_reduce_hc_combine_tap_f16(
         (tap_bf16_out != nullptr && (tap_offset_elems < 0 || tap_stride_elems < tap_offset_elems + hidden_size))) {
         return (int)cudaErrorInvalidValue;
     }
+    const size_t num_bytes = (size_t)num_tokens * (size_t)hidden_size * sizeof(__half);
+    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+        cudaError_t cpy_err = cudaMemcpyAsync(
+            (rank == 0) ? stage0 : stage1, local_block_out, num_bytes,
+            cudaMemcpyDefault, (cudaStream_t)ex->stream);
+        if (cpy_err != cudaSuccess) return (int)cpy_err;
+    }
     int blocks = num_tokens;
-    int cap = w34_comm::tp2_block_cap(num_tokens * hidden_size <= 36 * 5120);
-    if (num_tokens * hidden_size <= 36 * 5120 && cap > 16) cap = 16;
+    const int cap = w34_comm::tp2_pcie_block_cap();
     if (blocks > cap) blocks = cap;
     w34_comm::tp2_all_reduce_hc_combine_tap_f16_kernel<<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)residual_in, (const __half*)local_block_out, (__half*)ar_out,

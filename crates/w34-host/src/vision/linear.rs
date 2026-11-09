@@ -308,15 +308,26 @@ mod gpu_tests {
             .upload_slice(&[f32_to_f16(1.0), f32_to_f16(0.5)], &stream)
             .unwrap();
         let weight_ptr = arena
-            .upload_slice(&[f32_to_f16(1.0), f32_to_f16(0.0009765625)], &stream)
+            .upload_slice(
+                &[
+                    f32_to_f16(1.0),
+                    f32_to_f16(0.0009765625),
+                    f32_to_f16(1.0),
+                    f32_to_f16(0.0009765625),
+                ],
+                &stream,
+            )
             .unwrap();
         let bias = arena
-            .upload_slice(&[f32_to_f16(-0.00048828125)], &stream)
+            .upload_slice(
+                &[f32_to_f16(-0.00048828125), f32_to_f16(-0.00048828125)],
+                &stream,
+            )
             .unwrap();
-        let output = DeviceBuffer::alloc(0, 2).unwrap();
+        let output = DeviceBuffer::alloc(0, 4).unwrap();
         let projection = LinearProj::DenseF16 {
             weight_ptr,
-            size_n: 1,
+            size_n: 2,
             size_k: 2,
         };
         forward_bias(
@@ -331,11 +342,48 @@ mod gpu_tests {
             1,
         )
         .unwrap();
-        let mut got = [0u16];
+        let mut got = [0u16; 2];
         output.copy_to_host(&mut got, &stream).unwrap();
         stream.synchronize().unwrap();
-        // Fused: 1 + 2^-11 - 2^-11 = 1. Split rounds the dot to 1 first.
-        assert_eq!(got, [f32_to_f16(1.0)]);
+        // Fused: 1 + 2^-11 - 2^-11 = 1 across both sm_86 and sm_89 for even-aligned N=2.
+        // Split rounds the dot to 1 first and yields 1 - 2^-11 (0x3bff).
+        assert_eq!(got, [f32_to_f16(1.0), f32_to_f16(1.0)]);
+
+        // Also exercise odd `size_n = 1`: `sm_86` (`compute_minor == 6`) preserves the fused
+        // FP32 epilogue (`1.0`), whereas `sm_89` (`compute_minor == 9`) `cuBLASLt` falls back
+        // on odd `ldc = 1` (`1.0 - 2^-11 = 0x3bff`).
+        let proj_n1 = LinearProj::DenseF16 {
+            weight_ptr,
+            size_n: 1,
+            size_k: 2,
+        };
+        forward_bias(
+            &proj_n1,
+            &stream.exec(0, 0),
+            &cublas,
+            0,
+            0,
+            input,
+            bias,
+            output.addr(),
+            1,
+        )
+        .unwrap();
+        let mut got_n1 = [0u16; 1];
+        output.copy_to_host(&mut got_n1, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let mut props = w34_kernels::ffi::W34DeviceProps::default();
+        assert_eq!(
+            // SAFETY: `props` is a valid initialized stack `W34DeviceProps`.
+            unsafe { w34_kernels::ffi::w34_get_current_device_props(&raw mut props) },
+            0
+        );
+        let expected_n1 = if props.compute_minor == crate::cuda::ADA_SM89_COMPUTE_MINOR {
+            f32_to_f16(1.0 - 0.00048828125)
+        } else {
+            f32_to_f16(1.0)
+        };
+        assert_eq!(got_n1[0], expected_n1);
     }
 
     #[test]
