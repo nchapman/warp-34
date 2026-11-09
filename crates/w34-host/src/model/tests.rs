@@ -372,6 +372,66 @@ mod serving_capacity_tests {
         );
     }
 
+    #[test]
+    fn plan_host_embed_offload_respects_slack_and_fit_bounds() {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+
+        // 1. Tiered-MoE untied (`Qwen3.8-Flash-Next`) always uses mapped host `embed_tokens`.
+        let tiered_cfg = sample_qwen4_exp_config();
+        assert_eq!(
+            plan_host_embed_offload(&tiered_cfg, 3_200 * mib, 336 * mib, 128 * mib, 24 * gib),
+            (3_200 * mib, true)
+        );
+
+        // 2. Tied embeddings (`2B` / `4B`) never offload `embed_tokens`.
+        let mut tied_cfg = sample_qwen4_exp_config();
+        tied_cfg.num_experts = 0;
+        tied_cfg.tie_word_embeddings = true;
+        assert_eq!(
+            plan_host_embed_offload(&tied_cfg, 3_600 * mib, 512 * mib, 128 * mib, 7_500 * mib),
+            (3_600 * mib, false)
+        );
+
+        // 3. Untied dense `9B` (`vocab = 248,320`, `hidden = 4,096` -> `embed = 1,940 MiB`,
+        //    `est_weight_bytes = 7,104 MiB`, `scratch = 512 MiB`, `staging = 128 MiB`):
+        //    - Keeps GPU `embed_tokens` on 16 GiB (`15,400 MiB` free) and 24 GiB (`23,500 MiB` free).
+        //    - Offloads `embed_tokens` to `MappedHostBuffer` on 8 GiB (`7,670 MiB` free), reducing
+        //      `est_weight_bytes` to `5,164 MiB`.
+        let mut dense_9b = sample_qwen4_exp_config();
+        dense_9b.num_experts = 0;
+        dense_9b.tie_word_embeddings = false;
+        dense_9b.vocab_size = 248_320;
+        dense_9b.hidden_size = 4_096;
+        let est_9b = 7_104 * mib;
+        let scratch_9b = 512 * mib;
+        let staging_9b = 128 * mib;
+
+        assert_eq!(
+            plan_host_embed_offload(&dense_9b, est_9b, scratch_9b, staging_9b, 23_500 * mib),
+            (est_9b, false)
+        );
+        assert_eq!(
+            plan_host_embed_offload(&dense_9b, est_9b, scratch_9b, staging_9b, 15_400 * mib),
+            (est_9b, false)
+        );
+        let (adjusted_8gb, offload_8gb) =
+            plan_host_embed_offload(&dense_9b, est_9b, scratch_9b, staging_9b, 7_670 * mib);
+        assert!(offload_8gb, "9B TP=1 on 8 GiB must offload embed_tokens");
+        assert_eq!(adjusted_8gb, 5_164 * mib);
+
+        // 4. Untied dense `27B TP=1` on 16 GiB (`est_weight_bytes = 16,900 MiB`, `hidden = 5,120`
+        //    -> `embed = 2,425 MiB`, `without_embed = 14,476 MiB`): even without `embed_tokens`,
+        //    `boot_without_gpu_embed + MIN_HEADROOM_BYTES > 15,400 MiB`, so offload is declined
+        //    and pre-flight fails fast with the full model requirement.
+        let mut dense_27b = dense_9b;
+        dense_27b.hidden_size = 5_120;
+        assert_eq!(
+            plan_host_embed_offload(&dense_27b, 16_900 * mib, 384 * mib, 256 * mib, 15_400 * mib),
+            (16_900 * mib, false)
+        );
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn estimate_weight_arena_bytes_excludes_tied_lm_head_and_lut4_ple_scales() {

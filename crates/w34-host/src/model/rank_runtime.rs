@@ -2,11 +2,39 @@
 //! (tiered MoE initialization, PLE staging, speculative tap configuration, and
 //! prefill token capacity queries).
 
-use super::rank::{
-    MIN_PLE_ROW_STAGING_BYTES, PleRankRuntime, TIERED_MOE_COMPACT_MAX_HOT_EXPERTS,
-    TIERED_MOE_STAGE_CAPACITY_DEFAULT, TIERED_MOE_STAGE_CAPACITY_TP4,
-};
+use super::rank::{MIN_PLE_ROW_STAGING_BYTES, PleRankRuntime, select_tiered_moe_stage_capacity};
 use super::*;
+
+#[cfg(feature = "cuda")]
+pub(super) fn alloc_ple_runtime(
+    device_id: i32,
+    cfg: &ModelConfig,
+    ple_hasher: Arc<crate::ple::PleNgramHasher>,
+    ple_mmap_table: Arc<crate::ple::PleMmapTable>,
+) -> Result<PleRankRuntime> {
+    // Pre-allocate batch rows * ple_embed_dim F8 staging buffer at a fixed device address
+    // so both eager forward and CUDA Graphs can read from `f8_staging_dev.addr()`.
+    let max_ple_tokens = if cfg.uses_tiered_moe() {
+        crate::moe_offload::TIERED_MOE_MAX_BATCH_TOKENS
+    } else {
+        crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
+    };
+    let staged_row_bytes = ple_hasher
+        .ngram_heads
+        .saturating_mul(ple_mmap_table.staged_bytes_per_head());
+    let ple_row_bytes = cfg.ple_embed_dim.max(cfg.hidden_size).max(staged_row_bytes);
+    let staging_cap = max_ple_tokens * ple_row_bytes.max(MIN_PLE_ROW_STAGING_BYTES);
+    let f8_staging_dev = DeviceBuffer::alloc(device_id, staging_cap)?;
+    let f8_host_scratch = crate::cuda::MappedHostBuffer::alloc(2 * staging_cap)?;
+    Ok(PleRankRuntime {
+        hasher: ple_hasher,
+        mmap_table: ple_mmap_table,
+        f8_staging_dev,
+        f8_host_scratch,
+        f8_host_slot: 0,
+        ids_scratch: Vec::new(),
+    })
+}
 
 #[cfg(feature = "cuda")]
 impl Qwen3_5ModelRank {
@@ -33,14 +61,7 @@ impl Qwen3_5ModelRank {
         } else {
             default_hot
         };
-        let stage_cap = if self.tp_size >= 4
-            || (self.cfg.num_experts >= TIERED_MOE_MIN_MODEL_EXPERTS
-                && hot_per_layer <= TIERED_MOE_COMPACT_MAX_HOT_EXPERTS)
-        {
-            local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_TP4)
-        } else {
-            local_experts.clamp(1, TIERED_MOE_STAGE_CAPACITY_DEFAULT)
-        };
+        let stage_cap = select_tiered_moe_stage_capacity(&self.cfg, self.tp_size, hot_per_layer);
         let tiered_moe = crate::moe_offload::RankTieredMoe::load_for_rank(
             archive,
             &self.cfg,
@@ -70,32 +91,12 @@ impl Qwen3_5ModelRank {
         ple_mmap_table: Arc<crate::ple::PleMmapTable>,
     ) -> Result<()> {
         self.device.make_current()?;
-        // Pre-allocate batch rows * ple_embed_dim F8 staging buffer at a fixed device address
-        // so both eager forward and CUDA Graphs can read from `f8_staging_dev.addr()`.
-        let max_ple_tokens = if self.cfg.uses_tiered_moe() {
-            crate::moe_offload::TIERED_MOE_MAX_BATCH_TOKENS
-        } else {
-            crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
-        };
-        let staged_row_bytes = ple_hasher
-            .ngram_heads
-            .saturating_mul(ple_mmap_table.staged_bytes_per_head());
-        let ple_row_bytes = self
-            .cfg
-            .ple_embed_dim
-            .max(self.cfg.hidden_size)
-            .max(staged_row_bytes);
-        let staging_cap = max_ple_tokens * ple_row_bytes.max(MIN_PLE_ROW_STAGING_BYTES);
-        let f8_staging_dev = DeviceBuffer::alloc(self.device.device_id, staging_cap)?;
-        let f8_host_scratch = crate::cuda::MappedHostBuffer::alloc(2 * staging_cap)?;
-        self.ple_runtime = Some(PleRankRuntime {
-            hasher: ple_hasher,
-            mmap_table: ple_mmap_table,
-            f8_staging_dev,
-            f8_host_scratch,
-            f8_host_slot: 0,
-            ids_scratch: Vec::new(),
-        });
+        self.ple_runtime = Some(alloc_ple_runtime(
+            self.device.device_id,
+            &self.cfg,
+            ple_hasher,
+            ple_mmap_table,
+        )?);
         Ok(())
     }
 
