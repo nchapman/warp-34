@@ -333,7 +333,7 @@ fn exercise(kind: SpeculativeKind) {
 
     for bad in [
         json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"unknown"}}),
-        json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_schema","json_schema":{"strict":false,"schema":{"type":"object"}}}}),
+        json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_schema","json_schema":{"strict":"invalid","schema":{"type":"object"}}}}),
         json!({"messages":[{"role":"user","content":"hello"}], "response_format":{"type":"json_object"}, "structured_outputs":{"regex":"a"}}),
         json!({"messages":[{"role":"user","content":"hello"}], "structured_outputs":{"regex":"a".repeat(70_000)}}),
     ] {

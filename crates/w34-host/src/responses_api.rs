@@ -353,7 +353,7 @@ fn normalize_tool_def(tool: &Value) -> Result<(Value, Value), ResponsesApiError>
     let name = name
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| ResponsesApiError::bad_request("function tool missing non-empty 'name'"))?;
-    let params = parameters.unwrap_or_else(
+    let params = parameters.filter(|v| !v.is_null()).unwrap_or_else(
         || json!({"type": "object", "properties": {}, "additionalProperties": false}),
     );
 
@@ -409,6 +409,26 @@ fn normalize_tool_choice(
                 Some(json!({"type": "function", "function": {"name": name}})),
                 json!({"type": "function", "name": name}),
             ));
+        }
+        if kind == "allowed_tools" {
+            let mode = obj.get("mode").and_then(Value::as_str).unwrap_or("auto");
+            if mode == "required"
+                && let Some(arr) = obj.get("tools").and_then(Value::as_array)
+                && arr.len() == 1
+                && let Some(name) = arr[0]
+                    .get("name")
+                    .or_else(|| arr[0].pointer("/function/name"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+            {
+                return Ok((
+                    Some(json!({"type": "function", "function": {"name": name}})),
+                    v.clone(),
+                ));
+            }
+            if matches!(mode, "none" | "auto" | "required") {
+                return Ok((Some(json!(mode)), v.clone()));
+            }
         }
     }
     Err(ResponsesApiError::bad_request(
@@ -588,6 +608,8 @@ fn parse_input_items(
                             ResponsesApiError::bad_request("function_call item missing 'arguments'")
                         })?;
                         let args_str = match args_val {
+                            Value::Null => "{}".to_string(),
+                            Value::String(s) if s.trim().is_empty() => "{}".to_string(),
                             Value::String(s) => s.clone(),
                             Value::Object(_) => args_val.to_string(),
                             _ => {
@@ -737,13 +759,21 @@ fn parse_reasoning_and_text_config(
                     response_format = Some(json!({"type": "json_object"}));
                 }
                 "json_schema" => {
-                    let schema = fmt_obj.get("schema").ok_or_else(|| {
-                        ResponsesApiError::bad_request(
-                            "text.format type 'json_schema' requires 'schema'",
-                        )
-                    })?;
+                    let schema = fmt_obj
+                        .get("schema")
+                        .or_else(|| {
+                            fmt_obj
+                                .get("json_schema")
+                                .and_then(|js| js.get("schema").or(Some(js)))
+                        })
+                        .ok_or_else(|| {
+                            ResponsesApiError::bad_request(
+                                "text.format type 'json_schema' requires 'schema'",
+                            )
+                        })?;
                     let name = fmt_obj
                         .get("name")
+                        .or_else(|| fmt_val.pointer("/json_schema/name"))
                         .and_then(Value::as_str)
                         .unwrap_or("response_schema");
                     response_format = Some(json!({
@@ -995,7 +1025,9 @@ pub fn translate_responses_to_chat(
         }
         chat_req.insert("structured_outputs".into(), so.clone());
     }
-    if let Some(rf) = response_format {
+    if let Some(rf) =
+        response_format.or_else(|| obj.get("response_format").filter(|v| !v.is_null()).cloned())
+    {
         chat_req.insert("response_format".into(), rf);
     }
     let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {

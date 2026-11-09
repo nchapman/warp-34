@@ -62,16 +62,28 @@ pub fn parse_request_tool_format(request: &Value) -> Result<ToolFormat, String> 
         .get("chat_template_kwargs")
         .and_then(|v| v.get("tool_call_format"))
         .or_else(|| request.get("tool_call_format"))
+        .or_else(|| {
+            request
+                .get("extra_body")
+                .and_then(|eb| eb.get("tool_call_format"))
+        })
         .filter(|v| !v.is_null());
     match raw {
         None => Ok(ToolFormat::QwenXml),
         Some(Value::String(s))
-            if s.eq_ignore_ascii_case("xml") || s.eq_ignore_ascii_case("qwen_xml") =>
+            if s.eq_ignore_ascii_case("xml")
+                || s.eq_ignore_ascii_case("qwen")
+                || s.eq_ignore_ascii_case("qwen3")
+                || s.eq_ignore_ascii_case("qwen_xml")
+                || s.eq_ignore_ascii_case("qwen3_xml")
+                || s.eq_ignore_ascii_case("qwen3_coder") =>
         {
             Ok(ToolFormat::QwenXml)
         }
         Some(Value::String(s))
-            if s.eq_ignore_ascii_case("json") || s.eq_ignore_ascii_case("hermes") =>
+            if s.eq_ignore_ascii_case("json")
+                || s.eq_ignore_ascii_case("hermes")
+                || s.eq_ignore_ascii_case("hermes_json") =>
         {
             Ok(ToolFormat::HermesJson)
         }
@@ -81,31 +93,66 @@ pub fn parse_request_tool_format(request: &Value) -> Result<ToolFormat, String> 
 
 impl RequestConstraint {
     pub fn parse(request: &Value) -> Result<Option<Self>, String> {
+        let extra_body = request.get("extra_body");
+        let get_field = |key: &str| {
+            request
+                .get(key)
+                .or_else(|| extra_body.and_then(|eb| eb.get(key)))
+                .filter(|v| !v.is_null())
+        };
         let mut output = None;
-        if let Some(format) = request.get("response_format").filter(|v| !v.is_null()) {
-            check_spec_size("response_format", format)?;
-            output = match format.get("type").and_then(Value::as_str) {
-                Some("text") => None,
-                Some("json_object") => Some(Self::JsonObject),
-                Some("json_schema") => {
-                    let spec = format
-                        .get("json_schema")
-                        .ok_or("missing response_format.json_schema")?;
-                    match spec.get("strict") {
-                        None | Some(Value::Null) | Some(Value::Bool(true)) => {}
-                        _ => return Err("json_schema requires strict: true".into()),
+        if let Some(format) = get_field("response_format") {
+            if let Some(s) = format.as_str() {
+                output = match s {
+                    "text" => None,
+                    "json_object" => Some(Self::JsonObject),
+                    _ => return Err("unsupported response_format".into()),
+                };
+            } else {
+                let fmt_type = format.get("type").and_then(Value::as_str);
+                let size_limit = if fmt_type == Some("json_schema") {
+                    MAX_TOOLS_SPEC_BYTES
+                } else {
+                    MAX_CONSTRAINT_SPEC_BYTES
+                };
+                check_spec_size_limit("response_format", format, size_limit)?;
+                output = match fmt_type {
+                    Some("text") => None,
+                    Some("json_object") => Some(Self::JsonObject),
+                    Some("json_schema") => {
+                        let spec = format
+                            .get("json_schema")
+                            .or_else(|| format.get("schema").map(|_| format))
+                            .ok_or("missing response_format.json_schema")?;
+                        match spec.get("strict") {
+                            None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+                            _ => return Err("json_schema.strict must be a boolean".into()),
+                        }
+                        let raw_schema = spec
+                            .get("schema")
+                            .or_else(|| {
+                                (spec.get("type").is_some()
+                                    || spec.get("properties").is_some()
+                                    || spec.get("anyOf").is_some()
+                                    || spec.get("oneOf").is_some()
+                                    || spec.get("allOf").is_some())
+                                .then_some(spec)
+                            })
+                            .ok_or("missing json_schema.schema")?;
+                        let schema = if let Some(s) = raw_schema.as_str() {
+                            serde_json::from_str::<Value>(s)
+                                .map_err(|e| format!("invalid json_schema.schema string: {e}"))?
+                        } else {
+                            raw_schema.clone()
+                        };
+                        Some(Self::JsonSchema(schema))
                     }
-                    Some(Self::JsonSchema(
-                        spec.get("schema")
-                            .ok_or("missing json_schema.schema")?
-                            .clone(),
-                    ))
-                }
-                Some("structural_tag") => Some(Self::tags(format)?),
-                _ => return Err("unsupported response_format.type".into()),
-            };
+                    Some("structural_tag") => Some(Self::tags(format)?),
+                    _ => return Err("unsupported response_format.type".into()),
+                };
+            }
         }
-        if let Some(structured) = request.get("structured_outputs").filter(|v| !v.is_null()) {
+        if let Some(structured) = get_field("structured_outputs") {
             check_spec_size("structured_outputs", structured)?;
             if output.is_some() {
                 return Err("response_format and structured_outputs cannot be combined".into());
@@ -113,12 +160,38 @@ impl RequestConstraint {
             let object = structured
                 .as_object()
                 .ok_or("structured_outputs must be an object")?;
-            if object.len() != 1 {
+            let active: Vec<(&String, &Value)> = object
+                .iter()
+                .filter(|(k, v)| {
+                    !v.is_null()
+                        && !matches!(
+                            k.as_str(),
+                            "disable_fallback"
+                                | "disable_any_whitespace"
+                                | "disable_additional_properties"
+                                | "whitespace_pattern"
+                        )
+                        && !(k.as_str() == "json_object" && *v == &Value::Bool(false))
+                })
+                .collect();
+            if active.len() != 1 {
                 return Err("structured_outputs requires exactly one of json, regex, choice, grammar, structural_tag".into());
             }
-            let (kind, value) = object.iter().next().unwrap();
+            let (kind, value) = active[0];
             output = Some(match kind.as_str() {
-                "json" => Self::JsonSchema(value.clone()),
+                "json" => {
+                    let schema = if let Some(s) = value.as_str() {
+                        serde_json::from_str::<Value>(s)
+                            .map_err(|e| format!("invalid structured_outputs.json string: {e}"))?
+                    } else {
+                        value.clone()
+                    };
+                    Self::JsonSchema(schema)
+                }
+                "json_object" => match value {
+                    Value::Bool(true) => Self::JsonObject,
+                    _ => return Err("structured_outputs.json_object must be a boolean".into()),
+                },
                 "regex" => Self::Regex(value.as_str().ok_or("regex must be a string")?.into()),
                 "choice" => Self::Choice(parse_choices(value)?),
                 "grammar" => Self::Grammar(
@@ -137,8 +210,13 @@ impl RequestConstraint {
             "guided_choice",
             "guided_grammar",
         ] {
-            if let Some(val) = request.get(guided_key).filter(|v| !v.is_null()) {
-                check_spec_size(guided_key, val)?;
+            if let Some(val) = get_field(guided_key) {
+                let limit = if guided_key == "guided_json" {
+                    MAX_TOOLS_SPEC_BYTES
+                } else {
+                    MAX_CONSTRAINT_SPEC_BYTES
+                };
+                check_spec_size_limit(guided_key, val, limit)?;
                 if output.is_some() {
                     return Err("multiple structured output constraints cannot be combined".into());
                 }
@@ -171,13 +249,6 @@ impl RequestConstraint {
             Some(Value::Bool(b)) => *b,
             _ => return Err("parallel_tool_calls must be a boolean".into()),
         };
-        let tools = match request.get("tools") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(value) => {
-                check_spec_size_limit("tools", value, MAX_TOOLS_SPEC_BYTES)?;
-                value.as_array().ok_or("tools must be an array")?.clone()
-            }
-        };
         let choice = request
             .get("tool_choice")
             .filter(|v| !v.is_null())
@@ -186,12 +257,24 @@ impl RequestConstraint {
                 ToolChoice::parse(v)
             })
             .transpose()?;
+        let tools = match request.get("tools") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(value) => {
+                let arr = value.as_array().ok_or("tools must be an array")?;
+                if let Err(e) = check_spec_size_limit("tools", value, MAX_TOOLS_SPEC_BYTES) {
+                    match choice {
+                        None | Some(ToolChoice::Auto | ToolChoice::None) => return Ok(output),
+                        Some(ToolChoice::Required | ToolChoice::Named(_)) => return Err(e),
+                    }
+                }
+                arr.clone()
+            }
+        };
         if !tools.is_empty() || choice.is_some() {
             let choice = choice.unwrap_or(ToolChoice::Auto);
             if tools.is_empty() {
                 match choice {
-                    ToolChoice::Auto => return Ok(output),
-                    ToolChoice::None => {}
+                    ToolChoice::Auto | ToolChoice::None => return Ok(output),
                     ToolChoice::Required | ToolChoice::Named(_) => {
                         return Err("tool_choice requires nonempty tools".into());
                     }
@@ -230,13 +313,29 @@ impl RequestConstraint {
         )
     }
 
-    fn tags(value: &Value) -> Result<Self, String> {
+    fn tags(raw_value: &Value) -> Result<Self, String> {
+        let parsed;
+        let value = if let Some(s) = raw_value.as_str() {
+            parsed = serde_json::from_str::<Value>(s)
+                .map_err(|e| format!("invalid structural_tag string: {e}"))?;
+            &parsed
+        } else {
+            raw_value
+        };
+        let value = value.get("structural_tag").unwrap_or(value);
         let tags = value
             .get("structures")
             .and_then(Value::as_array)
             .ok_or("structural_tag requires structures array")?
             .iter()
             .map(|tag| {
+                let raw_schema = tag.get("schema").ok_or("structure.schema is required")?;
+                let schema = if let Some(s) = raw_schema.as_str() {
+                    serde_json::from_str::<Value>(s)
+                        .map_err(|e| format!("invalid structure.schema string: {e}"))?
+                } else {
+                    raw_schema.clone()
+                };
                 Ok(StructuralTag {
                     begin: tag
                         .get("begin")
@@ -248,10 +347,7 @@ impl RequestConstraint {
                         .and_then(Value::as_str)
                         .ok_or("structure.end must be a string")?
                         .into(),
-                    schema: tag
-                        .get("schema")
-                        .ok_or("structure.schema is required")?
-                        .clone(),
+                    schema,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -383,6 +479,16 @@ mod tests {
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {"strict": false, "schema": {"type": "object"}}
+                }
+            }))
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            RequestConstraint::parse(&json!({
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"strict": "invalid", "schema": {"type": "object"}}
                 }
             }))
             .is_err()

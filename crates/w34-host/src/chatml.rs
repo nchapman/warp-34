@@ -33,12 +33,14 @@ fn deserialize_arguments<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Map<String, Value>, D::Error> {
     let value = Value::deserialize(deserializer)?;
-    let value = if let Value::String(text) = value {
-        serde_json::from_str(&text).map_err(serde::de::Error::custom)?
-    } else {
-        value
+    let value = match value {
+        Value::Null => return Ok(Map::new()),
+        Value::String(text) if text.trim().is_empty() => return Ok(Map::new()),
+        Value::String(text) => serde_json::from_str(&text).map_err(serde::de::Error::custom)?,
+        other => other,
     };
     match value {
+        Value::Null => Ok(Map::new()),
         Value::Object(map) => Ok(map),
         _ => Err(serde::de::Error::custom(
             "tool arguments must be a JSON object",
@@ -67,10 +69,7 @@ pub fn parse_history_tools(value: Option<&Value>) -> Result<Vec<ChatToolCall>, S
 }
 
 fn valid_xml_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name
-            .chars()
-            .any(|c| c.is_whitespace() || "<>=/".contains(c))
+    !name.is_empty() && !name.chars().any(|c| c.is_whitespace() || "<>=".contains(c))
 }
 
 // Transformers overrides Jinja's HTML-escaping tojson with json.dumps, using

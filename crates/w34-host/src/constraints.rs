@@ -77,10 +77,11 @@ impl ConstraintFactory {
 
     pub fn json_schema(
         &self,
-        schema: serde_json::Value,
+        mut schema: serde_json::Value,
         thinking: bool,
     ) -> Result<TokenBitmaskConstraint, String> {
         validate_strict_schema_options(&schema)?;
+        normalize_schema_for_llguidance(&mut schema);
         self.compile(TopLevelGrammar::from_json_schema(schema), thinking)
     }
 
@@ -103,7 +104,11 @@ impl ConstraintFactory {
                 lits.push(lit);
             }
         }
-        self.lark(&format!("start: {}\n", lits.join(" | ")), thinking)
+        let prefix = if thinking { "/[ \\t\\r\\n]*/ " } else { "" };
+        self.lark(
+            &format!("start: {prefix}({})\n", lits.join(" | ")),
+            thinking,
+        )
     }
 
     /// Lark CFG syntax, not GBNF. Token limits and hidden-stop backtracking are
@@ -139,6 +144,8 @@ impl ConstraintFactory {
             format!("start: ({alternatives})* tag_end\ntag_end: TAG_TEXT\nTAG_TEXT: /(?s:.*)/\n");
         for (index, tag) in tags.iter().enumerate() {
             validate_strict_schema_options(&tag.schema)?;
+            let mut normalized_schema = tag.schema.clone();
+            normalize_schema_for_llguidance(&mut normalized_schema);
             let trigger = triggers
                 .iter()
                 .find(|trigger| tag.begin.starts_with(trigger.as_str()))
@@ -148,7 +155,7 @@ impl ConstraintFactory {
                 "tag_{index}_trig[lazy]: TAG_TEXT {}\ntag_{index}: tag_{index}_trig {} %json {} {}\n",
                 serde_json::to_string(trigger).unwrap(),
                 serde_json::to_string(suffix).unwrap(),
-                tag.schema,
+                normalized_schema,
                 serde_json::to_string(&tag.end).unwrap(),
             ));
         }
@@ -181,34 +188,48 @@ impl ConstraintFactory {
     ) -> Result<TokenBitmaskConstraint, String> {
         if *choice != crate::tool_constraints::ToolChoice::None {
             for tool in tools.as_array().ok_or("tools must be an array")? {
+                let func = tool.get("function").unwrap_or(tool);
                 if let crate::tool_constraints::ToolChoice::Named(name) = choice
-                    && tool["function"]["name"].as_str() != Some(name.as_str())
+                    && func.get("name").and_then(serde_json::Value::as_str) != Some(name.as_str())
                 {
                     continue;
                 }
-                if let Some(schema) = tool.get("function").and_then(|f| f.get("parameters")) {
+                if let Some(schema) = func.get("parameters").filter(|v| !v.is_null()) {
                     // Validate complete schemas before XML lowering, including
                     // keywords (such as additionalProperties) not emitted there.
                     let mut check_schema = schema.clone();
-                    if let Some(root_obj) = check_schema.as_object_mut()
-                        && let Some(props) = root_obj
+                    if let Some(root_obj) = check_schema.as_object_mut() {
+                        if !root_obj.contains_key("type")
+                            && !root_obj.contains_key("$ref")
+                            && !root_obj.contains_key("anyOf")
+                            && !root_obj.contains_key("oneOf")
+                            && !root_obj.contains_key("allOf")
+                        {
+                            root_obj
+                                .insert("type".into(), serde_json::Value::String("object".into()));
+                        }
+                        if let Some(props) = root_obj
                             .get("properties")
                             .and_then(serde_json::Value::as_object)
                             .cloned()
-                    {
-                        for def_key in ["$defs", "definitions"] {
-                            for prop_val in props.values() {
-                                let Some(prop_defs) =
-                                    prop_val.get(def_key).and_then(serde_json::Value::as_object)
-                                else {
-                                    continue;
-                                };
-                                let root_defs = root_obj
-                                    .entry(def_key.to_string())
-                                    .or_insert_with(|| serde_json::json!({}));
-                                if let Some(root_defs_obj) = root_defs.as_object_mut() {
-                                    for (k, v) in prop_defs {
-                                        root_defs_obj.entry(k.clone()).or_insert_with(|| v.clone());
+                        {
+                            for def_key in ["$defs", "definitions"] {
+                                for prop_val in props.values() {
+                                    let Some(prop_defs) = prop_val
+                                        .get(def_key)
+                                        .and_then(serde_json::Value::as_object)
+                                    else {
+                                        continue;
+                                    };
+                                    let root_defs = root_obj
+                                        .entry(def_key.to_string())
+                                        .or_insert_with(|| serde_json::json!({}));
+                                    if let Some(root_defs_obj) = root_defs.as_object_mut() {
+                                        for (k, v) in prop_defs {
+                                            root_defs_obj
+                                                .entry(k.clone())
+                                                .or_insert_with(|| v.clone());
+                                        }
                                     }
                                 }
                             }
@@ -278,6 +299,210 @@ impl ConstraintFactory {
             mask,
             committed: 0,
         })
+    }
+}
+
+fn normalize_type_name(t: &str) -> &str {
+    match t {
+        "int" | "uint" | "int32" | "int64" | "long" => "integer",
+        "str" | "text" | "varchar" | "char" => "string",
+        "bool" => "boolean",
+        "float" | "double" | "decimal" => "number",
+        "dict" | "map" => "object",
+        "list" | "set" | "tuple" => "array",
+        other => other,
+    }
+}
+
+pub(crate) fn is_llguidance_supported_format(fmt: &str) -> bool {
+    matches!(
+        fmt,
+        "date-time"
+            | "time"
+            | "date"
+            | "duration"
+            | "email"
+            | "hostname"
+            | "ipv4"
+            | "ipv6"
+            | "uuid"
+            | "uri"
+    )
+}
+
+fn normalize_type_and_format(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    match obj.get_mut("type") {
+        Some(serde_json::Value::String(s)) => {
+            let norm = normalize_type_name(s);
+            if norm != s {
+                *s = norm.to_string();
+            }
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            for item in arr {
+                if let serde_json::Value::String(s) = item {
+                    let norm = normalize_type_name(s);
+                    if norm != s {
+                        *s = norm.to_string();
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let type_allows_string = match obj.get("type") {
+        None => true,
+        Some(serde_json::Value::String(s)) => s == "string",
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some("string")),
+        _ => false,
+    };
+    if let Some(fmt_val) = obj.get("format") {
+        let keep =
+            type_allows_string && fmt_val.as_str().is_some_and(is_llguidance_supported_format);
+        if !keep {
+            obj.remove("format");
+        }
+    }
+    obj.remove("uniqueItems");
+}
+
+fn lower_property_names_and_unevaluated(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(uneval_props) = obj.remove("unevaluatedProperties")
+        && !obj.contains_key("additionalProperties")
+        && !obj.contains_key("allOf")
+        && !obj.contains_key("anyOf")
+        && !obj.contains_key("oneOf")
+        && !obj.contains_key("$ref")
+    {
+        obj.insert("additionalProperties".into(), uneval_props);
+    }
+    if let Some(uneval_items) = obj.remove("unevaluatedItems")
+        && !obj.contains_key("additionalItems")
+    {
+        obj.insert("additionalItems".into(), uneval_items);
+    }
+
+    let Some(prop_names) = obj.remove("propertyNames") else {
+        return;
+    };
+    let Some(pn_obj) = prop_names.as_object() else {
+        return;
+    };
+    if let Some(serde_json::Value::Array(enum_keys)) = pn_obj.get("enum")
+        && !obj.contains_key("properties")
+        && enum_keys.iter().all(serde_json::Value::is_string)
+    {
+        let val_schema = obj
+            .remove("additionalProperties")
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut props = serde_json::Map::new();
+        for k in enum_keys {
+            if let Some(ks) = k.as_str() {
+                props.insert(ks.to_string(), val_schema.clone());
+            }
+        }
+        obj.insert("properties".into(), serde_json::Value::Object(props));
+        obj.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
+    } else if let Some(serde_json::Value::String(pat)) = pn_obj.get("pattern")
+        && !obj.contains_key("patternProperties")
+    {
+        let val_schema = obj
+            .remove("additionalProperties")
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut pat_props = serde_json::Map::new();
+        pat_props.insert(pat.clone(), val_schema);
+        obj.insert(
+            "patternProperties".into(),
+            serde_json::Value::Object(pat_props),
+        );
+        obj.insert(
+            "additionalProperties".into(),
+            serde_json::Value::Bool(false),
+        );
+    }
+}
+
+fn lower_openapi_nullable(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    if obj.remove("nullable") != Some(serde_json::Value::Bool(true)) {
+        return;
+    }
+    if let Some(serde_json::Value::Array(arr)) = obj.get_mut("enum")
+        && !arr.contains(&serde_json::Value::Null)
+    {
+        arr.push(serde_json::Value::Null);
+    }
+    if let Some(t) = obj.get_mut("type") {
+        match t {
+            serde_json::Value::String(s) if s != "null" => {
+                *t = serde_json::json!([s.clone(), "null"]);
+            }
+            serde_json::Value::Array(arr) if !arr.iter().any(|v| v.as_str() == Some("null")) => {
+                arr.push(serde_json::Value::String("null".into()));
+            }
+            _ => {}
+        }
+    } else if let Some(serde_json::Value::Array(arr)) = obj.get_mut("anyOf") {
+        if !arr
+            .iter()
+            .any(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("null"))
+        {
+            arr.push(serde_json::json!({"type": "null"}));
+        }
+    } else if obj.contains_key("$ref") || obj.contains_key("properties") {
+        let mut inner = serde_json::Map::new();
+        let keys: Vec<String> = obj
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "$defs" | "definitions" | "$schema"))
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(v) = obj.remove(&k) {
+                inner.insert(k, v);
+            }
+        }
+        obj.insert(
+            "anyOf".into(),
+            serde_json::json!([serde_json::Value::Object(inner), {"type": "null"}]),
+        );
+    }
+}
+
+pub(crate) fn normalize_schema_for_llguidance(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        if let serde_json::Value::Array(items) = value {
+            for item in items {
+                normalize_schema_for_llguidance(item);
+            }
+        }
+        return;
+    };
+
+    normalize_type_and_format(obj);
+    lower_property_names_and_unevaluated(obj);
+    lower_openapi_nullable(obj);
+
+    for (k, v) in obj.iter_mut() {
+        if matches!(
+            k.as_str(),
+            "properties" | "$defs" | "definitions" | "patternProperties" | "dependentSchemas"
+        ) {
+            if let serde_json::Value::Object(map) = v {
+                for sub_schema in map.values_mut() {
+                    normalize_schema_for_llguidance(sub_schema);
+                }
+            }
+        } else if !matches!(
+            k.as_str(),
+            "enum" | "const" | "default" | "examples" | "example"
+        ) {
+            normalize_schema_for_llguidance(v);
+        }
     }
 }
 
@@ -502,18 +727,19 @@ impl TokenBitmaskConstraint {
         let Some(id) = self.pending_token.take() else {
             return Ok(());
         };
-        if let Some(matcher) = &mut self.matcher {
-            if let Err(e) = matcher.consume_token(id as u32) {
+        if let Some(matcher) = &self.matcher {
+            let mut next = matcher.clone();
+            if let Err(e) = next.consume_token(id as u32) {
                 self.pending_token = Some(id);
                 return Err(e.to_string());
             }
-            match matcher.compute_mask_or_eos() {
+            match next.compute_mask_or_eos() {
                 Ok(mask) => {
                     self.mask.clear();
                     self.mask.extend_from_slice(mask.as_slice());
+                    self.matcher = Some(next);
                 }
                 Err(e) => {
-                    let _ = matcher.rollback(1);
                     self.pending_token = Some(id);
                     return Err(e.to_string());
                 }
@@ -566,20 +792,13 @@ impl TokenBitmaskConstraint {
             self.committed += 1;
             return Ok(());
         }
-        if let Some(matcher) = &mut self.matcher {
-            matcher
-                .consume_token(id as u32)
-                .map_err(|e| e.to_string())?;
-            match matcher.compute_mask_or_eos() {
-                Ok(mask) => {
-                    self.mask.clear();
-                    self.mask.extend_from_slice(mask.as_slice());
-                }
-                Err(e) => {
-                    let _ = matcher.rollback(1);
-                    return Err(e.to_string());
-                }
-            }
+        if let Some(matcher) = &self.matcher {
+            let mut next = matcher.clone();
+            next.consume_token(id as u32).map_err(|e| e.to_string())?;
+            let mask = next.compute_mask_or_eos().map_err(|e| e.to_string())?;
+            self.mask.clear();
+            self.mask.extend_from_slice(mask.as_slice());
+            self.matcher = Some(next);
         }
         self.committed += 1;
         Ok(())

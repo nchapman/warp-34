@@ -1225,3 +1225,328 @@ fn jump_forward_ff_tokens_and_speculative_draft_repair() {
         .unwrap();
     assert_eq!(repaired_suffix, "/parameter>");
 }
+
+#[test]
+fn json_schema_normalization_for_llguidance_handles_real_world_openapi_and_pydantic() {
+    let (tok, factory) = setup();
+    let schema = json!({
+        "type": "dict",
+        "properties": {
+            "file_path": { "type": "str", "format": "path" },
+            "secret": { "type": "string", "format": "password", "writeOnly": true },
+            "count": { "type": "int", "format": "int64" },
+            "ratio": { "type": "float" },
+            "active": { "type": "bool" },
+            "tags": {
+                "type": "list",
+                "items": { "type": "string" },
+                "uniqueItems": true,
+                "unevaluatedItems": false
+            },
+            "note": { "type": "string", "nullable": true },
+            "labels": {
+                "type": "object",
+                "propertyNames": { "enum": ["env", "region"] },
+                "additionalProperties": { "type": "string" }
+            }
+        },
+        "required": ["file_path", "secret", "count", "ratio", "active", "tags", "note", "labels"],
+        "unevaluatedProperties": false
+    });
+
+    let mut c1 = factory.json_schema(schema.clone(), false).unwrap();
+    feed(
+        &mut c1,
+        &tok,
+        r#"{"file_path":"/tmp/a","secret":"pw","count":42,"ratio":1.5,"active":true,"tags":["x"],"note":null,"labels":{"env":"prod"}}"#,
+    )
+    .unwrap();
+    assert!(c1.is_token_allowed(EOS));
+
+    // `unevaluatedProperties: false` lowered to `additionalProperties: false` rejects extra keys
+    let mut c_extra = factory.json_schema(schema.clone(), false).unwrap();
+    assert!(
+        feed(
+            &mut c_extra,
+            &tok,
+            r#"{"file_path":"/tmp/a","secret":"pw","count":42,"ratio":1.5,"active":true,"tags":["x"],"note":"hi","labels":{"env":"prod"},"extra":1}"#,
+        )
+        .is_err()
+    );
+
+    // `propertyNames.enum` lowered to explicit `properties` + `additionalProperties: false` rejects undeclared label keys
+    let mut c_bad_label = factory.json_schema(schema, false).unwrap();
+    assert!(
+        feed(
+            &mut c_bad_label,
+            &tok,
+            r#"{"file_path":"/tmp/a","secret":"pw","count":42,"ratio":1.5,"active":true,"tags":["x"],"note":"hi","labels":{"invalid_key":"prod"}}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn xml_unquoted_numeric_boolean_bracket_empty_and_length_pattern_format_strings() {
+    use w34_host::{
+        parser::Qwen3Parser,
+        tool_constraints::{ToolChoice, ToolFormat},
+    };
+    let (tok, factory) = setup();
+    let tools = json!([{
+        "name": "inspect/item",
+        "parameters": {
+            "properties": {
+                "zip": { "$ref": "#/$defs/ZipCode" },
+                "opt_id": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "null" }
+                    ]
+                },
+                "slug": { "type": "string", "pattern": "^[a-z0-9_-]+$" },
+                "code": { "type": "string", "minLength": 3, "maxLength": 5 },
+                "date": { "type": "string", "format": "date" }
+            },
+            "required": ["zip", "opt_id"],
+            "$defs": {
+                "ZipCode": { "type": "string" }
+            }
+        }
+    }]);
+
+    // 1. Unquoted numeric string ("02138") on `$ref` string and ("12345") on `Optional[str]`,
+    // plus unquoted pattern, minLength/maxLength, and date format
+    let call_1 = "<tool_call>\n<function=inspect/item>\n<parameter=zip>\n02138\n</parameter>\n<parameter=opt_id>\n12345\n</parameter>\n<parameter=slug>\nmy_slug-1\n</parameter>\n<parameter=code>\nabcd\n</parameter>\n<parameter=date>\n2026-04-19\n</parameter>\n</function>\n</tool_call>";
+    let mut c1 = factory
+        .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+        .unwrap();
+    feed(&mut c1, &tok, call_1).unwrap();
+    assert!(c1.is_token_allowed(EOS));
+    let parsed_1 = Qwen3Parser::parse_complete_with_tools(call_1, false, Some(&tools));
+    let args_1: serde_json::Value =
+        serde_json::from_str(&parsed_1.tool_calls[0].function.arguments).unwrap();
+    assert_eq!(
+        args_1,
+        json!({
+            "zip": "02138",
+            "opt_id": "12345",
+            "slug": "my_slug-1",
+            "code": "abcd",
+            "date": "2026-04-19"
+        }),
+        "numeric-looking unquoted strings on string / Optional[str] / $ref string must stay JSON strings"
+    );
+
+    // 2. Unquoted `[INFO] msg`, boolean string `true`, empty string `<parameter=zip></parameter>`, and bare `null` on `opt_id`
+    for (zip_val, opt_val, expected_zip, expected_opt) in [
+        ("true", "null", json!("true"), json!(null)),
+        ("[INFO] ok", "\"null\"", json!("[INFO] ok"), json!("null")),
+        ("{k: v}", "false", json!("{k: v}"), json!("false")),
+        ("", "null", json!(""), json!(null)),
+    ] {
+        let xml = format!(
+            "<tool_call>\n<function=inspect/item>\n<parameter=zip>{zip_val}</parameter>\n<parameter=opt_id>\n{opt_val}\n</parameter>\n</function>\n</tool_call>"
+        );
+        let mut c = factory
+            .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+            .unwrap();
+        feed(&mut c, &tok, &xml).unwrap_or_else(|e| panic!("rejected valid {xml}: {e}"));
+        assert!(c.is_token_allowed(EOS));
+        let parsed = Qwen3Parser::parse_complete_with_tools(&xml, false, Some(&tools));
+        let args: serde_json::Value =
+            serde_json::from_str(&parsed.tool_calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"zip": expected_zip, "opt_id": expected_opt}));
+    }
+
+    // 3. Rejections: unquoted `null` on non-nullable `zip`, too-short `code`, invalid `slug`, invalid `date`
+    for bad_xml in [
+        "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nnull\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nok\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n<parameter=code>\nab\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nok\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n<parameter=slug>\nBAD SLUG\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<function=inspect/item>\n<parameter=zip>\nok\n</parameter>\n<parameter=opt_id>\nok\n</parameter>\n<parameter=date>\n2026/04/19\n</parameter>\n</function>\n</tool_call>",
+    ] {
+        let mut c_bad = factory
+            .tools(&tools, &ToolChoice::Required, ToolFormat::QwenXml, false)
+            .unwrap();
+        assert!(
+            feed(&mut c_bad, &tok, bad_xml).is_err(),
+            "unexpectedly accepted {bad_xml}"
+        );
+    }
+
+    // 4. Open-dictionary XML tool (`additionalProperties: {"type": "string"}` without `properties`)
+    // and `"parameters": null` / `{}`
+    let open_tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "set_tags",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "noop",
+                "parameters": null
+            }
+        }
+    ]);
+    let mut c_open = factory
+        .tools(
+            &open_tools,
+            &ToolChoice::Required,
+            ToolFormat::QwenXml,
+            false,
+        )
+        .unwrap();
+    feed(
+        &mut c_open,
+        &tok,
+        "<tool_call>\n<function=set_tags>\n<parameter=env>\nprod\n</parameter>\n<parameter=region>\nus-east\n</parameter>\n</function>\n</tool_call>",
+    )
+    .unwrap();
+    assert!(c_open.is_token_allowed(EOS));
+}
+
+#[test]
+fn request_constraint_vllm_structured_outputs_and_non_destructive_runtime_probes() {
+    use w34_host::{
+        parser::{Qwen3Parser, SamplerV1, SamplingParams},
+        request_constraints::{MAX_TOOLS_SPEC_BYTES, RequestConstraint, parse_request_tool_format},
+        tool_constraints::ToolFormat,
+    };
+    let (tok, factory) = setup();
+
+    // 1. `choice` allows leading whitespace (`\n\n`) after `</think>`
+    let mut c_choice = factory
+        .choice(&["APPROVED".into(), "REJECTED".into()], true)
+        .unwrap();
+    feed(&mut c_choice, &tok, "thinking...\n</think>\n\nAPPROVED").unwrap();
+    assert!(c_choice.is_token_allowed(EOS));
+
+    // 2. vLLM `StructuredOutputsParams` with `null` siblings, stringified `json`, `json_object: true`,
+    // `extra_body`, `strict: false`, flat `response_format`, and `qwen3_coder` alias
+    assert!(
+        RequestConstraint::parse(&json!({
+            "structured_outputs": {
+                "json": "{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}",
+                "regex": null,
+                "choice": null,
+                "grammar": null,
+                "structural_tag": null,
+                "json_object": false,
+                "disable_fallback": false
+            }
+        }))
+        .unwrap()
+        .is_some()
+    );
+    assert!(matches!(
+        RequestConstraint::parse(&json!({
+            "structured_outputs": {
+                "json": null,
+                "json_object": true
+            }
+        }))
+        .unwrap(),
+        Some(RequestConstraint::JsonObject)
+    ));
+    assert!(
+        RequestConstraint::parse(&json!({
+            "response_format": {
+                "type": "json_schema",
+                "schema": {"type": "object"}
+            }
+        }))
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        RequestConstraint::parse(&json!({
+            "extra_body": {
+                "guided_choice": ["yes", "no"],
+                "tool_call_format": "qwen3_coder"
+            }
+        }))
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(
+        parse_request_tool_format(&json!({"extra_body": {"tool_call_format": "qwen3_coder"}}))
+            .unwrap(),
+        ToolFormat::QwenXml
+    );
+
+    // 3. Oversized `tools` degrades cleanly (`Ok(None)`) on `tool_choice: "auto"` / `"none"`
+    // while failing closed (`Err`) on `tool_choice: "required"`
+    let huge_desc = "x".repeat(MAX_TOOLS_SPEC_BYTES + 1024);
+    let huge_tools = json!([{
+        "type": "function",
+        "function": { "name": "big", "description": huge_desc, "parameters": {"type": "object"} }
+    }]);
+    assert!(
+        RequestConstraint::parse(&json!({
+            "tools": huge_tools,
+            "tool_choice": "auto"
+        }))
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        RequestConstraint::parse(&json!({
+            "tools": huge_tools,
+            "tool_choice": "required"
+        }))
+        .is_err()
+    );
+
+    // 4. `Qwen3Parser` parses multiple `<function=...>` blocks in one `<tool_call>` and
+    // Hermes JSON with `"arguments": null`, `"parameters"`, and markdown fences
+    let multi_fn = "<tool_call>\n<function=f1>\n<parameter=a>\n1\n</parameter>\n</function>\n<function=f2>\n<parameter=b>\n2\n</parameter>\n</function>\n</tool_call>";
+    let parsed_multi = Qwen3Parser::parse_complete(multi_fn, false);
+    assert_eq!(parsed_multi.tool_calls.len(), 2);
+    assert_eq!(parsed_multi.tool_calls[0].function.name, "f1");
+    assert_eq!(parsed_multi.tool_calls[1].function.name, "f2");
+
+    let fenced_hermes =
+        "<tool_call>\n```json\n{\"name\": \"ping\", \"arguments\": null}\n```\n</tool_call>";
+    let parsed_hermes = Qwen3Parser::parse_complete(fenced_hermes, false);
+    assert_eq!(parsed_hermes.tool_calls.len(), 1);
+    assert_eq!(parsed_hermes.tool_calls[0].function.name, "ping");
+    assert_eq!(parsed_hermes.tool_calls[0].function.arguments, "{}");
+
+    // 5. `SamplerV1::append_gpu_row` does not ban EOS when the grammar forces EOS (`is_terminal_eos`)
+    // even when `min_tokens` or `ignore_eos` is active
+    let mut c_term = factory.choice(&["OK".into()], false).unwrap();
+    feed(&mut c_term, &tok, "OK").unwrap();
+    assert_eq!(c_term.single_allowed_token(), Some(EOS));
+    let params = SamplingParams {
+        min_tokens: 100,
+        ignore_eos: true,
+        ..SamplingParams::default()
+    };
+    let sampler = SamplerV1::new(params, &[], Some(c_term));
+    let mut bitmask_words = Vec::new();
+    let mut sparse = Vec::new();
+    let cfg = sampler
+        .append_gpu_row(
+            tok.get_vocab_size(true),
+            &[EOS],
+            0.5,
+            0.5,
+            -1,
+            false,
+            &mut bitmask_words,
+            &mut sparse,
+        )
+        .unwrap();
+    assert!(
+        sparse.is_empty() && cfg.sparse_count == 0,
+        "terminal grammar EOS must not be soft-banned by min_tokens or ignore_eos"
+    );
+}

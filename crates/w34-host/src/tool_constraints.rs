@@ -6,7 +6,7 @@
 
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolFormat {
     QwenXml,
     HermesJson,
@@ -28,6 +28,7 @@ impl ToolChoice {
             Some("required") => Ok(Self::Required),
             _ if value["type"] == "function" => value["function"]["name"]
                 .as_str()
+                .or_else(|| value["name"].as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| Self::Named(s.into()))
                 .ok_or_else(|| "named tool_choice requires a nonempty function.name".into()),
@@ -43,7 +44,34 @@ fn valid_name(value: &str) -> bool {
     !value.is_empty()
         && !value
             .chars()
-            .any(|c| c.is_whitespace() || "<>=/".contains(c))
+            .any(|c| c.is_whitespace() || "<>=".contains(c))
+}
+
+pub(crate) fn is_schema_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        "$defs"
+            | "definitions"
+            | "$schema"
+            | "$id"
+            | "id"
+            | "$anchor"
+            | "$comment"
+            | "title"
+            | "description"
+            | "default"
+            | "examples"
+            | "example"
+            | "deprecated"
+            | "readOnly"
+            | "writeOnly"
+            | "nullable"
+            | "contentMediaType"
+            | "contentEncoding"
+            | "xml"
+            | "externalDocs"
+            | "discriminator"
+    ) || (key.starts_with("x-") && key != "x-guidance")
 }
 
 fn contains_xml_tool_delimiter(s: &str) -> bool {
@@ -78,12 +106,14 @@ fn contains_xml_tool_delimiter(s: &str) -> bool {
     false
 }
 
-fn is_safe_unquoted_xml_string(s: &str) -> bool {
+fn is_safe_unquoted_xml_string(s: &str, allow_json_primitives: bool) -> bool {
     !s.is_empty()
         && s == s.trim()
+        && s != "null"
         && !contains_xml_tool_delimiter(s)
-        && !s.starts_with(['"', '{', '['])
-        && serde_json::from_str::<Value>(s).is_err()
+        && !s.starts_with('"')
+        && (allow_json_primitives
+            || (!s.starts_with(['{', '[']) && serde_json::from_str::<Value>(s).is_err()))
 }
 
 fn rewrite_local_property_refs(value: &mut Value, prop_prefix: &str) {
@@ -140,17 +170,35 @@ fn attach_root_defs(
 struct UnquotedXmlBranches {
     has_plain_string: bool,
     plain_string_min_length: Option<u64>,
+    plain_string_max_length: Option<u64>,
+    plain_string_pattern: Option<String>,
+    plain_string_format: Option<String>,
     has_null: bool,
     only_string_and_null: bool,
+    raw_literals: Vec<String>,
     literals: Vec<String>,
 }
 
-fn collect_unquoted_xml_string_branches(schema: &Value) -> UnquotedXmlBranches {
+fn collect_unquoted_xml_string_branches(
+    schema: &Value,
+    root_schema: &Value,
+) -> UnquotedXmlBranches {
     let mut out = UnquotedXmlBranches {
         only_string_and_null: true,
         ..Default::default()
     };
-    collect_unquoted_xml_inner(schema, 0, &mut out);
+    collect_unquoted_xml_inner(schema, root_schema, 0, &mut out);
+    for s in &out.raw_literals {
+        if is_safe_unquoted_xml_string(s, out.only_string_and_null) {
+            let lit = literal(s);
+            if !out.literals.contains(&lit) {
+                out.literals.push(lit);
+            }
+        } else if out.only_string_and_null {
+            // Unsafe literal (e.g. padded with whitespace or `"null"`) must remain JSON-quoted;
+            // keep the other safe literals available unquoted.
+        }
+    }
     out
 }
 
@@ -158,7 +206,23 @@ fn merge_plain_min_length(dst: &mut Option<u64>, min_len: u64) {
     *dst = Some(dst.map_or(min_len, |prev| prev.min(min_len)));
 }
 
-fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXmlBranches) {
+fn merge_plain_max_length(dst: &mut Option<u64>, max_len: Option<u64>, first_plain: bool) {
+    if first_plain {
+        *dst = max_len;
+    } else {
+        *dst = match (*dst, max_len) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            _ => None,
+        };
+    }
+}
+
+fn collect_unquoted_xml_inner(
+    schema: &Value,
+    root_schema: &Value,
+    depth: usize,
+    out: &mut UnquotedXmlBranches,
+) {
     if depth > 8 {
         out.only_string_and_null = false;
         return;
@@ -168,24 +232,29 @@ fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXm
         return;
     };
     let only_meta_or = |allowed: &[&str]| {
-        obj.keys().all(|k| {
-            matches!(
-                k.as_str(),
-                "title"
-                    | "description"
-                    | "default"
-                    | "examples"
-                    | "deprecated"
-                    | "$defs"
-                    | "definitions"
-            ) || allowed.contains(&k.as_str())
-        })
+        obj.keys()
+            .all(|k| is_schema_metadata_key(k.as_str()) || allowed.contains(&k.as_str()))
     };
+    if let Some(Value::String(ref_str)) = obj.get("$ref")
+        && only_meta_or(&["$ref"])
+        && let Some(ptr) = ref_str.strip_prefix('#')
+        && let Some(target) = root_schema.pointer(ptr)
+    {
+        collect_unquoted_xml_inner(target, root_schema, depth + 1, out);
+        return;
+    }
+    if let Some(Value::Array(items)) = obj.get("allOf")
+        && items.len() == 1
+        && only_meta_or(&["allOf"])
+    {
+        collect_unquoted_xml_inner(&items[0], root_schema, depth + 1, out);
+        return;
+    }
     if let Some(Value::Array(items)) = obj.get("anyOf")
         && only_meta_or(&["anyOf"])
     {
         for sub in items {
-            collect_unquoted_xml_inner(sub, depth + 1, out);
+            collect_unquoted_xml_inner(sub, root_schema, depth + 1, out);
         }
         return;
     }
@@ -217,11 +286,9 @@ fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXm
     }
     if let Some(Value::String(s)) = obj.get("const")
         && only_meta_or(&["type", "const"])
-        && is_safe_unquoted_xml_string(s)
     {
-        let lit = literal(s);
-        if !out.literals.contains(&lit) {
-            out.literals.push(lit);
+        if !out.raw_literals.contains(s) {
+            out.raw_literals.push(s.clone());
         }
         return;
     }
@@ -229,12 +296,9 @@ fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXm
         && only_meta_or(&["type", "enum"])
     {
         for item in items {
-            if let Value::String(s) = item
-                && is_safe_unquoted_xml_string(s)
-            {
-                let lit = literal(s);
-                if !out.literals.contains(&lit) {
-                    out.literals.push(lit);
+            if let Value::String(s) = item {
+                if !out.raw_literals.contains(s) {
+                    out.raw_literals.push(s.clone());
                 }
             } else if item.is_null() {
                 out.has_null = true;
@@ -250,19 +314,96 @@ fn collect_unquoted_xml_inner(schema: &Value, depth: usize, out: &mut UnquotedXm
         _ => false,
     };
     if explicit_string_type
-        && only_meta_or(&["type", "minLength"])
-        && obj
-            .get("minLength")
-            .and_then(Value::as_u64)
-            .is_none_or(|n| n <= 1)
+        && only_meta_or(&["type", "minLength", "maxLength", "pattern", "format"])
     {
-        out.has_plain_string = true;
+        let first_plain = !out.has_plain_string;
         let min_len = obj.get("minLength").and_then(Value::as_u64).unwrap_or(0);
+        let max_len = obj.get("maxLength").and_then(Value::as_u64);
+        let pat = obj.get("pattern").and_then(Value::as_str);
+        let fmt = obj.get("format").and_then(Value::as_str);
+        if max_len.is_some_and(|max| max < min_len) {
+            out.only_string_and_null = false;
+            return;
+        }
+        if !first_plain
+            && (pat.is_some()
+                || fmt.is_some()
+                || out.plain_string_pattern.is_some()
+                || out.plain_string_format.is_some())
+        {
+            out.only_string_and_null = false;
+            return;
+        }
+        if let Some(f) = fmt
+            && !matches!(
+                f,
+                "date" | "time" | "date-time" | "uuid" | "ipv4" | "email" | "uri" | "hostname"
+            )
+        {
+            out.only_string_and_null = false;
+            return;
+        }
+        out.has_plain_string = true;
         merge_plain_min_length(&mut out.plain_string_min_length, min_len);
+        merge_plain_max_length(&mut out.plain_string_max_length, max_len, first_plain);
+        if let Some(p) = pat {
+            out.plain_string_pattern = Some(p.to_string());
+        }
+        if let Some(f) = fmt {
+            out.plain_string_format = Some(f.to_string());
+        }
     } else {
         out.only_string_and_null = false;
     }
 }
+
+fn json_pattern_to_lark_regex(pat: &str) -> String {
+    let (anchored_start, body) = match pat.strip_prefix('^') {
+        Some(rest) => (true, rest),
+        None => (false, pat),
+    };
+    let anchored_end = body.ends_with('$') && !body.ends_with("\\$");
+    let core = if anchored_end {
+        &body[..body.len() - 1]
+    } else {
+        body
+    };
+    let mut escaped = String::with_capacity(core.len() + 16);
+    let mut prev_backslash = false;
+    for ch in core.chars() {
+        if ch == '/' && !prev_backslash {
+            escaped.push_str("\\/");
+        } else {
+            escaped.push(ch);
+        }
+        prev_backslash = ch == '\\' && !prev_backslash;
+    }
+    let prefix = if anchored_start { "" } else { "(?s:.*)" };
+    let suffix = if anchored_end { "" } else { "(?s:.*)" };
+    format!("/{prefix}({escaped}){suffix}/")
+}
+
+fn format_to_lark_regex(fmt: &str) -> Option<&'static str> {
+    match fmt {
+        "date" => Some("/[0-9]{4}-[0-9]{2}-[0-9]{2}/"),
+        "time" => Some("/[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})?/"),
+        "date-time" => Some(
+            "/[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})?/",
+        ),
+        "uuid" => {
+            Some("/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/")
+        }
+        "ipv4" => Some("/([0-9]{1,3}\\.){3}[0-9]{1,3}/"),
+        "email" => Some("/[^ \\t\\r\\n@<>]+@[^ \\t\\r\\n@<>]+\\.[^ \\t\\r\\n@<>]+/"),
+        "uri" => Some("/[a-zA-Z][a-zA-Z0-9+.\\-]*:[^\\r\\n \\t]*/"),
+        "hostname" => Some(
+            "/[a-zA-Z0-9]([a-zA-Z0-9\\-]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9\\-]*[a-zA-Z0-9])?)*/",
+        ),
+        _ => None,
+    }
+}
+
+const XML_DELIM_BAN_REGEX: &str = "/(?s:.*)(<[ \\t\\r\\n]*\\/[ \\t\\r\\n]*(parameter|tool_call|function)[ \\t\\r\\n]*>|<[ \\t\\r\\n]*(parameter|function)[ \\t\\r\\n]*=|<[ \\t\\r\\n]*tool_call[ \\t\\r\\n]*>)(?s:.*)/";
 
 fn xml_param_rule(
     rule: &str,
@@ -271,34 +412,95 @@ fn xml_param_rule(
     root_schema: &serde_json::Map<String, Value>,
     uses_unquoted_str: &mut bool,
     uses_unquoted_nullable_str: &mut bool,
+    extra_defs: &mut String,
 ) -> String {
     let open_tag = literal(&format!("<parameter={key}>"));
     let close_tag = literal("</parameter>");
-    let schema_with_defs = attach_root_defs(Some(key), value_schema, root_schema);
+    let mut schema_with_defs = attach_root_defs(Some(key), value_schema, root_schema);
+    crate::constraints::normalize_schema_for_llguidance(&mut schema_with_defs);
     let json_branch = format!("%json {schema_with_defs}");
     let default_rule = format!("{rule}: {open_tag} WS {json_branch} WS {close_tag} WS\n");
-    if !value_schema.is_object() {
+    if !schema_with_defs.is_object() {
         return default_rule;
     }
 
-    let branches = collect_unquoted_xml_string_branches(value_schema);
+    let branches = collect_unquoted_xml_string_branches(&schema_with_defs, &schema_with_defs);
 
     if branches.has_plain_string && branches.only_string_and_null && branches.literals.is_empty() {
-        let str_json = if branches.plain_string_min_length.unwrap_or(0) >= 1 {
-            "%json {\"type\":\"string\",\"minLength\":1}"
+        let min_len = branches.plain_string_min_length.unwrap_or(0);
+        let max_len = branches.plain_string_max_length;
+        let empty_alt = if min_len == 0 {
+            format!(" | {close_tag}")
         } else {
-            "%json {\"type\":\"string\"}"
+            String::new()
         };
-        if branches.has_null {
-            *uses_unquoted_str = true;
+        let null_alt = if branches.has_null {
             *uses_unquoted_nullable_str = true;
+            " | unquoted_xml_null_end"
+        } else {
+            ""
+        };
+        if min_len <= 1
+            && max_len.is_none()
+            && branches.plain_string_pattern.is_none()
+            && branches.plain_string_format.is_none()
+        {
+            let str_json = if min_len == 1 {
+                "%json {\"type\":\"string\",\"minLength\":1}"
+            } else {
+                "%json {\"type\":\"string\"}"
+            };
+            *uses_unquoted_str = true;
             return format!(
-                "{rule}: {open_tag} WS ({str_json} WS {close_tag} | unquoted_xml_param_end | unquoted_xml_null_end) WS\n"
+                "{rule}: {open_tag} WS ({str_json} WS {close_tag} | unquoted_xml_param_end{null_alt}{empty_alt}) WS\n"
             );
         }
-        *uses_unquoted_str = true;
+        // Constrained length (`minLength > 1` or `maxLength`), `pattern`, or `format` on plain string:
+        let mut str_schema = serde_json::Map::new();
+        str_schema.insert("type".into(), Value::String("string".into()));
+        if min_len > 0 {
+            str_schema.insert("minLength".into(), Value::from(min_len));
+        }
+        if let Some(max) = max_len {
+            str_schema.insert("maxLength".into(), Value::from(max));
+        }
+        if let Some(ref pat) = branches.plain_string_pattern {
+            str_schema.insert("pattern".into(), Value::String(pat.clone()));
+        }
+        if let Some(ref fmt) = branches.plain_string_format {
+            str_schema.insert("format".into(), Value::String(fmt.clone()));
+        }
+        let str_json = format!("%json {}", Value::Object(str_schema));
+        if max_len == Some(0) {
+            return format!(
+                "{rule}: {open_tag} WS ({str_json} WS {close_tag}{null_alt}{empty_alt}) WS\n"
+            );
+        }
+        let mut extra_intersects = String::new();
+        if min_len > 1 || max_len.is_some() {
+            let eff_min = min_len.max(1);
+            let len_rx = match max_len {
+                Some(max) => format!("/(?s:.{{{eff_min},{max}}})/"),
+                None => format!("/(?s:.{{{eff_min},}})/"),
+            };
+            extra_intersects.push_str(&format!(" & {len_rx}"));
+        }
+        if let Some(ref pat) = branches.plain_string_pattern {
+            let pat_rx = json_pattern_to_lark_regex(pat);
+            extra_intersects.push_str(&format!(" & {pat_rx}"));
+        }
+        if let Some(ref fmt) = branches.plain_string_format
+            && let Some(fmt_rx) = format_to_lark_regex(fmt)
+        {
+            extra_intersects.push_str(&format!(" & {fmt_rx}"));
+        }
+        let end_rule = format!("unquoted_end_{rule}");
+        let body_tok = format!("UNQUOTED_BODY_{}", rule.to_uppercase());
+        extra_defs.push_str(&format!(
+            "{end_rule}[lazy]: {body_tok} \"</parameter>\"\n{body_tok}: (/[^ \\t\\r\\n\"](?s:.*[^ \\t\\r\\n])?/{extra_intersects} & ~(\"null\" | {XML_DELIM_BAN_REGEX})) /[ \\t\\r\\n]*/\n"
+        ));
         return format!(
-            "{rule}: {open_tag} WS ({str_json} WS {close_tag} | unquoted_xml_param_end) WS\n"
+            "{rule}: {open_tag} WS ({str_json} WS {close_tag} | {end_rule}{null_alt}{empty_alt}) WS\n"
         );
     }
     if !branches.literals.is_empty() && !branches.has_plain_string {
@@ -309,6 +511,156 @@ fn xml_param_rule(
     }
 
     default_rule
+}
+
+fn build_qwen_xml_tool_body(
+    index: usize,
+    name: &str,
+    schema: &Value,
+    definitions: &mut String,
+    extra_defs: &mut String,
+    uses_unquoted_str: &mut bool,
+    uses_unquoted_nullable_str: &mut bool,
+) -> Result<String, String> {
+    let schema_obj = schema
+        .as_object()
+        .ok_or("tool parameters must be a schema object")?;
+    let is_object_type = match schema_obj.get("type") {
+        None => {
+            !schema_obj.contains_key("$ref")
+                && !schema_obj.contains_key("anyOf")
+                && !schema_obj.contains_key("oneOf")
+                && !schema_obj.contains_key("allOf")
+        }
+        Some(Value::String(s)) => s == "object",
+        Some(Value::Array(arr)) => arr.len() == 1 && arr[0].as_str() == Some("object"),
+        _ => false,
+    };
+    if !is_object_type {
+        return Err("XML tools require an object parameter schema".into());
+    }
+    // Cross-property constraints cannot be enforced by independent XML
+    // value grammars. Reject them rather than silently dropping semantics.
+    for key in schema_obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "type" | "properties" | "required" | "additionalProperties"
+        ) && !is_schema_metadata_key(key.as_str())
+        {
+            return Err(format!(
+                "XML object keyword '{key}' is unsupported; use Hermes JSON tools"
+            ));
+        }
+    }
+    let properties = match schema.get("properties") {
+        None => serde_json::Map::new(),
+        Some(Value::Object(props)) => props.clone(),
+        _ => return Err("tool properties must be an object".into()),
+    };
+    let required: Vec<&str> = match schema.get("required") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().ok_or("required entries must be strings"))
+            .collect::<Result<_, _>>()?,
+        _ => return Err("required must be an array".into()),
+    };
+    if required.iter().any(|key| !properties.contains_key(*key)) {
+        return Err("XML required parameters must have declared property schemas".into());
+    }
+    let mut body = format!("{} WS", literal(&format!("<function={name}>")));
+    let prop_entries: Vec<(&String, &Value)> = properties.iter().collect();
+    for (property_index, (key, value_schema)) in prop_entries.iter().enumerate() {
+        if !valid_name(key) {
+            return Err("invalid XML parameter name".into());
+        }
+        let rule = format!("param_{index}_{property_index}");
+        definitions.push_str(&xml_param_rule(
+            &rule,
+            key,
+            value_schema,
+            schema_obj,
+            uses_unquoted_str,
+            uses_unquoted_nullable_str,
+            extra_defs,
+        ));
+    }
+    let num_props = prop_entries.len();
+    if num_props == 0 {
+        let addl_schema = match schema_obj.get("additionalProperties") {
+            Some(Value::Bool(true)) => Some(json!({})),
+            Some(Value::Object(map)) => Some(Value::Object(map.clone())),
+            _ => None,
+        };
+        if let Some(val_schema) = addl_schema {
+            let dyn_val_rule = format!("dyn_val_{index}");
+            let mut val_with_defs = attach_root_defs(None, &val_schema, schema_obj);
+            crate::constraints::normalize_schema_for_llguidance(&mut val_with_defs);
+            let branches = collect_unquoted_xml_string_branches(&val_with_defs, &val_with_defs);
+            if branches.has_plain_string
+                && branches.only_string_and_null
+                && branches.literals.is_empty()
+            {
+                *uses_unquoted_str = true;
+                definitions.push_str(&format!(
+                    "{dyn_val_rule}: \"<parameter=\" /[a-zA-Z0-9_.\\-\\/]+/ \">\" WS (%json {{\"type\":\"string\"}} WS \"</parameter>\" | unquoted_xml_param_end) WS\n"
+                ));
+            } else {
+                definitions.push_str(&format!(
+                    "{dyn_val_rule}: \"<parameter=\" /[a-zA-Z0-9_.\\-\\/]+/ \">\" WS %json {val_with_defs} WS \"</parameter>\" WS\n"
+                ));
+            }
+            body.push_str(&format!(" ({dyn_val_rule})*"));
+        }
+    } else if num_props <= 6 {
+        let full_mask = (1usize << num_props) - 1;
+        let mut req_mask = 0usize;
+        for (p, (key, _)) in prop_entries.iter().enumerate() {
+            if required.contains(&key.as_str()) {
+                req_mask |= 1usize << p;
+            }
+        }
+        for mask in 0..full_mask {
+            let mut branches = Vec::with_capacity(num_props);
+            for p in 0..num_props {
+                if (mask & (1usize << p)) != 0 {
+                    continue;
+                }
+                let next_mask = mask | (1usize << p);
+                let p_rule = format!("param_{index}_{p}");
+                if next_mask == full_mask {
+                    branches.push(p_rule);
+                } else if (next_mask & req_mask) == req_mask {
+                    branches.push(format!("{p_rule} params_{index}_{next_mask}?"));
+                } else {
+                    branches.push(format!("{p_rule} params_{index}_{next_mask}"));
+                }
+            }
+            definitions.push_str(&format!(
+                "params_{index}_{mask}: {}\n",
+                branches.join(" | ")
+            ));
+        }
+        if req_mask == 0 {
+            body.push_str(&format!(" params_{index}_0?"));
+        } else {
+            body.push_str(&format!(" params_{index}_0"));
+        }
+    } else {
+        for (property_index, (key, _)) in prop_entries.iter().enumerate() {
+            let rule = format!("param_{index}_{property_index}");
+            body.push_str(&format!(
+                " {rule}{}",
+                if required.contains(&key.as_str()) {
+                    ""
+                } else {
+                    "?"
+                }
+            ));
+        }
+    }
+    body.push_str(" \"</function>\"");
+    Ok(body)
 }
 
 /// Returns a Lark grammar; unsupported object-level XML constraints fail closed.
@@ -339,14 +691,20 @@ pub fn tool_grammar_with_options(
         .ok_or("tools must be a nonempty array")?;
     let mut bodies = Vec::new();
     let mut definitions = String::new();
+    let mut extra_defs = String::new();
     let mut uses_unquoted_str = false;
     let mut uses_unquoted_nullable_str = false;
     let mut names = std::collections::HashSet::new();
     for (index, tool) in tools.iter().enumerate() {
-        if tool["type"] != "function" {
+        if tool
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function")
+            != "function"
+        {
             return Err("only function tools are supported".into());
         }
-        let function = &tool["function"];
+        let function = tool.get("function").unwrap_or(tool);
         let name = function["name"]
             .as_str()
             .filter(|s| valid_name(s))
@@ -360,7 +718,13 @@ pub fn tool_grammar_with_options(
             continue;
         }
         let empty = json!({"type":"object","properties":{},"additionalProperties":false});
-        let schema = function.get("parameters").unwrap_or(&empty);
+        let mut norm_schema = function
+            .get("parameters")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or(empty);
+        crate::constraints::normalize_schema_for_llguidance(&mut norm_schema);
+        let schema = &norm_schema;
         let body = match format {
             ToolFormat::HermesJson => {
                 let mut wrapper = json!({"type":"object","properties":{
@@ -368,124 +732,25 @@ pub fn tool_grammar_with_options(
                 },"required":["name","arguments"],"additionalProperties":false});
                 if let Some(schema_obj) = schema.as_object() {
                     wrapper = attach_root_defs(None, &wrapper, schema_obj);
+                    if let Some(Value::Object(props)) = schema_obj.get("properties") {
+                        for prop_val in props.values() {
+                            if let Some(prop_obj) = prop_val.as_object() {
+                                wrapper = attach_root_defs(None, &wrapper, prop_obj);
+                            }
+                        }
+                    }
                 }
                 format!("%json {wrapper}")
             }
-            ToolFormat::QwenXml => {
-                if schema["type"] != "object" {
-                    return Err("XML tools require an object parameter schema".into());
-                }
-                let schema_obj = schema
-                    .as_object()
-                    .ok_or("tool parameters must be a schema object")?;
-                // Cross-property constraints cannot be enforced by independent XML
-                // value grammars. Reject them rather than silently dropping semantics.
-                for key in schema_obj.keys() {
-                    if !matches!(
-                        key.as_str(),
-                        "type"
-                            | "properties"
-                            | "required"
-                            | "additionalProperties"
-                            | "$defs"
-                            | "definitions"
-                            | "title"
-                            | "description"
-                            | "$schema"
-                            | "default"
-                            | "examples"
-                            | "deprecated"
-                    ) {
-                        return Err(format!(
-                            "XML object keyword '{key}' is unsupported; use Hermes JSON tools"
-                        ));
-                    }
-                }
-                let properties = match schema.get("properties") {
-                    None => serde_json::Map::new(),
-                    Some(Value::Object(props)) => props.clone(),
-                    _ => return Err("tool properties must be an object".into()),
-                };
-                let required: Vec<&str> = match schema.get("required") {
-                    None => Vec::new(),
-                    Some(Value::Array(items)) => items
-                        .iter()
-                        .map(|v| v.as_str().ok_or("required entries must be strings"))
-                        .collect::<Result<_, _>>()?,
-                    _ => return Err("required must be an array".into()),
-                };
-                if required.iter().any(|key| !properties.contains_key(*key)) {
-                    return Err(
-                        "XML required parameters must have declared property schemas".into(),
-                    );
-                }
-                let mut body = format!("{} WS", literal(&format!("<function={name}>")));
-                let prop_entries: Vec<(&String, &Value)> = properties.iter().collect();
-                for (property_index, (key, value_schema)) in prop_entries.iter().enumerate() {
-                    if !valid_name(key) {
-                        return Err("invalid XML parameter name".into());
-                    }
-                    let rule = format!("param_{index}_{property_index}");
-                    definitions.push_str(&xml_param_rule(
-                        &rule,
-                        key,
-                        value_schema,
-                        schema_obj,
-                        &mut uses_unquoted_str,
-                        &mut uses_unquoted_nullable_str,
-                    ));
-                }
-                let num_props = prop_entries.len();
-                if num_props > 0 && num_props <= 6 {
-                    let full_mask = (1usize << num_props) - 1;
-                    let mut req_mask = 0usize;
-                    for (p, (key, _)) in prop_entries.iter().enumerate() {
-                        if required.contains(&key.as_str()) {
-                            req_mask |= 1usize << p;
-                        }
-                    }
-                    for mask in 0..full_mask {
-                        let mut branches = Vec::with_capacity(num_props);
-                        for p in 0..num_props {
-                            if (mask & (1usize << p)) != 0 {
-                                continue;
-                            }
-                            let next_mask = mask | (1usize << p);
-                            let p_rule = format!("param_{index}_{p}");
-                            if next_mask == full_mask {
-                                branches.push(p_rule);
-                            } else if (next_mask & req_mask) == req_mask {
-                                branches.push(format!("{p_rule} params_{index}_{next_mask}?"));
-                            } else {
-                                branches.push(format!("{p_rule} params_{index}_{next_mask}"));
-                            }
-                        }
-                        definitions.push_str(&format!(
-                            "params_{index}_{mask}: {}\n",
-                            branches.join(" | ")
-                        ));
-                    }
-                    if req_mask == 0 {
-                        body.push_str(&format!(" params_{index}_0?"));
-                    } else {
-                        body.push_str(&format!(" params_{index}_0"));
-                    }
-                } else {
-                    for (property_index, (key, _)) in prop_entries.iter().enumerate() {
-                        let rule = format!("param_{index}_{property_index}");
-                        body.push_str(&format!(
-                            " {rule}{}",
-                            if required.contains(&key.as_str()) {
-                                ""
-                            } else {
-                                "?"
-                            }
-                        ));
-                    }
-                }
-                body.push_str(" \"</function>\"");
-                body
-            }
+            ToolFormat::QwenXml => build_qwen_xml_tool_body(
+                index,
+                name,
+                schema,
+                &mut definitions,
+                &mut extra_defs,
+                &mut uses_unquoted_str,
+                &mut uses_unquoted_nullable_str,
+            )?,
         };
         let rule = format!("call_body_{index}");
         definitions.push_str(&format!("{rule}: {body}\n"));
@@ -518,14 +783,15 @@ pub fn tool_grammar_with_options(
         )
     };
     if uses_unquoted_str {
-        grammar.push_str(
-            "unquoted_xml_param_end[lazy]: UNQUOTED_XML_BODY \"</parameter>\"\nUNQUOTED_XML_BODY: (/[^ \\t\\r\\n\"\\[{](?s:.*[^ \\t\\r\\n])?/ & ~(\"true\" | \"false\" | \"null\" | /-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?/ | /(?s:.*)(<[ \\t\\r\\n]*\\/[ \\t\\r\\n]*(parameter|tool_call|function)[ \\t\\r\\n]*>|<[ \\t\\r\\n]*(parameter|function)[ \\t\\r\\n]*=|<[ \\t\\r\\n]*tool_call[ \\t\\r\\n]*>)(?s:.*)/)) /[ \\t\\r\\n]*/\n",
-        );
+        grammar.push_str(&format!(
+            "unquoted_xml_param_end[lazy]: UNQUOTED_XML_BODY \"</parameter>\"\nUNQUOTED_XML_BODY: (/[^ \\t\\r\\n\"](?s:.*[^ \\t\\r\\n])?/ & ~(\"null\" | {XML_DELIM_BAN_REGEX})) /[ \\t\\r\\n]*/\n"
+        ));
     }
     if uses_unquoted_nullable_str {
         grammar
             .push_str("unquoted_xml_null_end[lazy]: \"null\" /[ \\t\\r\\n]*/ \"</parameter>\"\n");
     }
+    grammar.push_str(&extra_defs);
     grammar.push_str(&definitions);
     Ok(grammar)
 }

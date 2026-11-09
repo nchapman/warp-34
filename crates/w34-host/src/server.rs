@@ -244,21 +244,27 @@ pub fn native_sampling_params(
     }
     let defaults = SamplingParams::default();
     let number = |name: &str, default: f32| -> Result<f32, String> {
-        req.get(name).map_or(Ok(default), |v| {
-            v.as_f64()
-                .map(|x| x as f32)
-                .ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(default), |v| {
+                v.as_f64()
+                    .map(|x| x as f32)
+                    .ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let boolean = |name: &str| -> Result<bool, String> {
-        req.get(name).map_or(Ok(false), |v| {
-            v.as_bool().ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(false), |v| {
+                v.as_bool().ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let unsigned = |name: &str, default: u64| -> Result<u64, String> {
-        req.get(name).map_or(Ok(default), |v| {
-            v.as_u64().ok_or_else(|| format!("invalid {name}"))
-        })
+        req.get(name)
+            .filter(|v| !v.is_null())
+            .map_or(Ok(default), |v| {
+                v.as_u64().ok_or_else(|| format!("invalid {name}"))
+            })
     };
     let stop_strings = match req.get("stop") {
         None | Some(serde_json::Value::Null) => Vec::new(),
@@ -300,11 +306,14 @@ pub fn native_sampling_params(
     }
     let params = SamplingParams {
         temperature: number("temperature", defaults.temperature)?,
-        top_k: req.get("top_k").map_or(Ok(defaults.top_k), |v| {
-            v.as_i64()
-                .and_then(|x| i32::try_from(x).ok())
-                .ok_or("invalid top_k")
-        })?,
+        top_k: req
+            .get("top_k")
+            .filter(|v| !v.is_null())
+            .map_or(Ok(defaults.top_k), |v| {
+                v.as_i64()
+                    .and_then(|x| i32::try_from(x).ok())
+                    .ok_or("invalid top_k")
+            })?,
         top_p: number("top_p", defaults.top_p)?,
         min_p: number("min_p", defaults.min_p)?,
         repetition_penalty: number("repetition_penalty", defaults.repetition_penalty)?,
@@ -384,7 +393,7 @@ pub fn parse_openai_messages_with_image_policy(
     let deadline = std::time::Instant::now() + crate::remote_images::REMOTE_IMAGE_TIMEOUT;
     let mut out = Vec::with_capacity(arr.len());
     let mut images = Vec::new();
-    for (index, item) in arr.iter().enumerate() {
+    for item in arr {
         let raw_role = item
             .get("role")
             .and_then(|v| v.as_str())
@@ -394,7 +403,7 @@ pub fn parse_openai_messages_with_image_policy(
             "user" | "assistant" | "tool" => raw_role,
             other => return Err(format!("unsupported message role '{other}'")),
         };
-        if role == "system" && index != 0 {
+        if role == "system" && !out.iter().all(|m: &ChatMessage| m.role == "system") {
             return Err("system message must be at the beginning".into());
         }
         let tool_calls = crate::chatml::parse_history_tools(item.get("tool_calls"))?;
@@ -462,6 +471,21 @@ pub fn parse_openai_messages_with_image_policy(
             }
             _ => return Err("message 'content' must be string, array, or null".into()),
         };
+        if role == "system"
+            && let Some(prev) = out.first_mut()
+            && prev.role == "system"
+        {
+            if let Some(new_c) = content.filter(|s| !s.is_empty()) {
+                match prev.content.as_mut() {
+                    Some(existing) if !existing.is_empty() => {
+                        existing.push_str("\n\n");
+                        existing.push_str(&new_c);
+                    }
+                    _ => prev.content = Some(new_c),
+                }
+            }
+            continue;
+        }
         out.push(ChatMessage {
             role: role.into(),
             content,

@@ -131,3 +131,49 @@ fn hermes_json_tool_format_prompt_and_history_serialization() {
     assert!(prompt.contains("return a json object with function name and arguments within <tool_call></tool_call> XML tags"));
     assert!(prompt.contains("<tool_call>\n{\"name\": \"weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 2}}\n</tool_call><|im_end|>\n"));
 }
+
+#[test]
+fn leading_system_developer_coalescing_slash_tool_names_and_null_sampling_fields() {
+    use w34_host::server::native_sampling_params;
+
+    let (messages, _) = parse_openai_messages_multimodal(&json!([
+        {"role":"system","content":"System rule 1."},
+        {"role":"developer","content":"Developer rule 2."},
+        {"role":"user","content":"Create an issue."},
+        {"role":"assistant","content":null,"tool_calls":[
+            {"id":"c1","type":"function","function":{"name":"github/create_issue","arguments":""}},
+            {"id":"c2","type":"function","function":{"name":"mcp/ping","arguments":null}}
+        ]},
+        {"role":"tool","tool_call_id":"c1","content":"ok"}
+    ]))
+    .unwrap();
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(
+        messages[0].content.as_deref(),
+        Some("System rule 1.\n\nDeveloper rule 2.")
+    );
+    let prompt = format_chatml_prompt(&messages, None, false);
+    assert!(prompt.contains("<function=github/create_issue>\n</function>"));
+    assert!(prompt.contains("<function=mcp/ping>\n</function>"));
+
+    let params = native_sampling_params(
+        &json!({
+            "temperature": null,
+            "top_p": null,
+            "top_k": null,
+            "min_p": null,
+            "seed": null,
+            "presence_penalty": null,
+            "frequency_penalty": null,
+            "repetition_penalty": null,
+            "min_tokens": null,
+            "ignore_eos": null,
+            "logprobs": null,
+            "top_logprobs": null
+        }),
+        64,
+    )
+    .unwrap();
+    assert_eq!(params.max_tokens, 64);
+    assert!(!params.logprobs);
+}

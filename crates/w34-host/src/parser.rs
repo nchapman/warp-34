@@ -429,7 +429,24 @@ impl SamplerV1 {
         let has_freq_pres =
             self.params.frequency_penalty.abs() > 1e-6 || self.params.presence_penalty.abs() > 1e-6;
         let under_min = self.output_history.len() < self.params.min_tokens;
-        let has_bans = self.params.ignore_eos || under_min;
+        let has_bans = (self.params.ignore_eos || under_min)
+            && self.constraint.as_ref().is_none_or(|c| {
+                c.mask_words().iter().enumerate().any(|(w_idx, &word)| {
+                    let mut w = word;
+                    while w != 0 {
+                        let bit = w.trailing_zeros() as usize;
+                        let tid = (w_idx * 32 + bit) as i32;
+                        if c.is_token_allowed(tid)
+                            && !self.is_token_soft_banned(tid, model_eos)
+                            && !(under_min && self.params.stop_token_ids.contains(&tid))
+                        {
+                            return true;
+                        }
+                        w &= w - 1;
+                    }
+                    false
+                })
+            });
 
         if has_rep || has_freq_pres || !self.params.logit_bias.is_empty() || has_bans {
             let vocab_i32 = i32::try_from(vocab_size).unwrap_or(i32::MAX);
@@ -725,7 +742,11 @@ impl SamplerV1 {
             if is_stop {
                 return Ok((forced, true));
             }
-            probe.try_commit_token(tok)?;
+            if probe.try_commit_token(tok).is_err()
+                || probe.materialize_pending_constraint().is_err()
+            {
+                return Ok((forced, false));
+            }
             forced.push(tok);
             if probe
                 .constraint
@@ -751,9 +772,9 @@ impl SamplerV1 {
         model_eos_ids: &[i32],
     ) -> Result<(), String> {
         let mut probe = self.clone();
+        probe.materialize_pending_constraint()?;
         let mut out = Vec::with_capacity(k_budget);
         for idx in 0..k_budget {
-            probe.materialize_pending_constraint()?;
             if probe
                 .constraint
                 .as_ref()
@@ -771,7 +792,13 @@ impl SamplerV1 {
                 if is_stop {
                     break;
                 }
-                probe.try_commit_token(forced_tok)?;
+                let mut next_probe = probe.clone();
+                if next_probe.try_commit_token(forced_tok).is_err()
+                    || next_probe.materialize_pending_constraint().is_err()
+                {
+                    break;
+                }
+                probe = next_probe;
                 out.push(forced_tok);
                 continue;
             }
@@ -785,17 +812,27 @@ impl SamplerV1 {
                     .as_ref()
                     .is_some_and(|c| c.eos_ids().contains(&cand) || !c.is_token_allowed(cand));
                 if !stop_or_banned {
-                    probe.try_commit_token(cand)?;
-                    out.push(cand);
-                    continue;
+                    let mut next_probe = probe.clone();
+                    if next_probe.try_commit_token(cand).is_ok()
+                        && next_probe.materialize_pending_constraint().is_ok()
+                    {
+                        probe = next_probe;
+                        out.push(cand);
+                        continue;
+                    }
                 }
             }
             if let Some(sub_tok) = probe.first_allowed_draft_token(model_eos_ids, pos_before)? {
-                probe.try_commit_token(sub_tok)?;
-                out.push(sub_tok);
-            } else {
-                break;
+                let mut next_probe = probe.clone();
+                if next_probe.try_commit_token(sub_tok).is_ok()
+                    && next_probe.materialize_pending_constraint().is_ok()
+                {
+                    probe = next_probe;
+                    out.push(sub_tok);
+                    continue;
+                }
             }
+            break;
         }
         *drafts = out;
         Ok(())
@@ -842,11 +879,15 @@ struct ParamTypeMask {
 }
 
 impl ParamTypeMask {
-    fn from_schema(schema: &serde_json::Value) -> Self {
-        Self::from_schema_depth(schema, 0)
+    fn from_schema_with_root(schema: &serde_json::Value, root_schema: &serde_json::Value) -> Self {
+        Self::from_schema_depth(schema, root_schema, 0)
     }
 
-    fn from_schema_depth(schema: &serde_json::Value, depth: usize) -> Self {
+    fn from_schema_depth(
+        schema: &serde_json::Value,
+        root_schema: &serde_json::Value,
+        depth: usize,
+    ) -> Self {
         let mut mask = Self::default();
         if depth > 16 {
             return mask;
@@ -854,12 +895,30 @@ impl ParamTypeMask {
         let Some(obj) = schema.as_object() else {
             return mask;
         };
+        if obj.get("nullable") == Some(&serde_json::Value::Bool(true)) {
+            mask.null = true;
+        }
+        if let Some(serde_json::Value::String(ref_str)) = obj.get("$ref")
+            && let Some(ptr) = ref_str.strip_prefix('#')
+            && let Some(target) = root_schema.pointer(ptr).or_else(|| schema.pointer(ptr))
+        {
+            let sub_mask = Self::from_schema_depth(target, root_schema, depth + 1);
+            mask.string |= sub_mask.string;
+            mask.string_enum_or_const |= sub_mask.string_enum_or_const;
+            mask.number |= sub_mask.number;
+            mask.boolean |= sub_mask.boolean;
+            mask.null |= sub_mask.null;
+            mask.structured |= sub_mask.structured;
+        }
         let mut add_type = |t: &str| match t {
-            "string" => mask.string = true,
-            "integer" | "number" => mask.number = true,
-            "boolean" => mask.boolean = true,
+            "string" | "str" | "text" | "varchar" | "char" => mask.string = true,
+            "integer" | "number" | "int" | "uint" | "int32" | "int64" | "long" | "float"
+            | "double" | "decimal" => mask.number = true,
+            "boolean" | "bool" => mask.boolean = true,
             "null" => mask.null = true,
-            "object" | "array" => mask.structured = true,
+            "object" | "array" | "dict" | "map" | "list" | "set" | "tuple" => {
+                mask.structured = true
+            }
             _ => {}
         };
         match obj.get("type") {
@@ -906,7 +965,7 @@ impl ParamTypeMask {
         for comb in ["anyOf", "oneOf", "allOf"] {
             if let Some(serde_json::Value::Array(subschemas)) = obj.get(comb) {
                 for sub in subschemas {
-                    let sub_mask = Self::from_schema_depth(sub, depth + 1);
+                    let sub_mask = Self::from_schema_depth(sub, root_schema, depth + 1);
                     mask.string |= sub_mask.string;
                     mask.string_enum_or_const |= sub_mask.string_enum_or_const;
                     mask.number |= sub_mask.number;
@@ -919,8 +978,8 @@ impl ParamTypeMask {
         mask
     }
 
-    fn is_strictly_string(self) -> bool {
-        self.string && !self.number && !self.boolean && !self.null && !self.structured
+    fn is_only_string_or_null(self) -> bool {
+        self.string && !self.number && !self.boolean && !self.structured
     }
 
     fn is_known_non_string(self) -> bool {
@@ -978,15 +1037,15 @@ impl Qwen3Parser {
                 let Some(fn_name) = func.get("name").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                let Some(props) = func
-                    .get("parameters")
-                    .and_then(|p| p.get("properties"))
-                    .and_then(|p| p.as_object())
+                let Some(params_schema) = func.get("parameters") else {
+                    continue;
+                };
+                let Some(props) = params_schema.get("properties").and_then(|p| p.as_object())
                 else {
                     continue;
                 };
                 for (param_name, schema) in props {
-                    let mask = ParamTypeMask::from_schema(schema);
+                    let mask = ParamTypeMask::from_schema_with_root(schema, params_schema);
                     self.param_types
                         .insert((fn_name.to_string(), param_name.clone()), mask);
                 }
@@ -1073,11 +1132,15 @@ impl Qwen3Parser {
     ) -> serde_json::Value {
         let trimmed_ws = trimmed.trim();
         if let Some(mask) = type_mask {
-            if mask.is_strictly_string() {
-                if let Ok(serde_json::Value::String(s)) =
-                    serde_json::from_str::<serde_json::Value>(trimmed_ws)
+            if mask.is_only_string_or_null() {
+                if trimmed_ws.starts_with('"')
+                    && let Ok(serde_json::Value::String(s)) =
+                        serde_json::from_str::<serde_json::Value>(trimmed_ws)
                 {
                     return serde_json::Value::String(s);
+                }
+                if mask.null && trimmed_ws == "null" {
+                    return serde_json::Value::Null;
                 }
                 if mask.string_enum_or_const {
                     return serde_json::Value::String(trimmed_ws.to_string());
@@ -1122,43 +1185,61 @@ impl Qwen3Parser {
     /// Parses either Qwen3-XML (`<function=name><parameter=k>v</parameter></function>`)
     /// or Hermes JSON (`{"name": "...", "arguments": ...}`) inside a `<tool_call>...</tool_call>` body.
     pub fn parse_tool_body(raw_body: &str, call_idx: usize) -> Option<ParsedToolCall> {
-        Self::parse_tool_body_with_types(raw_body, call_idx, &std::collections::HashMap::new())
+        Self::parse_tool_bodies_with_types(raw_body, call_idx, &std::collections::HashMap::new())
+            .into_iter()
+            .next()
     }
 
-    fn parse_tool_body_with_types(
+    fn strip_markdown_json_fence(body: &str) -> &str {
+        let s = body.trim();
+        let Some(after_open) = s
+            .strip_prefix("```json")
+            .or_else(|| s.strip_prefix("```JSON"))
+            .or_else(|| s.strip_prefix("```"))
+        else {
+            return s;
+        };
+        let inner = after_open.trim();
+        inner.strip_suffix("```").unwrap_or(inner).trim()
+    }
+
+    fn parse_tool_bodies_with_types(
         raw_body: &str,
-        call_idx: usize,
+        start_idx: usize,
         param_types: &std::collections::HashMap<(String, String), ParamTypeMask>,
-    ) -> Option<ParsedToolCall> {
+    ) -> Vec<ParsedToolCall> {
         let body = raw_body.trim();
         if body.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        // 1. Check Qwen3-XML format: `<function=func_name>...`
-        let xml_fn = if let Some(after_lt) = body.strip_prefix('<') {
-            let after_func = after_lt.trim_start();
-            if let Some(after_func_word) = after_func.strip_prefix("function") {
-                if let Some(after_eq) = after_func_word.trim_start().strip_prefix('=') {
-                    let close_angle = after_eq.find('>')?;
-                    let fn_name = after_eq[..close_angle].trim().to_string();
-                    let rest = &after_eq[close_angle + 1..];
-                    let fn_body = match Self::find_tool_delimiter(rest, "</function>") {
-                        Some(end_idx) => &rest[..end_idx],
-                        None => rest,
-                    };
-                    Some((fn_name, fn_body))
-                } else {
-                    None
-                }
-            } else {
-                None
+        // 1. Check Qwen3-XML format: one or more `<function=func_name>...` blocks
+        let mut xml_calls = Vec::new();
+        let mut cursor = body;
+        while let Some(fn_pos) = Self::find_tool_delimiter(cursor, "<function=") {
+            let after_fn = &cursor[fn_pos..];
+            let Some(close_angle) = after_fn.find('>') else {
+                break;
+            };
+            let tag_inside = &after_fn[1..close_angle];
+            let Some((_, raw_fn_name)) = tag_inside.split_once('=') else {
+                break;
+            };
+            let fn_name = raw_fn_name.trim().to_string();
+            if fn_name.is_empty() {
+                break;
             }
-        } else {
-            None
-        };
-
-        if let Some((fn_name, fn_body)) = xml_fn {
+            let rest = &after_fn[close_angle + 1..];
+            let (fn_body, next_cursor) = match Self::find_tool_delimiter(rest, "</function>") {
+                Some(end_idx) => {
+                    let after_close = match rest[end_idx..].find('>') {
+                        Some(gt) => &rest[end_idx + gt + 1..],
+                        None => "",
+                    };
+                    (&rest[..end_idx], after_close)
+                }
+                None => (rest, ""),
+            };
             let mut params = serde_json::Map::new();
             let mut search = fn_body;
             while let Some(p_start) = Self::find_tool_delimiter(search, "<parameter=") {
@@ -1196,7 +1277,8 @@ impl Qwen3Parser {
 
             let args_json =
                 serde_json::to_string(&serde_json::Value::Object(params)).unwrap_or_default();
-            return Some(ParsedToolCall {
+            let call_idx = start_idx + xml_calls.len();
+            xml_calls.push(ParsedToolCall {
                 id: format!("call_w34_{call_idx}"),
                 call_type: "function".to_string(),
                 function: ParsedFunctionCall {
@@ -1204,28 +1286,34 @@ impl Qwen3Parser {
                     arguments: args_json,
                 },
             });
+            cursor = next_cursor;
+        }
+        if !xml_calls.is_empty() {
+            return xml_calls;
         }
 
         // 2. Check Hermes JSON format: `{"name": "func_name", "arguments": {...}}`
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(body)
+        let json_body = Self::strip_markdown_json_fence(body);
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_body)
             && let Some(name) = val.get("name").and_then(|v| v.as_str())
         {
-            let args_str = match val.get("arguments") {
+            let args_val = val.get("arguments").or_else(|| val.get("parameters"));
+            let args_str = match args_val {
+                None | Some(serde_json::Value::Null) => "{}".to_string(),
                 Some(serde_json::Value::String(s)) => s.clone(),
                 Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
-                None => "{}".to_string(),
             };
-            return Some(ParsedToolCall {
-                id: format!("call_w34_{call_idx}"),
+            return vec![ParsedToolCall {
+                id: format!("call_w34_{start_idx}"),
                 call_type: "function".to_string(),
                 function: ParsedFunctionCall {
                     name: name.to_string(),
                     arguments: args_str,
                 },
-            });
+            }];
         }
 
-        None
+        Vec::new()
     }
 
     fn longest_tag_prefix_suffix(s: &str, tags: &[&str]) -> usize {
@@ -1260,7 +1348,7 @@ impl Qwen3Parser {
                     };
                     self.buffer.drain(..drain_end);
                     self.in_tool_call = false;
-                    if let Some(tc) = Self::parse_tool_body_with_types(
+                    for tc in Self::parse_tool_bodies_with_types(
                         &body,
                         self.next_tool_idx,
                         &self.param_types,

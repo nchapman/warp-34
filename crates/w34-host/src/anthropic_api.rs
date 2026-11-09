@@ -471,12 +471,74 @@ fn convert_messages(
     Ok(out)
 }
 
+fn parse_anthropic_tools(obj: &Map<String, Value>) -> Result<Vec<Value>, AnthropicApiError> {
+    let mut chat_tools = Vec::new();
+    let Some(tools_val) = obj.get("tools").filter(|v| !v.is_null()) else {
+        return Ok(chat_tools);
+    };
+    let arr = tools_val
+        .as_array()
+        .ok_or_else(|| AnthropicApiError::bad_request("'tools' must be an array"))?;
+    for t in arr {
+        let tobj = t
+            .as_object()
+            .ok_or_else(|| AnthropicApiError::bad_request("each tool must be an object"))?;
+        if let Some(ttype) = tobj.get("type").and_then(Value::as_str)
+            && !matches!(ttype, "custom" | "function")
+            && !tobj.contains_key("input_schema")
+            && !tobj.contains_key("parameters")
+        {
+            return Err(AnthropicApiError::bad_request(format!(
+                "Anthropic server tool type '{ttype}' without 'input_schema' is not supported"
+            )));
+        }
+        let name = tobj
+            .get("name")
+            .or_else(|| t.pointer("/function/name"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AnthropicApiError::bad_request("tool missing non-empty 'name'"))?;
+        let schema = tobj
+            .get("input_schema")
+            .or_else(|| tobj.get("parameters"))
+            .or_else(|| t.pointer("/function/parameters"))
+            .filter(|v| !v.is_null())
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        let mut fn_map = Map::new();
+        fn_map.insert("name".into(), json!(name));
+        if let Some(desc) = tobj
+            .get("description")
+            .or_else(|| t.pointer("/function/description"))
+            .filter(|v| !v.is_null())
+        {
+            fn_map.insert("description".into(), desc.clone());
+        }
+        fn_map.insert("parameters".into(), schema);
+        chat_tools.push(json!({
+            "type": "function",
+            "function": Value::Object(fn_map),
+        }));
+    }
+    Ok(chat_tools)
+}
+
 fn parse_anthropic_tool_choice(
     obj: &Map<String, Value>,
 ) -> Result<(Option<Value>, bool, bool), AnthropicApiError> {
     let Some(tc_val) = obj.get("tool_choice").filter(|v| !v.is_null()) else {
         return Ok((None, false, false));
     };
+    if let Some(s) = tc_val.as_str() {
+        return match s {
+            "auto" => Ok((Some(json!("auto")), false, false)),
+            "none" => Ok((Some(json!("none")), false, false)),
+            "any" | "required" => Ok((Some(json!("required")), true, false)),
+            other => Err(AnthropicApiError::bad_request(format!(
+                "unsupported tool_choice '{other}'"
+            ))),
+        };
+    }
     let tc_obj = tc_val
         .as_object()
         .ok_or_else(|| AnthropicApiError::bad_request("'tool_choice' must be an object"))?;
@@ -567,44 +629,7 @@ pub fn translate_anthropic_to_chat(
     let messages = convert_messages(messages_val, system)?;
 
     // Tools
-    let mut chat_tools = Vec::new();
-    if let Some(tools_val) = obj.get("tools").filter(|v| !v.is_null()) {
-        let arr = tools_val
-            .as_array()
-            .ok_or_else(|| AnthropicApiError::bad_request("'tools' must be an array"))?;
-        for t in arr {
-            let tobj = t
-                .as_object()
-                .ok_or_else(|| AnthropicApiError::bad_request("each tool must be an object"))?;
-            if let Some(ttype) = tobj.get("type").and_then(Value::as_str)
-                && ttype != "custom"
-                && !tobj.contains_key("input_schema")
-            {
-                return Err(AnthropicApiError::bad_request(format!(
-                    "Anthropic server tool type '{ttype}' without 'input_schema' is not supported"
-                )));
-            }
-            let name = tobj
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| AnthropicApiError::bad_request("tool missing non-empty 'name'"))?;
-            let schema = tobj
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            let mut fn_map = Map::new();
-            fn_map.insert("name".into(), json!(name));
-            if let Some(desc) = tobj.get("description").filter(|v| !v.is_null()) {
-                fn_map.insert("description".into(), desc.clone());
-            }
-            fn_map.insert("parameters".into(), schema);
-            chat_tools.push(json!({
-                "type": "function",
-                "function": Value::Object(fn_map),
-            }));
-        }
-    }
+    let chat_tools = parse_anthropic_tools(obj)?;
 
     // Tool choice
     let (chat_tool_choice, is_forced_tool_choice, disable_parallel_tool_use) =
@@ -693,9 +718,12 @@ pub fn translate_anthropic_to_chat(
             })?;
             match fmt_obj.get("type").and_then(Value::as_str) {
                 Some("json_schema") => {
-                    let schema = fmt_obj.get("schema").ok_or_else(|| {
-                        AnthropicApiError::bad_request("output_config.format missing 'schema'")
-                    })?;
+                    let schema = fmt_obj
+                        .get("schema")
+                        .or_else(|| fmt_val.pointer("/json_schema/schema"))
+                        .ok_or_else(|| {
+                            AnthropicApiError::bad_request("output_config.format missing 'schema'")
+                        })?;
                     response_format = Some(json!({
                         "type": "json_schema",
                         "json_schema": {
@@ -752,6 +780,12 @@ pub fn translate_anthropic_to_chat(
         "stop_token_ids",
         "min_tokens",
         "ignore_eos",
+        "tool_call_format",
+        "structured_outputs",
+        "guided_json",
+        "guided_regex",
+        "guided_choice",
+        "guided_grammar",
     ] {
         if let Some(val) = obj.get(key).filter(|v| !v.is_null()) {
             chat_req.insert(key.into(), val.clone());
@@ -762,11 +796,15 @@ pub fn translate_anthropic_to_chat(
     }
     if disable_parallel_tool_use {
         chat_req.insert("parallel_tool_calls".into(), json!(false));
+    } else if let Some(ptc) = obj.get("parallel_tool_calls").filter(|v| !v.is_null()) {
+        chat_req.insert("parallel_tool_calls".into(), ptc.clone());
     }
     if let Some(tc) = chat_tool_choice {
         chat_req.insert("tool_choice".into(), tc);
     }
-    if let Some(rf) = response_format {
+    if let Some(rf) =
+        response_format.or_else(|| obj.get("response_format").filter(|v| !v.is_null()).cloned())
+    {
         chat_req.insert("response_format".into(), rf);
     }
     let mut template_kwargs = match obj.get("chat_template_kwargs").filter(|v| !v.is_null()) {
