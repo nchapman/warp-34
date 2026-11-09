@@ -65,35 +65,39 @@ __device__ void write_kv_row(
     }
     if (head_dim == 256 && transform == W34_KV_TRANSFORM_RADEMACHER_WHT256 &&
         format == W34_KV_FORMAT_TQ4) {
-        // Exact warp3090 tq4_encode_row (Seed-42 Rademacher + WHT-256 +
-        // full-256 energy-preserving norm + Beta(256) codebook).
+        // TurboQuant Algorithm 1 (arXiv:2504.19874) at b=4 with Seed-42 Rademacher +
+        // WHT-256 rotation, per-128 post-WHT sub-block RMS normalization (matching
+        // Beta(256) codebook variance 1/256 with zero sub-block norm dispersion), and
+        // per-128 least-squares optimal scaling d_b = <v_b, c_b> / ||c_b||^2.
         // Runs on `target_warp` (0 for K, 1 for V) so K and V encode concurrently.
         if ((int)(threadIdx.x >> 5) == target_warp) {
             const int lane = threadIdx.x & 31;
             block_tq4_0* row2 = (block_tq4_0*)dst_row;
             float v[8];
-            float s_sq = 0.0f;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int col = 32 * j + lane;
-                float x = __half2float(src_row[col]);
-                v[j] = x;
-                s_sq += warp_reduce_sum(x * x);
-            }
-            const float grp_norm = __fsqrt_rn(s_sq);
-            const float inv_norm = (grp_norm > 1e-10f) ? __fdiv_rn(1.0f, grp_norm) : 0.0f;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int col = 32 * j + lane;
-                v[j] = v[j] * inv_norm * kTq4Signs256[col];
+                v[j] = __half2float(src_row[col]) * kTq4Signs256[col];
             }
             wht256_warp(v, lane);
+
+            float s_sq0 = 0.0f, s_sq1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                s_sq0 += warp_reduce_sum(v[j] * v[j]);
+                s_sq1 += warp_reduce_sum(v[j + 4] * v[j + 4]);
+            }
+            const float inv_norm0 =
+                (s_sq0 > 1e-20f) ? (0.7071067811865475f * rsqrtf(s_sq0)) : 0.0f;
+            const float inv_norm1 =
+                (s_sq1 > 1e-20f) ? (0.7071067811865475f * rsqrtf(s_sq1)) : 0.0f;
 
             float vc_dot0 = 0.0f, c_sq0 = 0.0f;
             float vc_dot1 = 0.0f, c_sq1 = 0.0f;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const float rv = v[j];
+                const float raw_v = v[j];
+                const float rv = raw_v * ((j < 4) ? inv_norm0 : inv_norm1);
                 int q = 0;
 #pragma unroll
                 for (int i = 0; i < 15; ++i) {
@@ -107,7 +111,7 @@ __device__ void write_kv_row(
                         (uint8_t)(nib | (partner << 4));
                 }
                 const float c = kTq4D256Centroids[q];
-                const float vc = warp_reduce_sum(rv * c);
+                const float vc = warp_reduce_sum(raw_v * c);
                 const float cc = warp_reduce_sum(c * c);
                 if (j < 4) {
                     vc_dot0 += vc;
@@ -118,8 +122,8 @@ __device__ void write_kv_row(
                 }
             }
             if (lane == 0) {
-                const float d0 = (c_sq0 > 1e-10f) ? (grp_norm * (vc_dot0 / c_sq0)) : 0.0f;
-                const float d1 = (c_sq1 > 1e-10f) ? (grp_norm * (vc_dot1 / c_sq1)) : 0.0f;
+                const float d0 = (c_sq0 > 1e-10f) ? (vc_dot0 / c_sq0) : 0.0f;
+                const float d1 = (c_sq1 > 1e-10f) ? (vc_dot1 / c_sq1) : 0.0f;
                 row2[0].d = __float2half(d0);
                 row2[1].d = __float2half(d1);
             }
@@ -133,18 +137,19 @@ __device__ void write_kv_row(
             const __half* sub_src = src_row + sb * 128;
             block_tq4_0* blk = (block_tq4_0*)(dst_row + sb * sizeof(block_tq4_0));
             float sq = 0.0f;
+            float x = 0.0f;
             if (threadIdx.x < 128) {
-                float x = __half2float(sub_src[threadIdx.x]);
+                x = __half2float(sub_src[threadIdx.x]);
                 sq = x * x;
             }
             float norm_x = sqrtf(block_reduce_sum_128(sq, s_warp));
-            float inv_norm = (norm_x > 1e-12f) ? (1.0f / norm_x) : 0.0f;
+            float inv_norm = (norm_x > 1e-12f) ? (0.7071067811865475f / norm_x) : 0.0f;
 
-            // Find nearest Beta(256) centroid for unit-normalized x
+            // Find nearest Beta(256) centroid for RMS-normalized 128-element sub-block
             uint8_t q_idx = 8;
             float c_val = 0.0f;
             if (threadIdx.x < 128) {
-                float u = __half2float(sub_src[threadIdx.x]) * inv_norm;
+                float u = x * inv_norm;
                 q_idx = 0;
 #pragma unroll
                 for (int b = 0; b < 15; b++) {
@@ -152,9 +157,9 @@ __device__ void write_kv_row(
                 }
                 c_val = kTq4D256Centroids[q_idx];
             }
+            float xc_dot = block_reduce_sum_128(x * c_val, s_warp);
             float c_sq = block_reduce_sum_128(c_val * c_val, s_warp);
-            float norm_c = sqrtf(c_sq);
-            float scale_d = (norm_c > 1e-12f) ? (norm_x / norm_c) : 0.0f;
+            float scale_d = (c_sq > 1e-12f) ? (xc_dot / c_sq) : 0.0f;
             if (threadIdx.x == 0) {
                 blk->d = __float2half(scale_d);
             }

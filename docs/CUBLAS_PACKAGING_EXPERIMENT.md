@@ -116,16 +116,19 @@ Size and throughput tables retain their original pre-merge measurements; they
 have not been relabeled for newer engine sources. No actual RTX 40-series or
 minimum-driver qualification was performed during the static experiment.
 
-## Remaining RTX 4090 qualification
+## RTX 4090 (`sm_89`) qualification (completed)
 
-Test the **current shared-library Docker image**, not the superseded static
-experiment. Verify native sm_86/sm_89 application code, actual shared-library
-linkage, plain/MTP/DFlash2/vision inference, HTTP serving, and model-cache access.
-Use `CUDA_DISABLE_PTX_JIT=1` to exercise native code, and record GPU, driver,
-source revision, image ID, and skipped multi-GPU cases. The README has current
-build/run commands; local `mise run check` no longer needs a static-library option.
+Verified on **2× NVIDIA GeForce RTX 4090 (`24,564 MiB`, `sm_89`, driver `595.84`, CUDA `13.2` / `libcudart.so.13.2.86`, `libcublas.so.13.4.0.1`, `libcublasLt.so.13.4.0.1`)** with `CUDA_DISABLE_PTX_JIT=1` across both:
+1. The exact `/usr/local/bin/w34` executable from `warp-34:shared-cublas-final` (`sha256:9260b1c51a9c2f7874993a6ff4a9f6560e83cfe4aaefc9d37609f909891f70f7`, `39,615,656` bytes, source `a3237c6`), and
+2. The merged `main` (`95a7c86`) build with `W34_ARCH=sm_86,sm_89 W34_NVCC_EXTRA=--compress-mode=size` (`39,592,816` bytes, `25 × sm_86` + `25 × sm_89` native cubins via `cuobjdump --list-elf`).
 
-A fresh static-versus-shared comparison is not a release requirement. If desired
-for research, keep engine code identical in both worktrees rather than comparing
-old static images with current engine sources. Minimum-driver qualification is
-separate from the 4090 hardware check.
+- **`Qwen3.5-4B-W4A16-GPTQ` (`128` prompt / `64` decode, `tq4`, CUDA Graphs, `CUDA_DISABLE_PTX_JIT=1`):**
+  - Plain (`TP=1`): `220.49 tok/s` (`9260b1c51a9c`, `12.17 ms` TTFT) / `220.77 tok/s` (`main`, `12.09 ms` TTFT).
+  - `MTP-3` (`TP=1`): `562.58 tok/s` / `560.21 tok/s` (`2.9375` accepted drafts/round), 100% lossless token match with Plain.
+  - `DFlash2` (`TP=1`, native `BF16` + `cuBLASLt`): `1,398.04 tok/s` / `1,409.28 tok/s` (`11.60` accepted drafts/round), 100% lossless token match.
+  - `DFlash2` (`TP=2`, 2× RTX 4090): `1,394.05 tok/s` (`29.60 ms` TTFT) / `1,476.03 tok/s` (`15.69 ms` TTFT), 100% lossless token match.
+- **Vision (`--stage vision`, `TP=1`, `CUDA_DISABLE_PTX_JIT=1`):**
+  - `lossless_parity: true`, `content_hash_isolated: true`, cold TTFT `31.21` / `31.31 ms` → warm TTFT `18.23` / `18.26 ms` (`1.71×` speedup), warm decode `212.85` / `212.82 tok/s`.
+- **HTTP Serving (`w34 serve --offline`, `CUDA_DISABLE_PTX_JIT=1`):**
+  - `GET /health` (`{"status":"ok"}`), `GET /` (embedded dashboard HTML/JS), `GET /v1/models` (cached snapshot via `HF_HUB_CACHE`), and `POST /v1/chat/completions` all passed.
+- Minimum-driver qualification remains separate from the 4090 hardware check.

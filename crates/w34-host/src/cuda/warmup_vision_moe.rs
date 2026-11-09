@@ -130,7 +130,14 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         ),
         "warmup w34_moe_w4a16_gate_up_silu_f16"
     )?;
-    for (top_k, n_interm) in [(1i32, 64i32), (8, 256), (8, 512), (10, 256), (10, 512)] {
+    for (top_k, n_interm) in [
+        (1i32, 64i32),
+        (8, 256),
+        (8, 512),
+        (10, 256),
+        (10, 512),
+        (10, 640),
+    ] {
         warmup_ffi!(
             ffi::w34_moe_w4a16_down_accum_f16(
                 ex,

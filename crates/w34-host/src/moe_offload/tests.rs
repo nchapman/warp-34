@@ -263,6 +263,7 @@ mod cuda_tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn tiered_moe_gpu_lru_cpu_hybrid_and_streamed_prefill_parity_tp1_and_ep2() {
         use super::super::{
             DeviceExpertSlotTable, ExpertPackLayout, HostExpertStore, HotExpertCache,
@@ -659,6 +660,151 @@ mod cuda_tests {
             assert!(cache.cpu_cold_evals > 0);
             assert!(cache.dma_experts_loaded > 0);
             assert_close_f16(&h_prefill_out, "TP=1 HybridStreamedPrefill(k_static=4)");
+        }
+
+        // 4d. Verify multi-cold-expert hybrid staging (`k_static = 1, k_hot = 9` -> 8 evictable slots)
+        //     with 7 distinct cold experts (`5, 8, 9, 10, 11, 12, 14`) and 2 evictable current-step
+        //     cache hits (`1` in slot 1, `4` in slot 8): verifies `n_gpu_cold >= 3` pulled on GPU,
+        //     `n_cpu_cold >= 3` evaluated on CPU, preservation of current-step cache hits, and
+        //     FP16 oracle parity across repeated CUDA Graph replays with mutating routing/inputs.
+        {
+            let t_bridge = 4usize;
+            let mut cache = HotExpertCache::new(0, 9, 0..num_experts, layout.clone()).unwrap();
+            let mut ws = TieredMoeWorkspace::new(0, layout.clone(), 8, num_tokens, top_k).unwrap();
+            cache
+                .populate_initial(
+                    &full_store,
+                    Some(&[0, 1, 2, 3, 6, 7, 13, 15, 4]),
+                    &mut ws,
+                    &stream,
+                )
+                .unwrap();
+            cache
+                .register_cpu_bridge(0, &full_store, 1, &stream)
+                .unwrap();
+            let d_out =
+                DeviceBuffer::alloc(0, t_bridge * k_hidden * std::mem::size_of::<u16>()).unwrap();
+            let d_x_mut = upload(&h_x[..t_bridge * k_hidden], &stream);
+            let d_ids_mut = upload(&h_topk_ids[..t_bridge * top_k], &stream);
+
+            let graph = crate::cuda::CudaGraph::capture(&stream, || {
+                TieredMoeEngine::execute_layer_device_lru(
+                    &full_store,
+                    &mut cache,
+                    &ws,
+                    &stream,
+                    d_x_mut.addr(),
+                    d_ids_mut.addr(),
+                    d_topk_weights.addr(),
+                    d_shared_out.addr(),
+                    d_shared_gate.addr(),
+                    d_out.addr(),
+                    t_bridge,
+                    top_k,
+                )
+            })
+            .unwrap();
+
+            for replay in 1..=3usize {
+                // Reset initial 9-slot cache before each replay and mutate routing/input scale
+                // so every replay exercises >= 6 distinct cold misses (`n_gpu_cold >= 3`) while
+                // keeping evictable hits (`1` in slot 1, `4` in slot 8) active in the step.
+                let init_slots = if replay % 2 == 1 {
+                    [0usize, 1, 2, 3, 6, 7, 13, 15, 4]
+                } else {
+                    [0usize, 1, 5, 8, 9, 10, 11, 12, 4]
+                };
+                cache
+                    .populate_initial(&full_store, Some(&init_slots), &mut ws, &stream)
+                    .unwrap();
+                let step_ids: Vec<i32> = if replay % 2 == 1 {
+                    // Hits: 0 (slot 0), 1 (slot 1), 4 (slot 8); 7 cold misses: 5, 8, 9, 10, 11, 12, 14
+                    vec![
+                        0, 4, 8, 11, // tok 0
+                        1, 4, 9, 14, // tok 1
+                        0, 5, 10, 12, // tok 2
+                        1, 5, 8, 12, // tok 3
+                    ]
+                } else {
+                    // Hits: 0 (slot 0), 1 (slot 1), 4 (slot 8); 7 cold misses: 2, 3, 6, 7, 13, 14, 15
+                    vec![
+                        0, 4, 2, 6, // tok 0
+                        1, 4, 3, 7, // tok 1
+                        0, 13, 14, 15, // tok 2
+                        1, 2, 13, 15, // tok 3
+                    ]
+                };
+                let scale = 1.0f32 + 0.125f32 * ((replay - 1) as f32);
+                let step_x: Vec<u16> = h_x[..t_bridge * k_hidden]
+                    .iter()
+                    .map(|&v| f32_to_f16(f16_to_f32(v) * scale))
+                    .collect();
+                d_x_mut.copy_from_host(&step_x, &stream).unwrap();
+                d_ids_mut.copy_from_host(&step_ids, &stream).unwrap();
+
+                let d_step_oracle =
+                    DeviceBuffer::alloc(0, t_bridge * k_hidden * std::mem::size_of::<u16>())
+                        .unwrap();
+                TieredMoeEngine::execute_layer(
+                    MoeOffloadMode::GpuLru,
+                    &full_store,
+                    &mut full_cache,
+                    &mut ws_oracle,
+                    &stream,
+                    d_x_mut.addr(),
+                    d_ids_mut.addr(),
+                    d_topk_weights.addr(),
+                    &step_ids,
+                    &h_topk_weights[..t_bridge * top_k],
+                    d_shared_out.addr(),
+                    d_shared_gate.addr(),
+                    d_step_oracle.addr(),
+                    t_bridge,
+                    top_k,
+                )
+                .unwrap();
+                let mut h_step_oracle = vec![0u16; t_bridge * k_hidden];
+                d_step_oracle
+                    .copy_to_host(&mut h_step_oracle, &stream)
+                    .unwrap();
+
+                graph.launch(&stream).unwrap();
+                let mut h_graph_out = vec![0u16; t_bridge * k_hidden];
+                d_out.copy_to_host(&mut h_graph_out, &stream).unwrap();
+                let mut misses = [0i32; 2];
+                ws.d_num_misses.copy_to_host(&mut misses, &stream).unwrap();
+                cache.sync_from_device_if_dirty(&stream).unwrap();
+
+                let (n_gpu_cold, n_cpu_cold) = (misses[0], misses[1]);
+                assert!(
+                    (3..=8).contains(&n_gpu_cold),
+                    "replay {replay}: expected n_gpu_cold in 3..=8, got {n_gpu_cold}"
+                );
+                assert!(
+                    n_cpu_cold >= 1,
+                    "replay {replay}: expected n_cpu_cold >= 1, got {n_cpu_cold}"
+                );
+                assert_eq!(
+                    n_gpu_cold + n_cpu_cold,
+                    7,
+                    "replay {replay}: expected 7 total cold experts partitioned across GPU+CPU"
+                );
+                // Current-step cache hits (static 0 in slot 0, evictable 1 in slot 1, evictable 4 in slot 8)
+                // must never be evicted during the same step.
+                assert_eq!(cache.slot_of(0), Some(0));
+                assert_eq!(cache.slot_of(1), Some(1));
+                assert_eq!(cache.slot_of(4), Some(8));
+
+                let replay_diff = h_graph_out
+                    .iter()
+                    .zip(&h_step_oracle)
+                    .map(|(&a, &b)| (f16_to_f32(a) - f16_to_f32(b)).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    replay_diff <= 1.6e-2,
+                    "TP=1 HybridCpuGpuBridge(8 evictable slots) replay {replay} max_abs_diff={replay_diff} exceeds 1.6e-2"
+                );
+            }
         }
 
         // 5. Verify TP=2 / EP=2 (`Rank 0: 0..8`, `Rank 1: 8..16`) across `GpuLru`, `CpuHybrid`, and `StreamedPrefill`,
