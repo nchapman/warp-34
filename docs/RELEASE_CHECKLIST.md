@@ -80,6 +80,31 @@ Use the existing `benchmarks/perf/` campaign tooling and `tools/oracle/` drivers
 - Ignored cases: `bench_prefill_query_tiles`, `benchmark_flash_next_pool`, `canonical_checkpoint_host_store_tp1_and_ep2_agree`, `pinned_hgptq_dflash2_lossless_and_tp2`, `pinned_hgptq_moe_35b_text_vision_mtp_and_tp2`, `pinned_hgptq_text_graph_mtp_and_tp2`, `pinned_hgptq_vision_matches_vllm_and_tp2`, `benchmark_block_hadamard`, `cached_hf_quantized_and_unquantized_checkpoints`, `test_qwen4_exp_real_checkpoint_tp1_and_tp2`, `test_qwen4_flash_next_128tok_plain_mtp3_dflash2_exact_parity`, `test_qwen4_exp_reference_bench_suite`, and `benchmark_cached_qwen_constraint`. These include qualification tests, not just optional timing benchmarks.
 - Fresh ignored real-model/format qualification, external oracle, performance/quality campaign, sustained soak, container, Ada, NVLink and TP4 runs: **not performed in this assessment**.
 
+## Lifecycle hardening verification
+
+Source: the hardening changes committed with this receipt on `fix/production-lifecycle-hardening`, parent `bc2a3e5`. This supplements rather than replaces the documentation-only baseline above.
+
+- Same local two RTX 3090 Ti / driver 615.71.09 / PHB setup; GPUs idle before and after the campaign.
+- `CUDA_VISIBLE_DEVICES=0,1 W34_STRICT_TESTS=1 CUDA_DISABLE_PTX_JIT=1 mise run check`: **PASS**, exit 0, 346.83 seconds; **491 Rust tests passed, 0 failed, 13 ignored**, 69 oracle-tooling, 91 performance-tooling and 18 dashboard tests. Formatting, both Clippy modes and rustdoc passed. The ignored inventory above is unchanged. An earlier attempt failed the new test modules' placement lint; corrected before this rerun.
+- Full-check log: `/tmp/w34-lifecycle-hardening-check-final.log`, SHA-256 `7b875a4b965d4ec86db91a6a7575ca2f91916f77486ed373913002f0a62f6f85`.
+- Targeted live Responses cancellation/readiness and native sampled-terminal-grammar tests also passed independently. The source review reported no actionable findings.
+- `cargo build --release --features cuda` and three sequential benchmark smoke runs passed, using `CUDA_VISIBLE_DEVICES=0,1 CUDA_DISABLE_PTX_JIT=1` and the common command below (default TP1). Each reported radix/vision lossless parity, distinct-image cache isolation, eight active scheduler sequences and 256 total scheduler output tokens.
+
+```sh
+./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline \
+  --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8
+# Repeat with --speculative mtp --mtp-k 3
+# Repeat with --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
+```
+
+| Mode | Decode tok/s (single run) | Local log | SHA-256 |
+|---|---:|---|---|
+| Plain | 211.68 | `/tmp/w34-lifecycle-bench-plain.log` | `238622b2cc07ff177380b94123abcab22c211b5ce0203c47ee26b70f4cfd7e3a` |
+| MTP-3 | 537.66 | `/tmp/w34-lifecycle-bench-mtp.log` | `b0c7649695f9568e58ba8c13dd994e27e580411b2a3c00da6a23a1444f53be5f` |
+| DFlash2 | 1427.58 | `/tmp/w34-lifecycle-bench-dflash2.log` | `51ee7c9b702e739ac431f228cfd235ce8b474480b24ceea2565d4bb3075dc95a` |
+
+These are smoke results, not matched before/after, competitor, or sustained-load qualification. Logs remain local and need durable upload for release sign-off. Sampled stateful-grammar handoff, external hard-stop/restart rehearsal, and all previously open hardware/model/soak gates remain open. See [READINESS.md](READINESS.md#focused-lifecycle-hardening-follow-up) for scope and [SERVING.md](SERVING.md#readiness-shutdown-and-bounded-recovery) for the operational procedure.
+
 ## Release receipt template
 
 Fill one per configuration; shared evidence may be referenced, not copied and relabeled. Do not place credentials or private user prompts in reports.

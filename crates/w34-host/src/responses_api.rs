@@ -110,8 +110,20 @@ pub struct ResponseStore {
     capacity: usize,
     per_scope_capacity: usize,
     scope_hasher: std::collections::hash_map::RandomState,
-    entries: Mutex<VecDeque<StoredResponse>>,
-    active_cancels: Mutex<HashMap<String, (String, Arc<AtomicBool>)>>,
+    // Cancellation and terminal publication share a lock: exactly one outcome wins.
+    state: Mutex<ResponseStoreState>,
+}
+
+struct ResponseStoreState {
+    entries: VecDeque<StoredResponse>,
+    active: HashMap<String, ActiveResponse>,
+}
+
+struct ActiveResponse {
+    owner_scope: String,
+    generation_cancel: Arc<AtomicBool>,
+    // Separate from the generation flag, which also signals disconnect/backpressure.
+    cancelled_response: Option<Value>,
 }
 
 impl Default for ResponseStore {
@@ -128,8 +140,10 @@ impl ResponseStore {
             capacity: cap,
             per_scope_capacity: per_scope,
             scope_hasher: std::collections::hash_map::RandomState::new(),
-            entries: Mutex::new(VecDeque::with_capacity(cap)),
-            active_cancels: Mutex::new(HashMap::new()),
+            state: Mutex::new(ResponseStoreState {
+                entries: VecDeque::with_capacity(cap),
+                active: HashMap::new(),
+            }),
         }
     }
 
@@ -177,7 +191,32 @@ impl ResponseStore {
     }
 
     pub fn insert(&self, entry: StoredResponse) {
-        let mut guard = self.entries.lock().unwrap();
+        self.finalize(entry, true);
+    }
+
+    /// Atomically retire cancellation and publish the winning terminal outcome.
+    /// Explicit cancellation discards partial assistant history. Transport failures do
+    /// not masquerade as caller cancellation and retain the existing no-store policy.
+    pub fn finalize(&self, mut entry: StoredResponse, persist: bool) -> Value {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .active
+            .get(&entry.id)
+            .is_some_and(|active| active.owner_scope == entry.owner_scope)
+            && let Some(active) = state.active.remove(&entry.id)
+            && let Some(cancelled) = active.cancelled_response
+        {
+            entry.response = cancelled;
+            entry.history_messages.clear();
+        }
+        let response = entry.response.clone();
+        if persist && response["status"] != "failed" {
+            self.insert_locked(&mut state.entries, entry);
+        }
+        response
+    }
+
+    fn insert_locked(&self, guard: &mut VecDeque<StoredResponse>, entry: StoredResponse) {
         if let Some(pos) = guard.iter().position(|e| e.id == entry.id) {
             guard.remove(pos);
         } else {
@@ -216,23 +255,26 @@ impl ResponseStore {
     }
 
     pub fn get_response(&self, id: &str, caller_scope: &str) -> Option<Value> {
-        let guard = self.entries.lock().unwrap();
-        guard
+        let state = self.state.lock().unwrap();
+        state
+            .entries
             .iter()
             .find(|e| e.id == id && e.owner_scope == caller_scope)
             .map(|e| e.response.clone())
     }
 
     pub fn get_history(&self, id: &str, caller_scope: &str) -> Option<Vec<Value>> {
-        let guard = self.entries.lock().unwrap();
-        guard
+        let state = self.state.lock().unwrap();
+        state
+            .entries
             .iter()
             .find(|e| e.id == id && e.owner_scope == caller_scope)
             .map(|e| e.history_messages.clone())
     }
 
     pub fn delete(&self, id: &str, caller_scope: &str) -> bool {
-        let mut guard = self.entries.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let guard = &mut state.entries;
         if let Some(pos) = guard
             .iter()
             .position(|e| e.id == id && e.owner_scope == caller_scope)
@@ -245,41 +287,44 @@ impl ResponseStore {
     }
 
     pub fn register_active(&self, id: String, owner_scope: String, flag: Arc<AtomicBool>) {
-        self.active_cancels
-            .lock()
-            .unwrap()
-            .insert(id, (owner_scope, flag));
+        self.state.lock().unwrap().active.insert(
+            id,
+            ActiveResponse {
+                owner_scope,
+                generation_cancel: flag,
+                cancelled_response: None,
+            },
+        );
     }
 
     pub fn unregister_active(&self, id: &str) {
-        self.active_cancels.lock().unwrap().remove(id);
+        self.state.lock().unwrap().active.remove(id);
     }
 
     pub fn cancel(&self, id: &str, caller_scope: &str) -> Option<Value> {
-        let matched = self
-            .active_cancels
-            .lock()
-            .unwrap()
-            .get(id)
-            .filter(|(owner, _)| owner == caller_scope)
-            .map(|(_, flag)| flag.clone());
-        if let Some(flag) = matched {
-            flag.store(true, Ordering::Release);
-            let now = unix_timestamp_secs();
-            let cancelled = json!({
-                "id": id,
-                "object": "response",
-                "created_at": now,
-                "status": "cancelled",
-                "error": Value::Null,
-                "incomplete_details": {"reason": "cancelled"},
-                "output": [],
-                "output_text": "",
+        let mut state = self.state.lock().unwrap();
+        if let Some(active) = state
+            .active
+            .get_mut(id)
+            .filter(|active| active.owner_scope == caller_scope)
+        {
+            active.generation_cancel.store(true, Ordering::Release);
+            let cancelled = active.cancelled_response.get_or_insert_with(|| {
+                json!({
+                    "id": id,
+                    "object": "response",
+                    "created_at": unix_timestamp_secs(),
+                    "status": "cancelled",
+                    "error": Value::Null,
+                    "incomplete_details": {"reason": "cancelled"},
+                    "output": [],
+                    "output_text": "",
+                })
             });
-            return Some(cancelled);
+            return Some(cancelled.clone());
         }
-        let mut guard = self.entries.lock().unwrap();
-        if let Some(entry) = guard
+        if let Some(entry) = state
+            .entries
             .iter_mut()
             .find(|e| e.id == id && e.owner_scope == caller_scope)
         {
@@ -1542,6 +1587,29 @@ impl ResponsesSseFormatter {
         output_tokens: usize,
         reasoning_tokens: usize,
     ) -> (Vec<(String, Value)>, Value, Vec<Value>) {
+        let (mut frames, response, history) = self.finish_output(
+            turn,
+            finish_reason,
+            input_tokens,
+            cached_tokens,
+            output_tokens,
+            reasoning_tokens,
+        );
+        frames.push(self.terminal_response(response.clone()));
+        (frames, response, history)
+    }
+
+    /// Prepare output-item closure separately from terminal publication, so the
+    /// HTTP handler can arbitrate completion against cancellation before emitting it.
+    pub fn finish_output(
+        &mut self,
+        turn: &ParsedAssistantTurn,
+        finish_reason: &str,
+        input_tokens: usize,
+        cached_tokens: usize,
+        output_tokens: usize,
+        reasoning_tokens: usize,
+    ) -> (Vec<(String, Value)>, Value, Vec<Value>) {
         let mut out = Vec::new();
         self.close_active(&mut out);
 
@@ -1622,15 +1690,6 @@ impl ResponsesSseFormatter {
             usage,
         );
 
-        let term_type = if is_incomplete {
-            "response.incomplete"
-        } else {
-            "response.completed"
-        };
-        let mut tm = Map::new();
-        tm.insert("response".into(), response.clone());
-        out.push(self.emit(term_type, tm));
-
         let (_, history) = build_response_object(
             &self.meta,
             turn,
@@ -1643,13 +1702,28 @@ impl ResponsesSseFormatter {
         (out, response, history)
     }
 
+    pub fn terminal_response(&mut self, response: Value) -> (String, Value) {
+        let event = match response["status"].as_str() {
+            Some("cancelled") => "response.cancelled",
+            Some("failed") => "response.failed",
+            Some("incomplete") => "response.incomplete",
+            _ => "response.completed",
+        };
+        let mut payload = Map::new();
+        payload.insert("response".into(), response);
+        self.emit(event, payload)
+    }
+
     pub fn fail(&mut self, message: &str) -> Vec<(String, Value)> {
-        let mut out = Vec::new();
+        vec![self.terminal_response(self.failure_response(message))]
+    }
+
+    pub fn failure_response(&self, message: &str) -> Value {
         let err_obj = json!({
             "code": "server_error",
             "message": message,
         });
-        let failed = build_response_envelope(
+        build_response_envelope(
             &self.meta,
             "failed",
             self.emitted_items.clone(),
@@ -1657,11 +1731,7 @@ impl ResponsesSseFormatter {
             Value::Null,
             err_obj,
             Value::Null,
-        );
-        let mut fm = Map::new();
-        fm.insert("response".into(), failed);
-        out.push(self.emit("response.failed", fm));
-        out
+        )
     }
 }
 

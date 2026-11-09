@@ -429,6 +429,11 @@ impl EngineWorker {
         self.max_model_len.unwrap_or(self.kv_token_capacity)
     }
 
+    /// Shutdown is terminal for this worker; callers must stop admitting requests.
+    pub fn is_stopping(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
     pub fn request_shutdown(&self) {
         self.stats.telemetry.set_status("stopping");
         self.shutdown.store(true, Ordering::Release);

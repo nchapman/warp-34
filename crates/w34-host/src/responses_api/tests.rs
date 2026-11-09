@@ -271,6 +271,165 @@ fn response_store_cancellation_deletion_and_lru_limits() {
 }
 
 #[test]
+fn completed_response_cannot_be_cancelled_while_terminal_frames_are_pending() {
+    let store = ResponseStore::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    store.register_active("resp_done".into(), "owner".into(), flag.clone());
+    let completed = json!({"id": "resp_done", "status": "completed", "output": []});
+    store.insert(StoredResponse {
+        id: "resp_done".into(),
+        owner_scope: "owner".into(),
+        response: completed.clone(),
+        history_messages: Vec::new(),
+    });
+    // The HTTP stream still owns its guard while terminal frames drain.
+    assert_eq!(store.cancel("resp_done", "owner"), Some(completed.clone()));
+    assert_eq!(store.get_response("resp_done", "owner"), Some(completed));
+    assert!(!flag.load(Ordering::Acquire));
+    assert!(store.cancel("resp_done", "other").is_none());
+}
+
+#[test]
+fn accepted_cancellation_wins_over_late_completion_publication() {
+    let store = ResponseStore::default();
+    let flag = Arc::new(AtomicBool::new(false));
+    store.register_active("resp_cancel".into(), "owner".into(), flag.clone());
+    let cancelled = store.cancel("resp_cancel", "owner").unwrap();
+    store.insert(StoredResponse {
+        id: "resp_cancel".into(),
+        owner_scope: "owner".into(),
+        response: json!({"id": "resp_cancel", "status": "completed"}),
+        history_messages: vec![json!({"role": "assistant", "content": "partial"})],
+    });
+    assert_eq!(
+        store.get_response("resp_cancel", "owner"),
+        Some(cancelled.clone())
+    );
+    assert_eq!(store.cancel("resp_cancel", "owner"), Some(cancelled));
+    assert!(flag.load(Ordering::Acquire));
+    assert_eq!(store.get_history("resp_cancel", "owner"), Some(Vec::new()));
+}
+
+#[test]
+fn cancellation_and_publication_race_has_one_terminal_outcome() {
+    for _ in 0..64 {
+        let store = ResponseStore::default();
+        store.register_active(
+            "resp_race".into(),
+            "owner".into(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let barrier = std::sync::Barrier::new(2);
+        let (cancelled, published) = std::thread::scope(|threads| {
+            let cancel = threads.spawn(|| {
+                barrier.wait();
+                store.cancel("resp_race", "owner").unwrap()
+            });
+            barrier.wait();
+            let published = store.finalize(
+                StoredResponse {
+                    id: "resp_race".into(),
+                    owner_scope: "owner".into(),
+                    response: json!({"id": "resp_race", "status": "completed"}),
+                    history_messages: Vec::new(),
+                },
+                true,
+            );
+            (cancel.join().unwrap(), published)
+        });
+        assert_eq!(cancelled, published);
+        assert_eq!(store.get_response("resp_race", "owner"), Some(published));
+    }
+}
+
+#[test]
+fn transport_cancellation_is_not_explicit_response_cancellation() {
+    let store = ResponseStore::default();
+    let transport_flag = Arc::new(AtomicBool::new(true));
+    store.register_active("resp_failed".into(), "owner".into(), transport_flag);
+    let failed = store.finalize(
+        StoredResponse {
+            id: "resp_failed".into(),
+            owner_scope: "owner".into(),
+            response: json!({"status": "failed"}),
+            history_messages: Vec::new(),
+        },
+        true,
+    );
+    assert_eq!(failed["status"], "failed");
+    assert!(store.cancel("resp_failed", "owner").is_none());
+    assert!(store.get_response("resp_failed", "owner").is_none());
+}
+
+#[test]
+fn unstored_cancellation_is_terminal_without_retaining_history() {
+    let store = ResponseStore::default();
+    store.register_active(
+        "resp_private".into(),
+        "owner".into(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let cancelled = store.cancel("resp_private", "owner").unwrap();
+    assert_eq!(
+        store.cancel("resp_private", "owner"),
+        Some(cancelled.clone())
+    );
+    let published = store.finalize(
+        StoredResponse {
+            id: "resp_private".into(),
+            owner_scope: "owner".into(),
+            response: json!({"status": "failed"}),
+            history_messages: Vec::new(),
+        },
+        false,
+    );
+    assert_eq!(published, cancelled);
+    assert!(store.get_response("resp_private", "owner").is_none());
+    assert!(store.cancel("resp_private", "owner").is_none());
+}
+
+#[test]
+fn cancelled_stream_uses_winning_response_and_contiguous_sequence_numbers() {
+    let store = ResponseStore::default();
+    let (_, meta) = translate_responses_to_chat(
+        &json!({"input": "hi", "store": true}),
+        "q",
+        &store,
+        Some("owner"),
+        1,
+    )
+    .unwrap();
+    store.register_active(
+        meta.response_id.clone(),
+        "owner".into(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mut formatter = ResponsesSseFormatter::new(meta.clone());
+    let mut frames = formatter.start();
+    let cancelled = store.cancel(&meta.response_id, "owner").unwrap();
+    let final_response = store.finalize(
+        StoredResponse {
+            id: meta.response_id.clone(),
+            owner_scope: "owner".into(),
+            response: formatter.failure_response("channel closed"),
+            history_messages: Vec::new(),
+        },
+        true,
+    );
+    frames.push(formatter.terminal_response(final_response));
+    for (sequence, (event, payload)) in frames.iter().enumerate() {
+        assert_eq!(payload["sequence_number"], sequence);
+        assert_eq!(payload["type"], event.as_str());
+    }
+    assert_eq!(frames.last().unwrap().0, "response.cancelled");
+    assert_eq!(frames.last().unwrap().1["response"], cancelled);
+    assert_eq!(
+        store.get_response(&meta.response_id, "owner"),
+        Some(cancelled)
+    );
+}
+
+#[test]
 fn responses_api_error_helpers_and_id_uniqueness() {
     let e1 = ResponsesApiError::bad_request("invalid field");
     let j1 = e1.to_openai_json();

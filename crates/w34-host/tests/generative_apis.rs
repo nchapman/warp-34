@@ -632,6 +632,50 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
             assert_eq!(cancel_a["id"], tenant_a_id);
             assert_eq!(cancel_a["status"], tenant_a_resp["status"]);
 
+            // Cancellation races real generation, but its returned terminal outcome
+            // must agree with the stream and stored response whichever side wins.
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                let mut response = client
+                    .post(format!("{base}/v1/responses"))
+                    .header("Authorization", "Bearer tenant-cancel")
+                    .json(&json!({
+                        "input": "Count upward, one number per line.",
+                        "stream": true, "store": true,
+                        "max_output_tokens": 1024, "ignore_eos": true,
+                        "reasoning": {"effort": "none"}
+                    }))
+                    .send().await.unwrap();
+                assert_eq!(response.status(), 200);
+                let mut raw = Vec::new();
+                let id = loop {
+                    raw.extend_from_slice(&response.chunk().await.unwrap().expect("response.created"));
+                    if let Some((_, created)) = parse_sse_frames(&String::from_utf8_lossy(&raw))
+                        .into_iter().find(|(event, _)| event == "response.created")
+                    {
+                        break created["response"]["id"].as_str().unwrap().to_owned();
+                    }
+                };
+                let cancellation: Value = client
+                    .post(format!("{base}/v1/responses/{id}/cancel"))
+                    .header("Authorization", "Bearer tenant-cancel")
+                    .send().await.unwrap().json().await.unwrap();
+                while let Some(chunk) = response.chunk().await.unwrap() {
+                    raw.extend_from_slice(&chunk);
+                }
+                let frames = parse_sse_frames(&String::from_utf8(raw).unwrap());
+                for (sequence, (_, payload)) in frames.iter().enumerate() {
+                    assert_eq!(payload["sequence_number"], sequence);
+                }
+                let (event, terminal) = frames.last().unwrap();
+                assert!(matches!(event.as_str(), "response.cancelled" | "response.completed" | "response.incomplete"), "{event}: {terminal}");
+                assert_eq!(terminal["response"], cancellation);
+                let stored: Value = client
+                    .get(format!("{base}/v1/responses/{id}"))
+                    .header("Authorization", "Bearer tenant-cancel")
+                    .send().await.unwrap().json().await.unwrap();
+                assert_eq!(stored, cancellation);
+            }).await.expect("Responses cancellation must terminate promptly");
+
             // Verify /tokenize and /detokenize roundtrip + invalid token rejection.
             let tok_resp: Value = client
                 .post(format!("{base}/tokenize"))
@@ -666,6 +710,11 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
                 400
             );
 
+            assert_eq!(client.get(format!("{base}/health")).send().await.unwrap().status(), 200);
+            state.worker.request_shutdown();
+            let health = client.get(format!("{base}/health")).send().await.unwrap();
+            assert_eq!(health.status(), 503);
+            assert_eq!(health.json::<Value>().await.unwrap()["status"], "stopping");
             let _ = stop_tx.send(());
             server_task.await.unwrap().unwrap();
         });

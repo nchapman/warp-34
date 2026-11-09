@@ -720,15 +720,14 @@ fn run_pipelined_decode_burst(
         }
 
         if any_stopped {
-            let out_next = engine
-                .wait_pipelined_decode_step(ticket_next)
-                .map_err(|e| {
-                    engine.abort_pipelined_decode();
-                    WorkerError::Cuda(e)
-                })?;
-            for outcome in deferred_releases {
-                release(engine, outcome);
-            }
+            let out_next = wait_and_release_deferred(
+                engine,
+                |engine| engine.wait_pipelined_decode_step(ticket_next),
+                Qwen3_5Engine::abort_pipelined_decode,
+                deferred_releases,
+                release,
+            )
+            .map_err(WorkerError::Cuda)?;
             for (req_id, err) in deferred_failures {
                 fail_request(engine, sched, requests, req_id, err);
             }
@@ -767,6 +766,25 @@ fn run_pipelined_decode_burst(
         ticket_cur = ticket_next;
         slices_cur = slices_next;
     }
+}
+
+fn wait_and_release_deferred<C, T, E>(
+    context: &mut C,
+    wait: impl FnOnce(&mut C) -> Result<T, E>,
+    abort: impl FnOnce(&mut C),
+    releases: Vec<Option<crate::radix::RadixDonationOutcome>>,
+    mut release: impl FnMut(&mut C, Option<crate::radix::RadixDonationOutcome>),
+) -> Result<T, E> {
+    let output = wait(context);
+    if output.is_err() {
+        // Abort synchronizes both streams before transferred scheduler resources
+        // can be freed. Cancellation cannot recover these deferred records.
+        abort(context);
+    }
+    for outcome in releases {
+        release(context, outcome);
+    }
+    output
 }
 
 fn commit_pipelined_step(
@@ -848,4 +866,63 @@ pub(super) fn check_full_hidden_final_count(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod deferred_release_tests {
+    use super::wait_and_release_deferred;
+    use crate::radix::RadixDonationOutcome;
+
+    fn check(fail: bool) {
+        let donations = vec![
+            Some(RadixDonationOutcome {
+                freed_kv_pages: vec![11, 12],
+                freed_mamba_slots: vec![21],
+                ..Default::default()
+            }),
+            None,
+            Some(RadixDonationOutcome {
+                freed_kv_pages: vec![13],
+                freed_mamba_slots: vec![22, 23],
+                ..Default::default()
+            }),
+        ];
+        let mut state = (Vec::new(), Vec::new());
+        let original_error = Box::new("original wait error");
+        let error_ptr = std::ptr::from_ref(original_error.as_ref());
+        let result = wait_and_release_deferred(
+            &mut state,
+            |state| {
+                state.0.push("wait");
+                if fail { Err(original_error) } else { Ok(42) }
+            },
+            |state| state.0.push("abort"),
+            donations.clone(),
+            |state, outcome| {
+                state.0.push("release");
+                state.1.push(outcome);
+            },
+        );
+        if fail {
+            assert_eq!(std::ptr::from_ref(result.unwrap_err().as_ref()), error_ptr);
+            assert_eq!(state.0, ["wait", "abort", "release", "release", "release"]);
+        } else {
+            assert_eq!(result, Ok(42));
+            assert_eq!(state.0, ["wait", "release", "release", "release"]);
+        }
+        assert_eq!(
+            state.1, donations,
+            "deliver every resource record exactly once"
+        );
+    }
+
+    #[test]
+    fn failed_wait_aborts_before_delivering_deferred_resources() {
+        check(true);
+    }
+
+    #[test]
+    fn successful_wait_delivers_deferred_resources_without_abort() {
+        check(false);
+    }
 }

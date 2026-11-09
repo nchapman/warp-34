@@ -167,14 +167,26 @@ pub(super) fn admission_error(err: tokio::sync::TryAcquireError) -> ApiError {
 }
 
 async fn health(State(s): State<Arc<OpenAiServerState>>) -> Response {
-    if s.worker.is_panicked() {
-        let detail = s
-            .worker
+    let panic = s.worker.is_panicked().then(|| {
+        s.worker
             .panic_reason()
-            .unwrap_or_else(|| "engine worker panicked".into());
+            .unwrap_or_else(|| "engine worker panicked".into())
+    });
+    health_response(panic, s.admission.is_closed() || s.worker.is_stopping())
+}
+
+fn health_response(panic: Option<String>, stopping: bool) -> Response {
+    if let Some(detail) = panic {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status":"error","error":format!("engine worker terminated after panic: {detail}")})),
+        )
+            .into_response();
+    }
+    if stopping {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status":"stopping"})),
         )
             .into_response();
     }
@@ -1019,6 +1031,56 @@ fn count_reasoning_tokens(
     }
 }
 
+fn finalize_response(
+    store: &crate::responses_api::ResponseStore,
+    meta: &crate::responses_api::ResponsesPreparedMeta,
+    scope: Option<&str>,
+    response: Value,
+    history: Vec<Value>,
+) -> Value {
+    let Some(scope) = scope else { return response };
+    store.finalize(
+        crate::responses_api::StoredResponse {
+            id: meta.response_id.clone(),
+            owner_scope: scope.to_owned(),
+            response,
+            history_messages: history,
+        },
+        meta.store,
+    )
+}
+
+fn responses_stream_failure(
+    store: &crate::responses_api::ResponseStore,
+    meta: &crate::responses_api::ResponsesPreparedMeta,
+    scope: Option<&str>,
+    sse: &mut crate::responses_api::ResponsesSseFormatter,
+    message: &str,
+) -> (String, Value) {
+    let response = finalize_response(
+        store,
+        meta,
+        scope,
+        sse.failure_response(message),
+        Vec::new(),
+    );
+    sse.terminal_response(response)
+}
+
+fn responses_sync_failure(
+    store: &crate::responses_api::ResponseStore,
+    meta: &crate::responses_api::ResponsesPreparedMeta,
+    scope: Option<&str>,
+    failure: ApiError,
+) -> Result<Response, ApiError> {
+    let response = finalize_response(store, meta, scope, json!({"status": "failed"}), Vec::new());
+    if response["status"] == "cancelled" {
+        Ok(Json(response).into_response())
+    } else {
+        Err(failure)
+    }
+}
+
 async fn responses_create(
     State(s): State<Arc<OpenAiServerState>>,
     request: Request,
@@ -1096,9 +1158,8 @@ async fn responses_create(
                             Ok(Some(t)) => t,
                             Ok(None) => continue,
                             Err(e) => {
-                                for (ev_name, payload) in sse.fail(&e.to_string()) {
-                                    yield Ok(Event::default().event(ev_name).data(payload.to_string()));
-                                }
+                                let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, &e.to_string());
+                                yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                                 return;
                             }
                         };
@@ -1120,9 +1181,8 @@ async fn responses_create(
                     }
                     GenerationEvent::Error(err) => {
                         let msg = err.to_string();
-                        for (ev_name, payload) in sse.fail(&msg) {
-                            yield Ok(Event::default().event(ev_name).data(payload.to_string()));
-                        }
+                        let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, &msg);
+                        yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                         return;
                     }
                 }
@@ -1130,9 +1190,8 @@ async fn responses_create(
             cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
             drop(generation);
             if !done {
-                for (ev_name, payload) in sse.fail("engine stream closed before completion") {
-                    yield Ok(Event::default().event(ev_name).data(payload.to_string()));
-                }
+                let (ev_name, payload) = responses_stream_failure(&s.response_store, &meta, caller_scope.as_deref(), &mut sse, "engine stream closed before completion");
+                yield Ok(Event::default().event(ev_name).data(payload.to_string()));
                 return;
             }
             let tail = std::mem::take(&mut stops.pending);
@@ -1153,18 +1212,10 @@ async fn responses_create(
                 "stop"
             };
             let reasoning_tokens = count_reasoning_tokens(tokenizer, &turn, count);
-            let (end_frames, final_resp, history) =
-                sse.finish(&turn, finish, prompt_len, cached, count, reasoning_tokens);
-            if meta.store
-                && let Some(ref scope) = caller_scope
-            {
-                s.response_store.insert(crate::responses_api::StoredResponse {
-                    id: meta.response_id.clone(),
-                    owner_scope: scope.clone(),
-                    response: final_resp,
-                    history_messages: history,
-                });
-            }
+            let (mut end_frames, final_resp, history) =
+                sse.finish_output(&turn, finish, prompt_len, cached, count, reasoning_tokens);
+            let final_resp = finalize_response(&s.response_store, &meta, caller_scope.as_deref(), final_resp, history);
+            end_frames.push(sse.terminal_response(final_resp));
             for (ev_name, payload) in end_frames {
                 yield Ok(Event::default().event(ev_name).data(payload.to_string()));
             }
@@ -1198,7 +1249,14 @@ async fn responses_create(
                     let decoded = match decoder.step(id as u32) {
                         Ok(Some(t)) => t,
                         Ok(None) => continue,
-                        Err(e) => return Err(error(StatusCode::INTERNAL_SERVER_ERROR, e)),
+                        Err(e) => {
+                            return responses_sync_failure(
+                                &s.response_store,
+                                &meta,
+                                caller_scope.as_deref(),
+                                error(StatusCode::INTERNAL_SERVER_ERROR, e),
+                            );
+                        }
                     };
                     let active_stops = if count >= prepared.params.min_tokens {
                         prepared.params.stop_strings.as_slice()
@@ -1219,17 +1277,27 @@ async fn responses_create(
                     break;
                 }
                 GenerationEvent::Error(err) => {
-                    return Err(worker_api_err(err));
+                    return responses_sync_failure(
+                        &s.response_store,
+                        &meta,
+                        caller_scope.as_deref(),
+                        worker_api_err(err),
+                    );
                 }
             }
         }
         cached = cached.max(generation.cached_tokens.load(Ordering::Acquire) as usize);
         drop(generation);
         if !done {
-            return Err(error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "engine stream closed before completion",
-            ));
+            return responses_sync_failure(
+                &s.response_store,
+                &meta,
+                caller_scope.as_deref(),
+                error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "engine stream closed before completion",
+                ),
+            );
         }
         let tail = std::mem::take(&mut stops.pending);
         if !tail.is_empty() {
@@ -1253,17 +1321,13 @@ async fn responses_create(
             count,
             reasoning_tokens,
         );
-        if meta.store
-            && let Some(scope) = caller_scope
-        {
-            s.response_store
-                .insert(crate::responses_api::StoredResponse {
-                    id: meta.response_id.clone(),
-                    owner_scope: scope,
-                    response: resp.clone(),
-                    history_messages: history,
-                });
-        }
+        let resp = finalize_response(
+            &s.response_store,
+            &meta,
+            caller_scope.as_deref(),
+            resp,
+            history,
+        );
         Ok(Json(resp).into_response())
     }
 }
@@ -1612,6 +1676,88 @@ mod tests {
             assert!(!super::is_inference_endpoint(&Method::POST, path));
             assert!(!super::is_inference_endpoint(&Method::GET, path));
         }
+    }
+
+    #[tokio::test]
+    async fn responses_failure_paths_distinguish_explicit_cancel_from_transport_failure() {
+        use crate::responses_api::{
+            ResponseStore, ResponsesSseFormatter, translate_responses_to_chat,
+        };
+        use serde_json::{Value, json};
+        use std::sync::{Arc, atomic::AtomicBool};
+        for streaming in [false, true] {
+            for explicit_cancel in [false, true] {
+                let store = ResponseStore::default();
+                let (_, meta) = translate_responses_to_chat(
+                    &json!({"input": "hi", "store": true}),
+                    "q",
+                    &store,
+                    Some("owner"),
+                    1,
+                )
+                .unwrap();
+                // The worker flag is also set on backpressure/disconnect. It must
+                // not itself turn a transport error into explicit cancellation.
+                store.register_active(
+                    meta.response_id.clone(),
+                    "owner".into(),
+                    Arc::new(AtomicBool::new(true)),
+                );
+                let cancelled =
+                    explicit_cancel.then(|| store.cancel(&meta.response_id, "owner").unwrap());
+                if streaming {
+                    let mut formatter = ResponsesSseFormatter::new(meta.clone());
+                    let (event, payload) = super::responses_stream_failure(
+                        &store,
+                        &meta,
+                        Some("owner"),
+                        &mut formatter,
+                        "channel closed",
+                    );
+                    if let Some(ref cancelled) = cancelled {
+                        assert_eq!(event, "response.cancelled");
+                        assert_eq!(&payload["response"], cancelled);
+                    } else {
+                        assert_eq!(event, "response.failed");
+                        assert_eq!(payload["response"]["error"]["message"], "channel closed");
+                    }
+                } else {
+                    let result = super::responses_sync_failure(
+                        &store,
+                        &meta,
+                        Some("owner"),
+                        super::error(StatusCode::INTERNAL_SERVER_ERROR, "channel closed"),
+                    );
+                    if let Some(ref cancelled) = cancelled {
+                        let response = result.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        assert_eq!(&serde_json::from_slice::<Value>(&bytes).unwrap(), cancelled);
+                    } else {
+                        assert_eq!(result.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                }
+                assert_eq!(store.get_response(&meta.response_id, "owner"), cancelled);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_is_unavailable_while_stopping_and_preserves_panic_diagnostics() {
+        use axum::body::to_bytes;
+        assert_eq!(super::health_response(None, false).status(), StatusCode::OK);
+        let stopping = super::health_response(None, true);
+        assert_eq!(stopping.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(stopping.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["status"], "stopping");
+        let failed = super::health_response(Some("test panic".into()), true);
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(failed.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("test panic"));
     }
 
     #[test]

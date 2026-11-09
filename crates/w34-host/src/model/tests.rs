@@ -91,6 +91,41 @@ mod serving_capacity_tests {
     }
 
     #[test]
+    fn legacy_pool_budget_charges_allocated_capacity_for_state() {
+        // DeviceArena reserves capacity even when uploads leave most of it unused.
+        let weights = super::super::rank::pool_weight_budget(false, 200, 600);
+        let slots = clamp_state_slots(64, 1200, weights + 100 + 100 + 100, 50);
+        assert_eq!(slots, 6);
+        assert!(600 + 100 + 100 + 100 + slots * 50 <= 1200);
+    }
+
+    #[test]
+    fn legacy_pool_budget_charges_allocated_capacity_for_kv() {
+        let weights = super::super::rank::pool_weight_budget(false, 200, 600);
+        let plan = crate::cuda::CapacityPlanner::plan_with_headroom(
+            1200, 1200, weights, 100, 300, 50, None, 100,
+        )
+        .unwrap();
+        assert_eq!(plan.max_kv_pages_per_layer, 2);
+        assert!(
+            crate::cuda::CapacityPlanner::plan_with_headroom(
+                1200,
+                1200,
+                weights,
+                100,
+                300,
+                50,
+                Some(3),
+                100,
+            )
+            .is_err()
+        );
+        // Live free VRAM already includes allocated capacity; keep its cancellation basis.
+        assert_eq!(super::super::rank::pool_weight_budget(true, 200, 600), 200);
+        assert_eq!(super::super::rank::pool_weight_budget(false, 600, 600), 600);
+    }
+
+    #[test]
     fn serving_budget_respects_memory_clamp() {
         assert_eq!(clamp_state_slots(64, 1000, 400, 10), 60);
         assert_eq!(clamp_state_slots(64, 2000, 400, 10), 64);

@@ -94,6 +94,43 @@ Token-count/tokenization endpoints are utilities and do not consume this budget.
 Absent output budgets still use each API's existing defaults, rather than silently
 shrinking the output budget to remaining capacity.
 
+## Readiness, shutdown, and bounded recovery
+
+`GET /health` returns 200 while the worker is available, 503 with `status: "stopping"`
+when HTTP admission closes or worker shutdown is requested, and 503 with the
+existing error details after a worker panic. Panic diagnostics take precedence over
+stopping. This is **not a proof of GPU forward progress**: a stalled kernel or
+collective may leave HTTP responsive. Monitor completion progress/latency and
+use a bounded real inference probe appropriate to the deployment workload.
+
+Graceful shutdown closes admission, allows up to **30 seconds for HTTP drain**,
+then requests worker shutdown and joins its thread. The join deliberately waits
+for safe CUDA/CPU-bridge teardown; the 30-second drain deadline is **not a total
+process-exit deadline**. Timing out a blocking thread join cannot safely cancel
+CUDA work or permit freeing in-flight mapped buffers.
+
+Configure an external hard stop budget, for example Docker `--stop-timeout 45`
+(or `docker stop --time 45 <container>`), or systemd `TimeoutStopSec=45s` with
+`SendSIGKILL=yes`. Choose a budget compatible with your request/drain policy.
+Docker health checks alone do not restart an unhealthy container; arrange the
+watchdog/orchestrator policy explicitly. A manually stopped Docker container
+also requires an explicit start rather than relying on its restart policy.
+
+Before release, rehearse on an **isolated disposable instance**:
+
+1. Send an inference request, initiate shutdown, and verify readiness becomes
+   unavailable and the normal drain completes.
+2. Exercise the supervisor's hard-stop path with a deliberately nonterminating
+   test process or a controlled stalled instance; verify it is killed within the
+   configured budget and GPU/process resources are gone before replacement.
+3. Restart the pinned image/model/configuration, serve a real request, and test
+   rollback to the last known-good combination. Record actual timings and status.
+
+Do not inject GPU/rank failure into a shared production worker. This is an operator
+qualification procedure, not a claim that the repository configures a supervisor
+or that the hard-stop rehearsal has already passed. In-memory Responses history
+is lost on restart; a partially delivered stream cannot be transparently retried.
+
 ## CLI scope and intentional omissions
 
 The five deployment settings (`--api-key`, `--api-key-env`,

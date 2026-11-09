@@ -42,7 +42,7 @@ All generative endpoints translate into `warp-34`'s single canonical prompt-prep
 
 ### Module Layout
 - `crates/w34-host/src/server.rs` & `crates/w34-host/src/server/http.rs` — Axum router registration, auth middleware (`Authorization: Bearer <token>` and Anthropic `x-api-key: <token>` accepted equivalently when `--api-key` is configured; `anthropic-version` and `anthropic-beta` headers tolerated), shared `PreparedPrompt` builder, `/v1/chat/completions`, `/v1/completions`, `*/input_tokens`, and `/tokenize` + `/detokenize`.
-- `crates/w34-host/src/responses_api.rs` — OpenAI Responses request/response types, bounded `ResponseStore` (`Mutex<VecDeque<StoredResponse>>`, capacity 256), `previous_response_id` history stitching, sync JSON builder, `/v1/responses/{response_id}/cancel`, and 0-indexed `sequence_number` SSE state machine.
+- `crates/w34-host/src/responses_api.rs` — OpenAI Responses request/response types, bounded `ResponseStore` (one mutex serializes stored entries and active cancellation, capacity 256), `previous_response_id` history stitching, sync JSON builder, `/v1/responses/{response_id}/cancel`, and 0-indexed `sequence_number` SSE state machine.
 - `crates/w34-host/src/anthropic_api.rs` — Anthropic Messages request/response types, `cch=` billing-header normalization, `thinking` / `tool_use` / `tool_result` / `image` block translation, sync JSON builder, typed Anthropic SSE state machine, `/v1/messages/count_tokens`, and Anthropic error envelopes.
 
 ### Invariants Preserved Across All Protocols
@@ -174,8 +174,15 @@ Every SSE frame sets `event: <type>` and carries `"type": "<type>"` plus a stric
 6. **Terminal event**:
    - `response.completed` (with full `response` object including `output` and `usage`) on normal/tool stop,
    - `response.incomplete` (`status: "incomplete"`, `incomplete_details: {"reason": "max_output_tokens"}`) on `FinishReason::Length`, or
-   - `response.failed` (`status: "failed"`, `error: {"code": "server_error", "message": "..."}`) on engine failure.
-   - Stream closes cleanly after the terminal event (no `[DONE]` frame, matching the OpenAI Responses specification).
+   - `response.failed` (`status: "failed"`, `error: {"code": "server_error", "message": "..."}`) on engine failure, or
+   - `response.cancelled` (`status: "cancelled"`) when an explicit cancel request wins before terminal publication. This is warp-34's cancellation event; clients must handle it rather than assume every upstream SDK recognizes this extension.
+   - Stream closes cleanly after the terminal event (no `[DONE]` frame).
+
+### 4.4 Cancellation and terminal publication
+
+Cancellation and final publication are serialized per store. Once completion is published, cancellation returns the stored terminal response rather than claiming to cancel it, even while the original stream is delivering its terminal frames. If cancellation wins first, the cancel endpoint and the original request's terminal result agree: streaming emits `response.cancelled`, and non-streaming returns the cancelled JSON object. A disconnect/backpressure flag alone does **not** count as an explicit cancel request; unexpected channel closure remains a failure.
+
+A cancelled result is the cancellation acknowledgment snapshot (`output: []`, `output_text: ""`, `incomplete_details.reason: "cancelled"`), not a completed answer or partial tool execution. Previously delivered deltas may exist; do not treat them as a successful final response. When the handler finalizes a `store: true` request, the snapshot is retained without partial assistant history. Before finalization, retrieval may still return 404. `store: false` requests retain no result after finalization, and abandoned/disconnected streams do not guarantee a persisted result. Failed requests retain the existing no-store behavior. All stored results are bounded, credential-scoped, and lost on process restart.
 
 ---
 

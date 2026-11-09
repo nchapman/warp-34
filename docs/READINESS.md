@@ -66,7 +66,7 @@ Paths beginning `tests/` in the register mean `crates/w34-host/tests/`; source p
 | API-03 | §2 Anthropic Messages/thinking/tools/count and billing-header normalization | B | `src/anthropic_api.rs`; `tests/{generative_apis,http_constraints}.rs`; E5 | Real supported-client conversation replay; malformed budgets/tool results and streaming event ordering. G2/G4. |
 | API-04 | §2 preprocessing/admission, body limits/timeouts, backpressure | B | `src/server/http.rs` (`BODY_LIMIT`, `BODY_TIMEOUT`); `tests/axum_serving.rs` | Burst/slow-body/CPU-heavy preprocessing mixed with decode; bounded memory and recovery under overload. G3/G4. |
 | API-05 | §2 model discovery, tokenization and token-count routes | B | `tests/{generative_apis,serving_options}.rs`; `src/server/http.rs` | Alias/count consistency with actual templates/images; auth and admission on aliases. G2/G4. |
-| OPS-01 | §2/§21 health, Prometheus and JSON telemetry | B | `src/{telemetry,server/http}.rs`; [METRICS.md](METRICS.md) | `/health` checks worker panic, not arbitrary GPU forward progress. Demonstrate stalled-worker detection externally or implement/test it; reconcile counters under cancel/error. G3/G6. |
+| OPS-01 | §2/§21 health, Prometheus and JSON telemetry | B | `src/{telemetry,server/http}.rs`; [METRICS.md](METRICS.md) | `/health` checks worker panic and stopping, not arbitrary GPU forward progress. Demonstrate stalled-worker detection externally or implement/test it; reconcile counters under cancel/error. G3/G6. |
 | DEC-01 | §3 Clef joint head, Kev pointer head | B | `tests/decision_models.rs`; `src/{clef,decision}/`; E5/E7 | Synthetic Kev-head coverage is not qualification of every production head. Pin real checkpoints/head artifacts and golden results. G2/G3. |
 | DEC-02 | §3 Nimble, Tev1, OpenJev, Xor/Lev scoring | C | `src/decision/{scoring,tests}.rs`; `tests/decision_models.rs`; E5 | Per-profile real-model correctness and throughput; option-count/normalization boundaries. Scores are not automatically calibrated probabilities. G2/G5. |
 | SEC-01 | §4 digest-based auth, Bearer/x-api-key route protection | B | `src/api_auth.rs`; `src/server/http.rs` auth tests; E5 | Auth is opt-in and service-level, not a tenant identity system. Verify fail-closed configuration and deployment exposure. G4/G6. |
@@ -153,6 +153,20 @@ Paths beginning `tests/` in the register mean `crates/w34-host/tests/`; source p
 | MoE offload × memory pressure × speculative verify | No stale mailbox reads, in-flight slot eviction, pinned-buffer reuse or leaked ownership | `src/moe_offload/tests.rs`; `tests/qwen4_flash_next.rs`; E1 |
 | Streaming tools × partial delimiters × slow/disconnected clients | No incomplete executable tool call, bounded buffers, prompt resource reclamation | `tests/{structured_constraints,http_constraints,axum_serving}.rs` |
 | Responses chaining × credentials × cancel/eviction | No cross-scope retrieval or contradictory terminal lifecycle; defined expiry/restart behavior | `src/responses_api/tests.rs`; `tests/generative_apis.rs` |
+
+## Focused lifecycle hardening follow-up
+
+The `fix/production-lifecycle-hardening` round (based on `bc2a3e5`) addresses specific findings without replacing the scheduler, speculative transaction model, or protocol adapters:
+
+| IDs | Change / regression coverage | Remaining qualification |
+|---|---|---|
+| ENG-02 / MEM-03 | Deferred pipeline release records are drained after abort on a failed next-step wait; CPU regressions check abort-before-release, exactly-once delivery, and original-error preservation. | Real device/rank failure and long-running pool conservation under churn. |
+| API-02 | One Responses-store lock arbitrates explicit cancellation and terminal publication; streaming/sync failure paths preserve that winner. Scope, racing publication, transport-vs-explicit cancellation and live SSE/store agreement are tested. | Sustained lifecycle/eviction churn and external client compatibility with the documented `response.cancelled` extension. |
+| GRM-02 / SPEC-03 | Native sampled generation stops at terminal grammar state even when the terminal ID is not a sampling stop/EOS ID; CPU predicate and real-model native MTP regressions. | Sampled stateful-grammar late-peer handoff remains unqualified. Deterministic request-specific handoff synchronization is not exposed; no timing-dependent test or broad hook was added in this round. |
+| OPS-01 | `/health` reports stopping as unavailable while retaining panic diagnostics; CPU and live route checks cover shutdown readiness. | A responsive probe still does not prove GPU progress. External hard-stop/restart rehearsal remains an operator gate; see [SERVING.md](SERVING.md#readiness-shutdown-and-bounded-recovery). |
+| MEM-01 | Legacy pool budgeting charges allocated arena capacity, not only its used bytes; state/KV boundary regressions cover the difference. Live serving-budget arithmetic and intentional minimum MoE-plan fallback remain unchanged. | Actual peak-memory/near-capacity qualification across supported configurations. |
+
+These changes do not promote any row to A or close G0–G7 automatically. See [STATE.md](STATE.md) for the completed verification results and limitations.
 
 ## Assessment maintenance
 

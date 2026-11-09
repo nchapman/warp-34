@@ -757,6 +757,14 @@ pub fn plan_host_embed_offload(
     }
 }
 
+#[cfg(any(test, feature = "cuda"))]
+pub(super) fn pool_weight_budget(use_live_budget: bool, used: usize, capacity: usize) -> usize {
+    // Live free VRAM already charges arena capacity; `used` is only a synthetic
+    // cancellation term there. Legacy budgets start before allocation and must
+    // charge the entire DeviceArena allocation, including unused capacity.
+    if use_live_budget { used } else { capacity }
+}
+
 // Preserve the minimum three-slot execution budget and the existing VRAM clamp.
 #[cfg(any(test, feature = "cuda"))]
 pub(super) fn clamp_state_slots(
@@ -1737,13 +1745,17 @@ impl PrePoolModelRank {
             .saturating_add(post_pool_moe_reserve)
             .saturating_add(rank0_extra_headroom);
         let use_live_pool_budget = capacity.state_slots.is_some() || cfg.uses_tiered_moe();
+        let pool_weight_bytes = pool_weight_budget(
+            use_live_pool_budget,
+            weight_arena.used(),
+            weight_arena.capacity(),
+        );
         let available_for_pools = if use_live_pool_budget {
             device.mem_info()?.0
         } else {
-            free_vram.saturating_sub(weight_arena.used().saturating_add(scratch_arena.capacity()))
+            free_vram.saturating_sub(pool_weight_bytes.saturating_add(scratch_arena.capacity()))
         };
-        let base_fixed = weight_arena
-            .used()
+        let base_fixed = pool_weight_bytes
             .saturating_add(scratch_arena.capacity())
             .saturating_add(required_headroom)
             .saturating_add(req_kv_bytes);
@@ -1822,7 +1834,7 @@ impl PrePoolModelRank {
                 .saturating_add(scratch_arena.capacity());
             (synthetic_free, resident_model_bytes)
         } else {
-            (free_vram, weight_arena.used())
+            (free_vram, pool_weight_bytes)
         };
         let capacity_plan = CapacityPlanner::plan_with_headroom(
             total_vram,

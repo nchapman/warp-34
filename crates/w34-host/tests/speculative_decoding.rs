@@ -244,6 +244,47 @@ fn exercise_http(engine: Qwen3_5Engine) {
 }
 
 #[test]
+fn native_sampled_terminal_grammar() {
+    let model = "nchapman/Qwen3.5-4B-W4A16-GPTQ";
+    if common::require_or_skip_cached_model(model, "native_sampled_terminal_grammar").is_none() {
+        return;
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use w34_host::parser::{SamplingParams, TokenBitmaskConstraint};
+    let mut engine = Qwen3_5Engine::load(model, 1, KvFormatPolicy::Fp16, Some(16), false).unwrap();
+    let prompt = engine.encode("The capital of France is").unwrap();
+    engine
+        .enable_speculative(&SpeculativeConfig {
+            kind: SpeculativeKind::Mtp,
+            draft_model: None,
+            mtp_k: 3,
+        })
+        .unwrap();
+    let terminal = (0..engine.cfg.vocab_size as i32)
+        .find(|id| !engine.cfg.eos_token_ids.contains(id))
+        .unwrap();
+    // Call the public proposer API directly: parameters and grammar are independent.
+    let mut proposer = engine.speculative.take().unwrap();
+    for min_tokens in [0, 3] {
+        let params = SamplingParams {
+            max_tokens: 4,
+            min_tokens,
+            ..SamplingParams::default()
+        };
+        assert!(!params.is_stop_or_eos(terminal, &engine.cfg.eos_token_ids));
+        let constraint =
+            TokenBitmaskConstraint::from_allowed_tokens(engine.cfg.vocab_size, vec![terminal])
+                .with_terminal_eos_ids(vec![terminal]);
+        let result = proposer
+            .generate_sampled(&mut engine, &prompt, params, Some(constraint), 64)
+            .unwrap();
+        assert_eq!(result.generated_token_ids, vec![terminal]);
+        assert_eq!(result.gen_len, 1);
+    }
+    engine.speculative = Some(proposer);
+}
+
+#[test]
 fn native_processed_sampling_and_grammar() {
     if common::require_or_skip_cached_model(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",

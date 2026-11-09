@@ -18,6 +18,18 @@ use w34_kernels::ffi;
 
 mod scheduled;
 
+fn generation_stopped(sampler: &SamplerV1, anchor: i32, stop_eos: bool, model_eos: &[i32]) -> bool {
+    // A closed grammar cannot be sampled again, even below min_tokens or when
+    // ordinary EOS stopping is disabled.
+    sampler
+        .constraint
+        .as_ref()
+        .is_some_and(|c| c.is_terminal_eos())
+        || (stop_eos
+            && sampler.output_history.len() >= sampler.params.min_tokens
+            && sampler.params.is_stop_or_eos(anchor, model_eos))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpeculativeKind {
     Mtp,
@@ -1283,11 +1295,7 @@ impl NativeProposer {
             let _decode_range = crate::profiling::Range::new(c"w34.decode");
             let mut pending_ingest: Vec<i32> = Vec::new();
             while generated.len() < max_new
-                && !(stop_eos
-                    && generated.len() >= sampler.params.min_tokens
-                    && sampler
-                        .params
-                        .is_stop_or_eos(anchor, &engine.cfg.eos_token_ids))
+                && !generation_stopped(&sampler, anchor, stop_eos, &engine.cfg.eos_token_ids)
             {
                 let k = self.k.min(max_new - generated.len() - 1);
                 let proposer_range = crate::profiling::Range::new(c"w34.proposer");
@@ -1465,5 +1473,64 @@ impl NativeProposer {
             generated_token_ids: generated,
             token_logprobs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampling_stops_still_respect_min_tokens_and_stop_eos() {
+        for constraint in [
+            None,
+            Some(TokenBitmaskConstraint::from_allowed_tokens(8, vec![4, 7])),
+        ] {
+            let mut sampler = SamplerV1::new(
+                SamplingParams {
+                    max_tokens: 4,
+                    min_tokens: 2,
+                    stop_token_ids: vec![4],
+                    ..SamplingParams::default()
+                },
+                &[1],
+                constraint,
+            );
+            sampler.try_commit_token(4).unwrap();
+            assert!(!generation_stopped(&sampler, 4, true, &[7]));
+            assert!(!generation_stopped(&sampler, 7, true, &[7]));
+            sampler.try_commit_token(4).unwrap();
+            for anchor in [4, 7] {
+                assert!(generation_stopped(&sampler, anchor, true, &[7]));
+                assert!(!generation_stopped(&sampler, anchor, false, &[7]));
+            }
+            assert!(!generation_stopped(&sampler, 3, true, &[7]));
+        }
+    }
+
+    #[test]
+    fn sampled_terminal_grammar_stops_independently() {
+        for min_tokens in [0, 3] {
+            for stop_eos in [false, true] {
+                let constraint = TokenBitmaskConstraint::from_allowed_tokens(8, vec![4])
+                    .with_terminal_eos_ids(vec![4]);
+                let mut sampler = SamplerV1::new(
+                    SamplingParams {
+                        max_tokens: 4,
+                        min_tokens,
+                        ..SamplingParams::default()
+                    },
+                    &[1],
+                    Some(constraint),
+                );
+                assert!(!generation_stopped(&sampler, 1, stop_eos, &[7]));
+                sampler.try_commit_token(4).unwrap();
+                assert!(sampler.constraint.as_ref().unwrap().is_terminal_eos());
+                assert!(
+                    generation_stopped(&sampler, 4, stop_eos, &[7]),
+                    "terminal grammar must stop before another sample, min_tokens={min_tokens}, stop_eos={stop_eos}"
+                );
+            }
+        }
     }
 }
