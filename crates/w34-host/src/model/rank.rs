@@ -1913,10 +1913,12 @@ impl PrePoolModelRank {
             0
         };
         let min_state_slots_for_moe = if capacity.state_slots.is_some() {
-            requested_state_slots.clamp(
-                MIN_ACTIVE_STATE_SLOTS,
-                PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS,
-            )
+            let cap = if tp_size >= 2 {
+                16
+            } else {
+                PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
+            };
+            requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, cap)
         } else if tp_size >= 2 {
             requested_state_slots
         } else {
@@ -1971,8 +1973,14 @@ impl PrePoolModelRank {
             capacity.native_mtp,
             mtp_experts_w4,
         );
+        // When DFlash2 is active (`dflash_reserve_bytes > 0`), native MTP is not loaded,
+        // so `dflash_reserve_bytes` replaces `post_pool_moe_reserve` rather than stacking on top.
+        let post_pool_spec_or_moe_reserve = if capacity.dflash_reserve_bytes > 0 {
+            capacity.dflash_reserve_bytes
+        } else {
+            post_pool_moe_reserve
+        };
         let required_headroom = base_headroom
-            .saturating_add(capacity.dflash_reserve_bytes)
             .saturating_add(if capacity.native_mtp {
                 crate::mtp::dense_serving_reserve(
                     &cfg,
@@ -1985,7 +1993,7 @@ impl PrePoolModelRank {
                 0
             })
             .saturating_add(resident_moe_mtp_reserve)
-            .saturating_add(post_pool_moe_reserve)
+            .saturating_add(post_pool_spec_or_moe_reserve)
             .saturating_add(rank0_extra_headroom);
         let use_live_pool_budget = capacity.state_slots.is_some() || cfg.uses_tiered_moe();
         let pool_weight_bytes = pool_weight_budget(
@@ -2002,19 +2010,22 @@ impl PrePoolModelRank {
             .saturating_add(scratch_arena.capacity())
             .saturating_add(required_headroom)
             .saturating_add(req_kv_bytes);
+        let effective_requested_state_slots =
+            if cfg.uses_tiered_moe() && capacity.state_slots.is_some() {
+                let max_tiered_serving_slots = if tp_size >= 2 { 18 } else { 20 };
+                requested_state_slots.min(max_tiered_serving_slots)
+            } else {
+                requested_state_slots
+            };
         let (state_budget_free, state_budget_fixed) = if capacity.state_slots.is_some() {
             // Serving can request many more slots than single-request defaults.
             // `available_for_pools` already reflects live arena capacity, `PleRankRuntime`,
             // and `RankTieredMoe`. `Qwen3VisionEncoder` is loaded lazily on the first
             // multimodal request (`ensure_vision_encoder_loaded`) and fits inside
             // `MIN_HEADROOM_BYTES` (1 GiB) when needed; only reserve dedicated ViT VRAM when
-            // `vision_reserve` still leaves room for `min_state_slots_for_moe`.
+            // `vision_reserve` still leaves room for `effective_requested_state_slots`.
             let base_reserved = required_headroom.saturating_add(req_kv_bytes);
-            let protected_state_slots = if cfg.uses_tiered_moe() {
-                min_state_slots_for_moe
-            } else {
-                requested_state_slots.max(MIN_ACTIVE_STATE_SLOTS)
-            };
+            let protected_state_slots = effective_requested_state_slots.max(MIN_ACTIVE_STATE_SLOTS);
             let min_state_bytes = bytes_per_state_slot.saturating_mul(protected_state_slots);
             let vision_reserve = if rank == 0
                 && has_vision_weights(&cfg, archive)
@@ -2045,7 +2056,7 @@ impl PrePoolModelRank {
             (free_vram, base_fixed)
         };
         let total_state_slots = clamp_state_slots(
-            requested_state_slots,
+            effective_requested_state_slots,
             state_budget_free,
             state_budget_fixed,
             bytes_per_state_slot,

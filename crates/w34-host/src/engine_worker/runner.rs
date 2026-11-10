@@ -332,7 +332,11 @@ fn admit_into_mtp_batch_slots(
     mtp_batch_slots: &mut MtpBatchSlots,
 ) {
     let saved_max = sched.cfg.max_num_seqs;
-    let slot_limit = saved_max.min(proposer.batch_slot_count());
+    let slot_limit = if engine.cfg.uses_tiered_moe() {
+        1
+    } else {
+        saved_max.min(proposer.batch_slot_count())
+    };
     let mut active_reserved: usize = sched
         .active
         .iter()
@@ -492,8 +496,16 @@ fn extend_or_yield_mtp_batch(
             .speculative
             .as_ref()
             .map_or(0, |p| p.batch_slot_count());
-        let active_cap = sched.cfg.max_num_seqs.min(slot_limit);
-        let desired_active = (active_mtp + sched.waiting.len()).min(sched.cfg.max_num_seqs);
+        let active_cap = if engine.cfg.uses_tiered_moe() {
+            1
+        } else {
+            sched.cfg.max_num_seqs.min(slot_limit)
+        };
+        let desired_active = if engine.cfg.uses_tiered_moe() {
+            1
+        } else {
+            (active_mtp + sched.waiting.len()).min(sched.cfg.max_num_seqs)
+        };
         let open_slots = active_cap.saturating_sub(active_mtp);
         let active_reserved: usize = sched
             .active
@@ -638,7 +650,11 @@ fn admit_requests(
                 .iter()
                 .map(|seq| requests[&seq.req_id].reserved_pages)
                 .sum();
-            let limit = sched.cfg.max_num_seqs;
+            let limit = if engine.cfg.uses_tiered_moe() {
+                1
+            } else {
+                sched.cfg.max_num_seqs
+            };
             while sched.active.len() < limit {
                 let Some(waiting) = sched.waiting.front() else {
                     break;

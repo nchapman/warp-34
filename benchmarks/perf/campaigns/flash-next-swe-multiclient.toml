@@ -1,0 +1,181 @@
+# Multi-client realistic Open-SWE-Traces benchmark for Qwen 3.8 Flash-Next (TP=1 and TP=2 on 2× RTX 3090 Ti).
+# Replays intact single-instance resolved trajectories from nvidia/Open-SWE-Traces
+# (HF SHA 4fa4c2ae9afc6b397bc50391d43450c79993c138; 7–15 turns, 519 → 12,354 prompt tokens).
+# Performance replay (recorded tool observations, tool_choice="none"), not SWE solve-rate qualification.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 1
+warmup_requests = 1
+timeout_s = 300
+max_inflight = 8
+
+[engine_defaults]
+support = "supported"
+cohort = "flash-next-swe-multiclient-sm86"
+model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
+model_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
+source_model_revision = "Qwen/Qwen3.8-Flash-Next@main"
+artifact_sha256 = "c760776b2dfab688970362d9794887537200917cb34bcc7d44465edc1b783e56"
+tokenizer_revision = "6ee06d2936b111f19eb5eb331044cb8b8b28562b"
+chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+weight_format = "HGPTQ-W4A16"
+quantization_details = "HGPTQ symmetric INT4 compressed-tensors; group64 H64 routed/shared/MTP experts; lut4-gptq PLE"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+ssm_state_dtype = "float32"
+base_url = "http://127.0.0.1:18836/v1"
+gpu_count = 2
+gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3,GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
+parallelism = "tp2"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-flash-tp2"
+engine = "warp-34"
+version = "6b2ec97"
+kv_format = "tq4"
+speculation = "mtp-3"
+cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens, 4 MTP batch slots), QSA side caches, MambaRadixCache (18 GDN slots), target hot112/layer/rank, MTP hot192, max_num_seqs 4, max_model_len 16384"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+
+[[engines]]
+id = "warp34-flash-tp2-dflash2"
+engine = "warp-34"
+version = "6b2ec97"
+kv_format = "tq4"
+speculation = "dflash2"
+draft_model = "nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ"
+draft_model_revision = "24a62babba3b54387b3ea73f5599e5de83029dd8"
+draft_artifact_sha256 = "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed"
+draft_activation_dtype = "bfloat16"
+draft_block_size = 8
+cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens, 8 DFlash2 batch slots), QSA side caches, MambaRadixCache (13 GDN slots), target hot112/layer/rank, DFlash2 M=8, max_num_seqs 4, max_model_len 16384"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+
+[[engines]]
+id = "warp34-flash-tp2-plain"
+engine = "warp-34"
+version = "6b2ec97"
+kv_format = "tq4"
+speculation = "none"
+cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens), QSA side caches, MambaRadixCache (18 GDN slots), target hot112/layer/rank, max_num_seqs 4, max_model_len 16384"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+
+[[engines]]
+id = "warp34-flash-tp1"
+engine = "warp-34"
+version = "6b2ec97"
+gpu_count = 1
+gpu_ids = "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
+parallelism = "single"
+kv_format = "tq4"
+speculation = "mtp-3"
+cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens, 4 MTP batch slots), QSA side caches, MambaRadixCache (20 GDN slots), target hot48/layer, MTP hot192, max_num_seqs 4, max_model_len 16384"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+
+[[engines]]
+id = "warp34-flash-tp1-dflash2"
+engine = "warp-34"
+version = "6b2ec97"
+gpu_count = 1
+gpu_ids = "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
+parallelism = "single"
+kv_format = "tq4"
+speculation = "dflash2"
+draft_model = "nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ"
+draft_model_revision = "24a62babba3b54387b3ea73f5599e5de83029dd8"
+draft_artifact_sha256 = "636db6a89b3ff5b2d51f19e7447ed3d317047bb78f13c66a9e827aff7a33efed"
+draft_activation_dtype = "bfloat16"
+draft_block_size = 8
+cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens, 8 DFlash2 batch slots), QSA side caches, MambaRadixCache (14 GDN slots), target hot48/layer, DFlash2 M=8, max_num_seqs 4, max_model_len 16384"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+
+[[engines]]
+id = "warp34-flash-tp1-plain"
+engine = "warp-34"
+version = "6b2ec97"
+gpu_count = 1
+gpu_ids = "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
+parallelism = "single"
+kv_format = "tq4"
+speculation = "none"
+cache_config = "TQ4 (3.07x) 4096 KV pages (65536 tokens), QSA side caches, MambaRadixCache (20 GDN slots), target hot48/layer, max_num_seqs 4, max_model_len 16384"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --revision 6ee06d2936b111f19eb5eb331044cb8b8b28562b --offline --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18836"
+
+[[engines]]
+id = "qfn-2x3090-mtp3"
+engine = "qfn-2x3090-vllm-overlay"
+version = "4dca58f7243f3910ba072a97e7f29fcf6f5636f3; vllm 0.1.dev20073+g8e685d198"
+gpu_count = 2
+gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3,GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
+parallelism = "tp2"
+model = "Qwen3.8-Flash-Next"
+model_revision = "ef554143369a706525336f6b42a09094835dc077"
+artifact_sha256 = "22f4df9d9667fc9dfbb528df1dc6f49236bdaf58627e32acd6ff8df60d54ee57"
+tokenizer_revision = "ef554143369a706525336f6b42a09094835dc077"
+chat_template_sha256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+weight_format = "AutoRound-W4A16-g128; FP8-E4M3-PLE; MTP-INT4-g32"
+activation_dtype = "bfloat16"
+kv_format = "bfloat16"
+speculation = "mtp-k3"
+cache_config = "128GB profile: hot84, dynamic LRU/mixed VMM, UVA expert offload 30 GB, CPU PLE; BF16 KV 4429185024 bytes, max len 262144, max seqs 1, chunk4096; prefix caching enabled"
+launch_command = "cd /tmp/w34-benchmark-refs/qfn-2x3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18836 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn:4dca58f bash scripts/docker_serve.sh"
+
+[[engines]]
+id = "qfn-3090-mtp3"
+engine = "qfn-3090-vllm-overlay"
+version = "10b24c282f59348037096a2259d3ba0948f1b202"
+gpu_count = 1
+gpu_ids = "GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
+parallelism = "single"
+model = "Qwen3.8-Flash-Next"
+model_revision = "ef554143369a706525336f6b42a09094835dc077"
+artifact_sha256 = "22f4df9d9667fc9dfbb528df1dc6f49236bdaf58627e32acd6ff8df60d54ee57"
+tokenizer_revision = "ef554143369a706525336f6b42a09094835dc077"
+chat_template_sha256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+weight_format = "AutoRound-W4A16-g128; FP8-E4M3-PLE; MTP-INT4-g32"
+activation_dtype = "bfloat16"
+kv_format = "int8_per_token_head"
+speculation = "mtp-k3; filtered draft vocabulary"
+cache_config = "default 3090-64gb-128k profile: hot32; CPU arena auto; mmap PLE; int8 KV3050000000 bytes; max len135168; seq1; chunk8192"
+launch_command = "cd /tmp/w34-benchmark-refs/qfn-3090 && env MODEL_DIR=/home/nchapman/.cache/w34-benchmark-models/flash-next PORT=18836 GPU_DEVICE=1 SERVED_MODEL_NAME=Qwen3.8-Flash-Next IMAGE=w34-bench-qfn1:10b24c2 bash scripts/docker_serve.sh"
+
+[[cases]]
+id = "smoke-warmup"
+fixture = "../fixtures/text.json"
+requests = 4
+concurrency = 2
+max_tokens = 32
+cache = "natural"
+
+[[cases]]
+id = "swe-c4-shared"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_intact_16k.json"
+requests = 6
+concurrency = 4
+max_tokens = 192
+think_time_s = 0.0
+cache = "natural"
+
+[[cases]]
+id = "swe-c4-unique"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_intact_16k.json"
+requests = 6
+concurrency = 4
+max_tokens = 192
+think_time_s = 0.0
+cache = "unique"
+
+[[cases]]
+id = "swe-c8-burst"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_intact_16k.json"
+requests = 8
+concurrency = 8
+max_tokens = 192
+think_time_s = 0.0
+cache = "natural"

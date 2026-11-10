@@ -1074,6 +1074,173 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
 
     rt.block_on(worker.shutdown()).expect("worker shutdown");
 
+    // Direct regression test for `Qwen3_5MtpRank::copy_kv_from_slot` copying QSA indexer
+    // side caches (`qsa_raw_k_buf` and `qsa_comp_k_buf`) across batch slots:
+    let shared_prefix: Vec<i32> = (0..64).map(|i| (i * 5 + 3) % 250).collect();
+    let c4_prompts: Vec<Vec<i32>> = (0..4)
+        .map(|client| {
+            let mut p = shared_prefix.clone();
+            p.extend((0..8).map(|j| (client * 17 + j * 3 + 11) % 250));
+            p
+        })
+        .collect();
+    let c4_expected: Vec<Vec<i32>> = {
+        let mut target_ref =
+            Qwen3_5Engine::load_from_dir(dir, 1, KvFormatPolicy::Fp16, Some(64), true)
+                .expect("load synthetic qwen4_exp TP=1 target for slot-copy & c=4 reference");
+        let mut mtp_rank = w34_host::mtp::Qwen3_5MtpRank::load(&target_ref.ranks[0], dir, 256)
+            .expect("load Qwen4 MTP rank for slot-copy test");
+        mtp_rank
+            .set_batch_mode(true)
+            .expect("enable MTP batch mode");
+        mtp_rank.select_batch_slot(0).expect("select slot 0");
+        let slot_count = mtp_rank.batch_slot_count();
+        let slot_pages = 16usize / slot_count;
+        let hidden_bytes = 32 * target_ref.cfg.hidden_size * 2;
+        let hidden_host: Vec<u16> = (0..hidden_bytes / 2)
+            .map(|i| 0x3800u16.wrapping_add((i % 17) as u16))
+            .collect();
+        let hidden_dev =
+            w34_host::cuda::DeviceBuffer::alloc(target_ref.ranks[0].device.device_id, hidden_bytes)
+                .unwrap();
+        hidden_dev
+            .copy_from_host(&hidden_host, &target_ref.ranks[0].stream)
+            .unwrap();
+        let toks_32: Vec<i32> = (0..32).map(|i| (i * 5 + 3) % 250).collect();
+        mtp_rank
+            .ingest(&target_ref.ranks[0], &toks_32, hidden_dev.addr(), None)
+            .expect("ingest 32 tokens into MTP slot 0");
+        mtp_rank
+            .copy_kv_from_slot(&target_ref.ranks[0], 0, 1, 32)
+            .expect("copy 32 tokens from MTP slot 0 to slot 1");
+        target_ref.ranks[0].stream.synchronize().unwrap();
+        let kv_layer = &mtp_rank.kv_pool().layers[0];
+        let total_pages = mtp_rank.kv_pool().num_pages;
+        let raw_buf = kv_layer
+            .qsa_raw_k_buf
+            .as_ref()
+            .expect("Qwen4 MTP must allocate qsa_raw_k_buf");
+        let comp_buf = kv_layer
+            .qsa_comp_k_buf
+            .as_ref()
+            .expect("Qwen4 MTP must allocate qsa_comp_k_buf");
+        let raw_stride = raw_buf.len_bytes / total_pages;
+        let comp_stride = comp_buf.len_bytes / total_pages;
+        let mut raw_host = vec![0u8; raw_buf.len_bytes];
+        let mut comp_host = vec![0u8; comp_buf.len_bytes];
+        raw_buf
+            .copy_to_host(&mut raw_host, &target_ref.ranks[0].stream)
+            .unwrap();
+        comp_buf
+            .copy_to_host(&mut comp_host, &target_ref.ranks[0].stream)
+            .unwrap();
+        target_ref.ranks[0].stream.synchronize().unwrap();
+        let raw_slot0 = &raw_host[..2 * raw_stride];
+        let raw_slot1 = &raw_host[slot_pages * raw_stride..(slot_pages + 2) * raw_stride];
+        assert!(
+            raw_slot0.iter().any(|&b| b != 0),
+            "MTP slot 0 qsa_raw_k_buf must be populated after ingest"
+        );
+        assert_eq!(
+            raw_slot1, raw_slot0,
+            "copy_kv_from_slot must copy qsa_raw_k_buf from slot 0 to slot 1"
+        );
+        let comp_slot0 = &comp_host[..2 * comp_stride];
+        let comp_slot1 = &comp_host[slot_pages * comp_stride..(slot_pages + 2) * comp_stride];
+        assert!(
+            comp_slot0.iter().any(|&b| b != 0),
+            "MTP slot 0 qsa_comp_k_buf must be populated after ingest"
+        );
+        assert_eq!(
+            comp_slot1, comp_slot0,
+            "copy_kv_from_slot must copy qsa_comp_k_buf from slot 0 to slot 1"
+        );
+        drop(mtp_rank);
+        c4_prompts
+            .iter()
+            .map(|p| {
+                target_ref
+                    .generate_tokens(p, 6, false)
+                    .expect("target reference greedy tokens for c=4 prompt")
+                    .generated_token_ids
+            })
+            .collect()
+    };
+
+    // Multi-client `max_num_seqs = 4` MTP serving with shared prefix (>32 tokens) on Qwen4:
+    // exercises `copy_kv_from_slot` (including QSA `qsa_raw_k_buf` and `qsa_comp_k_buf`)
+    // and single-active-slot multi-batch-slot scheduling on `cfg.uses_tiered_moe()`.
+    let mut engine_c4 = Qwen3_5Engine::load_for_serving_with_mtp(
+        dir.to_str().unwrap(),
+        1,
+        KvFormatPolicy::Fp16,
+        Some(128),
+        true,
+        4,
+        true,
+    )
+    .expect("load Qwen4 EngineWorker c=4");
+    engine_c4
+        .enable_speculative(spec_cfg)
+        .expect("enable Qwen4 MTP on c=4 EngineWorker");
+    let worker_c4 = EngineWorker::start(
+        engine_c4,
+        SchedulerConfig {
+            chunk_prefill_size: 512,
+            max_num_seqs: 4,
+            ..SchedulerConfig::default()
+        },
+    );
+    let mut c4_streams = Vec::new();
+    for p in &c4_prompts {
+        c4_streams.push(
+            worker_c4
+                .submit(
+                    p.clone(),
+                    SamplingParams {
+                        temperature: 0.0,
+                        max_tokens: 6,
+                        stop_token_ids: vec![],
+                        eos_token_ids: vec![],
+                        ..SamplingParams::default()
+                    },
+                    None,
+                )
+                .expect("submit c=4 shared-prefix MTP request"),
+        );
+    }
+    let mut cached_hits = 0usize;
+    for (mut stream, expected) in c4_streams.into_iter().zip(&c4_expected) {
+        let (ids, cached_tokens) = rt
+            .block_on(async move {
+                let mut out = Vec::new();
+                while let Some(ev) = stream.events.recv().await {
+                    match ev {
+                        GenerationEvent::Token { id, .. } => out.push(id),
+                        GenerationEvent::Finished { cached_tokens, .. } => {
+                            return Ok::<_, String>((out, cached_tokens));
+                        }
+                        GenerationEvent::Error(e) => return Err(e.to_string()),
+                    }
+                }
+                Err("stream closed without Finished".into())
+            })
+            .expect("c=4 shared-prefix MTP request must succeed");
+        if cached_tokens >= 32 {
+            cached_hits += 1;
+        }
+        assert_eq!(
+            &ids, expected,
+            "c=4 shared-prefix MTP request must match target greedy tokens"
+        );
+    }
+    assert!(
+        cached_hits >= 3,
+        "at least 3 of 4 shared-prefix c=4 requests must reuse >= 32 cached prefix tokens, got {cached_hits}"
+    );
+    rt.block_on(worker_c4.shutdown())
+        .expect("c=4 worker shutdown");
+
     // Verify `plan_tiered_moe_hot_per_layer` adapts TP=2 hot cache down from 128 when
     // multi-thousand-page contexts (`4096..8192` pages) + MTP headroom are requested.
     let cfg = w34_host::loader::ModelConfig::from_dir(dir).unwrap();

@@ -216,6 +216,79 @@ fn concurrent_27b_mtp_serving_allocates_verify_and_burst_state_slots() {
 }
 
 #[test]
+fn flash_next_serving_mtp_and_dflash2_allocate_state_pools_tp1_and_tp2() {
+    use w34_host::proposer::{SpeculativeConfig, SpeculativeKind};
+
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(target) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ",
+        "flash_next_serving_mtp_and_dflash2_allocate_state_pools_tp1_and_tp2",
+    ) else {
+        return;
+    };
+    let Some(draft) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ",
+        "flash_next_serving_mtp_and_dflash2_allocate_state_pools_tp1_and_tp2",
+    ) else {
+        return;
+    };
+    if w34_host::cuda::CudaDevice::set_current(1).is_ok() {
+        let engine_tp2_mtp = Qwen3_5Engine::load_for_serving_with_speculative(
+            target.to_str().unwrap(),
+            2,
+            KvFormatPolicy::Tq4,
+            Some(4096),
+            true,
+            4,
+            Some(&SpeculativeConfig {
+                kind: SpeculativeKind::Mtp,
+                draft_model: None,
+                mtp_k: 3,
+            }),
+        )
+        .expect("TP=2 Flash-Next MTP-3 serving at 4096 KV pages must fit in 24 GiB/rank");
+        assert_eq!(engine_tp2_mtp.ranks[0].kv_pool.num_pages, 4096);
+        assert!(
+            engine_tp2_mtp.ranks[0].state_pool.total_slots >= 18,
+            "TP=2 Flash-Next MTP-3 serving needs >= 18 GDN state slots, got {}",
+            engine_tp2_mtp.ranks[0].state_pool.total_slots,
+        );
+        assert_eq!(
+            engine_tp2_mtp.ranks[0].state_pool.total_slots,
+            engine_tp2_mtp.ranks[1].state_pool.total_slots,
+            "TP=2 MTP-3 ranks must allocate identical GDN state pool slot counts",
+        );
+        drop(engine_tp2_mtp);
+
+        let engine_tp2_dflash = Qwen3_5Engine::load_for_serving_with_speculative(
+            target.to_str().unwrap(),
+            2,
+            KvFormatPolicy::Tq4,
+            Some(4096),
+            true,
+            4,
+            Some(&SpeculativeConfig {
+                kind: SpeculativeKind::DFlash2,
+                draft_model: Some(draft.to_str().unwrap().to_owned()),
+                mtp_k: 3,
+            }),
+        )
+        .expect("TP=2 Flash-Next DFlash2 serving at 4096 KV pages must fit in 24 GiB/rank");
+        assert_eq!(engine_tp2_dflash.ranks[0].kv_pool.num_pages, 4096);
+        assert!(
+            engine_tp2_dflash.ranks[0].state_pool.total_slots >= 13,
+            "TP=2 Flash-Next DFlash2 serving needs >= 13 GDN state slots, got {}",
+            engine_tp2_dflash.ranks[0].state_pool.total_slots,
+        );
+        assert_eq!(
+            engine_tp2_dflash.ranks[0].state_pool.total_slots,
+            engine_tp2_dflash.ranks[1].state_pool.total_slots,
+            "TP=2 DFlash2 ranks must allocate identical GDN state pool slot counts",
+        );
+    }
+}
+
+#[test]
 fn invalid_serving_capacity_fails_before_model_resolution() {
     for max_num_seqs in [0, usize::MAX / 4 + 1, usize::MAX] {
         let error = Qwen3_5Engine::load_for_serving(

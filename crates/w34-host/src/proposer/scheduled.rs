@@ -722,7 +722,9 @@ impl NativeProposer {
         let max_budget = raw_budgets.iter().copied().max().unwrap_or(0);
         let mut all_extras: Vec<Vec<i32>> =
             raw_budgets.iter().map(|&b| Vec::with_capacity(b)).collect();
-        let max_verify_rows = if matches!(self.ranks, Ranks::Mtp(_))
+        let max_verify_rows = if engine.cfg.uses_tiered_moe() {
+            crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
+        } else if matches!(self.ranks, Ranks::Mtp(_))
             && engine.cfg.num_experts > 0
             && engine.tp_size == 1
             && batch_len >= 5

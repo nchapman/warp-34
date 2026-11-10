@@ -604,6 +604,15 @@ fn mandatory_bytes(
     weights: usize,
 ) -> Result<usize> {
     let rows = sum(&[capacity, cfg.block_size])?;
+    let logical_pages = rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
+    let slot_count = crate::mtp::MAX_MTP_BATCH_SLOTS;
+    let ring_phys_per_slot =
+        ((cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 16).max(256);
+    let phys_kv_pages = if cfg.window > 0 {
+        logical_pages.min(slot_count * ring_phys_per_slot)
+    } else {
+        logical_pages
+    };
     let h = cfg.model.hidden_size;
     let b = cfg.block_size;
     // KvPool owns separate K/V buffers; descriptors and page bitmap are host-only.
@@ -611,7 +620,7 @@ fn mandatory_bytes(
     sum(&[
         weights,
         product(&[
-            rows.div_ceil(16),
+            phys_kv_pages,
             16,
             DFLASH2_NUM_LAYERS,
             cfg.model.num_key_value_heads / tp,
