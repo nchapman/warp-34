@@ -944,6 +944,29 @@ pub(super) fn clamp_state_slots(
     }
 }
 
+/// Extra post-pool VRAM reserve beyond [`crate::cuda::MIN_HEADROOM_BYTES`] needed by
+/// resident-MoE (`35B-A3B`) native MTP serving (`Qwen3_5MtpRank`, 4-bit `draft_lm_head`,
+/// and CUDA graph capture), parameterized by whether the checkpoint's MTP experts are
+/// 4-bit quantized (`768 MiB`) or unquantized 16-bit (`1,600 MiB`).
+#[cfg(any(test, feature = "cuda"))]
+pub(super) fn resident_moe_mtp_serving_reserve(
+    cfg: &ModelConfig,
+    is_serving: bool,
+    native_mtp: bool,
+    mtp_experts_w4: bool,
+) -> usize {
+    if is_serving && native_mtp && cfg.num_experts > 0 && !cfg.uses_tiered_moe() && !cfg.uses_qsa()
+    {
+        if mtp_experts_w4 {
+            768 * 1024 * 1024
+        } else {
+            1600 * 1024 * 1024
+        }
+    } else {
+        0
+    }
+}
+
 #[cfg(feature = "cuda")]
 impl Qwen3_5ModelRank {
     pub fn load_rank(
@@ -1384,14 +1407,28 @@ impl Qwen3_5ModelRank {
         // allocations (e.g. PLE staging) remain subject to final live admission.
         let steady_bytes =
             steady_without_states.saturating_add(state_bytes.saturating_mul(min_state_floor));
+        let mtp_experts_w4 = cfg.quant.bits() == 4
+            && (archive
+                .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.qweight")
+                .is_some()
+                || archive
+                    .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_packed")
+                    .is_some());
+        let resident_moe_mtp_reserve = resident_moe_mtp_serving_reserve(
+            cfg,
+            capacity.state_slots.is_some(),
+            capacity.native_mtp,
+            mtp_experts_w4,
+        );
         let desired_gpu_steady_bytes = capacity.state_slots.map(|req_slots| {
-            let desired_slots = req_slots.clamp(min_state_floor, STANDARD_DEFAULT_STATE_SLOTS);
+            let desired_slots = req_slots.max(min_state_floor);
             let vision = if rank == 0 && archive_has_vision && pages < EXTREME_LONGCTX_MIN_PAGES {
                 VISION_ENCODER_LAZY_RESERVE_BYTES
             } else {
                 0
             };
             steady_without_states
+                .saturating_add(resident_moe_mtp_reserve)
                 .saturating_add(state_bytes.saturating_mul(desired_slots))
                 .saturating_add(vision)
         });
@@ -1921,6 +1958,19 @@ impl PrePoolModelRank {
             };
 
         // 3. Size and allocate `StateBundlePool` & `KvPool` from live post-TieredMoE free VRAM.
+        let mtp_experts_w4 = cfg.quant.bits() == 4
+            && (archive
+                .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.qweight")
+                .is_some()
+                || archive
+                    .resolve_name("mtp.layers.0.mlp.experts.0.gate_proj.weight_packed")
+                    .is_some());
+        let resident_moe_mtp_reserve = resident_moe_mtp_serving_reserve(
+            &cfg,
+            capacity.state_slots.is_some(),
+            capacity.native_mtp,
+            mtp_experts_w4,
+        );
         let required_headroom = base_headroom
             .saturating_add(capacity.dflash_reserve_bytes)
             .saturating_add(if capacity.native_mtp {
@@ -1934,6 +1984,7 @@ impl PrePoolModelRank {
             } else {
                 0
             })
+            .saturating_add(resident_moe_mtp_reserve)
             .saturating_add(post_pool_moe_reserve)
             .saturating_add(rank0_extra_headroom);
         let use_live_pool_budget = capacity.state_slots.is_some() || cfg.uses_tiered_moe();
@@ -1962,7 +2013,7 @@ impl PrePoolModelRank {
             let protected_state_slots = if cfg.uses_tiered_moe() {
                 min_state_slots_for_moe
             } else {
-                requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, STANDARD_DEFAULT_STATE_SLOTS)
+                requested_state_slots.max(MIN_ACTIVE_STATE_SLOTS)
             };
             let min_state_bytes = bytes_per_state_slot.saturating_mul(protected_state_slots);
             let vision_reserve = if rank == 0

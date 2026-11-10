@@ -538,6 +538,41 @@ mod serving_capacity_tests {
     }
 
     #[test]
+    fn resident_moe_mtp_serving_reserve_matches_expert_precision_and_mode() {
+        use super::super::rank::resident_moe_mtp_serving_reserve;
+        let mib = 1024 * 1024;
+        let mut cfg = sample_qwen4_exp_config();
+        // Resident MoE (35B-A3B geometry: 40 layers, hidden=2048, moe_inter=512, 256 experts < 20 GiB).
+        cfg.model_type = "qwen3_5_moe_text".to_string();
+        cfg.architectures = vec!["Qwen3_5MoeForConditionalGeneration".to_string()];
+        cfg.hidden_size = 2048;
+        cfg.moe_intermediate_size = 512;
+        cfg.num_hidden_layers = 40;
+        cfg.num_experts = 256;
+        cfg.hc_count = 1;
+        cfg.indexer_n_heads = 0;
+        assert_eq!(
+            resident_moe_mtp_serving_reserve(&cfg, true, true, true),
+            768 * mib
+        );
+        assert_eq!(
+            resident_moe_mtp_serving_reserve(&cfg, true, true, false),
+            1600 * mib
+        );
+        // Non-serving or non-MTP leaves single-request / non-MTP budgets untouched.
+        assert_eq!(resident_moe_mtp_serving_reserve(&cfg, false, true, true), 0);
+        assert_eq!(resident_moe_mtp_serving_reserve(&cfg, true, false, true), 0);
+        // Tiered MoE and dense models have their own dedicated reserves.
+        let tiered = sample_qwen4_exp_config();
+        assert_eq!(
+            resident_moe_mtp_serving_reserve(&tiered, true, true, true),
+            0
+        );
+        cfg.num_experts = 0;
+        assert_eq!(resident_moe_mtp_serving_reserve(&cfg, true, true, true), 0);
+    }
+
+    #[test]
     fn target_embedding_budget_boundaries() {
         use super::super::rank::{
             plan_host_embed_with_budget, target_base_headroom, target_pool_geometry,

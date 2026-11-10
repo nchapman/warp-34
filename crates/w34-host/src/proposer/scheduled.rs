@@ -683,7 +683,11 @@ impl NativeProposer {
         let k_cap = match &self.ranks {
             Ranks::Mtp(_) => {
                 if batch_len >= 5 {
-                    self.k.min(1)
+                    if engine.cfg.num_experts > 0 && self.max_rows > 256 {
+                        self.k.min(2)
+                    } else {
+                        self.k.min(1)
+                    }
                 } else if batch_len >= 3 {
                     if self.max_rows > 256 {
                         self.k.min(2)
@@ -718,13 +722,27 @@ impl NativeProposer {
         let max_budget = raw_budgets.iter().copied().max().unwrap_or(0);
         let mut all_extras: Vec<Vec<i32>> =
             raw_budgets.iter().map(|&b| Vec::with_capacity(b)).collect();
+        let max_verify_rows = if matches!(self.ranks, Ranks::Mtp(_))
+            && engine.cfg.num_experts > 0
+            && engine.tp_size == 1
+            && batch_len >= 5
+        {
+            18
+        } else {
+            usize::MAX
+        };
+        let mut total_verify_rows = batch_len;
         'outer: for round in 0..max_budget {
             for (idx, &budget) in raw_budgets.iter().enumerate() {
                 if round < budget {
+                    if total_verify_rows >= max_verify_rows {
+                        break 'outer;
+                    }
                     let Some(s) = engine.alloc_state_slot_preserving_leaves(radix) else {
                         break 'outer;
                     };
                     all_extras[idx].push(s);
+                    total_verify_rows += 1;
                 }
             }
         }
