@@ -85,6 +85,29 @@ impl Qwen3_5Engine {
         use_cuda_graph: bool,
         max_num_seqs: usize,
     ) -> Result<Self> {
+        Self::load_for_serving_with_mtp(
+            model_spec,
+            tp_size,
+            kv_policy,
+            requested_kv_pages,
+            use_cuda_graph,
+            max_num_seqs,
+            false,
+        )
+    }
+
+    /// Serving loader with native MTP intent known before embedding placement and
+    /// state-pool admission. Existing callers retain target-only budgeting.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_for_serving_with_mtp(
+        model_spec: &str,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        requested_kv_pages: Option<usize>,
+        use_cuda_graph: bool,
+        max_num_seqs: usize,
+        native_mtp: bool,
+    ) -> Result<Self> {
         let state_slots = serving_state_slots(max_num_seqs)?;
         assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
         let dir = resolve_hf_model_dir(model_spec)
@@ -96,10 +119,89 @@ impl Qwen3_5Engine {
             PoolCapacity {
                 kv_pages: requested_kv_pages,
                 state_slots: Some(state_slots),
+                native_mtp,
                 ..PoolCapacity::default()
             },
             use_cuda_graph,
         )
+    }
+
+    /// Serving admission and activation with the selected speculative checkpoint.
+    /// DFlash metadata is read before any target GPU allocation; activation uses
+    /// the resolved local directory, never a second resolution of a moving ref.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_for_serving_with_speculative(
+        model_spec: &str,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        requested_kv_pages: Option<usize>,
+        use_cuda_graph: bool,
+        max_num_seqs: usize,
+        speculative: Option<&crate::proposer::SpeculativeConfig>,
+    ) -> Result<Self> {
+        use crate::proposer::SpeculativeKind;
+        let mut selected = speculative.cloned();
+        let dir = resolve_hf_model_dir(model_spec)
+            .map_err(|e| loader_err_ctx("resolve target checkpoint", e.to_string()))?;
+        let mut capacity = PoolCapacity {
+            kv_pages: requested_kv_pages,
+            state_slots: Some(serving_state_slots(max_num_seqs)?),
+            ..PoolCapacity::default()
+        };
+        if let Some(config) = &mut selected {
+            match config.kind {
+                SpeculativeKind::Mtp => capacity.native_mtp = true,
+                SpeculativeKind::DFlash2 => {
+                    let name = config
+                        .draft_model
+                        .as_deref()
+                        .ok_or_else(|| loader_err("DFlash2 requires --draft-model"))?;
+                    let draft = resolve_hf_model_dir(name)
+                        .map_err(|e| loader_err_ctx("resolve DFlash2 checkpoint", e.to_string()))?;
+                    let cfg = ModelConfig::from_dir(&dir)
+                        .map_err(|e| loader_err_ctx("target config", e.to_string()))?;
+                    // Fix the page request explicitly. Pool admission must not grow
+                    // beyond this bound, which also bounds draft suffix/KV/RoPE.
+                    let pages = requested_kv_pages.unwrap_or(256);
+                    let tokens = pages
+                        .checked_mul(16)
+                        .ok_or_else(|| loader_err("DFlash context capacity overflow"))?;
+                    let draft_plan = crate::dflash::serving_reserve(&draft, &cfg, tp_size, tokens)
+                        .map_err(|e| {
+                            loader_err_ctx(
+                                "DFlash2 memory preflight",
+                                format!("{}: {e}", draft.display()),
+                            )
+                        })?;
+                    capacity.dflash_reserve_bytes = draft_plan.resident_bytes;
+                    capacity.dflash_min_state_slots = draft_plan.min_state_slots;
+                    capacity.kv_pages = Some(pages);
+                    capacity.state_slots = Some(serving_state_slots(max_num_seqs.max(6))?);
+                    config.draft_model = Some(
+                        draft
+                            .to_str()
+                            .ok_or_else(|| loader_err("DFlash checkpoint path is not UTF-8"))?
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        let mut engine =
+            Self::load_from_dir_with_capacity(&dir, tp_size, kv_policy, capacity, use_cuda_graph)?;
+        if capacity.dflash_reserve_bytes != 0
+            && engine
+                .ranks
+                .iter()
+                .any(|r| r.kv_pool.num_pages > capacity.kv_pages.unwrap())
+        {
+            return Err(loader_err(
+                "DFlash preflight page bound exceeded by target pool",
+            ));
+        }
+        if let Some(config) = &selected {
+            engine.enable_speculative(config)?;
+        }
+        Ok(engine)
     }
 
     pub fn load(
@@ -207,7 +309,7 @@ impl Qwen3_5Engine {
                 tp_size,
                 0,
                 kv_policy,
-                rank_capacity.kv_pages,
+                rank_capacity,
                 shared_vocab_ref,
             )?]
         } else {
@@ -222,7 +324,7 @@ impl Qwen3_5Engine {
                                 tp_size,
                                 r as i32,
                                 kv_policy,
-                                rank_capacity.kv_pages,
+                                rank_capacity,
                                 shared_vocab_ref,
                             )
                         })

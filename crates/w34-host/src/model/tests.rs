@@ -1,5 +1,73 @@
 //! Model serving capacity and tokenizer regression tests.
 
+#[cfg(feature = "cuda")]
+mod dflash_serving_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn dflash_missing_draft_fails_before_target_gpu_loading() {
+        let target = tempfile::tempdir().unwrap();
+        let config = crate::proposer::SpeculativeConfig {
+            kind: crate::proposer::SpeculativeKind::DFlash2,
+            draft_model: None,
+            mtp_k: 1,
+        };
+        let error = Qwen3_5Engine::load_for_serving_with_speculative(
+            target.path().to_str().unwrap(),
+            1,
+            KvFormatPolicy::Tq4,
+            Some(16384),
+            false,
+            1,
+            Some(&config),
+        )
+        .err()
+        .expect("missing draft must fail before any target allocation");
+        assert!(error.to_string().contains("requires --draft-model"));
+    }
+
+    #[test]
+    fn dflash_reserve_changes_placement_and_live_pool_admission() {
+        use super::super::rank::{clamp_state_slots, plan_host_embed_with_budget};
+        let mut cfg = ModelConfig::from_drafter_json(&serde_json::json!({
+            "hidden_size": 5120, "intermediate_size": 17408,
+            "num_attention_heads": 40, "num_key_value_heads": 4,
+            "head_dim": 128, "num_hidden_layers": 5, "vocab_size": 152064
+        }))
+        .unwrap();
+        cfg.tie_word_embeddings = false;
+        let gib = 1024 * 1024 * 1024;
+        let weights = 12 * gib;
+        let reserve = gib;
+        let steady = 4 * gib;
+        let free = weights + gib + steady;
+        let placement = |extra| {
+            plan_host_embed_with_budget(&cfg, weights, gib, gib / 8, free, 0, Some(steady + extra))
+        };
+        assert!(!placement(0).1);
+        assert!(placement(reserve).1);
+        let plan = |extra| {
+            crate::cuda::CapacityPlanner::plan_with_headroom(
+                free,
+                free,
+                weights,
+                gib,
+                gib,
+                gib / 256,
+                Some(256),
+                2 * gib + extra,
+            )
+        };
+        assert_eq!(plan(0).unwrap().max_kv_pages_per_layer, 256);
+        assert!(plan(reserve).is_err());
+        assert_eq!(
+            clamp_state_slots(24, 24 * 1024 + reserve, reserve, 1024),
+            24
+        );
+        assert!(clamp_state_slots(24, 24 * 1024 + reserve - 1, reserve, 1024) < 24);
+    }
+}
+
 use super::*;
 
 #[cfg(test)]
@@ -404,6 +472,173 @@ mod serving_capacity_tests {
                 expected_arena + MTP_DRAFT_LM_HEAD_POST_HEADROOM_BYTES
             ),
             Some((expected_qw, expected_sc, expected_arena))
+        );
+    }
+
+    #[test]
+    fn dense_mtp_placement_reserves_initialization_peak() {
+        use super::super::rank::plan_host_embed_with_budget;
+        let mut cfg = sample_qwen4_exp_config();
+        cfg.num_experts = 0;
+        cfg.indexer_n_heads = 0;
+        cfg.tie_word_embeddings = false;
+        let mib = 1024 * 1024;
+        for tp in [1, 2, 4] {
+            let low = crate::mtp::dense_serving_reserve(&cfg, tp, 229_376);
+            let high = crate::mtp::dense_serving_reserve(&cfg, tp, 262_144);
+            // Only FP16 KV and the two page tables grow once batch rows cap.
+            assert_eq!(
+                high - low,
+                32_768 * cfg.local_kv_heads(tp) * cfg.head_dim * 4 + (32_768 / 16) * 8
+            );
+            for tokens in [229_376, 262_144] {
+                let reserve = crate::mtp::dense_serving_reserve(&cfg, tp, tokens);
+                assert!(reserve > tokens * cfg.local_kv_heads(tp) * cfg.head_dim * 4);
+                let weights = 12 * 1024 * mib;
+                let scratch = 64 * mib;
+                let steady = 3 * 1024 * mib;
+                let free = weights + scratch + steady;
+                let plan = |free, extra| {
+                    plan_host_embed_with_budget(
+                        &cfg,
+                        weights,
+                        scratch,
+                        64 * mib,
+                        free,
+                        0,
+                        Some(steady + extra),
+                    )
+                };
+                assert_eq!(plan(free, 0), (weights, false));
+                assert!(
+                    plan(free, reserve).1,
+                    "MTP must influence embedding placement"
+                );
+                assert_eq!(plan(free + reserve, reserve), (weights, false));
+                assert!(plan(free + reserve - 1, reserve).1);
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_dense_reserve_saturates_extreme_capacity() {
+        let mut cfg = sample_qwen4_exp_config();
+        cfg.num_experts = 0;
+        cfg.indexer_n_heads = 0;
+        assert_eq!(
+            crate::mtp::dense_serving_reserve(&cfg, 1, usize::MAX),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn mtp_dense_reserve_leaves_moe_contract_unchanged() {
+        let cfg = sample_qwen4_exp_config();
+        assert_eq!(crate::mtp::dense_serving_reserve(&cfg, 1, 262_144), 0);
+    }
+
+    #[test]
+    fn target_embedding_budget_boundaries() {
+        use super::super::rank::{
+            plan_host_embed_with_budget, target_base_headroom, target_pool_geometry,
+        };
+        let mib = 1024 * 1024;
+        let mut cfg = sample_qwen4_exp_config();
+        cfg.num_experts = 0;
+        cfg.tie_word_embeddings = false;
+        cfg.vocab_size = 248_320;
+        cfg.hidden_size = 5120;
+        cfg.num_hidden_layers = 64;
+        cfg.indexer_n_heads = 0;
+        cfg.ple_layer_ids.clear();
+        cfg.num_key_value_heads = 4;
+        cfg.head_dim = 256;
+        cfg.layer_types = (0..64)
+            .map(|i| {
+                if i % 4 == 3 {
+                    LayerKind::FullAttention
+                } else {
+                    LayerKind::LinearAttention
+                }
+            })
+            .collect();
+        let (page, state) = target_pool_geometry(&cfg, 1, KvFormatPolicy::Tq4);
+        assert_eq!(page * 16_384, 5_603_590_144);
+        assert_eq!(state, 153_944_064);
+        let weights = 17_258 * mib;
+        let host = 14_834 * mib; // full replicated embedding, arena rounded to 2 MiB
+        let scratch = 336 * mib;
+        let staging = 128 * mib;
+        let steady = page * 16_384
+            + 3 * state
+            + target_base_headroom(&cfg, 1, 16_384, 24 * 1024 * mib)
+            + 16 * mib;
+        let plan = |free, reserve| {
+            plan_host_embed_with_budget(
+                &cfg,
+                weights,
+                scratch,
+                staging,
+                free,
+                16 * mib,
+                Some(reserve),
+            )
+        };
+        assert_eq!(plan(weights + scratch + steady, steady), (weights, false));
+        assert_eq!(plan(weights + scratch + steady - 1, steady), (host, true));
+        assert_eq!(plan(host + scratch + steady, steady), (host, true));
+        assert_eq!(plan(host + scratch + steady - 1, steady), (weights, false));
+        // Three execution slots fit even when eight requested serving slots do not.
+        assert_eq!(
+            plan(host + scratch + steady, steady + 5 * state),
+            (weights, false)
+        );
+        // Staging and steady pools fit separately at equality, but not together.
+        let boot = host + scratch + staging + 16 * mib + MIN_BOOT_MARGIN_BYTES;
+        assert!(boot < host + scratch + steady);
+        assert!(host + scratch + steady + staging > host + scratch + steady);
+        assert_eq!(plan(usize::MAX - 1, usize::MAX), (weights, false));
+        cfg.tie_word_embeddings = true;
+        assert_eq!(
+            plan_host_embed_with_budget(&cfg, weights, scratch, staging, 1, 0, Some(usize::MAX)),
+            (weights, false)
+        );
+        let tiered = sample_qwen4_exp_config();
+        assert_eq!(
+            plan_host_embed_with_budget(&tiered, weights, scratch, staging, 1, 0, Some(usize::MAX)),
+            (weights, true)
+        );
+    }
+
+    #[test]
+    fn target_pool_geometry_preserves_tp_qsa_and_ple() {
+        use super::super::rank::target_pool_geometry;
+        let mut cfg = sample_qwen4_exp_config();
+        let (page, state) = target_pool_geometry(&cfg, 1, KvFormatPolicy::Tq4);
+        let (tp_page, tp_state) = target_pool_geometry(&cfg, 2, KvFormatPolicy::Tq4);
+        let full = cfg
+            .layer_types
+            .iter()
+            .filter(|kind| matches!(kind, LayerKind::FullAttention))
+            .count();
+        let qsa = full
+            * cfg.indexer_kv_heads
+            * (16 + 16 / cfg.indexer_compress_ratio)
+            * cfg.indexer_head_dim
+            * 2;
+        let ple = cfg.ple_layer_ids.len() * cfg.hc_count * cfg.hidden_size * 18;
+        assert_eq!(tp_page, (page - qsa) / 2 + qsa);
+        assert_eq!(tp_state, (state - ple) / 2 + ple);
+        // KV heads replicate for TP=4 with two KV heads; QSA remains replicated.
+        assert_eq!(
+            target_pool_geometry(&cfg, 4, KvFormatPolicy::Tq4).0,
+            tp_page
+        );
+        cfg.indexer_n_heads = 0;
+        cfg.ple_layer_ids.clear();
+        assert_eq!(
+            target_pool_geometry(&cfg, 1, KvFormatPolicy::Tq4),
+            (page - qsa, state - ple)
         );
     }
 

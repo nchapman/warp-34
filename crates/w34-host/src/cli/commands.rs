@@ -543,20 +543,16 @@ pub(crate) fn run_serve(
         move || {
             let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
             let state_slot_seqs = serve_state_slot_seqs(max_num_seqs, spec_config.as_ref());
-            let mut engine = Qwen3_5Engine::load_for_serving(
+            let engine = Qwen3_5Engine::load_for_serving_with_speculative(
                 &worker_model,
                 tp,
                 policy,
                 pages,
                 use_cuda_graph,
                 state_slot_seqs,
+                spec_config.as_ref(),
             )
             .map_err(|e| e.to_string())?;
-            if let Some(config) = &spec_config {
-                engine
-                    .enable_speculative(config)
-                    .map_err(|e| e.to_string())?;
-            }
             Ok(engine)
         },
     )?;

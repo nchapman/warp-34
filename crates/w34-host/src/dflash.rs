@@ -341,6 +341,342 @@ impl DraftCandidates {
     }
 }
 
+// Metadata-only accounting shared by serving admission and the actual loader.
+fn product(values: &[usize]) -> Result<usize> {
+    values.iter().try_fold(1usize, |a, &b| {
+        a.checked_mul(b)
+            .ok_or_else(|| loader_err("DFlash allocation size overflow"))
+    })
+}
+fn sum(values: &[usize]) -> Result<usize> {
+    values.iter().try_fold(0usize, |a, &b| {
+        a.checked_add(b)
+            .ok_or_else(|| loader_err("DFlash allocation size overflow"))
+    })
+}
+fn dense_metadata(a: &SafetensorsArchive, name: &str, shape: &[usize]) -> Result<usize> {
+    let info = a
+        .tensor_info(name)
+        .map_err(|e| loader_err_ctx("DFlash metadata", format!("{name}: {e}")))?;
+    if info.shape != shape
+        || !matches!(info.dtype.as_str(), "BF16" | "F16" | "F32")
+        || info.len_bytes
+            != product(&[product(shape)?, if info.dtype == "F32" { 4 } else { 2 }])? as u64
+    {
+        return Err(loader_err_ctx("DFlash tensor shape/dtype", name));
+    }
+    product(&[product(shape)?, 2])
+}
+
+fn linear_metadata(
+    cfg: &DFlash2Config,
+    a: &SafetensorsArchive,
+    name: &str,
+    n: usize,
+    k: usize,
+    rn: usize,
+    cn: usize,
+) -> Result<usize> {
+    let quant = cfg
+        .model
+        .quant
+        .for_linear(name)
+        .map_err(|e| loader_err_ctx("DFlash metadata", format!("{name}: {e}")))?;
+    match quant {
+        QuantScheme::Unquantized => {
+            dense_metadata(a, &format!("{name}.weight"), &[n, k])?;
+            product(&[rn, cn, 2])
+        }
+        QuantScheme::CompressedTensors {
+            num_bits: 4,
+            group_size,
+            symmetric: true,
+            ..
+        } => {
+            let p = a
+                .tensor_info(&format!("{name}.weight_packed"))
+                .map_err(|e| loader_err_ctx("DFlash metadata", format!("{name}: {e}")))?;
+            let s = a
+                .tensor_info(&format!("{name}.weight_scale"))
+                .map_err(|e| loader_err_ctx("DFlash metadata", format!("{name}: {e}")))?;
+            if a.resolve_name(&format!("{name}.weight_zero_point"))
+                .is_some()
+                || !k.is_multiple_of(8)
+                || p.shape != [n, k / 8]
+                || !matches!(p.dtype.as_str(), "I32" | "U32")
+                || s.shape.len() != 2
+                || s.shape[0] != n
+                || s.shape[1] == 0
+                || !matches!(s.dtype.as_str(), "BF16" | "F16" | "F32")
+                || !k.is_multiple_of(s.shape[1])
+            {
+                return Err(loader_err_ctx("DFlash packed/scales metadata", name));
+            }
+            if p.len_bytes != product(&[n, k / 8, 4])? as u64
+                || s.len_bytes
+                    != product(&[n, s.shape[1], if s.dtype == "F32" { 4 } else { 2 }])? as u64
+            {
+                return Err(loader_err_ctx("DFlash tensor payload length", name));
+            }
+            let groups = s.shape[1];
+            let gs = k / groups;
+            let channelwise = groups == 1 && (group_size == 0 || k > MARLIN_TILE_K_W4);
+            if (channelwise && cn != k)
+                || (!channelwise
+                    && (!matches!(gs, 32 | 64 | 128)
+                        || (group_size != 0 && group_size != gs)
+                        || !cn.is_multiple_of(gs)))
+                || !rn.is_multiple_of(MARLIN_TILE_N)
+                || !cn.is_multiple_of(32)
+            {
+                return Err(loader_err_ctx(
+                    "DFlash unsupported scale groups/shard alignment",
+                    name,
+                ));
+            }
+            if let Some(block) = cfg
+                .model
+                .quant
+                .input_hadamard(name)
+                .map_err(|e| loader_err_ctx("DFlash metadata", format!("{name}: {e}")))?
+                && (!SUPPORTED_HADAMARD_BLOCKS.contains(&block) || !cn.is_multiple_of(block))
+            {
+                return Err(loader_err_ctx("DFlash Hadamard shard alignment", name));
+            }
+            sum(&[
+                product(&[rn, cn])? / 2,
+                product(&[rn, cn / gs, 2])?,
+                2 * DEVICE_SCRATCH_ALIGNMENT_BYTES,
+            ])
+        }
+        _ => Err(loader_err_ctx(
+            "unsupported DFlash linear quantization",
+            name,
+        )),
+    }
+}
+
+fn weight_arena_bytes(
+    cfg: &DFlash2Config,
+    a: &SafetensorsArchive,
+    tp: usize,
+    capacity: usize,
+) -> Result<usize> {
+    let c = &cfg.model;
+    if !matches!(tp, 1 | 2 | 4)
+        || capacity == 0
+        || capacity > DFLASH2_MAX_KV_CAPACITY
+        || !c.num_attention_heads.is_multiple_of(tp)
+        || !c.num_key_value_heads.is_multiple_of(tp)
+        || !c.intermediate_size.is_multiple_of(tp)
+    {
+        return Err(loader_err("DFlash target/rank/capacity mismatch"));
+    }
+    let (h, d) = (c.hidden_size, c.head_dim);
+    let q = product(&[c.num_attention_heads, d])?;
+    let kv = product(&[c.num_key_value_heads, d])?;
+    let i = c.intermediate_size;
+    if [q, kv, i, c.vocab_size]
+        .iter()
+        .any(|&n| n > i32::MAX as usize)
+    {
+        return Err(loader_err("DFlash dimensions exceed native kernel limits"));
+    }
+    let coeff = product(&[2, cfg.taps, h / cfg.group])?;
+    let rows = sum(&[capacity, cfg.block_size])?;
+    let mut bytes = vec![
+        DFLASH2_WEIGHT_ARENA_SLACK_BYTES,
+        product(&[rows, d, 4])?,
+        product(&[rows.div_ceil(16), 4])?,
+    ];
+    for name in ["hidden_norm.weight", "norm.weight"] {
+        bytes.push(dense_metadata(a, name, &[h])?);
+    }
+    for name in ["predecessor_codebook", "successor_codebook"] {
+        bytes.push(dense_metadata(
+            a,
+            &format!("candidate_selector.{name}"),
+            &[c.vocab_size, cfg.selector_rank],
+        )?);
+    }
+    let fc_k = product(&[h, cfg.target_layers.len()])?;
+    bytes.push(linear_metadata(cfg, a, "fc", h, fc_k, h, fc_k)?);
+    bytes.push(linear_metadata(
+        cfg,
+        a,
+        "candidate_selector.hidden_projection",
+        cfg.selector_rank,
+        h,
+        cfg.selector_rank,
+        h,
+    )?);
+    for l in 0..c.num_hidden_layers {
+        let p = format!("layers.{l}");
+        // concat_n_matrix requires identical effective quantization across parts.
+        for parts in [
+            vec!["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+            vec!["mlp.gate_proj", "mlp.up_proj"],
+        ] {
+            let mut first = None;
+            for part in parts {
+                let name = format!("{p}.{part}");
+                let quant = c
+                    .quant
+                    .for_linear(&name)
+                    .map_err(|e| loader_err_ctx("DFlash fused quantization", e.to_string()))?;
+                let signature = if matches!(quant, QuantScheme::Unquantized) {
+                    (false, 0, None)
+                } else {
+                    let s = a
+                        .tensor_info(&format!("{name}.weight_scale"))
+                        .map_err(|e| loader_err_ctx("DFlash fused scales", e.to_string()))?;
+                    let groups = s.shape.get(1).copied().unwrap_or(0);
+                    (
+                        true,
+                        groups,
+                        c.quant
+                            .input_hadamard(&name)
+                            .map_err(|e| loader_err_ctx("DFlash fused Hadamard", e.to_string()))?,
+                    )
+                };
+                if first.as_ref().is_some_and(|s| s != &signature) {
+                    return Err(loader_err_ctx("mismatched fused DFlash projections", name));
+                }
+                first = Some(signature);
+            }
+        }
+        for (name, size) in [
+            ("input_layernorm", h),
+            ("post_attention_layernorm", h),
+            ("self_attn.q_norm", d),
+            ("self_attn.k_norm", d),
+        ] {
+            bytes.push(dense_metadata(a, &format!("{p}.{name}.weight"), &[size])?);
+        }
+        for conv in ["attention_conv", "mlp_conv"] {
+            bytes.push(dense_metadata(
+                a,
+                &format!("{p}.{conv}.base_kernel"),
+                &[2, cfg.taps, h],
+            )?);
+            bytes.push(linear_metadata(
+                cfg,
+                a,
+                &format!("{p}.{conv}.kernel_projection"),
+                coeff,
+                h,
+                coeff,
+                h,
+            )?);
+        }
+        for (name, n, k, rn, cn) in [
+            ("self_attn.q_proj", q, h, q / tp, h),
+            ("self_attn.k_proj", kv, h, kv / tp, h),
+            ("self_attn.v_proj", kv, h, kv / tp, h),
+            ("self_attn.o_proj", h, q, h, q / tp),
+            ("mlp.gate_proj", i, h, i / tp, h),
+            ("mlp.up_proj", i, h, i / tp, h),
+            ("mlp.down_proj", h, i, h, i / tp),
+        ] {
+            let name = format!("{p}.{name}");
+            let b = linear_metadata(cfg, a, &name, n, k, rn, cn)?;
+            bytes.push(b);
+            if (name.ends_with("k_proj") || name.ends_with("v_proj"))
+                && !matches!(
+                    c.quant
+                        .for_linear(&name)
+                        .map_err(|e| loader_err_ctx("DFlash metadata", format!("{name}: {e}")))?,
+                    QuantScheme::Unquantized
+                )
+            {
+                bytes.push(b); // quantized fused QKV also owns a separate KV projection
+            }
+        }
+    }
+    sum(&bytes)
+}
+
+fn mandatory_bytes(
+    cfg: &DFlash2Config,
+    target: &ModelConfig,
+    tp: usize,
+    capacity: usize,
+    weights: usize,
+) -> Result<usize> {
+    let rows = sum(&[capacity, cfg.block_size])?;
+    let h = cfg.model.hidden_size;
+    let b = cfg.block_size;
+    // KvPool owns separate K/V buffers; descriptors and page bitmap are host-only.
+    // Page-table device storage is in the weight arena. Draft KV is ALWAYS BF16.
+    sum(&[
+        weights,
+        product(&[
+            rows.div_ceil(16),
+            16,
+            DFLASH2_NUM_LAYERS,
+            cfg.model.num_key_value_heads / tp,
+            cfg.model.head_dim,
+            4,
+        ])?,
+        32 * 1024 * 1024,
+        DFLASH2_FORWARD_GRAPH_ARENA_BYTES,
+        product(&[b, h, 2])?,
+        product(&[b - 1, cfg.selector_rank, 2])?,
+        product(&[sum(&[product(&[3, b])?, 4])?, 4])?,
+        product(&[b - 1, cfg.top_k, 8])?,
+        product(&[b - 1, 4])?,
+        // Preserve NativeProposer's larger target tap capture for tiered MoE;
+        // the drafter forward and shifted staging remain capped at 256 rows.
+        product(&[
+            capacity.min(if target.uses_tiered_moe() { 2048 } else { 256 }),
+            target.hidden_size,
+            DFLASH2_NUM_LAYERS,
+            2,
+        ])?,
+        product(&[capacity.min(256), target.hidden_size, DFLASH2_NUM_LAYERS, 2])?,
+        product(&[target.hidden_size, target.hc_count.max(1), 2])?,
+        product(&[b, target.vocab_size / tp, 2])?,
+    ])
+}
+
+pub(crate) struct ServingReserve {
+    pub resident_bytes: usize,
+    pub min_state_slots: usize,
+}
+
+// Three private request states, M-1 verification extras, and one locked radix
+// checkpoint. The preferred 24-slot serving pool is not an execution minimum.
+fn minimum_serving_state_slots(block_size: usize) -> Result<usize> {
+    block_size
+        .checked_add(3)
+        .ok_or_else(|| loader_err("DFlash state-slot budget overflow"))
+}
+
+pub(crate) fn serving_reserve(
+    dir: &Path,
+    target: &ModelConfig,
+    tp: usize,
+    capacity: usize,
+) -> Result<ServingReserve> {
+    let cfg = DFlash2Config::load(dir)?;
+    if cfg.model.hidden_size != target.hidden_size
+        || cfg.model.vocab_size != target.vocab_size
+        || cfg
+            .target_layers
+            .iter()
+            .any(|&l| l >= target.num_hidden_layers)
+    {
+        return Err(loader_err("DFlash target hidden/vocabulary/tap mismatch"));
+    }
+    let a = SafetensorsArchive::open(dir)
+        .map_err(|e| loader_err_ctx("open DFlash weights", e.to_string()))?;
+    let weights = weight_arena_bytes(&cfg, &a, tp, capacity)?;
+    Ok(ServingReserve {
+        resident_bytes: mandatory_bytes(&cfg, target, tp, capacity, weights)?,
+        min_state_slots: minimum_serving_state_slots(cfg.block_size)?,
+    })
+}
+
 struct DFlashGraphIo {
     forward_graph: Option<CudaGraph>,
     select_greedy_graph: Option<CudaGraph>,
@@ -411,6 +747,8 @@ impl DFlash2Rank {
         t.device.make_current()?;
         let archive = SafetensorsArchive::open(dir)
             .map_err(|e| loader_err_ctx("open DFlash weights", e.to_string()))?;
+        let total_weight_bytes = weight_arena_bytes(&cfg, &archive, tp, capacity)?;
+        mandatory_bytes(&cfg, &t.cfg, tp, capacity, total_weight_bytes)?;
         let (q, kv, i) = (
             c.num_attention_heads * d / tp,
             c.num_key_value_heads * d / tp,
@@ -418,56 +756,6 @@ impl DFlash2Rank {
         );
         let coeff = 2 * cfg.taps * (h / cfg.group);
         let rope_rows = capacity + cfg.block_size;
-        let linear_bytes = |name: &str, rn: usize, cn: usize| -> Result<usize> {
-            match c
-                .quant
-                .for_linear(name)
-                .map_err(|e| loader_err_ctx("DFlash linear quant rule", e.to_string()))?
-            {
-                QuantScheme::Unquantized => Ok(rn * cn * 2),
-                QuantScheme::CompressedTensors {
-                    num_bits: 4,
-                    group_size,
-                    symmetric: true,
-                    ..
-                } => {
-                    let gs = if group_size == 0 {
-                        cn
-                    } else {
-                        group_size.min(cn)
-                    };
-                    let num_groups = cn.div_ceil(gs.max(1));
-                    Ok((rn * cn / 2) + (rn * num_groups * 2) + 2 * DEVICE_SCRATCH_ALIGNMENT_BYTES)
-                }
-                _ => Err(loader_err("unsupported DFlash linear quantization")),
-            }
-        };
-        let mut total_weight_bytes = (2 * h + 2 * c.vocab_size * cfg.selector_rank) * 2
-            + linear_bytes("fc", h, h * cfg.target_layers.len())?
-            + linear_bytes("candidate_selector.hidden_projection", cfg.selector_rank, h)?
-            + rope_rows * d * 4
-            + DFLASH2_WEIGHT_ARENA_SLACK_BYTES;
-        for l in 0..c.num_hidden_layers {
-            let p = format!("layers.{l}");
-            let qkv_q = !matches!(
-                c.quant
-                    .for_linear(&format!("{p}.self_attn.q_proj"))
-                    .map_err(|e| loader_err_ctx("DFlash linear quant rule", e.to_string()))?,
-                QuantScheme::Unquantized
-            );
-            total_weight_bytes += (4 * cfg.taps * h + 2 * h + 2 * d) * 2
-                + linear_bytes(&format!("{p}.self_attn.q_proj"), q + 2 * kv, h)?
-                + if qkv_q {
-                    linear_bytes(&format!("{p}.self_attn.k_proj"), 2 * kv, h)?
-                } else {
-                    0
-                }
-                + linear_bytes(&format!("{p}.self_attn.o_proj"), h, q)?
-                + linear_bytes(&format!("{p}.mlp.gate_proj"), 2 * i, h)?
-                + linear_bytes(&format!("{p}.mlp.down_proj"), h, i)?
-                + linear_bytes(&format!("{p}.attention_conv.kernel_projection"), coeff, h)?
-                + linear_bytes(&format!("{p}.mlp_conv.kernel_projection"), coeff, h)?;
-        }
         let mut weights = DeviceArena::new(t.device.device_id, total_weight_bytes)?;
         fn read(a: &SafetensorsArchive, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
             let info = a
@@ -1802,6 +2090,269 @@ impl DFlash2Rank {
         let ids = self.scratch.upload_slice(&candidates.ids, &t.stream)?;
         let vals = self.scratch.upload_slice(&candidates.scores, &t.stream)?;
         self.select_greedy_from_device(t, anchor, ids, vals)
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn state_floor_includes_locked_prefix_without_requiring_preferred_pool() {
+        assert_eq!(minimum_serving_state_slots(8).unwrap(), 11);
+        assert_eq!(minimum_serving_state_slots(16).unwrap(), 19);
+        assert!(minimum_serving_state_slots(usize::MAX).is_err());
+    }
+
+    fn config() -> DFlash2Config {
+        let model = ModelConfig::from_drafter_json(&serde_json::json!({
+            "hidden_size": 256, "intermediate_size": 512,
+            "num_attention_heads": 4, "num_key_value_heads": 4,
+            "head_dim": 128, "num_hidden_layers": 5, "vocab_size": 1024
+        }))
+        .unwrap();
+        DFlash2Config {
+            model,
+            block_size: 8,
+            target_layers: vec![0, 1, 2, 3, 4],
+            group: 8,
+            taps: 4,
+            selector_rank: 128,
+            top_k: 8,
+            mask_token: 0,
+            window: 0,
+        }
+    }
+
+    fn archive(
+        tensors: Vec<(String, Vec<usize>, &'static str)>,
+    ) -> (tempfile::TempDir, SafetensorsArchive) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, shape, dtype) in tensors {
+            let bytes = shape.iter().product::<usize>() * if dtype == "I32" { 4 } else { 2 };
+            header.insert(
+                name,
+                serde_json::json!({"shape": shape, "dtype": dtype,
+                "data_offsets": [offset, offset + bytes]}),
+            );
+            offset += bytes;
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut file = std::fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len((8 + header.len() + offset) as u64).unwrap(); // sparse, no weight payload reads
+        let a = SafetensorsArchive::open(dir.path()).unwrap();
+        (dir, a)
+    }
+
+    fn dense_archive(c: &DFlash2Config) -> (tempfile::TempDir, SafetensorsArchive) {
+        let h = c.model.hidden_size;
+        let q = c.model.num_attention_heads * c.model.head_dim;
+        let kv = c.model.num_key_value_heads * c.model.head_dim;
+        let i = c.model.intermediate_size;
+        let mut tensors = vec![];
+        let mut add = |name: String, shape: Vec<usize>| tensors.push((name, shape, "BF16"));
+        for name in ["hidden_norm.weight", "norm.weight"] {
+            add(name.into(), vec![h]);
+        }
+        for name in ["predecessor_codebook", "successor_codebook"] {
+            add(
+                format!("candidate_selector.{name}"),
+                vec![c.model.vocab_size, c.selector_rank],
+            );
+        }
+        add("fc.weight".into(), vec![h, h * 5]);
+        add(
+            "candidate_selector.hidden_projection.weight".into(),
+            vec![c.selector_rank, h],
+        );
+        for l in 0..5 {
+            for (name, n) in [
+                ("input_layernorm", h),
+                ("post_attention_layernorm", h),
+                ("self_attn.q_norm", 128),
+                ("self_attn.k_norm", 128),
+            ] {
+                add(format!("layers.{l}.{name}.weight"), vec![n]);
+            }
+            for conv in ["attention_conv", "mlp_conv"] {
+                add(format!("layers.{l}.{conv}.base_kernel"), vec![2, c.taps, h]);
+                add(
+                    format!("layers.{l}.{conv}.kernel_projection.weight"),
+                    vec![2 * c.taps * h / c.group, h],
+                );
+            }
+            for (name, n, k) in [
+                ("self_attn.q_proj", q, h),
+                ("self_attn.k_proj", kv, h),
+                ("self_attn.v_proj", kv, h),
+                ("self_attn.o_proj", h, q),
+                ("mlp.gate_proj", i, h),
+                ("mlp.up_proj", i, h),
+                ("mlp.down_proj", h, i),
+            ] {
+                add(format!("layers.{l}.{name}.weight"), vec![n, k]);
+            }
+        }
+        if c.model.quant != QuantScheme::Unquantized {
+            tensors = tensors
+                .into_iter()
+                .flat_map(|(name, shape, dtype)| {
+                    if shape.len() == 2 && name.ends_with(".weight") {
+                        let base = name.strip_suffix(".weight").unwrap();
+                        vec![
+                            (
+                                format!("{base}.weight_packed"),
+                                vec![shape[0], shape[1] / 8],
+                                "I32",
+                            ),
+                            (
+                                format!("{base}.weight_scale"),
+                                vec![shape[0], shape[1] / 64],
+                                "BF16",
+                            ),
+                        ]
+                    } else {
+                        vec![(name, shape, dtype)]
+                    }
+                })
+                .collect();
+        }
+        archive(tensors)
+    }
+
+    #[test]
+    fn dflash_dense_shared_arena_tp_and_suffix() {
+        let mut c = config();
+        let (_dir, a) = dense_archive(&c);
+        for tp in [1, 2, 4] {
+            for block in [8, 16] {
+                c.block_size = block;
+                let weights = weight_arena_bytes(&c, &a, tp, 262144).unwrap();
+                let short = weight_arena_bytes(&c, &a, tp, 256).unwrap();
+                assert_eq!(
+                    weights - short,
+                    (262144 - 256) * 128 * 4 + (262144 - 256) / 16 * 4
+                );
+                assert!(
+                    mandatory_bytes(&c, &c.model, tp, 262144, weights).unwrap()
+                        > weights + 64 * 1024 * 1024
+                );
+                assert!(weight_arena_bytes(&c, &a, tp, 262145).is_err());
+                assert!(weight_arena_bytes(&c, &a, tp, 0).is_err());
+            }
+        }
+        // Only attention and MLP shard: codebooks, FC, convs and RoPE replicate.
+        let w1 = weight_arena_bytes(&c, &a, 1, 256).unwrap();
+        let w2 = weight_arena_bytes(&c, &a, 2, 256).unwrap();
+        let w4 = weight_arena_bytes(&c, &a, 4, 256).unwrap();
+        assert_eq!(w1 - w2, 2 * (w2 - w4));
+        assert!(w2 > w1 / 2);
+    }
+
+    #[test]
+    fn dflash_mandatory_native_kv_graphs_and_capped_io() {
+        let c = config();
+        let base = mandatory_bytes(&c, &c.model, 1, 256, 0).unwrap();
+        let next = mandatory_bytes(&c, &c.model, 1, 272, 0).unwrap();
+        // Taps/shifted do not grow past 256. No target KV format argument:
+        // target TQ4 cannot change the draft's native BF16 payload.
+        assert_eq!(next - base, 16 * 5 * 4 * 128 * 4);
+        let kv = (256usize + 8).div_ceil(16) * 16 * 5 * 4 * 128 * 4;
+        let expected = kv
+            + 64 * 1024 * 1024
+            + 8 * 256 * 2
+            + 7 * 128 * 2
+            + (3 * 8 + 4) * 4
+            + 7 * 8 * 8
+            + 7 * 4
+            + 256 * 256 * 5 * 2 * 2
+            + c.model.hyper_hidden_size() * 2
+            + 8 * 1024 * 2;
+        assert_eq!(base, expected); // no MTP batch-slot buffers or target GDN states
+        assert!(product(&[usize::MAX, 2]).is_err());
+        assert!(sum(&[usize::MAX, 1]).is_err());
+        assert!(mandatory_bytes(&c, &c.model, 1, usize::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn dflash_quantized_metadata_errors_are_not_zero_reserves() {
+        let mut c = config();
+        c.model.quant = ModelConfig::parse_quant(Some(&serde_json::json!({
+            "quant_method": "compressed-tensors", "format": "pack-quantized",
+            "config_groups": {"group_0": {"targets": ["Linear"], "weights": {
+                "num_bits": 4, "type": "int", "symmetric": true, "strategy": "group", "group_size": 64
+            }}}
+        }))).unwrap();
+        let (_full_dir, full) = dense_archive(&c);
+        for tp in [1, 2, 4] {
+            for block in [8, 16] {
+                c.block_size = block;
+                let linear = |n: usize, k: usize| {
+                    n * k / 2 + n * (k / 64) * 2 + 2 * DEVICE_SCRATCH_ALIGNMENT_BYTES
+                };
+                let expected = DFLASH2_WEIGHT_ARENA_SLACK_BYTES
+                    + (256 + block) * 128 * 4
+                    + (256 + block).div_ceil(16) * 4
+                    + 2 * 256 * 2
+                    + 2 * 1024 * 128 * 2
+                    + linear(256, 256 * 5)
+                    + linear(128, 256)
+                    + 5 * ((2 * 256 + 2 * 128) * 2
+                        + 4 * 4 * 256 * 2
+                        + 2 * linear(256, 256)
+                        + linear(512 / tp, 256)
+                        + 4 * linear(512 / tp, 256)
+                        + linear(256, 512 / tp)
+                        + 2 * linear(512 / tp, 256)
+                        + linear(256, 512 / tp));
+                // Four KV projections: K/V in fused QKV plus separate quantized KV.
+                assert_eq!(weight_arena_bytes(&c, &full, tp, 256).unwrap(), expected);
+            }
+        }
+        let (_dir, a) = archive(vec![
+            ("fc.weight_packed".into(), vec![128, 32], "I32"),
+            ("fc.weight_scale".into(), vec![128, 4], "BF16"),
+        ]);
+        assert_eq!(
+            linear_metadata(&c, &a, "fc", 128, 256, 128, 128).unwrap(),
+            128 * 128 / 2 + 128 * 2 * 2 + 2 * DEVICE_SCRATCH_ALIGNMENT_BYTES
+        );
+        assert!(linear_metadata(&c, &a, "missing", 128, 256, 128, 256).is_err());
+        let (_dir, bad) = archive(vec![
+            ("fc.weight_packed".into(), vec![128, 32], "I32"),
+            ("fc.weight_scale".into(), vec![128, 8], "BF16"),
+        ]);
+        assert!(linear_metadata(&c, &bad, "fc", 128, 256, 128, 128).is_err());
+        let (_dir, channel) = archive(vec![
+            ("fc.weight_packed".into(), vec![128, 32], "I32"),
+            ("fc.weight_scale".into(), vec![128, 1], "BF16"),
+        ]);
+        assert!(linear_metadata(&c, &channel, "fc", 128, 256, 128, 128).is_err());
+        c.model.quant = ModelConfig::parse_quant(Some(&serde_json::json!({
+            "quant_method": "compressed-tensors", "format": "pack-quantized",
+            "config_groups": {"group_0": {"targets": ["Linear"], "weights": {
+                "num_bits": 4, "type": "int", "symmetric": true, "strategy": "group", "group_size": 64
+            }}},
+            "transform_config": {"config_groups": {"h64": {
+                "type": "hadamard", "head_dim": 64, "randomize": false,
+                "apply": [
+                    {"location": "input", "inverse": false, "targets": ["re:.*"], "ignore": []},
+                    {"location": "weight_input", "inverse": true, "targets": ["re:.*"], "ignore": []}
+                ]
+            }}}
+        }))).unwrap();
+        assert_eq!(c.model.quant.input_hadamard("fc").unwrap(), Some(64));
+        assert!(linear_metadata(&c, &a, "fc", 128, 256, 128, 128).is_ok());
+        assert!(linear_metadata(&c, &a, "fc", 128, 256, 128, 32).is_err());
+        for tp in [1, 2, 4] {
+            assert!(weight_arena_bytes(&c, &full, tp, 256).is_ok());
+        }
     }
 }
 

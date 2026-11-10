@@ -300,6 +300,10 @@ pub(super) struct PoolCapacity {
     pub(super) kv_pages: Option<usize>,
     pub(super) state_slots: Option<usize>,
     pub(super) rank0_extra_headroom_bytes: usize,
+    pub(super) native_mtp: bool,
+    /// Metadata-validated per-rank DFlash resident reserve at the requested page bound.
+    pub(super) dflash_reserve_bytes: usize,
+    pub(super) dflash_min_state_slots: usize,
 }
 
 /// Number of state slots allocated per active sequence in serving mode (three private
@@ -320,7 +324,7 @@ const MIN_ACTIVE_STATE_SLOTS: usize = 3;
 const DEFAULT_TARGET_KV_PAGES: usize = 256;
 
 /// Tokens per paged-attention KV block (`KvPool` page size).
-#[cfg(feature = "cuda")]
+#[cfg(any(test, feature = "cuda"))]
 const KV_PAGE_BLOCK_TOKENS: usize = 16;
 
 /// Default state-bundle slot count for PLE / large (`>= 15 GiB`) checkpoints in non-serving mode.
@@ -720,18 +724,50 @@ pub fn plan_host_embed_offload(
     staging_bytes: usize,
     free_vram_bytes: usize,
 ) -> (usize, bool) {
+    plan_host_embed_with_budget(
+        cfg,
+        est_weight_bytes,
+        scratch_bytes,
+        staging_bytes,
+        free_vram_bytes,
+        0,
+        None,
+    )
+}
+
+/// Boot staging is transient: it must never be charged alongside target pools.
+/// `steady_bytes` includes persistent metadata/workspaces, minimum pools and headroom.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_host_embed_with_budget(
+    cfg: &ModelConfig,
+    est_weight_bytes: usize,
+    scratch_bytes: usize,
+    staging_bytes: usize,
+    free_vram_bytes: usize,
+    boot_persistent_bytes: usize,
+    steady_bytes: Option<usize>,
+) -> (usize, bool) {
+    let fits_steady = |weights: usize| {
+        steady_bytes.is_none_or(|bytes| {
+            (weights as u128 + scratch_bytes as u128 + bytes as u128) <= free_vram_bytes as u128
+        })
+    };
     if cfg.tie_word_embeddings {
         return (est_weight_bytes, false);
     }
     if cfg.uses_tiered_moe() {
         return (est_weight_bytes, true);
     }
-    let boot_with_gpu_embed = est_weight_bytes
-        .saturating_add(scratch_bytes)
-        .saturating_add(staging_bytes)
-        .saturating_add(MIN_BOOT_MARGIN_BYTES);
-    if boot_with_gpu_embed.saturating_add(HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES)
-        <= free_vram_bytes
+    let boot_need = |weights: usize| {
+        weights as u128
+            + scratch_bytes as u128
+            + staging_bytes as u128
+            + boot_persistent_bytes as u128
+            + MIN_BOOT_MARGIN_BYTES as u128
+    };
+    if boot_need(est_weight_bytes) + HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES as u128
+        <= free_vram_bytes as u128
+        && fits_steady(est_weight_bytes)
     {
         return (est_weight_bytes, false);
     }
@@ -746,11 +782,14 @@ pub fn plan_host_embed_offload(
         .div_ceil(WEIGHT_ARENA_ALIGNMENT_BYTES)
         .saturating_mul(WEIGHT_ARENA_ALIGNMENT_BYTES)
         .max(MIN_WEIGHT_ARENA_BYTES);
-    let boot_without_gpu_embed = est_without_embed
-        .saturating_add(scratch_bytes)
-        .saturating_add(staging_bytes)
-        .saturating_add(MIN_BOOT_MARGIN_BYTES);
-    if boot_without_gpu_embed.saturating_add(crate::cuda::MIN_HEADROOM_BYTES) <= free_vram_bytes {
+    let boot_reserve = if steady_bytes.is_some() {
+        0
+    } else {
+        crate::cuda::MIN_HEADROOM_BYTES
+    };
+    if boot_need(est_without_embed) + boot_reserve as u128 <= free_vram_bytes as u128
+        && fits_steady(est_without_embed)
+    {
         (est_without_embed, true)
     } else {
         (est_weight_bytes, false)
@@ -763,6 +802,91 @@ pub(super) fn pool_weight_budget(use_live_budget: bool, used: usize, capacity: u
     // cancellation term there. Legacy budgets start before allocation and must
     // charge the entire DeviceArena allocation, including unused capacity.
     if use_live_budget { used } else { capacity }
+}
+
+/// Shared target pool geometry; QSA indexer KV is replicated, ordinary KV follows
+/// `local_kv_heads` (including replication when TP exceeds the KV head count).
+#[cfg(any(test, feature = "cuda"))]
+pub(super) fn target_pool_geometry(
+    cfg: &ModelConfig,
+    tp: usize,
+    policy: KvFormatPolicy,
+) -> (usize, usize) {
+    let full = cfg
+        .layer_types
+        .iter()
+        .filter(|kind| matches!(kind, LayerKind::FullAttention))
+        .count();
+    let gdn = cfg.layer_types.len() - full;
+    let block = KV_PAGE_BLOCK_TOKENS;
+    let mut page = 0usize;
+    for ord in 0..full {
+        let (kf, vf, _, _) = policy.resolve_layer(ord, full);
+        let rows = crate::cache::kv_format_row_bytes(kf, cfg.head_dim)
+            .saturating_add(crate::cache::kv_format_row_bytes(vf, cfg.head_dim));
+        page = page.saturating_add(
+            cfg.local_kv_heads(tp)
+                .saturating_mul(block)
+                .saturating_mul(rows),
+        );
+        if cfg.uses_qsa() {
+            page = page.saturating_add(
+                cfg.indexer_kv_heads
+                    .saturating_mul(block + block / cfg.indexer_compress_ratio.max(1))
+                    .saturating_mul(cfg.indexer_head_dim)
+                    .saturating_mul(2),
+            );
+        }
+    }
+    let k = cfg
+        .linear_num_key_heads
+        .saturating_mul(cfg.linear_key_head_dim)
+        / tp;
+    let v = cfg
+        .linear_num_value_heads
+        .saturating_mul(cfg.linear_value_head_dim)
+        / tp;
+    let conv = k
+        .saturating_mul(2)
+        .saturating_add(v)
+        .saturating_mul(cfg.linear_conv_kernel_dim.saturating_sub(1))
+        .saturating_mul(2);
+    let recurrent = (cfg.linear_num_value_heads / tp)
+        .saturating_mul(cfg.linear_value_head_dim)
+        .saturating_mul(cfg.linear_key_head_dim)
+        .saturating_mul(4);
+    let ple = if cfg.uses_ple() {
+        cfg.ple_layer_ids
+            .len()
+            .saturating_mul(cfg.hc_count)
+            .saturating_mul(cfg.hidden_size)
+            .saturating_mul(18)
+    } else {
+        0
+    };
+    (
+        page,
+        gdn.saturating_mul(conv.saturating_add(recurrent))
+            .saturating_add(ple),
+    )
+}
+
+#[cfg(any(test, feature = "cuda"))]
+pub(super) fn target_base_headroom(
+    cfg: &ModelConfig,
+    tp: usize,
+    pages: usize,
+    free: usize,
+) -> usize {
+    if (tp == 1
+        && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
+        && pages >= EXTREME_LONGCTX_MIN_PAGES)
+        || (cfg.uses_tiered_moe() && free < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES)
+    {
+        crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES
+    } else {
+        crate::cuda::MIN_HEADROOM_BYTES
+    }
 }
 
 // Preserve the minimum three-slot execution budget and the existing VRAM clamp.
@@ -1127,7 +1251,7 @@ impl Qwen3_5ModelRank {
             tp_size,
             device_id,
             kv_policy,
-            capacity.kv_pages,
+            capacity,
             shared_vocab,
         )?;
         pre.finalize_runtime_and_pools(archive, kv_policy, capacity, None)
@@ -1141,9 +1265,10 @@ impl Qwen3_5ModelRank {
         tp_size: usize,
         device_id: i32,
         kv_policy: KvFormatPolicy,
-        requested_kv_pages: Option<usize>,
+        capacity: PoolCapacity,
         shared_vocab: Option<&SharedVocabHost>,
     ) -> Result<PrePoolModelRank> {
+        let requested_kv_pages = capacity.kv_pages;
         Self::validate_tp_geometry(cfg, tp_size)?;
         if cfg.head_dim != 256 && !matches!(kv_policy, KvFormatPolicy::Fp16 | KvFormatPolicy::Bf16)
         {
@@ -1191,12 +1316,43 @@ impl Qwen3_5ModelRank {
         if cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
             scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
         }
-        let (est_weight_bytes, use_host_embed) = plan_host_embed_offload(
+        let pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
+        let (page_bytes, state_bytes) = target_pool_geometry(cfg, tp_size, kv_policy);
+        // This is a placement admission floor, not a promise that all requested
+        // serving slots fit: the final live-memory planner retains its clamp.
+        // Repack staging is freed before pools; only the two Marlin workspaces
+        // and batch metadata coexist with them. Architecture-specific runtime
+        // allocations (e.g. PLE staging) remain subject to final live admission.
+        let steady_bytes = BATCH_META_ARENA_BYTES
+            .saturating_add(marlin_ws_bytes.saturating_mul(2))
+            .saturating_add(page_bytes.saturating_mul(pages))
+            .saturating_add(
+                state_bytes.saturating_mul(if capacity.dflash_reserve_bytes != 0 {
+                    capacity.dflash_min_state_slots
+                } else {
+                    MIN_ACTIVE_STATE_SLOTS
+                }),
+            )
+            .saturating_add(target_base_headroom(cfg, tp_size, pages, free_vram))
+            .saturating_add(capacity.dflash_reserve_bytes)
+            .saturating_add(if capacity.native_mtp {
+                crate::mtp::dense_serving_reserve(cfg, tp_size, pages.saturating_mul(16))
+            } else {
+                0
+            })
+            .saturating_add(if rank == 0 {
+                capacity.rank0_extra_headroom_bytes
+            } else {
+                0
+            });
+        let (est_weight_bytes, use_host_embed) = plan_host_embed_with_budget(
             cfg,
             raw_est_weight_bytes,
             scratch_bytes,
             staging_bytes,
             free_vram,
+            BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes),
+            Some(steady_bytes),
         );
         let min_boot_bytes = est_weight_bytes
             .saturating_add(scratch_bytes)
@@ -1648,29 +1804,8 @@ impl PrePoolModelRank {
 
         let requested_kv_pages = capacity.kv_pages;
         let block_size = KV_PAGE_BLOCK_TOKENS;
-        let mut bytes_per_kv_page_all_layers = 0usize;
-        for ord in 0..full_attn_layer_ids.len() {
-            let (kf, vf, _, _) = kv_policy.resolve_layer(ord, full_attn_layer_ids.len());
-            let kb = crate::cache::kv_format_row_bytes(kf, cfg.head_dim);
-            let vb = crate::cache::kv_format_row_bytes(vf, cfg.head_dim);
-            bytes_per_kv_page_all_layers += local_kv_heads * block_size * (kb + vb);
-            if cfg.uses_qsa() {
-                let comp_rows = block_size / cfg.indexer_compress_ratio.max(1);
-                bytes_per_kv_page_all_layers +=
-                    cfg.indexer_kv_heads * (block_size + comp_rows) * cfg.indexer_head_dim * 2;
-            }
-        }
-
-        let conv_dim = 2 * gdn_k_local + gdn_v_local;
-        let ple_slot_bytes = if cfg.uses_ple() {
-            cfg.ple_layer_ids.len() * cfg.hc_count * cfg.hidden_size * 9 * 2
-        } else {
-            0
-        };
-        let bytes_per_state_slot = gdn_layer_ids.len()
-            * (conv_dim * (cfg.linear_conv_kernel_dim - 1) * 2
-                + local_v_heads * cfg.linear_value_head_dim * cfg.linear_key_head_dim * 4)
-            + ple_slot_bytes;
+        let (bytes_per_kv_page_all_layers, bytes_per_state_slot) =
+            target_pool_geometry(&cfg, tp_size, kv_policy);
         let default_state_slots =
             if cfg.uses_ple() || est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
                 PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
@@ -1679,17 +1814,11 @@ impl PrePoolModelRank {
             };
         let requested_state_slots = capacity.state_slots.unwrap_or(default_state_slots);
         let default_pages = requested_kv_pages.or(Some(DEFAULT_TARGET_KV_PAGES));
-        let req_kv_bytes =
-            default_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES) * bytes_per_kv_page_all_layers;
-        let base_headroom = if (tp_size == 1
-            && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
-            && default_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES)
-            || (cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES)
-        {
-            crate::cuda::EXTREME_LONGCTX_HEADROOM_BYTES
-        } else {
-            crate::cuda::MIN_HEADROOM_BYTES
-        };
+        let req_kv_bytes = default_pages
+            .unwrap_or(DEFAULT_TARGET_KV_PAGES)
+            .saturating_mul(bytes_per_kv_page_all_layers);
+        let base_headroom =
+            target_base_headroom(&cfg, tp_size, default_pages.unwrap_or(0), free_vram);
         let rank0_extra_headroom = if rank == 0 {
             capacity.rank0_extra_headroom_bytes
         } else {
@@ -1742,6 +1871,18 @@ impl PrePoolModelRank {
 
         // 3. Size and allocate `StateBundlePool` & `KvPool` from live post-TieredMoE free VRAM.
         let required_headroom = base_headroom
+            .saturating_add(capacity.dflash_reserve_bytes)
+            .saturating_add(if capacity.native_mtp {
+                crate::mtp::dense_serving_reserve(
+                    &cfg,
+                    tp_size,
+                    default_pages
+                        .unwrap_or(DEFAULT_TARGET_KV_PAGES)
+                        .saturating_mul(16),
+                )
+            } else {
+                0
+            })
             .saturating_add(post_pool_moe_reserve)
             .saturating_add(rank0_extra_headroom);
         let use_live_pool_budget = capacity.state_slots.is_some() || cfg.uses_tiered_moe();
@@ -1809,6 +1950,13 @@ impl PrePoolModelRank {
             state_budget_fixed,
             bytes_per_state_slot,
         );
+        if total_state_slots < capacity.dflash_min_state_slots {
+            return Err(loader_err_msg(format!(
+                "insufficient memory for DFlash2: requires at least {} target state slots plus draft resident reserve; reduce KV capacity",
+                capacity.dflash_min_state_slots,
+            )));
+        }
+        let conv_dim = 2 * gdn_k_local + gdn_v_local;
         let mut state_pool = StateBundlePool::new(
             device_id,
             &gdn_layer_ids,

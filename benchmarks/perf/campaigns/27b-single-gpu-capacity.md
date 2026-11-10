@@ -1,8 +1,16 @@
 # 27B + MTP: single-3090-Ti capacity check
 
-## Conservative starting point
+> **Historical pre-fix measurements; the default recommendation is withdrawn.**
+> The single-client investigation found that embedding placement ignored requested
+> target KV capacity. Correcting that decision allowed single-client 262k TQ4
+> serving with MTP to start and complete near-262k requests. These earlier failures
+> therefore do not establish a hardware context limit. MTP allocation budgeting
+> and operating headroom are being qualified separately; concurrent latency/cache
+> findings below remain observations, not a diagnosed cause.
 
-For further **text-only** qualification on one 24 GB RTX 3090 Ti, use:
+## Earlier four-client pressure configuration (not the production default)
+
+The initial **text-only** pressure run on one 24 GB RTX 3090 Ti used:
 
 ```sh
 export PATH="/opt/cuda/bin:$PATH"

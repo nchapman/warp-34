@@ -26,6 +26,107 @@ use w34_kernels::ffi::{self, W34_KV_NAMESPACE_MTP_FULL_ATTN};
 
 mod propose;
 
+// Shared by pre-placement serving admission and the actual loader. The arena remains
+// FP16-sized even for quantized checkpoints; do not budget only its used bytes.
+fn weight_arena_bytes(c: &ModelConfig, tp: usize, capacity: usize, ffn: usize) -> usize {
+    let h = c.hidden_size;
+    let q = c.num_attention_heads * c.head_dim;
+    let local_kv = c.local_kv_heads(tp) * c.head_dim;
+    let hc = if c.uses_hyper_connection() {
+        c.hc_count.max(1)
+    } else {
+        1
+    };
+    (2 * (2 * h * h
+        + 2 * q * h / tp
+        + 2 * local_kv * h
+        + h * q / tp
+        + (5 + hc) * h
+        + 2 * c.head_dim))
+        .saturating_add(ffn)
+        .saturating_add(capacity.div_ceil(16).saturating_mul(4))
+        .saturating_add(32 * 1024 * 1024)
+}
+
+fn repack_staging_bytes(c: &ModelConfig, tp: usize) -> usize {
+    (64 * 1024 * 1024).max(
+        2 * (c.intermediate_size / tp).div_ceil(MARLIN_TILE_N)
+            * MARLIN_TILE_N
+            * c.hidden_size.div_ceil(MARLIN_TILE_K_W4)
+            * MARLIN_TILE_K_W4
+            * c.quant.bits()
+            / 8,
+    )
+}
+
+fn scratch_row_elements(c: &ModelConfig, tp: usize, ffn: usize) -> usize {
+    let hc = if c.uses_hyper_connection() {
+        c.hc_count.max(1)
+    } else {
+        1
+    };
+    (9 + 4 * hc) * c.hidden_size
+        + c.hc_lowrank.max(1)
+        + 3 * hc
+        + 8 * c.num_attention_heads * c.head_dim / tp
+        + 6 * c.local_kv_heads(tp) * c.head_dim
+        + 2 * (c.indexer_n_heads + c.indexer_kv_heads) * c.indexer_head_dim
+        + ffn
+}
+
+const MTP_SCRATCH_SLACK: usize = 2 * 1024 * 1024 + 131072;
+
+/// Mandatory dense MTP allocation peak, excluding the opportunistic draft LM head.
+/// MoE/QSA retain their existing archive-dependent expert/cache contracts: this
+/// dense-only correction must not double-charge their existing target reserves.
+pub(crate) fn dense_serving_reserve(c: &ModelConfig, tp: usize, capacity: usize) -> usize {
+    if c.num_experts > 0 || c.uses_qsa() {
+        return 0;
+    }
+    let pages = capacity.div_ceil(16);
+    let rows = capacity.min(256);
+    let hc = if c.uses_hyper_connection() {
+        c.hc_count.max(1)
+    } else {
+        1
+    };
+    let row = scratch_row_elements(c, tp, 3 * (c.intermediate_size / tp));
+    let logits = c.vocab_size.div_ceil(tp) * 2;
+    // Proposer IO: final-hidden tap, shifted rows, tail, four verify logits,
+    // and per-slot tail + four captured verify rows (maximum supported MTP-3).
+    // Using the tap row ceiling also bounds the proposer's staging row count.
+    let tap_rows = capacity.min(crate::dflash::DFLASH2_MAX_BATCH_ROWS);
+    let proposer_io =
+        (2 * tap_rows + 1 + MAX_MTP_BATCH_SLOTS * 5) * c.hyper_hidden_size() * 2 + 4 * logits;
+    // Capacity originates in --kv-pages. Saturate its products and the total so
+    // impossible requests fail admission rather than wrapping to a small reserve.
+    let kv_bytes = pages
+        .saturating_mul(16)
+        .saturating_mul(c.local_kv_heads(tp))
+        .saturating_mul(c.head_dim)
+        .saturating_mul(4);
+    [
+        proposer_io,
+        weight_arena_bytes(
+            c,
+            tp,
+            capacity,
+            6 * c.hidden_size * (c.intermediate_size / tp),
+        ),
+        repack_staging_bytes(c, tp),
+        kv_bytes,
+        (rows + 1) * row * 2,
+        2 * logits,
+        2 * MTP_SCRATCH_SLACK,
+        pages.saturating_mul(4),
+        (rows + 1) * hc * c.hidden_size * 2,
+        16 * 4,
+        4 * 4,
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
+}
+
 /// Double-buffered H2D staging capacity (`32` experts) for the single-layer `MTP` MoE workspace.
 const MTP_MOE_STAGE_CAPACITY: usize = 32;
 
@@ -305,23 +406,9 @@ impl Qwen3_5MtpRank {
         } else {
             2 * 3 * h * (i / tp)
         };
-        let bytes = 2
-            * (2 * h * h
-                + (2 * q) * h / tp
-                + (2 * local_kv) * h
-                + h * q / tp
-                + (5 + hc_count) * h
-                + 2 * c.head_dim)
-            + ffn_weight_bytes
-            + capacity.div_ceil(16) * 4
-            + 32 * 1024 * 1024;
-        const MTP_MIN_REPACK_STAGING_BYTES: usize = 64 * 1024 * 1024;
+        let bytes = weight_arena_bytes(c, tp, capacity, ffn_weight_bytes);
         let mut weights = DeviceArena::new(target.device.device_id, bytes)?;
-        let gate_up_staging_bytes = ((2 * (i / tp).div_ceil(MARLIN_TILE_N) * MARLIN_TILE_N)
-            * (h.div_ceil(MARLIN_TILE_K_W4) * MARLIN_TILE_K_W4)
-            * c.quant.bits())
-            / 8;
-        let staging_bytes = MTP_MIN_REPACK_STAGING_BYTES.max(gate_up_staging_bytes);
+        let staging_bytes = repack_staging_bytes(c, tp);
         let staging = DeviceBuffer::alloc(target.device.device_id, staging_bytes)?;
         let load = |name: &str, n: usize, k: usize| -> Result<RawLinearHost> {
             let raw = RawLinearHost::load(&archive, &format!("mtp.{name}"), &c.quant)?;
@@ -543,24 +630,18 @@ impl Qwen3_5MtpRank {
                     + 64
             }
         };
-        let row_elements = (9 + 4 * hc_count) * h
-            + c.hc_lowrank.max(1)
-            + 3 * hc_count
-            + 8 * q / tp
-            + 6 * local_kv
-            + 2 * (c.indexer_n_heads + c.indexer_kv_heads) * c.indexer_head_dim
-            + ffn_row_elements;
+        let row_elements = scratch_row_elements(c, tp, ffn_row_elements);
         let single_row_logits_bytes = target.local_vocab_size * 2;
         let scratch_bytes = max_batch_rows
             .checked_mul(row_elements)
             .and_then(|n| n.checked_mul(2))
             .and_then(|n| n.checked_add(single_row_logits_bytes))
-            .and_then(|n| n.checked_add(2 * 1024 * 1024 + 131072 + capacity.div_ceil(16) * 4))
+            .and_then(|n| n.checked_add(MTP_SCRATCH_SLACK + capacity.div_ceil(16) * 4))
             .ok_or_else(|| loader_err("MTP scratch size overflow"))?;
         let propose_arena_bytes = row_elements
             .checked_mul(2)
             .and_then(|n| n.checked_add(single_row_logits_bytes))
-            .and_then(|n| n.checked_add(2 * 1024 * 1024 + 131072))
+            .and_then(|n| n.checked_add(MTP_SCRATCH_SLACK))
             .ok_or_else(|| loader_err("MTP propose arena overflow"))?;
         let graph_io = MtpGraphIo {
             propose_graphs: std::array::from_fn(|_| None),

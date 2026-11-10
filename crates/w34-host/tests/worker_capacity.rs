@@ -10,9 +10,12 @@ use w34_host::{
     scheduler::SchedulerConfig,
 };
 
+static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Run under flock /tmp/w34-gpu1.lock with CUDA_VISIBLE_DEVICES=1.
 #[test]
 fn serving_sixteen_requests_reach_b16() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     if common::require_or_skip_cached_model(
         "nchapman/Qwen3.5-4B-W4A16-GPTQ",
         "serving_sixteen_requests_reach_b16",
@@ -86,6 +89,97 @@ fn serving_sixteen_requests_reach_b16() {
             assert_eq!(peak, 16);
             assert_ne!(mask & (1 << 4), 0, "B16 must be captured");
         });
+}
+
+#[test]
+fn single_client_27b_hgptq_serving_allocates_262k_tq4_context() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(model_dir) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+        "single_client_27b_hgptq_serving_allocates_262k_tq4_context",
+    ) else {
+        return;
+    };
+    let engine = Qwen3_5Engine::load_for_serving(
+        model_dir.to_str().unwrap(),
+        1,
+        KvFormatPolicy::Tq4,
+        Some(16_384),
+        true,
+        1,
+    )
+    .expect("single-client 27B HGPTQ must preserve the 262k TQ4 capacity target");
+    assert_eq!(engine.ranks[0].kv_pool.num_pages, 16_384);
+    assert!(engine.ranks[0].state_pool.total_slots >= 3);
+}
+
+#[test]
+fn single_client_27b_mtp_fits_both_long_context_budgets() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    use w34_host::proposer::{SpeculativeConfig, SpeculativeKind};
+
+    let Some(model_dir) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+        "single_client_27b_mtp_fits_both_long_context_budgets",
+    ) else {
+        return;
+    };
+    for pages in [14_336, 16_384] {
+        let mut engine = Qwen3_5Engine::load_for_serving_with_mtp(
+            model_dir.to_str().unwrap(),
+            1,
+            KvFormatPolicy::Tq4,
+            Some(pages),
+            true,
+            1,
+            true,
+        )
+        .unwrap_or_else(|error| panic!("target allocation failed at {pages} pages: {error}"));
+        engine
+            .enable_speculative(&SpeculativeConfig {
+                kind: SpeculativeKind::Mtp,
+                draft_model: None,
+                mtp_k: 3,
+            })
+            .unwrap_or_else(|error| panic!("MTP allocation failed at {pages} pages: {error}"));
+        assert_eq!(engine.ranks[0].kv_pool.num_pages, pages);
+        assert!(engine.ranks[0].state_pool.total_slots >= 3);
+    }
+}
+
+#[test]
+fn single_client_27b_dflash_serving_preserves_32k_context() {
+    use w34_host::proposer::{SpeculativeConfig, SpeculativeKind};
+
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(target) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+        "single_client_27b_dflash_serving_preserves_32k_context",
+    ) else {
+        return;
+    };
+    let Some(draft) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ",
+        "single_client_27b_dflash_serving_preserves_32k_context",
+    ) else {
+        return;
+    };
+    let engine = Qwen3_5Engine::load_for_serving_with_speculative(
+        target.to_str().unwrap(),
+        1,
+        KvFormatPolicy::Tq4,
+        Some(2048),
+        true,
+        1,
+        Some(&SpeculativeConfig {
+            kind: SpeculativeKind::DFlash2,
+            draft_model: Some(draft.to_str().unwrap().to_owned()),
+            mtp_k: 3,
+        }),
+    )
+    .expect("single-client DFlash must not require the preferred 24-slot state pool");
+    assert_eq!(engine.ranks[0].kv_pool.num_pages, 2048);
+    assert!(engine.ranks[0].state_pool.total_slots >= 11);
 }
 
 #[test]
