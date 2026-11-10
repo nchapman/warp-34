@@ -1,5 +1,12 @@
 # warp-34 — Session Orientation & Current State
 
+## Single-GPU production-target capacity investigation: 27B + MTP
+
+- Tested pinned `nchapman/Qwen3.8-27B-W4A16-HGPTQ@ae51987e3339a2a70070702548571e10fe8bcbc2`, MTP-3, TQ4 on one RTX 3090 Ti. **262,144 shared KV tokens / max 8 sequences failed startup** for insufficient serving state/headroom; 131,072 started with only 191 MiB free and 12 actual GDN slots. A 65,536-token pool / max 4 sequences completed 26 pressure-test responses but retained only ~587 MiB minimum free; not selected as the conservative default.
+- **Memory-tested starting point:** `--kv-pages 2560 --max-num-seqs 4 --max-model-len 8192` = **40,960 shared token slots, 8192 prompt+output per request, four active requests**, eight burst clients queue rather than execute simultaneously. Full 16-slot GDN pool; 26/26 two-turn responses passed at client concurrency 1/4/8 with 7455/7737 prompt tokens and 256 generated tokens. GPU peak **23,099 MiB**, free **1067 MiB**; server RSS peak **1956.43 MiB**. This is text-only short pressure evidence, not a proven production-safe maximum or long-duration 27B soak.
+- **Usability blocker to investigate:** single-client follow-up reused 7680 tokens and had ~0.10 s TTFT, but four-/eight-client follow-ups reported **zero cached tokens**. Eight-client follow-up TTFT **34.93–54.06 s**, median E2E **60.23 s** even at the chosen shorter context. Separate cache/state retention, prefill/decode interference and queueing investigation is needed; memory fit alone is not interactive readiness. No engine fix or root-cause claim made here.
+- Full configuration matrix, commands, metrics and local evidence hashes: [`27b-single-gpu-capacity.md`](../benchmarks/perf/campaigns/27b-single-gpu-capacity.md). Servers stopped cleanly; GPUs idle. Existing untracked `outputs/` preserved.
+
 ## Extended workload harness (`feat/extended-workload-soak`)
 
 - Added `python3 -m w34perf soak` in [`benchmarks/perf/`](../benchmarks/perf/SOAK.md): conjunctive minimum duration/successful-response targets, maximum measured workload duration, completion-progress watchdog, bounded sustained/burst admission, multi-turn replay, every-Nth-request local disconnect injection, per-response SLO/error gates, optional per-PID RSS/per-UUID GPU endpoint growth checks, and a quiet drain followed by a real noncancelled inference probe. Evidence is append-only with source/config/policy hashes and a separate `soak_summary.json` receipt; it is not the finite campaign report schema.
