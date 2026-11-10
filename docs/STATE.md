@@ -1,5 +1,12 @@
 # warp-34 — Session Orientation & Current State
 
+## Concurrent 27B soak: four sustained / eight burst clients
+
+- Restored the intended concurrent workload on unchanged engine `0105610`: one RTX 3090 Ti, TQ4/MTP-3, 65,536 shared KV tokens, 16,384 per-request limit, four active slots. **340 completed responses + 37 injected disconnects** in **627.57 s**, no unexpected errors, final recovery probe passed. Actual prompt lengths **185–1588 tokens**.
+- Concurrency is demonstrated, but performance is poor: server reached **four running requests**, yet **608/642 samples showed three running** with an actual **12-slot GDN pool**. Client peak was eight. Sustained/burst-admitted p95 TTFT **8.20 / 9.95 s**, E2E **17.50 / 19.76 s**. Aggregate output rate ~87 tok/s showed no observed improvement over the prior single-client run; mixes differ, so this is not a controlled scaling result.
+- Agent follow-up reuse mostly disappeared; turn 4 reused only **5.3%** of prompt tokens. Last sampled server counters: 4959 rounds, 1043 drafted / 791 accepted tokens. Investigate active admission, checkpoint ownership and speculative-state fallback together; do not infer a root cause from counters alone.
+- RSS grew **29.20 MiB**, GPU **22 MiB**, within configured gates; modest RSS drift remains. Server stopped cleanly. [Full results and receipts](../benchmarks/perf/campaigns/soak-27b-4x8-10min.md), [4/8 configuration](../benchmarks/perf/campaigns/soak-coding-27b.toml). Passing loose harness gates does not qualify interactive latency or scaling.
+
 ## Single-client 27B MTP soak after capacity fixes
 
 - Unchanged engine `0105610` passed a **600.106-second** synthetic/replay soak on one RTX 3090 Ti, TQ4/MTP-3, 196,608-token allocated capacity and one client: **332 completed responses + 36 injected local disconnects**, no unexpected errors or configured latency breaches, final inference probe passed.
