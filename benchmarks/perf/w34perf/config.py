@@ -15,6 +15,33 @@ def digest(value):
                                      separators=(",", ":")).encode()).hexdigest()
 
 
+def _validate_agent_trajectory(traj):
+    if (not isinstance(traj, dict) or not isinstance(traj.get("system"), str)
+            or not traj.get("turns") or not isinstance(traj["turns"], list)):
+        raise ValueError("agent fixture requires system and turns")
+    if "id" in traj and (not isinstance(traj["id"], str) or not traj["id"].strip()):
+        raise ValueError("trajectory id must be a nonempty string")
+    for turn_idx, turn in enumerate(traj["turns"]):
+        if not isinstance(turn, dict):
+            raise ValueError("agent turn must be an object")
+        user_text = turn.get("user")
+        tools = turn.get("tools", [])
+        if not isinstance(tools, list):
+            raise ValueError("agent turn tools must be a list")
+        if turn_idx == 0:
+            if not isinstance(user_text, str) or not user_text:
+                raise ValueError("first agent turn needs nonempty user text")
+        elif user_text is not None and not isinstance(user_text, str):
+            raise ValueError("agent turn user must be a string or null")
+        elif user_text is None and not tools:
+            raise ValueError("tool-only follow-up agent turn needs at least one tool")
+        for tool in tools:
+            if not isinstance(tool, dict) or not all(isinstance(tool.get(k), str) for k in ("name", "result")):
+                raise ValueError("replayed tool needs name, result, and arguments")
+            if not isinstance(tool.get("arguments"), dict):
+                raise ValueError("replayed tool arguments must be an object")
+
+
 def positive(value, name, *, zero=False, integer=False):
     if (isinstance(value, bool) or not isinstance(value, (int, float))
             or not math.isfinite(value) or value < 0 or (not zero and value == 0)
@@ -130,26 +157,22 @@ def load(path):
         if not isinstance(data, dict):
             raise ValueError("fixture must be a JSON object")
         if case.get("kind", "text") == "agent_replay":
-            if (not isinstance(data.get("system"), str) or not data.get("turns")
-                    or not isinstance(data["turns"], list)):
-                raise ValueError("agent fixture requires system and turns")
-            for turn_idx, turn in enumerate(data["turns"]):
-                user_text = turn.get("user")
-                tools = turn.get("tools", [])
-                if not isinstance(tools, list):
-                    raise ValueError("agent turn tools must be a list")
-                if turn_idx == 0:
-                    if not isinstance(user_text, str) or not user_text:
-                        raise ValueError("first agent turn needs nonempty user text")
-                elif user_text is not None and not isinstance(user_text, str):
-                    raise ValueError("agent turn user must be a string or null")
-                elif user_text is None and not tools:
-                    raise ValueError("tool-only follow-up agent turn needs at least one tool")
-                for tool in tools:
-                    if not all(isinstance(tool.get(k), str) for k in ("name", "result")):
-                        raise ValueError("replayed tool needs name, result, and arguments")
-                    if not isinstance(tool.get("arguments"), dict):
-                        raise ValueError("replayed tool arguments must be an object")
+            if "trajectories" in data:
+                if "turns" in data:
+                    raise ValueError("agent fixture cannot specify both turns and trajectories")
+                trajectories = data["trajectories"]
+                if not isinstance(trajectories, list) or not trajectories:
+                    raise ValueError("agent fixture trajectories must be a nonempty list")
+                seen_ids = set()
+                for traj in trajectories:
+                    _validate_agent_trajectory(traj)
+                    tid = traj.get("id")
+                    if tid is not None:
+                        if tid in seen_ids:
+                            raise ValueError(f"duplicate trajectory id {tid!r}")
+                        seen_ids.add(tid)
+            else:
+                _validate_agent_trajectory(data)
         elif (not isinstance(data.get("prompts"), list) or not data["prompts"]
               or any(not isinstance(p, str) or not p for p in data["prompts"])):
             raise ValueError("text fixture requires nonempty prompts")

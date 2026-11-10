@@ -152,6 +152,21 @@ fn record_computed_prefill(slices: &[ScheduledReqSlice], requests: &HashMap<u64,
     }
 }
 
+fn alloc_prefill_checkpoint_slot(
+    engine: &mut Qwen3_5Engine,
+    radix: &mut crate::radix::MambaRadixCache,
+    s: &ScheduledReqSlice,
+) -> Option<i32> {
+    if !s.is_prefill_chunk {
+        return None;
+    }
+    if s.is_final_prefill_chunk || s.ctx_len_before < 2048 {
+        engine.alloc_state_slot_from(radix)
+    } else {
+        engine.alloc_state_slot_preserving_leaves(radix)
+    }
+}
+
 pub(super) fn step_plain(
     engine: &mut Qwen3_5Engine,
     sched: &mut SchedulerV1,
@@ -458,11 +473,7 @@ pub(super) fn step_plain(
         } else {
             None
         };
-        let mut replacement = if s.is_prefill_chunk {
-            engine.alloc_state_slot_from(&mut sched.radix)
-        } else {
-            None
-        };
+        let mut replacement = alloc_prefill_checkpoint_slot(engine, &mut sched.radix, s);
         release(engine, sched.commit_slice(s, token, || replacement.take()));
         if let Some(slot) = replacement {
             engine.free_state_slots(&[slot]);

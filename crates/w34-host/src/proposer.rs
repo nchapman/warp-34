@@ -55,6 +55,7 @@ struct MtpBatchSlot {
     resident_tokens: Vec<i32>,
     processed: usize,
     current: Option<PrefixMemo>,
+    last_used_tick: u64,
 }
 pub struct NativeProposer {
     ranks: Ranks,
@@ -62,7 +63,7 @@ pub struct NativeProposer {
     total_capacity: usize,
     max_rows: usize,
     row_bytes: usize,
-    k: usize,
+    pub(crate) k: usize,
     max_k: usize,
     tail: Vec<DeviceBuffer>,
     shifted: Vec<DeviceBuffer>,
@@ -71,6 +72,8 @@ pub struct NativeProposer {
     resident_tokens: Vec<i32>,
     processed: usize,
     mtp_batch_active_slot: usize,
+    active_slot_last_used_tick: u64,
+    batch_slot_tick_counter: u64,
     mtp_batch_slots: Vec<MtpBatchSlot>,
     pub last_accepted: Vec<usize>,
     /// Draft rows actually included in the last successful scheduled verify call
@@ -78,8 +81,65 @@ pub struct NativeProposer {
     pub(crate) last_verified_draft_tokens: usize,
     pub last_restored_tokens: usize,
 }
-const MEMO_BUDGET: usize = 256 * 1024 * 1024;
-const MAX_MEMO_ENTRIES: usize = 32;
+const MEMO_BUDGET: usize = 2 * 1024 * 1024 * 1024;
+const MAX_MEMO_ENTRIES: usize = 64;
+const MEMO_GROWTH_ROWS: usize = 512;
+const SERVING_PROPOSER_MAX_TAP_ROWS: usize = 2048;
+
+fn grow_memo_features(buf: &mut Vec<u8>, new_len: usize, row_bytes: usize) {
+    if new_len > buf.capacity() {
+        let chunk = MEMO_GROWTH_ROWS.saturating_mul(row_bytes.max(1));
+        let target_cap = new_len.div_ceil(chunk).saturating_mul(chunk);
+        buf.reserve_exact(target_cap.saturating_sub(buf.len()));
+    }
+    buf.resize(new_len, 0);
+}
+
+pub(crate) fn dflash_slot_has_prefix(
+    res: &[i32],
+    tokens: &[i32],
+    ring_pages: Option<usize>,
+) -> bool {
+    if !res.starts_with(tokens) {
+        return false;
+    }
+    if let Some(phys_pages) = ring_pages {
+        let l_pages = res.len().div_ceil(16);
+        let win_start_page = tokens.len().saturating_sub(2048) / 16;
+        if l_pages.saturating_sub(win_start_page) > phys_pages {
+            return false;
+        }
+    }
+    true
+}
+
+fn push_mtp_memo(memos: &mut Vec<PrefixMemo>, memo: PrefixMemo) {
+    if memo.tokens.is_empty() {
+        return;
+    }
+    memos.retain(|existing| {
+        !(memo.tokens.starts_with(&existing.tokens)
+            && memo.features.len() >= existing.features.len())
+    });
+    if let Some(pos) = memos.iter().position(|existing| {
+        existing.tokens.starts_with(&memo.tokens) && existing.features.len() >= memo.features.len()
+    }) {
+        let existing = memos.remove(pos);
+        memos.push(existing);
+        return;
+    }
+    let mut total_bytes: usize = memos.iter().map(|m| m.features.capacity()).sum();
+    let incoming = memo.features.capacity();
+    while !memos.is_empty()
+        && (memos.len() >= MAX_MEMO_ENTRIES || total_bytes.saturating_add(incoming) > MEMO_BUDGET)
+    {
+        let removed = memos.remove(0);
+        total_bytes = total_bytes.saturating_sub(removed.features.capacity());
+    }
+    if incoming <= MEMO_BUDGET {
+        memos.push(memo);
+    }
+}
 const MTP_STAGE_ROWS: usize = 256;
 const TIERED_MOE_MTP_MAX_TAP_ROWS: usize = 6144;
 const TIERED_MOE_DFLASH2_MAX_TAP_ROWS: usize = 2048;
@@ -107,12 +167,15 @@ impl NativeProposer {
                 "native MTP requires k=1..3 and uses the target checkpoint",
             ));
         }
-        let capacity = engine.ranks[0].kv_pool.num_pages * 16;
+        let num_pages = engine.ranks[0].kv_pool.num_pages;
+        let capacity = num_pages * 16;
         let max_rows = if engine.cfg.uses_tiered_moe() {
             match config.kind {
                 SpeculativeKind::Mtp => capacity.min(TIERED_MOE_MTP_MAX_TAP_ROWS),
                 SpeculativeKind::DFlash2 => capacity.min(TIERED_MOE_DFLASH2_MAX_TAP_ROWS),
             }
+        } else if (4096..14336).contains(&num_pages) {
+            capacity.min(SERVING_PROPOSER_MAX_TAP_ROWS)
         } else {
             capacity.min(DFLASH2_MAX_BATCH_ROWS)
         };
@@ -240,31 +303,32 @@ impl NativeProposer {
         for (t, buffer) in engine.ranks.iter_mut().zip(logits) {
             t.speculative_logits = Some(buffer);
         }
-        let mtp_batch_slots = if config.kind == SpeculativeKind::Mtp {
-            (0..MAX_MTP_BATCH_SLOTS)
-                .map(|_| {
-                    let slot_tail = engine
+        let mtp_batch_slots = (0..MAX_MTP_BATCH_SLOTS)
+            .map(|_| {
+                let slot_tail = if config.kind == SpeculativeKind::Mtp {
+                    engine
                         .ranks
                         .iter()
                         .map(|t| DeviceBuffer::alloc(t.device.device_id, mtp_row_bytes))
-                        .collect::<Result<Vec<_>>>()?;
-                    let captured_verify_hidden = engine
-                        .ranks
-                        .iter()
-                        .map(|t| DeviceBuffer::alloc(t.device.device_id, (k + 1) * mtp_row_bytes))
-                        .collect::<Result<Vec<_>>>()?;
-                    Ok(MtpBatchSlot {
-                        tail: slot_tail,
-                        captured_verify_hidden,
-                        resident_tokens: vec![],
-                        processed: 0,
-                        current: None,
-                    })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    vec![]
+                };
+                let captured_verify_hidden = engine
+                    .ranks
+                    .iter()
+                    .map(|t| DeviceBuffer::alloc(t.device.device_id, (k + 1) * row_bytes))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(MtpBatchSlot {
+                    tail: slot_tail,
+                    captured_verify_hidden,
+                    resident_tokens: vec![],
+                    processed: 0,
+                    current: None,
+                    last_used_tick: 0,
                 })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![]
-        };
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             ranks,
             capacity,
@@ -280,6 +344,8 @@ impl NativeProposer {
             resident_tokens: vec![],
             processed: 0,
             mtp_batch_active_slot: 0,
+            active_slot_last_used_tick: 0,
+            batch_slot_tick_counter: 0,
             mtp_batch_slots,
             last_accepted: vec![],
             last_verified_draft_tokens: 0,
@@ -312,50 +378,38 @@ impl NativeProposer {
         if memo.tokens.is_empty() {
             return;
         }
-        if matches!(self.ranks, Ranks::DFlash(_)) {
-            self.memos.clear();
-            self.memos.push(memo);
-            return;
-        }
-        self.memos
-            .retain(|existing| !memo.tokens.starts_with(&existing.tokens));
-        if let Some(pos) = self
-            .memos
-            .iter()
-            .position(|existing| existing.tokens.starts_with(&memo.tokens))
-        {
-            let existing = self.memos.remove(pos);
-            self.memos.push(existing);
-            return;
-        }
-        let mut total_bytes: usize = self.memos.iter().map(|m| m.features.len()).sum();
-        while !self.memos.is_empty()
-            && (self.memos.len() >= MAX_MEMO_ENTRIES
-                || total_bytes.saturating_add(memo.features.len()) > MEMO_BUDGET)
-        {
-            let removed = self.memos.remove(0);
-            total_bytes = total_bytes.saturating_sub(removed.features.len());
-        }
-        self.memos.push(memo);
+        push_mtp_memo(&mut self.memos, memo);
     }
     fn can_restore(&self, tokens: &[i32]) -> bool {
         if tokens.is_empty() {
             return true;
         }
         match &self.ranks {
-            Ranks::DFlash(_) => {
-                self.memos.iter().any(|m| m.tokens.starts_with(tokens))
-                    && self.resident_tokens.starts_with(tokens)
+            Ranks::DFlash(rs) => {
+                let slot_count = rs.first().map_or(0, |r| r.batch_slot_count());
+                let ring_pages = rs.first().and_then(|r| r.ring_phys_pages_per_slot());
+                dflash_slot_has_prefix(&self.resident_tokens, tokens, ring_pages)
+                    || (rs.first().is_some_and(|r| r.is_batch_mode())
+                        && self.mtp_batch_slots.iter().take(slot_count).any(|s| {
+                            dflash_slot_has_prefix(&s.resident_tokens, tokens, ring_pages)
+                        }))
             }
             Ranks::Mtp(_) => {
                 let need_bytes = tokens.len().saturating_mul(self.row_bytes);
                 self.memos
                     .iter()
+                    .chain(self.current.iter())
+                    .chain(
+                        self.mtp_batch_slots
+                            .iter()
+                            .filter_map(|s| s.current.as_ref()),
+                    )
                     .any(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_bytes)
             }
         }
     }
     fn restore(&mut self, engine: &mut Qwen3_5Engine, tokens: &[i32]) -> Result<()> {
+        self.commit_current_memo();
         if tokens.is_empty() {
             self.reset()?;
             self.current = Some(PrefixMemo {
@@ -364,9 +418,89 @@ impl NativeProposer {
             });
             return Ok(());
         }
+        if let Ranks::DFlash(rs) = &mut self.ranks {
+            let n = tokens.len();
+            let ring_pages = rs.first().and_then(|r| r.ring_phys_pages_per_slot());
+            if !dflash_slot_has_prefix(&self.resident_tokens, tokens, ring_pages) {
+                let slot_count = rs.first().map_or(0, |r| r.batch_slot_count());
+                let donor = (0..slot_count)
+                    .find(|&s| {
+                        s != self.mtp_batch_active_slot
+                            && dflash_slot_has_prefix(
+                                &self.mtp_batch_slots[s].resident_tokens,
+                                tokens,
+                                ring_pages,
+                            )
+                    })
+                    .ok_or_else(|| loader_err("missing DFlash2 resident prefix"))?;
+                let dst = self.mtp_batch_active_slot;
+                for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                    r.copy_kv_from_slot(t, donor, dst, n)?;
+                }
+                self.resident_tokens.clear();
+                self.resident_tokens.extend_from_slice(tokens);
+            } else {
+                for r in rs {
+                    r.truncate(n)?;
+                }
+                self.resident_tokens.truncate(n);
+            }
+            self.processed = n;
+            self.last_accepted.clear();
+            self.last_restored_tokens = n;
+            self.current = Some(PrefixMemo {
+                tokens: tokens.to_vec(),
+                features: vec![],
+            });
+            return Ok(());
+        }
         let need_mtp_bytes = matches!(self.ranks, Ranks::Mtp(_))
             .then(|| tokens.len().saturating_mul(self.row_bytes))
             .unwrap_or(0);
+        // If another MTP batch slot already holds `tokens` in its resident GPU KV cache,
+        // clone its `(n - 1)` KV tokens via D2D copy so we hit the O(1) GPU fast path below.
+        if !self.resident_tokens.starts_with(tokens)
+            && let Ranks::Mtp(rs) = &mut self.ranks
+            && rs.first().is_some_and(|r| r.is_batch_mode())
+        {
+            let slot_count = rs[0].batch_slot_count();
+            if let Some(donor) = (0..slot_count).find(|&s| {
+                s != self.mtp_batch_active_slot
+                    && self.mtp_batch_slots[s].resident_tokens.starts_with(tokens)
+            }) {
+                let dst = self.mtp_batch_active_slot;
+                let n = tokens.len();
+                for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                    r.copy_kv_from_slot(t, donor, dst, n.saturating_sub(1))?;
+                }
+                self.resident_tokens.clear();
+                self.resident_tokens.extend_from_slice(tokens);
+            }
+        }
+        // If the matching memo is currently held in another active slot's `current`,
+        // clone its `n`-token prefix into `self.memos` so restoration succeeds cleanly.
+        if !self
+            .memos
+            .iter()
+            .any(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_mtp_bytes)
+            && let Some(donor_memo) = self
+                .mtp_batch_slots
+                .iter()
+                .filter_map(|s| s.current.as_ref())
+                .find(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_mtp_bytes)
+        {
+            let n = tokens.len();
+            let mut f = Vec::new();
+            grow_memo_features(&mut f, n * self.row_bytes, self.row_bytes);
+            f.copy_from_slice(&donor_memo.features[..n * self.row_bytes]);
+            push_mtp_memo(
+                &mut self.memos,
+                PrefixMemo {
+                    tokens: tokens.to_vec(),
+                    features: f,
+                },
+            );
+        }
         // Fast path: if the drafter's resident GPU KV cache already starts with `tokens`,
         // truncate the drafter KV cache in-place and restore MTP's 1-row tail without
         // re-running drafter prefill over the cached prefix.
@@ -376,7 +510,7 @@ impl NativeProposer {
                 .iter()
                 .rposition(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_mtp_bytes)
         {
-            let memo = self.memos.remove(idx);
+            let mut memo = self.memos.remove(idx);
             let n = tokens.len();
             match &mut self.ranks {
                 Ranks::DFlash(rs) => {
@@ -396,16 +530,33 @@ impl NativeProposer {
             self.processed = n;
             self.last_accepted.clear();
             self.last_restored_tokens = n;
-            let features = if memo.features.len() >= n * self.row_bytes {
-                memo.features[..n * self.row_bytes].to_vec()
+            // For long session-specific prefixes (> 2048 tokens), move `memo` directly into
+            // `self.current` in O(1) without cloning 80-120 MiB on CPU; `commit_current_memo`
+            // returns it to `self.memos` on turn completion or abort. Keep short shared system
+            // prefixes (<= 2048 tokens) in `self.memos` for concurrent sibling sessions.
+            if n > 2048 {
+                memo.tokens.truncate(n);
+                if matches!(self.ranks, Ranks::Mtp(_)) {
+                    memo.features.truncate(n * self.row_bytes);
+                } else {
+                    memo.features.clear();
+                }
+                self.current = Some(memo);
             } else {
-                vec![]
-            };
-            self.memos.push(memo);
-            self.current = Some(PrefixMemo {
-                tokens: tokens.to_vec(),
-                features,
-            });
+                let features = if memo.features.len() >= n * self.row_bytes {
+                    let mut f = Vec::new();
+                    grow_memo_features(&mut f, n * self.row_bytes, self.row_bytes);
+                    f.copy_from_slice(&memo.features[..n * self.row_bytes]);
+                    f
+                } else {
+                    vec![]
+                };
+                push_mtp_memo(&mut self.memos, memo);
+                self.current = Some(PrefixMemo {
+                    tokens: tokens.to_vec(),
+                    features,
+                });
+            }
             return Ok(());
         }
         self.reset()?;
@@ -415,7 +566,7 @@ impl NativeProposer {
             .iter()
             .rposition(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_mtp_bytes)
             .ok_or_else(|| loader_err("missing proposer prefix"))?;
-        let memo = self.memos.remove(idx);
+        let mut memo = self.memos.remove(idx);
         let step = self.max_rows.min(MTP_STAGE_ROWS);
         let result = (|| {
             for start in (0..tokens.len()).step_by(step) {
@@ -434,20 +585,33 @@ impl NativeProposer {
             }
             Ok(())
         })();
-        let restored_features = if result.is_ok() {
-            let prefix_bytes = tokens.len() * self.row_bytes;
-            Some(memo.features[..prefix_bytes].to_vec())
+        if result.is_ok() && tokens.len() > 2048 {
+            memo.tokens.truncate(tokens.len());
+            if matches!(self.ranks, Ranks::Mtp(_)) {
+                memo.features.truncate(tokens.len() * self.row_bytes);
+            } else {
+                memo.features.clear();
+            }
+            self.current = Some(memo);
         } else {
-            None
-        };
-        self.memos.push(memo);
-        result?;
-        if let Some(features) = restored_features {
-            self.current = Some(PrefixMemo {
-                tokens: tokens.to_vec(),
-                features,
-            });
+            let restored_features = if result.is_ok() {
+                let prefix_bytes = tokens.len() * self.row_bytes;
+                let mut f = Vec::new();
+                grow_memo_features(&mut f, prefix_bytes, self.row_bytes);
+                f.copy_from_slice(&memo.features[..prefix_bytes]);
+                Some(f)
+            } else {
+                None
+            };
+            push_mtp_memo(&mut self.memos, memo);
+            if let Some(features) = restored_features {
+                self.current = Some(PrefixMemo {
+                    tokens: tokens.to_vec(),
+                    features,
+                });
+            }
         }
+        result?;
         self.last_restored_tokens = tokens.len();
         Ok(())
     }
@@ -510,7 +674,7 @@ impl NativeProposer {
                 t0.device.make_current()?;
                 let len_bytes = tokens.len() * self.row_bytes;
                 let old_len = memo.features.len();
-                memo.features.resize(old_len + len_bytes, 0);
+                grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
                 check_rc(
                     // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
                     // rank 0's stream is synchronized before ingest returns below.
@@ -768,7 +932,7 @@ impl NativeProposer {
                     t0.device.make_current()?;
                     let len_bytes = tokens.len() * self.row_bytes;
                     let old_len = memo.features.len();
-                    memo.features.resize(old_len + len_bytes, 0);
+                    grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
                     check_rc(
                         // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
                         // rank 0's stream is synchronized before ingest_and_propose returns below.
@@ -1553,5 +1717,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mtp_memo_growth_bounds_slack_and_deduplicates_prefixes() {
+        let row_bytes = 10_240;
+        let mut buf = vec![1u8; 10_000 * row_bytes];
+        buf.shrink_to_fit();
+        // Appending 128 new SWE tool-observation tokens must grow by at most one 512-row
+        // (~5 MiB) chunk rather than doubling a 100 MiB buffer to 200 MiB.
+        grow_memo_features(&mut buf, 10_128 * row_bytes, row_bytes);
+        assert_eq!(buf.len(), 10_128 * row_bytes);
+        assert!(
+            buf.capacity() <= (10_128 + MEMO_GROWTH_ROWS) * row_bytes,
+            "unexpected Vec doubling: len={} cap={}",
+            buf.len(),
+            buf.capacity()
+        );
+
+        let mut memos = Vec::new();
+        let mut m1_feat = Vec::new();
+        grow_memo_features(&mut m1_feat, 512, 16);
+        let expected_cap = m1_feat.capacity();
+        push_mtp_memo(
+            &mut memos,
+            PrefixMemo {
+                tokens: vec![1, 2, 3],
+                features: m1_feat,
+            },
+        );
+        assert_eq!(memos.len(), 1);
+        assert_eq!(memos[0].features.capacity(), expected_cap);
+
+        // Strict prefix extension replaces the shorter turn memo cleanly.
+        push_mtp_memo(
+            &mut memos,
+            PrefixMemo {
+                tokens: vec![1, 2, 3, 4, 5],
+                features: vec![7; 1024],
+            },
+        );
+        assert_eq!(memos.len(), 1);
+        assert_eq!(memos[0].tokens, vec![1, 2, 3, 4, 5]);
+
+        // Re-committing a shorter or empty-feature prefix never downgrades an existing memo.
+        push_mtp_memo(
+            &mut memos,
+            PrefixMemo {
+                tokens: vec![1, 2, 3, 4, 5],
+                features: vec![],
+            },
+        );
+        assert_eq!(memos.len(), 1);
+        assert_eq!(memos[0].features.len(), 1024);
     }
 }

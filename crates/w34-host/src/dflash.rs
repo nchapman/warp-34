@@ -679,7 +679,7 @@ pub(crate) fn serving_reserve(
 
 struct DFlashGraphIo {
     forward_graph: Option<CudaGraph>,
-    select_greedy_graph: Option<CudaGraph>,
+    select_greedy_graphs: [Option<CudaGraph>; crate::mtp::MAX_MTP_BATCH_SLOTS],
     forward_arena: DeviceArena,
     meta_dev: DeviceBuffer,
     topk_ids_dev: DeviceBuffer,
@@ -697,11 +697,18 @@ pub struct DFlash2Rank {
     _weights: DeviceArena,
     scratch: DeviceArena,
     kv: KvPool,
+    all_pages: Vec<i32>,
+    all_pages_dev: u64,
+    ring_pages_dev_buf: Option<DeviceBuffer>,
     pages: Vec<i32>,
     pages_dev: u64,
     capacity: usize,
+    total_capacity: usize,
     max_rows: usize,
     committed: usize,
+    active_slot: usize,
+    batch_mode: bool,
+    slot_committed: [usize; crate::mtp::MAX_MTP_BATCH_SLOTS],
     proposal_anchor: Option<i32>,
     fc: Linear,
     hidden_norm: u64,
@@ -1170,6 +1177,15 @@ impl DFlash2Rank {
         }
         let rope = weights.upload_slice(&table, &t.stream)?;
         let layer_ids: Vec<usize> = (0..c.num_hidden_layers).collect();
+        let logical_pages = rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
+        let slot_count = crate::mtp::MAX_MTP_BATCH_SLOTS;
+        let ring_phys_per_slot =
+            ((cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 16).max(256);
+        let phys_kv_pages = if cfg.window > 0 {
+            logical_pages.min(slot_count * ring_phys_per_slot)
+        } else {
+            logical_pages
+        };
         let mut kv = KvPool::new(
             t.device.device_id,
             ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
@@ -1177,13 +1193,33 @@ impl DFlash2Rank {
             c.num_key_value_heads / tp,
             d,
             DFLASH2_KV_PAGE_BLOCK_TOKENS,
-            rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS),
+            phys_kv_pages,
             KvFormatPolicy::Bf16,
         )?;
-        let pages: Vec<i32> = (0..kv.num_pages)
+        let raw_pages: Vec<i32> = (0..kv.num_pages)
             .map(|_| kv.alloc_page().unwrap())
             .collect();
+        let pages: Vec<i32> = (0..logical_pages)
+            .map(|p| raw_pages[p % raw_pages.len()])
+            .collect();
         let pages_dev = weights.upload_slice(&pages, &t.stream)?;
+        let phys_per_slot = raw_pages.len() / slot_count;
+        let ring_pages_dev_buf = if cfg.window > 0
+            && phys_per_slot * DFLASH2_KV_PAGE_BLOCK_TOKENS > cfg.window + cfg.block_size
+        {
+            let mut table = Vec::with_capacity(slot_count * logical_pages);
+            for s in 0..slot_count {
+                let base = s * phys_per_slot;
+                for p in 0..logical_pages {
+                    table.push(raw_pages[base + (p % phys_per_slot)]);
+                }
+            }
+            let buf = DeviceBuffer::alloc(t.device.device_id, table.len() * 4)?;
+            buf.copy_from_host(&table, &t.stream)?;
+            Some(buf)
+        } else {
+            None
+        };
         let hidden = DeviceBuffer::alloc(t.device.device_id, cfg.block_size * h * 2)?;
         let projected = DeviceBuffer::alloc(
             t.device.device_id,
@@ -1193,7 +1229,7 @@ impl DFlash2Rank {
         let topk_elems = k_draft * cfg.top_k;
         let graph_io = DFlashGraphIo {
             forward_graph: None,
-            select_greedy_graph: None,
+            select_greedy_graphs: std::array::from_fn(|_| None),
             forward_arena: DeviceArena::new(t.device.device_id, DFLASH2_FORWARD_GRAPH_ARENA_BYTES)?,
             meta_dev: DeviceBuffer::alloc(t.device.device_id, (3 * cfg.block_size + 4) * 4)?,
             topk_ids_dev: DeviceBuffer::alloc(t.device.device_id, topk_elems * 4)?,
@@ -1201,6 +1237,7 @@ impl DFlash2Rank {
             out_path_dev: DeviceBuffer::alloc(t.device.device_id, k_draft * 4)?,
         };
         t.stream.synchronize()?;
+        let all_pages = raw_pages;
         Ok(Self {
             cfg,
             use_cuda_graph: true,
@@ -1211,11 +1248,18 @@ impl DFlash2Rank {
             _weights: weights,
             scratch: DeviceArena::new(t.device.device_id, 32 * 1024 * 1024)?,
             kv,
+            all_pages,
+            all_pages_dev: pages_dev,
+            ring_pages_dev_buf,
             pages,
             pages_dev,
             capacity,
+            total_capacity: capacity,
             max_rows,
             committed: 0,
+            active_slot: 0,
+            batch_mode: false,
+            slot_committed: [0; crate::mtp::MAX_MTP_BATCH_SLOTS],
             proposal_anchor: None,
             fc,
             hidden_norm,
@@ -1236,12 +1280,182 @@ impl DFlash2Rank {
     pub fn kv_layouts(&self) -> Vec<ffi::W34KvLayerLayout> {
         self.kv.layers.iter().map(|l| l.layout).collect()
     }
+    pub fn batch_slot_count(&self) -> usize {
+        if self.ring_pages_dev_buf.is_some() || self.all_pages.len() >= 8192 {
+            crate::mtp::MAX_MTP_BATCH_SLOTS
+        } else {
+            4
+        }
+    }
+    pub fn batch_slot_capacity(&self) -> usize {
+        if self.ring_pages_dev_buf.is_some() {
+            self.total_capacity
+        } else {
+            (self.all_pages.len() / self.batch_slot_count())
+                .saturating_mul(16)
+                .saturating_sub(self.cfg.block_size)
+        }
+    }
+    pub fn is_batch_mode(&self) -> bool {
+        self.batch_mode
+    }
+    pub fn ring_phys_pages_per_slot(&self) -> Option<usize> {
+        self.ring_pages_dev_buf
+            .as_ref()
+            .map(|_| self.all_pages.len() / crate::mtp::MAX_MTP_BATCH_SLOTS)
+    }
+    fn bind_slot_pages(&mut self, slot: usize) {
+        if let Some(ref ring_buf) = self.ring_pages_dev_buf {
+            let slot_count = crate::mtp::MAX_MTP_BATCH_SLOTS;
+            let phys_per_slot = self.all_pages.len() / slot_count;
+            let logical_pages = self.rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
+            let base = slot * phys_per_slot;
+            self.pages = (0..logical_pages)
+                .map(|p| self.all_pages[base + (p % phys_per_slot)])
+                .collect();
+            self.pages_dev = ring_buf.addr() + (slot * logical_pages * 4) as u64;
+            self.capacity = self.total_capacity;
+        } else {
+            let slot_count = self.batch_slot_count();
+            let slot_pages = self.all_pages.len() / slot_count;
+            self.pages = self.all_pages[slot * slot_pages..(slot + 1) * slot_pages].to_vec();
+            self.pages_dev = self.all_pages_dev + (slot * slot_pages * 4) as u64;
+            self.capacity = (slot_pages * 16).saturating_sub(self.cfg.block_size);
+        }
+    }
+    pub fn set_batch_mode(&mut self, batch_mode: bool) -> Result<()> {
+        if batch_mode && self.batch_slot_capacity() < 32 {
+            return Err(loader_err("insufficient DFlash KV pages for batched slots"));
+        }
+        if self.batch_mode != batch_mode {
+            self.graph_io.forward_graph = None;
+            self.graph_io.select_greedy_graphs = std::array::from_fn(|_| None);
+            self.batch_mode = batch_mode;
+        }
+        self.slot_committed = [0; crate::mtp::MAX_MTP_BATCH_SLOTS];
+        self.active_slot = 0;
+        self.committed = 0;
+        self.proposal_anchor = None;
+        if batch_mode {
+            self.bind_slot_pages(0);
+        } else {
+            let logical_pages = self.rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
+            self.pages = (0..logical_pages)
+                .map(|p| self.all_pages[p % self.all_pages.len()])
+                .collect();
+            self.pages_dev = self.all_pages_dev;
+            self.capacity = self.total_capacity;
+        }
+        Ok(())
+    }
+    pub fn promote_single_to_batch_slot0(&mut self) -> Result<()> {
+        let slot_cap = self.batch_slot_capacity();
+        if slot_cap < 32 || self.committed > slot_cap {
+            return Err(loader_err(
+                "single-slot DFlash state exceeds batch slot 0 capacity",
+            ));
+        }
+        if self.ring_pages_dev_buf.is_some() {
+            let phys_per_slot = self.all_pages.len() / crate::mtp::MAX_MTP_BATCH_SLOTS;
+            if self.committed > phys_per_slot * 16 {
+                return Err(loader_err(
+                    "single-slot DFlash state exceeds slot 0 physical ring span",
+                ));
+            }
+        }
+        if !self.batch_mode {
+            self.graph_io.forward_graph = None;
+            self.graph_io.select_greedy_graphs = std::array::from_fn(|_| None);
+            self.batch_mode = true;
+        }
+        self.slot_committed = [0; crate::mtp::MAX_MTP_BATCH_SLOTS];
+        self.slot_committed[0] = self.committed;
+        self.active_slot = 0;
+        self.proposal_anchor = None;
+        self.bind_slot_pages(0);
+        Ok(())
+    }
+    pub fn select_batch_slot(&mut self, slot: usize) -> Result<()> {
+        let slot_count = self.batch_slot_count();
+        if !self.batch_mode || slot >= slot_count {
+            return Err(loader_err("invalid DFlash batch slot"));
+        }
+        if slot == self.active_slot {
+            return Ok(());
+        }
+        self.slot_committed[self.active_slot] = self.committed;
+        self.active_slot = slot;
+        self.committed = self.slot_committed[slot];
+        self.proposal_anchor = None;
+        self.graph_io.forward_graph = None;
+        self.bind_slot_pages(slot);
+        Ok(())
+    }
     pub fn truncate(&mut self, len: usize) -> Result<()> {
         if len > self.committed {
             return Err(loader_err("DFlash truncate grows context"));
         }
         self.committed = len;
+        self.slot_committed[self.active_slot] = len;
         self.proposal_anchor = None;
+        Ok(())
+    }
+    pub fn copy_kv_from_slot(
+        &mut self,
+        t: &Qwen3_5ModelRank,
+        src_slot: usize,
+        dst_slot: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let slot_count = if self.ring_pages_dev_buf.is_some() {
+            crate::mtp::MAX_MTP_BATCH_SLOTS
+        } else {
+            self.batch_slot_count()
+        };
+        let phys_per_slot = self.all_pages.len() / slot_count;
+        let pages_to_copy = tokens
+            .div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS)
+            .min(phys_per_slot);
+        if src_slot != dst_slot && pages_to_copy > 0 {
+            t.device.make_current()?;
+            for layer in &self.kv.layers {
+                let k_stride = layer.layout.k_page_stride_bytes as usize;
+                let v_stride = layer.layout.v_page_stride_bytes as usize;
+                let k_src = layer.k_buf.addr() + (src_slot * phys_per_slot * k_stride) as u64;
+                let k_dst = layer.k_buf.addr() + (dst_slot * phys_per_slot * k_stride) as u64;
+                let v_src = layer.v_buf.addr() + (src_slot * phys_per_slot * v_stride) as u64;
+                let v_dst = layer.v_buf.addr() + (dst_slot * phys_per_slot * v_stride) as u64;
+                check_rc(
+                    // SAFETY: Each slot owns a disjoint `phys_per_slot * stride` region inside `k_buf`.
+                    unsafe {
+                        ffi::w34_memcpy_d2d_async(
+                            k_dst as *mut _,
+                            k_src as *const _,
+                            pages_to_copy * k_stride,
+                            t.stream.handle,
+                        )
+                    },
+                    "DFlash2 slot K copy",
+                )?;
+                check_rc(
+                    // SAFETY: Each slot owns a disjoint `phys_per_slot * stride` region inside `v_buf`.
+                    unsafe {
+                        ffi::w34_memcpy_d2d_async(
+                            v_dst as *mut _,
+                            v_src as *const _,
+                            pages_to_copy * v_stride,
+                            t.stream.handle,
+                        )
+                    },
+                    "DFlash2 slot V copy",
+                )?;
+            }
+        }
+        self.slot_committed[dst_slot] = tokens;
+        if self.active_slot == dst_slot {
+            self.committed = tokens;
+            self.proposal_anchor = None;
+        }
         Ok(())
     }
     fn validate_target(&self, t: &Qwen3_5ModelRank) -> Result<()> {
@@ -1403,6 +1617,7 @@ impl DFlash2Rank {
             )?;
         }
         self.committed += rows;
+        self.slot_committed[self.active_slot] = self.committed;
         Ok(())
     }
 
@@ -1706,7 +1921,8 @@ impl DFlash2Rank {
         t: &Qwen3_5ModelRank,
         comm: Option<&Tp2Collectives>,
     ) -> Result<()> {
-        if self.graph_io.select_greedy_graph.is_some() {
+        let slot_idx = if self.batch_mode { self.active_slot } else { 0 };
+        if self.graph_io.select_greedy_graphs[slot_idx].is_some() {
             return Ok(());
         }
         let (batch, ids_ptr, pos_ptr) = self.fixed_forward_batch_ptrs();
@@ -1757,7 +1973,7 @@ impl DFlash2Rank {
                 "DFlash greedy selector",
             )
         })?;
-        self.graph_io.select_greedy_graph = Some(graph);
+        self.graph_io.select_greedy_graphs[slot_idx] = Some(graph);
         Ok(())
     }
 
@@ -1775,9 +1991,8 @@ impl DFlash2Rank {
     }
 
     pub fn replay_select_greedy_graph_async(&self, t: &Qwen3_5ModelRank) -> Result<()> {
-        let graph = self
-            .graph_io
-            .select_greedy_graph
+        let slot_idx = if self.batch_mode { self.active_slot } else { 0 };
+        let graph = self.graph_io.select_greedy_graphs[slot_idx]
             .as_ref()
             .ok_or_else(|| loader_err("DFlash select_greedy graph not captured"))?;
         graph.launch(&t.stream)

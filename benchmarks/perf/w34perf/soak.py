@@ -19,7 +19,7 @@ from .metrics import tokens, tpot
 from .runner import Journal, provenance
 from .telemetry import TelemetrySampler
 from .transport import authorization, stream
-from .workloads import append_replay, body, messages
+from .workloads import agent_trajectory, append_replay, body, messages
 
 
 def _number(value, name, *, minimum=0, positive=False, integer=False):
@@ -164,8 +164,12 @@ def execute_soak(cfg, out, engine_id, *, duration_s, min_completed, max_duration
             for name in ("ttft_slo_ms", "e2e_slo_ms", "tpot_slo_ms"):
                 if shape.get(name) is not None:
                     _number(shape[name], name, positive=True)
-        if case.get("kind") == "agent_replay" and not case["fixture_data"]["turns"]:
-            raise ValueError("agent replay requires turns")
+        if case.get("kind") == "agent_replay":
+            items = case["fixture_data"].get("trajectories") if isinstance(case.get("fixture_data"), dict) and "trajectories" in case["fixture_data"] else [case.get("fixture_data")]
+            if not isinstance(items, list) or not items:
+                raise ValueError("agent replay requires turns")
+            for idx in range(len(items)):
+                agent_trajectory(case["fixture_data"], idx)
     cap = _number(run["max_inflight"], "max_inflight", positive=True, integer=True)
     timeout = _number(run["timeout_s"], "timeout_s", positive=True)
     warmups = _number(run.get("warmup_requests", 0), "warmup_requests", integer=True)
@@ -234,7 +238,9 @@ def execute_soak(cfg, out, engine_id, *, duration_s, min_completed, max_duration
         # would accidentally defeat natural cache sharing, including bursts.
         history = messages(request_case, case_index, f"soak:{run_id}:{traffic}:{case['id']}")
         agent = case.get("kind") == "agent_replay"
-        turns = case["fixture_data"]["turns"] if agent else [None]
+        traj = agent_trajectory(case["fixture_data"], case_index) if agent else None
+        traj_meta = {"trajectory_id": traj["id"]} if traj and "id" in traj else {}
+        turns = traj["turns"] if agent else [None]
         if phase == "probe":
             turns = turns[:1]  # One real inference, not another full replay session.
         outcome = "ok"
@@ -282,7 +288,7 @@ def execute_soak(cfg, out, engine_id, *, duration_s, min_completed, max_duration
                 good = result.get("status") == "ok"
                 breaches = _slo_breaches(result, request_case) if good else []
                 journal.put({**result, "type": "request", "engine_id": engine_id, "case_id": case["id"],
-                             "phase": phase, "session_id": sid, "step": step,
+                             "phase": phase, "session_id": sid, "step": step, **traj_meta,
                              "request_id": f"{run_id}:{sid}:{step}", "request": payload,
                              "request_sha256": digest(payload), "input_messages_sha256": digest(history),
                              "injection_scheduled": inject, "expected_cancellation": expected,

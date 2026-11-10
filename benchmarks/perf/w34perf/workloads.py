@@ -4,13 +4,32 @@ import copy
 import json
 
 
+def agent_trajectory(data, index):
+    if not isinstance(data, dict):
+        raise ValueError("agent fixture must be a JSON object")
+    if "trajectories" in data:
+        if "turns" in data:
+            raise ValueError("agent fixture cannot specify both turns and trajectories")
+        trajectories = data["trajectories"]
+        if not isinstance(trajectories, list) or not trajectories:
+            raise ValueError("agent replay requires nonempty trajectories")
+        traj = trajectories[index % len(trajectories)]
+    else:
+        traj = data
+    if (not isinstance(traj, dict) or not isinstance(traj.get("system"), str)
+            or not traj.get("turns") or not isinstance(traj["turns"], list)):
+        raise ValueError("agent replay requires system and turns")
+    return traj
+
+
 def messages(case, index, namespace):
     data = case["fixture_data"]
     cache = case.get("cache", "unique")
     # Put the nonce FIRST, before the shared system text, to defeat prefix reuse.
     tag = f"Benchmark session: {namespace}:{index if cache == 'unique' else 'shared'}.\n"
     if case.get("kind", "text") == "agent_replay":
-        return [{"role": "system", "content": tag + data["system"]}]
+        traj = agent_trajectory(data, index)
+        return [{"role": "system", "content": tag + traj["system"]}]
     prompt = data["prompts"][index % len(data["prompts"])]
     repeats = case.get("context_repetitions", 1)
     if not isinstance(repeats, int) or isinstance(repeats, bool) or repeats < 1:

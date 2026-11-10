@@ -286,12 +286,6 @@ fn cancel_requests(
                 }
             }
         }
-        if mtp_batch_slots.iter().all(|s| s.is_none())
-            && let Some(p) = &mut engine.speculative
-            && p.is_mtp_batch_mode()
-        {
-            let _ = p.set_mtp_batch_mode(false);
-        }
         release(engine, sched.cancel_request(id));
         if let Some(mut r) = requests.remove(&id)
             && let Some(tap) = r.decision_tap.take()
@@ -313,8 +307,9 @@ fn mtp_batch_pages_needed(
     prompt_len: usize,
     max_new_tokens: usize,
     reserved_pages: usize,
+    proposer_k: usize,
 ) -> usize {
-    (prompt_len + max_new_tokens.max(1) + 4)
+    (prompt_len + max_new_tokens.max(1) + proposer_k + 1)
         .div_ceil(16)
         .max(reserved_pages)
 }
@@ -337,24 +332,25 @@ fn admit_into_mtp_batch_slots(
     mtp_batch_slots: &mut MtpBatchSlots,
 ) {
     let saved_max = sched.cfg.max_num_seqs;
-    let slot_limit = saved_max.min(crate::mtp::MAX_MTP_BATCH_SLOTS);
+    let slot_limit = saved_max.min(proposer.batch_slot_count());
     let mut active_reserved: usize = sched
         .active
         .iter()
         .map(|seq| requests[&seq.req_id].reserved_pages)
         .sum();
-    while sched.active.len() < slot_limit {
+    while sched.active.len() < slot_limit && sched.active.iter().all(|s| s.is_prefill_complete()) {
         let Some(w) = sched.waiting.front() else {
             break;
         };
         let id = w.req_id;
         if !is_waiting_mtp_batch_eligible(proposer, w, &requests[&id]) {
             break;
-        }
+        };
         let need_pages = mtp_batch_pages_needed(
             w.prompt_tokens.len(),
             w.max_new_tokens,
             requests[&id].reserved_pages,
+            proposer.k,
         );
         if active_reserved + need_pages > engine.ranks[0].kv_pool.num_pages {
             break;
@@ -369,7 +365,7 @@ fn admit_into_mtp_batch_slots(
         sched.cfg.max_num_seqs = before + 1;
         sched.admit_waiting_with_filter(
             |r| engine.alloc_three_state_slots_from(r),
-            |_, prompt, matched| proposer.can_restore_prefix(&prompt[..matched]),
+            |_, prompt, matched| proposer.can_restore_batch_slot(slot_idx, &prompt[..matched]),
         );
         sched.cfg.max_num_seqs = saved_max;
         record_admissions(sched, requests);
@@ -428,22 +424,28 @@ fn yield_single_speculation(
         }
         let desired_active = (1 + sched.waiting.len()).min(sched.cfg.max_num_seqs);
         let open_slots = desired_active.saturating_sub(1);
+        let proposer_k = engine.speculative.as_ref().map_or(3, |p| p.k);
+        let slot_limit = engine
+            .speculative
+            .as_ref()
+            .map_or(0, |p| p.batch_slot_count());
         let active_need = mtp_batch_pages_needed(
             seq.prompt_tokens.len(),
             seq.max_new_tokens,
             requests[&id].reserved_pages,
+            proposer_k,
         );
         let w0_need = mtp_batch_pages_needed(
             w0.prompt_tokens.len(),
             w0.max_new_tokens,
             requests[&w0.req_id].reserved_pages,
+            proposer_k,
         );
-        let can_promote_to_mtp_batch = desired_active <= crate::mtp::MAX_MTP_BATCH_SLOTS
+        let can_promote_to_mtp_batch = desired_active <= slot_limit
             && active_need + w0_need <= engine.ranks[0].kv_pool.num_pages
             && is_batched_mtp_eligible(&requests[&id])
             && engine.speculative.as_ref().is_some_and(|p| {
-                p.is_mtp()
-                    && p.fits_mtp_batch_slot_capacity(seq.prompt_tokens.len(), seq.max_new_tokens)
+                p.fits_mtp_batch_slot_capacity(seq.prompt_tokens.len(), seq.max_new_tokens)
                     && sched
                         .waiting
                         .iter()
@@ -486,8 +488,13 @@ fn extend_or_yield_mtp_batch(
     // (`B >= 5`) or an open slot has an ineligible waiting arrival that fits KV.
     if !sched.waiting.is_empty() && mtp_batch_slots.iter().any(|s| s.is_some()) {
         let active_mtp = mtp_batch_slots.iter().filter(|s| s.is_some()).count();
+        let slot_limit = engine
+            .speculative
+            .as_ref()
+            .map_or(0, |p| p.batch_slot_count());
+        let active_cap = sched.cfg.max_num_seqs.min(slot_limit);
         let desired_active = (active_mtp + sched.waiting.len()).min(sched.cfg.max_num_seqs);
-        let open_slots = sched.cfg.max_num_seqs.saturating_sub(active_mtp);
+        let open_slots = active_cap.saturating_sub(active_mtp);
         let active_reserved: usize = sched
             .active
             .iter()
@@ -495,16 +502,15 @@ fn extend_or_yield_mtp_batch(
             .sum();
         let front_plain_fits = active_reserved + requests[&sched.waiting[0].req_id].reserved_pages
             <= engine.ranks[0].kv_pool.num_pages;
-        let should_yield = desired_active > crate::mtp::MAX_MTP_BATCH_SLOTS
+        let should_yield = desired_active > slot_limit
             || (open_slots > 0
                 && front_plain_fits
                 && !engine.speculative.as_ref().is_some_and(|p| {
-                    p.is_mtp()
-                        && sched
-                            .waiting
-                            .iter()
-                            .take(open_slots)
-                            .all(|w| is_waiting_mtp_batch_eligible(p, w, &requests[&w.req_id]))
+                    sched
+                        .waiting
+                        .iter()
+                        .take(open_slots)
+                        .all(|w| is_waiting_mtp_batch_eligible(p, w, &requests[&w.req_id]))
                 }));
         if should_yield {
             let all_prefilled = mtp_batch_slots.iter().flatten().all(|(id, _)| {
@@ -526,7 +532,7 @@ fn extend_or_yield_mtp_batch(
                     }
                 }
             }
-        } else if open_slots > 0 && engine.speculative.as_ref().is_some_and(|p| p.is_mtp()) {
+        } else if open_slots > 0 && engine.speculative.is_some() {
             let mut proposer = engine.speculative.take().unwrap();
             admit_into_mtp_batch_slots(engine, &mut proposer, sched, requests, mtp_batch_slots);
             engine.speculative = Some(proposer);
@@ -549,7 +555,42 @@ fn admit_requests(
     // Batched multi-slot MTP handles `target_batch` in `2..=4` regardless of deeper queue depth.
     if speculative_id.is_none() && mtp_batch_slots.iter().all(|s| s.is_none()) {
         let target_batch = sched.waiting.len().min(sched.cfg.max_num_seqs);
-        if sched.active.is_empty()
+        let batch_slot_limit = engine
+            .speculative
+            .as_ref()
+            .map_or(0, |p| p.batch_slot_count());
+        let prefer_batch_mode = engine.speculative.as_ref().is_some_and(|p| {
+            target_batch >= 1
+                && target_batch <= batch_slot_limit
+                && (target_batch >= 2 || p.is_mtp_batch_mode())
+                && sched
+                    .waiting
+                    .iter()
+                    .take(target_batch)
+                    .all(|w| is_waiting_mtp_batch_eligible(p, w, &requests[&w.req_id]))
+        });
+        if sched.active.is_empty() && prefer_batch_mode {
+            let mut proposer = engine.speculative.take().unwrap();
+            let first_two_pages: usize = sched
+                .waiting
+                .iter()
+                .take(target_batch.min(2))
+                .map(|w| {
+                    mtp_batch_pages_needed(
+                        w.prompt_tokens.len(),
+                        w.max_new_tokens,
+                        requests[&w.req_id].reserved_pages,
+                        proposer.k,
+                    )
+                })
+                .sum();
+            if first_two_pages <= engine.ranks[0].kv_pool.num_pages
+                && proposer.set_mtp_batch_mode(true).is_ok()
+            {
+                admit_into_mtp_batch_slots(engine, &mut proposer, sched, requests, mtp_batch_slots);
+            }
+            engine.speculative = Some(proposer);
+        } else if sched.active.is_empty()
             && target_batch == 1
             && !sched.waiting[0].custom_prefill
             && requests[&sched.waiting[0].req_id].decision_tap.is_none()
@@ -587,36 +628,6 @@ fn admit_requests(
                             proposer.abort_scheduled();
                         }
                     }
-                }
-            }
-            engine.speculative = Some(proposer);
-        } else if sched.active.is_empty()
-            && (2..=crate::mtp::MAX_MTP_BATCH_SLOTS).contains(&target_batch)
-            && engine.speculative.as_ref().is_some_and(|p| p.is_mtp())
-        {
-            let mut proposer = engine.speculative.take().unwrap();
-            let first_two_pages: usize = sched
-                .waiting
-                .iter()
-                .take(2)
-                .map(|w| {
-                    mtp_batch_pages_needed(
-                        w.prompt_tokens.len(),
-                        w.max_new_tokens,
-                        requests[&w.req_id].reserved_pages,
-                    )
-                })
-                .sum();
-            let eligible = first_two_pages <= engine.ranks[0].kv_pool.num_pages
-                && sched
-                    .waiting
-                    .iter()
-                    .take(target_batch)
-                    .all(|w| is_waiting_mtp_batch_eligible(&proposer, w, &requests[&w.req_id]));
-            if eligible && proposer.set_mtp_batch_mode(true).is_ok() {
-                admit_into_mtp_batch_slots(engine, &mut proposer, sched, requests, mtp_batch_slots);
-                if mtp_batch_slots.iter().all(|s| s.is_none()) {
-                    let _ = proposer.set_mtp_batch_mode(false);
                 }
             }
             engine.speculative = Some(proposer);
@@ -712,12 +723,6 @@ fn reserve_request_capacity(
                     let _ = p.reset_mtp_batch_slot(slot_idx);
                 }
             }
-        }
-        if mtp_batch_slots.iter().all(|s| s.is_none())
-            && let Some(p) = &mut engine.speculative
-            && p.is_mtp_batch_mode()
-        {
-            let _ = p.set_mtp_batch_mode(false);
         }
     }
 }
@@ -868,9 +873,6 @@ fn step_mtp_batch(
                     }
                     mtp_batch_slots[slot_idx] = None;
                     release(engine, sched.finish_request_early(id));
-                    if mtp_batch_slots.iter().all(|s| s.is_none()) {
-                        let _ = proposer.set_mtp_batch_mode(false);
-                    }
                     finish_res.map_err(WorkerError::Cuda)?;
                 }
                 Ok(())
@@ -878,12 +880,18 @@ fn step_mtp_batch(
             Err(e) => Err(e),
         }
     } else {
-        // All active MTP batch slots have completed prefill: execute one shared
+        // All active batch slots have completed prefill: execute one shared
         // batched target verification forward pass across all occupied slots.
         let slot_map: Vec<(usize, u64)> = mtp_batch_slots
             .iter()
             .enumerate()
             .filter_map(|(slot_idx, entry)| entry.as_ref().map(|(id, _)| (slot_idx, *id)))
+            .filter(|(_, id)| {
+                sched
+                    .active
+                    .iter()
+                    .any(|s| s.req_id == *id && s.is_prefill_complete())
+            })
             .collect();
         let mut pulled: Vec<(usize, u64, Vec<i32>, Request)> = Vec::with_capacity(slot_map.len());
         for &(slot_idx, id) in &slot_map {
@@ -959,9 +967,6 @@ fn step_mtp_batch(
                 }
                 for id in finished_ids {
                     release(engine, sched.finish_request_early(id));
-                }
-                if mtp_batch_slots.iter().all(|s| s.is_none()) {
-                    let _ = proposer.set_mtp_batch_mode(false);
                 }
                 match finish_err {
                     Some(err) => Err(err),

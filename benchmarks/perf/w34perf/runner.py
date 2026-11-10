@@ -20,7 +20,7 @@ from .metrics import summarize
 from .selection import select
 from .transport import stream
 from .telemetry import TelemetrySampler
-from .workloads import append_replay, body, messages
+from .workloads import agent_trajectory, append_replay, body, messages
 
 
 def command(args):
@@ -76,7 +76,9 @@ def run_trial(engine, case, run_cfg, phase, repetition, journal, *, namespace):
         request_case = {**case, **shape}
         history = messages(request_case, index, namespace)
         is_agent = case.get("kind", "text") == "agent_replay"
-        turns = case["fixture_data"]["turns"] if is_agent else [None]
+        traj = agent_trajectory(case["fixture_data"], index) if is_agent else None
+        traj_meta = {"trajectory_id": traj["id"]} if traj and "id" in traj else {}
+        turns = traj["turns"] if is_agent else [None]
         successful = True
         for step, turn in enumerate(turns):
             if step and case.get("think_time_s", 0):
@@ -90,7 +92,7 @@ def run_trial(engine, case, run_cfg, phase, repetition, journal, *, namespace):
                 result["status"] = "agent_replay_error"
                 result["error"] = "unexpected live tool call in replay"
             result.update({"engine_id": engine["id"], "case_id": case["id"], "phase": phase,
-                           "repetition": repetition, "session_id": index, "step": step,
+                           "repetition": repetition, "session_id": index, "step": step, **traj_meta,
                            "request_id": f"{engine['id']}:{case['id']}:{phase}:{repetition}:{index}:{step}",
                            "scheduled_at_ms": (due - started) * 1000 if step == 0 else None,
                            "sent_at_ms": (submitted - started) * 1000,
@@ -110,7 +112,7 @@ def run_trial(engine, case, run_cfg, phase, repetition, journal, *, namespace):
                     assistant["reasoning_content"] = result["reasoning"]
                 history.append(assistant)
         summary = {"engine_id": engine["id"], "case_id": case["id"], "phase": phase,
-                   "repetition": repetition, "session_id": index,
+                   "repetition": repetition, "session_id": index, **traj_meta,
                    "status": "ok" if successful else "error",
                    "e2e_ms": (time.perf_counter() - session_start) * 1000}
         journal.put({"type": "session", **summary})

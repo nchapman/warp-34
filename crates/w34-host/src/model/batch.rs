@@ -132,6 +132,26 @@ impl Qwen3_5Engine {
         None
     }
 
+    /// Allocates a GDN `StateBundle` slot from the free pool or by reclaiming a superseded
+    /// internal Mamba snapshot / unverified decode tail whose parent prompt frontier remains
+    /// intact in `radix`, without ever deleting a waiting session's prompt frontier.
+    pub fn alloc_state_slot_preserving_leaves(
+        &mut self,
+        radix: &mut MambaRadixCache,
+    ) -> Option<i32> {
+        if let Some(s0) = self.ranks[0].state_pool.alloc_slot() {
+            for r in &mut self.ranks[1..] {
+                let s_peer = r.state_pool.alloc_slot();
+                debug_assert_eq!(Some(s0), s_peer);
+            }
+            return Some(s0);
+        }
+        if radix.has_evictable_internal_mamba() {
+            return self.alloc_state_slot_from(radix);
+        }
+        None
+    }
+
     pub fn free_state_slots(&mut self, slots: &[i32]) {
         for r in &mut self.ranks {
             for &s in slots {

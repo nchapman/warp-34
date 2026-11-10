@@ -182,7 +182,10 @@ impl Qwen3_5Engine {
                     capacity.dflash_reserve_bytes = draft_plan.resident_bytes;
                     capacity.dflash_min_state_slots = draft_plan.min_state_slots;
                     capacity.kv_pages = Some(pages);
-                    capacity.state_slots = Some(serving_state_slots(max_num_seqs.max(6))?);
+                    capacity.state_slots = Some(
+                        serving_state_slots(max_num_seqs.max(6))?
+                            .max(max_num_seqs.saturating_mul(10)),
+                    );
                     config.draft_model = Some(
                         draft
                             .to_str()

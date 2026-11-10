@@ -1,0 +1,60 @@
+# Intact single-instance Open-SWE-Traces 4-sustained / 8-burst soak.
+# Replays 6 intact resolved trajectories (Claude Code, OpenCode, OpenHands; 7–15 turns,
+# ~519 → 12.3k prompt tokens) from nvidia/Open-SWE-Traces@4fa4c2ae9afc6b397bc50391d43450c79993c138.
+# Performance replay (recorded tool observations, tool_choice="none"), not SWE solve-rate qualification.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 1
+warmup_requests = 1
+timeout_s = 120
+max_inflight = 8
+
+[[engines]]
+id = "warp34-swe-soak"
+engine = "warp-34"
+version = "7bff273"
+support = "unverified"
+model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+source_model_revision = "unknown"
+artifact_sha256 = "unknown"
+tokenizer_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+chat_template_sha256 = "unknown"
+quantization_details = "unknown"
+gpu_count = 1
+gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
+base_url = "http://127.0.0.1:18834/v1"
+weight_format = "HGPTQ-int4"
+kv_format = "tq4"
+parallelism = "single"
+speculation = "mtp-3"
+cache_config = "4096 KV pages; 4 active sequences; max model len 16384"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --revision ae51987e3339a2a70070702548571e10fe8bcbc2 --offline --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 18834"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[cases]]
+id = "swe-intact-unique"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_intact_16k.json"
+requests = 12
+concurrency = 4
+max_tokens = 256
+think_time_s = 0.1
+cache = "unique"
+# Per-response bounding ceilings across 12k-token 8-way burst queueing, not interactive p95 SLOs.
+ttft_slo_ms = 60000
+e2e_slo_ms = 120000
+
+[[cases]]
+id = "swe-intact-shared-harness"
+kind = "agent_replay"
+fixture = "../fixtures/open_swe_intact_16k.json"
+requests = 12
+concurrency = 4
+max_tokens = 256
+think_time_s = 0.1
+cache = "natural"
+ttft_slo_ms = 60000
+e2e_slo_ms = 120000

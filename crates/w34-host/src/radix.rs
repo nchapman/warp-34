@@ -42,6 +42,7 @@ pub struct RadixNode {
     pub mamba_lock_ref: usize,
     pub last_access_tick: u64,
     pub mamba_last_access_tick: u64,
+    pub is_decode_tail: bool,
     pub alive: bool,
 }
 
@@ -158,6 +159,7 @@ impl MambaRadixCache {
             mamba_lock_ref: 1,
             last_access_tick: 1,
             mamba_last_access_tick: 1,
+            is_decode_tail: false,
             alive: true,
         });
     }
@@ -336,6 +338,7 @@ impl MambaRadixCache {
             mamba_lock_ref: 0,
             last_access_tick: tick,
             mamba_last_access_tick: tick,
+            is_decode_tail: false,
             alive: true,
         });
 
@@ -428,6 +431,7 @@ impl MambaRadixCache {
         let mut kv_pages = Vec::new();
         let mut draft_pages = Vec::new();
         for &nid in &path_nodes[..best_path_len] {
+            self.nodes[nid.0].is_decode_tail = false;
             kv_pages.extend_from_slice(&self.nodes[nid.0].value);
             draft_pages.extend_from_slice(&self.nodes[nid.0].draft_pages);
         }
@@ -589,6 +593,7 @@ impl MambaRadixCache {
                 cur_node = self.split_node(child_id, prefix_len);
                 break;
             } else {
+                self.nodes[child_id.0].is_decode_tail = false;
                 cur_node = child_id;
             }
         }
@@ -619,6 +624,7 @@ impl MambaRadixCache {
                 mamba_lock_ref: 0,
                 last_access_tick: tick,
                 mamba_last_access_tick: tick,
+                is_decode_tail: false,
                 alive: true,
             });
             self.nodes[cur_node.0]
@@ -715,9 +721,49 @@ impl MambaRadixCache {
         }
     }
 
+    pub fn mark_node_decode_tail(&mut self, nid: RadixNodeId) {
+        if nid != RadixNodeId::ROOT && self.nodes[nid.0].children.is_empty() {
+            self.nodes[nid.0].is_decode_tail = true;
+        }
+    }
+
+    fn has_non_decode_mamba_descendant(&self, nid: RadixNodeId) -> bool {
+        let n = &self.nodes[nid.0];
+        for &cid in n.children.values() {
+            let c = &self.nodes[cid.0];
+            if (c.mamba_value.is_some() && !c.is_decode_tail)
+                || self.has_non_decode_mamba_descendant(cid)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_reclaimable_decode_tail_leaf(&self, nid: RadixNodeId) -> bool {
+        let n = &self.nodes[nid.0];
+        n.children.is_empty()
+            && n.is_decode_tail
+            && n.full_lock_ref == 0
+            && n.mamba_lock_ref == 0
+            && n.parent
+                .is_some_and(|pid| self.nodes[pid.0].mamba_value.is_some())
+    }
+
     /// Evicts up to `num_mamba_slots` unlocked GDN `StateBundle` slots in `mamba_lru` order
     /// (`mamba_radix_cache.py:865-899`). Internal nodes are tombstoned; leaf nodes are deleted
     /// along with any exposed tombstone ancestors.
+    pub fn has_evictable_internal_mamba(&self) -> bool {
+        !self.disable
+            && self.mamba_lru.iter().any(|&nid| {
+                let n = &self.nodes[nid.0];
+                (n.mamba_lock_ref == 0
+                    && n.children.len() == 1
+                    && self.has_non_decode_mamba_descendant(nid))
+                    || self.is_reclaimable_decode_tail_leaf(nid)
+            })
+    }
+
     pub fn evict_mamba(&mut self, num_mamba_slots: usize) -> RadixEvictResult {
         let mut out = RadixEvictResult::default();
         if self.disable || num_mamba_slots == 0 {
@@ -725,14 +771,34 @@ impl MambaRadixCache {
         }
 
         while out.freed_mamba_slots.len() < num_mamba_slots {
-            // Find LRU node in `mamba_lru` with `mamba_lock_ref == 0`.
-            // Note: an internal node may have `full_lock_ref > 0` (descendant locked) while
-            // `mamba_lock_ref == 0` — its mamba state can still be tombstoned!
-            // A leaf node has no children, so `full_lock_ref > 0` iff `mamba_lock_ref > 0` or locked directly.
-            let candidate = self.mamba_lru.iter().copied().find(|&nid| {
-                let n = &self.nodes[nid.0];
-                n.mamba_lock_ref == 0 && (!n.children.is_empty() || n.full_lock_ref == 0)
-            });
+            // Priority 1: Superseded single-child internal nodes that have a non-decode-tail
+            // Mamba descendant (`has_non_decode_mamba_descendant`), freeing 0 KV pages while
+            // never tombstoning a prompt frontier whose only child is an unverified decode tail.
+            // Priority 2: Unverified decode-tail leaf nodes (`is_reclaimable_decode_tail_leaf`)
+            // whose parent prompt frontier still holds a live Mamba snapshot.
+            // Priority 3: Standard `mamba_lru` order.
+            let candidate = self
+                .mamba_lru
+                .iter()
+                .copied()
+                .find(|&nid| {
+                    let n = &self.nodes[nid.0];
+                    n.mamba_lock_ref == 0
+                        && n.children.len() == 1
+                        && self.has_non_decode_mamba_descendant(nid)
+                })
+                .or_else(|| {
+                    self.mamba_lru
+                        .iter()
+                        .copied()
+                        .find(|&nid| self.is_reclaimable_decode_tail_leaf(nid))
+                })
+                .or_else(|| {
+                    self.mamba_lru.iter().copied().find(|&nid| {
+                        let n = &self.nodes[nid.0];
+                        n.mamba_lock_ref == 0 && (!n.children.is_empty() || n.full_lock_ref == 0)
+                    })
+                });
             let Some(nid) = candidate else {
                 break;
             };
@@ -759,10 +825,23 @@ impl MambaRadixCache {
         }
 
         while out.freed_kv_pages.len() < num_pages {
-            let candidate = self.full_lru.iter().copied().find(|&nid| {
-                let n = &self.nodes[nid.0];
-                n.children.is_empty() && n.full_lock_ref == 0 && n.mamba_lock_ref == 0
-            });
+            let candidate = self
+                .full_lru
+                .iter()
+                .copied()
+                .find(|&nid| {
+                    let n = &self.nodes[nid.0];
+                    n.children.is_empty()
+                        && n.is_decode_tail
+                        && n.full_lock_ref == 0
+                        && n.mamba_lock_ref == 0
+                })
+                .or_else(|| {
+                    self.full_lru.iter().copied().find(|&nid| {
+                        let n = &self.nodes[nid.0];
+                        n.children.is_empty() && n.full_lock_ref == 0 && n.mamba_lock_ref == 0
+                    })
+                });
             let Some(nid) = candidate else {
                 break;
             };
@@ -1038,6 +1117,7 @@ impl ReqRadixState {
             } else {
                 &[]
             };
+            let had_protected_prompt = self.protected_pages > 0;
             let ins = radix.insert(
                 &self.token_ids[..cache_len],
                 &self.kv_pages[..cache_pages],
@@ -1045,6 +1125,9 @@ impl ReqRadixState {
                 donated_mamba_slot,
                 self.protected_pages,
             );
+            if finish_req && had_protected_prompt && !ins.mamba_already_existed {
+                radix.mark_node_decode_tail(ins.terminal_node);
+            }
             outcome.donated_seq_len = cache_len;
             outcome
                 .freed_kv_pages
@@ -1311,5 +1394,67 @@ mod tests {
         assert_eq!(ev3.freed_mamba_slots, vec![11]);
         assert_eq!(cache.mamba_evictable_slots(), 0);
         assert!(cache.sanity_check().is_ok());
+    }
+
+    #[test]
+    fn test_evict_mamba_tombstones_superseded_linear_turns_before_waiting_session_leaves() {
+        let mut cache = MambaRadixCache::new(16, 64);
+
+        // Wave 1: Session 0 finishes Turn 1 (64 tokens, leaf node holding mamba slot 10).
+        let s0_t1: Vec<i32> = (0..64).collect();
+        cache.insert(&s0_t1, &[1, 2, 3, 4], &[], 10, 0);
+
+        // Wave 2: Session 1 advances through Chunk 1 (64 tokens, mamba slot 20) and then
+        // Chunk 2 (128 tokens, mamba slot 21), making Chunk 1 a superseded single-child
+        // internal node with a newer timestamp than Session 0's waiting leaf.
+        let s1_c2: Vec<i32> = (1000..1128).collect();
+        cache.insert(&s1_c2[..64], &[10, 11, 12, 13], &[], 20, 0);
+        cache.insert(&s1_c2, &[10, 11, 12, 13, 14, 15, 16, 17], &[], 21, 4);
+
+        // Reclaiming 1 Mamba slot under pool pressure must tombstone Session 1's superseded
+        // linear intermediate node (slot 20, freeing 0 KV pages) rather than deleting
+        // Session 0's waiting turn frontier leaf (slot 10 and its 4 KV pages).
+        let ev = cache.evict_mamba(1);
+        assert_eq!(ev.freed_mamba_slots, vec![20]);
+        assert!(ev.freed_kv_pages.is_empty());
+        let hit_s0 = cache.match_prefix(&s0_t1);
+        assert_eq!(hit_s0.matched_tokens, 64);
+        assert_eq!(hit_s0.mamba_slot, Some(10));
+        assert!(cache.sanity_check().is_ok());
+    }
+
+    #[test]
+    fn test_evict_mamba_reclaims_decode_tail_leaf_preserving_parent_prompt_checkpoint() {
+        let mut radix = MambaRadixCache::new(16, 64);
+        let mut req = ReqRadixState::new(16, 64, 1, [2, 3]);
+
+        // Prefill 64 prompt tokens and donate prompt checkpoint (mamba slot 2).
+        let prompt: Vec<i32> = (0..64).collect();
+        req.kv_pages = vec![10, 11, 12, 13];
+        let ckpts_prefill = req.plan_checkpoints(64);
+        req.commit_tokens(&prompt, &ckpts_prefill);
+        let prefill_don = req.donate_committed_checkpoint(&mut radix, Some(4), false);
+        assert_eq!(prefill_don.donated_seq_len, 64);
+
+        // Decode 64 generated tokens and donate finish_req decode tail (mamba slot 3).
+        let generated: Vec<i32> = (1000..1064).collect();
+        req.kv_pages.extend_from_slice(&[14, 15, 16, 17]);
+        let ckpts_decode = req.plan_checkpoints(64);
+        req.commit_tokens(&generated, &ckpts_decode);
+        let finish_don = req.donate_committed_checkpoint(&mut radix, None, true);
+        assert_eq!(finish_don.donated_seq_len, 128);
+
+        // Reclaiming 1 Mamba slot must delete the unverified decode-tail leaf (slot 3 and pages
+        // 14..17) rather than tombstoning the parent prompt frontier (slot 2), so a subsequent
+        // turn that diverges from the generated tail still matches the 64-token prompt prefix.
+        let ev = radix.evict_mamba(1);
+        assert_eq!(ev.freed_mamba_slots, vec![3]);
+        assert_eq!(ev.freed_kv_pages, vec![14, 15, 16, 17]);
+        let mut next_turn = prompt.clone();
+        next_turn.extend(2000..2064);
+        let hit = radix.match_prefix(&next_turn);
+        assert_eq!(hit.matched_tokens, 64);
+        assert_eq!(hit.mamba_slot, Some(2));
+        assert!(radix.sanity_check().is_ok());
     }
 }
