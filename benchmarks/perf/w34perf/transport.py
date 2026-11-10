@@ -78,7 +78,18 @@ def models(engine, timeout_s):
     return result
 
 
-def stream(engine, payload, timeout_s):
+def stream(engine, payload, timeout_s, *, cancel_after_output_events=None):
+    """Stream a completion, optionally injecting a bounded local disconnect.
+
+    Cancellation fields describe only the requested/observed client-side close;
+    they do not confirm server cancellation or release of server resources.
+    """
+    if cancel_after_output_events is not None and (
+        isinstance(cancel_after_output_events, bool)
+        or not isinstance(cancel_after_output_events, int)
+        or cancel_after_output_events <= 0
+    ):
+        raise ValueError("cancel_after_output_events must be None or a positive integer")
     start = time.perf_counter()
     result = {"status": "error", "error": None, "http_status": None, "usage": None,
               "finish_reason": None, "events": [], "content": "", "reasoning": "",
@@ -88,6 +99,11 @@ def stream(engine, payload, timeout_s):
     cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
     connection = cls(url.hostname, url.port, timeout=timeout_s)
     deadline = start + timeout_s
+    response = None
+    sock = None
+    output_events = 0
+    if cancel_after_output_events is not None:
+        result.update(cancellation_requested=True, cancellation_observed=False)
 
     def remaining():
         value = deadline - time.perf_counter()
@@ -179,6 +195,7 @@ def stream(engine, payload, timeout_s):
             reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
             calls = delta.get("tool_calls") or []
             if text or reasoning or calls:
+                output_events += 1
                 if result["first_output_ms"] is None:
                     result["first_output_ms"] = stamp
                 result["last_output_ms"] = stamp
@@ -196,6 +213,25 @@ def stream(engine, payload, timeout_s):
                     entry["function"][key] += call.get("function", {}).get(key) or ""
             if choice.get("finish_reason") is not None:
                 result["finish_reason"] = choice["finish_reason"]
+            if (cancel_after_output_events is not None
+                    and output_events >= cancel_after_output_events
+                    and result["finish_reason"] is None):
+                # Check the deadline before injecting, including time spent parsing.
+                remaining()
+                if expired.is_set():
+                    raise TimeoutError("total request deadline exceeded")
+                # HTTPConnection may no longer own this socket (Connection: close).
+                # Shutdown first so closing a buffered response cannot leave it alive.
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    # The peer may have closed/reset after buffering output.
+                    # We still close our local owners; no server ack is implied.
+                    pass
+                response.close()
+                sock.close()
+                result.update(status="cancelled", error=None, cancellation_observed=True)
+                return result
         if not done:
             raise ValueError("truncated SSE: missing [DONE]")
         if result["finish_reason"] is None:
@@ -213,8 +249,15 @@ def stream(engine, payload, timeout_s):
         result["e2e_ms"] = elapsed()
         if timer:
             timer.cancel()
-        if expired.is_set():
+        if timer:
+            timer.join()
+        if expired.is_set() or time.perf_counter() >= deadline:
             result["status"] = "timeout"
             result["error"] = "request timeout"
+        # Close both owners explicitly, including failures and Connection: close.
+        if response is not None:
+            response.close()
         connection.close()
+        if sock is not None:
+            sock.close()
     return result

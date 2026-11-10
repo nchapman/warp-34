@@ -168,6 +168,10 @@ The `fix/production-lifecycle-hardening` round (based on `bc2a3e5`) addresses sp
 
 These changes do not promote any row to A or close G0–G7 automatically. See [STATE.md](STATE.md) for the completed verification results and limitations.
 
+## Extended-workload execution support
+
+[`w34perf soak`](../benchmarks/perf/SOAK.md) now supplies a bounded driver for duration/completion targets, sustained/burst replay, local disconnect churn, completion-progress checks, optional endpoint RSS/GPU growth gates and a final inference probe. The checked-in coding workload is synthetic/replay; a short real-model smoke verifies the driver, **not G3 qualification**. Missing image/grammar/Responses-cancel coverage, server ownership conservation, production workload representativeness and external failure/recovery qualification remain explicit. See [STATE.md](STATE.md) for the smoke receipt and limitations; no readiness grades or gates are promoted by adding the harness.
+
 ## Assessment maintenance
 
 For every promotion, attach: ID, scope, six dimension results, exact source/image/checkpoint revisions, command and exit status, actual executed/skipped tests, hardware/software metadata, artifact location/hash, observed limits, remaining risks, owner and date. Keep raw failed runs as well as successful ones. Large evidence belongs in durable release/CI storage with a checked-in manifest; `/tmp` or an agent-local `outputs/` path is not a contributor-accessible release archive.

@@ -9,6 +9,8 @@ or automatic benchmark-results claim.
 - **[Post-HGPTQ coverage audit and proposed refresh](COVERAGE_AUDIT.md)** — current gaps, checkpoint policy, and pod validation plan (not new results)
 - **[Where warp-34 stands: 27B and Flash Next](campaigns/standings.md)** — practical results, gaps and priorities
 - [Completed campaign evidence and limitations](campaigns/completion-results.md)
+- **[Extended workload / soak runner](SOAK.md)** — duration + completion targets, sustained/burst replay, local disconnect injection, progress/resource gates and separate pass/fail receipts
+- [Single-GPU 10-minute 4/8 workload check](campaigns/soak-4b-10min.md) — memory trajectory, client latency and per-turn cache reuse; not long-duration qualification
 - [Plan and persistent task list](PLAN.md)
 - [Engine recipes, qualification, and KV matrix](engines.md)
 - [Experiment template](suite.toml) — 10 deployment profiles, 13 workload cases

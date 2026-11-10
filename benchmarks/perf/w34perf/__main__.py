@@ -36,6 +36,26 @@ def main(argv=None):
                              help="attach sanitized inventory/preflight/quality/startup evidence; repeatable")
             sub.add_argument("--telemetry-interval", type=float, help="sample GPU/host resources every N seconds")
             sub.add_argument("--server-pid", action="append", type=int, default=[], help="explicit host PID to sample RSS")
+    soak = subs.add_parser("soak", help="bounded sustained/burst replay with an explicit pass/fail receipt")
+    soak.add_argument("config", type=Path)
+    soak.add_argument("--engine", required=True, help="one externally managed deployment")
+    soak.add_argument("--out", type=Path, required=True, help="new artifact directory")
+    soak.add_argument("--duration-s", type=float, required=True, help="minimum measured workload duration")
+    soak.add_argument("--min-completed", type=int, required=True, help="minimum successful measured responses, excluding injected disconnects")
+    soak.add_argument("--max-duration-s", type=float, required=True, help="hard workload admission/request deadline; excludes setup and drain")
+    soak.add_argument("--sustained-s", type=float, default=300)
+    soak.add_argument("--burst-s", type=float, default=30)
+    soak.add_argument("--burst-multiplier", type=int, default=2)
+    soak.add_argument("--cancel-every", type=int, default=0, help="inject a local disconnect every N measured requests (0 disables)")
+    soak.add_argument("--cancel-after-output-events", type=int, default=2)
+    soak.add_argument("--progress-timeout-s", type=float, default=120, help="fail without successful completed responses for this interval")
+    soak.add_argument("--drain-s", type=float, default=5, help="quiet interval before final real inference probe")
+    soak.add_argument("--max-error-rate", type=float, default=0, help="allowed unexpected request error fraction, in [0,1]")
+    soak.add_argument("--telemetry-interval", type=float, default=1)
+    soak.add_argument("--server-pid", action="append", type=int, default=[])
+    soak.add_argument("--gpu-uuid", action="append", default=[], help="explicit local GPU identity for memory-growth gates")
+    soak.add_argument("--max-rss-growth-mib", type=float, help="per-PID post-warmup to post-drain RSS growth budget")
+    soak.add_argument("--max-gpu-growth-mib", type=float, help="per-GPU post-warmup to post-drain memory growth budget")
     quality = subs.add_parser("quality", help="independent functional/retrieval HTTP qualification")
     quality.add_argument("config", type=Path)
     quality.add_argument("--engine", required=True)
@@ -89,6 +109,23 @@ def main(argv=None):
                 if args.case is not None:
                     raise ValueError("--preset and --case are mutually exclusive")
                 args.case = preset_cases
+        if args.command == "soak":
+            from .soak import execute_soak
+            result = execute_soak(
+                cfg, args.out, args.engine,
+                duration_s=args.duration_s, min_completed=args.min_completed,
+                max_duration_s=args.max_duration_s, sustained_s=args.sustained_s,
+                burst_s=args.burst_s, burst_multiplier=args.burst_multiplier,
+                cancel_every=args.cancel_every,
+                cancel_after_output_events=args.cancel_after_output_events,
+                progress_timeout_s=args.progress_timeout_s, drain_s=args.drain_s,
+                max_error_rate=args.max_error_rate,
+                max_rss_growth_mib=args.max_rss_growth_mib,
+                max_gpu_growth_mib=args.max_gpu_growth_mib,
+                telemetry_interval=args.telemetry_interval,
+                server_pids=args.server_pid, gpu_uuids=args.gpu_uuid)
+            print(json.dumps(result, indent=2))
+            return 0 if result["status"] == "passed" else 1
         if args.command == "quality":
             engines, _, _ = select(cfg, [args.engine])
             if len(engines) != 1:

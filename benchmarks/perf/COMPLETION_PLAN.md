@@ -129,7 +129,9 @@ reports rather than being counted as successful qualification cells.
 ## Scope discipline
 
 Implement only runner infrastructure needed to make these comparisons honest.
-Full managed orchestration, autonomous live-tool loops, all vision/structured
-output modes and endurance testing remain separate backlog unless a measured
-failure makes one necessary. Preserve unsupported/failed evidence without calling
+Full managed orchestration, autonomous live-tool loops and all vision/structured
+output modes remain separate backlog unless a measured failure makes one necessary.
+The separate [`soak` mode](SOAK.md) now supplies bounded endurance workload execution
+and client-side gates; it does not extend the historical comparison receipts or
+claim that production-duration qualification has been performed. Preserve unsupported/failed evidence without calling
 an incomplete, untested matrix complete.

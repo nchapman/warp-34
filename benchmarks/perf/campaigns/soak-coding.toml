@@ -1,0 +1,68 @@
+# Example workload shape, NOT an approved production SLO or pinned release receipt.
+# Copy and fill deployment metadata before qualification. Server is managed externally.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 1 # soak repeats sessions until its CLI targets; this is for finite `run`
+warmup_requests = 1 # complete sessions per case before the measured clock starts
+timeout_s = 90
+max_inflight = 8
+
+[[engines]]
+id = "warp34-soak"
+engine = "warp-34"
+version = "unknown"
+support = "unverified"
+model = "nchapman/Qwen3.5-4B-W4A16-GPTQ"
+model_revision = "unknown"
+source_model_revision = "unknown"
+artifact_sha256 = "unknown"
+tokenizer_revision = "unknown"
+chat_template_sha256 = "unknown"
+quantization_details = "unknown"
+gpu_count = 1
+gpu_ids = "unknown"
+base_url = "http://127.0.0.1:18834/v1"
+weight_format = "GPTQ-int4"
+kv_format = "tq4"
+parallelism = "single"
+speculation = "none"
+cache_config = "4096 KV pages; 8 active sequences; max model len 8192"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --max-model-len 8192 --port 18834"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[cases]]
+id = "coding-mixed"
+fixture = "../fixtures/text.json"
+requests = 32 # finite `run` only; soak rotates cases without a request-count cap
+concurrency = 4
+max_tokens = 256
+cache = "unique"
+mix = [{context_repetitions = 1, max_tokens = 64}, {context_repetitions = 8, max_tokens = 256}, {context_repetitions = 16, max_tokens = 512}]
+# Illustrative per-response ceilings, not a p95/p99 production qualification.
+ttft_slo_ms = 30000
+e2e_slo_ms = 90000
+
+[[cases]]
+id = "coding-agent-replay"
+kind = "agent_replay"
+fixture = "../fixtures/coding_agent.json"
+requests = 16
+concurrency = 4
+max_tokens = 256
+think_time_s = 0.1
+cache = "unique"
+ttft_slo_ms = 30000
+e2e_slo_ms = 90000
+
+[[cases]]
+id = "coding-warm-prefix"
+fixture = "../fixtures/text.json"
+requests = 32
+concurrency = 4
+max_tokens = 128
+context_repetitions = 8
+cache = "natural"
+ttft_slo_ms = 30000
+e2e_slo_ms = 90000
