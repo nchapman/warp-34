@@ -735,6 +735,16 @@ pub fn plan_host_embed_offload(
     )
 }
 
+fn has_vision_weights(cfg: &ModelConfig, archive: &SafetensorsArchive) -> bool {
+    cfg.vision_config.is_some()
+        && (archive
+            .resolve_name("model.visual.patch_embed.proj.weight")
+            .is_some()
+            || archive
+                .resolve_name("visual.patch_embed.proj.weight")
+                .is_some())
+}
+
 /// Boot staging is transient: it must never be charged alongside target pools.
 /// `steady_bytes` includes persistent metadata/workspaces, minimum pools and headroom.
 #[allow(clippy::too_many_arguments)]
@@ -747,8 +757,35 @@ pub(super) fn plan_host_embed_with_budget(
     boot_persistent_bytes: usize,
     steady_bytes: Option<usize>,
 ) -> (usize, bool) {
-    let fits_steady = |weights: usize| {
-        steady_bytes.is_none_or(|bytes| {
+    plan_host_embed_with_serving_budget(
+        cfg,
+        est_weight_bytes,
+        scratch_bytes,
+        staging_bytes,
+        free_vram_bytes,
+        boot_persistent_bytes,
+        steady_bytes,
+        None,
+    )
+}
+
+/// Like [`plan_host_embed_with_budget`], except `desired_gpu_steady_bytes` can require
+/// full serving state/vision reserves to fit before keeping `embed_tokens` in GPU VRAM,
+/// while still permitting host-embedding offload whenever `steady_bytes` (the minimum
+/// execution floor) fits.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_host_embed_with_serving_budget(
+    cfg: &ModelConfig,
+    est_weight_bytes: usize,
+    scratch_bytes: usize,
+    staging_bytes: usize,
+    free_vram_bytes: usize,
+    boot_persistent_bytes: usize,
+    steady_bytes: Option<usize>,
+    desired_gpu_steady_bytes: Option<usize>,
+) -> (usize, bool) {
+    let fits_budget = |weights: usize, budget: Option<usize>| {
+        budget.is_none_or(|bytes| {
             (weights as u128 + scratch_bytes as u128 + bytes as u128) <= free_vram_bytes as u128
         })
     };
@@ -767,7 +804,8 @@ pub(super) fn plan_host_embed_with_budget(
     };
     if boot_need(est_weight_bytes) + HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES as u128
         <= free_vram_bytes as u128
-        && fits_steady(est_weight_bytes)
+        && fits_budget(est_weight_bytes, steady_bytes)
+        && fits_budget(est_weight_bytes, desired_gpu_steady_bytes)
     {
         return (est_weight_bytes, false);
     }
@@ -788,7 +826,7 @@ pub(super) fn plan_host_embed_with_budget(
         crate::cuda::MIN_HEADROOM_BYTES
     };
     if boot_need(est_without_embed) + boot_reserve as u128 <= free_vram_bytes as u128
-        && fits_steady(est_without_embed)
+        && fits_budget(est_without_embed, steady_bytes)
     {
         (est_without_embed, true)
     } else {
@@ -1318,21 +1356,15 @@ impl Qwen3_5ModelRank {
         }
         let pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
         let (page_bytes, state_bytes) = target_pool_geometry(cfg, tp_size, kv_policy);
-        // This is a placement admission floor, not a promise that all requested
-        // serving slots fit: the final live-memory planner retains its clamp.
-        // Repack staging is freed before pools; only the two Marlin workspaces
-        // and batch metadata coexist with them. Architecture-specific runtime
-        // allocations (e.g. PLE staging) remain subject to final live admission.
-        let steady_bytes = BATCH_META_ARENA_BYTES
+        let archive_has_vision = has_vision_weights(cfg, archive);
+        let min_state_floor = if capacity.dflash_reserve_bytes != 0 {
+            capacity.dflash_min_state_slots
+        } else {
+            MIN_ACTIVE_STATE_SLOTS
+        };
+        let steady_without_states = BATCH_META_ARENA_BYTES
             .saturating_add(marlin_ws_bytes.saturating_mul(2))
             .saturating_add(page_bytes.saturating_mul(pages))
-            .saturating_add(
-                state_bytes.saturating_mul(if capacity.dflash_reserve_bytes != 0 {
-                    capacity.dflash_min_state_slots
-                } else {
-                    MIN_ACTIVE_STATE_SLOTS
-                }),
-            )
             .saturating_add(target_base_headroom(cfg, tp_size, pages, free_vram))
             .saturating_add(capacity.dflash_reserve_bytes)
             .saturating_add(if capacity.native_mtp {
@@ -1345,7 +1377,25 @@ impl Qwen3_5ModelRank {
             } else {
                 0
             });
-        let (est_weight_bytes, use_host_embed) = plan_host_embed_with_budget(
+        // This is a placement admission floor, not a promise that all requested
+        // serving slots fit: the final live-memory planner retains its clamp.
+        // Repack staging is freed before pools; only the two Marlin workspaces
+        // and batch metadata coexist with them. Architecture-specific runtime
+        // allocations (e.g. PLE staging) remain subject to final live admission.
+        let steady_bytes =
+            steady_without_states.saturating_add(state_bytes.saturating_mul(min_state_floor));
+        let desired_gpu_steady_bytes = capacity.state_slots.map(|req_slots| {
+            let desired_slots = req_slots.clamp(min_state_floor, STANDARD_DEFAULT_STATE_SLOTS);
+            let vision = if rank == 0 && archive_has_vision && pages < EXTREME_LONGCTX_MIN_PAGES {
+                VISION_ENCODER_LAZY_RESERVE_BYTES
+            } else {
+                0
+            };
+            steady_without_states
+                .saturating_add(state_bytes.saturating_mul(desired_slots))
+                .saturating_add(vision)
+        });
+        let (est_weight_bytes, use_host_embed) = plan_host_embed_with_serving_budget(
             cfg,
             raw_est_weight_bytes,
             scratch_bytes,
@@ -1353,6 +1403,7 @@ impl Qwen3_5ModelRank {
             free_vram,
             BATCH_META_ARENA_BYTES.saturating_add(marlin_ws_bytes),
             Some(steady_bytes),
+            desired_gpu_steady_bytes,
         );
         let min_boot_bytes = est_weight_bytes
             .saturating_add(scratch_bytes)
@@ -1907,17 +1958,15 @@ impl PrePoolModelRank {
             // multimodal request (`ensure_vision_encoder_loaded`) and fits inside
             // `MIN_HEADROOM_BYTES` (1 GiB) when needed; only reserve dedicated ViT VRAM when
             // `vision_reserve` still leaves room for `min_state_slots_for_moe`.
-            let archive_has_vision = cfg.vision_config.is_some()
-                && (archive
-                    .resolve_name("model.visual.patch_embed.proj.weight")
-                    .is_some()
-                    || archive
-                        .resolve_name("visual.patch_embed.proj.weight")
-                        .is_some());
             let base_reserved = required_headroom.saturating_add(req_kv_bytes);
-            let min_state_bytes = bytes_per_state_slot.saturating_mul(min_state_slots_for_moe);
+            let protected_state_slots = if cfg.uses_tiered_moe() {
+                min_state_slots_for_moe
+            } else {
+                requested_state_slots.clamp(MIN_ACTIVE_STATE_SLOTS, STANDARD_DEFAULT_STATE_SLOTS)
+            };
+            let min_state_bytes = bytes_per_state_slot.saturating_mul(protected_state_slots);
             let vision_reserve = if rank == 0
-                && archive_has_vision
+                && has_vision_weights(&cfg, archive)
                 && default_pages.unwrap_or(0) < EXTREME_LONGCTX_MIN_PAGES
             {
                 available_for_pools

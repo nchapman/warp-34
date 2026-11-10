@@ -388,3 +388,279 @@ fn batched_mtp_b5_fallback_matches_non_speculative_losslessly() {
         "B=5 MTP fallback must match non-speculative B=5 across all five complete outputs"
     );
 }
+
+async fn collect_with_cached(
+    stream: &mut GenerationStream,
+    expected_len: usize,
+) -> Result<(Vec<i32>, usize), String> {
+    let mut tokens = Vec::new();
+    while let Some(event) = stream.events.recv().await {
+        match event {
+            GenerationEvent::Token { id, .. } => tokens.push(id),
+            GenerationEvent::Finished {
+                cached_tokens,
+                generated_tokens,
+            } => {
+                if generated_tokens != expected_len || tokens.len() != expected_len {
+                    return Err(format!(
+                        "counts: finished={generated_tokens}, got={}, expected={expected_len}",
+                        tokens.len()
+                    ));
+                }
+                return Ok((tokens, cached_tokens));
+            }
+            GenerationEvent::Error(e) => return Err(e.to_string()),
+        }
+    }
+    Err("stream closed without Finished".into())
+}
+
+#[test]
+fn batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes() {
+    if common::require_or_skip_cached_model(
+        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes",
+    )
+    .is_none()
+    {
+        return;
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let shared_prefix = "System architecture notes: requests carry bounded deadlines, workers pull from bounded queues, and cache invalidations execute strictly after transaction commit to preserve serializability across concurrent readers and writers. ".repeat(6);
+    let suffixes = [
+        "List two race conditions in cache invalidation:",
+        "Explain how bounded queues prevent memory exhaustion:",
+        "Describe safe cancellation semantics for streaming RPCs:",
+        "Summarize retry backoff invariants under overload:",
+        "Give pseudocode for atomic lease renewal:",
+        "Identify lock-ordering hazards in connection pools:",
+        "Explain read-your-writes consistency with replicas:",
+        "Outline a deterministic test for timeout cleanup:",
+    ];
+    let followup_tail = " Next turn: provide a concise checklist for code review.";
+
+    let mut short_params = params();
+    short_params.max_tokens = 32;
+
+    let baseline_worker = EngineWorker::from_loader(
+        || {
+            Qwen3_5Engine::load_for_serving_with_speculative(
+                "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                1,
+                KvFormatPolicy::Tq4,
+                Some(1024),
+                true,
+                1,
+                Some(&SpeculativeConfig {
+                    kind: SpeculativeKind::Mtp,
+                    draft_model: None,
+                    mtp_k: 3,
+                }),
+            )
+            .map_err(|e| e.to_string())
+        },
+        SchedulerConfig {
+            max_num_seqs: 1,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+
+    let tok = baseline_worker.tokenizer.as_ref().unwrap().clone();
+    let encode = |text: &str| -> Vec<i32> {
+        tok.encode(text, false)
+            .unwrap()
+            .get_ids()
+            .iter()
+            .map(|&id| id as i32)
+            .collect()
+    };
+    let burst_prompts: Vec<Vec<i32>> = suffixes
+        .iter()
+        .map(|s| encode(&format!("{shared_prefix}{s}")))
+        .collect();
+    assert!(
+        burst_prompts.iter().all(|p| p.len() >= 192),
+        "shared prefix must cross >= 2 Mamba 64-token checkpoints"
+    );
+    let followup_suffix_ids = encode(followup_tail);
+
+    let (burst_baselines, followup_prompts, followup_baselines) = rt.block_on(async {
+        let mut burst_outs = Vec::with_capacity(burst_prompts.len());
+        for p in &burst_prompts {
+            let mut st = baseline_worker
+                .submit(p.clone(), short_params.clone(), None)
+                .unwrap();
+            let (out, _) =
+                tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut st, 32))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            burst_outs.push(out);
+        }
+        let mut follow_prompts = Vec::with_capacity(4);
+        let mut follow_outs = Vec::with_capacity(4);
+        for i in 0..4 {
+            let mut fp = burst_prompts[i].clone();
+            fp.extend_from_slice(&burst_outs[i]);
+            fp.extend_from_slice(&followup_suffix_ids);
+            let mut st = baseline_worker
+                .submit(fp.clone(), short_params.clone(), None)
+                .unwrap();
+            let (out, _) =
+                tokio::time::timeout(Duration::from_secs(120), collect_with_cached(&mut st, 32))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            follow_prompts.push(fp);
+            follow_outs.push(out);
+        }
+        baseline_worker.shutdown().await.unwrap();
+        (burst_outs, follow_prompts, follow_outs)
+    });
+
+    let burst_worker = EngineWorker::from_loader(
+        || {
+            Qwen3_5Engine::load_for_serving_with_speculative(
+                "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                1,
+                KvFormatPolicy::Tq4,
+                Some(1024),
+                true,
+                4,
+                Some(&SpeculativeConfig {
+                    kind: SpeculativeKind::Mtp,
+                    draft_model: None,
+                    mtp_k: 3,
+                }),
+            )
+            .map_err(|e| e.to_string())
+        },
+        SchedulerConfig {
+            max_num_seqs: 4,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+
+    let (burst_got, rounds_after_burst, followup_got, rounds_after_followup) = rt.block_on(async {
+        // Submit all 8 burst requests simultaneously while max_num_seqs == 4.
+        let mut streams: Vec<_> = burst_prompts
+            .iter()
+            .map(|p| {
+                burst_worker
+                    .submit(p.clone(), short_params.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let mut s_iter = streams.drain(..);
+        let (mut s0, mut s1, mut s2, mut s3, mut s4, mut s5, mut s6, mut s7) = (
+            s_iter.next().unwrap(),
+            s_iter.next().unwrap(),
+            s_iter.next().unwrap(),
+            s_iter.next().unwrap(),
+            s_iter.next().unwrap(),
+            s_iter.next().unwrap(),
+            s_iter.next().unwrap(),
+            s_iter.next().unwrap(),
+        );
+        let burst_got = tokio::time::timeout(Duration::from_secs(120), async {
+            let (r0, r1, r2, r3, r4, r5, r6, r7) = tokio::join!(
+                collect_with_cached(&mut s0, 32),
+                collect_with_cached(&mut s1, 32),
+                collect_with_cached(&mut s2, 32),
+                collect_with_cached(&mut s3, 32),
+                collect_with_cached(&mut s4, 32),
+                collect_with_cached(&mut s5, 32),
+                collect_with_cached(&mut s6, 32),
+                collect_with_cached(&mut s7, 32),
+            );
+            Ok::<_, String>(vec![r0?, r1?, r2?, r3?, r4?, r5?, r6?, r7?])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let rounds_after_burst = burst_worker.stats.verify_rounds.load(Ordering::Relaxed);
+
+        // Submit a 4-request multi-turn follow-up wave extending the first 4 burst conversations.
+        let mut f_streams: Vec<_> = followup_prompts
+            .iter()
+            .map(|p| {
+                burst_worker
+                    .submit(p.clone(), short_params.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let mut f_iter = f_streams.drain(..);
+        let (mut f0, mut f1, mut f2, mut f3) = (
+            f_iter.next().unwrap(),
+            f_iter.next().unwrap(),
+            f_iter.next().unwrap(),
+            f_iter.next().unwrap(),
+        );
+        let followup_got = tokio::time::timeout(Duration::from_secs(120), async {
+            let (r0, r1, r2, r3) = tokio::join!(
+                collect_with_cached(&mut f0, 32),
+                collect_with_cached(&mut f1, 32),
+                collect_with_cached(&mut f2, 32),
+                collect_with_cached(&mut f3, 32),
+            );
+            Ok::<_, String>(vec![r0?, r1?, r2?, r3?])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let rounds_after_followup = burst_worker.stats.verify_rounds.load(Ordering::Relaxed);
+
+        burst_worker.shutdown().await.unwrap();
+        (
+            burst_got,
+            rounds_after_burst,
+            followup_got,
+            rounds_after_followup,
+        )
+    });
+
+    assert_eq!(burst_worker.stats.peak_active.load(Ordering::Relaxed), 4);
+    assert!(
+        rounds_after_burst >= 110,
+        "8-request burst under max_num_seqs=4 must stay in batched MTP instead of plain fallback, got {rounds_after_burst} rounds"
+    );
+    assert!(
+        rounds_after_followup >= rounds_after_burst + 50,
+        "4-request follow-up wave must execute batched MTP verify rounds, before={rounds_after_burst} after={rounds_after_followup}"
+    );
+    assert!(
+        burst_worker.stats.accepted_drafts.load(Ordering::Relaxed) > 0,
+        "expected accepted drafts across burst and follow-up waves"
+    );
+    for (i, ((got, _), expected)) in burst_got.iter().zip(&burst_baselines).enumerate() {
+        assert_eq!(
+            got, expected,
+            "burst slot {i} must match B=1 greedy baseline"
+        );
+    }
+    assert!(
+        burst_got[4..].iter().all(|(_, cached)| *cached >= 128),
+        "second 4-request wave of shared-prefix burst must reuse warm radix+MTP prefix, got {:?}",
+        burst_got
+            .iter()
+            .map(|(_, cached)| *cached)
+            .collect::<Vec<_>>()
+    );
+    for (i, ((got, cached), expected)) in followup_got.iter().zip(&followup_baselines).enumerate() {
+        assert_eq!(
+            got, expected,
+            "follow-up turn {i} must match B=1 greedy baseline"
+        );
+        assert!(
+            *cached >= 192,
+            "multi-turn follow-up {i} in batched MTP must reuse prompt+generated prefix, got cached={cached}"
+        );
+    }
+}

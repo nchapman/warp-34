@@ -127,6 +127,40 @@ pub(crate) fn dense_serving_reserve(c: &ModelConfig, tp: usize, capacity: usize)
     .fold(0usize, usize::saturating_add)
 }
 
+/// Target GDN state-slot budget for native MTP serving.
+///
+/// Single-sequence serving keeps the existing 8-slot pool (`3` private + `1` locked
+/// radix checkpoint + `3` MTP-3 verify extras + `1` spare). Multi-sequence serving
+/// budgets `3` private + `1` locked checkpoint per active sequence, batched MTP
+/// verification extras (`2 * k` at `B = 2`, `min(B, 4) * min(k, 1)` at `B >= 3`),
+/// plus `1` cached radix checkpoint per sequence for burst/multi-turn reuse.
+pub(crate) fn serving_state_slots(max_num_seqs: usize, mtp_k: usize) -> crate::cuda::Result<usize> {
+    if max_num_seqs == 0 {
+        return Err(crate::model::loader_err(
+            "serving max_num_seqs must be nonzero and fit four state slots per sequence",
+        ));
+    }
+    let k = mtp_k.clamp(1, 3);
+    if max_num_seqs == 1 {
+        return Ok((4 + k).max(8));
+    }
+    let active_and_cached = max_num_seqs.checked_mul(5).ok_or_else(|| {
+        crate::model::loader_err(
+            "serving max_num_seqs must be nonzero and fit four state slots per sequence",
+        )
+    })?;
+    let verify_extras = if max_num_seqs == 2 {
+        2 * k
+    } else {
+        max_num_seqs.min(MAX_MTP_BATCH_SLOTS) * k.min(1)
+    };
+    active_and_cached.checked_add(verify_extras).ok_or_else(|| {
+        crate::model::loader_err(
+            "serving max_num_seqs must be nonzero and fit four state slots per sequence",
+        )
+    })
+}
+
 /// Double-buffered H2D staging capacity (`32` experts) for the single-layer `MTP` MoE workspace.
 const MTP_MOE_STAGE_CAPACITY: usize = 32;
 

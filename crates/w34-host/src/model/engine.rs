@@ -140,17 +140,23 @@ impl Qwen3_5Engine {
         speculative: Option<&crate::proposer::SpeculativeConfig>,
     ) -> Result<Self> {
         use crate::proposer::SpeculativeKind;
+        let base_state_slots = serving_state_slots(max_num_seqs)?;
+        assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
         let mut selected = speculative.cloned();
         let dir = resolve_hf_model_dir(model_spec)
             .map_err(|e| loader_err_ctx("resolve target checkpoint", e.to_string()))?;
         let mut capacity = PoolCapacity {
             kv_pages: requested_kv_pages,
-            state_slots: Some(serving_state_slots(max_num_seqs)?),
+            state_slots: Some(base_state_slots),
             ..PoolCapacity::default()
         };
         if let Some(config) = &mut selected {
             match config.kind {
-                SpeculativeKind::Mtp => capacity.native_mtp = true,
+                SpeculativeKind::Mtp => {
+                    capacity.native_mtp = true;
+                    capacity.state_slots =
+                        Some(crate::mtp::serving_state_slots(max_num_seqs, config.mtp_k)?);
+                }
                 SpeculativeKind::DFlash2 => {
                     let name = config
                         .draft_model

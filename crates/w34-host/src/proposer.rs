@@ -54,6 +54,7 @@ struct MtpBatchSlot {
     captured_verify_hidden: Vec<DeviceBuffer>,
     resident_tokens: Vec<i32>,
     processed: usize,
+    current: Option<PrefixMemo>,
 }
 pub struct NativeProposer {
     ranks: Ranks,
@@ -78,7 +79,7 @@ pub struct NativeProposer {
     pub last_restored_tokens: usize,
 }
 const MEMO_BUDGET: usize = 256 * 1024 * 1024;
-const MAX_MEMO_ENTRIES: usize = 16;
+const MAX_MEMO_ENTRIES: usize = 32;
 const MTP_STAGE_ROWS: usize = 256;
 const TIERED_MOE_MTP_MAX_TAP_ROWS: usize = 6144;
 const TIERED_MOE_DFLASH2_MAX_TAP_ROWS: usize = 2048;
@@ -257,6 +258,7 @@ impl NativeProposer {
                         captured_verify_hidden,
                         resident_tokens: vec![],
                         processed: 0,
+                        current: None,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -340,10 +342,17 @@ impl NativeProposer {
         if tokens.is_empty() {
             return true;
         }
-        let has_memo = self.memos.iter().any(|m| m.tokens.starts_with(tokens));
         match &self.ranks {
-            Ranks::DFlash(_) => has_memo && self.resident_tokens.starts_with(tokens),
-            Ranks::Mtp(_) => has_memo,
+            Ranks::DFlash(_) => {
+                self.memos.iter().any(|m| m.tokens.starts_with(tokens))
+                    && self.resident_tokens.starts_with(tokens)
+            }
+            Ranks::Mtp(_) => {
+                let need_bytes = tokens.len().saturating_mul(self.row_bytes);
+                self.memos
+                    .iter()
+                    .any(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_bytes)
+            }
         }
     }
     fn restore(&mut self, engine: &mut Qwen3_5Engine, tokens: &[i32]) -> Result<()> {
@@ -355,6 +364,9 @@ impl NativeProposer {
             });
             return Ok(());
         }
+        let need_mtp_bytes = matches!(self.ranks, Ranks::Mtp(_))
+            .then(|| tokens.len().saturating_mul(self.row_bytes))
+            .unwrap_or(0);
         // Fast path: if the drafter's resident GPU KV cache already starts with `tokens`,
         // truncate the drafter KV cache in-place and restore MTP's 1-row tail without
         // re-running drafter prefill over the cached prefix.
@@ -362,7 +374,7 @@ impl NativeProposer {
             && let Some(idx) = self
                 .memos
                 .iter()
-                .rposition(|m| m.tokens.starts_with(tokens))
+                .rposition(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_mtp_bytes)
         {
             let memo = self.memos.remove(idx);
             let n = tokens.len();
@@ -397,14 +409,11 @@ impl NativeProposer {
             return Ok(());
         }
         self.reset()?;
-        self.current = Some(PrefixMemo {
-            tokens: vec![],
-            features: vec![],
-        });
+        self.current = None;
         let idx = self
             .memos
             .iter()
-            .rposition(|m| m.tokens.starts_with(tokens))
+            .rposition(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_mtp_bytes)
             .ok_or_else(|| loader_err("missing proposer prefix"))?;
         let memo = self.memos.remove(idx);
         let step = self.max_rows.min(MTP_STAGE_ROWS);
@@ -425,8 +434,20 @@ impl NativeProposer {
             }
             Ok(())
         })();
+        let restored_features = if result.is_ok() {
+            let prefix_bytes = tokens.len() * self.row_bytes;
+            Some(memo.features[..prefix_bytes].to_vec())
+        } else {
+            None
+        };
         self.memos.push(memo);
         result?;
+        if let Some(features) = restored_features {
+            self.current = Some(PrefixMemo {
+                tokens: tokens.to_vec(),
+                features,
+            });
+        }
         self.last_restored_tokens = tokens.len();
         Ok(())
     }

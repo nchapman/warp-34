@@ -392,24 +392,23 @@ impl NativeProposer {
         for slot in &mut self.mtp_batch_slots {
             slot.resident_tokens.clear();
             slot.processed = 0;
+            slot.current = None;
         }
         self.resident_tokens.clear();
         self.processed = 0;
         self.current = None;
-        if enable {
-            self.memos.clear();
-            self.mtp_batch_active_slot = 0;
-            self.capacity = rs[0].batch_slot_capacity();
+        self.mtp_batch_active_slot = 0;
+        self.capacity = if enable {
+            rs[0].batch_slot_capacity()
         } else {
-            self.mtp_batch_active_slot = 0;
-            self.capacity = self.total_capacity;
-        }
+            self.total_capacity
+        };
         Ok(())
     }
 
     /// Promotes an already-active single-slot MTP sequence (`batch_mode == false`) into
     /// batch slot 0 without discarding its resident MTP KV pages (`all_pages[0..slot_pages]`),
-    /// `tail`, or `pending_ingest` target hidden rows.
+    /// `tail`, `current` memo, or `pending_ingest` target hidden rows.
     pub(crate) fn promote_single_to_mtp_batch_slot0(
         &mut self,
         engine: &Qwen3_5Engine,
@@ -428,6 +427,7 @@ impl NativeProposer {
             if idx != 0 {
                 slot.resident_tokens.clear();
                 slot.processed = 0;
+                slot.current = None;
             }
         }
         if pending_ingest_rows > 0 {
@@ -456,8 +456,6 @@ impl NativeProposer {
                 t.stream.synchronize()?;
             }
         }
-        self.memos.clear();
-        self.current = None;
         self.mtp_batch_active_slot = 0;
         self.capacity = rs[0].batch_slot_capacity();
         Ok(())
@@ -482,6 +480,7 @@ impl NativeProposer {
             &mut self.resident_tokens,
             &mut self.mtp_batch_slots[prev].resident_tokens,
         );
+        std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[prev].current);
         self.mtp_batch_slots[prev].processed = self.processed;
 
         self.mtp_batch_active_slot = slot;
@@ -490,8 +489,72 @@ impl NativeProposer {
             &mut self.resident_tokens,
             &mut self.mtp_batch_slots[slot].resident_tokens,
         );
+        std::mem::swap(&mut self.current, &mut self.mtp_batch_slots[slot].current);
         self.processed = self.mtp_batch_slots[slot].processed;
-        self.current = None;
+        Ok(())
+    }
+
+    fn batch_slot_resident_tokens(&self, slot: usize) -> &[i32] {
+        if slot == self.mtp_batch_active_slot {
+            &self.resident_tokens
+        } else {
+            &self.mtp_batch_slots[slot].resident_tokens
+        }
+    }
+
+    /// Selects a free MTP batch slot (`active[slot].is_none()`), preferring the slot whose
+    /// resident GPU MTP KV cache shares the longest `>= 16`-token prefix with `prompt` so
+    /// `restore_mtp_batch_slot` hits the zero-prefill fast path whenever possible.
+    pub(crate) fn pick_free_mtp_batch_slot<T>(
+        &self,
+        active: &[Option<T>],
+        prompt: &[i32],
+    ) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (slot, entry) in active.iter().enumerate().take(self.mtp_batch_slots.len()) {
+            if entry.is_some() {
+                continue;
+            }
+            let res = self.batch_slot_resident_tokens(slot);
+            let lcp = res.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+            let score = if lcp >= 16 { lcp } else { 0 };
+            if best.is_none_or(|(_, best_score)| score > best_score) {
+                best = Some((slot, score));
+            }
+        }
+        best.map(|(slot, _)| slot)
+    }
+
+    pub(crate) fn restore_mtp_batch_slot(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        slot: usize,
+        prefix: &[i32],
+    ) -> Result<()> {
+        self.select_mtp_batch_slot(slot)?;
+        self.restore(engine, prefix)
+    }
+
+    /// Flushes any trailing target-verified tokens from `captured_verify_hidden[slot]` into
+    /// the slot's MTP KV cache + `PrefixMemo`, commits the memo for future multi-turn reuse,
+    /// and leaves the slot's GPU MTP KV cache warm for `pick_free_mtp_batch_slot`.
+    pub(crate) fn finish_mtp_batch_slot(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        slot: usize,
+        pending_ingest: &mut Vec<i32>,
+    ) -> Result<()> {
+        self.select_mtp_batch_slot(slot)?;
+        if !pending_ingest.is_empty() {
+            let ptrs: Vec<u64> = self.mtp_batch_slots[slot]
+                .captured_verify_hidden
+                .iter()
+                .map(|b| b.addr())
+                .collect();
+            self.ingest(engine, pending_ingest, &ptrs)?;
+            pending_ingest.clear();
+        }
+        self.commit_current_memo();
         Ok(())
     }
 
@@ -548,71 +611,90 @@ impl NativeProposer {
             self.k
         };
 
-        // Pass 1: run fallible draft proposal before allocating any `StateTx` GDN slots so
-        // early `?` returns cannot leak extra state slots from earlier batch entries.
-        let mut proposed = Vec::with_capacity(batch_len);
-        for (slot, seq, pending_ingest, sampler) in items.iter_mut() {
-            let slot = *slot;
-            self.select_mtp_batch_slot(slot)?;
-            let anchor = *seq
-                .generated_tokens
-                .last()
-                .ok_or_else(|| loader_err("missing anchor in batched MTP verify"))?;
-            let k_budget = k_cap.min(
-                seq.max_new_tokens
-                    .saturating_sub(seq.generated_tokens.len() + 1),
-            );
-            let mut drafts = if pending_ingest.is_empty() {
-                self.propose(engine, anchor, k_budget)?
-            } else {
-                let ptrs: Vec<u64> = self.mtp_batch_slots[slot]
-                    .captured_verify_hidden
-                    .iter()
-                    .map(|b| b.addr())
-                    .collect();
-                let out =
-                    self.ingest_and_propose(engine, pending_ingest, &ptrs, anchor, k_budget)?;
-                pending_ingest.clear();
-                out
-            };
-            if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
-                let pos_before = seq.generated_tokens.len() + idx;
-                if pos_before < sampler.params.min_tokens {
-                    sampler.is_token_soft_banned(*id, &engine.cfg.eos_token_ids)
-                } else {
-                    sampler.is_token_soft_banned(*id, &engine.cfg.eos_token_ids)
-                        || sampler
-                            .params
-                            .is_stop_or_eos(*id, &engine.cfg.eos_token_ids)
+        // Pass 1: reserve speculative GDN state slots before running MTP draft forwards so
+        // draft GPU work is skipped when state slots are full, while releasing every reserved
+        // slot cleanly if any proposal step fails.
+        let mut proposed: Vec<(usize, i32, Vec<i32>, Vec<i32>)> = Vec::with_capacity(batch_len);
+        let propose_res: Result<()> = (|| {
+            for (slot, seq, pending_ingest, sampler) in items.iter_mut() {
+                let slot = *slot;
+                self.select_mtp_batch_slot(slot)?;
+                let anchor = *seq
+                    .generated_tokens
+                    .last()
+                    .ok_or_else(|| loader_err("missing anchor in batched MTP verify"))?;
+                let raw_budget = k_cap.min(
+                    seq.max_new_tokens
+                        .saturating_sub(seq.generated_tokens.len() + 1),
+                );
+                let mut extras = Vec::with_capacity(raw_budget);
+                for _ in 0..raw_budget {
+                    let Some(s) = engine.alloc_state_slot_from(radix) else {
+                        break;
+                    };
+                    extras.push(s);
                 }
-            }) {
-                drafts.truncate(eos);
+                let k_budget = extras.len();
+                let propose_step = if pending_ingest.is_empty() {
+                    self.propose(engine, anchor, k_budget)
+                } else {
+                    let ptrs: Vec<u64> = self.mtp_batch_slots[slot]
+                        .captured_verify_hidden
+                        .iter()
+                        .map(|b| b.addr())
+                        .collect();
+                    let res =
+                        self.ingest_and_propose(engine, pending_ingest, &ptrs, anchor, k_budget);
+                    if res.is_ok() {
+                        pending_ingest.clear();
+                    }
+                    res
+                };
+                let mut drafts = match propose_step {
+                    Ok(out) => out,
+                    Err(e) => {
+                        engine.free_state_slots(&extras);
+                        return Err(e);
+                    }
+                };
+                if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {
+                    let pos_before = seq.generated_tokens.len() + idx;
+                    if pos_before < sampler.params.min_tokens {
+                        sampler.is_token_soft_banned(*id, &engine.cfg.eos_token_ids)
+                    } else {
+                        sampler.is_token_soft_banned(*id, &engine.cfg.eos_token_ids)
+                            || sampler
+                                .params
+                                .is_stop_or_eos(*id, &engine.cfg.eos_token_ids)
+                    }
+                }) {
+                    drafts.truncate(eos);
+                }
+                if extras.len() > drafts.len() {
+                    let excess = extras.split_off(drafts.len());
+                    engine.free_state_slots(&excess);
+                }
+                proposed.push((slot, anchor, drafts, extras));
             }
-            proposed.push((slot, anchor, drafts));
+            Ok(())
+        })();
+        if let Err(e) = propose_res {
+            for (_, _, _, extras) in &proposed {
+                engine.free_state_slots(extras);
+            }
+            return Err(e);
         }
 
-        // Pass 2: infallibly allocate speculative GDN state slots (`StateTx`). Every fallible
-        // operation after this point runs inside `verify_and_commit` so any error triggers
-        // deterministic cleanup of all unresolved `prep.tx.spec_slots`.
-        for ((_, seq, _, _), (slot, anchor, mut drafts)) in items.iter_mut().zip(proposed) {
-            let mut extras = Vec::with_capacity(drafts.len());
-            for _ in 0..drafts.len() {
-                match engine.alloc_state_slot_from(radix) {
-                    Some(s) => extras.push(s),
-                    None => {
-                        engine.free_state_slots(&extras);
-                        extras.clear();
-                        drafts.clear();
-                        break;
-                    }
-                }
-            }
+        // Pass 2: infallibly assemble `StateTx` schedules. Every fallible operation after this
+        // point runs inside `res` so any error triggers deterministic `StateTx` cleanup.
+        for ((_, seq, _, _), (slot, anchor, drafts, extras)) in items.iter_mut().zip(proposed) {
             let mut tx = StateTx::new(seq.radix_state.active_state_slot);
             tx.commit_prefill(seq.radix_state.token_ids.len());
             let schedule = if !drafts.is_empty() {
                 tx.begin_spec_verify(extras);
                 tx.verify_slot_schedule()
             } else {
+                engine.free_state_slots(&extras);
                 vec![tx.committed_slot]
             };
             let mut verify = Vec::with_capacity(1 + drafts.len());

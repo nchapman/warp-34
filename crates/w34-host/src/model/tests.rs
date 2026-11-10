@@ -611,6 +611,58 @@ mod serving_capacity_tests {
     }
 
     #[test]
+    fn serving_budget_offloads_embed_when_concurrent_mtp_state_slots_exceed_gpu_embed_slack() {
+        use super::super::rank::plan_host_embed_with_serving_budget;
+        let mut cfg = sample_qwen4_exp_config();
+        cfg.num_experts = 0;
+        cfg.tie_word_embeddings = false;
+        cfg.vocab_size = 248_320;
+        cfg.hidden_size = 5120;
+        cfg.num_hidden_layers = 64;
+        cfg.indexer_n_heads = 0;
+        cfg.ple_layer_ids.clear();
+        let mib = 1024 * 1024;
+        let weights = 17_700 * mib;
+        let scratch = 640 * mib;
+        let staging = 300 * mib;
+        let floor_steady = 3_800 * mib;
+        let desired_steady = 8_350 * mib;
+        let free_24g = 24_100 * mib;
+        let (_, offload_24g) = plan_host_embed_with_serving_budget(
+            &cfg,
+            weights,
+            scratch,
+            staging,
+            free_24g,
+            16 * mib,
+            Some(floor_steady),
+            Some(desired_steady),
+        );
+        assert!(
+            offload_24g,
+            "24 GB card must offload 2.37 GiB embed_tokens so 24 concurrent MTP state slots fit"
+        );
+        let (_, offload_32g) = plan_host_embed_with_serving_budget(
+            &cfg,
+            weights,
+            scratch,
+            staging,
+            32_000 * mib,
+            16 * mib,
+            Some(floor_steady),
+            Some(desired_steady),
+        );
+        assert!(
+            !offload_32g,
+            "32 GB card fits both GPU embed_tokens and all 24 state slots"
+        );
+        assert_eq!(crate::mtp::serving_state_slots(1, 3).unwrap(), 8);
+        assert_eq!(crate::mtp::serving_state_slots(2, 3).unwrap(), 16);
+        assert_eq!(crate::mtp::serving_state_slots(4, 3).unwrap(), 24);
+        assert!(crate::mtp::serving_state_slots(0, 3).is_err());
+    }
+
+    #[test]
     fn target_pool_geometry_preserves_tp_qsa_and_ple() {
         use super::super::rank::target_pool_geometry;
         let mut cfg = sample_qwen4_exp_config();

@@ -183,6 +183,39 @@ fn single_client_27b_dflash_serving_preserves_32k_context() {
 }
 
 #[test]
+fn concurrent_27b_mtp_serving_allocates_verify_and_burst_state_slots() {
+    use w34_host::proposer::{SpeculativeConfig, SpeculativeKind};
+
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(target) = common::require_or_skip_cached_model(
+        "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+        "concurrent_27b_mtp_serving_allocates_verify_and_burst_state_slots",
+    ) else {
+        return;
+    };
+    let engine = Qwen3_5Engine::load_for_serving_with_speculative(
+        target.to_str().unwrap(),
+        1,
+        KvFormatPolicy::Tq4,
+        Some(4096),
+        true,
+        4,
+        Some(&SpeculativeConfig {
+            kind: SpeculativeKind::Mtp,
+            draft_model: None,
+            mtp_k: 3,
+        }),
+    )
+    .expect("concurrent 27B MTP serving must fit 4096 KV pages");
+    assert_eq!(engine.ranks[0].kv_pool.num_pages, 4096);
+    assert!(
+        engine.ranks[0].state_pool.total_slots >= 20,
+        "4-slot MTP serving needs >= 20 GDN state slots (12 private + 4 locked + 4 verify), got {}",
+        engine.ranks[0].state_pool.total_slots,
+    );
+}
+
+#[test]
 fn invalid_serving_capacity_fails_before_model_resolution() {
     for max_num_seqs in [0, usize::MAX / 4 + 1, usize::MAX] {
         let error = Qwen3_5Engine::load_for_serving(
