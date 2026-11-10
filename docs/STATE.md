@@ -1,5 +1,12 @@
 # warp-34 — Session Orientation & Current State
 
+## Single-client 27B MTP soak after capacity fixes
+
+- Unchanged engine `0105610` passed a **600.106-second** synthetic/replay soak on one RTX 3090 Ti, TQ4/MTP-3, 196,608-token allocated capacity and one client: **332 completed responses + 36 injected local disconnects**, no unexpected errors or configured latency breaches, final inference probe passed.
+- GPU memory stayed at **23,257 MiB**. RSS grew **261.83 MiB** (4225.89 → 4487.72 MiB), within the 512 MiB gate. Most growth was early, but later drift remains; ten minutes does not establish a permanent plateau.
+- Agent replay turns 3–4 reused about **81%** of prompt tokens; separate shared-prefix traffic reported **zero reuse**, still unexplained. Successful measured prompts were only **185–1588 tokens**: this is not long-context or intact-SWE qualification.
+- [Campaign, per-case latency, memory windows and receipt hash](../benchmarks/perf/campaigns/soak-27b-single-client-10min.md); [pinned single-client configuration](../benchmarks/perf/campaigns/soak-coding-27b-single-client.toml). Server stopped cleanly. Next: pinned intact single-task replay and longer-duration RSS/cache checks, rather than the existing assembled Open-SWE fixtures.
+
 ## Single-GPU production-target capacity investigation: 27B + MTP
 
 > The earlier 8k per-request recommendation below is **withdrawn**: it worked around

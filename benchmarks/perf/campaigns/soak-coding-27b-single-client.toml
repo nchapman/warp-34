@@ -1,0 +1,69 @@
+# Single-client production-target churn soak, NOT production qualification.
+# Synthetic fixtures; 192 Ki allocated capacity is not a full-context workload.
+# Server is managed externally. Unknown artifact fields remain explicitly unverified.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 1 # soak repeats sessions until its CLI targets; this is for finite `run`
+warmup_requests = 1 # complete sessions per case before the measured clock starts
+timeout_s = 90
+max_inflight = 1
+
+[[engines]]
+id = "warp34-soak"
+engine = "warp-34"
+version = "0105610b5ac89ea132b17a208900e91b9f0b6293"
+support = "unverified"
+model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+source_model_revision = "unknown"
+artifact_sha256 = "unknown"
+tokenizer_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+chat_template_sha256 = "unknown"
+quantization_details = "unknown"
+gpu_count = 1
+gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
+base_url = "http://127.0.0.1:18834/v1"
+weight_format = "HGPTQ-int4"
+kv_format = "tq4"
+parallelism = "single"
+speculation = "mtp-3"
+cache_config = "12288 KV pages; 1 active sequence; max model len 196608"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --revision ae51987e3339a2a70070702548571e10fe8bcbc2 --offline --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 12288 --max-num-seqs 1 --max-model-len 196608 --port 18834"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[cases]]
+id = "coding-mixed"
+fixture = "../fixtures/text.json"
+requests = 32 # finite `run` only; soak rotates cases without a request-count cap
+concurrency = 1
+max_tokens = 256
+cache = "unique"
+mix = [{context_repetitions = 1, max_tokens = 64}, {context_repetitions = 8, max_tokens = 256}, {context_repetitions = 16, max_tokens = 512}]
+# Illustrative per-response ceilings, not a p95/p99 production qualification.
+ttft_slo_ms = 30000
+e2e_slo_ms = 90000
+
+[[cases]]
+id = "coding-agent-replay"
+kind = "agent_replay"
+fixture = "../fixtures/coding_agent.json"
+requests = 16
+concurrency = 1
+max_tokens = 256
+think_time_s = 0.1
+cache = "unique"
+ttft_slo_ms = 30000
+e2e_slo_ms = 90000
+
+[[cases]]
+id = "coding-warm-prefix"
+fixture = "../fixtures/text.json"
+requests = 32
+concurrency = 1
+max_tokens = 128
+context_repetitions = 8
+cache = "natural"
+ttft_slo_ms = 30000
+e2e_slo_ms = 90000
