@@ -313,6 +313,26 @@ mod serving_capacity_tests {
         );
         assert_eq!(
             plan_mtp_tiered_moe_hot_experts(
+                1,
+                cfg.num_experts,
+                exp_bytes,
+                MTP_TP1_SERVING_MIN_FREE_VRAM_BYTES
+            ),
+            MTP_TP1_SERVING_HOT_EXPERTS
+        );
+        // Oversized expert_stride_bytes where 320 * stride + headroom exceeds 1,700 MiB must
+        // fall through to a smaller tier rather than overcommitting VRAM.
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(
+                1,
+                cfg.num_experts,
+                6 * 1024 * 1024,
+                MTP_TP1_SERVING_MIN_FREE_VRAM_BYTES
+            ),
+            MTP_TP1_STREAMED_PREFILL_MAX_HOT
+        );
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(
                 2,
                 cfg.num_experts / 2,
                 exp_bytes,

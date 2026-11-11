@@ -506,12 +506,18 @@ pub fn default_tiered_moe_hot_ceiling(
     }
 }
 
+/// `TP=1` `MTP` hot expert count (`320 / 512`) when `>= 1,700 MiB` free VRAM is available
+/// before `MTP` MoE allocation, leaving `>= 930 MiB` post-`MTP` for `MarlinW4A16` `draft_lm_head`
+/// (`322 MiB`) plus `~610 MiB` runtime headroom.
+pub const MTP_TP1_SERVING_HOT_EXPERTS: usize = 320;
+pub const MTP_TP1_SERVING_MIN_FREE_VRAM_BYTES: usize = 1700 * 1024 * 1024;
+
 /// Computes the `MTP` proposer's GPU hot expert cache capacity (`k_hot`) from live free VRAM.
 ///
 /// On `TP >= 2` (`local_experts <= 256`), places `100%` of local `MTP` experts in VRAM when
 /// `free_vram_bytes` covers all local experts plus [`MTP_FULL_RESIDENCY_HEADROOM_BYTES`].
-/// On `TP == 1` (`local_experts == 512`), caps at [`MTP_TP1_STREAMED_PREFILL_MAX_HOT`] (`192`)
-/// when affordable so `MTP` prompt ingestion retains fast `StreamedPrefill` chunking.
+/// On `TP == 1` (`local_experts == 512`), selects [`MTP_TP1_SERVING_HOT_EXPERTS`] (`320`) when
+/// `free_vram_bytes >= 1,700 MiB` or [`MTP_TP1_STREAMED_PREFILL_MAX_HOT`] (`192`) otherwise.
 pub fn plan_mtp_tiered_moe_hot_experts(
     tp_size: usize,
     local_experts: usize,
@@ -522,6 +528,9 @@ pub fn plan_mtp_tiered_moe_hot_experts(
     let slots_all_need = local_experts
         .saturating_mul(expert_stride_bytes)
         .saturating_add(MTP_FULL_RESIDENCY_HEADROOM_BYTES);
+    let slots_tp1_serving_need = MTP_TP1_SERVING_HOT_EXPERTS
+        .saturating_mul(expert_stride_bytes)
+        .saturating_add(MTP_PARTIAL_CACHE_HEADROOM_BYTES);
     let slots_tp1_max_need = MTP_TP1_STREAMED_PREFILL_MAX_HOT
         .saturating_mul(expert_stride_bytes)
         .saturating_add(MTP_PARTIAL_CACHE_HEADROOM_BYTES);
@@ -530,6 +539,11 @@ pub fn plan_mtp_tiered_moe_hot_experts(
         .saturating_add(MTP_PARTIAL_CACHE_HEADROOM_BYTES);
     if tp_size > 1 && free_vram_bytes >= slots_all_need {
         local_experts
+    } else if tp_size == 1
+        && local_experts >= MTP_TP1_SERVING_HOT_EXPERTS
+        && free_vram_bytes >= slots_tp1_serving_need.max(MTP_TP1_SERVING_MIN_FREE_VRAM_BYTES)
+    {
+        MTP_TP1_SERVING_HOT_EXPERTS
     } else if tp_size == 1
         && local_experts >= MTP_TP1_STREAMED_PREFILL_MAX_HOT
         && free_vram_bytes >= slots_tp1_max_need

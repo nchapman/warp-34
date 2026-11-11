@@ -130,7 +130,9 @@ impl TieredMoeEngine {
                         store.layout().hidden as i32,
                         store.layout().group_size as i32,
                         if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
-                            if crate::moe_cpu_bridge::has_avx512() {
+                            if crate::moe_cpu_bridge::has_avx512()
+                                || (num_tokens == 1 && k_hot >= 64)
+                            {
                                 TIERED_MOE_CPU_BRIDGE_COLD_WEIGHT_THRESHOLD
                             } else {
                                 TIERED_MOE_CPU_BRIDGE_AVX2_GPU_SHARE_FRAC
@@ -264,9 +266,14 @@ impl TieredMoeEngine {
         assert_eq!(h_topk_ids.len(), num_tokens * top_k);
 
         // Identify unique active local experts and count cache hits/misses.
+        // For `TP=2` serving prefill chunks (`num_tokens >= 256`, `!cache.has_cpu_bridge()`),
+        // `sync_from_device_if_dirty` has already synchronized `expert_to_slot` across all
+        // `0..cache.slots.capacity` GPU slots, so Pass 0 can use the full resident GPU hot cache.
         let local_start = cache.expert_ids.start;
         let local_len = cache.expert_ids.len();
-        let prefill_hot_limit = if use_prefill_hot_limit {
+        let prefill_hot_limit = if use_prefill_hot_limit
+            && ((cache.has_cpu_bridge() && cache.slots.capacity < 64) || num_tokens < 256)
+        {
             cache.prefill_hot_limit()
         } else {
             cache.slots.capacity
@@ -1127,7 +1134,13 @@ impl RankTieredMoe {
                 && HotExpertCache::auto_cpu_bridge_preferred()
             {
                 if ep_size == 1 {
-                    let k_static = k_hot;
+                    let k_static = if (64..=crate::model::TIERED_MOE_TP1_SERVING_KV_DEFAULT_HOT)
+                        .contains(&k_hot)
+                    {
+                        k_hot - 16
+                    } else {
+                        k_hot
+                    };
                     if bridge_runtime.is_none() {
                         bridge_runtime = Some(crate::moe_cpu_bridge::Runtime::new(stream)?);
                     }

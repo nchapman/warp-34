@@ -11,6 +11,42 @@ use crate::{
 
 use super::{NativeProposer, Ranks};
 
+/// Returns `Some(drafts)` of length `k_budget` when `history` (`>= 64` tokens) contains a
+/// suffix match of length `min_ngram..=16` for `[..history_tail, anchor]` and none of the
+/// looked-up tokens is a stop/EOS/soft-banned token.
+pub(crate) fn try_lookup_scheduled_suffix_drafts(
+    history: &[i32],
+    anchor: i32,
+    k_budget: usize,
+    min_ngram: usize,
+    generated_len: usize,
+    sampler: &SamplerV1,
+    eos_token_ids: &[i32],
+) -> Option<Vec<i32>> {
+    if k_budget == 0 || history.len() < 64 || sampler.constraint.is_some() {
+        return None;
+    }
+    let tail_prev = history.len().min(15);
+    let mut tail = Vec::with_capacity(tail_prev + 1);
+    tail.extend_from_slice(&history[history.len() - tail_prev..]);
+    tail.push(anchor);
+    let drafts =
+        crate::speculative::lookup_suffix_continuation(history, &tail, min_ngram, 16, k_budget)?;
+    if drafts.len() != k_budget {
+        return None;
+    }
+    let has_stop = drafts.iter().enumerate().any(|(idx, &id)| {
+        let pos_before = generated_len + idx;
+        if pos_before < sampler.params.min_tokens {
+            sampler.is_token_soft_banned(id, eos_token_ids)
+        } else {
+            sampler.is_token_soft_banned(id, eos_token_ids)
+                || sampler.params.is_stop_or_eos(id, eos_token_ids)
+        }
+    });
+    (!has_stop).then_some(drafts)
+}
+
 impl NativeProposer {
     #[inline]
     pub(crate) fn fits_capacity(&self, prompt_len: usize, max_new: usize) -> Option<usize> {
@@ -183,7 +219,31 @@ impl NativeProposer {
             seq.max_new_tokens
                 .saturating_sub(seq.generated_tokens.len() + 1),
         );
-        let mut drafts = if pending_ingest.is_empty() {
+        let lookup_min_ngram =
+            if engine.cfg.uses_tiered_moe() && matches!(self.ranks, Ranks::DFlash(_)) {
+                Some(5)
+            } else {
+                None
+            };
+        let lookup_drafts = lookup_min_ngram.and_then(|min_ngram| {
+            try_lookup_scheduled_suffix_drafts(
+                &seq.radix_state.token_ids,
+                anchor,
+                k_budget,
+                min_ngram,
+                seq.generated_tokens.len(),
+                sampler,
+                &engine.cfg.eos_token_ids,
+            )
+        });
+        let mut drafts = if let Some(out) = lookup_drafts {
+            if !pending_ingest.is_empty() {
+                let features = self.captured(engine)?;
+                self.ingest(engine, pending_ingest, &features)?;
+                pending_ingest.clear();
+            }
+            out
+        } else if pending_ingest.is_empty() {
             self.propose(engine, anchor, k_budget)?
         } else {
             let features = self.captured(engine)?;

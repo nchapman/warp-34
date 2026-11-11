@@ -1771,4 +1771,35 @@ mod tests {
         assert_eq!(memos.len(), 1);
         assert_eq!(memos[0].features.len(), 1024);
     }
+
+    #[test]
+    fn scheduled_suffix_lookup_matches_continuation_and_rejects_stop_or_short_history() {
+        let sampler = SamplerV1::new(SamplingParams::default(), &[1], None);
+        let mut history: Vec<i32> = (100..180).collect();
+        history.extend_from_slice(&[10, 20, 30, 40, 50, 60, 70]);
+        history.extend_from_slice(&[200, 201, 202, 10, 20]);
+        // Suffix ending with anchor=30 matches [10, 20, 30] and returns [40, 50, 60].
+        assert_eq!(
+            scheduled::try_lookup_scheduled_suffix_drafts(&history, 30, 3, 3, 5, &sampler, &[999],),
+            Some(vec![40, 50, 60]),
+        );
+        // Stop/EOS token in looked-up continuation rejects the bypass so normal proposer handles truncation.
+        assert_eq!(
+            scheduled::try_lookup_scheduled_suffix_drafts(&history, 30, 3, 3, 5, &sampler, &[50],),
+            None,
+        );
+        // Short history (< 64 tokens) does not trigger suffix lookup bypass.
+        assert_eq!(
+            scheduled::try_lookup_scheduled_suffix_drafts(
+                &history[..32],
+                130,
+                3,
+                3,
+                5,
+                &sampler,
+                &[999],
+            ),
+            None,
+        );
+    }
 }
