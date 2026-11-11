@@ -860,6 +860,22 @@ impl ModelConfig {
         allow_channelwise_8bit: bool,
     ) -> io::Result<()> {
         match bits {
+            2 if method == "compressed-tensors" => {
+                if !matches!(group_size, 32 | 64 | 128) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "unsupported {method} 2-bit group_size={} (supported on sm_86/sm_89 Marlin: 32, 64, 128)",
+                            if group_size == 0 {
+                                -1
+                            } else {
+                                group_size as i64
+                            }
+                        ),
+                    ));
+                }
+                Ok(())
+            }
             4 => {
                 if !matches!(group_size, 32 | 64 | 128) {
                     return Err(io::Error::new(
@@ -1042,8 +1058,19 @@ impl ModelConfig {
         gk: &str,
         grp: &Json,
     ) -> io::Result<(usize, usize, bool, bool)> {
+        let is_embedding_only = grp
+            .get("targets")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                !arr.is_empty()
+                    && arr
+                        .iter()
+                        .filter_map(|x| x.as_str())
+                        .all(|t| t == "Embedding" || t.contains("embed"))
+            });
         if let Some(gfmt) = grp.get("format").and_then(|v| v.as_str())
             && gfmt != "pack-quantized"
+            && !(is_embedding_only && gfmt == "lut4-gptq")
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1130,28 +1157,18 @@ impl ModelConfig {
             .get("symmetric")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        if num_bits == 8 && !symmetric {
+        if (num_bits == 2 || num_bits == 8) && !symmetric {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported compressed-tensors asymmetric 8-bit weights in '{}' (8-bit W8A16 requires symmetric=true)",
+                    "unsupported compressed-tensors asymmetric {num_bits}-bit weights in '{}' ({num_bits}-bit requires symmetric=true)",
                     sanitize_diag(gk)
                 ),
             ));
         }
-        if !(num_bits == 4 && group_size == 0 && strategy == "channel" && symmetric) {
+        if !(matches!(num_bits, 2 | 4) && group_size == 0 && strategy == "channel" && symmetric) {
             Self::validate_bits_and_group_size("compressed-tensors", num_bits, group_size, true)?;
         }
-        let is_embedding_only = grp
-            .get("targets")
-            .and_then(|v| v.as_array())
-            .is_some_and(|arr| {
-                !arr.is_empty()
-                    && arr
-                        .iter()
-                        .filter_map(|x| x.as_str())
-                        .all(|t| t == "Embedding" || t.contains("embed"))
-            });
         Ok((num_bits, group_size, symmetric, is_embedding_only))
     }
 

@@ -346,7 +346,8 @@ __global__ void Marlin(
   constexpr bool has_zp = b_type == vllm::kU4 || b_type == vllm::kU8;
   constexpr bool is_int_type = b_type == vllm::kU4 || b_type == vllm::kU8 ||
                                b_type == vllm::kS4 || b_type == vllm::kS8 ||
-                               b_type == vllm::kU4B8 || b_type == vllm::kU8B128;
+                               b_type == vllm::kU2B2 || b_type == vllm::kU4B8 ||
+                               b_type == vllm::kU8B128;
   // see comments of dequant.h for more details
   constexpr bool dequant_skip_flop =
       is_a_8bit || (b_type == vllm::kFE4M3fn && !(s_type == vllm::kFE8M0fnu)) ||
@@ -551,14 +552,16 @@ __global__ void Marlin(
   int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
   constexpr int b_sh_stride =
       ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
-  constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
-  constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
+  constexpr int b_thread_vecs = b_type.size_bits() == 8 ? 2 : 1;
+  constexpr int b_sh_stride_threads =
+      b_type.size_bits() == 2 ? (b_sh_stride * 2) : (b_sh_stride / b_thread_vecs);
 
   int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
-  constexpr int b_sh_wr_delta = threads * b_thread_vecs;
   constexpr int b_sh_stage =
       b_sh_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
-  constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
+  constexpr int b_sh_wr_iters =
+      (b_sh_stride_threads * thread_k_blocks / (is_a_8bit ? 2 : 1)) / threads;
+  constexpr int b_g2s_iters = b_sh_stage / threads;
 
   // Scale sizes/strides without act_order
   int s_gl_stride = prob_n / (is_8bit_scale ? 16 : 8);
@@ -615,7 +618,12 @@ __global__ void Marlin(
   b_gl_rd += b_sh_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
-  b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
+  if constexpr (b_type.size_bits() == 2) {
+    b_sh_rd += b_sh_rd / b_sh_stride_threads *
+               (b_sh_stride_threads * (b_sh_wr_iters - 1));
+  } else {
+    b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
+  }
 
   // For act_order
   int slice_k_start = tb_k * slice_row;
@@ -774,7 +782,7 @@ __global__ void Marlin(
   FragS frag_s[2][4];  // No act-order
   FragS frag_bias[2][4];
   FragS act_frag_s[2][4][4];             // For act-order
-  int frag_qzp[2][num_ints_per_thread];  // Zero-points
+  int frag_qzp[2][num_ints_per_thread > 0 ? num_ints_per_thread : 1];  // Zero-points
   FragZP frag_zp;                        // Zero-points in fp16
   FragZP frag_zpf[2];                    // Zero-points in fp16 in HQQ
 
@@ -853,7 +861,7 @@ __global__ void Marlin(
       }
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
   #pragma unroll
-      for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
+      for (int i = 0; i < b_g2s_iters; i++) {
         constexpr int count = div_ceil(b_sh_stride, threads);
         int b_gl_idx =
             b_gl_rd + (i % count) * threads +
@@ -966,11 +974,17 @@ __global__ void Marlin(
       }
     }
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-
+    if constexpr (b_type.size_bits() == 2) {
+      int2 const* sh_b_stage_i2 = reinterpret_cast<int2 const*>(sh_b_stage);
+      int2 v = sh_b_stage_i2[b_sh_stride_threads * (k % b_sh_wr_iters) + b_sh_rd];
+      frag_b_quant[k % 2][0][0] = v.x;
+      frag_b_quant[k % 2][0][1] = v.y;
+    } else {
   #pragma unroll
-    for (int i = 0; i < b_thread_vecs; i++) {
-      frag_b_quant[k % 2][i] = *reinterpret_cast<I4*>(
-          &sh_b_stage[b_sh_stride * (k % b_sh_wr_iters) + b_sh_rd + i]);
+      for (int i = 0; i < b_thread_vecs; i++) {
+        frag_b_quant[k % 2][i] = *reinterpret_cast<I4*>(
+            &sh_b_stage[b_sh_stride * (k % b_sh_wr_iters) + b_sh_rd + i]);
+      }
     }
   };
 
@@ -1258,6 +1272,10 @@ __global__ void Marlin(
       if constexpr (b_type_id == vllm::kFE2M1f.id()) {
         b_quant_1 = frag_b_quant[k2][0][j];
         b_quant_0 = b_quant_1 << 8;
+      } else if constexpr (b_type.size_bits() == 2) {
+        int raw_w = frag_b_quant[k2][0][j >> 1];
+        b_quant_0 = raw_w >> ((j & 1) * 8);
+        b_quant_1 = b_quant_0 >> 4;
       } else if constexpr (b_type.size_bits() == 4) {
         b_quant_0 = frag_b_quant[k2][0][j];
         b_quant_1 = b_quant_0 >> 8;
@@ -2055,7 +2073,8 @@ __global__ void Marlin(
           }
         }
       } else if (!has_act_order && group_blocks == -1 &&
-                 (b_type.size_bits() == 4 || b_type.size_bits() == 8) &&
+                 (b_type.size_bits() == 2 || b_type.size_bits() == 4 ||
+                  b_type.size_bits() == 8) &&
                  (has_zp && dequant_skip_flop || !has_zp)) {
         if (threadIdx.x / 32 < tb_n_warps) {
   #pragma unroll

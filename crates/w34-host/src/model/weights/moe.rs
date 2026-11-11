@@ -908,11 +908,16 @@ pub(crate) fn load_moe_layer_weights(
                     rd_full.dims()
                 )));
             }
-            let rg = rg_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
-            let ru = ru_full.slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm);
+            let rg = rg_full
+                .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm)
+                .into_u4b8_if_u2b2();
+            let ru = ru_full
+                .slice_rows(rank * local_moe_interm, (rank + 1) * local_moe_interm)
+                .into_u4b8_if_u2b2();
             let (gu, gu_had) = RawLinearHost::concat_rows(&[rg, ru])?.unwrap_hadamard();
             let (rd, rd_had) = rd_full
                 .slice_cols(rank * local_moe_interm, (rank + 1) * local_moe_interm)?
+                .into_u4b8_if_u2b2()
                 .unwrap_hadamard();
             if gu_had != exp0_in_had || rd_had != exp0_dn_had {
                 return Err(loader_err_msg(format!(
@@ -928,6 +933,7 @@ pub(crate) fn load_moe_layer_weights(
             &format!("{pfx}.mlp.experts.0.gate_proj"),
             &cfg.quant,
         )?
+        .into_u4b8_if_u2b2()
         .unwrap_hadamard();
         if matches!(exp0_gate, RawLinearHost::U8B128NMajor { .. }) {
             return Err(loader_err_msg(format!(
@@ -1183,6 +1189,9 @@ pub(crate) fn load_moe_layer_weights(
                     exp0_in_had,
                     exp0_dn_had,
                 )
+            }
+            RawLinearHost::U2B2NMajor { .. } => {
+                unreachable!("converted via into_u4b8_if_u2b2")
             }
         }
     };

@@ -5,6 +5,7 @@ use fancy_regex::{Regex, RegexBuilder};
 pub const HADAMARD_BLOCK_16: usize = 16;
 pub const HADAMARD_BLOCK_64: usize = 64;
 pub const SUPPORTED_HADAMARD_BLOCKS: [usize; 2] = [HADAMARD_BLOCK_16, HADAMARD_BLOCK_64];
+pub const SUPPORTED_MARLIN_U2_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 pub const SUPPORTED_MARLIN_U4_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 pub const SUPPORTED_MARLIN_U8_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 
@@ -24,6 +25,7 @@ const REGEX_BACKTRACK_LIMIT: usize = 100_000;
 const MAX_COMPRESSED_TENSORS_PATTERNS: usize = 1024;
 const MAX_COMPRESSED_TENSORS_GROUPS: usize = 32;
 const MAX_TENSOR_NAME_BYTES: usize = 16 * 1024;
+const COMPRESSED_TENSORS_U2_BITS: usize = 2;
 const COMPRESSED_TENSORS_U4_BITS: usize = 4;
 const COMPRESSED_TENSORS_U8_BITS: usize = 8;
 
@@ -250,11 +252,16 @@ impl CompressedTensorRules {
             ));
         }
         for (key, group) in quant_map {
-            let (bits, group_size, symmetric, _) =
+            let (bits, group_size, symmetric, is_embedding_only) =
                 ModelConfig::parse_compressed_tensors_group(key, group)?;
+            if is_embedding_only {
+                continue;
+            }
             let w = &group["weights"];
-            let valid_bits_and_gs = (bits == COMPRESSED_TENSORS_U4_BITS
-                && SUPPORTED_MARLIN_U4_GROUP_SIZES.contains(&group_size))
+            let valid_bits_and_gs = (bits == COMPRESSED_TENSORS_U2_BITS
+                && SUPPORTED_MARLIN_U2_GROUP_SIZES.contains(&group_size))
+                || (bits == COMPRESSED_TENSORS_U4_BITS
+                    && SUPPORTED_MARLIN_U4_GROUP_SIZES.contains(&group_size))
                 || (bits == COMPRESSED_TENSORS_U8_BITS
                     && SUPPORTED_MARLIN_U8_GROUP_SIZES.contains(&group_size));
             if !valid_bits_and_gs
@@ -265,7 +272,7 @@ impl CompressedTensorRules {
                         || w.get("group_size").is_some_and(|v| !v.is_null())))
             {
                 return Err(invalid(
-                    "HGPTQ requires static symmetric W4/W8 (g32/g64/g128 or channel) weights",
+                    "HGPTQ requires static symmetric W2/W4/W8 (g32/g64/g128 or channel) weights",
                 ));
             }
             quant_groups.push(QuantRule {
@@ -309,8 +316,13 @@ impl CompressedTensorRules {
                         "transform targets unquantized linear {name}"
                     )));
                 };
-                if sel.bits != COMPRESSED_TENSORS_U4_BITS {
-                    return Err(invalid(format!("transform targets non-W4 linear {name}")));
+                if !matches!(
+                    sel.bits,
+                    COMPRESSED_TENSORS_U2_BITS | COMPRESSED_TENSORS_U4_BITS
+                ) {
+                    return Err(invalid(format!(
+                        "transform targets non-W2/W4 linear {name}"
+                    )));
                 }
                 let slot = if rule.offline {
                     &mut offline

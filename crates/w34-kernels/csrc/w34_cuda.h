@@ -301,6 +301,8 @@ int w34_small_n_gemm_dual_f16(const w34_exec* ex, const void* x,
 
 // --- Marlin Repack & GEMMs (op_marlin.cu) ---
 int w34_zero_i32(const w34_exec* ex, void* ptr, int64_t count);
+int w34_marlin_repack_int2(const w34_exec* ex, const uint32_t* src_n_major,
+                           uint32_t* dst_marlin, int64_t k, int64_t n);
 int w34_marlin_repack_int4(const w34_exec* ex, const uint32_t* src_n_major,
                            uint32_t* dst_marlin, int64_t k, int64_t n);
 int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_major,
@@ -308,6 +310,10 @@ int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_major,
 int w34_marlin_quantize_f16_u4b8(const w34_exec* ex, const void* src_f16,
                                  uint32_t* dst_marlin, void* dst_scales_perm,
                                  int64_t k, int64_t n, int group_size);
+int w34_marlin_gemm_f16u2(const w34_exec* ex, const void* a, const void* b,
+                          const void* scales, void* c, int32_t* workspace,
+                          int64_t m, int64_t n, int64_t k,
+                          int64_t workspace_ints, int group_blocks);
 int w34_marlin_gemm_f16u4(const w34_exec* ex, const void* a, const void* b,
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,

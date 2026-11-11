@@ -111,6 +111,68 @@ __device__ inline void dequant(int q, scalar_t2* frag_b);
 // https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/cutlass_extensions/include/cutlass_extensions/interleaved_numeric_conversion.h#L327-L385
 //
 template <>
+__device__ inline void dequant<half2, vllm::kU2B2.id(), true>(int q,
+                                                              half2* frag_b) {
+  const int MASK = 0x00030003;
+  const int EX = 0x64006400;
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  q >>= 2;
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+
+  frag_b[0] = *reinterpret_cast<half2*>(&lo);
+  frag_b[1] = *reinterpret_cast<half2*>(&hi);
+}
+
+template <>
+__device__ inline void dequant<half2, vllm::kU2B2.id(), false>(int q,
+                                                               half2* frag_b) {
+  const int LO = 0x00030003;
+  const int HI = 0x000c000c;
+  const int EX = 0x64006400;
+  // clang-format off
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
+  // clang-format on
+  // Fuse the `-2` symmetric zero point of `uint2b2` (`{0, 1, 2, 3} -> {-2, -1, 0, +1}`)
+  // directly into `SUB` (`1026.0`) and `MUL`/`ADD` (`1/4`, `-258.0 = -1032/4`).
+  const int SUB = 0x64026402;
+  const int MUL = 0x34003400;
+  const int ADD = 0xdc08dc08;
+  frag_b[0] = __hsub2(*reinterpret_cast<half2*>(&lo),
+                      *reinterpret_cast<const half2*>(&SUB));
+  frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi),
+                      *reinterpret_cast<const half2*>(&MUL),
+                      *reinterpret_cast<const half2*>(&ADD));
+}
+
+template <>
+__device__ inline void dequant<nv_bfloat162, vllm::kU2B2.id(), true>(
+    int q, nv_bfloat162* frag_b) {
+  static constexpr uint32_t MASK = 0x00030003;
+  static constexpr uint32_t EX = 0x43004300;
+
+  // clang-format off
+  int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  q >>= 2;
+  int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+  // clang-format on
+
+  frag_b[0] = *reinterpret_cast<nv_bfloat162*>(&lo);
+  frag_b[1] = *reinterpret_cast<nv_bfloat162*>(&hi);
+}
+
+template <>
+__device__ inline void dequant<nv_bfloat162, vllm::kU2B2.id(), false>(
+    int q, nv_bfloat162* frag_b) {
+  dequant<nv_bfloat162, vllm::kU2B2.id(), true>(q, frag_b);
+
+  static constexpr uint32_t SUB = 0x43024302;
+
+  frag_b[0] = __hsub2(frag_b[0], *reinterpret_cast<const nv_bfloat162*>(&SUB));
+  frag_b[1] = __hsub2(frag_b[1], *reinterpret_cast<const nv_bfloat162*>(&SUB));
+}
+
+template <>
 __device__ inline void dequant<half2, vllm::kU4B8.id(), true>(int q,
                                                               half2* frag_b) {
   const int MASK = 0x000f000f;

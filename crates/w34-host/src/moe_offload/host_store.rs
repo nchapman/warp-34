@@ -326,16 +326,42 @@ impl HostExpertStore {
                                         "missing {experts_prefix}.{expert_id}.{proj_name}.weight_scale"
                                     ))
                                 })?;
+                                let is_u2 = k8.is_multiple_of(2) && wp_info.shape == [n_exp, k8 / 2];
                                 require(
-                                    wp_info.shape == [n_exp, k8]
+                                    (wp_info.shape == [n_exp, k8] || is_u2)
                                         && ws_info.shape == [n_exp, num_groups],
                                     format!(
-                                        "mismatched compressed-tensors weight_packed {:?} / weight_scale {:?} (4-bit) on '{experts_prefix}.{expert_id}.{proj_name}'",
+                                        "mismatched compressed-tensors weight_packed {:?} / weight_scale {:?} (2/4-bit) on '{experts_prefix}.{expert_id}.{proj_name}'",
                                         wp_info.shape, ws_info.shape
                                     ),
                                 )?;
-                                // `weight_packed` is already N-major `[n_exp, k8]`.
-                                archive.read_exact_info(wp_info, &mut pack[w_range])?;
+                                if is_u2 {
+                                    let u2_buf = &mut raw_qw_bytes[..w_range.len() / 2];
+                                    archive.read_exact_info(wp_info, u2_buf)?;
+                                    let dst_w = &mut pack[w_range];
+                                    for (dst_pair, src_word) in dst_w
+                                        .as_chunks_mut::<8>()
+                                        .0
+                                        .iter_mut()
+                                        .zip(u2_buf.as_chunks::<4>().0.iter())
+                                    {
+                                        let w = u32::from_le_bytes(*src_word);
+                                        for (half_idx, half) in
+                                            [w & 0xFFFF, w >> 16].into_iter().enumerate()
+                                        {
+                                            let mut x = half;
+                                            x = (x | (x << 8)) & 0x00FF_00FF;
+                                            x = (x | (x << 4)) & 0x0F0F_0F0F;
+                                            x = (x | (x << 2)) & 0x3333_3333;
+                                            x = x.wrapping_add(0x6666_6666);
+                                            dst_pair[half_idx * 4..(half_idx + 1) * 4]
+                                                .copy_from_slice(&x.to_le_bytes());
+                                        }
+                                    }
+                                } else {
+                                    // `weight_packed` is already N-major `[n_exp, k8]`.
+                                    archive.read_exact_info(wp_info, &mut pack[w_range])?;
+                                }
                                 // `weight_scale` is already N-major `[n_exp, num_groups]`.
                                 let sc_words = &mut raw_sc_words[..n_exp * num_groups];
                                 archive.read_f16_bits_info_into(ws_info, sc_words)?;

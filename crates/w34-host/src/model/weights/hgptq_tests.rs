@@ -717,3 +717,149 @@ fn h64_moe_ffn_block_shares_input_rotation_and_matches_reference() {
     assert_eq!(normed_prerot_after, h_x);
     assert_eq!(actual_prerot, expected);
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
+    let _device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let cublas = CublasHandle::new(&stream).unwrap();
+    let staging = DeviceBuffer::alloc(0, 16 * 1024 * 1024).unwrap();
+    let locks = DeviceBuffer::alloc(0, 65536 * 4).unwrap();
+    locks.copy_from_host(&vec![0i32; 65536], &stream).unwrap();
+
+    for (n, k, group) in [
+        (128, 128, 64),
+        (256, 256, 64),
+        (512, 1024, 64),
+        (128, 512, 512),
+    ] {
+        let words_per_row = k / 16;
+        let groups_per_row = k / group;
+        let packed_u2: Vec<u32> = (0..n * words_per_row)
+            .map(|i| {
+                let mut w = 0u32;
+                for c in 0..16 {
+                    let crumb = ((i * 17 + c * 5 + 3) % 4) as u32;
+                    w |= crumb << (c * 2);
+                }
+                w
+            })
+            .collect();
+        let scales: Vec<u16> = (0..n * groups_per_row)
+            .map(|i| f32_to_f16(((i % 19) as f32 + 1.0) / 32.0))
+            .collect();
+        let raw_u2 = RawLinearHost::U2B2NMajor {
+            packed: packed_u2,
+            scales,
+            n,
+            k,
+            group_size: group,
+        };
+        let raw_u4 = raw_u2.slice_rows(0, n).into_u4b8_if_u2b2();
+        assert_eq!(raw_u2.to_f16_vec(), raw_u4.to_f16_vec());
+
+        let mut arena = DeviceArena::new(0, 16 * 1024 * 1024).unwrap();
+        let proj_u2 = raw_u2.upload(&mut arena, &stream, &staging).unwrap();
+        let proj_u4 = raw_u4.upload(&mut arena, &stream, &staging).unwrap();
+        assert!(matches!(proj_u2, LinearProj::MarlinW2A16 { .. }));
+        assert!(matches!(proj_u4, LinearProj::MarlinW4A16 { .. }));
+        let scale_bytes = n * (if group == k { 1 } else { k / group }) * 2;
+        assert_eq!(proj_u2.byte_footprint(), (n * k / 4) + scale_bytes);
+        assert_eq!(proj_u4.byte_footprint(), (n * k / 2) + scale_bytes);
+
+        for m in [1, 4, 8, 16, 32, 64] {
+            let input: Vec<u16> = (0..m * k)
+                .map(|i| f32_to_f16(((i * 11) % 53) as f32 / 16.0 - 1.5))
+                .collect();
+            let x = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+            x.copy_from_host(&input, &stream).unwrap();
+            let y_u2 = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+            let y_u4 = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+            let ex = stream.exec(0, 0);
+            proj_u2
+                .forward(&ex, &cublas, locks.addr(), 65536, x.addr(), y_u2.addr(), m)
+                .unwrap();
+            proj_u4
+                .forward(&ex, &cublas, locks.addr(), 65536, x.addr(), y_u4.addr(), m)
+                .unwrap();
+            let mut out_u2 = vec![0u16; m * n];
+            let mut out_u4 = vec![0u16; m * n];
+            y_u2.copy_to_host(&mut out_u2, &stream).unwrap();
+            y_u4.copy_to_host(&mut out_u4, &stream).unwrap();
+            assert_eq!(
+                out_u2, out_u4,
+                "0-ULP mismatch for MarlinW2A16 vs dilated MarlinW4A16 at M={m}, N={n}, K={k}, group={group}"
+            );
+        }
+    }
+
+    // Also test unaligned Hadamard U2B2 padding + mixed U2B2+U4B8 row concatenation.
+    let (n, k, group, block) = (70, 192, 64, 64);
+    let words_per_row = k / 16;
+    let groups_per_row = k / group;
+    let raw_u2 = RawLinearHost::U2B2NMajor {
+        packed: (0..n * words_per_row)
+            .map(|i| 0x1b1b_1b1bu32.wrapping_add((i as u32) * 0x0101_0101))
+            .collect(),
+        scales: (0..n * groups_per_row)
+            .map(|i| f32_to_f16(((i % 13) as f32 + 1.0) / 16.0))
+            .collect(),
+        n,
+        k,
+        group_size: group,
+    };
+    let raw_u4 = raw_u2.slice_rows(0, n).into_u4b8_if_u2b2();
+    let had_u2 = RawLinearHost::Hadamard {
+        inner: Box::new(raw_u2.slice_rows(0, n)),
+        block_size: block,
+    };
+    let had_u4 = RawLinearHost::Hadamard {
+        inner: Box::new(raw_u4.slice_rows(0, n)),
+        block_size: block,
+    };
+    let mut arena = DeviceArena::new(0, 16 * 1024 * 1024).unwrap();
+    let proj_had_u2 = had_u2.upload(&mut arena, &stream, &staging).unwrap();
+    let proj_had_u4 = had_u4.upload(&mut arena, &stream, &staging).unwrap();
+    let LinearProj::Hadamard {
+        inner: inner_u2, ..
+    } = &proj_had_u2
+    else {
+        panic!("expected Hadamard");
+    };
+    assert!(matches!(**inner_u2, LinearProj::MarlinW2A16 { .. }));
+
+    for m in [1, 5, 16] {
+        let input: Vec<u16> = (0..m * k)
+            .map(|i| f32_to_f16(((i * 7) % 37) as f32 / 16.0 - 1.0))
+            .collect();
+        let x = DeviceBuffer::alloc(0, input.len() * 2).unwrap();
+        x.copy_from_host(&input, &stream).unwrap();
+        let y_u2 = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        let y_u4 = DeviceBuffer::alloc(0, m * n * 2).unwrap();
+        let scratch =
+            DeviceBuffer::alloc(0, proj_had_u2.input_transform_workspace_bytes(m).unwrap())
+                .unwrap();
+        let ex = stream.exec(scratch.addr(), scratch.len_bytes);
+        proj_had_u2
+            .forward(&ex, &cublas, locks.addr(), 65536, x.addr(), y_u2.addr(), m)
+            .unwrap();
+        proj_had_u4
+            .forward(&ex, &cublas, locks.addr(), 65536, x.addr(), y_u4.addr(), m)
+            .unwrap();
+        let mut out_u2 = vec![0u16; m * n];
+        let mut out_u4 = vec![0u16; m * n];
+        y_u2.copy_to_host(&mut out_u2, &stream).unwrap();
+        y_u4.copy_to_host(&mut out_u4, &stream).unwrap();
+        assert_eq!(out_u2, out_u4, "Hadamard U2B2 vs U4B8 mismatch at M={m}");
+    }
+
+    // Mixed U2B2 + U4B8 row fusion preserves lossless U4B8 representation.
+    let mixed =
+        RawLinearHost::concat_rows(&[raw_u2.slice_rows(0, 32), raw_u4.slice_rows(32, 64)]).unwrap();
+    assert!(matches!(
+        mixed,
+        RawLinearHost::U4B8NMajor { n: 64, k: 192, .. }
+    ));
+    assert_eq!(mixed.to_f16_vec(), raw_u2.slice_rows(0, 64).to_f16_vec());
+}

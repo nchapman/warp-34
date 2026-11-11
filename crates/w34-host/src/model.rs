@@ -10,12 +10,12 @@ use crate::cuda::{
     prepare_execution_plan,
 };
 use crate::loader::{
-    LayerKind, ModelConfig, QuantScheme, SafetensorsArchive, dequant_u4_zp_n_major_to_f16,
-    dequant_u4b8_n_major_to_f16, dequant_u8b128_n_major_to_f16, marlin_permute_scales_from_n_major,
-    marlin_permute_zero_points_from_n_major, resolve_hf_model_dir,
-    transpose_gptq_qweight_k4_n_to_n_major, transpose_gptq_qweight_k8_n_to_n_major,
-    unpack_awq_qweight_k_n8_to_n_major, unpack_awq_qzeros_kg_n8_to_n_major,
-    validate_static_gptq_g_idx,
+    LayerKind, ModelConfig, QuantScheme, SafetensorsArchive, dequant_u2b2_n_major_to_f16,
+    dequant_u4_zp_n_major_to_f16, dequant_u4b8_n_major_to_f16, dequant_u8b128_n_major_to_f16,
+    marlin_permute_scales_from_n_major, marlin_permute_zero_points_from_n_major,
+    repack_u2b2_to_u4b8, resolve_hf_model_dir, transpose_gptq_qweight_k4_n_to_n_major,
+    transpose_gptq_qweight_k8_n_to_n_major, unpack_awq_qweight_k_n8_to_n_major,
+    unpack_awq_qzeros_kg_n8_to_n_major, validate_static_gptq_g_idx,
 };
 use crate::radix::{MambaRadixCache, PlannedCheckpoint, ReqRadixState};
 use crate::scheduler::{SchedulerConfig, SchedulerV1};

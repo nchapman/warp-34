@@ -1172,49 +1172,69 @@ impl Qwen3_5ModelRank {
                 }
                 "I32" | "U32" => {
                     let is_expert = name.contains(".experts.");
-                    let skinny_dequant = if !is_expert
+                    if is_expert
                         && info.shape.len() == 2
                         && (name.ends_with(".weight_packed") || name.ends_with(".qweight"))
                     {
                         let base_name = name
                             .trim_end_matches(".weight_packed")
                             .trim_end_matches(".qweight");
-                        cfg.quant.for_linear(base_name).map(|t_quant| {
-                            let t_bits = t_quant.bits();
-                            let t_pf = if t_bits == 8 { 4usize } else { pack_factor };
-                            let (n, k) = if t_quant.is_awq_packing() && name.ends_with(".qweight") {
-                                (info.shape[1] * 8, info.shape[0])
-                            } else if name.ends_with(".qweight") {
-                                (info.shape[1], info.shape[0] * t_pf)
-                            } else {
-                                (info.shape[0], info.shape[1] * t_pf)
-                            };
-                            let (local_n, local_k) = if is_replicated {
-                                (n, k)
-                            } else if is_col_sharded {
-                                (n, k.div_ceil(tp_size))
-                            } else {
-                                (n.div_ceil(tp_size), k)
-                            };
-                            let marlin_ok = (local_n % 64 == 0 && local_k % 128 == 0)
-                                || (local_n % 128 == 0 && local_k % 64 == 0);
-                            let gs = t_quant.group_size_or(local_k);
-                            let gs_ok = ((t_quant.is_channelwise() && t_bits == 8)
-                                || matches!(gs, 32 | 64 | 128))
-                                && (gs == 0 || local_k.is_multiple_of(gs));
-                            if !marlin_ok || !gs_ok {
-                                Some(n * k * 2)
-                            } else {
-                                None
-                            }
-                        })
+                        let mult = cfg
+                            .quant
+                            .for_linear(base_name)
+                            .map(|t_quant| if t_quant.bits() == 2 { 2usize } else { 1usize })
+                            .unwrap_or(1);
+                        (info.len_bytes as usize).saturating_mul(mult)
                     } else {
-                        Ok(None)
-                    };
-                    match skinny_dequant {
-                        Ok(Some(bytes)) => bytes,
-                        Ok(None) => info.len_bytes as usize,
-                        Err(_) => (info.len_bytes as usize).saturating_mul(4),
+                        let skinny_dequant = if !is_expert
+                            && info.shape.len() == 2
+                            && (name.ends_with(".weight_packed") || name.ends_with(".qweight"))
+                        {
+                            let base_name = name
+                                .trim_end_matches(".weight_packed")
+                                .trim_end_matches(".qweight");
+                            cfg.quant.for_linear(base_name).map(|t_quant| {
+                                let t_bits = t_quant.bits();
+                                let t_pf = match t_bits {
+                                    2 => 16usize,
+                                    8 => 4usize,
+                                    _ => pack_factor,
+                                };
+                                let (n, k) =
+                                    if t_quant.is_awq_packing() && name.ends_with(".qweight") {
+                                        (info.shape[1] * 8, info.shape[0])
+                                    } else if name.ends_with(".qweight") {
+                                        (info.shape[1], info.shape[0] * t_pf)
+                                    } else {
+                                        (info.shape[0], info.shape[1] * t_pf)
+                                    };
+                                let (local_n, local_k) = if is_replicated {
+                                    (n, k)
+                                } else if is_col_sharded {
+                                    (n, k.div_ceil(tp_size))
+                                } else {
+                                    (n.div_ceil(tp_size), k)
+                                };
+                                let marlin_ok = (local_n % 64 == 0 && local_k % 128 == 0)
+                                    || (local_n % 128 == 0 && local_k % 64 == 0);
+                                let gs = t_quant.group_size_or(local_k);
+                                let gs_ok = (t_quant.is_channelwise()
+                                    || matches!(gs, 32 | 64 | 128))
+                                    && (gs == 0 || local_k.is_multiple_of(gs));
+                                if !marlin_ok || !gs_ok {
+                                    Some(n * k * 2)
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            Ok(None)
+                        };
+                        match skinny_dequant {
+                            Ok(Some(bytes)) => bytes,
+                            Ok(None) => info.len_bytes as usize,
+                            Err(_) => (info.len_bytes as usize).saturating_mul(4),
+                        }
                     }
                 }
                 _ => info.len_bytes as usize,
