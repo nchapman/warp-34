@@ -301,10 +301,15 @@ impl Qwen3_5ModelRank {
         } else {
             0
         };
+        let local_vocab_for_scratch = if self.lm_head.is_some() {
+            self.local_vocab_size
+        } else {
+            0
+        };
         scratch::token_capacity_up_to(
             self.scratch_arena.capacity(),
             self.cfg.hidden_size,
-            self.local_vocab_size,
+            local_vocab_for_scratch,
             max_num_seqs,
             max_chunks,
             |tokens| {

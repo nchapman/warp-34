@@ -347,13 +347,6 @@ fn build_code_readout_queries(
     reverse_options: bool,
 ) -> Result<Vec<CodeReadoutPreparedQuery>, DecisionError> {
     let media_prefix = build_media_prefix_tokens(tokenizer, media)?;
-    let special_token_strs: Vec<String> = tokenizer
-        .get_added_tokens_decoder()
-        .into_values()
-        .filter_map(|t| {
-            (t.special && (t.content.contains('<') || t.content.contains('>'))).then_some(t.content)
-        })
-        .collect();
 
     if config.style == CodeReadoutStyle::D3 && config.state_once {
         let prefix_str = build_d3_state_prefix(&req.context, &req.fields, config.header_v1);
@@ -402,6 +395,18 @@ fn build_code_readout_queries(
 
     let mut queries = Vec::with_capacity(req.fields.len());
     let mut longest = 0usize;
+    let special_token_strs: Vec<String> = if config.style == CodeReadoutStyle::Glide {
+        tokenizer
+            .get_added_tokens_decoder()
+            .into_values()
+            .filter_map(|t| {
+                (t.special && (t.content.contains('<') || t.content.contains('>')))
+                    .then_some(t.content)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let d3_prefix_ids = if config.style == CodeReadoutStyle::D3 {
         let prefix_str = build_d3_state_prefix(&req.context, &req.fields, config.header_v1);
         let prefix_enc = tokenizer

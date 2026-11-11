@@ -388,6 +388,29 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
         assert!(resp1["answers"]["severity"]["score"].is_i64());
         assert!(resp1["answers"]["severity"]["expected_level"].is_f64());
 
+        // Verify order_passes=2 forward+reverse combined radix wave and measure warm latency.
+        let mut glide_req_p2 = glide_req.clone();
+        glide_req_p2["order_passes"] = json!(2);
+        let t_glide = std::time::Instant::now();
+        let resp_p2 = client
+            .post(format!("{base_url}/v1/systemone"))
+            .json(&glide_req_p2)
+            .send()
+            .await
+            .unwrap();
+        let glide_p2_ms = t_glide.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(resp_p2.status().as_u16(), 200);
+        let resp2: Value = resp_p2.json().await.unwrap();
+        assert!(
+            resp2["usage"]["cached_tokens"].as_u64().unwrap() > 0,
+            "expected MambaRadixCache reuse across GLiDE order_passes=2 sub-queries, got: {}",
+            resp2["usage"]
+        );
+        eprintln!(
+            "[bench] GLiDE 4B (midloop 2x, 3 questions, order_passes=2 => 6 queries): {:.2} ms (cached_tokens={})",
+            glide_p2_ms, resp2["usage"]["cached_tokens"]
+        );
+
         // Verify direct uncached hidden tap (`prefix_cap = Some(0)`) matches HTTP response.
         let (_, glide_batch) =
             prepare_decision_batch(&glide_profile, &tokenizer, 4096, &glide_req).unwrap();
@@ -506,6 +529,56 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
         assert!(
             (p1 - p2).abs() > 1e-6,
             "visual input change must perturb state_once + prefix_bidir d3 readout: {p1} vs {p2}"
+        );
+        // Benchmark warm text-only d3 state_once + prefix_bidir (order_passes=1 and order_passes=2).
+        let d3_text_req = |passes: u64| {
+            json!({
+                "state": {
+                    "incident": "Primary PostgreSQL cluster in us-east-1 reported WAL archiver stall.",
+                    "replica_lag_gb": 42,
+                    "disk_pct": 96
+                },
+                "order_passes": passes,
+                "questions": {
+                    "q1": {"type": "noul", "instructions": "Escalate to DBA?"},
+                    "q2": {"type": "noul", "instructions": "Failover immediately?"},
+                    "q3": {"type": "choice", "instructions": "Runbook?", "criteria": {"wal": "Clear WAL", "noop": "Wait"}},
+                    "q4": {"type": "score", "instructions": "Severity?", "criteria": ["Low", "Med", "High"]}
+                }
+            })
+        };
+        let _ = client
+            .post(format!("{base_url}/v1/systemone"))
+            .json(&d3_text_req(1))
+            .send()
+            .await
+            .unwrap();
+        let t_d3_1 = std::time::Instant::now();
+        let r_d3_1 = client
+            .post(format!("{base_url}/v1/systemone"))
+            .json(&d3_text_req(1))
+            .send()
+            .await
+            .unwrap();
+        let d3_p1_ms = t_d3_1.elapsed().as_secs_f64() * 1000.0;
+        let status_d3_1 = r_d3_1.status().as_u16();
+        let body_d3_1 = r_d3_1.text().await.unwrap();
+        assert_eq!(status_d3_1, 200, "r_d3_1 failed: {body_d3_1}");
+
+        let t_d3_2 = std::time::Instant::now();
+        let r_d3_2 = client
+            .post(format!("{base_url}/v1/systemone"))
+            .json(&d3_text_req(2))
+            .send()
+            .await
+            .unwrap();
+        let d3_p2_ms = t_d3_2.elapsed().as_secs_f64() * 1000.0;
+        let status_d3_2 = r_d3_2.status().as_u16();
+        let body_d3_2 = r_d3_2.text().await.unwrap();
+        assert_eq!(status_d3_2, 200, "r_d3_2 failed: {body_d3_2}");
+        eprintln!(
+            "[bench] d3 4B state_once+prefix_bidir (4 questions): order_passes=1 {:.2} ms, order_passes=2 {:.2} ms",
+            d3_p1_ms, d3_p2_ms
         );
         *tp1_pair_sink.lock().unwrap() = Some((b1, b2));
     }));

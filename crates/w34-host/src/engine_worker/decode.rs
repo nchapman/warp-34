@@ -46,18 +46,27 @@ fn capture_decision_tap(
         }) => {
             let chunk_start = s.ctx_len_before;
             let chunk_end = chunk_start + slice_len;
-            let mut read_err = None;
+            let mut target_slots = Vec::new();
+            let mut batch_rows = Vec::new();
             for (p_idx, &pos) in positions.iter().enumerate() {
                 if (chunk_start..chunk_end).contains(&pos) {
-                    match engine.read_norm_hidden_row_f32(tok_off + (pos - chunk_start)) {
-                        Ok(row) => captured[p_idx] = Some(row),
-                        Err(e) => {
-                            read_err = Some(WorkerError::Cuda(e));
-                            break;
-                        }
-                    }
+                    target_slots.push(p_idx);
+                    batch_rows.push(tok_off + (pos - chunk_start));
                 }
             }
+            let read_err = if !batch_rows.is_empty() {
+                match engine.read_norm_hidden_rows_f32(&batch_rows) {
+                    Ok(rows) => {
+                        for (p_idx, row) in target_slots.into_iter().zip(rows) {
+                            captured[p_idx] = Some(row);
+                        }
+                        None
+                    }
+                    Err(e) => Some(WorkerError::Cuda(e)),
+                }
+            } else {
+                None
+            };
             if (read_err.is_some() || s.is_final_prefill_chunk)
                 && let Some(DecisionReadoutTap::HiddenPositions {
                     mut captured, tx, ..

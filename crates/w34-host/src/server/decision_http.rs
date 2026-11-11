@@ -47,17 +47,16 @@ fn shared_mamba_branch_hint<'a>(
     (aligned >= 64 && aligned < first.len()).then_some(aligned)
 }
 
-async fn run_one_candidate_query(
-    s: Arc<OpenAiServerState>,
-    prompt: Vec<i32>,
-    images: Vec<crate::vision::PreprocessedImage>,
-    cands: Vec<i32>,
-    branch_hint: Option<usize>,
+type SubmittedDecisionQuery = (
+    crate::engine_worker::GenerationStream,
+    tokio::sync::oneshot::Receiver<
+        Result<crate::engine_worker::DecisionTapOutput, crate::engine_worker::WorkerError>,
+    >,
+);
+
+async fn await_candidate_query(
+    (mut stream, rx): SubmittedDecisionQuery,
 ) -> Result<(Vec<f64>, usize), ApiError> {
-    let (mut stream, rx) = s
-        .worker
-        .submit_decision_candidate_logits_with_images(prompt, images, cands, branch_hint)
-        .map_err(worker_api_err)?;
     let tap = rx
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
@@ -87,26 +86,23 @@ async fn run_one_candidate_query(
     }
 }
 
-async fn run_one_hidden_query(
+async fn run_one_candidate_query(
     s: Arc<OpenAiServerState>,
     prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
-    positions: Vec<usize>,
-    prefix_cap: Option<usize>,
-    prefix_bidir_len: Option<usize>,
+    cands: Vec<i32>,
     branch_hint: Option<usize>,
-) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
-    let (mut stream, rx) = s
+) -> Result<(Vec<f64>, usize), ApiError> {
+    let sub = s
         .worker
-        .submit_decision_hidden_positions_with_images(
-            prompt,
-            images,
-            positions,
-            prefix_cap,
-            prefix_bidir_len,
-            branch_hint,
-        )
+        .submit_decision_candidate_logits_with_images(prompt, images, cands, branch_hint)
         .map_err(worker_api_err)?;
+    await_candidate_query(sub).await
+}
+
+async fn await_hidden_query(
+    (mut stream, rx): SubmittedDecisionQuery,
+) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
     let tap = rx
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
@@ -136,6 +132,29 @@ async fn run_one_hidden_query(
     }
 }
 
+async fn run_one_hidden_query(
+    s: Arc<OpenAiServerState>,
+    prompt: Vec<i32>,
+    images: Vec<crate::vision::PreprocessedImage>,
+    positions: Vec<usize>,
+    prefix_cap: Option<usize>,
+    prefix_bidir_len: Option<usize>,
+    branch_hint: Option<usize>,
+) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+    let sub = s
+        .worker
+        .submit_decision_hidden_positions_with_images(
+            prompt,
+            images,
+            positions,
+            prefix_cap,
+            branch_hint,
+            prefix_bidir_len,
+        )
+        .map_err(worker_api_err)?;
+    await_hidden_query(sub).await
+}
+
 async fn run_candidate_queries_radix_shared(
     s: &Arc<OpenAiServerState>,
     queries: Vec<(Vec<i32>, Vec<i32>)>,
@@ -153,115 +172,141 @@ async fn run_candidate_queries_radix_shared(
     results.push(run_one_candidate_query(s.clone(), p0, images.to_vec(), c0, branch0).await?);
 
     for wave in rest.chunks(8) {
-        let mut handles = Vec::with_capacity(wave.len());
+        let mut submitted = Vec::with_capacity(wave.len());
         for (p, c) in wave.iter().cloned() {
-            let st = s.clone();
-            let imgs = images.to_vec();
-            handles.push(tokio::spawn(async move {
-                run_one_candidate_query(st, p, imgs, c, None).await
-            }));
+            submitted.push(
+                s.worker
+                    .submit_decision_candidate_logits_with_images(p, images.to_vec(), c, None)
+                    .map_err(worker_api_err)?,
+            );
         }
-        for h in handles {
-            let out = h
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))??;
-            results.push(out);
+        for sub in submitted {
+            results.push(await_candidate_query(sub).await?);
         }
     }
     Ok(results)
 }
 
-async fn run_code_readout_queries(
+async fn run_code_readout_queries_raw(
     s: &Arc<OpenAiServerState>,
-    head: &crate::decision::CodeReadoutHead,
-    fields: &[crate::decision::DecisionField],
     queries: Vec<crate::decision::CodeReadoutPreparedQuery>,
     images: &[crate::vision::PreprocessedImage],
-) -> Result<(Vec<Vec<f64>>, usize, usize), ApiError> {
+) -> Result<(Vec<Vec<f32>>, usize, usize), ApiError> {
     if queries.is_empty() {
         return Ok((Vec::new(), 0, 0));
     }
     let mut input_tokens = 0usize;
     let mut cached_tokens = 0usize;
+    let mut total_positions = 0usize;
     for q in &queries {
         input_tokens += q.token_ids.len();
+        total_positions += q.positions.len();
     }
 
     let mut raw_outs = Vec::with_capacity(queries.len());
-    let mut iter = queries.into_iter();
-    let q0 = iter.next().unwrap();
-    let rest: Vec<_> = iter.collect();
-    let branch0 = if q0.prefix_bidir_len.is_none() {
-        shared_mamba_branch_hint(
-            &q0.token_ids,
-            rest.iter().map(|q| q.token_ids.as_slice()),
-            q0.prefix_cap,
-        )
-    } else {
-        None
-    };
-    raw_outs.push(
-        run_one_hidden_query(
-            s.clone(),
-            q0.token_ids,
-            images.to_vec(),
-            q0.positions,
-            q0.prefix_cap,
-            q0.prefix_bidir_len,
-            branch0,
-        )
-        .await?,
-    );
-    for wave in rest.chunks(8) {
-        let mut handles = Vec::with_capacity(wave.len());
-        for q in wave.iter().cloned() {
-            let st = s.clone();
-            let imgs = images.to_vec();
-            handles.push(tokio::spawn(async move {
-                run_one_hidden_query(
-                    st,
-                    q.token_ids,
-                    imgs,
-                    q.positions,
-                    q.prefix_cap,
-                    q.prefix_bidir_len,
-                    None,
-                )
-                .await
-            }));
+    let all_bidir = queries.iter().all(|q| q.prefix_bidir_len.is_some());
+    if all_bidir {
+        // Bidirectional prefixes (`d3` `prefix_bidir = true`) do not donate into
+        // `MambaRadixCache`; submit all queries synchronously into the worker queue
+        // so `order_passes == 2` forward + reverse passes batch together in lockstep.
+        for wave in queries.chunks(8) {
+            let mut submitted = Vec::with_capacity(wave.len());
+            for q in wave.iter().cloned() {
+                submitted.push(
+                    s.worker
+                        .submit_decision_hidden_positions_with_images(
+                            q.token_ids,
+                            images.to_vec(),
+                            q.positions,
+                            q.prefix_cap,
+                            None,
+                            q.prefix_bidir_len,
+                        )
+                        .map_err(worker_api_err)?,
+                );
+            }
+            for sub in submitted {
+                raw_outs.push(await_hidden_query(sub).await?);
+            }
         }
-        for h in handles {
-            let out = h
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))??;
-            raw_outs.push(out);
+    } else {
+        let mut iter = queries.into_iter();
+        let q0 = iter.next().unwrap();
+        let rest: Vec<_> = iter.collect();
+        let branch0 = if q0.prefix_bidir_len.is_none() {
+            shared_mamba_branch_hint(
+                &q0.token_ids,
+                rest.iter().map(|q| q.token_ids.as_slice()),
+                q0.prefix_cap,
+            )
+        } else {
+            None
+        };
+        raw_outs.push(
+            run_one_hidden_query(
+                s.clone(),
+                q0.token_ids,
+                images.to_vec(),
+                q0.positions,
+                q0.prefix_cap,
+                q0.prefix_bidir_len,
+                branch0,
+            )
+            .await?,
+        );
+        for wave in rest.chunks(8) {
+            let mut submitted = Vec::with_capacity(wave.len());
+            for q in wave.iter().cloned() {
+                submitted.push(
+                    s.worker
+                        .submit_decision_hidden_positions_with_images(
+                            q.token_ids,
+                            images.to_vec(),
+                            q.positions,
+                            q.prefix_cap,
+                            None,
+                            q.prefix_bidir_len,
+                        )
+                        .map_err(worker_api_err)?,
+                );
+            }
+            for sub in submitted {
+                raw_outs.push(await_hidden_query(sub).await?);
+            }
         }
     }
 
-    let mut all_rows = Vec::with_capacity(fields.len());
+    let mut all_rows = Vec::with_capacity(total_positions);
     for (rows, cached) in raw_outs {
         cached_tokens += cached;
         all_rows.extend(rows);
     }
-    if all_rows.len() != fields.len() {
+    Ok((all_rows, input_tokens, cached_tokens))
+}
+
+fn project_code_readout_rows(
+    head: &crate::decision::CodeReadoutHead,
+    fields: &[crate::decision::DecisionField],
+    rows: &[Vec<f32>],
+) -> Result<Vec<Vec<f64>>, ApiError> {
+    if rows.len() != fields.len() {
         return Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
                 "code_readout returned {} hidden rows for {} fields",
-                all_rows.len(),
+                rows.len(),
                 fields.len()
             ),
         ));
     }
-
     let mut field_logits = Vec::with_capacity(fields.len());
-    for (field, h) in fields.iter().zip(all_rows.iter()) {
+    for (field, h) in fields.iter().zip(rows.iter()) {
         let logits = head
             .forward(h, field.keys.len())
             .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
         field_logits.push(logits);
     }
-    Ok((field_logits, input_tokens, cached_tokens))
+    Ok(field_logits)
 }
 
 async fn execute_systemone_json(
@@ -312,16 +357,27 @@ async fn execute_systemone_json(
             forward_queries,
             reverse_queries,
         } => {
-            let (fwd_logits, in_fwd, c_fwd) =
-                run_code_readout_queries(s, &head, &fields, forward_queries, &images).await?;
-            input_tokens += in_fwd;
-            cached_tokens += c_fwd;
-
             if let Some(rev_queries) = reverse_queries {
-                let (rev_logits, in_rev, c_rev) =
-                    run_code_readout_queries(s, &head, &fields, rev_queries, &images).await?;
-                input_tokens += in_rev;
-                cached_tokens += c_rev;
+                let mut combined = Vec::with_capacity(forward_queries.len() + rev_queries.len());
+                combined.extend(forward_queries);
+                combined.extend(rev_queries);
+                let (all_rows, in_toks, c_toks) =
+                    run_code_readout_queries_raw(s, combined, &images).await?;
+                input_tokens += in_toks;
+                cached_tokens += c_toks;
+                let n = fields.len();
+                if all_rows.len() != 2 * n {
+                    return Err(error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "code_readout order_passes=2 returned {} hidden rows for {} fields",
+                            all_rows.len(),
+                            n
+                        ),
+                    ));
+                }
+                let fwd_logits = project_code_readout_rows(&head, &fields, &all_rows[..n])?;
+                let rev_logits = project_code_readout_rows(&head, &fields, &all_rows[n..])?;
                 for (field, (fwd, rev)) in
                     fields.iter().zip(fwd_logits.iter().zip(rev_logits.iter()))
                 {
@@ -333,6 +389,11 @@ async fn execute_systemone_json(
                     answers.insert(field.name.clone(), ans);
                 }
             } else {
+                let (all_rows, in_toks, c_toks) =
+                    run_code_readout_queries_raw(s, forward_queries, &images).await?;
+                input_tokens += in_toks;
+                cached_tokens += c_toks;
+                let fwd_logits = project_code_readout_rows(&head, &fields, &all_rows)?;
                 for (field, logits) in fields.iter().zip(fwd_logits.iter()) {
                     let ans =
                         crate::decision::answer_from_logits(field, logits, temperature, conf_kind)

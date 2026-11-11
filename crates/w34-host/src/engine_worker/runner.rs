@@ -235,7 +235,11 @@ fn coalesce_idle_burst(
             }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
             Err(mpsc::error::TryRecvError::Empty) => {
-                let quiet_cap = if prev_active_peak >= 2 {
+                let all_decision_taps =
+                    !requests.is_empty() && requests.values().all(|r| r.decision_tap.is_some());
+                let quiet_cap = if all_decision_taps {
+                    std::time::Duration::from_micros(100)
+                } else if prev_active_peak >= 2 {
                     std::time::Duration::from_micros(3500)
                 } else if requests.len() <= 1 {
                     if spec_active {

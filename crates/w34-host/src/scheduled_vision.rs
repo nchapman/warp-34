@@ -162,7 +162,11 @@ impl ScheduledVision {
             take = bidir_end - start;
         }
         let end = start + take;
-        let planned = seq.radix_state.plan_checkpoints(take);
+        let planned = if seq.prefix_bidir_len.is_some() {
+            Vec::new()
+        } else {
+            seq.radix_state.plan_checkpoints(take)
+        };
         let slice = ScheduledReqSlice {
             req_id: seq.req_id,
             is_prefill_chunk: true,
