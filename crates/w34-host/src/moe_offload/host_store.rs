@@ -210,8 +210,8 @@ impl HostExpertStore {
             .filter(|q| *q != QuantScheme::Unquantized)
             .unwrap_or_else(|| quant.clone());
         require(
-            expert_quant.symmetric_gptq_u4_group_size() == Some(layout.group_size),
-            "host expert store requires symmetric 4-bit GPTQ/AutoRound/CompressedTensors W4A16",
+            expert_quant.symmetric_gptq_u2_or_u4_group_size() == Some(layout.group_size),
+            "host expert store requires symmetric 2-bit/4-bit GPTQ/AutoRound/CompressedTensors W2A16/W4A16",
         )?;
         let bytes = layout
             .stride

@@ -1098,6 +1098,31 @@ impl Qwen3_5ModelRank {
         Ok(())
     }
 
+    fn fused_row_siblings(base_name: &str) -> Option<(&str, &'static [&'static str])> {
+        for (suffix, group) in [
+            (".self_attn.q_proj", &["q_proj", "k_proj", "v_proj"][..]),
+            (".self_attn.k_proj", &["q_proj", "k_proj", "v_proj"][..]),
+            (".self_attn.v_proj", &["q_proj", "k_proj", "v_proj"][..]),
+            (
+                ".linear_attn.in_proj_qkv",
+                &["in_proj_qkv", "in_proj_z"][..],
+            ),
+            (".linear_attn.in_proj_z", &["in_proj_qkv", "in_proj_z"][..]),
+            (".linear_attn.in_proj_b", &["in_proj_b", "in_proj_a"][..]),
+            (".linear_attn.in_proj_a", &["in_proj_b", "in_proj_a"][..]),
+            (".mlp.gate_proj", &["gate_proj", "up_proj"][..]),
+            (".mlp.up_proj", &["gate_proj", "up_proj"][..]),
+            (".shared_expert.gate_proj", &["gate_proj", "up_proj"][..]),
+            (".shared_expert.up_proj", &["gate_proj", "up_proj"][..]),
+        ] {
+            if base_name.ends_with(suffix) {
+                let stem_end = base_name.rfind('.').unwrap_or(base_name.len());
+                return Some((&base_name[..stem_end], group));
+            }
+        }
+        None
+    }
+
     pub(super) fn estimate_weight_arena_bytes(
         cfg: &ModelConfig,
         archive: &SafetensorsArchive,
@@ -1223,6 +1248,54 @@ impl Qwen3_5ModelRank {
                                     && (gs == 0 || local_k.is_multiple_of(gs));
                                 if !marlin_ok || !gs_ok {
                                     Some(n * k * 2)
+                                } else if let Some((parent, group)) =
+                                    Self::fused_row_siblings(base_name)
+                                {
+                                    let mut dequant_f16 = false;
+                                    let mut widen_w2_to_w4 = false;
+                                    for sib in group {
+                                        let sib_name = format!("{parent}.{sib}");
+                                        let sib_has_packed = archive
+                                            .resolve_name(&format!("{sib_name}.weight_packed"))
+                                            .is_some()
+                                            || archive
+                                                .resolve_name(&format!("{sib_name}.qweight"))
+                                                .is_some();
+                                        let sib_has_f16 = archive
+                                            .resolve_name(&format!("{sib_name}.weight"))
+                                            .is_some();
+                                        if !sib_has_packed && sib_has_f16 {
+                                            dequant_f16 = true;
+                                            break;
+                                        }
+                                        let Ok(sib_quant) = cfg.quant.for_linear(&sib_name) else {
+                                            dequant_f16 = true;
+                                            break;
+                                        };
+                                        if sib_quant == t_quant {
+                                            continue;
+                                        }
+                                        if matches!(t_bits, 2 | 4)
+                                            && matches!(sib_quant.bits(), 2 | 4)
+                                            && !t_quant.expects_zero_points()
+                                            && !sib_quant.expects_zero_points()
+                                            && sib_quant.group_size_or(local_k) == gs
+                                        {
+                                            if t_bits == 2 && sib_quant.bits() == 4 {
+                                                widen_w2_to_w4 = true;
+                                            }
+                                        } else {
+                                            dequant_f16 = true;
+                                            break;
+                                        }
+                                    }
+                                    if dequant_f16 {
+                                        Some(n * k * 2)
+                                    } else if widen_w2_to_w4 {
+                                        Some(n * k / 2)
+                                    } else {
+                                        None
+                                    }
                                 } else {
                                     None
                                 }

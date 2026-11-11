@@ -800,7 +800,7 @@ fn marlin_w2a16_and_hadamard_w2a16_match_dilated_w4a16_zero_ulp() {
     let groups_per_row = k / group;
     let raw_u2 = RawLinearHost::U2B2NMajor {
         packed: (0..n * words_per_row)
-            .map(|i| 0x1b1b_1b1bu32.wrapping_add((i as u32) * 0x0101_0101))
+            .map(|i| 0x1b1b_1b1bu32.wrapping_add((i as u32).wrapping_mul(0x0101_0101)))
             .collect(),
         scales: (0..n * groups_per_row)
             .map(|i| f32_to_f16(((i % 13) as f32 + 1.0) / 16.0))

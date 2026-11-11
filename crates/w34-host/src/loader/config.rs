@@ -123,6 +123,20 @@ impl QuantScheme {
             _ => None,
         }
     }
+
+    /// Returns the group size if this scheme uses symmetric 2-bit (`U2B2`) or 4-bit (`U4B8`)
+    /// packing compatible with `ExpertPackLayout` (where `U2B2` is dilated losslessly to `U4B8`).
+    pub fn symmetric_gptq_u2_or_u4_group_size(&self) -> Option<usize> {
+        match self {
+            Self::CompressedTensors {
+                num_bits: 2 | 4,
+                group_size,
+                symmetric: true,
+                ..
+            } if *group_size > 0 => Some(*group_size),
+            _ => self.symmetric_gptq_u4_group_size(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1516,7 +1530,7 @@ impl ModelConfig {
         }
         let expert_quant = self.routed_expert_quant_scheme();
         let group_size = expert_quant
-            .symmetric_gptq_u4_group_size()
+            .symmetric_gptq_u2_or_u4_group_size()
             .unwrap_or_else(|| expert_quant.group_size_or(32));
         crate::moe_offload::ExpertPackLayout::new(
             self.moe_intermediate_size,
@@ -1550,7 +1564,7 @@ impl ModelConfig {
             && self.moe_expert_pack_layout().is_some()
             && ((self
                 .routed_expert_quant_scheme()
-                .symmetric_gptq_u4_group_size()
+                .symmetric_gptq_u2_or_u4_group_size()
                 .is_some()
                 && self.routed_expert_total_bytes() > TIERED_MOE_MIN_TOTAL_EXPERT_BYTES)
                 || self.is_qwen4_exp())
