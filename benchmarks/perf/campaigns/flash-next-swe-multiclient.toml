@@ -11,6 +11,16 @@ warmup_requests = 1
 timeout_s = 300
 max_inflight = 8
 
+[presets.quick]
+cases = ["smoke-warmup", "swe-c4-shared"]
+repetitions = 1
+[presets.full]
+cases = ["smoke-warmup", "swe-c4-shared", "swe-c4-unique", "swe-c8-burst"]
+repetitions = 1
+[presets.release]
+cases = ["smoke-warmup", "swe-c4-shared", "swe-c4-unique", "swe-c8-burst"]
+repetitions = 3
+
 [engine_defaults]
 support = "supported"
 cohort = "flash-next-swe-multiclient-sm86"

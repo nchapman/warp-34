@@ -98,7 +98,7 @@ pub(super) fn require_healthy_host_compute<'a>(
     }
 }
 
-fn run_loop(
+pub(super) fn run_loop(
     engine: &mut Qwen3_5Engine,
     config: SchedulerConfig,
     receiver: &mut Receiver<Request>,
@@ -189,10 +189,12 @@ fn run_loop(
     }
     std::mem::swap(&mut engine.radix, &mut sched.radix);
     let ids: Vec<_> = requests.keys().copied().collect();
-    for id in ids {
-        release(engine, sched.cancel_request(id));
+    for id in &ids {
+        release(engine, sched.cancel_request(*id));
     }
-    if let Some(p) = &mut engine.speculative {
+    if !ids.is_empty()
+        && let Some(p) = &mut engine.speculative
+    {
         p.abort_scheduled();
     }
     std::mem::swap(&mut engine.radix, &mut sched.radix);

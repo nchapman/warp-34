@@ -111,7 +111,7 @@ depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "test", "oracle-che
 
 [tasks."perf-check"]
 description = "CPU-only tests and manifest validation for the independent performance suite"
-run = "cd benchmarks/perf && python3 -m unittest discover -s tests -v && python3 -m w34perf validate suite.toml"
+run = "cd benchmarks/perf && python3 -m unittest discover -s tests -v && python3 -m w34perf validate suite.toml && python3 -m w34perf validate campaigns/27b-swe-multiclient.toml && python3 -m w34perf validate campaigns/35b-swe-multiclient.toml && python3 -m w34perf validate campaigns/flash-next-swe-multiclient.toml"
 
 [tasks."quality-run"]
 description = "Run the sequential four-engine FP16-KV quality suite (defaults to 10 examples/task)"
@@ -154,14 +154,20 @@ run = """
 """
 
 [tasks."bench-all"]
-description = "Run multi-stage w34 bench (decode + radix + scheduler + vision) across plain, MTP, DFlash2, and 35B-A3B MoE"
+description = "Run multi-stage w34 bench (decode + radix + 2-turn multi-client scheduler + vision) across 4B, 27B, 35B-A3B MoE, and Qwen3.8-Flash-Next (plain, MTP-3, DFlash2)"
 depends = ["build"]
 run = """
-./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8
-./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8 --speculative mtp --mtp-k 3
-./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
-./target/release/w34 bench --model llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4 --tp 2 --stage decode --kv-format tq4 --kv-pages 128 --prompt-len 64 --gen-len 64
-./target/release/w34 bench --model llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4 --tp 2 --stage decode --kv-format tq4 --kv-pages 128 --prompt-len 64 --gen-len 64 --speculative mtp --mtp-k 3
+./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8
+./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8 --speculative mtp --mtp-k 3
+./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
+./target/release/w34 bench --offline --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8
+./target/release/w34 bench --offline --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative mtp --mtp-k 3
+./target/release/w34 bench --offline --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ
+./target/release/w34 bench --offline --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8
+./target/release/w34 bench --offline --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative mtp --mtp-k 3
+./target/release/w34 bench --offline --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8
+./target/release/w34 bench --offline --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative mtp --mtp-k 3
+./target/release/w34 bench --offline --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ
 """
 
 [tasks."profile-live"]

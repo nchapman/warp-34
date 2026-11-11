@@ -289,8 +289,18 @@ impl Qwen3_5Engine {
                 .ok_or_else(|| loader_err("model does not have a vision_config"))?;
             let archive = SafetensorsArchive::open(&self.model_dir)
                 .map_err(|_| loader_err("SafetensorsArchive::open for vision_encoder"))?;
+            self.ranks[0].device.make_current()?;
+            if self.ranks[0].device.mem_info()?.0 < 512 * 1024 * 1024 {
+                for rank in &mut self.ranks {
+                    rank.device.make_current()?;
+                    rank.decode_graph = None;
+                    rank.spec_verify_graph = None;
+                    rank.batched_decode_graphs.clear();
+                    rank.stream.synchronize()?;
+                }
+                self.ranks[0].device.make_current()?;
+            }
             let r0 = &self.ranks[0];
-            r0.device.make_current()?;
             let enc = crate::vision::Qwen3VisionEncoder::try_load(
                 &archive,
                 vcfg,
@@ -1056,6 +1066,17 @@ impl Qwen3_5Engine {
     ) -> Result<Vec<(Vec<i32>, usize)>> {
         if sched_cfg.page_size != 16 {
             return Err(loader_err("SchedulerConfig.page_size must be 16"));
+        }
+        if self.speculative.is_some() && self.ranks[0].state_pool.total_slots >= 12 {
+            let (results, _) =
+                crate::engine_worker::run_batch_in_place(self, prompts, max_new_tokens, sched_cfg)
+                    .map_err(|e| {
+                        super::loader_err_ctx(
+                            "run_batch_in_place failed in generate_batch_scheduled",
+                            e,
+                        )
+                    })?;
+            return Ok(results);
         }
         for rank in &self.ranks {
             let cap = rank.ordinary_prefill_token_capacity(sched_cfg.max_num_seqs)?;

@@ -1183,6 +1183,33 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
     engine_c4
         .enable_speculative(spec_cfg)
         .expect("enable Qwen4 MTP on c=4 EngineWorker");
+    let sched_c4_res = engine_c4
+        .generate_batch_scheduled(
+            &c4_prompts,
+            6,
+            SchedulerConfig {
+                chunk_prefill_size: 512,
+                max_num_seqs: 4,
+                ..SchedulerConfig::default()
+            },
+        )
+        .expect("generate_batch_scheduled on c=4 Qwen4 MTP engine");
+    for ((ids, _), expected) in sched_c4_res.iter().zip(&c4_expected) {
+        assert_eq!(
+            ids, expected,
+            "generate_batch_scheduled on Qwen4 MTP must match target greedy tokens"
+        );
+    }
+    assert!(
+        !engine_c4
+            .speculative
+            .as_ref()
+            .unwrap()
+            .last_accepted
+            .is_empty(),
+        "generate_batch_scheduled must execute speculative verification when speculative is enabled"
+    );
+    engine_c4.reset_all_states().unwrap();
     let worker_c4 = EngineWorker::start(
         engine_c4,
         SchedulerConfig {

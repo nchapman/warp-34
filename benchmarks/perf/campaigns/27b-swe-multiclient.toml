@@ -11,6 +11,16 @@ warmup_requests = 0
 max_inflight = 16
 timeout_s = 180
 
+[presets.quick]
+cases = ["smoke-warmup", "swe-c4-shared"]
+repetitions = 1
+[presets.full]
+cases = ["smoke-warmup", "swe-c4-shared", "swe-c4-unique", "swe-c8-burst"]
+repetitions = 1
+[presets.release]
+cases = ["smoke-warmup", "swe-c4-shared", "swe-c4-unique", "swe-c8-burst"]
+repetitions = 3
+
 [engine_defaults]
 support = "unverified"
 cohort = "27b-0df-identical-gptq-swe16k"
@@ -31,6 +41,27 @@ conv_state_dtype = "float16"
 kv_format = "fp16"
 speculation = "none"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-27b-tp2-plain"
+engine = "warp-34"
+version = "7bff273-dev"
+kv_format = "tq4"
+speculation = "none"
+cache_config = "TQ4 KV 8192 pages (131072 tokens) on 2x 3090 Ti TP=2, max-num-seqs 8, max-model-len 16384, plain"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --host 127.0.0.1 --port 18834"
+
+[[engines]]
+id = "warp34-27b-tp1-plain"
+engine = "warp-34"
+version = "7bff273-dev"
+gpu_count = 1
+gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
+parallelism = "single"
+kv_format = "tq4"
+speculation = "none"
+cache_config = "TQ4 KV 4096 pages (65536 tokens) on 1x 3090 Ti TP=1, max-num-seqs 4, max-model-len 16384, plain"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --host 127.0.0.1 --port 18834"
 
 [[engines]]
 id = "warp34-27b-tp2"

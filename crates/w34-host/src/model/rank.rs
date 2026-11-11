@@ -2026,7 +2026,15 @@ impl PrePoolModelRank {
             .saturating_add(req_kv_bytes);
         let effective_requested_state_slots =
             if cfg.uses_tiered_moe() && capacity.state_slots.is_some() {
-                let max_tiered_serving_slots = if tp_size >= 2 { 18 } else { 20 };
+                let max_tiered_serving_slots = if tp_size >= 2 {
+                    if capacity.native_mtp && default_pages.unwrap_or(0) < 2048 {
+                        16
+                    } else {
+                        18
+                    }
+                } else {
+                    20
+                };
                 requested_state_slots.min(max_tiered_serving_slots)
             } else {
                 requested_state_slots

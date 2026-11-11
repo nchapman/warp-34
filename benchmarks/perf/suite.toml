@@ -49,6 +49,160 @@ launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nc
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
+id = "warp34-4b-tp1-mtp3"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.5-4B-W4A16-GPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+weight_format = "GPTQ-int4"
+kv_format = "tq4"
+speculation = "mtp-3"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-4b-tp1-dflash2"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.5-4B-W4A16-GPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+weight_format = "GPTQ-int4"
+kv_format = "tq4"
+speculation = "dflash2"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-27b-tp1-mtp3"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "mtp-3"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-27b-tp1-dflash2"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "dflash2"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-27b-tp2-mtp3"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+gpu_count = 2
+parallelism = "tensor-2"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "mtp-3"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-27b-tp2-dflash2"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+gpu_count = 2
+parallelism = "tensor-2"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "dflash2"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-35b-tp1-mtp3"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "mtp-3"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-35b-tp2-mtp3"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+gpu_count = 2
+parallelism = "tensor-2"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "mtp-3"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 8192 --max-num-seqs 8 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-flash-tp1-mtp3"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "mtp-3"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 1 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-flash-tp1-dflash2"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "dflash2"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 1 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-flash-tp2-mtp3"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+gpu_count = 2
+parallelism = "tensor-2"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "mtp-3"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --speculative mtp --mtp-k 3 --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
+id = "warp34-flash-tp2-dflash2"
+engine = "warp-34"
+version = "unknown"
+model = "nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ"
+base_url = "http://127.0.0.1:8000/v1"
+gpu_count = 2
+parallelism = "tensor-2"
+weight_format = "HGPTQ-W4A16"
+kv_format = "tq4"
+speculation = "dflash2"
+launch_command = "CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ --tp 2 --speculative dflash2 --draft-model nchapman/Qwen3.8-Flash-Next-DFlash2-W4A16-HGPTQ --kv-format tq4 --kv-pages 4096 --max-num-seqs 4 --max-model-len 16384 --port 8000"
+request_overrides = {chat_template_kwargs = {enable_thinking = false}}
+
+[[engines]]
 id = "vllm-1-fp16"
 engine = "vllm"
 version = "0.31.0"
@@ -255,5 +409,35 @@ fixture = "fixtures/coding_agent.json"
 requests = 64
 concurrency = 16
 max_tokens = 256
+cache = "natural"
+think_time_s = 0.05
+
+[[cases]]
+id = "swe-c4-shared"
+kind = "agent_replay"
+fixture = "fixtures/open_swe_intact_16k.json"
+requests = 6
+concurrency = 4
+max_tokens = 192
+cache = "natural"
+think_time_s = 0.05
+
+[[cases]]
+id = "swe-c4-unique"
+kind = "agent_replay"
+fixture = "fixtures/open_swe_intact_16k.json"
+requests = 6
+concurrency = 4
+max_tokens = 192
+cache = "unique"
+think_time_s = 0.05
+
+[[cases]]
+id = "swe-c8-burst"
+kind = "agent_replay"
+fixture = "fixtures/open_swe_intact_16k.json"
+requests = 8
+concurrency = 8
+max_tokens = 192
 cache = "natural"
 think_time_s = 0.05

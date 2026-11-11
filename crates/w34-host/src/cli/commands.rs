@@ -169,15 +169,30 @@ pub(crate) fn run_bench(
         use_cuda_graph,
         ..
     } = options;
-    let mut engine = load_cli_engine(
-        &resolved_model,
-        tp,
-        policy,
-        kv_pages,
-        use_cuda_graph,
-        &spec_config,
-    )
-    .map_err(|e| e.to_string())?;
+    let mut engine = if matches!(bench_stage.as_str(), "scheduler" | "all") {
+        let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 512));
+        let state_slot_seqs = serve_state_slot_seqs(batch_size.max(8), spec_config.as_ref());
+        Qwen3_5Engine::load_for_serving_with_speculative(
+            &resolved_model,
+            tp,
+            policy,
+            pages,
+            use_cuda_graph,
+            state_slot_seqs,
+            spec_config.as_ref(),
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        load_cli_engine(
+            &resolved_model,
+            tp,
+            policy,
+            kv_pages,
+            use_cuda_graph,
+            &spec_config,
+        )
+        .map_err(|e| e.to_string())?
+    };
     let base_ids = engine
         .encode("The quick brown fox jumps over the lazy dog. ")
         .map_err(|e| e.to_string())?;
@@ -318,54 +333,14 @@ pub(crate) fn run_bench(
 
     let mut scheduler_summary = serde_json::Value::Null;
     if matches!(bench_stage.as_str(), "scheduler" | "all") {
-        engine.reset_all_states().map_err(|e| e.to_string())?;
-        let shared_prefix = make_prompt(64);
-        let s_gen = gen_len.clamp(4, 32);
-        let mut batch_prompts = Vec::with_capacity(batch_size);
-        for b in 0..batch_size {
-            let mut p = shared_prefix.clone();
-            for t in 0..16 {
-                p.push(base_ids[(b * 7 + t) % base_ids.len()]);
-            }
-            batch_prompts.push(p);
-        }
-        // Seed shared 64-token prefix into MambaRadixCache so batch exercises prefix sharing
-        let _ = engine
-            .generate_with_radix_cache(&batch_prompts[0], 2, 64, false)
-            .map_err(|e| e.to_string())?;
-        let sched_cfg = crate::scheduler::SchedulerConfig {
-            max_num_seqs: batch_size.min(8),
-            ..Default::default()
-        };
-        let t0 = std::time::Instant::now();
-        let batch_res = engine
-            .generate_batch_scheduled(&batch_prompts, s_gen, sched_cfg)
-            .map_err(|e| e.to_string())?;
-        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let total_prompt_tokens: usize = batch_prompts.iter().map(Vec::len).sum();
-        let total_cached_tokens: usize = batch_res.iter().map(|(_, c)| *c).sum();
-        let total_gen_tokens: usize = batch_res.iter().map(|(g, _)| g.len()).sum();
-        let aggregate_decode_tok_per_s = if wall_ms > 0.0 {
-            total_gen_tokens as f64 * 1000.0 / wall_ms
-        } else {
-            0.0
-        };
-        let total_tok_per_s = if wall_ms > 0.0 {
-            (total_prompt_tokens + total_gen_tokens) as f64 * 1000.0 / wall_ms
-        } else {
-            0.0
-        };
-        scheduler_summary = serde_json::json!({
-            "batch_size": batch_size,
-            "max_active_seqs": sched_cfg.max_num_seqs,
-            "total_prompt_tokens": total_prompt_tokens,
-            "total_cached_prefix_tokens": total_cached_tokens,
-            "radix_hit_rate": engine.radix.hit_rate(),
-            "total_gen_tokens": total_gen_tokens,
-            "wall_ms": wall_ms,
-            "aggregate_decode_tok_per_s": aggregate_decode_tok_per_s,
-            "total_tok_per_s": total_tok_per_s,
-        });
+        scheduler_summary = run_bench_scheduler_stage(
+            &mut engine,
+            &base_ids,
+            &make_prompt(64),
+            batch_size,
+            gen_len,
+            spec_config.as_ref(),
+        )?;
     }
 
     let mut vision_summary = serde_json::Value::Null;
@@ -495,6 +470,116 @@ pub(crate) fn run_bench(
             .map_err(|e| e.to_string())?;
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "cuda")]
+fn run_bench_scheduler_stage(
+    engine: &mut Qwen3_5Engine,
+    base_ids: &[i32],
+    shared_prefix: &[i32],
+    batch_size: usize,
+    gen_len: usize,
+    spec_config: Option<&crate::proposer::SpeculativeConfig>,
+) -> Result<serde_json::Value, String> {
+    engine.reset_all_states().map_err(|e| e.to_string())?;
+    let s_gen = gen_len.clamp(8, 32);
+    let mut batch_prompts = Vec::with_capacity(batch_size);
+    for b in 0..batch_size {
+        let mut p = shared_prefix.to_vec();
+        for t in 0..16 {
+            p.push(base_ids[(b * 7 + t) % base_ids.len()]);
+        }
+        batch_prompts.push(p);
+    }
+    // Seed shared 64-token prefix into MambaRadixCache so Turn 1 exercises shared-prefix hits.
+    let _ = engine
+        .generate_with_radix_cache(&batch_prompts[0], 2, 64, false)
+        .map_err(|e| e.to_string())?;
+    let max_spec_slots = engine
+        .speculative
+        .as_ref()
+        .map_or(8, |p| p.batch_slot_count().max(1));
+    let sched_cfg = crate::scheduler::SchedulerConfig {
+        max_num_seqs: batch_size.min(8).min(max_spec_slots),
+        ..Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let (turn1_res, stats1) =
+        crate::engine_worker::run_batch_in_place(engine, &batch_prompts, s_gen, sched_cfg)?;
+    let mut turn2_prompts = Vec::with_capacity(batch_size);
+    for (b, (p1, (gen1, _))) in batch_prompts.iter().zip(turn1_res.iter()).enumerate() {
+        let mut p2 = Vec::with_capacity(p1.len() + gen1.len() + 16);
+        p2.extend_from_slice(p1);
+        p2.extend_from_slice(gen1);
+        for t in 0..16 {
+            p2.push(base_ids[(b * 11 + t + 3) % base_ids.len()]);
+        }
+        turn2_prompts.push(p2);
+    }
+    let (turn2_res, stats2) =
+        crate::engine_worker::run_batch_in_place(engine, &turn2_prompts, s_gen, sched_cfg)?;
+    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let turn1_prompt_tokens: usize = batch_prompts.iter().map(Vec::len).sum();
+    let turn2_prompt_tokens: usize = turn2_prompts.iter().map(Vec::len).sum();
+    let total_prompt_tokens = turn1_prompt_tokens + turn2_prompt_tokens;
+    let turn1_cached_tokens: usize = turn1_res.iter().map(|(_, c)| *c).sum();
+    let turn2_cached_tokens: usize = turn2_res.iter().map(|(_, c)| *c).sum();
+    let total_cached_tokens = turn1_cached_tokens + turn2_cached_tokens;
+    if turn2_cached_tokens < batch_size * 64 {
+        return Err(format!(
+            "scheduler benchmark: expected >= {} cached tokens on Turn 2 continuation, got {}",
+            batch_size * 64,
+            turn2_cached_tokens
+        ));
+    }
+    let total_gen_tokens: usize = turn1_res.iter().map(|(g, _)| g.len()).sum::<usize>()
+        + turn2_res.iter().map(|(g, _)| g.len()).sum::<usize>();
+    let verify_rounds = stats1
+        .verify_rounds
+        .load(std::sync::atomic::Ordering::Relaxed)
+        + stats2
+            .verify_rounds
+            .load(std::sync::atomic::Ordering::Relaxed);
+    let accepted_drafts = stats1
+        .accepted_drafts
+        .load(std::sync::atomic::Ordering::Relaxed)
+        + stats2
+            .accepted_drafts
+            .load(std::sync::atomic::Ordering::Relaxed);
+    if spec_config.is_some() && verify_rounds == 0 {
+        return Err(
+            "scheduler benchmark: speculative mode enabled but executed 0 scheduled verify rounds"
+                .into(),
+        );
+    }
+    let mean_accepted_drafts =
+        (verify_rounds > 0).then(|| accepted_drafts as f64 / verify_rounds as f64);
+    let aggregate_decode_tok_per_s = if wall_ms > 0.0 {
+        total_gen_tokens as f64 * 1000.0 / wall_ms
+    } else {
+        0.0
+    };
+    let total_tok_per_s = if wall_ms > 0.0 {
+        (total_prompt_tokens + total_gen_tokens) as f64 * 1000.0 / wall_ms
+    } else {
+        0.0
+    };
+    Ok(serde_json::json!({
+        "batch_size": batch_size,
+        "max_active_seqs": sched_cfg.max_num_seqs,
+        "turns": 2,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_cached_prefix_tokens": total_cached_tokens,
+        "turn2_cached_prefix_tokens": turn2_cached_tokens,
+        "radix_hit_rate": engine.radix.hit_rate(),
+        "total_gen_tokens": total_gen_tokens,
+        "verify_rounds": verify_rounds,
+        "accepted_drafts": accepted_drafts,
+        "mean_accepted_drafts": mean_accepted_drafts,
+        "wall_ms": wall_ms,
+        "aggregate_decode_tok_per_s": aggregate_decode_tok_per_s,
+        "total_tok_per_s": total_tok_per_s,
+    }))
 }
 
 #[cfg(feature = "cuda")]

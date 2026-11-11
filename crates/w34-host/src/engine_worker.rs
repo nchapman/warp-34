@@ -737,6 +737,113 @@ impl Drop for EngineWorker {
     }
 }
 
+/// Synchronous batch result returned by [`run_batch_in_place`]: per-prompt
+/// `(generated_tokens, cached_prefix_tokens)` pairs and accumulated [`WorkerStats`].
+pub type BatchInPlaceOutput = (Vec<(Vec<i32>, usize)>, Arc<WorkerStats>);
+
+/// Executes a batch of `prompts` synchronously on the calling thread through the
+/// production [`EngineWorker`] tick loop (`SchedulerV1` + `MambaRadixCache` +
+/// `mtp_batch_slots` + `DFlash2` / `MTP` speculative verification), returning
+/// `(generated_tokens, cached_prefix_tokens)` for each prompt in submission order
+/// along with the accumulated [`WorkerStats`].
+pub fn run_batch_in_place(
+    engine: &mut Qwen3_5Engine,
+    prompts: &[Vec<i32>],
+    max_new_tokens: usize,
+    config: SchedulerConfig,
+) -> Result<BatchInPlaceOutput, String> {
+    if config.page_size != 16 {
+        return Err("SchedulerConfig.page_size must be 16".into());
+    }
+    if max_new_tokens == 0 {
+        return Err("max_new_tokens must be positive in run_batch_in_place".into());
+    }
+    if prompts.iter().any(Vec::is_empty) {
+        return Err("empty prompt in generate_batch_scheduled".into());
+    }
+    let mut clamped_cfg = config;
+    if engine.cfg.uses_tiered_moe()
+        && clamped_cfg.chunk_prefill_size == 2048
+        && clamped_cfg.max_num_batched_tokens == 2048
+    {
+        clamped_cfg.max_num_batched_tokens = 6144;
+        clamped_cfg.chunk_prefill_size = 6144;
+    }
+    for rank in &engine.ranks {
+        let cap = rank
+            .ordinary_prefill_token_capacity(clamped_cfg.max_num_seqs)
+            .map_err(|e| e.to_string())?;
+        clamped_cfg.clamp_for_token_capacity(cap);
+    }
+
+    let stats = Arc::new(WorkerStats::default());
+    let shutdown = AtomicBool::new(false);
+    let mut results = Vec::with_capacity(prompts.len());
+    // `enqueue` admits up to 32 in-flight requests per wave.
+    for wave in prompts.chunks(32) {
+        let (sender, mut receiver) = mpsc::channel(wave.len().max(1));
+        let mut streams = Vec::with_capacity(wave.len());
+        for prompt in wave {
+            let (output, events) = generation_channel(max_new_tokens.max(64) + 16);
+            let cached_tokens = Arc::new(AtomicU64::new(0));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let params = SamplingParams {
+                temperature: 0.0,
+                top_k: 1,
+                max_tokens: max_new_tokens,
+                ignore_eos: true,
+                stop_token_ids: Vec::new(),
+                eos_token_ids: Vec::new(),
+                ..SamplingParams::default()
+            };
+            let sampler = SamplerV1::new(params, prompt, None);
+            sender
+                .try_send(Request {
+                    lifecycle: None,
+                    prompt: prompt.clone(),
+                    images: Vec::new(),
+                    vision: None,
+                    reserved_pages: 0,
+                    cached_tokens: cached_tokens.clone(),
+                    sampler,
+                    output,
+                    terminal: events.terminal.clone(),
+                    cancelled: cancelled.clone(),
+                    max_prefix_lookup_len: None,
+                    mamba_branching_seqlen: None,
+                    decision_tap: None,
+                })
+                .map_err(|e| format!("failed to enqueue batch request: {e}"))?;
+            streams.push((events, cached_tokens));
+        }
+        drop(sender);
+        let mut requests = HashMap::new();
+        self::runner::run_loop(
+            engine,
+            clamped_cfg,
+            &mut receiver,
+            &mut requests,
+            &shutdown,
+            &stats,
+        );
+        for (mut events, cached_atomic) in streams {
+            let mut gen_ids = Vec::with_capacity(max_new_tokens);
+            while let Ok(ev) = events.receiver.try_recv() {
+                if let GenerationEvent::Token { id, .. } = ev {
+                    gen_ids.push(id);
+                }
+            }
+            let cached = match events.terminal.get() {
+                Some(GenerationEvent::Finished { cached_tokens, .. }) => *cached_tokens,
+                Some(GenerationEvent::Error(e)) => return Err(e.to_string()),
+                _ => cached_atomic.load(Ordering::Acquire) as usize,
+            };
+            results.push((gen_ids, cached));
+        }
+    }
+    Ok((results, stats))
+}
+
 fn kv_format_name(engine: &Qwen3_5Engine) -> String {
     use w34_kernels::ffi::{
         W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4,

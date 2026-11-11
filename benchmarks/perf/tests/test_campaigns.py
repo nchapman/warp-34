@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class CampaignTests(unittest.TestCase):
     def test_completion_campaigns_and_all_presets_plan_without_network(self):
         for name in ('27b-completion', '27b-kv-spec-completion', '27b-capacity-completion',
+                     '27b-swe-multiclient', '35b-swe-multiclient', 'flash-next-swe-multiclient',
                      'flash-next-serving', 'flash-next-hgptq', 'flash-next-longctx'):
             cfg = load(ROOT / 'campaigns' / (name + '.toml'))
             for tier in ('quick', 'full', 'release'):
@@ -25,6 +26,35 @@ class CampaignTests(unittest.TestCase):
                     self.assertTrue(engines)
                     self.assertEqual({c['id'] for c in selected}, set(cases))
                     self.assertEqual(len(coverage), len(cfg['engines']) * len(cases))
+
+    def test_primary_suite_and_swe_multiclient_campaigns_cover_all_models_and_modes(self):
+        suite = load(ROOT / 'suite.toml')
+        w34_engines = [e for e in suite['engines'] if e['engine'] == 'warp-34']
+        w34_models = {e['model'] for e in w34_engines}
+        for family in ('Qwen3.5-4B', 'Qwen3.8-27B', 'Qwen3.6-35B-A3B', 'Qwen3.8-Flash-Next'):
+            self.assertTrue(any(family in m for m in w34_models), f'missing {family} in suite.toml')
+        self.assertEqual({e['gpu_count'] for e in w34_engines}, {1, 2})
+        self.assertTrue({'none', 'mtp-3', 'dflash2'}.issubset({e['speculation'] for e in w34_engines}))
+        suite_cases = {c['id'] for c in suite['cases']}
+        self.assertTrue({'swe-c4-shared', 'swe-c4-unique', 'swe-c8-burst'}.issubset(suite_cases))
+
+        expected_modes = {
+            '27b-swe-multiclient': {'none', 'mtp-3', 'dflash2-m8'},
+            '35b-swe-multiclient': {'none', 'mtp-3'},
+            'flash-next-swe-multiclient': {'none', 'mtp-3', 'dflash2'},
+        }
+        for name, modes in expected_modes.items():
+            with self.subTest(campaign=name):
+                cfg = load(ROOT / 'campaigns' / (name + '.toml'))
+                w34 = [e for e in cfg['engines'] if e['engine'] == 'warp-34']
+                for tp in (1, 2):
+                    tp_modes = {e['speculation'] for e in w34 if e['gpu_count'] == tp}
+                    self.assertEqual(tp_modes, modes, f'{name} TP={tp} modes mismatch')
+                cases = {c['id']: c for c in cfg['cases']}
+                self.assertEqual(set(cases), {'smoke-warmup', 'swe-c4-shared', 'swe-c4-unique', 'swe-c8-burst'})
+                self.assertEqual(cases['swe-c4-shared']['concurrency'], 4)
+                self.assertEqual(cases['swe-c4-unique']['concurrency'], 4)
+                self.assertEqual(cases['swe-c8-burst']['concurrency'], 8)
 
     def test_capacity_calibration_identifies_current_fixture_and_increasing_lengths(self):
         fixture = ROOT / 'fixtures/quality-capacity.json'

@@ -1290,7 +1290,7 @@ impl DFlash2Rank {
         self.kv.layers.iter().map(|l| l.layout).collect()
     }
     pub fn batch_slot_count(&self) -> usize {
-        if self.ring_pages_dev_buf.is_some() || self.all_pages.len() >= 8192 {
+        if self.ring_pages_dev_buf.is_some() || self.all_pages.len() >= 4096 {
             crate::mtp::MAX_MTP_BATCH_SLOTS
         } else {
             4
