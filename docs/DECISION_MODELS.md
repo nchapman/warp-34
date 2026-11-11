@@ -121,5 +121,16 @@ Translates ordered-array or simplified decision payloads (`state` or `context`, 
 
 - `benchmarks/perf/fixtures/jevbench_public.json`: 128 single-question `/v1/systemone` items (`72` `original.jsonl` + `16` `easy.jsonl` + `40` `hard.jsonl`).
 - `benchmarks/perf/fixtures/jevbench_multiquestion.json`: 16 multi-question `/v1/systemone` requests (`4` questions per request = `64` decisions).
-- `benchmarks/perf/campaigns/decision-models.toml`: pinned profiles for `fastino/GLiDE-{0.8B,2B,9B,27B}`, `vllm-sr/d3-{flash,turbo,ultra}`, and `CausalLm` (`nchapman/Qwen3.5-4B-W4A16-GPTQ`, `nchapman/Qwen3.8-27B-W4A16-GPTQ`).
+- `benchmarks/perf/campaigns/decision-models.toml`: pinned profiles for `nchapman/GLiDE-{0.8B,2B,9B,27B}-W4A16-HGPTQ`, `nchapman/d3-{edge,lite,nano,mini,flash,turbo,ultra}-W4A16-HGPTQ` / `nchapman/d3-W4A16-HGPTQ`, `fastino/GLiDE-{0.8B,2B,9B,27B}`, `vllm-sr/d3-{flash,turbo,ultra}`, and `CausalLm` (`nchapman/Qwen3.5-4B-W4A16-GPTQ`, `nchapman/Qwen3.8-27B-W4A16-GPTQ`).
+
+### Verified JevBench Results on RTX 3090 Ti (`sm_86`)
+
+| Checkpoint | Profile & Features | JevBench Public (`128` items) | Public `c=1` / `c=16` (`dec/s`, `p50`) | JevBench MultiQ (`64` items) | MultiQ `c=1` / `c=8` (`dec/s`) |
+|---|---|---|---|---|---|
+| `nchapman/d3-edge-W4A16-HGPTQ` (`8216b11ee1`, `TP=1`) | `d3` `CodeReadout`, `noncausal_full_attention`, `W4A16-HGPTQ` + Vision (12L, 0.70 GB) | `90 / 128` (`70.31%`) | `149.9` (`3.91 ms`) / `232.1` | `46 / 64` (`71.88%`) | `341.0` / `399.0` |
+| `nchapman/d3-lite-W4A16-HGPTQ` (`91e438356c`, `TP=1`) | `d3` `CodeReadout`, `noncausal_full_attention`, `W4A16-HGPTQ` + Vision (24L, 0.83 GB) | `101 / 128` (`78.91%`) | `77.4` (`8.01 ms`) / `115.6` | `58 / 64` (`90.62%`) | `169.3` / `190.7` |
+| `nchapman/GLiDE-0.8B-W4A16-HGPTQ` (`7d9469893e`, `TP=1`) | `GLiDE` `CodeReadout`, `noncausal_full_attention`, `W4A16-HGPTQ` (24L, 0.78 GB) | `113 / 128` (`88.28%`) | `82.3` (`7.07 ms`) / `125.1` | `63 / 64` (`98.44%`) | `163.9` / `213.8` |
+| `nchapman/GLiDE-9B-W4A16-HGPTQ` (`11218cc42a`, `TP=1`) | `GLiDE` `CodeReadout`, `noncausal_full_attention` + `midloop` (`[[12,17],[18,23]], passes=2`), `W4A16-HGPTQ` (32L, 5.72 GB) | `124 / 128` (`96.88%`) | `9.0` (`43.95 ms`) / `9.8` | `64 / 64` (`100.00%`) | `15.5` / `15.7` |
+| `nchapman/d3-ultra-W4A16-HGPTQ` (`6a1f655fc7`, `TP=2`) | `d3` `CodeReadout`, `prefix_bidir` + `header-v1` + `temperature_by_questions`, `W4A16-HGPTQ` + Vision (64L, 15.77 GB) | `122 / 128` (`95.31%`) | `3.5` (`155.65 ms`) / `3.9` | `64 / 64` (`100.00%`) | `3.5` / `3.6` |
+
 

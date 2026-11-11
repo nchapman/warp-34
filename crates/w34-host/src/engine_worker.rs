@@ -305,6 +305,17 @@ impl EngineWorker {
                     {
                         clamped_cfg.max_num_batched_tokens = 6144;
                         clamped_cfg.chunk_prefill_size = 6144;
+                    } else if engine.cfg.requires_atomic_prefix_prefill()
+                        && clamped_cfg.chunk_prefill_size == 2048
+                        && clamped_cfg.max_num_batched_tokens == 2048
+                    {
+                        clamped_cfg.max_num_batched_tokens = 4096;
+                        clamped_cfg.chunk_prefill_size = 4096;
+                    }
+                    if let Some(comm) = &engine.tp2_comm {
+                        let tp_tok_cap =
+                            comm.max_stage_bytes_per_epoch / (engine.cfg.hidden_size.max(1) * 2);
+                        clamped_cfg.clamp_for_token_capacity(tp_tok_cap);
                     }
                     for rank in &engine.ranks {
                         match rank.ordinary_prefill_token_capacity(clamped_cfg.max_num_seqs) {
@@ -726,6 +737,16 @@ pub fn run_batch_in_place(
     {
         clamped_cfg.max_num_batched_tokens = 6144;
         clamped_cfg.chunk_prefill_size = 6144;
+    } else if engine.cfg.requires_atomic_prefix_prefill()
+        && clamped_cfg.chunk_prefill_size == 2048
+        && clamped_cfg.max_num_batched_tokens == 2048
+    {
+        clamped_cfg.max_num_batched_tokens = 4096;
+        clamped_cfg.chunk_prefill_size = 4096;
+    }
+    if let Some(comm) = &engine.tp2_comm {
+        let tp_tok_cap = comm.max_stage_bytes_per_epoch / (engine.cfg.hidden_size.max(1) * 2);
+        clamped_cfg.clamp_for_token_capacity(tp_tok_cap);
     }
     for rank in &engine.ranks {
         let cap = rank

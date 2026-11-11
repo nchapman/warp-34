@@ -630,12 +630,12 @@ pub fn plan_scratch_arena_bytes(
         && requested_kv_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
     {
         crate::scheduler::EXTREME_LONGCTX_SCRATCH_ARENA_BYTES
-    } else if tp_size == 1 && est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
-        crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES
-    } else if cfg.uses_tiered_moe()
+    } else if (cfg.uses_tiered_moe() || cfg.requires_atomic_prefix_prefill())
         && requested_kv_pages.unwrap_or(0) <= crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES
     {
         crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+    } else if tp_size == 1 && est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
+        crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES
     } else {
         crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES
     }

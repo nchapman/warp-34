@@ -282,7 +282,13 @@ impl Qwen3_5ModelRank {
 
     /// Maximum aligned ordinary prefill budget, including worst-case selected outputs.
     pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
-        let max_chunks = if self.cfg.uses_tiered_moe() { 96 } else { 32 };
+        let max_chunks = if self.cfg.uses_tiered_moe() {
+            96
+        } else if self.cfg.requires_atomic_prefix_prefill() {
+            64
+        } else {
+            32
+        };
         let has_active_midloop = self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
         let midloop_gdn_snap_bytes: usize =
             if has_active_midloop && let Some(first_st) = self.state_pool.layers.first() {

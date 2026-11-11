@@ -1724,6 +1724,14 @@ impl ModelConfig {
                 || self.is_qwen4_exp())
     }
 
+    /// Returns true when the checkpoint requires atomic (unsplit) prefix prefill
+    /// (`noncausal_full_attention`, `prefix_bidir`, or multi-pass `midloop`).
+    pub fn requires_atomic_prefix_prefill(&self) -> bool {
+        self.noncausal_full_attention
+            || self.prefix_bidir
+            || self.midloop.iter().any(|&(_, _, passes)| passes > 1)
+    }
+
     pub fn qsa_output_width(&self) -> usize {
         if self.uses_qsa() {
             self.indexer_budget + self.indexer_compress_ratio.saturating_sub(1)

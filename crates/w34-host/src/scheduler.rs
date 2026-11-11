@@ -490,7 +490,7 @@ impl SchedulerV1 {
             let start = seq.prefilled_tokens;
             let seq_noncausal = seq
                 .prefix_bidir_len
-                .is_some_and(|bidir_end| start < bidir_end);
+                .is_some_and(|bidir_end| start < bidir_end || seq.max_new_tokens <= 1);
             if let Some(expected_nc) = batch_noncausal
                 && seq_noncausal != expected_nc
             {
@@ -501,11 +501,15 @@ impl SchedulerV1 {
             // Align non-final chunks to `mamba_chunk_size = 64` boundaries so every
             // intermediate chunk ends on a valid `MambaRadixCache` checkpoint boundary,
             // except when `prefix_bidir_len` requires an atomic bidirectional prefix step
-            // before the causal question suffix.
+            // followed by an atomic question-block suffix step.
             let take = if let Some(bidir_end) = seq.prefix_bidir_len
-                && start < bidir_end
+                && (start < bidir_end || seq.max_new_tokens <= 1)
             {
-                let need = bidir_end.min(seq.prompt_tokens.len()) - start;
+                let need = if start < bidir_end {
+                    bidir_end.min(seq.prompt_tokens.len()) - start
+                } else {
+                    rem
+                };
                 if need == 0 || need > self.cfg.chunk_prefill_size || need > prefill_budget {
                     pending_prefills -= 1;
                     continue;

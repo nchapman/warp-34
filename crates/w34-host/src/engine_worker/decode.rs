@@ -119,15 +119,29 @@ fn alloc_prefill_checkpoint_slot(
     }
 }
 
-fn batch_is_noncausal_prefix_prefill(sched: &SchedulerV1, slices: &[ScheduledReqSlice]) -> bool {
+fn batch_is_noncausal_prefix_prefill(
+    sched: &SchedulerV1,
+    requests: &HashMap<u64, Request>,
+    slices: &[ScheduledReqSlice],
+) -> bool {
     let slice_is_bidir = |s: &ScheduledReqSlice| {
+        let single_pos_readout = requests.get(&s.req_id).is_none_or(|r| {
+            !matches!(
+                &r.decision_tap,
+                Some(DecisionReadoutTap::HiddenPositions { positions, .. }) if positions.len() > 1
+            )
+        });
         s.is_prefill_chunk
             && sched
                 .active
                 .iter()
                 .find(|seq| seq.req_id == s.req_id)
-                .and_then(|seq| seq.prefix_bidir_len)
-                .is_some_and(|bidir_end| s.ctx_len_before + s.query_tokens.len() <= bidir_end)
+                .is_some_and(|seq| {
+                    seq.prefix_bidir_len.is_some_and(|bidir_end| {
+                        s.ctx_len_before + s.query_tokens.len() <= bidir_end
+                            || (seq.max_new_tokens <= 1 && single_pos_readout)
+                    })
+                })
     };
     let noncausal = !slices.is_empty() && slices.iter().all(slice_is_bidir);
     debug_assert!(
@@ -273,7 +287,7 @@ pub(super) fn step_plain(
             (!s.is_prefill_chunk || s.is_final_prefill_chunk) && needs_vocab_logits
         })
         .collect();
-    let noncausal_override = batch_is_noncausal_prefix_prefill(sched, &slices);
+    let noncausal_override = batch_is_noncausal_prefix_prefill(sched, requests, &slices);
     let needs_gpu = slices.iter().enumerate().any(|(i, s)| {
         emit_mask[i] && {
             let r = &requests[&s.req_id];

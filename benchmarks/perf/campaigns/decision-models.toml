@@ -49,7 +49,119 @@ activation_dtype = "float16"
 conv_state_dtype = "float16"
 kv_format = "fp16"
 speculation = "none"
-cache_config = "256 FP16 pages; FP32 SSM; synchronous decision wave submission + 100us burst coalescing"
+cache_config = "2048 FP16 pages; FP32 SSM; synchronous decision wave submission + 100us burst coalescing"
+
+# ---------------------------------------------------------------------------
+# nchapman/GLiDE-*-W4A16-HGPTQ (CodeReadout, 4-bit HGPTQ, noncausal_full_attention + midloop on 9B/27B)
+# ---------------------------------------------------------------------------
+
+[[engines]]
+id = "warp34-glide-0_8b-hgptq-tp1"
+cohort = "glide-code-readout-hgptq"
+model = "nchapman/GLiDE-0.8B-W4A16-HGPTQ"
+model_revision = "7d9469893e6f37a3e02ce97950f1d5f5f92985ee"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/GLiDE-0.8B-W4A16-HGPTQ --revision 7d9469893e6f37a3e02ce97950f1d5f5f92985ee --tp 1 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-glide-2b-hgptq-tp1"
+cohort = "glide-code-readout-hgptq"
+model = "nchapman/GLiDE-2B-W4A16-HGPTQ"
+model_revision = "c676bd87f8118bdff6e7b3647a37275941cb70d3"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/GLiDE-2B-W4A16-HGPTQ --revision c676bd87f8118bdff6e7b3647a37275941cb70d3 --tp 1 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-glide-9b-hgptq-tp1"
+cohort = "glide-code-readout-hgptq"
+model = "nchapman/GLiDE-9B-W4A16-HGPTQ"
+model_revision = "11218cc42abd84f94d5e21a8e45d5f4e051eaebc"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/GLiDE-9B-W4A16-HGPTQ --revision 11218cc42abd84f94d5e21a8e45d5f4e051eaebc --tp 1 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-glide-27b-hgptq-tp2"
+cohort = "glide-code-readout-hgptq"
+gpu_count = 2
+parallelism = "tp2"
+model = "nchapman/GLiDE-27B-W4A16-HGPTQ"
+model_revision = "6057054c0b826965bfdfc70bf67cf2e442558956"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/GLiDE-27B-W4A16-HGPTQ --revision 6057054c0b826965bfdfc70bf67cf2e442558956 --tp 2 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+# ---------------------------------------------------------------------------
+# nchapman/d3-*-W4A16-HGPTQ (CodeReadout, 4-bit HGPTQ, noncausal_full_attention + prefix_bidir on turbo/ultra)
+# ---------------------------------------------------------------------------
+
+[[engines]]
+id = "warp34-d3-edge-hgptq-tp1"
+cohort = "d3-code-readout-hgptq"
+model = "nchapman/d3-edge-W4A16-HGPTQ"
+model_revision = "8216b11ee123107ea87aaf75789da86b9527700b"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/d3-edge-W4A16-HGPTQ --revision 8216b11ee123107ea87aaf75789da86b9527700b --tp 1 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-lite-hgptq-tp1"
+cohort = "d3-code-readout-hgptq"
+model = "nchapman/d3-lite-W4A16-HGPTQ"
+model_revision = "91e438356c20e98734eb1d59d8291b6808367ff0"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/d3-lite-W4A16-HGPTQ --revision 91e438356c20e98734eb1d59d8291b6808367ff0 --tp 1 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-nano-hgptq-tp1"
+cohort = "d3-code-readout-hgptq"
+model = "nchapman/d3-nano-W4A16-HGPTQ"
+model_revision = "c048c110b4d97760badf667dd7e11a8acdaace50"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/d3-nano-W4A16-HGPTQ --revision c048c110b4d97760badf667dd7e11a8acdaace50 --tp 1 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-mini-hgptq-tp1"
+cohort = "d3-code-readout-hgptq"
+model = "nchapman/d3-mini-W4A16-HGPTQ"
+model_revision = "7bc6cbeeed1eb8762e0971004f27995cdea0d6c0"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/d3-mini-W4A16-HGPTQ --revision 7bc6cbeeed1eb8762e0971004f27995cdea0d6c0 --tp 1 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-flash-hgptq-tp1"
+cohort = "d3-code-readout-hgptq"
+model = "nchapman/d3-flash-W4A16-HGPTQ"
+model_revision = "c00f2c61ceba665b7e84a0df80dd8a0470643182"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/d3-flash-W4A16-HGPTQ --revision c00f2c61ceba665b7e84a0df80dd8a0470643182 --tp 1 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-hgptq-tp2"
+cohort = "d3-code-readout-hgptq"
+gpu_count = 2
+parallelism = "tp2"
+model = "nchapman/d3-W4A16-HGPTQ"
+model_revision = "5d74bc57096114e3e0cc386f06d20060edefe4c3"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/d3-W4A16-HGPTQ --revision 5d74bc57096114e3e0cc386f06d20060edefe4c3 --tp 2 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-turbo-hgptq-tp2"
+cohort = "d3-code-readout-hgptq"
+gpu_count = 2
+parallelism = "tp2"
+model = "nchapman/d3-turbo-W4A16-HGPTQ"
+model_revision = "80bbd618700bd3473409a68646446fdfd8aa3ad1"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/d3-turbo-W4A16-HGPTQ --revision 80bbd618700bd3473409a68646446fdfd8aa3ad1 --tp 2 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-ultra-hgptq-tp2"
+cohort = "d3-code-readout-hgptq"
+gpu_count = 2
+parallelism = "tp2"
+model = "nchapman/d3-ultra-W4A16-HGPTQ"
+model_revision = "6a1f655fc792f36251805cb9df04d70ccd64544b"
+weight_format = "compressed-tensors-HGPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model nchapman/d3-ultra-W4A16-HGPTQ --revision 6a1f655fc792f36251805cb9df04d70ccd64544b --tp 2 --kv-format fp16 --kv-pages 2048 --host 127.0.0.1 --port 18034"
 
 # ---------------------------------------------------------------------------
 # fastino/GLiDE-* (CodeReadout, noncausal_full_attention + damped-Euler midloop on 9B/27B)
