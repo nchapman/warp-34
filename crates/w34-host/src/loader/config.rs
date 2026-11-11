@@ -1003,6 +1003,9 @@ impl ModelConfig {
                             ),
                         ));
                     }
+                    if prev_b != 4 && num_bits == 4 {
+                        chosen_linear = Some((num_bits, group_size, symmetric));
+                    }
                 } else {
                     chosen_linear = Some((num_bits, group_size, symmetric));
                 }
