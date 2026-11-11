@@ -24,7 +24,7 @@ const METADATA: &[&str] = &[
     "processor_config.json",
     "preprocessor_config.json",
     "video_preprocessor_config.json",
-    "joint_head_config.json",
+    "decision_config.json",
     "static_hot_cache_rankings.json",
     "runtime/static_hot_cache_rankings.json",
     "runtime/mtp-int4-g32/config.json",
@@ -78,11 +78,9 @@ pub(super) fn weight_files(dir: &Path, files: &BTreeSet<String>) -> io::Result<V
             "repository has no model.safetensors or model.safetensors.index.json; only Safetensors checkpoints are supported (not pickle, GGUF, or remote Python code)",
         ));
     }
-    // Decision heads are loaded separately from the backbone archive.
-    for name in ["head.safetensors", "joint_head.safetensors"] {
-        if files.contains(name) {
-            selected.insert(name.into());
-        }
+    // Decision readout heads are loaded separately from the backbone archive.
+    if files.contains("readout.safetensors") {
+        selected.insert("readout.safetensors".into());
     }
     // Embedded Qwen4 MTP INT4 draft checkpoint shards (when published inside the target repo).
     if files.contains("runtime/mtp-int4-g32/model.safetensors.index.json") {
@@ -207,10 +205,8 @@ pub(super) fn validate_checkpoint(
     validate_files(dir, &weight_files(dir, names)?)?;
     // Parse headers and check tensor bounds, without loading weights into RAM or touching CUDA.
     crate::loader::SafetensorsArchive::open(dir)?;
-    for name in ["head.safetensors", "joint_head.safetensors"] {
-        if names.contains(name) {
-            crate::loader::SafetensorsArchive::open(&dir.join(name))?;
-        }
+    if names.contains("readout.safetensors") {
+        crate::loader::SafetensorsArchive::open(&dir.join("readout.safetensors"))?;
     }
     Ok(())
 }

@@ -771,9 +771,24 @@ fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
 
     // Exercise `EngineWorker` + `OpenAiServerState` + `server::serve` HTTP routes in-process.
     engine
-        .set_decision_profile(crate::decision::DecisionModelProfile::Xor {
-            temperature: 1.0,
-            lev_noul_9_scale: false,
+        .set_decision_profile(crate::decision::DecisionModelProfile::CodeReadout {
+            head: std::sync::Arc::new(crate::decision::CodeReadoutHead {
+                hidden_size: h,
+                num_codes: 4,
+                weight: vec![0.01; 4 * h],
+                bias: Some(vec![0.1, 0.2, 0.0, -0.1]),
+            }),
+            config: crate::decision::CodeReadoutConfig {
+                style: crate::decision::CodeReadoutStyle::D3,
+                codes: vec!["A".into(), "B".into(), "C".into(), "D".into()],
+                temperature: 1.0,
+                temperature_by_questions: Vec::new(),
+                state_once: true,
+                prefix_bidir: true,
+                header_v1: true,
+                max_seq_len: 32768,
+                system_prompt: crate::decision::GLIDE_SYSTEM_PROMPT.to_owned(),
+            },
         })
         .unwrap();
     let state = crate::server::OpenAiServerState::new("synthetic-model".to_string(), engine);

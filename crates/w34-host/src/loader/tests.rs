@@ -1010,3 +1010,78 @@ fn test_safetensors_archive_rejects_truncated_and_out_of_bounds_headers() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_resolve_name_language_model_prefix_and_decision_config_midloop_validation() {
+    let tmp = std::env::temp_dir().join(format!("w34_lm_prefix_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let hdr = br#"{"language_model.layers.0.input_layernorm.weight":{"dtype":"F16","shape":[4],"data_offsets":[0,8]}}"#;
+    let mut bytes = (hdr.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(hdr);
+    bytes.extend_from_slice(&[0u8; 8]);
+    std::fs::write(tmp.join("model.safetensors"), &bytes).unwrap();
+
+    let archive = SafetensorsArchive::open(&tmp).unwrap();
+    assert_eq!(
+        archive.resolve_name("model.layers.0.input_layernorm.weight"),
+        Some("language_model.layers.0.input_layernorm.weight".to_string())
+    );
+
+    // Valid decision_config.json with midloop, noncausal_full_attention, prefix_bidir
+    std::fs::write(
+        tmp.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "hidden_size": 1024,
+            "num_hidden_layers": 24,
+            "vocab_size": 248320
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("decision_config.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "noncausal_full_attention": true,
+            "prefix_bidir": true,
+            "midloop": [[8, 13, 3], [16, 21, 2]]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let cfg = ModelConfig::from_dir(&tmp).unwrap();
+    assert!(cfg.noncausal_full_attention);
+    assert!(cfg.prefix_bidir);
+    assert_eq!(cfg.midloop, vec![(8, 13, 3), (16, 21, 2)]);
+
+    // Overlapping or out-of-range midloop rejected
+    std::fs::write(
+        tmp.join("decision_config.json"),
+        r#"{"midloop": [[8, 15, 2], [12, 18, 2]]}"#,
+    )
+    .unwrap();
+    assert!(ModelConfig::from_dir(&tmp).is_err());
+
+    std::fs::write(
+        tmp.join("decision_config.json"),
+        r#"{"midloop": [[8, 24, 2]]}"#,
+    )
+    .unwrap();
+    assert!(ModelConfig::from_dir(&tmp).is_err());
+
+    // PPLX v1.2 format_version=2 and joint_config.json rejected in ModelConfig::from_dir
+    std::fs::write(
+        tmp.join("decision_config.json"),
+        r#"{"format_version": 2, "format_id": "joint-question-inline-readout-v1"}"#,
+    )
+    .unwrap();
+    assert!(ModelConfig::from_dir(&tmp).is_err());
+    std::fs::remove_file(tmp.join("decision_config.json")).unwrap();
+
+    std::fs::write(tmp.join("joint_config.json"), "{}").unwrap();
+    assert!(ModelConfig::from_dir(&tmp).is_err());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

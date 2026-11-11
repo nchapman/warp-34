@@ -342,8 +342,11 @@ impl Qwen3_5MtpRank {
     /// Returns the online-quantized `MarlinW4A16` `draft_lm_head` copy when enabled, or
     /// falls back to borrowing `target.lm_head` (`vLLM` PR #59973 `quantized_lm_head_copy`).
     #[inline]
-    pub(crate) fn lm_head<'a>(&'a self, target: &'a Qwen3_5ModelRank) -> &'a LinearProj {
-        self.draft_lm_head.as_ref().unwrap_or(&target.lm_head)
+    pub(crate) fn lm_head<'a>(&'a self, target: &'a Qwen3_5ModelRank) -> Result<&'a LinearProj> {
+        self.draft_lm_head
+            .as_ref()
+            .or(target.lm_head.as_ref())
+            .ok_or_else(|| loader_err("target checkpoint has no lm_head"))
     }
 
     /// Returns `true` when this `MTP` rank owns an online-quantized `MarlinW4A16` copy of `target.lm_head`.
@@ -833,13 +836,14 @@ impl Qwen3_5MtpRank {
             None
         };
         let free_vram_post_mtp = target.device.mem_info().map_or(0, |(free, _)| free);
-        let (_draft_lm_head_arena, draft_lm_head) = if let LinearProj::DenseF16 {
-            weight_ptr,
-            size_n,
-            size_k,
-        } = target.lm_head
+        let (_draft_lm_head_arena, draft_lm_head) = if let Some(target_lm_head) = &target.lm_head
+            && let LinearProj::DenseF16 {
+                weight_ptr,
+                size_n,
+                size_k,
+            } = *target_lm_head
             && let Some((qweight_bytes, scales_bytes, arena_bytes)) =
-                plan_mtp_draft_lm_head_bytes(&target.lm_head, free_vram_post_mtp)
+                plan_mtp_draft_lm_head_bytes(target_lm_head, free_vram_post_mtp)
             && let Ok(mut arena) = DeviceArena::new(target.device.device_id, arena_bytes)
             && let Ok(b_q_weight_ptr) = arena.alloc_aligned(qweight_bytes)
             && let Ok(b_scales_ptr) = arena.alloc_aligned(scales_bytes)

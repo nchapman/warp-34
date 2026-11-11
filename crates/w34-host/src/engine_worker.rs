@@ -99,10 +99,6 @@ pub enum DecisionTapOutput {
         rows: Vec<Vec<f32>>,
         cached_tokens: usize,
     },
-    ClefLogits {
-        logits: Vec<Vec<f64>>,
-        cached_tokens: usize,
-    },
 }
 
 enum DecisionReadoutTap {
@@ -115,44 +111,21 @@ enum DecisionReadoutTap {
         captured: Vec<Option<Vec<f32>>>,
         tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, WorkerError>>,
     },
-    ClefJoint {
-        record: Arc<crate::clef::ClefEncodedRecord>,
-        gpu_state: Option<crate::clef::ClefDeviceRequestState>,
-        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, WorkerError>>,
-    },
 }
 
 impl DecisionReadoutTap {
     fn fail(self, error: WorkerError) {
         match self {
-            Self::CandidateLogits { tx, .. }
-            | Self::HiddenPositions { tx, .. }
-            | Self::ClefJoint { tx, .. } => {
+            Self::CandidateLogits { tx, .. } | Self::HiddenPositions { tx, .. } => {
                 let _ = tx.send(Err(error));
             }
         }
     }
 
-    fn recycle_into(self, engine: &mut Qwen3_5Engine) {
-        if let Self::ClefJoint {
-            gpu_state: Some(st),
-            ..
-        } = self
-        {
-            engine.clef_recycle_request(st);
-        }
-    }
+    fn recycle_into(self, _engine: &mut Qwen3_5Engine) {}
 
-    fn fail_and_recycle(self, engine: &mut Qwen3_5Engine, error: WorkerError) {
-        match self {
-            Self::ClefJoint { gpu_state, tx, .. } => {
-                if let Some(st) = gpu_state {
-                    engine.clef_recycle_request(st);
-                }
-                let _ = tx.send(Err(error));
-            }
-            other => other.fail(error),
-        }
+    fn fail_and_recycle(self, _engine: &mut Qwen3_5Engine, error: WorkerError) {
+        self.fail(error);
     }
 }
 
@@ -169,6 +142,7 @@ struct Request {
     cancelled: Arc<AtomicBool>,
     max_prefix_lookup_len: Option<usize>,
     mamba_branching_seqlen: Option<usize>,
+    prefix_bidir_len: Option<usize>,
     decision_tap: Option<DecisionReadoutTap>,
 }
 
@@ -549,6 +523,7 @@ impl EngineWorker {
             cancelled: cancelled.clone(),
             max_prefix_lookup_len: None,
             mamba_branching_seqlen: None,
+            prefix_bidir_len: None,
             decision_tap: None,
         })?;
         Ok(GenerationStream {
@@ -597,6 +572,7 @@ impl EngineWorker {
             images,
             None,
             mamba_branching_seqlen,
+            None,
             DecisionReadoutTap::CandidateLogits { token_ids, tx },
         )?;
         Ok((stream, rx))
@@ -621,6 +597,7 @@ impl EngineWorker {
             positions,
             max_prefix_lookup_len,
             mamba_branching_seqlen,
+            None,
         )
     }
 
@@ -631,6 +608,7 @@ impl EngineWorker {
         positions: Vec<usize>,
         max_prefix_lookup_len: Option<usize>,
         mamba_branching_seqlen: Option<usize>,
+        prefix_bidir_len: Option<usize>,
     ) -> Result<
         (
             GenerationStream,
@@ -645,38 +623,10 @@ impl EngineWorker {
             images,
             max_prefix_lookup_len,
             mamba_branching_seqlen,
+            prefix_bidir_len,
             DecisionReadoutTap::HiddenPositions {
                 positions,
                 captured,
-                tx,
-            },
-        )?;
-        Ok((stream, rx))
-    }
-
-    pub fn submit_decision_clef_with_images(
-        &self,
-        record: Arc<crate::clef::ClefEncodedRecord>,
-        images: Vec<crate::vision::PreprocessedImage>,
-    ) -> Result<
-        (
-            GenerationStream,
-            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
-        ),
-        WorkerError,
-    > {
-        let prompt = record.input_ids.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        // Clef JointSchemaHead cross-attends over every token [0..total_tokens], so disable
-        // radix prefix skipping (`max_prefix_lookup_len: Some(0)`).
-        let stream = self.submit_decision_internal(
-            prompt,
-            images,
-            Some(0),
-            None,
-            DecisionReadoutTap::ClefJoint {
-                record,
-                gpu_state: None,
                 tx,
             },
         )?;
@@ -689,6 +639,7 @@ impl EngineWorker {
         images: Vec<crate::vision::PreprocessedImage>,
         max_prefix_lookup_len: Option<usize>,
         mamba_branching_seqlen: Option<usize>,
+        prefix_bidir_len: Option<usize>,
         tap: DecisionReadoutTap,
     ) -> Result<GenerationStream, WorkerError> {
         if prompt.is_empty() {
@@ -721,6 +672,7 @@ impl EngineWorker {
             cancelled: cancelled.clone(),
             max_prefix_lookup_len,
             mamba_branching_seqlen,
+            prefix_bidir_len,
             decision_tap: Some(tap),
         })?;
         Ok(GenerationStream {
@@ -811,6 +763,7 @@ pub fn run_batch_in_place(
                     cancelled: cancelled.clone(),
                     max_prefix_lookup_len: None,
                     mamba_branching_seqlen: None,
+                    prefix_bidir_len: None,
                     decision_tap: None,
                 })
                 .map_err(|e| format!("failed to enqueue batch request: {e}"))?;
@@ -965,7 +918,7 @@ fn enqueue(
         .vision
         .as_ref()
         .map_or_else(|| prompt_tokens.clone(), |v| v.radix_key.clone());
-    let id = sched.submit_request_with_prefix_options(
+    let id = sched.submit_request_with_prefix_and_bidir(
         prompt_tokens,
         key,
         p.max_tokens,
@@ -976,6 +929,7 @@ fn enqueue(
         request.vision.is_some(),
         request.max_prefix_lookup_len,
         request.mamba_branching_seqlen,
+        request.prefix_bidir_len,
     );
     requests.insert(id, request);
 }

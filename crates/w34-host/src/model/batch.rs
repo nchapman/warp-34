@@ -629,6 +629,23 @@ impl Qwen3_5Engine {
         emit_mask: Option<&[bool]>,
         skip_host_greedy: bool,
     ) -> Result<Vec<Vec<i32>>> {
+        self.step_batch_slices_for_sampler_filtered_bidir(
+            slices,
+            rope_pos_deltas,
+            emit_mask,
+            skip_host_greedy,
+            false,
+        )
+    }
+
+    pub(crate) fn step_batch_slices_for_sampler_filtered_bidir(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+        emit_mask: Option<&[bool]>,
+        skip_host_greedy: bool,
+        noncausal_override: bool,
+    ) -> Result<Vec<Vec<i32>>> {
         if slices.is_empty() {
             return Ok(Vec::new());
         }
@@ -644,7 +661,8 @@ impl Qwen3_5Engine {
         }
         let all_emit = emit_mask.is_none_or(|m| m.iter().all(|&e| e));
         let max_pages = self.ranks[0].kv_pool.num_pages;
-        if all_emit
+        if !noncausal_override
+            && all_emit
             && let Some(bucket_b) = decode_graph_bucket(slices.len())
             && self.use_cuda_graph
             && self
@@ -860,7 +878,7 @@ impl Qwen3_5Engine {
         let total_tokens = flat_tokens.len();
         let flat_ids = if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
-            let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
+            let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r0.upload_batch_meta(
                 &flat_tokens,
                 &flat_positions,
                 &q_start_loc,
@@ -882,6 +900,9 @@ impl Qwen3_5Engine {
                 max_verify_tokens,
                 max_checkpoints_per_req,
             )?;
+            if noncausal_override {
+                attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
+            }
             r0.forward_selected_rows_maybe_skip_greedy(
                 tok_ptr,
                 pos_ptr,
@@ -923,7 +944,7 @@ impl Qwen3_5Engine {
             let (res0, peer_results) = std::thread::scope(|sc| {
                 let c0 = comm.clone();
                 let h0 = sc.spawn(move || -> Result<Vec<i32>> {
-                    let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
+                    let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r0.upload_batch_meta(
                         ft_ref,
                         fp_ref,
                         qs_ref,
@@ -945,6 +966,9 @@ impl Qwen3_5Engine {
                         max_verify_tokens,
                         max_checkpoints_per_req,
                     )?;
+                    if noncausal_override {
+                        attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
+                    }
                     r0.forward_selected_rows_maybe_skip_greedy(
                         tok_ptr,
                         pos_ptr,
@@ -961,28 +985,32 @@ impl Qwen3_5Engine {
                 for r_peer in peer_ranks {
                     let cp = comm.clone();
                     peer_handles.push(sc.spawn(move || -> Result<()> {
-                        let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r_peer.upload_batch_meta(
-                            ft_ref,
-                            fp_ref,
-                            qs_ref,
-                            cb_ref,
-                            sa_ref,
-                            bt_ref,
-                            ws_ref,
-                            si_ref,
-                            so_ref,
-                            hi_ref,
-                            sp_ref,
-                            cd_ref,
-                            co_ref,
-                            num_reqs,
-                            total_tokens,
-                            max_blocks_per_req,
-                            max_q_len,
-                            max_seq_len,
-                            max_verify_tokens,
-                            max_checkpoints_per_req,
-                        )?;
+                        let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r_peer
+                            .upload_batch_meta(
+                                ft_ref,
+                                fp_ref,
+                                qs_ref,
+                                cb_ref,
+                                sa_ref,
+                                bt_ref,
+                                ws_ref,
+                                si_ref,
+                                so_ref,
+                                hi_ref,
+                                sp_ref,
+                                cd_ref,
+                                co_ref,
+                                num_reqs,
+                                total_tokens,
+                                max_blocks_per_req,
+                                max_q_len,
+                                max_seq_len,
+                                max_verify_tokens,
+                                max_checkpoints_per_req,
+                            )?;
+                        if noncausal_override {
+                            attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
+                        }
                         let _ = r_peer.forward_selected_rows_maybe_skip_greedy(
                             tok_ptr,
                             pos_ptr,

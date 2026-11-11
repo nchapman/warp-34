@@ -155,6 +155,12 @@ impl ScheduledVision {
                 take = take.min(aligned_branch - start);
             }
         }
+        if let Some(bidir_end) = seq.prefix_bidir_len
+            && start < bidir_end
+            && start + take >= bidir_end
+        {
+            take = bidir_end - start;
+        }
         let end = start + take;
         let planned = seq.radix_state.plan_checkpoints(take);
         let slice = ScheduledReqSlice {
@@ -287,7 +293,10 @@ impl ScheduledVision {
             checkpoints: &checkpoints,
             emit_all_query_tokens: false,
         };
-        let result = engine.step_single_slice_with_mrope_and_vision(
+        let noncausal_prefix = seq
+            .prefix_bidir_len
+            .is_some_and(|bidir_end| end <= bidir_end);
+        let result = engine.step_single_slice_with_mrope_and_vision_bidir(
             &engine_slice,
             &positions,
             take as i32,
@@ -296,6 +305,7 @@ impl ScheduledVision {
             } else {
                 Some(&pointers)
             },
+            noncausal_prefix,
         );
         let mut sync_result = Ok(());
         for rank in &engine.ranks {

@@ -226,83 +226,6 @@ unsafe extern "C" {
         n_interm: i32,
     ) -> i32;
 
-    pub fn w34_clef_accum_spans_f16_to_f32(
-        ex: *const W34Exec,
-        chunk_normed_f16: *const c_void,
-        span_bounds: *const i32,
-        span_accum_f32: *mut f32,
-        chunk_start: i32,
-        chunk_len: i32,
-        num_spans: i32,
-        hidden_size: i32,
-    ) -> i32;
-
-    pub fn w34_clef_cast_f32_to_f16(
-        ex: *const W34Exec,
-        src_f32: *const f32,
-        dst_f16: *mut c_void,
-        num_elems: i64,
-    ) -> i32;
-
-    pub fn w34_clef_build_option_queries_f16(
-        ex: *const W34Exec,
-        ctx_proj_f16: *const c_void,
-        lex_proj_f16: *const c_void,
-        opt_q_proj_f16: *const c_void,
-        opt_q_idx: *const i32,
-        out_f16: *mut c_void,
-        total_opts: i32,
-        num_q: i32,
-        width: i32,
-    ) -> i32;
-
-    pub fn w34_clef_mha_attn_f16(
-        ex: *const W34Exec,
-        q_f16: *const c_void,
-        q_bias_f16: *const c_void,
-        kv_f16: *const c_void,
-        kv_bias_f16: *const c_void,
-        out_f16: *mut c_void,
-        q_len: i32,
-        m_len: i32,
-        heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
-    pub fn w34_clef_option_summaries_f16(
-        ex: *const W34Exec,
-        routed_opts_f16: *const c_void,
-        base_fields_f16: *const c_void,
-        q_opt_offsets: *const i32,
-        out_summaries_f16: *mut c_void,
-        num_q: i32,
-        total_opts: i32,
-        width: i32,
-    ) -> i32;
-
-    pub fn w34_clef_build_fields_f16(
-        ex: *const W34Exec,
-        base_fields_f16: *const c_void,
-        norm_summaries_f16: *const c_void,
-        global_proj_f16: *const c_void,
-        type_embed_f16: *const c_void,
-        q_types: *const i32,
-        out_fields_f16: *mut c_void,
-        num_q: i32,
-        width: i32,
-    ) -> i32;
-
-    pub fn w34_clef_build_residual_features_f16(
-        ex: *const W34Exec,
-        fields_f16: *const c_void,
-        options_normed_f16: *const c_void,
-        opt_q_idx: *const i32,
-        out_features_f16: *mut c_void,
-        total_opts: i32,
-        num_q: i32,
-        width: i32,
-    ) -> i32;
-
     pub fn w34_hc_init_streams_f16(
         ex: *const W34Exec,
         embed_in: *const c_void,
@@ -634,6 +557,15 @@ unsafe extern "C" {
         dst_f16: *mut c_void,
         src_f16: *const c_void,
         num_elems: i64,
+    ) -> i32;
+
+    pub fn w34_midloop_damped_euler_f16(
+        ex: *const W34Exec,
+        dst_f16: *mut c_void,
+        x_prev_f16: *const c_void,
+        g_x_f16: *const c_void,
+        num_elems: i64,
+        alpha: f32,
     ) -> i32;
 
     pub fn w34_moe_gpu_lru_update_and_pull(

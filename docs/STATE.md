@@ -1,5 +1,21 @@
 # warp-34 — Session Orientation & Current State
 
+## Unified `CodeReadout` (`GLiDE` + `vllm-sr/d3`) & `CausalLm` Decision Models (`#12`)
+
+- **Simplified `DecisionModelProfile` & Removed Legacy Gen-1 Decision Profiles (`decision.rs`, `decision/batch.rs`, `decision/scoring.rs`, `server/decision_http.rs`):**
+  - Replaced `Clef`, `Kev`, `Nimble`, `OpenJev`, and `Xor`/`Lev` profiles and removed `crates/w34-host/src/clef*` and `crates/w34-kernels/csrc/ops/op_clef.cu` (`w34_clef_*`) in favor of two unified profiles:
+    - **`DecisionModelProfile::CodeReadout`** for `fastino/GLiDE-*` (`GLiDE-mini` 0.8B, `GLiDE-small` 2B, `GLiDE-base` 4B, `GLiDE-large` 9B) and `vllm-sr/d3-*` (`d3-flash` 0.8B, `d3-turbo` 4B, `d3-ultra` 9B), projecting post-final-`GemmaRMSNorm` hidden states via `CodeReadoutHead` (`readout.weight` `[num_codes, hidden_size]` + optional `readout.bias` from `readout.safetensors`).
+    - **`DecisionModelProfile::CausalLm`** fallback for standard Qwen 3.5 / 3.6 / 3.8 generative scoring (`Tev1` ChatML prompt + candidate-token `lm_head` logits).
+  - Added generic `order_passes: 1 | 2` forward+reverse option permutation probability averaging across both `CodeReadout` and `CausalLm`.
+  - Added explicit fail-fast rejection for deferred `perplexity-ai/pplx-decider-v1.2` (`joint_config.json`, `format_version >= 2`, `format_id == "joint-question-inline-readout-v1"`).
+- **Loader, Hub, & Optional `lm_head` Support (`hub/files.rs`, `loader.rs`, `loader/config.rs`, `model/rank.rs`, `mtp.rs`, `dflash.rs`):**
+  - Updated Hub download allowlist for `decision_config.json` and `readout.safetensors`.
+  - Added `language_model.*` bare prefix resolution in `SafetensorsArchive::resolve_name` alongside `model.language_model.*` and `model.layers.*`.
+  - Made `Qwen3_5ModelRank::lm_head` optional (`Option<LinearProj>`), skipping vocab head allocation when `tie_word_embeddings == false` and no `lm_head` tensor is present in the checkpoint, and suppressing `selected_rows` (`emit_mask = false`) on `HiddenPositions`-only prefill batches.
+- **Engine Execution Seams (`noncausal_full_attention`, `prefix_bidir` State-Once, & `midloop` Damped-Euler Recurrence):**
+  - Added `w34_midloop_damped_euler_f16` in `op_norms_rope_act.cu` (registered in `prepare_execution_plan()` warmup) and implemented `midloop` damped-Euler recurrence (`h <- x_i + (1 / passes) * (f(x_i) - x_i)`) in `model/forward.rs` with GDN `conv_state`/`ssm_state` snapshot/restore on intermediate passes and input norm re-evaluation on loop wrap and loop exit.
+  - Wired `noncausal_full_attention` and `prefix_bidir_len` (`W34_ATTN_MASK_SYMMETRIC_WINDOW` with `sliding_window = 0` on full-attention layers, exact token boundary splitting in `SchedulerV1::schedule_step` and `ScheduledVision::step_prefill`, and disabled `MambaRadixCache` prefix donation for bidirectional prefixes).
+
 ## Multi-client Open-SWE-Traces 27B, 35B-A3B & Flash-Next serving optimization (`MTP`, `DFlash2` & `Plain`, `TP=1` & `TP=2`) and 1-hour intact SWE soak
 
 - Built the intact single-instance `nvidia/Open-SWE-Traces` (`4fa4c2ae9afc6b397bc50391d43450c79993c138`) multi-turn trajectory fixture [`open_swe_intact_16k.json`](../benchmarks/perf/fixtures/open_swe_intact_16k.json) (`6` permissive-license resolved trajectories across Claude Code, OpenCode, and OpenHands; `7–15` turns, `519 → 12,354` prompt tokens; recorded tool observations replayed with `tool_choice: "none"`), [`27b-swe-multiclient.toml`](../benchmarks/perf/campaigns/27b-swe-multiclient.toml), [`35b-swe-multiclient.toml`](../benchmarks/perf/campaigns/35b-swe-multiclient.toml), [`flash-next-swe-multiclient.toml`](../benchmarks/perf/campaigns/flash-next-swe-multiclient.toml), [`soak-swe-27b.toml`](../benchmarks/perf/campaigns/soak-swe-27b.toml), and [`soak-swe-27b-1hr.toml`](../benchmarks/perf/campaigns/soak-swe-27b-1hr.toml).

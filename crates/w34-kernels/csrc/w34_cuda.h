@@ -667,33 +667,6 @@ int w34_moe_f16_down_accum(const w34_exec* ex, const void* interm_in, const void
                            void* out, int num_tokens, int top_k, int num_experts,
                            int k_hidden, int n_interm);
 
-// --- Cloudflare Clef JointSchemaHead Kernels (op_clef.cu) ---
-int w34_clef_accum_spans_f16_to_f32(const w34_exec* ex, const void* chunk_normed_f16,
-                                    const int32_t* span_bounds, float* span_accum_f32,
-                                    int chunk_start, int chunk_len, int num_spans,
-                                    int hidden_size);
-int w34_clef_cast_f32_to_f16(const w34_exec* ex, const float* src_f32, void* dst_f16,
-                             int64_t num_elems);
-int w34_clef_build_option_queries_f16(const w34_exec* ex, const void* ctx_proj_f16,
-                                      const void* lex_proj_f16, const void* opt_q_proj_f16,
-                                      const int32_t* opt_q_idx, void* out_f16,
-                                      int total_opts, int num_q, int width);
-int w34_clef_mha_attn_f16(const w34_exec* ex, const void* q_f16, const void* q_bias_f16,
-                          const void* kv_f16, const void* kv_bias_f16, void* out_f16,
-                          int q_len, int m_len, int heads, int head_dim);
-int w34_clef_option_summaries_f16(const w34_exec* ex, const void* routed_opts_f16,
-                                  const void* base_fields_f16, const int32_t* q_opt_offsets,
-                                  void* out_summaries_f16, int num_q, int total_opts,
-                                  int width);
-int w34_clef_build_fields_f16(const w34_exec* ex, const void* base_fields_f16,
-                              const void* norm_summaries_f16, const void* global_proj_f16,
-                              const void* type_embed_f16, const int32_t* q_types,
-                              void* out_fields_f16, int num_q, int width);
-int w34_clef_build_residual_features_f16(const w34_exec* ex, const void* fields_f16,
-                                         const void* options_normed_f16,
-                                         const int32_t* opt_q_idx, void* out_features_f16,
-                                         int total_opts, int num_q, int width);
-
 // --- Qwen3.8-Flash-Next (qwen4_exp): HyperConnection, PLE, and QSA Kernels ---
 int w34_hc_init_streams_f16(const w34_exec* ex, const void* embed_in, void* residual_out,
                             const uint8_t* valid_token_mask, int num_tokens,
@@ -825,6 +798,9 @@ int w34_moe_remap_topk_ids_i32(const w34_exec* ex, const int32_t* global_topk_id
 // Source and destination must be disjoint and 4-byte aligned (half2).
 int w34_add_inplace_f16(const w34_exec* ex, void* dst_f16, const void* src_f16,
                         int64_t num_elems);
+int w34_midloop_damped_euler_f16(const w34_exec* ex, void* dst_f16,
+                                 const void* x_prev_f16, const void* g_x_f16,
+                                 int64_t num_elems, float alpha);
 int w34_moe_gpu_lru_update_and_pull(
     const w34_exec* ex, const int32_t* global_topk_ids, int32_t* expert_to_slot,
     int32_t* slot_to_expert, uint64_t* slot_last_used, uint64_t* step_counter,

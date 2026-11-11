@@ -91,85 +91,10 @@ impl Qwen3_5Engine {
 
     pub fn set_decision_profile(
         &mut self,
-        mut profile: crate::decision::DecisionModelProfile,
+        profile: crate::decision::DecisionModelProfile,
     ) -> std::result::Result<(), String> {
-        self.clef_head_gpu = match &profile {
-            crate::decision::DecisionModelProfile::Clef { .. } => {
-                let head = profile
-                    .take_clef_host_head()
-                    .ok_or_else(|| "clef profile missing host head weights".to_string())?;
-                let r0 = &self.ranks[0];
-                r0.device.make_current().map_err(|e| e.to_string())?;
-                Some(crate::clef::ClefJointHeadGpu::from_host(
-                    r0.device.device_id,
-                    &r0.stream,
-                    &head,
-                )?)
-            }
-            _ => None,
-        };
         self.decision_profile = profile;
         Ok(())
-    }
-
-    pub fn clef_begin_request(
-        &mut self,
-        record: &crate::clef::ClefEncodedRecord,
-    ) -> std::result::Result<crate::clef::ClefDeviceRequestState, String> {
-        let r0 = &self.ranks[0];
-        r0.device.make_current().map_err(|e| e.to_string())?;
-        let gpu = self
-            .clef_head_gpu
-            .as_mut()
-            .ok_or_else(|| "clef gpu head not initialized".to_string())?;
-        gpu.begin_request(record, &r0.stream)
-    }
-
-    pub fn clef_ingest_norm_hidden_range(
-        &mut self,
-        state: &mut crate::clef::ClefDeviceRequestState,
-        start_row: usize,
-        ctx_len_before: usize,
-        count: usize,
-    ) -> std::result::Result<(), String> {
-        if count == 0 {
-            return Ok(());
-        }
-        let r0 = &self.ranks[0];
-        let end_row = start_row
-            .checked_add(count)
-            .ok_or_else(|| "clef norm hidden row range overflow".to_string())?;
-        if end_row > r0.last_norm_hidden_rows || r0.last_norm_hidden_ptr == 0 {
-            return Err("clef norm hidden row range out of bounds".into());
-        }
-        let h_dim = self.cfg.hidden_size;
-        let src = r0.last_norm_hidden_ptr + (start_row * h_dim * 2) as u64;
-        r0.device.make_current().map_err(|e| e.to_string())?;
-        let gpu = self
-            .clef_head_gpu
-            .as_mut()
-            .ok_or_else(|| "clef gpu head not initialized".to_string())?;
-        gpu.ingest_chunk(state, src, ctx_len_before, count, &r0.cublas, &r0.stream)
-    }
-
-    pub fn clef_finalize_request(
-        &mut self,
-        state: crate::clef::ClefDeviceRequestState,
-        record: &crate::clef::ClefEncodedRecord,
-    ) -> std::result::Result<Vec<Vec<f64>>, String> {
-        let r0 = &self.ranks[0];
-        r0.device.make_current().map_err(|e| e.to_string())?;
-        let gpu = self
-            .clef_head_gpu
-            .as_mut()
-            .ok_or_else(|| "clef gpu head not initialized".to_string())?;
-        gpu.finalize(state, record, &r0.cublas, &r0.stream)
-    }
-
-    pub fn clef_recycle_request(&mut self, state: crate::clef::ClefDeviceRequestState) {
-        if let Some(gpu) = self.clef_head_gpu.as_mut() {
-            gpu.recycle_request_state(state);
-        }
     }
 
     /// Enable one native proposer before target graph capture. The proposer

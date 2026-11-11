@@ -40,6 +40,9 @@ pub(super) fn alloc_ple_runtime(
 impl Qwen3_5ModelRank {
     /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph.
     pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
+        if self.lm_head.is_none() || self.cfg.noncausal_full_attention {
+            return false;
+        }
         let top_k = self.cfg.num_experts_per_tok.max(1);
         self.tiered_moe
             .as_ref()
@@ -277,6 +280,27 @@ impl Qwen3_5ModelRank {
     /// Maximum aligned ordinary prefill budget, including worst-case selected outputs.
     pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
         let max_chunks = if self.cfg.uses_tiered_moe() { 96 } else { 32 };
+        let has_active_midloop = self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
+        let midloop_gdn_snap_bytes: usize = if has_active_midloop {
+            self.state_pool
+                .layers
+                .iter()
+                .filter(|st| {
+                    self.cfg
+                        .midloop
+                        .iter()
+                        .any(|&(a, b, passes)| passes > 1 && st.layer_id >= a && st.layer_id <= b)
+                })
+                .map(|st| {
+                    st.conv_state
+                        .len_bytes
+                        .saturating_add(st.ssm_state.len_bytes)
+                        .saturating_add(512)
+                })
+                .sum()
+        } else {
+            0
+        };
         scratch::token_capacity_up_to(
             self.scratch_arena.capacity(),
             self.cfg.hidden_size,
@@ -284,9 +308,23 @@ impl Qwen3_5ModelRank {
             max_num_seqs,
             max_chunks,
             |tokens| {
+                let streams = if self.final_residual.is_hyper_connection() {
+                    self.cfg.hc_count.max(1)
+                } else {
+                    1
+                };
                 let hc_extra = if self.final_residual.is_hyper_connection() {
-                    let streams = self.cfg.hc_count.max(1);
                     tokens * (streams - 1) * self.cfg.hidden_size * 2 + tokens * streams * 4 + 512
+                } else {
+                    0
+                };
+                let midloop_extra = if has_active_midloop {
+                    tokens
+                        .saturating_mul(streams)
+                        .saturating_mul(self.cfg.hidden_size)
+                        .saturating_mul(2)
+                        .saturating_add(256)
+                        .saturating_add(midloop_gdn_snap_bytes)
                 } else {
                     0
                 };
@@ -315,7 +353,9 @@ impl Qwen3_5ModelRank {
                         } else {
                             0
                         };
-                        l.0.saturating_add(hc_extra).saturating_add(transform)
+                        l.0.saturating_add(hc_extra)
+                            .saturating_add(midloop_extra)
+                            .saturating_add(transform)
                     })
             },
         )

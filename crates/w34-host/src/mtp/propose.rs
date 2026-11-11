@@ -524,7 +524,7 @@ impl Qwen3_5MtpRank {
                     "MTP batch hidden tail",
                 )?;
             }
-            Self::project(self.lm_head(t), &ex, t, self.hidden.addr(), logits_buf, 1)?;
+            Self::project(self.lm_head(t)?, &ex, t, self.hidden.addr(), logits_buf, 1)?;
             check_rc(
                 // SAFETY: logits_buf contains local_vocab_size valid half logits, output pointers have capacity for argmax results.
                 unsafe {
@@ -1629,7 +1629,7 @@ impl Qwen3_5MtpRank {
             } else {
                 last_multi_ptr
             };
-            Self::project(self.lm_head(t), &ex, t, lm_input, logits_buf, 1)?;
+            Self::project(self.lm_head(t)?, &ex, t, lm_input, logits_buf, 1)?;
             check_rc(
                 // SAFETY: `logits_buf` holds `local_vocab_size` FP16 elements and `out_id`/
                 // `local_id`/`local_val` are 4-byte device allocations.
