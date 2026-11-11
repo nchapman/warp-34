@@ -11,7 +11,7 @@ struct ForwardScratch {
     mlp: u64,
     injection: u64,
     midloop_residual: u64,
-    midloop_gdn_snaps: Vec<(usize, u64, usize, u64, usize)>,
+    midloop_gdn_snaps: Vec<(u64, usize, u64, usize)>,
     attention: [u64; 6],
     gdn: [u64; 5],
     ffn: [u64; 10],
@@ -45,20 +45,33 @@ impl Qwen3_5ModelRank {
             0
         };
         let mut midloop_gdn_snaps = Vec::new();
-        if has_active_midloop {
-            for (ord, st) in self.state_pool.layers.iter().enumerate() {
-                if self
-                    .cfg
-                    .midloop
-                    .iter()
-                    .any(|&(a, b, passes)| passes > 1 && st.layer_id >= a && st.layer_id <= b)
-                {
-                    let conv_b = st.conv_state.len_bytes;
-                    let ssm_b = st.ssm_state.len_bytes;
-                    let conv_snap = self.scratch_arena.alloc_aligned(conv_b)?;
-                    let ssm_snap = self.scratch_arena.alloc_aligned(ssm_b)?;
-                    midloop_gdn_snaps.push((ord, conv_snap, conv_b, ssm_snap, ssm_b));
-                }
+        if has_active_midloop && let Some(first_st) = self.state_pool.layers.first() {
+            let total_slots = self.state_pool.total_slots.max(1);
+            let conv_slot_b = first_st.conv_state.len_bytes / total_slots;
+            let ssm_slot_b = first_st.ssm_state.len_bytes / total_slots;
+            let active_slots = self.last_batch_state_slots.len().clamp(1, total_slots);
+            let max_span_gdn = self
+                .cfg
+                .midloop
+                .iter()
+                .filter(|&&(_, _, passes)| passes > 1)
+                .map(|&(a, b, _)| {
+                    self.state_pool
+                        .layers
+                        .iter()
+                        .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            for _ in 0..max_span_gdn {
+                let conv_snap = self
+                    .scratch_arena
+                    .alloc_aligned(active_slots * conv_slot_b)?;
+                let ssm_snap = self
+                    .scratch_arena
+                    .alloc_aligned(active_slots * ssm_slot_b)?;
+                midloop_gdn_snaps.push((conv_snap, conv_slot_b, ssm_snap, ssm_slot_b));
             }
         }
         let (attention, gdn, ffn, ple, qsa, overlay_end) =
@@ -203,9 +216,10 @@ impl Qwen3_5ModelRank {
             final_out,
             dump_out.as_deref_mut(),
         )?;
-        let Some(lm_head) = &self.lm_head else {
-            return Ok(0);
-        };
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .ok_or_else(|| loader_err("checkpoint has no lm_head for token generation"))?;
         lm_head.forward(
             &ex,
             &self.cublas,
@@ -638,28 +652,38 @@ impl Qwen3_5ModelRank {
                     },
                     "snapshot midloop_residual",
                 )?;
-                for &(ord, conv_snap, conv_b, ssm_snap, ssm_b) in &s.midloop_gdn_snaps {
-                    let st = &self.state_pool.layers[ord];
-                    if st.layer_id >= a && st.layer_id <= b {
+                for (st, &(conv_snap, conv_slot_b, ssm_snap, ssm_slot_b)) in self
+                    .state_pool
+                    .layers
+                    .iter()
+                    .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                    .zip(s.midloop_gdn_snaps.iter())
+                {
+                    for (slot_pos, &slot) in self.last_batch_state_slots.iter().enumerate() {
+                        if slot >= self.state_pool.total_slots {
+                            continue;
+                        }
                         check_rc(
-                            // SAFETY: conv_snap and conv_state have identical byte capacity conv_b.
+                            // SAFETY: slot < total_slots and conv_snap reserves last_batch_state_slots.len() * conv_slot_b bytes.
                             unsafe {
                                 ffi::w34_memcpy_d2d_async(
-                                    conv_snap as *mut c_void,
-                                    st.conv_state.addr() as *const c_void,
-                                    conv_b,
+                                    (conv_snap + (slot_pos * conv_slot_b) as u64) as *mut c_void,
+                                    (st.conv_state.addr() + (slot * conv_slot_b) as u64)
+                                        as *const c_void,
+                                    conv_slot_b,
                                     self.stream.handle,
                                 )
                             },
                             "snapshot midloop gdn conv_state",
                         )?;
                         check_rc(
-                            // SAFETY: ssm_snap and ssm_state have identical byte capacity ssm_b.
+                            // SAFETY: slot < total_slots and ssm_snap reserves last_batch_state_slots.len() * ssm_slot_b bytes.
                             unsafe {
                                 ffi::w34_memcpy_d2d_async(
-                                    ssm_snap as *mut c_void,
-                                    st.ssm_state.addr() as *const c_void,
-                                    ssm_b,
+                                    (ssm_snap + (slot_pos * ssm_slot_b) as u64) as *mut c_void,
+                                    (st.ssm_state.addr() + (slot * ssm_slot_b) as u64)
+                                        as *const c_void,
+                                    ssm_slot_b,
                                     self.stream.handle,
                                 )
                             },
@@ -852,28 +876,40 @@ impl Qwen3_5ModelRank {
                         },
                         "update midloop_residual",
                     )?;
-                    for &(ord, conv_snap, conv_b, ssm_snap, ssm_b) in &s.midloop_gdn_snaps {
-                        let st = &self.state_pool.layers[ord];
-                        if st.layer_id >= a && st.layer_id <= b {
+                    for (st, &(conv_snap, conv_slot_b, ssm_snap, ssm_slot_b)) in self
+                        .state_pool
+                        .layers
+                        .iter()
+                        .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                        .zip(s.midloop_gdn_snaps.iter())
+                    {
+                        for (slot_pos, &slot) in self.last_batch_state_slots.iter().enumerate() {
+                            if slot >= self.state_pool.total_slots {
+                                continue;
+                            }
                             check_rc(
-                                // SAFETY: conv_state and conv_snap have identical byte size conv_b.
+                                // SAFETY: slot < total_slots and conv_snap holds last_batch_state_slots.len() * conv_slot_b bytes.
                                 unsafe {
                                     ffi::w34_memcpy_d2d_async(
-                                        st.conv_state.addr() as *mut c_void,
-                                        conv_snap as *const c_void,
-                                        conv_b,
+                                        (st.conv_state.addr() + (slot * conv_slot_b) as u64)
+                                            as *mut c_void,
+                                        (conv_snap + (slot_pos * conv_slot_b) as u64)
+                                            as *const c_void,
+                                        conv_slot_b,
                                         self.stream.handle,
                                     )
                                 },
                                 "restore midloop gdn conv_state",
                             )?;
                             check_rc(
-                                // SAFETY: ssm_state and ssm_snap have identical byte size ssm_b.
+                                // SAFETY: slot < total_slots and ssm_snap holds last_batch_state_slots.len() * ssm_slot_b bytes.
                                 unsafe {
                                     ffi::w34_memcpy_d2d_async(
-                                        st.ssm_state.addr() as *mut c_void,
-                                        ssm_snap as *const c_void,
-                                        ssm_b,
+                                        (st.ssm_state.addr() + (slot * ssm_slot_b) as u64)
+                                            as *mut c_void,
+                                        (ssm_snap + (slot_pos * ssm_slot_b) as u64)
+                                            as *const c_void,
+                                        ssm_slot_b,
                                         self.stream.handle,
                                     )
                                 },
@@ -1340,6 +1376,23 @@ impl Qwen3_5ModelRank {
         let off_sp = push_slice(&mut packed, spec_state_indices);
         let off_cd = push_slice(&mut packed, checkpoint_dst_indices);
         let off_co = push_slice(&mut packed, checkpoint_token_offsets);
+        self.last_batch_state_slots.clear();
+        for &slot in state_in_indices
+            .iter()
+            .chain(state_out_indices.iter())
+            .chain(spec_state_indices.iter())
+            .chain(checkpoint_dst_indices.iter())
+        {
+            if slot >= 0 && (slot as usize) < self.state_pool.total_slots {
+                let u = slot as usize;
+                if !self.last_batch_state_slots.contains(&u) {
+                    self.last_batch_state_slots.push(u);
+                }
+            }
+        }
+        if self.last_batch_state_slots.is_empty() {
+            self.last_batch_state_slots.push(0);
+        }
         let base = self.batch_meta_arena.upload_slice(&packed, &self.stream)?;
         let ptr_at = |off: usize| -> u64 { base + (off * 4) as u64 };
         let has_init_ptr = self

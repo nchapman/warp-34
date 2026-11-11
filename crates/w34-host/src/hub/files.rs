@@ -25,6 +25,7 @@ const METADATA: &[&str] = &[
     "preprocessor_config.json",
     "video_preprocessor_config.json",
     "decision_config.json",
+    "joint_config.json",
     "static_hot_cache_rankings.json",
     "runtime/static_hot_cache_rankings.json",
     "runtime/mtp-int4-g32/config.json",

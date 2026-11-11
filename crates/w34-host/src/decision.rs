@@ -490,10 +490,19 @@ impl DecisionModelProfile {
             .get("state_once")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let noncausal_full_attention = dc
+            .get("noncausal_full_attention")
+            .and_then(Value::as_bool)
+            .unwrap_or(cfg.noncausal_full_attention);
+        let has_midloop = cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+            || dc
+                .get("midloop")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty());
         let prefix_bidir = dc
             .get("prefix_bidir")
             .and_then(Value::as_bool)
-            .unwrap_or(cfg.prefix_bidir);
+            .unwrap_or(cfg.prefix_bidir || noncausal_full_attention || has_midloop);
         let header_v1 = dc
             .get("prompt_layout")
             .and_then(Value::as_str)

@@ -498,47 +498,54 @@ impl SchedulerV1 {
                 continue;
             }
             let rem = seq.prompt_tokens.len() - start;
-            // Share pure-prefill waves so one bulk request does not enter decode while
-            // another is still starved, forcing the remainder through the mixed-step cap.
-            // Active decodes always retain their existing latency-bounded policy.
-            let share = if !has_active_decodes && pending_prefills > 1 {
-                let aligned = (prefill_budget / pending_prefills / self.cfg.mamba_chunk_size)
-                    * self.cfg.mamba_chunk_size;
-                aligned.max(self.cfg.mamba_chunk_size).min(prefill_budget)
-            } else {
-                prefill_budget
-            };
-            pending_prefills -= 1;
-            let mut max_take = rem.min(self.cfg.chunk_prefill_size).min(share);
-            if let Some(branch_end) = seq.mamba_branching_seqlen {
-                let aligned_branch =
-                    (branch_end / self.cfg.mamba_chunk_size) * self.cfg.mamba_chunk_size;
-                if aligned_branch > start && aligned_branch < seq.prompt_tokens.len() {
-                    max_take = max_take.min(aligned_branch - start);
-                }
-            }
-            if max_take == 0 {
-                continue;
-            }
             // Align non-final chunks to `mamba_chunk_size = 64` boundaries so every
             // intermediate chunk ends on a valid `MambaRadixCache` checkpoint boundary,
-            // except when `prefix_bidir_len` requires an exact boundary split between the
-            // bidirectional state prefix and the causal question suffix.
+            // except when `prefix_bidir_len` requires an atomic bidirectional prefix step
+            // before the causal question suffix.
             let take = if let Some(bidir_end) = seq.prefix_bidir_len
                 && start < bidir_end
-                && start + max_take >= bidir_end
             {
-                bidir_end - start
-            } else if start + max_take < seq.prompt_tokens.len() {
-                let next_aligned =
-                    ((start + max_take) / self.cfg.mamba_chunk_size) * self.cfg.mamba_chunk_size;
-                if next_aligned > start {
-                    next_aligned - start
+                let need = bidir_end.min(seq.prompt_tokens.len()) - start;
+                if need == 0 || need > self.cfg.chunk_prefill_size || need > prefill_budget {
+                    pending_prefills -= 1;
+                    continue;
+                }
+                pending_prefills -= 1;
+                need
+            } else {
+                // Share pure-prefill waves so one bulk request does not enter decode while
+                // another is still starved, forcing the remainder through the mixed-step cap.
+                // Active decodes always retain their existing latency-bounded policy.
+                let share = if !has_active_decodes && pending_prefills > 1 {
+                    let aligned = (prefill_budget / pending_prefills / self.cfg.mamba_chunk_size)
+                        * self.cfg.mamba_chunk_size;
+                    aligned.max(self.cfg.mamba_chunk_size).min(prefill_budget)
+                } else {
+                    prefill_budget
+                };
+                pending_prefills -= 1;
+                let mut max_take = rem.min(self.cfg.chunk_prefill_size).min(share);
+                if let Some(branch_end) = seq.mamba_branching_seqlen {
+                    let aligned_branch =
+                        (branch_end / self.cfg.mamba_chunk_size) * self.cfg.mamba_chunk_size;
+                    if aligned_branch > start && aligned_branch < seq.prompt_tokens.len() {
+                        max_take = max_take.min(aligned_branch - start);
+                    }
+                }
+                if max_take == 0 {
+                    continue;
+                }
+                if start + max_take < seq.prompt_tokens.len() {
+                    let next_aligned = ((start + max_take) / self.cfg.mamba_chunk_size)
+                        * self.cfg.mamba_chunk_size;
+                    if next_aligned > start {
+                        next_aligned - start
+                    } else {
+                        max_take
+                    }
                 } else {
                     max_take
                 }
-            } else {
-                max_take
             };
             let end = start + take;
             let is_final = end == seq.prompt_tokens.len();
@@ -1201,5 +1208,29 @@ mod tests {
         assert_eq!(outcome.donated_seq_len, 0);
         assert!(sched.active[0].finished);
         assert_eq!(sched.radix.mamba_evictable_slots(), 0);
+
+        // When prefill budget is smaller than `bidir_end`, the scheduler must defer
+        // the bidirectional prefix rather than splitting it into causal sub-chunks.
+        let mut constrained = SchedulerV1::new(SchedulerConfig {
+            max_num_batched_tokens: 64,
+            chunk_prefill_size: 128,
+            ..SchedulerConfig::default()
+        });
+        constrained.submit_request_with_prefix_and_bidir(
+            prompt.clone(),
+            prompt,
+            1,
+            0,
+            false,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            Some(80),
+        );
+        constrained.admit_waiting(|_| Some((0, [1, 2])));
+        constrained.active[0].radix_state.kv_pages = (0..7).collect();
+        assert!(constrained.schedule_step().is_empty());
     }
 }

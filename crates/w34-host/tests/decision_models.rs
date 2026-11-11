@@ -401,15 +401,29 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
         let glide_p2_ms = t_glide.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(resp_p2.status().as_u16(), 200);
         let resp2: Value = resp_p2.json().await.unwrap();
-        assert!(
-            resp2["usage"]["cached_tokens"].as_u64().unwrap() > 0,
-            "expected MambaRadixCache reuse across GLiDE order_passes=2 sub-queries, got: {}",
+        assert_eq!(
+            resp2["usage"]["cached_tokens"].as_u64().unwrap(),
+            0,
+            "noncausal_full_attention + midloop GLiDE must not reuse MambaRadixCache prefixes across sub-queries: {}",
             resp2["usage"]
         );
         eprintln!(
-            "[bench] GLiDE 4B (midloop 2x, 3 questions, order_passes=2 => 6 queries): {:.2} ms (cached_tokens={})",
-            glide_p2_ms, resp2["usage"]["cached_tokens"]
+            "[bench] GLiDE 4B (midloop 2x, 3 questions, order_passes=2 => 6 queries): {:.2} ms",
+            glide_p2_ms
         );
+
+        // Verify token generation requests on a headless (`lm_head = None`) model fail closed with 400.
+        let bad_gen = client
+            .post(format!("{base_url}/v1/completions"))
+            .json(&json!({
+                "model": "qwen3.5-4b-glide",
+                "prompt": "Hello",
+                "max_tokens": 1
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_gen.status().as_u16(), 400);
 
         // Verify direct uncached hidden tap (`prefix_cap = Some(0)`) matches HTTP response.
         let (_, glide_batch) =

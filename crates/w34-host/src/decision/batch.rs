@@ -385,10 +385,12 @@ fn build_code_readout_queries(
                 token_ids.len()
             )));
         }
+        let prefix_cap =
+            (!config.prefix_bidir).then(|| positions.first().copied().unwrap_or(prefix_len));
         return Ok(vec![CodeReadoutPreparedQuery {
             token_ids,
             positions,
-            prefix_cap: None,
+            prefix_cap,
             prefix_bidir_len: config.prefix_bidir.then_some(prefix_len),
         }]);
     }
@@ -473,7 +475,7 @@ fn build_code_readout_queries(
         queries.push(CodeReadoutPreparedQuery {
             token_ids,
             positions: vec![last_pos],
-            prefix_cap: None,
+            prefix_cap: (!config.prefix_bidir).then_some(last_pos),
             prefix_bidir_len: config.prefix_bidir.then_some(prefix_len),
         });
     }

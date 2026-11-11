@@ -712,6 +712,41 @@ fn decision_images_and_batch_preparation_for_glide_d3_and_causal_lm() {
         other => panic!("expected CodeReadout, got {other:?}"),
     }
 
+    // Verify `state_once: true, prefix_bidir: false` caps prefix lookup at `positions[0]`.
+    let d3_causal_profile = DecisionModelProfile::CodeReadout {
+        head: Arc::new(CodeReadoutHead {
+            hidden_size: 4,
+            num_codes: 4,
+            weight: vec![0.1; 16],
+            bias: None,
+        }),
+        config: CodeReadoutConfig {
+            style: CodeReadoutStyle::D3,
+            codes: vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            temperature: 0.7,
+            temperature_by_questions: Vec::new(),
+            state_once: true,
+            prefix_bidir: false,
+            header_v1: true,
+            max_seq_len: 4096,
+            system_prompt: GLIDE_SYSTEM_PROMPT.to_owned(),
+        },
+    };
+    let (_, d3_causal_batch) =
+        prepare_decision_batch(&d3_causal_profile, &tok, 4096, &d3_req).unwrap();
+    if let PreparedDecisionBatch::CodeReadout {
+        forward_queries, ..
+    } = d3_causal_batch
+    {
+        assert_eq!(
+            forward_queries[0].prefix_cap,
+            Some(forward_queries[0].positions[0])
+        );
+        assert_eq!(forward_queries[0].prefix_bidir_len, None);
+    } else {
+        panic!("expected CodeReadout");
+    }
+
     assert_eq!(
         dump_python_json(&json!({"big": 1e20, "tiny": 1.5e-7})).unwrap(),
         r#"{"big": 1e+20, "tiny": 1.5e-07}"#

@@ -390,6 +390,7 @@ fn worker_panic_containment_drains_in_flight_and_queued_and_poisons_future_submi
         has_vision_weights: false,
         hidden_size: 1024,
         kv_token_capacity: 4096,
+        unshareable_prefill: false,
         max_model_len: None,
     };
 

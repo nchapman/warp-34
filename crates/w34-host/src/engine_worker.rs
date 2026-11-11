@@ -231,6 +231,7 @@ pub struct EngineWorker {
     pub has_vision_weights: bool,
     pub hidden_size: usize,
     pub kv_token_capacity: usize,
+    pub unshareable_prefill: bool,
     max_model_len: Option<usize>,
 }
 impl EngineWorker {
@@ -317,6 +318,8 @@ impl EngineWorker {
                     let default_preserve_thinking =
                         crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
                     let kv_token_capacity = engine.ranks[0].kv_pool.num_pages * 16;
+                    let unshareable_prefill = engine.cfg.noncausal_full_attention
+                        || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
                     let info = (
                         engine.tokenizer.clone(),
                         engine.cfg.eos_token_ids.clone(),
@@ -327,6 +330,7 @@ impl EngineWorker {
                         engine.has_vision_weights,
                         engine.cfg.hidden_size,
                         kv_token_capacity,
+                        unshareable_prefill,
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
                         run(
@@ -355,6 +359,7 @@ impl EngineWorker {
             has_vision_weights,
             hidden_size,
             kv_token_capacity,
+            unshareable_prefill,
         ) = match ready_rx.recv() {
             Ok(Ok(info)) => info,
             Ok(Err(error)) => {
@@ -382,6 +387,7 @@ impl EngineWorker {
             has_vision_weights,
             hidden_size,
             kv_token_capacity,
+            unshareable_prefill,
             max_model_len: None,
         })
     }
@@ -872,6 +878,44 @@ fn enqueue(
     }
     let vocab = engine.cfg.vocab_size;
     let p = &mut request.sampler.params;
+    let needs_lm_head = p.max_tokens > 0
+        || matches!(
+            request.decision_tap,
+            Some(DecisionReadoutTap::CandidateLogits { .. })
+        );
+    if needs_lm_head && engine.ranks[0].lm_head.is_none() {
+        let err =
+            WorkerError::invalid_request("loaded checkpoint has no lm_head for token generation");
+        if let Some(tap) = request.decision_tap.take() {
+            tap.fail(err.clone());
+        }
+        request.set_terminal(GenerationEvent::Error(err));
+        return;
+    }
+    if engine.cfg.noncausal_full_attention
+        || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+    {
+        request.prefix_bidir_len = Some(request.prompt.len());
+        request.max_prefix_lookup_len = Some(0);
+        request.mamba_branching_seqlen = None;
+    }
+    let single_chunk_cap = sched
+        .cfg
+        .chunk_prefill_size
+        .min(sched.cfg.max_num_batched_tokens);
+    if request
+        .prefix_bidir_len
+        .is_some_and(|bidir_end| bidir_end > request.prompt.len() || bidir_end > single_chunk_cap)
+    {
+        let err = WorkerError::invalid_request(
+            "bidirectional or midloop prompt prefix exceeds single-chunk prefill capacity",
+        );
+        if let Some(tap) = request.decision_tap.take() {
+            tap.fail(err.clone());
+        }
+        request.set_terminal(GenerationEvent::Error(err));
+        return;
+    }
     let valid = request
         .prompt
         .iter()

@@ -327,6 +327,7 @@ impl Qwen3_5Engine {
             pos_plane_stride,
             vis_splice_per_rank,
             false,
+            true,
         )
     }
 
@@ -337,6 +338,7 @@ impl Qwen3_5Engine {
         pos_plane_stride: i32,
         vis_splice_per_rank: Option<&[(u64, u64, usize)]>,
         noncausal_prefix: bool,
+        emit_last_row: bool,
     ) -> Result<i32> {
         let q_len = slice.tokens.len();
         if q_len == 0 {
@@ -376,8 +378,7 @@ impl Qwen3_5Engine {
             checkpoint_token_offsets.push(trig);
             checkpoint_dst_indices.push(dst);
         }
-        let has_lm_head = self.ranks[0].lm_head.is_some();
-        let selected_rows: &[usize] = if has_lm_head { &[q_len - 1] } else { &[] };
+        let selected_rows: &[usize] = if emit_last_row { &[q_len - 1] } else { &[] };
 
         for (r_idx, rank) in self.ranks.iter_mut().enumerate() {
             rank.current_pos_plane_stride = pos_plane_stride;

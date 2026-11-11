@@ -204,11 +204,12 @@ async fn run_code_readout_queries_raw(
     }
 
     let mut raw_outs = Vec::with_capacity(queries.len());
-    let all_bidir = queries.iter().all(|q| q.prefix_bidir_len.is_some());
+    let all_bidir =
+        s.worker.unshareable_prefill || queries.iter().all(|q| q.prefix_bidir_len.is_some());
     if all_bidir {
-        // Bidirectional prefixes (`d3` `prefix_bidir = true`) do not donate into
-        // `MambaRadixCache`; submit all queries synchronously into the worker queue
-        // so `order_passes == 2` forward + reverse passes batch together in lockstep.
+        // Bidirectional or midloop models (`d3` `prefix_bidir = true` and `GLiDE`
+        // `noncausal_full_attention` / `midloop`) do not donate into `MambaRadixCache`;
+        // submit all queries synchronously into the worker queue so waves batch in lockstep.
         for wave in queries.chunks(8) {
             let mut submitted = Vec::with_capacity(wave.len());
             for q in wave.iter().cloned() {

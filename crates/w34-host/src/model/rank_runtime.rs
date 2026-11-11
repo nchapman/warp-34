@@ -40,7 +40,10 @@ pub(super) fn alloc_ple_runtime(
 impl Qwen3_5ModelRank {
     /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph.
     pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
-        if self.lm_head.is_none() || self.cfg.noncausal_full_attention {
+        if self.lm_head.is_none()
+            || self.cfg.noncausal_full_attention
+            || self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+        {
             return false;
         }
         let top_k = self.cfg.num_experts_per_tok.max(1);
@@ -281,26 +284,34 @@ impl Qwen3_5ModelRank {
     pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
         let max_chunks = if self.cfg.uses_tiered_moe() { 96 } else { 32 };
         let has_active_midloop = self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
-        let midloop_gdn_snap_bytes: usize = if has_active_midloop {
-            self.state_pool
-                .layers
-                .iter()
-                .filter(|st| {
-                    self.cfg
-                        .midloop
-                        .iter()
-                        .any(|&(a, b, passes)| passes > 1 && st.layer_id >= a && st.layer_id <= b)
-                })
-                .map(|st| {
-                    st.conv_state
-                        .len_bytes
-                        .saturating_add(st.ssm_state.len_bytes)
-                        .saturating_add(512)
-                })
-                .sum()
-        } else {
-            0
-        };
+        let midloop_gdn_snap_bytes: usize =
+            if has_active_midloop && let Some(first_st) = self.state_pool.layers.first() {
+                let total_slots = self.state_pool.total_slots.max(1);
+                let conv_slot_b = first_st.conv_state.len_bytes / total_slots;
+                let ssm_slot_b = first_st.ssm_state.len_bytes / total_slots;
+                let active_slots = max_num_seqs.clamp(1, total_slots);
+                let max_span_gdn = self
+                    .cfg
+                    .midloop
+                    .iter()
+                    .filter(|&&(_, _, passes)| passes > 1)
+                    .map(|&(a, b, _)| {
+                        self.state_pool
+                            .layers
+                            .iter()
+                            .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                            .count()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                max_span_gdn.saturating_mul(
+                    active_slots
+                        .saturating_mul(conv_slot_b.saturating_add(ssm_slot_b))
+                        .saturating_add(512),
+                )
+            } else {
+                0
+            };
         let local_vocab_for_scratch = if self.lm_head.is_some() {
             self.local_vocab_size
         } else {
