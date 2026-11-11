@@ -1,0 +1,928 @@
+{
+  "schema_version": 1,
+  "source": "https://github.com/fstandhartinger/jevbench",
+  "source_commit": "609a664e81f46e03731600bd7bd9f1b7a61257c5",
+  "data_card": "https://benchmarkheaven.com/jev-models/data",
+  "license": "MIT",
+  "upstream_files_sha256": {
+    "datasets/public/original.jsonl": "5c2414edb3006b8bfcb70fda433f0f9ca015759433849f8d3104328a1f7c4180"
+  },
+  "requests": [
+    {
+      "id": "jevbench-multiq-00",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-policy-01-0": "Policy: refunds require a receipt and purchase within 30 days. A customer bought 12 days ago but has no receipt. Issue a refund.",
+        "case_2_original-policy-01-1": "A receipt AND an age of at most 30 days are required. The purchase was 12 days ago; proof of purchase is absent. May we refund?",
+        "case_3_original-policy-02-0": "Policy: trial users may export CSV; PDF needs a paid plan. Trial user asks for CSV.",
+        "case_4_original-policy-02-1": "A trial account requests CSV export. Rules allow trial CSV, but reserve PDF for paid accounts."
+      },
+      "questions": {
+        "q1_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_1_original-policy-01-0] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q2_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_2_original-policy-01-1] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q3_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_3_original-policy-02-0] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q4_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_4_original-policy-02-1] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        }
+      },
+      "expected": {
+        "q1_policy": "no",
+        "q2_policy": "no",
+        "q3_policy": "yes",
+        "q4_policy": "yes"
+      }
+    },
+    {
+      "id": "jevbench-multiq-01",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-policy-03-0": "Policy: visitors need an escort unless they are registered contractors. A registered contractor arrives alone. Admit them.",
+        "case_2_original-policy-03-1": "Escort rule exempts registered contractors. This visitor is a registered contractor without an escort. Can they enter?",
+        "case_3_original-policy-04-0": "Policy: send a reminder only when payment is overdue and no dispute is open. Payment is overdue; a dispute is open. Send reminder.",
+        "case_4_original-policy-04-1": "There is an open dispute on an overdue invoice. Reminders require overdue status AND absence of disputes. Is a reminder allowed?"
+      },
+      "questions": {
+        "q1_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_1_original-policy-03-0] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q2_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_2_original-policy-03-1] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q3_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_3_original-policy-04-0] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q4_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_4_original-policy-04-1] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        }
+      },
+      "expected": {
+        "q1_policy": "yes",
+        "q2_policy": "yes",
+        "q3_policy": "no",
+        "q4_policy": "no"
+      }
+    },
+    {
+      "id": "jevbench-multiq-02",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-policy-05-0": "Policy: staff may access files in their own team. A temporary suspension overrides all access. The staff member owns the team but is suspended. Open its file.",
+        "case_2_original-policy-05-1": "Suspension blocks access even to own-team files. A suspended employee requests their own team file. May it be opened?",
+        "case_3_original-policy-06-0": "Policy: bookings can be cancelled free until 24 hours before departure, including exactly 24 hours. Departure is 24 hours away. Cancel free.",
+        "case_4_original-policy-06-1": "There are exactly 24 hours until departure. Free cancellation is allowed at or before that 24-hour cutoff."
+      },
+      "questions": {
+        "q1_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_1_original-policy-05-0] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q2_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_2_original-policy-05-1] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q3_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_3_original-policy-06-0] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        },
+        "q4_policy": {
+          "type": "noul",
+          "instructions": "[Regarding case_4_original-policy-06-1] Under the stated policy, is the requested action permitted? Treat unproved required conditions as not satisfied.",
+          "criteria": {
+            "false": "A condition is missing or a prohibition applies.",
+            "true": "Every required condition is established and no prohibition applies."
+          }
+        }
+      },
+      "expected": {
+        "q1_policy": "no",
+        "q2_policy": "no",
+        "q3_policy": "yes",
+        "q4_policy": "yes"
+      }
+    },
+    {
+      "id": "jevbench-multiq-03",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-intent-01-0": "Do not cancel my membership. Please return the duplicate charge.",
+        "case_2_original-intent-01-1": "Keep my subscription active; I only want the second charge refunded.",
+        "case_3_original-intent-02-0": "Where is the parcel? Keep the delivery address as it is.",
+        "case_4_original-intent-02-1": "Please tell me the package progress. No address changes needed."
+      },
+      "questions": {
+        "q1_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_1_original-intent-01-0] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q2_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_2_original-intent-01-1] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q3_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_3_original-intent-02-0] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q4_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_4_original-intent-02-1] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        }
+      },
+      "expected": {
+        "q1_intent": "refund",
+        "q2_intent": "refund",
+        "q3_intent": "status",
+        "q4_intent": "status"
+      }
+    },
+    {
+      "id": "jevbench-multiq-04",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-intent-03-0": "The order has not shipped. Send it to my new office instead.",
+        "case_2_original-intent-03-1": "Please replace my shipping address with the office address before dispatch.",
+        "case_3_original-intent-04-0": "Stop renewing my subscription after this month; I am not asking for money back.",
+        "case_4_original-intent-04-1": "End the membership at the next renewal. No refund requested."
+      },
+      "questions": {
+        "q1_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_1_original-intent-03-0] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q2_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_2_original-intent-03-1] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q3_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_3_original-intent-04-0] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q4_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_4_original-intent-04-1] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        }
+      },
+      "expected": {
+        "q1_intent": "change_address",
+        "q2_intent": "change_address",
+        "q3_intent": "cancel",
+        "q4_intent": "cancel"
+      }
+    },
+    {
+      "id": "jevbench-multiq-05",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-intent-05-0": "Your refund policy is clearer now. Thanks for explaining it.",
+        "case_2_original-intent-05-1": "Thank you; I understand the policy on refunds now.",
+        "case_3_original-intent-06-0": "I cancelled yesterday. Was the parcel delivered yet?",
+        "case_4_original-intent-06-1": "The cancellation is already done. My question is whether the shipment has arrived."
+      },
+      "questions": {
+        "q1_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_1_original-intent-05-0] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q2_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_2_original-intent-05-1] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q3_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_3_original-intent-06-0] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        },
+        "q4_intent": {
+          "type": "choice",
+          "instructions": "[Regarding case_4_original-intent-06-1] Select the primary requested action. A mention without a request does not establish intent.",
+          "criteria": {
+            "cancel": "End an existing subscription",
+            "change_address": "Modify a delivery address",
+            "other": "None of these actions is requested",
+            "refund": "Return money already charged",
+            "status": "Learn delivery progress"
+          }
+        }
+      },
+      "expected": {
+        "q1_intent": "other",
+        "q2_intent": "other",
+        "q3_intent": "status",
+        "q4_intent": "status"
+      }
+    },
+    {
+      "id": "jevbench-multiq-06",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-ordinal-01-0": "The icon is misaligned. Every function works.",
+        "case_2_original-ordinal-01-1": "All features work normally; only an icon looks off. ",
+        "case_3_original-ordinal-02-0": "One user cannot download an attachment but can open it in the browser.",
+        "case_4_original-ordinal-02-1": "A single user has a download failure; viewing the attachment online still works."
+      },
+      "questions": {
+        "q1_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_1_original-ordinal-01-0] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q2_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_2_original-ordinal-01-1] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q3_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_3_original-ordinal-02-0] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q4_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_4_original-ordinal-02-1] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        }
+      },
+      "expected": {
+        "q1_ordinal": 0,
+        "q2_ordinal": 0,
+        "q3_ordinal": 1,
+        "q4_ordinal": 1
+      }
+    },
+    {
+      "id": "jevbench-multiq-07",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-ordinal-03-0": "All customers cannot sign in. No records are lost.",
+        "case_2_original-ordinal-03-1": "Login is unavailable to every customer, but stored data remains intact.",
+        "case_3_original-ordinal-04-0": "Backups and original customer records have been irreversibly deleted.",
+        "case_4_original-ordinal-04-1": "Customer records are permanently gone and there is no remaining backup."
+      },
+      "questions": {
+        "q1_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_1_original-ordinal-03-0] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q2_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_2_original-ordinal-03-1] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q3_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_3_original-ordinal-04-0] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q4_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_4_original-ordinal-04-1] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        }
+      },
+      "expected": {
+        "q1_ordinal": 2,
+        "q2_ordinal": 2,
+        "q3_ordinal": 3,
+        "q4_ordinal": 3
+      }
+    },
+    {
+      "id": "jevbench-multiq-08",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-ordinal-05-0": "A banner says possible data loss. Investigation confirms no loss and no function failure.",
+        "case_2_original-ordinal-05-1": "Despite a warning banner, checks find every function working and no missing data.",
+        "case_3_original-ordinal-06-0": "Many users cannot edit orders; read-only access still works. No data loss.",
+        "case_4_original-ordinal-06-1": "Order editing, a core function, is blocked for many users. Viewing orders is possible; nothing has been lost."
+      },
+      "questions": {
+        "q1_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_1_original-ordinal-05-0] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q2_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_2_original-ordinal-05-1] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q3_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_3_original-ordinal-06-0] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        },
+        "q4_ordinal": {
+          "type": "score",
+          "instructions": "[Regarding case_4_original-ordinal-06-1] Rate incident impact using only reported facts. Use the highest fully supported level.",
+          "criteria": [
+            "No function impaired; cosmetic only",
+            "One user or a nonessential function impaired, with a workaround",
+            "Many users blocked from a core function, no data loss",
+            "Confirmed irreversible data loss or physical harm"
+          ]
+        }
+      },
+      "expected": {
+        "q1_ordinal": 0,
+        "q2_ordinal": 0,
+        "q3_ordinal": 2,
+        "q4_ordinal": 2
+      }
+    },
+    {
+      "id": "jevbench-multiq-09",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-extraction-01-0": "We considered courier, then confirmed pickup at the depot.",
+        "case_2_original-extraction-01-1": "The final arrangement is depot pickup, replacing the earlier courier idea.",
+        "case_3_original-extraction-02-0": "If approved, we might use post. No method is booked yet.",
+        "case_4_original-extraction-02-1": "Postal delivery is a possibility awaiting approval; nothing has been confirmed."
+      },
+      "questions": {
+        "q1_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_1_original-extraction-01-0] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q2_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_2_original-extraction-01-1] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q3_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_3_original-extraction-02-0] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q4_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_4_original-extraction-02-1] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        }
+      },
+      "expected": {
+        "q1_extraction": "pickup",
+        "q2_extraction": "pickup",
+        "q3_extraction": "unknown",
+        "q4_extraction": "unknown"
+      }
+    },
+    {
+      "id": "jevbench-multiq-10",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-extraction-03-0": "Courier booked for Tuesday. The customer asked about pickup but did not change the booking.",
+        "case_2_original-extraction-03-1": "Tuesday courier delivery is confirmed. A later question about pickup did not alter it.",
+        "case_3_original-extraction-04-0": "Pickup was cancelled. The parcel was handed to the postal service.",
+        "case_4_original-extraction-04-1": "After cancelling collection, we sent the package by post."
+      },
+      "questions": {
+        "q1_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_1_original-extraction-03-0] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q2_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_2_original-extraction-03-1] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q3_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_3_original-extraction-04-0] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q4_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_4_original-extraction-04-1] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        }
+      },
+      "expected": {
+        "q1_extraction": "courier",
+        "q2_extraction": "courier",
+        "q3_extraction": "post",
+        "q4_extraction": "post"
+      }
+    },
+    {
+      "id": "jevbench-multiq-11",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-extraction-05-0": "No courier service is available. We have not decided what to do.",
+        "case_2_original-extraction-05-1": "Courier is unavailable and no alternative has been selected.",
+        "case_3_original-extraction-06-0": "The final signed order says courier, despite an old email saying post.",
+        "case_4_original-extraction-06-1": "An earlier postal plan was superseded by the signed courier order."
+      },
+      "questions": {
+        "q1_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_1_original-extraction-05-0] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q2_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_2_original-extraction-05-1] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q3_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_3_original-extraction-06-0] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        },
+        "q4_extraction": {
+          "type": "choice",
+          "instructions": "[Regarding case_4_original-extraction-06-1] Extract the final confirmed delivery method. Ignore cancelled plans and hypothetical alternatives. Choose unknown if no final method is confirmed.",
+          "criteria": {
+            "courier": "Courier delivery",
+            "pickup": "Customer pickup",
+            "post": "Postal service",
+            "unknown": "No final confirmed method"
+          }
+        }
+      },
+      "expected": {
+        "q1_extraction": "unknown",
+        "q2_extraction": "unknown",
+        "q3_extraction": "courier",
+        "q4_extraction": "courier"
+      }
+    },
+    {
+      "id": "jevbench-multiq-12",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-adequacy-01-0": "Request: Return only the sum of 17 and 25. Response:42",
+        "case_2_original-adequacy-01-1": "Task: Give just 17+25. Answer:42",
+        "case_3_original-adequacy-02-0": "Request: Name both colors from reference. Reference: red and teal. Response:red",
+        "case_4_original-adequacy-02-1": "Reference lists red and teal. Asked to return both, the answer gives only red."
+      },
+      "questions": {
+        "q1_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_1_original-adequacy-01-0] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q2_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_2_original-adequacy-01-1] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q3_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_3_original-adequacy-02-0] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q4_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_4_original-adequacy-02-1] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        }
+      },
+      "expected": {
+        "q1_adequacy": "yes",
+        "q2_adequacy": "yes",
+        "q3_adequacy": "no",
+        "q4_adequacy": "no"
+      }
+    },
+    {
+      "id": "jevbench-multiq-13",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-adequacy-03-0": "Request: Return a JSON array containing the integer 3. Response:{\"value\":3}",
+        "case_2_original-adequacy-03-1": "Task: Output an array with integer 3. Answer is an object with a value property set to 3.",
+        "case_3_original-adequacy-04-0": "Request: Is the library open Sunday? Reference: Closed Sunday. Response:No, it is closed on Sunday.",
+        "case_4_original-adequacy-04-1": "Reference says the library is closed on Sunday. Asked whether it opens Sunday, the answer says no."
+      },
+      "questions": {
+        "q1_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_1_original-adequacy-03-0] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q2_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_2_original-adequacy-03-1] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q3_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_3_original-adequacy-04-0] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q4_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_4_original-adequacy-04-1] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        }
+      },
+      "expected": {
+        "q1_adequacy": "no",
+        "q2_adequacy": "no",
+        "q3_adequacy": "yes",
+        "q4_adequacy": "yes"
+      }
+    },
+    {
+      "id": "jevbench-multiq-14",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-adequacy-05-0": "Request: Say exactly two words. Response:All done now",
+        "case_2_original-adequacy-05-1": "Task requires exactly two words; the response is All done now.",
+        "case_3_original-adequacy-06-0": "Request: Which train leaves first? Reference:A at 09:20, B at 08:50. Response:B",
+        "case_4_original-adequacy-06-1": "Reference departures are 09:20 for A and 08:50 for B. The requested earliest train is answered B."
+      },
+      "questions": {
+        "q1_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_1_original-adequacy-05-0] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q2_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_2_original-adequacy-05-1] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q3_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_3_original-adequacy-06-0] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        },
+        "q4_adequacy": {
+          "type": "noul",
+          "instructions": "[Regarding case_4_original-adequacy-06-1] Does the response fully satisfy the request, using the supplied reference when present?",
+          "criteria": {
+            "false": "Wrong, incomplete, unsupported or violates a constraint",
+            "true": "Correct, complete, and follows all explicit constraints"
+          }
+        }
+      },
+      "expected": {
+        "q1_adequacy": "no",
+        "q2_adequacy": "no",
+        "q3_adequacy": "yes",
+        "q4_adequacy": "yes"
+      }
+    },
+    {
+      "id": "jevbench-multiq-15",
+      "tier": "original-multiq-4",
+      "family": "multi_question",
+      "state": {
+        "case_1_original-routing-01-0": "Compute the least common multiple of 12 and 18.",
+        "case_2_original-routing-01-1": "Find LCM(12,18).",
+        "case_3_original-routing-02-0": "Write a Python function that reverses a list; no files need editing.",
+        "case_4_original-routing-02-1": "Show standalone Python code to reverse a list."
+      },
+      "questions": {
+        "q1_routing": {
+          "type": "choice",
+          "instructions": "[Regarding case_1_original-routing-01-0] Choose the specialist needed for the request. File edits with test execution use coding_agent, even if code-related.",
+          "criteria": {
+            "coding": "Self-contained code writing or explanation without repository operations",
+            "coding_agent": "Inspect/edit repository files or run tests",
+            "document": "Answer from a supplied document",
+            "general": "None of the specialist categories",
+            "math": "Self-contained calculation or proof",
+            "tools": "Carry out an external service action"
+          }
+        },
+        "q2_routing": {
+          "type": "choice",
+          "instructions": "[Regarding case_2_original-routing-01-1] Choose the specialist needed for the request. File edits with test execution use coding_agent, even if code-related.",
+          "criteria": {
+            "coding": "Self-contained code writing or explanation without repository operations",
+            "coding_agent": "Inspect/edit repository files or run tests",
+            "document": "Answer from a supplied document",
+            "general": "None of the specialist categories",
+            "math": "Self-contained calculation or proof",
+            "tools": "Carry out an external service action"
+          }
+        },
+        "q3_routing": {
+          "type": "choice",
+          "instructions": "[Regarding case_3_original-routing-02-0] Choose the specialist needed for the request. File edits with test execution use coding_agent, even if code-related.",
+          "criteria": {
+            "coding": "Self-contained code writing or explanation without repository operations",
+            "coding_agent": "Inspect/edit repository files or run tests",
+            "document": "Answer from a supplied document",
+            "general": "None of the specialist categories",
+            "math": "Self-contained calculation or proof",
+            "tools": "Carry out an external service action"
+          }
+        },
+        "q4_routing": {
+          "type": "choice",
+          "instructions": "[Regarding case_4_original-routing-02-1] Choose the specialist needed for the request. File edits with test execution use coding_agent, even if code-related.",
+          "criteria": {
+            "coding": "Self-contained code writing or explanation without repository operations",
+            "coding_agent": "Inspect/edit repository files or run tests",
+            "document": "Answer from a supplied document",
+            "general": "None of the specialist categories",
+            "math": "Self-contained calculation or proof",
+            "tools": "Carry out an external service action"
+          }
+        }
+      },
+      "expected": {
+        "q1_routing": "math",
+        "q2_routing": "math",
+        "q3_routing": "coding",
+        "q4_routing": "coding"
+      }
+    }
+  ]
+}

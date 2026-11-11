@@ -292,29 +292,80 @@ impl ModelConfig {
         val: &Json,
         num_hidden_layers: usize,
     ) -> io::Result<Vec<(usize, usize, usize)>> {
-        let arr = val.as_array().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid midloop config: expected array of [start_layer, end_layer, passes] triples",
-            )
-        })?;
-        let mut specs = Vec::with_capacity(arr.len());
-        for entry in arr {
-            let triple = entry.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
-                io::Error::new(
+        let mut specs = Vec::new();
+        if let Some(arr) = val.as_array() {
+            specs.reserve(arr.len());
+            for entry in arr {
+                let triple = entry.as_array().filter(|a| a.len() == 3).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid midloop entry: expected [start_layer, end_layer, passes]",
+                    )
+                })?;
+                let a = triple[0].as_u64().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid midloop start_layer")
+                })? as usize;
+                let b = triple[1].as_u64().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid midloop end_layer")
+                })? as usize;
+                let passes = triple[2].as_u64().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid midloop passes")
+                })? as usize;
+                specs.push((a, b, passes));
+            }
+        } else if let Some(obj) = val.as_object() {
+            let strategy = obj
+                .get("strategy")
+                .and_then(|v| v.as_str())
+                .unwrap_or("euler");
+            let conv = obj.get("conv").and_then(|v| v.as_str()).unwrap_or("A");
+            let n_gate = obj.get("n_gate").and_then(|v| v.as_u64()).unwrap_or(0);
+            let n_lora = obj.get("n_lora").and_then(|v| v.as_u64()).unwrap_or(0);
+            if !strategy.eq_ignore_ascii_case("euler")
+                || !conv.eq_ignore_ascii_case("A")
+                || n_gate != 0
+                || n_lora != 0
+            {
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "invalid midloop entry: expected [start_layer, end_layer, passes]",
-                )
-            })?;
-            let a = triple[0].as_u64().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid midloop start_layer")
-            })? as usize;
-            let b = triple[1].as_u64().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid midloop end_layer")
-            })? as usize;
-            let passes = triple[2].as_u64().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid midloop passes")
-            })? as usize;
+                    "unsupported midloop recurrence configuration (expected parameter-free euler conv='A')",
+                ));
+            }
+            let passes = obj.get("passes").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            if let Some(blocks) = obj.get("blocks").and_then(|v| v.as_array()) {
+                for blk in blocks {
+                    let pair = blk.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid midloop.blocks entry: expected [start_layer, end_layer]",
+                        )
+                    })?;
+                    let a = pair[0].as_u64().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid midloop start_layer")
+                    })? as usize;
+                    let b = pair[1].as_u64().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid midloop end_layer")
+                    })? as usize;
+                    specs.push((a, b, passes));
+                }
+            } else if let (Some(a), Some(b)) = (
+                obj.get("a").and_then(|v| v.as_u64()),
+                obj.get("b").and_then(|v| v.as_u64()),
+            ) {
+                specs.push((a as usize, b as usize, passes));
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid midloop object: expected 'blocks' or ('a', 'b')",
+                ));
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid midloop config: expected array of [start_layer, end_layer, passes] triples or object",
+            ));
+        }
+        for &(a, b, passes) in &specs {
             if passes < 1 || a > b || b >= num_hidden_layers {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -323,7 +374,6 @@ impl ModelConfig {
                     ),
                 ));
             }
-            specs.push((a, b, passes));
         }
         specs.sort_by_key(|&(a, _, _)| a);
         for w in specs.windows(2) {
@@ -358,6 +408,13 @@ impl ModelConfig {
                 io::ErrorKind::InvalidData,
                 "unsupported decision_config.json format_id='joint-question-inline-readout-v1' (PPLX v1.2 is deferred)",
             ));
+        }
+        if let Some(am) = dc.get("attention_mode").and_then(|v| v.as_str()) {
+            if am.eq_ignore_ascii_case("noncausal_full_attention") {
+                self.noncausal_full_attention = true;
+            } else if am.eq_ignore_ascii_case("prefix_bidir") {
+                self.prefix_bidir = true;
+            }
         }
         if let Some(nc) = dc.get("noncausal_full_attention").and_then(|v| v.as_bool()) {
             self.noncausal_full_attention = nc;
@@ -865,18 +922,24 @@ impl ModelConfig {
                 .map(String::from),
             decision_temperature: get_f64("decision_temperature").or_else(|| dc_f64("temperature")),
         };
+        let attn_mode = root
+            .get("attention_mode")
+            .or_else(|| tc.get("attention_mode"))
+            .or_else(|| dc.and_then(|d| d.get("attention_mode")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let noncausal_full_attention = root
             .get("noncausal_full_attention")
             .or_else(|| tc.get("noncausal_full_attention"))
             .or_else(|| dc.and_then(|d| d.get("noncausal_full_attention")))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or_else(|| attn_mode.eq_ignore_ascii_case("noncausal_full_attention"));
         let prefix_bidir = root
             .get("prefix_bidir")
             .or_else(|| tc.get("prefix_bidir"))
             .or_else(|| dc.and_then(|d| d.get("prefix_bidir")))
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or_else(|| attn_mode.eq_ignore_ascii_case("prefix_bidir"));
         let midloop = if let Some(ml) = root
             .get("midloop")
             .or_else(|| tc.get("midloop"))

@@ -108,6 +108,10 @@ def summarize(records, sessions, duration_s, case):
     total_cached = sum(cached_tokens(r) for r in accounted) if all_cached else None
     total_uncached = (total_prompt - total_cached) if (total_prompt is not None and total_cached is not None) else None
     cache_hit_ratio = (total_cached / total_prompt) if (total_cached is not None and total_prompt) else None
+    scored_decisions = [r for r in good if isinstance(r.get("decision_total"), int) and r["decision_total"] > 0]
+    decision_total = sum(r["decision_total"] for r in scored_decisions) if scored_decisions else None
+    decision_correct = sum(r.get("decision_correct") or 0 for r in scored_decisions) if scored_decisions else None
+    decision_accuracy = (decision_correct / decision_total) if decision_total else None
     warm_ttfts, cold_ttfts, cold_rates = [], [], []
     for r in accounted:
         ptok = tokens(r)[0]
@@ -132,6 +136,9 @@ def summarize(records, sessions, duration_s, case):
         "successful_requests_s": len(good) / duration_s,
         "completion_tokens": sum(tokens(r)[1] for r in accounted) if all_accounted else None,
         "completion_tokens_s": sum(tokens(r)[1] for r in accounted) / duration_s if all_accounted else None,
+        "decision_correct": decision_correct,
+        "decision_total": decision_total,
+        "decision_accuracy": decision_accuracy,
         "reported_prompt_tokens": total_prompt,
         "peak_prompt_tokens": max((tokens(r)[0] for r in accounted), default=None) if all_accounted else None,
         "cached_prompt_tokens": total_cached,

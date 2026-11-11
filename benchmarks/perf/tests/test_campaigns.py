@@ -17,7 +17,8 @@ class CampaignTests(unittest.TestCase):
     def test_completion_campaigns_and_all_presets_plan_without_network(self):
         for name in ('27b-completion', '27b-kv-spec-completion', '27b-capacity-completion',
                      '27b-swe-multiclient', '35b-swe-multiclient', 'flash-next-swe-multiclient',
-                     'flash-next-serving', 'flash-next-hgptq', 'flash-next-longctx'):
+                     'flash-next-serving', 'flash-next-hgptq', 'flash-next-longctx',
+                     'decision-models'):
             cfg = load(ROOT / 'campaigns' / (name + '.toml'))
             for tier in ('quick', 'full', 'release'):
                 with self.subTest(campaign=name, tier=tier):
@@ -55,6 +56,26 @@ class CampaignTests(unittest.TestCase):
                 self.assertEqual(cases['swe-c4-shared']['concurrency'], 4)
                 self.assertEqual(cases['swe-c4-unique']['concurrency'], 4)
                 self.assertEqual(cases['swe-c8-burst']['concurrency'], 8)
+
+    def test_decision_models_campaign_covers_glide_d3_causallm_and_jevbench(self):
+        cfg = load(ROOT / 'campaigns' / 'decision-models.toml')
+        models = {e['model'] for e in cfg['engines']}
+        for expected in (
+            'fastino/GLiDE-0.8B',
+            'fastino/GLiDE-2B',
+            'fastino/GLiDE-9B',
+            'fastino/GLiDE-27B',
+            'vllm-sr/d3-flash',
+            'vllm-sr/d3-turbo',
+            'vllm-sr/d3-ultra',
+            'nchapman/Qwen3.5-4B-W4A16-GPTQ',
+            'nchapman/Qwen3.8-27B-W4A16-GPTQ',
+        ):
+            self.assertIn(expected, models)
+        cases = {c['id']: c for c in cfg['cases']}
+        self.assertEqual(len(cases['jevbench-full-128-c1']['fixture_data']['requests']), 128)
+        self.assertEqual(len(cases['jevbench-multiq-c1']['fixture_data']['requests']), 16)
+        self.assertEqual(cases['jevbench-single-c1-p2']['order_passes'], 2)
 
     def test_capacity_calibration_identifies_current_fixture_and_increasing_lengths(self):
         fixture = ROOT / 'fixtures/quality-capacity.json'

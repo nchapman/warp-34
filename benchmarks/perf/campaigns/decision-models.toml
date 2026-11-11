@@ -1,0 +1,228 @@
+# Decision-model (GLiDE / vllm-sr d3 / CausalLm) JevBench campaign (`POST /v1/systemone`).
+# Launch profiles serially and select with `--engines <id>`.
+schema_version = 1
+
+[run]
+seed = 34
+repetitions = 3
+warmup_requests = 2
+max_inflight = 16
+timeout_s = 180
+
+[presets.quick]
+cases = ["jevbench-smoke-c1", "jevbench-multiq-c1"]
+repetitions = 1
+
+[presets.full]
+cases = [
+  "jevbench-single-c1",
+  "jevbench-single-c1-p2",
+  "jevbench-single-c8",
+  "jevbench-multiq-c1",
+  "jevbench-multiq-c4",
+]
+repetitions = 3
+
+[presets.release]
+cases = [
+  "jevbench-full-128-c1",
+  "jevbench-single-c1-p2",
+  "jevbench-single-c8",
+  "jevbench-multiq-c1",
+  "jevbench-multiq-c4",
+]
+repetitions = 5
+
+[engine_defaults]
+support = "supported"
+engine = "warp-34"
+version = "current-tree"
+gpu_count = 1
+parallelism = "single"
+base_url = "http://127.0.0.1:18034/v1"
+source_model_revision = "same as model_revision"
+artifact_sha256 = "pinned-hf-revision"
+tokenizer_revision = "same as model_revision"
+chat_template_sha256 = "pinned-hf-revision"
+quantization_details = "native checkpoint or W4A16 GPTQ"
+activation_dtype = "float16"
+conv_state_dtype = "float16"
+kv_format = "fp16"
+speculation = "none"
+cache_config = "256 FP16 pages; FP32 SSM; synchronous decision wave submission + 100us burst coalescing"
+
+# ---------------------------------------------------------------------------
+# fastino/GLiDE-* (CodeReadout, noncausal_full_attention + damped-Euler midloop on 9B/27B)
+# ---------------------------------------------------------------------------
+
+[[engines]]
+id = "warp34-glide-0_8b-tp1"
+cohort = "glide-code-readout"
+model = "fastino/GLiDE-0.8B"
+model_revision = "9eacdeec79fa48ec52a8d6f54b331376b4bbfaf0"
+weight_format = "bf16-safetensors"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model fastino/GLiDE-0.8B --revision 9eacdeec79fa48ec52a8d6f54b331376b4bbfaf0 --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-glide-2b-tp1"
+cohort = "glide-code-readout"
+model = "fastino/GLiDE-2B"
+model_revision = "00f122c120cdeed82284106cb77d9bab5a50ad16"
+weight_format = "bf16-safetensors"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model fastino/GLiDE-2B --revision 00f122c120cdeed82284106cb77d9bab5a50ad16 --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-glide-9b-tp1"
+cohort = "glide-code-readout"
+model = "fastino/GLiDE-9B"
+model_revision = "ab54df5acba0eebf7df45560ffdaacd64e32df3b"
+weight_format = "bf16-safetensors"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model fastino/GLiDE-9B --revision ab54df5acba0eebf7df45560ffdaacd64e32df3b --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-glide-27b-tp2"
+cohort = "glide-code-readout"
+gpu_count = 2
+parallelism = "tp2"
+model = "fastino/GLiDE-27B"
+model_revision = "4d32743ae96b74f0116f050d37742bbd43c04e7d"
+weight_format = "bf16-safetensors"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model fastino/GLiDE-27B --revision 4d32743ae96b74f0116f050d37742bbd43c04e7d --tp 2 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+# ---------------------------------------------------------------------------
+# vllm-sr/d3-* (CodeReadout, noncausal_full_attention on flash, prefix_bidir on turbo/ultra)
+# ---------------------------------------------------------------------------
+
+[[engines]]
+id = "warp34-d3-flash-tp1"
+cohort = "d3-code-readout"
+model = "vllm-sr/d3-flash"
+model_revision = "67e03e1bc157961c582ee7c6a35d9b15fada3dec"
+weight_format = "bf16-safetensors"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model vllm-sr/d3-flash --revision 67e03e1bc157961c582ee7c6a35d9b15fada3dec --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-turbo-tp2"
+cohort = "d3-code-readout"
+gpu_count = 2
+parallelism = "tp2"
+model = "vllm-sr/d3-turbo"
+model_revision = "9df220de4ce52ab11047156fa54b8c0313d8b0eb"
+weight_format = "bf16-safetensors"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model vllm-sr/d3-turbo --revision 9df220de4ce52ab11047156fa54b8c0313d8b0eb --tp 2 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-d3-ultra-tp2"
+cohort = "d3-code-readout"
+gpu_count = 2
+parallelism = "tp2"
+model = "vllm-sr/d3-ultra"
+model_revision = "ccdcfa611649a59e095e0b5e1732a15cedafadd6"
+weight_format = "bf16-safetensors"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/release/w34 serve --model vllm-sr/d3-ultra --revision ccdcfa611649a59e095e0b5e1732a15cedafadd6 --tp 2 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+# ---------------------------------------------------------------------------
+# CausalLm (Tev1) decision fallback on local 4-bit GPTQ checkpoints
+# ---------------------------------------------------------------------------
+
+[[engines]]
+id = "warp34-causallm-4b-tp1"
+cohort = "causal-lm-decision"
+model = "nchapman/Qwen3.5-4B-W4A16-GPTQ"
+model_revision = "94c4c3ca0d822579ac6f013fa0a351908c279282"
+weight_format = "compressed-tensors-GPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ --revision 94c4c3ca0d822579ac6f013fa0a351908c279282 --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-causallm-27b-tp1"
+cohort = "causal-lm-decision"
+model = "nchapman/Qwen3.8-27B-W4A16-GPTQ"
+model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+weight_format = "compressed-tensors-GPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-GPTQ --revision 0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+[[engines]]
+id = "warp34-causallm-27b-tp2"
+cohort = "causal-lm-decision"
+gpu_count = 2
+parallelism = "tp2"
+model = "nchapman/Qwen3.8-27B-W4A16-GPTQ"
+model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+weight_format = "compressed-tensors-GPTQ-int4"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-GPTQ --revision 0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+
+# ---------------------------------------------------------------------------
+# JevBench Cases (from https://github.com/fstandhartinger/jevbench)
+# ---------------------------------------------------------------------------
+
+[[cases]]
+id = "jevbench-smoke-c1"
+kind = "decision"
+fixture = "../fixtures/jevbench_public.json"
+requests = 8
+concurrency = 1
+max_tokens = 1
+order_passes = 1
+cache = "unique"
+
+[[cases]]
+id = "jevbench-single-c1"
+kind = "decision"
+fixture = "../fixtures/jevbench_public.json"
+requests = 32
+concurrency = 1
+max_tokens = 1
+order_passes = 1
+cache = "unique"
+e2e_slo_ms = 250
+
+[[cases]]
+id = "jevbench-single-c1-p2"
+kind = "decision"
+fixture = "../fixtures/jevbench_public.json"
+requests = 32
+concurrency = 1
+max_tokens = 1
+order_passes = 2
+cache = "unique"
+e2e_slo_ms = 500
+
+[[cases]]
+id = "jevbench-single-c8"
+kind = "decision"
+fixture = "../fixtures/jevbench_public.json"
+requests = 64
+concurrency = 8
+max_tokens = 1
+order_passes = 1
+cache = "unique"
+
+[[cases]]
+id = "jevbench-full-128-c1"
+kind = "decision"
+fixture = "../fixtures/jevbench_public.json"
+requests = 128
+concurrency = 1
+max_tokens = 1
+order_passes = 1
+cache = "unique"
+
+[[cases]]
+id = "jevbench-multiq-c1"
+kind = "decision"
+fixture = "../fixtures/jevbench_multiquestion.json"
+requests = 16
+concurrency = 1
+max_tokens = 1
+order_passes = 1
+cache = "unique"
+
+[[cases]]
+id = "jevbench-multiq-c4"
+kind = "decision"
+fixture = "../fixtures/jevbench_multiquestion.json"
+requests = 32
+concurrency = 4
+max_tokens = 1
+order_passes = 1
+cache = "unique"

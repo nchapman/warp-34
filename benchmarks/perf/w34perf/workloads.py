@@ -69,3 +69,40 @@ def append_replay(history, turn, session, step):
         history.append({"role": "assistant", "content": None, "tool_calls": calls})
         history.extend({"role": "tool", "tool_call_id": call["id"], "content": tool["result"]}
                        for call, tool in zip(calls, tools))
+
+
+def decision_request(case, index, namespace):
+    data = case["fixture_data"]
+    requests = data.get("requests")
+    if not isinstance(requests, list) or not requests:
+        raise ValueError("decision fixture requires nonempty requests")
+    item = copy.deepcopy(requests[index % len(requests)])
+    cache = case.get("cache", "unique")
+    tag = f"Benchmark session: {namespace}:{index if cache == 'unique' else 'shared'}.\n"
+    repeats = case.get("context_repetitions", 1)
+    if not isinstance(repeats, int) or isinstance(repeats, bool) or not 1 <= repeats <= 256:
+        raise ValueError("context_repetitions must be an integer in 1..256")
+    state = item["state"]
+    if isinstance(state, str):
+        item["state"] = tag + (state * repeats)
+    elif isinstance(state, dict):
+        merged = {"_benchmark_session": tag.strip(), **state}
+        if repeats > 1:
+            merged["_context_padding"] = [copy.deepcopy(state) for _ in range(repeats - 1)]
+        item["state"] = merged
+    elif isinstance(state, list):
+        item["state"] = [tag.strip(), *(state * repeats)]
+    return item
+
+
+def decision_body(engine, case, item):
+    payload = {
+        "model": engine["model"],
+        "state": copy.deepcopy(item["state"]),
+        "questions": copy.deepcopy(item["questions"]),
+    }
+    if "order_passes" in case:
+        payload["order_passes"] = case["order_passes"]
+    payload.update(copy.deepcopy(engine.get("request_overrides", {})))
+    return payload
+

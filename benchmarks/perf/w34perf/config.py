@@ -42,6 +42,29 @@ def _validate_agent_trajectory(traj):
                 raise ValueError("replayed tool arguments must be an object")
 
 
+def _validate_decision_request(req):
+    if not isinstance(req, dict):
+        raise ValueError("decision request entry must be an object")
+    if "id" in req and (not isinstance(req["id"], str) or not req["id"].strip()):
+        raise ValueError("decision request id must be a nonempty string")
+    if not isinstance(req.get("state"), (str, dict, list)) or (
+        isinstance(req["state"], str) and not req["state"].strip()
+    ):
+        raise ValueError("decision request requires nonempty state")
+    questions = req.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        raise ValueError("decision request requires nonempty questions object")
+    for qk, q in questions.items():
+        if not isinstance(qk, str) or not qk.strip() or not isinstance(q, dict):
+            raise ValueError("decision question must be a named object")
+        if q.get("type") not in ("noul", "choice", "score"):
+            raise ValueError("decision question type must be noul, choice, or score")
+        if not isinstance(q.get("instructions"), (str, dict, list)):
+            raise ValueError("decision question requires instructions")
+    if "expected" in req and not isinstance(req["expected"], dict):
+        raise ValueError("decision request expected must be an object")
+
+
 def positive(value, name, *, zero=False, integer=False):
     if (isinstance(value, bool) or not isinstance(value, (int, float))
             or not math.isfinite(value) or value < 0 or (not zero and value == 0)
@@ -110,7 +133,8 @@ def load(path):
                 raise ValueError(f"{engine['id']}: {key} must be recorded (use 'unknown' if needed)")
         if not isinstance(engine.get("request_overrides", {}), dict):
             raise ValueError("request_overrides must be a table")
-        reserved = {"model", "messages", "stream", "stream_options", "max_tokens", "n"}
+        reserved = {"model", "messages", "stream", "stream_options", "max_tokens", "n",
+                    "state", "questions", "decisions"}
         if reserved.intersection(engine.get("request_overrides", {})):
             raise ValueError("request_overrides cannot replace workload/stream/model fields")
     run = cfg.setdefault("run", {})
@@ -124,8 +148,13 @@ def load(path):
         run.setdefault(key, default)
         positive(run[key], key, zero=zero, integer=integer)
     for case in cases:
-        if case.get("kind", "text") not in ("text", "agent_replay"):
-            raise ValueError("kind must be text or agent_replay")
+        if case.get("kind", "text") not in ("text", "agent_replay", "decision"):
+            raise ValueError("kind must be text, agent_replay, or decision")
+        if "order_passes" in case:
+            if (case.get("kind", "text") != "decision"
+                    or isinstance(case["order_passes"], bool)
+                    or case["order_passes"] not in (1, 2)):
+                raise ValueError("order_passes must be 1 or 2 on a decision case")
         for key, default in (("requests", 32), ("concurrency", 1), ("max_tokens", 128)):
             case.setdefault(key, default)
             positive(case[key], key, integer=True)
@@ -173,6 +202,18 @@ def load(path):
                         seen_ids.add(tid)
             else:
                 _validate_agent_trajectory(data)
+        elif case.get("kind", "text") == "decision":
+            requests = data.get("requests")
+            if not isinstance(requests, list) or not requests:
+                raise ValueError("decision fixture requires nonempty requests")
+            seen_ids = set()
+            for req in requests:
+                _validate_decision_request(req)
+                rid = req.get("id")
+                if rid is not None:
+                    if rid in seen_ids:
+                        raise ValueError(f"duplicate decision request id {rid!r}")
+                    seen_ids.add(rid)
         elif (not isinstance(data.get("prompts"), list) or not data["prompts"]
               or any(not isinstance(p, str) or not p for p in data["prompts"])):
             raise ValueError("text fixture requires nonempty prompts")

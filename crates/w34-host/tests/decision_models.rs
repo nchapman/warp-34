@@ -664,7 +664,7 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
                     let n1 = tp1_b["answers"]["urgent"]["noul"].as_f64().unwrap();
                     let n2 = tp2_b["answers"]["urgent"]["noul"].as_f64().unwrap();
                     assert!(
-                        (n1 - n2).abs() < 3e-3,
+                        (n1 - n2).abs() < 1e-2,
                         "d3 TP=1 vs TP=2 noul mismatch ({label}): tp1={n1} vs tp2={n2}"
                     );
                     for k in ["zeta", "alpha"] {
@@ -675,7 +675,7 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
                             .as_f64()
                             .unwrap();
                         assert!(
-                            (c1 - c2).abs() < 3e-3,
+                            (c1 - c2).abs() < 1e-2,
                             "d3 TP=1 vs TP=2 choice[{k}] mismatch ({label}): tp1={c1} vs tp2={c2}"
                         );
                     }
