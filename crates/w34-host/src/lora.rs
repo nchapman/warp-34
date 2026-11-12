@@ -957,13 +957,40 @@ pub struct DeviceLoraStack {
     pub rank_pad: usize,
     pub num_adapters: usize,
     pub adapter_mask: u64,
+    pub num_b_slices: u8,
+    pub b_slices4: [i32; 12],
     pub state: std::sync::Arc<RankLoraState>,
 }
 
 #[cfg(feature = "cuda")]
 impl DeviceLoraStack {
     #[inline]
+    pub fn is_currently_noop(&self) -> bool {
+        if self.adapter_mask == 0 {
+            return true;
+        }
+        let d_ids_ptr = self.state.token_lora_ids_ptr.load(Ordering::Relaxed);
+        let def_id = self.state.default_lora_id.load(Ordering::Relaxed);
+        d_ids_ptr == 0
+            && (def_id < 0
+                || (def_id as usize) >= self.num_adapters
+                || ((self.adapter_mask >> def_id) & 1) == 0)
+    }
+
+    #[inline]
     pub fn forward(&self, ex: &W34Exec, x_ptr: u64, y_inout_ptr: u64, rows: usize) -> Result<()> {
+        self.forward_with_cublas(ex, 0, x_ptr, y_inout_ptr, rows)
+    }
+
+    #[inline]
+    pub fn forward_with_cublas(
+        &self,
+        ex: &W34Exec,
+        cublas_handle: usize,
+        x_ptr: u64,
+        y_inout_ptr: u64,
+        rows: usize,
+    ) -> Result<()> {
         if rows == 0 || self.adapter_mask == 0 {
             return Ok(());
         }
@@ -983,6 +1010,39 @@ impl DeviceLoraStack {
                 needed_ws, self.rank_pad, self.state.lowrank_ws_elems
             )));
         }
+        let rows_i32 = i32::try_from(rows).map_err(|_| loader_err_msg("LoRA rows exceeds i32"))?;
+        let size_n_i32 =
+            i32::try_from(self.size_n).map_err(|_| loader_err_msg("LoRA size_n exceeds i32"))?;
+        let size_k_i32 =
+            i32::try_from(self.size_k).map_err(|_| loader_err_msg("LoRA size_k exceeds i32"))?;
+        let rank_pad_i32 = i32::try_from(self.rank_pad)
+            .map_err(|_| loader_err_msg("LoRA rank_pad exceeds i32"))?;
+        let num_adapters_i32 = i32::try_from(self.num_adapters)
+            .map_err(|_| loader_err_msg("LoRA num_adapters exceeds i32"))?;
+        if d_ids_ptr == 0 && def_id >= 0 && cublas_handle != 0 && rows >= 8 && self.rank_pad >= 64 {
+            return check_rc(
+                // SAFETY: `cublas_handle` is bound to `ex.stream`; `x_ptr`, `y_inout_ptr`,
+                // `lora_a_ptr`, `lora_b_ptr`, and `lowrank_ws_ptr` are valid device allocations.
+                unsafe {
+                    ffi::w34_cublas_lora_shrink_expand_f16(
+                        cublas_handle,
+                        x_ptr as *const c_void,
+                        y_inout_ptr as *mut c_void,
+                        self.lora_a_ptr as *const c_void,
+                        self.lora_b_ptr as *const c_void,
+                        self.state.lowrank_ws_ptr as *mut c_void,
+                        def_id,
+                        rows_i32,
+                        size_n_i32,
+                        size_k_i32,
+                        rank_pad_i32,
+                        i32::from(self.num_b_slices),
+                        self.b_slices4.as_ptr(),
+                    )
+                },
+                "w34_cublas_lora_shrink_expand_f16",
+            );
+        }
         check_rc(
             // SAFETY: `x_ptr` holds `[rows, size_k]` FP16, `y_inout_ptr` holds `[rows, size_n]` FP16,
             // `lora_a_ptr` holds `[num_adapters, rank_pad, size_k]` FP16, `lora_b_ptr` holds
@@ -997,11 +1057,11 @@ impl DeviceLoraStack {
                     d_ids_ptr as *const i32,
                     self.state.lowrank_ws_ptr as *mut f32,
                     y_inout_ptr as *mut c_void,
-                    rows as i32,
-                    self.size_n as i32,
-                    self.size_k as i32,
-                    self.rank_pad as i32,
-                    self.num_adapters as i32,
+                    rows_i32,
+                    size_n_i32,
+                    size_k_i32,
+                    rank_pad_i32,
+                    num_adapters_i32,
                     def_id,
                     self.adapter_mask,
                 )
@@ -1071,6 +1131,8 @@ pub struct PackedProjLoraHost {
     pub rank_pad: usize,
     pub num_adapters: usize,
     pub adapter_mask: u64,
+    pub num_b_slices: u8,
+    pub b_slices4: [i32; 12],
 }
 
 impl PackedProjLoraHost {
@@ -1189,6 +1251,8 @@ pub fn pack_multi_slice_lora(
 
     let mut a_f32 = vec![0.0f32; num_adapters * rank_pad * local_k];
     let mut b_f32 = vec![0.0f32; num_adapters * local_n * rank_pad];
+    let mut common_b_slices: Option<Vec<[i32; 4]>> = None;
+    let mut b_slices_uniform = true;
 
     for (ad_idx, slices) in per_adapter_slices.iter().enumerate() {
         let mut r_off = 0usize;
@@ -1196,6 +1260,7 @@ pub fn pack_multi_slice_lora(
         let a_ad_base = ad_idx * rank_pad * local_k;
         let b_ad_base = ad_idx * local_n * rank_pad;
         let mut placed_as: Vec<(usize, usize, &[f32])> = Vec::with_capacity(slices.len());
+        let mut ad_b_slices: Vec<[i32; 4]> = Vec::with_capacity(slices.len());
         for s in slices {
             if let Some(w) = s.weight {
                 let use_r_off = if let Some(&(existing_r_off, _, _)) =
@@ -1219,8 +1284,37 @@ pub fn pack_multi_slice_lora(
                     let dst_row_start = b_ad_base + (n_off + row) * rank_pad + use_r_off;
                     b_f32[dst_row_start..dst_row_start + w.r].copy_from_slice(src_row);
                 }
+                ad_b_slices.push([n_off as i32, s.local_n as i32, use_r_off as i32, w.r as i32]);
             }
             n_off += s.local_n;
+        }
+        if ((adapter_mask >> ad_idx) & 1) != 0 {
+            match &common_b_slices {
+                None => common_b_slices = Some(ad_b_slices),
+                Some(prev) if prev != &ad_b_slices => b_slices_uniform = false,
+                Some(_) => {}
+            }
+        }
+    }
+
+    let mut num_b_slices = 0u8;
+    let mut b_slices4 = [0i32; 12];
+    if b_slices_uniform
+        && let Some(ref bs) = common_b_slices
+        && (2..=3).contains(&bs.len())
+        && bs.iter().all(|&[n_off, sn, r_off, sr]| {
+            n_off % 8 == 0 && sn >= 8 && sn % 8 == 0 && r_off % 8 == 0 && sr >= 8 && sr % 8 == 0
+        })
+    {
+        // Only split B into sub-slices when they do not all share the same r_off (i.e. block-diagonal)
+        let all_same_r = bs
+            .windows(2)
+            .all(|w| w[0][2] == w[1][2] && w[0][3] == w[1][3]);
+        if !all_same_r {
+            num_b_slices = bs.len() as u8;
+            for (i, s) in bs.iter().enumerate() {
+                b_slices4[i * 4..i * 4 + 4].copy_from_slice(s);
+            }
         }
     }
 
@@ -1232,6 +1326,8 @@ pub fn pack_multi_slice_lora(
         rank_pad,
         num_adapters,
         adapter_mask,
+        num_b_slices,
+        b_slices4,
     }))
 }
 

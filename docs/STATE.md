@@ -2,9 +2,9 @@
 
 ## Multi-LoRA / PEFT Adapter Support (`FP16` & `W4A16-HGPTQ` Base Models, Mixed-Adapter Batching, & Hadamard Pre-Rotation)
 
-- **CUDA Multi-LoRA Shrink+Expand Kernels (`crates/w34-kernels/csrc/ops/op_lora.cu`, `w34_cuda.h`, `ffi_ext.rs`, `warmup.rs`):**
-  - Implemented `w34_lora_shrink_expand_f16` (`lora_fused_shrink_expand_512t_f16_kernel` for decode `m <= 4 && rank_pad <= 16`, plus 4-token-tiled `lora_shrink_f16_kernel` + 8-token-tiled `lora_expand_add_f16_kernel` for larger `m` / `rank_pad`) with vectorized `float4` (`8 × FP16`) loads, `FP32` low-rank accumulation (`U[t, r] = sum_k X[t, k] * A[lid, r, k]`), and in-place `FP16` residual output accumulation (`Y[t, n] += sum_r U[t, r] * B_scaled[lid, n, r]`). Tiling 4 tokens per shrink block and 8 tokens per expand block cuts prefill global-memory reads of `lora_A`/`lora_B` by 4×/8× while preserving 0-ULP per-token accumulation parity (~2× end-to-end JevBench speedup at `r = 128`).
-  - Supports per-token `token_lora_ids[t]` routing across up to 62 simultaneously loaded adapters (`lora_id >= 0`) and base model (`lora_id = -1`, 0-ULP unchanged output) within the same prefill, decode, or speculative verify batch, and is CUDA-Graph capturable (`RankLoraState` binds graph-static device pointers via `SpecVerifyGraphIo::meta_i32` and `BatchedDecodeGraphIo::meta_i32`).
+- **CUDA Multi-LoRA Shrink+Expand Kernels (`crates/w34-kernels/csrc/ops/op_lora.cu`, `op_init.cu`, `w34_cuda.h`, `ffi_ext.rs`, `warmup.rs`):**
+  - Implemented `w34_lora_shrink_expand_f16` (`lora_fused_shrink_expand_512t_f16_kernel` for decode `m <= 4 && rank_pad <= 16`, plus 4-token-tiled `lora_shrink_f16_kernel` + 8-token-tiled `lora_expand_add_f16_kernel` for mixed-adapter batches) and `w34_cublas_lora_shrink_expand_f16` (homogeneous-batch Tensor Core `cublasGemmEx` `U = X @ A^T` (`beta = 0`) followed by per-slice non-zero block `Y[:, n_off..n_off+slice_n] += U[:, r_off..r_off+slice_r] @ B_s^T` (`beta = 1`) for `rows >= 8 && rank_pad >= 64`, skipping off-diagonal zero blocks in packed multi-slice `qkv_proj`/`in_proj_qkvz`/`gate_up_proj` `lora_B` matrices).
+  - Supports per-token `token_lora_ids[t]` routing across up to 62 simultaneously loaded adapters (`lora_id >= 0`) and base model (`lora_id = -1`, 0-ULP unchanged output, preserving `in_proj_ba.can_fork_on_aux_stream() == true` when `lora.is_currently_noop()`) within the same prefill, decode, or speculative verify batch, and is CUDA-Graph capturable (`RankLoraState` binds graph-static device pointers via `SpecVerifyGraphIo::meta_i32` and `BatchedDecodeGraphIo::meta_i32`).
   - Registered `w34_lora_shrink_expand_f16` in `prepare_execution_plan()` warmup for cold-start `TP=2`/`TP=4` safety.
 - **PEFT Adapter Loader, Hub Subfolder Resolution, & Hadamard-Fused `LinearProj::WithLora` (`crates/w34-host/src/lora.rs`, `hub.rs`, `model/weights.rs`):**
   - Parses standard HuggingFace PEFT `adapter_config.json` (`r`, `lora_alpha`, `use_rslora`, `rank_pattern`, `alpha_pattern`) and `adapter_model.safetensors` (`F16`, `BF16`, `F32`) across local paths, HF repo IDs (`owner/repo`), and subfolder repo specs (`owner/repo/sub/folder[@rev]`).
@@ -18,14 +18,14 @@
   - **Verified Live on `nchapman/Qwen3.5-9B-W4A16-HGPTQ` + `nchapman/Qwen3.5-9B-Heretic-LoRA`:** **`141.55 tok/s`** single-stream decode with CUDA graphs enabled, 0-ULP identical base-model output when `lora_id = -1`, exact mixed-batch (`base` + `heretic`) continuous-batching parity, and `TP=1` vs `TP=2` `dump-diff` parity (`tp1_top1 == tp2_top1`, `min_cosine = 0.998927`).
   - **Verified Live Decision LoRA JevBench (`128` Public + `64` MultiQ, `0` errors) on `W4A16-HGPTQ` Base Models:**
     - **`nchapman/Qwen3.5-0.8B-W4A16-HGPTQ` (`3a51478079`) + `glide-0.8b=nchapman/Qwen3.5-0.8B-GLiDE-LoRA` (`3f1915bc51`, `r=128`):**
-      - Base model (`CausalLm`): Public **`66 / 128` (`51.56%`)** at **`99.6 dec/s`**, MultiQ **`26 / 64` (`40.62%`)** at **`228.5 dec/s`**.
-      - `glide-0.8b` (`CodeReadout` + `noncausal_full_attention`): Public **`106 / 128` (`82.81%`, `+31.25 pp`)** at **`44.9 dec/s`** (`2.85s`), MultiQ **`63 / 64` (`98.44%`, `+57.81 pp`)** at **`74.7 dec/s`** (`0.86s`).
+      - Base model (`CausalLm`): Public **`67 / 128` (`52.34%`)** at **`100.2 dec/s`** (`1.28s`), MultiQ **`26 / 64` (`40.62%`)** at **`234.7 dec/s`** (`0.27s`).
+      - `glide-0.8b` (`CodeReadout` + `noncausal_full_attention`): Public **`106 / 128` (`82.81%`, `+30.47 pp`)** at **`99.0 dec/s`** (`1.29s`), MultiQ **`63 / 64` (`98.44%`, `+57.81 pp`)** at **`176.8 dec/s`** (`0.36s`).
     - **`nchapman/Qwen3.5-2B-W4A16-HGPTQ` (`a9b3c78230`) + `glide-2b=nchapman/Qwen3.5-2B-GLiDE-LoRA` (`ea5b1407c3`, `r=128`):**
-      - Base model (`CausalLm`): Public **`83 / 128` (`64.84%`)** at **`48.7 dec/s`**, MultiQ **`34 / 64` (`53.12%`)** at **`113.0 dec/s`**.
-      - `glide-2b` (`CodeReadout` + `noncausal_full_attention`): Public **`113 / 128` (`88.28%`, `+23.44 pp`)** at **`27.8 dec/s`** (`4.61s`), MultiQ **`62 / 64` (`96.88%`, `+43.75 pp`)** at **`45.3 dec/s`** (`1.41s`).
+      - Base model (`CausalLm`): Public **`82 / 128` (`64.06%`)** at **`49.2 dec/s`** (`2.60s`), MultiQ **`34 / 64` (`53.12%`)** at **`114.9 dec/s`** (`0.56s`).
+      - `glide-2b` (`CodeReadout` + `noncausal_full_attention`): Public **`113 / 128` (`88.28%`, `+24.22 pp`)** at **`51.6 dec/s`** (`2.48s`), MultiQ **`62 / 64` (`96.88%`, `+43.75 pp`)** at **`87.3 dec/s`** (`0.73s`).
     - **`nchapman/Qwen3.5-9B-W4A16-HGPTQ` (`332dad698d`) + `glide-9b=nchapman/Qwen3.5-9B-GLiDE-LoRA` (`948c7d02ca`, `r=128`, 2-pass `midloop` `[[12,17],[18,23]]`):**
-      - Base model (`CausalLm`): Public **`110 / 128` (`85.94%`)** at **`11.3 dec/s`**, MultiQ **`61 / 64` (`95.31%`)** at **`26.7 dec/s`**.
-      - `glide-9b` (`CodeReadout` + `noncausal_full_attention` + 2-pass `midloop`): Public **`122 / 128` (`95.31%`, `+9.38 pp`)** at **`5.7 dec/s`** (`22.39s`), MultiQ **`64 / 64` (`100.00%`, `+4.69 pp`)** at **`9.2 dec/s`** (`6.98s`).
+      - Base model (`CausalLm`): Public **`110 / 128` (`85.94%`)** at **`11.4 dec/s`** (`11.25s`), MultiQ **`61 / 64` (`95.31%`)** at **`26.7 dec/s`** (`2.40s`).
+      - `glide-9b` (`CodeReadout` + `noncausal_full_attention` + 2-pass `midloop`): Public **`122 / 128` (`95.31%`, `+9.38 pp`)** at **`9.1 dec/s`** (`14.09s`), MultiQ **`64 / 64` (`100.00%`, `+4.69 pp`)** at **`14.9 dec/s`** (`4.31s`).
 
 ## Model Checkpoint Standardization (`Qwen/Qwen3.5-4B` Core Tests, `nchapman/*-W4A16-HGPTQ` `w34` Targets, & Mainstream Competitor Baselines)
 

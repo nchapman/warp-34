@@ -54,7 +54,7 @@ pub enum LinearProj {
     },
     WithLora {
         inner: Box<LinearProj>,
-        lora: crate::lora::DeviceLoraStack,
+        lora: Box<crate::lora::DeviceLoraStack>,
     },
     MarlinW2A16 {
         b_q_weight_ptr: u64,
@@ -181,7 +181,11 @@ impl LinearProj {
     #[inline]
     pub fn can_fork_on_aux_stream(&self) -> bool {
         match *self {
-            Self::Hadamard { .. } | Self::WithLora { .. } => false,
+            Self::Hadamard { .. } => false,
+            Self::WithLora {
+                ref inner,
+                ref lora,
+            } => lora.is_currently_noop() && inner.can_fork_on_aux_stream(),
             Self::DenseF16 { size_n, size_k, .. } => {
                 size_n <= SMALL_N_GEMM_ALWAYS_MAX_N && size_k.is_multiple_of(SMALL_N_GEMM_K_ALIGN)
             }
@@ -250,7 +254,7 @@ impl LinearProj {
         );
         *target = Self::WithLora {
             inner: Box::new(prev),
-            lora: crate::lora::DeviceLoraStack {
+            lora: Box::new(crate::lora::DeviceLoraStack {
                 lora_a_ptr,
                 lora_b_ptr,
                 size_n: phys_n,
@@ -258,8 +262,14 @@ impl LinearProj {
                 rank_pad: packed.rank_pad,
                 num_adapters: packed.num_adapters,
                 adapter_mask: packed.adapter_mask,
+                num_b_slices: if phys_n == packed.logical_n {
+                    packed.num_b_slices
+                } else {
+                    0
+                },
+                b_slices4: packed.b_slices4,
                 state: std::sync::Arc::clone(state),
-            },
+            }),
         };
         Ok(())
     }
@@ -277,7 +287,7 @@ impl LinearProj {
     ) -> Result<()> {
         if let Self::WithLora { inner, lora } = self {
             inner.forward(ex, cublas, marlin_ws_ptr, marlin_ws_ints, x_ptr, out_ptr, m)?;
-            return lora.forward(ex, x_ptr, out_ptr, m);
+            return lora.forward_with_cublas(ex, cublas.handle, x_ptr, out_ptr, m);
         }
         if let Self::Hadamard {
             inner,

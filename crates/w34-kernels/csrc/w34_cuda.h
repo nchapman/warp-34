@@ -169,6 +169,10 @@ int w34_cublas_gemm_f16_bias(uintptr_t handle, const void* a, const void* b,
                             const void* bias, void* c, int m, int n, int k);
 int w34_cublas_gemm_f16(uintptr_t handle, const void* a, const void* b, void* c,
                         int m, int n, int k);
+int w34_cublas_lora_shrink_expand_f16(
+    uintptr_t handle, const void* x, void* y_inout, const void* lora_a, const void* lora_b,
+    void* lowrank_ws, int adapter_id, int m, int size_n, int size_k, int rank_pad,
+    int num_b_slices, const int32_t* b_slices4);
 int w34_cublas_gemm_bf16(uintptr_t handle, const void* a, const void* b, void* c,
                          int m, int n, int k);
 

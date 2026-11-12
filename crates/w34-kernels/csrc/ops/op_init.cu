@@ -533,6 +533,102 @@ extern "C" int w34_cublas_gemm_f16(uintptr_t handle, const void* a, const void* 
     return (int)st;
 }
 
+// Homogeneous-batch Tensor Core LoRA shrink + expand:
+//   1. U [m, rank_pad] = X [m, size_k] @ A[adapter_id]^T [rank_pad, size_k]   (beta = 0)
+//   2. For each non-zero slice s in 0..num_b_slices:
+//      Y[:, n_off..n_off+slice_n] += U[:, r_off..r_off+slice_r] @ B_s^T       (beta = 1)
+extern "C" int w34_cublas_lora_shrink_expand_f16(
+    uintptr_t handle,
+    const void* x,
+    void* y_inout,
+    const void* lora_a,
+    const void* lora_b,
+    void* lowrank_ws,
+    int adapter_id,
+    int m,
+    int size_n,
+    int size_k,
+    int rank_pad,
+    int num_b_slices,
+    const int32_t* b_slices4) {
+    if (handle == 0 || x == nullptr || y_inout == nullptr || lora_a == nullptr ||
+        lora_b == nullptr || lowrank_ws == nullptr || adapter_id < 0 ||
+        m <= 0 || size_n <= 0 || size_k <= 0 || rank_pad <= 0 ||
+        num_b_slices < 0 || num_b_slices > 3) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_b_slices > 1) {
+        if (b_slices4 == nullptr) return (int)cudaErrorInvalidValue;
+        for (int s = 0; s < num_b_slices; ++s) {
+            const int n_off = b_slices4[s * 4 + 0];
+            const int slice_n = b_slices4[s * 4 + 1];
+            const int r_off = b_slices4[s * 4 + 2];
+            const int slice_r = b_slices4[s * 4 + 3];
+            if (n_off < 0 || slice_n <= 0 || r_off < 0 || slice_r <= 0 ||
+                (int64_t)n_off + (int64_t)slice_n > (int64_t)size_n ||
+                (int64_t)r_off + (int64_t)slice_r > (int64_t)rank_pad) {
+                return (int)cudaErrorInvalidValue;
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lock(((W34Blas*)handle)->mutex);
+    cublasHandle_t blas = ((W34Blas*)handle)->blas;
+    const __half* a_adapter = (const __half*)lora_a + (size_t)adapter_id * rank_pad * size_k;
+    const __half* b_adapter = (const __half*)lora_b + (size_t)adapter_id * size_n * rank_pad;
+    const float alpha = 1.0f;
+    const float beta0 = 0.0f;
+    const float beta1 = 1.0f;
+    cublasStatus_t st = cublasGemmEx(
+        blas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        rank_pad, m, size_k,
+        &alpha,
+        a_adapter, CUDA_R_16F, size_k,
+        x, CUDA_R_16F, size_k,
+        &beta0,
+        lowrank_ws, CUDA_R_16F, rank_pad,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (st != CUBLAS_STATUS_SUCCESS) return (int)st;
+    if (num_b_slices > 1 && b_slices4 != nullptr) {
+        for (int s = 0; s < num_b_slices; ++s) {
+            const int n_off = b_slices4[s * 4 + 0];
+            const int slice_n = b_slices4[s * 4 + 1];
+            const int r_off = b_slices4[s * 4 + 2];
+            const int slice_r = b_slices4[s * 4 + 3];
+            if (slice_n <= 0 || slice_r <= 0) continue;
+            const __half* b_sub = b_adapter + (size_t)n_off * rank_pad + r_off;
+            const __half* u_sub = (const __half*)lowrank_ws + r_off;
+            __half* y_sub = (__half*)y_inout + n_off;
+            st = cublasGemmEx(
+                blas,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                slice_n, m, slice_r,
+                &alpha,
+                b_sub, CUDA_R_16F, rank_pad,
+                u_sub, CUDA_R_16F, rank_pad,
+                &beta1,
+                y_sub, CUDA_R_16F, size_n,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (st != CUBLAS_STATUS_SUCCESS) return (int)st;
+        }
+        return (int)CUBLAS_STATUS_SUCCESS;
+    }
+    st = cublasGemmEx(
+        blas,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        size_n, m, rank_pad,
+        &alpha,
+        b_adapter, CUDA_R_16F, rank_pad,
+        lowrank_ws, CUDA_R_16F, rank_pad,
+        &beta1,
+        y_inout, CUDA_R_16F, size_n,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return (int)st;
+}
+
 // Pinned native gemm_and_bias policy: FP32 scalars/compute, FP16 data,
 // default reduction preference, one heuristic and a 1 MiB workspace limit.
 static int prepare_vision_plan(W34Blas* owner, VisionPlan* p) {
