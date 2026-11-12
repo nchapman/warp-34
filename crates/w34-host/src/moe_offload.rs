@@ -4,12 +4,13 @@ use std::io;
 use std::ops::Range;
 
 /// One expert's DMA layout. All four regions and successive packs are aligned.
-/// We keep N-major U4B8 weights and unpermuted FP16 scales, matching the MoE kernel.
+/// We keep N-major `U4B8` / `U2B2` weights and unpermuted FP16 scales, matching the MoE kernel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpertPackLayout {
     pub intermediate: usize,
     pub hidden: usize,
     pub group_size: usize,
+    pub bits: usize,
     pub down_hadamard_block_size: usize,
     pub gate_up_packed: Range<usize>,
     pub gate_up_scales: Range<usize>,
@@ -20,13 +21,26 @@ pub struct ExpertPackLayout {
 
 impl ExpertPackLayout {
     pub fn new(intermediate: usize, hidden: usize, group_size: usize) -> io::Result<Self> {
+        Self::new_with_bits(intermediate, hidden, group_size, 4)
+    }
+
+    pub fn new_with_bits(
+        intermediate: usize,
+        hidden: usize,
+        group_size: usize,
+        bits: usize,
+    ) -> io::Result<Self> {
         let invalid =
             || io::Error::new(io::ErrorKind::InvalidInput, "invalid expert pack geometry");
+        if !matches!(bits, 2 | 4) {
+            return Err(invalid());
+        }
+        let pack_factor = 32 / bits;
         if intermediate == 0
             || hidden == 0
             || group_size == 0
-            || !intermediate.is_multiple_of(8)
-            || !hidden.is_multiple_of(8)
+            || !intermediate.is_multiple_of(pack_factor)
+            || !hidden.is_multiple_of(pack_factor)
             || !intermediate.is_multiple_of(group_size)
             || !hidden.is_multiple_of(group_size)
             || intermediate > i32::MAX as usize / 2
@@ -36,13 +50,15 @@ impl ExpertPackLayout {
             return Err(invalid());
         }
         let matrix = intermediate.checked_mul(hidden).ok_or_else(invalid)?;
+        let gu_packed_bytes = if bits == 2 { matrix / 2 } else { matrix };
+        let dn_packed_bytes = if bits == 2 { matrix / 4 } else { matrix / 2 };
         let sizes = [
-            matrix,
+            gu_packed_bytes,
             matrix
                 .checked_div(group_size)
                 .and_then(|v| v.checked_mul(4))
                 .ok_or_else(invalid)?,
-            matrix / 2,
+            dn_packed_bytes,
             matrix
                 .checked_div(group_size)
                 .and_then(|v| v.checked_mul(2))
@@ -63,6 +79,7 @@ impl ExpertPackLayout {
             intermediate,
             hidden,
             group_size,
+            bits,
             down_hadamard_block_size: 0,
             gate_up_packed: regions[0].clone(),
             gate_up_scales: regions[1].clone(),
@@ -171,9 +188,12 @@ impl ExpertPackLayout {
         let dn_packed_bytes = &pack[self.down_packed.clone()];
         let dn_scales_bytes = &pack[self.down_scales.clone()];
 
-        let words_per_k = self.hidden / 8;
+        let pack_factor = 32 / self.bits;
+        let mask = (1u32 << self.bits) - 1;
+        let bias = 1i32 << (self.bits - 1);
+        let words_per_k = self.hidden / pack_factor;
         let groups_per_k = self.hidden / self.group_size;
-        let words_per_group_k = self.group_size / 8;
+        let words_per_group_k = self.group_size / pack_factor;
 
         // 1. Gate + Up projection + donor vLLM SiluAndMul (FP16 intermediate)
         let mut interm_f16 = vec![0u16; self.intermediate];
@@ -212,11 +232,11 @@ impl ExpertPackLayout {
                         gu_packed_bytes[uw_off + 2],
                         gu_packed_bytes[uw_off + 3],
                     ]);
-                    let k_base = w_idx * 8;
-                    for b in 0..8 {
+                    let k_base = w_idx * pack_factor;
+                    for b in 0..pack_factor {
                         let x_val = f16_to_f32(x_f16[k_base + b]);
-                        let gnib = ((gw >> (b * 4)) & 0xF) as i32 - 8;
-                        let unib = ((uw >> (b * 4)) & 0xF) as i32 - 8;
+                        let gnib = ((gw >> (b * self.bits)) & mask) as i32 - bias;
+                        let unib = ((uw >> (b * self.bits)) & mask) as i32 - bias;
                         let gw_h = f16_to_f32(f32_to_f16((gnib as f32) * gs));
                         let uw_h = f16_to_f32(f32_to_f16((unib as f32) * us));
                         gate_acc += gw_h * x_val;
@@ -257,7 +277,7 @@ impl ExpertPackLayout {
         }
 
         // 2. Down projection + Top-K weight scaling
-        let words_per_interm = self.intermediate / 8;
+        let words_per_interm = self.intermediate / pack_factor;
         let groups_per_interm = self.intermediate / self.group_size;
         let tw_h = f16_to_f32(f32_to_f16(topk_weight));
         for (h, dst_out) in out_accum_f32.iter_mut().enumerate() {
@@ -279,10 +299,10 @@ impl ExpertPackLayout {
                         dn_packed_bytes[dw_off + 2],
                         dn_packed_bytes[dw_off + 3],
                     ]);
-                    let k_base = w_idx * 8;
-                    for b in 0..8 {
+                    let k_base = w_idx * pack_factor;
+                    for b in 0..pack_factor {
                         let x_val = f16_to_f32(interm_f16[k_base + b]);
-                        let dnib = ((dw >> (b * 4)) & 0xF) as i32 - 8;
+                        let dnib = ((dw >> (b * self.bits)) & mask) as i32 - bias;
                         let dw_h = f16_to_f32(f32_to_f16((dnib as f32) * ds));
                         down_acc += dw_h * x_val;
                     }

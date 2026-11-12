@@ -779,6 +779,7 @@ fn run_job(batch: &Batch, index: usize, scratch: &mut Scratch) {
             hidden: h,
             intermediate: layout.intermediate,
             group_size: gs,
+            bits: layout.bits,
             down_hadamard: layout.down_hadamard_block_size,
             gate_up_words: words(layout.gate_up_packed.clone()),
             gate_up_scales: scales(layout.gate_up_scales.clone()),

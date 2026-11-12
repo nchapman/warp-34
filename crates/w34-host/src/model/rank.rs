@@ -692,6 +692,13 @@ pub fn plan_tiered_moe_hot_per_layer(
         .saturating_add(min_state_pool_bytes)
         .saturating_add(extra_reserve);
     let per_hot_step = cfg.num_hidden_layers * exp_bytes;
+    let actual_per_hot_step: usize = (0..cfg.num_hidden_layers)
+        .filter(|l| !cfg.mlp_only_layers.contains(l))
+        .map(|l| {
+            cfg.layer_moe_expert_pack_layout(l)
+                .map_or(exp_bytes, |lay| lay.stride)
+        })
+        .sum();
     let min_standard_total = fixed_overhead.saturating_add(min_hot.saturating_mul(per_hot_step));
     let min_base_and_state = base_headroom_plus_kv_bytes.saturating_add(min_state_pool_bytes);
     if available_vram_after_weights_and_scratch < min_standard_total
@@ -706,7 +713,7 @@ pub fn plan_tiered_moe_hot_per_layer(
         let compact_extra_reserve =
             TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS.saturating_mul(exp_bytes);
         let hot = TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot);
-        let reserve = (cfg.num_hidden_layers * hot) * exp_bytes + compact_extra_reserve;
+        let reserve = hot.saturating_mul(actual_per_hot_step) + compact_extra_reserve;
         return (hot, reserve);
     }
     let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
@@ -718,7 +725,7 @@ pub fn plan_tiered_moe_hot_per_layer(
     } else {
         min_hot
     };
-    let reserve = (cfg.num_hidden_layers * hot) * exp_bytes + extra_reserve;
+    let reserve = hot.saturating_mul(actual_per_hot_step) + extra_reserve;
     (hot, reserve)
 }
 
@@ -1201,15 +1208,7 @@ impl Qwen3_5ModelRank {
                         && info.shape.len() == 2
                         && (name.ends_with(".weight_packed") || name.ends_with(".qweight"))
                     {
-                        let base_name = name
-                            .trim_end_matches(".weight_packed")
-                            .trim_end_matches(".qweight");
-                        let mult = cfg
-                            .quant
-                            .for_linear(base_name)
-                            .map(|t_quant| if t_quant.bits() == 2 { 2usize } else { 1usize })
-                            .unwrap_or(1);
-                        (info.len_bytes as usize).saturating_mul(mult)
+                        info.len_bytes as usize
                     } else {
                         let skinny_dequant = if !is_expert
                             && info.shape.len() == 2

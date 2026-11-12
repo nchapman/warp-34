@@ -439,6 +439,7 @@ impl RawLinearHost {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_u4b8_if_u2b2(self) -> Self {
         match self {
             Self::Hadamard { inner, block_size } => Self::Hadamard {

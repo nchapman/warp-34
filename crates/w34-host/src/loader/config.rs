@@ -1522,8 +1522,47 @@ impl ModelConfig {
         self.quant.clone()
     }
 
+    /// Returns the quantization scheme for routed MoE experts in decoder layer `layer_id`.
+    pub fn layer_routed_expert_quant_scheme(&self, layer_id: usize) -> QuantScheme {
+        for candidate in [
+            format!("model.layers.{layer_id}.mlp.experts.0.gate_proj"),
+            format!("model.language_model.layers.{layer_id}.mlp.experts.0.gate_proj"),
+            format!("layers.{layer_id}.mlp.experts.0.gate_proj"),
+        ] {
+            if let Ok(resolved) = self.quant.for_linear(&candidate)
+                && resolved != QuantScheme::Unquantized
+            {
+                return resolved;
+            }
+        }
+        self.routed_expert_quant_scheme()
+    }
+
+    /// Returns the per-layer `ExpertPackLayout` (`bits = 2` for `w2_g64` or `4` for `w4_g64`)
+    /// for decoder layer `layer_id`.
+    pub fn layer_moe_expert_pack_layout(
+        &self,
+        layer_id: usize,
+    ) -> Option<crate::moe_offload::ExpertPackLayout> {
+        if self.num_experts == 0 {
+            return None;
+        }
+        let expert_quant = self.layer_routed_expert_quant_scheme(layer_id);
+        let group_size = expert_quant
+            .symmetric_gptq_u2_or_u4_group_size()
+            .unwrap_or_else(|| expert_quant.group_size_or(32));
+        let bits = if expert_quant.bits() == 2 { 2 } else { 4 };
+        crate::moe_offload::ExpertPackLayout::new_with_bits(
+            self.moe_intermediate_size,
+            self.hidden_size,
+            group_size,
+            bits,
+        )
+        .ok()
+    }
+
     /// Returns the `ExpertPackLayout` if this model's MoE geometry supports host/VRAM
-    /// tiered `U4B8` expert storage.
+    /// tiered `U4B8` / `U2B2` expert storage.
     pub fn moe_expert_pack_layout(&self) -> Option<crate::moe_offload::ExpertPackLayout> {
         if self.num_experts == 0 {
             return None;
@@ -1541,17 +1580,25 @@ impl ModelConfig {
     }
 
     /// Total byte footprint of all routed experts across all MoE decoder layers
-    /// when stored in symmetric `U4B8` `ExpertPackLayout` slots.
+    /// when stored in their per-layer `U2B2` / `U4B8` `ExpertPackLayout` slots.
     pub fn routed_expert_total_bytes(&self) -> usize {
-        let Some(layout) = self.moe_expert_pack_layout() else {
+        let Some(base_layout) = self.moe_expert_pack_layout() else {
             return 0;
         };
-        let moe_layers = self
-            .num_hidden_layers
-            .saturating_sub(self.mlp_only_layers.len());
-        moe_layers
-            .saturating_mul(self.num_experts)
-            .saturating_mul(layout.stride)
+        if self.num_hidden_layers == 0 {
+            return 0;
+        }
+        let mut total = 0usize;
+        for layer_id in 0..self.num_hidden_layers {
+            if self.mlp_only_layers.contains(&layer_id) {
+                continue;
+            }
+            let stride = self
+                .layer_moe_expert_pack_layout(layer_id)
+                .map_or(base_layout.stride, |l| l.stride);
+            total = total.saturating_add(self.num_experts.saturating_mul(stride));
+        }
+        total
     }
 
     pub fn uses_tiered_moe(&self) -> bool {

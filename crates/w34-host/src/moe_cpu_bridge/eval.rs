@@ -20,6 +20,7 @@ pub(super) struct ExpertLayout<'a> {
     pub hidden: usize,
     pub intermediate: usize,
     pub group_size: usize,
+    pub bits: usize,
     pub down_hadamard: usize,
     pub gate_up_words: &'a [u32],
     pub gate_up_scales: &'a [u16],
@@ -349,16 +350,20 @@ fn validate(
         || !h.is_multiple_of(128)
         || !i.is_multiple_of(128)
         || !matches!(gs, 64 | 128)
+        || !matches!(d.bits, 2 | 4)
         || !matches!(d.down_hadamard, 0 | 64)
     {
         return Err(EvalError::InvalidLayout);
     }
-    let words_per_group = gs / 8;
+    let w_per_word = 32 / d.bits;
+    let words_per_group = gs / w_per_word;
     let gu = i
         .checked_mul(2)
-        .and_then(|v| v.checked_mul(h / 8))
+        .and_then(|v| v.checked_mul(h / w_per_word))
         .ok_or(EvalError::InvalidLayout)?;
-    let dn = h.checked_mul(i / 8).ok_or(EvalError::InvalidLayout)?;
+    let dn = h
+        .checked_mul(i / w_per_word)
+        .ok_or(EvalError::InvalidLayout)?;
     if d.gate_up_words.len() < gu
         || d.gate_up_scales.len() < gu / words_per_group
         || d.down_words.len() < dn
@@ -385,17 +390,26 @@ fn row_portable(
     xg_t: &[f32],
     groups: usize,
     group_size: usize,
+    bits: usize,
 ) -> f32 {
     let mut total = [0.0f32; 16];
     let mut bias = 0.0f32;
+    let words_per_128 = 4 * bits;
+    let mask = (1u32 << bits) - 1;
+    let bias_mul = (1u32 << (bits - 1)) as f32;
     for g in 0..groups {
         let mut acc = [0.0f32; 16];
-        let wg = &w[g * 16..(g + 1) * 16];
+        let wg = &w[g * words_per_128..(g + 1) * words_per_128];
         let xpg = &xp_t[g * 128..(g + 1) * 128];
         for b in 0..8 {
             let xb = &xpg[b * 16..(b + 1) * 16];
             for l in 0..16 {
-                let nib = ((wg[l] >> (4 * b)) & 15) as f32;
+                let lw = if bits == 2 {
+                    (wg[l >> 1] >> ((l & 1) * 16)) & 0xFFFF
+                } else {
+                    wg[l]
+                };
+                let nib = ((lw >> (bits * b)) & mask) as f32;
                 acc[l] = nib.mul_add(xb[l], acc[l]);
             }
         }
@@ -427,7 +441,7 @@ fn row_portable(
     }
     let s2_0 = s4[0] + s4[1];
     let s2_1 = s4[2] + s4[3];
-    (s2_0 + s2_1) - 8.0 * bias
+    (s2_0 + s2_1) - bias_mul * bias
 }
 
 fn expert_portable(
@@ -442,6 +456,9 @@ fn expert_portable(
     let h = d.hidden;
     let i = d.intermediate;
     let gs_len = d.group_size;
+    let bits = d.bits;
+    let w_per_word = 32 / bits;
+    let words_per_128 = 4 * bits;
     let g_per_128 = 128 / gs_len;
     let n = wt.len();
     let g_in = h / 128;
@@ -449,7 +466,7 @@ fn expert_portable(
     let cols = sg * 128;
     let (act, rest) = scratch.split_at_mut(n * cols);
     let (ap, ag) = rest.split_at_mut(n * cols);
-    let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
+    let gw = |r: usize| &d.gate_up_words[r * (h / w_per_word)..];
     let gs = |r: usize| &d.gate_up_scales[r * (h / gs_len)..];
     for c in 0..cols {
         let r = range.start * 128 + c;
@@ -460,8 +477,8 @@ fn expert_portable(
         for t in 0..n {
             let xp_t = &xp[t * h..(t + 1) * h];
             let xg_t = &xg[t * (h / gs_len)..(t + 1) * (h / gs_len)];
-            let g = row_portable(w_gate, s_gate, xp_t, xg_t, g_in, gs_len);
-            let u = row_portable(w_up, s_up, xp_t, xg_t, g_in, gs_len);
+            let g = row_portable(w_gate, s_gate, xp_t, xg_t, g_in, gs_len, bits);
+            let u = row_portable(w_up, s_up, xp_t, xg_t, g_in, gs_len, bits);
             act[t * cols + c] = (g / (1.0f32 + (-g).exp())) * u;
         }
     }
@@ -477,7 +494,7 @@ fn expert_portable(
         )
         .unwrap();
     }
-    let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
+    let dw = |r: usize| &d.down_words[r * (i / w_per_word) + range.start * words_per_128..];
     let ds = |r: usize| &d.down_scales[r * (i / gs_len) + range.start * g_per_128..];
     for r in 0..h {
         let w_dn = dw(r);
@@ -485,7 +502,7 @@ fn expert_portable(
         for (t, &w_tok) in wt.iter().enumerate() {
             let ap_t = &ap[t * cols..(t + 1) * cols];
             let ag_t = &ag[t * sg * g_per_128..(t + 1) * sg * g_per_128];
-            out[t * h + r] = w_tok * row_portable(w_dn, s_dn, ap_t, ag_t, sg, gs_len);
+            out[t * h + r] = w_tok * row_portable(w_dn, s_dn, ap_t, ag_t, sg, gs_len, bits);
         }
     }
 }
@@ -899,6 +916,66 @@ pub(crate) mod simd {
         )
     }
 
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn srli256_elem<const BITS: usize, const B: i32>(v: __m256i) -> __m256i {
+        if B == 0 {
+            v
+        } else if BITS == 2 {
+            match B {
+                1 => _mm256_srli_epi32::<2>(v),
+                2 => _mm256_srli_epi32::<4>(v),
+                3 => _mm256_srli_epi32::<6>(v),
+                4 => _mm256_srli_epi32::<8>(v),
+                5 => _mm256_srli_epi32::<10>(v),
+                6 => _mm256_srli_epi32::<12>(v),
+                7 => _mm256_srli_epi32::<14>(v),
+                _ => unreachable!(),
+            }
+        } else {
+            match B {
+                1 => _mm256_srli_epi32::<4>(v),
+                2 => _mm256_srli_epi32::<8>(v),
+                3 => _mm256_srli_epi32::<12>(v),
+                4 => _mm256_srli_epi32::<16>(v),
+                5 => _mm256_srli_epi32::<20>(v),
+                6 => _mm256_srli_epi32::<24>(v),
+                7 => _mm256_srli_epi32::<28>(v),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn srli512_elem<const BITS: usize, const B: i32>(v: __m512i) -> __m512i {
+        if B == 0 {
+            v
+        } else if BITS == 2 {
+            match B {
+                1 => _mm512_srli_epi32::<2>(v),
+                2 => _mm512_srli_epi32::<4>(v),
+                3 => _mm512_srli_epi32::<6>(v),
+                4 => _mm512_srli_epi32::<8>(v),
+                5 => _mm512_srli_epi32::<10>(v),
+                6 => _mm512_srli_epi32::<12>(v),
+                7 => _mm512_srli_epi32::<14>(v),
+                _ => unreachable!(),
+            }
+        } else {
+            match B {
+                1 => _mm512_srli_epi32::<4>(v),
+                2 => _mm512_srli_epi32::<8>(v),
+                3 => _mm512_srli_epi32::<12>(v),
+                4 => _mm512_srli_epi32::<16>(v),
+                5 => _mm512_srli_epi32::<20>(v),
+                6 => _mm512_srli_epi32::<24>(v),
+                7 => _mm512_srli_epi32::<28>(v),
+                _ => unreachable!(),
+            }
+        }
+    }
+
     // AVX2 + FMA + F16C fallback for Zen 2 / Zen 3 / Alder Lake / Raptor Lake CPUs
     // without AVX-512. Splits each 16-lane group into (lo, hi) __m256 pairs with
     // identical FMA and reduction tree to `row_tile` (0 ULP bit-identical output).
@@ -907,7 +984,12 @@ pub(crate) mod simd {
     // before `acc_hi` so the working set stays within the 16 YMM architectural registers.
     #[target_feature(enable = "avx2,fma,f16c")]
     #[allow(clippy::cognitive_complexity, clippy::needless_range_loop)]
-    pub(crate) unsafe fn row_tile_avx2<const R: usize, const T: usize, const G64: bool>(
+    pub(crate) unsafe fn row_tile_avx2<
+        const R: usize,
+        const T: usize,
+        const G64: bool,
+        const BITS: usize,
+    >(
         w: [&[u32]; R],
         s: [&[u16]; R],
         xp: &[f32],
@@ -918,17 +1000,26 @@ pub(crate) mod simd {
         let mut total_lo = [[z; R]; T];
         let mut total_hi = [[z; R]; T];
         let mut bias = [[0.0f32; R]; T];
-        let mask15 = _mm256_set1_epi32(15);
+        let words_per_128 = 4 * BITS;
+        let mask = _mm256_set1_epi32((1i32 << BITS) - 1);
+        let bias_mul = (1u32 << (BITS - 1)) as f32;
         if R * T <= 2 {
             for g in 0..groups {
                 let mut q_lo = [_mm256_setzero_si256(); R];
                 let mut q_hi = [_mm256_setzero_si256(); R];
                 for r in 0..R {
-                    let ptr = w[r].as_ptr().add(g * 16);
-                    q_lo[r] = _mm256_loadu_si256(ptr.cast());
-                    q_hi[r] = _mm256_loadu_si256(ptr.add(8).cast());
-                    if (g + 4) * 16 < w[r].len() {
-                        _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
+                    let ptr = w[r].as_ptr().add(g * words_per_128);
+                    if BITS == 2 {
+                        q_lo[r] = _mm256_cvtepu16_epi32(_mm_loadu_si128(ptr.cast()));
+                        q_hi[r] = _mm256_cvtepu16_epi32(_mm_loadu_si128(ptr.add(4).cast()));
+                    } else {
+                        q_lo[r] = _mm256_loadu_si256(ptr.cast());
+                        q_hi[r] = _mm256_loadu_si256(ptr.add(8).cast());
+                    }
+                    if (g + 4) * words_per_128 < w[r].len() {
+                        _mm_prefetch::<_MM_HINT_T0>(
+                            w[r].as_ptr().add((g + 4) * words_per_128).cast(),
+                        );
                     }
                 }
                 let mut scale_lo = [0.0; R];
@@ -959,12 +1050,12 @@ pub(crate) mod simd {
                     ($b:literal) => {{
                         for r in 0..R {
                             let ws_lo = _mm256_cvtepi32_ps(_mm256_and_si256(
-                                _mm256_srli_epi32::<{ 4 * $b }>(q_lo[r]),
-                                mask15,
+                                srli256_elem::<BITS, $b>(q_lo[r]),
+                                mask,
                             ));
                             let ws_hi = _mm256_cvtepi32_ps(_mm256_and_si256(
-                                _mm256_srli_epi32::<{ 4 * $b }>(q_hi[r]),
-                                mask15,
+                                srli256_elem::<BITS, $b>(q_hi[r]),
+                                mask,
                             ));
                             for t in 0..T {
                                 let x_ptr = xp.as_ptr().add(t * groups * 128 + g * 128 + 16 * $b);
@@ -1006,10 +1097,16 @@ pub(crate) mod simd {
             for g in 0..groups {
                 let mut q_lo = [_mm256_setzero_si256(); R];
                 for r in 0..R {
-                    let ptr = w[r].as_ptr().add(g * 16);
-                    q_lo[r] = _mm256_loadu_si256(ptr.cast());
-                    if (g + 4) * 16 < w[r].len() {
-                        _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
+                    let ptr = w[r].as_ptr().add(g * words_per_128);
+                    q_lo[r] = if BITS == 2 {
+                        _mm256_cvtepu16_epi32(_mm_loadu_si128(ptr.cast()))
+                    } else {
+                        _mm256_loadu_si256(ptr.cast())
+                    };
+                    if (g + 4) * words_per_128 < w[r].len() {
+                        _mm_prefetch::<_MM_HINT_T0>(
+                            w[r].as_ptr().add((g + 4) * words_per_128).cast(),
+                        );
                     }
                 }
                 let mut acc_lo = [[z; R]; T];
@@ -1018,8 +1115,8 @@ pub(crate) mod simd {
                         let mut ws = [z; R];
                         for r in 0..R {
                             ws[r] = _mm256_cvtepi32_ps(_mm256_and_si256(
-                                _mm256_srli_epi32::<{ 4 * $b }>(q_lo[r]),
-                                mask15,
+                                srli256_elem::<BITS, $b>(q_lo[r]),
+                                mask,
                             ));
                         }
                         for t in 0..T {
@@ -1054,8 +1151,12 @@ pub(crate) mod simd {
 
                 let mut q_hi = [_mm256_setzero_si256(); R];
                 for r in 0..R {
-                    let ptr = w[r].as_ptr().add(g * 16 + 8);
-                    q_hi[r] = _mm256_loadu_si256(ptr.cast());
+                    let ptr = w[r].as_ptr().add(g * words_per_128 + BITS * 2);
+                    q_hi[r] = if BITS == 2 {
+                        _mm256_cvtepu16_epi32(_mm_loadu_si128(ptr.cast()))
+                    } else {
+                        _mm256_loadu_si256(ptr.cast())
+                    };
                 }
                 let mut acc_hi = [[z; R]; T];
                 macro_rules! nib_hi {
@@ -1063,8 +1164,8 @@ pub(crate) mod simd {
                         let mut ws = [z; R];
                         for r in 0..R {
                             ws[r] = _mm256_cvtepi32_ps(_mm256_and_si256(
-                                _mm256_srli_epi32::<{ 4 * $b }>(q_hi[r]),
-                                mask15,
+                                srli256_elem::<BITS, $b>(q_hi[r]),
+                                mask,
                             ));
                         }
                         for t in 0..T {
@@ -1112,7 +1213,7 @@ pub(crate) mod simd {
         let mut out = [[0.0; R]; T];
         for t in 0..T {
             for r in 0..R {
-                out[t][r] = hsum256_pair(total_lo[t][r], total_hi[t][r]) - 8.0 * bias[t][r];
+                out[t][r] = hsum256_pair(total_lo[t][r], total_hi[t][r]) - bias_mul * bias[t][r];
             }
         }
         out
@@ -1120,7 +1221,7 @@ pub(crate) mod simd {
 
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "avx2,fma,f16c")]
-    unsafe fn rows_avx2<const R: usize>(
+    unsafe fn rows_avx2<const R: usize, const BITS: usize>(
         w: [&[u32]; R],
         s: [&[u16]; R],
         xp: &[f32],
@@ -1136,7 +1237,7 @@ pub(crate) mod simd {
         if R <= 2 {
             while t + 4 <= n {
                 let v = if group_size == 64 {
-                    row_tile_avx2::<R, 4, true>(
+                    row_tile_avx2::<R, 4, true, BITS>(
                         w,
                         s,
                         &xp[t * xp_stride..],
@@ -1144,7 +1245,7 @@ pub(crate) mod simd {
                         groups,
                     )
                 } else {
-                    row_tile_avx2::<R, 4, false>(
+                    row_tile_avx2::<R, 4, false, BITS>(
                         w,
                         s,
                         &xp[t * xp_stride..],
@@ -1159,7 +1260,7 @@ pub(crate) mod simd {
             }
             while t + 2 <= n {
                 let v = if group_size == 64 {
-                    row_tile_avx2::<R, 2, true>(
+                    row_tile_avx2::<R, 2, true, BITS>(
                         w,
                         s,
                         &xp[t * xp_stride..],
@@ -1167,7 +1268,7 @@ pub(crate) mod simd {
                         groups,
                     )
                 } else {
-                    row_tile_avx2::<R, 2, false>(
+                    row_tile_avx2::<R, 2, false, BITS>(
                         w,
                         s,
                         &xp[t * xp_stride..],
@@ -1182,7 +1283,7 @@ pub(crate) mod simd {
         }
         while t < n {
             let v = if group_size == 64 {
-                row_tile_avx2::<R, 1, true>(
+                row_tile_avx2::<R, 1, true, BITS>(
                     w,
                     s,
                     &xp[t * xp_stride..],
@@ -1190,7 +1291,7 @@ pub(crate) mod simd {
                     groups,
                 )
             } else {
-                row_tile_avx2::<R, 1, false>(
+                row_tile_avx2::<R, 1, false, BITS>(
                     w,
                     s,
                     &xp[t * xp_stride..],
@@ -1210,7 +1311,12 @@ pub(crate) mod simd {
     // keeping `R * T <= 8` (`<= 30` ZMM registers) 100% register-resident with zero spills.
     #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
     #[allow(clippy::cognitive_complexity, clippy::needless_range_loop)]
-    pub(crate) unsafe fn row_tile<const R: usize, const T: usize, const G64: bool>(
+    pub(crate) unsafe fn row_tile<
+        const R: usize,
+        const T: usize,
+        const G64: bool,
+        const BITS: usize,
+    >(
         w: [&[u32]; R],
         s: [&[u16]; R],
         xp: &[f32],
@@ -1220,12 +1326,20 @@ pub(crate) mod simd {
         let z = _mm512_setzero_ps();
         let mut total = [[z; R]; T];
         let mut bias = [[0.0f32; R]; T];
+        let words_per_128 = 4 * BITS;
+        let mask = _mm512_set1_epi32((1i32 << BITS) - 1);
+        let bias_mul = (1u32 << (BITS - 1)) as f32;
         for g in 0..groups {
             let mut q = [_mm512_setzero_si512(); R];
             for r in 0..R {
-                q[r] = _mm512_loadu_si512(w[r].as_ptr().add(g * 16).cast());
-                if (g + 4) * 16 < w[r].len() {
-                    _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * 16).cast());
+                let ptr = w[r].as_ptr().add(g * words_per_128);
+                q[r] = if BITS == 2 {
+                    _mm512_cvtepu16_epi32(_mm256_loadu_si256(ptr.cast()))
+                } else {
+                    _mm512_loadu_si512(ptr.cast())
+                };
+                if (g + 4) * words_per_128 < w[r].len() {
+                    _mm_prefetch::<_MM_HINT_T0>(w[r].as_ptr().add((g + 4) * words_per_128).cast());
                 }
             }
             let mut scale_lo = [0.0; R];
@@ -1257,8 +1371,8 @@ pub(crate) mod simd {
                     let mut ws = [z; R];
                     for r in 0..R {
                         ws[r] = _mm512_cvtepi32_ps(_mm512_and_si512(
-                            _mm512_srli_epi32::<{ 4 * $b }>(q[r]),
-                            _mm512_set1_epi32(15),
+                            srli512_elem::<BITS, $b>(q[r]),
+                            mask,
                         ));
                     }
                     for t in 0..T {
@@ -1297,7 +1411,7 @@ pub(crate) mod simd {
         let mut out = [[0.0; R]; T];
         for t in 0..T {
             for r in 0..R {
-                out[t][r] = hsum(total[t][r]) - 8.0 * bias[t][r];
+                out[t][r] = hsum(total[t][r]) - bias_mul * bias[t][r];
             }
         }
         out
@@ -1305,7 +1419,7 @@ pub(crate) mod simd {
 
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
-    unsafe fn rows<const R: usize>(
+    unsafe fn rows<const R: usize, const BITS: usize>(
         w: [&[u32]; R],
         s: [&[u16]; R],
         xp: &[f32],
@@ -1321,9 +1435,15 @@ pub(crate) mod simd {
         if R <= 2 {
             while t + 4 <= n {
                 let v = if group_size == 64 {
-                    row_tile::<R, 4, true>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+                    row_tile::<R, 4, true, BITS>(
+                        w,
+                        s,
+                        &xp[t * xp_stride..],
+                        &xg[t * xg_stride..],
+                        groups,
+                    )
                 } else {
-                    row_tile::<R, 4, false>(
+                    row_tile::<R, 4, false, BITS>(
                         w,
                         s,
                         &xp[t * xp_stride..],
@@ -1339,9 +1459,21 @@ pub(crate) mod simd {
         }
         while t + 2 <= n {
             let v = if group_size == 64 {
-                row_tile::<R, 2, true>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+                row_tile::<R, 2, true, BITS>(
+                    w,
+                    s,
+                    &xp[t * xp_stride..],
+                    &xg[t * xg_stride..],
+                    groups,
+                )
             } else {
-                row_tile::<R, 2, false>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+                row_tile::<R, 2, false, BITS>(
+                    w,
+                    s,
+                    &xp[t * xp_stride..],
+                    &xg[t * xg_stride..],
+                    groups,
+                )
             };
             emit(t, v[0]);
             emit(t + 1, v[1]);
@@ -1349,9 +1481,21 @@ pub(crate) mod simd {
         }
         if t < n {
             let v = if group_size == 64 {
-                row_tile::<R, 1, true>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+                row_tile::<R, 1, true, BITS>(
+                    w,
+                    s,
+                    &xp[t * xp_stride..],
+                    &xg[t * xg_stride..],
+                    groups,
+                )
             } else {
-                row_tile::<R, 1, false>(w, s, &xp[t * xp_stride..], &xg[t * xg_stride..], groups)
+                row_tile::<R, 1, false, BITS>(
+                    w,
+                    s,
+                    &xp[t * xp_stride..],
+                    &xg[t * xg_stride..],
+                    groups,
+                )
             };
             emit(t, v[0]);
         }
@@ -1382,21 +1526,39 @@ pub(crate) mod simd {
         out: &mut [f32],
         scratch: &mut [f32],
     ) {
+        if d.bits == 2 {
+            expert_avx2_bits::<2>(d, range, [xp, xg], wt, out, scratch);
+        } else {
+            expert_avx2_bits::<4>(d, range, [xp, xg], wt, out, scratch);
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c")]
+    unsafe fn expert_avx2_bits<const BITS: usize>(
+        d: ExpertLayout<'_>,
+        range: Range<usize>,
+        [xp, xg]: [&[f32]; 2],
+        wt: &[f32],
+        out: &mut [f32],
+        scratch: &mut [f32],
+    ) {
         let h = d.hidden;
         let i = d.intermediate;
         let gs_len = d.group_size;
+        let w_per_word = 32 / BITS;
+        let words_per_128 = 4 * BITS;
         let g_per_128 = 128 / gs_len;
         let n = wt.len();
         let sg = range.end - range.start;
         let cols = sg * 128;
         let (act, rest) = scratch.split_at_mut(n * cols);
         let (ap, ag) = rest.split_at_mut(n * cols);
-        let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
+        let gw = |r: usize| &d.gate_up_words[r * (h / w_per_word)..];
         let gs = |r: usize| &d.gate_up_scales[r * (h / gs_len)..];
         let mut c = 0;
         while c < cols {
             let r = range.start * 128 + c;
-            rows_avx2::<2>(
+            rows_avx2::<2, BITS>(
                 [gw(r), gw(i + r)],
                 [gs(r), gs(i + r)],
                 xp,
@@ -1424,11 +1586,11 @@ pub(crate) mod simd {
                 prepare_x_perm_avx2(act_t, ap_t, ag_t);
             }
         }
-        let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
+        let dw = |r: usize| &d.down_words[r * (i / w_per_word) + range.start * words_per_128..];
         let ds = |r: usize| &d.down_scales[r * (i / gs_len) + range.start * g_per_128..];
         let mut r = 0;
         while r + 2 <= h {
-            rows_avx2::<2>(
+            rows_avx2::<2, BITS>(
                 [dw(r), dw(r + 1)],
                 [ds(r), ds(r + 1)],
                 ap,
@@ -1445,7 +1607,7 @@ pub(crate) mod simd {
             r += 2;
         }
         while r < h {
-            rows_avx2::<1>([dw(r)], [ds(r)], ap, ag, sg, gs_len, n, |t, v| {
+            rows_avx2::<1, BITS>([dw(r)], [ds(r)], ap, ag, sg, gs_len, n, |t, v| {
                 out[t * h + r] = wt[t] * v[0];
             });
             r += 1;
@@ -1462,22 +1624,41 @@ pub(crate) mod simd {
         scratch: &mut [f32],
         tile: bool,
     ) {
+        if d.bits == 2 {
+            expert_avx512_bits::<2>(d, range, [xp, xg], wt, out, scratch, tile);
+        } else {
+            expert_avx512_bits::<4>(d, range, [xp, xg], wt, out, scratch, tile);
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
+    unsafe fn expert_avx512_bits<const BITS: usize>(
+        d: ExpertLayout<'_>,
+        range: Range<usize>,
+        [xp, xg]: [&[f32]; 2],
+        wt: &[f32],
+        out: &mut [f32],
+        scratch: &mut [f32],
+        tile: bool,
+    ) {
         let h = d.hidden;
         let i = d.intermediate;
         let gs_len = d.group_size;
+        let w_per_word = 32 / BITS;
+        let words_per_128 = 4 * BITS;
         let g_per_128 = 128 / gs_len;
         let n = wt.len();
         let sg = range.end - range.start;
         let cols = sg * 128;
         let (act, rest) = scratch.split_at_mut(n * cols);
         let (ap, ag) = rest.split_at_mut(n * cols);
-        let gw = |r: usize| &d.gate_up_words[r * (h / 8)..];
+        let gw = |r: usize| &d.gate_up_words[r * (h / w_per_word)..];
         let gs = |r: usize| &d.gate_up_scales[r * (h / gs_len)..];
         let mut c = 0;
         while c < cols {
             let r = range.start * 128 + c;
             if tile {
-                rows::<4>(
+                rows::<4, BITS>(
                     [gw(r), gw(r + 1), gw(i + r), gw(i + r + 1)],
                     [gs(r), gs(r + 1), gs(i + r), gs(i + r + 1)],
                     xp,
@@ -1495,7 +1676,7 @@ pub(crate) mod simd {
                 );
                 c += 2;
             } else {
-                rows::<2>(
+                rows::<2, BITS>(
                     [gw(r), gw(i + r)],
                     [gs(r), gs(i + r)],
                     xp,
@@ -1524,12 +1705,12 @@ pub(crate) mod simd {
                 prepare_x_perm_avx2(act_t, ap_t, ag_t);
             }
         }
-        let dw = |r: usize| &d.down_words[r * (i / 8) + range.start * 16..];
+        let dw = |r: usize| &d.down_words[r * (i / w_per_word) + range.start * words_per_128..];
         let ds = |r: usize| &d.down_scales[r * (i / gs_len) + range.start * g_per_128..];
         let mut r = 0;
         if tile {
             while r + 4 <= h {
-                rows::<4>(
+                rows::<4, BITS>(
                     [dw(r), dw(r + 1), dw(r + 2), dw(r + 3)],
                     [ds(r), ds(r + 1), ds(r + 2), ds(r + 3)],
                     ap,
@@ -1547,7 +1728,7 @@ pub(crate) mod simd {
             }
         }
         while r + 2 <= h {
-            rows::<2>(
+            rows::<2, BITS>(
                 [dw(r), dw(r + 1)],
                 [ds(r), ds(r + 1)],
                 ap,
@@ -1564,7 +1745,7 @@ pub(crate) mod simd {
             r += 2;
         }
         while r < h {
-            rows::<1>([dw(r)], [ds(r)], ap, ag, sg, gs_len, n, |t, v| {
+            rows::<1, BITS>([dw(r)], [ds(r)], ap, ag, sg, gs_len, n, |t, v| {
                 out[t * h + r] = wt[t] * v[0];
             });
             r += 1;

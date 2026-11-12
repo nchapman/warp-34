@@ -73,7 +73,7 @@ pub unsafe fn probe_prepare_x_perm_f16c_g64(x: &[u16], xp: &mut [f32], xg: &mut 
 pub unsafe fn probe_row_tile_avx2_r2_t1_g64(
     w: [&[u32]; 2], s: [&[u16]; 2], xp: &[f32], xg: &[f32], groups: usize,
 ) -> [[f32; 2]; 1] {{
-    unsafe {{ eval::simd::row_tile_avx2::<2, 1, true>(w, s, xp, xg, groups) }}
+    unsafe {{ eval::simd::row_tile_avx2::<2, 1, true, 4>(w, s, xp, xg, groups) }}
 }}
 
 #[target_feature(enable = "avx2,fma,f16c")]
@@ -81,7 +81,7 @@ pub unsafe fn probe_row_tile_avx2_r2_t1_g64(
 pub unsafe fn probe_row_tile_avx2_r2_t2_g64(
     w: [&[u32]; 2], s: [&[u16]; 2], xp: &[f32], xg: &[f32], groups: usize,
 ) -> [[f32; 2]; 2] {{
-    unsafe {{ eval::simd::row_tile_avx2::<2, 2, true>(w, s, xp, xg, groups) }}
+    unsafe {{ eval::simd::row_tile_avx2::<2, 2, true, 4>(w, s, xp, xg, groups) }}
 }}
 
 #[target_feature(enable = "avx2,fma,f16c")]
@@ -89,7 +89,15 @@ pub unsafe fn probe_row_tile_avx2_r2_t2_g64(
 pub unsafe fn probe_row_tile_avx2_r2_t4_g64(
     w: [&[u32]; 2], s: [&[u16]; 2], xp: &[f32], xg: &[f32], groups: usize,
 ) -> [[f32; 2]; 4] {{
-    unsafe {{ eval::simd::row_tile_avx2::<2, 4, true>(w, s, xp, xg, groups) }}
+    unsafe {{ eval::simd::row_tile_avx2::<2, 4, true, 4>(w, s, xp, xg, groups) }}
+}}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+#[unsafe(no_mangle)]
+pub unsafe fn probe_row_tile_avx2_r2_t1_g64_u2(
+    w: [&[u32]; 2], s: [&[u16]; 2], xp: &[f32], xg: &[f32], groups: usize,
+) -> [[f32; 2]; 1] {{
+    unsafe {{ eval::simd::row_tile_avx2::<2, 1, true, 2>(w, s, xp, xg, groups) }}
 }}
 
 #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
@@ -97,7 +105,7 @@ pub unsafe fn probe_row_tile_avx2_r2_t4_g64(
 pub unsafe fn probe_row_tile_avx512_r4_t1_g64(
     w: [&[u32]; 4], s: [&[u16]; 4], xp: &[f32], xg: &[f32], groups: usize,
 ) -> [[f32; 4]; 1] {{
-    unsafe {{ eval::simd::row_tile::<4, 1, true>(w, s, xp, xg, groups) }}
+    unsafe {{ eval::simd::row_tile::<4, 1, true, 4>(w, s, xp, xg, groups) }}
 }}
 
 #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
@@ -105,7 +113,7 @@ pub unsafe fn probe_row_tile_avx512_r4_t1_g64(
 pub unsafe fn probe_row_tile_avx512_r4_t2_g64(
     w: [&[u32]; 4], s: [&[u16]; 4], xp: &[f32], xg: &[f32], groups: usize,
 ) -> [[f32; 4]; 2] {{
-    unsafe {{ eval::simd::row_tile::<4, 2, true>(w, s, xp, xg, groups) }}
+    unsafe {{ eval::simd::row_tile::<4, 2, true, 4>(w, s, xp, xg, groups) }}
 }}
 
 #[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
@@ -113,7 +121,15 @@ pub unsafe fn probe_row_tile_avx512_r4_t2_g64(
 pub unsafe fn probe_row_tile_avx512_r2_t4_g64(
     w: [&[u32]; 2], s: [&[u16]; 2], xp: &[f32], xg: &[f32], groups: usize,
 ) -> [[f32; 2]; 4] {{
-    unsafe {{ eval::simd::row_tile::<2, 4, true>(w, s, xp, xg, groups) }}
+    unsafe {{ eval::simd::row_tile::<2, 4, true, 4>(w, s, xp, xg, groups) }}
+}}
+
+#[target_feature(enable = "avx2,fma,f16c,avx512f,avx512vl")]
+#[unsafe(no_mangle)]
+pub unsafe fn probe_row_tile_avx512_r4_t1_g64_u2(
+    w: [&[u32]; 4], s: [&[u16]; 4], xp: &[f32], xg: &[f32], groups: usize,
+) -> [[f32; 4]; 1] {{
+    unsafe {{ eval::simd::row_tile::<4, 1, true, 2>(w, s, xp, xg, groups) }}
 }}
 
 #[target_feature(enable = "avx2,f16c")]
@@ -297,6 +313,11 @@ def main() -> int:
             "required": ["vfmadd", "vcvtdq2ps", "vinsertf64x4"],
             "forbidden": [],
         },
+        "probe_row_tile_avx512_r4_t1_g64_u2": {
+            "max_insns": 320,
+            "required": ["vpmovzxwd", "vfmadd", "vcvtdq2ps", "vinsertf64x4"],
+            "forbidden": [],
+        },
     }
 
     for sym, spec in zero_spill_kernels.items():
@@ -321,6 +342,7 @@ def main() -> int:
 
     for sym, max_rsp_fmas in [
         ("probe_row_tile_avx2_r2_t1_g64", 0),
+        ("probe_row_tile_avx2_r2_t1_g64_u2", 0),
         ("probe_row_tile_avx2_r2_t2_g64", 0),
         ("probe_row_tile_avx2_r2_t4_g64", 12),
     ]:

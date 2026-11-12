@@ -736,12 +736,23 @@ extern "C" int w34_moe_unpack_staged_experts(
     }
     if (num_staged == 0) return 0;
 
-    const size_t gu_packed_bytes = (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
+    size_t gu_packed_bytes = (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
     const size_t gu_scales_bytes =
         (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
-    const size_t dn_packed_bytes = (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
+    size_t dn_packed_bytes = (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
     const size_t dn_scales_bytes =
         (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
+    const size_t w4_raw_bytes =
+        gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes;
+    const size_t w2_raw_bytes =
+        (gu_packed_bytes >> 1) + gu_scales_bytes + (dn_packed_bytes >> 1) + dn_scales_bytes;
+    const size_t w2_aligned_stride = (w2_raw_bytes + 4095u) & ~size_t(4095u);
+    if (pack_stride_bytes < w4_raw_bytes &&
+        (pack_stride_bytes == w2_aligned_stride || pack_stride_bytes == w2_raw_bytes) &&
+        (n_interm % 16) == 0 && (k_hidden % 16) == 0) {
+        gu_packed_bytes >>= 1;
+        dn_packed_bytes >>= 1;
+    }
     if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
         (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
         pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
@@ -797,12 +808,23 @@ extern "C" int w34_moe_pull_mapped_experts_with_count(
     }
     if (max_staged == 0) return 0;
 
-    const size_t gu_packed_bytes = (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
+    size_t gu_packed_bytes = (size_t)(2 * n_interm) * (size_t)(k_hidden / 8) * sizeof(uint32_t);
     const size_t gu_scales_bytes =
         (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
-    const size_t dn_packed_bytes = (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
+    size_t dn_packed_bytes = (size_t)k_hidden * (size_t)(n_interm / 8) * sizeof(uint32_t);
     const size_t dn_scales_bytes =
         (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
+    const size_t w4_raw_bytes =
+        gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes;
+    const size_t w2_raw_bytes =
+        (gu_packed_bytes >> 1) + gu_scales_bytes + (dn_packed_bytes >> 1) + dn_scales_bytes;
+    const size_t w2_aligned_stride = (w2_raw_bytes + 4095u) & ~size_t(4095u);
+    if (pack_stride_bytes < w4_raw_bytes &&
+        (pack_stride_bytes == w2_aligned_stride || pack_stride_bytes == w2_raw_bytes) &&
+        (n_interm % 16) == 0 && (k_hidden % 16) == 0) {
+        gu_packed_bytes >>= 1;
+        dn_packed_bytes >>= 1;
+    }
     if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
         (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
         pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {

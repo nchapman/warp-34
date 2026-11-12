@@ -130,6 +130,23 @@ pub(super) fn warmup_vision_moe_and_qwen4(
         ),
         "warmup w34_moe_w4a16_gate_up_silu_f16"
     )?;
+    warmup_ffi!(
+        ffi::w34_moe_w2a16_gate_up_silu_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *const u32,
+            buf_a as *const c_void,
+            reject_ids as *const i32,
+            buf_c as *mut c_void,
+            1,
+            1,
+            2,
+            16,
+            64,
+            64,
+        ),
+        "warmup w34_moe_w2a16_gate_up_silu_f16"
+    )?;
     for (top_k, n_interm) in [
         (1i32, 64i32),
         (8, 256),
@@ -157,6 +174,26 @@ pub(super) fn warmup_vision_moe_and_qwen4(
                 64,
             ),
             "warmup w34_moe_w4a16_down_accum_f16"
+        )?;
+        warmup_ffi!(
+            ffi::w34_moe_w2a16_down_accum_f16(
+                ex,
+                buf_c as *const c_void,
+                buf_b as *const u32,
+                buf_a as *const c_void,
+                zero_i32 as *const i32,
+                buf_a as *const f32,
+                buf_a as *const c_void,
+                buf_a as *const c_void,
+                buf_c as *mut c_void,
+                1,
+                top_k,
+                2,
+                64,
+                n_interm,
+                64,
+            ),
+            "warmup w34_moe_w2a16_down_accum_f16"
         )?;
     }
     let moe_ids_m4 = arena.upload_slice(&[0i32, 1, 0, 1], stream)?;
@@ -188,6 +225,30 @@ pub(super) fn warmup_vision_moe_and_qwen4(
                     down_had,
                 ),
                 "warmup w34_moe_w4a16_mlp_ex_f16"
+            )?;
+            warmup_ffi!(
+                ffi::w34_moe_w2a16_mlp_ex_f16(
+                    &ex_moe,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    buf_b as *const u32,
+                    buf_a as *const c_void,
+                    moe_ids_m4 as *const i32,
+                    moe_w_m4 as *const f32,
+                    buf_a as *const c_void,
+                    buf_a as *const c_void,
+                    buf_c as *mut c_void,
+                    buf_d as *mut c_void,
+                    m_tok,
+                    1,
+                    n_exp,
+                    64,
+                    64,
+                    64,
+                    down_had,
+                ),
+                "warmup w34_moe_w2a16_mlp_ex_f16"
             )?;
             warmup_ffi!(
                 ffi::w34_moe_w4a16_mlp_zp_ex_f16(
@@ -249,6 +310,30 @@ pub(super) fn warmup_vision_moe_and_qwen4(
                         down_had,
                     ),
                     "warmup sparse w34_moe_w4a16_mlp_ex_f16"
+                )?;
+                warmup_ffi!(
+                    ffi::w34_moe_w2a16_mlp_ex_f16(
+                        &ex_moe,
+                        buf_a as *const c_void,
+                        moe_sparse_weights as *const u32,
+                        buf_a as *const c_void,
+                        moe_sparse_weights as *const u32,
+                        buf_a as *const c_void,
+                        moe_ids_m8 as *const i32,
+                        moe_w_m8 as *const f32,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        buf_c as *mut c_void,
+                        buf_d as *mut c_void,
+                        m_sparse,
+                        1,
+                        16,
+                        128,
+                        128,
+                        group_size,
+                        down_had,
+                    ),
+                    "warmup sparse w34_moe_w2a16_mlp_ex_f16"
                 )?;
             }
         }

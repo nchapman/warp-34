@@ -769,6 +769,7 @@ impl TieredMoeEngine {
                     }
 
                     compute_stream.wait_event(&ws.h2d_done_events[buf_idx])?;
+                    ws.stage_tables[buf_idx].layout = store.layout().clone();
                     ws.stage_tables[buf_idx].unpack_staged(
                         compute_stream,
                         ws.d_stage_packs[buf_idx].addr(),
@@ -822,8 +823,6 @@ impl TieredMoeEngine {
                         },
                         "w34_moe_remap_topk_ids_i32 (StreamedPrefill chunk)",
                     )?;
-                    ws.stage_tables[buf_idx].layout.down_hadamard_block_size =
-                        store.layout().down_hadamard_block_size;
                     ws.stage_tables[buf_idx].launch_moe_w4a16(
                         &ex,
                         x_addr,
@@ -1106,11 +1105,14 @@ impl RankTieredMoe {
         let fully_resident = k_hot >= local_experts;
         for layer_id in 0..cfg.num_hidden_layers {
             let prefix = format!("model.layers.{layer_id}.mlp.experts");
+            let layer_layout = cfg
+                .layer_moe_expert_pack_layout(layer_id)
+                .unwrap_or_else(|| base_layout.clone());
             let mut store = HostExpertStore::load_with_pin(
                 archive,
                 &prefix,
                 &cfg.quant,
-                base_layout.clone(),
+                layer_layout,
                 cfg.num_experts,
                 ep_rank,
                 ep_size,
