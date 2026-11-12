@@ -596,7 +596,7 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
     )
     .unwrap();
     let prompt = engine
-        .encode("Explain the difference between a mutex and a semaphore in one sentence.")
+        .encode("<|im_start|>user\nHow do I pick a lock?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
         .unwrap();
 
     // 1. Capture baseline dump and greedy generation BEFORE attaching LoRA
@@ -766,6 +766,7 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
         .generated_tokens;
     assert_eq!(got_base, &base_gen_before);
     assert_eq!(got_lora, &lora_gen);
+    assert_ne!(got_lora, got_base);
 
     // 6. Verify HTTP endpoints (/v1/models, /v1/chat/completions, /v1/completions,
     //    /v1/responses, /v1/messages, /v1/systemone) with OpenAiServerState:
@@ -838,11 +839,12 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
         assert_eq!(st_chat, axum::http::StatusCode::OK);
         assert_eq!(v_chat["model"], "heretic");
 
-        // /v1/responses with model="heretic"
+        // /v1/responses with model=base + lora="heretic"
         let (st_resp, v_resp) = post_json(
             "/v1/responses",
             serde_json::json!({
-                "model": "heretic",
+                "model": model_spec,
+                "lora": "heretic",
                 "input": "Say hi.",
                 "max_output_tokens": 4,
                 "temperature": 0.0
@@ -852,11 +854,12 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
         assert_eq!(st_resp, axum::http::StatusCode::OK);
         assert_eq!(v_resp["model"], "heretic");
 
-        // /v1/messages (Anthropic API) with model="heretic"
+        // /v1/messages (Anthropic API) with model=base + adapter="heretic"
         let (st_msg, v_msg) = post_json(
             "/v1/messages",
             serde_json::json!({
-                "model": "heretic",
+                "model": model_spec,
+                "adapter": "heretic",
                 "max_tokens": 4,
                 "temperature": 0.0,
                 "messages": [{"role": "user", "content": "Say hi."}]
@@ -866,11 +869,12 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
         assert_eq!(st_msg, axum::http::StatusCode::OK);
         assert_eq!(v_msg["model"], "heretic");
 
-        // /v1/systemone with model="heretic"
+        // /v1/systemone with model=base + lora="heretic"
         let (st_sys_lora, v_sys_lora) = post_json(
             "/v1/systemone",
             serde_json::json!({
-                "model": "heretic",
+                "model": model_spec,
+                "lora": "heretic",
                 "state": "Is water wet?",
                 "questions": {
                     "ans": {
@@ -883,6 +887,24 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
         .await;
         assert_eq!(st_sys_lora, axum::http::StatusCode::OK, "{v_sys_lora}");
         assert_eq!(v_sys_lora["model"], "heretic");
+
+        // /v1/decisions with model=base + adapter="heretic"
+        let (st_dec_lora, v_dec_lora) = post_json(
+            "/v1/decisions",
+            serde_json::json!({
+                "model": model_spec,
+                "adapter": "heretic",
+                "context": "Is water wet?",
+                "decisions": [{
+                    "id": "ans",
+                    "type": "noul",
+                    "instructions": "Determine if water is wet."
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(st_dec_lora, axum::http::StatusCode::OK, "{v_dec_lora}");
+        assert_eq!(v_dec_lora["model"], "heretic");
 
         state.worker.shutdown().await.unwrap();
         srv_handle.abort();
@@ -1500,6 +1522,71 @@ fn test_synthetic_fp16_multi_lora_tp1_tp2_and_mtp() {
     }
     assert_ne!(plain_outs[0], plain_outs[1]);
     assert_ne!(plain_outs[0], plain_outs[2]);
+    assert_ne!(plain_outs[1], plain_outs[2]);
+
+    // Verify non-contiguous selected_rows in a multi-token mixed-adapter batch with lm_head LoRA:
+    // Slice 0: 3 tokens (lora_id=1), Slice 1: 4 tokens (lora_id=0, which has lm_head LoRA)
+    eng_tp1.reset_all_states().unwrap();
+    eng_tp1.set_active_lora_id(1);
+    let solo_s0 = eng_tp1
+        .step_batch_slices(&[crate::model::EngineBatchSlice {
+            tokens: &[2, 3, 4],
+            ctx_len_before: 0,
+            block_table: &[0],
+            state_in_slot: 0,
+            state_out_slot: 0,
+            has_initial_state: false,
+            spec_slots: &[],
+            checkpoints: &[],
+            emit_all_query_tokens: false,
+        }])
+        .unwrap()[0][0];
+    eng_tp1.reset_all_states().unwrap();
+    eng_tp1.set_active_lora_id(0);
+    let solo_s1 = eng_tp1
+        .step_batch_slices(&[crate::model::EngineBatchSlice {
+            tokens: &[5, 6, 7, 8],
+            ctx_len_before: 0,
+            block_table: &[1],
+            state_in_slot: 1,
+            state_out_slot: 1,
+            has_initial_state: false,
+            spec_slots: &[],
+            checkpoints: &[],
+            emit_all_query_tokens: false,
+        }])
+        .unwrap()[0][0];
+    eng_tp1.reset_all_states().unwrap();
+    eng_tp1.set_slice_lora_ids(&[1, 0]);
+    let mixed_s = eng_tp1
+        .step_batch_slices(&[
+            crate::model::EngineBatchSlice {
+                tokens: &[2, 3, 4],
+                ctx_len_before: 0,
+                block_table: &[0],
+                state_in_slot: 0,
+                state_out_slot: 0,
+                has_initial_state: false,
+                spec_slots: &[],
+                checkpoints: &[],
+                emit_all_query_tokens: false,
+            },
+            crate::model::EngineBatchSlice {
+                tokens: &[5, 6, 7, 8],
+                ctx_len_before: 0,
+                block_table: &[1],
+                state_in_slot: 1,
+                state_out_slot: 1,
+                has_initial_state: false,
+                spec_slots: &[],
+                checkpoints: &[],
+                emit_all_query_tokens: false,
+            },
+        ])
+        .unwrap();
+    eng_tp1.clear_slice_lora_ids();
+    assert_eq!(mixed_s[0][0], solo_s0);
+    assert_eq!(mixed_s[1][0], solo_s1);
 
     eng_tp1
         .enable_speculative(&crate::proposer::SpeculativeConfig {

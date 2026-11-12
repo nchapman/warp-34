@@ -428,14 +428,23 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                 if val.starts_with('-') || val.trim().is_empty() {
                     return Err("missing --lora value".into());
                 }
-                if lora_modules.iter().any(|m| m.name == val) {
-                    active_lora = Some(val);
-                } else {
+                if val.contains('=') || val.contains('/') || val.contains('.') || val.contains('{')
+                {
                     let spec =
                         crate::lora::LoraModuleSpec::parse(&val).map_err(|e| e.to_string())?;
                     active_lora = Some(spec.name.clone());
                     lora_modules.push(spec);
+                } else {
+                    active_lora = Some(val);
                 }
+            }
+            "--active-lora" => {
+                i += 1;
+                let val = args.get(i).cloned().ok_or("missing --active-lora value")?;
+                if val.starts_with('-') || val.trim().is_empty() {
+                    return Err("missing --active-lora value".into());
+                }
+                active_lora = Some(val);
             }
             "--batch-size" => {
                 i += 1;

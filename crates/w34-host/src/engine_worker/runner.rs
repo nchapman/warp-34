@@ -365,7 +365,8 @@ fn admit_into_mtp_batch_slots(
         if active_reserved + need_pages > engine.ranks[0].kv_pool.num_pages {
             break;
         }
-        let Some(slot_idx) = proposer.pick_free_mtp_batch_slot(mtp_batch_slots, &w.prompt_tokens)
+        let Some(slot_idx) =
+            proposer.pick_free_mtp_batch_slot(mtp_batch_slots, &w.radix_key_tokens)
         else {
             break;
         };
@@ -385,7 +386,7 @@ fn admit_into_mtp_batch_slots(
         }
         let prefix = {
             let seq = sched.active.last().unwrap();
-            seq.prompt_tokens[..seq.cached_prefix_tokens].to_vec()
+            seq.radix_key_tokens[..seq.cached_prefix_tokens].to_vec()
         };
         match proposer.restore_mtp_batch_slot(engine, slot_idx, &prefix) {
             Ok(()) => {
@@ -633,7 +634,7 @@ fn admit_requests(
                 record_admissions(sched, requests);
                 if let Some(seq) = sched.active.first_mut() {
                     match proposer
-                        .restore_prefix(engine, &seq.prompt_tokens[..seq.cached_prefix_tokens])
+                        .restore_prefix(engine, &seq.radix_key_tokens[..seq.cached_prefix_tokens])
                     {
                         Ok(()) => {
                             *speculative_id = Some(id);

@@ -318,9 +318,11 @@ pub(super) fn step_plain(
             .all(|s| requests[&s.req_id].sampler.params.stop_strings.is_empty())
     };
     if all_pure_decode && stateless_decode_ok && engine.can_pipeline_decode_slices(&batch) {
-        return run_pipelined_decode_burst(
+        let res = run_pipelined_decode_burst(
             engine, sched, requests, receiver, shutdown, slices, &deltas, needs_gpu,
         );
+        engine.clear_slice_lora_ids();
+        return res;
     }
 
     let greedy = engine.step_batch_slices_for_sampler_filtered_bidir(
@@ -329,7 +331,9 @@ pub(super) fn step_plain(
         Some(&emit_mask),
         needs_gpu,
         noncausal_override,
-    )?;
+    );
+    engine.clear_slice_lora_ids();
+    let greedy = greedy?;
     record_computed_prefill(&slices, requests);
     {
         let mut batch_tok_offset = 0usize;

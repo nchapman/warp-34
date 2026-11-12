@@ -192,6 +192,15 @@ impl LinearProj {
         }
     }
 
+    /// Returns the underlying projection with any outer [`LinearProj::WithLora`] wrapper peeled off.
+    #[inline]
+    pub fn without_lora(&self) -> &LinearProj {
+        match self {
+            Self::WithLora { inner, .. } => inner.without_lora(),
+            other => other,
+        }
+    }
+
     /// Removes any attached [`LinearProj::WithLora`] wrapper in place, restoring the base projection.
     pub fn strip_lora(&mut self) {
         match self {

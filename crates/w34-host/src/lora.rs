@@ -297,12 +297,19 @@ pub fn salt_radix_key_for_lora(tokens: &[i32], lora_id: i32) -> Vec<i32> {
 }
 
 /// In-place variant of [`salt_radix_key_for_lora`].
+/// If `tokens[0]` already carries a valid LoRA tag (`bits 30..31 == 0b10` and `bits 24..29 in 1..=MAX_LORA_ADAPTERS`),
+/// it is preserved unchanged so a per-request salted key is never overwritten by a default `MambaRadixCache` adapter ID.
 #[inline]
 pub fn salt_radix_key_in_place(tokens: &mut [i32], lora_id: i32) {
     if lora_id < 0 || tokens.is_empty() {
         return;
     }
     let tok0 = tokens[0] as u32;
+    let existing_tag = (tok0 >> 24) & 0x3F;
+    if (tok0 & 0xC000_0000) == 0x8000_0000 && (1..=MAX_LORA_ADAPTERS as u32).contains(&existing_tag)
+    {
+        return;
+    }
     let low = tok0 & 0x00FF_FFFF;
     let tag = (((lora_id as u32) + 1) & 0x3F) << 24;
     // Bit 31 = 1, bits 24..29 = lora_id + 1 (1..=62), placing the salted token in
@@ -415,7 +422,8 @@ impl PeftConfig {
     }
 
     /// Computes the PEFT scaling factor `alpha / r` (or `alpha / sqrt(r)` for `use_rslora`),
-    /// honoring `rank_pattern` and `alpha_pattern` overrides when present.
+    /// honoring `rank_pattern` and `alpha_pattern` overrides (`model.layers.{l}.{suffix}`,
+    /// `layers.{l}.{suffix}`, `{suffix}`, or leaf module name e.g. `q_proj`).
     pub fn scaling_for_module(
         &self,
         layer_id: Option<usize>,
@@ -424,27 +432,43 @@ impl PeftConfig {
     ) -> f32 {
         let mut alpha = self.lora_alpha;
         let mut r = actual_r.max(1);
+        let leaf = module_suffix
+            .rsplit_once('.')
+            .map_or(module_suffix, |(_, l)| l);
         if let Some(l) = layer_id {
+            let model_key = format!("model.layers.{l}.{module_suffix}");
             let full_key = format!("layers.{l}.{module_suffix}");
             if let Some(&pat_r) = self
                 .rank_pattern
-                .get(&full_key)
+                .get(&model_key)
+                .or_else(|| self.rank_pattern.get(&full_key))
                 .or_else(|| self.rank_pattern.get(module_suffix))
+                .or_else(|| self.rank_pattern.get(leaf))
             {
                 r = pat_r.max(1);
             }
             if let Some(&pat_a) = self
                 .alpha_pattern
-                .get(&full_key)
+                .get(&model_key)
+                .or_else(|| self.alpha_pattern.get(&full_key))
                 .or_else(|| self.alpha_pattern.get(module_suffix))
+                .or_else(|| self.alpha_pattern.get(leaf))
             {
                 alpha = pat_a;
             }
         } else {
-            if let Some(&pat_r) = self.rank_pattern.get(module_suffix) {
+            if let Some(&pat_r) = self
+                .rank_pattern
+                .get(module_suffix)
+                .or_else(|| self.rank_pattern.get(leaf))
+            {
                 r = pat_r.max(1);
             }
-            if let Some(&pat_a) = self.alpha_pattern.get(module_suffix) {
+            if let Some(&pat_a) = self
+                .alpha_pattern
+                .get(module_suffix)
+                .or_else(|| self.alpha_pattern.get(leaf))
+            {
                 alpha = pat_a;
             }
         }
@@ -567,11 +591,14 @@ impl LoraAdapterHost {
         for tensor_name in archive.tensor_names() {
             let (layer_opt, module_suffix, is_b) = parse_peft_tensor_key(tensor_name)?;
             let entry = pairs.entry((layer_opt, module_suffix)).or_default();
-            if is_b {
-                entry.1 = Some(tensor_name.to_string());
-            } else {
-                entry.0 = Some(tensor_name.to_string());
+            let slot = if is_b { &mut entry.1 } else { &mut entry.0 };
+            if slot.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("LoRA adapter '{name}': duplicate tensor key '{tensor_name}'"),
+                ));
             }
+            *slot = Some(tensor_name.to_string());
         }
         if pairs.is_empty() {
             return Err(io::Error::new(
@@ -689,9 +716,24 @@ fn read_2d_tensor_f32(
     let shape = [info.shape[0], info.shape[1]];
     let vals = match info.dtype.as_str() {
         "F32" => archive.read_f32(name)?,
-        "F16" | "BF16" => {
+        "F16" => {
             let bits = archive.read_f16_bits(name)?;
             bits.into_iter().map(f16_to_f32).collect()
+        }
+        "BF16" => {
+            let bytes = archive.read_bytes(name)?;
+            if !bytes.len().is_multiple_of(2) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("BF16 tensor '{name}' byte length is not a multiple of 2"),
+                ));
+            }
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[b0, b1]| f32::from_bits((u16::from_le_bytes([b0, b1]) as u32) << 16))
+                .collect()
         }
         other => {
             return Err(io::Error::new(
@@ -738,6 +780,14 @@ pub fn parse_peft_tensor_key(key: &str) -> io::Result<(Option<usize>, String, bo
     };
 
     if let Some(idx) = stem.find("layers.") {
+        let prefix = &stem[..idx];
+        if !prefix.is_empty() && !prefix.ends_with("model.") && !prefix.ends_with("language_model.")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported non-decoder layer prefix '{prefix}' in '{key}'"),
+            ));
+        }
         let after = &stem[idx + "layers.".len()..];
         let (layer_str, mod_suffix) = after.split_once('.').ok_or_else(|| {
             io::Error::new(
@@ -1237,29 +1287,43 @@ fn pack_single_slice_for_adapters(
 }
 
 #[cfg(feature = "cuda")]
-fn pack_multi_slices_for_adapters(
+fn pack_fused_or_split_for_adapters(
     adapters: &[LoraAdapterHost],
     slice_local_ns: &[usize],
     local_n: usize,
     local_k: usize,
-    mut extract: impl FnMut(&LoraAdapterHost, usize) -> io::Result<Option<LoraSliceWeight>>,
+    mut extract_fused: impl FnMut(&LoraAdapterHost) -> io::Result<Option<LoraSliceWeight>>,
+    mut extract_split: impl FnMut(&LoraAdapterHost, usize) -> io::Result<Option<LoraSliceWeight>>,
 ) -> Result<Option<PackedProjLoraHost>> {
-    let mut owned: Vec<Vec<Option<LoraSliceWeight>>> = Vec::with_capacity(adapters.len());
+    let mut owned: Vec<Vec<(Option<LoraSliceWeight>, usize)>> = Vec::with_capacity(adapters.len());
     for ad in adapters {
-        let mut row = Vec::with_capacity(slice_local_ns.len());
-        for idx in 0..slice_local_ns.len() {
-            row.push(extract(ad, idx).map_err(|e| loader_err_msg(e.to_string()))?);
+        let fused = extract_fused(ad).map_err(|e| loader_err_msg(e.to_string()))?;
+        let mut split_row = Vec::with_capacity(slice_local_ns.len());
+        let mut any_split = false;
+        for (idx, &sn) in slice_local_ns.iter().enumerate() {
+            let sw = extract_split(ad, idx).map_err(|e| loader_err_msg(e.to_string()))?;
+            any_split |= sw.is_some();
+            split_row.push((sw, sn));
         }
-        owned.push(row);
+        if fused.is_some() && any_split {
+            return Err(loader_err_msg(format!(
+                "LoRA adapter '{}' defines both fused and split target weights for the same projection",
+                ad.name
+            )));
+        }
+        if fused.is_some() {
+            owned.push(vec![(fused, local_n)]);
+        } else {
+            owned.push(split_row);
+        }
     }
     let refs: Vec<Vec<LoraSubSlice<'_>>> = owned
         .iter()
         .map(|row| {
             row.iter()
-                .zip(slice_local_ns.iter())
-                .map(|(w, &sn)| LoraSubSlice {
+                .map(|(w, sn)| LoraSubSlice {
                     weight: w.as_ref(),
-                    local_n: sn,
+                    local_n: *sn,
                 })
                 .collect()
         })
@@ -1429,12 +1493,12 @@ pub fn attach_lora_to_rank(
         match &layer.block {
             LayerBlockWeights::FullAttention(fa) => {
                 let qkv_local_n = q_gate_local + 2 * kv_local;
-                let any_fused = adapters.iter().any(|a| {
-                    a.get_layer_module(layer_id, TargetLoraModule::QkvProj)
-                        .is_some()
-                });
-                pl.qkv = if any_fused {
-                    pack_single_slice_for_adapters(adapters, qkv_local_n, h_dim, |ad| {
+                pl.qkv = pack_fused_or_split_for_adapters(
+                    adapters,
+                    &[q_gate_local, kv_local, kv_local],
+                    qkv_local_n,
+                    h_dim,
+                    |ad| {
                         ad.get_layer_module(layer_id, TargetLoraModule::QkvProj)
                             .map(|w| {
                                 w.slice_concat_rows(&[
@@ -1450,41 +1514,26 @@ pub fn attach_lora_to_rank(
                                 ])
                             })
                             .transpose()
-                    })?
-                } else {
-                    pack_multi_slices_for_adapters(
-                        adapters,
-                        &[q_gate_local, kv_local, kv_local],
-                        qkv_local_n,
-                        h_dim,
-                        |ad, idx| match idx {
-                            0 => ad
-                                .get_layer_module(layer_id, TargetLoraModule::QProj)
-                                .map(|w| {
-                                    w.slice_rows(rank * q_gate_local, (rank + 1) * q_gate_local)
-                                })
-                                .transpose(),
-                            1 => ad
-                                .get_layer_module(layer_id, TargetLoraModule::KProj)
-                                .map(|w| {
-                                    w.slice_rows(
-                                        kv_shard_idx * kv_local,
-                                        (kv_shard_idx + 1) * kv_local,
-                                    )
-                                })
-                                .transpose(),
-                            _ => ad
-                                .get_layer_module(layer_id, TargetLoraModule::VProj)
-                                .map(|w| {
-                                    w.slice_rows(
-                                        kv_shard_idx * kv_local,
-                                        (kv_shard_idx + 1) * kv_local,
-                                    )
-                                })
-                                .transpose(),
-                        },
-                    )?
-                };
+                    },
+                    |ad, idx| match idx {
+                        0 => ad
+                            .get_layer_module(layer_id, TargetLoraModule::QProj)
+                            .map(|w| w.slice_rows(rank * q_gate_local, (rank + 1) * q_gate_local))
+                            .transpose(),
+                        1 => ad
+                            .get_layer_module(layer_id, TargetLoraModule::KProj)
+                            .map(|w| {
+                                w.slice_rows(kv_shard_idx * kv_local, (kv_shard_idx + 1) * kv_local)
+                            })
+                            .transpose(),
+                        _ => ad
+                            .get_layer_module(layer_id, TargetLoraModule::VProj)
+                            .map(|w| {
+                                w.slice_rows(kv_shard_idx * kv_local, (kv_shard_idx + 1) * kv_local)
+                            })
+                            .transpose(),
+                    },
+                )?;
                 pl.o = pack_single_slice_for_adapters(adapters, h_dim, o_cols, |ad| {
                     ad.get_layer_module(layer_id, TargetLoraModule::OProj)
                         .map(|w| w.slice_cols(rank * o_cols, (rank + 1) * o_cols))
@@ -1496,12 +1545,12 @@ pub fn attach_lora_to_rank(
             LayerBlockWeights::LinearAttention(gdn) => {
                 let qkv_local_n = 2 * gdn_k_local + gdn_v_local;
                 let qkvz_local_n = qkv_local_n + gdn_v_local;
-                let any_fused_qkvz = adapters.iter().any(|a| {
-                    a.get_layer_module(layer_id, TargetLoraModule::InProjQkvz)
-                        .is_some()
-                });
-                pl.qkvz = if any_fused_qkvz {
-                    pack_single_slice_for_adapters(adapters, qkvz_local_n, h_dim, |ad| {
+                pl.qkvz = pack_fused_or_split_for_adapters(
+                    adapters,
+                    &[qkv_local_n, gdn_v_local],
+                    qkvz_local_n,
+                    h_dim,
+                    |ad| {
                         ad.get_layer_module(layer_id, TargetLoraModule::InProjQkvz)
                             .map(|w| {
                                 w.slice_concat_rows(&[
@@ -1521,45 +1570,38 @@ pub fn attach_lora_to_rank(
                                 ])
                             })
                             .transpose()
-                    })?
-                } else {
-                    pack_multi_slices_for_adapters(
-                        adapters,
-                        &[qkv_local_n, gdn_v_local],
-                        qkvz_local_n,
-                        h_dim,
-                        |ad, idx| match idx {
-                            0 => ad
-                                .get_layer_module(layer_id, TargetLoraModule::InProjQkv)
-                                .map(|w| {
-                                    w.slice_concat_rows(&[
-                                        (rank * gdn_k_local, (rank + 1) * gdn_k_local),
-                                        (
-                                            gdn_k_total + rank * gdn_k_local,
-                                            gdn_k_total + (rank + 1) * gdn_k_local,
-                                        ),
-                                        (
-                                            2 * gdn_k_total + rank * gdn_v_local,
-                                            2 * gdn_k_total + (rank + 1) * gdn_v_local,
-                                        ),
-                                    ])
-                                })
-                                .transpose(),
-                            _ => ad
-                                .get_layer_module(layer_id, TargetLoraModule::InProjZ)
-                                .map(|w| w.slice_rows(rank * gdn_v_local, (rank + 1) * gdn_v_local))
-                                .transpose(),
-                        },
-                    )?
-                };
+                    },
+                    |ad, idx| match idx {
+                        0 => ad
+                            .get_layer_module(layer_id, TargetLoraModule::InProjQkv)
+                            .map(|w| {
+                                w.slice_concat_rows(&[
+                                    (rank * gdn_k_local, (rank + 1) * gdn_k_local),
+                                    (
+                                        gdn_k_total + rank * gdn_k_local,
+                                        gdn_k_total + (rank + 1) * gdn_k_local,
+                                    ),
+                                    (
+                                        2 * gdn_k_total + rank * gdn_v_local,
+                                        2 * gdn_k_total + (rank + 1) * gdn_v_local,
+                                    ),
+                                ])
+                            })
+                            .transpose(),
+                        _ => ad
+                            .get_layer_module(layer_id, TargetLoraModule::InProjZ)
+                            .map(|w| w.slice_rows(rank * gdn_v_local, (rank + 1) * gdn_v_local))
+                            .transpose(),
+                    },
+                )?;
 
                 let ba_local_n = 2 * local_v_heads;
-                let any_fused_ba = adapters.iter().any(|a| {
-                    a.get_layer_module(layer_id, TargetLoraModule::InProjBa)
-                        .is_some()
-                });
-                pl.ba = if any_fused_ba {
-                    pack_single_slice_for_adapters(adapters, ba_local_n, h_dim, |ad| {
+                pl.ba = pack_fused_or_split_for_adapters(
+                    adapters,
+                    &[local_v_heads, local_v_heads],
+                    ba_local_n,
+                    h_dim,
+                    |ad| {
                         ad.get_layer_module(layer_id, TargetLoraModule::InProjBa)
                             .map(|w| {
                                 w.slice_concat_rows(&[
@@ -1571,29 +1613,18 @@ pub fn attach_lora_to_rank(
                                 ])
                             })
                             .transpose()
-                    })?
-                } else {
-                    pack_multi_slices_for_adapters(
-                        adapters,
-                        &[local_v_heads, local_v_heads],
-                        ba_local_n,
-                        h_dim,
-                        |ad, idx| match idx {
-                            0 => ad
-                                .get_layer_module(layer_id, TargetLoraModule::InProjB)
-                                .map(|w| {
-                                    w.slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads)
-                                })
-                                .transpose(),
-                            _ => ad
-                                .get_layer_module(layer_id, TargetLoraModule::InProjA)
-                                .map(|w| {
-                                    w.slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads)
-                                })
-                                .transpose(),
-                        },
-                    )?
-                };
+                    },
+                    |ad, idx| match idx {
+                        0 => ad
+                            .get_layer_module(layer_id, TargetLoraModule::InProjB)
+                            .map(|w| w.slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads))
+                            .transpose(),
+                        _ => ad
+                            .get_layer_module(layer_id, TargetLoraModule::InProjA)
+                            .map(|w| w.slice_rows(rank * local_v_heads, (rank + 1) * local_v_heads))
+                            .transpose(),
+                    },
+                )?;
 
                 pl.out = pack_single_slice_for_adapters(adapters, h_dim, gdn_v_local, |ad| {
                     ad.get_layer_module(layer_id, TargetLoraModule::OutProj)
@@ -1613,12 +1644,12 @@ pub fn attach_lora_to_rank(
                 down_proj,
             } => {
                 let gu_local_n = 2 * local_interm;
-                let any_fused_gu = adapters.iter().any(|a| {
-                    a.get_layer_module(layer_id, TargetLoraModule::GateUpProj)
-                        .is_some()
-                });
-                pl.ffn_gu = if any_fused_gu {
-                    pack_single_slice_for_adapters(adapters, gu_local_n, h_dim, |ad| {
+                pl.ffn_gu = pack_fused_or_split_for_adapters(
+                    adapters,
+                    &[local_interm, local_interm],
+                    gu_local_n,
+                    h_dim,
+                    |ad| {
                         ad.get_layer_module(layer_id, TargetLoraModule::GateUpProj)
                             .map(|w| {
                                 w.slice_concat_rows(&[
@@ -1630,29 +1661,18 @@ pub fn attach_lora_to_rank(
                                 ])
                             })
                             .transpose()
-                    })?
-                } else {
-                    pack_multi_slices_for_adapters(
-                        adapters,
-                        &[local_interm, local_interm],
-                        gu_local_n,
-                        h_dim,
-                        |ad, idx| match idx {
-                            0 => ad
-                                .get_layer_module(layer_id, TargetLoraModule::GateProj)
-                                .map(|w| {
-                                    w.slice_rows(rank * local_interm, (rank + 1) * local_interm)
-                                })
-                                .transpose(),
-                            _ => ad
-                                .get_layer_module(layer_id, TargetLoraModule::UpProj)
-                                .map(|w| {
-                                    w.slice_rows(rank * local_interm, (rank + 1) * local_interm)
-                                })
-                                .transpose(),
-                        },
-                    )?
-                };
+                    },
+                    |ad, idx| match idx {
+                        0 => ad
+                            .get_layer_module(layer_id, TargetLoraModule::GateProj)
+                            .map(|w| w.slice_rows(rank * local_interm, (rank + 1) * local_interm))
+                            .transpose(),
+                        _ => ad
+                            .get_layer_module(layer_id, TargetLoraModule::UpProj)
+                            .map(|w| w.slice_rows(rank * local_interm, (rank + 1) * local_interm))
+                            .transpose(),
+                    },
+                )?;
                 pl.ffn_down =
                     pack_single_slice_for_adapters(adapters, h_dim, local_interm, |ad| {
                         ad.get_layer_module(layer_id, TargetLoraModule::DownProj)
@@ -1665,12 +1685,12 @@ pub fn attach_lora_to_rank(
             FfnBlockWeights::Moe(moe) => {
                 if let Some(sh_gu) = &moe.shared_gate_up_proj {
                     let gu_local_n = 2 * local_shared_interm;
-                    let any_fused_gu = adapters.iter().any(|a| {
-                        a.get_layer_module(layer_id, TargetLoraModule::SharedGateUpProj)
-                            .is_some()
-                    });
-                    pl.ffn_gu = if any_fused_gu {
-                        pack_single_slice_for_adapters(adapters, gu_local_n, h_dim, |ad| {
+                    pl.ffn_gu = pack_fused_or_split_for_adapters(
+                        adapters,
+                        &[local_shared_interm, local_shared_interm],
+                        gu_local_n,
+                        h_dim,
+                        |ad| {
                             ad.get_layer_module(layer_id, TargetLoraModule::SharedGateUpProj)
                                 .map(|w| {
                                     w.slice_concat_rows(&[
@@ -1687,35 +1707,28 @@ pub fn attach_lora_to_rank(
                                     ])
                                 })
                                 .transpose()
-                        })?
-                    } else {
-                        pack_multi_slices_for_adapters(
-                            adapters,
-                            &[local_shared_interm, local_shared_interm],
-                            gu_local_n,
-                            h_dim,
-                            |ad, idx| match idx {
-                                0 => ad
-                                    .get_layer_module(layer_id, TargetLoraModule::SharedGateProj)
-                                    .map(|w| {
-                                        w.slice_rows(
-                                            rank * local_shared_interm,
-                                            (rank + 1) * local_shared_interm,
-                                        )
-                                    })
-                                    .transpose(),
-                                _ => ad
-                                    .get_layer_module(layer_id, TargetLoraModule::SharedUpProj)
-                                    .map(|w| {
-                                        w.slice_rows(
-                                            rank * local_shared_interm,
-                                            (rank + 1) * local_shared_interm,
-                                        )
-                                    })
-                                    .transpose(),
-                            },
-                        )?
-                    };
+                        },
+                        |ad, idx| match idx {
+                            0 => ad
+                                .get_layer_module(layer_id, TargetLoraModule::SharedGateProj)
+                                .map(|w| {
+                                    w.slice_rows(
+                                        rank * local_shared_interm,
+                                        (rank + 1) * local_shared_interm,
+                                    )
+                                })
+                                .transpose(),
+                            _ => ad
+                                .get_layer_module(layer_id, TargetLoraModule::SharedUpProj)
+                                .map(|w| {
+                                    w.slice_rows(
+                                        rank * local_shared_interm,
+                                        (rank + 1) * local_shared_interm,
+                                    )
+                                })
+                                .transpose(),
+                        },
+                    )?;
                     account_packed(&pl.ffn_gu, sh_gu);
                 }
                 if let Some(sh_down) = &moe.shared_down_proj {

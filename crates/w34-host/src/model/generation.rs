@@ -380,9 +380,15 @@ impl Qwen3_5Engine {
         }
         let selected_rows: &[usize] = if emit_last_row { &[q_len - 1] } else { &[] };
 
+        let active_lora_id = self
+            .slice_lora_ids
+            .first()
+            .copied()
+            .unwrap_or(self.active_lora_id);
         for (r_idx, rank) in self.ranks.iter_mut().enumerate() {
             rank.current_pos_plane_stride = pos_plane_stride;
             rank.pending_visual_splice = vis_splice_per_rank.and_then(|s| s.get(r_idx).copied());
+            rank.set_lora_uniform(active_lora_id);
         }
 
         let run_res: Result<i32> = (|| {
@@ -1120,7 +1126,20 @@ impl Qwen3_5Engine {
                 std::mem::swap(&mut sched.radix, &mut self.radix);
                 return Err(loader_err("empty prompt in generate_batch_scheduled"));
             }
-            let id = sched.submit_request(p.clone(), max_new_tokens, Vec::new());
+            let id = sched.submit_request_with_lora_and_bidir(
+                p.clone(),
+                p.clone(),
+                max_new_tokens,
+                0,
+                false,
+                Vec::new(),
+                Vec::new(),
+                false,
+                None,
+                None,
+                None,
+                self.active_lora_id,
+            );
             req_ids.push(id);
         }
 

@@ -730,6 +730,8 @@ pub fn compile_systemone_request(
         obj,
         &[
             "model",
+            "lora",
+            "adapter",
             "state",
             "questions",
             "images",

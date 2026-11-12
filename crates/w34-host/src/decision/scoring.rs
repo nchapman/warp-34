@@ -260,6 +260,8 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
     };
     const TOP_KEYS: &[&str] = &[
         "model",
+        "lora",
+        "adapter",
         "state",
         "context",
         "questions",
@@ -277,8 +279,10 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
     }
     if obj.contains_key("questions") && obj.get("questions").is_some_and(Value::is_object) {
         let mut canonical = Map::new();
-        if let Some(m) = obj.get("model") {
-            canonical.insert("model".into(), m.clone());
+        for k in ["model", "lora", "adapter"] {
+            if let Some(v) = obj.get(k) {
+                canonical.insert(k.into(), v.clone());
+            }
         }
         if let Some(st) = obj.get("state").or_else(|| obj.get("context")) {
             canonical.insert("state".into(), st.clone());
@@ -397,8 +401,10 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
     }
 
     let mut canonical = Map::new();
-    if let Some(m) = obj.get("model") {
-        canonical.insert("model".into(), m.clone());
+    for k in ["model", "lora", "adapter"] {
+        if let Some(v) = obj.get(k) {
+            canonical.insert(k.into(), v.clone());
+        }
     }
     canonical.insert("state".into(), state.clone());
     if let Some(imgs) = obj.get("images") {

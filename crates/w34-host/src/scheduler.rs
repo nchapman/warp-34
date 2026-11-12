@@ -405,7 +405,7 @@ impl SchedulerV1 {
                     .map_or(default_lookup, |cap| cap.min(default_lookup));
                 let raw_hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
                 let allow_hit = raw_hit.matched_tokens == 0
-                    || allow_prefix_hit(w.req_id, &w.prompt_tokens, raw_hit.matched_tokens);
+                    || allow_prefix_hit(w.req_id, &w.radix_key_tokens, raw_hit.matched_tokens);
                 let pinned_hit =
                     allow_hit && raw_hit.matched_tokens > 0 && raw_hit.mamba_slot.is_some();
                 (lookup_len, raw_hit, allow_hit, pinned_hit)

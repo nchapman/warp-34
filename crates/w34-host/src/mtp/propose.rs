@@ -754,21 +754,21 @@ impl Qwen3_5MtpRank {
         output: u64,
         rows: usize,
     ) -> Result<()> {
-        match *proj {
+        match proj {
+            LinearProj::WithLora { inner, .. } => Self::project(inner, ex, t, input, output, rows),
             LinearProj::DenseF16 {
                 weight_ptr,
                 size_n,
                 size_k,
             } => t.cublas.gemm_f16(
                 input,
-                weight_ptr,
+                *weight_ptr,
                 output,
                 rows as i32,
-                size_n as i32,
-                size_k as i32,
+                *size_n as i32,
+                *size_k as i32,
             ),
             LinearProj::Hadamard { .. }
-            | LinearProj::WithLora { .. }
             | LinearProj::MarlinW2A16 { .. }
             | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }

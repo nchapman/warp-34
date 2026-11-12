@@ -1135,7 +1135,7 @@ async fn responses_create(
     let caller_scope = responses_caller_scope(&s, request.headers());
     let body = read_json(&s, request).await?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let (chat_req, meta) = crate::responses_api::translate_responses_to_chat(
+    let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat(
         &body,
         &s.model_name,
         &s.response_store,
@@ -1145,6 +1145,7 @@ async fn responses_create(
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
     let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true)).await?;
+    meta.model.clone_from(&prepared.served_model);
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
@@ -1386,13 +1387,14 @@ async fn anthropic_messages(
         .map_err(|err| to_anthropic_err(admission_error(err)))?;
     let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let (chat_req, meta) =
+    let (chat_req, mut meta) =
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
             .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     let prep_state = s.clone();
     let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true))
         .await
         .map_err(to_anthropic_err)?;
+    meta.model.clone_from(&prepared.served_model);
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker

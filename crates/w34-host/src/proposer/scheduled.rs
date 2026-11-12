@@ -145,7 +145,7 @@ impl NativeProposer {
         }])?;
         let mut anchor = out[0][0];
         let features = self.captured(engine)?;
-        self.ingest(engine, tokens, &features)?;
+        self.ingest(engine, radix_tokens, &features)?;
         seq.radix_state.commit_tokens(radix_tokens, &planned);
         seq.prefilled_tokens = end;
 

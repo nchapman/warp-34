@@ -996,6 +996,8 @@ pub fn translate_responses_to_chat(
         chat_req.insert("top_k".into(), top_k.clone());
     }
     for key in [
+        "lora",
+        "adapter",
         "min_p",
         "presence_penalty",
         "frequency_penalty",

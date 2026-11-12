@@ -86,7 +86,8 @@ pub fn resolve_lora_adapter(
     let normalized_sha = is_commit(revision).then(|| revision.to_ascii_lowercase());
     let revision = normalized_sha.as_deref().unwrap_or(revision);
     if opts.offline {
-        let dir = crate::lora::resolve_cached_or_local_lora_dir(&spec.path, Some(revision))?;
+        let offline_rev = opts.revision.as_deref().map(|_| revision);
+        let dir = crate::lora::resolve_cached_or_local_lora_dir(&spec.path, offline_rev)?;
         validate_lora_dir(&dir)?;
         eprintln!(
             "Using cached LoRA adapter '{}': {}",

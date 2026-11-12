@@ -310,6 +310,7 @@ impl ScheduledVision {
             .prefix_bidir_len
             .is_some_and(|bidir_end| end <= bidir_end);
         let emit_last_row = seq.max_new_tokens > 0 || engine.ranks[0].lm_head.is_some();
+        engine.set_slice_lora_ids(&[seq.lora_id]);
         let result = engine.step_single_slice_with_mrope_and_vision_bidir(
             &engine_slice,
             &positions,
@@ -322,6 +323,7 @@ impl ScheduledVision {
             noncausal_prefix,
             emit_last_row,
         );
+        engine.clear_slice_lora_ids();
         let mut sync_result = Ok(());
         for rank in &engine.ranks {
             let synced = rank

@@ -1374,8 +1374,11 @@ impl NativeProposer {
                 "invalid speculative prompt or insufficient KV capacity",
             ));
         }
-        let lookup = engine.radix.match_prefix(&prompt[..prompt.len() - 1]);
-        let hit = if self.can_restore(&prompt[..lookup.matched_tokens]) {
+        let radix_prompt = crate::lora::salt_radix_key_for_lora(prompt, engine.active_lora_id);
+        let lookup = engine
+            .radix
+            .match_prefix(&radix_prompt[..radix_prompt.len() - 1]);
+        let hit = if self.can_restore(&radix_prompt[..lookup.matched_tokens]) {
             lookup
         } else {
             let mut cold = engine.radix.match_prefix(&[]);
@@ -1383,12 +1386,12 @@ impl NativeProposer {
             cold
         };
         let cached = hit.matched_tokens;
-        self.restore(engine, &prompt[..cached])?;
+        self.restore(engine, &radix_prompt[..cached])?;
         let (active, pp) = engine
             .alloc_three_state_slots()
             .ok_or_else(|| loader_err("no speculative request state slots"))?;
         let mut req = ReqRadixState::new(16, 64, active, pp);
-        req.restore_prefix_hit(&mut engine.radix, prompt, &hit);
+        req.restore_prefix_hit(&mut engine.radix, &radix_prompt, &hit);
         let mut tx = StateTx::new(active);
         let processed_sampling = configured_sampler.is_some();
         let mut sampler = configured_sampler.unwrap_or_else(|| {
@@ -1429,6 +1432,7 @@ impl NativeProposer {
                 };
                 let end = cursor + take;
                 let tokens = &prompt[cursor..end];
+                let radix_tokens = &radix_prompt[cursor..end];
                 let planned = req.plan_checkpoints(tokens.len());
                 let pairs: Vec<_> = planned
                     .iter()
@@ -1447,8 +1451,8 @@ impl NativeProposer {
                 }])?;
                 anchor = out[0][0];
                 let features = self.captured(engine)?;
-                self.ingest(engine, tokens, &features)?;
-                req.commit_tokens(tokens, &planned);
+                self.ingest(engine, radix_tokens, &features)?;
+                req.commit_tokens(radix_tokens, &planned);
                 cursor = end;
                 if (cursor < prompt.len() || max_new > 1)
                     && req.last_track_seqlen.is_some()
