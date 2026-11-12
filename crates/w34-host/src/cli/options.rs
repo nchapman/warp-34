@@ -596,6 +596,11 @@ pub(crate) fn validate_cuda_options(
             return Err(format!("duplicate LoRA adapter name '{}'", a.name));
         }
     }
+    if let Some(ref active) = options.active_lora
+        && !options.lora_modules.iter().any(|m| &m.name == active)
+    {
+        return Err(format!("unknown active LoRA adapter '{active}'"));
+    }
     validate_cuda_command(options, sub)?;
     Ok(policy)
 }
@@ -608,6 +613,11 @@ pub(crate) fn attach_cli_lora(
     activate_for_single_seq: bool,
 ) -> crate::cuda::Result<()> {
     if lora_modules.is_empty() {
+        if let Some(name) = active_lora {
+            return Err(crate::model::loader_err_msg(format!(
+                "unknown active LoRA adapter '{name}'"
+            )));
+        }
         return Ok(());
     }
     engine.attach_lora_adapters(lora_modules)?;

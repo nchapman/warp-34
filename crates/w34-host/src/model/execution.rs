@@ -27,6 +27,10 @@ impl Qwen3_5Engine {
 
     pub fn reset_all_states(&mut self) -> Result<()> {
         self.radix.reset();
+        self.radix.active_lora_id = self.active_lora_id;
+        if let Some(proposer) = &mut self.speculative {
+            proposer.clear_all_caches()?;
+        }
         for r in &mut self.ranks {
             r.device.make_current()?;
             r.kv_pool.reset_all_pages();
@@ -1006,7 +1010,6 @@ impl Qwen3_5Engine {
         stop_on_eos: bool,
     ) -> Result<BenchMetrics> {
         self.reset_all_states()?;
-        self.radix = MambaRadixCache::new(16, 64);
         if self.speculative.is_some() {
             let max_chunk = if self.cfg.uses_tiered_moe() {
                 6144

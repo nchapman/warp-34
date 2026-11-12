@@ -910,6 +910,21 @@ pub(crate) fn profile_bench_args(options: &CudaCliOptions, exe: &Path) -> Vec<St
         args.push("--stage".to_string());
         args.push(options.bench_stage.clone());
     }
+    if !options.lora_modules.is_empty() {
+        args.push("--lora-modules".to_string());
+        for spec in &options.lora_modules {
+            let rev_suffix = spec
+                .revision
+                .as_deref()
+                .map(|r| format!("@{r}"))
+                .unwrap_or_default();
+            args.push(format!("{}={}{rev_suffix}", spec.name, spec.path));
+        }
+    }
+    if let Some(ref active) = options.active_lora {
+        args.push("--active-lora".to_string());
+        args.push(active.clone());
+    }
     args
 }
 

@@ -870,7 +870,7 @@ pub fn run_batch_in_place(
                     max_prefix_lookup_len: None,
                     mamba_branching_seqlen: None,
                     prefix_bidir_len: None,
-                    lora_id: crate::lora::BASE_MODEL_LORA_ID,
+                    lora_id: engine.active_lora_id,
                     decision_tap: None,
                 })
                 .map_err(|e| format!("failed to enqueue batch request: {e}"))?;

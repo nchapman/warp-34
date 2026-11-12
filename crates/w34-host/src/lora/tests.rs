@@ -143,17 +143,17 @@ fn test_lora_adapter_host_load_dtypes_and_fan_in_fan_out() {
     }"#;
     fs::write(tmp.path().join("adapter_config.json"), cfg_json).unwrap();
 
-    // With fan_in_fan_out = true:
-    // lora_A on disk has shape [in_features=4, r=2], transposed on load to [r=2, in=4].
-    // lora_B on disk has shape [r=2, out_features=3], transposed on load to [out=3, r=2] and pre-scaled by alpha/r = 2.0.
-    let a_disk = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]; // [4, 2]
-    let b_disk = [0.5f32, 1.0, 1.5, 2.0, 2.5, 3.0]; // [2, 3]
+    // Canonical PEFT shapes on disk (even when fan_in_fan_out = true):
+    // lora_A has shape [r=2, in_features=4].
+    // lora_B has shape [out_features=3, r=2] and is pre-scaled on load by alpha/r = 2.0.
+    let a_disk = [1.0f32, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0]; // [2, 4]
+    let b_disk = [0.5f32, 2.0, 1.0, 2.5, 1.5, 3.0]; // [3, 2]
     let a_bytes = bf16s_from_f32s_bytes(&a_disk);
     let b_bytes = f16s_from_f32s_bytes(&b_disk);
 
     // Also include a linear_attn.out_proj in FP32
-    let a2 = [1.0f32; 8]; // [in=4, r=2]
-    let b2 = [1.0f32; 6]; // [r=2, out=3]
+    let a2 = [1.0f32; 8]; // [r=2, in=4]
+    let b2 = [1.0f32; 6]; // [out=3, r=2]
     let a2_bytes = f32s_to_bytes(&a2);
     let b2_bytes = f32s_to_bytes(&b2);
 
@@ -163,25 +163,25 @@ fn test_lora_adapter_host_load_dtypes_and_fan_in_fan_out() {
             (
                 "base_model.model.model.language_model.layers.0.self_attn.o_proj.lora_A.weight",
                 "BF16",
-                &[4, 2],
+                &[2, 4],
                 &a_bytes,
             ),
             (
                 "base_model.model.model.language_model.layers.0.self_attn.o_proj.lora_B.weight",
                 "F16",
-                &[2, 3],
+                &[3, 2],
                 &b_bytes,
             ),
             (
                 "base_model.model.layers.0.linear_attn.out_proj.lora_A.weight",
                 "F32",
-                &[4, 2],
+                &[2, 4],
                 &a2_bytes,
             ),
             (
                 "base_model.model.layers.0.linear_attn.out_proj.lora_B.weight",
                 "F32",
-                &[2, 3],
+                &[3, 2],
                 &b2_bytes,
             ),
         ],
@@ -196,10 +196,9 @@ fn test_lora_adapter_host_load_dtypes_and_fan_in_fan_out() {
     assert_eq!(o_proj.r, 2);
     assert_eq!(o_proj.in_features, 4);
     assert_eq!(o_proj.out_features, 3);
-    // Row 0 of A after transpose is [1, 3, 5, 7], Row 1 is [2, 4, 6, 8]
     assert_eq!(o_proj.a_f32[0..4], [1.0, 3.0, 5.0, 7.0]);
     assert_eq!(o_proj.a_f32[4..8], [2.0, 4.0, 6.0, 8.0]);
-    // Row 0 of B after transpose is [0.5, 2.0], scaled by alpha/r = 4/2 = 2 -> [1.0, 4.0]
+    // Row 0 of B is [0.5, 2.0], scaled by alpha/r = 4/2 = 2 -> [1.0, 4.0]
     assert_eq!(o_proj.b_f32[0..2], [1.0, 4.0]);
 
     let out_proj = host
@@ -1606,5 +1605,17 @@ fn test_synthetic_fp16_multi_lora_tp1_tp2_and_mtp() {
             spec_out, plain_outs[idx],
             "MTP speculative decoding must be lossless for lora_id={lid}"
         );
+        // Verify generate_tokens preserved self.radix.active_lora_id == lid
+        assert_eq!(eng_tp1.radix.active_lora_id, lid);
     }
+
+    // Verify re-attaching adapters in swapped order [a1, a0] invalidates radix & proposer caches:
+    let swapped_specs = vec![specs[1].clone(), specs[0].clone()];
+    eng_tp1.attach_lora_adapters(&swapped_specs).unwrap();
+    eng_tp1.set_active_lora_id(0);
+    let swapped_out0 = eng_tp1
+        .generate_tokens(&prompt, 6, false)
+        .unwrap()
+        .generated_token_ids;
+    assert_eq!(swapped_out0, plain_outs[2]);
 }

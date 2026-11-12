@@ -446,9 +446,7 @@ impl Qwen3_5Engine {
         for r in &mut self.ranks {
             r.attach_lora_adapters(&host_adapters)?;
         }
-        if let Some(proposer) = &mut self.speculative {
-            proposer.abort_scheduled();
-        }
+        self.reset_all_states()?;
         self.lora_registry = registry;
         self.set_active_lora_id(crate::lora::BASE_MODEL_LORA_ID);
         self.slice_lora_ids.clear();

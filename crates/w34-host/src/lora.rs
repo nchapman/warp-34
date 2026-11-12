@@ -634,20 +634,10 @@ impl LoraAdapterHost {
                 )
             })?;
 
-            let (a_shape, mut a_f32) = read_2d_tensor_f32(&archive, &a_key)?;
+            let (a_shape, a_f32) = read_2d_tensor_f32(&archive, &a_key)?;
             let (b_shape, mut b_f32) = read_2d_tensor_f32(&archive, &b_key)?;
-            let (r_a, in_features) = if config.fan_in_fan_out {
-                a_f32 = transpose_2d(&a_f32, a_shape[0], a_shape[1]);
-                (a_shape[1], a_shape[0])
-            } else {
-                (a_shape[0], a_shape[1])
-            };
-            let (out_features, r_b) = if config.fan_in_fan_out {
-                b_f32 = transpose_2d(&b_f32, b_shape[0], b_shape[1]);
-                (b_shape[1], b_shape[0])
-            } else {
-                (b_shape[0], b_shape[1])
-            };
+            let (r_a, in_features) = (a_shape[0], a_shape[1]);
+            let (out_features, r_b) = (b_shape[0], b_shape[1]);
             if r_a != r_b || r_a == 0 || r_a > MAX_LORA_RANK_PAD {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -743,16 +733,6 @@ fn read_2d_tensor_f32(
         }
     };
     Ok((shape, vals))
-}
-
-fn transpose_2d(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut dst = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            dst[c * rows + r] = src[r * cols + c];
-        }
-    }
-    dst
 }
 
 /// Parses a PEFT safetensors key such as:

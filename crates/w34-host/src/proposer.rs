@@ -352,6 +352,12 @@ impl NativeProposer {
             last_restored_tokens: 0,
         })
     }
+    pub(crate) fn clear_all_caches(&mut self) -> Result<()> {
+        self.abort_scheduled();
+        self.memos.clear();
+        self.current = None;
+        self.reset()
+    }
     fn reset(&mut self) -> Result<()> {
         self.resident_tokens.clear();
         self.processed = 0;

@@ -704,4 +704,51 @@ fn lora_cli_flags_resolve_and_validate() {
         .err()
         .unwrap();
     assert!(err.contains("duplicate LoRA adapter name"));
+
+    // Unknown active adapter name is rejected both with and without --lora-modules:
+    let missing_no_modules = args(&["generate", "--model", "org/target", "--lora", "missing"]);
+    let err_no_mod = prepare_cuda_cli(&missing_no_modules, |_, _, _| panic!("must not resolve"))
+        .err()
+        .unwrap();
+    assert!(err_no_mod.contains("unknown active LoRA adapter 'missing'"));
+
+    let missing_with_modules = args(&[
+        "generate",
+        "--model",
+        "org/target",
+        "--lora-modules",
+        "a0=org/a0",
+        "--active-lora",
+        "missing",
+    ]);
+    let err_with_mod =
+        prepare_cuda_cli(&missing_with_modules, |_, _, _| panic!("must not resolve"))
+            .err()
+            .unwrap();
+    assert!(err_with_mod.contains("unknown active LoRA adapter 'missing'"));
+
+    // profile-diff forwards --lora-modules (with @revision) and --active-lora to nested bench:
+    let prof_args = args(&[
+        "profile-diff",
+        "--model",
+        "org/target",
+        "--lora-modules",
+        "heretic=nchapman/Qwen3.5-9B-Heretic-LoRA@rev1",
+        "--active-lora",
+        "heretic",
+    ]);
+    let prof_prepared = prepare_cuda_cli(&prof_args, |_, _, _| panic!("must not resolve"))
+        .unwrap()
+        .unwrap();
+    let bench_argv = profile_bench_args(&prof_prepared.options, std::path::Path::new("/bin/w34"));
+    assert!(bench_argv.windows(2).any(|w| w
+        == [
+            "--lora-modules",
+            "heretic=nchapman/Qwen3.5-9B-Heretic-LoRA@rev1"
+        ]));
+    assert!(
+        bench_argv
+            .windows(2)
+            .any(|w| w == ["--active-lora", "heretic"])
+    );
 }
