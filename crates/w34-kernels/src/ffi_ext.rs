@@ -919,4 +919,21 @@ unsafe extern "C" {
         tap_stride_elems: i32,
         tap_offset_elems: i32,
     ) -> i32;
+
+    pub fn w34_lora_shrink_expand_f16(
+        ex: *const W34Exec,
+        x_f16: *const c_void,
+        lora_a_stacked: *const c_void,
+        lora_b_stacked: *const c_void,
+        token_lora_ids: *const i32,
+        lowrank_f32_ws: *mut f32,
+        y_inout_f16: *mut c_void,
+        m: i32,
+        size_n: i32,
+        size_k: i32,
+        rank_pad: i32,
+        num_adapters: i32,
+        default_lora_id: i32,
+        adapter_mask: u64,
+    ) -> i32;
 }

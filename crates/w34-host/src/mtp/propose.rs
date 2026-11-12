@@ -768,6 +768,7 @@ impl Qwen3_5MtpRank {
                 size_k as i32,
             ),
             LinearProj::Hadamard { .. }
+            | LinearProj::WithLora { .. }
             | LinearProj::MarlinW2A16 { .. }
             | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }
@@ -798,6 +799,7 @@ impl Qwen3_5MtpRank {
         match *proj {
             LinearProj::DenseF16 { .. } => Self::project(proj, ex, t, input, output, rows),
             LinearProj::Hadamard { .. }
+            | LinearProj::WithLora { .. }
             | LinearProj::MarlinW2A16 { .. }
             | LinearProj::MarlinW4A16 { .. }
             | LinearProj::MarlinW4A16Zp { .. }

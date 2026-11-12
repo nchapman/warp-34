@@ -143,6 +143,7 @@ struct Request {
     max_prefix_lookup_len: Option<usize>,
     mamba_branching_seqlen: Option<usize>,
     prefix_bidir_len: Option<usize>,
+    lora_id: i32,
     decision_tap: Option<DecisionReadoutTap>,
 }
 
@@ -232,6 +233,7 @@ pub struct EngineWorker {
     pub hidden_size: usize,
     pub kv_token_capacity: usize,
     pub unshareable_prefill: bool,
+    pub lora_registry: crate::lora::LoraAdapterRegistry,
     max_model_len: Option<usize>,
 }
 impl EngineWorker {
@@ -342,6 +344,7 @@ impl EngineWorker {
                         engine.cfg.hidden_size,
                         kv_token_capacity,
                         unshareable_prefill,
+                        engine.lora_registry.clone(),
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
                         run(
@@ -371,6 +374,7 @@ impl EngineWorker {
             hidden_size,
             kv_token_capacity,
             unshareable_prefill,
+            lora_registry,
         ) = match ready_rx.recv() {
             Ok(Ok(info)) => info,
             Ok(Err(error)) => {
@@ -399,6 +403,7 @@ impl EngineWorker {
             hidden_size,
             kv_token_capacity,
             unshareable_prefill,
+            lora_registry,
             max_model_len: None,
         })
     }
@@ -517,6 +522,23 @@ impl EngineWorker {
         params: SamplingParams,
         constraint: Option<TokenBitmaskConstraint>,
     ) -> Result<GenerationStream, WorkerError> {
+        self.submit_with_images_and_lora(
+            prompt,
+            images,
+            params,
+            constraint,
+            crate::lora::BASE_MODEL_LORA_ID,
+        )
+    }
+
+    pub fn submit_with_images_and_lora(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        params: SamplingParams,
+        constraint: Option<TokenBitmaskConstraint>,
+        lora_id: i32,
+    ) -> Result<GenerationStream, WorkerError> {
         params.validate().map_err(WorkerError::invalid_request)?;
         if prompt.is_empty() || params.max_tokens == 0 {
             return Err(WorkerError::invalid_request(
@@ -541,6 +563,7 @@ impl EngineWorker {
             max_prefix_lookup_len: None,
             mamba_branching_seqlen: None,
             prefix_bidir_len: None,
+            lora_id,
             decision_tap: None,
         })?;
         Ok(GenerationStream {
@@ -583,6 +606,29 @@ impl EngineWorker {
         ),
         WorkerError,
     > {
+        self.submit_decision_candidate_logits_with_images_and_lora(
+            prompt,
+            images,
+            token_ids,
+            mamba_branching_seqlen,
+            crate::lora::BASE_MODEL_LORA_ID,
+        )
+    }
+
+    pub fn submit_decision_candidate_logits_with_images_and_lora(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        token_ids: Vec<i32>,
+        mamba_branching_seqlen: Option<usize>,
+        lora_id: i32,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
+        ),
+        WorkerError,
+    > {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let stream = self.submit_decision_internal(
             prompt,
@@ -590,6 +636,7 @@ impl EngineWorker {
             None,
             mamba_branching_seqlen,
             None,
+            lora_id,
             DecisionReadoutTap::CandidateLogits { token_ids, tx },
         )?;
         Ok((stream, rx))
@@ -633,6 +680,34 @@ impl EngineWorker {
         ),
         WorkerError,
     > {
+        self.submit_decision_hidden_positions_with_images_and_lora(
+            prompt,
+            images,
+            positions,
+            max_prefix_lookup_len,
+            mamba_branching_seqlen,
+            prefix_bidir_len,
+            crate::lora::BASE_MODEL_LORA_ID,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_decision_hidden_positions_with_images_and_lora(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        positions: Vec<usize>,
+        max_prefix_lookup_len: Option<usize>,
+        mamba_branching_seqlen: Option<usize>,
+        prefix_bidir_len: Option<usize>,
+        lora_id: i32,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
+        ),
+        WorkerError,
+    > {
         let captured = vec![None; positions.len()];
         let (tx, rx) = tokio::sync::oneshot::channel();
         let stream = self.submit_decision_internal(
@@ -641,6 +716,7 @@ impl EngineWorker {
             max_prefix_lookup_len,
             mamba_branching_seqlen,
             prefix_bidir_len,
+            lora_id,
             DecisionReadoutTap::HiddenPositions {
                 positions,
                 captured,
@@ -650,6 +726,7 @@ impl EngineWorker {
         Ok((stream, rx))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_decision_internal(
         &self,
         prompt: Vec<i32>,
@@ -657,6 +734,7 @@ impl EngineWorker {
         max_prefix_lookup_len: Option<usize>,
         mamba_branching_seqlen: Option<usize>,
         prefix_bidir_len: Option<usize>,
+        lora_id: i32,
         tap: DecisionReadoutTap,
     ) -> Result<GenerationStream, WorkerError> {
         if prompt.is_empty() {
@@ -690,6 +768,7 @@ impl EngineWorker {
             max_prefix_lookup_len,
             mamba_branching_seqlen,
             prefix_bidir_len,
+            lora_id,
             decision_tap: Some(tap),
         })?;
         Ok(GenerationStream {
@@ -791,6 +870,7 @@ pub fn run_batch_in_place(
                     max_prefix_lookup_len: None,
                     mamba_branching_seqlen: None,
                     prefix_bidir_len: None,
+                    lora_id: crate::lora::BASE_MODEL_LORA_ID,
                     decision_tap: None,
                 })
                 .map_err(|e| format!("failed to enqueue batch request: {e}"))?;
@@ -983,7 +1063,7 @@ fn enqueue(
         .vision
         .as_ref()
         .map_or_else(|| prompt_tokens.clone(), |v| v.radix_key.clone());
-    let id = sched.submit_request_with_prefix_and_bidir(
+    let id = sched.submit_request_with_lora_and_bidir(
         prompt_tokens,
         key,
         p.max_tokens,
@@ -995,6 +1075,7 @@ fn enqueue(
         request.max_prefix_lookup_len,
         request.mamba_branching_seqlen,
         request.prefix_bidir_len,
+        request.lora_id,
     );
     requests.insert(id, request);
 }

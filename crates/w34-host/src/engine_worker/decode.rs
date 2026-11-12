@@ -172,6 +172,8 @@ pub(super) fn step_plain(
     for id in vision_ids {
         let seq = sched.active.iter().find(|seq| seq.req_id == id).unwrap();
         let cached_toks = seq.cached_prefix_tokens;
+        engine.set_active_lora_id(seq.lora_id);
+        engine.clear_slice_lora_ids();
         let request = requests.get_mut(&id).unwrap();
         let (greedy, slice) = request.vision.as_mut().unwrap().step_prefill(
             engine,
@@ -234,6 +236,8 @@ pub(super) fn step_plain(
     if slices.is_empty() {
         return Ok(());
     }
+    let slice_lora_ids: Vec<i32> = slices.iter().map(|s| s.lora_id).collect();
+    engine.set_slice_lora_ids(&slice_lora_ids);
     let checkpoints: Vec<Vec<_>> = slices
         .iter()
         .map(|s| {
@@ -630,6 +634,7 @@ fn run_pipelined_decode_burst(
                     state_out_slot: seq.radix_state.active_state_slot,
                     has_initial_state: true,
                     planned_checkpoints: Vec::new(),
+                    lora_id: s.lora_id,
                 }
             })
             .collect();

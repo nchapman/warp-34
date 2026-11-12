@@ -36,6 +36,7 @@ mod generation;
 mod graph_io;
 mod graphs;
 mod rank;
+mod rank_capacity;
 mod rank_runtime;
 mod sampling;
 pub(crate) mod weights;
@@ -45,10 +46,10 @@ pub use graph_io::*;
 #[cfg(feature = "cuda")]
 pub use rank::Qwen3_5ModelRank;
 #[cfg(test)]
-use rank::clamp_state_slots;
+use rank_capacity::clamp_state_slots;
 #[cfg(any(test, feature = "cuda"))]
-use rank::serving_state_slots;
-pub use rank::{
+use rank_capacity::serving_state_slots;
+pub use rank_capacity::{
     DEVICE_ARENA_TENSOR_ALIGNMENT_BYTES, EXTREME_LONGCTX_MIN_LAYERS, EXTREME_LONGCTX_MIN_PAGES,
     HOST_EMBED_GPU_RESIDENCY_MIN_SLACK_BYTES, LARGE_MODEL_WEIGHT_THRESHOLD_BYTES,
     MIN_BOOT_MARGIN_BYTES, MIN_WEIGHT_ARENA_BYTES, MTP_COMPACT_HOT_EXPERTS,
@@ -68,7 +69,7 @@ pub use rank::{
     plan_mtp_tiered_moe_hot_experts, plan_scratch_arena_bytes, plan_tiered_moe_hot_per_layer,
 };
 #[cfg(feature = "cuda")]
-use rank::{PoolCapacity, SharedVocabHost};
+use rank_capacity::{PoolCapacity, SharedVocabHost};
 pub(crate) use weights::RawLinearHost;
 #[cfg(feature = "cuda")]
 pub(crate) use weights::load_moe_layer_weights;

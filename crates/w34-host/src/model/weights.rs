@@ -52,6 +52,10 @@ pub enum LinearProj {
         size_k: usize,
         block_size: usize,
     },
+    WithLora {
+        inner: Box<LinearProj>,
+        lora: crate::lora::DeviceLoraStack,
+    },
     MarlinW2A16 {
         b_q_weight_ptr: u64,
         b_scales_ptr: u64,
@@ -92,6 +96,7 @@ pub enum LinearProj {
 impl LinearProj {
     pub fn size_n(&self) -> usize {
         match self {
+            Self::WithLora { inner, .. } => inner.size_n(),
             Self::Hadamard { size_n, .. }
             | Self::MarlinW2A16 { size_n, .. }
             | Self::MarlinW4A16 { size_n, .. }
@@ -103,6 +108,7 @@ impl LinearProj {
 
     pub fn size_k(&self) -> usize {
         match self {
+            Self::WithLora { inner, .. } => inner.size_k(),
             Self::Hadamard { size_k, .. }
             | Self::MarlinW2A16 { size_k, .. }
             | Self::MarlinW4A16 { size_k, .. }
@@ -114,7 +120,7 @@ impl LinearProj {
 
     pub fn byte_footprint(&self) -> usize {
         match self {
-            Self::Hadamard { inner, .. } => inner.byte_footprint(),
+            Self::Hadamard { inner, .. } | Self::WithLora { inner, .. } => inner.byte_footprint(),
             Self::MarlinW2A16 {
                 size_n,
                 size_k,
@@ -175,7 +181,7 @@ impl LinearProj {
     #[inline]
     pub fn can_fork_on_aux_stream(&self) -> bool {
         match *self {
-            Self::Hadamard { .. } => false,
+            Self::Hadamard { .. } | Self::WithLora { .. } => false,
             Self::DenseF16 { size_n, size_k, .. } => {
                 size_n <= SMALL_N_GEMM_ALWAYS_MAX_N && size_k.is_multiple_of(SMALL_N_GEMM_K_ALIGN)
             }
@@ -184,6 +190,69 @@ impl LinearProj {
             | Self::MarlinW4A16Zp { .. }
             | Self::MarlinW8A16 { .. } => true,
         }
+    }
+
+    /// Removes any attached [`LinearProj::WithLora`] wrapper in place, restoring the base projection.
+    pub fn strip_lora(&mut self) {
+        match self {
+            Self::Hadamard { inner, .. } => inner.strip_lora(),
+            Self::WithLora { inner, .. } => {
+                inner.strip_lora();
+                let dummy = Self::DenseF16 {
+                    weight_ptr: 0,
+                    size_n: 0,
+                    size_k: 0,
+                };
+                let base = core::mem::replace(inner.as_mut(), dummy);
+                *self = base;
+            }
+            _ => {}
+        }
+    }
+
+    /// Wraps this projection (or its inner projection when `Self::Hadamard`) with a
+    /// [`crate::lora::DeviceLoraStack`], uploading `a_f16` and `b_f16` (pre-rotated in the
+    /// Hadamard basis when `Self::Hadamard`) into `lora_arena`.
+    pub fn wrap_with_lora(
+        &mut self,
+        packed: &crate::lora::PackedProjLoraHost,
+        lora_arena: &mut DeviceArena,
+        stream: &CudaStream,
+        state: &std::sync::Arc<crate::lora::RankLoraState>,
+    ) -> Result<()> {
+        self.strip_lora();
+        let (target, had_blk): (&mut LinearProj, Option<usize>) = match self {
+            Self::Hadamard {
+                inner, block_size, ..
+            } => (inner.as_mut(), Some(*block_size)),
+            other => (other, None),
+        };
+        let (phys_n, phys_k) = (target.size_n(), target.size_k());
+        let (a_f16, b_f16) = packed.to_device_f16(phys_n, phys_k, had_blk);
+        let lora_a_ptr = lora_arena.upload_slice(&a_f16, stream)?;
+        let lora_b_ptr = lora_arena.upload_slice(&b_f16, stream)?;
+        let prev = core::mem::replace(
+            target,
+            Self::DenseF16 {
+                weight_ptr: 0,
+                size_n: 0,
+                size_k: 0,
+            },
+        );
+        *target = Self::WithLora {
+            inner: Box::new(prev),
+            lora: crate::lora::DeviceLoraStack {
+                lora_a_ptr,
+                lora_b_ptr,
+                size_n: phys_n,
+                size_k: phys_k,
+                rank_pad: packed.rank_pad,
+                num_adapters: packed.num_adapters,
+                adapter_mask: packed.adapter_mask,
+                state: std::sync::Arc::clone(state),
+            },
+        };
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -197,6 +266,10 @@ impl LinearProj {
         out_ptr: u64,
         m: usize,
     ) -> Result<()> {
+        if let Self::WithLora { inner, lora } = self {
+            inner.forward(ex, cublas, marlin_ws_ptr, marlin_ws_ints, x_ptr, out_ptr, m)?;
+            return lora.forward(ex, x_ptr, out_ptr, m);
+        }
         if let Self::Hadamard {
             inner,
             size_n,
@@ -219,7 +292,7 @@ impl LinearProj {
             );
         }
         match *self {
-            Self::Hadamard { .. } => unreachable!("handled above"),
+            Self::Hadamard { .. } | Self::WithLora { .. } => unreachable!("handled above"),
             Self::MarlinW2A16 {
                 b_q_weight_ptr,
                 b_scales_ptr,

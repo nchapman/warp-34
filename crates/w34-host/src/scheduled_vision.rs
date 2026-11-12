@@ -141,7 +141,8 @@ impl ScheduledVision {
             || seq.resources_released
             || start >= self.prompt.len()
             || seq.prompt_tokens != self.prompt
-            || seq.radix_key_tokens != self.radix_key
+            || seq.radix_key_tokens.len() != self.radix_key.len()
+            || seq.radix_key_tokens[1..] != self.radix_key[1..]
             || seq.radix_state.token_ids.len() != start
         {
             return Err(loader_err(
@@ -184,6 +185,7 @@ impl ScheduledVision {
             state_out_slot: seq.radix_state.active_state_slot,
             has_initial_state: seq.radix_state.has_initial_state,
             planned_checkpoints: planned,
+            lora_id: seq.lora_id,
         };
         let mut positions = Vec::with_capacity(3 * take);
         for plane in &self.mrope_planes {

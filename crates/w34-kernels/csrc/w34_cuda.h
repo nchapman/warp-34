@@ -903,6 +903,11 @@ int w34_tp4_all_reduce_hc_combine_tap_f16(
     void* stage0, void* stage1, void* stage2, void* stage3,
     void* sig0, void* sig1, void* sig2, void* sig3, int rank, int num_tokens,
     int hc_count, int hidden_size, int tap_stride_elems, int tap_offset_elems);
+int w34_lora_shrink_expand_f16(
+    const w34_exec* ex, const void* x_f16, const void* lora_a_stacked,
+    const void* lora_b_stacked, const int32_t* token_lora_ids,
+    float* lowrank_f32_ws, void* y_inout_f16, int m, int size_n, int size_k,
+    int rank_pad, int num_adapters, int default_lora_id, uint64_t adapter_mask);
 
 #ifdef __cplusplus
 }

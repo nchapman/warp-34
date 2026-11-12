@@ -704,6 +704,7 @@ impl LayerResidual {
 
 /// Final pre-LM-head residual normalization / stream mixer.
 #[cfg(feature = "cuda")]
+#[allow(clippy::large_enum_variant)]
 pub enum FinalResidual {
     /// Single-stream `GemmaRMSNorm` (`[num_tokens, h_dim] -> [num_tokens, h_dim]`).
     SingleStream { norm_ptr: u64 },

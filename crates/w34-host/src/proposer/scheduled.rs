@@ -124,11 +124,14 @@ impl NativeProposer {
         };
         let end = start + take;
         let tokens = &seq.prompt_tokens[start..end];
+        let radix_tokens = &seq.radix_key_tokens[start..end];
         let planned = seq.radix_state.plan_checkpoints(tokens.len());
         let pairs: Vec<_> = planned
             .iter()
             .map(|p| (p.trigger_offset_1based, p.dst_slot))
             .collect();
+        engine.set_active_lora_id(seq.lora_id);
+        engine.clear_slice_lora_ids();
         let out = engine.step_batch_slices(&[EngineBatchSlice {
             tokens,
             ctx_len_before: start,
@@ -143,7 +146,7 @@ impl NativeProposer {
         let mut anchor = out[0][0];
         let features = self.captured(engine)?;
         self.ingest(engine, tokens, &features)?;
-        seq.radix_state.commit_tokens(tokens, &planned);
+        seq.radix_state.commit_tokens(radix_tokens, &planned);
         seq.prefilled_tokens = end;
 
         if end < seq.prompt_tokens.len() {
@@ -212,6 +215,8 @@ impl NativeProposer {
             .generated_tokens
             .last()
             .ok_or_else(|| loader_err("missing anchor in step_scheduled_verify_round"))?;
+        engine.set_active_lora_id(seq.lora_id);
+        engine.clear_slice_lora_ids();
         let mut tx = StateTx::new(seq.radix_state.active_state_slot);
         tx.commit_prefill(seq.radix_state.token_ids.len());
 
@@ -914,6 +919,8 @@ impl NativeProposer {
 
         let res: Result<Vec<Vec<i32>>> = (|| {
             let outs = {
+                let slice_lids: Vec<i32> = items.iter().map(|(_, seq, _, _)| seq.lora_id).collect();
+                engine.set_slice_lora_ids(&slice_lids);
                 let slices: Vec<EngineBatchSlice<'_>> = items
                     .iter()
                     .zip(&prepared)
@@ -929,7 +936,9 @@ impl NativeProposer {
                         emit_all_query_tokens: true,
                     })
                     .collect();
-                engine.step_batch_slices(&slices)?
+                let res = engine.step_batch_slices(&slices);
+                engine.clear_slice_lora_ids();
+                res?
             };
 
             let any_gpu_sampler = items.iter().any(|(_, _, _, sampler)| {

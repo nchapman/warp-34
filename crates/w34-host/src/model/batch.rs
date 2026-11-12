@@ -165,7 +165,8 @@ impl Qwen3_5Engine {
     fn step_spec_verify_graph(&mut self, s: &EngineBatchSlice<'_>) -> Result<Vec<Vec<i32>>> {
         let q_len = s.tokens.len();
         let long_ctx = !self.cfg.uses_qsa() && s.ctx_len_before + q_len > 1024;
-        let host_meta = SpecVerifyGraphIo::pack_meta(s)?;
+        let lora_id = self.slice_lora_id(0);
+        let host_meta = SpecVerifyGraphIo::pack_meta_with_lora(s, lora_id)?;
         use crate::coordinated::{ReplayPhase, replay_ranks};
         let comm = self.tp2_comm.as_ref().cloned();
         if let Some(comm) = &comm {
@@ -217,6 +218,10 @@ impl Qwen3_5Engine {
                     r.ensure_spec_verify_graph(q_len, long_ctx, comm.as_deref())
                 }
                 ReplayPhase::Launch => {
+                    if let Some(rt) = &r.lora_runtime {
+                        rt.state
+                            .set_device_ids(r.spec_verify_io.token_lora_ids_ptr());
+                    }
                     r.spec_verify_graph.as_ref().unwrap().1.launch(&r.stream)?;
                     r.mark_tiered_moe_device_lru_dirty();
                     r.speculative_logits_rows = if r.has_spec_logits_capacity(q_len) {
@@ -264,7 +269,14 @@ impl Qwen3_5Engine {
         skip_host_greedy: bool,
     ) -> Result<Vec<Vec<i32>>> {
         let n = slices.len();
-        let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta(slices, rope_pos_deltas)?;
+        let slice_lids =
+            (!self.slice_lora_ids.is_empty()).then_some(self.slice_lora_ids.as_slice());
+        let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta_with_lora(
+            slices,
+            rope_pos_deltas,
+            slice_lids,
+            self.active_lora_id,
+        )?;
         use crate::coordinated::{ReplayPhase, replay_ranks};
         let comm = self.tp2_comm.as_ref().cloned();
         let stage_bytes = bucket_b
@@ -299,6 +311,10 @@ impl Qwen3_5Engine {
                     r.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, comm.as_deref())
                 }
                 ReplayPhase::Launch => {
+                    if let Some(rt) = &r.lora_runtime {
+                        rt.state
+                            .set_device_ids(r.batched_decode_io.token_lora_ids_ptr());
+                    }
                     let (logits_ptr, graph) = r
                         .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
                         .unwrap();
@@ -407,7 +423,14 @@ impl Qwen3_5Engine {
 
         let slot = slot & 1;
         let n = slices.len();
-        let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta(slices, rope_pos_deltas)?;
+        let slice_lids =
+            (!self.slice_lora_ids.is_empty()).then_some(self.slice_lora_ids.as_slice());
+        let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta_with_lora(
+            slices,
+            rope_pos_deltas,
+            slice_lids,
+            self.active_lora_id,
+        )?;
         let r0 = &mut self.ranks[0];
         r0.device.make_current()?;
         if tokens_already_on_device
@@ -433,6 +456,10 @@ impl Qwen3_5Engine {
         if let Some((cfgs, sparse)) = fast_greedy_inputs {
             r0.batched_decode_io
                 .upload_fast_greedy_slot(slot, cfgs, sparse, bucket_b, &r0.stream)?;
+        }
+        if let Some(rt) = &r0.lora_runtime {
+            rt.state
+                .set_device_ids(r0.batched_decode_io.token_lora_ids_ptr());
         }
         let (logits_ptr, graph) = r0
             .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
@@ -876,6 +903,18 @@ impl Qwen3_5Engine {
         }
 
         let total_tokens = flat_tokens.len();
+        let first_lora_id = self.slice_lora_id(0);
+        let all_same_lora = (1..slices.len()).all(|r| self.slice_lora_id(r) == first_lora_id);
+        let flat_lora_ids: Option<Vec<i32>> = (!all_same_lora && !self.lora_registry.is_empty())
+            .then(|| {
+                let mut out = Vec::with_capacity(total_tokens);
+                for (r, s) in slices.iter().enumerate() {
+                    let lid = self.slice_lora_id(r);
+                    out.resize(out.len() + s.tokens.len(), lid);
+                }
+                out
+            });
+        let flat_lora_ref = flat_lora_ids.as_deref();
         let flat_ids = if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
             let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r0.upload_batch_meta(
@@ -900,6 +939,7 @@ impl Qwen3_5Engine {
                 max_verify_tokens,
                 max_checkpoints_per_req,
             )?;
+            r0.bind_lora_for_batch(Some(first_lora_id), flat_lora_ref)?;
             if noncausal_override {
                 attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
             }
@@ -966,6 +1006,7 @@ impl Qwen3_5Engine {
                         max_verify_tokens,
                         max_checkpoints_per_req,
                     )?;
+                    r0.bind_lora_for_batch(Some(first_lora_id), flat_lora_ref)?;
                     if noncausal_override {
                         attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
                     }
@@ -1008,6 +1049,7 @@ impl Qwen3_5Engine {
                                 max_verify_tokens,
                                 max_checkpoints_per_req,
                             )?;
+                        r_peer.bind_lora_for_batch(Some(first_lora_id), flat_lora_ref)?;
                         if noncausal_override {
                             attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
                         }

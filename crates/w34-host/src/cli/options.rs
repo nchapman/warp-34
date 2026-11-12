@@ -32,6 +32,7 @@ pub fn print_usage() {
            --max-num-seqs <1..16> (default 16; fixed graph limit).\n\
            --max-model-len <positive integer> caps total prompt + output admission only (default: engine capacity); does not size VRAM.\n\
          Hub options: --revision <ref> [--offline]; --draft-revision <ref> requires --draft-model.\n\
+         LoRA options: --lora-modules <name=path|path>... [--lora <name|name=path|path>]\n\
          Image options: --allow-remote-images enables public HTTP(S) fetch (16 MiB, 10 s, no redirects).\n\
          Speculative options (generate/bench/greedy-diff/dump-diff/profile-diff/serve/chat):\n\
            --speculative mtp|dflash2 [--draft-model <id|path>] [--mtp-k 1..3] [--kv-pages <n>]\n\
@@ -198,6 +199,8 @@ pub(crate) struct CudaCliOptions {
     pub(crate) live_profile: bool,
     pub(crate) image_urls: Vec<String>,
     pub(crate) allow_remote_images: bool,
+    pub(crate) lora_modules: Vec<crate::lora::LoraModuleSpec>,
+    pub(crate) active_lora: Option<String>,
 }
 
 #[cfg(feature = "cuda")]
@@ -248,6 +251,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
     let mut live_profile = false;
     let mut image_urls: Vec<String> = Vec::new();
     let mut allow_remote_images = false;
+    let mut lora_modules: Vec<crate::lora::LoraModuleSpec> = Vec::new();
+    let mut active_lora: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -404,6 +409,34 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
                 i += 1;
                 image_urls.push(args.get(i).cloned().ok_or("missing --image value")?);
             }
+            "--lora-modules" | "--lora-module" => {
+                let mut count = 0usize;
+                while i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    let spec =
+                        crate::lora::LoraModuleSpec::parse(&args[i]).map_err(|e| e.to_string())?;
+                    lora_modules.push(spec);
+                    count += 1;
+                }
+                if count == 0 {
+                    return Err("missing --lora-modules value".into());
+                }
+            }
+            "--lora" => {
+                i += 1;
+                let val = args.get(i).cloned().ok_or("missing --lora value")?;
+                if val.starts_with('-') || val.trim().is_empty() {
+                    return Err("missing --lora value".into());
+                }
+                if lora_modules.iter().any(|m| m.name == val) {
+                    active_lora = Some(val);
+                } else {
+                    let spec =
+                        crate::lora::LoraModuleSpec::parse(&val).map_err(|e| e.to_string())?;
+                    active_lora = Some(spec.name.clone());
+                    lora_modules.push(spec);
+                }
+            }
             "--batch-size" => {
                 i += 1;
                 batch_size = args
@@ -469,6 +502,8 @@ pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOption
         live_profile,
         image_urls,
         allow_remote_images,
+        lora_modules,
+        active_lora,
     }))
 }
 
@@ -541,23 +576,62 @@ pub(crate) fn validate_cuda_options(
     if options.max_prompts == 0 {
         return Err("--max-prompts must be >= 1".into());
     }
+    if options.lora_modules.len() > crate::lora::MAX_LORA_ADAPTERS {
+        return Err(format!(
+            "at most {} LoRA adapters can be loaded simultaneously",
+            crate::lora::MAX_LORA_ADAPTERS
+        ));
+    }
+    for (idx, a) in options.lora_modules.iter().enumerate() {
+        if options.lora_modules[..idx].iter().any(|b| b.name == a.name) {
+            return Err(format!("duplicate LoRA adapter name '{}'", a.name));
+        }
+    }
     validate_cuda_command(options, sub)?;
     Ok(policy)
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn load_cli_engine(
+pub(crate) fn attach_cli_lora(
+    engine: &mut Qwen3_5Engine,
+    lora_modules: &[crate::lora::LoraModuleSpec],
+    active_lora: Option<&str>,
+    activate_for_single_seq: bool,
+) -> crate::cuda::Result<()> {
+    if lora_modules.is_empty() {
+        return Ok(());
+    }
+    engine.attach_lora_adapters(lora_modules)?;
+    if activate_for_single_seq {
+        let lid = if let Some(name) = active_lora {
+            engine.lora_registry.resolve_name(name).ok_or_else(|| {
+                crate::model::loader_err_msg(format!("unknown active LoRA adapter '{name}'"))
+            })?
+        } else {
+            0
+        };
+        engine.set_active_lora_id(lid);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_cli_engine_with_lora(
     model: &str,
     tp: usize,
     policy: KvFormatPolicy,
     kv_pages: Option<usize>,
     use_cuda_graph: bool,
     spec_config: &Option<crate::proposer::SpeculativeConfig>,
+    lora_modules: &[crate::lora::LoraModuleSpec],
+    active_lora: Option<&str>,
 ) -> crate::cuda::Result<Qwen3_5Engine> {
     // Leave VRAM for the resident drafter instead of filling it with target KV.
     // Speculative taps/logits are configured in enable_speculative before lazy graph capture.
     let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
     let mut engine = Qwen3_5Engine::load(model, tp, policy, pages, use_cuda_graph)?;
+    attach_cli_lora(&mut engine, lora_modules, active_lora, true)?;
     if let Some(config) = spec_config {
         engine.enable_speculative(config)?;
     }
@@ -651,6 +725,18 @@ pub(crate) fn prepare_cuda_cli_with_env(
             draft_model,
             mtp_k: options.mtp_k,
         });
+    for spec in &mut options.lora_modules {
+        let dir = resolve(
+            &spec.path,
+            &HubOptions {
+                revision: spec.revision.clone(),
+                offline: options.offline,
+            },
+            ModelRole::Lora,
+        )
+        .map_err(|e| e.to_string())?;
+        spec.resolved_dir = Some(dir);
+    }
     Ok(Some(PreparedCudaCli {
         options,
         policy,

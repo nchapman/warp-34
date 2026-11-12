@@ -139,6 +139,7 @@ pub struct WaitingReq {
     pub max_prefix_lookup_len: Option<usize>,
     pub mamba_branching_seqlen: Option<usize>,
     pub prefix_bidir_len: Option<usize>,
+    pub lora_id: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +156,7 @@ pub struct SeqEntry {
     pub custom_prefill: bool,
     pub mamba_branching_seqlen: Option<usize>,
     pub prefix_bidir_len: Option<usize>,
+    pub lora_id: i32,
     /// Number of prompt tokens already processed into KV + GDN state.
     pub prefilled_tokens: usize,
     /// Number of prompt tokens restored from `MambaRadixCache` on arrival.
@@ -198,6 +200,7 @@ pub struct ScheduledReqSlice {
     pub state_out_slot: i32,
     pub has_initial_state: bool,
     pub planned_checkpoints: Vec<PlannedCheckpoint>,
+    pub lora_id: i32,
 }
 
 pub struct SchedulerV1 {
@@ -301,10 +304,45 @@ impl SchedulerV1 {
         mamba_branching_seqlen: Option<usize>,
         prefix_bidir_len: Option<usize>,
     ) -> u64 {
+        self.submit_request_with_lora_and_bidir(
+            prompt_tokens,
+            radix_key_tokens,
+            max_new_tokens,
+            min_tokens,
+            ignore_eos,
+            stop_token_ids,
+            eos_token_ids,
+            custom_prefill,
+            max_prefix_lookup_len,
+            mamba_branching_seqlen,
+            prefix_bidir_len,
+            crate::lora::BASE_MODEL_LORA_ID,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_request_with_lora_and_bidir(
+        &mut self,
+        prompt_tokens: Vec<i32>,
+        mut radix_key_tokens: Vec<i32>,
+        max_new_tokens: usize,
+        min_tokens: usize,
+        ignore_eos: bool,
+        stop_token_ids: Vec<i32>,
+        eos_token_ids: Vec<i32>,
+        custom_prefill: bool,
+        max_prefix_lookup_len: Option<usize>,
+        mamba_branching_seqlen: Option<usize>,
+        prefix_bidir_len: Option<usize>,
+        lora_id: i32,
+    ) -> u64 {
         assert!(
             !prompt_tokens.is_empty() && prompt_tokens.len() == radix_key_tokens.len(),
             "prompt_tokens and radix_key_tokens must be non-empty and equal length"
         );
+        if lora_id >= 0 {
+            radix_key_tokens = crate::lora::salt_radix_key_for_lora(&radix_key_tokens, lora_id);
+        }
         let max_prefix_lookup_len = if prefix_bidir_len.is_some() {
             Some(0)
         } else {
@@ -325,6 +363,7 @@ impl SchedulerV1 {
             max_prefix_lookup_len,
             mamba_branching_seqlen,
             prefix_bidir_len,
+            lora_id,
         });
         id
     }
@@ -422,6 +461,7 @@ impl SchedulerV1 {
                     .mamba_branching_seqlen
                     .or(match_res.mamba_branching_seqlen),
                 prefix_bidir_len: w.prefix_bidir_len,
+                lora_id: w.lora_id,
                 prefilled_tokens: match_res.matched_tokens,
                 cached_prefix_tokens: match_res.matched_tokens,
                 radix_state,
@@ -461,6 +501,7 @@ impl SchedulerV1 {
                 state_out_slot: seq.radix_state.active_state_slot,
                 has_initial_state: seq.radix_state.has_initial_state,
                 planned_checkpoints: planned,
+                lora_id: seq.lora_id,
             });
             budget -= 1;
         }
@@ -571,6 +612,7 @@ impl SchedulerV1 {
                 state_out_slot: seq.radix_state.active_state_slot,
                 has_initial_state: seq.radix_state.has_initial_state,
                 planned_checkpoints: planned,
+                lora_id: seq.lora_id,
             });
             budget -= take;
             prefill_budget -= take;
@@ -725,6 +767,7 @@ mod tests {
             custom_prefill: false,
             mamba_branching_seqlen: None,
             prefix_bidir_len: None,
+            lora_id: crate::lora::BASE_MODEL_LORA_ID,
             prefilled_tokens: 3,
             cached_prefix_tokens: 0,
             radix_state: ReqRadixState::new(16, 64, 0, [1, 2]),

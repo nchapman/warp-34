@@ -175,10 +175,12 @@ impl Qwen3_5Engine {
         let st_in_arr = [state_in_slot];
         let st_out_arr = [state_out_slot];
         let has_init_arr = [u8::from(has_initial_state)];
+        let active_lora_id = self.active_lora_id;
 
         if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
             r0.device.make_current()?;
+            r0.set_lora_uniform(active_lora_id);
             r0.stage_ple_f8_for_batch(
                 tokens,
                 &q_start,
@@ -299,6 +301,7 @@ impl Qwen3_5Engine {
                 let d0_ref = &mut dump0;
                 let h0 = sc.spawn(move || -> Result<(i32, f32, [i32; 5], [f32; 5])> {
                     r0.device.make_current()?;
+                    r0.set_lora_uniform(active_lora_id);
                     r0.stage_ple_f8_for_batch(
                         tokens,
                         &q_start,
@@ -409,6 +412,7 @@ impl Qwen3_5Engine {
                     let cp = comm.clone();
                     peer_handles.push(sc.spawn(move || -> Result<(f32, [i32; 5], [f32; 5])> {
                         r_peer.device.make_current()?;
+                        r_peer.set_lora_uniform(active_lora_id);
                         r_peer.stage_ple_f8_for_batch(
                             tokens,
                             &q_start,
@@ -584,6 +588,7 @@ impl Qwen3_5Engine {
         let seq_arr = [seq_after as i32];
         let slot_arr = [write_slot];
         let st_arr = [state_slot];
+        let lora_arr = [self.active_lora_id];
         for r in &mut self.ranks {
             r.stage_ple_f8_for_batch(
                 &tok_arr,
@@ -626,15 +631,24 @@ impl Qwen3_5Engine {
             r0.decode_io
                 .state_out_indices
                 .copy_from_host(&st_arr, &r0.stream)?;
+            if r0.lora_runtime.is_some() {
+                r0.decode_io
+                    .token_lora_ids
+                    .copy_from_host(&lora_arr, &r0.stream)?;
+            }
 
             let long_ctx = seq_after > 1024;
             if self.use_cuda_graph && r0.supports_cuda_graph_for_tokens(1) {
                 r0.ensure_decode_graph(long_ctx, None)?;
+                if let Some(rt) = &r0.lora_runtime {
+                    rt.state.set_device_ids(r0.decode_io.token_lora_ids.addr());
+                }
                 r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
                 r0.mark_tiered_moe_device_lru_dirty();
                 r0.last_logits_ptr = r0.captured_decode_logits_ptr;
                 r0.last_logits_rows = 1;
             } else {
+                r0.set_lora_uniform(lora_arr[0]);
                 let attn_batch = W34AttentionBatch {
                     query_start_loc: r0.decode_io.q_start_loc.addr() as *const i32,
                     context_lens_before: r0.decode_io.ctx_lens_before.addr() as *const i32,
@@ -726,6 +740,12 @@ impl Qwen3_5Engine {
                     r.decode_io
                         .state_out_indices
                         .copy_from_host(&st_arr, &r.stream)?;
+                    if let Some(rt) = &r.lora_runtime {
+                        r.decode_io
+                            .token_lora_ids
+                            .copy_from_host(&lora_arr, &r.stream)?;
+                        rt.state.set_device_ids(r.decode_io.token_lora_ids.addr());
+                    }
                     r.decode_graph.as_ref().unwrap().1.launch(&r.stream)?;
                     r.mark_tiered_moe_device_lru_dirty();
                     r.last_logits_ptr = r.captured_decode_logits_ptr;
@@ -773,13 +793,22 @@ impl Qwen3_5Engine {
                     r0.decode_io
                         .state_out_indices
                         .copy_from_host(&st_arr, &r0.stream)?;
+                    if r0.lora_runtime.is_some() {
+                        r0.decode_io
+                            .token_lora_ids
+                            .copy_from_host(&lora_arr, &r0.stream)?;
+                    }
                     if use_graph {
                         r0.ensure_decode_graph(long_ctx, Some(&c0))?;
+                        if let Some(rt) = &r0.lora_runtime {
+                            rt.state.set_device_ids(r0.decode_io.token_lora_ids.addr());
+                        }
                         r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
                         r0.mark_tiered_moe_device_lru_dirty();
                         r0.last_logits_ptr = r0.captured_decode_logits_ptr;
                         r0.last_logits_rows = 1;
                     } else {
+                        r0.set_lora_uniform(lora_arr[0]);
                         let attn_batch = W34AttentionBatch {
                             query_start_loc: r0.decode_io.q_start_loc.addr() as *const i32,
                             context_lens_before: r0.decode_io.ctx_lens_before.addr() as *const i32,
@@ -874,8 +903,18 @@ impl Qwen3_5Engine {
                             .decode_io
                             .state_out_indices
                             .copy_from_host(&st_arr, &r_peer.stream)?;
+                        if r_peer.lora_runtime.is_some() {
+                            r_peer
+                                .decode_io
+                                .token_lora_ids
+                                .copy_from_host(&lora_arr, &r_peer.stream)?;
+                        }
                         if use_graph {
                             r_peer.ensure_decode_graph(long_ctx, Some(&cp))?;
+                            if let Some(rt) = &r_peer.lora_runtime {
+                                rt.state
+                                    .set_device_ids(r_peer.decode_io.token_lora_ids.addr());
+                            }
                             r_peer
                                 .decode_graph
                                 .as_ref()
@@ -886,6 +925,7 @@ impl Qwen3_5Engine {
                             r_peer.last_logits_ptr = r_peer.captured_decode_logits_ptr;
                             r_peer.last_logits_rows = 1;
                         } else {
+                            r_peer.set_lora_uniform(lora_arr[0]);
                             let attn_batch = W34AttentionBatch {
                                 query_start_loc: r_peer.decode_io.q_start_loc.addr() as *const i32,
                                 context_lens_before: r_peer.decode_io.ctx_lens_before.addr()

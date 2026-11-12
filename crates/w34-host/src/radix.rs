@@ -89,6 +89,7 @@ pub struct MambaRadixCache {
     pub page_size: usize,
     pub mamba_chunk_size: usize,
     pub disable: bool,
+    pub active_lora_id: i32,
     nodes: Vec<RadixNode>,
     /// Ordered from LRU (index 0) to MRU (last). Contains all alive non-root nodes.
     full_lru: Vec<RadixNodeId>,
@@ -116,6 +117,7 @@ impl MambaRadixCache {
             page_size,
             mamba_chunk_size,
             disable: false,
+            active_lora_id: crate::lora::BASE_MODEL_LORA_ID,
             nodes: Vec::new(),
             full_lru: Vec::new(),
             mamba_lru: Vec::new(),
@@ -377,6 +379,16 @@ impl MambaRadixCache {
                 mamba_branching_seqlen: None,
             };
         }
+        let salted_buf;
+        let token_ids = if self.active_lora_id >= 0 {
+            salted_buf = crate::lora::salt_radix_key_for_lora(
+                &token_ids[..aligned_len],
+                self.active_lora_id,
+            );
+            salted_buf.as_slice()
+        } else {
+            &token_ids[..aligned_len]
+        };
 
         let mut cur_node = RadixNodeId::ROOT;
         let mut key_offset = 0usize;
@@ -555,6 +567,13 @@ impl MambaRadixCache {
                 terminal_node: RadixNodeId::ROOT,
             };
         }
+        let salted_buf;
+        let token_ids = if self.active_lora_id >= 0 {
+            salted_buf = crate::lora::salt_radix_key_for_lora(token_ids, self.active_lora_id);
+            salted_buf.as_slice()
+        } else {
+            token_ids
+        };
 
         let mut cur_node = RadixNodeId::ROOT;
         let mut key_offset = 0usize;

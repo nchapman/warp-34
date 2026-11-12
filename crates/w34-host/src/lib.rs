@@ -18,6 +18,7 @@ pub mod dflash;
 pub mod engine_worker;
 pub mod hub;
 pub mod loader;
+pub mod lora;
 #[cfg(feature = "cuda")]
 pub mod model;
 #[cfg(feature = "cuda")]

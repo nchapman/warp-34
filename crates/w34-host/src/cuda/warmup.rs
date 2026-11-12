@@ -1425,6 +1425,25 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup w34_rejection_stochastic"
     )?;
+    warmup_ffi!(
+        ffi::w34_lora_shrink_expand_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *const c_void,
+            reject_ids as *const i32,
+            buf_ws as *mut f32,
+            buf_d as *mut c_void,
+            1,
+            64,
+            64,
+            4,
+            1,
+            0,
+            1,
+        ),
+        "warmup w34_lora_shrink_expand_f16"
+    )?;
     warmup_vision_moe::warmup_vision_moe_and_qwen4(
         &mut arena,
         &stream,

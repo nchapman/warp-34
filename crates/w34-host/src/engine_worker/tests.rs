@@ -38,6 +38,7 @@ fn terminal_test_request() -> (
         max_prefix_lookup_len: None,
         mamba_branching_seqlen: None,
         prefix_bidir_len: None,
+        lora_id: crate::lora::BASE_MODEL_LORA_ID,
         decision_tap: Some(DecisionReadoutTap::CandidateLogits {
             token_ids: vec![1],
             tx,
@@ -391,6 +392,7 @@ fn worker_panic_containment_drains_in_flight_and_queued_and_poisons_future_submi
         hidden_size: 1024,
         kv_token_capacity: 4096,
         unshareable_prefill: false,
+        lora_registry: crate::lora::LoraAdapterRegistry::new(),
         max_model_len: None,
     };
 

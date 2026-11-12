@@ -71,6 +71,10 @@ impl Qwen3_5ModelRank {
             "w34_graph_begin_capture",
         )?;
         self.is_capturing_graph = true;
+        if let Some(rt) = &self.lora_runtime {
+            rt.state
+                .set_device_ids(self.decode_io.token_lora_ids.addr());
+        }
         let res = self.forward_device_batches(
             tok_ptr,
             pos_ptr,
@@ -181,6 +185,10 @@ impl Qwen3_5ModelRank {
             "w34_graph_begin_capture (spec_verify)",
         )?;
         self.is_capturing_graph = true;
+        if let Some(rt) = &self.lora_runtime {
+            rt.state
+                .set_device_ids(self.spec_verify_io.token_lora_ids_ptr());
+        }
         let res = self.forward_selected_rows_device(
             tok_ptr,
             pos_ptr,
@@ -297,6 +305,10 @@ impl Qwen3_5ModelRank {
             "w34_graph_begin_capture (batched_decode)",
         )?;
         self.is_capturing_graph = true;
+        if let Some(rt) = &self.lora_runtime {
+            rt.state
+                .set_device_ids(self.batched_decode_io.token_lora_ids_ptr());
+        }
         let emit_device_greedy = sample_mode == DecodeGraphSampleMode::PlainGreedy;
         let res = self
             .forward_selected_rows_device(

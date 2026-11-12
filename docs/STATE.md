@@ -1,5 +1,21 @@
 # warp-34 — Session Orientation & Current State
 
+## Multi-LoRA / PEFT Adapter Support (`FP16` & `W4A16-HGPTQ` Base Models, Mixed-Adapter Batching, & Hadamard Pre-Rotation)
+
+- **CUDA Multi-LoRA Shrink+Expand Kernels (`crates/w34-kernels/csrc/ops/op_lora.cu`, `w34_cuda.h`, `ffi_ext.rs`, `warmup.rs`):**
+  - Implemented `w34_lora_shrink_expand_f16` (`lora_shrink_f16_kernel` + `lora_expand_f16_kernel`) with vectorized `float4` (`8 × FP16`) loads, `FP32` low-rank accumulation (`U[t, r] = sum_k X[t, k] * A[lid, r, k]`), and in-place `FP16` residual output accumulation (`Y[t, n] += sum_r U[t, r] * B_scaled[lid, n, r]`).
+  - Supports per-token `token_lora_ids[t]` routing across up to 32 simultaneously loaded adapters (`lora_id >= 0`) and base model (`lora_id = -1`, 0-ULP unchanged output) within the same prefill, decode, or speculative verify batch, and is CUDA-Graph capturable (`RankLoraState` binds graph-static device pointers via `SpecVerifyGraphIo::meta_i32` and `BatchedDecodeGraphIo::meta_i32`).
+  - Registered `w34_lora_shrink_expand_f16` in `prepare_execution_plan()` warmup for cold-start `TP=2`/`TP=4` safety.
+- **PEFT Adapter Loader, Hub Subfolder Resolution, & Hadamard-Fused `LinearProj::WithLora` (`crates/w34-host/src/lora.rs`, `hub.rs`, `model/weights.rs`):**
+  - Parses standard HuggingFace PEFT `adapter_config.json` (`r`, `lora_alpha`, `use_rslora`, `fan_in_fan_out`, `rank_pattern`, `alpha_pattern`) and `adapter_model.safetensors` (`F16`, `BF16`, `F32`) across local paths, HF repo IDs (`owner/repo`), and subfolder repo specs (`owner/repo/sub/folder[@rev]`).
+  - Supports all Qwen 3.5 / 3.6 / 3.8 projections (`q_proj`, `k_proj`, `v_proj`, `qkv_proj`, `o_proj`, `in_proj_qkv`, `in_proj_z`, `in_proj_qkvz`, `in_proj_b`, `in_proj_a`, `in_proj_ba`, `out_proj`, `gate_proj`, `up_proj`, `gate_up_proj`, `down_proj`, `lm_head`) with automatic block-diagonal packing for fused projections (`qkv_proj`, `in_proj_qkvz`, `in_proj_ba`, `gate_up_proj`) and column-parallel (`TP=2` / `TP=4`) or row-parallel (`o_proj`, `out_proj`, `down_proj` with `rank == 0` scaling so TP all-reduce sums once) sharding.
+  - Nests `LinearProj::WithLora` inside `LinearProj::Hadamard` and pre-rotates `lora_A` rows on the host by $H_B$ (`hadamard_rows_f32` using orthogonal $H_B^T H_B = I$), preserving `can_fuse_h64_from_producer() == true` (`RMSNorm+H64` and `SiLU*Mul+H64`) on `W4A16-HGPTQ` checkpoints with **zero extra Hadamard launches and zero `ex.scratch_ptr` overhead**.
+- **Per-Request Multi-LoRA Routing, `MambaRadixCache` Prefix Isolation, CLI, & HTTP Serving (`radix.rs`, `scheduler.rs`, `cli/`, `server/`):**
+  - Salts `MambaRadixCache` root token keys (`salt_radix_key_for_lora`) when `lora_id >= 0` so base-model (`-1`) and per-adapter (`0..N`) KV pages and GDN `StateBundle` checkpoints are strictly isolated in the shared radix tree.
+  - Added repeatable `--lora-modules` / `--lora` (`<name>=<path_or_hf_repo>[/subfolder][@rev]`) and `--active-lora <name>` CLI flags across `w34 serve`, `generate`, `bench`, `chat`, `dump-diff`, `greedy-diff`, and `profile-diff`.
+  - Listed loaded LoRA adapters in `GET /v1/models` (`parent: <base_model>`) and routed requests by `"model": "<adapter_name>"` (or `"lora"` / `"adapter"`) across `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/systemone`, and `/v1/decisions`.
+  - **Verified Live on `nchapman/Qwen3.5-9B-W4A16-HGPTQ` + `nchapman/Qwen3.5-9B-Heretic-LoRA`:** **`141.55 tok/s`** single-stream decode with CUDA graphs enabled, 0-ULP identical base-model output when `lora_id = -1`, exact mixed-batch (`base` + `heretic`) continuous-batching parity, and `TP=1` vs `TP=2` `dump-diff` parity (`tp1_top1 == tp2_top1`, `min_cosine = 0.998927`).
+
 ## Model Checkpoint Standardization (`Qwen/Qwen3.5-4B` Core Tests, `nchapman/*-W4A16-HGPTQ` `w34` Targets, & Mainstream Competitor Baselines)
 
 - **Standardized Model References Across Code, Tests, Oracles, Benchmarks, & Docs:**
