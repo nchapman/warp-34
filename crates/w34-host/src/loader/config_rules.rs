@@ -5,7 +5,9 @@ use fancy_regex::{Regex, RegexBuilder};
 pub const HADAMARD_BLOCK_16: usize = 16;
 pub const HADAMARD_BLOCK_64: usize = 64;
 pub const SUPPORTED_HADAMARD_BLOCKS: [usize; 2] = [HADAMARD_BLOCK_16, HADAMARD_BLOCK_64];
+pub const SUPPORTED_MARLIN_U2_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 pub const SUPPORTED_MARLIN_U4_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
+pub const SUPPORTED_MARLIN_U8_GROUP_SIZES: [usize; 4] = [0, 32, 64, 128];
 
 /// Returns `true` when `block` is either disabled (`0`) or a supported Hadamard block size
 /// (`HADAMARD_BLOCK_16` or `HADAMARD_BLOCK_64`) that evenly divides non-zero `dim`.
@@ -20,17 +22,30 @@ pub const fn is_valid_hadamard_block_for_dim(block: usize, dim: usize) -> bool {
 
 const MAX_REGEX_PATTERN_BYTES: usize = 8 * 1024;
 const REGEX_BACKTRACK_LIMIT: usize = 100_000;
-const MAX_COMPRESSED_TENSORS_PATTERNS: usize = 64;
+const MAX_COMPRESSED_TENSORS_PATTERNS: usize = 1024;
 const MAX_COMPRESSED_TENSORS_GROUPS: usize = 32;
 const MAX_TENSOR_NAME_BYTES: usize = 16 * 1024;
+const COMPRESSED_TENSORS_U2_BITS: usize = 2;
 const COMPRESSED_TENSORS_U4_BITS: usize = 4;
+const COMPRESSED_TENSORS_U8_BITS: usize = 8;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct CompressedTensorRules {
     ignore: Vec<CompiledPattern>,
     groups: Vec<QuantRule>,
     transforms: Vec<TransformRule>,
+    moe_expert_layer_cache: std::sync::OnceLock<Vec<Option<(usize, usize, bool)>>>,
 }
+
+impl PartialEq for CompressedTensorRules {
+    fn eq(&self, other: &Self) -> bool {
+        self.ignore == other.ignore
+            && self.groups == other.groups
+            && self.transforms == other.transforms
+    }
+}
+
+impl Eq for CompressedTensorRules {}
 
 #[derive(Clone, Debug)]
 enum CompiledPattern {
@@ -248,19 +263,27 @@ impl CompressedTensorRules {
             ));
         }
         for (key, group) in quant_map {
-            let (bits, group_size, symmetric, _) =
+            let (bits, group_size, symmetric, is_embedding_only) =
                 ModelConfig::parse_compressed_tensors_group(key, group)?;
+            if is_embedding_only {
+                continue;
+            }
             let w = &group["weights"];
-            if bits != COMPRESSED_TENSORS_U4_BITS
+            let valid_bits_and_gs = (bits == COMPRESSED_TENSORS_U2_BITS
+                && SUPPORTED_MARLIN_U2_GROUP_SIZES.contains(&group_size))
+                || (bits == COMPRESSED_TENSORS_U4_BITS
+                    && SUPPORTED_MARLIN_U4_GROUP_SIZES.contains(&group_size))
+                || (bits == COMPRESSED_TENSORS_U8_BITS
+                    && SUPPORTED_MARLIN_U8_GROUP_SIZES.contains(&group_size));
+            if !valid_bits_and_gs
                 || !symmetric
-                || !SUPPORTED_MARLIN_U4_GROUP_SIZES.contains(&group_size)
                 || w.get("dynamic").is_some_and(|v| v != false)
                 || (group_size == 0
                     && (w.get("strategy").and_then(Json::as_str) != Some("channel")
                         || w.get("group_size").is_some_and(|v| !v.is_null())))
             {
                 return Err(invalid(
-                    "HGPTQ requires static symmetric W4 (g32/g64/g128 or channel) weights",
+                    "HGPTQ requires static symmetric W2/W4/W8 (g32/g64/g128 or channel) weights",
                 ));
             }
             quant_groups.push(QuantRule {
@@ -274,7 +297,34 @@ impl CompressedTensorRules {
             ignore,
             groups: quant_groups,
             transforms,
+            moe_expert_layer_cache: std::sync::OnceLock::new(),
         }))
+    }
+
+    pub(super) fn resolve_moe_layer_expert(&self, layer_id: usize) -> Option<(usize, usize, bool)> {
+        const MAX_CACHED_MOE_LAYERS: usize = 128;
+        if layer_id < MAX_CACHED_MOE_LAYERS {
+            let cache = self.moe_expert_layer_cache.get_or_init(|| {
+                (0..MAX_CACHED_MOE_LAYERS)
+                    .map(|l| self.resolve_moe_layer_expert_uncached(l))
+                    .collect()
+            });
+            return cache[layer_id];
+        }
+        self.resolve_moe_layer_expert_uncached(layer_id)
+    }
+
+    fn resolve_moe_layer_expert_uncached(&self, layer_id: usize) -> Option<(usize, usize, bool)> {
+        for candidate in [
+            format!("model.layers.{layer_id}.mlp.experts.0.gate_proj"),
+            format!("model.language_model.layers.{layer_id}.mlp.experts.0.gate_proj"),
+            format!("layers.{layer_id}.mlp.experts.0.gate_proj"),
+        ] {
+            if let Ok((Some(g), _)) = self.resolve(&candidate) {
+                return Some((g.bits, g.group_size, g.symmetric));
+            }
+        }
+        None
     }
 
     fn resolve(&self, name: &str) -> io::Result<(Option<&QuantRule>, Option<usize>)> {
@@ -299,9 +349,17 @@ impl CompressedTensorRules {
         let mut offline = None;
         for rule in &self.transforms {
             if matches(&rule.targets, name)? && !matches(&rule.ignore, name)? {
-                if selected.is_none() {
+                let Some(sel) = selected else {
                     return Err(invalid(format!(
                         "transform targets unquantized linear {name}"
+                    )));
+                };
+                if !matches!(
+                    sel.bits,
+                    COMPRESSED_TENSORS_U2_BITS | COMPRESSED_TENSORS_U4_BITS
+                ) {
+                    return Err(invalid(format!(
+                        "transform targets non-W2/W4 linear {name}"
                     )));
                 }
                 let slot = if rule.offline {

@@ -69,6 +69,70 @@ pub fn marlin_permute_scales_from_n_major(
     marlin_permute_scales_k_by_n(&k_by_n, size_k, size_n, group_size)
 }
 
+/// Losslessly dilates N-major 2-bit `uint2b2` packed words (`16` crumbs/word, zero-point `2`)
+/// into N-major 4-bit `uint4b8` packed words (`8` nibbles/word, zero-point `8`, `u4 = u2 + 6`).
+pub fn repack_u2b2_to_u4b8(packed_u2: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(packed_u2.len() * 2);
+    for &w in packed_u2 {
+        for half in [w & 0xFFFF, w >> 16] {
+            let mut x = half;
+            x = (x | (x << 8)) & 0x00FF_00FF;
+            x = (x | (x << 4)) & 0x0F0F_0F0F;
+            x = (x | (x << 2)) & 0x3333_3333;
+            x = x.wrapping_add(0x6666_6666);
+            out.push(x);
+        }
+    }
+    out
+}
+
+/// Dequantizes an N-major `[N, K/16]` `U2B2` weight + `[N, K/group_size]` `FP16` scale tensor
+/// into an N-major `[N, K]` `FP16` matrix.
+pub fn dequant_u2b2_n_major_to_f16(
+    packed_n_by_k16: &[u32],
+    scales_n_by_kg: &[u16],
+    size_n: usize,
+    size_k: usize,
+    group_size: usize,
+) -> Vec<u16> {
+    let eff_gs = if group_size == 0 { size_k } else { group_size };
+    let words_per_row = size_k / 16;
+    let groups_per_row = size_k / eff_gs;
+    assert_eq!(packed_n_by_k16.len(), size_n * words_per_row);
+    assert_eq!(scales_n_by_kg.len(), size_n * groups_per_row);
+    let mut out = vec![0u16; size_n * size_k];
+    let dequant_rows = |row_start: usize, dst_rows: &mut [u16]| {
+        for (rel_n, dst_row) in dst_rows.chunks_exact_mut(size_k).enumerate() {
+            let n = row_start + rel_n;
+            let row_words = &packed_n_by_k16[n * words_per_row..(n + 1) * words_per_row];
+            let row_scales = &scales_n_by_kg[n * groups_per_row..(n + 1) * groups_per_row];
+            for (w_idx, &word) in row_words.iter().enumerate() {
+                for b in 0..16 {
+                    let k = w_idx * 16 + b;
+                    let crumb = ((word >> (b * 2)) & 0x3) as i32 - 2;
+                    let scale = f16_to_f32(row_scales[k / eff_gs]);
+                    dst_row[k] = f32_to_f16((crumb as f32) * scale);
+                }
+            }
+        }
+    };
+    if size_n < 2048 {
+        dequant_rows(0, &mut out);
+    } else {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 8))
+            .unwrap_or(4);
+        let rows_per_chunk = size_n.div_ceil(num_threads).max(1);
+        std::thread::scope(|s| {
+            for (chunk_idx, dst_chunk) in out.chunks_mut(rows_per_chunk * size_k).enumerate() {
+                let row_start = chunk_idx * rows_per_chunk;
+                s.spawn(move || dequant_rows(row_start, dst_chunk));
+            }
+        });
+    }
+    out
+}
+
 /// Dequantizes an N-major `[N, K/8]` `U4B8` weight + `[N, K/group_size]` `FP16` scale tensor
 /// into an N-major `[N, K]` `FP16` matrix (used for skinny projections with `N < 64` or `N % 64 != 0`).
 pub fn dequant_u4b8_n_major_to_f16(

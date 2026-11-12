@@ -178,6 +178,7 @@ mod cuda_tests {
                     128,
                     128,
                     128,
+                    4,
                 )
             },
             0
@@ -252,6 +253,7 @@ mod cuda_tests {
                     intermediate,
                     hidden,
                     group,
+                    4,
                 )
             };
             assert_ne!(
@@ -259,6 +261,47 @@ mod cuda_tests {
                 "accepted geometry {intermediate}/{hidden}/{group}/{stride}"
             );
         }
+
+        // Also verify a valid W2 layout with intermediate=32, hidden=64, group_size=32
+        // (where padded stride=4096 exceeds the W4 raw size of 3456 bytes) unpacks
+        // accurately using explicit bits=2 without misclassifying as W4.
+        let w2_layout = ExpertPackLayout::new_with_bits(32, 64, 32, 2).unwrap();
+        assert_eq!(w2_layout.stride, 4096);
+        let mut h_pack = vec![0u8; w2_layout.stride];
+        for (i, b) in h_pack[..w2_layout.down_scales.end].iter_mut().enumerate() {
+            *b = ((i * 37 + 11) & 0xFF) as u8;
+        }
+        let d_staged = DeviceBuffer::alloc(0, w2_layout.stride).unwrap();
+        d_staged.copy_from_host(&h_pack, &stream).unwrap();
+        let d_slot = DeviceBuffer::alloc(0, 4).unwrap();
+        d_slot.copy_from_host(&[0i32], &stream).unwrap();
+        let d_gu_w = DeviceBuffer::alloc(0, w2_layout.gate_up_packed.len()).unwrap();
+        let d_gu_s = DeviceBuffer::alloc(0, w2_layout.gate_up_scales.len()).unwrap();
+        let d_dn_w = DeviceBuffer::alloc(0, w2_layout.down_packed.len()).unwrap();
+        let d_dn_s = DeviceBuffer::alloc(0, w2_layout.down_scales.len()).unwrap();
+        // SAFETY: all device buffers are allocated to the exact sizes of `w2_layout` for 1 slot.
+        let rc = unsafe {
+            ffi::w34_moe_unpack_staged_experts(
+                &ex,
+                d_staged.addr() as *const _,
+                d_slot.addr() as *const i32,
+                d_gu_w.addr() as *mut u32,
+                d_gu_s.addr() as *mut _,
+                d_dn_w.addr() as *mut u32,
+                d_dn_s.addr() as *mut _,
+                1,
+                1,
+                w2_layout.stride,
+                w2_layout.intermediate as i32,
+                w2_layout.hidden as i32,
+                w2_layout.group_size as i32,
+                w2_layout.bits as i32,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut out_dn_s = vec![0u8; w2_layout.down_scales.len()];
+        d_dn_s.copy_to_host(&mut out_dn_s, &stream).unwrap();
+        assert_eq!(&out_dn_s[..], &h_pack[w2_layout.down_scales.clone()]);
         stream.synchronize().unwrap();
     }
 
@@ -1767,5 +1810,328 @@ mod cuda_tests {
         assert!(cache.slot_of(66).is_some_and(|s| s < 24));
         assert!(cache.slot_of(67).is_some_and(|s| s < 24));
         assert_ne!(cache.slot_of(66), cache.slot_of(67));
+    }
+
+    #[test]
+    fn w2a16_u2b2_zero_ulp_parity_with_dilated_u4b8_across_all_regimes_and_tiered_modes() {
+        use crate::cuda::f32_to_f16;
+        let _dev = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+
+        let num_experts = 8usize;
+        let n_interm = 128usize;
+        let k_hidden = 128usize;
+        let group_size = 64usize;
+        let top_k = 2usize;
+        let max_m = 20usize;
+
+        let layout_u2 = ExpertPackLayout::new_with_bits(n_interm, k_hidden, group_size, 2)
+            .unwrap()
+            .with_down_hadamard(64)
+            .unwrap();
+        let layout_u4 = ExpertPackLayout::new_with_bits(n_interm, k_hidden, group_size, 4)
+            .unwrap()
+            .with_down_hadamard(64)
+            .unwrap();
+        assert_eq!(
+            layout_u2.gate_up_packed.len(),
+            layout_u4.gate_up_packed.len() / 2
+        );
+        assert_eq!(layout_u2.down_packed.len(), layout_u4.down_packed.len() / 2);
+
+        let gu_u2_words = 2 * n_interm * (k_hidden / 16);
+        let gu_u4_words = 2 * n_interm * (k_hidden / 8);
+        let gu_scales_len = 2 * n_interm * (k_hidden / group_size);
+        let dn_u2_words = k_hidden * (n_interm / 16);
+        let dn_u4_words = k_hidden * (n_interm / 8);
+        let dn_scales_len = k_hidden * (n_interm / group_size);
+
+        let mut raw_packs_u2 = vec![0u8; num_experts * layout_u2.stride];
+        let mut raw_packs_u4 = vec![0u8; num_experts * layout_u4.stride];
+        for e in 0..num_experts {
+            let mut gu_p_u2 = vec![0u32; gu_u2_words];
+            let mut gu_p_u4 = vec![0u32; gu_u4_words];
+            for (idx, w2_dst) in gu_p_u2.iter_mut().enumerate() {
+                let mut w2 = 0u32;
+                let mut w4_lo = 0u32;
+                let mut w4_hi = 0u32;
+                for j in 0..16 {
+                    let q2 = ((e * 19 + idx * 7 + j * 3) & 3) as u32;
+                    w2 |= q2 << (2 * j);
+                    if j < 8 {
+                        w4_lo |= (q2 + 6) << (4 * j);
+                    } else {
+                        w4_hi |= (q2 + 6) << (4 * (j - 8));
+                    }
+                }
+                *w2_dst = w2;
+                gu_p_u4[2 * idx] = w4_lo;
+                gu_p_u4[2 * idx + 1] = w4_hi;
+            }
+            let gu_s: Vec<u16> = (0..gu_scales_len)
+                .map(|i| f32_to_f16(0.015 + ((e * 7 + i) % 9) as f32 * 0.004))
+                .collect();
+
+            let mut dn_p_u2 = vec![0u32; dn_u2_words];
+            let mut dn_p_u4 = vec![0u32; dn_u4_words];
+            for (idx, w2_dst) in dn_p_u2.iter_mut().enumerate() {
+                let mut w2 = 0u32;
+                let mut w4_lo = 0u32;
+                let mut w4_hi = 0u32;
+                for j in 0..16 {
+                    let q2 = ((e * 23 + idx * 11 + j * 5) & 3) as u32;
+                    w2 |= q2 << (2 * j);
+                    if j < 8 {
+                        w4_lo |= (q2 + 6) << (4 * j);
+                    } else {
+                        w4_hi |= (q2 + 6) << (4 * (j - 8));
+                    }
+                }
+                *w2_dst = w2;
+                dn_p_u4[2 * idx] = w4_lo;
+                dn_p_u4[2 * idx + 1] = w4_hi;
+            }
+            let dn_s: Vec<u16> = (0..dn_scales_len)
+                .map(|i| f32_to_f16(0.012 + ((e * 5 + i) % 11) as f32 * 0.003))
+                .collect();
+
+            layout_u2
+                .write_pack(
+                    &gu_p_u2,
+                    &gu_s,
+                    &dn_p_u2,
+                    &dn_s,
+                    &mut raw_packs_u2[e * layout_u2.stride..(e + 1) * layout_u2.stride],
+                )
+                .unwrap();
+            layout_u4
+                .write_pack(
+                    &gu_p_u4,
+                    &gu_s,
+                    &dn_p_u4,
+                    &dn_s,
+                    &mut raw_packs_u4[e * layout_u4.stride..(e + 1) * layout_u4.stride],
+                )
+                .unwrap();
+        }
+
+        let h_x: Vec<u16> = (0..max_m * k_hidden)
+            .map(|i| f32_to_f16(((i as f32 * 0.13).sin()) * 0.45))
+            .collect();
+        let h_topk_ids: Vec<i32> = (0..max_m)
+            .flat_map(|t| {
+                [
+                    (t * 3 % num_experts) as i32,
+                    ((t * 5 + 1) % num_experts) as i32,
+                ]
+            })
+            .collect();
+        let h_topk_weights: Vec<f32> = (0..max_m * top_k)
+            .map(|i| if i % 2 == 0 { 0.65 } else { 0.35 })
+            .collect();
+
+        let d_x = upload(&h_x, &stream);
+        let d_topk_ids = upload(&h_topk_ids, &stream);
+        let d_topk_weights = upload(&h_topk_weights, &stream);
+
+        let store_u2 = HostExpertStore::from_raw_packs(
+            layout_u2.clone(),
+            0..num_experts,
+            &raw_packs_u2,
+            num_experts * layout_u2.stride,
+        )
+        .unwrap();
+        let store_u4 = HostExpertStore::from_raw_packs(
+            layout_u4.clone(),
+            0..num_experts,
+            &raw_packs_u4,
+            num_experts * layout_u4.stride,
+        )
+        .unwrap();
+
+        let mut ws = TieredMoeWorkspace::new(0, layout_u4.clone(), 8, max_m, top_k).unwrap();
+        let mut full_cache_u2 =
+            HotExpertCache::new(0, num_experts, 0..num_experts, layout_u2.clone()).unwrap();
+        full_cache_u2
+            .populate_initial(&store_u2, None, &mut ws, &stream)
+            .unwrap();
+        let mut full_cache_u4 =
+            HotExpertCache::new(0, num_experts, 0..num_experts, layout_u4.clone()).unwrap();
+        full_cache_u4
+            .populate_initial(&store_u4, None, &mut ws, &stream)
+            .unwrap();
+
+        // 1. Verify 0-ULP bit-for-bit equality across all 5 GPU kernel regimes:
+        //    M=1 (decode), M=4 (vec4), M=8 (sparse_mma M<=8), M=16 (sparse_mma M<=16), M=20 (grouped_mma).
+        for m in [1usize, 4, 8, 16, 20] {
+            let mut tasks = Vec::with_capacity(m * top_k);
+            for tok in 0..m {
+                for k in 0..top_k {
+                    let idx = tok * top_k + k;
+                    tasks.push((tok, h_topk_ids[idx] as usize, h_topk_weights[idx]));
+                }
+            }
+            let h_cpu_u2 = store_u2.eval_cold_tasks_cpu(&h_x[..m * k_hidden], m, &tasks);
+            let h_cpu_u4 = store_u4.eval_cold_tasks_cpu(&h_x[..m * k_hidden], m, &tasks);
+            assert_eq!(
+                h_cpu_u2, h_cpu_u4,
+                "CPU reference eval_cold_tasks_cpu U2B2 vs U4B8 mismatch at m={m}"
+            );
+
+            let d_out_u2 = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+            let d_out_u4 = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+            TieredMoeEngine::execute_layer_device_lru(
+                &store_u2,
+                &mut full_cache_u2,
+                &ws,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                0,
+                0,
+                d_out_u2.addr(),
+                m,
+                top_k,
+            )
+            .unwrap();
+            TieredMoeEngine::execute_layer_device_lru(
+                &store_u4,
+                &mut full_cache_u4,
+                &ws,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                0,
+                0,
+                d_out_u4.addr(),
+                m,
+                top_k,
+            )
+            .unwrap();
+            let mut h_gpu_u2 = vec![0u16; m * k_hidden];
+            let mut h_gpu_u4 = vec![0u16; m * k_hidden];
+            d_out_u2.copy_to_host(&mut h_gpu_u2, &stream).unwrap();
+            d_out_u4.copy_to_host(&mut h_gpu_u4, &stream).unwrap();
+            assert_eq!(
+                h_gpu_u2, h_gpu_u4,
+                "0-ULP GPU mismatch between native W2A16 (U2B2) and dilated W4A16 (U4B8) at m={m}"
+            );
+        }
+
+        // 2. Verify 0-ULP bit-for-bit equality for tiered GpuLru (including device-side PCIe pull)
+        //    and StreamedPrefill (including staged unpack) with k_hot = 4 on m = 6.
+        let m = 6usize;
+        for mode in [MoeOffloadMode::GpuLru, MoeOffloadMode::StreamedPrefill] {
+            let mut cache_u2 =
+                HotExpertCache::new(0, 4, 0..num_experts, layout_u2.clone()).unwrap();
+            let mut cache_u4 =
+                HotExpertCache::new(0, 4, 0..num_experts, layout_u4.clone()).unwrap();
+            let mut ws_small = TieredMoeWorkspace::new(0, layout_u4.clone(), 3, m, top_k).unwrap();
+            cache_u2
+                .populate_initial(&store_u2, Some(&[0, 1, 2, 3]), &mut ws_small, &stream)
+                .unwrap();
+            cache_u4
+                .populate_initial(&store_u4, Some(&[0, 1, 2, 3]), &mut ws_small, &stream)
+                .unwrap();
+            let d_out_u2 = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+            let d_out_u4 = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+            TieredMoeEngine::execute_layer(
+                mode,
+                &store_u2,
+                &mut cache_u2,
+                &mut ws_small,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids[..m * top_k],
+                &h_topk_weights[..m * top_k],
+                0,
+                0,
+                d_out_u2.addr(),
+                m,
+                top_k,
+            )
+            .unwrap();
+            TieredMoeEngine::execute_layer(
+                mode,
+                &store_u4,
+                &mut cache_u4,
+                &mut ws_small,
+                &stream,
+                d_x.addr(),
+                d_topk_ids.addr(),
+                d_topk_weights.addr(),
+                &h_topk_ids[..m * top_k],
+                &h_topk_weights[..m * top_k],
+                0,
+                0,
+                d_out_u4.addr(),
+                m,
+                top_k,
+            )
+            .unwrap();
+            let mut h_gpu_u2 = vec![0u16; m * k_hidden];
+            let mut h_gpu_u4 = vec![0u16; m * k_hidden];
+            d_out_u2.copy_to_host(&mut h_gpu_u2, &stream).unwrap();
+            d_out_u4.copy_to_host(&mut h_gpu_u4, &stream).unwrap();
+            assert_eq!(
+                h_gpu_u2, h_gpu_u4,
+                "0-ULP GPU mismatch in tiered {mode:?} between U2B2 and U4B8"
+            );
+        }
+
+        // 3. Also verify device-side LRU PCIe pull (`execute_layer_device_lru` with k_hot = 4, m = 2).
+        let m_lru = 2usize;
+        let mut cache_u2 = HotExpertCache::new(0, 4, 0..num_experts, layout_u2).unwrap();
+        let mut cache_u4 = HotExpertCache::new(0, 4, 0..num_experts, layout_u4).unwrap();
+        cache_u2
+            .populate_initial(&store_u2, Some(&[0, 1, 2, 3]), &mut ws, &stream)
+            .unwrap();
+        cache_u4
+            .populate_initial(&store_u4, Some(&[0, 1, 2, 3]), &mut ws, &stream)
+            .unwrap();
+        let d_out_u2 = DeviceBuffer::alloc(0, m_lru * k_hidden * 2).unwrap();
+        let d_out_u4 = DeviceBuffer::alloc(0, m_lru * k_hidden * 2).unwrap();
+        TieredMoeEngine::execute_layer_device_lru(
+            &store_u2,
+            &mut cache_u2,
+            &ws,
+            &stream,
+            d_x.addr(),
+            d_topk_ids.addr(),
+            d_topk_weights.addr(),
+            0,
+            0,
+            d_out_u2.addr(),
+            m_lru,
+            top_k,
+        )
+        .unwrap();
+        TieredMoeEngine::execute_layer_device_lru(
+            &store_u4,
+            &mut cache_u4,
+            &ws,
+            &stream,
+            d_x.addr(),
+            d_topk_ids.addr(),
+            d_topk_weights.addr(),
+            0,
+            0,
+            d_out_u4.addr(),
+            m_lru,
+            top_k,
+        )
+        .unwrap();
+        let mut h_gpu_u2 = vec![0u16; m_lru * k_hidden];
+        let mut h_gpu_u4 = vec![0u16; m_lru * k_hidden];
+        d_out_u2.copy_to_host(&mut h_gpu_u2, &stream).unwrap();
+        d_out_u4.copy_to_host(&mut h_gpu_u4, &stream).unwrap();
+        assert_eq!(
+            h_gpu_u2, h_gpu_u4,
+            "0-ULP GPU mismatch in execute_layer_device_lru PCIe pull between U2B2 and U4B8"
+        );
     }
 }

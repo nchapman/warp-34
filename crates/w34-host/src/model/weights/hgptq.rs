@@ -32,20 +32,25 @@ impl RawLinearHost {
         let Some(block_size) = block else {
             return Ok(raw);
         };
-        let Self::U4B8NMajor {
-            n, k, group_size, ..
-        } = &raw
-        else {
-            return Err(loader_err_msg(format!(
-                "HGPTQ requires symmetric packed W4 weights: {name}"
-            )));
+        let (n, k, group_size) = match &raw {
+            Self::U2B2NMajor {
+                n, k, group_size, ..
+            }
+            | Self::U4B8NMajor {
+                n, k, group_size, ..
+            } => (*n, *k, *group_size),
+            _ => {
+                return Err(loader_err_msg(format!(
+                    "HGPTQ requires symmetric packed W2/W4 weights: {name}"
+                )));
+            }
         };
-        if *n == 0
-            || *k == 0
+        if n == 0
+            || k == 0
             || !k.is_multiple_of(block_size)
-            || *n > i32::MAX as usize - MARLIN_TILE_K_W4
-            || *k > i32::MAX as usize - MARLIN_TILE_K_W4
-            || *group_size != resolved.group_size_or(*k)
+            || n > i32::MAX as usize - MARLIN_TILE_K_W4
+            || k > i32::MAX as usize - MARLIN_TILE_K_W4
+            || group_size != resolved.group_size_or(k)
         {
             return Err(loader_err_msg(format!(
                 "HGPTQ geometry/group mismatch for {name}: N={n} K={k} group={group_size} block={block_size}"
@@ -98,8 +103,11 @@ impl RawLinearHost {
             &padded
         };
         let inner = storage.upload(arena, stream, staging)?;
-        if !matches!(inner, LinearProj::MarlinW4A16 { .. }) {
-            return Err(loader_err("HGPTQ must remain native W4 after upload"));
+        if !matches!(
+            inner,
+            LinearProj::MarlinW2A16 { .. } | LinearProj::MarlinW4A16 { .. }
+        ) {
+            return Err(loader_err("HGPTQ must remain native W2/W4 after upload"));
         }
         Ok(LinearProj::Hadamard {
             inner: Box::new(inner),
@@ -110,44 +118,72 @@ impl RawLinearHost {
     }
 
     // Marlin accepts N multiples of 64 with K multiples of 128. Padding is in
-    // the rotated basis: nibble 8 is U4B8 zero, not nibble 0 (-8).
+    // the rotated basis: nibble 8 is U4B8 zero (crumb 2 is U2B2 zero), not 0.
     #[cfg(any(feature = "cuda", test))]
     pub(super) fn pad_hadamard_weight(&self) -> Result<Self> {
-        let Self::U4B8NMajor {
-            packed,
-            scales,
-            n,
-            k,
-            group_size,
-        } = self
-        else {
-            return Err(loader_err("HGPTQ padding expects symmetric W4"));
+        let (packed, scales, n, k, group_size, is_u2) = match self {
+            Self::U2B2NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => (packed, scales, *n, *k, *group_size, true),
+            Self::U4B8NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => (packed, scales, *n, *k, *group_size, false),
+            _ => return Err(loader_err("HGPTQ padding expects symmetric W2/W4")),
         };
         let pn = n.div_ceil(MARLIN_TILE_N) * MARLIN_TILE_N;
         let pk = k.div_ceil(MARLIN_TILE_K_W4) * MARLIN_TILE_K_W4;
-        let channelwise = *group_size == *k;
-        if !channelwise && !matches!(*group_size, 32 | 64 | 128) {
+        let channelwise = group_size == k;
+        if !channelwise && !matches!(group_size, 32 | 64 | 128) {
             return Err(loader_err("unsupported HGPTQ group size"));
         }
         let groups = if channelwise { 1 } else { pk / group_size };
         let old_groups = k / group_size;
-        let words_pk = pk / U4_NIBBLES_PER_U32;
-        let words_k = k / U4_NIBBLES_PER_U32;
-        let mut padded = vec![U4B8_PACKED_ZERO_WORD; pn * words_pk];
+        let pack_factor = if is_u2 {
+            U2_CRUMBS_PER_U32
+        } else {
+            U4_NIBBLES_PER_U32
+        };
+        let zero_word = if is_u2 {
+            U2B2_PACKED_ZERO_WORD
+        } else {
+            U4B8_PACKED_ZERO_WORD
+        };
+        let words_pk = pk / pack_factor;
+        let words_k = k / pack_factor;
+        let mut padded = vec![zero_word; pn * words_pk];
         let mut padded_scales = vec![f32_to_f16(1.0); pn * groups];
-        for row in 0..*n {
+        for row in 0..n {
             padded[row * words_pk..row * words_pk + words_k]
                 .copy_from_slice(&packed[row * words_k..(row + 1) * words_k]);
             padded_scales[row * groups..row * groups + old_groups]
                 .copy_from_slice(&scales[row * old_groups..(row + 1) * old_groups]);
         }
-        Ok(Self::U4B8NMajor {
-            packed: padded,
-            scales: padded_scales,
-            n: pn,
-            k: pk,
-            group_size: if channelwise { pk } else { *group_size },
-        })
+        let new_gs = if channelwise { pk } else { group_size };
+        if is_u2 {
+            Ok(Self::U2B2NMajor {
+                packed: padded,
+                scales: padded_scales,
+                n: pn,
+                k: pk,
+                group_size: new_gs,
+            })
+        } else {
+            Ok(Self::U4B8NMajor {
+                packed: padded,
+                scales: padded_scales,
+                n: pn,
+                k: pk,
+                group_size: new_gs,
+            })
+        }
     }
 
     pub(crate) fn unwrap_hadamard(self) -> (Self, usize) {

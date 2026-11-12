@@ -13,6 +13,7 @@
 namespace marlin {
 static constexpr int kF16 = vllm::ST_ID_F16;
 static constexpr int kBF16 = vllm::ST_ID_BF16;
+static constexpr int kU2B2 = vllm::ST_ID_U2B2;
 static constexpr int kU4 = vllm::ST_ID_U4;
 static constexpr int kU4B8 = vllm::ST_ID_U4B8;
 static constexpr int kU8B128 = vllm::ST_ID_U8B128;
@@ -52,16 +53,18 @@ __global__ void gptq_marlin_repack_n_major_kernel(
     uint32_t* __restrict__ out_ptr,
     int size_k,
     int size_n) {
-    static_assert(num_bits == 4 || num_bits == 8, "num_bits must be 4 or 8");
+    static_assert(num_bits == 2 || num_bits == 4 || num_bits == 8,
+                  "num_bits must be 2, 4, or 8");
     constexpr int pack_factor = 32 / num_bits;
     constexpr int tile_k = tile_k_size;
     constexpr int tile_ints = tile_k / pack_factor;
-    constexpr int pair_ints = tile_ints * 2;
+    constexpr int k_group_tiles = num_bits == 2 ? 4 : 2;
+    constexpr int pair_ints = tile_ints * k_group_tiles;
     constexpr int pair_int4s = pair_ints / 4;
     constexpr int cur_stage_int4s = tile_n_size * pair_int4s;
     static_assert(cur_stage_int4s <= num_threads, "stage copy exceeds CTA threads");
 
-    int k_pairs = size_k / (tile_k * 2);
+    int k_pairs = size_k / (tile_k * k_group_tiles);
     int n_tiles = size_n / tile_n_size;
     int block_k_pairs = div_ceil(k_pairs, gridDim.x);
 
@@ -75,6 +78,7 @@ __global__ void gptq_marlin_repack_n_major_kernel(
     };
 
     extern __shared__ int4 sh[];
+    __shared__ uint16_t sh_repack_u2[32 * 4];
 
     auto fetch_to_shared = [&](int pipe, int k_pair, int n_tile_id) {
         if (n_tile_id >= n_tiles) {
@@ -123,9 +127,28 @@ __global__ void gptq_marlin_repack_n_major_kernel(
         }
 
         constexpr int tile_out_size = tile_k * tile_n_size / pack_factor;
-        int k_tile_id = k_pair * 2 + sub;
+        int k_tile_id = k_pair * k_group_tiles + sub;
         int out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_out_size;
-        if constexpr (num_bits == 4) {
+        if constexpr (num_bits == 2) {
+            constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+            uint32_t lo_byte = 0;
+            uint32_t hi_byte = 0;
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                lo_byte |= vals[pack_idx[i]] << (i * 2);
+                hi_byte |= vals[pack_idx[4 + i]] << (i * 2);
+            }
+            sh_repack_u2[th_id * 4 + warp_id] = (uint16_t)(lo_byte | (hi_byte << 8));
+            asm volatile("bar.sync 1, 128;");
+            if (threadIdx.x < 64) {
+                uint16_t even = sh_repack_u2[threadIdx.x * 2 + 0];
+                uint16_t odd = sh_repack_u2[threadIdx.x * 2 + 1];
+                uint32_t w_even = (uint32_t)(even & 0xffu) | ((uint32_t)(even >> 8) << 16);
+                uint32_t w_odd = (uint32_t)(odd & 0xffu) | ((uint32_t)(odd >> 8) << 16);
+                out_ptr[out_offset + threadIdx.x] = w_even | (w_odd << 8);
+            }
+            asm volatile("bar.sync 1, 128;");
+        } else if constexpr (num_bits == 4) {
             constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
             uint32_t res = 0;
 #pragma unroll
@@ -163,8 +186,10 @@ __global__ void gptq_marlin_repack_n_major_kernel(
             for (int pipe = 0; pipe < repack_stages; pipe++) {
                 fetch_to_shared((pipe + repack_stages - 1) % repack_stages, k_pair,
                                 n_tile_id + pipe + repack_stages - 1);
-                repack_tile(pipe, k_pair, n_tile_id + pipe, 0);
-                repack_tile(pipe, k_pair, n_tile_id + pipe, 1);
+#pragma unroll
+                for (int sub = 0; sub < k_group_tiles; sub++) {
+                    repack_tile(pipe, k_pair, n_tile_id + pipe, sub);
+                }
                 wait_for_stage();
             }
             n_tile_id += repack_stages;
@@ -389,6 +414,29 @@ static MarlinFuncPtr get_marlin_kernel_bf16u4(thread_config_t const& th_config,
     return nullptr;
 }
 
+static MarlinFuncPtr get_marlin_kernel_f16u2(thread_config_t const& th_config,
+                                             int thread_m_blocks,
+                                             bool m_block_size_8,
+                                             int group_blocks) {
+    if (group_blocks == -1) {
+        MARLIN_CASES_15(marlin::kU2B2, -1)
+        return nullptr;
+    }
+    if (group_blocks == 2) {
+        MARLIN_CASES_15(marlin::kU2B2, 2)
+        return nullptr;
+    }
+    if (group_blocks == 4) {
+        MARLIN_CASES_15(marlin::kU2B2, 4)
+        return nullptr;
+    }
+    if (group_blocks == 8) {
+        MARLIN_CASES_15(marlin::kU2B2, 8)
+        return nullptr;
+    }
+    return nullptr;
+}
+
 static MarlinFuncPtr get_marlin_kernel_f16u4(thread_config_t const& th_config,
                                              int thread_m_blocks,
                                              bool m_block_size_8,
@@ -460,6 +508,10 @@ static MarlinFuncPtr get_marlin_kernel_f16(thread_config_t const& th_config,
                                            int thread_m_blocks,
                                            bool m_block_size_8,
                                            int group_blocks) {
+    if (num_bits == 2) {
+        if (has_zp) return nullptr;
+        return get_marlin_kernel_f16u2(th_config, thread_m_blocks, m_block_size_8, group_blocks);
+    }
     if (num_bits == 8) {
         if (has_zp) return nullptr;
         return get_marlin_kernel_f16u8(th_config, thread_m_blocks, m_block_size_8, group_blocks);
@@ -528,7 +580,8 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     int prob_m = (int)m, prob_n = (int)n, prob_k = (int)k;
     const bool valid_gb = (group_blocks == 2 || group_blocks == 4 || group_blocks == 8) ||
                           (!has_zp && group_blocks == -1);
-    if (prob_m <= 0 || prob_n <= 0 || prob_k <= 0 || (prob_k % 32) != 0 ||
+    const int k_align = (num_bits == 2) ? 64 : 32;
+    if (prob_m <= 0 || prob_n <= 0 || prob_k <= 0 || (prob_k % k_align) != 0 ||
         (prob_n % 64) != 0 || !valid_gb ||
         (group_blocks > 0 && (prob_k % (group_blocks * 16)) != 0)) {
         return (int)cudaErrorInvalidValue;
@@ -666,6 +719,25 @@ extern "C" int w34_zero_i32(const w34_exec* ex, void* ptr, int64_t count) {
     return (int)cudaGetLastError();
 }
 
+extern "C" int w34_marlin_repack_int2(const w34_exec* ex, const uint32_t* src_n_major,
+                                      uint32_t* dst_marlin, int64_t k, int64_t n) {
+    if (ex == nullptr || src_n_major == nullptr || dst_marlin == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (k <= 0 || n <= 0 || (k % 64) != 0 || (n % 64) != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    w34_device_props dev_props{};
+    int props_rc = w34_get_current_device_props(&dev_props);
+    if (props_rc != 0) return props_rc;
+    int blocks = dev_props.multi_processor_count;
+    size_t smem = w34_marlin::stage_int4s * sizeof(int4) * w34_marlin::repack_stages;
+    w34_marlin::gptq_marlin_repack_n_major_kernel<w34_marlin::repack_threads, 2>
+        <<<(unsigned)blocks, w34_marlin::repack_threads, smem, (cudaStream_t)ex->stream>>>(
+            src_n_major, dst_marlin, (int)k, (int)n);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int w34_marlin_repack_int4(const w34_exec* ex, const uint32_t* src_n_major,
                                       uint32_t* dst_marlin, int64_t k, int64_t n) {
     if (ex == nullptr || src_n_major == nullptr || dst_marlin == nullptr) {
@@ -729,6 +801,14 @@ extern "C" int w34_marlin_quantize_f16_u4b8(
         reinterpret_cast<half const*>(src_f16), dst_marlin,
         reinterpret_cast<half*>(dst_scales_perm), (int)k, (int)n, group_size);
     return (int)cudaGetLastError();
+}
+
+extern "C" int w34_marlin_gemm_f16u2(const w34_exec* ex, const void* a, const void* b,
+                                     const void* scales, void* c, int32_t* workspace,
+                                     int64_t m, int64_t n, int64_t k,
+                                     int64_t workspace_ints, int group_blocks) {
+    return w34_marlin::marlin_gemm_impl(
+        ex, a, b, scales, nullptr, c, workspace, m, n, k, workspace_ints, group_blocks, 2, false, false);
 }
 
 extern "C" int w34_marlin_gemm_f16u4(const w34_exec* ex, const void* a, const void* b,

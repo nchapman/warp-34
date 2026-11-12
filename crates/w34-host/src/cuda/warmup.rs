@@ -290,6 +290,10 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
 
     // 2. Marlin repack & GEMM + cuBLAS GEMM
     warmup_ffi!(
+        ffi::w34_marlin_repack_int2(&ex, buf_a as *const u32, buf_b as *mut u32, 128, 64),
+        "warmup w34_marlin_repack_int2"
+    )?;
+    warmup_ffi!(
         ffi::w34_marlin_repack_int4(&ex, buf_a as *const u32, buf_b as *mut u32, 128, 64),
         "warmup w34_marlin_repack_int4"
     )?;
@@ -325,6 +329,10 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ) -> i32;
         for group_blocks in [8i32, 4, 2, -1] {
             for (gemm_fn, label) in [
+                (
+                    ffi::w34_marlin_gemm_f16u2 as MarlinGemmFn,
+                    "warmup w34_marlin_gemm_f16u2",
+                ),
                 (
                     ffi::w34_marlin_gemm_f16u4 as MarlinGemmFn,
                     "warmup w34_marlin_gemm_f16u4",

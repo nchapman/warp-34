@@ -56,6 +56,7 @@ pub(super) fn load_projection(
 fn repack_bytes(raw: &RawLinearHost) -> Result<usize> {
     let (n, k, divisor) = match raw {
         RawLinearHost::Hadamard { inner, .. } => return repack_bytes(inner),
+        RawLinearHost::U2B2NMajor { n, k, .. } => (*n, *k, 4),
         RawLinearHost::U4B8NMajor { n, k, .. } | RawLinearHost::U4ZpNMajor { n, k, .. } => {
             (*n, *k, 2)
         }

@@ -301,6 +301,8 @@ int w34_small_n_gemm_dual_f16(const w34_exec* ex, const void* x,
 
 // --- Marlin Repack & GEMMs (op_marlin.cu) ---
 int w34_zero_i32(const w34_exec* ex, void* ptr, int64_t count);
+int w34_marlin_repack_int2(const w34_exec* ex, const uint32_t* src_n_major,
+                           uint32_t* dst_marlin, int64_t k, int64_t n);
 int w34_marlin_repack_int4(const w34_exec* ex, const uint32_t* src_n_major,
                            uint32_t* dst_marlin, int64_t k, int64_t n);
 int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_major,
@@ -308,6 +310,10 @@ int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_major,
 int w34_marlin_quantize_f16_u4b8(const w34_exec* ex, const void* src_f16,
                                  uint32_t* dst_marlin, void* dst_scales_perm,
                                  int64_t k, int64_t n, int group_size);
+int w34_marlin_gemm_f16u2(const w34_exec* ex, const void* a, const void* b,
+                          const void* scales, void* c, int32_t* workspace,
+                          int64_t m, int64_t n, int64_t k,
+                          int64_t workspace_ints, int group_blocks);
 int w34_marlin_gemm_f16u4(const w34_exec* ex, const void* a, const void* b,
                           const void* scales, void* c, int32_t* workspace,
                           int64_t m, int64_t n, int64_t k,
@@ -633,6 +639,37 @@ int w34_moe_w4a16_mlp_ex_f16(const w34_exec* ex, const void* x,
                              int num_tokens, int top_k, int num_experts,
                              int n_interm, int k_hidden, int group_size,
                              int down_hadamard_block_size);
+int w34_moe_w2a16_gate_up_silu_f16(const w34_exec* ex, const void* x,
+                                   const uint32_t* gate_up_packed, const void* gate_up_scales,
+                                   const int32_t* topk_ids, void* interm_out,
+                                   int num_tokens, int top_k, int num_experts,
+                                   int n_interm, int k_hidden, int group_size);
+int w34_moe_w2a16_down_accum_f16(const w34_exec* ex, const void* interm_in,
+                                 const uint32_t* down_packed, const void* down_scales,
+                                 const int32_t* topk_ids, const float* topk_weights,
+                                 const void* shared_expert_out,
+                                 const void* shared_expert_gate_logits,
+                                 void* out, int num_tokens, int top_k, int num_experts,
+                                 int k_hidden, int n_interm, int group_size);
+int w34_moe_w2a16_mlp_f16(const w34_exec* ex, const void* x,
+                          const uint32_t* gate_up_packed, const void* gate_up_scales,
+                          const uint32_t* down_packed, const void* down_scales,
+                          const int32_t* topk_ids, const float* topk_weights,
+                          const void* shared_expert_out,
+                          const void* shared_expert_gate_logits,
+                          void* interm_buf, void* out,
+                          int num_tokens, int top_k, int num_experts,
+                          int n_interm, int k_hidden, int group_size);
+int w34_moe_w2a16_mlp_ex_f16(const w34_exec* ex, const void* x,
+                             const uint32_t* gate_up_packed, const void* gate_up_scales,
+                             const uint32_t* down_packed, const void* down_scales,
+                             const int32_t* topk_ids, const float* topk_weights,
+                             const void* shared_expert_out,
+                             const void* shared_expert_gate_logits,
+                             void* interm_buf, void* out,
+                             int num_tokens, int top_k, int num_experts,
+                             int n_interm, int k_hidden, int group_size,
+                             int down_hadamard_block_size);
 int w34_moe_w4a16_mlp_zp_f16(const w34_exec* ex, const void* x,
                              const uint32_t* gate_up_packed, const void* gate_up_scales,
                              const uint32_t* gate_up_qzeros,
@@ -777,20 +814,20 @@ int w34_moe_unpack_staged_experts(const w34_exec* ex, const void* staged_packs,
                                   void* gate_up_scales_base, uint32_t* down_packed_base,
                                   void* down_scales_base, int num_staged, int dst_capacity,
                                   size_t pack_stride_bytes, int n_interm, int k_hidden,
-                                  int group_size);
+                                  int group_size, int bits);
 int w34_moe_pull_mapped_experts(const w34_exec* ex, const void* mapped_host_packs,
                                 const int32_t* src_local_experts, const int32_t* dst_slots,
                                 uint32_t* gate_up_packed_base, void* gate_up_scales_base,
                                 uint32_t* down_packed_base, void* down_scales_base,
                                 int num_staged, int local_num_experts, int dst_capacity,
                                 size_t pack_stride_bytes, int n_interm, int k_hidden,
-                                int group_size);
+                                int group_size, int bits);
 int w34_moe_pull_mapped_experts_with_count(
     const w34_exec* ex, const void* mapped_host_packs, const int32_t* src_local_experts,
     const int32_t* dst_slots, const int32_t* num_staged_buf, uint32_t* gate_up_packed_base,
     void* gate_up_scales_base, uint32_t* down_packed_base, void* down_scales_base,
     int max_staged, int local_num_experts, int dst_capacity, size_t pack_stride_bytes,
-    int n_interm, int k_hidden, int group_size);
+    int n_interm, int k_hidden, int group_size, int bits);
 int w34_moe_remap_topk_ids_i32(const w34_exec* ex, const int32_t* global_topk_ids,
                                const int32_t* expert_to_slot, int32_t* remapped_topk_ids,
                                int total_pairs, int global_expert_offset,
@@ -810,7 +847,7 @@ int w34_moe_gpu_lru_update_and_pull(
     void* gate_up_scales_base, uint32_t* down_packed_base,
     void* down_scales_base, int total_pairs, int global_expert_offset,
     int local_num_experts, int k_hot, int max_misses,
-    size_t pack_stride_bytes, int n_interm, int k_hidden, int group_size);
+    size_t pack_stride_bytes, int n_interm, int k_hidden, int group_size, int bits);
 
 int w34_gemma_rms_norm_hadamard_f16(
     const w34_exec* ex, const void* x, const void* weight, void* out, void* out_had64,
