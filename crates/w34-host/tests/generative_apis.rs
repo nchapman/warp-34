@@ -67,7 +67,7 @@ fn parse_sse_frames(raw: &str) -> Vec<(String, Value)> {
 #[test]
 fn live_responses_anthropic_messages_and_token_count_endpoints() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "live_responses_anthropic_messages_and_token_count_endpoints",
     )
     .is_none()
@@ -75,15 +75,9 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
         return;
     }
     let _gpu = GPU_LOCK.lock().unwrap();
-    let state = OpenAiServerState::from_loader("Qwen3.5-4B-W4A16-GPTQ".into(), false, || {
-        Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Tq4,
-            Some(256),
-            true,
-        )
-        .map_err(|e| e.to_string())
+    let state = OpenAiServerState::from_loader("Qwen3.5-4B".into(), false, || {
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(256), true)
+            .map_err(|e| e.to_string())
     })
     .unwrap();
 
@@ -330,7 +324,7 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
             // 3. Anthropic Messages API: cch= cache stability, streaming SSE, tool_use, multimodal image, and error envelope
             let long_sys = "You are a precise systems assistant. ".repeat(24);
             let anth_req_1 = json!({
-                "model": "Qwen3.5-4B-W4A16-GPTQ",
+                "model": "Qwen3.5-4B",
                 "max_tokens": 64,
                 "temperature": 0.0,
                 "thinking": {"type": "disabled"},
@@ -358,7 +352,7 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
 
             // Second request changes cch= hash — MambaRadixCache must still hit!
             let anth_req_2 = json!({
-                "model": "Qwen3.5-4B-W4A16-GPTQ",
+                "model": "Qwen3.5-4B",
                 "max_tokens": 64,
                 "temperature": 0.0,
                 "thinking": {"type": "disabled"},
@@ -402,7 +396,7 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
             let anth_sse_raw = client
                 .post(format!("{base}/v1/messages"))
                 .json(&json!({
-                    "model": "Qwen3.5-4B-W4A16-GPTQ",
+                    "model": "Qwen3.5-4B",
                     "max_tokens": 1280,
                     "temperature": 0.0,
                     "stream": true,
@@ -464,7 +458,7 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
             let anth_img: Value = client
                 .post(format!("{base}/v1/messages"))
                 .json(&json!({
-                    "model": "Qwen3.5-4B-W4A16-GPTQ",
+                    "model": "Qwen3.5-4B",
                     "max_tokens": 32,
                     "temperature": 0.0,
                     "thinking": {"type": "disabled"},
@@ -503,7 +497,7 @@ fn live_responses_anthropic_messages_and_token_count_endpoints() {
             let bad_remote = client
                 .post(format!("{base}/v1/messages"))
                 .json(&json!({
-                    "model": "Qwen3.5-4B-W4A16-GPTQ",
+                    "model": "Qwen3.5-4B",
                     "max_tokens": 16,
                     "messages": [{
                         "role": "user",

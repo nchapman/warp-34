@@ -25,7 +25,7 @@ is performed by the suite):
 export PATH="/opt/cuda/bin:$PATH"
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv
 CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ \
+  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
   --kv-format fp16 --kv-pages 4096 --port 8000
 ```
 

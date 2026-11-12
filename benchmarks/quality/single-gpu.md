@@ -40,13 +40,13 @@ process list was empty. Local GPUs were not used.
 | Engine | Checkpoint | Exact revision |
 |---|---|---|
 | warp-34 (merged branch `9b04799`, engine tree `f6ab96e`) | `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `1de743eedefdb7422e6b171174c7080204f5b005` |
-| vLLM 0.31.0 / SGLang 0.5.19 | `nchapman/Qwen3.8-27B-W4A16-GPTQ` | `0df81eadcfd59601cb82ccece2f16ea7d39244bf` |
+| vLLM 0.31.0 / SGLang 0.5.19 | `SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16` | `e28c5f952bdd9abac6420ac3efad651b40d15eb5` |
 | llama.cpp v0.9.0 (`cd959bae99ff4bed22bef2604f45241c09bbb8c8`) | `unsloth/Qwen3.8-27B-GGUF` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` |
 
 The user-selected llama.cpp reference is **Unsloth UD-Q4_K_XL**, not ggml-org's
 GGUF. Use `Qwen3.8-27B-UD-Q4_K_XL.gguf` and its same-repository native MTP export
 `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`. The MTP file is the model's built-in head, not a
-separately trained DFlash2 drafter. No abliterated/heretic checkpoints are used.
+separately trained DFlash2 drafter. No abliterated checkpoints are used.
 
 Quantization and KV policies differ by engine, so this is a practical migration
 configuration, not a matched-quant quality comparison. Preserve each engine's

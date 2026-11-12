@@ -122,7 +122,7 @@ Verified on **2× NVIDIA GeForce RTX 4090 (`24,564 MiB`, `sm_89`, driver `595.84
 1. The exact `/usr/local/bin/w34` executable from `warp-34:shared-cublas-final` (`sha256:9260b1c51a9c2f7874993a6ff4a9f6560e83cfe4aaefc9d37609f909891f70f7`, `39,615,656` bytes, source `a3237c6`), and
 2. The merged `main` (`95a7c86`) build with `W34_ARCH=sm_86,sm_89 W34_NVCC_EXTRA=--compress-mode=size` (`39,592,816` bytes, `25 × sm_86` + `25 × sm_89` native cubins via `cuobjdump --list-elf`).
 
-- **`Qwen3.5-4B-W4A16-GPTQ` (`128` prompt / `64` decode, `tq4`, CUDA Graphs, `CUDA_DISABLE_PTX_JIT=1`):**
+- **`Qwen3.5-4B-W4A16-HGPTQ` (`128` prompt / `64` decode, `tq4`, CUDA Graphs, `CUDA_DISABLE_PTX_JIT=1`):**
   - Plain (`TP=1`): `220.49 tok/s` (`9260b1c51a9c`, `12.17 ms` TTFT) / `220.77 tok/s` (`main`, `12.09 ms` TTFT).
   - `MTP-3` (`TP=1`): `562.58 tok/s` / `560.21 tok/s` (`2.9375` accepted drafts/round), 100% lossless token match with Plain.
   - `DFlash2` (`TP=1`, native `BF16` + `cuBLASLt`): `1,398.04 tok/s` / `1,409.28 tok/s` (`11.60` accepted drafts/round), 100% lossless token match.

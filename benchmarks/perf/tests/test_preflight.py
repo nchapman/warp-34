@@ -185,7 +185,7 @@ class PreflightTests(unittest.TestCase):
         fp16_sglang = next(e for e in runnable if e["engine"] == "sglang" and e["activation_dtype"] == "float16")
         self.assertEqual(fp16_sglang["conv_state_dtype"], "float16")
         self.assertIn("-e SGLANG_MAMBA_CONV_DTYPE=float16", fp16_sglang["launch_command"])
-        snapshot_arg = "--model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/" + fp16_sglang["model_revision"]
+        snapshot_arg = "--model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/" + fp16_sglang["model_revision"]
         self.assertIn(snapshot_arg, fp16_sglang["launch_command"])
         failed = [e for e in cfg["engines"] if not e["enabled"]]
         self.assertEqual(len(failed), 2)

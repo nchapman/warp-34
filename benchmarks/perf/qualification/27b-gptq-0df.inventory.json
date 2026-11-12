@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "created_utc": "2026-10-30T23:38:46.236241+00:00",
-  "root": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+  "root": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
   "include": [],
   "files": {
     "README.md": {"bytes": 1388, "sha256": "29702d72cf8cfdccfbd596151e425d5932788e9de83a763e45b280f7b56be09d"},

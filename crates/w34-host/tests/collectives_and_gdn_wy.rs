@@ -316,7 +316,7 @@ fn test_cuda_graph_spec_rollback_and_tp2_collectives() {
     };
     assert_eq!(taps.layer_ids.len(), 3);
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "test_cuda_graph_spec_rollback_and_tp2_collectives",
     )
     .is_none()
@@ -324,22 +324,12 @@ fn test_cuda_graph_spec_rollback_and_tp2_collectives() {
         return;
     }
 
-    let mut eng_graph = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Fp16,
-        Some(256),
-        true,
-    )
-    .expect("load 4B graph");
-    let mut eng_eager = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Fp16,
-        Some(256),
-        false,
-    )
-    .expect("load 4B eager");
+    let mut eng_graph =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(256), true)
+            .expect("load 4B graph");
+    let mut eng_eager =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(256), false)
+            .expect("load 4B eager");
 
     let prompt_ids = eng_graph
         .encode("The capital of France is")

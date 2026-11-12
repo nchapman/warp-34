@@ -28,7 +28,7 @@
   "artifact_sha256": {
     "/workspace/sglang-venv/bin/python": "6f21e31b12afd5cb7f834e39463fbbd08350b36758d49aa11f35b29c1df3047c",
     "/workspace/quality-venv/bin/lm-eval": "9b20525c2f4ad78a637124bf09732f09be94412895546b24270eaa23b079cb31",
-    "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf/config.json": "ccaf8c6239c41f02ffb2e4921c5fc6596e3ded1395483be3f6b516d11ba0a536"
+    "/workspace/.hf_home/hub/models--SergiioB--Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16/snapshots/e28c5f952bdd9abac6420ac3efad651b40d15eb5/config.json": "ccaf8c6239c41f02ffb2e4921c5fc6596e3ded1395483be3f6b516d11ba0a536"
   },
   "gpu_uuid": "GPU-ed9993e0-8ae3-4e65-5796-46e98f60f7f8",
   "cleanup_established": true,

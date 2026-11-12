@@ -1,4 +1,4 @@
-# Qwen3.8-27B-W4A16-GPTQ (0df81eadcfd59601cb82ccece2f16ea7d39244bf) Paged TQ4 (3.07x / 3.88x)
+# Qwen3.8-27B-W4A16-HGPTQ (ae51987e3339a2a70070702548571e10fe8bcbc2) Paged TQ4 (3.07x / 3.88x)
 # high-concurrency (C8-C16) & long-context serving campaign on 1x 24 GiB RTX 3090 Ti (TP=1).
 schema_version = 1
 
@@ -16,8 +16,8 @@ gpu_count = 1
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
 parallelism = "single"
 base_url = "http://127.0.0.1:18034/v1"
-model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
-model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
 weight_format = "compressed-tensors-GPTQ-int4"
 activation_dtype = "float16"
 conv_state_dtype = "float16"
@@ -31,7 +31,7 @@ engine = "warp-34"
 version = "5492c39+sm86-roadmap"
 kv_format = "tq4"
 cache_config = "TQ4 (3.07x, 21376 B/tok) 2048 pages (32768 tokens) on 1x 24 GiB RTX 3090 Ti"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 2048 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4 --kv-pages 2048 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-27b-tp1-tq4all-32k"
@@ -39,7 +39,7 @@ engine = "warp-34"
 version = "5492c39+sm86-roadmap"
 kv_format = "tq4_all"
 cache_config = "TQ4_all (3.88x, 16896 B/tok) 2048 pages (32768 tokens) on 1x 24 GiB RTX 3090 Ti"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 2048 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4_all --kv-pages 2048 --host 127.0.0.1 --port 18034"
 
 [[cases]]
 id = "throughput-c8"

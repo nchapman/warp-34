@@ -37,7 +37,7 @@ example configuration, from the repository root on an otherwise idle GPU:
 ```sh
 export PATH="/opt/cuda/bin:$PATH"
 CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline \
+  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
   --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --max-model-len 8192 \
   --port 18834
 ```

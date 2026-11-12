@@ -214,7 +214,7 @@ pub(crate) fn revision_value(args: &[String], index: &mut usize) -> Result<Strin
 #[cfg(feature = "cuda")]
 pub(crate) fn parse_cuda_options(args: &[String]) -> Result<Option<CudaCliOptions>, String> {
     let mut serve = ServeCliConfig::default();
-    let mut model = "nchapman/Qwen3.5-4B-W4A16-GPTQ".to_string();
+    let mut model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ".to_string();
     let mut revision = None;
     let mut draft_revision = None;
     let mut offline = false;

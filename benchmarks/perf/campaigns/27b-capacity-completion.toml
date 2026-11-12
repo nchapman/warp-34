@@ -24,9 +24,9 @@ gpu_count = 1
 gpu_ids = "0"
 parallelism = "TP1"
 base_url = "http://127.0.0.1:18034/v1"
-model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
-model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
-weight_format = "compressed-tensors-GPTQ-int4"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+weight_format = "HGPTQ-W4A16"
 activation_dtype = "float16"
 conv_state_dtype = "float16"
 speculation = "none"
@@ -36,13 +36,13 @@ request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 id = "warp34-27b-tp1-tq4-capacity"
 kv_format = "tq4"
 cache_config = "16384 pages; FP32 persistent SSM; max sequences1; no model offload; OS cache not flushed"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-27b-tp1-tq4all-capacity"
 kv_format = "tq4_all"
 cache_config = "16384 pages; all-layer TQ4; FP32 persistent SSM; max sequences1; no model offload; OS cache not flushed"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4_all --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034"
 
 [[cases]]
 id = "cold-read-60k"

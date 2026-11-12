@@ -34,7 +34,7 @@ export GGUF=/absolute/path/to/unsloth/snapshot
 | Variable | Hugging Face repository | Revision |
 |---|---|---|
 | `HGPTQ` | `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `1de743eedefdb7422e6b171174c7080204f5b005` |
-| `GPTQ` | `nchapman/Qwen3.8-27B-W4A16-GPTQ` | `0df81eadcfd59601cb82ccece2f16ea7d39244bf` |
+| `GPTQ` | `SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16` | `e28c5f952bdd9abac6420ac3efad651b40d15eb5` |
 | `GGUF` | `unsloth/Qwen3.8-27B-GGUF` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` |
 
 The Unsloth directory must contain `Qwen3.8-27B-UD-Q4_K_XL.gguf` and

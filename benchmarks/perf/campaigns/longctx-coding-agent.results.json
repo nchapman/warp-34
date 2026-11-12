@@ -47,10 +47,10 @@
               "support": "supported",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x, 21376 B/tok) 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB RTX 3090 Ti, FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -67,10 +67,10 @@
               "support": "unverified",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4_all",
               "cache_config": "TQ4_all 16384 pages (262144 tokens, 16896 B/tok), FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -1547,10 +1547,10 @@
               "support": "supported",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x, 21376 B/tok) 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB RTX 3090 Ti, FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -1567,10 +1567,10 @@
               "support": "unverified",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18035/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4_all",
               "cache_config": "TQ4_all 16384 pages (262144 tokens, 16896 B/tok), FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035",
               "enabled": true
             },
             {
@@ -3028,7 +3028,7 @@
             "gpu_count": 2,
             "parallelism": "TP=2",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -3042,7 +3042,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -3053,7 +3053,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -3062,7 +3062,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -3073,7 +3073,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -3093,7 +3093,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -3113,7 +3113,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -4150,7 +4150,7 @@
             "gpu_count": 2,
             "parallelism": "TP=2",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -4164,7 +4164,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -4175,7 +4175,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -4184,7 +4184,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -4195,7 +4195,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -4215,7 +4215,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -4235,7 +4235,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -5336,7 +5336,7 @@
             "gpu_count": 2,
             "parallelism": "TP=2",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -5350,7 +5350,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -5361,7 +5361,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -5370,7 +5370,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -5381,7 +5381,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -5401,7 +5401,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -5421,7 +5421,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -6522,7 +6522,7 @@
             "gpu_count": 2,
             "parallelism": "TP=2",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -6536,7 +6536,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -6547,7 +6547,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -6556,7 +6556,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -6567,7 +6567,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -6587,7 +6587,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -6607,7 +6607,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -7708,7 +7708,7 @@
             "gpu_count": 1,
             "parallelism": "TP=1",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -7722,7 +7722,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -7733,7 +7733,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -7742,7 +7742,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -7753,7 +7753,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -7773,7 +7773,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -7793,7 +7793,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -8811,7 +8811,7 @@
             "gpu_count": 1,
             "parallelism": "TP=1",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -8825,7 +8825,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -8836,7 +8836,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -8845,7 +8845,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -8856,7 +8856,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -8876,7 +8876,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -8896,7 +8896,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -9914,7 +9914,7 @@
             "gpu_count": 1,
             "parallelism": "TP=1",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -9928,7 +9928,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -9939,7 +9939,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -9948,7 +9948,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -9959,7 +9959,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -9979,7 +9979,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -9999,7 +9999,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -11497,7 +11497,7 @@
             "gpu_count": 1,
             "parallelism": "TP=1",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -11511,7 +11511,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -11522,7 +11522,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -11531,7 +11531,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -11542,7 +11542,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -11562,7 +11562,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -11582,7 +11582,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -13080,7 +13080,7 @@
             "gpu_count": 1,
             "parallelism": "TP=1",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -13094,7 +13094,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -13105,7 +13105,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -13114,7 +13114,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -13125,7 +13125,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -13145,7 +13145,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -13165,7 +13165,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -14982,7 +14982,7 @@
             "gpu_count": 1,
             "parallelism": "TP=1",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -14996,7 +14996,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -15007,7 +15007,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -15016,7 +15016,7 @@
               "gpu_count": 1,
               "parallelism": "TP=1",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "model_revision": "42e302203ae5d3428ce2682d7b443578ef04d5dd",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -15027,7 +15027,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -15047,7 +15047,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -15067,7 +15067,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -16884,7 +16884,7 @@
             "gpu_count": 2,
             "parallelism": "TP=2",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -16898,7 +16898,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -16909,7 +16909,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -16918,7 +16918,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -16929,7 +16929,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -16949,7 +16949,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -16969,7 +16969,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -18265,7 +18265,7 @@
             "gpu_count": 2,
             "parallelism": "TP=2",
             "base_url": "http://127.0.0.1:18034/v1",
-            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+            "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
             "weight_format": "compressed-tensors-GPTQ-int4",
             "activation_dtype": "float16",
@@ -18279,7 +18279,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -18290,7 +18290,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x) 16384 pages (262144 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -18299,7 +18299,7 @@
               "gpu_count": 2,
               "parallelism": "TP=2",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "weight_format": "compressed-tensors-GPTQ-int4",
               "activation_dtype": "float16",
@@ -18310,7 +18310,7 @@
               "version": "0.1.0+prefill64q",
               "kv_format": "fp16",
               "cache_config": "FP16 KV 10240 pages (163840 tokens) TP=2, FP32 SSM, hybrid GDN+KV radix prefix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 10240 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -18330,7 +18330,7 @@
               "version": "0.31.0",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -18350,7 +18350,7 @@
               "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1",
               "kv_format": "fp16",
               "cache_config": "FP16 KV TP=2 (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3",
-              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
+              "launch_command": "docker run --rm --name w34-perf-27b-tp2-sglang --gpus all --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034",
               "enabled": true
             }
           ],
@@ -19665,10 +19665,10 @@
               "support": "supported",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18034/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4",
               "cache_config": "TQ4 (3.07x, 21376 B/tok) 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB RTX 3090 Ti, FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034",
               "enabled": true
             },
             {
@@ -19685,10 +19685,10 @@
               "support": "supported",
               "version": "0.1.0+prefill64q",
               "base_url": "http://127.0.0.1:18035/v1",
-              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+              "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
               "kv_format": "tq4_all",
               "cache_config": "TQ4_all 16384 pages (262144 tokens, 16896 B/tok), FP32 SSM, hybrid GDN+KV radix cache",
-              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035",
+              "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035",
               "enabled": true
             },
             {
@@ -21483,8 +21483,8 @@
       "path": "benchmarks/perf/results/needle_262k/27b_tp1_tq4_262144_d50.json",
       "sha256": "caee5c7b962f100a7419b6bd9bfa92bad9760ef966c18e9f0e671c54f2c2ff26",
       "schema_version": 1,
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
-      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
       "kv_policy": "tq4",
       "tp": 1,
       "context_window": 262144,
@@ -21518,8 +21518,8 @@
       "path": "benchmarks/perf/results/needle_262k/27b_tp1_tq4_262144_d50_final.json",
       "sha256": "85465c2099aa1ac8896d607cf659d0c405a86f79b45c8520f854b775f9b58ed0",
       "schema_version": 1,
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
-      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
       "kv_policy": "tq4",
       "tp": 1,
       "context_window": 262144,
@@ -21553,8 +21553,8 @@
       "path": "benchmarks/perf/results/needle_262k/27b_tp1_tq4_32768_d50.json",
       "sha256": "a8ec45d8dc99b89839c69563132a9381a743571a226c5e29c4b8d8364ab9de2f",
       "schema_version": 1,
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
-      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
       "kv_policy": "tq4",
       "tp": 1,
       "context_window": 32768,
@@ -21588,8 +21588,8 @@
       "path": "benchmarks/perf/results/needle_262k/27b_tp1_tq4all_262144_d50.json",
       "sha256": "7814e380ec529e3a2ab3a68c2235cdb8982217fc16de86430ae8ba9a2216782f",
       "schema_version": 1,
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
-      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
       "kv_policy": "tq4_all",
       "tp": 1,
       "context_window": 262144,
@@ -21623,8 +21623,8 @@
       "path": "benchmarks/perf/results/goal-needle/27b_tp1_tq4_262144_d50.json",
       "sha256": "8866c6052e1a3f2647e06d3564ce2174ba5abb9ea99c5ccdd3fa3dd47ec6d73e",
       "schema_version": 1,
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
-      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model_snapshot": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
       "kv_policy": "tq4",
       "tp": 1,
       "context_window": 262144,
@@ -21659,7 +21659,7 @@
     {
       "path": "benchmarks/perf/results/prefill64q-ab/9b-64k-after.json",
       "sha256": "3e2b45549f6fc43b0eafe5cd115d0e8057cd1024555738a64737dcee83070f0c",
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
       "tp": 1,
       "kv_format": "tq4",
       "kv_bytes_per_token": 12928,
@@ -21690,7 +21690,7 @@
     {
       "path": "benchmarks/perf/results/prefill64q-ab/9b-64k-before.json",
       "sha256": "7fa73fcaa158db99460761a28b4273b92b7f0e108981a01b876cede35c606005",
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd",
       "tp": 1,
       "kv_format": "tq4",
       "kv_bytes_per_token": 12928,
@@ -21721,7 +21721,7 @@
     {
       "path": "benchmarks/perf/results/prefill64q-ab/after.json",
       "sha256": "c3ae0f0dd4bc5631e5faaeb7b7c7a299ce0f1b04fa4737dfca02179aee6cbe2a",
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
       "tp": 1,
       "kv_format": "tq4",
       "kv_bytes_per_token": 21376,
@@ -21752,7 +21752,7 @@
     {
       "path": "benchmarks/perf/results/prefill64q-ab/before.json",
       "sha256": "ac4001df48907a427f9bce3e3a7132d80ac76fc05d8f7cc83ea8b20c03900202",
-      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+      "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
       "tp": 1,
       "kv_format": "tq4",
       "kv_bytes_per_token": 21376,
@@ -21909,7 +21909,7 @@
         "bundle": "goal-needle",
         "command": [
           "/home/nchapman/Code/warp-34/target/release/examples/needle_gate",
-          "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "tq4",
           "262144",
           "50",

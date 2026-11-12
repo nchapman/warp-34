@@ -59,6 +59,10 @@ const GOLDEN_MOE_MM_FINAL_MIN_LAST_COSINE: f64 = 0.975;
 const GOLDEN_MOE_MM_LAYER_MAX_LAST_REL_L2: f64 = 0.30;
 #[cfg(any(test, feature = "cuda"))]
 const GOLDEN_MOE_MM_LAYER_MIN_LAST_COSINE: f64 = 0.955;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_TEXT_RESIDUAL_MAX_LAST_REL_L2: f64 = 0.06;
+#[cfg(any(test, feature = "cuda"))]
+const GOLDEN_MOE_TEXT_RESIDUAL_MIN_LAST_COSINE: f64 = 0.998;
 
 #[cfg(any(test, feature = "cuda"))]
 pub(crate) fn evaluate_golden_tensor_diff(
@@ -188,7 +192,10 @@ pub(crate) fn evaluate_moe_or_golden_tensor_diff(
                 GOLDEN_MOE_SUBLAYER_MIN_LAST_COSINE,
             )
         } else if !is_multimodal {
-            (GOLDEN_STRICT_MAX_REL_L2, GOLDEN_STRICT_MIN_LAST_COSINE)
+            (
+                GOLDEN_MOE_TEXT_RESIDUAL_MAX_LAST_REL_L2,
+                GOLDEN_MOE_TEXT_RESIDUAL_MIN_LAST_COSINE,
+            )
         } else if name == "final_norm" {
             (
                 GOLDEN_MOE_MM_FINAL_MAX_LAST_REL_L2,

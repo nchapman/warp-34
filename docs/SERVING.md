@@ -7,7 +7,7 @@ sequences, automatic KV capacity, and the existing scheduler tuning.
 ```sh
 # Export W34_API_KEY securely through your deployment's secret manager first.
 CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline \
+  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
   --served-model-name coding-model \
   --api-key-env W34_API_KEY \
   --max-num-seqs 4 --kv-pages 512 --max-model-len 8192

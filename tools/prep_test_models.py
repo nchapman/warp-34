@@ -26,13 +26,13 @@ class ModelSpec:
 
 
 CORE_TEST_MODELS: tuple[ModelSpec, ...] = (
-    # Core 4B target checkpoint pinned to the oracle provenance snapshot (`d5874365...`)
+    # Core 4B target checkpoint pinned to the unquantized snapshot (`851bf6e8...`)
     # required by `dflash_proposer::actual_sglang_full_model_hidden_parity` as well as
     # `mtp_proposer`, `tq4_vision_and_moe`, `axum_serving`, `decode_graphs`, etc.
     ModelSpec(
-        repo_id="nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        revision="d5874365f7093b28b69379722d2f45d660fcbca6",
-        required_files=("config.json", "model.safetensors", "model_mtp.safetensors", "tokenizer.json"),
+        repo_id="Qwen/Qwen3.5-4B",
+        revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        required_files=("config.json", "model.safetensors.index.json", "tokenizer.json"),
     ),
     # Core 4B DFlash2 drafter checkpoint.
     ModelSpec(
@@ -47,13 +47,6 @@ CORE_TEST_MODELS: tuple[ModelSpec, ...] = (
         required_files=("config.json",),
         allow_patterns=("config.json",),
     ),
-    # CLEF tokenizer checked by `clef::tests::clef_encode_record_matches_clef_flash_hf_tokenizer_goldens`.
-    ModelSpec(
-        repo_id="Cloudflare/clef-flash",
-        revision="fb4417d31c1d0f9e7e77f1141b40aaede7491e00",
-        required_files=("config.json", "tokenizer.json"),
-        allow_patterns=("config.json", "tokenizer.json", "tokenizer_config.json"),
-    ),
 )
 
 FULL_SUITE_MODELS: tuple[ModelSpec, ...] = (
@@ -63,23 +56,18 @@ FULL_SUITE_MODELS: tuple[ModelSpec, ...] = (
         required_files=("config.json", "model.safetensors", "tokenizer.json"),
     ),
     ModelSpec(
+        repo_id="nchapman/Qwen3.5-4B-W4A16-HGPTQ",
+        revision="493bf19cf3b9947d55320c93cb0f8d4c187a9083",
+        required_files=("config.json", "model.safetensors", "tokenizer.json"),
+    ),
+    ModelSpec(
         repo_id="nchapman/Qwen3.5-9B-W4A16-HGPTQ",
         revision="7b2e48b7e7e8ee38925f5337c66feed22d3b031b",
         required_files=("config.json", "model.safetensors", "model_mtp.safetensors", "tokenizer.json"),
     ),
     ModelSpec(
-        repo_id="nchapman/Qwen3.5-9B-W4A16-GPTQ",
-        revision="a161b410df67c1674e76f4f40592a691a5ffafbd",
-        required_files=("config.json", "model.safetensors", "model_mtp.safetensors", "tokenizer.json"),
-    ),
-    ModelSpec(
         repo_id="nchapman/Qwen3.8-27B-W4A16-HGPTQ",
         revision="ae51987e3339a2a70070702548571e10fe8bcbc2",
-        required_files=("config.json", "model.safetensors.index.json", "model_mtp.safetensors", "tokenizer.json"),
-    ),
-    ModelSpec(
-        repo_id="nchapman/Qwen3.8-27B-W4A16-GPTQ",
-        revision="0df81eadcfd59601cb82ccece2f16ea7d39244bf",
         required_files=("config.json", "model.safetensors.index.json", "model_mtp.safetensors", "tokenizer.json"),
     ),
     ModelSpec(
@@ -95,11 +83,6 @@ FULL_SUITE_MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(
         repo_id="nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ",
         revision="4f5de21c886d79e17af5b8a4bfc625e226703fb6",
-        required_files=("config.json", "model.safetensors.index.json", "tokenizer.json"),
-    ),
-    ModelSpec(
-        repo_id="llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4",
-        revision="fb685a8409e4290f8a15dad0a691e6a9e3d42c3f",
         required_files=("config.json", "model.safetensors.index.json", "tokenizer.json"),
     ),
     ModelSpec(

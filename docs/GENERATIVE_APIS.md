@@ -96,7 +96,7 @@ All three token-counting routes execute `prepare_chat_prompt()` (including Jinja
   "incomplete_details": null,
   "instructions": null,
   "max_output_tokens": 512,
-  "model": "Qwen3.5-9B-W4A16-GPTQ",
+  "model": "Qwen3.5-9B-W4A16-HGPTQ",
   "output": [
     {
       "id": "rs_<hex>",
@@ -210,7 +210,7 @@ A cancelled result is the cancellation acknowledgment snapshot (`output: []`, `o
   "id": "msg_<hex>",
   "type": "message",
   "role": "assistant",
-  "model": "Qwen3.5-9B-W4A16-GPTQ",
+  "model": "Qwen3.5-9B-W4A16-HGPTQ",
   "content": [
     {
       "type": "thinking",
@@ -307,4 +307,4 @@ Every frame uses `event: <event_name>\ndata: <json>\n\n`:
    - Request translation & validation for `/v1/messages` (`system` blocks + `cch=` stripping, `thinking.budget_tokens` bounds & forced-`tool_choice` conflict 400, `tool_use` + `tool_result` multi-turn round-trip, `image` base64 + SSRF remote-URL gate, `usage` cached-token subtraction, Anthropic error envelope JSON).
    - SSE frame sequence verification for both protocols (monotonic 0-indexed `sequence_number` on `/v1/responses`; exact `message_start -> content_block_start -> content_block_delta -> content_block_stop -> message_delta -> message_stop` ordering on `/v1/messages` across thinking + text + tool calls).
 2. **End-to-end HTTP + GPU tests (`--features cuda`)**:
-   - Live Axum router backed by `Qwen3.5-4B-W4A16-GPTQ` exercising sync + streaming `/v1/responses` and `/v1/messages` (plain text, `<think>` reasoning blocks, structured tool calls, `tool_choice: "none"` safety, JSON schema `text.format` / `output_config`, `previous_response_id` multi-turn cache hit, and exact agreement between `/v1/responses/input_tokens`, `/v1/messages/count_tokens`, `/v1/chat/completions/input_tokens`, and actual generation `usage`).
+   - Live Axum router backed by `Qwen/Qwen3.5-4B` exercising sync + streaming `/v1/responses` and `/v1/messages` (plain text, `<think>` reasoning blocks, structured tool calls, `tool_choice: "none"` safety, JSON schema `text.format` / `output_config`, `previous_response_id` multi-turn cache hit, and exact agreement between `/v1/responses/input_tokens`, `/v1/messages/count_tokens`, `/v1/chat/completions/input_tokens`, and actual generation `usage`).

@@ -10,7 +10,7 @@
   },
   "artifacts": [
     {
-      "repo": "nchapman/Qwen3.8-27B-W4A16-GPTQ",
+      "repo": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
       "revision": "c11a884fe4b659eccdce66761f26d3775cf7696c",
       "format": "compressed-tensors GPTQ W4A16 g128 symmetric static actorder",
       "local": false,
@@ -30,7 +30,7 @@
       "blockers": ["Exact base source revision not recorded in cached README/recipe/config", "Tokenizer/template differ from official source; audit before claiming aligned inputs", "No independent suite quality qualification"]
     },
     {
-      "repo": "nchapman/Qwen3.8-27B-W4A16-GPTQ",
+      "repo": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
       "revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
       "format": "compressed-tensors GPTQ W4A16 g128 symmetric static actorder; GDN a/b projections unquantized",
       "local": true,

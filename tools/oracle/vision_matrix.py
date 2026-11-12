@@ -13,8 +13,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-MODELS = ["nchapman/Qwen3.5-4B-W4A16-GPTQ", "nchapman/Qwen3.8-27B-W4A16-GPTQ",
-          "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4"]
+MODELS = ["Qwen/Qwen3.5-4B", "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
+          "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ"]
 
 
 def main():

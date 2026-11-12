@@ -26,17 +26,22 @@ use w34_kernels::ffi::{
 #[test]
 fn test_loader_all_five_cached_checkpoints() {
     let models = [
-        ("nchapman/Qwen3.5-4B-W4A16-GPTQ", 32usize, 2560usize, 1usize),
-        ("nchapman/Qwen3.5-9B-W4A16-GPTQ", 32usize, 4096usize, 2usize),
+        ("Qwen/Qwen3.5-4B", 32usize, 2560usize, 1usize),
         (
-            "nchapman/Qwen3.8-27B-W4A16-GPTQ",
+            "nchapman/Qwen3.5-9B-W4A16-HGPTQ",
+            32usize,
+            4096usize,
+            2usize,
+        ),
+        (
+            "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
             64usize,
             5120usize,
             2usize,
         ),
         ("incoai/Qwen3.8-27B-DFlash2", 5usize, 5120usize, 2usize),
         (
-            "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4",
+            "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ",
             40usize,
             2048usize,
             2usize,

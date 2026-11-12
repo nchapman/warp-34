@@ -121,7 +121,7 @@ Translates ordered-array or simplified decision payloads (`state` or `context`, 
 
 - `benchmarks/perf/fixtures/jevbench_public.json`: 128 single-question `/v1/systemone` items (`72` `original.jsonl` + `16` `easy.jsonl` + `40` `hard.jsonl`).
 - `benchmarks/perf/fixtures/jevbench_multiquestion.json`: 16 multi-question `/v1/systemone` requests (`4` questions per request = `64` decisions).
-- `benchmarks/perf/campaigns/decision-models.toml`: pinned profiles for `nchapman/GLiDE-{0.8B,2B,9B,27B}-W4A16-HGPTQ`, `nchapman/d3-{edge,lite,nano,mini,flash,turbo,ultra}-W4A16-HGPTQ` / `nchapman/d3-W4A16-HGPTQ`, `fastino/GLiDE-{0.8B,2B,9B,27B}`, `vllm-sr/d3-{flash,turbo,ultra}`, and `CausalLm` (`nchapman/Qwen3.5-4B-W4A16-GPTQ`, `nchapman/Qwen3.8-27B-W4A16-GPTQ`).
+- `benchmarks/perf/campaigns/decision-models.toml`: pinned profiles for `nchapman/GLiDE-{0.8B,2B,9B,27B}-W4A16-HGPTQ`, `nchapman/d3-{edge,lite,nano,mini,flash,turbo,ultra}-W4A16-HGPTQ` / `nchapman/d3-W4A16-HGPTQ`, `fastino/GLiDE-{0.8B,2B,9B,27B}`, `vllm-sr/d3-{flash,turbo,ultra}`, and `CausalLm` (`nchapman/Qwen3.5-4B-W4A16-HGPTQ`, `nchapman/Qwen3.8-27B-W4A16-HGPTQ`).
 
 ### Verified JevBench Results on RTX 3090 Ti (`sm_86`)
 

@@ -35,7 +35,7 @@ Point `w34 serve` at a Hugging Face repo ID or a local directory. It will pull t
 
 ```sh
 ./target/release/w34 serve \
-  --model nchapman/Qwen3.8-27B-W4A16-GPTQ \
+  --model nchapman/Qwen3.8-27B-W4A16-HGPTQ \
   --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash \
   --kv-format tq4 --tp 1 --port 8000
 ```
@@ -50,7 +50,7 @@ While it is running, open **`http://127.0.0.1:8000/`** in your browser to see th
 curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "nchapman/Qwen3.8-27B-W4A16-GPTQ",
+    "model": "nchapman/Qwen3.8-27B-W4A16-HGPTQ",
     "messages": [{"role": "user", "content": "Explain why Gated DeltaNet needs state checkpoints for prefix caching."}],
     "max_tokens": 256
   }'
@@ -60,11 +60,11 @@ For quick offline testing or benchmarking from the terminal without spinning up 
 
 ```sh
 # One-off generation:
-./target/release/w34 generate --model nchapman/Qwen3.5-4B-W4A16-GPTQ --prompt "Hello!"
+./target/release/w34 generate --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --prompt "Hello!"
 
 # Benchmark prefill + decode with lossless speculative verification check:
 ./target/release/w34 bench \
-  --model nchapman/Qwen3.8-27B-W4A16-GPTQ \
+  --model nchapman/Qwen3.8-27B-W4A16-HGPTQ \
   --speculative dflash2 --draft-model z-lab/Qwen3.5-27B-DFlash \
   --kv-format tq4 --tp 1 --prompt-len 512 --gen-len 128 --verify-lossless
 ```
@@ -156,7 +156,7 @@ When you load a checkpoint, `warp-34` automatically inspects `config.json` and a
 
 | Profile | Example Checkpoints | How It Evaluates Decisions |
 |---|---|---|
-| **`Clef`** | `Cloudflare/clef-flash` (9B), `Cloudflare/clef` (27B) | Encodes `STATE:`, optional vision media, and **all questions (`1..64`) into one joint prefill pass**, then runs `ClefJointHead` (`EvidenceRoutingLayer` + `TransformerDecoderLayer` + on-demand lexical `lm_head` priors). |
+| **`Clef`** | `Cloudflare/clef` (27B) | Encodes `STATE:`, optional vision media, and **all questions (`1..64`) into one joint prefill pass**, then runs `ClefJointHead` (`EvidenceRoutingLayer` + `TransformerDecoderLayer` + on-demand lexical `lm_head` priors). |
 | **`Kev`** | Qwen 3.5 `KevModel` checkpoints (`head.safetensors`) | Encodes FIM/box delimiters (`<\|box_start\|>...<\|box_end\|>`), reads post-norm hidden states before `lm_head`, and scores via `PointerHead` (`f64` dot-product, skipping the full vocabulary GEMM). |
 | **`Nimble`** | `Bespoke-Nimble-9B` | Compiles `SafeJson` prompts and reads calibrated last-row `lm_head` candidate logits (`A..Z`, `nimble_temperature`). |
 | **`OpenJev`** | `OpenJevModel` checkpoints | Reads single-token candidate logits across `A..Z` and `a..z` (`2..52` options) with `true`-first `noul` ordering. |
@@ -245,7 +245,7 @@ Authentication is off by default for local ergonomics. For deployments, pass an 
 ```sh
 export W34_API_KEY="your-secret-key"
 ./target/release/w34 serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ \
+  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
   --api-key-env W34_API_KEY \
   --served-model-name coding-model \
   --max-num-seqs 8 --kv-pages 2048 --max-model-len 32768
@@ -282,7 +282,7 @@ docker run --rm --name w34-local --gpus '"device=0"' \
   -p 127.0.0.1:8000:8000 \
   --mount type=bind,src="$HOME/.cache/huggingface/hub",dst=/models,readonly \
   warp-34:local serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline --host 0.0.0.0
+  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline --host 0.0.0.0
 ```
 
 For download-on-first-use, use a persistent writable named volume instead of the read-only bind mount, and omit `--offline`:
@@ -293,7 +293,7 @@ docker run --rm --name w34-local --gpus '"device=0"' \
   --mount type=volume,src=w34-models,dst=/home/w34/.cache/huggingface/hub \
   --health-start-period=10m \
   warp-34:local serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --host 0.0.0.0
+  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --host 0.0.0.0
 ```
 
 The image defaults to non-root `w34`. The read-only host-cache example instead uses your host UID/GID because Hub metadata can be owner-readable only; it also moves `HOME` and the cache outside `w34`'s private home directory. A new named volume inherits the image's cache-directory ownership and works with the default user. Adjust `--health-start-period` for slow downloads or large models. The default healthcheck probes port 8000; if you change the server port, also override `--health-cmd`.

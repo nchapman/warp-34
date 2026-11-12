@@ -3,7 +3,7 @@
   "sglang_version": "0.5.19",
   "steps": 1,
   "requested_engine_args": {
-    "model_path": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6",
+    "model_path": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
     "tp_size": 1,
     "dtype": "float16",
     "mem_fraction_static": 0.6,
@@ -14,7 +14,7 @@
     "speculative_num_steps": 1,
     "speculative_eagle_topk": 1,
     "speculative_num_draft_tokens": 2,
-    "speculative_draft_model_path": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6"
+    "speculative_draft_model_path": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
   },
   "prompt": "The capital of France is",
   "sampling_params": {
@@ -658,7 +658,7 @@
   },
   "status": "error",
   "resolved_server_args": {
-    "model_path": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6",
+    "model_path": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
     "tokenizer_path": null,
     "tokenizer_mode": "auto",
     "tokenizer_backend": "huggingface",
@@ -909,7 +909,7 @@
     "enable_torch_compile_debug_mode": false,
     "torch_compile_max_bs": 32,
     "speculative_algorithm": "NEXTN",
-    "speculative_draft_model_path": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6",
+    "speculative_draft_model_path": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
     "speculative_draft_model_revision": null,
     "speculative_draft_load_format": null,
     "speculative_num_steps": 1,
@@ -1147,7 +1147,7 @@
     "forward_hooks": null,
     "msprobe_dump_config": null,
     "_raw_input": {
-      "model_path": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6",
+      "model_path": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
       "tokenizer_path": null,
       "tokenizer_mode": "auto",
       "tokenizer_backend": "huggingface",
@@ -1398,7 +1398,7 @@
       "enable_torch_compile_debug_mode": false,
       "torch_compile_max_bs": 32,
       "speculative_algorithm": "NEXTN",
-      "speculative_draft_model_path": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6",
+      "speculative_draft_model_path": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
       "speculative_draft_model_revision": null,
       "speculative_draft_load_format": null,
       "speculative_num_steps": 1,
@@ -1664,13 +1664,13 @@
       [
         "_handle_missing_default_values",
         {
-          "tokenizer_path": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6"
+          "tokenizer_path": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
         }
       ],
       [
         "_handle_missing_default_values",
         {
-          "served_model_name": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6"
+          "served_model_name": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
         }
       ],
       [
@@ -1840,7 +1840,7 @@
     ],
     "_quantization_explicitly_unset": false,
     "_model_config": "<sglang.srt.configs.model_config.ModelConfig object at 0x7f8b8b956180>",
-    "_model_config_built_from": "/hf/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6",
+    "_model_config_built_from": "/hf/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
     "_cuda_graph_config_locked": "{('decode', 'backend'), ('prefill', 'backend')}",
     "_resolution_finished": true,
     "_max_speculative_num_draft_tokens": 2

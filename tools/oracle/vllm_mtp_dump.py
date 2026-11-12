@@ -91,7 +91,7 @@ def install_hook(worker, out_dir):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default=str(Path.home() / ".cache/huggingface/hub/models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6"))
+    ap.add_argument("--model", default=str(Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"))
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     from vllm import LLM, SamplingParams

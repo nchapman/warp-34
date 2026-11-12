@@ -1850,7 +1850,7 @@
           "engine": "sglang",
           "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1; image sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9",
           "cache_config": "FP16 KV TP2; context 8192; FP32 SSM; FP16 conv; radix; static .88; prefill 1024; max running requests 8; Mamba cache slots 32",
-          "launch_command": "docker run --rm --name w34-kvspec-sglang-baseline --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 8192 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 1024 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034"
+          "launch_command": "docker run --rm --name w34-kvspec-sglang-baseline --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 8192 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 1024 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034"
         }
       ],
       "cases": [
@@ -2015,7 +2015,7 @@
           "engine": "sglang",
           "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1; image sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9",
           "cache_config": "FP16 KV TP2; context 8192; FP32 SSM; FP16 conv; radix; static .88; prefill 1024; max running requests 8; Mamba cache slots 32",
-          "launch_command": "docker run --rm --name w34-kvspec-sglang-dflash2 --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 8192 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 1024 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034 --speculative-algorithm DFLASH --speculative-num-draft-tokens 8 --speculative-draft-model-path /models/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5",
+          "launch_command": "docker run --rm --name w34-kvspec-sglang-dflash2 --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 8192 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 1024 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034 --speculative-algorithm DFLASH --speculative-num-draft-tokens 8 --speculative-draft-model-path /models/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5",
           "qualification_note": "Unverified qualification probe, not a supported claim. Cookbook flags cover other formats/newer GPUs; GPTQ int4 + SM86 TP2 may be hardware/checkpoint incompatible. Pinned incoai DFlash2 draft; qualify draft/target dtype and checkpoint compatibility without a draft dtype override. Attempt the pinned recipe; record boot failures, memory fit, speculative acceptance and C1/C8 quality before any support claim; do not substitute a newer image."
         }
       ],
@@ -2181,7 +2181,7 @@
           "engine": "sglang",
           "version": "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1; image sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9",
           "cache_config": "FP16 KV TP2; context 8192; FP32 SSM; FP16 conv; radix; static .88; prefill 1024; max running requests 8; Mamba cache slots 32",
-          "launch_command": "docker run --rm --name w34-kvspec-sglang-mtp --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 8192 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 1024 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "launch_command": "docker run --rm --name w34-kvspec-sglang-mtp --gpus '\"device=0,1\"' --shm-size 4g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-27b-gptq --dtype float16 --tp-size 2 --context-length 8192 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 1024 --max-running-requests 8 --max-mamba-cache-size 32 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034 --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "qualification_note": "Unverified qualification probe, not a supported claim. Cookbook flags cover other formats/newer GPUs; GPTQ int4 + SM86 TP2 may be hardware/checkpoint incompatible. Native MTP explicitly reuses the target snapshot; qualify embedded MTP tensors and GPTQ draft loading. Attempt the pinned recipe; record boot failures, memory fit, speculative acceptance and C1/C8 quality before any support claim; do not substitute a newer image."
         }
       ],
@@ -2330,7 +2330,7 @@
           "gpu_count": 2,
           "parallelism": "tp2",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
           "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
@@ -2347,7 +2347,7 @@
           "engine": "vllm",
           "version": "0.31.0",
           "cache_config": "FP16 auto KV; FP32 SSM; prefix on; max sequences 8; prefill budget 1024; GPU budget .90; CPU offload 0",
-          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034"
+          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --dtype half --tensor-parallel-size 2 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034"
         }
       ],
       "cases": [
@@ -2495,7 +2495,7 @@
           "gpu_count": 2,
           "parallelism": "tp2",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
           "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
@@ -2512,7 +2512,7 @@
           "engine": "warp-34",
           "version": "66974d8; binary sha256 f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
           "cache_config": "FP16 KV 1024 pages (16384 tokens), DFlash2 BF16 drafter (incoai/Qwen3.8-27B-DFlash2, M=8)",
-          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5 --host 127.0.0.1 --port 18034"
+          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5 --host 127.0.0.1 --port 18034"
         }
       ],
       "cases": [
@@ -2660,7 +2660,7 @@
           "gpu_count": 2,
           "parallelism": "tp2",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
           "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
@@ -2677,7 +2677,7 @@
           "engine": "warp-34",
           "version": "66974d8; binary sha256 f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
           "cache_config": "FP16 KV 1024 pages (16384 tokens) on 2x 3090 Ti TP=2, odd-stage pipelined sysmem AllReduce",
-          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --host 127.0.0.1 --port 18034"
+          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --host 127.0.0.1 --port 18034"
         }
       ],
       "cases": [
@@ -2825,7 +2825,7 @@
           "gpu_count": 2,
           "parallelism": "tp2",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
           "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
@@ -2842,7 +2842,7 @@
           "engine": "warp-34",
           "version": "66974d8; binary sha256 f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
           "cache_config": "FP16 KV 1024 pages (16384 tokens), Native MTP k=2 with batched B=2..4 verification",
-          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --speculative mtp --mtp-k 2 --host 127.0.0.1 --port 18034"
+          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --speculative mtp --mtp-k 2 --host 127.0.0.1 --port 18034"
         }
       ],
       "cases": [
@@ -2990,7 +2990,7 @@
           "gpu_count": 1,
           "parallelism": "single",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
           "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
@@ -3007,7 +3007,7 @@
           "engine": "warp-34",
           "version": "66974d8; binary sha256 f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
           "cache_config": "512 q8_0 pages (8192 tokens); native radix/graphs; FP32 SSM; no offload",
-          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format q8_0 --kv-pages 512 --host 127.0.0.1 --port 18034"
+          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format q8_0 --kv-pages 512 --host 127.0.0.1 --port 18034"
         }
       ],
       "cases": [
@@ -3155,7 +3155,7 @@
           "gpu_count": 1,
           "parallelism": "single",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
           "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
@@ -3172,7 +3172,7 @@
           "engine": "warp-34",
           "version": "66974d8; binary sha256 f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
           "cache_config": "512 tq4 pages (8192 tokens); native radix/graphs; FP32 SSM; no offload",
-          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 512 --host 127.0.0.1 --port 18034"
+          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 512 --host 127.0.0.1 --port 18034"
         }
       ],
       "cases": [
@@ -3320,7 +3320,7 @@
           "gpu_count": 1,
           "parallelism": "single",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "source_model_revision": "unknown; identical artifact does not establish cross-format equivalence",
           "artifact_sha256": "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03",
@@ -3337,7 +3337,7 @@
           "engine": "warp-34",
           "version": "66974d8; binary sha256 f203e7efd883893192cd6262871d278997b1380253e3874053f8d7947cb8948f",
           "cache_config": "512 tq4_all pages (8192 tokens); native radix/graphs; FP32 SSM; no offload",
-          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 512 --host 127.0.0.1 --port 18034"
+          "launch_command": "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 512 --host 127.0.0.1 --port 18034"
         }
       ],
       "cases": [
@@ -3488,7 +3488,7 @@
           "gpu_ids": "0",
           "parallelism": "TP1",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "weight_format": "compressed-tensors-GPTQ-int4",
           "activation_dtype": "float16",
@@ -3497,7 +3497,7 @@
           "id": "warp34-27b-tp1-tq4-capacity",
           "kv_format": "tq4",
           "cache_config": "16384 pages; FP32 persistent SSM; max sequences1; no model offload; OS cache not flushed",
-          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
+          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
           "enabled": true
         }
       ],
@@ -3642,7 +3642,7 @@
           "gpu_ids": "0",
           "parallelism": "TP1",
           "base_url": "http://127.0.0.1:18034/v1",
-          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+          "model": "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
           "weight_format": "compressed-tensors-GPTQ-int4",
           "activation_dtype": "float16",
@@ -3651,7 +3651,7 @@
           "id": "warp34-27b-tp1-tq4all-capacity",
           "kv_format": "tq4_all",
           "cache_config": "16384 pages; all-layer TQ4; FP32 persistent SSM; max sequences1; no model offload; OS cache not flushed",
-          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
+          "launch_command": "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --max-num-seqs 1 --host 127.0.0.1 --port 18034",
           "enabled": true
         }
       ],

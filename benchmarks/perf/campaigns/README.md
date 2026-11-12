@@ -5,7 +5,7 @@
 - Configuration: [27b-fp16-first.toml](27b-fp16-first.toml)
 - Results: [27b-fp16-first.md](27b-fp16-first.md)
 - Machine: one RTX 3090 Ti, GPU 0; engines run serially.
-- Model: `nchapman/Qwen3.8-27B-W4A16-GPTQ`, snapshot
+- Model: `nchapman/Qwen3.8-27B-W4A16-HGPTQ`, snapshot
   `0df81eadcfd59601cb82ccece2f16ea7d39244bf`.
 - Precision: GPTQ INT4 weights, FP16 activations/KV/convolution history,
   FP32 recurrent SSM; no speculation or CPU offload.

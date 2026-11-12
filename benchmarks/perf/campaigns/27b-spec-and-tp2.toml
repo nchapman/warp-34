@@ -1,4 +1,4 @@
-# Qwen3.8-27B-W4A16-GPTQ (0df81eadcfd59601cb82ccece2f16ea7d39244bf) speculative & 2-GPU topology campaign.
+# Qwen3.8-27B-W4A16-HGPTQ (ae51987e3339a2a70070702548571e10fe8bcbc2) speculative & 2-GPU topology campaign.
 # Compares: TP=1 FP16, TP=2 FP16 (pipelined sysmem AllReduce), TP=2 MTP k=2 (C1 + batched B=2..4),
 # TP=2 DFlash2 (M=8 BF16 drafter), and 2x TP=1 data-parallel replicas across PCIe Gen4 x8 (topo PHB).
 schema_version = 1
@@ -17,8 +17,8 @@ gpu_count = 2
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3,GPU-6fccb3f1-5daf-d65c-7f92-affffe1f024a"
 parallelism = "tp2"
 base_url = "http://127.0.0.1:18034/v1"
-model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
-model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
 weight_format = "compressed-tensors-GPTQ-int4"
 activation_dtype = "float16"
 conv_state_dtype = "float16"
@@ -34,14 +34,14 @@ gpu_count = 1
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
 parallelism = "single"
 cache_config = "FP16 KV 512 pages (8192 tokens) on 1x 3090 Ti, FP32 SSM"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format fp16 --kv-pages 512 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format fp16 --kv-pages 512 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-27b-tp2-fp16"
 engine = "warp-34"
 version = "5492c39+sm86-roadmap"
 cache_config = "FP16 KV 1024 pages (16384 tokens) on 2x 3090 Ti TP=2, odd-stage pipelined sysmem AllReduce"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format fp16 --kv-pages 1024 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-27b-tp2-mtp2"
@@ -49,7 +49,7 @@ engine = "warp-34"
 version = "5492c39+sm86-roadmap"
 speculation = "mtp-k2"
 cache_config = "FP16 KV 1024 pages (16384 tokens), Native MTP k=2 with batched B=2..4 verification"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --speculative mtp --mtp-k 2 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format fp16 --kv-pages 1024 --speculative mtp --mtp-k 2 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-27b-tp2-dflash2"
@@ -57,7 +57,7 @@ engine = "warp-34"
 version = "5492c39+sm86-roadmap"
 speculation = "dflash2-m8"
 cache_config = "FP16 KV 1024 pages (16384 tokens), DFlash2 BF16 drafter (incoai/Qwen3.8-27B-DFlash2, M=8)"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 1024 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format fp16 --kv-pages 1024 --speculative dflash2 --draft-model /home/nchapman/.cache/huggingface/hub/models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-27b-2xtp1-dp"

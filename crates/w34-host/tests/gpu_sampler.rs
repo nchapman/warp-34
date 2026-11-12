@@ -301,7 +301,7 @@ fn tp1_and_tp2_gpu_sampler_and_bitmask_parity_plain_and_speculative() {
     ) {
         return;
     }
-    let model = "nchapman/Qwen3.5-4B-W4A16-GPTQ";
+    let model = "Qwen/Qwen3.5-4B";
     if common::require_or_skip_cached_model(
         model,
         "tp1_and_tp2_gpu_sampler_and_bitmask_parity_plain_and_speculative",

@@ -26,8 +26,8 @@ for a controlled cross-server quality comparison. No 9B or 35B check was run.
   `1de743eedefdb7422e6b171174c7080204f5b005`.
 - `nchapman/Qwen3.8-Flash-Next-W4A16-HGPTQ`:
   `6ee06d2936b111f19eb5eb331044cb8b8b28562b`.
-- `nchapman/Qwen3.8-27B-W4A16-GPTQ`:
-  `0df81eadcfd59601cb82ccece2f16ea7d39244bf`.
+- `SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16`:
+  `e28c5f952bdd9abac6420ac3efad651b40d15eb5`.
 
 Dataset cache refs: IFEval `966cd89545d6b6acfd7638bc708b98261ca58e84`;
 GSM8K `740312add88f781978c0658806c59bc2815b9866`.

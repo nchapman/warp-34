@@ -697,7 +697,7 @@ fn load_35b_tp1_or_skip_low_vram(model: &str) -> Option<Qwen3_5Engine> {
 #[test]
 fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let model = "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4";
+    let model = "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ";
     if common::require_or_skip_cached_model(
         model,
         "real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2",
@@ -710,11 +710,11 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
     // 1. Validate real layer-0 MoE weights (including live router, shared expert, and shared gate)
     // across M = 4 (vec4), M = 8 & 16 & 64 (sparse MMA), and M = 306 (3-chunk Grouped MMA in 8 MiB scratch).
     let prompts_tp1 = [
-        vec![151644, 872, 198, 785],
-        vec![151644, 872, 198, 785, 6722, 315, 9625, 374],
+        vec![760, 6511, 314, 9338],
+        vec![3710, 369, 279, 6511, 314, 9338, 30, 561],
         vec![
-            151644, 872, 198, 785, 6722, 315, 9625, 374, 13, 151645, 198, 151644, 77091, 198,
-            151667, 198,
+            248045, 846, 198, 760, 6511, 314, 9338, 248046, 198, 248045, 74455, 198, 248068, 271,
+            248069, 271,
         ],
     ];
     let mut tp1_l0 = Vec::new();
@@ -736,6 +736,10 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
             let FfnBlockWeights::Moe(moe) = ffn else {
                 unreachable!()
             };
+            let w34_host::model::MoeExpertStorage::W4A16 { group_size, .. } = &moe.experts else {
+                panic!("35B-A3B MoE experts must be W4A16");
+            };
+            let moe_group_size = *group_size as i32;
             let h = engine.cfg.hidden_size;
             let k = moe.top_k;
             let e = moe.num_experts;
@@ -778,7 +782,7 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
                         e as i32,
                         n_moe as i32,
                         h as i32,
-                        128,
+                        moe_group_size,
                     )
                 };
                 assert_eq!(
@@ -792,8 +796,8 @@ fn real_weight_sparse_moe_m4_m8_m16_and_actual_tp1_tp2() {
                         x_host.push(f32_to_f16(v));
                     }
                 }
-                d_x.copy_from_host(&x_host, &stream).unwrap();
                 for (ex, d_out) in [(&ex_ref, &d_out_ref), (&ex_opt, &d_out_opt)] {
+                    d_x.copy_from_host(&x_host, &stream).unwrap();
                     ffn.forward(
                         ex,
                         &blas,

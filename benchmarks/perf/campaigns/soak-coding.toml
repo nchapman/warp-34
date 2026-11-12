@@ -14,7 +14,7 @@ id = "warp34-soak"
 engine = "warp-34"
 version = "unknown"
 support = "unverified"
-model = "nchapman/Qwen3.5-4B-W4A16-GPTQ"
+model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ"
 model_revision = "unknown"
 source_model_revision = "unknown"
 artifact_sha256 = "unknown"
@@ -29,7 +29,7 @@ kv_format = "tq4"
 parallelism = "single"
 speculation = "none"
 cache_config = "4096 KV pages; 8 active sequences; max model len 8192"
-launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --max-model-len 8192 --port 18834"
+launch_command = "CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline --kv-format tq4 --kv-pages 4096 --max-num-seqs 8 --max-model-len 8192 --port 18834"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[cases]]

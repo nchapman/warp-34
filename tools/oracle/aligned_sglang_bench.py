@@ -21,7 +21,7 @@ import sys
 
 IMAGE = 'sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9'
 PHRASE = 'The quick brown fox jumps over the lazy dog. '
-TARGET = 'nchapman/Qwen3.5-4B-W4A16-GPTQ'
+TARGET = 'Qwen/Qwen3.5-4B'
 DRAFT = 'nchapman/Qwen3.5-4B-DFlash2'
 
 

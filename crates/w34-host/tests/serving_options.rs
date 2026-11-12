@@ -38,7 +38,7 @@ fn invalid_options_do_not_load_model() {
 #[test]
 fn authenticated_serving_alias_context_and_concurrency() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "authenticated_serving_alias_context_and_concurrency",
     )
     .is_none()
@@ -53,7 +53,7 @@ fn authenticated_serving_alias_context_and_concurrency() {
     let state =
         OpenAiServerState::from_loader_with_options("coding-model".into(), false, options, || {
             let engine = Qwen3_5Engine::load_for_serving(
-                "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                "Qwen/Qwen3.5-4B",
                 1,
                 KvFormatPolicy::Tq4,
                 Some(256),

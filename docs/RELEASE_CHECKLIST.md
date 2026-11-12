@@ -91,7 +91,7 @@ Source: the hardening changes committed with this receipt on `fix/production-lif
 - `cargo build --release --features cuda` and three sequential benchmark smoke runs passed, using `CUDA_VISIBLE_DEVICES=0,1 CUDA_DISABLE_PTX_JIT=1` and the common command below (default TP1). Each reported radix/vision lossless parity, distinct-image cache isolation, eight active scheduler sequences and 256 total scheduler output tokens.
 
 ```sh
-./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline \
+./target/release/w34 bench --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
   --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8
 # Repeat with --speculative mtp --mtp-k 3
 # Repeat with --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2

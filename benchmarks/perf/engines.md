@@ -95,7 +95,7 @@ advertised values, not verification of local GGUF/ninfer bytes.
 
 | Artifact | Immutable revision | Bytes | Status |
 |---|---|---:|---|
-| `nchapman/Qwen3.8-27B-W4A16-GPTQ` | `0df81eadcfd59601cb82ccece2f16ea7d39244bf` | 19,610,855,960 (13 visible files incl. sidecars/tokenizer/template) | **Current GPTQ candidate**; full inventory re-verified after old-cache removal |
+| `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `0df81eadcfd59601cb82ccece2f16ea7d39244bf` | 19,610,855,960 (13 visible files incl. sidecars/tokenizer/template) | **Current GPTQ candidate**; full inventory re-verified after old-cache removal |
 | Same repo, obsolete quant | `c11a884fe4b659eccdce66761f26d3775cf7696c` | 19,438,009,793 (historical inventory) | **Retired/deleted locally**; historical evidence only |
 | `WarlaxZ/Qwen3.8-27B-NInfer-3090/qwen3_8_27b.ninfer` | `ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1` | 18,982,458,624 | 3090-specific candidate, not downloaded |
 | `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` | 16,464,440,224 | Candidate, not downloaded |
@@ -303,7 +303,7 @@ For warp-34 the same one-card example can be restarted with each KV format:
 ```sh
 # Run separately, not concurrently:
 CUDA_VISIBLE_DEVICES=0 ./target/release/w34 serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ \
+  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
   --kv-format q8_0 --kv-pages 4096 --port 8000
 # Copy the endpoint table to id=warp34-1-q8, kv_format=q8_0, and record this command.
 ```

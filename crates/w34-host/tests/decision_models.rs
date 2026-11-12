@@ -86,7 +86,7 @@ where
 fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
     let _gpu = GPU_LOCK.lock().unwrap();
     let Some(dir) = common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams",
     ) else {
         return;
@@ -178,14 +178,8 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
 
     // 3. Live GPU HTTP test A: Default CausalLm generative decision scoring (/v1/systemone + /v1/decisions + order_passes=2).
     let state_causal = OpenAiServerState::from_loader("qwen3.5-4b".into(), false, || {
-        Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Fp16,
-            Some(256),
-            false,
-        )
-        .map_err(|e| e.to_string())
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(256), false)
+            .map_err(|e| e.to_string())
     })
     .unwrap();
 
@@ -321,14 +315,9 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
     };
     let glide_prof_for_loader = glide_profile.clone();
     let state_glide = OpenAiServerState::from_loader("qwen3.5-4b-glide".into(), false, move || {
-        let mut engine = Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Fp16,
-            Some(256),
-            false,
-        )
-        .map_err(|e| e.to_string())?;
+        let mut engine =
+            Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(256), false)
+                .map_err(|e| e.to_string())?;
         // Exercise optional `lm_head = None`, `noncausal_full_attention = true`, and `midloop` recurrence on GPU.
         for r in &mut engine.ranks {
             r.lm_head = None;
@@ -483,14 +472,9 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
     // 5. Live GPU HTTP test C: d3 CodeReadout (`state_once: true`, `prefix_bidir: true`, `header-v1`, multimodal `images`, and TP=1 vs TP=2 parity).
     let d3_prof_tp1 = detected_d3_profile.clone();
     let state_d3 = OpenAiServerState::from_loader("qwen3.5-4b-d3".into(), false, move || {
-        let mut engine = Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Fp16,
-            Some(256),
-            false,
-        )
-        .map_err(|e| e.to_string())?;
+        let mut engine =
+            Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(256), false)
+                .map_err(|e| e.to_string())?;
         for r in &mut engine.ranks {
             r.cfg.prefix_bidir = true;
         }
@@ -606,7 +590,7 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
         let state_d3_tp2 =
             OpenAiServerState::from_loader("qwen3.5-4b-d3-tp2".into(), false, move || {
                 let mut engine = Qwen3_5Engine::load_for_serving(
-                    "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                    "Qwen/Qwen3.5-4B",
                     2,
                     KvFormatPolicy::Fp16,
                     Some(256),

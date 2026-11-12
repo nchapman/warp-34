@@ -97,21 +97,15 @@ fn verify_speculative_telemetry(state: &OpenAiServerState, kind: SpeculativeKind
 }
 
 fn exercise(kind: SpeculativeKind) {
-    if common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-W4A16-GPTQ", "exercise").is_none()
+    if common::require_or_skip_cached_model("Qwen/Qwen3.5-4B", "exercise").is_none()
         || (kind == SpeculativeKind::DFlash2
             && common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-DFlash2", "exercise")
                 .is_none())
     {
         return;
     }
-    let mut engine = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Tq4,
-        Some(64),
-        true,
-    )
-    .unwrap();
+    let mut engine =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(64), true).unwrap();
     engine
         .enable_speculative(&SpeculativeConfig {
             kind,
@@ -339,7 +333,7 @@ fn exercise_request_validation(state: Arc<OpenAiServerState>) {
 #[test]
 fn non_speculative_and_multimodal_mandatory_constraints_are_enforced() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "non_speculative_and_multimodal_mandatory_constraints_are_enforced",
     )
     .is_none()
@@ -347,14 +341,8 @@ fn non_speculative_and_multimodal_mandatory_constraints_are_enforced() {
         return;
     }
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let engine = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Tq4,
-        Some(64),
-        true,
-    )
-    .unwrap();
+    let engine =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(64), true).unwrap();
     let state = OpenAiServerState::new("plain-serve-test".into(), engine);
     let tools = json!([{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{},"additionalProperties":false}}}]);
 
@@ -445,7 +433,7 @@ fn dflash_http_strict_schema_is_enforced() {
 #[test]
 fn qwen3_6_moe_mtp_http_tool_and_schema_adherence() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let model = "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4";
+    let model = "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ";
     if !common::require_or_skip_gpus(2, "qwen3_6_moe_mtp_http_tool_and_schema_adherence")
         || common::require_or_skip_cached_model(
             model,

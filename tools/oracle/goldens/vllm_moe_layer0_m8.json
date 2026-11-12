@@ -1,8 +1,8 @@
 {
   "description": "Real canonical PNG prefill M=8 prefix capture of layer-0 Qwen3_5MoeSparseMoeBlock in vLLM 0.31.0",
   "vllm_version": "0.31.0",
-  "model_id": "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4",
-  "model_snapshot_revision": "fb685a8409e4290f8a15dad0a691e6a9e3d42c3f",
+  "model_id": "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ",
+  "model_snapshot_revision": "4f5de21c886d79e17af5b8a4bfc625e226703fb6",
   "image_fixture": "tools/oracle/fixtures/coco_sample.png",
   "image_sha256": "cf6f3c4befa148732c7453e0de5afab00f682427435fead2d88b07a9615cdac2",
   "raw_prompt": "<|vision_start|><|image_pad|><|vision_end|>Describe this image.",
@@ -10,7 +10,7 @@
   "full_prompt_tokens": 306,
   "layer_index": 0,
   "safetensors_file": "vllm_moe_layer0_m8.safetensors",
-  "safetensors_sha256": "b02d65cb855d05f48fc8ee25f0e2c6f5517a600b0dea190b745f0026cb6e5647",
+  "safetensors_sha256": "1af83cfffcd8056870560d5882bddf451fba3b069fabc81aef95525ca167d282",
   "native_self_repeat_final_norm_rel_l2": {
     "png_range": [
       0.14828487,
@@ -24,5 +24,5 @@
   },
   "layer0_rel_l2_limit": 0.005,
   "frontend_rel_l2_limit": 0.005,
-  "config_sha256": "7342c56e5d5f2011ba147c738babeb6039b4f005763f9a2ac1ba87e9cfdc38bc"
+  "config_sha256": "40ae790aeb3ec9e007a88ae3b42d9580f23b92ac1bb7f0e7bb50ff151c286b0b"
 }

@@ -14,15 +14,9 @@ use w34_host::{
 fn worker_with_policy(kind: Option<SpeculativeKind>, policy: KvFormatPolicy) -> EngineWorker {
     EngineWorker::from_loader(
         move || {
-            let mut engine = Qwen3_5Engine::load_for_serving(
-                "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-                1,
-                policy,
-                Some(256),
-                true,
-                16,
-            )
-            .map_err(|e| e.to_string())?;
+            let mut engine =
+                Qwen3_5Engine::load_for_serving("Qwen/Qwen3.5-4B", 1, policy, Some(256), true, 16)
+                    .map_err(|e| e.to_string())?;
             if let Some(kind) = kind {
                 engine
                     .enable_speculative(&SpeculativeConfig {
@@ -77,7 +71,7 @@ static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn native_speculation_yields_to_late_peer_losslessly() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "native_speculation_yields_to_late_peer_losslessly",
     )
     .is_none()
@@ -159,7 +153,7 @@ fn native_speculation_yields_to_late_peer_losslessly() {
 #[test]
 fn batched_mtp_b4_matches_single_stream_losslessly() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "batched_mtp_b4_matches_single_stream_losslessly",
     )
     .is_none()
@@ -343,7 +337,7 @@ async fn collect_b5(worker: &EngineWorker, prompts: &[Vec<i32>; 5]) -> Vec<Vec<i
 #[test]
 fn batched_mtp_b5_fallback_matches_non_speculative_losslessly() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "batched_mtp_b5_fallback_matches_non_speculative_losslessly",
     )
     .is_none()
@@ -418,7 +412,7 @@ async fn collect_with_cached(
 #[test]
 fn batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes",
     )
     .is_none()
@@ -450,7 +444,7 @@ fn batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes() {
     let baseline_worker = EngineWorker::from_loader(
         || {
             Qwen3_5Engine::load_for_serving_with_speculative(
-                "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                "Qwen/Qwen3.5-4B",
                 1,
                 KvFormatPolicy::Tq4,
                 Some(1024),
@@ -527,7 +521,7 @@ fn batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes() {
     let burst_worker = EngineWorker::from_loader(
         || {
             Qwen3_5Engine::load_for_serving_with_speculative(
-                "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+                "Qwen/Qwen3.5-4B",
                 1,
                 KvFormatPolicy::Tq4,
                 Some(1024),

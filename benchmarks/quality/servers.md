@@ -32,8 +32,8 @@ for each server in the run receipt. The evaluator has its own hashed dependency
 lock. No Docker-in-Docker or driver changes are required.
 
 For the donor commands below, `MODEL` is an absolute local snapshot path for
-`nchapman/Qwen3.8-27B-W4A16-GPTQ` revision
-`0df81eadcfd59601cb82ccece2f16ea7d39244bf`. This is **not** the HGPTQ checkpoint
+`SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16` revision
+`e28c5f952bdd9abac6420ac3efad651b40d15eb5`. This is **not** the HGPTQ checkpoint
 used by the initial warp-34 checks. The [README](README.md) gives warp-34's
 HGPTQ/MTP-3 command. Retain exact snapshot identities even though the API alias
 is shared.
@@ -41,7 +41,7 @@ is shared.
 ```sh
 export PATH="/usr/local/cuda/bin:$PATH"
 export HF_HOME=/workspace/.hf_home
-export MODEL="$HF_HOME/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+export MODEL="$HF_HOME/hub/models--SergiioB--Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16/snapshots/e28c5f952bdd9abac6420ac3efad651b40d15eb5"
 ```
 
 ## vLLM 0.31.0 — 27B TP2/MTP-3

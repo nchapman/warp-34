@@ -14,7 +14,7 @@ static GPU_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn decode_buckets_replay_mutated_requests_match_eager() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "decode_buckets_replay_mutated_requests_match_eager",
     )
     .is_none()
@@ -23,14 +23,9 @@ fn decode_buckets_replay_mutated_requests_match_eager() {
     }
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for tp in [1, 2] {
-        let mut engine = Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            tp,
-            KvFormatPolicy::Tq4,
-            Some(64),
-            true,
-        )
-        .unwrap();
+        let mut engine =
+            Qwen3_5Engine::load("Qwen/Qwen3.5-4B", tp, KvFormatPolicy::Tq4, Some(64), true)
+                .unwrap();
         // Separate pages and state slots for each request, including padded rows.
         let pages: Vec<_> = (0..16).map(|_| engine.alloc_kv_page().unwrap()).collect();
         let slots: Vec<_> = (0..16)
@@ -128,7 +123,7 @@ fn pipelined_fast_greedy_burst_matches_single_and_handles_staggered_finish_and_c
     ];
     let lengths = [12usize, 70, 25, 70];
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "pipelined_fast_greedy_burst_matches_single_and_handles_staggered_finish_and_chunk_boundary",
     )
     .is_none()
@@ -136,14 +131,8 @@ fn pipelined_fast_greedy_burst_matches_single_and_handles_staggered_finish_and_c
         return;
     }
 
-    let mut ref_engine = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Fp16,
-        Some(128),
-        false,
-    )
-    .unwrap();
+    let mut ref_engine =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(128), false).unwrap();
     let expected: Vec<Vec<i32>> = prompts
         .iter()
         .zip(lengths)
@@ -157,14 +146,8 @@ fn pipelined_fast_greedy_burst_matches_single_and_handles_staggered_finish_and_c
     drop(ref_engine);
 
     let state = OpenAiServerState::from_loader("pipelined-fast-greedy".into(), false, || {
-        Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Fp16,
-            Some(128),
-            true,
-        )
-        .map_err(|e| e.to_string())
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(128), true)
+            .map_err(|e| e.to_string())
     })
     .unwrap();
 

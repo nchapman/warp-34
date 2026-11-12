@@ -9,9 +9,9 @@ static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lossless_cold_and_warm(kind: SpeculativeKind, tp: usize, large: bool) {
     let model = if large {
-        "nchapman/Qwen3.8-27B-W4A16-GPTQ"
+        "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
     } else {
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ"
+        "Qwen/Qwen3.5-4B"
     };
     if common::require_or_skip_cached_model(model, "lossless_cold_and_warm").is_none() {
         return;
@@ -245,7 +245,7 @@ fn exercise_http(engine: Qwen3_5Engine) {
 
 #[test]
 fn native_sampled_terminal_grammar() {
-    let model = "nchapman/Qwen3.5-4B-W4A16-GPTQ";
+    let model = "Qwen/Qwen3.5-4B";
     if common::require_or_skip_cached_model(model, "native_sampled_terminal_grammar").is_none() {
         return;
     }
@@ -287,7 +287,7 @@ fn native_sampled_terminal_grammar() {
 #[test]
 fn native_processed_sampling_and_grammar() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "native_processed_sampling_and_grammar",
     )
     .is_none()
@@ -296,14 +296,8 @@ fn native_processed_sampling_and_grammar() {
     }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use w34_host::parser::{SamplingParams, TokenBitmaskConstraint};
-    let mut engine = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Fp16,
-        Some(16),
-        false,
-    )
-    .unwrap();
+    let mut engine =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(16), false).unwrap();
     let prompt = engine.encode("The capital of France is").unwrap();
     engine
         .enable_speculative(&SpeculativeConfig {
@@ -586,7 +580,7 @@ fn sglang_dflash2_fixtures_operator_dump_diff_parity() {
 #[test]
 fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "speculative_verify_cuda_graph_matches_eager_and_sampled",
     )
     .is_none()
@@ -600,14 +594,8 @@ fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
         draft_model: None,
         mtp_k: 3,
     };
-    let mut eager = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Tq4,
-        Some(16),
-        false,
-    )
-    .unwrap();
+    let mut eager =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(16), false).unwrap();
     eager.enable_speculative(&spec).unwrap();
     let prompt = eager
         .encode("Explain the difference between a mutex and a semaphore in two sentences.")
@@ -630,14 +618,8 @@ fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
         .generated_token_ids;
     drop(eager);
 
-    let mut graphed = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Tq4,
-        Some(16),
-        true,
-    )
-    .unwrap();
+    let mut graphed =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(16), true).unwrap();
     graphed.enable_speculative(&spec).unwrap();
     assert!(graphed.use_cuda_graph);
     assert!(graphed.ranks[0].spec_verify_graph.is_none());
@@ -664,7 +646,7 @@ fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
 #[test]
 fn dflash_and_tp2_proposer_cuda_graphs_match_eager() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "dflash_and_tp2_proposer_cuda_graphs_match_eager",
     )
     .is_none()
@@ -682,14 +664,8 @@ fn dflash_and_tp2_proposer_cuda_graphs_match_eager() {
         draft_model: Some("nchapman/Qwen3.5-4B-DFlash2".to_string()),
         mtp_k: 3,
     };
-    let mut eager_df = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Tq4,
-        Some(16),
-        false,
-    )
-    .unwrap();
+    let mut eager_df =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(16), false).unwrap();
     eager_df.enable_speculative(&dflash_spec).unwrap();
     let prompt = eager_df
         .encode("Write a compact Rust function computing Fibonacci numbers iteratively.")
@@ -701,14 +677,9 @@ fn dflash_and_tp2_proposer_cuda_graphs_match_eager() {
     drop(eager_df);
 
     for tp in [1usize, 2usize] {
-        let mut graphed_df = Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            tp,
-            KvFormatPolicy::Tq4,
-            Some(16),
-            true,
-        )
-        .unwrap();
+        let mut graphed_df =
+            Qwen3_5Engine::load("Qwen/Qwen3.5-4B", tp, KvFormatPolicy::Tq4, Some(16), true)
+                .unwrap();
         graphed_df.enable_speculative(&dflash_spec).unwrap();
         let got_df = graphed_df
             .generate_with_radix_cache(&prompt, 32, 64, false)
@@ -725,14 +696,8 @@ fn dflash_and_tp2_proposer_cuda_graphs_match_eager() {
         draft_model: None,
         mtp_k: 3,
     };
-    let mut eager_mtp2 = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        2,
-        KvFormatPolicy::Tq4,
-        Some(16),
-        false,
-    )
-    .unwrap();
+    let mut eager_mtp2 =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 2, KvFormatPolicy::Tq4, Some(16), false).unwrap();
     eager_mtp2.enable_speculative(&mtp_spec).unwrap();
     let expected_mtp2 = eager_mtp2
         .generate_with_radix_cache(&prompt, 20, 64, false)
@@ -740,14 +705,8 @@ fn dflash_and_tp2_proposer_cuda_graphs_match_eager() {
         .generated_token_ids;
     drop(eager_mtp2);
 
-    let mut graphed_mtp2 = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        2,
-        KvFormatPolicy::Tq4,
-        Some(16),
-        true,
-    )
-    .unwrap();
+    let mut graphed_mtp2 =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 2, KvFormatPolicy::Tq4, Some(16), true).unwrap();
     graphed_mtp2.enable_speculative(&mtp_spec).unwrap();
     let got_mtp2 = graphed_mtp2
         .generate_with_radix_cache(&prompt, 20, 64, false)

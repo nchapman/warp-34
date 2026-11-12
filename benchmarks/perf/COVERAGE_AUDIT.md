@@ -29,7 +29,7 @@ Paths below are relative to `benchmarks/perf/` unless stated otherwise.
 | 2B | No dedicated campaign | HGPTQ plain and MTP, TP1/TP2 |
 | 9B | `campaigns/9b-longctx-coding-agent.toml`: plain GPTQ long-context replay | HGPTQ and short/medium-context decode coverage |
 | 27B | `27b-completion.toml`, `27b-kv-spec-completion.toml`, `27b-spec-and-tp2.toml` and long-context/capacity campaigns: GPTQ, KV sweeps, MTP, BF16 DFlash2 drafter, multiple engines | HGPTQ target; HGPTQ drafter; updated engine binaries and newly qualified serving configurations |
-| 35B-A3B | `35b-a3b-moe-serving.toml`: third-party `llmfan46/...uncensored-heretic...GPTQ-Int4`, MTP-k2 | HGPTQ; plain versus MTP; source-model equivalence cannot be assumed for the modified heretic checkpoint |
+| 35B-A3B | `35b-a3b-moe-serving.toml`: `nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ`, MTP-k2 | Plain versus MTP; multi-client SWE serving coverage |
 | Flash-Next | `flash-next-serving.toml`, `flash-next-longctx.toml`: `albucino/...W4A16-FP8PLE`, warp-34 target/MTP TP1/TP2; specialized vLLM overlays and other practical baselines | HGPTQ/lut4 PLE target; quantized DFlash2 drafter; current residency policy; new serving qualification |
 | Multimodal | Workload schema supports only text and agent replay (`w34perf/config.py`, `workloads.py`) | No first-class image performance cases; a gap if claiming coverage of all serving capabilities |
 
@@ -87,7 +87,7 @@ skip/failure/capacity outcomes rather than dropping unsuccessful profiles.
 ### Tier 1: current warp-34 capability coverage
 
 Scope is limited to four mainstream, unmodified model families: **9B, 27B,
-35B-A3B, and Flash-Next**. Exclude uncensored/heretic derivatives. Do not add 2B
+35B-A3B, and Flash-Next**. Exclude uncensored derivatives. Do not add 2B
 or legacy 4B to this refreshed campaign; their inventory entries above describe
 historical coverage only.
 

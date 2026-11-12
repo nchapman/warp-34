@@ -1,5 +1,5 @@
 # Open-SWE-Traces long-context coding-agent benchmark on 1x RTX 3090 Ti (24 GiB, sm_86):
-# Qwen3.5-9B-W4A16-GPTQ (42e302203ae5d3428ce2682d7b443578ef04d5dd) at 60K-120K context
+# Qwen3.5-9B-W4A16-HGPTQ (7b2e48b7e7e8ee38925f5337c66feed22d3b031b) at 60K-120K context
 # comparing warp-34 (FP16 & TQ4 KV) vs vLLM 0.31.0 vs SGLang v0.5.19 with prefix caching & Qwen3 thinking enabled.
 schema_version = 1
 
@@ -12,13 +12,13 @@ timeout_s = 360
 
 [engine_defaults]
 support = "supported"
-cohort = "9b-42e-open-swe-longctx-sm86"
+cohort = "9b-open-swe-longctx-sm86"
 gpu_count = 1
 parallelism = "TP=1"
 base_url = "http://127.0.0.1:18034/v1"
-model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd"
-model_revision = "42e302203ae5d3428ce2682d7b443578ef04d5dd"
-weight_format = "compressed-tensors-GPTQ-int4"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b"
+model_revision = "7b2e48b7e7e8ee38925f5337c66feed22d3b031b"
+weight_format = "HGPTQ-W4A16"
 activation_dtype = "float16"
 conv_state_dtype = "float16"
 speculation = "none"
@@ -29,7 +29,7 @@ engine = "warp-34"
 version = "0.1.0+prefill64q"
 kv_format = "tq4"
 cache_config = "TQ4 (3.07x) 16384 pages (262144 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-9b-tp1-fp16"
@@ -37,25 +37,29 @@ engine = "warp-34"
 version = "0.1.0+prefill64q"
 kv_format = "fp16"
 cache_config = "FP16 KV 12288 pages (196608 tokens), FP32 SSM, hybrid GDN+KV radix prefix cache"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-HGPTQ/snapshots/7b2e48b7e7e8ee38925f5337c66feed22d3b031b --tp 1 --kv-format fp16 --kv-pages 12288 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "vllm-9b-tp1-fp16"
 engine = "vllm"
 version = "0.31.0"
-model = "qwen35-9b-gptq"
+model = "qwen35-9b-awq"
+model_revision = "e4d2d39cede86b72cd2d7fb36e9ce62912b554ca"
+weight_format = "AWQ-int4-g128"
 kv_format = "fp16"
 cache_config = "FP16 KV (max_model_len 131072, gpu_memory_utilization 0.90), FP32 SSM, V1 APC prefix caching on, reasoning-parser qwen3"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.5-9B-AWQ-4bit/snapshots/e4d2d39cede86b72cd2d7fb36e9ce62912b554ca --served-model-name qwen35-9b-awq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --mamba-ssm-cache-dtype float32 --reasoning-parser qwen3 --generation-config vllm --enable-prompt-tokens-details --seed 34 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "sglang-9b-tp1-fp16"
 engine = "sglang"
 version = "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1"
-model = "qwen35-9b-gptq"
+model = "qwen35-9b-awq"
+model_revision = "e4d2d39cede86b72cd2d7fb36e9ce62912b554ca"
+weight_format = "AWQ-int4-g128"
 kv_format = "fp16"
 cache_config = "FP16 KV (context_length 131072, mem_fraction_static 0.88), FP16 conv, FP32 SSM, MambaRadixCache on, reasoning-parser qwen3"
-launch_command = "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.5-9B-W4A16-GPTQ/snapshots/42e302203ae5d3428ce2682d7b443578ef04d5dd --served-model-name qwen35-9b-gptq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034"
+launch_command = "docker run --rm --name w34-perf-9b-sglang --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang:v0.5.19 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.5-9B-AWQ-4bit/snapshots/e4d2d39cede86b72cd2d7fb36e9ce62912b554ca --served-model-name qwen35-9b-awq --dtype float16 --tp-size 1 --context-length 131072 --mamba-ssm-dtype float32 --mem-fraction-static 0.88 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 4 8 --cuda-graph-bs-prefill 512 1024 2048 --reasoning-parser qwen3 --enable-cache-report --random-seed 34 --host 0.0.0.0 --port 18034"
 
 [[cases]]
 id = "swe-agent-64k-c1"

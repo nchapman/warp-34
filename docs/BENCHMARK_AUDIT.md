@@ -28,7 +28,7 @@ Targets and locally verified checkpoint revision prefixes:
 
 | Label | Target | Revision |
 |---|---|---|
-| 4B | `nchapman/Qwen3.5-4B-W4A16-GPTQ` | `d5874365f7` |
+| 4B | `nchapman/Qwen3.5-4B-W4A16-HGPTQ` | `493bf19cf3` |
 | 9B | `nchapman/Qwen3.5-9B-W4A16-HGPTQ` | `7b2e48b7e7` |
 | 27B | `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `ae51987e33` |
 | 35B | `nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ` | `4f5de21c88` |

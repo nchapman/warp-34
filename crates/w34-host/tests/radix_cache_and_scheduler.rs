@@ -198,7 +198,7 @@ static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn test_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "test_warm_prefix_hit_speculation_and_cross_boundary_rejection",
     )
     .is_none()
@@ -206,14 +206,9 @@ fn test_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
         return;
     }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut engine = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Fp16,
-        Some(128),
-        false,
-    )
-    .expect("load 4B TP=1 for warm prefix speculation test");
+    let mut engine =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(128), false)
+            .expect("load 4B TP=1 for warm prefix speculation test");
 
     // Build a 122-token prompt (`64` prefix + `58` suffix -> 6 tokens short of the `C = 128` checkpoint boundary!)
     let prompt_122: Vec<i32> = (0..122).map(|i| 1500 + ((i * 7 + 3) % 400)).collect();
@@ -391,7 +386,7 @@ fn test_warm_prefix_hit_speculation_and_cross_boundary_rejection() {
 #[test]
 fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server",
     )
     .is_none()
@@ -399,14 +394,9 @@ fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
         return;
     }
     let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut engine = Qwen3_5Engine::load(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        1,
-        KvFormatPolicy::Fp16,
-        Some(256),
-        true,
-    )
-    .expect("load 4B TP=1 for warm-prefix benchmark & server test");
+    let mut engine =
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Fp16, Some(256), true)
+            .expect("load 4B TP=1 for warm-prefix benchmark & server test");
     engine.reset_all_states().unwrap();
 
     // 1. Measure cold vs warm TTFT on a 516-token prompt (`512` prefix tokens = 8 x 64 checkpoints + `4` suffix tokens)
@@ -457,7 +447,7 @@ fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
     }
 
     // 3. Test OpenAI HTTP/1.1 + SSE Server (`/health`, `/v1/models`, `/tokenize`, `/v1/chat/completions` JSON & SSE, `/metrics`)
-    let state = OpenAiServerState::new("nchapman/Qwen3.5-4B-W4A16-GPTQ".to_string(), engine);
+    let state = OpenAiServerState::new("Qwen/Qwen3.5-4B".to_string(), engine);
     let send_req = |method: &str, path: &str, body: Option<&str>| {
         common::raw_request(&state, method, path, body)
     };
@@ -466,21 +456,19 @@ fn test_warm_prefix_ttft_drop_scheduler_batch_and_openai_http_sse_server() {
     assert!(health_resp.contains("200 OK") && health_resp.contains(r#""status":"ok""#));
 
     let models_resp = send_req("GET", "/v1/models", None);
-    assert!(
-        models_resp.contains("200 OK") && models_resp.contains("nchapman/Qwen3.5-4B-W4A16-GPTQ")
-    );
+    assert!(models_resp.contains("200 OK") && models_resp.contains("Qwen/Qwen3.5-4B"));
 
     let tok_resp = send_req("POST", "/tokenize", Some(r#"{"prompt":"Hello warp-34!"}"#));
     assert!(tok_resp.contains("200 OK") && tok_resp.contains(r#""tokens":"#));
 
-    let chat_req = r#"{"model":"nchapman/Qwen3.5-4B-W4A16-GPTQ","messages":[{"role":"user","content":"Say hello in one word."}],"max_tokens":12,"chat_template_kwargs":{"enable_thinking":false}}"#;
+    let chat_req = r#"{"model":"Qwen/Qwen3.5-4B","messages":[{"role":"user","content":"Say hello in one word."}],"max_tokens":12,"chat_template_kwargs":{"enable_thinking":false}}"#;
     let chat_resp = send_req("POST", "/v1/chat/completions", Some(chat_req));
     assert!(
         chat_resp.contains("200 OK") && chat_resp.contains(r#""object":"chat.completion""#),
         "unexpected chat_resp: {chat_resp}"
     );
 
-    let chat_sse_req = r#"{"model":"nchapman/Qwen3.5-4B-W4A16-GPTQ","messages":[{"role":"user","content":"Say hello in one word."}],"max_tokens":8,"stream":true,"chat_template_kwargs":{"enable_thinking":false}}"#;
+    let chat_sse_req = r#"{"model":"Qwen/Qwen3.5-4B","messages":[{"role":"user","content":"Say hello in one word."}],"max_tokens":8,"stream":true,"chat_template_kwargs":{"enable_thinking":false}}"#;
     let chat_sse_resp = send_req("POST", "/v1/chat/completions", Some(chat_sse_req));
     assert!(
         chat_sse_resp.contains("text/event-stream") && chat_sse_resp.contains("data: [DONE]"),

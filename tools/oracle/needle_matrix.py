@@ -45,7 +45,7 @@ def passes_report(status, measured, policy, window, depth):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="nchapman/Qwen3.8-27B-W4A16-GPTQ")
+    ap.add_argument("--model", default="nchapman/Qwen3.8-27B-W4A16-HGPTQ")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "outputs/needle")
     ap.add_argument("--depths", type=int, nargs="+", default=[50])
     ap.add_argument("--policies", nargs="+", choices=POLICIES, default=list(POLICIES))

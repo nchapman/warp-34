@@ -68,8 +68,8 @@ class CampaignTests(unittest.TestCase):
             'vllm-sr/d3-flash',
             'vllm-sr/d3-turbo',
             'vllm-sr/d3-ultra',
-            'nchapman/Qwen3.5-4B-W4A16-GPTQ',
-            'nchapman/Qwen3.8-27B-W4A16-GPTQ',
+            'nchapman/Qwen3.5-4B-W4A16-HGPTQ',
+            'nchapman/Qwen3.8-27B-W4A16-HGPTQ',
         ):
             self.assertIn(expected, models)
         cases = {c['id']: c for c in cfg['cases']}

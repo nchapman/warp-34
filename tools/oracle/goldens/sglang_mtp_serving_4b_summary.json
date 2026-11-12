@@ -1,7 +1,7 @@
 {
   "image": "lmsysorg/sglang:v0.5.19",
   "image_id": "sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9",
-  "checkpoint": "models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6",
+  "checkpoint": "models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
   "runs": [
     {
       "label": "baseline",

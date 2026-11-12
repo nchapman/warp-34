@@ -12,7 +12,7 @@ import subprocess
 import traceback
 
 IMAGE = 'lmsysorg/sglang:v0.5.19'
-SNAP = 'models--nchapman--Qwen3.5-4B-W4A16-GPTQ/snapshots/d5874365f7093b28b69379722d2f45d660fcbca6'
+SNAP = 'models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a'
 PREFIX = 'sglang_mtp_serving_4b'
 PROMPT = 'The capital of France is'
 

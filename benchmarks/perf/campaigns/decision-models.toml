@@ -240,28 +240,28 @@ launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 ./target/rel
 [[engines]]
 id = "warp34-causallm-4b-tp1"
 cohort = "causal-lm-decision"
-model = "nchapman/Qwen3.5-4B-W4A16-GPTQ"
-model_revision = "94c4c3ca0d822579ac6f013fa0a351908c279282"
-weight_format = "compressed-tensors-GPTQ-int4"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ --revision 94c4c3ca0d822579ac6f013fa0a351908c279282 --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+model = "nchapman/Qwen3.5-4B-W4A16-HGPTQ"
+model_revision = "493bf19cf3b9947d55320c93cb0f8d4c187a9083"
+weight_format = "HGPTQ-W4A16"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --revision 493bf19cf3b9947d55320c93cb0f8d4c187a9083 --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-causallm-27b-tp1"
 cohort = "causal-lm-decision"
-model = "nchapman/Qwen3.8-27B-W4A16-GPTQ"
-model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
-weight_format = "compressed-tensors-GPTQ-int4"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-GPTQ --revision 0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+weight_format = "HGPTQ-W4A16"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --revision ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-causallm-27b-tp2"
 cohort = "causal-lm-decision"
 gpu_count = 2
 parallelism = "tp2"
-model = "nchapman/Qwen3.8-27B-W4A16-GPTQ"
-model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
-weight_format = "compressed-tensors-GPTQ-int4"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-GPTQ --revision 0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 2 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
+model = "nchapman/Qwen3.8-27B-W4A16-HGPTQ"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+weight_format = "HGPTQ-W4A16"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0,1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --revision ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 2 --kv-format fp16 --kv-pages 256 --host 127.0.0.1 --port 18034"
 
 # ---------------------------------------------------------------------------
 # JevBench Cases (from https://github.com/fstandhartinger/jevbench)

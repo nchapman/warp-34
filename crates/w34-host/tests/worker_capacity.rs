@@ -16,16 +16,13 @@ static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn serving_sixteen_requests_reach_b16() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-        "serving_sixteen_requests_reach_b16",
-    )
-    .is_none()
+    if common::require_or_skip_cached_model("Qwen/Qwen3.5-4B", "serving_sixteen_requests_reach_b16")
+        .is_none()
     {
         return;
     }
     let worker = EngineWorker::from_loader(|| {
-        let engine = Qwen3_5Engine::load_for_serving("nchapman/Qwen3.5-4B-W4A16-GPTQ", 1, KvFormatPolicy::Tq4, Some(256), true, 16)
+        let engine = Qwen3_5Engine::load_for_serving("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(256), true, 16)
             .map_err(|e| e.to_string())?;
         let rank = &engine.ranks[0];
         let state_bytes: usize = rank.state_pool.layers.iter()

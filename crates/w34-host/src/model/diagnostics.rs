@@ -325,6 +325,28 @@ impl Qwen3_5Engine {
             Ok((err_sq / ref_sq.max(1e-30)).sqrt())
         };
 
+        let d_x_routed = if moe.routed_input_hadamard > 0 {
+            let buf = DeviceBuffer::alloc(dev_id, m * h * 2)?;
+            buf.copy_from_host(&hidden_f16, stream)?;
+            let ex0 = stream.exec(0, 0);
+            check_rc(
+                // SAFETY: `buf` is a distinct `m * h` FP16 buffer on `dev_id`.
+                unsafe {
+                    ffi::w34_block_hadamard_inplace_f16(
+                        &ex0,
+                        buf.addr() as *mut c_void,
+                        m as i32,
+                        h as i32,
+                        moe.routed_input_hadamard as i32,
+                    )
+                },
+                "w34_block_hadamard_inplace_f16 (verify_moe_layer0_golden)",
+            )?;
+            Some(buf)
+        } else {
+            None
+        };
+
         let run_same_route =
             |use_scratch: bool, with_shared: bool, reference: &[f32]| -> Result<f64> {
                 let ex = if use_scratch {
@@ -340,15 +362,17 @@ impl Qwen3_5Engine {
                 } else {
                     (core::ptr::null(), core::ptr::null())
                 };
+                let x_routed_ptr =
+                    d_x_routed.as_ref().map_or(d_x.addr(), |buf| buf.addr()) as *const c_void;
                 check_rc(
                     // SAFETY: fixture shapes and route IDs were checked above;
                     // these distinct DeviceBuffers have M/H/K-sized extents and
                     // remain live through the synchronized output read. Weights
                     // belong to the loaded layer; absent shared inputs are null.
                     unsafe {
-                        ffi::w34_moe_w4a16_mlp_f16(
+                        ffi::w34_moe_w4a16_mlp_ex_f16(
                             &ex,
-                            d_x.addr() as *const c_void,
+                            x_routed_ptr,
                             *gate_up_packed_ptr as *const u32,
                             *gate_up_scales_ptr as *const c_void,
                             *down_packed_ptr as *const u32,
@@ -365,9 +389,10 @@ impl Qwen3_5Engine {
                             moe.local_moe_interm as i32,
                             h as i32,
                             *group_size as i32,
+                            moe.routed_down_hadamard as i32,
                         )
                     },
-                    "w34_moe_w4a16_mlp_f16 (verify_moe_layer0_golden)",
+                    "w34_moe_w4a16_mlp_ex_f16 (verify_moe_layer0_golden)",
                 )?;
                 let mut got = vec![0u16; m * h];
                 d_out.copy_to_host(&mut got, stream)?;

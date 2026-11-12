@@ -19,7 +19,7 @@ static GPU_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn invalid_vision_request_does_not_abort_text_peer() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "invalid_vision_request_does_not_abort_text_peer",
     )
     .is_none()
@@ -28,14 +28,8 @@ fn invalid_vision_request_does_not_abort_text_peer() {
     }
     let _gpu = GPU_LOCK.lock().unwrap();
     let state = OpenAiServerState::from_loader("vision-isolation".into(), false, || {
-        Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Tq4,
-            Some(64),
-            true,
-        )
-        .map_err(|e| e.to_string())
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(64), true)
+            .map_err(|e| e.to_string())
     })
     .unwrap();
     tokio::runtime::Builder::new_current_thread()
@@ -118,7 +112,7 @@ fn invalid_vision_request_does_not_abort_text_peer() {
 #[test]
 fn kv_pressure_queues_newcomers_without_failing_running_requests() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "kv_pressure_queues_newcomers_without_failing_running_requests",
     )
     .is_none()
@@ -127,14 +121,8 @@ fn kv_pressure_queues_newcomers_without_failing_running_requests() {
     }
     let _gpu = GPU_LOCK.lock().unwrap();
     let state = OpenAiServerState::from_loader("isolation".into(), false, || {
-        Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Tq4,
-            Some(64),
-            true,
-        )
-        .map_err(|e| e.to_string())
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(64), true)
+            .map_err(|e| e.to_string())
     })
     .unwrap();
     tokio::runtime::Builder::new_current_thread()
@@ -186,7 +174,7 @@ fn kv_pressure_queues_newcomers_without_failing_running_requests() {
 #[test]
 fn axum_live_sse_concurrency_disconnect_backpressure_and_shutdown() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "axum_live_sse_concurrency_disconnect_backpressure_and_shutdown",
     )
     .is_none()
@@ -196,14 +184,8 @@ fn axum_live_sse_concurrency_disconnect_backpressure_and_shutdown() {
     let _gpu = GPU_LOCK.lock().unwrap();
     let state = OpenAiServerState::from_loader("axum-test".into(), false, || {
         assert_eq!(std::thread::current().name(), Some("w34-cuda"));
-        Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Tq4,
-            Some(256),
-            true,
-        )
-        .map_err(|e| e.to_string())
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(256), true)
+            .map_err(|e| e.to_string())
     })
     .unwrap();
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async {
@@ -333,7 +315,7 @@ fn axum_live_sse_concurrency_disconnect_backpressure_and_shutdown() {
 #[test]
 fn legacy_terminal_token_logprobs_live() {
     if common::require_or_skip_cached_model(
-        "nchapman/Qwen3.5-4B-W4A16-GPTQ",
+        "Qwen/Qwen3.5-4B",
         "legacy_terminal_token_logprobs_live",
     )
     .is_none()
@@ -342,14 +324,8 @@ fn legacy_terminal_token_logprobs_live() {
     }
     let _gpu = GPU_LOCK.lock().unwrap();
     let state = OpenAiServerState::from_loader("terminal-test".into(), false, || {
-        Qwen3_5Engine::load(
-            "nchapman/Qwen3.5-4B-W4A16-GPTQ",
-            1,
-            KvFormatPolicy::Tq4,
-            Some(64),
-            true,
-        )
-        .map_err(|e| e.to_string())
+        Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(64), true)
+            .map_err(|e| e.to_string())
     })
     .unwrap();
     tokio::runtime::Builder::new_current_thread()

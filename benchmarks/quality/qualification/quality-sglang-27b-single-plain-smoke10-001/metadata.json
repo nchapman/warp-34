@@ -6,7 +6,7 @@
     "-m",
     "sglang.launch_server",
     "--model-path",
-    "/workspace/.hf_home/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+    "/workspace/.hf_home/hub/models--SergiioB--Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16/snapshots/e28c5f952bdd9abac6420ac3efad651b40d15eb5",
     "--served-model-name",
     "warp34-quality",
     "--dtype",
@@ -44,7 +44,7 @@
     "--port",
     "18034"
   ],
-  "model_revision": "0df81eadcfd59601cb82ccece2f16ea7d39244bf",
+  "model_revision": "e28c5f952bdd9abac6420ac3efad651b40d15eb5",
   "status": "complete",
   "commands": [
     [

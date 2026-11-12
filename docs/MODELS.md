@@ -4,13 +4,13 @@
 
 ```sh
 # Download on first use, then load the model. No Python/CLI dependency.
-w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ
+w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ
 
 # Reproducible deployment: use a full 40-character commit SHA.
 w34 serve --model username/modelname --revision <commit-sha>
 
 # No network access or cache writes; also works with read-only cache mounts.
-w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline
+w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline
 
 # Local directories never contact the Hub.
 w34 generate --model /models/qwen --prompt 'Hello'
@@ -63,7 +63,7 @@ remains the public API model name and the model identifier in benchmark reports.
 Target and draft repositories have **independent revisions**:
 
 ```sh
-w34 serve --model nchapman/Qwen3.5-4B-W4A16-GPTQ \
+w34 serve --model nchapman/Qwen3.5-4B-W4A16-HGPTQ \
   --revision <target-commit> \
   --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 \
   --draft-revision <draft-commit>

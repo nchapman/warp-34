@@ -93,7 +93,7 @@ depends = ["dashboard-build"]
 run = "cargo llvm-cov --features cuda --lib --html"
 
 [tasks."test-prep"]
-description = "Verify and download pinned core test checkpoints (4B GPTQ, 4B DFlash2, clef-flash tokenizer)"
+description = "Verify and download pinned core test checkpoints (4B FP16, 4B DFlash2)"
 run = "python3 tools/prep_test_models.py"
 
 [tasks."test-prep-all"]
@@ -137,29 +137,29 @@ run = "python3 tools/oracle/needle_matrix.py"
 description = "Run w34 dump-diff TP=1 vs TP=2 parity across plain, Vision, MTP, DFlash2, and 35B-A3B MoE"
 depends = ["build"]
 run = """
-./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --compare-tp2
-./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --image rgb://https://w34.test/sample.ppm --compare-tp2
-./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --speculative mtp --mtp-k 3 --compare-tp2
-./target/release/w34 dump-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --compare-tp2
-./target/release/w34 dump-diff --model llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4 --kv-format tq4 --kv-pages 64 --compare-tp2
-./target/release/w34 dump-diff --model llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4 --kv-format tq4 --kv-pages 64 --speculative mtp --mtp-k 3 --compare-tp2
+./target/release/w34 dump-diff --model Qwen/Qwen3.5-4B --kv-format tq4 --compare-tp2
+./target/release/w34 dump-diff --model Qwen/Qwen3.5-4B --kv-format tq4 --image rgb://https://w34.test/sample.ppm --compare-tp2
+./target/release/w34 dump-diff --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative mtp --mtp-k 3 --compare-tp2
+./target/release/w34 dump-diff --model Qwen/Qwen3.5-4B --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --compare-tp2
+./target/release/w34 dump-diff --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --kv-format tq4 --kv-pages 64 --compare-tp2
+./target/release/w34 dump-diff --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --kv-format tq4 --kv-pages 64 --speculative mtp --mtp-k 3 --compare-tp2
 """
 
 [tasks."oracle-greedy"]
 description = "Run w34 greedy-diff with boundary-anchored TQ4, lossless speculative, and warm radix verification"
 depends = ["build"]
 run = """
-./target/release/w34 greedy-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --kv-format tq4 --speculative mtp --mtp-k 3 --verify-lossless --verify-radix-warm
-./target/release/w34 greedy-diff --model nchapman/Qwen3.5-4B-W4A16-GPTQ --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --verify-lossless --verify-radix-warm
+./target/release/w34 greedy-diff --model Qwen/Qwen3.5-4B --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --kv-format tq4 --speculative mtp --mtp-k 3 --verify-lossless --verify-radix-warm
+./target/release/w34 greedy-diff --model Qwen/Qwen3.5-4B --golden tools/oracle/goldens/4B --max-prompts 4 --max-tokens 32 --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2 --verify-lossless --verify-radix-warm
 """
 
 [tasks."bench-all"]
 description = "Run multi-stage w34 bench (decode + radix + 2-turn multi-client scheduler + vision) across 4B, 27B, 35B-A3B MoE, and Qwen3.8-Flash-Next (plain, MTP-3, DFlash2)"
 depends = ["build"]
 run = """
-./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8
-./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8 --speculative mtp --mtp-k 3
-./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-GPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
+./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8
+./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8 --speculative mtp --mtp-k 3
+./target/release/w34 bench --offline --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --stage all --kv-format tq4 --prompt-len 128 --gen-len 128 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
 ./target/release/w34 bench --offline --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8
 ./target/release/w34 bench --offline --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative mtp --mtp-k 3
 ./target/release/w34 bench --offline --model nchapman/Qwen3.8-27B-W4A16-HGPTQ --tp 2 --stage all --kv-format tq4 --kv-pages 512 --prompt-len 64 --gen-len 64 --batch-size 8 --speculative dflash2 --draft-model nchapman/Qwen3.8-27B-DFlash2-W4A16-HGPTQ
@@ -174,8 +174,8 @@ run = """
 description = "Capture live nsys SQLite profiles and render category scoreboards vs vLLM/SGLang"
 depends = ["build"]
 run = """
-./target/release/w34 profile-diff --live --preset vllm_4b_tp1_decode --model nchapman/Qwen3.5-4B-W4A16-GPTQ --tp 1 --kv-format tq4
-./target/release/w34 profile-diff --live --preset vllm_4b_tp1_mtp_k3 --model nchapman/Qwen3.5-4B-W4A16-GPTQ --tp 1 --kv-format tq4 --speculative mtp --mtp-k 3
-./target/release/w34 profile-diff --live --preset sglang_4b_tp1_dflash2_m16 --model nchapman/Qwen3.5-4B-W4A16-GPTQ --tp 1 --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
-./target/release/w34 profile-diff --live --preset vllm_35b_moe_tp2_decode --model llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4 --tp 2 --kv-format tq4 --kv-pages 128
+./target/release/w34 profile-diff --live --preset vllm_4b_tp1_decode --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --tp 1 --kv-format tq4
+./target/release/w34 profile-diff --live --preset vllm_4b_tp1_mtp_k3 --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --tp 1 --kv-format tq4 --speculative mtp --mtp-k 3
+./target/release/w34 profile-diff --live --preset sglang_4b_tp1_dflash2_m16 --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --tp 1 --kv-format tq4 --speculative dflash2 --draft-model nchapman/Qwen3.5-4B-DFlash2
+./target/release/w34 profile-diff --live --preset vllm_35b_moe_tp2_decode --model nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ --tp 2 --kv-format tq4 --kv-pages 128
 """

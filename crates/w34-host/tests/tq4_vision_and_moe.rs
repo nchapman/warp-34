@@ -848,14 +848,12 @@ fn live_qwen3_vision_encoder_and_multimodal_radix_cache() {
     if !common::require_or_skip_gpus(1, test_name) {
         return;
     }
-    let Some(dir) =
-        common::require_or_skip_cached_model("nchapman/Qwen3.5-4B-W4A16-GPTQ", test_name)
-    else {
+    let Some(dir) = common::require_or_skip_cached_model("Qwen/Qwen3.5-4B", test_name) else {
         return;
     };
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut eng = Qwen3_5Engine::load_from_dir(&dir, 1, KvFormatPolicy::Tq4, Some(128), false)
-        .expect("load Qwen3.5-4B-W4A16-GPTQ for vision test");
+        .expect("load Qwen/Qwen3.5-4B for vision test");
 
     // Create two distinct 64x64 RGB images (each produces a 1x4x4 patch grid -> 4 merged visual tokens).
     let mut rgb_a = vec![0u8; 64 * 64 * 3];
@@ -921,7 +919,7 @@ fn moe_checkpoint_config_and_dense_f16_tp_parity() {
 
     // 1. Verify Qwen3.6-35B-A3B MoE checkpoint config parsing if cached on disk
     if let Some(dir) = common::require_or_skip_cached_model(
-        "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4",
+        "nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ",
         "moe_checkpoint_config_and_dense_f16_tp_parity",
     ) {
         let cfg = ModelConfig::from_dir(&dir).expect("parse 35B-A3B MoE config");

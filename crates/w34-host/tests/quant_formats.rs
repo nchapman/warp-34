@@ -19,17 +19,14 @@ fn cached_hf_quantized_and_unquantized_checkpoints() {
     let cases = [
         ("Qwen/Qwen3.5-4B", 1),
         ("cyankiwi/Qwen3.5-9B-AWQ-4bit", 1),
-        ("nchapman/Qwen3.8-27B-W4A16-GPTQ", 2),
+        ("nchapman/Qwen3.8-27B-W4A16-HGPTQ", 2),
         ("cyankiwi/Qwen3.8-27B-AWQ-INT4", 2),
         ("TheUnderscore/Swift-Qwen3.8-27b-W4A16-AWQ", 2),
         ("Lorbus/Qwen3.6-27B-int4-AutoRound", 2),
         ("lued/Qwen3.8-27B-INT8-W8A16-DFlash2", 2),
         ("cyankiwi/Ornith-1.5-35B-A3B-AWQ-INT4", 2),
         ("biMEMO/Ornith-1.5-35B-A3B-int4-AutoRound-MTP", 2),
-        (
-            "llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GPTQ-Int4",
-            2,
-        ),
+        ("nchapman/Qwen3.6-35B-A3B-W4A16-HGPTQ", 2),
     ];
     let mut failures = Vec::new();
     for (model, tp) in cases {

@@ -10,7 +10,7 @@ long-SWE-session qualification, answer-quality result, or production sign-off.
   `feat/extended-workload-soak` (source digest below).
 - Hardware: one RTX 3090 Ti, driver `615.71.09`, `CUDA_VISIBLE_DEVICES=0`;
   `CUDA_DISABLE_PTX_JIT=1`. Other card unused. GPUs idle before the campaign.
-- Model: `nchapman/Qwen3.5-4B-W4A16-GPTQ`, cached revision
+- Model: `nchapman/Qwen3.5-4B-W4A16-HGPTQ`, cached revision
   `d5874365f7093b28b69379722d2f45d660fcbca6`; TP1, TQ4, no speculation,
   greedy sampling, thinking disabled.
 - Fresh server: 4096 KV pages, max 8 active sequences, max context 8192.
@@ -125,7 +125,7 @@ Server (repository root):
 
 ```sh
 CUDA_VISIBLE_DEVICES=0 CUDA_DISABLE_PTX_JIT=1 ./target/release/w34 serve \
-  --model nchapman/Qwen3.5-4B-W4A16-GPTQ --offline --kv-format tq4 \
+  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline --kv-format tq4 \
   --kv-pages 4096 --max-num-seqs 8 --max-model-len 8192 --port 18834
 ```
 

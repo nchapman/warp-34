@@ -1,6 +1,6 @@
 # Single-card 262K (16384 pages = 262,144 tokens) Open-SWE-Traces coding-agent benchmark
 # on 1x 24 GiB RTX 3090 Ti (TP=1, default --kv-format tq4):
-# Qwen3.8-27B-W4A16-GPTQ (0df81eadcfd59601cb82ccece2f16ea7d39244bf) from 60K -> 120K -> 252K context.
+# Qwen3.8-27B-W4A16-HGPTQ (ae51987e3339a2a70070702548571e10fe8bcbc2) from 60K -> 120K -> 252K context.
 # vLLM's measured 65,536-token TP=1 launch OOMs. SGLang TP=1 is excluded here;
 # its full 262K FP16 KV plus weights exceed one 24 GiB card.
 schema_version = 1
@@ -16,7 +16,7 @@ timeout_s = 720
 cohort = "27b-0df-tp1-262k-open-swe-sm86"
 gpu_count = 1
 parallelism = "TP=1"
-model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
 weight_format = "compressed-tensors-GPTQ-int4"
 activation_dtype = "float16"
 conv_state_dtype = "float16"
@@ -28,10 +28,10 @@ engine = "warp-34"
 support = "supported"
 version = "0.1.0+prefill64q"
 base_url = "http://127.0.0.1:18034/v1"
-model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2"
 kv_format = "tq4"
 cache_config = "TQ4 (3.07x, 21376 B/tok) 16384 pages (262144 tokens = 5.22 GiB KV) on 1x 24 GiB RTX 3090 Ti, FP32 SSM, hybrid GDN+KV radix cache"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4 --kv-pages 16384 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "warp34-27b-tp1-tq4all-262k"
@@ -39,10 +39,10 @@ engine = "warp-34"
 support = "supported"
 version = "0.1.0+prefill64q"
 base_url = "http://127.0.0.1:18035/v1"
-model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2"
 kv_format = "tq4_all"
 cache_config = "TQ4_all 16384 pages (262144 tokens, 16896 B/tok), FP32 SSM, hybrid GDN+KV radix cache"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-GPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format tq4_all --kv-pages 16384 --host 127.0.0.1 --port 18035"
 
 [[engines]]
 id = "vllm-27b-tp1-fp16"
