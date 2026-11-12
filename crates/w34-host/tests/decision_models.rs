@@ -308,6 +308,8 @@ fn decision_endpoints_verify_glide_d3_causal_lm_and_gpu_seams() {
             temperature_by_questions: Vec::new(),
             state_once: false,
             prefix_bidir: false,
+            noncausal_full_attention: false,
+            midloop: Vec::new(),
             header_v1: false,
             max_seq_len: 4096,
             system_prompt: GLIDE_SYSTEM_PROMPT.to_owned(),

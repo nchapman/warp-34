@@ -521,6 +521,7 @@ impl SchedulerV1 {
             .filter(|seq| !seq.finished && !seq.is_prefill_complete() && !seq.custom_prefill)
             .count();
         let mut batch_noncausal: Option<bool> = (!batch.is_empty()).then_some(false);
+        let mut batch_noncausal_lora: Option<i32> = None;
         for seq in &self.active {
             if seq.finished || seq.is_prefill_complete() || seq.custom_prefill {
                 continue;
@@ -534,6 +535,13 @@ impl SchedulerV1 {
                 .is_some_and(|bidir_end| start < bidir_end || seq.max_new_tokens <= 1);
             if let Some(expected_nc) = batch_noncausal
                 && seq_noncausal != expected_nc
+            {
+                pending_prefills -= 1;
+                continue;
+            }
+            if seq_noncausal
+                && let Some(expected_lid) = batch_noncausal_lora
+                && seq.lora_id != expected_lid
             {
                 pending_prefills -= 1;
                 continue;
@@ -601,6 +609,9 @@ impl SchedulerV1 {
                 seq.radix_state.plan_checkpoints(query_tokens.len())
             };
             batch_noncausal = Some(seq_noncausal);
+            if seq_noncausal {
+                batch_noncausal_lora = Some(seq.lora_id);
+            }
 
             batch.push(ScheduledReqSlice {
                 req_id: seq.req_id,

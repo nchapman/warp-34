@@ -343,6 +343,20 @@ impl Qwen3_5ModelRank {
         self.decode_graph = None;
         self.spec_verify_graph = None;
         self.batched_decode_graphs.clear();
+        if !adapters.is_empty() {
+            let target_scratch = if adapters
+                .iter()
+                .any(|ad| ad.midloop.iter().any(|&(_, _, passes)| passes > 1))
+            {
+                960 * 1024 * 1024
+            } else {
+                crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+            };
+            if self.scratch_arena.capacity() < target_scratch {
+                self.scratch_arena = DeviceArena::new(self.device.device_id, 4096)?;
+                self.scratch_arena = DeviceArena::new(self.device.device_id, target_scratch)?;
+            }
+        }
         self.lora_runtime = crate::lora::attach_lora_to_rank(
             &self.cfg,
             self.rank,

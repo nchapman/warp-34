@@ -38,11 +38,66 @@ pub(super) fn alloc_ple_runtime(
 
 #[cfg(feature = "cuda")]
 impl Qwen3_5ModelRank {
+    /// Returns the active damped-Euler `midloop` `(start_layer, end_layer, passes)` specs
+    /// for the currently bound LoRA adapter (falling back to `&self.cfg.midloop` when
+    /// `lora_id == -1` or when the active adapter defines no `midloop`).
+    pub fn active_midloop_specs(&self) -> &[(usize, usize, usize)] {
+        if let Some(rt) = &self.lora_runtime {
+            let lid = rt
+                .state
+                .default_lora_id
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if lid >= 0
+                && let Some(ml) = rt.adapter_midloops.get(lid as usize)
+                && !ml.is_empty()
+            {
+                return ml.as_slice();
+            }
+        }
+        &self.cfg.midloop
+    }
+
+    /// Returns whether the base model or any attached LoRA adapter configures multi-pass `midloop`.
+    pub fn any_midloop_configured(&self) -> bool {
+        self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+            || self.lora_runtime.as_ref().is_some_and(|rt| {
+                rt.adapter_midloops
+                    .iter()
+                    .any(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
+            })
+    }
+
+    /// Returns the worst-case number of GDN layers inside any single `midloop` span across
+    /// the base model and all attached LoRA adapters.
+    pub fn max_midloop_span_gdn_layers(&self) -> usize {
+        let span_gdn = |specs: &[(usize, usize, usize)]| -> usize {
+            specs
+                .iter()
+                .filter(|&&(_, _, passes)| passes > 1)
+                .map(|&(a, b, _)| {
+                    self.state_pool
+                        .layers
+                        .iter()
+                        .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let mut max_gdn = span_gdn(&self.cfg.midloop);
+        if let Some(rt) = &self.lora_runtime {
+            for ml in &rt.adapter_midloops {
+                max_gdn = max_gdn.max(span_gdn(ml));
+            }
+        }
+        max_gdn
+    }
+
     /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph.
     pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
         if self.lm_head.is_none()
             || self.cfg.noncausal_full_attention
-            || self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+            || self.any_midloop_configured()
         {
             return false;
         }
@@ -284,32 +339,19 @@ impl Qwen3_5ModelRank {
     pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
         let max_chunks = if self.cfg.uses_tiered_moe() {
             96
-        } else if self.cfg.requires_atomic_prefix_prefill() {
+        } else if self.cfg.requires_atomic_prefix_prefill() || self.lora_runtime.is_some() {
             64
         } else {
             32
         };
-        let has_active_midloop = self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
+        let has_active_midloop = self.any_midloop_configured();
         let midloop_gdn_snap_bytes: usize =
             if has_active_midloop && let Some(first_st) = self.state_pool.layers.first() {
                 let total_slots = self.state_pool.total_slots.max(1);
                 let conv_slot_b = first_st.conv_state.len_bytes / total_slots;
                 let ssm_slot_b = first_st.ssm_state.len_bytes / total_slots;
                 let active_slots = max_num_seqs.clamp(1, total_slots);
-                let max_span_gdn = self
-                    .cfg
-                    .midloop
-                    .iter()
-                    .filter(|&&(_, _, passes)| passes > 1)
-                    .map(|&(a, b, _)| {
-                        self.state_pool
-                            .layers
-                            .iter()
-                            .filter(|st| st.layer_id >= a && st.layer_id <= b)
-                            .count()
-                    })
-                    .max()
-                    .unwrap_or(0);
+                let max_span_gdn = self.max_midloop_span_gdn_layers();
                 max_span_gdn.saturating_mul(
                     active_slots
                         .saturating_mul(conv_slot_b.saturating_add(ssm_slot_b))

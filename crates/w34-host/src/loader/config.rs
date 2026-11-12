@@ -302,7 +302,7 @@ impl ModelConfig {
         Ok(cfg)
     }
 
-    fn parse_midloop_specs(
+    pub(crate) fn parse_midloop_specs(
         val: &Json,
         num_hidden_layers: usize,
     ) -> io::Result<Vec<(usize, usize, usize)>> {

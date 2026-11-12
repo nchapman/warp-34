@@ -27,6 +27,7 @@ pub use scoring::{
 
 pub const MAX_SYSTEMONE_QUESTIONS: usize = 64;
 pub const MAX_SYSTEMONE_ANSWERS: usize = 64;
+pub const MAX_READOUT_CODES: usize = 1024;
 pub const TEV1_MAX_OPTIONS: usize = 24;
 
 pub const ANSWER_BOUNDARY: &str = "\n\n";
@@ -286,6 +287,8 @@ pub struct CodeReadoutConfig {
     pub temperature_by_questions: Vec<(usize, f64)>,
     pub state_once: bool,
     pub prefix_bidir: bool,
+    pub noncausal_full_attention: bool,
+    pub midloop: Vec<(usize, usize, usize)>,
     pub header_v1: bool,
     pub max_seq_len: usize,
     pub system_prompt: String,
@@ -301,6 +304,8 @@ impl CodeReadoutConfig {
         self.temperature
     }
 }
+
+pub type VocabRowReader<'a> = dyn Fn(&[usize]) -> Result<Vec<f32>, String> + 'a;
 
 #[derive(Clone, Debug)]
 pub enum DecisionModelProfile {
@@ -344,6 +349,15 @@ impl DecisionModelProfile {
         dir: &Path,
         cfg: &ModelConfig,
         main_archive: Option<&SafetensorsArchive>,
+    ) -> Result<Self, String> {
+        Self::from_dir_and_config_with_fallback(dir, cfg, main_archive, None)
+    }
+
+    pub fn from_dir_and_config_with_fallback(
+        dir: &Path,
+        cfg: &ModelConfig,
+        main_archive: Option<&SafetensorsArchive>,
+        vocab_row_reader: Option<&VocabRowReader<'_>>,
     ) -> Result<Self, String> {
         if dir.join("joint_config.json").is_file() {
             return Err(
@@ -403,8 +417,50 @@ impl DecisionModelProfile {
                 let ro_arch = SafetensorsArchive::open(&readout_path)
                     .map_err(|e| format!("open {}: {e}", readout_path.display()))?;
                 CodeReadoutHead::from_archive(&ro_arch, cfg.hidden_size)?
-            } else if let Some(arch) = main_archive {
+            } else if has_readout_in_main && let Some(arch) = main_archive {
                 CodeReadoutHead::from_archive(arch, cfg.hidden_size)?
+            } else if let Some(dc) = &inline_dc
+                && let Some(tok_arr) = dc.get("token_ids").and_then(Value::as_array)
+                && !tok_arr.is_empty()
+                && let Some(reader) = vocab_row_reader
+            {
+                if tok_arr.len() > MAX_READOUT_CODES {
+                    return Err(format!(
+                        "code_readout: token_ids length {} exceeds maximum {MAX_READOUT_CODES}",
+                        tok_arr.len()
+                    ));
+                }
+                let mut token_ids = Vec::with_capacity(tok_arr.len());
+                for v in tok_arr {
+                    let id = v.as_u64().ok_or_else(|| {
+                        "code_readout: token_ids must be unsigned integers".to_string()
+                    })? as usize;
+                    token_ids.push(id);
+                }
+                let weight = reader(&token_ids)?;
+                let head = CodeReadoutHead {
+                    hidden_size: cfg.hidden_size,
+                    num_codes: token_ids.len(),
+                    weight,
+                    bias: None,
+                };
+                head.validate_shapes()?;
+                head
+            } else if let Some(dc) = &inline_dc
+                && dc
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.eq_ignore_ascii_case("causal_lm"))
+            {
+                let temperature = dc
+                    .get("temperature")
+                    .and_then(Value::as_f64)
+                    .or(cfg.decision_meta.decision_temperature)
+                    .unwrap_or(1.0);
+                if !(temperature > 0.0 && temperature.is_finite()) {
+                    return Err("CausalLm: decision_temperature must be positive and finite".into());
+                }
+                return Ok(Self::CausalLm { temperature });
             } else {
                 return Err(
                     "CodeReadout model requires readout.safetensors (readout.weight)".into(),
@@ -524,15 +580,13 @@ impl DecisionModelProfile {
                 cfg.noncausal_full_attention
                     || attn_mode.eq_ignore_ascii_case("noncausal_full_attention")
             });
-        let has_midloop = cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
-            || dc
-                .get("midloop")
-                .and_then(Value::as_array)
-                .is_some_and(|a| !a.is_empty())
-            || dc
-                .get("midloop")
-                .and_then(Value::as_object)
-                .is_some_and(|m| m.get("passes").and_then(Value::as_u64).unwrap_or(1) > 1);
+        let midloop = if let Some(ml_val) = dc.get("midloop").filter(|v| !v.is_null()) {
+            ModelConfig::parse_midloop_specs(ml_val, cfg.num_hidden_layers)
+                .map_err(|e| format!("code_readout: {e}"))?
+        } else {
+            cfg.midloop.clone()
+        };
+        let has_midloop = midloop.iter().any(|&(_, _, passes)| passes > 1);
         let prefix_bidir = dc
             .get("prefix_bidir")
             .and_then(Value::as_bool)
@@ -566,6 +620,8 @@ impl DecisionModelProfile {
             temperature_by_questions,
             state_once,
             prefix_bidir,
+            noncausal_full_attention,
+            midloop,
             header_v1,
             max_seq_len,
             system_prompt,

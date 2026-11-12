@@ -341,25 +341,35 @@ async fn execute_systemone_json(
         .or_else(|| body.get("adapter"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let req_model_hint = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let (lora_id, resolved_model) = s
+        .resolve_request_lora(req_model_hint.as_deref(), explicit_lora.as_deref())
+        .map_err(bad)?;
     let prep_state = s.clone();
     let (req_model, batch, images) = cpu(s, move || {
         Ok::<_, String>((|| {
             let Some(tokenizer) = prep_state.worker.tokenizer.as_ref() else {
                 return Err(bad("loaded model has no tokenizer"));
             };
+            let decision_profile = prep_state
+                .worker
+                .lora_registry
+                .decision_profile(lora_id)
+                .unwrap_or(&prep_state.worker.decision_profile);
             let vctx = crate::decision::DecisionVisionContext {
                 vision_config: prep_state.worker.vision_config.clone(),
                 has_vision_weights: prep_state.worker.has_vision_weights,
                 allow_remote_images: prep_state.allow_remote_images,
             };
-            let images = crate::decision::parse_decision_images(
-                &body,
-                &prep_state.worker.decision_profile,
-                &vctx,
-            )
-            .map_err(decision_err)?;
+            let images = crate::decision::parse_decision_images(&body, decision_profile, &vctx)
+                .map_err(decision_err)?;
             let (req_model, batch) = crate::decision::prepare_decision_batch_with_images(
-                &prep_state.worker.decision_profile,
+                decision_profile,
                 tokenizer,
                 prep_state.worker.kv_token_capacity,
                 &body,
@@ -371,10 +381,6 @@ async fn execute_systemone_json(
         })())
     })
     .await??;
-
-    let (lora_id, resolved_model) = s
-        .resolve_request_lora(req_model.as_deref(), explicit_lora.as_deref())
-        .map_err(bad)?;
 
     let mut answers = serde_json::Map::new();
     let mut input_tokens = 0usize;

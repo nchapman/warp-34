@@ -142,8 +142,28 @@ pub fn resolve_lora_adapter(
             )));
         }
     }
+    let optional_candidates: Vec<String> = match &subfolder {
+        Some(sub) => vec![
+            format!("{sub}/decision_config.json"),
+            format!("{sub}/readout.safetensors"),
+        ],
+        None => vec![
+            "decision_config.json".to_string(),
+            "readout.safetensors".to_string(),
+        ],
+    };
+    let mut optional_files = Vec::new();
+    for opt in optional_candidates {
+        safe_path(&opt)?;
+        if available.contains(&opt) {
+            optional_files.push(opt);
+        }
+    }
     let reporter = progress::Reporter::new(progress)?;
     let snap_dir = fetch_files(&repo, &commit, &required, &reporter)?;
+    if !optional_files.is_empty() {
+        let _ = fetch_files(&repo, &commit, &optional_files, &reporter);
+    }
     let adapter_dir = match &subfolder {
         Some(sub) => snap_dir.join(sub),
         None => snap_dir,

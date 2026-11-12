@@ -789,6 +789,8 @@ fn decision_images_and_batch_preparation_for_glide_d3_and_causal_lm() {
             temperature_by_questions: Vec::new(),
             state_once: true,
             prefix_bidir: true,
+            noncausal_full_attention: false,
+            midloop: Vec::new(),
             header_v1: true,
             max_seq_len: 4096,
             system_prompt: GLIDE_SYSTEM_PROMPT.to_owned(),
@@ -837,6 +839,8 @@ fn decision_images_and_batch_preparation_for_glide_d3_and_causal_lm() {
             temperature_by_questions: Vec::new(),
             state_once: true,
             prefix_bidir: false,
+            noncausal_full_attention: false,
+            midloop: Vec::new(),
             header_v1: true,
             max_seq_len: 4096,
             system_prompt: GLIDE_SYSTEM_PROMPT.to_owned(),
@@ -861,4 +865,134 @@ fn decision_images_and_batch_preparation_for_glide_d3_and_causal_lm() {
         dump_python_json(&json!({"big": 1e20, "tiny": 1.5e-7})).unwrap(),
         r#"{"big": 1e+20, "tiny": 1.5e-07}"#
     );
+}
+
+#[test]
+fn d3_noncausal_full_attention_sets_full_prompt_bidir_len() {
+    let tok = synthetic_decision_tokenizer();
+    let d3_req = json!({
+        "state": "Sky is blue",
+        "order_passes": 2,
+        "questions": {
+            "q1": {"type": "noul", "instructions": "Is sky blue?"},
+            "q2": {"type": "choice", "instructions": "Pick color", "criteria": {"blue": "Blue", "red": "Red"}}
+        }
+    });
+    for state_once in [false, true] {
+        for prefix_bidir in [false, true] {
+            let d3_nc_profile = DecisionModelProfile::CodeReadout {
+                head: Arc::new(CodeReadoutHead {
+                    hidden_size: 4,
+                    num_codes: 4,
+                    weight: vec![0.1; 16],
+                    bias: None,
+                }),
+                config: CodeReadoutConfig {
+                    style: CodeReadoutStyle::D3,
+                    codes: vec!["A".into(), "B".into(), "C".into(), "D".into()],
+                    temperature: 0.7,
+                    temperature_by_questions: Vec::new(),
+                    state_once,
+                    prefix_bidir,
+                    noncausal_full_attention: true,
+                    midloop: Vec::new(),
+                    header_v1: true,
+                    max_seq_len: 4096,
+                    system_prompt: GLIDE_SYSTEM_PROMPT.to_owned(),
+                },
+            };
+            let (_, d3_nc_batch) =
+                prepare_decision_batch(&d3_nc_profile, &tok, 4096, &d3_req).unwrap();
+            if let PreparedDecisionBatch::CodeReadout {
+                forward_queries,
+                reverse_queries,
+                ..
+            } = d3_nc_batch
+            {
+                for q in forward_queries
+                    .iter()
+                    .chain(reverse_queries.as_ref().unwrap().iter())
+                {
+                    assert_eq!(q.prefix_bidir_len, Some(q.token_ids.len()));
+                    assert_eq!(q.prefix_cap, Some(0));
+                }
+            } else {
+                panic!("expected CodeReadout");
+            }
+        }
+    }
+
+    // Verify `from_dir_and_config_with_fallback` for `token_ids` reader, `MAX_READOUT_CODES` cap,
+    // and `mode: "causal_lm"`:
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = crate::loader::ModelConfig::from_json(&json!({
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": "qwen3_5_text",
+        "vocab_size": 64,
+        "hidden_size": 4,
+        "intermediate_size": 8,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "rms_norm_eps": 1e-6,
+        "layer_types": ["full_attention"]
+    }))
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("decision_config.json"),
+        json!({
+            "format_version": 1,
+            "prompt": "d3",
+            "attention_mode": "noncausal_full_attention",
+            "codes": ["A", "B"],
+            "token_ids": [10, 11],
+            "temperature": 0.8
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let reader = |ids: &[usize]| -> Result<Vec<f32>, String> { Ok(vec![0.25f32; ids.len() * 4]) };
+    let prof = DecisionModelProfile::from_dir_and_config_with_fallback(
+        tmp.path(),
+        &cfg,
+        None,
+        Some(&reader),
+    )
+    .unwrap();
+    assert_eq!(prof.family_name(), "d3");
+
+    let too_many_ids: Vec<usize> = (0..=MAX_READOUT_CODES).collect();
+    std::fs::write(
+        tmp.path().join("decision_config.json"),
+        json!({
+            "format_version": 1,
+            "codes": ["A", "B"],
+            "token_ids": too_many_ids
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let err = DecisionModelProfile::from_dir_and_config_with_fallback(
+        tmp.path(),
+        &cfg,
+        None,
+        Some(&reader),
+    )
+    .unwrap_err();
+    assert!(err.contains("exceeds maximum"));
+
+    std::fs::write(
+        tmp.path().join("decision_config.json"),
+        json!({
+            "mode": "causal_lm",
+            "temperature": 0.65
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let prof_clm =
+        DecisionModelProfile::from_dir_and_config_with_fallback(tmp.path(), &cfg, None, None)
+            .unwrap();
+    assert_eq!(prof_clm.family_name(), "causal_lm");
 }

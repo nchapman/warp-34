@@ -38,7 +38,8 @@ impl Qwen3_5ModelRank {
         } else {
             0
         };
-        let has_active_midloop = self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
+        let midloop_specs = self.active_midloop_specs();
+        let has_active_midloop = midloop_specs.iter().any(|&(_, _, passes)| passes > 1);
         let midloop_residual = if has_active_midloop {
             self.scratch_arena.alloc_aligned(rows * streams * h * 2)?
         } else {
@@ -51,8 +52,7 @@ impl Qwen3_5ModelRank {
             let ssm_slot_b = first_st.ssm_state.len_bytes / total_slots;
             let active_slots = self.last_batch_state_slots.len().clamp(1, total_slots);
             let max_span_gdn = self
-                .cfg
-                .midloop
+                .active_midloop_specs()
                 .iter()
                 .filter(|&&(_, _, passes)| passes > 1)
                 .map(|&(a, b, _)| {
@@ -676,8 +676,7 @@ impl Qwen3_5ModelRank {
         while layer_idx < self.layers.len() {
             if active_midloop.is_none()
                 && let Some(&(a, b, passes)) = self
-                    .cfg
-                    .midloop
+                    .active_midloop_specs()
                     .iter()
                     .find(|&&(a, _, passes)| a == layer_idx && passes > 1)
             {
@@ -762,8 +761,7 @@ impl Qwen3_5ModelRank {
             let redo_input_norm = layer.ple.is_some()
                 || active_midloop.is_some_and(|(a, _, _, pass_idx)| layer_idx == a && pass_idx > 0)
                 || self
-                    .cfg
-                    .midloop
+                    .active_midloop_specs()
                     .iter()
                     .any(|&(_, b, passes)| passes > 1 && b + 1 == layer_idx);
             let norm_layer_idx = if redo_input_norm { 0 } else { layer_idx };

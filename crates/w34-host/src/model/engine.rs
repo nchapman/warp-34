@@ -436,11 +436,37 @@ impl Qwen3_5Engine {
                 )
                 .map_err(|e| loader_err_ctx("resolve LoRA adapter", e.to_string()))?,
             };
-            registry
-                .register(spec.name.clone(), spec.path.clone())
-                .map_err(|e| loader_err_msg(e.to_string()))?;
             let host = crate::lora::LoraAdapterHost::load_from_dir(&spec.name, &spec.path, &dir)
                 .map_err(|e| loader_err_ctx("load LoRA adapter", e.to_string()))?;
+            let adapter_st = dir.join("adapter_model.safetensors");
+            let adapter_archive = crate::loader::SafetensorsArchive::open(&adapter_st)
+                .map_err(|e| loader_err_ctx("open LoRA safetensors", e.to_string()))?;
+            let has_decision_files = dir.join("decision_config.json").is_file()
+                || dir.join("readout.safetensors").is_file()
+                || dir.join("joint_config.json").is_file()
+                || adapter_archive.contains("readout.weight")
+                || adapter_archive.contains("weight");
+            let decision_profile = if has_decision_files {
+                let vocab_reader = |ids: &[usize]| self.read_vocab_rows_f32(ids);
+                Some(
+                    crate::decision::DecisionModelProfile::from_dir_and_config_with_fallback(
+                        &dir,
+                        &self.cfg,
+                        Some(&adapter_archive),
+                        Some(&vocab_reader),
+                    )
+                    .map_err(|e| loader_err_ctx("load LoRA decision_profile", e))?,
+                )
+            } else {
+                None
+            };
+            registry
+                .register_with_decision_profile(
+                    spec.name.clone(),
+                    spec.path.clone(),
+                    decision_profile,
+                )
+                .map_err(|e| loader_err_msg(e.to_string()))?;
             host_adapters.push(host);
         }
         for r in &mut self.ranks {
@@ -451,6 +477,19 @@ impl Qwen3_5Engine {
         self.set_active_lora_id(crate::lora::BASE_MODEL_LORA_ID);
         self.slice_lora_ids.clear();
         Ok(())
+    }
+
+    /// Returns `true` if either the base checkpoint or any attached Decision LoRA adapter
+    /// requires atomic bidirectional prefix prefill (`noncausal_full_attention` or `prefix_bidir`).
+    pub fn requires_atomic_prefix_prefill(&self) -> bool {
+        self.cfg.requires_atomic_prefix_prefill()
+            || self.lora_registry.entries().iter().any(|e| {
+                matches!(
+                    &e.decision_profile,
+                    Some(crate::decision::DecisionModelProfile::CodeReadout { config, .. })
+                        if config.prefix_bidir || config.noncausal_full_attention
+                )
+            })
     }
 
     /// Sets the active `lora_id` (`-1` for base model, `0..num_adapters-1` for a loaded adapter)

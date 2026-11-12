@@ -307,7 +307,7 @@ impl EngineWorker {
                     {
                         clamped_cfg.max_num_batched_tokens = 6144;
                         clamped_cfg.chunk_prefill_size = 6144;
-                    } else if engine.cfg.requires_atomic_prefix_prefill()
+                    } else if engine.requires_atomic_prefix_prefill()
                         && clamped_cfg.chunk_prefill_size == 2048
                         && clamped_cfg.max_num_batched_tokens == 2048
                     {
@@ -816,7 +816,7 @@ pub fn run_batch_in_place(
     {
         clamped_cfg.max_num_batched_tokens = 6144;
         clamped_cfg.chunk_prefill_size = 6144;
-    } else if engine.cfg.requires_atomic_prefix_prefill()
+    } else if engine.requires_atomic_prefix_prefill()
         && clamped_cfg.chunk_prefill_size == 2048
         && clamped_cfg.max_num_batched_tokens == 2048
     {
@@ -993,8 +993,16 @@ fn enqueue(
         request.set_terminal(GenerationEvent::Error(err));
         return;
     }
+    let lora_has_midloop = request.lora_id >= 0
+        && engine.ranks[0].lora_runtime.as_ref().is_some_and(|rt| {
+            rt.adapter_midloops
+                .get(request.lora_id as usize)
+                .is_some_and(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
+        });
     if engine.cfg.noncausal_full_attention
         || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+        || lora_has_midloop
+        || request.prefix_bidir_len == Some(request.prompt.len())
     {
         request.prefix_bidir_len = Some(request.prompt.len());
         request.max_prefix_lookup_len = Some(0);

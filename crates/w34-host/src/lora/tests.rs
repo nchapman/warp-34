@@ -575,6 +575,9 @@ fn test_cuda_lora_shrink_expand_and_hadamard_fusion() {
 #[cfg(feature = "cuda")]
 #[test]
 fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
+    let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let model_spec = "nchapman/Qwen3.5-9B-W4A16-HGPTQ";
     let lora_spec_str = "heretic=nchapman/Qwen3.5-9B-Heretic-LoRA";
     let Ok(model_dir) = crate::hub::resolve_model(
@@ -927,6 +930,9 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
 #[cfg(feature = "cuda")]
 #[test]
 fn test_synthetic_fp16_multi_lora_tp1_tp2_and_mtp() {
+    let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let model_tmp = tempfile::tempdir().unwrap();
     let lora0_tmp = tempfile::tempdir().unwrap();
     let lora1_tmp = tempfile::tempdir().unwrap();
@@ -1632,4 +1638,317 @@ fn test_synthetic_fp16_multi_lora_tp1_tp2_and_mtp() {
         .unwrap()
         .generated_token_ids;
     assert_eq!(swapped_out0, plain_outs[2]);
+
+    // Verify per-adapter `DecisionModelProfile` loading (`d3` via `token_ids` lm_head fallback
+    // and `glide` via `readout.safetensors` with `noncausal_full_attention`) and HTTP routing:
+    eng_tp1.disable_speculative().unwrap();
+    {
+        use tokenizers::AddedToken;
+        use tokenizers::models::bpe::{BPE, Vocab};
+        let mut vocab_map = Vocab::default();
+        vocab_map.insert("[UNK]".to_owned(), 0);
+        for (next_id, ch) in (1u32..).zip(
+            ['\t', '\n', '\r']
+                .into_iter()
+                .chain((0x20u8..=0x7eu8).map(|b| b as char)),
+        ) {
+            vocab_map.insert(ch.to_string(), next_id);
+        }
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab_map, Vec::new())
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .unwrap();
+        let mut tok = tokenizers::Tokenizer::new(bpe);
+        let added: Vec<AddedToken> = [
+            "<|endoftext|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<think>",
+            "</think>",
+        ]
+        .iter()
+        .map(|&s| AddedToken::from(s, true))
+        .collect();
+        tok.add_special_tokens(&added);
+        eng_tp1.tokenizer = Some(tok);
+    }
+    fs::write(
+        lora0_tmp.path().join("decision_config.json"),
+        serde_json::json!({
+            "format_version": 1,
+            "format_id": "d3-code-readout-v1",
+            "prompt": "d3",
+            "attention_mode": "noncausal_full_attention",
+            "codes": ["A", "B", "C", "D"],
+            "token_ids": [2, 3, 4, 5],
+            "temperature": 1.0
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        lora1_tmp.path().join("decision_config.json"),
+        serde_json::json!({
+            "format_version": 1,
+            "attention_mode": "noncausal_full_attention",
+            "prompt_format": "quick-empty-think-medium-v1",
+            "codes": ["A", "B", "C", "D"],
+            "temperature": 1.0,
+            "model_name": "a1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut readout_weights = vec![0.0f32; 4 * h];
+    for c in 0..4 {
+        for j in 0..h {
+            readout_weights[c * h + j] = ((c as f32 + 1.0) * (j as f32 + 1.0) * 0.01).sin() * 0.1;
+        }
+    }
+    let readout_bias = vec![0.3f32, -0.1, 0.0, -0.2];
+    write_safetensors_file(
+        &lora1_tmp.path().join("readout.safetensors"),
+        &[
+            (
+                "readout.weight",
+                "F32",
+                &[4, h],
+                &f32s_to_bytes(&readout_weights),
+            ),
+            ("readout.bias", "F32", &[4], &f32s_to_bytes(&readout_bias)),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(eng_tp1.decision_profile.family_name(), "causal_lm");
+    eng_tp1.attach_lora_adapters(&specs).unwrap();
+    assert_eq!(
+        eng_tp1
+            .lora_registry
+            .decision_profile(0)
+            .unwrap()
+            .family_name(),
+        "d3"
+    );
+    assert_eq!(
+        eng_tp1
+            .lora_registry
+            .decision_profile(1)
+            .unwrap()
+            .family_name(),
+        "glide"
+    );
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let state = crate::server::OpenAiServerState::new("base-qwen".to_string(), eng_tp1);
+    rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::server::router(state.clone());
+        let srv_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        let post_json = |uri: &str, body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!("{base_url}{uri}");
+            async move {
+                let r = client.post(url).json(&body).send().await.unwrap();
+                let status = r.status();
+                let v: serde_json::Value = r.json().await.unwrap();
+                (status, v)
+            }
+        };
+
+        // 1. `/v1/systemone` targeting `a1` (GLiDE CodeReadout): score response includes `expected_level`
+        let (st_glide, v_glide) = post_json(
+            "/v1/systemone",
+            serde_json::json!({
+                "model": "a1",
+                "state": "hello world",
+                "questions": {
+                    "sev": {
+                        "type": "score",
+                        "instructions": "Rate severity",
+                        "criteria": ["Low", "High"]
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(st_glide, axum::http::StatusCode::OK, "{v_glide}");
+        assert_eq!(v_glide["model"], "a1");
+        assert!(
+            v_glide["answers"]["sev"].get("expected_level").is_some(),
+            "GLiDE LoRA must use CodeReadout(Glide) profile with expected_level: {v_glide}"
+        );
+
+        // 2. `/v1/systemone` targeting `a0` (D3 CodeReadout via `lora` field): includes `legend`
+        let (st_d3, v_d3) = post_json(
+            "/v1/systemone",
+            serde_json::json!({
+                "model": "base-qwen",
+                "lora": "a0",
+                "state": "hello world",
+                "questions": {
+                    "sev": {
+                        "type": "score",
+                        "instructions": "Rate severity",
+                        "criteria": ["Low", "High"]
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(st_d3, axum::http::StatusCode::OK, "{v_d3}");
+        assert_eq!(v_d3["model"], "a0");
+        assert!(
+            v_d3["answers"]["sev"].get("legend").is_some(),
+            "d3 LoRA must use CodeReadout(D3) profile with legend: {v_d3}"
+        );
+
+        // 3. `/v1/decisions` targeting `a1` alongside base-model `/v1/completions`
+        let (st_dec, v_dec) = post_json(
+            "/v1/decisions",
+            serde_json::json!({
+                "model": "a1",
+                "context": "hello world",
+                "decisions": [{
+                    "id": "flag",
+                    "type": "noul",
+                    "instructions": "Check flag"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(st_dec, axum::http::StatusCode::OK, "{v_dec}");
+        assert_eq!(v_dec["model"], "a1");
+
+        let (st_base, v_base) = post_json(
+            "/v1/completions",
+            serde_json::json!({
+                "model": "base-qwen",
+                "prompt": "hello world",
+                "max_tokens": 3,
+                "temperature": 0.0
+            }),
+        )
+        .await;
+        assert_eq!(st_base, axum::http::StatusCode::OK, "{v_base}");
+        assert_eq!(v_base["model"], "base-qwen");
+
+        state.worker.shutdown().await.unwrap();
+        srv_handle.abort();
+    });
+}
+
+#[test]
+fn test_pack_multi_slice_lora_deduplicates_shared_a() {
+    let k = 64usize;
+    let r = 8usize;
+    let shared_a: Vec<f32> = (0..r * k).map(|i| (i as f32 + 1.0) * 0.01).collect();
+    let b_q: Vec<f32> = (0..16 * r).map(|i| (i as f32 + 1.0) * 0.1).collect();
+    let b_k: Vec<f32> = (0..8 * r).map(|i| -(i as f32 + 1.0) * 0.1).collect();
+    let b_v: Vec<f32> = (0..8 * r).map(|i| (i as f32 + 1.0) * 0.2).collect();
+
+    let w_q = LoraSliceWeight {
+        r,
+        in_features: k,
+        out_features: 16,
+        a_f32: shared_a.clone(),
+        b_f32: b_q.clone(),
+    };
+    let w_k = LoraSliceWeight {
+        r,
+        in_features: k,
+        out_features: 8,
+        a_f32: shared_a.clone(),
+        b_f32: b_k.clone(),
+    };
+    let w_v = LoraSliceWeight {
+        r,
+        in_features: k,
+        out_features: 8,
+        a_f32: shared_a.clone(),
+        b_f32: b_v.clone(),
+    };
+
+    let packed = pack_multi_slice_lora(
+        &[vec![
+            LoraSubSlice {
+                weight: Some(&w_q),
+                local_n: 16,
+            },
+            LoraSubSlice {
+                weight: Some(&w_k),
+                local_n: 8,
+            },
+            LoraSubSlice {
+                weight: Some(&w_v),
+                local_n: 8,
+            },
+        ]],
+        32,
+        k,
+    )
+    .unwrap()
+    .unwrap();
+
+    // Shared A across Q, K, V must keep rank_pad == r (8) instead of 3*r (24)
+    assert_eq!(packed.rank_pad, r);
+    assert_eq!(packed.a_f32, shared_a);
+    assert_eq!(&packed.b_f32[0..16 * r], &b_q[..]);
+    assert_eq!(&packed.b_f32[16 * r..24 * r], &b_k[..]);
+    assert_eq!(&packed.b_f32[24 * r..32 * r], &b_v[..]);
+
+    // Verify r = 256 joint-SVD QKV fits within MAX_LORA_RANK_PAD = 512 (whereas 3 * 256 = 768 would fail)
+    let r256 = 256usize;
+    let a256 = vec![0.25f32; r256 * k];
+    let w256_q = LoraSliceWeight {
+        r: r256,
+        in_features: k,
+        out_features: 16,
+        a_f32: a256.clone(),
+        b_f32: vec![0.1f32; 16 * r256],
+    };
+    let w256_k = LoraSliceWeight {
+        r: r256,
+        in_features: k,
+        out_features: 8,
+        a_f32: a256.clone(),
+        b_f32: vec![0.2f32; 8 * r256],
+    };
+    let w256_v = LoraSliceWeight {
+        r: r256,
+        in_features: k,
+        out_features: 8,
+        a_f32: a256,
+        b_f32: vec![0.3f32; 8 * r256],
+    };
+    let packed256 = pack_multi_slice_lora(
+        &[vec![
+            LoraSubSlice {
+                weight: Some(&w256_q),
+                local_n: 16,
+            },
+            LoraSubSlice {
+                weight: Some(&w256_k),
+                local_n: 8,
+            },
+            LoraSubSlice {
+                weight: Some(&w256_v),
+                local_n: 8,
+            },
+        ]],
+        32,
+        k,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(packed256.rank_pad, 256);
 }

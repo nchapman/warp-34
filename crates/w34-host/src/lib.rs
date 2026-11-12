@@ -55,6 +55,9 @@ pub const fn cuda_enabled() -> bool {
     w34_kernels::cuda_enabled()
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) static LIB_GPU_ENGINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     #[test]

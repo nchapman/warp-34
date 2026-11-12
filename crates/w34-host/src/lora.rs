@@ -570,6 +570,9 @@ pub struct LoraAdapterHost {
     pub layer_weights: BTreeMap<(usize, TargetLoraModule), LoraSliceWeight>,
     /// Optional `lm_head` LoRA weight.
     pub lm_head_weight: Option<LoraSliceWeight>,
+    /// Optional per-adapter damped-Euler `midloop` `(start_layer, end_layer, passes)` specs
+    /// parsed from `decision_config.json` (e.g. `GLiDE-9B` / `GLiDE-27B`).
+    pub midloop: Vec<(usize, usize, usize)>,
 }
 
 impl LoraAdapterHost {
@@ -595,6 +598,12 @@ impl LoraAdapterHost {
         type LoraPairMap = BTreeMap<(Option<usize>, String), (Option<String>, Option<String>)>;
         let mut pairs: LoraPairMap = BTreeMap::new();
         for tensor_name in archive.tensor_names() {
+            if matches!(
+                tensor_name,
+                "readout.weight" | "readout.bias" | "weight" | "bias"
+            ) {
+                continue;
+            }
             let (layer_opt, module_suffix, is_b) = parse_peft_tensor_key(tensor_name)?;
             let entry = pairs.entry((layer_opt, module_suffix)).or_default();
             let slot = if is_b { &mut entry.1 } else { &mut entry.0 };
@@ -676,6 +685,26 @@ impl LoraAdapterHost {
             }
         }
 
+        let midloop = {
+            let dc_path = dir.join("decision_config.json");
+            if dc_path.is_file() {
+                let text = fs::read_to_string(&dc_path)?;
+                let dc_val: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("LoRA adapter '{name}': bad {}: {e}", dc_path.display()),
+                    )
+                })?;
+                if let Some(ml_val) = dc_val.get("midloop").filter(|v| !v.is_null()) {
+                    crate::loader::ModelConfig::parse_midloop_specs(ml_val, usize::MAX)?
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        };
+
         Ok(Self {
             name,
             raw_path,
@@ -683,6 +712,7 @@ impl LoraAdapterHost {
             config,
             layer_weights,
             lm_head_weight,
+            midloop,
         })
     }
 
@@ -808,11 +838,12 @@ pub struct LoraAdapterRegistry {
 }
 
 /// Metadata for a single loaded LoRA adapter in [`LoraAdapterRegistry`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LoraAdapterEntry {
     pub lora_id: i32,
     pub name: String,
     pub root: String,
+    pub decision_profile: Option<crate::decision::DecisionModelProfile>,
 }
 
 impl LoraAdapterRegistry {
@@ -833,6 +864,15 @@ impl LoraAdapterRegistry {
     }
 
     pub fn register(&mut self, name: String, root: String) -> io::Result<i32> {
+        self.register_with_decision_profile(name, root, None)
+    }
+
+    pub fn register_with_decision_profile(
+        &mut self,
+        name: String,
+        root: String,
+        decision_profile: Option<crate::decision::DecisionModelProfile>,
+    ) -> io::Result<i32> {
         if self.by_name.contains_key(&name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -851,12 +891,22 @@ impl LoraAdapterRegistry {
             lora_id: id,
             name,
             root,
+            decision_profile,
         });
         Ok(id)
     }
 
     pub fn resolve_name(&self, model_name: &str) -> Option<i32> {
         self.by_name.get(model_name).copied()
+    }
+
+    pub fn decision_profile(&self, lora_id: i32) -> Option<&crate::decision::DecisionModelProfile> {
+        if lora_id < 0 {
+            return None;
+        }
+        self.entries
+            .get(lora_id as usize)
+            .and_then(|e| e.decision_profile.as_ref())
     }
 }
 
@@ -1073,7 +1123,16 @@ pub struct LoraSubSlice<'a> {
     pub local_n: usize,
 }
 
-/// Packs per-adapter `LoraSubSlice`s into a single block-diagonal `PackedProjLoraHost`.
+fn f32_slice_bits_eq(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Packs per-adapter `LoraSubSlice`s into a single `PackedProjLoraHost`, deduplicating
+/// any sub-slices within an adapter that share an identical `lora_A` matrix (e.g., joint-SVD
+/// exports of `q_proj`/`k_proj`/`v_proj`, `gate_proj`/`up_proj`, or `in_proj_qkv`/`in_proj_z`).
 pub fn pack_multi_slice_lora(
     per_adapter_slices: &[Vec<LoraSubSlice<'_>>],
     local_n: usize,
@@ -1091,6 +1150,7 @@ pub fn pack_multi_slice_lora(
             ));
         }
         let mut total_r = 0usize;
+        let mut unique_as: Vec<(usize, &[f32])> = Vec::with_capacity(slices.len());
         for s in slices {
             if let Some(w) = s.weight {
                 if w.in_features != local_k || w.out_features != s.local_n {
@@ -1102,7 +1162,13 @@ pub fn pack_multi_slice_lora(
                         ),
                     ));
                 }
-                total_r += w.r;
+                if !unique_as
+                    .iter()
+                    .any(|&(prev_r, prev_a)| prev_r == w.r && f32_slice_bits_eq(prev_a, &w.a_f32))
+                {
+                    unique_as.push((w.r, &w.a_f32));
+                    total_r += w.r;
+                }
             }
         }
         if total_r > 0 {
@@ -1129,19 +1195,30 @@ pub fn pack_multi_slice_lora(
         let mut n_off = 0usize;
         let a_ad_base = ad_idx * rank_pad * local_k;
         let b_ad_base = ad_idx * local_n * rank_pad;
+        let mut placed_as: Vec<(usize, usize, &[f32])> = Vec::with_capacity(slices.len());
         for s in slices {
             if let Some(w) = s.weight {
-                // Copy A: [w.r, local_k] -> a_f32[ad_idx, r_off .. r_off + w.r, 0..local_k]
-                let dst_a =
-                    &mut a_f32[a_ad_base + r_off * local_k..a_ad_base + (r_off + w.r) * local_k];
-                dst_a.copy_from_slice(&w.a_f32);
-                // Copy B: [s.local_n, w.r] -> b_f32[ad_idx, n_off .. n_off + s.local_n, r_off .. r_off + w.r]
+                let use_r_off = if let Some(&(existing_r_off, _, _)) =
+                    placed_as.iter().find(|&&(_, prev_r, prev_a)| {
+                        prev_r == w.r && f32_slice_bits_eq(prev_a, &w.a_f32)
+                    }) {
+                    existing_r_off
+                } else {
+                    // Copy A: [w.r, local_k] -> a_f32[ad_idx, r_off .. r_off + w.r, 0..local_k]
+                    let dst_a = &mut a_f32
+                        [a_ad_base + r_off * local_k..a_ad_base + (r_off + w.r) * local_k];
+                    dst_a.copy_from_slice(&w.a_f32);
+                    let placed_off = r_off;
+                    placed_as.push((placed_off, w.r, &w.a_f32));
+                    r_off += w.r;
+                    placed_off
+                };
+                // Copy B: [s.local_n, w.r] -> b_f32[ad_idx, n_off .. n_off + s.local_n, use_r_off .. use_r_off + w.r]
                 for row in 0..s.local_n {
                     let src_row = &w.b_f32[row * w.r..(row + 1) * w.r];
-                    let dst_row_start = b_ad_base + (n_off + row) * rank_pad + r_off;
+                    let dst_row_start = b_ad_base + (n_off + row) * rank_pad + use_r_off;
                     b_f32[dst_row_start..dst_row_start + w.r].copy_from_slice(src_row);
                 }
-                r_off += w.r;
             }
             n_off += s.local_n;
         }
@@ -1247,6 +1324,7 @@ pub struct RankLoraRuntime {
     pub state: std::sync::Arc<RankLoraState>,
     pub num_adapters: usize,
     pub max_rank_pad: usize,
+    pub adapter_midloops: Vec<Vec<(usize, usize, usize)>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1379,6 +1457,14 @@ pub fn attach_lora_to_rank(
     }
 
     for ad in adapters {
+        for &(a, b, passes) in &ad.midloop {
+            if passes < 1 || a > b || b >= cfg.num_hidden_layers {
+                return Err(loader_err_msg(format!(
+                    "LoRA adapter '{}': invalid midloop triple [{a}, {b}, {passes}] for num_hidden_layers={}",
+                    ad.name, cfg.num_hidden_layers
+                )));
+            }
+        }
         for &(layer_id, target) in ad.layer_weights.keys() {
             if layer_id >= cfg.num_hidden_layers {
                 return Err(loader_err_msg(format!(
@@ -1821,6 +1907,7 @@ pub fn attach_lora_to_rank(
         state,
         num_adapters: adapters.len(),
         max_rank_pad,
+        adapter_midloops: adapters.iter().map(|ad| ad.midloop.clone()).collect(),
     }))
 }
 

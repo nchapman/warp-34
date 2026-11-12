@@ -116,6 +116,109 @@ impl Qwen3_5Engine {
         Ok(())
     }
 
+    /// Reads vocabulary rows `lm_head.weight[token_ids]` (or tied `embed_tokens.weight[token_ids]`)
+    /// as flat `[token_ids.len() * hidden_size]` `f32` weights for `CodeReadoutHead` fallback.
+    pub fn read_vocab_rows_f32(
+        &self,
+        token_ids: &[usize],
+    ) -> std::result::Result<Vec<f32>, String> {
+        if token_ids.is_empty() || token_ids.len() > crate::decision::MAX_READOUT_CODES {
+            return Err(format!(
+                "code_readout: token_ids length {} outside 1..={}",
+                token_ids.len(),
+                crate::decision::MAX_READOUT_CODES
+            ));
+        }
+        let h_dim = self.cfg.hidden_size;
+        let mut out = vec![0.0f32; token_ids.len() * h_dim];
+        let mut row_f16 = vec![0u16; h_dim];
+        for (slot, &tok_id) in token_ids.iter().enumerate() {
+            if tok_id >= self.cfg.vocab_size {
+                return Err(format!(
+                    "code_readout: token_id {tok_id} out of range for vocab_size={}",
+                    self.cfg.vocab_size
+                ));
+            }
+            let rank = self
+                .ranks
+                .iter()
+                .find(|r| tok_id >= r.vocab_offset && tok_id < r.vocab_offset + r.local_vocab_size)
+                .unwrap_or(&self.ranks[0]);
+            let dense_lm_ptr = match &rank.lm_head {
+                Some(LinearProj::DenseF16 { weight_ptr, .. }) => Some(*weight_ptr),
+                Some(LinearProj::WithLora { inner, .. }) => match inner.as_ref() {
+                    LinearProj::DenseF16 { weight_ptr, .. } => Some(*weight_ptr),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(weight_ptr) = dense_lm_ptr {
+                let local_row = tok_id - rank.vocab_offset;
+                let src = weight_ptr + (local_row * h_dim * 2) as u64;
+                rank.device
+                    .make_current()
+                    .map_err(|e| format!("make_current: {e:?}"))?;
+                check_rc(
+                    // SAFETY: local_row < rank.local_vocab_size and row_f16 has length h_dim.
+                    unsafe {
+                        ffi::w34_memcpy_d2h_async(
+                            row_f16.as_mut_ptr().cast(),
+                            src as *const c_void,
+                            h_dim * 2,
+                            rank.stream.handle,
+                        )
+                    },
+                    "read lm_head row f16",
+                )
+                .map_err(|e| format!("read lm_head row: {e:?}"))?;
+                rank.stream
+                    .synchronize()
+                    .map_err(|e| format!("stream sync: {e:?}"))?;
+            } else if self.ranks[0].embed_tokens_ptr != 0 {
+                let r0 = &self.ranks[0];
+                let src = r0.embed_tokens_ptr + (tok_id * h_dim * 2) as u64;
+                r0.device
+                    .make_current()
+                    .map_err(|e| format!("make_current: {e:?}"))?;
+                check_rc(
+                    // SAFETY: tok_id < vocab_size and row_f16 has length h_dim.
+                    unsafe {
+                        ffi::w34_memcpy_d2h_async(
+                            row_f16.as_mut_ptr().cast(),
+                            src as *const c_void,
+                            h_dim * 2,
+                            r0.stream.handle,
+                        )
+                    },
+                    "read embed_tokens row f16",
+                )
+                .map_err(|e| format!("read embed_tokens row: {e:?}"))?;
+                r0.stream
+                    .synchronize()
+                    .map_err(|e| format!("stream sync: {e:?}"))?;
+            } else if let Some(host_emb) = &self.ranks[0].host_embed_tokens {
+                // SAFETY: `tok_id < self.cfg.vocab_size` was checked above and `host_emb`
+                // holds `vocab_size * h_dim` FP16 elements in pinned host memory.
+                let src_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        (host_emb.host_ptr as *const u16).add(tok_id * h_dim),
+                        h_dim,
+                    )
+                };
+                row_f16.copy_from_slice(src_bytes);
+            } else {
+                return Err(
+                    "code_readout: cannot extract token_ids rows without readout.safetensors or dense lm_head".into(),
+                );
+            }
+            let dst = &mut out[slot * h_dim..(slot + 1) * h_dim];
+            for (d, &bits) in dst.iter_mut().zip(row_f16.iter()) {
+                *d = crate::cuda::f16_to_f32(bits);
+            }
+        }
+        Ok(out)
+    }
+
     /// Enable one native proposer before target graph capture. The proposer
     /// remains resident across requests, including its bounded prefix memo.
     pub fn enable_speculative(
