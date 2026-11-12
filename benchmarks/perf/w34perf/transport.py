@@ -261,3 +261,147 @@ def stream(engine, payload, timeout_s, *, cancel_after_output_events=None):
         if sock is not None:
             sock.close()
     return result
+
+
+def _score_decision_answers(questions, answers, expected):
+    if not isinstance(expected, dict) or not expected:
+        return None, None
+    correct = 0
+    total = 0
+    for qk, exp_val in expected.items():
+        if qk not in questions or qk not in answers:
+            continue
+        ans = answers[qk]
+        if not isinstance(ans, dict):
+            continue
+        qtype = ans.get("type")
+        total += 1
+        if qtype == "noul":
+            prob = ans.get("noul")
+            if isinstance(prob, (int, float)) and not isinstance(prob, bool):
+                pred = "yes" if prob >= 0.5 else "no"
+                if (exp_val in ("yes", True) and pred == "yes") or (exp_val in ("no", False) and pred == "no"):
+                    correct += 1
+        elif qtype == "choice":
+            if ans.get("choice") == exp_val:
+                correct += 1
+        elif qtype == "score":
+            probs = ans.get("probabilities")
+            score_val = ans.get("score")
+            if isinstance(probs, dict) and probs and all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) for v in probs.values()
+            ):
+                best_k = max(probs, key=lambda k: probs[k])
+                if str(best_k) == str(exp_val):
+                    correct += 1
+            elif isinstance(score_val, (int, float)) and not isinstance(score_val, bool):
+                if str(int(round(score_val))) == str(exp_val):
+                    correct += 1
+    return correct, total
+
+
+def decision(engine, payload, timeout_s, *, expected=None):
+    """Execute a bounded POST /systemone typed decision request."""
+    start = time.perf_counter()
+    result = {"status": "error", "error": None, "http_status": None, "usage": None,
+              "finish_reason": "stop", "events": [], "content": "", "reasoning": "",
+              "tool_calls": {}, "answers": None, "decision_correct": None,
+              "decision_total": None, "first_output_ms": None, "first_text_ms": None,
+              "last_output_ms": None, "e2e_ms": None}
+    url = urlsplit(engine["base_url"])
+    cls = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    connection = cls(url.hostname, url.port, timeout=timeout_s)
+    deadline = start + timeout_s
+    response = None
+    sock = None
+    timer = None
+    expired = threading.Event()
+
+    def remaining():
+        value = deadline - time.perf_counter()
+        if value <= 0:
+            raise TimeoutError("total request deadline exceeded")
+        return value
+
+    def elapsed():
+        return (time.perf_counter() - start) * 1000
+
+    def abort(s):
+        expired.set()
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    try:
+        headers = {"Content-Type": "application/json", "Accept": "application/json", **authorization(engine)}
+        connection.connect()
+        sock = connection.sock
+        timer = threading.Timer(remaining(), abort, args=(sock,))
+        timer.daemon = True
+        timer.start()
+        sock.settimeout(remaining())
+        connection.request("POST", url.path.rstrip("/") + "/systemone",
+                           body=json.dumps(payload).encode("utf-8"), headers=headers)
+        sock.settimeout(remaining())
+        response = connection.getresponse()
+        result["http_status"] = response.status
+        if response.status != 200:
+            raise ValueError(f"HTTP {response.status}")
+        raw = response.read(MAX_RESPONSE + 1)
+        if len(raw) > MAX_RESPONSE:
+            raise ValueError("decision response exceeded byte limit")
+        try:
+            data = json.loads(raw)
+            json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (ValueError, UnicodeError, RecursionError):
+            raise ValueError("invalid non-finite or Unicode decision JSON") from None
+        if not isinstance(data, dict):
+            raise ValueError("decision response must be an object")
+        answers = data.get("answers")
+        questions = payload.get("questions", {})
+        if not isinstance(answers, dict) or set(answers) != set(questions):
+            raise ValueError("decision response answers keys do not match questions")
+        for qk, q in questions.items():
+            ans = answers.get(qk)
+            if not isinstance(ans, dict) or ans.get("type") != q.get("type"):
+                raise ValueError(f"decision answer {qk!r} missing or wrong type")
+        stamp = elapsed()
+        raw_usage = data.get("usage")
+        if isinstance(raw_usage, dict):
+            in_tok = raw_usage.get("input_tokens", raw_usage.get("prompt_tokens"))
+            cached_tok = raw_usage.get("cached_tokens", 0)
+            if (isinstance(in_tok, int) and not isinstance(in_tok, bool) and in_tok > 0
+                    and isinstance(cached_tok, int) and not isinstance(cached_tok, bool)
+                    and 0 <= cached_tok <= in_tok):
+                result["usage"] = {
+                    "prompt_tokens": in_tok,
+                    "completion_tokens": len(questions),
+                    "prompt_tokens_details": {"cached_tokens": cached_tok},
+                    "decision_questions": len(questions),
+                }
+        correct, total = _score_decision_answers(questions, answers, expected)
+        result.update(status="ok", answers=answers, decision_correct=correct,
+                      decision_total=total, content=json.dumps(answers, sort_keys=True),
+                      first_output_ms=stamp, first_text_ms=stamp, last_output_ms=stamp)
+    except (TimeoutError, socket.timeout):
+        result["error"] = "request timeout"
+        result["status"] = "timeout"
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException) as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"[:500]
+    finally:
+        result["e2e_ms"] = elapsed()
+        if timer:
+            timer.cancel()
+        if timer:
+            timer.join()
+        if expired.is_set() or time.perf_counter() >= deadline:
+            result["status"] = "timeout"
+            result["error"] = "request timeout"
+        if response is not None:
+            response.close()
+        connection.close()
+        if sock is not None:
+            sock.close()
+    return result
+

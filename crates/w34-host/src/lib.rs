@@ -4,7 +4,6 @@ pub mod anthropic_api;
 pub mod api_auth;
 pub mod cache;
 pub mod chatml;
-pub mod clef;
 pub mod cli;
 pub mod constraints;
 #[cfg(feature = "cuda")]

@@ -148,15 +148,32 @@ impl ScheduledVision {
                 "scheduled vision sequence does not match prefill state",
             ));
         }
-        let mut take = (self.prompt.len() - start).min(chunk_size.max(1));
-        if let Some(branch_end) = seq.mamba_branching_seqlen {
-            let aligned_branch = (branch_end / 64) * 64;
-            if aligned_branch > start && aligned_branch < self.prompt.len() {
-                take = take.min(aligned_branch - start);
+        let take = if let Some(bidir_end) = seq.prefix_bidir_len
+            && start < bidir_end
+        {
+            let need = bidir_end.min(self.prompt.len()) - start;
+            if need > chunk_size.max(1) {
+                return Err(loader_err(
+                    "bidirectional prefix exceeds chunk_prefill_size in multimodal step",
+                ));
             }
-        }
+            need
+        } else {
+            let mut max_take = (self.prompt.len() - start).min(chunk_size.max(1));
+            if let Some(branch_end) = seq.mamba_branching_seqlen {
+                let aligned_branch = (branch_end / 64) * 64;
+                if aligned_branch > start && aligned_branch < self.prompt.len() {
+                    max_take = max_take.min(aligned_branch - start);
+                }
+            }
+            max_take
+        };
         let end = start + take;
-        let planned = seq.radix_state.plan_checkpoints(take);
+        let planned = if seq.prefix_bidir_len.is_some() {
+            Vec::new()
+        } else {
+            seq.radix_state.plan_checkpoints(take)
+        };
         let slice = ScheduledReqSlice {
             req_id: seq.req_id,
             is_prefill_chunk: true,
@@ -287,7 +304,11 @@ impl ScheduledVision {
             checkpoints: &checkpoints,
             emit_all_query_tokens: false,
         };
-        let result = engine.step_single_slice_with_mrope_and_vision(
+        let noncausal_prefix = seq
+            .prefix_bidir_len
+            .is_some_and(|bidir_end| end <= bidir_end);
+        let emit_last_row = seq.max_new_tokens > 0 || engine.ranks[0].lm_head.is_some();
+        let result = engine.step_single_slice_with_mrope_and_vision_bidir(
             &engine_slice,
             &positions,
             take as i32,
@@ -296,6 +317,8 @@ impl ScheduledVision {
             } else {
                 Some(&pointers)
             },
+            noncausal_prefix,
+            emit_last_row,
         );
         let mut sync_result = Ok(());
         for rank in &engine.ranks {

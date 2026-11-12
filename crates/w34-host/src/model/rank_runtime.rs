@@ -40,6 +40,12 @@ pub(super) fn alloc_ple_runtime(
 impl Qwen3_5ModelRank {
     /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph.
     pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
+        if self.lm_head.is_none()
+            || self.cfg.noncausal_full_attention
+            || self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+        {
+            return false;
+        }
         let top_k = self.cfg.num_experts_per_tok.max(1);
         self.tiered_moe
             .as_ref()
@@ -276,17 +282,71 @@ impl Qwen3_5ModelRank {
 
     /// Maximum aligned ordinary prefill budget, including worst-case selected outputs.
     pub fn ordinary_prefill_token_capacity(&self, max_num_seqs: usize) -> Result<usize> {
-        let max_chunks = if self.cfg.uses_tiered_moe() { 96 } else { 32 };
+        let max_chunks = if self.cfg.uses_tiered_moe() {
+            96
+        } else if self.cfg.requires_atomic_prefix_prefill() {
+            64
+        } else {
+            32
+        };
+        let has_active_midloop = self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
+        let midloop_gdn_snap_bytes: usize =
+            if has_active_midloop && let Some(first_st) = self.state_pool.layers.first() {
+                let total_slots = self.state_pool.total_slots.max(1);
+                let conv_slot_b = first_st.conv_state.len_bytes / total_slots;
+                let ssm_slot_b = first_st.ssm_state.len_bytes / total_slots;
+                let active_slots = max_num_seqs.clamp(1, total_slots);
+                let max_span_gdn = self
+                    .cfg
+                    .midloop
+                    .iter()
+                    .filter(|&&(_, _, passes)| passes > 1)
+                    .map(|&(a, b, _)| {
+                        self.state_pool
+                            .layers
+                            .iter()
+                            .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                            .count()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                max_span_gdn.saturating_mul(
+                    active_slots
+                        .saturating_mul(conv_slot_b.saturating_add(ssm_slot_b))
+                        .saturating_add(512),
+                )
+            } else {
+                0
+            };
+        let local_vocab_for_scratch = if self.lm_head.is_some() {
+            self.local_vocab_size
+        } else {
+            0
+        };
         scratch::token_capacity_up_to(
             self.scratch_arena.capacity(),
             self.cfg.hidden_size,
-            self.local_vocab_size,
+            local_vocab_for_scratch,
             max_num_seqs,
             max_chunks,
             |tokens| {
+                let streams = if self.final_residual.is_hyper_connection() {
+                    self.cfg.hc_count.max(1)
+                } else {
+                    1
+                };
                 let hc_extra = if self.final_residual.is_hyper_connection() {
-                    let streams = self.cfg.hc_count.max(1);
                     tokens * (streams - 1) * self.cfg.hidden_size * 2 + tokens * streams * 4 + 512
+                } else {
+                    0
+                };
+                let midloop_extra = if has_active_midloop {
+                    tokens
+                        .saturating_mul(streams)
+                        .saturating_mul(self.cfg.hidden_size)
+                        .saturating_mul(2)
+                        .saturating_add(256)
+                        .saturating_add(midloop_gdn_snap_bytes)
                 } else {
                     0
                 };
@@ -315,7 +375,9 @@ impl Qwen3_5ModelRank {
                         } else {
                             0
                         };
-                        l.0.saturating_add(hc_extra).saturating_add(transform)
+                        l.0.saturating_add(hc_extra)
+                            .saturating_add(midloop_extra)
+                            .saturating_add(transform)
                     })
             },
         )

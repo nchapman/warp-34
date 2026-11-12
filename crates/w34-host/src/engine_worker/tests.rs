@@ -9,30 +9,11 @@ use tokio::sync::mpsc;
 
 use super::{
     DecisionReadoutTap, DecisionTapOutput, EngineWorker, GenerationEvent, GenerationStream,
-    Request, SamplerV1, SamplingParams, Telemetry, WorkerError, WorkerStats,
-    decode::{check_full_hidden_chunk_offset, check_full_hidden_final_count},
-    generation_channel, notify_request_error,
+    Request, SamplerV1, SamplingParams, Telemetry, WorkerError, WorkerStats, generation_channel,
+    notify_request_error,
     runner::{emit, require_healthy_host_compute, run_supervised_loop},
     validate_request_length,
 };
-
-#[test]
-fn full_hidden_tap_accounting_detects_gaps_and_short_counts() {
-    assert!(check_full_hidden_chunk_offset(0, 0).is_ok());
-    assert!(check_full_hidden_chunk_offset(256, 256).is_ok());
-    let gap_err = check_full_hidden_chunk_offset(128, 192).unwrap_err();
-    assert!(
-        gap_err.contains("expected offset 128, got 192"),
-        "{gap_err}"
-    );
-
-    assert!(check_full_hidden_final_count(404, 404).is_ok());
-    let short_err = check_full_hidden_final_count(380, 404).unwrap_err();
-    assert!(
-        short_err.contains("captured 380 hidden rows after final prefill chunk, expected 404"),
-        "{short_err}"
-    );
-}
 
 fn terminal_test_request() -> (
     Request,
@@ -56,6 +37,7 @@ fn terminal_test_request() -> (
         cancelled: cancelled.clone(),
         max_prefix_lookup_len: None,
         mamba_branching_seqlen: None,
+        prefix_bidir_len: None,
         decision_tap: Some(DecisionReadoutTap::CandidateLogits {
             token_ids: vec![1],
             tx,
@@ -403,11 +385,12 @@ fn worker_panic_containment_drains_in_flight_and_queued_and_poisons_future_submi
         eos_token_ids: vec![2],
         vocab_size: 1024,
         default_preserve_thinking: false,
-        decision_profile: crate::decision::DecisionModelProfile::Tev1 { temperature: 1.0 },
+        decision_profile: crate::decision::DecisionModelProfile::CausalLm { temperature: 1.0 },
         vision_config: None,
         has_vision_weights: false,
         hidden_size: 1024,
         kv_token_capacity: 4096,
+        unshareable_prefill: false,
         max_model_len: None,
     };
 

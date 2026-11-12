@@ -321,6 +321,25 @@ impl Qwen3_5Engine {
         pos_plane_stride: i32,
         vis_splice_per_rank: Option<&[(u64, u64, usize)]>,
     ) -> Result<i32> {
+        self.step_single_slice_with_mrope_and_vision_bidir(
+            slice,
+            custom_positions,
+            pos_plane_stride,
+            vis_splice_per_rank,
+            false,
+            true,
+        )
+    }
+
+    pub(crate) fn step_single_slice_with_mrope_and_vision_bidir(
+        &mut self,
+        slice: &EngineBatchSlice<'_>,
+        custom_positions: &[i32],
+        pos_plane_stride: i32,
+        vis_splice_per_rank: Option<&[(u64, u64, usize)]>,
+        noncausal_prefix: bool,
+        emit_last_row: bool,
+    ) -> Result<i32> {
         let q_len = slice.tokens.len();
         if q_len == 0 {
             return Err(loader_err(
@@ -359,7 +378,7 @@ impl Qwen3_5Engine {
             checkpoint_token_offsets.push(trig);
             checkpoint_dst_indices.push(dst);
         }
-        let selected_rows = [q_len - 1];
+        let selected_rows: &[usize] = if emit_last_row { &[q_len - 1] } else { &[] };
 
         for (r_idx, rank) in self.ranks.iter_mut().enumerate() {
             rank.current_pos_plane_stride = pos_plane_stride;
@@ -369,7 +388,7 @@ impl Qwen3_5Engine {
         let run_res: Result<i32> = (|| {
             if self.tp_size == 1 {
                 let r0 = &mut self.ranks[0];
-                let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
+                let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r0.upload_batch_meta(
                     slice.tokens,
                     custom_positions,
                     &q_start_loc,
@@ -391,6 +410,9 @@ impl Qwen3_5Engine {
                     0,
                     max_checkpoints_per_req,
                 )?;
+                if noncausal_prefix {
+                    attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
+                }
                 let ids = r0.forward_selected_rows(
                     tok_ptr,
                     pos_ptr,
@@ -398,9 +420,9 @@ impl Qwen3_5Engine {
                     &attn_batch,
                     &gdn_batch,
                     None,
-                    &selected_rows,
+                    selected_rows,
                 )?;
-                Ok(ids[0])
+                Ok(ids.first().copied().unwrap_or(0))
             } else {
                 let comm = self.tp2_comm.as_ref().unwrap().clone();
                 let (r0, peer_ranks) = self.ranks.split_first_mut().unwrap();
@@ -416,11 +438,11 @@ impl Qwen3_5Engine {
                 let hi_ref = &has_initial_state;
                 let cd_ref = &checkpoint_dst_indices;
                 let co_ref = &checkpoint_token_offsets;
-                let sr_ref = &selected_rows;
+                let sr_ref = selected_rows;
                 let (res0, peer_results) = std::thread::scope(|sc| {
                     let c0 = comm.clone();
                     let h0 = sc.spawn(move || -> Result<Vec<i32>> {
-                        let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r0.upload_batch_meta(
+                        let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r0.upload_batch_meta(
                             ft_ref,
                             fp_ref,
                             qs_ref,
@@ -442,6 +464,9 @@ impl Qwen3_5Engine {
                             0,
                             max_checkpoints_per_req,
                         )?;
+                        if noncausal_prefix {
+                            attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
+                        }
                         r0.forward_selected_rows(
                             tok_ptr,
                             pos_ptr,
@@ -456,7 +481,7 @@ impl Qwen3_5Engine {
                     for r_peer in peer_ranks {
                         let cp = comm.clone();
                         peer_handles.push(sc.spawn(move || -> Result<()> {
-                            let (tok_ptr, pos_ptr, attn_batch, gdn_batch) = r_peer
+                            let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r_peer
                                 .upload_batch_meta(
                                     ft_ref,
                                     fp_ref,
@@ -479,6 +504,10 @@ impl Qwen3_5Engine {
                                     0,
                                     max_checkpoints_per_req,
                                 )?;
+                            if noncausal_prefix {
+                                attn_batch.mask_mode =
+                                    w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
+                            }
                             let _ = r_peer.forward_selected_rows(
                                 tok_ptr,
                                 pos_ptr,
@@ -500,7 +529,7 @@ impl Qwen3_5Engine {
                 for pr in peer_results {
                     pr?;
                 }
-                Ok(res0?[0])
+                Ok(res0?.first().copied().unwrap_or(0))
             }
         })();
 

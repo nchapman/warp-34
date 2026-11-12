@@ -29,7 +29,7 @@ pub struct Qwen3_5ModelRank {
     pub embed_tokens_ptr: u64,
     pub host_embed_tokens: Option<crate::cuda::MappedHostBuffer>,
     pub final_residual: FinalResidual,
-    pub lm_head: LinearProj,
+    pub lm_head: Option<LinearProj>,
     pub local_vocab_size: usize,
     pub vocab_offset: usize,
     pub layers: Vec<DecoderLayerWeights>,
@@ -61,6 +61,7 @@ pub struct Qwen3_5ModelRank {
     pub pending_visual_splice: Option<(u64, u64, usize)>,
     pub last_norm_hidden_ptr: u64,
     pub last_norm_hidden_rows: usize,
+    pub last_batch_state_slots: Vec<usize>,
     pub tiered_moe: Option<crate::moe_offload::RankTieredMoe>,
     pub tiered_moe_hot_per_layer: usize,
     pub ple_runtime: Option<PleRankRuntime>,
@@ -607,7 +608,7 @@ pub(super) struct PrePoolModelRank {
     embed_tokens_ptr: u64,
     host_embed_tokens: Option<crate::cuda::MappedHostBuffer>,
     final_residual: FinalResidual,
-    lm_head: LinearProj,
+    lm_head: Option<LinearProj>,
     layers: Vec<DecoderLayerWeights>,
     aux_stream: CudaStream,
     aux_marlin_ws: DeviceBuffer,
@@ -629,12 +630,12 @@ pub fn plan_scratch_arena_bytes(
         && requested_kv_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
     {
         crate::scheduler::EXTREME_LONGCTX_SCRATCH_ARENA_BYTES
-    } else if tp_size == 1 && est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
-        crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES
-    } else if cfg.uses_tiered_moe()
+    } else if (cfg.uses_tiered_moe() || cfg.requires_atomic_prefix_prefill())
         && requested_kv_pages.unwrap_or(0) <= crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES
     {
         crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+    } else if tp_size == 1 && est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
+        crate::scheduler::LARGE_MODEL_TP1_SCRATCH_ARENA_BYTES
     } else {
         crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES
     }
@@ -1588,15 +1589,19 @@ impl Qwen3_5ModelRank {
 
         // 1. embed_tokens (replicated in FP16; dequantized on host when packed)
         //    and optional untied lm_head (loaded once and shared across TP ranks when `shared_vocab` is provided).
+        let has_untied_lm_head = !cfg.tie_word_embeddings
+            && ["lm_head.weight", "lm_head.weight_packed", "lm_head.qweight"]
+                .iter()
+                .any(|k| archive.resolve_name(k).is_some());
         let owned_vocab;
         let (embed_f16, shared_lm_opt): (&[u16], Option<&RawLinearHost>) =
             if let Some(cell) = shared_vocab {
                 let res = cell.get_or_init(|| {
                     let emb = Self::load_embed_tokens_f16(archive, cfg)?;
-                    let lm = if cfg.tie_word_embeddings {
-                        None
-                    } else {
+                    let lm = if has_untied_lm_head {
                         Some(RawLinearHost::load(archive, "lm_head", &cfg.quant)?)
+                    } else {
+                        None
                     };
                     Ok((emb, lm))
                 });
@@ -1646,7 +1651,7 @@ impl Qwen3_5ModelRank {
             }
         };
 
-        // 3. lm_head (sharded along vocab N across TP ranks)
+        // 3. lm_head (sharded along vocab N across TP ranks; None for readout-only decision models)
         let local_vocab_size = cfg.vocab_size / tp_size;
         let vocab_offset = rank * local_vocab_size;
         let lm_head = if cfg.tie_word_embeddings {
@@ -1658,18 +1663,20 @@ impl Qwen3_5ModelRank {
             } else {
                 weight_arena.upload_slice(slice, &stream)?
             };
-            LinearProj::DenseF16 {
+            Some(LinearProj::DenseF16 {
                 weight_ptr: ptr,
                 size_n: local_vocab_size,
                 size_k: cfg.hidden_size,
-            }
+            })
         } else if let Some(raw_lm) = shared_lm_opt {
             let sharded = raw_lm.slice_rows(vocab_offset, vocab_offset + local_vocab_size);
-            sharded.upload(&mut weight_arena, &stream, &repack_staging)?
-        } else {
+            Some(sharded.upload(&mut weight_arena, &stream, &repack_staging)?)
+        } else if has_untied_lm_head {
             let raw_lm = RawLinearHost::load(archive, "lm_head", &cfg.quant)?;
             let sharded = raw_lm.slice_rows(vocab_offset, vocab_offset + local_vocab_size);
-            sharded.upload(&mut weight_arena, &stream, &repack_staging)?
+            Some(sharded.upload(&mut weight_arena, &stream, &repack_staging)?)
+        } else {
+            None
         };
 
         // 4. Decoder layers
@@ -2298,6 +2305,7 @@ impl PrePoolModelRank {
             pending_visual_splice: None,
             last_norm_hidden_ptr: 0,
             last_norm_hidden_rows: 0,
+            last_batch_state_slots: vec![0],
             tiered_moe,
             tiered_moe_hot_per_layer,
             ple_runtime,

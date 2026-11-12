@@ -99,10 +99,6 @@ pub enum DecisionTapOutput {
         rows: Vec<Vec<f32>>,
         cached_tokens: usize,
     },
-    ClefLogits {
-        logits: Vec<Vec<f64>>,
-        cached_tokens: usize,
-    },
 }
 
 enum DecisionReadoutTap {
@@ -115,44 +111,21 @@ enum DecisionReadoutTap {
         captured: Vec<Option<Vec<f32>>>,
         tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, WorkerError>>,
     },
-    ClefJoint {
-        record: Arc<crate::clef::ClefEncodedRecord>,
-        gpu_state: Option<crate::clef::ClefDeviceRequestState>,
-        tx: tokio::sync::oneshot::Sender<Result<DecisionTapOutput, WorkerError>>,
-    },
 }
 
 impl DecisionReadoutTap {
     fn fail(self, error: WorkerError) {
         match self {
-            Self::CandidateLogits { tx, .. }
-            | Self::HiddenPositions { tx, .. }
-            | Self::ClefJoint { tx, .. } => {
+            Self::CandidateLogits { tx, .. } | Self::HiddenPositions { tx, .. } => {
                 let _ = tx.send(Err(error));
             }
         }
     }
 
-    fn recycle_into(self, engine: &mut Qwen3_5Engine) {
-        if let Self::ClefJoint {
-            gpu_state: Some(st),
-            ..
-        } = self
-        {
-            engine.clef_recycle_request(st);
-        }
-    }
+    fn recycle_into(self, _engine: &mut Qwen3_5Engine) {}
 
-    fn fail_and_recycle(self, engine: &mut Qwen3_5Engine, error: WorkerError) {
-        match self {
-            Self::ClefJoint { gpu_state, tx, .. } => {
-                if let Some(st) = gpu_state {
-                    engine.clef_recycle_request(st);
-                }
-                let _ = tx.send(Err(error));
-            }
-            other => other.fail(error),
-        }
+    fn fail_and_recycle(self, _engine: &mut Qwen3_5Engine, error: WorkerError) {
+        self.fail(error);
     }
 }
 
@@ -169,6 +142,7 @@ struct Request {
     cancelled: Arc<AtomicBool>,
     max_prefix_lookup_len: Option<usize>,
     mamba_branching_seqlen: Option<usize>,
+    prefix_bidir_len: Option<usize>,
     decision_tap: Option<DecisionReadoutTap>,
 }
 
@@ -257,6 +231,7 @@ pub struct EngineWorker {
     pub has_vision_weights: bool,
     pub hidden_size: usize,
     pub kv_token_capacity: usize,
+    pub unshareable_prefill: bool,
     max_model_len: Option<usize>,
 }
 impl EngineWorker {
@@ -330,6 +305,17 @@ impl EngineWorker {
                     {
                         clamped_cfg.max_num_batched_tokens = 6144;
                         clamped_cfg.chunk_prefill_size = 6144;
+                    } else if engine.cfg.requires_atomic_prefix_prefill()
+                        && clamped_cfg.chunk_prefill_size == 2048
+                        && clamped_cfg.max_num_batched_tokens == 2048
+                    {
+                        clamped_cfg.max_num_batched_tokens = 4096;
+                        clamped_cfg.chunk_prefill_size = 4096;
+                    }
+                    if let Some(comm) = &engine.tp2_comm {
+                        let tp_tok_cap =
+                            comm.max_stage_bytes_per_epoch / (engine.cfg.hidden_size.max(1) * 2);
+                        clamped_cfg.clamp_for_token_capacity(tp_tok_cap);
                     }
                     for rank in &engine.ranks {
                         match rank.ordinary_prefill_token_capacity(clamped_cfg.max_num_seqs) {
@@ -343,6 +329,8 @@ impl EngineWorker {
                     let default_preserve_thinking =
                         crate::chatml::detect_default_preserve_thinking(&engine.model_dir);
                     let kv_token_capacity = engine.ranks[0].kv_pool.num_pages * 16;
+                    let unshareable_prefill = engine.cfg.noncausal_full_attention
+                        || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
                     let info = (
                         engine.tokenizer.clone(),
                         engine.cfg.eos_token_ids.clone(),
@@ -353,6 +341,7 @@ impl EngineWorker {
                         engine.has_vision_weights,
                         engine.cfg.hidden_size,
                         kv_token_capacity,
+                        unshareable_prefill,
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
                         run(
@@ -381,6 +370,7 @@ impl EngineWorker {
             has_vision_weights,
             hidden_size,
             kv_token_capacity,
+            unshareable_prefill,
         ) = match ready_rx.recv() {
             Ok(Ok(info)) => info,
             Ok(Err(error)) => {
@@ -408,6 +398,7 @@ impl EngineWorker {
             has_vision_weights,
             hidden_size,
             kv_token_capacity,
+            unshareable_prefill,
             max_model_len: None,
         })
     }
@@ -549,6 +540,7 @@ impl EngineWorker {
             cancelled: cancelled.clone(),
             max_prefix_lookup_len: None,
             mamba_branching_seqlen: None,
+            prefix_bidir_len: None,
             decision_tap: None,
         })?;
         Ok(GenerationStream {
@@ -597,6 +589,7 @@ impl EngineWorker {
             images,
             None,
             mamba_branching_seqlen,
+            None,
             DecisionReadoutTap::CandidateLogits { token_ids, tx },
         )?;
         Ok((stream, rx))
@@ -621,6 +614,7 @@ impl EngineWorker {
             positions,
             max_prefix_lookup_len,
             mamba_branching_seqlen,
+            None,
         )
     }
 
@@ -631,6 +625,7 @@ impl EngineWorker {
         positions: Vec<usize>,
         max_prefix_lookup_len: Option<usize>,
         mamba_branching_seqlen: Option<usize>,
+        prefix_bidir_len: Option<usize>,
     ) -> Result<
         (
             GenerationStream,
@@ -645,38 +640,10 @@ impl EngineWorker {
             images,
             max_prefix_lookup_len,
             mamba_branching_seqlen,
+            prefix_bidir_len,
             DecisionReadoutTap::HiddenPositions {
                 positions,
                 captured,
-                tx,
-            },
-        )?;
-        Ok((stream, rx))
-    }
-
-    pub fn submit_decision_clef_with_images(
-        &self,
-        record: Arc<crate::clef::ClefEncodedRecord>,
-        images: Vec<crate::vision::PreprocessedImage>,
-    ) -> Result<
-        (
-            GenerationStream,
-            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
-        ),
-        WorkerError,
-    > {
-        let prompt = record.input_ids.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        // Clef JointSchemaHead cross-attends over every token [0..total_tokens], so disable
-        // radix prefix skipping (`max_prefix_lookup_len: Some(0)`).
-        let stream = self.submit_decision_internal(
-            prompt,
-            images,
-            Some(0),
-            None,
-            DecisionReadoutTap::ClefJoint {
-                record,
-                gpu_state: None,
                 tx,
             },
         )?;
@@ -689,6 +656,7 @@ impl EngineWorker {
         images: Vec<crate::vision::PreprocessedImage>,
         max_prefix_lookup_len: Option<usize>,
         mamba_branching_seqlen: Option<usize>,
+        prefix_bidir_len: Option<usize>,
         tap: DecisionReadoutTap,
     ) -> Result<GenerationStream, WorkerError> {
         if prompt.is_empty() {
@@ -721,6 +689,7 @@ impl EngineWorker {
             cancelled: cancelled.clone(),
             max_prefix_lookup_len,
             mamba_branching_seqlen,
+            prefix_bidir_len,
             decision_tap: Some(tap),
         })?;
         Ok(GenerationStream {
@@ -768,6 +737,16 @@ pub fn run_batch_in_place(
     {
         clamped_cfg.max_num_batched_tokens = 6144;
         clamped_cfg.chunk_prefill_size = 6144;
+    } else if engine.cfg.requires_atomic_prefix_prefill()
+        && clamped_cfg.chunk_prefill_size == 2048
+        && clamped_cfg.max_num_batched_tokens == 2048
+    {
+        clamped_cfg.max_num_batched_tokens = 4096;
+        clamped_cfg.chunk_prefill_size = 4096;
+    }
+    if let Some(comm) = &engine.tp2_comm {
+        let tp_tok_cap = comm.max_stage_bytes_per_epoch / (engine.cfg.hidden_size.max(1) * 2);
+        clamped_cfg.clamp_for_token_capacity(tp_tok_cap);
     }
     for rank in &engine.ranks {
         let cap = rank
@@ -811,6 +790,7 @@ pub fn run_batch_in_place(
                     cancelled: cancelled.clone(),
                     max_prefix_lookup_len: None,
                     mamba_branching_seqlen: None,
+                    prefix_bidir_len: None,
                     decision_tap: None,
                 })
                 .map_err(|e| format!("failed to enqueue batch request: {e}"))?;
@@ -919,6 +899,44 @@ fn enqueue(
     }
     let vocab = engine.cfg.vocab_size;
     let p = &mut request.sampler.params;
+    let needs_lm_head = p.max_tokens > 0
+        || matches!(
+            request.decision_tap,
+            Some(DecisionReadoutTap::CandidateLogits { .. })
+        );
+    if needs_lm_head && engine.ranks[0].lm_head.is_none() {
+        let err =
+            WorkerError::invalid_request("loaded checkpoint has no lm_head for token generation");
+        if let Some(tap) = request.decision_tap.take() {
+            tap.fail(err.clone());
+        }
+        request.set_terminal(GenerationEvent::Error(err));
+        return;
+    }
+    if engine.cfg.noncausal_full_attention
+        || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+    {
+        request.prefix_bidir_len = Some(request.prompt.len());
+        request.max_prefix_lookup_len = Some(0);
+        request.mamba_branching_seqlen = None;
+    }
+    let single_chunk_cap = sched
+        .cfg
+        .chunk_prefill_size
+        .min(sched.cfg.max_num_batched_tokens);
+    if request
+        .prefix_bidir_len
+        .is_some_and(|bidir_end| bidir_end > request.prompt.len() || bidir_end > single_chunk_cap)
+    {
+        let err = WorkerError::invalid_request(
+            "bidirectional or midloop prompt prefix exceeds single-chunk prefill capacity",
+        );
+        if let Some(tap) = request.decision_tap.take() {
+            tap.fail(err.clone());
+        }
+        request.set_terminal(GenerationEvent::Error(err));
+        return;
+    }
     let valid = request
         .prompt
         .iter()
@@ -965,7 +983,7 @@ fn enqueue(
         .vision
         .as_ref()
         .map_or_else(|| prompt_tokens.clone(), |v| v.radix_key.clone());
-    let id = sched.submit_request_with_prefix_options(
+    let id = sched.submit_request_with_prefix_and_bidir(
         prompt_tokens,
         key,
         p.max_tokens,
@@ -976,6 +994,7 @@ fn enqueue(
         request.vision.is_some(),
         request.max_prefix_lookup_len,
         request.mamba_branching_seqlen,
+        request.prefix_bidir_len,
     );
     requests.insert(id, request);
 }

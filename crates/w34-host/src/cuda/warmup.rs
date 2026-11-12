@@ -140,6 +140,18 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         "warmup w34_linear_epilogue_f16"
     )?;
 
+    warmup_ffi!(
+        ffi::w34_midloop_damped_euler_f16(
+            &ex,
+            buf_c as *mut c_void,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            128,
+            0.5,
+        ),
+        "warmup w34_midloop_damped_euler_f16"
+    )?;
+
     // 1. Norms, RoPE, activations
     warmup_ffi!(
         ffi::w34_embed_lookup_f16(

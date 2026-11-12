@@ -85,6 +85,23 @@ pub fn mode_distance_score_confidence(probs: &[f64]) -> f64 {
     (1.0 - s / ((l - 1) as f64)).clamp(0.0, 1.0)
 }
 
+pub fn top1_top2_margin_confidence(probs: &[f64]) -> f64 {
+    if probs.len() <= 1 {
+        return 1.0;
+    }
+    let mut top1 = 0.0;
+    let mut top2 = 0.0;
+    for &p in probs {
+        if p >= top1 {
+            top2 = top1;
+            top1 = p;
+        } else if p > top2 {
+            top2 = p;
+        }
+    }
+    (top1 - top2).clamp(0.0, 1.0)
+}
+
 pub fn softmax_temperature(logits: &[f64], temperature: f64) -> Result<Vec<f64>, DecisionError> {
     if logits.is_empty() {
         return Err(DecisionError::internal("decision: empty candidate logits"));
@@ -118,7 +135,7 @@ pub fn softmax_temperature(logits: &[f64], temperature: f64) -> Result<Vec<f64>,
     Ok(probs)
 }
 
-/// Averages forward `[0..N]` and reverse `[N-1..=0]` probability distributions (`Xor`/`Lev`).
+/// Averages forward `[0..N]` and reverse `[N-1..=0]` probability distributions (`order_passes == 2`).
 pub fn calibrate_forward_reverse_logits(
     fwd_logits: &[f64],
     rev_logits: &[f64],
@@ -126,7 +143,7 @@ pub fn calibrate_forward_reverse_logits(
 ) -> Result<Vec<f64>, DecisionError> {
     if fwd_logits.len() != rev_logits.len() {
         return Err(DecisionError::internal(
-            "xor: forward/reverse logit count mismatch",
+            "decision: forward/reverse logit count mismatch",
         ));
     }
     let fwd = softmax_temperature(fwd_logits, temperature)?;
@@ -145,28 +162,38 @@ pub fn answer_from_probabilities(
             "decision: probability count differs from field choices",
         ));
     }
+    let mut dist = Map::new();
+    for (k, &p) in field.keys.iter().zip(probs) {
+        dist.insert(k.clone(), json!(p));
+    }
+
     if field.field_type == "noul" {
         let true_idx = field
             .keys
             .iter()
             .position(|k| k == "true")
             .unwrap_or(probs.len() - 1);
+        let p_true = probs[true_idx];
         let mut out = Map::new();
         out.insert("type".into(), Value::String("noul".into()));
-        out.insert("noul".into(), json!(probs[true_idx]));
+        out.insert("noul".into(), json!(p_true));
+        if conf_kind == ConfidenceKind::Top1Top2Margin {
+            let conf = ((p_true - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+            out.insert("confidence".into(), json!(conf));
+            out.insert("probabilities".into(), Value::Object(dist));
+        }
         return Ok(Value::Object(out));
     }
 
-    let mut dist = Map::new();
-    for (k, &p) in field.keys.iter().zip(probs) {
-        dist.insert(k.clone(), json!(p));
-    }
-
     if field.field_type == "score" {
-        let mut score = 0.0;
+        let mut expected_level = 0.0;
+        let mut best = 0usize;
         let mut legend = Map::new();
         for (i, &p) in probs.iter().enumerate() {
-            score += (i as f64) * p;
+            expected_level += (i as f64) * p;
+            if p > probs[best] {
+                best = i;
+            }
             legend.insert(
                 field.keys[i].clone(),
                 Value::String(field.value_descriptions[i].clone()),
@@ -175,14 +202,23 @@ pub fn answer_from_probabilities(
         let conf = match conf_kind {
             ConfidenceKind::NormalizedEntropy => entropy_confidence(probs),
             ConfidenceKind::MarginAndModeDistance => mode_distance_score_confidence(probs),
-            ConfidenceKind::MaxProbability => probs.iter().copied().fold(0.0, f64::max),
+            ConfidenceKind::MaxProbability => probs[best],
+            ConfidenceKind::Top1Top2Margin => top1_top2_margin_confidence(probs),
         };
         let mut out = Map::new();
         out.insert("type".into(), Value::String("score".into()));
-        out.insert("score".into(), json!(score));
-        out.insert("legend".into(), Value::Object(legend));
-        out.insert("probabilities".into(), Value::Object(dist));
-        out.insert("confidence".into(), json!(conf));
+        if conf_kind == ConfidenceKind::Top1Top2Margin {
+            let top_int = field.keys[best].parse::<i64>().unwrap_or(best as i64);
+            out.insert("score".into(), json!(top_int));
+            out.insert("expected_level".into(), json!(expected_level));
+            out.insert("confidence".into(), json!(conf));
+            out.insert("probabilities".into(), Value::Object(dist));
+        } else {
+            out.insert("score".into(), json!(expected_level));
+            out.insert("legend".into(), Value::Object(legend));
+            out.insert("probabilities".into(), Value::Object(dist));
+            out.insert("confidence".into(), json!(conf));
+        }
         return Ok(Value::Object(out));
     }
 
@@ -196,6 +232,7 @@ pub fn answer_from_probabilities(
         ConfidenceKind::NormalizedEntropy => entropy_confidence(probs),
         ConfidenceKind::MarginAndModeDistance => margin_choice_confidence(probs),
         ConfidenceKind::MaxProbability => probs[best],
+        ConfidenceKind::Top1Top2Margin => top1_top2_margin_confidence(probs),
     };
     let mut out = Map::new();
     out.insert("type".into(), Value::String("choice".into()));
@@ -215,8 +252,8 @@ pub fn answer_from_logits(
     answer_from_probabilities(field, &probs, conf_kind)
 }
 
-/// Normalizes an ergonomic `/v1/decisions` request (supporting `context` or `state`, and an
-/// array of `decisions` or an object `questions`) into canonical `/v1/systemone` request JSON.
+/// Normalizes an ergonomic `/v1/decisions` request (supporting `context` or `state`, `order_passes`,
+/// and an array of `decisions` or an object `questions`) into canonical `/v1/systemone` request JSON.
 pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, DecisionError> {
     let Some(obj) = body.as_object() else {
         return Err(DecisionError::bad_request("request body must be an object"));
@@ -229,6 +266,7 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
         "decisions",
         "images",
         "videos",
+        "order_passes",
     ];
     for k in obj.keys() {
         if !TOP_KEYS.contains(&k.as_str()) {
@@ -250,6 +288,9 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
         }
         if let Some(vids) = obj.get("videos") {
             canonical.insert("videos".into(), vids.clone());
+        }
+        if let Some(op) = obj.get("order_passes") {
+            canonical.insert("order_passes".into(), op.clone());
         }
         canonical.insert("questions".into(), obj["questions"].clone());
         return Ok(Value::Object(canonical));
@@ -365,6 +406,9 @@ pub fn normalize_decisions_adapter_request(body: &Value) -> Result<Value, Decisi
     }
     if let Some(vids) = obj.get("videos") {
         canonical.insert("videos".into(), vids.clone());
+    }
+    if let Some(op) = obj.get("order_passes") {
+        canonical.insert("order_passes".into(), op.clone());
     }
     canonical.insert("questions".into(), Value::Object(questions));
     Ok(Value::Object(canonical))

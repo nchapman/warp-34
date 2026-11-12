@@ -10,6 +10,8 @@ struct ForwardScratch {
     block: u64,
     mlp: u64,
     injection: u64,
+    midloop_residual: u64,
+    midloop_gdn_snaps: Vec<(u64, usize, u64, usize)>,
     attention: [u64; 6],
     gdn: [u64; 5],
     ffn: [u64; 10],
@@ -36,6 +38,42 @@ impl Qwen3_5ModelRank {
         } else {
             0
         };
+        let has_active_midloop = self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
+        let midloop_residual = if has_active_midloop {
+            self.scratch_arena.alloc_aligned(rows * streams * h * 2)?
+        } else {
+            0
+        };
+        let mut midloop_gdn_snaps = Vec::new();
+        if has_active_midloop && let Some(first_st) = self.state_pool.layers.first() {
+            let total_slots = self.state_pool.total_slots.max(1);
+            let conv_slot_b = first_st.conv_state.len_bytes / total_slots;
+            let ssm_slot_b = first_st.ssm_state.len_bytes / total_slots;
+            let active_slots = self.last_batch_state_slots.len().clamp(1, total_slots);
+            let max_span_gdn = self
+                .cfg
+                .midloop
+                .iter()
+                .filter(|&&(_, _, passes)| passes > 1)
+                .map(|&(a, b, _)| {
+                    self.state_pool
+                        .layers
+                        .iter()
+                        .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            for _ in 0..max_span_gdn {
+                let conv_snap = self
+                    .scratch_arena
+                    .alloc_aligned(active_slots * conv_slot_b)?;
+                let ssm_snap = self
+                    .scratch_arena
+                    .alloc_aligned(active_slots * ssm_slot_b)?;
+                midloop_gdn_snaps.push((conv_snap, conv_slot_b, ssm_snap, ssm_slot_b));
+            }
+        }
         let (attention, gdn, ffn, ple, qsa, overlay_end) =
             alloc_layer_scratch(&mut self.scratch_arena, &self.cfg, self.tp_size, rows)?;
         Ok(ForwardScratch {
@@ -44,6 +82,8 @@ impl Qwen3_5ModelRank {
             block,
             mlp,
             injection,
+            midloop_residual,
+            midloop_gdn_snaps,
             attention,
             gdn,
             ffn,
@@ -176,7 +216,11 @@ impl Qwen3_5ModelRank {
             final_out,
             dump_out.as_deref_mut(),
         )?;
-        self.lm_head.forward(
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .ok_or_else(|| loader_err("checkpoint has no lm_head for token generation"))?;
+        lm_head.forward(
             &ex,
             &self.cublas,
             self.marlin_ws.addr(),
@@ -455,6 +499,10 @@ impl Qwen3_5ModelRank {
         if n == 0 {
             return Ok((0, false));
         }
+        let lm_head = self
+            .lm_head
+            .as_ref()
+            .ok_or_else(|| loader_err("checkpoint has no lm_head for token generation"))?;
         let hidden = if contiguous {
             final_out + (selected_rows[0] * h * 2) as u64
         } else {
@@ -474,7 +522,7 @@ impl Qwen3_5ModelRank {
             }
             gathered
         };
-        self.lm_head.forward(
+        lm_head.forward(
             &ex,
             &self.cublas,
             self.marlin_ws.addr(),
@@ -582,7 +630,69 @@ impl Qwen3_5ModelRank {
             .ple_conv_state
             .as_ref()
             .map_or(0, |b| b.addr());
-        for layer_idx in 0..self.layers.len() {
+        let mut active_midloop: Option<(usize, usize, usize, usize)> = None;
+        let mut layer_idx = 0usize;
+        while layer_idx < self.layers.len() {
+            if active_midloop.is_none()
+                && let Some(&(a, b, passes)) = self
+                    .cfg
+                    .midloop
+                    .iter()
+                    .find(|&&(a, _, passes)| a == layer_idx && passes > 1)
+            {
+                check_rc(
+                    // SAFETY: midloop_residual and residual both hold rows * streams * h FP16 elements.
+                    unsafe {
+                        ffi::w34_memcpy_d2d_async(
+                            s.midloop_residual as *mut c_void,
+                            s.residual as *const c_void,
+                            rows * streams * h * 2,
+                            self.stream.handle,
+                        )
+                    },
+                    "snapshot midloop_residual",
+                )?;
+                for (st, &(conv_snap, conv_slot_b, ssm_snap, ssm_slot_b)) in self
+                    .state_pool
+                    .layers
+                    .iter()
+                    .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                    .zip(s.midloop_gdn_snaps.iter())
+                {
+                    for (slot_pos, &slot) in self.last_batch_state_slots.iter().enumerate() {
+                        if slot >= self.state_pool.total_slots {
+                            continue;
+                        }
+                        check_rc(
+                            // SAFETY: slot < total_slots and conv_snap reserves last_batch_state_slots.len() * conv_slot_b bytes.
+                            unsafe {
+                                ffi::w34_memcpy_d2d_async(
+                                    (conv_snap + (slot_pos * conv_slot_b) as u64) as *mut c_void,
+                                    (st.conv_state.addr() + (slot * conv_slot_b) as u64)
+                                        as *const c_void,
+                                    conv_slot_b,
+                                    self.stream.handle,
+                                )
+                            },
+                            "snapshot midloop gdn conv_state",
+                        )?;
+                        check_rc(
+                            // SAFETY: slot < total_slots and ssm_snap reserves last_batch_state_slots.len() * ssm_slot_b bytes.
+                            unsafe {
+                                ffi::w34_memcpy_d2d_async(
+                                    (ssm_snap + (slot_pos * ssm_slot_b) as u64) as *mut c_void,
+                                    (st.ssm_state.addr() + (slot * ssm_slot_b) as u64)
+                                        as *const c_void,
+                                    ssm_slot_b,
+                                    self.stream.handle,
+                                )
+                            },
+                            "snapshot midloop gdn ssm_state",
+                        )?;
+                    }
+                }
+                active_midloop = Some((a, b, passes, 0));
+            }
             let layer = &self.layers[layer_idx];
             if let Some(ple) = &layer.ple {
                 ple.forward(
@@ -606,7 +716,16 @@ impl Qwen3_5ModelRank {
             }
             // PLE mutates the residual: a single-stream layer must then redo the input norm,
             // rather than consume the norm fused by its predecessor before that mutation.
-            let norm_layer_idx = if layer.ple.is_some() { 0 } else { layer_idx };
+            // Similarly, midloop pass > 0 at loop start `a` or the layer `b + 1` immediately
+            // following a midloop damped-Euler update must recompute its input norm from `s.residual`.
+            let redo_input_norm = layer.ple.is_some()
+                || active_midloop.is_some_and(|(a, _, _, pass_idx)| layer_idx == a && pass_idx > 0)
+                || self
+                    .cfg
+                    .midloop
+                    .iter()
+                    .any(|&(_, b, passes)| passes > 1 && b + 1 == layer_idx);
+            let norm_layer_idx = if redo_input_norm { 0 } else { layer_idx };
             let hc_ctx = super::HcStepContext {
                 ex,
                 cublas: &self.cublas,
@@ -706,7 +825,13 @@ impl Qwen3_5ModelRank {
                         0,
                     ]
                 };
-            let (dst, stride, offset) = self.layer_tap_target(layer_idx, rows, h);
+            let is_final_midloop_pass =
+                active_midloop.is_none_or(|(_, _, passes, pass_idx)| pass_idx + 1 == passes);
+            let (dst, stride, offset) = if is_final_midloop_pass {
+                self.layer_tap_target(layer_idx, rows, h)
+            } else {
+                (0, 0, 0)
+            };
             self.layers[layer_idx].residual.post_mlp_with_targets(
                 &hc_ctx,
                 tp2,
@@ -719,6 +844,105 @@ impl Qwen3_5ModelRank {
                     offset,
                 },
             )?;
+            if let Some((a, b, passes, pass_idx)) = active_midloop
+                && layer_idx == b
+            {
+                let alpha = 1.0f32 / (passes as f32);
+                let elem_count = (rows * streams * h) as i64;
+                check_rc(
+                    // SAFETY: s.residual and s.midloop_residual hold elem_count FP16 elements.
+                    unsafe {
+                        ffi::w34_midloop_damped_euler_f16(
+                            ex,
+                            s.residual as *mut c_void,
+                            s.midloop_residual as *const c_void,
+                            s.residual as *const c_void,
+                            elem_count,
+                            alpha,
+                        )
+                    },
+                    "w34_midloop_damped_euler_f16",
+                )?;
+                if pass_idx + 1 < passes {
+                    check_rc(
+                        // SAFETY: midloop_residual and residual have identical size.
+                        unsafe {
+                            ffi::w34_memcpy_d2d_async(
+                                s.midloop_residual as *mut c_void,
+                                s.residual as *const c_void,
+                                rows * streams * h * 2,
+                                self.stream.handle,
+                            )
+                        },
+                        "update midloop_residual",
+                    )?;
+                    for (st, &(conv_snap, conv_slot_b, ssm_snap, ssm_slot_b)) in self
+                        .state_pool
+                        .layers
+                        .iter()
+                        .filter(|st| st.layer_id >= a && st.layer_id <= b)
+                        .zip(s.midloop_gdn_snaps.iter())
+                    {
+                        for (slot_pos, &slot) in self.last_batch_state_slots.iter().enumerate() {
+                            if slot >= self.state_pool.total_slots {
+                                continue;
+                            }
+                            check_rc(
+                                // SAFETY: slot < total_slots and conv_snap holds last_batch_state_slots.len() * conv_slot_b bytes.
+                                unsafe {
+                                    ffi::w34_memcpy_d2d_async(
+                                        (st.conv_state.addr() + (slot * conv_slot_b) as u64)
+                                            as *mut c_void,
+                                        (conv_snap + (slot_pos * conv_slot_b) as u64)
+                                            as *const c_void,
+                                        conv_slot_b,
+                                        self.stream.handle,
+                                    )
+                                },
+                                "restore midloop gdn conv_state",
+                            )?;
+                            check_rc(
+                                // SAFETY: slot < total_slots and ssm_snap holds last_batch_state_slots.len() * ssm_slot_b bytes.
+                                unsafe {
+                                    ffi::w34_memcpy_d2d_async(
+                                        (st.ssm_state.addr() + (slot * ssm_slot_b) as u64)
+                                            as *mut c_void,
+                                        (ssm_snap + (slot_pos * ssm_slot_b) as u64)
+                                            as *const c_void,
+                                        ssm_slot_b,
+                                        self.stream.handle,
+                                    )
+                                },
+                                "restore midloop gdn ssm_state",
+                            )?;
+                        }
+                    }
+                    active_midloop = Some((a, b, passes, pass_idx + 1));
+                    layer_idx = a;
+                    continue;
+                }
+                active_midloop = None;
+                if layer_idx + 1 == self.layers.len()
+                    && let Some(norm_w) = self.final_residual.single_stream_norm_ptr()
+                {
+                    check_rc(
+                        // SAFETY: final_out and s.residual hold rows * h FP16 elements.
+                        unsafe {
+                            ffi::w34_gemma_rms_norm_f16(
+                                ex,
+                                s.residual as *const c_void,
+                                norm_w as *const c_void,
+                                final_out as *mut c_void,
+                                std::ptr::null(),
+                                rows as i32,
+                                h as i32,
+                                eps,
+                            )
+                        },
+                        "w34_gemma_rms_norm_f16 (post-midloop final norm)",
+                    )?;
+                }
+            }
             if layer_idx + 1 < self.layers.len()
                 && let Some(dump) = dump_out.as_deref_mut()
                 && self.rank == 0
@@ -731,6 +955,7 @@ impl Qwen3_5ModelRank {
                     dump,
                 )?;
             }
+            layer_idx += 1;
         }
         let final_hc_ctx = super::HcStepContext {
             ex,
@@ -1151,11 +1376,33 @@ impl Qwen3_5ModelRank {
         let off_sp = push_slice(&mut packed, spec_state_indices);
         let off_cd = push_slice(&mut packed, checkpoint_dst_indices);
         let off_co = push_slice(&mut packed, checkpoint_token_offsets);
+        self.last_batch_state_slots.clear();
+        for &slot in state_in_indices
+            .iter()
+            .chain(state_out_indices.iter())
+            .chain(spec_state_indices.iter())
+            .chain(checkpoint_dst_indices.iter())
+        {
+            if slot >= 0 && (slot as usize) < self.state_pool.total_slots {
+                let u = slot as usize;
+                if !self.last_batch_state_slots.contains(&u) {
+                    self.last_batch_state_slots.push(u);
+                }
+            }
+        }
+        if self.last_batch_state_slots.is_empty() {
+            self.last_batch_state_slots.push(0);
+        }
         let base = self.batch_meta_arena.upload_slice(&packed, &self.stream)?;
         let ptr_at = |off: usize| -> u64 { base + (off * 4) as u64 };
         let has_init_ptr = self
             .batch_meta_arena
             .upload_slice(has_initial_state, &self.stream)?;
+        let mask_mode = if self.cfg.noncausal_full_attention {
+            w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
+        } else {
+            W34_ATTN_MASK_CAUSAL
+        };
         let attn_batch = W34AttentionBatch {
             query_start_loc: ptr_at(off_qs) as *const i32,
             context_lens_before: ptr_at(off_cb) as *const i32,
@@ -1169,7 +1416,7 @@ impl Qwen3_5ModelRank {
             max_blocks_per_req: max_blocks_per_req as i32,
             max_q_len: max_q_len as i32,
             max_seq_len: max_seq_len as i32,
-            mask_mode: W34_ATTN_MASK_CAUSAL,
+            mask_mode,
             sliding_window: 0,
             sm_scale: (self.cfg.head_dim as f32).powf(-0.5),
             reserved: 0,

@@ -46,18 +46,27 @@ fn capture_decision_tap(
         }) => {
             let chunk_start = s.ctx_len_before;
             let chunk_end = chunk_start + slice_len;
-            let mut read_err = None;
+            let mut target_slots = Vec::new();
+            let mut batch_rows = Vec::new();
             for (p_idx, &pos) in positions.iter().enumerate() {
                 if (chunk_start..chunk_end).contains(&pos) {
-                    match engine.read_norm_hidden_row_f32(tok_off + (pos - chunk_start)) {
-                        Ok(row) => captured[p_idx] = Some(row),
-                        Err(e) => {
-                            read_err = Some(WorkerError::Cuda(e));
-                            break;
-                        }
-                    }
+                    target_slots.push(p_idx);
+                    batch_rows.push(tok_off + (pos - chunk_start));
                 }
             }
+            let read_err = if !batch_rows.is_empty() {
+                match engine.read_norm_hidden_rows_f32(&batch_rows) {
+                    Ok(rows) => {
+                        for (p_idx, row) in target_slots.into_iter().zip(rows) {
+                            captured[p_idx] = Some(row);
+                        }
+                        None
+                    }
+                    Err(e) => Some(WorkerError::Cuda(e)),
+                }
+            } else {
+                None
+            };
             if (read_err.is_some() || s.is_final_prefill_chunk)
                 && let Some(DecisionReadoutTap::HiddenPositions {
                     mut captured, tx, ..
@@ -72,65 +81,8 @@ fn capture_decision_tap(
                     })
                 } else {
                     Err(WorkerError::internal(
-                        "kev: missing hidden position after final prefill chunk",
+                        "code_readout: missing hidden position after final prefill chunk",
                     ))
-                };
-                tap_done = Some((tx, res));
-            }
-        }
-        Some(DecisionReadoutTap::ClefJoint {
-            record, gpu_state, ..
-        }) => {
-            let expected_total = record.input_ids.len();
-            let read_err = if gpu_state.is_none() {
-                match check_full_hidden_chunk_offset(0, s.ctx_len_before)
-                    .and_then(|()| engine.clef_begin_request(record))
-                {
-                    Ok(st) => {
-                        *gpu_state = Some(st);
-                        None
-                    }
-                    Err(e) => Some(WorkerError::internal(e)),
-                }
-            } else {
-                None
-            }
-            .or_else(|| {
-                let st = gpu_state.as_mut().unwrap();
-                check_full_hidden_chunk_offset(st.next_offset(), s.ctx_len_before)
-                    .and_then(|()| {
-                        engine.clef_ingest_norm_hidden_range(
-                            st,
-                            tok_off,
-                            s.ctx_len_before,
-                            slice_len,
-                        )
-                    })
-                    .err()
-                    .map(WorkerError::internal)
-            });
-            if (read_err.is_some() || s.is_final_prefill_chunk)
-                && let Some(DecisionReadoutTap::ClefJoint {
-                    record,
-                    gpu_state,
-                    tx,
-                }) = req.decision_tap.take()
-            {
-                let res = if let Some(err) = read_err {
-                    if let Some(st) = gpu_state {
-                        engine.clef_recycle_request(st);
-                    }
-                    Err(err)
-                } else if let Some(st) = gpu_state {
-                    check_full_hidden_final_count(st.next_offset(), expected_total)
-                        .and_then(|()| engine.clef_finalize_request(st, &record))
-                        .map(|logits| DecisionTapOutput::ClefLogits {
-                            logits,
-                            cached_tokens: cached_toks,
-                        })
-                        .map_err(WorkerError::internal)
-                } else {
-                    Err(WorkerError::internal("clef gpu request state missing"))
                 };
                 tap_done = Some((tx, res));
             }
@@ -165,6 +117,38 @@ fn alloc_prefill_checkpoint_slot(
     } else {
         engine.alloc_state_slot_preserving_leaves(radix)
     }
+}
+
+fn batch_is_noncausal_prefix_prefill(
+    sched: &SchedulerV1,
+    requests: &HashMap<u64, Request>,
+    slices: &[ScheduledReqSlice],
+) -> bool {
+    let slice_is_bidir = |s: &ScheduledReqSlice| {
+        let single_pos_readout = requests.get(&s.req_id).is_none_or(|r| {
+            !matches!(
+                &r.decision_tap,
+                Some(DecisionReadoutTap::HiddenPositions { positions, .. }) if positions.len() > 1
+            )
+        });
+        s.is_prefill_chunk
+            && sched
+                .active
+                .iter()
+                .find(|seq| seq.req_id == s.req_id)
+                .is_some_and(|seq| {
+                    seq.prefix_bidir_len.is_some_and(|bidir_end| {
+                        s.ctx_len_before + s.query_tokens.len() <= bidir_end
+                            || (seq.max_new_tokens <= 1 && single_pos_readout)
+                    })
+                })
+    };
+    let noncausal = !slices.is_empty() && slices.iter().all(slice_is_bidir);
+    debug_assert!(
+        slices.iter().all(|s| slice_is_bidir(s) == noncausal),
+        "scheduler must not mix bidirectional prefix prefill slices with causal slices"
+    );
+    noncausal
 }
 
 pub(super) fn step_plain(
@@ -292,8 +276,18 @@ pub(super) fn step_plain(
         .collect();
     let emit_mask: Vec<bool> = slices
         .iter()
-        .map(|s| !s.is_prefill_chunk || s.is_final_prefill_chunk)
+        .map(|s| {
+            let needs_vocab_logits = requests.get(&s.req_id).is_some_and(|r| {
+                r.sampler.params.max_tokens > 0
+                    || matches!(
+                        r.decision_tap,
+                        Some(DecisionReadoutTap::CandidateLogits { .. })
+                    )
+            });
+            (!s.is_prefill_chunk || s.is_final_prefill_chunk) && needs_vocab_logits
+        })
         .collect();
+    let noncausal_override = batch_is_noncausal_prefix_prefill(sched, requests, &slices);
     let needs_gpu = slices.iter().enumerate().any(|(i, s)| {
         emit_mask[i] && {
             let r = &requests[&s.req_id];
@@ -325,11 +319,12 @@ pub(super) fn step_plain(
         );
     }
 
-    let greedy = engine.step_batch_slices_for_sampler_filtered(
+    let greedy = engine.step_batch_slices_for_sampler_filtered_bidir(
         &batch,
         Some(&deltas),
         Some(&emit_mask),
         needs_gpu,
+        noncausal_override,
     )?;
     record_computed_prefill(&slices, requests);
     {
@@ -853,30 +848,6 @@ fn commit_pipelined_step(
         emit(r, id, lp);
         release(engine, sched.commit_slice(s, Some(id), || None));
     }
-}
-
-pub(super) fn check_full_hidden_chunk_offset(
-    captured_len: usize,
-    ctx_len_before: usize,
-) -> std::result::Result<(), String> {
-    if ctx_len_before != captured_len {
-        return Err(format!(
-            "clef: non-contiguous prefill chunk (expected offset {captured_len}, got {ctx_len_before})"
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn check_full_hidden_final_count(
-    captured_len: usize,
-    expected_total: usize,
-) -> std::result::Result<(), String> {
-    if captured_len != expected_total {
-        return Err(format!(
-            "clef: captured {captured_len} hidden rows after final prefill chunk, expected {expected_total}"
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

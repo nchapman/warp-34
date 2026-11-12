@@ -100,7 +100,8 @@ fn fixture_files() -> BTreeMap<String, Vec<u8>> {
         ("config.json".into(), config()),
         ("tokenizer.json".into(), b"{}".to_vec()),
         ("model.safetensors".into(), weights()),
-        ("head.safetensors".into(), weights()),
+        ("readout.safetensors".into(), weights()),
+        ("decision_config.json".into(), b"{}".to_vec()),
         ("preprocessor_config.json".into(), b"{}".to_vec()),
         ("chat_template.jinja".into(), b"{{ messages }}".to_vec()),
         ("model.bin".into(), b"do not download".to_vec()),
@@ -420,7 +421,8 @@ fn downloads_pinned_selected_assets_reuses_cache_and_works_offline() {
     };
     let dir = resolve_remote("test/model", &options, ModelRole::Target, &s).unwrap();
     assert_eq!(dir.file_name().unwrap(), SHA);
-    assert!(dir.join("head.safetensors").exists());
+    assert!(dir.join("readout.safetensors").exists());
+    assert!(dir.join("decision_config.json").exists());
     assert!(dir.join("preprocessor_config.json").exists());
     assert!(!dir.join("model.bin").exists());
     assert!(!dir.join("alternative.safetensors").exists());

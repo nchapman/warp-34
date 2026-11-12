@@ -461,6 +461,117 @@ max_tokens = 32
             self.assertIn("| w34 | swe | 1 | 1/1 | 9000.00 | 8192.00 | 808.00 | 250.00 |", md)
             self.assertIn("25384", md)
 
+    def test_decision_case_executes_systemone_and_scores_accuracy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            fixture = {
+                "requests": [
+                    {
+                        "id": "jev-1",
+                        "state": "Policy: refunds within 30 days. Purchase was 10 days ago with receipt.",
+                        "questions": {
+                            "refund": {
+                                "type": "noul",
+                                "instructions": "Is the refund permitted?",
+                            },
+                            "route": {
+                                "type": "choice",
+                                "instructions": "Which team?",
+                                "criteria": {"billing": "Billing", "tech": "Tech"},
+                            },
+                        },
+                        "expected": {"refund": "yes", "route": "billing"},
+                    }
+                ]
+            }
+            (tmp_dir / "jev.json").write_text(json.dumps(fixture))
+            toml_text = """
+schema_version = 1
+[run]
+repetitions = 1
+warmup_requests = 0
+timeout_s = 10
+max_inflight = 4
+seed = 34
+[[engines]]
+id = "w34-glide"
+engine = "warp-34"
+support = "supported"
+gpu_count = 1
+base_url = "http://127.0.0.1:18034/v1"
+model = "fastino/GLiDE-0.8B"
+version = "test"
+model_revision = "rev"
+weight_format = "bf16"
+kv_format = "fp16"
+parallelism = "single"
+speculation = "none"
+cache_config = "test"
+launch_command = "w34 serve"
+[[cases]]
+id = "jev-p2"
+kind = "decision"
+fixture = "jev.json"
+requests = 2
+concurrency = 1
+max_tokens = 1
+order_passes = 2
+cache = "unique"
+"""
+            cfg_path = tmp_dir / "decision.toml"
+            cfg_path.write_text(toml_text)
+            cfg = load(cfg_path)
+
+            seen_payloads = []
+
+            def fake_decision(_engine, payload, _timeout, *, expected=None):
+                seen_payloads.append((copy.deepcopy(payload), copy.deepcopy(expected)))
+                return {
+                    "status": "ok",
+                    "error": None,
+                    "http_status": 200,
+                    "usage": {
+                        "prompt_tokens": 128,
+                        "completion_tokens": 2,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                        "decision_questions": 2,
+                    },
+                    "finish_reason": "stop",
+                    "events": [],
+                    "content": "{}",
+                    "reasoning": "",
+                    "tool_calls": {},
+                    "answers": {
+                        "refund": {"type": "noul", "noul": 0.92},
+                        "route": {
+                            "type": "choice",
+                            "choice": "billing",
+                            "probabilities": {"billing": 0.85, "tech": 0.15},
+                            "confidence": 0.70,
+                        },
+                    },
+                    "decision_correct": 2,
+                    "decision_total": 2,
+                    "first_output_ms": 4.2,
+                    "first_text_ms": 4.2,
+                    "last_output_ms": 4.2,
+                    "e2e_ms": 4.2,
+                }
+
+            with patch("w34perf.runner.decision", side_effect=fake_decision), \
+                    patch("w34perf.runner.provenance", return_value={}):
+                out = tmp_dir / "out"
+                rows = execute(cfg, out)
+
+            self.assertEqual(len(seen_payloads), 2)
+            self.assertEqual(seen_payloads[0][0]["order_passes"], 2)
+            self.assertTrue(seen_payloads[0][0]["state"].startswith("Benchmark session:"))
+            self.assertEqual(rows[0]["successful_requests"], 2)
+            self.assertEqual(rows[0]["completion_tokens"], 4)
+            self.assertEqual(rows[0]["decision_correct"], 4)
+            self.assertEqual(rows[0]["decision_total"], 4)
+            self.assertAlmostEqual(rows[0]["decision_accuracy"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

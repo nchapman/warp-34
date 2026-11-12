@@ -47,17 +47,16 @@ fn shared_mamba_branch_hint<'a>(
     (aligned >= 64 && aligned < first.len()).then_some(aligned)
 }
 
-async fn run_one_candidate_query(
-    s: Arc<OpenAiServerState>,
-    prompt: Vec<i32>,
-    images: Vec<crate::vision::PreprocessedImage>,
-    cands: Vec<i32>,
-    branch_hint: Option<usize>,
+type SubmittedDecisionQuery = (
+    crate::engine_worker::GenerationStream,
+    tokio::sync::oneshot::Receiver<
+        Result<crate::engine_worker::DecisionTapOutput, crate::engine_worker::WorkerError>,
+    >,
+);
+
+async fn await_candidate_query(
+    (mut stream, rx): SubmittedDecisionQuery,
 ) -> Result<(Vec<f64>, usize), ApiError> {
-    let (mut stream, rx) = s
-        .worker
-        .submit_decision_candidate_logits_with_images(prompt, images, cands, branch_hint)
-        .map_err(worker_api_err)?;
     let tap = rx
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
@@ -87,24 +86,23 @@ async fn run_one_candidate_query(
     }
 }
 
-async fn run_one_hidden_query(
+async fn run_one_candidate_query(
     s: Arc<OpenAiServerState>,
     prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
-    positions: Vec<usize>,
-    prefix_cap: Option<usize>,
+    cands: Vec<i32>,
     branch_hint: Option<usize>,
-) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
-    let (mut stream, rx) = s
+) -> Result<(Vec<f64>, usize), ApiError> {
+    let sub = s
         .worker
-        .submit_decision_hidden_positions_with_images(
-            prompt,
-            images,
-            positions,
-            prefix_cap,
-            branch_hint,
-        )
+        .submit_decision_candidate_logits_with_images(prompt, images, cands, branch_hint)
         .map_err(worker_api_err)?;
+    await_candidate_query(sub).await
+}
+
+async fn await_hidden_query(
+    (mut stream, rx): SubmittedDecisionQuery,
+) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
     let tap = rx
         .await
         .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
@@ -134,42 +132,27 @@ async fn run_one_hidden_query(
     }
 }
 
-async fn run_one_clef_query(
+async fn run_one_hidden_query(
     s: Arc<OpenAiServerState>,
-    record: Arc<crate::clef::ClefEncodedRecord>,
+    prompt: Vec<i32>,
     images: Vec<crate::vision::PreprocessedImage>,
-) -> Result<(Vec<Vec<f64>>, usize), ApiError> {
-    let (mut stream, rx) = s
+    positions: Vec<usize>,
+    prefix_cap: Option<usize>,
+    prefix_bidir_len: Option<usize>,
+    branch_hint: Option<usize>,
+) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+    let sub = s
         .worker
-        .submit_decision_clef_with_images(record, images)
+        .submit_decision_hidden_positions_with_images(
+            prompt,
+            images,
+            positions,
+            prefix_cap,
+            branch_hint,
+            prefix_bidir_len,
+        )
         .map_err(worker_api_err)?;
-    let tap = rx
-        .await
-        .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "decision worker dropped"))?
-        .map_err(worker_api_err)?;
-    let mut cached_done = 0usize;
-    while let Some(ev) = stream.events.recv().await {
-        match ev {
-            GenerationEvent::Finished { cached_tokens, .. } => {
-                cached_done = cached_tokens;
-                break;
-            }
-            GenerationEvent::Error(err) => {
-                return Err(worker_api_err(err));
-            }
-            GenerationEvent::Token { .. } => {}
-        }
-    }
-    match tap {
-        crate::engine_worker::DecisionTapOutput::ClefLogits {
-            logits,
-            cached_tokens,
-        } => Ok((logits, cached_tokens.max(cached_done))),
-        _ => Err(error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "unexpected decision tap variant",
-        )),
-    }
+    await_hidden_query(sub).await
 }
 
 async fn run_candidate_queries_radix_shared(
@@ -189,22 +172,142 @@ async fn run_candidate_queries_radix_shared(
     results.push(run_one_candidate_query(s.clone(), p0, images.to_vec(), c0, branch0).await?);
 
     for wave in rest.chunks(8) {
-        let mut handles = Vec::with_capacity(wave.len());
+        let mut submitted = Vec::with_capacity(wave.len());
         for (p, c) in wave.iter().cloned() {
-            let st = s.clone();
-            let imgs = images.to_vec();
-            handles.push(tokio::spawn(async move {
-                run_one_candidate_query(st, p, imgs, c, None).await
-            }));
+            submitted.push(
+                s.worker
+                    .submit_decision_candidate_logits_with_images(p, images.to_vec(), c, None)
+                    .map_err(worker_api_err)?,
+            );
         }
-        for h in handles {
-            let out = h
-                .await
-                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))??;
-            results.push(out);
+        for sub in submitted {
+            results.push(await_candidate_query(sub).await?);
         }
     }
     Ok(results)
+}
+
+async fn run_code_readout_queries_raw(
+    s: &Arc<OpenAiServerState>,
+    queries: Vec<crate::decision::CodeReadoutPreparedQuery>,
+    images: &[crate::vision::PreprocessedImage],
+) -> Result<(Vec<Vec<f32>>, usize, usize), ApiError> {
+    if queries.is_empty() {
+        return Ok((Vec::new(), 0, 0));
+    }
+    let mut input_tokens = 0usize;
+    let mut cached_tokens = 0usize;
+    let mut total_positions = 0usize;
+    for q in &queries {
+        input_tokens += q.token_ids.len();
+        total_positions += q.positions.len();
+    }
+
+    let mut raw_outs = Vec::with_capacity(queries.len());
+    let all_bidir =
+        s.worker.unshareable_prefill || queries.iter().all(|q| q.prefix_bidir_len.is_some());
+    if all_bidir {
+        // Bidirectional or midloop models (`d3` `prefix_bidir = true` and `GLiDE`
+        // `noncausal_full_attention` / `midloop`) do not donate into `MambaRadixCache`;
+        // submit all queries synchronously into the worker queue so waves batch in lockstep.
+        for wave in queries.chunks(8) {
+            let mut submitted = Vec::with_capacity(wave.len());
+            for q in wave.iter().cloned() {
+                submitted.push(
+                    s.worker
+                        .submit_decision_hidden_positions_with_images(
+                            q.token_ids,
+                            images.to_vec(),
+                            q.positions,
+                            q.prefix_cap,
+                            None,
+                            q.prefix_bidir_len,
+                        )
+                        .map_err(worker_api_err)?,
+                );
+            }
+            for sub in submitted {
+                raw_outs.push(await_hidden_query(sub).await?);
+            }
+        }
+    } else {
+        let mut iter = queries.into_iter();
+        let q0 = iter.next().unwrap();
+        let rest: Vec<_> = iter.collect();
+        let branch0 = if q0.prefix_bidir_len.is_none() {
+            shared_mamba_branch_hint(
+                &q0.token_ids,
+                rest.iter().map(|q| q.token_ids.as_slice()),
+                q0.prefix_cap,
+            )
+        } else {
+            None
+        };
+        raw_outs.push(
+            run_one_hidden_query(
+                s.clone(),
+                q0.token_ids,
+                images.to_vec(),
+                q0.positions,
+                q0.prefix_cap,
+                q0.prefix_bidir_len,
+                branch0,
+            )
+            .await?,
+        );
+        for wave in rest.chunks(8) {
+            let mut submitted = Vec::with_capacity(wave.len());
+            for q in wave.iter().cloned() {
+                submitted.push(
+                    s.worker
+                        .submit_decision_hidden_positions_with_images(
+                            q.token_ids,
+                            images.to_vec(),
+                            q.positions,
+                            q.prefix_cap,
+                            None,
+                            q.prefix_bidir_len,
+                        )
+                        .map_err(worker_api_err)?,
+                );
+            }
+            for sub in submitted {
+                raw_outs.push(await_hidden_query(sub).await?);
+            }
+        }
+    }
+
+    let mut all_rows = Vec::with_capacity(total_positions);
+    for (rows, cached) in raw_outs {
+        cached_tokens += cached;
+        all_rows.extend(rows);
+    }
+    Ok((all_rows, input_tokens, cached_tokens))
+}
+
+fn project_code_readout_rows(
+    head: &crate::decision::CodeReadoutHead,
+    fields: &[crate::decision::DecisionField],
+    rows: &[Vec<f32>],
+) -> Result<Vec<Vec<f64>>, ApiError> {
+    if rows.len() != fields.len() {
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "code_readout returned {} hidden rows for {} fields",
+                rows.len(),
+                fields.len()
+            ),
+        ));
+    }
+    let mut field_logits = Vec::with_capacity(fields.len());
+    for (field, h) in fields.iter().zip(rows.iter()) {
+        let logits = head
+            .forward(h, field.keys.len())
+            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        field_logits.push(logits);
+    }
+    Ok(field_logits)
 }
 
 async fn execute_systemone_json(
@@ -247,26 +350,57 @@ async fn execute_systemone_json(
     let mut cached_tokens = 0usize;
 
     match batch {
-        crate::decision::PreparedDecisionBatch::Clef { fields, record } => {
-            input_tokens = record.input_ids.len();
-            let record_arc = Arc::new(record);
-            let (all_logits, cached) =
-                run_one_clef_query(s.clone(), record_arc.clone(), images).await?;
-            cached_tokens += cached;
-            for (field, (q_enc, raw_logits)) in fields
-                .iter()
-                .zip(record_arc.questions.iter().zip(all_logits.iter()))
-            {
-                let ordered = crate::clef::reorder_clef_question_logits(q_enc, field, raw_logits)
-                    .map_err(decision_err)?;
-                let ans = crate::decision::answer_from_logits(
-                    field,
-                    &ordered,
-                    1.0,
-                    crate::decision::ConfidenceKind::MaxProbability,
-                )
-                .map_err(decision_err)?;
-                answers.insert(field.name.clone(), ans);
+        crate::decision::PreparedDecisionBatch::CodeReadout {
+            head,
+            temperature,
+            conf_kind,
+            fields,
+            forward_queries,
+            reverse_queries,
+        } => {
+            if let Some(rev_queries) = reverse_queries {
+                let mut combined = Vec::with_capacity(forward_queries.len() + rev_queries.len());
+                combined.extend(forward_queries);
+                combined.extend(rev_queries);
+                let (all_rows, in_toks, c_toks) =
+                    run_code_readout_queries_raw(s, combined, &images).await?;
+                input_tokens += in_toks;
+                cached_tokens += c_toks;
+                let n = fields.len();
+                if all_rows.len() != 2 * n {
+                    return Err(error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!(
+                            "code_readout order_passes=2 returned {} hidden rows for {} fields",
+                            all_rows.len(),
+                            n
+                        ),
+                    ));
+                }
+                let fwd_logits = project_code_readout_rows(&head, &fields, &all_rows[..n])?;
+                let rev_logits = project_code_readout_rows(&head, &fields, &all_rows[n..])?;
+                for (field, (fwd, rev)) in
+                    fields.iter().zip(fwd_logits.iter().zip(rev_logits.iter()))
+                {
+                    let probs =
+                        crate::decision::calibrate_forward_reverse_logits(fwd, rev, temperature)
+                            .map_err(decision_err)?;
+                    let ans = crate::decision::answer_from_probabilities(field, &probs, conf_kind)
+                        .map_err(decision_err)?;
+                    answers.insert(field.name.clone(), ans);
+                }
+            } else {
+                let (all_rows, in_toks, c_toks) =
+                    run_code_readout_queries_raw(s, forward_queries, &images).await?;
+                input_tokens += in_toks;
+                cached_tokens += c_toks;
+                let fwd_logits = project_code_readout_rows(&head, &fields, &all_rows)?;
+                for (field, logits) in fields.iter().zip(fwd_logits.iter()) {
+                    let ans =
+                        crate::decision::answer_from_logits(field, logits, temperature, conf_kind)
+                            .map_err(decision_err)?;
+                    answers.insert(field.name.clone(), ans);
+                }
             }
         }
         crate::decision::PreparedDecisionBatch::CandidateLogits {
@@ -274,125 +408,47 @@ async fn execute_systemone_json(
             conf_kind,
             fields,
             prompts,
+            reverse_prompts,
             candidates,
             ..
         } => {
             for p in &prompts {
                 input_tokens += p.len();
             }
-            let pairs: Vec<_> = prompts.into_iter().zip(candidates).collect();
-            let outs = run_candidate_queries_radix_shared(s, pairs, &images).await?;
-            for (field, (logits, cached)) in fields.iter().zip(outs) {
-                cached_tokens += cached;
-                let ans =
-                    crate::decision::answer_from_logits(field, &logits, temperature, conf_kind)
-                        .map_err(decision_err)?;
-                answers.insert(field.name.clone(), ans);
-            }
-        }
-        crate::decision::PreparedDecisionBatch::Kev {
-            head,
-            temperature,
-            fields,
-            encoded,
-        } => {
-            let mut queries = Vec::with_capacity(encoded.len());
-            for q_enc in &encoded {
-                input_tokens += q_enc.token_ids.len();
-                let mut positions = Vec::with_capacity(1 + q_enc.option_indices.len());
-                positions.push(q_enc.decide_index);
-                positions.extend_from_slice(&q_enc.option_indices);
-                let min_pos = positions.iter().copied().min().unwrap_or(0);
-                queries.push((q_enc.token_ids.clone(), positions, Some(min_pos)));
-            }
-            let mut outs = Vec::with_capacity(queries.len());
-            let mut iter = queries.into_iter();
-            if let Some((p0, pos0, cap0)) = iter.next() {
-                let rest: Vec<_> = iter.collect();
-                let branch0 =
-                    shared_mamba_branch_hint(&p0, rest.iter().map(|(p, _, _)| p.as_slice()), cap0);
-                outs.push(
-                    run_one_hidden_query(s.clone(), p0, images.clone(), pos0, cap0, branch0)
-                        .await?,
-                );
-                for wave in rest.chunks(8) {
-                    let mut handles = Vec::with_capacity(wave.len());
-                    for (p, pos, cap) in wave.iter().cloned() {
-                        let st = s.clone();
-                        let imgs = images.clone();
-                        handles.push(tokio::spawn(async move {
-                            run_one_hidden_query(st, p, imgs, pos, cap, None).await
-                        }));
-                    }
-                    for h in handles {
-                        let out = h
-                            .await
-                            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))??;
-                        outs.push(out);
-                    }
+            if let Some(rev_prompts) = reverse_prompts {
+                for p in &rev_prompts {
+                    input_tokens += p.len();
                 }
-            }
-            for (field, (rows, cached)) in fields.iter().zip(outs) {
-                cached_tokens += cached;
-                let n_opts = field.keys.len();
-                let h_decide = &rows[0];
-                let h_opts: Vec<f32> = rows[1..].iter().flatten().copied().collect();
-                let raw_logits = head
-                    .forward(h_decide, &h_opts, n_opts)
-                    .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-                let logits_f64: Vec<f64> = raw_logits.into_iter().map(|x| x as f64).collect();
-                let ans = crate::decision::answer_from_logits(
-                    field,
-                    &logits_f64,
-                    temperature,
-                    crate::decision::ConfidenceKind::MarginAndModeDistance,
-                )
-                .map_err(decision_err)?;
-                answers.insert(field.name.clone(), ans);
-            }
-        }
-        crate::decision::PreparedDecisionBatch::Xor {
-            temperature,
-            lev_noul_9_scale,
-            fields,
-            variants,
-        } => {
-            let mut pairs = Vec::with_capacity(variants.len() * 2);
-            for (fwd, rev, cands) in variants {
-                input_tokens += fwd.len() + rev.len();
-                pairs.push((fwd, cands.clone()));
-                pairs.push((rev, cands));
-            }
-            let outs = run_candidate_queries_radix_shared(s, pairs, &images).await?;
-            for (i, field) in fields.iter().enumerate() {
-                let (fwd_logits, c_fwd) = &outs[2 * i];
-                let (rev_logits, c_rev) = &outs[2 * i + 1];
-                cached_tokens += *c_fwd + *c_rev;
-                let probs = crate::decision::calibrate_forward_reverse_logits(
-                    fwd_logits,
-                    rev_logits,
-                    temperature,
-                )
-                .map_err(decision_err)?;
-                let ans = if lev_noul_9_scale && field.field_type == "noul" {
-                    let expected: f64 = probs
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, &p)| p * (idx as f64) / 8.0)
-                        .sum();
-                    json!({
-                        "type": "noul",
-                        "noul": expected,
-                    })
-                } else {
-                    crate::decision::answer_from_probabilities(
-                        field,
-                        &probs,
-                        crate::decision::ConfidenceKind::MarginAndModeDistance,
+                let mut pairs = Vec::with_capacity(fields.len() * 2);
+                for ((fwd, rev), cands) in prompts.into_iter().zip(rev_prompts).zip(candidates) {
+                    pairs.push((fwd, cands.clone()));
+                    pairs.push((rev, cands));
+                }
+                let outs = run_candidate_queries_radix_shared(s, pairs, &images).await?;
+                for (i, field) in fields.iter().enumerate() {
+                    let (fwd_logits, c_fwd) = &outs[2 * i];
+                    let (rev_logits, c_rev) = &outs[2 * i + 1];
+                    cached_tokens += *c_fwd + *c_rev;
+                    let probs = crate::decision::calibrate_forward_reverse_logits(
+                        fwd_logits,
+                        rev_logits,
+                        temperature,
                     )
-                    .map_err(decision_err)?
-                };
-                answers.insert(field.name.clone(), ans);
+                    .map_err(decision_err)?;
+                    let ans = crate::decision::answer_from_probabilities(field, &probs, conf_kind)
+                        .map_err(decision_err)?;
+                    answers.insert(field.name.clone(), ans);
+                }
+            } else {
+                let pairs: Vec<_> = prompts.into_iter().zip(candidates).collect();
+                let outs = run_candidate_queries_radix_shared(s, pairs, &images).await?;
+                for (field, (logits, cached)) in fields.iter().zip(outs) {
+                    cached_tokens += cached;
+                    let ans =
+                        crate::decision::answer_from_logits(field, &logits, temperature, conf_kind)
+                            .map_err(decision_err)?;
+                    answers.insert(field.name.clone(), ans);
+                }
             }
         }
     }

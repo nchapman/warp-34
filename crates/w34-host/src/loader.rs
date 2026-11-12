@@ -340,7 +340,7 @@ impl SafetensorsArchive {
         self.read_exact_info(info, dst)
     }
 
-    /// Resolves either `<prefix>.<suffix>` or `model.language_model.<stripped>.<suffix>`.
+    /// Resolves `<prefix>.<suffix>`, `model.language_model.<stripped>.<suffix>`, or `language_model.<stripped>.<suffix>`.
     pub fn resolve_name(&self, canonical: &str) -> Option<String> {
         if self.entries.contains_key(canonical) {
             return Some(canonical.to_string());
@@ -349,6 +349,10 @@ impl SafetensorsArchive {
             let alt = format!("model.language_model.{rest}");
             if self.entries.contains_key(&alt) {
                 return Some(alt);
+            }
+            let alt_bare = format!("language_model.{rest}");
+            if self.entries.contains_key(&alt_bare) {
+                return Some(alt_bare);
             }
         }
         None

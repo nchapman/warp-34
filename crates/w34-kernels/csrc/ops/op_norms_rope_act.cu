@@ -1907,3 +1907,53 @@ extern "C" int w34_apply_attn_output_gate_hadamard_f16(
         valid_token_mask, total_dim);
     return (int)cudaGetLastError();
 }
+
+namespace w34 {
+
+__global__ void midloop_damped_euler_f16_kernel(
+    __half* __restrict__ dst_f16,
+    const __half* __restrict__ x_prev_f16,
+    const __half* __restrict__ g_x_f16,
+    int64_t num_elems,
+    float alpha) {
+    const float one_minus_alpha = 1.0f - alpha;
+    int64_t idx = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    const int64_t stride = (int64_t)gridDim.x * blockDim.x * 2;
+    for (; idx + 1 < num_elems; idx += stride) {
+        const __half2 p2 = *reinterpret_cast<const __half2*>(x_prev_f16 + idx);
+        const __half2 g2 = *reinterpret_cast<const __half2*>(g_x_f16 + idx);
+        const float2 pf = __half22float2(p2);
+        const float2 gf = __half22float2(g2);
+        __half2 out2;
+        out2.x = __float2half(one_minus_alpha * pf.x + alpha * gf.x);
+        out2.y = __float2half(one_minus_alpha * pf.y + alpha * gf.y);
+        *reinterpret_cast<__half2*>(dst_f16 + idx) = out2;
+    }
+    if (idx < num_elems) {
+        const float pf = __half2float(x_prev_f16[idx]);
+        const float gf = __half2float(g_x_f16[idx]);
+        dst_f16[idx] = __float2half(one_minus_alpha * pf + alpha * gf);
+    }
+}
+
+}  // namespace w34
+
+extern "C" int w34_midloop_damped_euler_f16(
+    const w34_exec* ex,
+    void* dst_f16,
+    const void* x_prev_f16,
+    const void* g_x_f16,
+    int64_t num_elems,
+    float alpha) {
+    if (ex == nullptr || dst_f16 == nullptr || x_prev_f16 == nullptr || g_x_f16 == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (num_elems <= 0) return 0;
+    const unsigned blk = 256u;
+    const int64_t pairs = (num_elems + 1) / 2;
+    const unsigned grid = (unsigned)((pairs + blk - 1) / blk < 1024 ? (pairs + blk - 1) / blk : 1024);
+    w34::midloop_damped_euler_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
+        (__half*)dst_f16, (const __half*)x_prev_f16, (const __half*)g_x_f16, num_elems, alpha);
+    return (int)cudaGetLastError();
+}
+

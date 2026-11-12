@@ -1859,15 +1859,18 @@ impl DFlash2Rank {
             },
             "DFlash shared head cast",
         )?;
-        t.lm_head.forward(
-            &ex,
-            &t.cublas,
-            t.marlin_ws.addr(),
-            t.marlin_ws.len_bytes / 4,
-            head_input,
-            logits,
-            m - 1,
-        )?;
+        t.lm_head
+            .as_ref()
+            .ok_or_else(|| loader_err("target checkpoint has no lm_head"))?
+            .forward(
+                &ex,
+                &t.cublas,
+                t.marlin_ws.addr(),
+                t.marlin_ws.len_bytes / 4,
+                head_input,
+                logits,
+                m - 1,
+            )?;
         let topk_elems = (m - 1) * self.cfg.top_k;
         let num_splits = (256 / self.cfg.top_k).clamp(1, 16);
         let split_ids_ws = self

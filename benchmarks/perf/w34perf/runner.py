@@ -18,9 +18,16 @@ from .config import digest, public_config
 from .evidence import attach, quality_status
 from .metrics import summarize
 from .selection import select
-from .transport import stream
+from .transport import decision, stream
 from .telemetry import TelemetrySampler
-from .workloads import agent_trajectory, append_replay, body, messages
+from .workloads import (
+    agent_trajectory,
+    append_replay,
+    body,
+    decision_body,
+    decision_request,
+    messages,
+)
 
 
 def command(args):
@@ -74,8 +81,39 @@ def run_trial(engine, case, run_cfg, phase, repetition, journal, *, namespace):
         session_start = time.perf_counter()
         shape = case["mix"][index % len(case["mix"])] if case.get("mix") else {}
         request_case = {**case, **shape}
+        kind = case.get("kind", "text")
+        if kind == "decision":
+            item = decision_request(request_case, index, namespace)
+            payload = decision_body(engine, request_case, item)
+            item_meta = {"decision_item_id": item["id"]} if "id" in item else {}
+            submitted = time.perf_counter()
+            result = decision(engine, payload, run_cfg["timeout_s"], expected=item.get("expected"))
+            result.update({
+                "engine_id": engine["id"], "case_id": case["id"], "phase": phase,
+                "repetition": repetition, "session_id": index, "step": 0, **item_meta,
+                "request_id": f"{engine['id']}:{case['id']}:{phase}:{repetition}:{index}:0",
+                "scheduled_at_ms": (due - started) * 1000,
+                "sent_at_ms": (submitted - started) * 1000,
+                "schedule_lag_ms": max(0, (submitted - due) * 1000),
+                "request": payload,
+                "request_sha256": digest(payload),
+                "input_messages_sha256": digest({"state": item["state"], "questions": item["questions"]}),
+            })
+            journal.put({"type": "request", **result})
+            with lock:
+                records.append(result)
+            summary = {
+                "engine_id": engine["id"], "case_id": case["id"], "phase": phase,
+                "repetition": repetition, "session_id": index, **item_meta,
+                "status": "ok" if result["status"] == "ok" else "error",
+                "e2e_ms": (time.perf_counter() - session_start) * 1000,
+            }
+            journal.put({"type": "session", **summary})
+            with lock:
+                sessions.append(summary)
+            return
         history = messages(request_case, index, namespace)
-        is_agent = case.get("kind", "text") == "agent_replay"
+        is_agent = kind == "agent_replay"
         traj = agent_trajectory(case["fixture_data"], index) if is_agent else None
         traj_meta = {"trajectory_id": traj["id"]} if traj and "id" in traj else {}
         turns = traj["turns"] if is_agent else [None]

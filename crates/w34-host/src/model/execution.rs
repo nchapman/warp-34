@@ -226,7 +226,11 @@ impl Qwen3_5Engine {
                 max_blocks_per_req: block_table.len() as i32,
                 max_q_len: num_tokens as i32,
                 max_seq_len: seq_after as i32,
-                mask_mode: W34_ATTN_MASK_CAUSAL,
+                mask_mode: if r0.cfg.noncausal_full_attention {
+                    w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
+                } else {
+                    W34_ATTN_MASK_CAUSAL
+                },
                 sliding_window: 0,
                 sm_scale: (r0.cfg.head_dim as f32).powf(-0.5),
                 reserved: 0,
@@ -342,7 +346,11 @@ impl Qwen3_5Engine {
                         max_blocks_per_req: block_table.len() as i32,
                         max_q_len: num_tokens as i32,
                         max_seq_len: seq_after as i32,
-                        mask_mode: W34_ATTN_MASK_CAUSAL,
+                        mask_mode: if r0.cfg.noncausal_full_attention {
+                            w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
+                        } else {
+                            W34_ATTN_MASK_CAUSAL
+                        },
                         sliding_window: 0,
                         sm_scale: (r0.cfg.head_dim as f32).powf(-0.5),
                         reserved: 0,
@@ -451,7 +459,11 @@ impl Qwen3_5Engine {
                             max_blocks_per_req: block_table.len() as i32,
                             max_q_len: num_tokens as i32,
                             max_seq_len: seq_after as i32,
-                            mask_mode: W34_ATTN_MASK_CAUSAL,
+                            mask_mode: if r_peer.cfg.noncausal_full_attention {
+                                w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
+                            } else {
+                                W34_ATTN_MASK_CAUSAL
+                            },
                             sliding_window: 0,
                             sm_scale: (r_peer.cfg.head_dim as f32).powf(-0.5),
                             reserved: 0,
