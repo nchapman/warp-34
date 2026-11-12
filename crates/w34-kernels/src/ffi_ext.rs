@@ -675,6 +675,7 @@ unsafe extern "C" {
         n_interm: i32,
         k_hidden: i32,
         group_size: i32,
+        bits: i32,
     ) -> i32;
 
     pub fn w34_moe_pull_mapped_experts(
@@ -693,6 +694,7 @@ unsafe extern "C" {
         n_interm: i32,
         k_hidden: i32,
         group_size: i32,
+        bits: i32,
     ) -> i32;
 
     pub fn w34_moe_remap_topk_ids_i32(
@@ -737,6 +739,7 @@ unsafe extern "C" {
         n_interm: i32,
         k_hidden: i32,
         group_size: i32,
+        bits: i32,
     ) -> i32;
 
     pub fn w34_moe_hybrid_submit_and_pull(
@@ -768,6 +771,7 @@ unsafe extern "C" {
         n_interm: i32,
         k_hidden: i32,
         group_size: i32,
+        bits: i32,
         gpu_share_frac: f32,
     ) -> i32;
 

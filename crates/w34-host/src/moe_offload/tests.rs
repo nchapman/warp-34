@@ -178,6 +178,7 @@ mod cuda_tests {
                     128,
                     128,
                     128,
+                    4,
                 )
             },
             0
@@ -252,6 +253,7 @@ mod cuda_tests {
                     intermediate,
                     hidden,
                     group,
+                    4,
                 )
             };
             assert_ne!(
@@ -259,6 +261,47 @@ mod cuda_tests {
                 "accepted geometry {intermediate}/{hidden}/{group}/{stride}"
             );
         }
+
+        // Also verify a valid W2 layout with intermediate=32, hidden=64, group_size=32
+        // (where padded stride=4096 exceeds the W4 raw size of 3456 bytes) unpacks
+        // accurately using explicit bits=2 without misclassifying as W4.
+        let w2_layout = ExpertPackLayout::new_with_bits(32, 64, 32, 2).unwrap();
+        assert_eq!(w2_layout.stride, 4096);
+        let mut h_pack = vec![0u8; w2_layout.stride];
+        for (i, b) in h_pack[..w2_layout.down_scales.end].iter_mut().enumerate() {
+            *b = ((i * 37 + 11) & 0xFF) as u8;
+        }
+        let d_staged = DeviceBuffer::alloc(0, w2_layout.stride).unwrap();
+        d_staged.copy_from_host(&h_pack, &stream).unwrap();
+        let d_slot = DeviceBuffer::alloc(0, 4).unwrap();
+        d_slot.copy_from_host(&[0i32], &stream).unwrap();
+        let d_gu_w = DeviceBuffer::alloc(0, w2_layout.gate_up_packed.len()).unwrap();
+        let d_gu_s = DeviceBuffer::alloc(0, w2_layout.gate_up_scales.len()).unwrap();
+        let d_dn_w = DeviceBuffer::alloc(0, w2_layout.down_packed.len()).unwrap();
+        let d_dn_s = DeviceBuffer::alloc(0, w2_layout.down_scales.len()).unwrap();
+        // SAFETY: all device buffers are allocated to the exact sizes of `w2_layout` for 1 slot.
+        let rc = unsafe {
+            ffi::w34_moe_unpack_staged_experts(
+                &ex,
+                d_staged.addr() as *const _,
+                d_slot.addr() as *const i32,
+                d_gu_w.addr() as *mut u32,
+                d_gu_s.addr() as *mut _,
+                d_dn_w.addr() as *mut u32,
+                d_dn_s.addr() as *mut _,
+                1,
+                1,
+                w2_layout.stride,
+                w2_layout.intermediate as i32,
+                w2_layout.hidden as i32,
+                w2_layout.group_size as i32,
+                w2_layout.bits as i32,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut out_dn_s = vec![0u8; w2_layout.down_scales.len()];
+        d_dn_s.copy_to_host(&mut out_dn_s, &stream).unwrap();
+        assert_eq!(&out_dn_s[..], &h_pack[w2_layout.down_scales.clone()]);
         stream.synchronize().unwrap();
     }
 

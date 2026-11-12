@@ -129,6 +129,7 @@ impl TieredMoeEngine {
                         store.layout().intermediate as i32,
                         store.layout().hidden as i32,
                         store.layout().group_size as i32,
+                        store.layout().bits as i32,
                         if cache.k_static < k_hot && store.mapped_dev_ptr() != 0 {
                             if crate::moe_cpu_bridge::has_avx512()
                                 || (num_tokens == 1 && k_hot >= 64)
@@ -205,6 +206,7 @@ impl TieredMoeEngine {
                     store.layout().intermediate as i32,
                     store.layout().hidden as i32,
                     store.layout().group_size as i32,
+                    store.layout().bits as i32,
                 )
             },
             "w34_moe_gpu_lru_update_and_pull",
@@ -769,7 +771,25 @@ impl TieredMoeEngine {
                     }
 
                     compute_stream.wait_event(&ws.h2d_done_events[buf_idx])?;
-                    ws.stage_tables[buf_idx].layout = store.layout().clone();
+                    let stage_cap = ws.stage_tables[buf_idx].capacity;
+                    let sl = store.layout();
+                    if ws.d_stage_packs[buf_idx].len_bytes < chunk.len().saturating_mul(sl.stride)
+                        || ws.stage_tables[buf_idx].gate_up_packed.len_bytes
+                            < stage_cap.saturating_mul(sl.gate_up_packed.len())
+                        || ws.stage_tables[buf_idx].gate_up_scales.len_bytes
+                            < stage_cap.saturating_mul(sl.gate_up_scales.len())
+                        || ws.stage_tables[buf_idx].down_packed.len_bytes
+                            < stage_cap.saturating_mul(sl.down_packed.len())
+                        || ws.stage_tables[buf_idx].down_scales.len_bytes
+                            < stage_cap.saturating_mul(sl.down_scales.len())
+                    {
+                        return Err(crate::cuda::CudaError::with_detail(
+                            -1,
+                            "TieredMoeEngine::execute_layer_streamed_prefill",
+                            "stage table buffer capacity smaller than layer ExpertPackLayout",
+                        ));
+                    }
+                    ws.stage_tables[buf_idx].layout = sl.clone();
                     ws.stage_tables[buf_idx].unpack_staged(
                         compute_stream,
                         ws.d_stage_packs[buf_idx].addr(),
@@ -1083,11 +1103,32 @@ impl RankTieredMoe {
         stage_capacity: usize,
         stream: &crate::cuda::CudaStream,
     ) -> crate::cuda::Result<Self> {
-        let group_size = cfg.routed_expert_quant_scheme().group_size_or(128);
-        let base_layout =
-            ExpertPackLayout::new(cfg.moe_intermediate_size, cfg.hidden_size, group_size).map_err(
-                |e| crate::cuda::CudaError::with_detail(-1, "ExpertPackLayout::new", e.to_string()),
-            )?;
+        let min_group_size = (0..cfg.num_hidden_layers)
+            .filter(|l| !cfg.mlp_only_layers.contains(l))
+            .filter_map(|l| {
+                cfg.layer_moe_expert_pack_layout(l)
+                    .map(|lay| lay.group_size)
+            })
+            .min()
+            .unwrap_or_else(|| cfg.routed_expert_quant_scheme().group_size_or(128));
+        let max_bits = (0..cfg.num_hidden_layers)
+            .filter(|l| !cfg.mlp_only_layers.contains(l))
+            .filter_map(|l| cfg.layer_moe_expert_pack_layout(l).map(|lay| lay.bits))
+            .max()
+            .unwrap_or(4);
+        let base_layout = ExpertPackLayout::new_with_bits(
+            cfg.moe_intermediate_size,
+            cfg.hidden_size,
+            min_group_size,
+            max_bits,
+        )
+        .map_err(|e| {
+            crate::cuda::CudaError::with_detail(
+                -1,
+                "ExpertPackLayout::new_with_bits",
+                e.to_string(),
+            )
+        })?;
         let mut ws = TieredMoeWorkspace::new(
             device_id,
             base_layout.clone(),

@@ -29,12 +29,23 @@ const COMPRESSED_TENSORS_U2_BITS: usize = 2;
 const COMPRESSED_TENSORS_U4_BITS: usize = 4;
 const COMPRESSED_TENSORS_U8_BITS: usize = 8;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct CompressedTensorRules {
     ignore: Vec<CompiledPattern>,
     groups: Vec<QuantRule>,
     transforms: Vec<TransformRule>,
+    moe_expert_layer_cache: std::sync::OnceLock<Vec<Option<(usize, usize, bool)>>>,
 }
+
+impl PartialEq for CompressedTensorRules {
+    fn eq(&self, other: &Self) -> bool {
+        self.ignore == other.ignore
+            && self.groups == other.groups
+            && self.transforms == other.transforms
+    }
+}
+
+impl Eq for CompressedTensorRules {}
 
 #[derive(Clone, Debug)]
 enum CompiledPattern {
@@ -286,7 +297,34 @@ impl CompressedTensorRules {
             ignore,
             groups: quant_groups,
             transforms,
+            moe_expert_layer_cache: std::sync::OnceLock::new(),
         }))
+    }
+
+    pub(super) fn resolve_moe_layer_expert(&self, layer_id: usize) -> Option<(usize, usize, bool)> {
+        const MAX_CACHED_MOE_LAYERS: usize = 128;
+        if layer_id < MAX_CACHED_MOE_LAYERS {
+            let cache = self.moe_expert_layer_cache.get_or_init(|| {
+                (0..MAX_CACHED_MOE_LAYERS)
+                    .map(|l| self.resolve_moe_layer_expert_uncached(l))
+                    .collect()
+            });
+            return cache[layer_id];
+        }
+        self.resolve_moe_layer_expert_uncached(layer_id)
+    }
+
+    fn resolve_moe_layer_expert_uncached(&self, layer_id: usize) -> Option<(usize, usize, bool)> {
+        for candidate in [
+            format!("model.layers.{layer_id}.mlp.experts.0.gate_proj"),
+            format!("model.language_model.layers.{layer_id}.mlp.experts.0.gate_proj"),
+            format!("layers.{layer_id}.mlp.experts.0.gate_proj"),
+        ] {
+            if let Ok((Some(g), _)) = self.resolve(&candidate) {
+                return Some((g.bits, g.group_size, g.symmetric));
+            }
+        }
+        None
     }
 
     fn resolve(&self, name: &str) -> io::Result<(Option<&QuantRule>, Option<usize>)> {

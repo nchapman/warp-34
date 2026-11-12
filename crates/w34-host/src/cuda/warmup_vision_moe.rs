@@ -775,6 +775,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
             128,
             128,
             128,
+            4,
         ),
         "warmup w34_moe_unpack_staged_experts"
     )?;
@@ -820,6 +821,7 @@ pub(super) fn warmup_vision_moe_and_qwen4(
             128,
             128,
             128,
+            4,
         ),
         "warmup w34_moe_gpu_lru_update_and_pull"
     )?;

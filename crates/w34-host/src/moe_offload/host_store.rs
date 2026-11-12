@@ -707,6 +707,7 @@ impl DeviceExpertSlotTable {
                     self.layout.intermediate as i32,
                     self.layout.hidden as i32,
                     self.layout.group_size as i32,
+                    self.layout.bits as i32,
                 )
             },
             "w34_moe_unpack_staged_experts",
@@ -747,6 +748,7 @@ impl DeviceExpertSlotTable {
                     self.layout.intermediate as i32,
                     self.layout.hidden as i32,
                     self.layout.group_size as i32,
+                    self.layout.bits as i32,
                 )
             },
             "w34_moe_pull_mapped_experts",

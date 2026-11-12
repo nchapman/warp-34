@@ -16,7 +16,7 @@ pub enum QuantScheme {
         group_size: usize,
         symmetric: bool,
         ignore: Vec<String>,
-        rules: Option<Box<CompressedTensorRules>>,
+        rules: Option<std::sync::Arc<CompressedTensorRules>>,
     },
     Gptq {
         bits: usize,
@@ -1064,7 +1064,7 @@ impl ModelConfig {
             group_size,
             symmetric,
             ignore,
-            rules: rules.map(Box::new),
+            rules: rules.map(std::sync::Arc::new),
         })
     }
 
@@ -1509,11 +1509,15 @@ impl ModelConfig {
 
     /// Resolves the effective `QuantScheme` for routed MoE experts (`mlp.experts.0.gate_proj`).
     pub fn routed_expert_quant_scheme(&self) -> QuantScheme {
+        let first_moe_layer = (0..self.num_hidden_layers)
+            .find(|l| !self.mlp_only_layers.contains(l))
+            .unwrap_or(0);
         for candidate in [
-            "model.language_model.layers.0.mlp.experts.0.gate_proj",
-            "model.layers.0.mlp.experts.0.gate_proj",
+            format!("model.language_model.layers.{first_moe_layer}.mlp.experts.0.gate_proj"),
+            format!("model.layers.{first_moe_layer}.mlp.experts.0.gate_proj"),
+            format!("layers.{first_moe_layer}.mlp.experts.0.gate_proj"),
         ] {
-            if let Ok(resolved) = self.quant.for_linear(candidate)
+            if let Ok(resolved) = self.quant.for_linear(&candidate)
                 && resolved != QuantScheme::Unquantized
             {
                 return resolved;
@@ -1524,18 +1528,63 @@ impl ModelConfig {
 
     /// Returns the quantization scheme for routed MoE experts in decoder layer `layer_id`.
     pub fn layer_routed_expert_quant_scheme(&self, layer_id: usize) -> QuantScheme {
-        for candidate in [
-            format!("model.layers.{layer_id}.mlp.experts.0.gate_proj"),
-            format!("model.language_model.layers.{layer_id}.mlp.experts.0.gate_proj"),
-            format!("layers.{layer_id}.mlp.experts.0.gate_proj"),
-        ] {
-            if let Ok(resolved) = self.quant.for_linear(&candidate)
-                && resolved != QuantScheme::Unquantized
-            {
-                return resolved;
-            }
+        if let QuantScheme::CompressedTensors {
+            rules: Some(rules),
+            ignore,
+            ..
+        } = &self.quant
+            && let Some((bits, group_size, symmetric)) = rules.resolve_moe_layer_expert(layer_id)
+        {
+            return QuantScheme::CompressedTensors {
+                num_bits: bits,
+                group_size,
+                symmetric,
+                ignore: ignore.clone(),
+                rules: Some(rules.clone()),
+            };
         }
         self.routed_expert_quant_scheme()
+    }
+
+    fn layer_routed_expert_bits_and_group_size(
+        &self,
+        layer_id: usize,
+    ) -> Option<(usize, usize, bool)> {
+        if let QuantScheme::CompressedTensors {
+            rules: Some(rules), ..
+        } = &self.quant
+        {
+            if let Some((bits, gs, sym)) = rules.resolve_moe_layer_expert(layer_id) {
+                return Some((bits, gs, sym));
+            }
+            let first_moe_layer = (0..self.num_hidden_layers)
+                .find(|l| !self.mlp_only_layers.contains(l))
+                .unwrap_or(0);
+            if let Some((bits, gs, sym)) = rules.resolve_moe_layer_expert(first_moe_layer) {
+                return Some((bits, gs, sym));
+            }
+        }
+        match &self.quant {
+            QuantScheme::CompressedTensors {
+                num_bits,
+                group_size,
+                symmetric,
+                ..
+            } => Some((*num_bits, *group_size, *symmetric)),
+            QuantScheme::Gptq {
+                bits,
+                group_size,
+                sym,
+                ..
+            } => Some((*bits, *group_size, *sym)),
+            QuantScheme::AutoRound {
+                bits,
+                group_size,
+                sym,
+                awq_packing: false,
+            } => Some((*bits, *group_size, *sym)),
+            _ => None,
+        }
     }
 
     /// Returns the per-layer `ExpertPackLayout` (`bits = 2` for `w2_g64` or `4` for `w4_g64`)
@@ -1547,11 +1596,17 @@ impl ModelConfig {
         if self.num_experts == 0 {
             return None;
         }
-        let expert_quant = self.layer_routed_expert_quant_scheme(layer_id);
-        let group_size = expert_quant
-            .symmetric_gptq_u2_or_u4_group_size()
-            .unwrap_or_else(|| expert_quant.group_size_or(32));
-        let bits = if expert_quant.bits() == 2 { 2 } else { 4 };
+        let (raw_bits, raw_gs, _sym) = self
+            .layer_routed_expert_bits_and_group_size(layer_id)
+            .unwrap_or_else(|| {
+                (
+                    self.quant.bits(),
+                    self.quant.group_size_or(32),
+                    !self.quant.expects_zero_points(),
+                )
+            });
+        let group_size = if raw_gs > 0 { raw_gs } else { 32 };
+        let bits = if raw_bits == 2 { 2 } else { 4 };
         crate::moe_offload::ExpertPackLayout::new_with_bits(
             self.moe_intermediate_size,
             self.hidden_size,
@@ -1561,20 +1616,39 @@ impl ModelConfig {
         .ok()
     }
 
-    /// Returns the `ExpertPackLayout` if this model's MoE geometry supports host/VRAM
-    /// tiered `U4B8` / `U2B2` expert storage.
+    /// Returns the shared upper-bound `ExpertPackLayout` across all MoE layers if this model's
+    /// MoE geometry supports host/VRAM tiered `U4B8` / `U2B2` expert storage.
     pub fn moe_expert_pack_layout(&self) -> Option<crate::moe_offload::ExpertPackLayout> {
         if self.num_experts == 0 {
             return None;
         }
-        let expert_quant = self.routed_expert_quant_scheme();
-        let group_size = expert_quant
-            .symmetric_gptq_u2_or_u4_group_size()
-            .unwrap_or_else(|| expert_quant.group_size_or(32));
-        crate::moe_offload::ExpertPackLayout::new(
+        let mut min_group_size: Option<usize> = None;
+        let mut max_bits: usize = 4;
+        if self.num_hidden_layers > 0 {
+            let mut layer_bits_max = 0usize;
+            for layer_id in 0..self.num_hidden_layers {
+                if self.mlp_only_layers.contains(&layer_id) {
+                    continue;
+                }
+                let lay = self.layer_moe_expert_pack_layout(layer_id)?;
+                min_group_size =
+                    Some(min_group_size.map_or(lay.group_size, |g| g.min(lay.group_size)));
+                layer_bits_max = layer_bits_max.max(lay.bits);
+            }
+            if layer_bits_max > 0 {
+                max_bits = layer_bits_max.max(4);
+            }
+        }
+        let group_size = min_group_size.unwrap_or_else(|| {
+            self.layer_routed_expert_bits_and_group_size(0)
+                .map(|(_, gs, _)| if gs > 0 { gs } else { 32 })
+                .unwrap_or_else(|| self.quant.group_size_or(32))
+        });
+        crate::moe_offload::ExpertPackLayout::new_with_bits(
             self.moe_intermediate_size,
             self.hidden_size,
             group_size,
+            max_bits,
         )
         .ok()
     }
@@ -1603,18 +1677,17 @@ impl ModelConfig {
 
     pub fn uses_tiered_moe(&self) -> bool {
         // Use host/VRAM tiered MoE storage whenever all layers are MoE layers with a compatible
-        // symmetric U4B8 expert layout and either:
-        // - the total routed-expert footprint exceeds a single 24 GiB GPU budget (> 20 GiB), or
-        // - the model uses the Qwen4 high-expert-count architecture (including small synthetic test fixtures).
+        // symmetric U2B2/U4B8 expert layout and either:
+        // - the model uses the Qwen4 high-expert-count architecture (including small synthetic test fixtures), or
+        // - the total routed-expert footprint exceeds a single 24 GiB GPU budget (> 20 GiB).
         const TIERED_MOE_MIN_TOTAL_EXPERT_BYTES: usize = 20 * 1024 * 1024 * 1024;
         self.mlp_only_layers.is_empty()
             && self.moe_expert_pack_layout().is_some()
-            && ((self
-                .routed_expert_quant_scheme()
-                .symmetric_gptq_u2_or_u4_group_size()
-                .is_some()
-                && self.routed_expert_total_bytes() > TIERED_MOE_MIN_TOTAL_EXPERT_BYTES)
-                || self.is_qwen4_exp())
+            && (self.is_qwen4_exp()
+                || (self
+                    .layer_routed_expert_bits_and_group_size(0)
+                    .is_some_and(|(bits, gs, sym)| sym && matches!(bits, 2 | 4) && gs > 0)
+                    && self.routed_expert_total_bytes() > TIERED_MOE_MIN_TOTAL_EXPERT_BYTES))
     }
 
     pub fn qsa_output_width(&self) -> usize {
