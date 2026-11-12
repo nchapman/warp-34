@@ -13,6 +13,8 @@ pub const MARLIN_TILE_N: usize = 64;
 pub const MARLIN_TILE_K_W4: usize = 128;
 pub const MARLIN_GROUP_BLOCK_K: usize = 16;
 pub const MARLIN_CHANNELWISE_GROUP_BLOCKS: i32 = -1;
+pub const U2B2_PACKED_ZERO_WORD: u32 = 0xaaaa_aaaa;
+pub const U2_CRUMBS_PER_U32: usize = 16;
 pub const U4B8_PACKED_ZERO_WORD: u32 = 0x8888_8888;
 pub const U4_NIBBLES_PER_U32: usize = 8;
 pub const U8_BYTES_PER_U32: usize = 4;
@@ -50,6 +52,13 @@ pub enum LinearProj {
         size_k: usize,
         block_size: usize,
     },
+    MarlinW2A16 {
+        b_q_weight_ptr: u64,
+        b_scales_ptr: u64,
+        size_n: usize,
+        size_k: usize,
+        group_blocks: i32,
+    },
     MarlinW4A16 {
         b_q_weight_ptr: u64,
         b_scales_ptr: u64,
@@ -84,6 +93,7 @@ impl LinearProj {
     pub fn size_n(&self) -> usize {
         match self {
             Self::Hadamard { size_n, .. }
+            | Self::MarlinW2A16 { size_n, .. }
             | Self::MarlinW4A16 { size_n, .. }
             | Self::MarlinW4A16Zp { size_n, .. }
             | Self::MarlinW8A16 { size_n, .. }
@@ -94,6 +104,7 @@ impl LinearProj {
     pub fn size_k(&self) -> usize {
         match self {
             Self::Hadamard { size_k, .. }
+            | Self::MarlinW2A16 { size_k, .. }
             | Self::MarlinW4A16 { size_k, .. }
             | Self::MarlinW4A16Zp { size_k, .. }
             | Self::MarlinW8A16 { size_k, .. }
@@ -104,6 +115,19 @@ impl LinearProj {
     pub fn byte_footprint(&self) -> usize {
         match self {
             Self::Hadamard { inner, .. } => inner.byte_footprint(),
+            Self::MarlinW2A16 {
+                size_n,
+                size_k,
+                group_blocks,
+                ..
+            } => {
+                let groups = if *group_blocks < 0 {
+                    1
+                } else {
+                    size_k / (*group_blocks as usize * MARLIN_GROUP_BLOCK_K)
+                };
+                (size_n * size_k / 4) + (size_n * groups * 2)
+            }
             Self::MarlinW4A16 {
                 size_n,
                 size_k,
@@ -155,9 +179,10 @@ impl LinearProj {
             Self::DenseF16 { size_n, size_k, .. } => {
                 size_n <= SMALL_N_GEMM_ALWAYS_MAX_N && size_k.is_multiple_of(SMALL_N_GEMM_K_ALIGN)
             }
-            Self::MarlinW4A16 { .. } | Self::MarlinW4A16Zp { .. } | Self::MarlinW8A16 { .. } => {
-                true
-            }
+            Self::MarlinW2A16 { .. }
+            | Self::MarlinW4A16 { .. }
+            | Self::MarlinW4A16Zp { .. }
+            | Self::MarlinW8A16 { .. } => true,
         }
     }
 
@@ -195,6 +220,33 @@ impl LinearProj {
         }
         match *self {
             Self::Hadamard { .. } => unreachable!("handled above"),
+            Self::MarlinW2A16 {
+                b_q_weight_ptr,
+                b_scales_ptr,
+                size_n,
+                size_k,
+                group_blocks,
+            } => check_rc(
+                // SAFETY: model upload repacks U2B2 weights and permutes scales
+                // for this N/K/group geometry. X/output/workspace extents and
+                // stream ordering are supplied by the raw-address caller.
+                unsafe {
+                    ffi::w34_marlin_gemm_f16u2(
+                        ex,
+                        x_ptr as *const c_void,
+                        b_q_weight_ptr as *const c_void,
+                        b_scales_ptr as *const c_void,
+                        out_ptr as *mut c_void,
+                        marlin_ws_ptr as *mut i32,
+                        m as i64,
+                        size_n as i64,
+                        size_k as i64,
+                        marlin_ws_ints as i64,
+                        group_blocks,
+                    )
+                },
+                "w34_marlin_gemm_f16u2",
+            ),
             Self::MarlinW4A16 {
                 b_q_weight_ptr,
                 b_scales_ptr,
@@ -337,6 +389,13 @@ pub(crate) enum RawLinearHost {
         inner: Box<RawLinearHost>,
         block_size: usize,
     },
+    U2B2NMajor {
+        packed: Vec<u32>,
+        scales: Vec<u16>,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    },
     U4B8NMajor {
         packed: Vec<u32>,
         scales: Vec<u16>,
@@ -372,10 +431,35 @@ impl RawLinearHost {
     pub(crate) fn dims(&self) -> (usize, usize) {
         match self {
             Self::Hadamard { inner, .. } => inner.dims(),
-            Self::U4B8NMajor { n, k, .. }
+            Self::U2B2NMajor { n, k, .. }
+            | Self::U4B8NMajor { n, k, .. }
             | Self::U4ZpNMajor { n, k, .. }
             | Self::U8B128NMajor { n, k, .. }
             | Self::DenseF16 { n, k, .. } => (*n, *k),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_u4b8_if_u2b2(self) -> Self {
+        match self {
+            Self::Hadamard { inner, block_size } => Self::Hadamard {
+                inner: Box::new(inner.into_u4b8_if_u2b2()),
+                block_size,
+            },
+            Self::U2B2NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => Self::U4B8NMajor {
+                packed: repack_u2b2_to_u4b8(&packed),
+                scales,
+                n,
+                k,
+                group_size,
+            },
+            other => other,
         }
     }
 
@@ -383,6 +467,13 @@ impl RawLinearHost {
         match self {
             Self::Hadamard { inner, block_size } => hgptq::unrotate_weights(inner, *block_size),
             Self::DenseF16 { weight, .. } => weight.clone(),
+            Self::U2B2NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => dequant_u2b2_n_major_to_f16(packed, scales, *n, *k, *group_size),
             Self::U4B8NMajor {
                 packed,
                 scales,
@@ -492,6 +583,7 @@ impl RawLinearHost {
                 }
                 let pf = shape_k / p_info.shape[1];
                 let inferred = match pf {
+                    16 => 2usize,
                     8 => 4usize,
                     4 => 8usize,
                     _ => {
@@ -514,6 +606,7 @@ impl RawLinearHost {
                 match quant.bits() {
                     8 => 8usize,
                     4 | 0 => 4usize,
+                    2 => 2usize,
                     other => {
                         return Err(loader_err_msg(format!(
                             "unsupported compressed-tensors bit-width {other} on '{base_prefix}'"
@@ -640,6 +733,14 @@ impl RawLinearHost {
                     k,
                     group_size,
                     channelwise,
+                })
+            } else if bits == 2 {
+                Ok(Self::U2B2NMajor {
+                    packed,
+                    scales,
+                    n,
+                    k,
+                    group_size,
                 })
             } else {
                 Ok(Self::U4B8NMajor {
@@ -954,6 +1055,23 @@ impl RawLinearHost {
                 inner: Box::new(inner.slice_rows(row_start, row_end)),
                 block_size: *block_size,
             },
+            Self::U2B2NMajor {
+                packed,
+                scales,
+                k,
+                group_size,
+                ..
+            } => {
+                let words_per_row = k / 16;
+                let groups_per_row = k / group_size;
+                Self::U2B2NMajor {
+                    packed: packed[row_start * words_per_row..row_end * words_per_row].to_vec(),
+                    scales: scales[row_start * groups_per_row..row_end * groups_per_row].to_vec(),
+                    n: out_n,
+                    k: *k,
+                    group_size: *group_size,
+                }
+            }
             Self::U4B8NMajor {
                 packed,
                 scales,
@@ -1048,6 +1166,59 @@ impl RawLinearHost {
                 inner: Box::new(inner.slice_cols_inner(col_start, col_end)),
                 block_size: *block_size,
             },
+            Self::U2B2NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => {
+                let channelwise = *group_size == *k && *group_size > 128;
+                if !col_start.is_multiple_of(16)
+                    || !out_k.is_multiple_of(16)
+                    || (!channelwise
+                        && (!col_start.is_multiple_of(*group_size)
+                            || !out_k.is_multiple_of(*group_size)))
+                {
+                    let dense = self.to_f16_vec();
+                    let col_major: Vec<u16> = dense
+                        .chunks_exact(*k)
+                        .flat_map(|row| row[col_start..col_end].iter().copied())
+                        .collect();
+                    return Self::DenseF16 {
+                        weight: col_major,
+                        n: *n,
+                        k: out_k,
+                    };
+                }
+                let in_words = k / 16;
+                let out_words = out_k / 16;
+                let w_start = col_start / 16;
+                let in_groups = k / group_size;
+                let out_groups = if channelwise { 1 } else { out_k / group_size };
+                let g_start = if channelwise {
+                    0
+                } else {
+                    col_start / group_size
+                };
+                let mut new_packed = vec![0u32; n * out_words];
+                let mut new_scales = vec![0u16; n * out_groups];
+                for r in 0..*n {
+                    new_packed[r * out_words..(r + 1) * out_words].copy_from_slice(
+                        &packed[r * in_words + w_start..r * in_words + w_start + out_words],
+                    );
+                    new_scales[r * out_groups..(r + 1) * out_groups].copy_from_slice(
+                        &scales[r * in_groups + g_start..r * in_groups + g_start + out_groups],
+                    );
+                }
+                Self::U2B2NMajor {
+                    packed: new_packed,
+                    scales: new_scales,
+                    n: *n,
+                    k: out_k,
+                    group_size: if channelwise { out_k } else { *group_size },
+                }
+            }
             Self::U4B8NMajor {
                 packed,
                 scales,
@@ -1255,6 +1426,38 @@ impl RawLinearHost {
                 )));
             }
         }
+        if let Self::U2B2NMajor {
+            group_size: gs0, ..
+        } = &parts[0]
+            && parts
+                .iter()
+                .all(|p| matches!(p, Self::U2B2NMajor { group_size, .. } if group_size == gs0))
+        {
+            let mut packed = Vec::new();
+            let mut scales = Vec::new();
+            let mut total_n = 0;
+            for p in parts {
+                if let Self::U2B2NMajor {
+                    packed: pk,
+                    scales: sc,
+                    n,
+                    ..
+                } = p
+                {
+                    packed.extend_from_slice(pk);
+                    scales.extend_from_slice(sc);
+                    total_n += *n;
+                }
+            }
+            return Ok(Self::U2B2NMajor {
+                packed,
+                scales,
+                n: total_n,
+                k,
+                group_size: *gs0,
+            });
+        }
+
         if let Self::U4B8NMajor {
             group_size: gs0, ..
         } = &parts[0]
@@ -1276,6 +1479,57 @@ impl RawLinearHost {
                     packed.extend_from_slice(pk);
                     scales.extend_from_slice(sc);
                     total_n += *n;
+                }
+            }
+            return Ok(Self::U4B8NMajor {
+                packed,
+                scales,
+                n: total_n,
+                k,
+                group_size: *gs0,
+            });
+        }
+
+        if let Self::U2B2NMajor {
+            group_size: gs0, ..
+        }
+        | Self::U4B8NMajor {
+            group_size: gs0, ..
+        } = &parts[0]
+            && parts.iter().all(|p| {
+                matches!(
+                    p,
+                    Self::U2B2NMajor { group_size, .. } | Self::U4B8NMajor { group_size, .. }
+                        if group_size == gs0
+                )
+            })
+        {
+            let mut packed = Vec::new();
+            let mut scales = Vec::new();
+            let mut total_n = 0;
+            for p in parts {
+                match p {
+                    Self::U2B2NMajor {
+                        packed: pk,
+                        scales: sc,
+                        n,
+                        ..
+                    } => {
+                        packed.extend_from_slice(&repack_u2b2_to_u4b8(pk));
+                        scales.extend_from_slice(sc);
+                        total_n += *n;
+                    }
+                    Self::U4B8NMajor {
+                        packed: pk,
+                        scales: sc,
+                        n,
+                        ..
+                    } => {
+                        packed.extend_from_slice(pk);
+                        scales.extend_from_slice(sc);
+                        total_n += *n;
+                    }
+                    _ => unreachable!(),
                 }
             }
             return Ok(Self::U4B8NMajor {
@@ -1411,6 +1665,14 @@ impl RawLinearHost {
                     k as i64,
                     n as i64,
                 )
+            } else if bits == 2 {
+                ffi::w34_marlin_repack_int2(
+                    &ex,
+                    repack_staging.addr() as *const u32,
+                    b_q_weight_ptr as *mut u32,
+                    k as i64,
+                    n as i64,
+                )
             } else {
                 ffi::w34_marlin_repack_int4(
                     &ex,
@@ -1439,6 +1701,55 @@ impl RawLinearHost {
         match self {
             Self::Hadamard { inner, block_size } => {
                 inner.upload_hadamard(*block_size, arena, stream, repack_staging)
+            }
+            Self::U2B2NMajor {
+                packed,
+                scales,
+                n,
+                k,
+                group_size,
+            } => {
+                let channelwise = *group_size == *k && *group_size > MARLIN_TILE_K_W4;
+                if marlin_geom_ok(*n, *k)
+                    && k.is_multiple_of(64)
+                    && (channelwise || matches!(*group_size, 32 | 64 | 128))
+                {
+                    let b_q_weight_ptr = Self::repack_with_staging(
+                        packed,
+                        *n,
+                        *k,
+                        2,
+                        arena,
+                        stream,
+                        repack_staging,
+                    )?;
+                    let perm_scales = marlin_permute_scales_from_n_major(
+                        scales,
+                        *k,
+                        *n,
+                        if channelwise { 0 } else { *group_size },
+                    );
+                    let b_scales_ptr = arena.upload_slice(&perm_scales, stream)?;
+                    Ok(LinearProj::MarlinW2A16 {
+                        b_q_weight_ptr,
+                        b_scales_ptr,
+                        size_n: *n,
+                        size_k: *k,
+                        group_blocks: if channelwise {
+                            MARLIN_CHANNELWISE_GROUP_BLOCKS
+                        } else {
+                            (*group_size / MARLIN_GROUP_BLOCK_K) as i32
+                        },
+                    })
+                } else {
+                    let f16_w = dequant_u2b2_n_major_to_f16(packed, scales, *n, *k, *group_size);
+                    let weight_ptr = arena.upload_slice(&f16_w, stream)?;
+                    Ok(LinearProj::DenseF16 {
+                        weight_ptr,
+                        size_n: *n,
+                        size_k: *k,
+                    })
+                }
             }
             Self::U4B8NMajor {
                 packed,

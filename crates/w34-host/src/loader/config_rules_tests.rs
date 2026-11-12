@@ -475,3 +475,363 @@ fn flash_next_rules_resolve_experts_shared_mtp_ple_and_vision_fc2() {
     assert_eq!(scheme.for_linear(fc2).unwrap().raw_group_size(), 0);
     assert_eq!(scheme.input_hadamard(fc2).unwrap(), Some(16));
 }
+
+#[test]
+fn updated_9b_hgptq_rules_resolve_per_layer_w4_g64_and_w8_head() {
+    let mut w4_targets = Vec::with_capacity(200);
+    for layer in 0..32 {
+        if layer % 4 == 3 {
+            for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                w4_targets.push(format!(
+                    "re:.*(?<!mtp\\.)layers\\.{layer}\\.self_attn\\.{proj}$"
+                ));
+            }
+        } else {
+            for proj in ["in_proj_qkv", "in_proj_z", "out_proj"] {
+                w4_targets.push(format!(
+                    "re:.*(?<!mtp\\.)layers\\.{layer}\\.linear_attn\\.{proj}$"
+                ));
+            }
+        }
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            w4_targets.push(format!("re:.*(?<!mtp\\.)layers\\.{layer}\\.mlp\\.{proj}$"));
+        }
+    }
+    assert_eq!(w4_targets.len(), 200);
+
+    let q = serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "ignore": [
+            "re:.*linear_attn\\.in_proj_a$",
+            "re:.*linear_attn\\.in_proj_b$",
+            "re:.*mlp\\.gate$",
+            "re:.*mlp\\.shared_expert_gate$"
+        ],
+        "config_groups": {
+            "group_0": {
+                "format": "pack-quantized",
+                "targets": [
+                    "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                    "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
+                ],
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": 64,
+                    "num_bits": 4,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            },
+            "vision_fc2_channel": {
+                "format": "pack-quantized",
+                "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"],
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": null,
+                    "num_bits": 4,
+                    "strategy": "channel",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            },
+            "w4_g64": {
+                "format": "pack-quantized",
+                "targets": w4_targets,
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": 64,
+                    "num_bits": 4,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            },
+            "w8_head": {
+                "format": "pack-quantized",
+                "targets": [
+                    "re:(?:^|.*\\.)lm_head$",
+                    "re:(?:^|.*\\.)mtp\\.fc$"
+                ],
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": 64,
+                    "num_bits": 8,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            }
+        },
+        "transform_config": {
+            "config_groups": {
+                "v": {
+                    "head_dim": 64,
+                    "precision": "torch.float32",
+                    "randomize": false,
+                    "requires_grad": false,
+                    "type": "hadamard",
+                    "apply": [
+                        {
+                            "ignore": [
+                                "lm_head",
+                                "re:.*linear_attn\\.in_proj_a$",
+                                "re:.*linear_attn\\.in_proj_b$",
+                                "re:.*mlp\\.gate$",
+                                "re:.*mlp\\.shared_expert_gate$"
+                            ],
+                            "inverse": true,
+                            "location": "weight_input",
+                            "targets": [
+                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
+                            ]
+                        },
+                        {
+                            "ignore": [
+                                "lm_head",
+                                "re:.*linear_attn\\.in_proj_a$",
+                                "re:.*linear_attn\\.in_proj_b$",
+                                "re:.*mlp\\.gate$",
+                                "re:.*mlp\\.shared_expert_gate$"
+                            ],
+                            "inverse": false,
+                            "location": "input",
+                            "targets": [
+                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.(self_attn|linear_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkv|in_proj_z|out_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp(?:\\.(?:experts\\.\\d+|shared_expert))?)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$",
+                                "re:.*visual\\.(blocks\\.\\d+\\.(attn\\.(qkv|proj)|mlp\\.linear_fc1)|merger\\.linear_fc[12])$"
+                            ]
+                        }
+                    ]
+                },
+                "v_vision_fc2": {
+                    "head_dim": 16,
+                    "precision": "torch.float32",
+                    "randomize": false,
+                    "requires_grad": false,
+                    "type": "hadamard",
+                    "apply": [
+                        {
+                            "ignore": [],
+                            "inverse": true,
+                            "location": "weight_input",
+                            "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"]
+                        },
+                        {
+                            "ignore": [],
+                            "inverse": false,
+                            "location": "input",
+                            "targets": ["re:.*visual\\.blocks\\.\\d+\\.mlp\\.linear_fc2$"]
+                        }
+                    ]
+                }
+            }
+        }
+    });
+
+    let scheme = parse(&q).expect("updated 9B HGPTQ config must parse");
+    assert_eq!(scheme.bits(), 4);
+    assert_eq!(scheme.raw_group_size(), 64);
+
+    for name in [
+        "model.language_model.layers.0.linear_attn.in_proj_qkv",
+        "model.language_model.layers.31.self_attn.o_proj",
+        "model.language_model.layers.15.mlp.down_proj",
+        "mtp.layers.0.self_attn.q_proj",
+        "mtp.layers.0.mlp.gate_proj",
+        "model.visual.blocks.0.attn.qkv",
+    ] {
+        let resolved = scheme.for_linear(name).unwrap();
+        assert_eq!(resolved.bits(), 4, "{name}");
+        assert_eq!(resolved.raw_group_size(), 64, "{name}");
+        assert_eq!(scheme.input_hadamard(name).unwrap(), Some(64), "{name}");
+    }
+
+    for head in ["lm_head", "mtp.fc"] {
+        let resolved = scheme.for_linear(head).unwrap();
+        assert_eq!(resolved.bits(), 8, "{head}");
+        assert_eq!(resolved.raw_group_size(), 64, "{head}");
+        assert_eq!(scheme.input_hadamard(head).unwrap(), None, "{head}");
+    }
+
+    for ignored in [
+        "model.language_model.layers.0.linear_attn.in_proj_a",
+        "model.language_model.layers.0.linear_attn.in_proj_b",
+    ] {
+        assert_eq!(
+            scheme.for_linear(ignored).unwrap(),
+            QuantScheme::Unquantized
+        );
+        assert_eq!(scheme.input_hadamard(ignored).unwrap(), None);
+    }
+
+    let mut bad_transform = q.clone();
+    bad_transform["transform_config"]["config_groups"]["v"]["apply"][0]["targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("re:(?:^|.*\\.)mtp\\.fc$"));
+    bad_transform["transform_config"]["config_groups"]["v"]["apply"][1]["targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!("re:(?:^|.*\\.)mtp\\.fc$"));
+    let bad_scheme = parse(&bad_transform).unwrap();
+    let err = bad_scheme.for_linear("mtp.fc").unwrap_err();
+    assert!(
+        err.to_string().contains("non-W2/W4 linear mtp.fc"),
+        "expected non-W2/W4 transform error, got: {err}"
+    );
+
+    // Even when the 8-bit group key sorts lexicographically before all 4-bit groups,
+    // top-level QuantScheme summary retains 4-bit.
+    let mut w8_first = q.clone();
+    let groups = w8_first["config_groups"].as_object_mut().unwrap();
+    let w8_group = groups.remove("w8_head").unwrap();
+    groups.insert("a_w8_head".to_owned(), w8_group);
+    let w8_first_scheme = parse(&w8_first).expect("w8-first HGPTQ config must parse");
+    assert_eq!(w8_first_scheme.bits(), 4);
+    assert_eq!(w8_first_scheme.raw_group_size(), 64);
+}
+
+#[test]
+fn parses_w2_6_hgptq_rco_mixed_w2_w4_w8_and_lut4_ple_config() {
+    let mut w2_targets = Vec::new();
+    for layer in 0..32 {
+        w2_targets.push(format!(
+            "re:.*(?<!mtp\\.)layers\\.{layer}\\.mlp\\.(gate_proj|up_proj)$"
+        ));
+    }
+    let q = serde_json::json!({
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "ignore": [
+            "re:.*linear_attn\\.in_proj_[ab]$",
+            "re:.*mlp\\.(gate|shared_expert_gate)$"
+        ],
+        "config_groups": {
+            "group_0": {
+                "format": "pack-quantized",
+                "targets": [
+                    "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
+                ],
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": 64,
+                    "num_bits": 4,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            },
+            "ple__group_0": {
+                "format": "lut4-gptq",
+                "targets": ["re:.*ple\\.embed_tokens$"],
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": 128,
+                    "num_bits": 4,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            },
+            "w2_g64": {
+                "format": "pack-quantized",
+                "targets": w2_targets,
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": 64,
+                    "num_bits": 2,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            },
+            "w4_g64": {
+                "format": "pack-quantized",
+                "targets": [
+                    "re:.*(?<!mtp\\.)layers\\.0\\.mlp\\.down_proj$"
+                ],
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": 64,
+                    "num_bits": 4,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            },
+            "w8_head": {
+                "format": "pack-quantized",
+                "targets": [
+                    "re:(?:^|.*\\.)lm_head$",
+                    "re:(?:^|.*\\.)mtp\\.fc$"
+                ],
+                "weights": {
+                    "actorder": null,
+                    "dynamic": false,
+                    "group_size": 64,
+                    "num_bits": 8,
+                    "strategy": "group",
+                    "symmetric": true,
+                    "type": "int"
+                }
+            }
+        },
+        "transform_config": {
+            "config_groups": {
+                "v": {
+                    "head_dim": 64,
+                    "precision": "torch.float32",
+                    "randomize": false,
+                    "requires_grad": false,
+                    "type": "hadamard",
+                    "apply": [
+                        {
+                            "ignore": [],
+                            "inverse": true,
+                            "location": "weight_input",
+                            "targets": [
+                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.mlp\\.(gate_proj|up_proj|down_proj)$",
+                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
+                            ]
+                        },
+                        {
+                            "ignore": [],
+                            "inverse": false,
+                            "location": "input",
+                            "targets": [
+                                "re:.*(?<!mtp\\.)layers\\.\\d+\\.mlp\\.(gate_proj|up_proj|down_proj)$",
+                                "re:.*mtp\\.layers\\.\\d+\\.(self_attn|mlp)\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    });
+
+    let scheme = parse(&q).expect("W2.6 HGPTQ-RCO config must parse");
+    assert_eq!(scheme.bits(), 4);
+    let gate0 = "model.language_model.layers.0.mlp.gate_proj";
+    assert_eq!(scheme.for_linear(gate0).unwrap().bits(), 2);
+    assert_eq!(scheme.for_linear(gate0).unwrap().raw_group_size(), 64);
+    assert_eq!(scheme.input_hadamard(gate0).unwrap(), Some(64));
+
+    let down0 = "model.language_model.layers.0.mlp.down_proj";
+    assert_eq!(scheme.for_linear(down0).unwrap().bits(), 4);
+    assert_eq!(scheme.input_hadamard(down0).unwrap(), Some(64));
+
+    assert_eq!(scheme.for_linear("lm_head").unwrap().bits(), 8);
+    assert_eq!(scheme.input_hadamard("lm_head").unwrap(), None);
+}

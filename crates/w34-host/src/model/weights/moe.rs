@@ -2,6 +2,13 @@ use super::*;
 
 #[cfg(feature = "cuda")]
 pub enum MoeExpertStorage {
+    W2A16 {
+        gate_up_packed_ptr: u64,
+        gate_up_scales_ptr: u64,
+        down_packed_ptr: u64,
+        down_scales_ptr: u64,
+        group_size: usize,
+    },
     W4A16 {
         gate_up_packed_ptr: u64,
         gate_up_scales_ptr: u64,
@@ -80,7 +87,9 @@ impl FfnBlockWeights {
                         .is_none_or(LinearProj::can_fuse_h64_from_producer) =>
             {
                 match &moe.experts {
-                    MoeExpertStorage::W4A16 { .. } | MoeExpertStorage::W4A16Zp { .. }
+                    MoeExpertStorage::W2A16 { .. }
+                    | MoeExpertStorage::W4A16 { .. }
+                    | MoeExpertStorage::W4A16Zp { .. }
                         if mlp_out_buf != 0 && mlp_out_buf != normed_buf =>
                     {
                         [normed_buf, mlp_out_buf]
@@ -502,6 +511,42 @@ impl FfnBlockWeights {
                 }
 
                 match &moe.experts {
+                    MoeExpertStorage::W2A16 {
+                        gate_up_packed_ptr,
+                        gate_up_scales_ptr,
+                        down_packed_ptr,
+                        down_scales_ptr,
+                        group_size,
+                    } => check_rc(
+                        // SAFETY: loader stores expert-major packed U2B2 weights and
+                        // FP16 scales with the loaded group size. Top-k buffers were
+                        // produced above; model scratch reserves routed intermediate
+                        // and output rows. Shared inputs are null when absent.
+                        unsafe {
+                            ffi::w34_moe_w2a16_mlp_ex_f16(
+                                ex,
+                                rotated_input_buf as *const c_void,
+                                *gate_up_packed_ptr as *const u32,
+                                *gate_up_scales_ptr as *const c_void,
+                                *down_packed_ptr as *const u32,
+                                *down_scales_ptr as *const c_void,
+                                moe_topk_ids_buf as *const i32,
+                                moe_topk_weights_buf as *const f32,
+                                sh_out_ptr,
+                                sh_gate_ptr,
+                                moe_interm_buf as *mut c_void,
+                                mlp_out_buf as *mut c_void,
+                                num_tokens as i32,
+                                moe.top_k as i32,
+                                moe.num_experts as i32,
+                                moe.local_moe_interm as i32,
+                                h_dim as i32,
+                                *group_size as i32,
+                                moe.routed_down_hadamard as i32,
+                            )
+                        },
+                        "w34_moe_w2a16_mlp_ex_f16",
+                    ),
                     MoeExpertStorage::W4A16 {
                         gate_up_packed_ptr,
                         gate_up_scales_ptr,
@@ -922,7 +967,7 @@ pub(crate) fn load_moe_layer_weights(
             Ok((gu, rd))
         };
 
-        // Probe expert 0 to determine W4A16 vs W4A16Zp vs DenseF16 storage
+        // Probe expert 0 to determine W2A16 vs W4A16 vs W4A16Zp vs DenseF16 storage
         let (exp0_gate, _) = RawLinearHost::load(
             archive,
             &format!("{pfx}.mlp.experts.0.gate_proj"),
@@ -1179,6 +1224,83 @@ pub(crate) fn load_moe_layer_weights(
                     MoeExpertStorage::DenseF16 {
                         gate_up_ptr,
                         down_ptr,
+                    },
+                    exp0_in_had,
+                    exp0_dn_had,
+                )
+            }
+            RawLinearHost::U2B2NMajor { group_size, .. } => {
+                if !h.is_multiple_of(16)
+                    || !local_moe_interm.is_multiple_of(16)
+                    || !h.is_multiple_of(group_size)
+                    || !local_moe_interm.is_multiple_of(group_size)
+                {
+                    return Err(loader_err_msg(format!(
+                        "W2A16 MoE requires hidden_size ({h}) and local_moe_interm ({local_moe_interm}) divisible by 16 and group_size ({group_size})"
+                    )));
+                }
+                let gu_words_per_exp = (2 * local_moe_interm) * (h / 16);
+                let gu_scales_per_exp = (2 * local_moe_interm) * (h / group_size);
+                let dn_words_per_exp = h * (local_moe_interm / 16);
+                let dn_scales_per_exp = h * (local_moe_interm / group_size);
+
+                let mut all_gu_packed = Vec::with_capacity(num_exp * gu_words_per_exp);
+                let mut all_gu_scales = Vec::with_capacity(num_exp * gu_scales_per_exp);
+                let mut all_dn_packed = Vec::with_capacity(num_exp * dn_words_per_exp);
+                let mut all_dn_scales = Vec::with_capacity(num_exp * dn_scales_per_exp);
+
+                for batch_start in (0..num_exp).step_by(EXP_BATCH) {
+                    let batch_end = (batch_start + EXP_BATCH).min(num_exp);
+                    for (rel_e, (gu, rd)) in load_expert_batch(batch_start, batch_end)?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let e = batch_start + rel_e;
+                        let epfx = format!("{pfx}.mlp.experts.{e}");
+                        if let RawLinearHost::U2B2NMajor {
+                            packed,
+                            scales,
+                            group_size: gs,
+                            ..
+                        } = gu
+                            && gs == group_size
+                        {
+                            all_gu_packed.extend_from_slice(&packed);
+                            all_gu_scales.extend_from_slice(&scales);
+                        } else {
+                            return Err(loader_err_msg(format!(
+                                "inconsistent MoE expert quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size})"
+                            )));
+                        }
+                        if let RawLinearHost::U2B2NMajor {
+                            packed,
+                            scales,
+                            group_size: gs,
+                            ..
+                        } = rd
+                            && gs == group_size
+                        {
+                            all_dn_packed.extend_from_slice(&packed);
+                            all_dn_scales.extend_from_slice(&scales);
+                        } else {
+                            return Err(loader_err_msg(format!(
+                                "inconsistent MoE down_proj quantization at '{epfx}' (expected symmetric W2A16 group_size={group_size})"
+                            )));
+                        }
+                    }
+                }
+
+                let gate_up_packed_ptr = weight_arena.upload_slice(&all_gu_packed, stream)?;
+                let gate_up_scales_ptr = weight_arena.upload_slice(&all_gu_scales, stream)?;
+                let down_packed_ptr = weight_arena.upload_slice(&all_dn_packed, stream)?;
+                let down_scales_ptr = weight_arena.upload_slice(&all_dn_scales, stream)?;
+                (
+                    MoeExpertStorage::W2A16 {
+                        gate_up_packed_ptr,
+                        gate_up_scales_ptr,
+                        down_packed_ptr,
+                        down_scales_ptr,
+                        group_size,
                     },
                     exp0_in_had,
                     exp0_dn_had,

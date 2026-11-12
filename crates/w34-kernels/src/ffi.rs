@@ -560,6 +560,13 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn w34_zero_i32(ex: *const W34Exec, ptr: *mut c_void, count: i64) -> i32;
+    pub fn w34_marlin_repack_int2(
+        ex: *const W34Exec,
+        src_n_major: *const u32,
+        dst_marlin: *mut u32,
+        k: i64,
+        n: i64,
+    ) -> i32;
     pub fn w34_marlin_repack_int4(
         ex: *const W34Exec,
         src_n_major: *const u32,
@@ -582,6 +589,19 @@ unsafe extern "C" {
         k: i64,
         n: i64,
         group_size: i32,
+    ) -> i32;
+    pub fn w34_marlin_gemm_f16u2(
+        ex: *const W34Exec,
+        a: *const c_void,
+        b: *const c_void,
+        scales: *const c_void,
+        c: *mut c_void,
+        workspace: *mut i32,
+        m: i64,
+        n: i64,
+        k: i64,
+        workspace_ints: i64,
+        group_blocks: i32,
     ) -> i32;
     pub fn w34_marlin_gemm_f16u4(
         ex: *const W34Exec,

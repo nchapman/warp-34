@@ -355,6 +355,7 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     int n_interm,
     int k_hidden,
     int group_size,
+    int bits,
     float gpu_share_frac) {
     if (!ex || !d_req_slot || !x_f16 || !global_topk_ids || !topk_weights ||
         !expert_to_slot || !slot_to_expert || !slot_last_used || !step_counter ||
@@ -413,7 +414,8 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
             pack_stride_bytes,
             n_interm,
             k_hidden,
-            group_size);
+            group_size,
+            bits);
     }
 
     return 0;

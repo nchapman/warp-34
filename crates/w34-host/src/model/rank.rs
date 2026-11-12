@@ -692,6 +692,13 @@ pub fn plan_tiered_moe_hot_per_layer(
         .saturating_add(min_state_pool_bytes)
         .saturating_add(extra_reserve);
     let per_hot_step = cfg.num_hidden_layers * exp_bytes;
+    let actual_per_hot_step: usize = (0..cfg.num_hidden_layers)
+        .filter(|l| !cfg.mlp_only_layers.contains(l))
+        .map(|l| {
+            cfg.layer_moe_expert_pack_layout(l)
+                .map_or(exp_bytes, |lay| lay.stride)
+        })
+        .sum();
     let min_standard_total = fixed_overhead.saturating_add(min_hot.saturating_mul(per_hot_step));
     let min_base_and_state = base_headroom_plus_kv_bytes.saturating_add(min_state_pool_bytes);
     if available_vram_after_weights_and_scratch < min_standard_total
@@ -706,7 +713,7 @@ pub fn plan_tiered_moe_hot_per_layer(
         let compact_extra_reserve =
             TIERED_MOE_COMPACT_STAGE_RESERVE_SLOTS.saturating_mul(exp_bytes);
         let hot = TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot);
-        let reserve = (cfg.num_hidden_layers * hot) * exp_bytes + compact_extra_reserve;
+        let reserve = hot.saturating_mul(actual_per_hot_step) + compact_extra_reserve;
         return (hot, reserve);
     }
     let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
@@ -718,7 +725,7 @@ pub fn plan_tiered_moe_hot_per_layer(
     } else {
         min_hot
     };
-    let reserve = (cfg.num_hidden_layers * hot) * exp_bytes + extra_reserve;
+    let reserve = hot.saturating_mul(actual_per_hot_step) + extra_reserve;
     (hot, reserve)
 }
 
@@ -1098,6 +1105,31 @@ impl Qwen3_5ModelRank {
         Ok(())
     }
 
+    fn fused_row_siblings(base_name: &str) -> Option<(&str, &'static [&'static str])> {
+        for (suffix, group) in [
+            (".self_attn.q_proj", &["q_proj", "k_proj", "v_proj"][..]),
+            (".self_attn.k_proj", &["q_proj", "k_proj", "v_proj"][..]),
+            (".self_attn.v_proj", &["q_proj", "k_proj", "v_proj"][..]),
+            (
+                ".linear_attn.in_proj_qkv",
+                &["in_proj_qkv", "in_proj_z"][..],
+            ),
+            (".linear_attn.in_proj_z", &["in_proj_qkv", "in_proj_z"][..]),
+            (".linear_attn.in_proj_b", &["in_proj_b", "in_proj_a"][..]),
+            (".linear_attn.in_proj_a", &["in_proj_b", "in_proj_a"][..]),
+            (".mlp.gate_proj", &["gate_proj", "up_proj"][..]),
+            (".mlp.up_proj", &["gate_proj", "up_proj"][..]),
+            (".shared_expert.gate_proj", &["gate_proj", "up_proj"][..]),
+            (".shared_expert.up_proj", &["gate_proj", "up_proj"][..]),
+        ] {
+            if base_name.ends_with(suffix) {
+                let stem_end = base_name.rfind('.').unwrap_or(base_name.len());
+                return Some((&base_name[..stem_end], group));
+            }
+        }
+        None
+    }
+
     pub(super) fn estimate_weight_arena_bytes(
         cfg: &ModelConfig,
         archive: &SafetensorsArchive,
@@ -1172,39 +1204,110 @@ impl Qwen3_5ModelRank {
                 }
                 "I32" | "U32" => {
                     let is_expert = name.contains(".experts.");
-                    let skinny_dequant = if !is_expert
+                    if is_expert
                         && info.shape.len() == 2
                         && (name.ends_with(".weight_packed") || name.ends_with(".qweight"))
                     {
-                        let (n, k) = if cfg.quant.is_awq_packing() && name.ends_with(".qweight") {
-                            (info.shape[1] * 8, info.shape[0])
-                        } else if name.ends_with(".qweight") {
-                            (info.shape[1], info.shape[0] * pack_factor)
-                        } else {
-                            (info.shape[0], info.shape[1] * pack_factor)
-                        };
-                        let (local_n, local_k) = if is_replicated {
-                            (n, k)
-                        } else if is_col_sharded {
-                            (n, k.div_ceil(tp_size))
-                        } else {
-                            (n.div_ceil(tp_size), k)
-                        };
-                        let marlin_ok = (local_n % 64 == 0 && local_k % 128 == 0)
-                            || (local_n % 128 == 0 && local_k % 64 == 0);
-                        let gs = cfg.quant.group_size_or(local_k);
-                        let gs_ok = ((cfg.quant.is_channelwise() && cfg.quant.bits() == 8)
-                            || matches!(gs, 32 | 64 | 128))
-                            && (gs == 0 || local_k.is_multiple_of(gs));
-                        if !marlin_ok || !gs_ok {
-                            Some(n * k * 2)
-                        } else {
-                            None
-                        }
+                        info.len_bytes as usize
                     } else {
-                        None
-                    };
-                    skinny_dequant.unwrap_or(info.len_bytes as usize)
+                        let skinny_dequant = if !is_expert
+                            && info.shape.len() == 2
+                            && (name.ends_with(".weight_packed") || name.ends_with(".qweight"))
+                        {
+                            let base_name = name
+                                .trim_end_matches(".weight_packed")
+                                .trim_end_matches(".qweight");
+                            cfg.quant.for_linear(base_name).map(|t_quant| {
+                                let t_bits = t_quant.bits();
+                                let t_pf = match t_bits {
+                                    2 => 16usize,
+                                    8 => 4usize,
+                                    _ => pack_factor,
+                                };
+                                let (n, k) =
+                                    if t_quant.is_awq_packing() && name.ends_with(".qweight") {
+                                        (info.shape[1] * 8, info.shape[0])
+                                    } else if name.ends_with(".qweight") {
+                                        (info.shape[1], info.shape[0] * t_pf)
+                                    } else {
+                                        (info.shape[0], info.shape[1] * t_pf)
+                                    };
+                                let (local_n, local_k) = if is_replicated {
+                                    (n, k)
+                                } else if is_col_sharded {
+                                    (n, k.div_ceil(tp_size))
+                                } else {
+                                    (n.div_ceil(tp_size), k)
+                                };
+                                let marlin_ok = (local_n % 64 == 0 && local_k % 128 == 0)
+                                    || (local_n % 128 == 0 && local_k % 64 == 0);
+                                let gs = t_quant.group_size_or(local_k);
+                                let gs_ok = (t_quant.is_channelwise()
+                                    || matches!(gs, 32 | 64 | 128))
+                                    && (gs == 0 || local_k.is_multiple_of(gs));
+                                if !marlin_ok || !gs_ok {
+                                    Some(n * k * 2)
+                                } else if let Some((parent, group)) =
+                                    Self::fused_row_siblings(base_name)
+                                {
+                                    let mut dequant_f16 = false;
+                                    let mut widen_w2_to_w4 = false;
+                                    for sib in group {
+                                        let sib_name = format!("{parent}.{sib}");
+                                        let sib_has_packed = archive
+                                            .resolve_name(&format!("{sib_name}.weight_packed"))
+                                            .is_some()
+                                            || archive
+                                                .resolve_name(&format!("{sib_name}.qweight"))
+                                                .is_some();
+                                        let sib_has_f16 = archive
+                                            .resolve_name(&format!("{sib_name}.weight"))
+                                            .is_some();
+                                        if !sib_has_packed && sib_has_f16 {
+                                            dequant_f16 = true;
+                                            break;
+                                        }
+                                        let Ok(sib_quant) = cfg.quant.for_linear(&sib_name) else {
+                                            dequant_f16 = true;
+                                            break;
+                                        };
+                                        if sib_quant == t_quant {
+                                            continue;
+                                        }
+                                        if matches!(t_bits, 2 | 4)
+                                            && matches!(sib_quant.bits(), 2 | 4)
+                                            && !t_quant.expects_zero_points()
+                                            && !sib_quant.expects_zero_points()
+                                            && sib_quant.group_size_or(local_k) == gs
+                                        {
+                                            if t_bits == 2 && sib_quant.bits() == 4 {
+                                                widen_w2_to_w4 = true;
+                                            }
+                                        } else {
+                                            dequant_f16 = true;
+                                            break;
+                                        }
+                                    }
+                                    if dequant_f16 {
+                                        Some(n * k * 2)
+                                    } else if widen_w2_to_w4 {
+                                        Some(n * k / 2)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            Ok(None)
+                        };
+                        match skinny_dequant {
+                            Ok(Some(bytes)) => bytes,
+                            Ok(None) => info.len_bytes as usize,
+                            Err(_) => (info.len_bytes as usize).saturating_mul(4),
+                        }
+                    }
                 }
                 _ => info.len_bytes as usize,
             };

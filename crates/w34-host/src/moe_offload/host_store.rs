@@ -136,8 +136,13 @@ impl HostExpertStore {
         // Revalidate public geometry before using it to size or address unsafe storage.
         require(
             layout
-                == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?
-                    .with_down_hadamard(layout.down_hadamard_block_size)?,
+                == ExpertPackLayout::new_with_bits(
+                    layout.intermediate,
+                    layout.hidden,
+                    layout.group_size,
+                    layout.bits,
+                )?
+                .with_down_hadamard(layout.down_hadamard_block_size)?,
             "inconsistent expert pack layout",
         )?;
         let count = num_experts / ep_size;
@@ -210,8 +215,8 @@ impl HostExpertStore {
             .filter(|q| *q != QuantScheme::Unquantized)
             .unwrap_or_else(|| quant.clone());
         require(
-            expert_quant.symmetric_gptq_u4_group_size() == Some(layout.group_size),
-            "host expert store requires symmetric 4-bit GPTQ/AutoRound/CompressedTensors W4A16",
+            expert_quant.symmetric_gptq_u2_or_u4_group_size() == Some(layout.group_size),
+            "host expert store requires symmetric 2-bit/4-bit GPTQ/AutoRound/CompressedTensors W2A16/W4A16",
         )?;
         let bytes = layout
             .stride
@@ -326,16 +331,45 @@ impl HostExpertStore {
                                         "missing {experts_prefix}.{expert_id}.{proj_name}.weight_scale"
                                     ))
                                 })?;
+                                let is_u2 = k8.is_multiple_of(2) && wp_info.shape == [n_exp, k8 / 2];
                                 require(
-                                    wp_info.shape == [n_exp, k8]
-                                        && ws_info.shape == [n_exp, num_groups],
+                                    (if layout_ref.bits == 2 {
+                                        is_u2
+                                    } else {
+                                        wp_info.shape == [n_exp, k8] || is_u2
+                                    }) && ws_info.shape == [n_exp, num_groups],
                                     format!(
-                                        "mismatched compressed-tensors weight_packed {:?} / weight_scale {:?} (4-bit) on '{experts_prefix}.{expert_id}.{proj_name}'",
+                                        "mismatched compressed-tensors weight_packed {:?} / weight_scale {:?} (2/4-bit) on '{experts_prefix}.{expert_id}.{proj_name}'",
                                         wp_info.shape, ws_info.shape
                                     ),
                                 )?;
-                                // `weight_packed` is already N-major `[n_exp, k8]`.
-                                archive.read_exact_info(wp_info, &mut pack[w_range])?;
+                                if is_u2 && layout_ref.bits == 4 {
+                                    let u2_buf = &mut raw_qw_bytes[..w_range.len() / 2];
+                                    archive.read_exact_info(wp_info, u2_buf)?;
+                                    let dst_w = &mut pack[w_range];
+                                    for (dst_pair, src_word) in dst_w
+                                        .as_chunks_mut::<8>()
+                                        .0
+                                        .iter_mut()
+                                        .zip(u2_buf.as_chunks::<4>().0.iter())
+                                    {
+                                        let w = u32::from_le_bytes(*src_word);
+                                        for (half_idx, half) in
+                                            [w & 0xFFFF, w >> 16].into_iter().enumerate()
+                                        {
+                                            let mut x = half;
+                                            x = (x | (x << 8)) & 0x00FF_00FF;
+                                            x = (x | (x << 4)) & 0x0F0F_0F0F;
+                                            x = (x | (x << 2)) & 0x3333_3333;
+                                            x = x.wrapping_add(0x6666_6666);
+                                            dst_pair[half_idx * 4..(half_idx + 1) * 4]
+                                                .copy_from_slice(&x.to_le_bytes());
+                                        }
+                                    }
+                                } else {
+                                    // `weight_packed` is already N-major (`[n_exp, k8 / 2]` for 2-bit or `[n_exp, k8]` for 4-bit).
+                                    archive.read_exact_info(wp_info, &mut pack[w_range])?;
+                                }
                                 // `weight_scale` is already N-major `[n_exp, num_groups]`.
                                 let sc_words = &mut raw_sc_words[..n_exp * num_groups];
                                 archive.read_f16_bits_info_into(ws_info, sc_words)?;
@@ -453,8 +487,13 @@ impl HostExpertStore {
     ) -> Result<Self> {
         require(
             layout
-                == ExpertPackLayout::new(layout.intermediate, layout.hidden, layout.group_size)?
-                    .with_down_hadamard(layout.down_hadamard_block_size)?,
+                == ExpertPackLayout::new_with_bits(
+                    layout.intermediate,
+                    layout.hidden,
+                    layout.group_size,
+                    layout.bits,
+                )?
+                .with_down_hadamard(layout.down_hadamard_block_size)?,
             "inconsistent expert pack layout",
         )?;
         let count = expert_ids.len();
@@ -668,6 +707,7 @@ impl DeviceExpertSlotTable {
                     self.layout.intermediate as i32,
                     self.layout.hidden as i32,
                     self.layout.group_size as i32,
+                    self.layout.bits as i32,
                 )
             },
             "w34_moe_unpack_staged_experts",
@@ -708,6 +748,7 @@ impl DeviceExpertSlotTable {
                     self.layout.intermediate as i32,
                     self.layout.hidden as i32,
                     self.layout.group_size as i32,
+                    self.layout.bits as i32,
                 )
             },
             "w34_moe_pull_mapped_experts",
@@ -729,10 +770,42 @@ impl DeviceExpertSlotTable {
         num_tokens: usize,
         top_k: usize,
     ) -> crate::cuda::Result<()> {
+        type MoeMlpExFn = unsafe extern "C" fn(
+            *const w34_kernels::ffi::W34Exec,
+            *const core::ffi::c_void,
+            *const u32,
+            *const core::ffi::c_void,
+            *const u32,
+            *const core::ffi::c_void,
+            *const i32,
+            *const f32,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+        ) -> i32;
+        let (mlp_fn, label): (MoeMlpExFn, &str) = if self.layout.bits == 2 {
+            (
+                w34_kernels::ffi::w34_moe_w2a16_mlp_ex_f16,
+                "w34_moe_w2a16_mlp_ex_f16 (tiered)",
+            )
+        } else {
+            (
+                w34_kernels::ffi::w34_moe_w4a16_mlp_ex_f16,
+                "w34_moe_w4a16_mlp_ex_f16 (tiered)",
+            )
+        };
         crate::cuda::check_rc(
             // SAFETY: all device addresses are valid for `num_tokens` and `top_k`.
             unsafe {
-                w34_kernels::ffi::w34_moe_w4a16_mlp_ex_f16(
+                mlp_fn(
                     ex,
                     x_addr as *const core::ffi::c_void,
                     self.gate_up_packed.addr() as *const u32,
@@ -754,7 +827,7 @@ impl DeviceExpertSlotTable {
                     self.layout.down_hadamard_block_size as i32,
                 )
             },
-            "w34_moe_w4a16_mlp_ex_f16 (tiered)",
+            label,
         )
     }
 }
@@ -1251,7 +1324,8 @@ impl TieredMoeWorkspace {
         }
         assert_eq!(n, dst_slots.len());
         assert!(n <= self.stage_capacity);
-        let stride = self.layout.stride;
+        let stride = store.layout().stride;
+        assert!(stride <= self.layout.stride);
         if store.mapped_dev_ptr() != 0 {
             let start = store.expert_ids().start;
             let local_ids: Vec<i32> = global_expert_ids
@@ -1313,7 +1387,8 @@ impl TieredMoeWorkspace {
         }
         assert_eq!(n, dst_slots.len());
         assert!(n <= self.stage_capacity);
-        let stride = self.layout.stride;
+        let stride = store.layout().stride;
+        assert!(stride <= self.layout.stride);
         if store.mapped_dev_ptr() != 0 {
             debug_assert!(
                 dst_slots.iter().copied().eq(0..n as i32),
