@@ -135,15 +135,29 @@ fn test_peft_config_scaling_and_patterns() {
 #[test]
 fn test_lora_adapter_host_load_dtypes_and_fan_in_fan_out() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg_json = r#"{
+    // Reject Conv1D-style fan_in_fan_out = true adapters:
+    let bad_cfg_json = r#"{
         "peft_type": "LORA",
         "r": 2,
         "lora_alpha": 4.0,
         "fan_in_fan_out": true
     }"#;
+    fs::write(tmp.path().join("adapter_config.json"), bad_cfg_json).unwrap();
+    let err = PeftConfig::from_dir(tmp.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("fan_in_fan_out=true"),
+        "unexpected error: {err}"
+    );
+
+    let cfg_json = r#"{
+        "peft_type": "LORA",
+        "r": 2,
+        "lora_alpha": 4.0,
+        "fan_in_fan_out": false
+    }"#;
     fs::write(tmp.path().join("adapter_config.json"), cfg_json).unwrap();
 
-    // Canonical PEFT shapes on disk (even when fan_in_fan_out = true):
+    // Canonical PEFT shapes on disk:
     // lora_A has shape [r=2, in_features=4].
     // lora_B has shape [out_features=3, r=2] and is pre-scaled on load by alpha/r = 2.0.
     let a_disk = [1.0f32, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0]; // [2, 4]

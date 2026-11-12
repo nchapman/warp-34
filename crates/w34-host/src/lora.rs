@@ -374,6 +374,12 @@ impl PeftConfig {
                 "DoRA adapters (use_dora=true) are not supported",
             ));
         }
+        if self.fan_in_fan_out {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Conv1D-style LoRA adapters (fan_in_fan_out=true) are not supported",
+            ));
+        }
         if let Some(ref bias) = self.bias
             && !bias.eq_ignore_ascii_case("none")
         {
