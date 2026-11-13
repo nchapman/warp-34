@@ -894,8 +894,13 @@ impl Qwen3_5ModelRank {
             .max()
             .unwrap_or(0);
         let staging_bytes = MIN_REPACK_STAGING_BYTES.max(max_packed_tensor_bytes);
-        let mut scratch_bytes =
-            plan_scratch_arena_bytes(cfg, tp_size, raw_est_weight_bytes, requested_kv_pages);
+        let mut scratch_bytes = plan_scratch_arena_bytes_with_lora(
+            cfg,
+            tp_size,
+            raw_est_weight_bytes,
+            requested_kv_pages,
+            capacity.lora_reserve,
+        );
         if cfg.uses_tiered_moe() && free_vram < TIERED_MOE_COMPACT_VRAM_THRESHOLD_BYTES {
             scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
         }
@@ -912,6 +917,7 @@ impl Qwen3_5ModelRank {
             .saturating_add(page_bytes.saturating_mul(pages))
             .saturating_add(target_base_headroom(cfg, tp_size, pages, free_vram))
             .saturating_add(capacity.dflash_reserve_bytes)
+            .saturating_add(capacity.lora_reserve.device_bytes_per_rank)
             .saturating_add(if capacity.native_mtp {
                 crate::mtp::dense_serving_reserve(cfg, tp_size, pages.saturating_mul(16))
             } else {
@@ -1464,6 +1470,7 @@ impl PrePoolModelRank {
                     post_weight_available,
                     base_headroom
                         .saturating_add(req_kv_bytes)
+                        .saturating_add(capacity.lora_reserve.device_bytes_per_rank)
                         .saturating_add(rank0_extra_headroom),
                     bytes_per_state_slot.saturating_mul(min_state_slots_for_moe),
                 );
@@ -1522,6 +1529,7 @@ impl PrePoolModelRank {
             })
             .saturating_add(resident_moe_mtp_reserve)
             .saturating_add(post_pool_spec_or_moe_reserve)
+            .saturating_add(capacity.lora_reserve.device_bytes_per_rank)
             .saturating_add(rank0_extra_headroom);
         let use_live_pool_budget = capacity.state_slots.is_some() || cfg.uses_tiered_moe();
         let pool_weight_bytes = pool_weight_budget(
@@ -1631,6 +1639,19 @@ impl PrePoolModelRank {
         } else {
             (free_vram, pool_weight_bytes)
         };
+        let fixed_without_kv = plan_weight_bytes
+            .saturating_add(scratch_arena.capacity())
+            .saturating_add(state_pool_bytes);
+        let planned_kv_pages = plan_target_kv_pages(
+            requested_kv_pages,
+            capacity.state_slots.is_some(),
+            capacity.dflash_reserve_bytes,
+            capacity.native_mtp,
+            plan_free_vram,
+            fixed_without_kv,
+            required_headroom,
+            bytes_per_kv_page_all_layers,
+        );
         let capacity_plan = CapacityPlanner::plan_with_headroom(
             total_vram,
             plan_free_vram,
@@ -1638,7 +1659,7 @@ impl PrePoolModelRank {
             scratch_arena.capacity(),
             state_pool_bytes,
             bytes_per_kv_page_all_layers,
-            default_pages,
+            Some(planned_kv_pages),
             required_headroom,
         )
         .map_err(|e| loader_err_ctx("CapacityPlanner failed", e))?;

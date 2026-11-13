@@ -141,15 +141,42 @@ impl Qwen3_5Engine {
         max_num_seqs: usize,
         speculative: Option<&crate::proposer::SpeculativeConfig>,
     ) -> Result<Self> {
+        Self::load_for_serving_with_speculative_and_lora(
+            model_spec,
+            tp_size,
+            kv_policy,
+            requested_kv_pages,
+            use_cuda_graph,
+            max_num_seqs,
+            speculative,
+            &[],
+        )
+    }
+
+    /// Serving admission and activation with pre-planned LoRA adapter reserves and speculative decoding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_for_serving_with_speculative_and_lora(
+        model_spec: &str,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        requested_kv_pages: Option<usize>,
+        use_cuda_graph: bool,
+        max_num_seqs: usize,
+        speculative: Option<&crate::proposer::SpeculativeConfig>,
+        lora_modules: &[crate::lora::LoraModuleSpec],
+    ) -> Result<Self> {
         use crate::proposer::SpeculativeKind;
         let base_state_slots = serving_state_slots(max_num_seqs)?;
         assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
+        let lora_reserve = crate::lora::estimate_lora_reserve_from_specs(lora_modules, tp_size)
+            .map_err(|e| loader_err_ctx("LoRA memory preflight", e.to_string()))?;
         let mut selected = speculative.cloned();
         let dir = resolve_hf_model_dir(model_spec)
             .map_err(|e| loader_err_ctx("resolve target checkpoint", e.to_string()))?;
         let mut capacity = PoolCapacity {
             kv_pages: requested_kv_pages,
             state_slots: Some(base_state_slots),
+            lora_reserve,
             ..PoolCapacity::default()
         };
         if let Some(config) = &mut selected {
@@ -209,6 +236,9 @@ impl Qwen3_5Engine {
                 "DFlash preflight page bound exceeded by target pool",
             ));
         }
+        if !lora_modules.is_empty() {
+            engine.attach_lora_adapters(lora_modules)?;
+        }
         if let Some(config) = &selected {
             engine.enable_speculative(config)?;
         }
@@ -222,10 +252,44 @@ impl Qwen3_5Engine {
         requested_kv_pages: Option<usize>,
         use_cuda_graph: bool,
     ) -> Result<Self> {
+        Self::load_with_lora(
+            model_spec,
+            tp_size,
+            kv_policy,
+            requested_kv_pages,
+            use_cuda_graph,
+            &[],
+        )
+    }
+
+    pub fn load_with_lora(
+        model_spec: &str,
+        tp_size: usize,
+        kv_policy: KvFormatPolicy,
+        requested_kv_pages: Option<usize>,
+        use_cuda_graph: bool,
+        lora_modules: &[crate::lora::LoraModuleSpec],
+    ) -> Result<Self> {
         assert!(matches!(tp_size, 1 | 2 | 4), "tp_size must be 1, 2, or 4");
+        let lora_reserve = crate::lora::estimate_lora_reserve_from_specs(lora_modules, tp_size)
+            .map_err(|e| loader_err_ctx("LoRA memory preflight", e.to_string()))?;
         let dir = resolve_hf_model_dir(model_spec)
             .map_err(|e| loader_err_ctx("resolve_hf_model_dir", e.to_string()))?;
-        Self::load_from_dir(&dir, tp_size, kv_policy, requested_kv_pages, use_cuda_graph)
+        let mut engine = Self::load_from_dir_with_capacity(
+            &dir,
+            tp_size,
+            kv_policy,
+            PoolCapacity {
+                kv_pages: requested_kv_pages,
+                lora_reserve,
+                ..PoolCapacity::default()
+            },
+            use_cuda_graph,
+        )?;
+        if !lora_modules.is_empty() {
+            engine.attach_lora_adapters(lora_modules)?;
+        }
+        Ok(engine)
     }
 
     pub fn load_from_dir(

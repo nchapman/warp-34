@@ -5,6 +5,8 @@ use super::*;
 #[cfg(feature = "cuda")]
 pub(super) type SharedVocabHost = std::sync::OnceLock<Result<(Vec<u16>, Option<RawLinearHost>)>>;
 
+pub use crate::lora::LoraCapacityReserve;
+
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Default)]
 pub(super) struct PoolCapacity {
@@ -15,6 +17,8 @@ pub(super) struct PoolCapacity {
     /// Metadata-validated per-rank DFlash resident reserve at the requested page bound.
     pub(super) dflash_reserve_bytes: usize,
     pub(super) dflash_min_state_slots: usize,
+    /// Pre-computed per-rank LoRA VRAM reserve and execution traits.
+    pub(super) lora_reserve: LoraCapacityReserve,
 }
 
 /// Number of state slots allocated per active sequence in serving mode (three private
@@ -30,9 +34,17 @@ pub(super) const MIN_SERVING_STATE_SLOTS_TOTAL: usize = 8;
 #[cfg(any(test, feature = "cuda"))]
 pub(super) const MIN_ACTIVE_STATE_SLOTS: usize = 3;
 
-/// Default target KV page count (`256 * 16 = 4,096` tokens) when `--kv-pages` is omitted.
-#[cfg(feature = "cuda")]
-pub(super) const DEFAULT_TARGET_KV_PAGES: usize = 256;
+/// Default target KV page count (`256 * 16 = 4,096` tokens) when `--kv-pages` is omitted in non-serving mode.
+pub const DEFAULT_TARGET_KV_PAGES: usize = 256;
+
+/// Default serving KV page target (`2,048 * 16 = 32,768` tokens) when `--kv-pages` is omitted in serving mode.
+pub const DEFAULT_SERVING_TARGET_KV_PAGES: usize = 2048;
+
+/// Extra post-pool VRAM breathing room (`1.5 GiB`) preserved when auto-sizing serving KV pages.
+pub const AUTO_SERVING_KV_EXTRA_HEADROOM_BYTES: usize = 1536 * 1024 * 1024;
+
+/// Per-rank transient `scratch_arena` capacity (`960 MiB`) when a multi-pass `midloop` LoRA adapter is attached.
+pub const MIDLOOP_LORA_SCRATCH_ARENA_BYTES: usize = 960 * 1024 * 1024;
 
 /// Tokens per paged-attention KV block (`KvPool` page size).
 #[cfg(any(test, feature = "cuda"))]
@@ -278,20 +290,28 @@ pub(super) fn select_tiered_moe_stage_capacity(
 }
 
 /// Selects the per-rank transient `scratch_arena` capacity (`336 MiB`, `384 MiB`,
-/// `512 MiB`, or `1,056 MiB`) based on model geometry, `tp_size`, estimated weight
-/// footprint, and requested KV pages.
-pub fn plan_scratch_arena_bytes(
+/// `512 MiB`, `960 MiB`, or `1,056 MiB`) based on model geometry, `tp_size`, estimated weight
+/// footprint, requested KV pages, and any pre-planned LoRA adapter traits.
+pub fn plan_scratch_arena_bytes_with_lora(
     cfg: &ModelConfig,
     tp_size: usize,
     est_weight_bytes: usize,
     requested_kv_pages: Option<usize>,
+    lora: LoraCapacityReserve,
 ) -> usize {
     if tp_size == 1
         && cfg.num_hidden_layers >= EXTREME_LONGCTX_MIN_LAYERS
         && requested_kv_pages.unwrap_or(0) >= EXTREME_LONGCTX_MIN_PAGES
     {
         crate::scheduler::EXTREME_LONGCTX_SCRATCH_ARENA_BYTES
-    } else if (cfg.uses_tiered_moe() || cfg.requires_atomic_prefix_prefill())
+    } else if lora.has_midloop
+        && requested_kv_pages.unwrap_or(0) <= crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES
+    {
+        MIDLOOP_LORA_SCRATCH_ARENA_BYTES
+    } else if (cfg.uses_tiered_moe()
+        || cfg.requires_atomic_prefix_prefill()
+        || lora.requires_atomic_prefix
+        || lora.device_bytes_per_rank > 0)
         && requested_kv_pages.unwrap_or(0) <= crate::scheduler::TIERED_MOE_FULL_SCRATCH_MAX_KV_PAGES
     {
         crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
@@ -300,6 +320,60 @@ pub fn plan_scratch_arena_bytes(
     } else {
         crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES
     }
+}
+
+/// Selects the per-rank transient `scratch_arena` capacity (`336 MiB`, `384 MiB`,
+/// `512 MiB`, or `1,056 MiB`) based on model geometry, `tp_size`, estimated weight
+/// footprint, and requested KV pages.
+pub fn plan_scratch_arena_bytes(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    est_weight_bytes: usize,
+    requested_kv_pages: Option<usize>,
+) -> usize {
+    plan_scratch_arena_bytes_with_lora(
+        cfg,
+        tp_size,
+        est_weight_bytes,
+        requested_kv_pages,
+        LoraCapacityReserve::default(),
+    )
+}
+
+/// Selects the target `KvPool` page count:
+/// - When `requested_kv_pages` is `Some(req)`, returns `req` verbatim.
+/// - In non-serving CLI/test mode (`!is_serving`) or when `dflash_reserve_bytes > 0` / `native_mtp`,
+///   returns [`DEFAULT_TARGET_KV_PAGES`] (`256` pages = `4,096` tokens).
+/// - In serving mode (`is_serving`) when `--kv-pages` is omitted (`None`), auto-sizes between
+///   [`DEFAULT_TARGET_KV_PAGES`] (`256` pages = `4,096` tokens) and
+///   [`DEFAULT_SERVING_TARGET_KV_PAGES`] (`2,048` pages = `32,768` tokens) in 64-page increments
+///   while preserving `required_headroom + AUTO_SERVING_KV_EXTRA_HEADROOM_BYTES`.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_target_kv_pages(
+    requested_kv_pages: Option<usize>,
+    is_serving: bool,
+    dflash_reserve_bytes: usize,
+    native_mtp: bool,
+    plan_free_vram: usize,
+    fixed_without_kv: usize,
+    required_headroom: usize,
+    bytes_per_kv_page_all_layers: usize,
+) -> usize {
+    if let Some(req) = requested_kv_pages {
+        return req;
+    }
+    if !is_serving || dflash_reserve_bytes > 0 || native_mtp || bytes_per_kv_page_all_layers == 0 {
+        return DEFAULT_TARGET_KV_PAGES;
+    }
+    let auto_reserved = fixed_without_kv
+        .saturating_add(required_headroom)
+        .saturating_add(AUTO_SERVING_KV_EXTRA_HEADROOM_BYTES);
+    if plan_free_vram <= auto_reserved {
+        return DEFAULT_TARGET_KV_PAGES;
+    }
+    let max_auto_pages = (plan_free_vram - auto_reserved) / bytes_per_kv_page_all_layers;
+    let aligned_pages = (max_auto_pages / 64) * 64;
+    aligned_pages.clamp(DEFAULT_TARGET_KV_PAGES, DEFAULT_SERVING_TARGET_KV_PAGES)
 }
 
 #[cfg(any(test, feature = "cuda"))]

@@ -738,6 +738,131 @@ impl LoraAdapterHost {
     }
 }
 
+/// Pre-computed per-rank VRAM reserve and execution traits for attached LoRA adapters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoraCapacityReserve {
+    /// Estimated per-rank GPU memory (`lora_A` + `lora_B` + `lowrank_ws` + alignment margin) in bytes.
+    pub device_bytes_per_rank: usize,
+    /// True if any attached LoRA adapter configures multi-pass `midloop` (`passes > 1`).
+    pub has_midloop: bool,
+    /// True if any attached LoRA adapter requires atomic bidirectional prefix prefill.
+    pub requires_atomic_prefix: bool,
+}
+
+/// Computes the pre-allocation per-rank GPU memory reserve and execution traits (`has_midloop`,
+/// `requires_atomic_prefix`) from LoRA adapter metadata and safetensors headers before target
+/// rank loading begins.
+pub fn estimate_lora_reserve_from_specs(
+    specs: &[LoraModuleSpec],
+    tp_size: usize,
+) -> io::Result<LoraCapacityReserve> {
+    if specs.is_empty() {
+        return Ok(LoraCapacityReserve::default());
+    }
+    let tp = tp_size.max(1);
+    let mut total_weight_bytes = 0usize;
+    let mut max_rank_pad = 4usize;
+    let mut has_midloop = false;
+    let mut requires_atomic_prefix = false;
+
+    for spec in specs {
+        let dir = match &spec.resolved_dir {
+            Some(d) => d.clone(),
+            None => resolve_cached_or_local_lora_dir(&spec.path, spec.revision.as_deref())?,
+        };
+        let config = PeftConfig::from_dir(&dir)?;
+        max_rank_pad = max_rank_pad.max(config.r.max(1).div_ceil(4) * 4);
+
+        let st_path = dir.join("adapter_model.safetensors");
+        if !st_path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "LoRA adapter '{}' is missing {}",
+                    spec.name,
+                    st_path.display()
+                ),
+            ));
+        }
+        let archive = SafetensorsArchive::open(&st_path)?;
+        for (name, info) in archive.iter_entries() {
+            if matches!(name, "readout.weight" | "readout.bias" | "weight" | "bias") {
+                continue;
+            }
+            if info.shape.len() == 2 {
+                let r_dim = info.shape[0].min(info.shape[1]);
+                max_rank_pad = max_rank_pad.max(r_dim.max(1).div_ceil(4) * 4);
+            }
+            let elems: usize = info.shape.iter().copied().product();
+            let raw_f16_bytes = (elems.saturating_mul(2) + 255) & !255;
+            let is_col_parallel =
+                name.contains("o_proj") || name.contains("out_proj") || name.contains("down_proj");
+            let sharded = (name.contains("lora_A") && is_col_parallel)
+                || (name.contains("lora_B") && !is_col_parallel);
+            let rank_bytes = if sharded {
+                raw_f16_bytes.div_ceil(tp)
+            } else {
+                raw_f16_bytes
+            };
+            total_weight_bytes = total_weight_bytes.saturating_add(rank_bytes);
+        }
+
+        let dc_path = dir.join("decision_config.json");
+        if dc_path.is_file() {
+            let text = fs::read_to_string(&dc_path)?;
+            let dc_val: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "LoRA adapter '{}': bad {}: {e}",
+                        spec.name,
+                        dc_path.display()
+                    ),
+                )
+            })?;
+            if let Some(ml_val) = dc_val.get("midloop").filter(|v| !v.is_null()) {
+                let ml = crate::loader::ModelConfig::parse_midloop_specs(ml_val, usize::MAX)?;
+                if ml.iter().any(|&(_, _, passes)| passes > 1) {
+                    has_midloop = true;
+                }
+            }
+            let noncausal = dc_val
+                .get("noncausal_full_attention")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| {
+                    dc_val
+                        .get("attention_mode")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.eq_ignore_ascii_case("noncausal_full_attention"))
+                });
+            let prefix_bidir = dc_val
+                .get("prefix_bidir")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| {
+                    dc_val
+                        .get("attention_mode")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.eq_ignore_ascii_case("prefix_bidir"))
+                });
+            if noncausal || prefix_bidir {
+                requires_atomic_prefix = true;
+            }
+        }
+    }
+
+    let max_tokens = crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS.max(6144);
+    let lowrank_ws_bytes = max_tokens.saturating_mul(max_rank_pad).saturating_mul(4);
+    let device_bytes_per_rank = total_weight_bytes
+        .saturating_add(lowrank_ws_bytes)
+        .saturating_add(64 * 1024 * 1024);
+
+    Ok(LoraCapacityReserve {
+        device_bytes_per_rank,
+        has_midloop,
+        requires_atomic_prefix,
+    })
+}
+
 fn read_2d_tensor_f32(
     archive: &SafetensorsArchive,
     name: &str,

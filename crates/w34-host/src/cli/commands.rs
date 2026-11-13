@@ -178,7 +178,7 @@ pub(crate) fn run_bench(
     let mut engine = if matches!(bench_stage.as_str(), "scheduler" | "all") {
         let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 512));
         let state_slot_seqs = serve_state_slot_seqs(batch_size.max(8), spec_config.as_ref());
-        let mut eng = Qwen3_5Engine::load_for_serving_with_speculative(
+        let mut eng = Qwen3_5Engine::load_for_serving_with_speculative_and_lora(
             &resolved_model,
             tp,
             policy,
@@ -186,6 +186,7 @@ pub(crate) fn run_bench(
             use_cuda_graph,
             state_slot_seqs,
             spec_config.as_ref(),
+            &lora_modules,
         )
         .map_err(|e| e.to_string())?;
         attach_cli_lora(&mut eng, &lora_modules, active_lora.as_deref(), true)
@@ -640,7 +641,7 @@ pub(crate) fn run_serve(
         move || {
             let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
             let state_slot_seqs = serve_state_slot_seqs(max_num_seqs, spec_config.as_ref());
-            let mut engine = Qwen3_5Engine::load_for_serving_with_speculative(
+            let mut engine = Qwen3_5Engine::load_for_serving_with_speculative_and_lora(
                 &worker_model,
                 tp,
                 policy,
@@ -648,6 +649,7 @@ pub(crate) fn run_serve(
                 use_cuda_graph,
                 state_slot_seqs,
                 spec_config.as_ref(),
+                &lora_modules,
             )
             .map_err(|e| e.to_string())?;
             attach_cli_lora(&mut engine, &lora_modules, None, false).map_err(|e| e.to_string())?;

@@ -620,7 +620,9 @@ pub(crate) fn attach_cli_lora(
         }
         return Ok(());
     }
-    engine.attach_lora_adapters(lora_modules)?;
+    if engine.lora_registry.is_empty() {
+        engine.attach_lora_adapters(lora_modules)?;
+    }
     if activate_for_single_seq {
         let lid = if let Some(name) = active_lora {
             engine.lora_registry.resolve_name(name).ok_or_else(|| {
@@ -649,7 +651,8 @@ pub(crate) fn load_cli_engine_with_lora(
     // Leave VRAM for the resident drafter instead of filling it with target KV.
     // Speculative taps/logits are configured in enable_speculative before lazy graph capture.
     let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
-    let mut engine = Qwen3_5Engine::load(model, tp, policy, pages, use_cuda_graph)?;
+    let mut engine =
+        Qwen3_5Engine::load_with_lora(model, tp, policy, pages, use_cuda_graph, lora_modules)?;
     attach_cli_lora(&mut engine, lora_modules, active_lora, true)?;
     if let Some(config) = spec_config {
         engine.enable_speculative(config)?;

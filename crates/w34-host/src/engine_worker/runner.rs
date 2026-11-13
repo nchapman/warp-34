@@ -129,7 +129,7 @@ pub(super) fn run_loop(
             enqueue(engine, &mut sched, requests, r);
         }
         // Bound queue draining even if producers keep replenishing it.
-        for _ in 0..32 {
+        for _ in 0..256 {
             match receiver.try_recv() {
                 Ok(r) => enqueue(engine, &mut sched, requests, r),
                 Err(_) => break,

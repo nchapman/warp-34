@@ -268,7 +268,7 @@ impl EngineWorker {
         loader: impl FnOnce() -> Result<Qwen3_5Engine, String> + Send + 'static,
         config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let (sender, receiver) = mpsc::channel(32);
+        let (sender, receiver) = mpsc::channel(256);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
@@ -973,7 +973,7 @@ fn enqueue(
     requests: &mut HashMap<u64, Request>,
     mut request: Request,
 ) {
-    if requests.len() >= 32 {
+    if requests.len() >= 256 {
         let err = WorkerError::overload("engine admission capacity exceeded");
         if let Some(tap) = request.decision_tap.take() {
             tap.fail(err.clone());
