@@ -20,6 +20,21 @@ __device__ __forceinline__ float softplus_f32(float x) {
     return (x > 20.0f) ? x : log1pf(expf(x));
 }
 
+// Evaluates `g = -exp(a_log) * softplus(x)` without forming `(-inf) * 0 = NaN` when `a_log`
+// overflows `expf` while `softplus(x)` underflows, and clamps strong forget gates at `-104.0f`
+// (`expf(-104.0f) == 0.0f` exact in FP32) so chunk prefix sums never saturate to `-inf`.
+__device__ __forceinline__ float gdn_chunk_log_decay_f32(float a_log_val, float neg_exp_a, float x) {
+    float g;
+    if (a_log_val > 80.0f && x < -20.0f) {
+        g = -expf(a_log_val + x);
+    } else {
+        const float sp = softplus_f32(x);
+        g = (sp == 0.0f) ? 0.0f : (neg_exp_a * sp);
+    }
+    if (isnan(g)) return 0.0f;
+    return (g < -104.0f) ? -104.0f : g;
+}
+
 __device__ __forceinline__ void gdn_norm_qk_warp(
     const __half* __restrict__ q_tok_hk,
     const __half* __restrict__ k_tok_hk,
@@ -280,7 +295,8 @@ __global__ __launch_bounds__(256, 2) void gdn_wy_stage1_wu_f16_kernel(
     using FragB_Row = wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major>;
     using FragB_Col = wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major>;
 
-    const float neg_exp_a = -expf(a_log[hv]);
+    const float a_log_hv = a_log[hv];
+    const float neg_exp_a = -expf(a_log_hv);
     const float dt_bias_hv = dt_bias[hv];
     const int k_total_dim = num_k_heads * DK;
     const int v_total_dim = num_v_heads * DK;
@@ -307,7 +323,7 @@ __global__ __launch_bounds__(256, 2) void gdn_wy_stage1_wu_f16_kernel(
         if (lane == 0) {
             const float a_val = __half2float(a_in[(size_t)tok * ba_row_stride + hv]);
             const float b_val = __half2float(b_in[(size_t)tok * ba_row_stride + hv]);
-            s_g[s_norm] = neg_exp_a * softplus_f32(a_val + dt_bias_hv);
+            s_g[s_norm] = gdn_chunk_log_decay_f32(a_log_hv, neg_exp_a, a_val + dt_bias_hv);
             s_beta[s_norm] = 1.0f / (1.0f + expf(-b_val));
         }
     }
@@ -728,7 +744,9 @@ __global__ __launch_bounds__(256, 2) void gdn_wy_stage2_deltah_f16_kernel(
                 (tid < tile_len) ? g_cum[(size_t)(tok0 + tid) * num_v_heads + hv] : 0.0f;
             const float gl = g_cum[(size_t)(tok0 + tile_len - 1) * num_v_heads + hv];
             s_g[tid] = gv;
-            s_sc[tid] = (tid < tile_len) ? expf(gl - gv) : 0.0f;
+            s_sc[tid] = (tid < tile_len)
+                ? ((tid == tile_len - 1) ? 1.0f : expf(gl - gv))
+                : 0.0f;
         }
         __syncthreads();
 
@@ -1098,7 +1116,7 @@ __global__ __launch_bounds__(256, 2) void gdn_wy_stage3_out_f16_kernel(
             const int row = it * 16 + r;
             const int col = jt * 16 + c;
             s_Q[row * QKP + col] = (row < tile_len && col <= row)
-                ? __float2half(expf(s_g[row] - s_g[col]) * s_Stage[r * SP + c])
+                ? __float2half(((row == col) ? 1.0f : expf(s_g[row] - s_g[col])) * s_Stage[r * SP + c])
                 : __float2half(0.0f);
         }
         __syncwarp();

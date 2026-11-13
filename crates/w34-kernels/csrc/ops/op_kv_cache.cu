@@ -949,6 +949,7 @@ __global__ void paged_attention_gqa_bf16_kernel(
         next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffu, next_max, 2));
         next_max = fmaxf(next_max, __shfl_xor_sync(0xffffffffu, next_max, 1));
         const float alpha = (next_max == -FLT_MAX) ? 0.f : ptx_exp2(prev_max * scale - next_max * scale);
+        __syncwarp();
         if (sub_lane == 0) {
             s_max[row_r] = next_max;
             s_alpha[row_r] = alpha;

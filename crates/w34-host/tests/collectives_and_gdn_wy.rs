@@ -701,3 +701,336 @@ fn test_tp2_and_tp4_all_gather_topk_and_hc_combine() {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_tp2_alternating_cta_counts_preserve_staging_banks() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut dev_count = 0i32;
+    // SAFETY: queries CUDA runtime device count.
+    if unsafe { ffi::w34_get_device_count(&raw mut dev_count) } != 0 || dev_count < 2 {
+        return;
+    }
+    for r in 0..2 {
+        prepare_execution_plan(r).unwrap();
+    }
+    // M=16, H=1536 -> 24,576 elements = 48 KiB (< 64 KiB SM-TX path):
+    // - `all_reduce_residual_gemma_rms_norm_f16` launches `blocks = 16` CTAs (row-major).
+    // - `all_reduce_f16` launches `blocks = 6` CTAs (flat strided).
+    let (m, h) = (16usize, 1536usize);
+    let n = m * h;
+    let comm = Tp2Collectives::new_for_tp_with_p2p(2, 64 * 1024, false).unwrap();
+
+    let w_f32: Vec<f32> = (0..h).map(|i| 0.05 * ((i % 13) as f32 - 6.0)).collect();
+    let w_f16: Vec<u16> = w_f32.iter().copied().map(f32_to_f16).collect();
+
+    let streams = [CudaStream::new(0).unwrap(), CudaStream::new(1).unwrap()];
+    let s_bg1 = CudaStream::new(1).unwrap();
+    let d_w = [
+        DeviceBuffer::alloc(0, h * 2).unwrap(),
+        DeviceBuffer::alloc(1, h * 2).unwrap(),
+    ];
+    let d_in_a = [
+        DeviceBuffer::alloc(0, n * 2).unwrap(),
+        DeviceBuffer::alloc(1, n * 2).unwrap(),
+    ];
+    let d_res = [
+        DeviceBuffer::alloc(0, n * 2).unwrap(),
+        DeviceBuffer::alloc(1, n * 2).unwrap(),
+    ];
+    let d_norm_out = [
+        DeviceBuffer::alloc(0, n * 2).unwrap(),
+        DeviceBuffer::alloc(1, n * 2).unwrap(),
+    ];
+    let d_in_b = [
+        DeviceBuffer::alloc(0, n * 2).unwrap(),
+        DeviceBuffer::alloc(1, n * 2).unwrap(),
+    ];
+    let d_ar_out = [
+        DeviceBuffer::alloc(0, n * 2).unwrap(),
+        DeviceBuffer::alloc(1, n * 2).unwrap(),
+    ];
+    let d_delay = DeviceBuffer::alloc(1, 512 * 1024 * 2).unwrap();
+
+    for r in 0..2 {
+        let _dev = CudaDevice::set_current(r as i32).unwrap();
+        d_w[r].copy_from_host(&w_f16, &streams[r]).unwrap();
+        streams[r].synchronize().unwrap();
+    }
+
+    let steps = 8usize;
+    let in_a0: Vec<u16> = (0..n)
+        .map(|i| f32_to_f16(0.25 + 0.01 * ((i % 53) as f32)))
+        .collect();
+    let in_a1: Vec<u16> = (0..n)
+        .map(|i| f32_to_f16(-0.15 + 0.01 * (((i * 3) % 47) as f32)))
+        .collect();
+    let res_init: Vec<u16> = (0..n)
+        .map(|i| f32_to_f16(0.05 * ((i % 29) as f32) - 0.7))
+        .collect();
+    // Distinct giant values in `in_b` so any bank overwrite on rows 2..3 is unmistakable.
+    let in_b0: Vec<u16> = (0..n).map(|i| f32_to_f16(50.0 + (i % 7) as f32)).collect();
+    let in_b1: Vec<u16> = (0..n).map(|i| f32_to_f16(25.0 + (i % 5) as f32)).collect();
+
+    for (r, (ia, ib)) in [(&in_a0, &in_b0), (&in_a1, &in_b1)].into_iter().enumerate() {
+        let _dev = CudaDevice::set_current(r as i32).unwrap();
+        d_in_a[r].copy_from_host(ia, &streams[r]).unwrap();
+        d_res[r].copy_from_host(&res_init, &streams[r]).unwrap();
+        d_in_b[r].copy_from_host(ib, &streams[r]).unwrap();
+        streams[r].synchronize().unwrap();
+    }
+
+    // Stream all steps back-to-back without host barriers between collectives so Rank 0 can
+    // enter Step `k` Call B (2 CTAs) while Rank 1's CTAs 2..3 are still finishing Step `k` Call A (4 CTAs).
+    std::thread::scope(|sc| {
+        for r in 0..2usize {
+            let s = &streams[r];
+            let c = &comm;
+            let dw = &d_w[r];
+            let dia = &d_in_a[r];
+            let dres = &d_res[r];
+            let dnorm = &d_norm_out[r];
+            let dib = &d_in_b[r];
+            let dar = &d_ar_out[r];
+            let ddel = &d_delay;
+            let bg = &s_bg1;
+            sc.spawn(move || {
+                let _dev = CudaDevice::set_current(r as i32).unwrap();
+                let ex = s.exec(0, 0);
+                if r == 1 {
+                    let ex_bg = bg.exec(0, 0);
+                    for _ in 0..64 {
+                        // Saturate Rank 1 SMs concurrently so CTAs 6..15 of Call A lag behind Rank 0.
+                        // SAFETY: `ddel` holds `512 * 1024` FP16s and `dw` holds `1536` FP16s on rank 1.
+                        unsafe {
+                            assert_eq!(
+                                ffi::w34_gemma_rms_norm_f16(
+                                    &ex_bg,
+                                    ddel.addr() as *const c_void,
+                                    dw.addr() as *const c_void,
+                                    ddel.addr() as *mut c_void,
+                                    core::ptr::null(),
+                                    320,
+                                    1536,
+                                    1e-6,
+                                ),
+                                0
+                            );
+                        }
+                    }
+                }
+                for _ in 0..steps {
+                    // Call A: 16 CTAs (`M=16, H=1536`).
+                    c.all_reduce_residual_gemma_rms_norm_f16(
+                        &ex,
+                        dia.addr(),
+                        0,
+                        dres.addr(),
+                        dw.addr(),
+                        dnorm.addr(),
+                        0,
+                        r as i32,
+                        m as i32,
+                        h as i32,
+                        1e-6,
+                        0,
+                        0,
+                    )
+                    .unwrap();
+                    // Call B: 6 CTAs (`num_elems = 24576`).
+                    c.all_reduce_f16(&ex, dib.addr(), dar.addr(), r as i32, n as i32)
+                        .unwrap();
+                }
+                s.synchronize().unwrap();
+                if r == 1 {
+                    bg.synchronize().unwrap();
+                }
+            });
+        }
+    });
+
+    let mut expected_res = res_init.clone();
+    for _ in 0..steps {
+        for i in 0..n {
+            let ar = f16_to_f32(f32_to_f16(f16_to_f32(in_a0[i]) + f16_to_f32(in_a1[i])));
+            expected_res[i] = f32_to_f16(f16_to_f32(expected_res[i]) + ar);
+        }
+    }
+    let mut expected_ar = vec![0u16; n];
+    for i in 0..n {
+        expected_ar[i] = f32_to_f16(f16_to_f32(in_b0[i]) + f16_to_f32(in_b1[i]));
+    }
+
+    for r in 0..2usize {
+        let _dev = CudaDevice::set_current(r as i32).unwrap();
+        let mut got_res = vec![0u16; n];
+        let mut got_ar = vec![0u16; n];
+        d_res[r].copy_to_host(&mut got_res, &streams[r]).unwrap();
+        d_ar_out[r].copy_to_host(&mut got_ar, &streams[r]).unwrap();
+        streams[r].synchronize().unwrap();
+        for i in 0..n {
+            let diff = (f16_to_f32(got_res[i]) - f16_to_f32(expected_res[i])).abs();
+            assert!(
+                diff <= 1e-2,
+                "rank={r} row={} col={} res got={} expected={}",
+                i / h,
+                i % h,
+                f16_to_f32(got_res[i]),
+                f16_to_f32(expected_res[i]),
+            );
+            let ar_diff = (f16_to_f32(got_ar[i]) - f16_to_f32(expected_ar[i])).abs();
+            assert!(
+                ar_diff <= 5e-2,
+                "rank={r} idx={i} ar got={} expected={}",
+                f16_to_f32(got_ar[i]),
+                f16_to_f32(expected_ar[i]),
+            );
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_gdn_wy_extreme_decay_gates_produce_finite_outputs_and_states() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).expect("CudaDevice(0)");
+    let stream = CudaStream::new(dev.device_id).expect("stream");
+
+    let (hk, hv, dk, dv) = (2usize, 4usize, 128usize, 128usize);
+    let conv_dim = 2 * hk * dk + hv * dv;
+    let seq_len = 128usize;
+    let num_slots = 4usize;
+    let dims = (hk, dk, hv, dv, num_slots);
+
+    let qkv_host: Vec<u16> = (0..(seq_len * conv_dim))
+        .map(|i| f32_to_f16(((i % 89) as f32 - 44.0) * 0.01))
+        .collect();
+    let b_host: Vec<u16> = (0..(seq_len * hv))
+        .map(|i| f32_to_f16(((i % 13) as f32 - 6.0) * 0.15))
+        .collect();
+    // Alternate strong positive and strongly negative `a` values while `a_log` includes `92.0`
+    // (`-expf(92.0) = -inf`), exercising both `-inf - (-inf)` in `s_g` and `-inf * softplus(-120)`.
+    let a_host: Vec<u16> = (0..(seq_len * hv))
+        .map(|i| {
+            if (i / hv) % 7 == 0 {
+                f32_to_f16(4.0)
+            } else {
+                f32_to_f16(-60.0)
+            }
+        })
+        .collect();
+    let a_log = vec![92.0f32, 92.0f32, -1.2f32, 90.0f32];
+    let dt_bias = vec![0.0f32, -60.0f32, -0.1f32, 2.0f32];
+
+    let d_qkv = DeviceBuffer::alloc(0, qkv_host.len() * 2).unwrap();
+    let d_b = DeviceBuffer::alloc(0, b_host.len() * 2).unwrap();
+    let d_a = DeviceBuffer::alloc(0, a_host.len() * 2).unwrap();
+    let d_alog = DeviceBuffer::alloc(0, a_log.len() * 4).unwrap();
+    let d_dtb = DeviceBuffer::alloc(0, dt_bias.len() * 4).unwrap();
+    d_qkv.copy_from_host(&qkv_host, &stream).unwrap();
+    d_b.copy_from_host(&b_host, &stream).unwrap();
+    d_a.copy_from_host(&a_host, &stream).unwrap();
+    d_alog.copy_from_host(&a_log, &stream).unwrap();
+    d_dtb.copy_from_host(&dt_bias, &stream).unwrap();
+
+    let pool = StateBundlePool::new(0, &[0], num_slots, conv_dim, 4, hv, dk, dv).unwrap();
+    let st = &pool.layers[0];
+    let state_elems = hv * dv * dk;
+    let ssm_init: Vec<f32> = (0..(num_slots * state_elems))
+        .map(|i| ((i % 71) as f32 - 35.0) * 0.005)
+        .collect();
+    st.ssm_state.copy_from_host(&ssm_init, &stream).unwrap();
+
+    let d_meta = DeviceBuffer::alloc(0, 256).unwrap();
+    let d_ws = DeviceBuffer::alloc(0, 8 * 1024 * 1024).unwrap();
+    let d_out_split = DeviceBuffer::alloc(0, seq_len * hv * dv * 2).unwrap();
+    let d_out_chunk64 = DeviceBuffer::alloc(0, seq_len * hv * dv * 2).unwrap();
+
+    // 1. Split-WY path (with 8 MiB workspace).
+    let ex_split = stream.exec(d_ws.addr(), d_ws.len_bytes);
+    run_gdn_batch(
+        &ex_split,
+        &stream,
+        &d_meta,
+        &[0, seq_len as i32],
+        &[0],
+        &[1],
+        d_qkv.addr() as *const c_void,
+        d_b.addr() as *const c_void,
+        d_a.addr() as *const c_void,
+        &d_alog,
+        &d_dtb,
+        st.ssm_state.addr(),
+        d_out_split.addr(),
+        dims,
+    );
+
+    // 2. Fallback chunk64-WY path (`scratch_size = 0`).
+    let ex_chunk64 = stream.exec(0, 0);
+    run_gdn_batch(
+        &ex_chunk64,
+        &stream,
+        &d_meta,
+        &[0, seq_len as i32],
+        &[0],
+        &[2],
+        d_qkv.addr() as *const c_void,
+        d_b.addr() as *const c_void,
+        d_a.addr() as *const c_void,
+        &d_alog,
+        &d_dtb,
+        st.ssm_state.addr(),
+        d_out_chunk64.addr(),
+        dims,
+    );
+
+    // 3. Single-step / decode recurrent path (`seq_len = 1`) with the same extreme gates.
+    let d_out_step = DeviceBuffer::alloc(0, hv * dv * 2).unwrap();
+    run_gdn_batch(
+        &ex_chunk64,
+        &stream,
+        &d_meta,
+        &[0, 1],
+        &[0],
+        &[3],
+        d_qkv.addr() as *const c_void,
+        d_b.addr() as *const c_void,
+        d_a.addr() as *const c_void,
+        &d_alog,
+        &d_dtb,
+        st.ssm_state.addr(),
+        d_out_step.addr(),
+        dims,
+    );
+
+    let mut out_split = vec![0u16; seq_len * hv * dv];
+    let mut out_chunk64 = vec![0u16; seq_len * hv * dv];
+    let mut out_step = vec![0u16; hv * dv];
+    let mut ssm_got = vec![0.0f32; num_slots * state_elems];
+    d_out_split.copy_to_host(&mut out_split, &stream).unwrap();
+    d_out_chunk64
+        .copy_to_host(&mut out_chunk64, &stream)
+        .unwrap();
+    d_out_step.copy_to_host(&mut out_step, &stream).unwrap();
+    st.ssm_state.copy_to_host(&mut ssm_got, &stream).unwrap();
+    stream.synchronize().unwrap();
+
+    assert!(
+        out_split.iter().all(|&x| f16_to_f32(x).is_finite()),
+        "split-WY produced non-finite output under strong decay"
+    );
+    assert!(
+        out_chunk64.iter().all(|&x| f16_to_f32(x).is_finite()),
+        "chunk64-WY produced non-finite output under strong decay"
+    );
+    assert!(
+        out_step.iter().all(|&x| f16_to_f32(x).is_finite()),
+        "decode/recurrent GDN produced non-finite output under strong decay"
+    );
+    assert!(
+        ssm_got[state_elems..4 * state_elems]
+            .iter()
+            .all(|x| x.is_finite()),
+        "GDN produced non-finite ssm_state under strong decay"
+    );
+}

@@ -99,7 +99,9 @@ __device__ __forceinline__ float block_reduce_sum_128(float v, float* s_warp) {
         if (lane == 0) s_warp[0] = v;
     }
     __syncthreads();
-    return s_warp[0];
+    const float out = s_warp[0];
+    __syncthreads();
+    return out;
 }
 
 __device__ __forceinline__ float block_reduce_max_128(float v, float* s_warp) {
@@ -120,7 +122,9 @@ __device__ __forceinline__ float block_reduce_max_128(float v, float* s_warp) {
         if (lane == 0) s_warp[0] = v;
     }
     __syncthreads();
-    return s_warp[0];
+    const float out = s_warp[0];
+    __syncthreads();
+    return out;
 }
 
 }  // namespace w34_attn

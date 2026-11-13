@@ -433,6 +433,7 @@ __global__ void paged_attention_gqa_mma_f16_kernel(
         p_sum += __shfl_xor_sync(0xffffffffu, p_sum, 2);
         p_sum += __shfl_xor_sync(0xffffffffu, p_sum, 1);
         *reinterpret_cast<__half2*>(&s_p[row_r][t0]) = __floats2half2_rn(p0, p1);
+        __syncwarp();
         if (sub_lane == 0) {
             if (has_tile) {
                 s_m[row_r] = m_new;

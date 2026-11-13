@@ -1474,6 +1474,10 @@ fn test_gdn_wy_split_and_fallback_prefill_parity() {
     .into_iter()
     .enumerate()
     {
+        assert!(
+            wy_outs[mode_idx].iter().all(|&g| f16_to_f32(g).is_finite()),
+            "WY {mode_name} output contained non-finite values"
+        );
         let max_out_err = out_ref
             .iter()
             .zip(wy_outs[mode_idx].iter())
@@ -1487,6 +1491,10 @@ fn test_gdn_wy_split_and_fallback_prefill_parity() {
             let ref_s = &ssm_all[(1 + ck) * state_elems..(2 + ck) * state_elems];
             let got_s =
                 &ssm_all[(base_slot + ck) * state_elems..(base_slot + ck + 1) * state_elems];
+            assert!(
+                got_s.iter().all(|g| g.is_finite()),
+                "WY {mode_name} slot+{ck} ssm_state contained non-finite values"
+            );
             let max_s_err = ref_s
                 .iter()
                 .zip(got_s.iter())

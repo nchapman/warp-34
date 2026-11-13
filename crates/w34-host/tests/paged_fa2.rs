@@ -517,3 +517,100 @@ fn single_request_long_context_graph_matches_eager() {
     s.synchronize().unwrap();
     assert_eq!(got, replay, "shortened replay must match eager");
 }
+
+#[test]
+fn tight_two_page_partial_tile_does_not_read_past_block_table() {
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let s = CudaStream::new(0).unwrap();
+    // Exact 32-token (2-page) sequence inside a 64-token KV tile: `partial_block_size = 32`,
+    // `max_blocks_per_req = 2`, and `pages` is allocated to exact `2 * sizeof(i32) = 8` bytes.
+    let q = upload(&s, &vec![0u16; 32 * 2 * 256]);
+    let k = upload(&s, &vec![0u16; 2 * 16 * 256]);
+    let values: Vec<u16> = (0..2 * 16 * 256)
+        .map(|i| {
+            if (i / 256 + i % 256) % 2 == 0 {
+                0x3c00
+            } else {
+                0xbc00
+            }
+        })
+        .collect();
+    let v = upload(&s, &values);
+    let out = upload(&s, &vec![0u16; 32 * 2 * 256]);
+    let starts = upload(&s, &[0i32, 32]);
+    let ctx = upload(&s, &[0i32]);
+    let seq = upload(&s, &[32i32]);
+    // Place the 2-entry `block_tables` (`8 B`) at the end of a 16-byte allocation (`+8 B` offset,
+    // 4B-aligned) so `block_table[2]` is immediately out of bounds at byte `+16`.
+    let pages = upload(&s, &[0i32, 0i32, 1i32, 0i32]);
+    let ws = upload(&s, &vec![0u8; 32 * 2 * 4]);
+    let layout = ffi::W34KvLayerLayout {
+        k_base: k.addr(),
+        v_base: v.addr(),
+        k_page_stride_bytes: 8192,
+        v_page_stride_bytes: 8192,
+        k_head_stride_bytes: 512,
+        v_head_stride_bytes: 512,
+        k_token_stride_bytes: 512,
+        v_token_stride_bytes: 512,
+        namespace_id: ffi::W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+        layer_id: 0,
+        local_kv_heads: 1,
+        head_dim: 256,
+        block_size: 16,
+        k_format: ffi::W34_KV_FORMAT_FP16,
+        v_format: ffi::W34_KV_FORMAT_FP16,
+        k_transform: 0,
+        v_transform: 0,
+        reserved: 0,
+    };
+    let batch = ffi::W34AttentionBatch {
+        query_start_loc: starts.addr() as *const i32,
+        context_lens_before: ctx.addr() as *const i32,
+        seq_lens_after: seq.addr() as *const i32,
+        block_tables: (pages.addr() + 8) as *const i32,
+        write_slot_mapping: std::ptr::null(),
+        valid_token_mask: std::ptr::null(),
+        valid_req_mask: std::ptr::null(),
+        num_reqs: 1,
+        total_tokens: 32,
+        max_blocks_per_req: 2,
+        max_q_len: 32,
+        max_seq_len: 32,
+        mask_mode: ffi::W34_ATTN_MASK_CAUSAL,
+        sliding_window: 0,
+        sm_scale: 0.0625,
+        reserved: 0,
+    };
+    check_rc(
+        // SAFETY: all buffers are live on device 0; `pages` has exact length `2` matching `max_blocks_per_req`.
+        unsafe {
+            ffi::w34_paged_attention_f16(
+                &s.exec(ws.addr(), 32 * 2 * 4),
+                &layout,
+                &batch,
+                q.addr() as *const c_void,
+                out.addr() as *mut c_void,
+                2,
+            )
+        },
+        "tight 2-page paged FA2",
+    )
+    .unwrap();
+    let mut got = vec![0u16; 32 * 2 * 256];
+    out.copy_to_host(&mut got, &s).unwrap();
+    s.synchronize().unwrap();
+    let perm = [1usize, 0usize];
+    for row in 0..32usize {
+        for col in 0..256usize {
+            let end = row + 1;
+            let expected: f32 = (0..end)
+                .map(|t| half(values[(perm[t / 16] * 16 + t % 16) * 256 + col]))
+                .sum::<f32>()
+                / end as f32;
+            for h in 0..2usize {
+                assert!((half(got[(row * 2 + h) * 256 + col]) - expected).abs() < 0.001);
+            }
+        }
+    }
+}

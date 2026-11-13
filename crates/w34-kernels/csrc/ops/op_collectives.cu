@@ -66,6 +66,26 @@ __device__ __forceinline__ T* small_epoch_ptr(T* fallback_base, Signal* sig, boo
     return stage_epoch_ptr(fallback_base, sig, odd, num_elems);
 }
 
+// Advances communicator-wide 1-barrier staging bank parity in `Signal::end[129..137]` (`144` u32s).
+// Each active CTA `b < gridDim.x` updates only `bank_flags[b]`, while CTA 0 updates inactive
+// slots `b >= gridDim.x` so consecutive collectives with different `gridDim.x` stay in lockstep
+// across all ranks and CUDA Graph replays without any inter-CTA data race.
+__device__ __forceinline__ bool next_comm_bank_odd(Signal* self_sg, bool advance_bank = true) {
+    if (!advance_bank) return false;
+    uint32_t* bank_flags = &self_sg->end[129][0];
+    const uint32_t bp = bank_flags[blockIdx.x] + 1u;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        bank_flags[blockIdx.x] = bp;
+    }
+    if (blockIdx.x == 0) {
+        for (int b = (int)gridDim.x + (int)threadIdx.x; b < kMaxBlocks; b += (int)blockDim.x) {
+            bank_flags[b] = bp;
+        }
+    }
+    return (bp & 1u) != 0u;
+}
+
 inline int tp2_block_cap(bool is_small) {
     int min_sms = 84;
     if (w34_get_tp2_min_sm_count(&min_sms) != 0 || min_sms < 1) {
@@ -160,8 +180,7 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
     int num_elems) {
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg, !dma_tx);
 
     __half* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
     __half* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
@@ -255,8 +274,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp2_all_reduce_residual_gemma_rms_
     const int num_elems = num_tokens * hidden_size;
     const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg, !dma_tx);
 
     __half* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
     __half* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
@@ -478,8 +496,7 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_bf16_kernel(
     int num_elems) {
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     const bool dma_tx = ((size_t)num_elems * sizeof(__nv_bfloat16) >= kDmaThresholdBytes);
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg, !dma_tx);
 
     __nv_bfloat16* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
     __nv_bfloat16* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
@@ -562,8 +579,7 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f32_kernel(
     int num_elems) {
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     const bool dma_tx = ((size_t)num_elems * sizeof(float) >= kDmaThresholdBytes);
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg, !dma_tx);
 
     float* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
     float* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
@@ -644,8 +660,7 @@ __global__ void __launch_bounds__(256, 1) tp2_broadcast_i32_kernel(
     int num_elems) {
     (void)s1;
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
     int32_t* s0_buf = small_epoch_ptr(s0, sig0, odd, num_elems);
 
     if (rank == 0) {
@@ -679,8 +694,7 @@ __global__ void __launch_bounds__(256, 1) tp2_all_gather_top1_f32_i32_kernel(
     int rank,
     int num_rows) {
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
 
     Top1Pair* s0_buf = small_epoch_ptr(s0, sig0, odd, num_rows);
     Top1Pair* s1_buf = small_epoch_ptr(s1, sig1, odd, num_rows);
@@ -710,7 +724,7 @@ __global__ void __launch_bounds__(256, 1) tp2_all_gather_topk_f32_i32_kernel(
     int rank, int num_rows, int k) {
     const int num_elems = num_rows * k;
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
     Top1Pair* s0_buf = small_epoch_ptr(s0, sig0, odd, num_elems);
     Top1Pair* s1_buf = small_epoch_ptr(s1, sig1, odd, num_elems);
     Top1Pair* my_s = (rank == 0) ? s0_buf : s1_buf;
@@ -751,7 +765,7 @@ __global__ void __launch_bounds__(256, 1) tp2_all_reduce_hc_combine_tap_f16_kern
     const int num_elems = num_tokens * hidden_size;
     const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg, !dma_tx);
     __half* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
     __half* s1_buf = dma_tx ? s1 : stage_epoch_ptr(s1, self_sg, odd, num_elems);
     __half* my_s = (rank == 0) ? s0_buf : s1_buf;
@@ -897,8 +911,7 @@ __global__ void __launch_bounds__(512, 1) tp2_gather_vocab_f16_kernel(
     int local_vocab_size) {
     const int num_elems = num_rows * local_vocab_size;
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
     __half* s1_buf = stage_epoch_ptr(s1, self_sg, odd, num_elems);
     const int full_vocab = local_vocab_size * 2;
 
@@ -1019,8 +1032,7 @@ __global__ void __launch_bounds__(512, 1) tp4_all_reduce_f16_kernel(
     int rank,
     int num_elems) {
     Signal* self_sg = ptrs.sig[rank];
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
 
     __half* s_buf[4];
 #pragma unroll
@@ -1109,8 +1121,7 @@ __global__ void __launch_bounds__(THREADS, 2) tp4_all_reduce_residual_gemma_rms_
     int tap_col_offset) {
     const int num_elems = num_tokens * hidden_size;
     Signal* self_sg = ptrs.sig[rank];
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
 
     __half* s_buf[4];
 #pragma unroll
@@ -1315,8 +1326,7 @@ __global__ void __launch_bounds__(512, 1) tp4_all_reduce_bf16_kernel(
     int rank,
     int num_elems) {
     Signal* self_sg = ptrs.sig[rank];
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
 
     __nv_bfloat16* s_buf[4];
 #pragma unroll
@@ -1350,8 +1360,7 @@ __global__ void __launch_bounds__(512, 1) tp4_all_reduce_f32_kernel(
     int rank,
     int num_elems) {
     Signal* self_sg = ptrs.sig[rank];
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
 
     float* s_buf[4];
 #pragma unroll
@@ -1384,8 +1393,7 @@ __global__ void __launch_bounds__(256, 1) tp4_broadcast_i32_kernel(
     int rank,
     int num_elems) {
     Signal* self_sg = ptrs.sig[rank];
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
     int32_t* s0_base = reinterpret_cast<int32_t*>(ptrs.s[0]);
     int32_t* s0_buf = small_epoch_ptr(s0_base, ptrs.sig[0], odd, num_elems);
 
@@ -1412,8 +1420,7 @@ __global__ void __launch_bounds__(256, 1) tp4_all_gather_top1_f32_i32_kernel(
     int rank,
     int num_rows) {
     Signal* self_sg = ptrs.sig[rank];
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
 
     Top1Pair* s_buf[4];
 #pragma unroll
@@ -1449,7 +1456,7 @@ __global__ void __launch_bounds__(256, 1) tp4_all_gather_topk_f32_i32_kernel(
     Tp4Ptrs ptrs, int rank, int num_rows, int k) {
     const int num_elems = num_rows * k;
     Signal* self_sg = ptrs.sig[rank];
-    bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
     Top1Pair* s_buf[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
@@ -1500,7 +1507,7 @@ __global__ void __launch_bounds__(256, 1) tp4_all_reduce_hc_combine_tap_f16_kern
     int tap_stride_elems, int tap_offset_elems) {
     const int num_elems = num_tokens * hidden_size;
     Signal* self_sg = ptrs.sig[rank];
-    bool odd = ((self_sg->flag[blockIdx.x] + 1) & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
     __half* s_buf[4];
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
@@ -1561,8 +1568,7 @@ __global__ void __launch_bounds__(512, 1) tp4_gather_vocab_f16_kernel(
     int local_vocab_size) {
     const int num_elems = num_rows * local_vocab_size;
     Signal* self_sg = ptrs.sig[rank];
-    uint32_t epoch_pre = self_sg->flag[blockIdx.x] + 1;
-    bool odd = (epoch_pre & 1u) != 0;
+    bool odd = next_comm_bank_odd(self_sg);
 
     __half* s_buf[4];
 #pragma unroll

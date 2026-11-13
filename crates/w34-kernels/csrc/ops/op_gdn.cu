@@ -30,6 +30,14 @@ __device__ __forceinline__ float softplus_f32(float x) {
     return (x > 20.0f) ? x : log1pf(expf(x));
 }
 
+__device__ __forceinline__ float gdn_step_decay_f32(float a_log_val, float neg_exp_a, float x) {
+    if (a_log_val > 80.0f && x < -20.0f) {
+        return expf(-expf(a_log_val + x));
+    }
+    const float sp = softplus_f32(x);
+    return (sp == 0.0f) ? 1.0f : expf(neg_exp_a * sp);
+}
+
 // Grid: (ceil(conv_dim / 256), num_reqs, z_tiles), Block: 256 threads.
 // Processes one (request, channel) sliding window across the request's query tokens
 // (parallelized across `gridDim.z` token chunks of >= 32 tokens during prefill),
@@ -579,7 +587,8 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void gdn_recurrent_decode_f16_kern
     }
 
     const float scale = rsqrtf((float)head_k_dim);
-    const float neg_exp_a = -expf(a_log[hv]);
+    const float a_log_hv = a_log[hv];
+    const float neg_exp_a = -expf(a_log_hv);
     const float dt_bias_hv = dt_bias[hv];
     const int k_total_dim = num_k_heads * 128;
     const int v_total_dim = num_v_heads * head_v_dim;
@@ -606,7 +615,7 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void gdn_recurrent_decode_f16_kern
 
         const float a_val = __half2float(a_in[(size_t)tok * ba_row_stride + hv]);
         const float b_val = __half2float(b_in[(size_t)tok * ba_row_stride + hv]);
-        const float decay = expf(neg_exp_a * softplus_f32(a_val + dt_bias_hv));
+        const float decay = gdn_step_decay_f32(a_log_hv, neg_exp_a, a_val + dt_bias_hv);
         const float beta = 1.0f / (1.0f + expf(-b_val));
         float vv[ROWS];
 #pragma unroll
@@ -716,7 +725,8 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void gdn_recurrent_prefill_f16_ker
     }
 
     const float scale = rsqrtf((float)head_k_dim);
-    const float neg_exp_a = -expf(a_log[hv]);
+    const float a_log_hv = a_log[hv];
+    const float neg_exp_a = -expf(a_log_hv);
     const float dt_bias_hv = dt_bias[hv];
     const int k_total_dim = num_k_heads * 128;
     const int v_total_dim = num_v_heads * head_v_dim;
@@ -784,7 +794,7 @@ __global__ __launch_bounds__(128, MIN_BLOCKS) void gdn_recurrent_prefill_f16_ker
             if (lane == 0) {
                 const float a_val = __half2float(a_in[(size_t)tok * ba_row_stride + hv]);
                 const float b_val = __half2float(b_in[(size_t)tok * ba_row_stride + hv]);
-                s_decay[s_norm] = expf(neg_exp_a * softplus_f32(a_val + dt_bias_hv));
+                s_decay[s_norm] = gdn_step_decay_f32(a_log_hv, neg_exp_a, a_val + dt_bias_hv);
                 s_beta[s_norm] = 1.0f / (1.0f + expf(-b_val));
             }
         }

@@ -55,7 +55,9 @@ __device__ __forceinline__ ValIdx block_reduce_max_pair(ValIdx v, float* s_val, 
         }
     }
     __syncthreads();
-    return ValIdx{s_val[0], s_idx[0]};
+    const ValIdx out{s_val[0], s_idx[0]};
+    __syncthreads();
+    return out;
 }
 
 __device__ __forceinline__ float block_reduce_sum(float v, float* s_val) {
@@ -77,7 +79,9 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* s_val) {
         if (lane == 0) s_val[0] = v;
     }
     __syncthreads();
-    return s_val[0];
+    const float out = s_val[0];
+    __syncthreads();
+    return out;
 }
 
 __device__ __forceinline__ double block_reduce_sum_f64(double v, double* s_val) {
@@ -99,7 +103,9 @@ __device__ __forceinline__ double block_reduce_sum_f64(double v, double* s_val) 
         if (lane == 0) s_val[0] = v;
     }
     __syncthreads();
-    return s_val[0];
+    const double out = s_val[0];
+    __syncthreads();
+    return out;
 }
 
 __device__ __forceinline__ uint32_t block_reduce_sum_u32(uint32_t v, uint32_t* s_val) {
@@ -121,7 +127,9 @@ __device__ __forceinline__ uint32_t block_reduce_sum_u32(uint32_t v, uint32_t* s
         if (lane == 0) s_val[0] = v;
     }
     __syncthreads();
-    return s_val[0];
+    const uint32_t out = s_val[0];
+    __syncthreads();
+    return out;
 }
 
 static_assert(sizeof(w34_sampler_row_cfg) == 64, "w34_sampler_row_cfg ABI mismatch");

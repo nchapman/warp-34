@@ -35,7 +35,7 @@ __forceinline__ __device__ int64_t resolve_thread_kv_page_slice_offset<W34PagedD
     if (partial_block_size) {
         const int final_row_offset = *partial_block_size > 1 ? (*partial_block_size - 1) : 0;
         const int final_thread_row_offset =
-            ceil_div(final_row_offset, kGmemRowsPerThread) * kGmemRowsPerThread;
+            (final_row_offset / kGmemRowsPerThread) * kGmemRowsPerThread;
         if (final_thread_row_offset < block_row_offset) {
             block_row_offset = final_thread_row_offset;
         }

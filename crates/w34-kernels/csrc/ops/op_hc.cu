@@ -40,7 +40,9 @@ __device__ __forceinline__ float hc_block_reduce_sum(float val, float* s_warp) {
         }
     }
     __syncthreads();
-    return s_warp[0];
+    const float out = s_warp[0];
+    __syncthreads();
+    return out;
 }
 
 // Replicates initial token embeddings [num_tokens, hidden_size] across hc_count streams

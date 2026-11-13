@@ -15,6 +15,18 @@ __device__ __forceinline__ float softplus_f32(float x) {
     return (x > 20.0f) ? x : log1pf(expf(x));
 }
 
+__device__ __forceinline__ float gdn_chunk_log_decay_f32(float a_log_val, float neg_exp_a, float x) {
+    float g;
+    if (a_log_val > 80.0f && x < -20.0f) {
+        g = -expf(a_log_val + x);
+    } else {
+        const float sp = softplus_f32(x);
+        g = (sp == 0.0f) ? 0.0f : (neg_exp_a * sp);
+    }
+    if (isnan(g)) return 0.0f;
+    return (g < -104.0f) ? -104.0f : g;
+}
+
 __device__ __forceinline__ void gdn_norm_qk_warp(
     const __half* __restrict__ q_tok_hk,
     const __half* __restrict__ k_tok_hk,
@@ -173,7 +185,8 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
     }
 
     const float scale = rsqrtf((float)DK);
-    const float neg_exp_a = -expf(a_log[hv]);
+    const float a_log_hv = a_log[hv];
+    const float neg_exp_a = -expf(a_log_hv);
     const float dt_bias_hv = dt_bias[hv];
     const int k_total_dim = num_k_heads * DK;
     const int v_total_dim = num_v_heads * DK;
@@ -230,7 +243,7 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
             if (lane == 0) {
                 const float a_val = __half2float(a_in[(size_t)tok * ba_row_stride + hv]);
                 const float b_val = __half2float(b_in[(size_t)tok * ba_row_stride + hv]);
-                s_g[s_norm] = neg_exp_a * softplus_f32(a_val + dt_bias_hv);
+                s_g[s_norm] = gdn_chunk_log_decay_f32(a_log_hv, neg_exp_a, a_val + dt_bias_hv);
                 s_beta[s_norm] = 1.0f / (1.0f + expf(-b_val));
             }
         }
@@ -559,7 +572,7 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
             const int i = idx >> 6;
             const int j = idx & 63;
             s_Q[idx] = (i < tile_len && j <= i)
-                ? __float2half(expf(s_g[i] - s_g[j]) * s_A[idx])
+                ? __float2half(((i == j) ? 1.0f : expf(s_g[i] - s_g[j])) * s_A[idx])
                 : __float2half(0.0f);
             s_T[idx] = (i < tile_len) ? (s_eg[i] * s_T[idx]) : 0.0f;
         }
@@ -605,7 +618,8 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
             const int k = idx >> 6;
             const int i = idx & 63;
             const float kv = (i < tile_len)
-                ? (expf(g_last - s_g[i]) * __half2float(s_K[i * DK + k]))
+                ? (((i == tile_len - 1) ? 1.0f : expf(g_last - s_g[i])) *
+                   __half2float(s_K[i * DK + k]))
                 : 0.0f;
             s_Q[k * BT + i] = __float2half(kv);
         }

@@ -1002,3 +1002,88 @@ fn test_fast_greedy_masked_matches_full_sampler_and_edges() {
         );
     }
 }
+
+#[test]
+fn gpu_sampler_back_to_back_reductions_high_warp_only_valid_and_nan() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Only token 1023 (owned exclusively by warp 31, lane 31) is allowed; warp 0 has
+    // `local_valid == 0` and `local_nonfinite == 0`, exercising back-to-back `s_u32` / `s_val`
+    // block reductions without warp 0 clobbering `s_u32[0]` before warps 1..31 read it.
+    let vocab_size = 2048usize;
+    let num_rows = 64usize;
+    let words_per_row = vocab_size / 32;
+    let mut logits = vec![f32_to_f16(1.25); num_rows * vocab_size];
+    let mut masks = vec![0u32; num_rows * words_per_row];
+    let mut cfgs = Vec::with_capacity(num_rows);
+    for r in 0..num_rows {
+        masks[r * words_per_row + (1023 / 32)] = 1u32 << (1023 % 32);
+        if r % 2 == 1 {
+            // Also allow token 1022 with NaN logit on warp 31 only -> must report status=2 cleanly.
+            masks[r * words_per_row + (1022 / 32)] |= 1u32 << (1022 % 32);
+            logits[r * vocab_size + 1022] = 0x7e00u16;
+        }
+        cfgs.push(W34SamplerRowCfg {
+            temperature: 0.9,
+            top_k: 8,
+            top_p: 0.95,
+            min_p: 0.05,
+            repetition_penalty: 1.0,
+            uniform_sample: 0.5,
+            draft_token_id: -1,
+            has_bitmask: 1,
+            row_bitmask_word_offset: (r * words_per_row) as i32,
+            top_logprobs_k: 4,
+            ..Default::default()
+        });
+    }
+
+    prepare_execution_plan(0).unwrap();
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let mut arena = DeviceArena::new(0, 64 * 1024 * 1024).unwrap();
+    let d_logits = arena.upload_slice(&logits, &stream).unwrap();
+    let d_masks = arena.upload_slice(&masks, &stream).unwrap();
+    let d_cfgs = arena.upload_slice(&cfgs, &stream).unwrap();
+    let out_bytes = num_rows * core::mem::size_of::<W34SamplerRowOut>();
+    let d_out = arena.alloc_aligned(out_bytes).unwrap();
+    let (ws_ptr, ws_cap) = arena.remaining_workspace();
+    let ex = stream.exec(ws_ptr, ws_cap);
+    // SAFETY: all pointers reside in `arena` on device 0 with ample remaining workspace.
+    let rc = unsafe {
+        ffi::w34_sampler_step_f16(
+            &ex,
+            d_logits as *const c_void,
+            d_cfgs as *const W34SamplerRowCfg,
+            d_masks as *const u32,
+            core::ptr::null(),
+            d_out as *mut W34SamplerRowOut,
+            num_rows as i32,
+            vocab_size as i32,
+            0,
+        )
+    };
+    assert_eq!(rc, 0);
+    let mut outs = vec![W34SamplerRowOut::default(); num_rows];
+    // SAFETY: `outs` has `out_bytes` stack/heap capacity matching `d_out`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                outs.as_mut_ptr() as *mut c_void,
+                d_out as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+    for (r, out) in outs.iter().enumerate() {
+        if r % 2 == 0 {
+            assert_eq!(out.status, 0, "row {r} status");
+            assert_eq!(out.sampled_id, 1023, "row {r} sampled_id");
+        } else {
+            assert_eq!(out.status, 2, "row {r} expected NaN status=2");
+            assert_eq!(out.sampled_id, -1, "row {r} sampled_id");
+        }
+    }
+}
