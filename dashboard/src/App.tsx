@@ -63,14 +63,19 @@ function PoolBar({
   );
 }
 
-function throughputPoints(history: Snapshot[]): Point[] {
-  return history.map((s, i) => ({
-    time: s.uptime_seconds,
-    value: counterRate(
-      history.slice(Math.max(0, i - 5), i + 1),
-      (sample) => sample.tokens.generated,
-    ),
-  }));
+function throughputPoints(history: Snapshot[], decisionMode = false): Point[] {
+  return history.map((s, i) => {
+    const slice = history.slice(Math.max(0, i - 5), i + 1);
+    const genRate = counterRate(slice, (sample) => sample.tokens.generated);
+    const compRate = counterRate(slice, (sample) => sample.tokens.computed);
+    return {
+      time: s.uptime_seconds,
+      value:
+        decisionMode || (genRate === 0 && (compRate ?? 0) > 0)
+          ? compRate
+          : genRate,
+    };
+  });
 }
 function latencyPoints(history: Snapshot[]): Point[] {
   return history
@@ -79,8 +84,14 @@ function latencyPoints(history: Snapshot[]): Point[] {
         history.find(
           (sample) => sample.uptime_seconds >= s.uptime_seconds - 30,
         ) ?? history[0];
-      const histogram =
+      const ttftHist =
         i === 0 ? null : histogramDelta(first.latency.ttft, s.latency.ttft);
+      const histogram =
+        ttftHist && ttftHist.count > 0
+          ? ttftHist
+          : i === 0
+            ? null
+            : histogramDelta(first.latency.e2e, s.latency.e2e);
       return {
         time: s.uptime_seconds,
         value: (quantile(histogram, 0.95)?.value ?? NaN) * 1000,
@@ -122,8 +133,25 @@ function Overview({ state }: { state: MetricsState }) {
   const latest = history.at(-1);
   const first = history[0];
   const fresh = connection === "live";
-  const rate = fresh ? counterRate(history, (s) => s.tokens.generated) : null;
-  const ttft = recentHistogram(history, "ttft");
+  const ttftRaw = recentHistogram(history, "ttft");
+  const e2eRaw = recentHistogram(history, "e2e");
+  const isDecisionWorkload = Boolean(
+    latest &&
+      first &&
+      history.length > 1 &&
+      latest.tokens.generated === first.tokens.generated &&
+      (latest.tokens.computed > first.tokens.computed ||
+        (e2eRaw && e2eRaw.count > 0 && (!ttftRaw || ttftRaw.count === 0))),
+  );
+  const genRate = fresh ? counterRate(history, (s) => s.tokens.generated) : null;
+  const promptRate = fresh
+    ? counterRate(history, (s) => s.tokens.computed)
+    : null;
+  const rate =
+    isDecisionWorkload || (genRate === 0 && (promptRate ?? 0) > 0)
+      ? promptRate
+      : genRate;
+  const ttft = ttftRaw && ttftRaw.count > 0 ? ttftRaw : e2eRaw;
   const queue = recentHistogram(history, "queue");
   const pacing = recentHistogram(history, "time_per_output_token");
   const cached =
@@ -198,7 +226,7 @@ function Overview({ state }: { state: MetricsState }) {
             <h2 id="throughput-title">Generation throughput</h2>
             <span className="legend">
               <i className="amber-dot" />
-              Output tokens
+              {isDecisionWorkload ? "Prompt tokens" : "Output tokens"}
             </span>
           </div>
           <div className="hero-number numeric">
@@ -206,10 +234,12 @@ function Overview({ state }: { state: MetricsState }) {
             <span>tok/s</span>
           </div>
           <p className="metric-caption">
-            Aggregate engine output · trailing 10 seconds
+            {isDecisionWorkload
+              ? "Aggregate prompt evaluation · trailing 10 seconds"
+              : "Aggregate engine output · trailing 10 seconds"}
           </p>
           <Chart
-            points={throughputPoints(history)}
+            points={throughputPoints(history, isDecisionWorkload)}
             label="Generation throughput"
             unit="tokens per second"
           />
@@ -302,10 +332,20 @@ function Overview({ state }: { state: MetricsState }) {
             <span>{percentile(quantile(queue, 0.95))}</span>
           </div>
           <div className="detail-row">
-            <span>Time / output token</span>
+            <span>
+              {pacing && pacing.count > 0
+                ? "Time / output token"
+                : isDecisionWorkload
+                  ? "Mean decision E2E"
+                  : "Time / output token"}
+            </span>
             <span>
               {duration(
-                pacing && pacing.count > 0 ? pacing.sum / pacing.count : null,
+                pacing && pacing.count > 0
+                  ? pacing.sum / pacing.count
+                  : isDecisionWorkload && e2eRaw && e2eRaw.count > 0
+                    ? e2eRaw.sum / e2eRaw.count
+                    : null,
               )}
             </span>
           </div>
