@@ -1652,3 +1652,110 @@ fn moe_router_512_k10_warp_matches_generic_and_unaligned_fallback() {
         }
     }
 }
+
+#[test]
+fn moe_down_accum_subwarp_packing_matches_unaligned_fallback() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+
+    // Exercises `moe_w4a16_down_accum_f16_kernel` sub-warp column packing (`kRpw = 4` on
+    // `n_interm = 256`, `kRpw = 2` on `n_interm = 512, 640`) across `M in [1, 2, 3]` and odd
+    // `k_hidden` tail columns (`71`), checking bit-exact parity against the unaligned fallback.
+    let num_experts = 16usize;
+    let k_hidden = 71usize;
+    let group_size = 64usize;
+    for &(n_interm, top_k) in &[
+        (256usize, 8usize),
+        (512, 8),
+        (256, 10),
+        (512, 10),
+        (640, 10),
+    ] {
+        let words_per_row = n_interm / 8;
+        let groups_per_row = n_interm / group_size;
+        let pad_u32 = 1usize; // +4B offset on `down_packed` forces `subwarp_vec = false`
+        let mut down_packed = vec![0u32; pad_u32 + num_experts * k_hidden * words_per_row];
+        for (i, slot) in down_packed[pad_u32..].iter_mut().enumerate() {
+            let mut w = 0u32;
+            for p in 0..8 {
+                let q = ((i * 13 + p * 7 + 5) % 16) as u32;
+                w |= q << (p * 4);
+            }
+            *slot = w;
+        }
+        let down_scales: Vec<u16> = (0..num_experts * k_hidden * groups_per_row)
+            .map(|i| f32_to_f16(((i % 19) as f32 + 1.0) * 0.0078125))
+            .collect();
+        let d_ds = DeviceBuffer::alloc(0, down_scales.len() * 2).unwrap();
+        d_ds.copy_from_host(&down_scales, &stream).unwrap();
+
+        for m in [1usize, 2, 3] {
+            let pairs = m * top_k;
+            let interm: Vec<u16> = (0..pairs * n_interm)
+                .map(|idx| f32_to_f16(((idx % 53) as f32 - 26.0) * 0.03125))
+                .collect();
+            let topk_ids: Vec<i32> = (0..pairs)
+                .map(|p| ((p * 5 + 3) % num_experts) as i32)
+                .collect();
+            let topk_w: Vec<f32> = (0..pairs)
+                .map(|p| 1.0 / (top_k as f32) + ((p % 3) as f32) * 0.01)
+                .collect();
+            let shared_out: Vec<u16> = (0..m * k_hidden)
+                .map(|i| f32_to_f16(((i % 29) as f32 - 14.0) * 0.0625))
+                .collect();
+            let shared_gate: Vec<u16> =
+                (0..m).map(|i| f32_to_f16((i as f32 - 1.0) * 0.5)).collect();
+
+            let d_in = DeviceBuffer::alloc(0, interm.len() * 2).unwrap();
+            let d_ids = DeviceBuffer::alloc(0, topk_ids.len() * 4).unwrap();
+            let d_tw = DeviceBuffer::alloc(0, topk_w.len() * 4).unwrap();
+            let d_sh = DeviceBuffer::alloc(0, shared_out.len() * 2).unwrap();
+            let d_sg = DeviceBuffer::alloc(0, shared_gate.len() * 2).unwrap();
+            d_in.copy_from_host(&interm, &stream).unwrap();
+            d_ids.copy_from_host(&topk_ids, &stream).unwrap();
+            d_tw.copy_from_host(&topk_w, &stream).unwrap();
+            d_sh.copy_from_host(&shared_out, &stream).unwrap();
+            d_sg.copy_from_host(&shared_gate, &stream).unwrap();
+
+            let run = |off_u32: usize| -> Vec<u16> {
+                let d_dp = DeviceBuffer::alloc(0, down_packed.len() * 4).unwrap();
+                let d_out = DeviceBuffer::alloc(0, m * k_hidden * 2).unwrap();
+                d_dp.copy_from_host(&down_packed[pad_u32 - off_u32..], &stream)
+                    .unwrap();
+                // SAFETY: All device buffers are live on device 0 and match `(m, top_k, num_experts, k_hidden, n_interm, group_size)`.
+                let rc = unsafe {
+                    w34_kernels::ffi::w34_moe_w4a16_down_accum_f16(
+                        &ex,
+                        d_in.addr() as *const c_void,
+                        (d_dp.addr() + (off_u32 * 4) as u64) as *const u32,
+                        d_ds.addr() as *const c_void,
+                        d_ids.addr() as *const i32,
+                        d_tw.addr() as *const f32,
+                        d_sh.addr() as *const c_void,
+                        d_sg.addr() as *const c_void,
+                        d_out.addr() as *mut c_void,
+                        m as i32,
+                        top_k as i32,
+                        num_experts as i32,
+                        k_hidden as i32,
+                        n_interm as i32,
+                        group_size as i32,
+                    )
+                };
+                assert_eq!(rc, 0);
+                let mut got = vec![0u16; m * k_hidden];
+                d_out.copy_to_host(&mut got, &stream).unwrap();
+                stream.synchronize().unwrap();
+                got
+            };
+            let fast = run(0);
+            let scalar = run(pad_u32);
+            assert_eq!(
+                fast, scalar,
+                "down_accum subwarp_vec mismatch for n_interm={n_interm}, top_k={top_k}, m={m}"
+            );
+        }
+    }
+}

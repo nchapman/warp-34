@@ -10,7 +10,7 @@ constexpr int kLoraFusedMaxRankPad = 16;
 constexpr int kLoraFusedMaxBlocks = 8;
 constexpr int kLoraMaxAdapters = 64;
 
-__global__ __launch_bounds__(512, 2) void lora_fused_shrink_expand_512t_f16_kernel(
+__global__ __launch_bounds__(512, 1) void lora_fused_shrink_expand_512t_f16_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ lora_a,
     const __half* __restrict__ lora_b,
@@ -420,22 +420,28 @@ __global__ void lora_expand_add_f16_kernel(
     if (tok_base >= m) return;
     const int tile_m = (m - tok_base < 8) ? (m - tok_base) : 8;
 
-    int32_t lids[8];
-    bool all_same = true;
-#pragma unroll
-    for (int t = 0; t < 8; t++) {
-        if (t < tile_m) {
-            lids[t] = (token_lora_ids != nullptr) ? token_lora_ids[tok_base + t] : default_lora_id;
-            if (lids[t] != lids[0]) all_same = false;
-        } else {
-            lids[t] = -1;
-        }
-    }
-
     __shared__ alignas(16) float s_lowrank[8][kLoraMaxRankPad];
+    __shared__ int32_t s_lids[8];
+    __shared__ int32_t s_all_same;
 
-    if (all_same) {
-        const int32_t lora_id = lids[0];
+    if (threadIdx.x < 8) {
+        const int t = (int)threadIdx.x;
+        s_lids[t] = (t < tile_m)
+            ? ((token_lora_ids != nullptr) ? token_lora_ids[tok_base + t] : default_lora_id)
+            : -1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int same = 1;
+        for (int t = 1; t < tile_m; ++t) {
+            if (s_lids[t] != s_lids[0]) same = 0;
+        }
+        s_all_same = same;
+    }
+    __syncthreads();
+
+    if (s_all_same != 0) {
+        const int32_t lora_id = s_lids[0];
         if (lora_id < 0 || lora_id >= num_adapters || ((adapter_mask >> lora_id) & 1ULL) == 0ULL) {
             return;
         }
@@ -501,17 +507,20 @@ __global__ void lora_expand_add_f16_kernel(
                     }
                 }
             }
-            for (int t = 0; t < tile_m; t++) {
-                __half* y_ptr = y_inout + (size_t)(tok_base + t) * size_n + col0;
-                if ((reinterpret_cast<uintptr_t>(y_ptr) & 3u) == 0u) {
-                    uint32_t y_pair = *reinterpret_cast<const uint32_t*>(y_ptr);
-                    __half* yh = reinterpret_cast<__half*>(&y_pair);
-                    yh[0] = __float2half_rn(__half2float(yh[0]) + sum0[t]);
-                    yh[1] = __float2half_rn(__half2float(yh[1]) + sum1[t]);
-                    *reinterpret_cast<uint32_t*>(y_ptr) = y_pair;
-                } else {
-                    y_ptr[0] = __float2half_rn(__half2float(y_ptr[0]) + sum0[t]);
-                    y_ptr[1] = __float2half_rn(__half2float(y_ptr[1]) + sum1[t]);
+#pragma unroll
+            for (int t = 0; t < 8; t++) {
+                if (t < tile_m) {
+                    __half* y_ptr = y_inout + (size_t)(tok_base + t) * size_n + col0;
+                    if ((reinterpret_cast<uintptr_t>(y_ptr) & 3u) == 0u) {
+                        uint32_t y_pair = *reinterpret_cast<const uint32_t*>(y_ptr);
+                        __half* yh = reinterpret_cast<__half*>(&y_pair);
+                        yh[0] = __float2half_rn(__half2float(yh[0]) + sum0[t]);
+                        yh[1] = __float2half_rn(__half2float(yh[1]) + sum1[t]);
+                        *reinterpret_cast<uint32_t*>(y_ptr) = y_pair;
+                    } else {
+                        y_ptr[0] = __float2half_rn(__half2float(y_ptr[0]) + sum0[t]);
+                        y_ptr[1] = __float2half_rn(__half2float(y_ptr[1]) + sum1[t]);
+                    }
                 }
             }
         } else {
@@ -524,9 +533,12 @@ __global__ void lora_expand_add_f16_kernel(
                     }
                 }
             }
-            for (int t = 0; t < tile_m; t++) {
-                __half* y_ptr = y_inout + (size_t)(tok_base + t) * size_n + col0;
-                y_ptr[0] = __float2half_rn(__half2float(y_ptr[0]) + sum0[t]);
+#pragma unroll
+            for (int t = 0; t < 8; t++) {
+                if (t < tile_m) {
+                    __half* y_ptr = y_inout + (size_t)(tok_base + t) * size_n + col0;
+                    y_ptr[0] = __float2half_rn(__half2float(y_ptr[0]) + sum0[t]);
+                }
             }
         }
         return;
@@ -534,7 +546,7 @@ __global__ void lora_expand_add_f16_kernel(
 
     const int col0 = ((int)blockIdx.x * 256 + (int)threadIdx.x) * 2;
     for (int t = 0; t < tile_m; t++) {
-        const int32_t lora_id = lids[t];
+        const int32_t lora_id = s_lids[t];
         if (lora_id < 0 || lora_id >= num_adapters || ((adapter_mask >> lora_id) & 1ULL) == 0ULL) {
             continue;
         }

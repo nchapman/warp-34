@@ -564,8 +564,18 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
         src_head = qg_base;
         const __half* gate_src = qg_base + head_dim;
         __half* gate_dst = gate_out + ((size_t)tok * num_q_heads + local_head) * head_dim;
-        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-            gate_dst[i] = gate_src[i];
+        if ((head_dim & 7) == 0 &&
+            ((((uintptr_t)gate_src | (uintptr_t)gate_dst) & 15u) == 0u)) {
+            const int vec_hd = head_dim >> 3;
+            const uint4* gs_v = reinterpret_cast<const uint4*>(gate_src);
+            uint4* gd_v = reinterpret_cast<uint4*>(gate_dst);
+            for (int v = threadIdx.x; v < vec_hd; v += blockDim.x) {
+                gd_v[v] = __ldg(&gs_v[v]);
+            }
+        } else {
+            for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+                gate_dst[i] = gate_src[i];
+            }
         }
         norm_w = q_norm_w;
         dst_head = q_out + ((size_t)tok * num_q_heads + local_head) * head_dim;
@@ -576,17 +586,52 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
     }
 
     float sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = __half2float(src_head[i]);
-        sum_sq += v * v;
+    const bool vec_src_w = ((head_dim & 7) == 0) &&
+                           ((((uintptr_t)src_head | (uintptr_t)norm_w) & 15u) == 0u);
+    if (vec_src_w) {
+        const int vec_hd = head_dim >> 3;
+        const uint4* src_v = reinterpret_cast<const uint4*>(src_head);
+        for (int vc = threadIdx.x; vc < vec_hd; vc += blockDim.x) {
+            const uint4 u = __ldg(&src_v[vc]);
+            const __half* h = reinterpret_cast<const __half*>(&u);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = __half2float(h[j]);
+                sum_sq += v * v;
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float v = __half2float(src_head[i]);
+            sum_sq += v * v;
+        }
     }
     sum_sq = block_reduce_sum(sum_sq, s_warp);
     const float inv_rms = rsqrtf(sum_sq / (float)head_dim + rms_eps);
 
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = __half2float(src_head[i]) * inv_rms;
-        float w = 1.0f + __half2float(norm_w[i]);
-        s_normed[i] = __half2float(__float2half(v * w));
+    if (vec_src_w) {
+        const int vec_hd = head_dim >> 3;
+        const uint4* src_v = reinterpret_cast<const uint4*>(src_head);
+        const uint4* w_v = reinterpret_cast<const uint4*>(norm_w);
+        for (int vc = threadIdx.x; vc < vec_hd; vc += blockDim.x) {
+            const uint4 u = __ldg(&src_v[vc]);
+            const uint4 wu = __ldg(&w_v[vc]);
+            const __half* h = reinterpret_cast<const __half*>(&u);
+            const __half* wh = reinterpret_cast<const __half*>(&wu);
+            const int base_i = vc << 3;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = __half2float(h[j]) * inv_rms;
+                const float w = 1.0f + __half2float(wh[j]);
+                s_normed[base_i + j] = __half2float(__float2half(v * w));
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float v = __half2float(src_head[i]) * inv_rms;
+            float w = 1.0f + __half2float(norm_w[i]);
+            s_normed[i] = __half2float(__float2half(v * w));
+        }
     }
     __syncthreads();
 
@@ -615,8 +660,25 @@ __global__ void fused_qk_rmsnorm_rope_gate_f16_kernel(
         dst_head[i] = __float2half(x1 * cos_a - x2 * sin_a);
         dst_head[i + half_rot] = __float2half(x2 * cos_a + x1 * sin_a);
     }
-    for (int i = rotary_dim + threadIdx.x; i < head_dim; i += blockDim.x) {
-        dst_head[i] = __float2half(s_normed[i]);
+    if ((rotary_dim & 7) == 0 && (head_dim & 7) == 0 &&
+        (((uintptr_t)dst_head & 15u) == 0u)) {
+        const int vec_start = rotary_dim >> 3;
+        const int vec_end = head_dim >> 3;
+        uint4* dst_v = reinterpret_cast<uint4*>(dst_head);
+        for (int vc = vec_start + threadIdx.x; vc < vec_end; vc += blockDim.x) {
+            uint4 ov;
+            __half* oh = reinterpret_cast<__half*>(&ov);
+            const int base_i = vc << 3;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                oh[j] = __float2half(s_normed[base_i + j]);
+            }
+            dst_v[vc] = ov;
+        }
+    } else {
+        for (int i = rotary_dim + threadIdx.x; i < head_dim; i += blockDim.x) {
+            dst_head[i] = __float2half(s_normed[i]);
+        }
     }
 }
 

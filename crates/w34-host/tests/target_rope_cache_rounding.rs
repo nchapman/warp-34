@@ -126,3 +126,101 @@ fn check_native_rope(native_q: &[u16; 64], q: &[u16; 256], planes: [i32; 3], unr
         }
     }
 }
+
+#[test]
+fn target_rope_vectorized_fast_path_matches_unaligned_fallback() {
+    let device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(device.device_id).unwrap();
+    let ex = stream.exec(0, 0);
+
+    let m = 7usize;
+    let q_heads = 4usize;
+    let kv_heads = 2usize;
+    let hd = 256usize;
+    let pad = 1usize; // +2B offset forces scalar fallback on inputs & outputs
+    let mut qg = vec![0u16; pad + m * q_heads * 2 * hd];
+    for (i, slot) in qg[pad..].iter_mut().enumerate() {
+        *slot = (14000u16).wrapping_add(((i * 37) % 1024) as u16);
+    }
+    let mut k = vec![0u16; pad + m * kv_heads * hd];
+    for (i, slot) in k[pad..].iter_mut().enumerate() {
+        *slot = (46800u16).wrapping_add(((i * 53) % 1024) as u16);
+    }
+    let mut qw = vec![0u16; pad + hd];
+    let mut kw = vec![0u16; pad + hd];
+    for i in 0..hd {
+        qw[pad + i] = (12000u16).wrapping_add(((i * 19) % 512) as u16);
+        kw[pad + i] = (12100u16).wrapping_add(((i * 23) % 512) as u16);
+    }
+    let positions: Vec<i32> = (0..3 * m).map(|i| (i * 11 + 5) as i32).collect();
+    let d_pos = DeviceBuffer::alloc(device.device_id, positions.len() * 4).unwrap();
+    d_pos.copy_from_host(&positions, &stream).unwrap();
+
+    let run = |off: usize| -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let d_qg = DeviceBuffer::alloc(device.device_id, qg.len() * 2).unwrap();
+        let d_k = DeviceBuffer::alloc(device.device_id, k.len() * 2).unwrap();
+        let d_qw = DeviceBuffer::alloc(device.device_id, qw.len() * 2).unwrap();
+        let d_kw = DeviceBuffer::alloc(device.device_id, kw.len() * 2).unwrap();
+        let d_qo = DeviceBuffer::alloc(device.device_id, (pad + m * q_heads * hd) * 2).unwrap();
+        let d_ko = DeviceBuffer::alloc(device.device_id, (pad + m * kv_heads * hd) * 2).unwrap();
+        let d_go = DeviceBuffer::alloc(device.device_id, (pad + m * q_heads * hd) * 2).unwrap();
+        d_qg.copy_from_host(&qg[pad - off..], &stream).unwrap();
+        d_k.copy_from_host(&k[pad - off..], &stream).unwrap();
+        d_qw.copy_from_host(&qw[pad - off..], &stream).unwrap();
+        d_kw.copy_from_host(&kw[pad - off..], &stream).unwrap();
+        let bytes = (off * 2) as u64;
+        // SAFETY: All device pointers shifted by `bytes` remain in-bounds for `(m, q_heads, kv_heads, hd)` until `synchronize()`.
+        let rc = unsafe {
+            ffi::w34_fused_qk_rmsnorm_rope_gate_f16(
+                &ex,
+                (d_qg.addr() + bytes) as *const c_void,
+                (d_k.addr() + bytes) as *const c_void,
+                (d_qw.addr() + bytes) as *const c_void,
+                (d_kw.addr() + bytes) as *const c_void,
+                d_pos.addr() as *const i32,
+                core::ptr::null(),
+                (d_qo.addr() + bytes) as *mut c_void,
+                (d_ko.addr() + bytes) as *mut c_void,
+                (d_go.addr() + bytes) as *mut c_void,
+                m as i32,
+                m as i32,
+                q_heads as i32,
+                kv_heads as i32,
+                hd as i32,
+                64,
+                11,
+                11,
+                10,
+                10_000_000.0,
+                1e-6,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut qo = vec![0u16; pad + m * q_heads * hd];
+        let mut ko = vec![0u16; pad + m * kv_heads * hd];
+        let mut go = vec![0u16; pad + m * q_heads * hd];
+        d_qo.copy_to_host(&mut qo, &stream).unwrap();
+        d_ko.copy_to_host(&mut ko, &stream).unwrap();
+        d_go.copy_to_host(&mut go, &stream).unwrap();
+        stream.synchronize().unwrap();
+        (
+            qo[off..off + m * q_heads * hd].to_vec(),
+            ko[off..off + m * kv_heads * hd].to_vec(),
+            go[off..off + m * q_heads * hd].to_vec(),
+        )
+    };
+    let (qo_fast, ko_fast, go_fast) = run(0);
+    let (qo_scal, ko_scal, go_scal) = run(pad);
+    assert_eq!(
+        qo_fast, qo_scal,
+        "vectorized q_out must match scalar fallback"
+    );
+    assert_eq!(
+        ko_fast, ko_scal,
+        "vectorized k_out must match scalar fallback"
+    );
+    assert_eq!(
+        go_fast, go_scal,
+        "vectorized gate_out must match scalar fallback"
+    );
+}

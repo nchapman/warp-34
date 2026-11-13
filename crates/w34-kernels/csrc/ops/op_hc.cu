@@ -59,7 +59,9 @@ __global__ void hc_init_streams_f16_kernel(
     const bool valid = (valid_token_mask == nullptr) || (valid_token_mask[tok] != 0);
     const __half* src = embed_in + (size_t)tok * hidden_size;
     __half* dst_base = residual_out + (size_t)tok * hc_count * hidden_size;
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+    const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    const int d_stride = (int)gridDim.y * (int)blockDim.x;
+    for (int d = d_start; d < hidden_size; d += d_stride) {
         const __half v = valid ? src[d] : __float2half(0.0f);
         for (int s = 0; s < hc_count; ++s) {
             dst_base[(size_t)s * hidden_size + d] = v;
@@ -163,8 +165,10 @@ __global__ void hc_mix_streams_f16_kernel(
     const int tok = blockIdx.x;
     if (tok >= num_tokens) return;
     __half* dst = mixed_out + (size_t)tok * hidden_size;
+    const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    const int d_stride = (int)gridDim.y * (int)blockDim.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
-        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        for (int d = d_start; d < hidden_size; d += d_stride) {
             dst[d] = __float2half(0.0f);
         }
         return;
@@ -175,7 +179,7 @@ __global__ void hc_mix_streams_f16_kernel(
     const __half* up_tok = up_raw_in + base;
     const float inv_hc = 1.0f / (float)hc_count;
 
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+    for (int d = d_start; d < hidden_size; d += d_stride) {
         float acc = 0.0f;
         for (int s = 0; s < hc_count; ++s) {
             const size_t idx = (size_t)s * hidden_size + d;
@@ -202,7 +206,9 @@ __global__ void hc_mix_streams_hadamard_f16_kernel(
     __half* dst = (mixed_out != nullptr) ? (mixed_out + (size_t)tok * hidden_size) : nullptr;
     __half* dst_had = (had64_out != nullptr) ? (had64_out + (size_t)tok * hidden_size) : nullptr;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
-        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+        const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+        const int d_stride = (int)gridDim.y * (int)blockDim.x;
+        for (int d = d_start; d < hidden_size; d += d_stride) {
             if (dst != nullptr) dst[d] = __float2half(0.0f);
             if (dst_had != nullptr) dst_had[d] = __float2half(0.0f);
         }
@@ -214,7 +220,9 @@ __global__ void hc_mix_streams_hadamard_f16_kernel(
     const __half* up_tok = up_raw_in + base;
     const float inv_hc = 1.0f / (float)hc_count;
 
-    for (int base_col = 0; base_col < hidden_size; base_col += (int)blockDim.x * 4) {
+    const int tile_span = (int)blockDim.x * 4;
+    const int grid_span = (int)gridDim.y * tile_span;
+    for (int base_col = (int)blockIdx.y * tile_span; base_col < hidden_size; base_col += grid_span) {
         const int col0 = base_col + (int)threadIdx.x * 4;
         if (col0 < hidden_size) {
             __half h[4];
@@ -279,7 +287,9 @@ __global__ void hc_combine_f16_kernel(
             : nullptr;
     const float inv_hc = 1.0f / static_cast<float>(hc_count);
 
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+    const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    const int d_stride = (int)gridDim.y * (int)blockDim.x;
+    for (int d = d_start; d < hidden_size; d += d_stride) {
         const float y = __half2float(blk_tok[d]);
         float tap_sum = 0.0f;
         for (int s = 0; s < hc_count; ++s) {
@@ -317,7 +327,8 @@ int w34_hc_init_streams_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::hc_init_streams_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const unsigned col_blocks = (unsigned)(((hidden_size + 255) / 256 < 64) ? ((hidden_size + 255) / 256) : 64);
+    w34::hc_init_streams_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
          static_cast<const __half*>(embed_in),
         static_cast<__half*>(residual_out),
         valid_token_mask,
@@ -398,7 +409,8 @@ int w34_hc_mix_streams_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::hc_mix_streams_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const unsigned col_blocks = (unsigned)(((hidden_size + 255) / 256 < 64) ? ((hidden_size + 255) / 256) : 64);
+    w34::hc_mix_streams_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
         static_cast<const __half*>(residual_in),
         static_cast<const __half*>(up_raw_in),
         static_cast<__half*>(mixed_out),
@@ -430,7 +442,8 @@ int w34_hc_mix_streams_hadamard_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::hc_mix_streams_hadamard_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const unsigned col_blocks = (unsigned)(((hidden_size + 1023) / 1024 < 64) ? ((hidden_size + 1023) / 1024) : 64);
+    w34::hc_mix_streams_hadamard_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
         static_cast<const __half*>(residual_in),
         static_cast<const __half*>(up_raw_in),
         static_cast<__half*>(mixed_out),
@@ -466,7 +479,8 @@ int w34_hc_combine_tap_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::hc_combine_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const unsigned col_blocks = (unsigned)(((hidden_size + 255) / 256 < 64) ? ((hidden_size + 255) / 256) : 64);
+    w34::hc_combine_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
         static_cast<const __half*>(residual_in),
         static_cast<const __half*>(block_out),
         inject_weights,
@@ -519,7 +533,9 @@ __global__ void qwen4_mtp_broadcast_add_f16_kernel(
     const int tok = blockIdx.x;
     if (tok >= num_tokens) return;
     const __half* emb_row = fc_embed + static_cast<size_t>(tok) * hidden_size;
-    for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+    const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    const int d_stride = (int)gridDim.y * (int)blockDim.x;
+    for (int d = d_start; d < hidden_size; d += d_stride) {
         const __half e = emb_row[d];
         for (int b = 0; b < hc_count; ++b) {
             const size_t idx =
@@ -543,7 +559,8 @@ int w34_qwen4_mtp_broadcast_add_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    qwen4_mtp_broadcast_add_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const unsigned col_blocks = (unsigned)(((hidden_size + 255) / 256 < 64) ? ((hidden_size + 255) / 256) : 64);
+    qwen4_mtp_broadcast_add_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
         static_cast<const __half*>(fc_embed),
         static_cast<const __half*>(fc_hidden),
         static_cast<__half*>(out_multi_hidden),

@@ -87,7 +87,7 @@ __device__ __forceinline__ void gdn_norm_qk_warp(
 // `GdnChunkOWmmaKernel`, fused across chunks so persistent state `H [128, 64]` remains in FP32
 // `wmma::accumulator` registers across the entire sequence while checkpoints clamp `tile_len` to
 // hit exact token offsets. Used as the 0-scratch fallback when split WY workspace is unavailable.
-static constexpr int kWy64SmemBytes = 99072;
+static constexpr int kWy64SmemBytes = 101120;
 
 __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
     w34_gdn_batch batch,
@@ -109,6 +109,7 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
     constexpr int BT = 64;
     constexpr int BV = 64;
     constexpr int DK = 128;
+    constexpr int S_H_STRIDE = BV + 8;  // 72 __halfs (144 B): eliminates 32-bank wmma conflicts on s_H
 
     const int i_v = blockIdx.x;
     const int i_nh = blockIdx.y;
@@ -135,16 +136,16 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
     float* s_H_f32 = reinterpret_cast<float*>(smem_raw);
     __half* s_Q = reinterpret_cast<__half*>(smem_raw);
     __half* s_W = reinterpret_cast<__half*>(smem_raw + 16384);
-    // [32768 .. 49152): s_H [128, 64] __half (16 KiB)
+    // [32768 .. 51200): s_H [128, 72] __half (18 KiB, +8 __half row skew)
     __half* s_H = reinterpret_cast<__half*>(smem_raw + 32768);
-    // [49152 .. 65536): s_K [64, 128] __half (16 KiB)
-    __half* s_K = reinterpret_cast<__half*>(smem_raw + 49152);
-    // [65536 .. 81920): s_A [64, 64] float (16 KiB)
-    float* s_A = reinterpret_cast<float*>(smem_raw + 65536);
-    // [81920 .. 98304): s_T [64, 64] float (16 KiB)
-    float* s_T = reinterpret_cast<float*>(smem_raw + 81920);
-    // [98304 .. 99072): s_g[64], s_eg[64], s_beta[64] (768 B)
-    float* s_g = reinterpret_cast<float*>(smem_raw + 98304);
+    // [51200 .. 67584): s_K [64, 128] __half (16 KiB)
+    __half* s_K = reinterpret_cast<__half*>(smem_raw + 51200);
+    // [67584 .. 83968): s_A [64, 64] float (16 KiB)
+    float* s_A = reinterpret_cast<float*>(smem_raw + 67584);
+    // [83968 .. 100352): s_T [64, 64] float (16 KiB)
+    float* s_T = reinterpret_cast<float*>(smem_raw + 83968);
+    // [100352 .. 101120): s_g[64], s_eg[64], s_beta[64] (768 B)
+    float* s_g = reinterpret_cast<float*>(smem_raw + 100352);
     float* s_eg = s_g + 64;
     float* s_beta = s_g + 128;
 
@@ -164,7 +165,7 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
             const int k = idx & 127;
             const float val = head_in[(size_t)(vbase + vc) * DK + k];
             s_H_f32[k * BV + vc] = val;
-            s_H[k * BV + vc] = __float2half(val);
+            s_H[k * S_H_STRIDE + vc] = __float2half(val);
         }
         __syncthreads();
 #pragma unroll
@@ -174,7 +175,7 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
         }
         __syncthreads();
     } else {
-        for (int idx = tid; idx < DK * BV; idx += 256) {
+        for (int idx = tid; idx < DK * S_H_STRIDE; idx += 256) {
             s_H[idx] = __float2half(0.0f);
         }
 #pragma unroll
@@ -534,7 +535,7 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
                 FragA_Row a;
                 FragB_Row b;
                 wmma::load_matrix_sync(a, s_W + (it * 16) * DK + d, DK);
-                wmma::load_matrix_sync(b, s_H + d * BV + (vt * 16), BV);
+                wmma::load_matrix_sync(b, s_H + d * S_H_STRIDE + (vt * 16), S_H_STRIDE);
                 wmma::mma_sync(acc, a, b, acc);
             }
             wmma::store_matrix_sync(s_A + (it * 16) * BV + (vt * 16), acc, BV, wmma::mem_row_major);
@@ -562,7 +563,7 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
                 FragB_Row bh;
                 FragB_Col bk;
                 wmma::load_matrix_sync(aq, s_Q + (it * 16) * DK + d, DK);
-                wmma::load_matrix_sync(bh, s_H + d * BV + (ct * 16), BV);
+                wmma::load_matrix_sync(bh, s_H + d * S_H_STRIDE + (ct * 16), S_H_STRIDE);
                 wmma::load_matrix_sync(bk, s_K + (ct * 16) * DK + d, DK);
                 wmma::mma_sync(acc_qh, aq, bh, acc_qh);
                 wmma::mma_sync(acc_qk, aq, bk, acc_qk);
@@ -659,7 +660,9 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
             __syncthreads();
             if (!is_last_chunk) {
                 for (int idx = tid; idx < DK * BV; idx += 256) {
-                    s_H[idx] = __float2half(s_H_f32[idx]);
+                    const int k = idx >> 6;
+                    const int vc = idx & 63;
+                    s_H[k * S_H_STRIDE + vc] = __float2half(s_H_f32[idx]);
                 }
             }
             if (need_ckpt) {

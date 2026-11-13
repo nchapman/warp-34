@@ -40,14 +40,16 @@ __global__ void ple_dequant_f8_to_f16_kernel(
     if (tok >= num_tokens) return;
     const size_t base = (size_t)tok * embed_dim;
     __half* dst = f16_out + base;
+    const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    const int d_stride = (int)gridDim.y * (int)blockDim.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
-        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+        for (int d = d_start; d < embed_dim; d += d_stride) {
             dst[d] = __float2half(0.0f);
         }
         return;
     }
     const uint8_t* src = f8_in + base;
-    for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+    for (int d = d_start; d < embed_dim; d += d_stride) {
         const float val = ple_f8_e4m3_to_f32(src[d]) * weight_scale;
         dst[d] = __float2half(val);
     }
@@ -66,8 +68,10 @@ __global__ void ple_dequant_lut4_to_f16_kernel(
     if (tok >= num_tokens) return;
     const int embed_dim = num_heads * head_dim;
     __half* dst = f16_out + (size_t)tok * embed_dim;
+    const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+    const int d_stride = (int)gridDim.y * (int)blockDim.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
-        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+        for (int d = d_start; d < embed_dim; d += d_stride) {
             dst[d] = __float2half(0.0f);
         }
         return;
@@ -83,7 +87,7 @@ __global__ void ple_dequant_lut4_to_f16_kernel(
     const int head_stride = packed_bytes + num_groups * 2;
     const uint8_t* tok_src = raw_in + (size_t)tok * num_heads * head_stride;
 
-    for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+    for (int d = d_start; d < embed_dim; d += d_stride) {
         const int h = d / head_dim;
         const int col = d - h * head_dim;
         const uint8_t* head_ptr = tok_src + (size_t)h * head_stride;
@@ -109,13 +113,17 @@ __global__ void ple_dequant_f8_hadamard_to_f16_kernel(
     const size_t base = (size_t)tok * embed_dim;
     __half* dst = f16_out + base;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
-        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+        const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+        const int d_stride = (int)gridDim.y * (int)blockDim.x;
+        for (int d = d_start; d < embed_dim; d += d_stride) {
             dst[d] = __float2half(0.0f);
         }
         return;
     }
     const uint8_t* src = f8_in + base;
-    for (int base_col = 0; base_col < embed_dim; base_col += (int)blockDim.x * 4) {
+    const int tile_span = (int)blockDim.x * 4;
+    const int grid_span = (int)gridDim.y * tile_span;
+    for (int base_col = (int)blockIdx.y * tile_span; base_col < embed_dim; base_col += grid_span) {
         const int col0 = base_col + (int)threadIdx.x * 4;
         if (col0 < embed_dim) {
             __half h[4];
@@ -144,7 +152,9 @@ __global__ void ple_dequant_lut4_hadamard_to_f16_kernel(
     const int embed_dim = num_heads * head_dim;
     __half* dst = f16_out + (size_t)tok * embed_dim;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) {
-        for (int d = threadIdx.x; d < embed_dim; d += blockDim.x) {
+        const int d_start = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
+        const int d_stride = (int)gridDim.y * (int)blockDim.x;
+        for (int d = d_start; d < embed_dim; d += d_stride) {
             dst[d] = __float2half(0.0f);
         }
         return;
@@ -160,7 +170,9 @@ __global__ void ple_dequant_lut4_hadamard_to_f16_kernel(
     const int head_stride = packed_bytes + num_groups * 2;
     const uint8_t* tok_src = raw_in + (size_t)tok * num_heads * head_stride;
 
-    for (int base_col = 0; base_col < embed_dim; base_col += (int)blockDim.x * 4) {
+    const int tile_span = (int)blockDim.x * 4;
+    const int grid_span = (int)gridDim.y * tile_span;
+    for (int base_col = (int)blockIdx.y * tile_span; base_col < embed_dim; base_col += grid_span) {
         const int col0 = base_col + (int)threadIdx.x * 4;
         if (col0 < embed_dim) {
             __half h[4];
@@ -566,7 +578,8 @@ int w34_ple_dequant_f8_to_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::ple_dequant_f8_to_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const unsigned col_blocks = (unsigned)(((embed_dim + 255) / 256 < 64) ? ((embed_dim + 255) / 256) : 64);
+    w34::ple_dequant_f8_to_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
         f8_in,
         static_cast<__half*>(f16_out),
         valid_token_mask,
@@ -589,7 +602,8 @@ int w34_ple_dequant_f8_hadamard_to_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::ple_dequant_f8_hadamard_to_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const unsigned col_blocks = (unsigned)(((embed_dim + 1023) / 1024 < 64) ? ((embed_dim + 1023) / 1024) : 64);
+    w34::ple_dequant_f8_hadamard_to_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
         f8_in,
         static_cast<__half*>(f16_out),
         valid_token_mask,
@@ -616,7 +630,9 @@ int w34_ple_dequant_lut4_to_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::ple_dequant_lut4_to_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const int embed_dim = num_heads * head_dim;
+    const unsigned col_blocks = (unsigned)(((embed_dim + 255) / 256 < 64) ? ((embed_dim + 255) / 256) : 64);
+    w34::ple_dequant_lut4_to_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
         raw_in,
         lut16,
         static_cast<__half*>(f16_out),
@@ -646,7 +662,9 @@ int w34_ple_dequant_lut4_hadamard_to_f16(
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
-    w34::ple_dequant_lut4_hadamard_to_f16_kernel<<<num_tokens, 256, 0, stream>>>(
+    const int embed_dim = num_heads * head_dim;
+    const unsigned col_blocks = (unsigned)(((embed_dim + 1023) / 1024 < 64) ? ((embed_dim + 1023) / 1024) : 64);
+    w34::ple_dequant_lut4_hadamard_to_f16_kernel<<<dim3((unsigned)num_tokens, col_blocks), 256, 0, stream>>>(
         raw_in,
         lut16,
         static_cast<__half*>(f16_out),

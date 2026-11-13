@@ -280,7 +280,8 @@ __global__ __launch_bounds__(128, 4) void moe_sparse_vec4_kernel(
         const int grp = tid >> 4;
         const int lane16 = tid & 15;
         if (grp < valid_cnt) {
-            const int p = pair_v[grp];
+            const int p =
+                (grp == 0) ? pair_v[0] : ((grp == 1) ? pair_v[1] : ((grp == 2) ? pair_v[2] : pair_v[3]));
             if (p >= 0) {
                 for (int b64 = 0; b64 < cta_rows; b64 += 64) {
                     if (cta_base_row + b64 < N) {

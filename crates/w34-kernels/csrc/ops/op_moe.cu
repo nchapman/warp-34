@@ -385,7 +385,8 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
     int num_experts,
     int k_hidden,
     int n_interm,
-    int group_size) {
+    int group_size,
+    bool subwarp_vec = false) {
     static_assert(BITS == 2 || BITS == 4, "BITS must be 2 or 4");
     static_assert(!HAS_ZP || BITS == 4, "HAS_ZP requires BITS == 4");
     using w_vec_t = typename std::conditional<BITS == 2, uint2, uint4>::type;
@@ -395,8 +396,6 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
 
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5; // 0..3
-    const int out_col = blockIdx.x * 4 + wid;
-    if (out_col >= k_hidden) return;
 
     const int chunks8_per_row = (FIXED_WORDS_PER_ROW > 0) ? FIXED_WORDS_PER_ROW : (n_interm >> 3);
     const int row_stride_words = (BITS == 2) ? (chunks8_per_row >> 1) : chunks8_per_row;
@@ -406,16 +405,19 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
         : -1;
     const int groups_per_row = (n_interm + group_size - 1) / group_size;
 
-    float total_sum = 0.0f;
-
     if (!HAS_ZP && FIXED_WORDS_PER_ROW > 0 && (FIXED_WORDS_PER_ROW & 3) == 0 &&
-        FIXED_TOP_K > 0 && (words_per_group & 3) == 0 &&
-        (((uintptr_t)down_packed) & kVecAlignMask) == 0u) {
+        FIXED_TOP_K > 0 && subwarp_vec) {
         constexpr int kU4PerRow = FIXED_WORDS_PER_ROW >> 2;
         constexpr int kFixedRowStrideWords = (BITS == 2) ? (FIXED_WORDS_PER_ROW >> 1) : FIXED_WORDS_PER_ROW;
         constexpr int kLpr =
             (kU4PerRow >= 32) ? 32 : (kU4PerRow >= 16) ? 16 : (kU4PerRow >= 8) ? 8 : 4;
+        constexpr int kRpw = 32 / kLpr;
+        const int sub_lane = lane & (kLpr - 1);
+        const int sub_row = lane / kLpr;
+        const int out_col = blockIdx.x * (4 * kRpw) + wid * kRpw + sub_row;
+        if (out_col >= k_hidden) return;
         const int w_cols_per_group = words_per_group >> 2;
+        float total_sum = 0.0f;
 #pragma unroll
         for (int slot = 0; slot < FIXED_TOP_K; ++slot) {
             const int pair_idx = tok * FIXED_TOP_K + slot;
@@ -429,27 +431,25 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
             const __half* ds_ptr = down_scales + row_idx * groups_per_row;
 
             float dot = 0.0f;
-            if (lane < kLpr) {
 #pragma unroll
-                for (int w_col = lane; w_col < kU4PerRow; w_col += kLpr) {
-                    const int g_idx = w_col / w_cols_per_group;
-                    const int x_col0 = w_col * 4;
-                    const w_vec_t dw4 = __ldg(&dw_u4[w_col]);
-                    const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
-                    const uint32_t* dw_words = reinterpret_cast<const uint32_t*>(&dw4);
+            for (int w_col = sub_lane; w_col < kU4PerRow; w_col += kLpr) {
+                const int g_idx = w_col / w_cols_per_group;
+                const int x_col0 = w_col * 4;
+                const w_vec_t dw4 = __ldg(&dw_u4[w_col]);
+                const __half2 ds_h2 = __half2half2(__ldg(&ds_ptr[g_idx]));
+                const uint32_t* dw_words = reinterpret_cast<const uint32_t*>(&dw4);
 #pragma unroll
-                    for (int word_i = 0; word_i < 4; ++word_i) {
-                        const uint32_t dw = (BITS == 2) ? dw_words[word_i >> 1] : dw_words[word_i];
-                        const uint4 xv = __ldg(&x_vec4[x_col0 + word_i]);
-                        const __half2* xh2 = reinterpret_cast<const __half2*>(&xv);
+                for (int word_i = 0; word_i < 4; ++word_i) {
+                    const uint32_t dw = (BITS == 2) ? dw_words[word_i >> 1] : dw_words[word_i];
+                    const uint4 xv = __ldg(&x_vec4[x_col0 + word_i]);
+                    const __half2* xh2 = reinterpret_cast<const __half2*>(&xv);
 #pragma unroll
-                        for (int p = 0; p < 4; ++p) {
-                            const __half2 dwh2 = (BITS == 2)
-                                ? unpack_u2b2_pair_scaled_h2(dw, ((word_i & 1) << 2) + p, ds_h2)
-                                : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
-                            dot += __low2float(dwh2) * __low2float(xh2[p]) +
-                                   __high2float(dwh2) * __high2float(xh2[p]);
-                        }
+                    for (int p = 0; p < 4; ++p) {
+                        const __half2 dwh2 = (BITS == 2)
+                            ? unpack_u2b2_pair_scaled_h2(dw, ((word_i & 1) << 2) + p, ds_h2)
+                            : unpack_u4b8_pair_scaled_h2(dw, p, ds_h2);
+                        dot += __low2float(dwh2) * __low2float(xh2[p]) +
+                               __high2float(dwh2) * __high2float(xh2[p]);
                     }
                 }
             }
@@ -459,7 +459,28 @@ __global__ void __launch_bounds__(128, 8) moe_w4a16_down_accum_f16_kernel(
             }
             total_sum += __half2float(__hmul(__float2half_rn(dot), tw_h));
         }
-    } else if constexpr (FIXED_WORDS_PER_ROW > 0 && FIXED_TOP_K > 0) {
+        if (sub_lane == 0) {
+            __half res_h = __float2half_rn(total_sum);
+            if (shared_expert_out != nullptr) {
+                __half sh_h = shared_expert_out[(size_t)tok * k_hidden + out_col];
+                if (shared_expert_gate_logits != nullptr) {
+                    const float gl = __half2float(shared_expert_gate_logits[tok]);
+                    const __half sig_h = __float2half_rn(__fdiv_rn(1.0f, 1.0f + __nv_expf(-gl)));
+                    sh_h = __hmul(sig_h, sh_h);
+                }
+                res_h = __hadd(res_h, sh_h);
+            }
+            out[(size_t)tok * k_hidden + out_col] = res_h;
+        }
+        return;
+    }
+
+    const int out_col = blockIdx.x * 4 + wid;
+    if (out_col >= k_hidden) return;
+
+    float total_sum = 0.0f;
+
+    if constexpr (FIXED_WORDS_PER_ROW > 0 && FIXED_TOP_K > 0) {
         constexpr int kFixedRowStrideWords = (BITS == 2) ? (FIXED_WORDS_PER_ROW >> 1) : FIXED_WORDS_PER_ROW;
 #pragma unroll
         for (int slot = 0; slot < FIXED_TOP_K; ++slot) {
@@ -1331,7 +1352,8 @@ static int moe_wna16_down_accum_f16_impl(
     if (ex == nullptr || interm_in == nullptr || down_packed == nullptr || down_scales == nullptr ||
         topk_ids == nullptr || topk_weights == nullptr || out == nullptr || num_tokens < 0 ||
         top_k <= 0 || num_experts <= 0 || k_hidden <= 0 || n_interm <= 0 ||
-        (n_interm % kPackFactor) != 0 || group_size <= 0 || (group_size % kPackFactor) != 0) {
+        (n_interm % kPackFactor) != 0 || group_size <= 0 || (group_size % kPackFactor) != 0 ||
+        (((uintptr_t)interm_in) & 15u) != 0u || (((uintptr_t)down_packed) & 3u) != 0u) {
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens == 0) return 0;
@@ -1380,42 +1402,54 @@ static int moe_wna16_down_accum_f16_impl(
         }
         return (int)cudaGetLastError();
     }
-    dim3 grid((unsigned)((k_hidden + 3) / 4), (unsigned)num_tokens);
+    constexpr uintptr_t kDownAlign = (BITS == 2) ? 7u : 15u;
+    const bool subwarp_vec = (((group_size >> 3) & 3) == 0) &&
+                             ((((uintptr_t)down_packed) & kDownAlign) == 0u) &&
+                             ((((uintptr_t)interm_in) & 15u) == 0u);
+    auto grid_for_cols = [&](int cols_per_cta) {
+        return dim3((unsigned)((k_hidden + cols_per_cta - 1) / cols_per_cta), (unsigned)num_tokens);
+    };
     if (n_interm == kMoeInterm256 && top_k == kMoeTopK8) {
+        const dim3 grid = grid_for_cols(subwarp_vec ? 16 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow256, kMoeTopK8, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
     } else if (n_interm == kMoeInterm512 && top_k == kMoeTopK8) {
+        const dim3 grid = grid_for_cols(subwarp_vec ? 8 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow512, kMoeTopK8, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
     } else if (n_interm == kMoeInterm256 && top_k == kMoeTopK10) {
+        const dim3 grid = grid_for_cols(subwarp_vec ? 16 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow256, kMoeTopK10, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
     } else if (n_interm == kMoeInterm512 && top_k == kMoeTopK10) {
+        const dim3 grid = grid_for_cols(subwarp_vec ? 8 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow512, kMoeTopK10, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
     } else if (n_interm == kMoeInterm640 && top_k == kMoeTopK10) {
+        const dim3 grid = grid_for_cols(subwarp_vec ? 8 : 4);
         moe_w4a16_down_accum_f16_kernel<false, kWordsPerRow640, kMoeTopK10, BITS>
             <<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
                 (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
                 (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+                num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, subwarp_vec);
     } else {
+        const dim3 grid = grid_for_cols(4);
         moe_w4a16_down_accum_f16_kernel<false, 0, 0, BITS><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)interm_in, down_packed, (const __half*)down_scales, nullptr, topk_ids, topk_weights,
             (const __half*)shared_expert_out, (const __half*)shared_expert_gate_logits, (__half*)out,
-            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size);
+            num_tokens, top_k, num_experts, k_hidden, n_interm, group_size, false);
     }
     return (int)cudaGetLastError();
 }
