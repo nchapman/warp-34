@@ -171,19 +171,81 @@ __global__ void sampler_scatter_sparse_kernel(
     }
 }
 
-__device__ __forceinline__ uint64_t radix_kth_largest_key(
+static constexpr uint32_t kSamplerCandCap = 2048u;
+
+__device__ __forceinline__ void warp_add_bin_mass_hist(
+    uint32_t b,
+    double val,
+    double* s_mass,
+    uint32_t* s_hist) {
+    const uint32_t active = __activemask();
+    const int lane = (int)(threadIdx.x & 31);
+    if (active == 0xffffffffu) {
+        const uint32_t b0 = __shfl_sync(0xffffffffu, b, 0);
+        if (__all_sync(0xffffffffu, b == b0)) {
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const uint64_t bits = (uint64_t)__double_as_longlong(val);
+                const uint32_t lo = __shfl_xor_sync(0xffffffffu, (uint32_t)bits, off);
+                const uint32_t hi = __shfl_xor_sync(0xffffffffu, (uint32_t)(bits >> 32), off);
+                val += __longlong_as_double((int64_t)(((uint64_t)hi << 32) | (uint64_t)lo));
+            }
+            if (lane == 0) {
+                atomicAdd(&s_mass[b0], val);
+                atomicAdd(&s_hist[b0], 32u);
+            }
+            return;
+        }
+    }
+    const uint32_t peers = __match_any_sync(active, b);
+    const int cnt = __popc(peers);
+    if (cnt <= 2) {
+        atomicAdd(&s_mass[b], val);
+        atomicAdd(&s_hist[b], 1u);
+        return;
+    }
+    const int leader = __ffs((int)peers) - 1;
+    const uint64_t bits = (uint64_t)__double_as_longlong(val);
+    const uint32_t lo = (uint32_t)bits;
+    const uint32_t hi = (uint32_t)(bits >> 32);
+    double sum = 0.0;
+    uint32_t m = peers;
+    while (m != 0u) {
+        const int src = __ffs((int)m) - 1;
+        const uint32_t s_lo = __shfl_sync(peers, lo, src);
+        const uint32_t s_hi = __shfl_sync(peers, hi, src);
+        if (lane == leader) {
+            sum += __longlong_as_double((int64_t)(((uint64_t)s_hi << 32) | (uint64_t)s_lo));
+        }
+        m &= (m - 1u);
+    }
+    if (lane == leader) {
+        atomicAdd(&s_mass[b], sum);
+        atomicAdd(&s_hist[b], (uint32_t)cnt);
+    }
+}
+
+__device__ __noinline__ uint64_t radix_kth_largest_key(
     const float* __restrict__ row_logit,
     int vocab_size,
     uint64_t min_key,
     uint32_t k_target,
     uint32_t* s_hist,
     uint64_t* s_prefix,
-    uint32_t* s_rem_k) {
+    uint32_t* s_rem_k,
+    int32_t* s_cand,
+    float* s_cand_logit,
+    uint32_t* s_cand_cnt,
+    uint64_t* s_exact_key) {
     if (threadIdx.x == 0) {
         *s_prefix = 0ull;
         *s_rem_k = k_target;
+        *s_cand_cnt = 0u;
     }
     __syncthreads();
+
+    bool use_cand = false;
+    uint32_t cand_n = 0u;
 
     for (int pass = 0; pass < 8; ++pass) {
         if (threadIdx.x < 256) s_hist[threadIdx.x] = 0u;
@@ -192,13 +254,22 @@ __device__ __forceinline__ uint64_t radix_kth_largest_key(
         const uint64_t pref = *s_prefix;
         const int shift = 56 - pass * 8;
         const int hi_shift = 64 - pass * 8;
-        for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-            const uint64_t key = make_rank_key(row_logit[tid], tid);
-            if (key >= min_key && (pass == 0 || (key >> hi_shift) == (pref >> hi_shift))) {
-                const uint32_t b = (uint32_t)((key >> shift) & 0xffu);
-                const uint32_t peers = __match_any_sync(__activemask(), b);
-                if (((int)(threadIdx.x & 31)) == (__ffs((int)peers) - 1)) {
-                    atomicAdd(&s_hist[b], (uint32_t)__popc(peers));
+        if (!use_cand) {
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                const uint64_t key = make_rank_key(row_logit[tid], tid);
+                if (key >= min_key && (pass == 0 || (key >> hi_shift) == (pref >> hi_shift))) {
+                    const uint32_t b = (uint32_t)((key >> shift) & 0xffu);
+                    const uint32_t peers = __match_any_sync(__activemask(), b);
+                    if (((int)(threadIdx.x & 31)) == (__ffs((int)peers) - 1)) {
+                        atomicAdd(&s_hist[b], (uint32_t)__popc(peers));
+                    }
+                }
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                const uint64_t key = make_rank_key(s_cand_logit[i], s_cand[i]);
+                if ((key >> hi_shift) == (pref >> hi_shift)) {
+                    atomicAdd(&s_hist[(uint32_t)((key >> shift) & 0xffu)], 1u);
                 }
             }
         }
@@ -227,57 +298,76 @@ __device__ __forceinline__ uint64_t radix_kth_largest_key(
             }
             *s_prefix = pref | (uint64_t(chosen) << shift);
             *s_rem_k = rem;
+            *s_cand_cnt = s_hist[chosen];
         }
         __syncthreads();
-    }
-    return *s_prefix;
-}
 
-__device__ __forceinline__ void warp_atomic_add_bin_mass_and_hist(
-    uint32_t b,
-    double val,
-    double* s_mass,
-    uint32_t* s_hist) {
-    const uint32_t active = __activemask();
-    const uint32_t peers = __match_any_sync(active, b);
-    const int lane = (int)(threadIdx.x & 31);
-    const int leader = __ffs((int)peers) - 1;
-    if (peers == (1u << lane)) {
-        atomicAdd(&s_mass[b], val);
-        atomicAdd(&s_hist[b], 1u);
-        return;
-    }
-    const uint64_t bits = __double_as_longlong(val);
-    const uint32_t lo = (uint32_t)bits;
-    const uint32_t hi = (uint32_t)(bits >> 32);
-    double sum = 0.0;
-    uint32_t m = peers;
-    while (m != 0u) {
-        const int src = __ffs((int)m) - 1;
-        const uint32_t s_lo = __shfl_sync(peers, lo, src);
-        const uint32_t s_hi = __shfl_sync(peers, hi, src);
-        if (lane == leader) {
-            sum += __longlong_as_double(((int64_t)s_hi << 32) | (int64_t)s_lo);
+        const uint32_t chosen_cnt = *s_cand_cnt;
+        const uint64_t new_pref = *s_prefix;
+        const int next_hi_shift = 56 - pass * 8;
+
+        if (chosen_cnt == 1u && pass < 7) {
+            if (use_cand) {
+                for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                    const uint64_t key = make_rank_key(s_cand_logit[i], s_cand[i]);
+                    if ((key >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                        *s_exact_key = key;
+                    }
+                }
+            } else {
+                for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                    const uint64_t key = make_rank_key(row_logit[tid], tid);
+                    if (key >= min_key && (key >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                        *s_exact_key = key;
+                    }
+                }
+            }
+            __syncthreads();
+            const uint64_t exact = *s_exact_key;
+            __syncthreads();
+            return exact;
         }
-        m &= (m - 1u);
+
+        if (!use_cand && chosen_cnt > 1u && chosen_cnt <= kSamplerCandCap && pass < 7) {
+            __syncthreads();
+            if (threadIdx.x == 0) *s_cand_cnt = 0u;
+            __syncthreads();
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                const float l = row_logit[tid];
+                const uint64_t key = make_rank_key(l, tid);
+                if (key >= min_key && (key >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                    const uint32_t slot = atomicAdd(s_cand_cnt, 1u);
+                    if (slot < kSamplerCandCap) {
+                        s_cand[slot] = tid;
+                        s_cand_logit[slot] = l;
+                    }
+                }
+            }
+            __syncthreads();
+            cand_n = *s_cand_cnt;
+            use_cand = (cand_n <= kSamplerCandCap);
+            __syncthreads();
+        }
     }
-    if (lane == leader) {
-        atomicAdd(&s_mass[b], sum);
-        atomicAdd(&s_hist[b], (uint32_t)__popc(peers));
-    }
+    const uint64_t out = *s_prefix;
+    __syncthreads();
+    return out;
 }
 
-__device__ __forceinline__ uint64_t radix_descending_mass_key(
-    const float* __restrict__ row_logit,
-    const float* __restrict__ row_prob,
-    int vocab_size,
+__device__ __noinline__ uint64_t radix_descending_mass_key_cand(
+    const int32_t* __restrict__ s_cand,
+    const float* __restrict__ s_cand_logit,
+    const float* __restrict__ s_cand_prob,
+    uint32_t cand_n,
     uint64_t min_key,
     bool require_positive_prob,
     double target_mass,
     double* s_mass,
     uint32_t* s_hist,
     uint64_t* s_prefix,
-    double* s_rem_mass) {
+    double* s_rem_mass,
+    uint32_t* s_chosen_cnt_out,
+    uint64_t* s_exact_key) {
     if (threadIdx.x == 0) {
         *s_prefix = 0ull;
         *s_rem_mass = target_mass;
@@ -294,13 +384,14 @@ __device__ __forceinline__ uint64_t radix_descending_mass_key(
         const uint64_t pref = *s_prefix;
         const int shift = 56 - pass * 8;
         const int hi_shift = 64 - pass * 8;
-        for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-            const float p = row_prob[tid];
+        for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+            const float p = s_cand_prob[i];
             if (require_positive_prob && !(p > 0.0f)) continue;
-            const uint64_t key = make_rank_key(row_logit[tid], tid);
+            const uint64_t key = make_rank_key(s_cand_logit[i], s_cand[i]);
             if (key >= min_key && (pass == 0 || (key >> hi_shift) == (pref >> hi_shift))) {
                 const uint32_t b = (uint32_t)((key >> shift) & 0xffu);
-                warp_atomic_add_bin_mass_and_hist(b, (double)p, s_mass, s_hist);
+                atomicAdd(&s_mass[b], (double)p);
+                atomicAdd(&s_hist[b], 1u);
             }
         }
         __syncthreads();
@@ -328,15 +419,37 @@ __device__ __forceinline__ uint64_t radix_descending_mass_key(
             }
             *s_prefix = pref | (uint64_t(chosen) << shift);
             *s_rem_mass = rem;
+            *s_chosen_cnt_out = s_hist[chosen];
         }
         __syncthreads();
+
+        if (*s_chosen_cnt_out == 1u && pass < 7) {
+            const uint64_t new_pref = *s_prefix;
+            const int next_hi_shift = 56 - pass * 8;
+            for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                const float p = s_cand_prob[i];
+                if (require_positive_prob && !(p > 0.0f)) continue;
+                const uint64_t key = make_rank_key(s_cand_logit[i], s_cand[i]);
+                if (key >= min_key && (key >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                    *s_exact_key = key;
+                }
+            }
+            __syncthreads();
+            const uint64_t exact = *s_exact_key;
+            __syncthreads();
+            return exact;
+        }
     }
-    return *s_prefix;
+    const uint64_t out = *s_prefix;
+    __syncthreads();
+    return out;
 }
 
-__device__ __forceinline__ int32_t radix_ascending_tid_cdf(
-    const float* __restrict__ row_logit,
-    const float* __restrict__ row_prob,
+__device__ __noinline__ int32_t radix_ascending_tid_cdf_cand(
+    const int32_t* __restrict__ s_cand,
+    const float* __restrict__ s_cand_logit,
+    const float* __restrict__ s_cand_prob,
+    uint32_t cand_n,
     int vocab_size,
     uint64_t min_key,
     int32_t exclude_tid,
@@ -344,7 +457,9 @@ __device__ __forceinline__ int32_t radix_ascending_tid_cdf(
     double* s_mass,
     uint32_t* s_hist,
     uint64_t* s_prefix,
-    double* s_rem_mass) {
+    double* s_rem_mass,
+    uint32_t* s_chosen_cnt_out,
+    uint64_t* s_exact_key) {
     if (threadIdx.x == 0) {
         *s_prefix = 0ull;
         *s_rem_mass = target_mass;
@@ -363,16 +478,18 @@ __device__ __forceinline__ int32_t radix_ascending_tid_cdf(
         const uint32_t pref = (uint32_t)(*s_prefix);
         const int shift = 24 - pass * 8;
         const int hi_shift = 32 - pass * 8;
-        for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+        for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+            const int32_t tid = s_cand[i];
             if (tid == exclude_tid) continue;
-            const float p = row_prob[tid];
+            const float p = s_cand_prob[i];
             if (!(p > 0.0f)) continue;
-            const uint64_t key = make_rank_key(row_logit[tid], tid);
+            const uint64_t key = make_rank_key(s_cand_logit[i], tid);
             if (key < min_key) continue;
             const uint32_t u_tid = (uint32_t)tid;
             if (pass == start_pass || (u_tid >> hi_shift) == (pref >> hi_shift)) {
                 const uint32_t b = (u_tid >> shift) & 0xffu;
-                warp_atomic_add_bin_mass_and_hist(b, (double)p, s_mass, s_hist);
+                atomicAdd(&s_mass[b], (double)p);
+                atomicAdd(&s_hist[b], 1u);
             }
         }
         __syncthreads();
@@ -400,10 +517,328 @@ __device__ __forceinline__ int32_t radix_ascending_tid_cdf(
             }
             *s_prefix = uint64_t(pref | (chosen << shift));
             *s_rem_mass = rem;
+            *s_chosen_cnt_out = s_hist[chosen];
         }
         __syncthreads();
+
+        if (*s_chosen_cnt_out == 1u && pass < 3) {
+            const uint32_t new_pref = (uint32_t)(*s_prefix);
+            const int next_hi_shift = 24 - pass * 8;
+            for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                const int32_t tid = s_cand[i];
+                if (tid == exclude_tid) continue;
+                const float p = s_cand_prob[i];
+                if (!(p > 0.0f)) continue;
+                const uint64_t key = make_rank_key(s_cand_logit[i], tid);
+                if (key < min_key) continue;
+                if ((((uint32_t)tid) >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                    *s_exact_key = (uint64_t)(uint32_t)tid;
+                }
+            }
+            __syncthreads();
+            const int32_t exact = (int32_t)(uint32_t)(*s_exact_key);
+            __syncthreads();
+            return exact;
+        }
     }
-    return (int32_t)(uint32_t)(*s_prefix);
+    const int32_t out = (int32_t)(uint32_t)(*s_prefix);
+    __syncthreads();
+    return out;
+}
+
+__device__ __noinline__ uint64_t radix_descending_mass_key(
+    const float* __restrict__ row_logit,
+    const float* __restrict__ row_prob,
+    int vocab_size,
+    uint64_t min_key,
+    bool require_positive_prob,
+    double target_mass,
+    double* s_mass,
+    uint32_t* s_hist,
+    uint64_t* s_prefix,
+    double* s_rem_mass,
+    int32_t* s_cand,
+    float* s_cand_logit,
+    float* s_cand_prob,
+    uint32_t* s_cand_cnt,
+    uint64_t* s_exact_key) {
+    if (threadIdx.x == 0) {
+        *s_prefix = 0ull;
+        *s_rem_mass = target_mass;
+        *s_cand_cnt = 0u;
+    }
+    __syncthreads();
+
+    bool use_cand = false;
+    uint32_t cand_n = 0u;
+
+    for (int pass = 0; pass < 8; ++pass) {
+        if (threadIdx.x < 256) {
+            s_mass[threadIdx.x] = 0.0;
+            s_hist[threadIdx.x] = 0u;
+        }
+        __syncthreads();
+
+        const uint64_t pref = *s_prefix;
+        const int shift = 56 - pass * 8;
+        const int hi_shift = 64 - pass * 8;
+        if (!use_cand) {
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                const float p = row_prob[tid];
+                if (require_positive_prob && !(p > 0.0f)) continue;
+                const uint64_t key = make_rank_key(row_logit[tid], tid);
+                if (key >= min_key && (pass == 0 || (key >> hi_shift) == (pref >> hi_shift))) {
+                    const uint32_t b = (uint32_t)((key >> shift) & 0xffu);
+                    warp_add_bin_mass_hist(b, (double)p, s_mass, s_hist);
+                }
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                const uint64_t key = make_rank_key(s_cand_logit[i], s_cand[i]);
+                if ((key >> hi_shift) == (pref >> hi_shift)) {
+                    const uint32_t b = (uint32_t)((key >> shift) & 0xffu);
+                    atomicAdd(&s_mass[b], (double)s_cand_prob[i]);
+                    atomicAdd(&s_hist[b], 1u);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            double rem = *s_rem_mass;
+            uint32_t chosen = 0u;
+            uint32_t last_nonempty = 0u;
+            bool found = false;
+            for (int b = 255; b >= 0; --b) {
+                if (s_hist[b] > 0u) {
+                    last_nonempty = (uint32_t)b;
+                    const double m = s_mass[b];
+                    if (rem <= m) {
+                        chosen = (uint32_t)b;
+                        found = true;
+                        break;
+                    }
+                    rem -= m;
+                }
+            }
+            if (!found) {
+                chosen = last_nonempty;
+                rem = 0.0;
+            }
+            *s_prefix = pref | (uint64_t(chosen) << shift);
+            *s_rem_mass = rem;
+            *s_cand_cnt = s_hist[chosen];
+        }
+        __syncthreads();
+
+        const uint32_t chosen_cnt = *s_cand_cnt;
+        const uint64_t new_pref = *s_prefix;
+        const int next_hi_shift = 56 - pass * 8;
+
+        if (chosen_cnt == 1u && pass < 7) {
+            if (use_cand) {
+                for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                    const uint64_t key = make_rank_key(s_cand_logit[i], s_cand[i]);
+                    if ((key >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                        *s_exact_key = key;
+                    }
+                }
+            } else {
+                for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                    const float p = row_prob[tid];
+                    if (require_positive_prob && !(p > 0.0f)) continue;
+                    const uint64_t key = make_rank_key(row_logit[tid], tid);
+                    if (key >= min_key && (key >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                        *s_exact_key = key;
+                    }
+                }
+            }
+            __syncthreads();
+            const uint64_t exact = *s_exact_key;
+            __syncthreads();
+            return exact;
+        }
+
+        if (!use_cand && chosen_cnt > 1u && chosen_cnt <= kSamplerCandCap && pass < 7) {
+            __syncthreads();
+            if (threadIdx.x == 0) *s_cand_cnt = 0u;
+            __syncthreads();
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                const float p = row_prob[tid];
+                if (require_positive_prob && !(p > 0.0f)) continue;
+                const float l = row_logit[tid];
+                const uint64_t key = make_rank_key(l, tid);
+                if (key >= min_key && (key >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                    const uint32_t slot = atomicAdd(s_cand_cnt, 1u);
+                    if (slot < kSamplerCandCap) {
+                        s_cand[slot] = tid;
+                        s_cand_logit[slot] = l;
+                        s_cand_prob[slot] = p;
+                    }
+                }
+            }
+            __syncthreads();
+            cand_n = *s_cand_cnt;
+            use_cand = (cand_n <= kSamplerCandCap);
+            __syncthreads();
+        }
+    }
+    const uint64_t out = *s_prefix;
+    __syncthreads();
+    return out;
+}
+
+__device__ __noinline__ int32_t radix_ascending_tid_cdf(
+    const float* __restrict__ row_logit,
+    const float* __restrict__ row_prob,
+    int vocab_size,
+    uint64_t min_key,
+    int32_t exclude_tid,
+    double target_mass,
+    double* s_mass,
+    uint32_t* s_hist,
+    uint64_t* s_prefix,
+    double* s_rem_mass,
+    int32_t* s_cand,
+    float* s_cand_logit,
+    float* s_cand_prob,
+    uint32_t* s_cand_cnt,
+    uint64_t* s_exact_key) {
+    if (threadIdx.x == 0) {
+        *s_prefix = 0ull;
+        *s_rem_mass = target_mass;
+        *s_cand_cnt = 0u;
+    }
+    __syncthreads();
+
+    bool use_cand = false;
+    uint32_t cand_n = 0u;
+
+    const int start_pass =
+        (vocab_size <= 256) ? 3 : ((vocab_size <= 65536) ? 2 : ((vocab_size <= (1 << 24)) ? 1 : 0));
+    for (int pass = start_pass; pass < 4; ++pass) {
+        if (threadIdx.x < 256) {
+            s_mass[threadIdx.x] = 0.0;
+            s_hist[threadIdx.x] = 0u;
+        }
+        __syncthreads();
+
+        const uint32_t pref = (uint32_t)(*s_prefix);
+        const int shift = 24 - pass * 8;
+        const int hi_shift = 32 - pass * 8;
+        if (!use_cand) {
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                if (tid == exclude_tid) continue;
+                const float p = row_prob[tid];
+                if (!(p > 0.0f)) continue;
+                const uint64_t key = make_rank_key(row_logit[tid], tid);
+                if (key < min_key) continue;
+                const uint32_t u_tid = (uint32_t)tid;
+                if (pass == start_pass || (u_tid >> hi_shift) == (pref >> hi_shift)) {
+                    const uint32_t b = (u_tid >> shift) & 0xffu;
+                    warp_add_bin_mass_hist(b, (double)p, s_mass, s_hist);
+                }
+            }
+        } else {
+            for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                const uint32_t u_tid = (uint32_t)s_cand[i];
+                if ((u_tid >> hi_shift) == (pref >> hi_shift)) {
+                    const uint32_t b = (u_tid >> shift) & 0xffu;
+                    atomicAdd(&s_mass[b], (double)s_cand_prob[i]);
+                    atomicAdd(&s_hist[b], 1u);
+                }
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            double rem = *s_rem_mass;
+            uint32_t chosen = 0u;
+            uint32_t last_nonempty = 0u;
+            bool found = false;
+            for (int b = 0; b < 256; ++b) {
+                if (s_hist[b] > 0u) {
+                    last_nonempty = (uint32_t)b;
+                    const double m = s_mass[b];
+                    if (rem < m) {
+                        chosen = (uint32_t)b;
+                        found = true;
+                        break;
+                    }
+                    rem -= m;
+                }
+            }
+            if (!found) {
+                chosen = last_nonempty;
+                rem = 0.0;
+            }
+            *s_prefix = uint64_t(pref | (chosen << shift));
+            *s_rem_mass = rem;
+            *s_cand_cnt = s_hist[chosen];
+        }
+        __syncthreads();
+
+        const uint32_t chosen_cnt = *s_cand_cnt;
+        const uint32_t new_pref = (uint32_t)(*s_prefix);
+        const int next_hi_shift = 24 - pass * 8;
+
+        if (chosen_cnt == 1u && pass < 3) {
+            if (use_cand) {
+                for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                    const uint32_t u_tid = (uint32_t)s_cand[i];
+                    if ((u_tid >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                        *s_exact_key = (uint64_t)u_tid;
+                    }
+                }
+            } else {
+                for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                    if (tid == exclude_tid) continue;
+                    const float p = row_prob[tid];
+                    if (!(p > 0.0f)) continue;
+                    const uint64_t key = make_rank_key(row_logit[tid], tid);
+                    if (key < min_key) continue;
+                    const uint32_t u_tid = (uint32_t)tid;
+                    if ((u_tid >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                        *s_exact_key = (uint64_t)u_tid;
+                    }
+                }
+            }
+            __syncthreads();
+            const int32_t exact = (int32_t)(uint32_t)(*s_exact_key);
+            __syncthreads();
+            return exact;
+        }
+
+        if (!use_cand && chosen_cnt > 1u && chosen_cnt <= kSamplerCandCap && pass < 3) {
+            __syncthreads();
+            if (threadIdx.x == 0) *s_cand_cnt = 0u;
+            __syncthreads();
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                if (tid == exclude_tid) continue;
+                const float p = row_prob[tid];
+                if (!(p > 0.0f)) continue;
+                const float l = row_logit[tid];
+                const uint64_t key = make_rank_key(l, tid);
+                if (key < min_key) continue;
+                const uint32_t u_tid = (uint32_t)tid;
+                if ((u_tid >> next_hi_shift) == (new_pref >> next_hi_shift)) {
+                    const uint32_t slot = atomicAdd(s_cand_cnt, 1u);
+                    if (slot < kSamplerCandCap) {
+                        s_cand[slot] = tid;
+                        s_cand_logit[slot] = l;
+                        s_cand_prob[slot] = p;
+                    }
+                }
+            }
+            __syncthreads();
+            cand_n = *s_cand_cnt;
+            use_cand = (cand_n <= kSamplerCandCap);
+            __syncthreads();
+        }
+    }
+    const int32_t out = (int32_t)(uint32_t)(*s_prefix);
+    __syncthreads();
+    return out;
 }
 
 static constexpr int kFastGreedySplits = 16;
@@ -855,8 +1290,8 @@ __global__ void sampler_scatter_ids_to_tokens_kernel(
     dst_token_ids[i] = (id >= 0) ? id : 0;
 }
 
-// Grid: num_rows, Block: 512 threads (up to 128 regs/thread with 0 stack spill)
-__global__ void __launch_bounds__(512) sampler_step_f16_kernel(
+// Grid: num_rows, Block: 1024 threads (full 32-warp single-SM MLP)
+__global__ void __launch_bounds__(1024, 1) sampler_step_f16_kernel(
     const __half* __restrict__ logits_f16,
     const w34_sampler_row_cfg* __restrict__ row_cfgs,
     const uint32_t* __restrict__ bitmask_u32,
@@ -895,8 +1330,15 @@ __global__ void __launch_bounds__(512) sampler_step_f16_kernel(
     __shared__ uint32_t s_u32[32];
     __shared__ double s_f64[32];
     __shared__ uint64_t s_prefix;
+    __shared__ uint64_t s_exact_key;
     __shared__ uint32_t s_rem_k;
     __shared__ double s_rem_mass;
+    __shared__ int32_t s_cand[kSamplerCandCap];
+    __shared__ float s_cand_logit[kSamplerCandCap];
+    __shared__ float s_cand_prob[kSamplerCandCap];
+    __shared__ uint32_t s_cand_cnt;
+    __shared__ uint32_t s_chosen_cnt;
+    __shared__ float s_draft_prob;
     __shared__ int32_t picked_lp_ids[W34_MAX_TOP_LOGPROBS];
     __shared__ float picked_lp_vals[W34_MAX_TOP_LOGPROBS];
 
@@ -914,6 +1356,8 @@ __global__ void __launch_bounds__(512) sampler_step_f16_kernel(
     }
 
     // 2. Optional raw/biased logprobs + top_logprobs (0..=20)
+    const bool logits_aligned16 = (((uintptr_t)row_logits) & 15u) == 0u;
+    const int vec8_end = logits_aligned16 ? (vocab_size & ~7) : 0;
     float log_z = 0.0f;
     const bool want_logprobs = (cfg.top_logprobs_k >= 0);
     const int k_lp = want_logprobs
@@ -927,18 +1371,61 @@ __global__ void __launch_bounds__(512) sampler_step_f16_kernel(
         float raw_max = -FLT_MAX;
         for (int k = 0; k < iters; ++k) {
             ValIdx best = {-FLT_MAX, -1};
-            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-                bool dup = false;
+            if (row_bias == nullptr && vec8_end > 0) {
+                int32_t min_p_id = INT32_MAX;
+                int32_t max_p_id = -1;
                 for (int p = 0; p < k; ++p) {
-                    if (picked_lp_ids[p] == tid) {
-                        dup = true;
-                        break;
+                    const int32_t pid = picked_lp_ids[p];
+                    if (pid < min_p_id) min_p_id = pid;
+                    if (pid > max_p_id) max_p_id = pid;
+                }
+                for (int col = (int)threadIdx.x * 8; col < vec8_end; col += (int)blockDim.x * 8) {
+                    HalfVec8 hv;
+                    hv.u = __ldg(reinterpret_cast<const uint4*>(row_logits + col));
+                    const bool check_dup = (k > 0 && col + 7 >= min_p_id && col <= max_p_id);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const int tid = col + j;
+                        bool dup = false;
+                        if (check_dup) {
+                            for (int p = 0; p < k; ++p) {
+                                if (picked_lp_ids[p] == tid) {
+                                    dup = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!dup) {
+                            best = better_pair(best, ValIdx{__half2float(hv.h[j]), tid});
+                        }
                     }
                 }
-                if (!dup) {
-                    const float b = (row_bias != nullptr) ? row_bias[tid] : 0.0f;
-                    const float v = __half2float(row_logits[tid]) + b;
-                    best = better_pair(best, ValIdx{v, tid});
+                for (int tid = vec8_end + (int)threadIdx.x; tid < vocab_size; tid += (int)blockDim.x) {
+                    bool dup = false;
+                    for (int p = 0; p < k; ++p) {
+                        if (picked_lp_ids[p] == tid) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        best = better_pair(best, ValIdx{__half2float(row_logits[tid]), tid});
+                    }
+                }
+            } else {
+                for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                    bool dup = false;
+                    for (int p = 0; p < k; ++p) {
+                        if (picked_lp_ids[p] == tid) {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        const float b = (row_bias != nullptr) ? row_bias[tid] : 0.0f;
+                        const float v = __half2float(row_logits[tid]) + b;
+                        best = better_pair(best, ValIdx{v, tid});
+                    }
                 }
             }
             ValIdx win = block_reduce_max_pair(best, s_val, s_idx);
@@ -952,10 +1439,24 @@ __global__ void __launch_bounds__(512) sampler_step_f16_kernel(
             }
         }
         double sum_exp_raw = 0.0;
-        for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-            const float b = (row_bias != nullptr) ? row_bias[tid] : 0.0f;
-            const float v = __half2float(row_logits[tid]) + b;
-            sum_exp_raw += (double)expf(v - raw_max);
+        if (row_bias == nullptr && vec8_end > 0) {
+            for (int col = (int)threadIdx.x * 8; col < vec8_end; col += (int)blockDim.x * 8) {
+                HalfVec8 hv;
+                hv.u = __ldg(reinterpret_cast<const uint4*>(row_logits + col));
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    sum_exp_raw += (double)expf(__half2float(hv.h[j]) - raw_max);
+                }
+            }
+            for (int tid = vec8_end + (int)threadIdx.x; tid < vocab_size; tid += (int)blockDim.x) {
+                sum_exp_raw += (double)expf(__half2float(row_logits[tid]) - raw_max);
+            }
+        } else {
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                const float b = (row_bias != nullptr) ? row_bias[tid] : 0.0f;
+                const float v = __half2float(row_logits[tid]) + b;
+                sum_exp_raw += (double)expf(v - raw_max);
+            }
         }
         sum_exp_raw = block_reduce_sum_f64(sum_exp_raw, s_f64);
         log_z = raw_max + (float)log(fmax(sum_exp_raw, 1e-30));
@@ -969,55 +1470,111 @@ __global__ void __launch_bounds__(512) sampler_step_f16_kernel(
     uint32_t local_nonfinite = 0u;
     ValIdx local_best = {-FLT_MAX, -1};
 
-    for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-        bool allowed = (row_mask == nullptr) ||
-                       ((row_mask[tid >> 5] & (1u << (tid & 31))) != 0u);
-        uint32_t packed_cnt = (row_counts != nullptr) ? row_counts[tid] : 0u;
-        if (allowed && honor_bans && ((packed_cnt >> 31) != 0u)) {
-            allowed = false;
-        }
-        if (!allowed) {
-            if (!is_greedy_policy) {
-                row_logit[tid] = -INFINITY;
-                row_prob[tid] = 0.0f;
+    if (row_mask == nullptr && row_counts == nullptr && row_bias == nullptr && vec8_end > 0) {
+        const bool logit_aligned16 = (((uintptr_t)row_logit) & 15u) == 0u;
+        for (int col = (int)threadIdx.x * 8; col < vec8_end; col += (int)blockDim.x * 8) {
+            HalfVec8 hv;
+            hv.u = __ldg(reinterpret_cast<const uint4*>(row_logits + col));
+            float out8[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int tid = col + j;
+                const float raw = __half2float(hv.h[j]);
+                if (!isfinite(raw)) {
+                    local_nonfinite = 1u;
+                    out8[j] = -INFINITY;
+                } else {
+                    const float l = is_greedy_policy ? raw : (raw * inv_temp);
+                    if (!isfinite(l)) {
+                        local_nonfinite = 1u;
+                        out8[j] = -INFINITY;
+                    } else {
+                        out8[j] = l;
+                        local_valid += 1u;
+                        local_best = better_pair(local_best, ValIdx{l, tid});
+                    }
+                }
             }
-            continue;
-        }
-        const float raw = __half2float(row_logits[tid]);
-        if (!isfinite(raw)) {
-            local_nonfinite = 1u;
             if (!is_greedy_policy) {
-                row_logit[tid] = -INFINITY;
-                row_prob[tid] = 0.0f;
+                if (logit_aligned16) {
+                    *reinterpret_cast<float4*>(row_logit + col) =
+                        make_float4(out8[0], out8[1], out8[2], out8[3]);
+                    *reinterpret_cast<float4*>(row_logit + col + 4) =
+                        make_float4(out8[4], out8[5], out8[6], out8[7]);
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) row_logit[col + j] = out8[j];
+                }
             }
-            continue;
         }
-        float l = raw + ((row_bias != nullptr) ? row_bias[tid] : 0.0f);
-        const bool in_prompt = ((packed_cnt >> 30) & 1u) != 0u;
-        const uint32_t out_cnt = packed_cnt & 0x3fffffffu;
-        if ((in_prompt || out_cnt > 0u) && has_rep) {
-            l = (l > 0.0f) ? (l / cfg.repetition_penalty) : (l * cfg.repetition_penalty);
+        for (int tid = vec8_end + (int)threadIdx.x; tid < vocab_size; tid += (int)blockDim.x) {
+            const float raw = __half2float(row_logits[tid]);
+            if (!isfinite(raw)) {
+                local_nonfinite = 1u;
+                if (!is_greedy_policy) row_logit[tid] = -INFINITY;
+                continue;
+            }
+            const float l = is_greedy_policy ? raw : (raw * inv_temp);
+            if (!isfinite(l)) {
+                local_nonfinite = 1u;
+                if (!is_greedy_policy) row_logit[tid] = -INFINITY;
+                continue;
+            }
+            if (!is_greedy_policy) row_logit[tid] = l;
+            local_valid += 1u;
+            local_best = better_pair(local_best, ValIdx{l, tid});
         }
-        if (out_cnt > 0u) {
-            l -= cfg.frequency_penalty * (float)out_cnt;
-            l -= cfg.presence_penalty;
-        }
-        if (!is_greedy_policy) {
-            l *= inv_temp;
-        }
-        if (!isfinite(l)) {
-            local_nonfinite = 1u;
+    } else {
+        for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+            bool allowed = (row_mask == nullptr) ||
+                           ((row_mask[tid >> 5] & (1u << (tid & 31))) != 0u);
+            uint32_t packed_cnt = (row_counts != nullptr) ? row_counts[tid] : 0u;
+            if (allowed && honor_bans && ((packed_cnt >> 31) != 0u)) {
+                allowed = false;
+            }
+            if (!allowed) {
+                if (!is_greedy_policy) {
+                    row_logit[tid] = -INFINITY;
+                    row_prob[tid] = 0.0f;
+                }
+                continue;
+            }
+            const float raw = __half2float(row_logits[tid]);
+            if (!isfinite(raw)) {
+                local_nonfinite = 1u;
+                if (!is_greedy_policy) {
+                    row_logit[tid] = -INFINITY;
+                    row_prob[tid] = 0.0f;
+                }
+                continue;
+            }
+            float l = raw + ((row_bias != nullptr) ? row_bias[tid] : 0.0f);
+            const bool in_prompt = ((packed_cnt >> 30) & 1u) != 0u;
+            const uint32_t out_cnt = packed_cnt & 0x3fffffffu;
+            if ((in_prompt || out_cnt > 0u) && has_rep) {
+                l = (l > 0.0f) ? (l / cfg.repetition_penalty) : (l * cfg.repetition_penalty);
+            }
+            if (out_cnt > 0u) {
+                l -= cfg.frequency_penalty * (float)out_cnt;
+                l -= cfg.presence_penalty;
+            }
             if (!is_greedy_policy) {
-                row_logit[tid] = -INFINITY;
-                row_prob[tid] = 0.0f;
+                l *= inv_temp;
             }
-            continue;
+            if (!isfinite(l)) {
+                local_nonfinite = 1u;
+                if (!is_greedy_policy) {
+                    row_logit[tid] = -INFINITY;
+                    row_prob[tid] = 0.0f;
+                }
+                continue;
+            }
+            if (!is_greedy_policy) {
+                row_logit[tid] = l;
+            }
+            local_valid += 1u;
+            local_best = better_pair(local_best, ValIdx{l, tid});
         }
-        if (!is_greedy_policy) {
-            row_logit[tid] = l;
-        }
-        local_valid += 1u;
-        local_best = better_pair(local_best, ValIdx{l, tid});
     }
 
     const uint32_t valid_count = block_reduce_sum_u32(local_valid, s_u32);
@@ -1057,27 +1614,53 @@ __global__ void __launch_bounds__(512) sampler_step_f16_kernel(
         uint64_t min_key = (uint64_t(1u) << 32);
         if (cfg.top_k > 0 && (uint32_t)cfg.top_k < valid_count) {
             min_key = radix_kth_largest_key(
-                row_logit, vocab_size, min_key, (uint32_t)cfg.top_k, s_hist, &s_prefix, &s_rem_k);
+                row_logit, vocab_size, min_key, (uint32_t)cfg.top_k,
+                s_hist, &s_prefix, &s_rem_k, s_cand, s_cand_logit, &s_cand_cnt, &s_exact_key);
         }
 
-        // Stage B: softmax over K >= min_key
+        // Stage B: softmax over K >= min_key (compacts into shared memory whenever <= 2048 tokens survive)
+        const bool guaranteed_compact =
+            (valid_count <= kSamplerCandCap) ||
+            (cfg.top_k > 0 && (uint32_t)cfg.top_k <= kSamplerCandCap);
+        __syncthreads();
+        if (threadIdx.x == 0) s_cand_cnt = 0u;
+        __syncthreads();
+
         const float max_l = winner.val;
         double sum_p_d = 0.0;
         for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-            const uint64_t key = make_rank_key(row_logit[tid], tid);
+            const float l = row_logit[tid];
+            const uint64_t key = make_rank_key(l, tid);
             if (key >= min_key) {
-                const float w = expf(row_logit[tid] - max_l);
-                row_prob[tid] = w;
+                const float w = expf(l - max_l);
                 sum_p_d += (double)w;
-            } else {
+                const uint32_t slot = atomicAdd(&s_cand_cnt, 1u);
+                if (slot < kSamplerCandCap) {
+                    s_cand[slot] = tid;
+                    s_cand_logit[slot] = l;
+                    s_cand_prob[slot] = w;
+                }
+                if (!guaranteed_compact) {
+                    row_prob[tid] = w;
+                }
+            } else if (!guaranteed_compact) {
                 row_prob[tid] = 0.0f;
             }
         }
         const float sum_p = (float)block_reduce_sum_f64(sum_p_d, s_f64);
+        bool use_surv_cand = (s_cand_cnt <= kSamplerCandCap);
+        uint32_t cand_n = use_surv_cand ? s_cand_cnt : 0u;
+
         if (sum_p > 0.0f) {
             const float inv_sum = 1.0f / sum_p;
-            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-                if (row_prob[tid] > 0.0f) row_prob[tid] *= inv_sum;
+            if (use_surv_cand) {
+                for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                    s_cand_prob[i] *= inv_sum;
+                }
+            } else {
+                for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                    if (row_prob[tid] > 0.0f) row_prob[tid] *= inv_sum;
+                }
             }
         }
         __syncthreads();
@@ -1086,88 +1669,200 @@ __global__ void __launch_bounds__(512) sampler_step_f16_kernel(
         if (cfg.min_p > 0.0f && sum_p > 0.0f) {
             const float thresh = (1.0f / sum_p) * cfg.min_p;
             double renorm_d = 0.0;
-            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-                const uint64_t key = make_rank_key(row_logit[tid], tid);
-                if (key >= min_key) {
-                    const float p = row_prob[tid];
+            if (use_surv_cand) {
+                for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                    const int32_t tid = s_cand[i];
+                    const float p = s_cand_prob[i];
                     if (tid == winner.idx || p >= thresh) {
                         renorm_d += (double)p;
                     } else {
-                        row_logit[tid] = -INFINITY;
-                        row_prob[tid] = 0.0f;
+                        s_cand_logit[i] = -INFINITY;
+                        s_cand_prob[i] = 0.0f;
                     }
                 }
-            }
-            const float renorm = (float)block_reduce_sum_f64(renorm_d, s_f64);
-            if (renorm > 0.0f) {
-                const float inv_renorm = 1.0f / renorm;
-                for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-                    if (row_prob[tid] > 0.0f) row_prob[tid] *= inv_renorm;
+                const float renorm = (float)block_reduce_sum_f64(renorm_d, s_f64);
+                if (renorm > 0.0f) {
+                    const float inv_renorm = 1.0f / renorm;
+                    for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                        if (s_cand_prob[i] > 0.0f) s_cand_prob[i] *= inv_renorm;
+                    }
                 }
+                __syncthreads();
+            } else {
+                if (threadIdx.x == 0) s_cand_cnt = 0u;
+                __syncthreads();
+                for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                    const float l = row_logit[tid];
+                    const uint64_t key = make_rank_key(l, tid);
+                    if (key >= min_key) {
+                        const float p = row_prob[tid];
+                        if (tid == winner.idx || p >= thresh) {
+                            renorm_d += (double)p;
+                            const uint32_t slot = atomicAdd(&s_cand_cnt, 1u);
+                            if (slot < kSamplerCandCap) {
+                                s_cand[slot] = tid;
+                                s_cand_logit[slot] = l;
+                                s_cand_prob[slot] = p;
+                            }
+                        } else {
+                            row_logit[tid] = -INFINITY;
+                            row_prob[tid] = 0.0f;
+                        }
+                    }
+                }
+                const float renorm = (float)block_reduce_sum_f64(renorm_d, s_f64);
+                if (s_cand_cnt <= kSamplerCandCap) {
+                    use_surv_cand = true;
+                    cand_n = s_cand_cnt;
+                }
+                if (renorm > 0.0f) {
+                    const float inv_renorm = 1.0f / renorm;
+                    if (use_surv_cand) {
+                        for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                            s_cand_prob[i] *= inv_renorm;
+                        }
+                    } else {
+                        for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                            if (row_prob[tid] > 0.0f) row_prob[tid] *= inv_renorm;
+                        }
+                    }
+                }
+                __syncthreads();
             }
-            __syncthreads();
         }
 
         // Stage C: top_p nucleus cutoff
-        uint32_t surv_local = 0u;
-        for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-            if (make_rank_key(row_logit[tid], tid) >= min_key) surv_local += 1u;
-        }
-        const uint32_t surv_count = block_reduce_sum_u32(surv_local, s_u32);
-        if (cfg.top_p < 1.0f && surv_count > 1u) {
-            min_key = radix_descending_mass_key(
-                row_logit, row_prob, vocab_size, min_key, false, (double)cfg.top_p,
-                s_mass, s_hist, &s_prefix, &s_rem_mass);
-            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-                if (make_rank_key(row_logit[tid], tid) < min_key) {
-                    row_prob[tid] = 0.0f;
-                }
+        if (use_surv_cand) {
+            uint32_t surv_local = 0u;
+            for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                if (make_rank_key(s_cand_logit[i], s_cand[i]) >= min_key) surv_local += 1u;
             }
+            const uint32_t surv_count = block_reduce_sum_u32(surv_local, s_u32);
+            if (cfg.top_p < 1.0f && surv_count > 1u) {
+                min_key = radix_descending_mass_key_cand(
+                    s_cand, s_cand_logit, s_cand_prob, cand_n, min_key, false, (double)cfg.top_p,
+                    s_mass, s_hist, &s_prefix, &s_rem_mass, &s_chosen_cnt, &s_exact_key);
+                for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                    if (make_rank_key(s_cand_logit[i], s_cand[i]) < min_key) {
+                        s_cand_prob[i] = 0.0f;
+                    }
+                }
+                __syncthreads();
+            }
+
+            // Stage D (compact shared-memory candidates)
+            if (cfg.draft_token_id >= 0 && threadIdx.x == 0) s_draft_prob = 0.0f;
             __syncthreads();
-        }
-
-        // Stage D: Sample (direct sorted CDF, bonus ascending-tid CDF, or draft rejection)
-        double norm_sum_d = 0.0;
-        for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
-            if (make_rank_key(row_logit[tid], tid) >= min_key) {
-                norm_sum_d += (double)row_prob[tid];
-            }
-        }
-        const double norm_sum = block_reduce_sum_f64(norm_sum_d, s_f64);
-
-        if (cfg.draft_token_id >= 0) {
-            const int32_t d = cfg.draft_token_id;
-            const double raw_pd = (d < vocab_size && make_rank_key(row_logit[d], d) >= min_key)
-                                      ? (double)row_prob[d]
-                                      : 0.0;
-            const double p_d = (norm_sum > 0.0) ? (raw_pd / norm_sum) : 0.0;
-            draft_prob = (float)p_d;
-            if ((double)cfg.uniform_sample < fmin(1.0, p_d)) {
-                draft_accepted = 1;
-                sampled_id = d;
-            } else {
-                draft_accepted = 0;
-                const double res_sum = fmax(norm_sum - raw_pd, 0.0);
-                if (res_sum > 0.0) {
-                    sampled_id = radix_ascending_tid_cdf(
-                        row_logit, row_prob, vocab_size, min_key, d,
-                        (double)cfg.recovery_uniform * res_sum,
-                        s_mass, s_hist, &s_prefix, &s_rem_mass);
-                } else {
-                    sampled_id = winner.idx;
+            double norm_sum_d = 0.0;
+            const int32_t d_tok = cfg.draft_token_id;
+            for (uint32_t i = threadIdx.x; i < cand_n; i += blockDim.x) {
+                const int32_t tid = s_cand[i];
+                if (make_rank_key(s_cand_logit[i], tid) >= min_key) {
+                    const float p = s_cand_prob[i];
+                    norm_sum_d += (double)p;
+                    if (d_tok >= 0 && tid == d_tok) {
+                        s_draft_prob = p;
+                    }
                 }
             }
-        } else if (cfg.use_token_id_cdf != 0) {
-            sampled_id = radix_ascending_tid_cdf(
-                row_logit, row_prob, vocab_size, min_key, -1,
-                (double)cfg.recovery_uniform * norm_sum,
-                s_mass, s_hist, &s_prefix, &s_rem_mass);
+            const double norm_sum = block_reduce_sum_f64(norm_sum_d, s_f64);
+
+            if (d_tok >= 0) {
+                const double raw_pd = (d_tok < vocab_size) ? (double)s_draft_prob : 0.0;
+                const double p_d = (norm_sum > 0.0) ? (raw_pd / norm_sum) : 0.0;
+                draft_prob = (float)p_d;
+                if ((double)cfg.uniform_sample < fmin(1.0, p_d)) {
+                    draft_accepted = 1;
+                    sampled_id = d_tok;
+                } else {
+                    draft_accepted = 0;
+                    const double res_sum = fmax(norm_sum - raw_pd, 0.0);
+                    if (res_sum > 0.0) {
+                        sampled_id = radix_ascending_tid_cdf_cand(
+                            s_cand, s_cand_logit, s_cand_prob, cand_n, vocab_size, min_key, d_tok,
+                            (double)cfg.recovery_uniform * res_sum,
+                            s_mass, s_hist, &s_prefix, &s_rem_mass, &s_chosen_cnt, &s_exact_key);
+                    } else {
+                        sampled_id = winner.idx;
+                    }
+                }
+            } else if (cfg.use_token_id_cdf != 0) {
+                sampled_id = radix_ascending_tid_cdf_cand(
+                    s_cand, s_cand_logit, s_cand_prob, cand_n, vocab_size, min_key, -1,
+                    (double)cfg.recovery_uniform * norm_sum,
+                    s_mass, s_hist, &s_prefix, &s_rem_mass, &s_chosen_cnt, &s_exact_key);
+            } else {
+                const double target = (double)cfg.uniform_sample * (double)((float)norm_sum);
+                const uint64_t chosen_key = radix_descending_mass_key_cand(
+                    s_cand, s_cand_logit, s_cand_prob, cand_n, min_key, true, target,
+                    s_mass, s_hist, &s_prefix, &s_rem_mass, &s_chosen_cnt, &s_exact_key);
+                sampled_id = (int32_t)(~uint32_t(chosen_key));
+            }
         } else {
-            const double target = (double)cfg.uniform_sample * (double)((float)norm_sum);
-            const uint64_t chosen_key = radix_descending_mass_key(
-                row_logit, row_prob, vocab_size, min_key, true, target,
-                s_mass, s_hist, &s_prefix, &s_rem_mass);
-            sampled_id = (int32_t)(~uint32_t(chosen_key));
+            uint32_t surv_local = 0u;
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                if (make_rank_key(row_logit[tid], tid) >= min_key) surv_local += 1u;
+            }
+            const uint32_t surv_count = block_reduce_sum_u32(surv_local, s_u32);
+            if (cfg.top_p < 1.0f && surv_count > 1u) {
+                min_key = radix_descending_mass_key(
+                    row_logit, row_prob, vocab_size, min_key, false, (double)cfg.top_p,
+                    s_mass, s_hist, &s_prefix, &s_rem_mass,
+                    s_cand, s_cand_logit, s_cand_prob, &s_cand_cnt, &s_exact_key);
+                for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                    if (make_rank_key(row_logit[tid], tid) < min_key) {
+                        row_prob[tid] = 0.0f;
+                    }
+                }
+                __syncthreads();
+            }
+
+            // Stage D: Sample (direct sorted CDF, bonus ascending-tid CDF, or draft rejection)
+            double norm_sum_d = 0.0;
+            for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
+                if (make_rank_key(row_logit[tid], tid) >= min_key) {
+                    norm_sum_d += (double)row_prob[tid];
+                }
+            }
+            const double norm_sum = block_reduce_sum_f64(norm_sum_d, s_f64);
+
+            if (cfg.draft_token_id >= 0) {
+                const int32_t d = cfg.draft_token_id;
+                const double raw_pd = (d < vocab_size && make_rank_key(row_logit[d], d) >= min_key)
+                                          ? (double)row_prob[d]
+                                          : 0.0;
+                const double p_d = (norm_sum > 0.0) ? (raw_pd / norm_sum) : 0.0;
+                draft_prob = (float)p_d;
+                if ((double)cfg.uniform_sample < fmin(1.0, p_d)) {
+                    draft_accepted = 1;
+                    sampled_id = d;
+                } else {
+                    draft_accepted = 0;
+                    const double res_sum = fmax(norm_sum - raw_pd, 0.0);
+                    if (res_sum > 0.0) {
+                        sampled_id = radix_ascending_tid_cdf(
+                            row_logit, row_prob, vocab_size, min_key, d,
+                            (double)cfg.recovery_uniform * res_sum,
+                            s_mass, s_hist, &s_prefix, &s_rem_mass,
+                            s_cand, s_cand_logit, s_cand_prob, &s_cand_cnt, &s_exact_key);
+                    } else {
+                        sampled_id = winner.idx;
+                    }
+                }
+            } else if (cfg.use_token_id_cdf != 0) {
+                sampled_id = radix_ascending_tid_cdf(
+                    row_logit, row_prob, vocab_size, min_key, -1,
+                    (double)cfg.recovery_uniform * norm_sum,
+                    s_mass, s_hist, &s_prefix, &s_rem_mass,
+                    s_cand, s_cand_logit, s_cand_prob, &s_cand_cnt, &s_exact_key);
+            } else {
+                const double target = (double)cfg.uniform_sample * (double)((float)norm_sum);
+                const uint64_t chosen_key = radix_descending_mass_key(
+                    row_logit, row_prob, vocab_size, min_key, true, target,
+                    s_mass, s_hist, &s_prefix, &s_rem_mass,
+                    s_cand, s_cand_logit, s_cand_prob, &s_cand_cnt, &s_exact_key);
+                sampled_id = (int32_t)(~uint32_t(chosen_key));
+            }
         }
     }
 
@@ -1367,7 +2062,7 @@ extern "C" int w34_sampler_step_f16(
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return (int)err;
     }
-    w34_sampler::sampler_step_f16_kernel<<<num_rows, 512, 0, stream>>>(
+    w34_sampler::sampler_step_f16_kernel<<<num_rows, 1024, 0, stream>>>(
         (const __half*)logits_f16,
         row_cfgs,
         bitmask_u32,

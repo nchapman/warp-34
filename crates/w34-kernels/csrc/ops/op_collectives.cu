@@ -772,7 +772,7 @@ __global__ void __launch_bounds__(256, 1) tp2_all_gather_topk_f32_i32_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256, 1) tp2_all_reduce_hc_combine_tap_f16_kernel(
+__global__ void __launch_bounds__(512, 1) tp2_all_reduce_hc_combine_tap_f16_kernel(
     const __half* residual_in, const __half* local_in, __half* ar_out,
     const float* inject_weights, const __half* ple_delta, __half* residual_out,
     __nv_bfloat16* tap_bf16_out, const uint8_t* valid_token_mask,
@@ -839,16 +839,22 @@ __global__ void __launch_bounds__(256, 1) tp2_all_reduce_hc_combine_tap_f16_kern
                 const __half* ph = reinterpret_cast<const __half*>(&pv);
                 uint4 arv;
                 __half* arh = reinterpret_cast<__half*>(&arv);
-                float y_arr[8];
-                float tap_sum[8];
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float lf = __half2float(lh[j]);
-                    const float pf = __half2float(ph[j]);
-                    const __half ar_h = __float2half((rank == 0) ? (lf + pf) : (pf + lf));
-                    arh[j] = ar_h;
-                    y_arr[j] = __half2float(ar_h);
-                    tap_sum[j] = 0.0f;
+                float y0, y1, y2, y3, y4, y5, y6, y7;
+                float ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
+                float ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
+                {
+                    const __half a0 = __float2half((rank == 0) ? (__half2float(lh[0]) + __half2float(ph[0])) : (__half2float(ph[0]) + __half2float(lh[0])));
+                    const __half a1 = __float2half((rank == 0) ? (__half2float(lh[1]) + __half2float(ph[1])) : (__half2float(ph[1]) + __half2float(lh[1])));
+                    const __half a2 = __float2half((rank == 0) ? (__half2float(lh[2]) + __half2float(ph[2])) : (__half2float(ph[2]) + __half2float(lh[2])));
+                    const __half a3 = __float2half((rank == 0) ? (__half2float(lh[3]) + __half2float(ph[3])) : (__half2float(ph[3]) + __half2float(lh[3])));
+                    const __half a4 = __float2half((rank == 0) ? (__half2float(lh[4]) + __half2float(ph[4])) : (__half2float(ph[4]) + __half2float(lh[4])));
+                    const __half a5 = __float2half((rank == 0) ? (__half2float(lh[5]) + __half2float(ph[5])) : (__half2float(ph[5]) + __half2float(lh[5])));
+                    const __half a6 = __float2half((rank == 0) ? (__half2float(lh[6]) + __half2float(ph[6])) : (__half2float(ph[6]) + __half2float(lh[6])));
+                    const __half a7 = __float2half((rank == 0) ? (__half2float(lh[7]) + __half2float(ph[7])) : (__half2float(ph[7]) + __half2float(lh[7])));
+                    arh[0] = a0; arh[1] = a1; arh[2] = a2; arh[3] = a3;
+                    arh[4] = a4; arh[5] = a5; arh[6] = a6; arh[7] = a7;
+                    y0 = __half2float(a0); y1 = __half2float(a1); y2 = __half2float(a2); y3 = __half2float(a3);
+                    y4 = __half2float(a4); y5 = __half2float(a5); y6 = __half2float(a6); y7 = __half2float(a7);
                 }
                 if (ar_v != nullptr) ar_v[c] = arv;
                 for (int s = 0; s < hc_count; ++s) {
@@ -864,31 +870,41 @@ __global__ void __launch_bounds__(256, 1) tp2_all_reduce_hc_combine_tap_f16_kern
                     const __half* plh = reinterpret_cast<const __half*>(&pv_ple);
                     uint4 outv;
                     __half* outh = reinterpret_cast<__half*>(&outv);
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        float val = __half2float(rh[j]) + inj_s * y_arr[j];
-                        if (ple_tok != nullptr) val += __half2float(plh[j]);
-                        const __half out_h = __float2half(val);
-                        outh[j] = out_h;
-                        if (tap_row != nullptr) tap_sum[j] += __half2float(out_h);
-                    }
+                    #define HC_ELEM(J, YJ, TSJ) do { \
+                        float val = __half2float(rh[J]) + inj_s * (YJ); \
+                        if (ple_tok != nullptr) val += __half2float(plh[J]); \
+                        const __half out_h = __float2half(val); \
+                        outh[J] = out_h; \
+                        if (tap_row != nullptr) (TSJ) += __half2float(out_h); \
+                    } while (0)
+                    HC_ELEM(0, y0, ts0); HC_ELEM(1, y1, ts1); HC_ELEM(2, y2, ts2); HC_ELEM(3, y3, ts3);
+                    HC_ELEM(4, y4, ts4); HC_ELEM(5, y5, ts5); HC_ELEM(6, y6, ts6); HC_ELEM(7, y7, ts7);
+                    #undef HC_ELEM
                     rout_v[c] = outv;
                 }
                 if (tap_row != nullptr) {
                     if (tap_vec8) {
                         uint4 tv;
                         __nv_bfloat16* th = reinterpret_cast<__nv_bfloat16*>(&tv);
-#pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            th[j] = __float2bfloat16_rn(tap_sum[j] * inv_hc);
-                        }
+                        th[0] = __float2bfloat16_rn(ts0 * inv_hc);
+                        th[1] = __float2bfloat16_rn(ts1 * inv_hc);
+                        th[2] = __float2bfloat16_rn(ts2 * inv_hc);
+                        th[3] = __float2bfloat16_rn(ts3 * inv_hc);
+                        th[4] = __float2bfloat16_rn(ts4 * inv_hc);
+                        th[5] = __float2bfloat16_rn(ts5 * inv_hc);
+                        th[6] = __float2bfloat16_rn(ts6 * inv_hc);
+                        th[7] = __float2bfloat16_rn(ts7 * inv_hc);
                         reinterpret_cast<uint4*>(tap_row)[c] = tv;
                     } else {
                         const int d_base = c << 3;
-#pragma unroll
-                        for (int j = 0; j < 8; ++j) {
-                            tap_row[d_base + j] = __float2bfloat16_rn(tap_sum[j] * inv_hc);
-                        }
+                        tap_row[d_base + 0] = __float2bfloat16_rn(ts0 * inv_hc);
+                        tap_row[d_base + 1] = __float2bfloat16_rn(ts1 * inv_hc);
+                        tap_row[d_base + 2] = __float2bfloat16_rn(ts2 * inv_hc);
+                        tap_row[d_base + 3] = __float2bfloat16_rn(ts3 * inv_hc);
+                        tap_row[d_base + 4] = __float2bfloat16_rn(ts4 * inv_hc);
+                        tap_row[d_base + 5] = __float2bfloat16_rn(ts5 * inv_hc);
+                        tap_row[d_base + 6] = __float2bfloat16_rn(ts6 * inv_hc);
+                        tap_row[d_base + 7] = __float2bfloat16_rn(ts7 * inv_hc);
                     }
                 }
             }
@@ -1540,7 +1556,7 @@ __global__ void __launch_bounds__(256, 1) tp4_all_gather_topk_f32_i32_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256, 1) tp4_all_reduce_hc_combine_tap_f16_kernel(
+__global__ void __launch_bounds__(512, 1) tp4_all_reduce_hc_combine_tap_f16_kernel(
     const __half* residual_in, const __half* local_in, __half* ar_out,
     const float* inject_weights, const __half* ple_delta, __half* residual_out,
     __nv_bfloat16* tap_bf16_out, const uint8_t* valid_token_mask,
@@ -1554,10 +1570,25 @@ __global__ void __launch_bounds__(256, 1) tp4_all_reduce_hc_combine_tap_f16_kern
     __half* s2_buf = stage_epoch_ptr(reinterpret_cast<__half*>(ptrs.s[2]), self_sg, odd, num_elems);
     __half* s3_buf = stage_epoch_ptr(reinterpret_cast<__half*>(ptrs.s[3]), self_sg, odd, num_elems);
     __half* my_s = tp4_select_ptr(s0_buf, s1_buf, s2_buf, s3_buf, rank);
-    for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
-        const size_t roff = (size_t)tok * hidden_size;
-        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-            my_s[roff + d] = local_in[roff + d];
+    const bool vec8 = ((hidden_size & 7) == 0) &&
+                      ((((uintptr_t)residual_in | (uintptr_t)local_in | (uintptr_t)ar_out |
+                         (uintptr_t)ple_delta | (uintptr_t)residual_out | (uintptr_t)s0_buf |
+                         (uintptr_t)s1_buf | (uintptr_t)s2_buf | (uintptr_t)s3_buf) & 15u) == 0);
+    if (vec8) {
+        const int vec_cols = hidden_size >> 3;
+        for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
+            const uint4* src_v = reinterpret_cast<const uint4*>(local_in + (size_t)tok * hidden_size);
+            uint4* dst_v = reinterpret_cast<uint4*>(my_s + (size_t)tok * hidden_size);
+            for (int c = threadIdx.x; c < vec_cols; c += blockDim.x) {
+                st_global_wb_v4(dst_v + c, src_v[c]);
+            }
+        }
+    } else {
+        for (int tok = blockIdx.x; tok < num_tokens; tok += gridDim.x) {
+            const size_t roff = (size_t)tok * hidden_size;
+            for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+                my_s[roff + d] = local_in[roff + d];
+            }
         }
     }
     uint32_t epoch = 0;
@@ -1575,26 +1606,104 @@ __global__ void __launch_bounds__(256, 1) tp4_all_reduce_hc_combine_tap_f16_kern
         __nv_bfloat16* tap_row = (tap_bf16_out != nullptr)
             ? (tap_bf16_out + (size_t)tok * tap_stride_elems + tap_offset_elems)
             : nullptr;
-        for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
-            const size_t roff = (size_t)tok * hidden_size + d;
-            const float lf = __half2float(loc_row[d]);
-            const float f0 = (rank == 0) ? lf : __half2float(s0_buf[roff]);
-            const float f1 = (rank == 1) ? lf : __half2float(s1_buf[roff]);
-            const float f2 = (rank == 2) ? lf : __half2float(s2_buf[roff]);
-            const float f3 = (rank == 3) ? lf : __half2float(s3_buf[roff]);
-            const __half ar_h = __float2half((f0 + f1) + (f2 + f3));
-            if (ar_row != nullptr) ar_row[d] = ar_h;
-            const float y = __half2float(ar_h);
-            float tap_sum = 0.0f;
-            for (int s = 0; s < hc_count; ++s) {
-                const size_t idx = (size_t)s * hidden_size + d;
-                float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
-                if (ple_tok != nullptr) val += __half2float(ple_tok[idx]);
-                const __half out_h = __float2half(val);
-                res_out_tok[idx] = out_h;
-                if (tap_row != nullptr) tap_sum += __half2float(out_h);
+        if (vec8) {
+            const int vec_cols = hidden_size >> 3;
+            for (int c = threadIdx.x; c < vec_cols; c += blockDim.x) {
+                const size_t voff = (size_t)tok * vec_cols + (size_t)c;
+                const uint4 lv = reinterpret_cast<const uint4*>(loc_row)[c];
+                const uint4 v0 = (rank == 0) ? lv : reinterpret_cast<const uint4*>(s0_buf)[voff];
+                const uint4 v1 = (rank == 1) ? lv : reinterpret_cast<const uint4*>(s1_buf)[voff];
+                const uint4 v2 = (rank == 2) ? lv : reinterpret_cast<const uint4*>(s2_buf)[voff];
+                const uint4 v3 = (rank == 3) ? lv : reinterpret_cast<const uint4*>(s3_buf)[voff];
+                const __half* h0 = reinterpret_cast<const __half*>(&v0);
+                const __half* h1 = reinterpret_cast<const __half*>(&v1);
+                const __half* h2 = reinterpret_cast<const __half*>(&v2);
+                const __half* h3 = reinterpret_cast<const __half*>(&v3);
+                uint4 arv;
+                __half* arh = reinterpret_cast<__half*>(&arv);
+                float y0, y1, y2, y3, y4, y5, y6, y7;
+                float ts0 = 0.0f, ts1 = 0.0f, ts2 = 0.0f, ts3 = 0.0f;
+                float ts4 = 0.0f, ts5 = 0.0f, ts6 = 0.0f, ts7 = 0.0f;
+                #define TP4_AR_ELEM(J, YJ) do { \
+                    const __half a_h = __float2half((__half2float(h0[J]) + __half2float(h1[J])) + (__half2float(h2[J]) + __half2float(h3[J]))); \
+                    arh[J] = a_h; \
+                    (YJ) = __half2float(a_h); \
+                } while (0)
+                TP4_AR_ELEM(0, y0); TP4_AR_ELEM(1, y1); TP4_AR_ELEM(2, y2); TP4_AR_ELEM(3, y3);
+                TP4_AR_ELEM(4, y4); TP4_AR_ELEM(5, y5); TP4_AR_ELEM(6, y6); TP4_AR_ELEM(7, y7);
+                #undef TP4_AR_ELEM
+                if (ar_row != nullptr) reinterpret_cast<uint4*>(ar_row)[c] = arv;
+                for (int s = 0; s < hc_count; ++s) {
+                    const float inj_s = inj_tok[s];
+                    const uint4 rv = reinterpret_cast<const uint4*>(res_in_tok + (size_t)s * hidden_size)[c];
+                    const __half* rh = reinterpret_cast<const __half*>(&rv);
+                    uint4 pv_ple = make_uint4(0, 0, 0, 0);
+                    if (ple_tok != nullptr) {
+                        pv_ple = reinterpret_cast<const uint4*>(ple_tok + (size_t)s * hidden_size)[c];
+                    }
+                    const __half* plh = reinterpret_cast<const __half*>(&pv_ple);
+                    uint4 outv;
+                    __half* outh = reinterpret_cast<__half*>(&outv);
+                    #define TP4_HC_ELEM(J, YJ, TSJ) do { \
+                        float val = __half2float(rh[J]) + inj_s * (YJ); \
+                        if (ple_tok != nullptr) val += __half2float(plh[J]); \
+                        const __half out_h = __float2half(val); \
+                        outh[J] = out_h; \
+                        if (tap_row != nullptr) (TSJ) += __half2float(out_h); \
+                    } while (0)
+                    TP4_HC_ELEM(0, y0, ts0); TP4_HC_ELEM(1, y1, ts1); TP4_HC_ELEM(2, y2, ts2); TP4_HC_ELEM(3, y3, ts3);
+                    TP4_HC_ELEM(4, y4, ts4); TP4_HC_ELEM(5, y5, ts5); TP4_HC_ELEM(6, y6, ts6); TP4_HC_ELEM(7, y7, ts7);
+                    #undef TP4_HC_ELEM
+                    reinterpret_cast<uint4*>(res_out_tok + (size_t)s * hidden_size)[c] = outv;
+                }
+                if (tap_row != nullptr) {
+                    if ((((uintptr_t)tap_row) & 15u) == 0) {
+                        uint4 tv;
+                        __nv_bfloat16* th = reinterpret_cast<__nv_bfloat16*>(&tv);
+                        th[0] = __float2bfloat16_rn(ts0 * inv_hc);
+                        th[1] = __float2bfloat16_rn(ts1 * inv_hc);
+                        th[2] = __float2bfloat16_rn(ts2 * inv_hc);
+                        th[3] = __float2bfloat16_rn(ts3 * inv_hc);
+                        th[4] = __float2bfloat16_rn(ts4 * inv_hc);
+                        th[5] = __float2bfloat16_rn(ts5 * inv_hc);
+                        th[6] = __float2bfloat16_rn(ts6 * inv_hc);
+                        th[7] = __float2bfloat16_rn(ts7 * inv_hc);
+                        reinterpret_cast<uint4*>(tap_row)[c] = tv;
+                    } else {
+                        const int d_base = c << 3;
+                        tap_row[d_base + 0] = __float2bfloat16_rn(ts0 * inv_hc);
+                        tap_row[d_base + 1] = __float2bfloat16_rn(ts1 * inv_hc);
+                        tap_row[d_base + 2] = __float2bfloat16_rn(ts2 * inv_hc);
+                        tap_row[d_base + 3] = __float2bfloat16_rn(ts3 * inv_hc);
+                        tap_row[d_base + 4] = __float2bfloat16_rn(ts4 * inv_hc);
+                        tap_row[d_base + 5] = __float2bfloat16_rn(ts5 * inv_hc);
+                        tap_row[d_base + 6] = __float2bfloat16_rn(ts6 * inv_hc);
+                        tap_row[d_base + 7] = __float2bfloat16_rn(ts7 * inv_hc);
+                    }
+                }
             }
-            if (tap_row != nullptr) tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
+        } else {
+            for (int d = threadIdx.x; d < hidden_size; d += blockDim.x) {
+                const size_t roff = (size_t)tok * hidden_size + d;
+                const float lf = __half2float(loc_row[d]);
+                const float f0 = (rank == 0) ? lf : __half2float(s0_buf[roff]);
+                const float f1 = (rank == 1) ? lf : __half2float(s1_buf[roff]);
+                const float f2 = (rank == 2) ? lf : __half2float(s2_buf[roff]);
+                const float f3 = (rank == 3) ? lf : __half2float(s3_buf[roff]);
+                const __half ar_h = __float2half((f0 + f1) + (f2 + f3));
+                if (ar_row != nullptr) ar_row[d] = ar_h;
+                const float y = __half2float(ar_h);
+                float tap_sum = 0.0f;
+                for (int s = 0; s < hc_count; ++s) {
+                    const size_t idx = (size_t)s * hidden_size + d;
+                    float val = __half2float(res_in_tok[idx]) + inj_tok[s] * y;
+                    if (ple_tok != nullptr) val += __half2float(ple_tok[idx]);
+                    const __half out_h = __float2half(val);
+                    res_out_tok[idx] = out_h;
+                    if (tap_row != nullptr) tap_sum += __half2float(out_h);
+                }
+                if (tap_row != nullptr) tap_row[d] = __float2bfloat16_rn(tap_sum * inv_hc);
+            }
         }
     }
 }
@@ -2237,10 +2346,10 @@ extern "C" int w34_tp2_all_reduce_hc_combine_tap_f16(
             cudaMemcpyDefault, (cudaStream_t)ex->stream);
         if (cpy_err != cudaSuccess) return (int)cpy_err;
     }
-    int blocks = num_tokens;
     const int cap = w34_comm::tp2_pcie_block_cap();
-    if (blocks > cap) blocks = cap;
-    w34_comm::tp2_all_reduce_hc_combine_tap_f16_kernel<<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+    const int blocks = (num_tokens > cap) ? cap : num_tokens;
+    const unsigned threads = (hidden_size > 2048) ? 512u : 256u;
+    w34_comm::tp2_all_reduce_hc_combine_tap_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)residual_in, (const __half*)local_block_out, (__half*)ar_out,
         inject_weights, (const __half*)ple_delta, (__half*)residual_out,
         (__nv_bfloat16*)tap_bf16_out, valid_token_mask,
@@ -2263,15 +2372,15 @@ extern "C" int w34_tp4_all_reduce_hc_combine_tap_f16(
         (tap_bf16_out != nullptr && (tap_offset_elems < 0 || tap_stride_elems < tap_offset_elems + hidden_size))) {
         return (int)cudaErrorInvalidValue;
     }
-    int blocks = num_tokens;
     int cap = w34_comm::tp4_block_cap(num_tokens * hidden_size <= 36 * 5120);
     if (num_tokens * hidden_size <= 36 * 5120 && cap > 16) cap = 16;
-    if (blocks > cap) blocks = cap;
+    const int blocks = (num_tokens > cap) ? cap : num_tokens;
+    const unsigned threads = (hidden_size > 2048) ? 512u : 256u;
     w34_comm::Tp4Ptrs ptrs{
         {stage0, stage1, stage2, stage3},
         {(w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1, (w34_comm::Signal*)sig2, (w34_comm::Signal*)sig3},
     };
-    w34_comm::tp4_all_reduce_hc_combine_tap_f16_kernel<<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
+    w34_comm::tp4_all_reduce_hc_combine_tap_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)residual_in, (const __half*)local_block_out, (__half*)ar_out,
         inject_weights, (const __half*)ple_delta, (__half*)residual_out,
         (__nv_bfloat16*)tap_bf16_out, valid_token_mask, ptrs,
