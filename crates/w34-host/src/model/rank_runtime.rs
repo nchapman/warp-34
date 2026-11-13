@@ -57,6 +57,26 @@ impl Qwen3_5ModelRank {
         &self.cfg.midloop
     }
 
+    /// Returns whether the base model or the currently bound LoRA adapter configures
+    /// full-prompt non-causal attention (`W34_ATTN_MASK_SYMMETRIC_WINDOW`).
+    pub fn active_noncausal_full_attention(&self) -> bool {
+        if self.cfg.noncausal_full_attention {
+            return true;
+        }
+        if let Some(rt) = &self.lora_runtime {
+            let lid = rt
+                .state
+                .default_lora_id
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if lid >= 0
+                && let Some(&nc) = rt.adapter_noncausal.get(lid as usize)
+            {
+                return nc;
+            }
+        }
+        false
+    }
+
     /// Returns whether the base model or any attached LoRA adapter configures multi-pass `midloop`.
     pub fn any_midloop_configured(&self) -> bool {
         self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)

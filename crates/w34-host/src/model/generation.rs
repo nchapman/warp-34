@@ -1120,11 +1120,37 @@ impl Qwen3_5Engine {
         let mut sched = SchedulerV1::new(sched_cfg);
         std::mem::swap(&mut sched.radix, &mut self.radix);
 
+        let is_noncausal_or_midloop = self.cfg.noncausal_full_attention
+            || self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+            || (self.active_lora_id >= 0
+                && self.ranks[0].lora_runtime.as_ref().is_some_and(|rt| {
+                    rt.adapter_noncausal
+                        .get(self.active_lora_id as usize)
+                        .copied()
+                        .unwrap_or(false)
+                        || rt
+                            .adapter_midloops
+                            .get(self.active_lora_id as usize)
+                            .is_some_and(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
+                }));
+
+        let single_chunk_cap = sched
+            .cfg
+            .chunk_prefill_size
+            .min(sched.cfg.max_num_batched_tokens);
         let mut req_ids = Vec::with_capacity(prompts.len());
         for p in prompts {
             if p.is_empty() {
                 std::mem::swap(&mut sched.radix, &mut self.radix);
+                self.radix.active_lora_id = self.active_lora_id;
                 return Err(loader_err("empty prompt in generate_batch_scheduled"));
+            }
+            if is_noncausal_or_midloop && p.len() > single_chunk_cap {
+                std::mem::swap(&mut sched.radix, &mut self.radix);
+                self.radix.active_lora_id = self.active_lora_id;
+                return Err(loader_err(
+                    "bidirectional or midloop prompt prefix exceeds single-chunk prefill capacity",
+                ));
             }
             let id = sched.submit_request_with_lora_and_bidir(
                 p.clone(),
@@ -1135,9 +1161,9 @@ impl Qwen3_5Engine {
                 Vec::new(),
                 Vec::new(),
                 false,
+                is_noncausal_or_midloop.then_some(0),
                 None,
-                None,
-                None,
+                is_noncausal_or_midloop.then_some(p.len()),
                 self.active_lora_id,
             );
             req_ids.push(id);
@@ -1243,6 +1269,7 @@ impl Qwen3_5Engine {
             self.free_state_slots(&aborted.freed_mamba_slots);
         }
         std::mem::swap(&mut sched.radix, &mut self.radix);
+        self.radix.active_lora_id = self.active_lora_id;
         loop_res?;
 
         Ok(req_ids

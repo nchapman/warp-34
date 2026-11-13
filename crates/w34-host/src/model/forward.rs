@@ -1437,7 +1437,7 @@ impl Qwen3_5ModelRank {
         let has_init_ptr = self
             .batch_meta_arena
             .upload_slice(has_initial_state, &self.stream)?;
-        let mask_mode = if self.cfg.noncausal_full_attention {
+        let mask_mode = if self.active_noncausal_full_attention() {
             w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
         } else {
             W34_ATTN_MASK_CAUSAL

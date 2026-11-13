@@ -573,6 +573,8 @@ pub struct LoraAdapterHost {
     /// Optional per-adapter damped-Euler `midloop` `(start_layer, end_layer, passes)` specs
     /// parsed from `decision_config.json` (e.g. `GLiDE-9B` / `GLiDE-27B`).
     pub midloop: Vec<(usize, usize, usize)>,
+    /// Whether this adapter configures full-prompt non-causal attention (`decision_config.json`).
+    pub noncausal_full_attention: bool,
 }
 
 impl LoraAdapterHost {
@@ -685,7 +687,7 @@ impl LoraAdapterHost {
             }
         }
 
-        let midloop = {
+        let (midloop, noncausal_full_attention) = {
             let dc_path = dir.join("decision_config.json");
             if dc_path.is_file() {
                 let text = fs::read_to_string(&dc_path)?;
@@ -695,13 +697,23 @@ impl LoraAdapterHost {
                         format!("LoRA adapter '{name}': bad {}: {e}", dc_path.display()),
                     )
                 })?;
-                if let Some(ml_val) = dc_val.get("midloop").filter(|v| !v.is_null()) {
+                let ml = if let Some(ml_val) = dc_val.get("midloop").filter(|v| !v.is_null()) {
                     crate::loader::ModelConfig::parse_midloop_specs(ml_val, usize::MAX)?
                 } else {
                     Vec::new()
-                }
+                };
+                let noncausal = dc_val
+                    .get("noncausal_full_attention")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or_else(|| {
+                        dc_val
+                            .get("attention_mode")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|m| m.eq_ignore_ascii_case("noncausal_full_attention"))
+                    });
+                (ml, noncausal)
             } else {
-                Vec::new()
+                (Vec::new(), false)
             }
         };
 
@@ -713,6 +725,7 @@ impl LoraAdapterHost {
             layer_weights,
             lm_head_weight,
             midloop,
+            noncausal_full_attention,
         })
     }
 
@@ -1421,6 +1434,7 @@ pub struct RankLoraRuntime {
     pub num_adapters: usize,
     pub max_rank_pad: usize,
     pub adapter_midloops: Vec<Vec<(usize, usize, usize)>>,
+    pub adapter_noncausal: Vec<bool>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2004,6 +2018,10 @@ pub fn attach_lora_to_rank(
         num_adapters: adapters.len(),
         max_rank_pad,
         adapter_midloops: adapters.iter().map(|ad| ad.midloop.clone()).collect(),
+        adapter_noncausal: adapters
+            .iter()
+            .map(|ad| ad.noncausal_full_attention)
+            .collect(),
     }))
 }
 

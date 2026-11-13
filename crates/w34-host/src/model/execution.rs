@@ -180,6 +180,20 @@ impl Qwen3_5Engine {
         let st_out_arr = [state_out_slot];
         let has_init_arr = [u8::from(has_initial_state)];
         let active_lora_id = self.active_lora_id;
+        for r in &mut self.ranks {
+            r.last_batch_state_slots.clear();
+            for &s in &[state_in_slot, state_out_slot] {
+                if s >= 0
+                    && (s as usize) < r.state_pool.total_slots
+                    && !r.last_batch_state_slots.contains(&(s as usize))
+                {
+                    r.last_batch_state_slots.push(s as usize);
+                }
+            }
+            if r.last_batch_state_slots.is_empty() {
+                r.last_batch_state_slots.push(0);
+            }
+        }
 
         if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
@@ -232,7 +246,7 @@ impl Qwen3_5Engine {
                 max_blocks_per_req: block_table.len() as i32,
                 max_q_len: num_tokens as i32,
                 max_seq_len: seq_after as i32,
-                mask_mode: if r0.cfg.noncausal_full_attention {
+                mask_mode: if r0.active_noncausal_full_attention() {
                     w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
                 } else {
                     W34_ATTN_MASK_CAUSAL
@@ -353,7 +367,7 @@ impl Qwen3_5Engine {
                         max_blocks_per_req: block_table.len() as i32,
                         max_q_len: num_tokens as i32,
                         max_seq_len: seq_after as i32,
-                        mask_mode: if r0.cfg.noncausal_full_attention {
+                        mask_mode: if r0.active_noncausal_full_attention() {
                             w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
                         } else {
                             W34_ATTN_MASK_CAUSAL
@@ -467,7 +481,7 @@ impl Qwen3_5Engine {
                             max_blocks_per_req: block_table.len() as i32,
                             max_q_len: num_tokens as i32,
                             max_seq_len: seq_after as i32,
-                            mask_mode: if r_peer.cfg.noncausal_full_attention {
+                            mask_mode: if r_peer.active_noncausal_full_attention() {
                                 w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
                             } else {
                                 W34_ATTN_MASK_CAUSAL
@@ -594,6 +608,13 @@ impl Qwen3_5Engine {
         let st_arr = [state_slot];
         let lora_arr = [self.active_lora_id];
         for r in &mut self.ranks {
+            r.last_batch_state_slots.clear();
+            let slot_u = if state_slot >= 0 && (state_slot as usize) < r.state_pool.total_slots {
+                state_slot as usize
+            } else {
+                0
+            };
+            r.last_batch_state_slots.push(slot_u);
             r.stage_ple_f8_for_batch(
                 &tok_arr,
                 &[0, 1],

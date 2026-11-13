@@ -340,6 +340,7 @@ impl SchedulerV1 {
             !prompt_tokens.is_empty() && prompt_tokens.len() == radix_key_tokens.len(),
             "prompt_tokens and radix_key_tokens must be non-empty and equal length"
         );
+        self.radix.active_lora_id = crate::lora::BASE_MODEL_LORA_ID;
         if lora_id >= 0 {
             radix_key_tokens = crate::lora::salt_radix_key_for_lora(&radix_key_tokens, lora_id);
         }
@@ -387,6 +388,7 @@ impl SchedulerV1 {
         F: FnMut(&mut MambaRadixCache) -> Option<(i32, [i32; 2])>,
         P: FnMut(u64, &[i32], usize) -> bool,
     {
+        self.radix.active_lora_id = crate::lora::BASE_MODEL_LORA_ID;
         let evictions = Vec::new();
         while self.active.len() < self.cfg.max_num_seqs {
             let (lookup_len, raw_hit, allow_hit, pinned_hit) = {

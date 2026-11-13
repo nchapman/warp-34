@@ -895,12 +895,16 @@ pub fn run_batch_in_place(
             }
             let cached = match events.terminal.get() {
                 Some(GenerationEvent::Finished { cached_tokens, .. }) => *cached_tokens,
-                Some(GenerationEvent::Error(e)) => return Err(e.to_string()),
+                Some(GenerationEvent::Error(e)) => {
+                    engine.radix.active_lora_id = engine.active_lora_id;
+                    return Err(e.to_string());
+                }
                 _ => cached_atomic.load(Ordering::Acquire) as usize,
             };
             results.push((gen_ids, cached));
         }
     }
+    engine.radix.active_lora_id = engine.active_lora_id;
     Ok((results, stats))
 }
 
@@ -993,15 +997,20 @@ fn enqueue(
         request.set_terminal(GenerationEvent::Error(err));
         return;
     }
-    let lora_has_midloop = request.lora_id >= 0
+    let lora_noncausal_or_midloop = request.lora_id >= 0
         && engine.ranks[0].lora_runtime.as_ref().is_some_and(|rt| {
-            rt.adapter_midloops
+            rt.adapter_noncausal
                 .get(request.lora_id as usize)
-                .is_some_and(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
+                .copied()
+                .unwrap_or(false)
+                || rt
+                    .adapter_midloops
+                    .get(request.lora_id as usize)
+                    .is_some_and(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
         });
     if engine.cfg.noncausal_full_attention
         || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
-        || lora_has_midloop
+        || lora_noncausal_or_midloop
         || request.prefix_bidir_len == Some(request.prompt.len())
     {
         request.prefix_bidir_len = Some(request.prompt.len());
