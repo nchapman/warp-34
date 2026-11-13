@@ -64,18 +64,14 @@ function PoolBar({
 }
 
 function throughputPoints(history: Snapshot[], decisionMode = false): Point[] {
-  return history.map((s, i) => {
-    const slice = history.slice(Math.max(0, i - 5), i + 1);
-    const genRate = counterRate(slice, (sample) => sample.tokens.generated);
-    const compRate = counterRate(slice, (sample) => sample.tokens.computed);
-    return {
-      time: s.uptime_seconds,
-      value:
-        decisionMode || (genRate === 0 && (compRate ?? 0) > 0)
-          ? compRate
-          : genRate,
-    };
-  });
+  return history.map((s, i) => ({
+    time: s.uptime_seconds,
+    value: counterRate(
+      history.slice(Math.max(0, i - 5), i + 1),
+      (sample) =>
+        decisionMode ? sample.tokens.computed : sample.tokens.generated,
+    ),
+  }));
 }
 function latencyPoints(history: Snapshot[]): Point[] {
   return history
@@ -147,10 +143,7 @@ function Overview({ state }: { state: MetricsState }) {
   const promptRate = fresh
     ? counterRate(history, (s) => s.tokens.computed)
     : null;
-  const rate =
-    isDecisionWorkload || (genRate === 0 && (promptRate ?? 0) > 0)
-      ? promptRate
-      : genRate;
+  const rate = isDecisionWorkload ? promptRate : genRate;
   const ttft = ttftRaw && ttftRaw.count > 0 ? ttftRaw : e2eRaw;
   const queue = recentHistogram(history, "queue");
   const pacing = recentHistogram(history, "time_per_output_token");

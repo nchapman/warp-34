@@ -793,7 +793,19 @@ pub fn estimate_lora_reserve_from_specs(
                 let r_dim = info.shape[0].min(info.shape[1]);
                 max_rank_pad = max_rank_pad.max(r_dim.max(1).div_ceil(4) * 4);
             }
-            let elems: usize = info.shape.iter().copied().product();
+            let elems: usize = info
+                .shape
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "LoRA adapter '{}': shape overflow on tensor '{name}'",
+                            spec.name
+                        ),
+                    )
+                })?;
             let raw_f16_bytes = (elems.saturating_mul(2) + 255) & !255;
             let is_col_parallel =
                 name.contains("o_proj") || name.contains("out_proj") || name.contains("down_proj");
