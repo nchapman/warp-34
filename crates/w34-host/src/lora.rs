@@ -910,7 +910,26 @@ impl LoraAdapterRegistry {
     }
 
     pub fn resolve_name(&self, model_name: &str) -> Option<i32> {
-        self.by_name.get(model_name).copied()
+        if let Some(&id) = self.by_name.get(model_name) {
+            return Some(id);
+        }
+        let trimmed = model_name.trim();
+        for entry in &self.entries {
+            if entry.name.eq_ignore_ascii_case(trimmed)
+                || entry.root == trimmed
+                || entry
+                    .decision_profile
+                    .as_ref()
+                    .is_some_and(|p| p.family_name().eq_ignore_ascii_case(trimmed))
+                || (trimmed.eq_ignore_ascii_case("glide")
+                    && entry.name.to_ascii_lowercase().starts_with("glide"))
+                || (trimmed.eq_ignore_ascii_case("d3")
+                    && entry.name.to_ascii_lowercase().starts_with("d3"))
+            {
+                return Some(entry.lora_id);
+            }
+        }
+        None
     }
 
     pub fn decision_profile(&self, lora_id: i32) -> Option<&crate::decision::DecisionModelProfile> {

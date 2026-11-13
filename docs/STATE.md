@@ -26,6 +26,8 @@
     - **`nchapman/Qwen3.5-9B-W4A16-HGPTQ` (`332dad698d`) + `glide-9b=nchapman/Qwen3.5-9B-GLiDE-LoRA` (`948c7d02ca`, `r=128`, 2-pass `midloop` `[[12,17],[18,23]]`):**
       - Base model (`CausalLm`): Public **`110 / 128` (`85.94%`)** at **`11.4 dec/s`** (`11.25s`), MultiQ **`61 / 64` (`95.31%`)** at **`26.7 dec/s`** (`2.40s`).
       - `glide-9b` (`CodeReadout` + `noncausal_full_attention` + 2-pass `midloop`): Public **`122 / 128` (`95.31%`, `+9.38 pp`)** at **`9.1 dec/s`** (`14.09s`), MultiQ **`64 / 64` (`100.00%`, `+4.69 pp`)** at **`14.9 dec/s`** (`4.31s`).
+    - **`nchapman/Qwen3.8-27B-W4A16-HGPTQ` (`cc31dcc085`, `TP=2`) + `glide-27b=nchapman/Qwen3.5-27B-GLiDE-LoRA` (`5ea3c159de`, `r=128`, 2-pass `midloop` `[[24,35],[36,47]]`):**
+      - `glide-27b` (`CodeReadout` + `noncausal_full_attention` + 2-pass `midloop`, 88 layer evals): Public **`121 / 128` (`94.53%`)** at **`3.14 dec/s`** (`c=1`, `p50 = 127.9 ms`) / **`3.43 dec/s`** (`c=16`, `37.37s`), MultiQ **`64 / 64` (`100.00%`)** at **`5.49 dec/s`** (`c=8`, `11.65s`).
 
 ## Model Checkpoint Standardization (`Qwen/Qwen3.5-4B` Core Tests, `nchapman/*-W4A16-HGPTQ` `w34` Targets, & Mainstream Competitor Baselines)
 
