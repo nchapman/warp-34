@@ -59,9 +59,17 @@ run = "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --features cuda"
 description = "Static assembly & llvm-mca audit for CPU SIMD kernels across AVX2/AVX-512 microarchitectures"
 run = "python3 tools/check_cpu_simd.py"
 
+[tasks."cuda-bin-check"]
+description = "Static cuobjdump resource & stack-spill audit across sm_86 and sm_89 CUDA fatbinaries"
+run = "python3 tools/check_cuda_binaries.py"
+
+[tasks."cuda-sanitize"]
+description = "Targeted compute-sanitizer (memcheck + racecheck + synccheck) gate across all CUDA subsystems"
+run = "python3 tools/check_cuda_sanitizer.py"
+
 [tasks."check-quick"]
-description = "Format check, clippy (both feature states), rustdoc check, and CPU SIMD assembly audit"
-depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "simd-check"]
+description = "Format check, clippy (both feature states), rustdoc check, CPU SIMD assembly audit, and CUDA binary resource audit"
+depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "simd-check", "cuda-bin-check"]
 
 [tasks."test-quick"]
 description = "Unit tests only (lib target with CUDA)"
@@ -106,8 +114,11 @@ depends = ["dashboard-build"]
 run = "cargo test --release --features cuda"
 
 [tasks.check]
-description = "Format check, clippy (both states), rustdoc check, and full release test suite"
-depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "test", "oracle-check", "perf-check", "dashboard-check"]
+description = "Format check, clippy (both states), rustdoc check, CUDA binary audit, full release test suite, and CUDA compute-sanitizer gate"
+depends = ["fmt-check", "clippy", "clippy-cpu", "doc-check", "simd-check", "cuda-bin-check", "test", "oracle-check", "perf-check", "dashboard-check"]
+# Runs AFTER `depends` (`test`) finishes so `compute-sanitizer` reuses compiled
+# release test binaries and never contends with `worker_capacity` for GPU VRAM.
+run = "python3 tools/check_cuda_sanitizer.py"
 
 [tasks."perf-check"]
 description = "CPU-only tests and manifest validation for the independent performance suite"

@@ -1002,6 +1002,11 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
                 __half* s_head = APPLY_HAD64
                     ? reinterpret_cast<__half*>(s_work[wid][0])
                     : dst_head;
+                if constexpr (APPLY_HAD64) {
+                    // Ensure all lanes finish reading float `s_work[wid][0][0..255]` (0..1023 B)
+                    // before any lane overwrites `__half s_head[0..255]` (0..511 B).
+                    __syncwarp();
+                }
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     const int col = lane + 32 * j;

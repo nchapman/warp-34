@@ -1283,3 +1283,222 @@ fn test_tp4_all_reduce_mismatched_pointer_alignment_does_not_mismatch_grid() {
         }
     }
 }
+
+/// Real 2-GPU (`device 0` + `device 1`) parity test for `all_gather_top1_f32_i32`,
+/// `broadcast_i32`, `all_gather_topk_f32_i32`, and 512-thread (`h = 2560 > 2048`)
+/// `all_reduce_hc_combine_tap_f16`. Placing one rank per physical GPU allows
+/// `compute-sanitizer` (`memcheck` / `racecheck` / `synccheck`) to verify cooperative
+/// cross-GPU spin-barriers without single-GPU kernel serialization deadlocks.
+#[cfg(feature = "cuda")]
+#[test]
+fn test_tp2_real_devices_all_gather_topk_and_hc_combine_2560() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if CudaDevice::count().unwrap_or(0) < 2 {
+        return;
+    }
+    prepare_execution_plan(0).unwrap();
+    prepare_execution_plan(1).unwrap();
+
+    let tp = 2usize;
+    let comm = Tp2Collectives::new_for_tp(tp, 1 << 20).unwrap();
+    let streams: Vec<_> = (0..tp)
+        .map(|r| {
+            let _dev = CudaDevice::set_current(r as i32).unwrap();
+            CudaStream::new(r as i32).unwrap()
+        })
+        .collect();
+
+    let rows = 3usize;
+    let k = 4usize;
+    let num_tokens = 4usize;
+    let hc_count = 4usize;
+    let h = 2560usize;
+
+    let res_in_host: Vec<u16> = (0..num_tokens * hc_count * h)
+        .map(|i| f32_to_f16(((i % 19) as f32 - 9.0) * 0.1))
+        .collect();
+    let inj_host: Vec<f32> = (0..num_tokens * hc_count)
+        .map(|i| ((i % 5) as f32 + 1.0) * 0.25)
+        .collect();
+
+    let mut d_vals = Vec::new();
+    let mut d_ids = Vec::new();
+    let mut d_res_fused = Vec::new();
+    let mut d_blk_in = Vec::new();
+    let mut d_inj = Vec::new();
+    let mut d_tap_fused = Vec::new();
+
+    let mut blk_per_rank = Vec::with_capacity(tp);
+    for (r, s) in streams.iter().enumerate() {
+        let dev_id = r as i32;
+        let _dev = CudaDevice::set_current(dev_id).unwrap();
+        let mut vals = Vec::with_capacity(rows * k);
+        let mut ids = Vec::with_capacity(rows * k);
+        for row in 0..rows {
+            for j in 0..k {
+                let v = if row == 1 && j == 0 {
+                    100.0f32
+                } else {
+                    ((rows - row) * 20 + (k - j) * 3 + r) as f32
+                };
+                vals.push(v);
+                ids.push((r * 1000 + row * 100 + j) as i32);
+            }
+        }
+        let dv = DeviceBuffer::alloc(dev_id, rows * k * 4).unwrap();
+        let di = DeviceBuffer::alloc(dev_id, rows * k * 4).unwrap();
+        dv.copy_from_host(&vals, s).unwrap();
+        di.copy_from_host(&ids, s).unwrap();
+        d_vals.push(dv);
+        d_ids.push(di);
+
+        let blk: Vec<u16> = (0..num_tokens * h)
+            .map(|i| f32_to_f16(((i + r * 7) % 13) as f32 * 0.125 - 0.5))
+            .collect();
+        let dr = DeviceBuffer::alloc(dev_id, res_in_host.len() * 2).unwrap();
+        let db = DeviceBuffer::alloc(dev_id, blk.len() * 2).unwrap();
+        let dinj = DeviceBuffer::alloc(dev_id, inj_host.len() * 4).unwrap();
+        let dt = DeviceBuffer::alloc(dev_id, num_tokens * h * 2).unwrap();
+        dr.copy_from_host(&res_in_host, s).unwrap();
+        db.copy_from_host(&blk, s).unwrap();
+        dinj.copy_from_host(&inj_host, s).unwrap();
+        s.synchronize().unwrap();
+        blk_per_rank.push(blk);
+        d_res_fused.push(dr);
+        d_blk_in.push(db);
+        d_inj.push(dinj);
+        d_tap_fused.push(dt);
+    }
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (r, ((((s, dv), di), dr), (db, (dinj, dt)))) in streams
+            .iter()
+            .zip(d_vals.iter())
+            .zip(d_ids.iter())
+            .zip(d_res_fused.iter())
+            .zip(d_blk_in.iter().zip(d_inj.iter().zip(d_tap_fused.iter())))
+            .enumerate()
+        {
+            let c = &comm;
+            handles.push(scope.spawn(move || {
+                let _dev = CudaDevice::set_current(r as i32).unwrap();
+                let ex = s.exec(0, 0);
+                c.all_gather_top1_f32_i32(
+                    &ex,
+                    dv.addr(),
+                    di.addr(),
+                    dv.addr(),
+                    di.addr(),
+                    r as i32,
+                    1,
+                )
+                .unwrap();
+                c.broadcast_i32(&ex, di.addr(), di.addr(), r as i32, 1)
+                    .unwrap();
+                c.all_gather_topk_f32_i32(
+                    &ex,
+                    dv.addr(),
+                    di.addr(),
+                    dv.addr(),
+                    di.addr(),
+                    r as i32,
+                    rows as i32,
+                    k as i32,
+                )
+                .unwrap();
+                c.all_reduce_hc_combine_tap_f16(
+                    &ex,
+                    dr.addr(),
+                    db.addr(),
+                    db.addr(),
+                    dinj.addr(),
+                    0,
+                    dr.addr(),
+                    dt.addr(),
+                    0,
+                    r as i32,
+                    num_tokens as i32,
+                    hc_count as i32,
+                    h as i32,
+                    h as i32,
+                    0,
+                )
+                .unwrap();
+                s.synchronize().unwrap();
+            }));
+        }
+        for h_join in handles {
+            h_join.join().unwrap();
+        }
+    });
+
+    let _dev0 = CudaDevice::set_current(0).unwrap();
+    let mut ref_ids = vec![0i32; rows * k];
+    d_ids[0].copy_to_host(&mut ref_ids, &streams[0]).unwrap();
+    streams[0].synchronize().unwrap();
+    assert_eq!(ref_ids[k], 100);
+
+    let expected_blk_sum: Vec<u16> = (0..num_tokens * h)
+        .map(|i| {
+            let sum: f32 = (0..tp).map(|r| f16_to_f32(blk_per_rank[r][i])).sum();
+            f32_to_f16(sum)
+        })
+        .collect();
+    let d_blk_sum_ref = DeviceBuffer::alloc(0, expected_blk_sum.len() * 2).unwrap();
+    let d_res_ref = DeviceBuffer::alloc(0, res_in_host.len() * 2).unwrap();
+    let d_tap_ref = DeviceBuffer::alloc(0, num_tokens * h * 2).unwrap();
+    d_blk_sum_ref
+        .copy_from_host(&expected_blk_sum, &streams[0])
+        .unwrap();
+    d_res_ref.copy_from_host(&res_in_host, &streams[0]).unwrap();
+    w34_host::ple::gpu_ops::hc_combine_tap_f16(
+        &streams[0].exec(0, 0),
+        d_res_ref.addr(),
+        d_blk_sum_ref.addr(),
+        d_inj[0].addr(),
+        0,
+        d_res_ref.addr(),
+        d_tap_ref.addr(),
+        0,
+        num_tokens,
+        hc_count,
+        h,
+        h as i32,
+        0,
+    )
+    .unwrap();
+    let mut expected_res = vec![0u16; res_in_host.len()];
+    let mut expected_tap = vec![0u16; num_tokens * h];
+    d_res_ref
+        .copy_to_host(&mut expected_res, &streams[0])
+        .unwrap();
+    d_tap_ref
+        .copy_to_host(&mut expected_tap, &streams[0])
+        .unwrap();
+    streams[0].synchronize().unwrap();
+
+    for r in 0..tp {
+        let _dev = CudaDevice::set_current(r as i32).unwrap();
+        let mut ids_r = vec![0i32; rows * k];
+        let mut got_blk = vec![0u16; expected_blk_sum.len()];
+        let mut got_res = vec![0u16; res_in_host.len()];
+        let mut got_tap = vec![0u16; num_tokens * h];
+        d_ids[r].copy_to_host(&mut ids_r, &streams[r]).unwrap();
+        d_blk_in[r].copy_to_host(&mut got_blk, &streams[r]).unwrap();
+        d_res_fused[r]
+            .copy_to_host(&mut got_res, &streams[r])
+            .unwrap();
+        d_tap_fused[r]
+            .copy_to_host(&mut got_tap, &streams[r])
+            .unwrap();
+        streams[r].synchronize().unwrap();
+        assert_eq!(ids_r, ref_ids);
+        assert_eq!(
+            got_blk, expected_blk_sum,
+            "rank {r} fused all-reduce block_out mismatch"
+        );
+        assert_eq!(got_res, expected_res, "rank {r} fused HC residual mismatch");
+        assert_eq!(got_tap, expected_tap, "rank {r} fused HC BF16 tap mismatch");
+    }
+}

@@ -1096,7 +1096,7 @@ fn verify_qwen4_mtp_engine_worker_and_capacity(
         mtp_rank.select_batch_slot(0).expect("select slot 0");
         let slot_count = mtp_rank.batch_slot_count();
         let slot_pages = 16usize / slot_count;
-        let hidden_bytes = 32 * target_ref.cfg.hidden_size * 2;
+        let hidden_bytes = 32 * target_ref.cfg.hc_count.max(1) * target_ref.cfg.hidden_size * 2;
         let hidden_host: Vec<u16> = (0..hidden_bytes / 2)
             .map(|i| 0x3800u16.wrapping_add((i % 17) as u16))
             .collect();

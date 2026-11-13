@@ -20,8 +20,10 @@ Prefix GPU commands with `export PATH="/opt/cuda/bin:$PATH"` and select free car
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv              # check GPU squatters first
 mise run test-prep                                                        # verify/download pinned test models & oracle fixtures
 mise run build                                                            # cargo build --release --features cuda
-mise run check-quick                                                      # fmt --check + clippy (with and without cuda)
-mise run check                                                            # fmt + clippy (both states) + release test suite
+mise run check-quick                                                      # fmt --check + clippy + doc + simd/cuda-bin checks
+mise run check                                                            # full check + release tests + cuda-sanitize gate
+mise run cuda-bin-check                                                   # static cuobjdump STACK/LOCAL/SHARED/REG gate (<0.2s)
+mise run cuda-sanitize                                                    # standalone compute-sanitizer memcheck+racecheck+synccheck
 mise run test-quick                                                       # cargo test --release --features cuda --lib
 mise run test-cpu                                                         # cargo test --lib (fast CPU unit tests)
 mise run coverage                                                         # cargo llvm-cov --features cuda --lib --summary-only

@@ -112,6 +112,9 @@ fn main() {
     }
 
     let lib = out.join("libw34_kernels.a");
+    // Remove any existing archive before recreating so deleted `.cu` objects
+    // never linger inside `libw34_kernels.a` across incremental builds.
+    let _ = fs::remove_file(&lib);
     let mut ar = Command::new("ar");
     ar.arg("rcs").arg(&lib);
     for src in &sources {
