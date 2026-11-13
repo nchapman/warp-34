@@ -171,7 +171,7 @@ __global__ void sampler_scatter_sparse_kernel(
     }
 }
 
-__device__ uint64_t radix_kth_largest_key(
+__device__ __forceinline__ uint64_t radix_kth_largest_key(
     const float* __restrict__ row_logit,
     int vocab_size,
     uint64_t min_key,
@@ -195,7 +195,11 @@ __device__ uint64_t radix_kth_largest_key(
         for (int tid = threadIdx.x; tid < vocab_size; tid += blockDim.x) {
             const uint64_t key = make_rank_key(row_logit[tid], tid);
             if (key >= min_key && (pass == 0 || (key >> hi_shift) == (pref >> hi_shift))) {
-                atomicAdd(&s_hist[(key >> shift) & 0xffu], 1u);
+                const uint32_t b = (uint32_t)((key >> shift) & 0xffu);
+                const uint32_t peers = __match_any_sync(__activemask(), b);
+                if (((int)(threadIdx.x & 31)) == (__ffs((int)peers) - 1)) {
+                    atomicAdd(&s_hist[b], (uint32_t)__popc(peers));
+                }
             }
         }
         __syncthreads();
@@ -229,7 +233,41 @@ __device__ uint64_t radix_kth_largest_key(
     return *s_prefix;
 }
 
-__device__ uint64_t radix_descending_mass_key(
+__device__ __forceinline__ void warp_atomic_add_bin_mass_and_hist(
+    uint32_t b,
+    double val,
+    double* s_mass,
+    uint32_t* s_hist) {
+    const uint32_t active = __activemask();
+    const uint32_t peers = __match_any_sync(active, b);
+    const int lane = (int)(threadIdx.x & 31);
+    const int leader = __ffs((int)peers) - 1;
+    if (peers == (1u << lane)) {
+        atomicAdd(&s_mass[b], val);
+        atomicAdd(&s_hist[b], 1u);
+        return;
+    }
+    const uint64_t bits = __double_as_longlong(val);
+    const uint32_t lo = (uint32_t)bits;
+    const uint32_t hi = (uint32_t)(bits >> 32);
+    double sum = 0.0;
+    uint32_t m = peers;
+    while (m != 0u) {
+        const int src = __ffs((int)m) - 1;
+        const uint32_t s_lo = __shfl_sync(peers, lo, src);
+        const uint32_t s_hi = __shfl_sync(peers, hi, src);
+        if (lane == leader) {
+            sum += __longlong_as_double(((int64_t)s_hi << 32) | (int64_t)s_lo);
+        }
+        m &= (m - 1u);
+    }
+    if (lane == leader) {
+        atomicAdd(&s_mass[b], sum);
+        atomicAdd(&s_hist[b], (uint32_t)__popc(peers));
+    }
+}
+
+__device__ __forceinline__ uint64_t radix_descending_mass_key(
     const float* __restrict__ row_logit,
     const float* __restrict__ row_prob,
     int vocab_size,
@@ -262,8 +300,7 @@ __device__ uint64_t radix_descending_mass_key(
             const uint64_t key = make_rank_key(row_logit[tid], tid);
             if (key >= min_key && (pass == 0 || (key >> hi_shift) == (pref >> hi_shift))) {
                 const uint32_t b = (uint32_t)((key >> shift) & 0xffu);
-                atomicAdd(&s_mass[b], (double)p);
-                atomicAdd(&s_hist[b], 1u);
+                warp_atomic_add_bin_mass_and_hist(b, (double)p, s_mass, s_hist);
             }
         }
         __syncthreads();
@@ -297,7 +334,7 @@ __device__ uint64_t radix_descending_mass_key(
     return *s_prefix;
 }
 
-__device__ int32_t radix_ascending_tid_cdf(
+__device__ __forceinline__ int32_t radix_ascending_tid_cdf(
     const float* __restrict__ row_logit,
     const float* __restrict__ row_prob,
     int vocab_size,
@@ -314,7 +351,9 @@ __device__ int32_t radix_ascending_tid_cdf(
     }
     __syncthreads();
 
-    for (int pass = 0; pass < 4; ++pass) {
+    const int start_pass =
+        (vocab_size <= 256) ? 3 : ((vocab_size <= 65536) ? 2 : ((vocab_size <= (1 << 24)) ? 1 : 0));
+    for (int pass = start_pass; pass < 4; ++pass) {
         if (threadIdx.x < 256) {
             s_mass[threadIdx.x] = 0.0;
             s_hist[threadIdx.x] = 0u;
@@ -331,10 +370,9 @@ __device__ int32_t radix_ascending_tid_cdf(
             const uint64_t key = make_rank_key(row_logit[tid], tid);
             if (key < min_key) continue;
             const uint32_t u_tid = (uint32_t)tid;
-            if (pass == 0 || (u_tid >> hi_shift) == (pref >> hi_shift)) {
+            if (pass == start_pass || (u_tid >> hi_shift) == (pref >> hi_shift)) {
                 const uint32_t b = (u_tid >> shift) & 0xffu;
-                atomicAdd(&s_mass[b], (double)p);
-                atomicAdd(&s_hist[b], 1u);
+                warp_atomic_add_bin_mass_and_hist(b, (double)p, s_mass, s_hist);
             }
         }
         __syncthreads();
@@ -817,8 +855,8 @@ __global__ void sampler_scatter_ids_to_tokens_kernel(
     dst_token_ids[i] = (id >= 0) ? id : 0;
 }
 
-// Grid: num_rows, Block: 1024 threads
-__global__ void __launch_bounds__(1024, 1) sampler_step_f16_kernel(
+// Grid: num_rows, Block: 512 threads (up to 128 regs/thread with 0 stack spill)
+__global__ void __launch_bounds__(512) sampler_step_f16_kernel(
     const __half* __restrict__ logits_f16,
     const w34_sampler_row_cfg* __restrict__ row_cfgs,
     const uint32_t* __restrict__ bitmask_u32,
@@ -859,6 +897,8 @@ __global__ void __launch_bounds__(1024, 1) sampler_step_f16_kernel(
     __shared__ uint64_t s_prefix;
     __shared__ uint32_t s_rem_k;
     __shared__ double s_rem_mass;
+    __shared__ int32_t picked_lp_ids[W34_MAX_TOP_LOGPROBS];
+    __shared__ float picked_lp_vals[W34_MAX_TOP_LOGPROBS];
 
     // 1. Check whether soft EOS/stop bans leave at least one allowed token.
     bool honor_bans = (row_counts != nullptr && cfg.sparse_count > 0);
@@ -882,8 +922,6 @@ __global__ void __launch_bounds__(1024, 1) sampler_step_f16_kernel(
                                 : W34_MAX_TOP_LOGPROBS)
                          : 0;
     const int actual_lp = (k_lp < vocab_size) ? k_lp : vocab_size;
-    int32_t picked_lp_ids[W34_MAX_TOP_LOGPROBS];
-    float picked_lp_vals[W34_MAX_TOP_LOGPROBS];
     if (want_logprobs) {
         const int iters = (actual_lp > 1) ? actual_lp : 1;
         float raw_max = -FLT_MAX;
@@ -906,8 +944,11 @@ __global__ void __launch_bounds__(1024, 1) sampler_step_f16_kernel(
             ValIdx win = block_reduce_max_pair(best, s_val, s_idx);
             if (k == 0) raw_max = win.val;
             if (k < actual_lp) {
-                picked_lp_ids[k] = win.idx;
-                picked_lp_vals[k] = win.val;
+                if (threadIdx.x == 0) {
+                    picked_lp_ids[k] = win.idx;
+                    picked_lp_vals[k] = win.val;
+                }
+                __syncthreads();
             }
         }
         double sum_exp_raw = 0.0;
@@ -1326,7 +1367,7 @@ extern "C" int w34_sampler_step_f16(
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return (int)err;
     }
-    w34_sampler::sampler_step_f16_kernel<<<num_rows, 1024, 0, stream>>>(
+    w34_sampler::sampler_step_f16_kernel<<<num_rows, 512, 0, stream>>>(
         (const __half*)logits_f16,
         row_cfgs,
         bitmask_u32,

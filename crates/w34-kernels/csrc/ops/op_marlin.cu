@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 
 #define MARLIN_NAMESPACE_NAME marlin
@@ -364,6 +365,9 @@ static bool is_valid_config(thread_config_t const& th_config, int thread_m_block
 
 typedef void (*MarlinFuncPtr)(MARLIN_KERNEL_PARAMS);
 
+static std::atomic<uint32_t> g_marlin_attr_warm_mask{0u};
+static int warmup_all_specializations_impl(int max_shared_mem);
+
 #define MARLIN_CASE_ATYPE_BTYPE(ATYPE, BTYPE, T_K, T_N, THR, M_BLOCKS, M8, GBX) \
     if (th_config.thread_k == (T_K) && th_config.thread_n == (T_N) &&           \
         th_config.num_threads == (THR) && thread_m_blocks == (M_BLOCKS) &&      \
@@ -698,18 +702,30 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
                   th_cfg, num_bits, has_zp, thread_m_blocks, m_block_size_8, group_blocks);
         if (kernel == nullptr) return (int)cudaErrorInvalidValue;
 
-        if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem) != cudaSuccess) {
-            return (int)cudaGetLastError();
+        const int tile_smem = get_kernel_cache_size(
+            th_cfg, thread_m_blocks, num_bits, groupsize, has_zp, stages);
+        if (tile_smem > 48 * 1024) {
+            int cur_dev = -1;
+            const bool already_warm =
+                (cudaGetDevice(&cur_dev) == cudaSuccess) && cur_dev >= 0 && cur_dev < 32 &&
+                ((g_marlin_attr_warm_mask.load(std::memory_order_acquire) & (1u << cur_dev)) != 0u);
+            if (!already_warm) {
+                if (cudaFuncSetAttribute(
+                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem) !=
+                    cudaSuccess) {
+                    return (int)cudaGetLastError();
+                }
+            }
         }
         bool part_use_atomic_add = (blocks <= mn_tiles) && !enable_m_invariant_split_k &&
                                    (div_ceil(prob_m_split, 64) * prob_n <= 2048);
 
-        kernel<<<blocks, th_cfg.num_threads, max_shared_mem, stream>>>(
+        kernel<<<blocks, th_cfg.num_threads, tile_smem, stream>>>(
             A_ptr, B_ptr, C_ptr, nullptr,
             nullptr, S_ptr, nullptr, ZP_ptr, nullptr,
             num_groups, prob_m_split, prob_n,
             prob_k, prob_k, workspace,
-            false, part_use_atomic_add, max_shared_mem);
+            false, part_use_atomic_add, tile_smem);
 
         A_ptr += (size_t)prob_m_split * (size_t)(prob_k / 8);
         C_ptr += (size_t)prob_m_split * (size_t)(prob_n / 8);
@@ -750,6 +766,10 @@ static int warmup_all_specializations_impl(int max_shared_mem) {
                 }
             }
         }
+    }
+    int cur_dev = -1;
+    if (cudaGetDevice(&cur_dev) == cudaSuccess && cur_dev >= 0 && cur_dev < 32) {
+        g_marlin_attr_warm_mask.fetch_or(1u << cur_dev, std::memory_order_release);
     }
     return 0;
 }

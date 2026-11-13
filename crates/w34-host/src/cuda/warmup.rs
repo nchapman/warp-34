@@ -1315,32 +1315,37 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup rms_norm_bf16"
     )?;
-    warmup_ffi!(
-        ffi::w34_rms_norm_bf16(
-            &ex,
-            buf_a as *const c_void,
-            buf_b as *mut c_void,
-            buf_c as *const c_void,
-            buf_d as *mut c_void,
-            1,
-            256,
-            1e-6,
-        ),
-        "warmup rms_norm_bf16 vec8"
-    )?;
-    warmup_ffi!(
-        ffi::w34_rms_norm_bf16(
-            &ex,
-            buf_a as *const c_void,
-            buf_b as *mut c_void,
-            buf_c as *const c_void,
-            buf_d as *mut c_void,
-            1,
-            2560,
-            1e-6,
-        ),
-        "warmup rms_norm_bf16 vec8 h2560"
-    )?;
+    for hs_bf16 in (256..=3072).step_by(256) {
+        warmup_ffi!(
+            ffi::w34_rms_norm_bf16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut c_void,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                1,
+                hs_bf16,
+                1e-6,
+            ),
+            "warmup rms_norm_bf16 vec8"
+        )?;
+    }
+    for (ne, tk) in [(256i32, 8i32), (512, 10), (128, 4), (384, 8), (768, 8)] {
+        warmup_ffi!(
+            ffi::w34_moe_topk_router_f16(
+                &ex,
+                buf_a as *const c_void,
+                buf_b as *mut f32,
+                buf_c as *mut i32,
+                1,
+                ne,
+                tk,
+                1,
+                0,
+            ),
+            "warmup moe_topk_router_f16"
+        )?;
+    }
     warmup_ffi!(
         ffi::w34_silu_and_mul_bf16(&ex, buf_a as *const c_void, buf_b as *mut c_void, 1, 128),
         "warmup silu_and_mul_bf16"

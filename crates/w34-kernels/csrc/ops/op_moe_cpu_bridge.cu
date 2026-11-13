@@ -99,6 +99,11 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
     int k_hot,
     float gpu_share_frac) {
     __shared__ int32_t s_cpu_le[kMaxPairs];
+    __shared__ int32_t distinct_cold[kMaxPairs];
+    __shared__ int32_t distinct_ge[kMaxPairs];
+    __shared__ int32_t cold_hits[kMaxPairs];
+    __shared__ int32_t cold_score[kMaxPairs];
+    __shared__ int32_t cold_assigned_slot[kMaxPairs];
     __shared__ int32_t s_n_cpu_cold;
 
     const int total_pairs = num_tokens * top_k;
@@ -106,10 +111,6 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
         const uint64_t step = (*step_counter) + 1;
         *step_counter = step;
 
-        int32_t distinct_cold[kMaxPairs];
-        int32_t distinct_ge[kMaxPairs];
-        int32_t cold_hits[kMaxPairs];
-        int32_t cold_score[kMaxPairs];
         int n_cold = 0;
 
         for (int p = 0; p < total_pairs; ++p) {
@@ -172,7 +173,6 @@ __global__ void moe_hybrid_plan_and_submit_kernel(
             if (want_gpu_cold > n_cold) want_gpu_cold = n_cold;
         }
 
-        int32_t cold_assigned_slot[kMaxPairs];
         for (int c = 0; c < n_cold; ++c) {
             cold_assigned_slot[c] = -1;
         }

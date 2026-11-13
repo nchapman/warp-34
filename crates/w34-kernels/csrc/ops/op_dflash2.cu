@@ -158,28 +158,28 @@ __global__ void norm_bf16_vec8_1warp(
     }
 }
 
-// 4-warp (4 rows/CTA), register-cached, 128-bit vectorized BF16 RMSNorm preserving
-// the exact 32-lane x vec=8 FP32 reduction tree of FlashInfer's <=3072-width norm.
-__global__ void norm_bf16_vec8_4warp(
+// 4-warp (4 rows/CTA), compile-time unrolled, zero-stack register-resident 128-bit vectorized
+// BF16 RMSNorm preserving the exact 32-lane x vec=8 FP32 reduction tree of FlashInfer's <=3072-width norm.
+template <int ROUNDS>
+__global__ void __launch_bounds__(128) norm_bf16_vec8_4warp(
     const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* __restrict__ residual,
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ y,
     int rows,
-    int hidden,
     float eps) {
-    constexpr int MAX_ROUNDS = 12; // 12 * 256 = 3072
+    constexpr int HIDDEN = ROUNDS << 8;
     const int wid = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int row = (int)blockIdx.x * 4 + wid;
     if (row >= rows) return;
 
-    const int64_t base = (int64_t)row * hidden;
-    const int rounds = hidden >> 8;
-    float vals[MAX_ROUNDS][8];
+    const int64_t base = (int64_t)row * HIDDEN;
+    float vals[ROUNDS][8];
     float sq = 0.0f;
 
-    for (int i = 0; i < rounds; ++i) {
+#pragma unroll
+    for (int i = 0; i < ROUNDS; ++i) {
         const int col0 = ((i << 5) + lane) << 3;
         Bf16Vec8 xv;
         xv.u = *reinterpret_cast<const uint4*>(x + base + col0);
@@ -208,10 +208,11 @@ __global__ void norm_bf16_vec8_4warp(
     }
 
     float inv;
-    const float var_eps = sq / (float)hidden + eps;
+    const float var_eps = sq / (float)HIDDEN + eps;
     asm volatile("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv) : "f"(var_eps));
 
-    for (int i = 0; i < rounds; ++i) {
+#pragma unroll
+    for (int i = 0; i < ROUNDS; ++i) {
         const int col0 = ((i << 5) + lane) << 3;
         Bf16Vec8 wv;
         wv.u = *reinterpret_cast<const uint4*>(weight + col0);
@@ -1175,10 +1176,26 @@ int w34_rms_norm_bf16(
     }
     if (aligned16 && hidden >= 256 && hidden <= 3072 && (hidden & 255) == 0) {
         const unsigned blocks = (unsigned)((rows + 3) / 4);
-        norm_bf16_vec8_4warp<<<blocks, 128, 0, (cudaStream_t)ex->stream>>>(
-            (const __nv_bfloat16*)x, (__nv_bfloat16*)residual,
-            (const __nv_bfloat16*)weight, (__nv_bfloat16*)y,
-            rows, hidden, eps);
+        const cudaStream_t stream = (cudaStream_t)ex->stream;
+        #define LAUNCH_NORM_4WARP(R) \
+            norm_bf16_vec8_4warp<(R)><<<blocks, 128, 0, stream>>>( \
+                (const __nv_bfloat16*)x, (__nv_bfloat16*)residual, \
+                (const __nv_bfloat16*)weight, (__nv_bfloat16*)y, rows, eps)
+        switch (hidden >> 8) {
+            case 1: LAUNCH_NORM_4WARP(1); break;
+            case 2: LAUNCH_NORM_4WARP(2); break;
+            case 3: LAUNCH_NORM_4WARP(3); break;
+            case 4: LAUNCH_NORM_4WARP(4); break;
+            case 5: LAUNCH_NORM_4WARP(5); break;
+            case 6: LAUNCH_NORM_4WARP(6); break;
+            case 7: LAUNCH_NORM_4WARP(7); break;
+            case 8: LAUNCH_NORM_4WARP(8); break;
+            case 9: LAUNCH_NORM_4WARP(9); break;
+            case 10: LAUNCH_NORM_4WARP(10); break;
+            case 11: LAUNCH_NORM_4WARP(11); break;
+            default: LAUNCH_NORM_4WARP(12); break;
+        }
+        #undef LAUNCH_NORM_4WARP
         return (int)cudaGetLastError();
     }
     const int threads = (hidden <= 3072) ? 32 : ((hidden <= 6144) ? 64 : 128);

@@ -138,6 +138,228 @@ __global__ void __launch_bounds__(32) moe_topk_router_256_k8_f16_kernel(
     }
 }
 
+// Specialized 1-warp (32-thread) register-only router for num_experts == 512 and top_k == 10
+// (`Qwen3.8-Flash-Next` / 512-expert architectures): two 16-byte uint4 loads per lane (16 FP16
+// logits/lane in registers), winner-only rescan across 10 tournament rounds, 0 shared memory, 0 stack.
+__global__ void __launch_bounds__(32) moe_topk_router_512_k10_f16_kernel(
+    const __half* __restrict__ router_logits,
+    float* __restrict__ topk_weights,
+    int32_t* __restrict__ topk_ids,
+    int num_tokens,
+    int norm_topk_prob,
+    int scoring_func) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+
+    const int lane = threadIdx.x & 31;
+    const uint4* row_v4 = reinterpret_cast<const uint4*>(router_logits + (size_t)tok * 512);
+    const uint4 v0 = __ldg(&row_v4[lane * 2]);
+    const uint4 v1 = __ldg(&row_v4[lane * 2 + 1]);
+    const __half* h0 = reinterpret_cast<const __half*>(&v0);
+    const __half* h1 = reinterpret_cast<const __half*>(&v1);
+    const int base_e = lane * 16;
+
+    float p[16];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        p[i] = __half2float(h0[i]);
+        p[i + 8] = __half2float(h1[i]);
+    }
+
+    if (scoring_func == 1) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            p[i] = 1.0f / (1.0f + expf(-p[i]));
+        }
+    } else {
+        float local_max = p[0];
+#pragma unroll
+        for (int i = 1; i < 16; ++i) {
+            local_max = fmaxf(local_max, p[i]);
+        }
+        const float max_val = warp_reduce_max(local_max);
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const float ev = expf(p[i] - max_val);
+            p[i] = ev;
+            local_sum += ev;
+        }
+        const float sum_val = warp_reduce_sum(local_sum);
+        const float inv_sum = (sum_val > 0.0f) ? (1.0f / sum_val) : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            p[i] *= inv_sum;
+        }
+    }
+
+    float best_v = p[0];
+    int best_e = base_e;
+#pragma unroll
+    for (int i = 1; i < 16; ++i) {
+        if (p[i] > best_v) {
+            best_v = p[i];
+            best_e = base_e + i;
+        }
+    }
+
+    float w_sum = 0.0f;
+    float my_w = 0.0f;
+    int32_t my_id = 0;
+
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        float cur_v = best_v;
+        int cur_e = best_e;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, cur_v, off);
+            const int oe = __shfl_xor_sync(0xffffffffu, cur_e, off);
+            if (ov > cur_v || (ov == cur_v && oe < cur_e)) {
+                cur_v = ov;
+                cur_e = oe;
+            }
+        }
+        const float win_v = __shfl_sync(0xffffffffu, cur_v, 0);
+        const int win_e = __shfl_sync(0xffffffffu, cur_e, 0);
+        w_sum += win_v;
+        if (lane == k) {
+            my_w = win_v;
+            my_id = win_e;
+        }
+        if ((win_e >> 4) == lane && k < 9) {
+            best_v = -1.0f;
+            best_e = 512;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                if (base_e + i == win_e) {
+                    p[i] = -2.0f;
+                }
+                if (p[i] > best_v) {
+                    best_v = p[i];
+                    best_e = base_e + i;
+                }
+            }
+        }
+    }
+
+    if (lane < 10) {
+        const float scale = (norm_topk_prob != 0 && w_sum > 0.0f && isfinite(w_sum)) ? (1.0f / w_sum) : 1.0f;
+        topk_weights[(size_t)tok * 10 + lane] = my_w * scale;
+        topk_ids[(size_t)tok * 10 + lane] = my_id;
+    }
+}
+
+// Fast 1-warp (32-thread) register-only router for 256 < num_experts <= 512 and top_k <= 32.
+__global__ void __launch_bounds__(32) moe_topk_router_warp512_f16_kernel(
+    const __half* __restrict__ router_logits,
+    float* __restrict__ topk_weights,
+    int32_t* __restrict__ topk_ids,
+    int num_tokens,
+    int num_experts,
+    int top_k,
+    int norm_topk_prob,
+    int scoring_func) {
+    const int tok = blockIdx.x;
+    if (tok >= num_tokens) return;
+
+    const int lane = threadIdx.x & 31;
+    const __half* row = router_logits + (size_t)tok * num_experts;
+
+    float p[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int e = lane + i * 32;
+        p[i] = (e < num_experts) ? __half2float(__ldg(&row[e])) : -FLT_MAX;
+    }
+
+    if (scoring_func == 1) {
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int e = lane + i * 32;
+            p[i] = (e < num_experts) ? (1.0f / (1.0f + expf(-p[i]))) : -2.0f;
+        }
+    } else {
+        float local_max = -FLT_MAX;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            local_max = fmaxf(local_max, p[i]);
+        }
+        const float max_val = warp_reduce_max(local_max);
+
+        float local_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int e = lane + i * 32;
+            if (e < num_experts) {
+                const float v = expf(p[i] - max_val);
+                p[i] = v;
+                local_sum += v;
+            } else {
+                p[i] = -2.0f;
+            }
+        }
+        const float sum_val = warp_reduce_sum(local_sum);
+        const float inv_sum = (sum_val > 0.0f) ? (1.0f / sum_val) : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int e = lane + i * 32;
+            if (e < num_experts) {
+                p[i] *= inv_sum;
+            }
+        }
+    }
+
+    float w_sum = 0.0f;
+    float my_w = 0.0f;
+    int32_t my_id = 0;
+
+    for (int k = 0; k < top_k; ++k) {
+        float best_v = -1.0f;
+        int best_e = num_experts;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            const int e = lane + i * 32;
+            if (e < num_experts) {
+                const float v = p[i];
+                if (v > best_v || (v == best_v && e < best_e)) {
+                    best_v = v;
+                    best_e = e;
+                }
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best_v, off);
+            const int oe = __shfl_xor_sync(0xffffffffu, best_e, off);
+            if (ov > best_v || (ov == best_v && oe < best_e)) {
+                best_v = ov;
+                best_e = oe;
+            }
+        }
+        const float win_v = __shfl_sync(0xffffffffu, best_v, 0);
+        const int win_e = __shfl_sync(0xffffffffu, best_e, 0);
+        w_sum += win_v;
+        if (lane == k) {
+            my_w = win_v;
+            my_id = win_e;
+        }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            if (lane + i * 32 == win_e) {
+                p[i] = -2.0f;
+            }
+        }
+    }
+
+    if (lane < top_k) {
+        const float scale = (norm_topk_prob != 0 && w_sum > 0.0f && isfinite(w_sum)) ? (1.0f / w_sum) : 1.0f;
+        topk_weights[(size_t)tok * top_k + lane] = my_w * scale;
+        topk_ids[(size_t)tok * top_k + lane] = my_id;
+    }
+}
+
 // Fast 1-warp (32-thread) register-only router for num_experts <= 256 and top_k <= 32.
 // Eliminates all shared memory and CTA barriers.
 __global__ void moe_topk_router_warp256_f16_kernel(
@@ -268,6 +490,8 @@ __global__ void moe_topk_router_f16_kernel(
     const __half* row = router_logits + (size_t)tok * num_experts;
     __shared__ float s_probs[1024];
     __shared__ float s_warp[32];
+    __shared__ float s_chosen_w[32];
+    __shared__ int32_t s_chosen_id[32];
 
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
@@ -322,8 +546,6 @@ __global__ void moe_topk_router_f16_kernel(
     // Thread 0..31 (Warp 0) finds top_k iteratively using warp reductions
     if (wid == 0) {
         float w_sum = 0.0f;
-        float chosen_w[32];
-        int32_t chosen_id[32];
 
         for (int k = 0; k < top_k; ++k) {
             float best_v = -1.0f;
@@ -345,8 +567,8 @@ __global__ void moe_topk_router_f16_kernel(
                 }
             }
             if (lane == 0) {
-                chosen_w[k] = best_v;
-                chosen_id[k] = best_e;
+                s_chosen_w[k] = best_v;
+                s_chosen_id[k] = best_e;
                 w_sum += best_v;
                 if (best_e < num_experts) {
                     s_probs[best_e] = -2.0f;
@@ -355,14 +577,11 @@ __global__ void moe_topk_router_f16_kernel(
             __syncwarp();
         }
 
-        if (lane == 0) {
+        w_sum = __shfl_sync(0xffffffffu, w_sum, 0);
+        if (lane < top_k) {
             const float scale = (norm_topk_prob != 0 && w_sum > 0.0f && isfinite(w_sum)) ? (1.0f / w_sum) : 1.0f;
-            float* out_w = topk_weights + (size_t)tok * top_k;
-            int32_t* out_id = topk_ids + (size_t)tok * top_k;
-            for (int k = 0; k < top_k; ++k) {
-                out_w[k] = chosen_w[k] * scale;
-                out_id[k] = chosen_id[k];
-            }
+            topk_weights[(size_t)tok * top_k + lane] = s_chosen_w[lane] * scale;
+            topk_ids[(size_t)tok * top_k + lane] = s_chosen_id[lane];
         }
     }
 }
@@ -388,8 +607,15 @@ extern "C" int w34_moe_topk_router_f16(
     if (num_experts == 256 && top_k == 8 && (((uintptr_t)router_logits & 15u) == 0u)) {
         w34_moe::moe_topk_router_256_k8_f16_kernel<<<(unsigned)num_tokens, 32, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)router_logits, topk_weights, topk_ids, num_tokens, norm_topk_prob, scoring_func);
+    } else if (num_experts == 512 && top_k == 10 && (((uintptr_t)router_logits & 15u) == 0u)) {
+        w34_moe::moe_topk_router_512_k10_f16_kernel<<<(unsigned)num_tokens, 32, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)router_logits, topk_weights, topk_ids, num_tokens, norm_topk_prob, scoring_func);
     } else if (num_experts <= 256) {
         w34_moe::moe_topk_router_warp256_f16_kernel<<<(unsigned)num_tokens, 32, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)router_logits, topk_weights, topk_ids, num_tokens, num_experts, top_k,
+            norm_topk_prob, scoring_func);
+    } else if (num_experts <= 512) {
+        w34_moe::moe_topk_router_warp512_f16_kernel<<<(unsigned)num_tokens, 32, 0, (cudaStream_t)ex->stream>>>(
             (const __half*)router_logits, topk_weights, topk_ids, num_tokens, num_experts, top_k,
             norm_topk_prob, scoring_func);
     } else {

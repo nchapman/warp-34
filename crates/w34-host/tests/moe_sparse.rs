@@ -1590,3 +1590,65 @@ fn moe_router_lru_and_bridge_validate_before_mutating_state() {
         "wait_and_add must reject num_tokens > kMaxTokens (8)"
     );
 }
+
+#[test]
+fn moe_router_512_k10_warp_matches_generic_and_unaligned_fallback() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+
+    let rows = 16usize;
+    let ne = 512usize;
+    let tk = 10usize;
+    let pad_u16 = 2usize; // +4B offset forces `moe_topk_router_warp512_f16_kernel` instead of `512_k10`
+    let mut logits_host = vec![0u16; pad_u16 + rows * ne];
+    for r in 0..rows {
+        for e in 0..ne {
+            let v = (((r * 131 + e * 37) % 509) as f32 - 254.0) * 0.03125;
+            logits_host[pad_u16 + r * ne + e] = f32_to_f16(v);
+        }
+    }
+    for scoring_func in [0i32, 1i32] {
+        let run = |off_u16: usize| -> (Vec<f32>, Vec<i32>) {
+            let d_l = DeviceBuffer::alloc(0, logits_host.len() * 2).unwrap();
+            let d_w = DeviceBuffer::alloc(0, rows * tk * 4).unwrap();
+            let d_i = DeviceBuffer::alloc(0, rows * tk * 4).unwrap();
+            d_l.copy_from_host(&logits_host[pad_u16 - off_u16..], &stream)
+                .unwrap();
+            // SAFETY: `d_l`, `d_w`, and `d_i` remain live on device 0 until `stream.synchronize()` below.
+            let rc = unsafe {
+                w34_kernels::ffi::w34_moe_topk_router_f16(
+                    &ex,
+                    (d_l.addr() + (off_u16 * 2) as u64) as *const c_void,
+                    d_w.addr() as *mut f32,
+                    d_i.addr() as *mut i32,
+                    rows as i32,
+                    ne as i32,
+                    tk as i32,
+                    1,
+                    scoring_func,
+                )
+            };
+            assert_eq!(rc, 0);
+            let mut got_w = vec![0.0f32; rows * tk];
+            let mut got_i = vec![0i32; rows * tk];
+            d_w.copy_to_host(&mut got_w, &stream).unwrap();
+            d_i.copy_to_host(&mut got_i, &stream).unwrap();
+            stream.synchronize().unwrap();
+            (got_w, got_i)
+        };
+        let (w_fast, i_fast) = run(0);
+        let (w_unaligned, i_unaligned) = run(pad_u16);
+        assert_eq!(
+            i_fast, i_unaligned,
+            "512/k10 router IDs mismatch for scoring_func={scoring_func}"
+        );
+        for (idx, (&a, &b)) in w_fast.iter().zip(w_unaligned.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-6,
+                "512/k10 router weight mismatch at {idx} (scoring={scoring_func}): {a} vs {b}"
+            );
+        }
+    }
+}
