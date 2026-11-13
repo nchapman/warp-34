@@ -793,12 +793,13 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
             __syncthreads();
 
             const int g_idx = kc / group_size;
+            const bool group_covers_ktile = ((group_size & 63) == 0);
             const __half2 gs_h2 = n_valid ? __half2half2(gate_s_row[g_idx]) : __float2half2_rn(0.0f);
             const __half2 us_h2 = n_valid ? __half2half2(up_s_row[g_idx]) : __float2half2_rn(0.0f);
             uint32_t g_zp_64 = 8u;
             uint32_t u_zp_64 = 8u;
             if constexpr (HAS_ZP) {
-                if (n_valid && group_size >= 64) {
+                if (n_valid && group_covers_ktile) {
                     g_zp_64 = load_zp_nibble(zp_exp, n_col, groups_per_row, g_idx);
                     u_zp_64 = load_zp_nibble(zp_exp, n_interm + n_col, groups_per_row, g_idx);
                 }
@@ -816,10 +817,10 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
                 uint32_t gb0 = 0u, gb1 = 0u, ub0 = 0u, ub1 = 0u;
                 if (n_valid) {
                     const int cur_g = col_base / group_size;
-                    const __half2 gs_cur = (group_size >= 64)
+                    const __half2 gs_cur = group_covers_ktile
                         ? gs_h2
                         : __half2half2(gate_s_row[cur_g]);
-                    const __half2 us_cur = (group_size >= 64)
+                    const __half2 us_cur = group_covers_ktile
                         ? us_h2
                         : __half2half2(up_s_row[cur_g]);
                     if constexpr (BITS == 2) {
@@ -832,10 +833,10 @@ __global__ void moe_w4a16_grouped_gate_up_silu_mma_f16_kernel(
                         ub1 = unpack_u2b2_pair_scaled(uw16, tid_in_grp + 4, us_cur);
                     } else if constexpr (HAS_ZP) {
                         const int w_idx = col_base >> 3;
-                        const uint32_t g_zp = (group_size >= 64)
+                        const uint32_t g_zp = group_covers_ktile
                             ? g_zp_64
                             : load_zp_nibble(zp_exp, n_col, groups_per_row, cur_g);
-                        const uint32_t u_zp = (group_size >= 64)
+                        const uint32_t u_zp = group_covers_ktile
                             ? u_zp_64
                             : load_zp_nibble(zp_exp, n_interm + n_col, groups_per_row, cur_g);
                         gb0 = unpack_u4_zp_pair_scaled(gate_w_row[w_idx], tid_in_grp, g_zp, gs_cur);
@@ -985,12 +986,13 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
         __syncthreads();
 
         const int g_idx = kc / group_size;
+        const bool group_covers_ktile = ((group_size & 63) == 0);
         const __half2 sa_h2 = valid_a ? __half2half2(ds_a[g_idx]) : __float2half2_rn(0.0f);
         const __half2 sb_h2 = valid_b ? __half2half2(ds_b[g_idx]) : __float2half2_rn(0.0f);
         uint32_t za_64 = 8u;
         uint32_t zb_64 = 8u;
         if constexpr (HAS_ZP) {
-            if (group_size >= 64) {
+            if (group_covers_ktile) {
                 if (valid_a) za_64 = load_zp_nibble(zp_exp, col_a, groups_per_row, g_idx);
                 if (valid_b) zb_64 = load_zp_nibble(zp_exp, col_b, groups_per_row, g_idx);
             }
@@ -1008,7 +1010,7 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
             const int cur_g = col_base / group_size;
             uint32_t ba0 = 0u, ba1 = 0u, bb0 = 0u, bb1 = 0u;
             if (valid_a) {
-                const __half2 sa_cur = (group_size >= 64)
+                const __half2 sa_cur = group_covers_ktile
                     ? sa_h2
                     : __half2half2(ds_a[cur_g]);
                 if constexpr (BITS == 2) {
@@ -1018,7 +1020,7 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
                     ba1 = unpack_u2b2_pair_scaled(dwa16, tid_in_grp + 4, sa_cur);
                 } else if constexpr (HAS_ZP) {
                     const int w_idx = col_base >> 3;
-                    const uint32_t za = (group_size >= 64)
+                    const uint32_t za = group_covers_ktile
                         ? za_64
                         : load_zp_nibble(zp_exp, col_a, groups_per_row, cur_g);
                     ba0 = unpack_u4_zp_pair_scaled(dw_a[w_idx], tid_in_grp, za, sa_cur);
@@ -1030,7 +1032,7 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
                 }
             }
             if (valid_b) {
-                const __half2 sb_cur = (group_size >= 64)
+                const __half2 sb_cur = group_covers_ktile
                     ? sb_h2
                     : __half2half2(ds_b[cur_g]);
                 if constexpr (BITS == 2) {
@@ -1040,7 +1042,7 @@ __global__ void moe_w4a16_grouped_down_mma_f16_kernel(
                     bb1 = unpack_u2b2_pair_scaled(dwb16, tid_in_grp + 4, sb_cur);
                 } else if constexpr (HAS_ZP) {
                     const int w_idx = col_base >> 3;
-                    const uint32_t zb = (group_size >= 64)
+                    const uint32_t zb = group_covers_ktile
                         ? zb_64
                         : load_zp_nibble(zp_exp, col_b, groups_per_row, cur_g);
                     bb0 = unpack_u4_zp_pair_scaled(dw_b[w_idx], tid_in_grp, zb, sb_cur);

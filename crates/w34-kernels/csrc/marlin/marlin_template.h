@@ -197,7 +197,10 @@ __device__ inline void barrier_release(int* lock, bool reset = false) {
   __syncthreads();
   if (threadIdx.x == 0) {
     if (reset) {
-      lock[0] = 0;
+      int zero = 0;
+      asm volatile("st.global.release.gpu.b32 [%0], %1;\n"
+                   :
+                   : "l"(lock), "r"(zero));
       return;
     }
     int val = 1;
@@ -467,7 +470,7 @@ __global__ void Marlin(
         if (row < prob_m) {
           int col = slice_col * 16 * thread_n_blocks / 8 +
                     threadIdx.x % threads_per_m;
-          C[row * prob_n / 8 + col] = {0, 0, 0, 0};
+          C[(size_t)row * (size_t)(prob_n / 8) + col] = {0, 0, 0, 0};
         }
       }
       // After write zero to output, write a negative value to lock.
@@ -475,7 +478,12 @@ __global__ void Marlin(
       // the negative value, and then atomicAdd 1 to it.
       // After all SMs are processed, the lock value would back to 0 again.
       __syncthreads();
-      if (threadIdx.x == 0) locks[locks_off] = 1 - slice_count;
+      if (threadIdx.x == 0) {
+        int init_lock = 1 - slice_count;
+        asm volatile("st.global.release.gpu.b32 [%0], %1;\n"
+                     :
+                     : "l"(&locks[locks_off]), "r"(init_lock));
+      }
     }
 
     if (slice_col == n_tiles) {
@@ -1692,6 +1700,7 @@ __global__ void Marlin(
         }
       }
     }
+    __syncthreads();
   };
 
   // Globally reduce over threadblocks that compute the same column block.
@@ -2004,6 +2013,7 @@ __global__ void Marlin(
         cp_async_fence();
       }
 
+      __syncthreads();
       thread_block_reduce();
 
       if (has_bias && last) {

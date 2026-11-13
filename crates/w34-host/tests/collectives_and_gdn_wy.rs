@@ -1034,3 +1034,164 @@ fn test_gdn_wy_extreme_decay_gates_produce_finite_outputs_and_states() {
         "GDN produced non-finite ssm_state under strong decay"
     );
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_gdn_wy_duplicate_checkpoint_offsets_and_conv_kernel_size_validation() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = CudaDevice::set_current(0).expect("CudaDevice(0)");
+    let stream = CudaStream::new(dev.device_id).expect("stream");
+
+    let (hk, hv, dk, dv) = (2usize, 4usize, 128usize, 128usize);
+    let conv_dim = 2 * hk * dk + hv * dv;
+    let seq_len = 128usize;
+    let num_slots = 6usize;
+
+    let qkv_host: Vec<u16> = (0..(seq_len * conv_dim))
+        .map(|i| f32_to_f16(((i % 83) as f32 - 41.0) * 0.01))
+        .collect();
+    let b_host: Vec<u16> = (0..(seq_len * hv))
+        .map(|i| f32_to_f16(((i % 11) as f32 - 5.0) * 0.1))
+        .collect();
+    let a_host: Vec<u16> = (0..(seq_len * hv))
+        .map(|i| f32_to_f16(((i % 17) as f32 - 8.0) * 0.08))
+        .collect();
+    let a_log = vec![-1.2f32, -0.8f32, -1.5f32, -0.5f32];
+    let dt_bias = vec![0.1f32, -0.1f32, 0.05f32, -0.05f32];
+
+    let d_qkv = DeviceBuffer::alloc(0, qkv_host.len() * 2).unwrap();
+    let d_b = DeviceBuffer::alloc(0, b_host.len() * 2).unwrap();
+    let d_a = DeviceBuffer::alloc(0, a_host.len() * 2).unwrap();
+    let d_alog = DeviceBuffer::alloc(0, a_log.len() * 4).unwrap();
+    let d_dtb = DeviceBuffer::alloc(0, dt_bias.len() * 4).unwrap();
+    d_qkv.copy_from_host(&qkv_host, &stream).unwrap();
+    d_b.copy_from_host(&b_host, &stream).unwrap();
+    d_a.copy_from_host(&a_host, &stream).unwrap();
+    d_alog.copy_from_host(&a_log, &stream).unwrap();
+    d_dtb.copy_from_host(&dt_bias, &stream).unwrap();
+
+    // 1. Validate `w34_gdn_causal_conv1d_strided_f16` rejects unsupported `kernel_size = 5` / `0`.
+    let pool = StateBundlePool::new(0, &[0], num_slots, conv_dim, 4, hv, dk, dv).unwrap();
+    let st = &pool.layers[0];
+    let d_qsl = DeviceBuffer::alloc(0, 8).unwrap();
+    let d_si = DeviceBuffer::alloc(0, 4).unwrap();
+    let d_so = DeviceBuffer::alloc(0, 4).unwrap();
+    let d_hi = DeviceBuffer::alloc(0, 1).unwrap();
+    d_qsl.copy_from_host(&[0i32, 16i32], &stream).unwrap();
+    d_si.copy_from_host(&[0i32], &stream).unwrap();
+    d_so.copy_from_host(&[1i32], &stream).unwrap();
+    d_hi.copy_from_host(&[0u8], &stream).unwrap();
+    let d_conv_w = DeviceBuffer::alloc(0, conv_dim * 5 * 2).unwrap();
+    let d_conv_out = DeviceBuffer::alloc(0, seq_len * conv_dim * 2).unwrap();
+    let ex0 = stream.exec(0, 0);
+    let conv_batch = W34GdnBatch {
+        query_start_loc: d_qsl.addr() as *const i32,
+        state_in_indices: d_si.addr() as *const i32,
+        state_out_indices: d_so.addr() as *const i32,
+        has_initial_state: d_hi.addr() as *const u8,
+        spec_state_indices: core::ptr::null(),
+        checkpoint_dst_indices: core::ptr::null(),
+        checkpoint_token_offsets: core::ptr::null(),
+        valid_req_mask: core::ptr::null(),
+        num_reqs: 1,
+        total_tokens: 16,
+        max_verify_tokens: 0,
+        max_checkpoints_per_req: 0,
+    };
+    for bad_k in [0i32, 5i32] {
+        // SAFETY: All device pointers are valid on device 0; `bad_k` tests boundary validation.
+        let rc = unsafe {
+            ffi::w34_gdn_causal_conv1d_strided_f16(
+                &ex0,
+                &conv_batch,
+                d_qkv.addr() as *const c_void,
+                d_conv_w.addr() as *const c_void,
+                core::ptr::null(),
+                st.conv_state.addr() as *mut c_void,
+                d_conv_out.addr() as *mut c_void,
+                conv_dim as i32,
+                conv_dim as i32,
+                bad_k,
+                num_slots as i32,
+                1,
+            )
+        };
+        assert_ne!(rc, 0, "expected conv1d to reject kernel_size={bad_k}");
+    }
+
+    // 2. Duplicate checkpoint offsets `[64, 64]` writing to two distinct destination slots `[2, 3]`
+    // must populate BOTH slots in both split-WY (`ws_size > 0`) and chunk64-WY (`ws_size == 0`).
+    d_qsl
+        .copy_from_host(&[0i32, seq_len as i32], &stream)
+        .unwrap();
+    let d_ckpt_dst = DeviceBuffer::alloc(0, 8).unwrap();
+    let d_ckpt_off = DeviceBuffer::alloc(0, 8).unwrap();
+    d_ckpt_dst.copy_from_host(&[2i32, 3i32], &stream).unwrap();
+    d_ckpt_off.copy_from_host(&[64i32, 64i32], &stream).unwrap();
+
+    let state_elems = hv * dv * dk;
+    let d_ws = DeviceBuffer::alloc(0, 8 * 1024 * 1024).unwrap();
+    let d_out = DeviceBuffer::alloc(0, seq_len * hv * dv * 2).unwrap();
+
+    for use_split in [true, false] {
+        let zero_ssm = vec![0.0f32; num_slots * state_elems];
+        st.ssm_state.copy_from_host(&zero_ssm, &stream).unwrap();
+        let ex = if use_split {
+            stream.exec(d_ws.addr(), d_ws.len_bytes)
+        } else {
+            stream.exec(0, 0)
+        };
+        let batch = W34GdnBatch {
+            query_start_loc: d_qsl.addr() as *const i32,
+            state_in_indices: d_si.addr() as *const i32,
+            state_out_indices: d_so.addr() as *const i32,
+            has_initial_state: d_hi.addr() as *const u8,
+            spec_state_indices: core::ptr::null(),
+            checkpoint_dst_indices: d_ckpt_dst.addr() as *const i32,
+            checkpoint_token_offsets: d_ckpt_off.addr() as *const i32,
+            valid_req_mask: core::ptr::null(),
+            num_reqs: 1,
+            total_tokens: seq_len as i32,
+            max_verify_tokens: 0,
+            max_checkpoints_per_req: 2,
+        };
+        // SAFETY: All device buffers are live and sized for `[seq_len=128, hk=2, hv=4, d=128]`.
+        let rc = unsafe {
+            ffi::w34_gdn_recurrent_strided_f16(
+                &ex,
+                &batch,
+                d_qkv.addr() as *const c_void,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                d_b.addr() as *const c_void,
+                d_a.addr() as *const c_void,
+                d_alog.addr() as *const f32,
+                d_dtb.addr() as *const f32,
+                st.ssm_state.addr() as *mut f32,
+                d_out.addr() as *mut c_void,
+                hk as i32,
+                dk as i32,
+                hv as i32,
+                dv as i32,
+                hv as i32,
+                num_slots as i32,
+            )
+        };
+        assert_eq!(rc, 0);
+        let mut ssm_got = vec![0.0f32; num_slots * state_elems];
+        st.ssm_state.copy_to_host(&mut ssm_got, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let slot2 = &ssm_got[2 * state_elems..3 * state_elems];
+        let slot3 = &ssm_got[3 * state_elems..4 * state_elems];
+        let norm2: f32 = slot2.iter().map(|x| x * x).sum();
+        assert!(
+            norm2 > 1e-4,
+            "expected non-zero checkpoint in slot 2 (split={use_split})"
+        );
+        assert_eq!(
+            slot2, slot3,
+            "duplicate checkpoint offset must populate both slot 2 and slot 3 (split={use_split})"
+        );
+    }
+}

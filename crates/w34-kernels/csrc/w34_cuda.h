@@ -305,6 +305,7 @@ int w34_small_n_gemm_dual_f16(const w34_exec* ex, const void* x,
 
 // --- Marlin Repack & GEMMs (op_marlin.cu) ---
 int w34_zero_i32(const w34_exec* ex, void* ptr, int64_t count);
+int w34_marlin_warmup_specializations(void);
 int w34_marlin_repack_int2(const w34_exec* ex, const uint32_t* src_n_major,
                            uint32_t* dst_marlin, int64_t k, int64_t n);
 int w34_marlin_repack_int4(const w34_exec* ex, const uint32_t* src_n_major,

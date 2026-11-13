@@ -128,7 +128,8 @@ __global__ void gptq_marlin_repack_n_major_kernel(
 
         constexpr int tile_out_size = tile_k * tile_n_size / pack_factor;
         int k_tile_id = k_pair * k_group_tiles + sub;
-        int out_offset = (k_tile_id * n_tiles + n_tile_id) * tile_out_size;
+        size_t out_offset = ((size_t)k_tile_id * (size_t)n_tiles + (size_t)n_tile_id) *
+                            (size_t)tile_out_size;
         if constexpr (num_bits == 2) {
             constexpr int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
             uint32_t lo_byte = 0;
@@ -220,7 +221,7 @@ __global__ void marlin_quantize_f16_u4b8_kernel(
     constexpr int kTileK = 16;
     const int n_tiles = size_n / kTileN;
     const int num_groups = size_k / group_size;
-    const int total_tiles = n_tiles * num_groups;
+    const int64_t total_tiles = (int64_t)n_tiles * (int64_t)num_groups;
     const int sub_tiles = group_size / kTileK;
 
     __shared__ uint8_t sh_q[kTileN][kTileK];
@@ -234,9 +235,9 @@ __global__ void marlin_quantize_f16_u4b8_kernel(
     constexpr int tc_offsets[4] = {0, 1, 8, 9};
     const int cur_n = warp_id * 16 + tc_col;
 
-    for (int tile_idx = blockIdx.x; tile_idx < total_tiles; tile_idx += gridDim.x) {
-        const int n_tile_id = tile_idx % n_tiles;
-        const int group_id = tile_idx / n_tiles;
+    for (int64_t tile_idx = blockIdx.x; tile_idx < total_tiles; tile_idx += gridDim.x) {
+        const int n_tile_id = (int)(tile_idx % n_tiles);
+        const int group_id = (int)(tile_idx / n_tiles);
         const int first_n = n_tile_id * kTileN;
         const int first_k = group_id * group_size;
         half const* row_ptr = src_f16 + (size_t)(first_n + r) * size_k + first_k;
@@ -576,6 +577,14 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
     int sms = dev_props.multi_processor_count;
     int max_shared_mem = dev_props.max_shared_mem_per_block_optin;
     if (workspace_ints < sms) return (int)cudaErrorInvalidValue;
+    if (m <= 0 || n <= 0 || k <= 0 || m > INT32_MAX || n > INT32_MAX || k > INT32_MAX) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const uintptr_t align_mask =
+        (uintptr_t)A | (uintptr_t)B | (uintptr_t)S | (uintptr_t)C | (has_zp ? (uintptr_t)ZP : 0u);
+    if ((align_mask & 15u) != 0u) {
+        return (int)cudaErrorInvalidValue;
+    }
 
     int prob_m = (int)m, prob_n = (int)n, prob_k = (int)k;
     const bool valid_gb = (group_blocks == 2 || group_blocks == 4 || group_blocks == 8) ||
@@ -702,14 +711,57 @@ static int marlin_gemm_impl(const w34_exec* ex, const void* A, const void* B,
             prob_k, prob_k, workspace,
             false, part_use_atomic_add, max_shared_mem);
 
-        A_ptr += prob_m_split * (prob_k / 8);
-        C_ptr += prob_m_split * (prob_n / 8);
+        A_ptr += (size_t)prob_m_split * (size_t)(prob_k / 8);
+        C_ptr += (size_t)prob_m_split * (size_t)(prob_n / 8);
         rest_m -= prob_m_split;
     }
     return (int)cudaGetLastError();
 }
 
+static int warmup_all_specializations_impl(int max_shared_mem) {
+    struct SpecCase {
+        thread_config_t cfg;
+        int m_blocks;
+        bool m8;
+    };
+    static constexpr SpecCase kCases[15] = {
+        {{128, 128, 256}, 1, false}, {{64, 128, 128}, 1, false}, {{128, 64, 128}, 1, false},
+        {{128, 128, 256}, 1, true},  {{64, 128, 128}, 1, true},  {{128, 64, 128}, 1, true},
+        {{64, 256, 256}, 2, false},  {{64, 128, 128}, 2, false}, {{128, 64, 128}, 2, false},
+        {{64, 256, 256}, 3, false},  {{64, 128, 128}, 3, false}, {{128, 64, 128}, 3, false},
+        {{64, 256, 256}, 4, false},  {{64, 128, 128}, 4, false}, {{128, 64, 128}, 4, false},
+    };
+    static constexpr int kGroups[4] = {-1, 2, 4, 8};
+    for (int gb : kGroups) {
+        for (const auto& sc : kCases) {
+            MarlinFuncPtr fns[5] = {
+                get_marlin_kernel_bf16u4(sc.cfg, sc.m_blocks, sc.m8, gb),
+                get_marlin_kernel_f16u2(sc.cfg, sc.m_blocks, sc.m8, gb),
+                get_marlin_kernel_f16u4(sc.cfg, sc.m_blocks, sc.m8, gb),
+                get_marlin_kernel_f16u4_zp(sc.cfg, sc.m_blocks, sc.m8, gb),
+                get_marlin_kernel_f16u8(sc.cfg, sc.m_blocks, sc.m8, gb),
+            };
+            for (MarlinFuncPtr fn : fns) {
+                if (fn == nullptr) continue;
+                if (cudaFuncSetAttribute(
+                        fn, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem) !=
+                    cudaSuccess) {
+                    return (int)cudaGetLastError();
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 }  // namespace w34_marlin
+
+extern "C" int w34_marlin_warmup_specializations() {
+    w34_device_props dev_props{};
+    int props_rc = w34_get_current_device_props(&dev_props);
+    if (props_rc != 0) return props_rc;
+    return w34_marlin::warmup_all_specializations_impl(dev_props.max_shared_mem_per_block_optin);
+}
 
 extern "C" int w34_zero_i32(const w34_exec* ex, void* ptr, int64_t count) {
     if (ex == nullptr || ptr == nullptr) return (int)cudaErrorInvalidValue;
@@ -724,7 +776,8 @@ extern "C" int w34_marlin_repack_int2(const w34_exec* ex, const uint32_t* src_n_
     if (ex == nullptr || src_n_major == nullptr || dst_marlin == nullptr) {
         return (int)cudaErrorInvalidValue;
     }
-    if (k <= 0 || n <= 0 || (k % 64) != 0 || (n % 64) != 0) {
+    if (k <= 0 || n <= 0 || k > INT32_MAX || n > INT32_MAX || (k % 64) != 0 || (n % 64) != 0 ||
+        (((uintptr_t)src_n_major) & 15u) != 0u) {
         return (int)cudaErrorInvalidValue;
     }
     w34_device_props dev_props{};
@@ -743,7 +796,8 @@ extern "C" int w34_marlin_repack_int4(const w34_exec* ex, const uint32_t* src_n_
     if (ex == nullptr || src_n_major == nullptr || dst_marlin == nullptr) {
         return (int)cudaErrorInvalidValue;
     }
-    if (k <= 0 || n <= 0 || (k % 32) != 0 || (n % 64) != 0) {
+    if (k <= 0 || n <= 0 || k > INT32_MAX || n > INT32_MAX || (k % 32) != 0 || (n % 64) != 0 ||
+        (((uintptr_t)src_n_major) & 15u) != 0u) {
         return (int)cudaErrorInvalidValue;
     }
     w34_device_props dev_props{};
@@ -762,7 +816,8 @@ extern "C" int w34_marlin_repack_int8(const w34_exec* ex, const uint32_t* src_n_
     if (ex == nullptr || src_n_major == nullptr || dst_marlin == nullptr) {
         return (int)cudaErrorInvalidValue;
     }
-    if (k <= 0 || n <= 0 || (k % 32) != 0 || (n % 64) != 0) {
+    if (k <= 0 || n <= 0 || k > INT32_MAX || n > INT32_MAX || (k % 32) != 0 || (n % 64) != 0 ||
+        (((uintptr_t)src_n_major) & 15u) != 0u) {
         return (int)cudaErrorInvalidValue;
     }
     w34_device_props dev_props{};
@@ -783,7 +838,7 @@ extern "C" int w34_marlin_quantize_f16_u4b8(
         dst_scales_perm == nullptr) {
         return (int)cudaErrorInvalidValue;
     }
-    if (k <= 0 || n <= 0 || (k % 32) != 0 || (n % 64) != 0 ||
+    if (k <= 0 || n <= 0 || k > INT32_MAX || n > INT32_MAX || (k % 32) != 0 || (n % 64) != 0 ||
         (group_size != 32 && group_size != 64 && group_size != 128) ||
         (k % group_size) != 0) {
         return (int)cudaErrorInvalidValue;

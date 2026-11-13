@@ -575,6 +575,7 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn w34_zero_i32(ex: *const W34Exec, ptr: *mut c_void, count: i64) -> i32;
+    pub fn w34_marlin_warmup_specializations() -> i32;
     pub fn w34_marlin_repack_int2(
         ex: *const W34Exec,
         src_n_major: *const u32,

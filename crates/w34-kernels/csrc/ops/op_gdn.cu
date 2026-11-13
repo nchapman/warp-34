@@ -933,7 +933,9 @@ extern "C" int w34_gdn_causal_conv1d_strided_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (batch->num_reqs <= 0 || batch->total_tokens <= 0 || conv_dim <= 0) return 0;
-    if (x_in_row_stride < conv_dim) return (int)cudaErrorInvalidValue;
+    if (x_in_row_stride < conv_dim || kernel_size < 1 || kernel_size > 4) {
+        return (int)cudaErrorInvalidValue;
+    }
     unsigned z_tiles = 1u;
     if (batch->spec_state_indices == nullptr &&
         x_in != x_out &&

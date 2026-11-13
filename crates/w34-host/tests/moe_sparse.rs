@@ -1441,3 +1441,25 @@ fn moe_grouped_mma_exact_parity_and_tp2() {
         "Grouped mma.sync MoE TP=1 vs TP=2 rel_l2 {tp_rel_l2} >= 1e-3"
     );
 }
+
+#[test]
+fn grouped_mma_moe_group_size_96_and_32_matches_cpu_reference() {
+    // `hidden = 192, interm = 192` (`% 64 == 0` and `% 128 != 0`) routes directly into
+    // `moe_w4a16_grouped_gate_up_silu_mma_f16_kernel` + `moe_w4a16_grouped_down_mma_f16_kernel`
+    // (`regime = 3`), where `group_size = 96` spans 1.5 64-element K-tiles (`kc = 64, ks = 2`
+    // crosses from group 0 into group 1 at `col_base = 96`).
+    for gs in [96usize, 32usize] {
+        check_sparse(SparseShape {
+            num_tokens: 8,
+            top_k: 2,
+            num_experts: 4,
+            hidden: 192,
+            interm: 192,
+            group_size: gs,
+            concentrated: false,
+            ws_cap: 4 * 1024 * 1024,
+            expected_regime: 3,
+            check_tp2_partition: false,
+        });
+    }
+}

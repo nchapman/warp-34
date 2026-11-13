@@ -188,9 +188,12 @@ __global__ void gdn_wy_plan_chunks_kernel(
                     const int32_t trig_off =
                         batch.checkpoint_token_offsets[req * batch.max_checkpoints_per_req + e];
                     if (trig_off == base_s + tile_len) {
-                        hit_ckpt_slot =
+                        const int32_t cand_slot =
                             batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
-                        break;
+                        if (cand_slot >= 0 && cand_slot < total_state_slots) {
+                            hit_ckpt_slot = cand_slot;
+                            break;
+                        }
                     }
                 }
             }
@@ -896,12 +899,22 @@ __global__ __launch_bounds__(256, 2) void gdn_wy_stage2_deltah_f16_kernel(
                 }
             }
             if (need_ckpt) {
-                float* head_dst =
-                    ssm_state_pool + ((size_t)cd.ckpt_slot * num_v_heads + hv) * head_state_elems;
-                for (int idx = tid; idx < BV * DK; idx += 256) {
-                    const int vc = idx >> 7;
-                    const int k = idx & 127;
-                    head_dst[(size_t)(vbase + vc) * DK + k] = s_H_f32[k * BV_PAD + vc];
+                const int end_step = (cd.tok0 - batch.query_start_loc[req]) + cd.len;
+                for (int e = 0; e < batch.max_checkpoints_per_req; ++e) {
+                    if (batch.checkpoint_token_offsets[req * batch.max_checkpoints_per_req + e] !=
+                        end_step) {
+                        continue;
+                    }
+                    const int32_t c_slot =
+                        batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
+                    if (c_slot < 0 || c_slot >= total_state_slots) continue;
+                    float* head_dst =
+                        ssm_state_pool + ((size_t)c_slot * num_v_heads + hv) * head_state_elems;
+                    for (int idx = tid; idx < BV * DK; idx += 256) {
+                        const int vc = idx >> 7;
+                        const int k = idx & 127;
+                        head_dst[(size_t)(vbase + vc) * DK + k] = s_H_f32[k * BV_PAD + vc];
+                    }
                 }
             }
             if (need_final) {
@@ -1274,10 +1287,11 @@ extern "C" int w34_gdn_launch_wy_prefill_f16(
                     if (cudaFuncSetAttribute(
                             w34_gdn::gdn_wy_stage1_wu_f16_kernel,
                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            w34_gdn::kWyStage1SmemBytes) != cudaSuccess ||
-                        w34_gdn_init_wy_chunk64_f16() != 0) {
+                            w34_gdn::kWyStage1SmemBytes) != cudaSuccess) {
                         return (int)cudaGetLastError();
                     }
+                    const int init_rc = w34_gdn_init_wy_chunk64_f16();
+                    if (init_rc != 0) return init_rc;
                     s_split_wy_attr_mask.fetch_or(dev_bit, std::memory_order_relaxed);
                 }
                 char* ws = reinterpret_cast<char*>((uintptr_t)ex->scratch_ptr);

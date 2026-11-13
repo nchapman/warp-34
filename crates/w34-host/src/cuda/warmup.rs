@@ -290,6 +290,10 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
 
     // 2. Marlin repack & GEMM + cuBLAS GEMM
     warmup_ffi!(
+        ffi::w34_marlin_warmup_specializations(),
+        "warmup w34_marlin_warmup_specializations"
+    )?;
+    warmup_ffi!(
         ffi::w34_marlin_repack_int2(&ex, buf_a as *const u32, buf_b as *mut u32, 128, 64),
         "warmup w34_marlin_repack_int2"
     )?;

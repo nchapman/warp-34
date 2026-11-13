@@ -212,9 +212,12 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
                 const int32_t trig_off =
                     batch.checkpoint_token_offsets[req * batch.max_checkpoints_per_req + e];
                 if (trig_off == base_s + tile_len) {
-                    hit_ckpt_slot =
+                    const int32_t cand_slot =
                         batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
-                    break;
+                    if (cand_slot >= 0 && cand_slot < total_state_slots) {
+                        hit_ckpt_slot = cand_slot;
+                        break;
+                    }
                 }
             }
         }
@@ -660,12 +663,22 @@ __global__ __launch_bounds__(256, 1) void gdn_wy_chunk64_prefill_f16_kernel(
                 }
             }
             if (need_ckpt) {
-                float* head_dst =
-                    ssm_state_pool + ((size_t)hit_ckpt_slot * num_v_heads + hv) * head_state_elems;
-                for (int idx = tid; idx < BV * DK; idx += 256) {
-                    const int vc = idx >> 7;
-                    const int k = idx & 127;
-                    head_dst[(size_t)(vbase + vc) * DK + k] = s_H_f32[k * BV + vc];
+                const int end_step = base_s + tile_len;
+                for (int e = 0; e < batch.max_checkpoints_per_req; ++e) {
+                    if (batch.checkpoint_token_offsets[req * batch.max_checkpoints_per_req + e] !=
+                        end_step) {
+                        continue;
+                    }
+                    const int32_t c_slot =
+                        batch.checkpoint_dst_indices[req * batch.max_checkpoints_per_req + e];
+                    if (c_slot < 0 || c_slot >= total_state_slots) continue;
+                    float* head_dst =
+                        ssm_state_pool + ((size_t)c_slot * num_v_heads + hv) * head_state_elems;
+                    for (int idx = tid; idx < BV * DK; idx += 256) {
+                        const int vc = idx >> 7;
+                        const int k = idx & 127;
+                        head_dst[(size_t)(vbase + vc) * DK + k] = s_H_f32[k * BV + vc];
+                    }
                 }
             }
             if (need_final) {
