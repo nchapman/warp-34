@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { Dashboard } from "./App";
-import { snapshot } from "./fixtures";
+import { histogram, snapshot } from "./fixtures";
 
 describe("dashboard states", () => {
   it("shows an intentional connecting state without invented data", () => {
@@ -92,5 +92,35 @@ describe("dashboard states", () => {
       "href",
       "/api/metrics",
     );
+  });
+  it("populates throughput and latency panels for zero-generated-token decision workloads", () => {
+    const s1 = snapshot({
+      uptime_seconds: 100,
+      tokens: { prompt: 1000, computed: 1000, cached: 0, generated: 0 },
+      latency: {
+        ttft: histogram(0),
+        queue: histogram(10),
+        e2e: histogram(10),
+        time_per_output_token: histogram(0),
+      },
+    });
+    const s2 = snapshot({
+      uptime_seconds: 102,
+      tokens: { prompt: 3000, computed: 3000, cached: 0, generated: 0 },
+      latency: {
+        ttft: histogram(0),
+        queue: histogram(20),
+        e2e: histogram(20),
+        time_per_output_token: histogram(0),
+      },
+    });
+    render(
+      <Dashboard
+        state={{ history: [s1, s2], connection: "live", error: null }}
+      />,
+    );
+    expect(screen.getByText("Prompt tokens")).toBeVisible();
+    expect(screen.getByText("1,000")).toBeVisible();
+    expect(screen.getByText("Mean decision E2E")).toBeVisible();
   });
 });

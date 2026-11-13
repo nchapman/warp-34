@@ -377,6 +377,7 @@ fn draft_resolution_uses_its_own_revision_and_preserves_original_id() {
                     assert_eq!(options.revision.as_deref(), draft_revision);
                     "/cache/draft"
                 }
+                ModelRole::Lora => unreachable!("unexpected Lora role in draft test"),
             };
             calls.push(spec.to_string());
             Ok(path.into())
@@ -660,4 +661,94 @@ fn serve_state_slot_seqs_promotes_small_max_num_seqs_for_dflash2() {
     assert_eq!(serve_state_slot_seqs(8, Some(&dflash)), 8);
     assert_eq!(serve_state_slot_seqs(2, Some(&mtp)), 2);
     assert_eq!(serve_state_slot_seqs(2, None), 2);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn lora_cli_flags_resolve_and_validate() {
+    let values = args(&[
+        "serve",
+        "--model",
+        "org/target",
+        "--lora-modules",
+        "heretic=nchapman/Qwen3.5-9B-Heretic-LoRA",
+        "trial3=nchapman/Qwen3.5-9B-Heretic-LoRA/pareto/trial_3@rev123",
+    ]);
+    let mut roles = Vec::new();
+    let prepared = prepare_cuda_cli(&values, |spec, opts, role| {
+        roles.push((spec.to_string(), opts.revision.clone(), role));
+        Ok(format!("/cache/{}", spec.replace('/', "_")).into())
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(roles.len(), 3);
+    assert_eq!(roles[0].2, ModelRole::Target);
+    assert_eq!(roles[1].2, ModelRole::Lora);
+    assert_eq!(roles[1].0, "nchapman/Qwen3.5-9B-Heretic-LoRA");
+    assert_eq!(roles[2].2, ModelRole::Lora);
+    assert_eq!(roles[2].1.as_deref(), Some("rev123"));
+    assert_eq!(prepared.options.lora_modules.len(), 2);
+    assert_eq!(prepared.options.lora_modules[0].name, "heretic");
+    assert_eq!(prepared.options.lora_modules[1].name, "trial3");
+
+    // Duplicate adapter names are rejected before resolution:
+    let dup = args(&[
+        "serve",
+        "--model",
+        "org/target",
+        "--lora-modules",
+        "dup=org/a",
+        "dup=org/b",
+    ]);
+    let err = prepare_cuda_cli(&dup, |_, _, _| panic!("must not resolve"))
+        .err()
+        .unwrap();
+    assert!(err.contains("duplicate LoRA adapter name"));
+
+    // Unknown active adapter name is rejected both with and without --lora-modules:
+    let missing_no_modules = args(&["generate", "--model", "org/target", "--lora", "missing"]);
+    let err_no_mod = prepare_cuda_cli(&missing_no_modules, |_, _, _| panic!("must not resolve"))
+        .err()
+        .unwrap();
+    assert!(err_no_mod.contains("unknown active LoRA adapter 'missing'"));
+
+    let missing_with_modules = args(&[
+        "generate",
+        "--model",
+        "org/target",
+        "--lora-modules",
+        "a0=org/a0",
+        "--active-lora",
+        "missing",
+    ]);
+    let err_with_mod =
+        prepare_cuda_cli(&missing_with_modules, |_, _, _| panic!("must not resolve"))
+            .err()
+            .unwrap();
+    assert!(err_with_mod.contains("unknown active LoRA adapter 'missing'"));
+
+    // profile-diff forwards --lora-modules (with @revision) and --active-lora to nested bench:
+    let prof_args = args(&[
+        "profile-diff",
+        "--model",
+        "org/target",
+        "--lora-modules",
+        "heretic=nchapman/Qwen3.5-9B-Heretic-LoRA@rev1",
+        "--active-lora",
+        "heretic",
+    ]);
+    let prof_prepared = prepare_cuda_cli(&prof_args, |_, _, _| panic!("must not resolve"))
+        .unwrap()
+        .unwrap();
+    let bench_argv = profile_bench_args(&prof_prepared.options, std::path::Path::new("/bin/w34"));
+    assert!(bench_argv.windows(2).any(|w| w
+        == [
+            "--lora-modules",
+            "heretic=nchapman/Qwen3.5-9B-Heretic-LoRA@rev1"
+        ]));
+    assert!(
+        bench_argv
+            .windows(2)
+            .any(|w| w == ["--active-lora", "heretic"])
+    );
 }

@@ -22,6 +22,7 @@ pub struct DecodeGraphIo {
     pub local_max_id: DeviceBuffer,
     pub global_max_val: DeviceBuffer,
     pub global_max_id: DeviceBuffer,
+    pub token_lora_ids: DeviceBuffer,
     pub max_blocks_per_req: usize,
 }
 
@@ -47,6 +48,8 @@ impl DecodeGraphIo {
         let local_max_id = DeviceBuffer::alloc(device_id, 4)?;
         let global_max_val = DeviceBuffer::alloc(device_id, 4)?;
         let global_max_id = DeviceBuffer::alloc(device_id, 4)?;
+        let token_lora_ids = DeviceBuffer::alloc(device_id, 4)?;
+        token_lora_ids.copy_from_host(&[crate::lora::BASE_MODEL_LORA_ID], stream)?;
         Ok(Self {
             token_ids,
             positions,
@@ -65,6 +68,7 @@ impl DecodeGraphIo {
             local_max_id,
             global_max_val,
             global_max_id,
+            token_lora_ids,
             max_blocks_per_req,
         })
     }
@@ -72,7 +76,7 @@ impl DecodeGraphIo {
 
 pub const MAX_SPEC_VERIFY_TOKENS: usize = 16;
 pub const MAX_SPEC_VERIFY_CHECKPOINTS: usize = 4;
-const SPEC_META_I32_LEN: usize = 4 * MAX_SPEC_VERIFY_TOKENS + 2 * MAX_SPEC_VERIFY_CHECKPOINTS + 6;
+const SPEC_META_I32_LEN: usize = 5 * MAX_SPEC_VERIFY_TOKENS + 2 * MAX_SPEC_VERIFY_CHECKPOINTS + 6;
 
 /// Static device buffers used for fixed-shape `M_verify = K + 1` (`2..=16`) speculative
 /// verification CUDA Graph capture and replay (`MTP` & `DFlash2`, `TP=1` & `TP=2`).
@@ -148,8 +152,19 @@ impl SpecVerifyGraphIo {
     pub fn state_out_indices_ptr(&self) -> u64 {
         self.q_start_loc_ptr() + 20
     }
+    #[inline]
+    pub fn token_lora_ids_ptr(&self) -> u64 {
+        self.q_start_loc_ptr() + 24
+    }
 
     pub fn pack_meta(slice: &EngineBatchSlice<'_>) -> Result<[i32; SPEC_META_I32_LEN]> {
+        Self::pack_meta_with_lora(slice, crate::lora::BASE_MODEL_LORA_ID)
+    }
+
+    pub fn pack_meta_with_lora(
+        slice: &EngineBatchSlice<'_>,
+        lora_id: i32,
+    ) -> Result<[i32; SPEC_META_I32_LEN]> {
         let q_len = slice.tokens.len();
         let seq_after = slice
             .ctx_len_before
@@ -189,13 +204,17 @@ impl SpecVerifyGraphIo {
         m[q_base + 3] = seq_after as i32;
         m[q_base + 4] = slice.state_in_slot;
         m[q_base + 5] = slice.state_out_slot;
+        let lora_base = q_base + 6;
+        for step in 0..q_len {
+            m[lora_base + step] = lora_id;
+        }
         Ok(m)
     }
 }
 
 pub const MAX_BATCHED_DECODE_REQS: usize = 16;
 pub const DECODE_GRAPH_BUCKETS: [usize; 5] = [1, 2, 4, 8, 16];
-const BATCHED_DECODE_META_I32_LEN: usize = 10 * MAX_BATCHED_DECODE_REQS + 1;
+const BATCHED_DECODE_META_I32_LEN: usize = 11 * MAX_BATCHED_DECODE_REQS + 1;
 const BATCHED_DECODE_MASKS_U8_LEN: usize = 3 * MAX_BATCHED_DECODE_REQS;
 
 #[inline]
@@ -361,6 +380,10 @@ impl BatchedDecodeGraphIo {
         self.checkpoint_dst_indices_ptr() + (MAX_BATCHED_DECODE_REQS * 4) as u64
     }
     #[inline]
+    pub fn token_lora_ids_ptr(&self) -> u64 {
+        self.checkpoint_token_offsets_ptr() + (MAX_BATCHED_DECODE_REQS * 4) as u64
+    }
+    #[inline]
     pub fn has_initial_state_ptr(&self) -> u64 {
         self.meta_i32.addr() + Self::MASKS_DEV_OFFSET as u64
     }
@@ -380,6 +403,23 @@ impl BatchedDecodeGraphIo {
         [i32; BATCHED_DECODE_META_I32_LEN],
         [u8; BATCHED_DECODE_MASKS_U8_LEN],
     )> {
+        Self::pack_meta_with_lora(
+            slices,
+            rope_pos_deltas,
+            None,
+            crate::lora::BASE_MODEL_LORA_ID,
+        )
+    }
+
+    pub fn pack_meta_with_lora(
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+        slice_lora_ids: Option<&[i32]>,
+        default_lora_id: i32,
+    ) -> Result<(
+        [i32; BATCHED_DECODE_META_I32_LEN],
+        [u8; BATCHED_DECODE_MASKS_U8_LEN],
+    )> {
         let n = slices.len();
         if n == 0 || n > MAX_BATCHED_DECODE_REQS {
             return Err(loader_err("invalid slice count for BatchedDecodeGraphIo"));
@@ -394,6 +434,7 @@ impl BatchedDecodeGraphIo {
         let so_base = si_base + MAX_BATCHED_DECODE_REQS;
         let cd_base = so_base + MAX_BATCHED_DECODE_REQS;
         let co_base = cd_base + MAX_BATCHED_DECODE_REQS;
+        let lora_base = co_base + MAX_BATCHED_DECODE_REQS;
 
         for i in 0..=MAX_BATCHED_DECODE_REQS {
             m[qs_base + i] = i as i32;
@@ -403,6 +444,7 @@ impl BatchedDecodeGraphIo {
             m[so_base + r] = -1;
             m[cd_base + r] = -1;
             m[co_base + r] = -1;
+            m[lora_base + r] = crate::lora::BASE_MODEL_LORA_ID;
         }
         for (r, s) in slices.iter().enumerate() {
             if s.tokens.len() != 1
@@ -429,6 +471,9 @@ impl BatchedDecodeGraphIo {
                 m[cd_base + r] = dst_slot;
                 m[co_base + r] = trig_off;
             }
+            m[lora_base + r] = slice_lora_ids
+                .and_then(|ids| ids.get(r).copied())
+                .unwrap_or(default_lora_id);
             masks[r] = u8::from(s.has_initial_state);
             masks[MAX_BATCHED_DECODE_REQS + r] = 1;
             masks[2 * MAX_BATCHED_DECODE_REQS + r] = 1;
@@ -800,7 +845,18 @@ mod tests {
         assert_eq!(&meta[3 * n..3 * n + 2], &[8, 9]);
         assert_eq!(meta[4 * n], 6);
         assert_eq!(meta[4 * n + cp], 1);
-        assert_eq!(&meta[4 * n + 2 * cp..], &[0, 2, 15, 17, 2, 5]);
+        assert_eq!(
+            &meta[4 * n + 2 * cp..4 * n + 2 * cp + 6],
+            &[0, 2, 15, 17, 2, 5]
+        );
+        assert_eq!(&meta[4 * n + 2 * cp + 6..], &[-1; MAX_SPEC_VERIFY_TOKENS]);
+        let meta_lora = SpecVerifyGraphIo::pack_meta_with_lora(&slice(&[41, 42]), 3).unwrap();
+        assert_eq!(&meta_lora[4 * n + 2 * cp + 6..4 * n + 2 * cp + 8], &[3, 3]);
+        assert!(
+            meta_lora[4 * n + 2 * cp + 8..]
+                .iter()
+                .all(|&v| v == crate::lora::BASE_MODEL_LORA_ID)
+        );
         for base in [0, n, 2 * n, 3 * n] {
             assert!(meta[base + 2..base + n].iter().all(|&v| v == -1));
         }

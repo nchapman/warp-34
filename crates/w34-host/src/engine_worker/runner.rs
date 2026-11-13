@@ -129,7 +129,7 @@ pub(super) fn run_loop(
             enqueue(engine, &mut sched, requests, r);
         }
         // Bound queue draining even if producers keep replenishing it.
-        for _ in 0..32 {
+        for _ in 0..256 {
             match receiver.try_recv() {
                 Ok(r) => enqueue(engine, &mut sched, requests, r),
                 Err(_) => break,
@@ -238,7 +238,11 @@ fn coalesce_idle_burst(
                 let all_decision_taps =
                     !requests.is_empty() && requests.values().all(|r| r.decision_tap.is_some());
                 let quiet_cap = if all_decision_taps {
-                    std::time::Duration::from_micros(100)
+                    if requests.len() >= 2 || prev_active_peak >= 2 {
+                        std::time::Duration::from_micros(1500)
+                    } else {
+                        std::time::Duration::from_micros(100)
+                    }
                 } else if prev_active_peak >= 2 {
                     std::time::Duration::from_micros(3500)
                 } else if requests.len() <= 1 {
@@ -365,7 +369,8 @@ fn admit_into_mtp_batch_slots(
         if active_reserved + need_pages > engine.ranks[0].kv_pool.num_pages {
             break;
         }
-        let Some(slot_idx) = proposer.pick_free_mtp_batch_slot(mtp_batch_slots, &w.prompt_tokens)
+        let Some(slot_idx) =
+            proposer.pick_free_mtp_batch_slot(mtp_batch_slots, &w.radix_key_tokens)
         else {
             break;
         };
@@ -385,7 +390,7 @@ fn admit_into_mtp_batch_slots(
         }
         let prefix = {
             let seq = sched.active.last().unwrap();
-            seq.prompt_tokens[..seq.cached_prefix_tokens].to_vec()
+            seq.radix_key_tokens[..seq.cached_prefix_tokens].to_vec()
         };
         match proposer.restore_mtp_batch_slot(engine, slot_idx, &prefix) {
             Ok(()) => {
@@ -633,7 +638,7 @@ fn admit_requests(
                 record_admissions(sched, requests);
                 if let Some(seq) = sched.active.first_mut() {
                     match proposer
-                        .restore_prefix(engine, &seq.prompt_tokens[..seq.cached_prefix_tokens])
+                        .restore_prefix(engine, &seq.radix_key_tokens[..seq.cached_prefix_tokens])
                     {
                         Ok(()) => {
                             *speculative_id = Some(id);

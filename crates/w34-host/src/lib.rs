@@ -18,6 +18,7 @@ pub mod dflash;
 pub mod engine_worker;
 pub mod hub;
 pub mod loader;
+pub mod lora;
 #[cfg(feature = "cuda")]
 pub mod model;
 #[cfg(feature = "cuda")]
@@ -53,6 +54,9 @@ pub mod vision;
 pub const fn cuda_enabled() -> bool {
     w34_kernels::cuda_enabled()
 }
+
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) static LIB_GPU_ENGINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {

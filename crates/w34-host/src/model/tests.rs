@@ -434,6 +434,118 @@ mod serving_capacity_tests {
             sched.max_num_batched_tokens,
             crate::scheduler::DEFAULT_MAX_NUM_BATCHED_TOKENS
         );
+
+        // 5. LoRA adapter with midloop pre-sizes scratch_arena to 960 MiB up front;
+        //    non-midloop LoRA pre-sizes scratch_arena to 1,056 MiB.
+        let midloop_lora = LoraCapacityReserve {
+            device_bytes_per_rank: 1280 * 1024 * 1024,
+            has_midloop: true,
+            requires_atomic_prefix: true,
+        };
+        assert_eq!(
+            plan_scratch_arena_bytes_with_lora(
+                &dense_64l,
+                2,
+                LARGE_MODEL_WEIGHT_THRESHOLD_BYTES,
+                None,
+                midloop_lora,
+            ),
+            MIDLOOP_LORA_SCRATCH_ARENA_BYTES
+        );
+        let standard_lora = LoraCapacityReserve {
+            device_bytes_per_rank: 512 * 1024 * 1024,
+            has_midloop: false,
+            requires_atomic_prefix: false,
+        };
+        assert_eq!(
+            plan_scratch_arena_bytes_with_lora(
+                &dense_64l,
+                2,
+                LARGE_MODEL_WEIGHT_THRESHOLD_BYTES,
+                None,
+                standard_lora,
+            ),
+            crate::scheduler::TIERED_MOE_SCRATCH_ARENA_BYTES
+        );
+    }
+
+    #[test]
+    fn plan_target_kv_pages_auto_sizes_serving_and_preserves_lora_and_headroom() {
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let page_bytes = 2 * mib; // e.g. ~2 MiB/page
+
+        // 1. Explicit `--kv-pages` is always honored verbatim.
+        assert_eq!(
+            plan_target_kv_pages(
+                Some(1024),
+                true,
+                0,
+                false,
+                24 * gib,
+                12 * gib,
+                2 * gib,
+                page_bytes
+            ),
+            1024
+        );
+
+        // 2. Non-serving CLI/test mode defaults to 256 pages (4,096 tokens).
+        assert_eq!(
+            plan_target_kv_pages(
+                None,
+                false,
+                0,
+                false,
+                24 * gib,
+                12 * gib,
+                2 * gib,
+                page_bytes
+            ),
+            DEFAULT_TARGET_KV_PAGES
+        );
+
+        // 3. Serving mode with ample VRAM (24 GiB total, 12 GiB fixed, 2.3 GiB headroom+LoRA)
+        //    auto-sizes to DEFAULT_SERVING_TARGET_KV_PAGES (2,048 pages = 32,768 tokens).
+        assert_eq!(
+            plan_target_kv_pages(
+                None,
+                true,
+                0,
+                false,
+                24 * gib,
+                12 * gib,
+                2300 * mib,
+                page_bytes
+            ),
+            DEFAULT_SERVING_TARGET_KV_PAGES
+        );
+
+        // 4. Serving mode under tighter VRAM (e.g. TP=1 27B + LoRA where 1.8 GiB remains above
+        //    fixed + required_headroom + 1.5 GiB extra margin) scales to 64-aligned 896 pages.
+        let fixed = 17 * gib;
+        let req_headroom = 3 * gib;
+        let free = fixed + req_headroom + AUTO_SERVING_KV_EXTRA_HEADROOM_BYTES + 1800 * mib;
+        assert_eq!(
+            plan_target_kv_pages(None, true, 0, false, free, fixed, req_headroom, page_bytes),
+            896
+        );
+
+        // 5. Very tight VRAM falls back to DEFAULT_TARGET_KV_PAGES (256).
+        let tight_free = fixed + req_headroom + 512 * mib;
+        assert_eq!(
+            plan_target_kv_pages(
+                None,
+                true,
+                0,
+                false,
+                tight_free,
+                fixed,
+                req_headroom,
+                page_bytes
+            ),
+            DEFAULT_TARGET_KV_PAGES
+        );
     }
 
     #[test]

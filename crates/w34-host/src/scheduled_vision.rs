@@ -141,7 +141,8 @@ impl ScheduledVision {
             || seq.resources_released
             || start >= self.prompt.len()
             || seq.prompt_tokens != self.prompt
-            || seq.radix_key_tokens != self.radix_key
+            || seq.radix_key_tokens.len() != self.radix_key.len()
+            || seq.radix_key_tokens[1..] != self.radix_key[1..]
             || seq.radix_state.token_ids.len() != start
         {
             return Err(loader_err(
@@ -184,6 +185,7 @@ impl ScheduledVision {
             state_out_slot: seq.radix_state.active_state_slot,
             has_initial_state: seq.radix_state.has_initial_state,
             planned_checkpoints: planned,
+            lora_id: seq.lora_id,
         };
         let mut positions = Vec::with_capacity(3 * take);
         for plane in &self.mrope_planes {
@@ -308,6 +310,7 @@ impl ScheduledVision {
             .prefix_bidir_len
             .is_some_and(|bidir_end| end <= bidir_end);
         let emit_last_row = seq.max_new_tokens > 0 || engine.ranks[0].lm_head.is_some();
+        engine.set_slice_lora_ids(&[seq.lora_id]);
         let result = engine.step_single_slice_with_mrope_and_vision_bidir(
             &engine_slice,
             &positions,
@@ -320,6 +323,7 @@ impl ScheduledVision {
             noncausal_prefix,
             emit_last_row,
         );
+        engine.clear_slice_lora_ids();
         let mut sync_result = Ok(());
         for rank in &engine.ranks {
             let synced = rank

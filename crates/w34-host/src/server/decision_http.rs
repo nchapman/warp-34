@@ -92,10 +92,17 @@ async fn run_one_candidate_query(
     images: Vec<crate::vision::PreprocessedImage>,
     cands: Vec<i32>,
     branch_hint: Option<usize>,
+    lora_id: i32,
 ) -> Result<(Vec<f64>, usize), ApiError> {
     let sub = s
         .worker
-        .submit_decision_candidate_logits_with_images(prompt, images, cands, branch_hint)
+        .submit_decision_candidate_logits_with_images_and_lora(
+            prompt,
+            images,
+            cands,
+            branch_hint,
+            lora_id,
+        )
         .map_err(worker_api_err)?;
     await_candidate_query(sub).await
 }
@@ -132,6 +139,7 @@ async fn await_hidden_query(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one_hidden_query(
     s: Arc<OpenAiServerState>,
     prompt: Vec<i32>,
@@ -140,16 +148,18 @@ async fn run_one_hidden_query(
     prefix_cap: Option<usize>,
     prefix_bidir_len: Option<usize>,
     branch_hint: Option<usize>,
+    lora_id: i32,
 ) -> Result<(Vec<Vec<f32>>, usize), ApiError> {
     let sub = s
         .worker
-        .submit_decision_hidden_positions_with_images(
+        .submit_decision_hidden_positions_with_images_and_lora(
             prompt,
             images,
             positions,
             prefix_cap,
             branch_hint,
             prefix_bidir_len,
+            lora_id,
         )
         .map_err(worker_api_err)?;
     await_hidden_query(sub).await
@@ -159,6 +169,7 @@ async fn run_candidate_queries_radix_shared(
     s: &Arc<OpenAiServerState>,
     queries: Vec<(Vec<i32>, Vec<i32>)>,
     images: &[crate::vision::PreprocessedImage],
+    lora_id: i32,
 ) -> Result<Vec<(Vec<f64>, usize)>, ApiError> {
     if queries.is_empty() {
         return Ok(Vec::new());
@@ -169,14 +180,21 @@ async fn run_candidate_queries_radix_shared(
     let (p0, c0) = iter.next().unwrap();
     let rest: Vec<_> = iter.collect();
     let branch0 = shared_mamba_branch_hint(&p0, rest.iter().map(|(p, _)| p.as_slice()), None);
-    results.push(run_one_candidate_query(s.clone(), p0, images.to_vec(), c0, branch0).await?);
+    results
+        .push(run_one_candidate_query(s.clone(), p0, images.to_vec(), c0, branch0, lora_id).await?);
 
     for wave in rest.chunks(8) {
         let mut submitted = Vec::with_capacity(wave.len());
         for (p, c) in wave.iter().cloned() {
             submitted.push(
                 s.worker
-                    .submit_decision_candidate_logits_with_images(p, images.to_vec(), c, None)
+                    .submit_decision_candidate_logits_with_images_and_lora(
+                        p,
+                        images.to_vec(),
+                        c,
+                        None,
+                        lora_id,
+                    )
                     .map_err(worker_api_err)?,
             );
         }
@@ -191,6 +209,7 @@ async fn run_code_readout_queries_raw(
     s: &Arc<OpenAiServerState>,
     queries: Vec<crate::decision::CodeReadoutPreparedQuery>,
     images: &[crate::vision::PreprocessedImage],
+    lora_id: i32,
 ) -> Result<(Vec<Vec<f32>>, usize, usize), ApiError> {
     if queries.is_empty() {
         return Ok((Vec::new(), 0, 0));
@@ -215,13 +234,14 @@ async fn run_code_readout_queries_raw(
             for q in wave.iter().cloned() {
                 submitted.push(
                     s.worker
-                        .submit_decision_hidden_positions_with_images(
+                        .submit_decision_hidden_positions_with_images_and_lora(
                             q.token_ids,
                             images.to_vec(),
                             q.positions,
                             q.prefix_cap,
                             None,
                             q.prefix_bidir_len,
+                            lora_id,
                         )
                         .map_err(worker_api_err)?,
                 );
@@ -252,6 +272,7 @@ async fn run_code_readout_queries_raw(
                 q0.prefix_cap,
                 q0.prefix_bidir_len,
                 branch0,
+                lora_id,
             )
             .await?,
         );
@@ -260,13 +281,14 @@ async fn run_code_readout_queries_raw(
             for q in wave.iter().cloned() {
                 submitted.push(
                     s.worker
-                        .submit_decision_hidden_positions_with_images(
+                        .submit_decision_hidden_positions_with_images_and_lora(
                             q.token_ids,
                             images.to_vec(),
                             q.positions,
                             q.prefix_cap,
                             None,
                             q.prefix_bidir_len,
+                            lora_id,
                         )
                         .map_err(worker_api_err)?,
                 );
@@ -314,25 +336,40 @@ async fn execute_systemone_json(
     s: &Arc<OpenAiServerState>,
     body: Value,
 ) -> Result<Value, ApiError> {
+    let explicit_lora = body
+        .get("lora")
+        .or_else(|| body.get("adapter"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let req_model_hint = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let (lora_id, resolved_model) = s
+        .resolve_request_lora(req_model_hint.as_deref(), explicit_lora.as_deref())
+        .map_err(bad)?;
     let prep_state = s.clone();
     let (req_model, batch, images) = cpu(s, move || {
         Ok::<_, String>((|| {
             let Some(tokenizer) = prep_state.worker.tokenizer.as_ref() else {
                 return Err(bad("loaded model has no tokenizer"));
             };
+            let decision_profile = prep_state
+                .worker
+                .lora_registry
+                .decision_profile(lora_id)
+                .unwrap_or(&prep_state.worker.decision_profile);
             let vctx = crate::decision::DecisionVisionContext {
                 vision_config: prep_state.worker.vision_config.clone(),
                 has_vision_weights: prep_state.worker.has_vision_weights,
                 allow_remote_images: prep_state.allow_remote_images,
             };
-            let images = crate::decision::parse_decision_images(
-                &body,
-                &prep_state.worker.decision_profile,
-                &vctx,
-            )
-            .map_err(decision_err)?;
+            let images = crate::decision::parse_decision_images(&body, decision_profile, &vctx)
+                .map_err(decision_err)?;
             let (req_model, batch) = crate::decision::prepare_decision_batch_with_images(
-                &prep_state.worker.decision_profile,
+                decision_profile,
                 tokenizer,
                 prep_state.worker.kv_token_capacity,
                 &body,
@@ -363,7 +400,7 @@ async fn execute_systemone_json(
                 combined.extend(forward_queries);
                 combined.extend(rev_queries);
                 let (all_rows, in_toks, c_toks) =
-                    run_code_readout_queries_raw(s, combined, &images).await?;
+                    run_code_readout_queries_raw(s, combined, &images, lora_id).await?;
                 input_tokens += in_toks;
                 cached_tokens += c_toks;
                 let n = fields.len();
@@ -391,7 +428,7 @@ async fn execute_systemone_json(
                 }
             } else {
                 let (all_rows, in_toks, c_toks) =
-                    run_code_readout_queries_raw(s, forward_queries, &images).await?;
+                    run_code_readout_queries_raw(s, forward_queries, &images, lora_id).await?;
                 input_tokens += in_toks;
                 cached_tokens += c_toks;
                 let fwd_logits = project_code_readout_rows(&head, &fields, &all_rows)?;
@@ -424,7 +461,7 @@ async fn execute_systemone_json(
                     pairs.push((fwd, cands.clone()));
                     pairs.push((rev, cands));
                 }
-                let outs = run_candidate_queries_radix_shared(s, pairs, &images).await?;
+                let outs = run_candidate_queries_radix_shared(s, pairs, &images, lora_id).await?;
                 for (i, field) in fields.iter().enumerate() {
                     let (fwd_logits, c_fwd) = &outs[2 * i];
                     let (rev_logits, c_rev) = &outs[2 * i + 1];
@@ -441,7 +478,7 @@ async fn execute_systemone_json(
                 }
             } else {
                 let pairs: Vec<_> = prompts.into_iter().zip(candidates).collect();
-                let outs = run_candidate_queries_radix_shared(s, pairs, &images).await?;
+                let outs = run_candidate_queries_radix_shared(s, pairs, &images, lora_id).await?;
                 for (field, (logits, cached)) in fields.iter().zip(outs) {
                     cached_tokens += cached;
                     let ans =
@@ -453,8 +490,13 @@ async fn execute_systemone_json(
         }
     }
 
+    let out_model = if lora_id >= 0 {
+        resolved_model
+    } else {
+        req_model.unwrap_or(resolved_model)
+    };
     Ok(json!({
-        "model": req_model.unwrap_or_else(|| s.model_name.clone()),
+        "model": out_model,
         "answers": Value::Object(answers),
         "usage": {
             "input_tokens": input_tokens,

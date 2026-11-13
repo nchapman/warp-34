@@ -325,6 +325,9 @@ fn compressed_tensors_weight_shape_validates_and_resolves_embed_tokens_bits() {
 #[cfg(feature = "cuda")]
 #[test]
 fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
+    let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let h = 128usize;
     let interm = 256usize;
     let vocab = 256usize;
@@ -785,6 +788,8 @@ fn synthetic_hybrid_engine_forward_generate_and_diagnostics() {
                 temperature_by_questions: Vec::new(),
                 state_once: true,
                 prefix_bidir: true,
+                noncausal_full_attention: false,
+                midloop: Vec::new(),
                 header_v1: true,
                 max_seq_len: 32768,
                 system_prompt: crate::decision::GLIDE_SYSTEM_PROMPT.to_owned(),

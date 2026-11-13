@@ -27,6 +27,10 @@ impl Qwen3_5Engine {
 
     pub fn reset_all_states(&mut self) -> Result<()> {
         self.radix.reset();
+        self.radix.active_lora_id = self.active_lora_id;
+        if let Some(proposer) = &mut self.speculative {
+            proposer.clear_all_caches()?;
+        }
         for r in &mut self.ranks {
             r.device.make_current()?;
             r.kv_pool.reset_all_pages();
@@ -175,10 +179,26 @@ impl Qwen3_5Engine {
         let st_in_arr = [state_in_slot];
         let st_out_arr = [state_out_slot];
         let has_init_arr = [u8::from(has_initial_state)];
+        let active_lora_id = self.active_lora_id;
+        for r in &mut self.ranks {
+            r.last_batch_state_slots.clear();
+            for &s in &[state_in_slot, state_out_slot] {
+                if s >= 0
+                    && (s as usize) < r.state_pool.total_slots
+                    && !r.last_batch_state_slots.contains(&(s as usize))
+                {
+                    r.last_batch_state_slots.push(s as usize);
+                }
+            }
+            if r.last_batch_state_slots.is_empty() {
+                r.last_batch_state_slots.push(0);
+            }
+        }
 
         if self.tp_size == 1 {
             let r0 = &mut self.ranks[0];
             r0.device.make_current()?;
+            r0.set_lora_uniform(active_lora_id);
             r0.stage_ple_f8_for_batch(
                 tokens,
                 &q_start,
@@ -226,7 +246,7 @@ impl Qwen3_5Engine {
                 max_blocks_per_req: block_table.len() as i32,
                 max_q_len: num_tokens as i32,
                 max_seq_len: seq_after as i32,
-                mask_mode: if r0.cfg.noncausal_full_attention {
+                mask_mode: if r0.active_noncausal_full_attention() {
                     w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
                 } else {
                     W34_ATTN_MASK_CAUSAL
@@ -299,6 +319,7 @@ impl Qwen3_5Engine {
                 let d0_ref = &mut dump0;
                 let h0 = sc.spawn(move || -> Result<(i32, f32, [i32; 5], [f32; 5])> {
                     r0.device.make_current()?;
+                    r0.set_lora_uniform(active_lora_id);
                     r0.stage_ple_f8_for_batch(
                         tokens,
                         &q_start,
@@ -346,7 +367,7 @@ impl Qwen3_5Engine {
                         max_blocks_per_req: block_table.len() as i32,
                         max_q_len: num_tokens as i32,
                         max_seq_len: seq_after as i32,
-                        mask_mode: if r0.cfg.noncausal_full_attention {
+                        mask_mode: if r0.active_noncausal_full_attention() {
                             w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
                         } else {
                             W34_ATTN_MASK_CAUSAL
@@ -409,6 +430,7 @@ impl Qwen3_5Engine {
                     let cp = comm.clone();
                     peer_handles.push(sc.spawn(move || -> Result<(f32, [i32; 5], [f32; 5])> {
                         r_peer.device.make_current()?;
+                        r_peer.set_lora_uniform(active_lora_id);
                         r_peer.stage_ple_f8_for_batch(
                             tokens,
                             &q_start,
@@ -459,7 +481,7 @@ impl Qwen3_5Engine {
                             max_blocks_per_req: block_table.len() as i32,
                             max_q_len: num_tokens as i32,
                             max_seq_len: seq_after as i32,
-                            mask_mode: if r_peer.cfg.noncausal_full_attention {
+                            mask_mode: if r_peer.active_noncausal_full_attention() {
                                 w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
                             } else {
                                 W34_ATTN_MASK_CAUSAL
@@ -584,7 +606,15 @@ impl Qwen3_5Engine {
         let seq_arr = [seq_after as i32];
         let slot_arr = [write_slot];
         let st_arr = [state_slot];
+        let lora_arr = [self.active_lora_id];
         for r in &mut self.ranks {
+            r.last_batch_state_slots.clear();
+            let slot_u = if state_slot >= 0 && (state_slot as usize) < r.state_pool.total_slots {
+                state_slot as usize
+            } else {
+                0
+            };
+            r.last_batch_state_slots.push(slot_u);
             r.stage_ple_f8_for_batch(
                 &tok_arr,
                 &[0, 1],
@@ -626,15 +656,24 @@ impl Qwen3_5Engine {
             r0.decode_io
                 .state_out_indices
                 .copy_from_host(&st_arr, &r0.stream)?;
+            if r0.lora_runtime.is_some() {
+                r0.decode_io
+                    .token_lora_ids
+                    .copy_from_host(&lora_arr, &r0.stream)?;
+            }
 
             let long_ctx = seq_after > 1024;
             if self.use_cuda_graph && r0.supports_cuda_graph_for_tokens(1) {
                 r0.ensure_decode_graph(long_ctx, None)?;
+                if let Some(rt) = &r0.lora_runtime {
+                    rt.state.set_device_ids(r0.decode_io.token_lora_ids.addr());
+                }
                 r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
                 r0.mark_tiered_moe_device_lru_dirty();
                 r0.last_logits_ptr = r0.captured_decode_logits_ptr;
                 r0.last_logits_rows = 1;
             } else {
+                r0.set_lora_uniform(lora_arr[0]);
                 let attn_batch = W34AttentionBatch {
                     query_start_loc: r0.decode_io.q_start_loc.addr() as *const i32,
                     context_lens_before: r0.decode_io.ctx_lens_before.addr() as *const i32,
@@ -726,6 +765,12 @@ impl Qwen3_5Engine {
                     r.decode_io
                         .state_out_indices
                         .copy_from_host(&st_arr, &r.stream)?;
+                    if let Some(rt) = &r.lora_runtime {
+                        r.decode_io
+                            .token_lora_ids
+                            .copy_from_host(&lora_arr, &r.stream)?;
+                        rt.state.set_device_ids(r.decode_io.token_lora_ids.addr());
+                    }
                     r.decode_graph.as_ref().unwrap().1.launch(&r.stream)?;
                     r.mark_tiered_moe_device_lru_dirty();
                     r.last_logits_ptr = r.captured_decode_logits_ptr;
@@ -773,13 +818,22 @@ impl Qwen3_5Engine {
                     r0.decode_io
                         .state_out_indices
                         .copy_from_host(&st_arr, &r0.stream)?;
+                    if r0.lora_runtime.is_some() {
+                        r0.decode_io
+                            .token_lora_ids
+                            .copy_from_host(&lora_arr, &r0.stream)?;
+                    }
                     if use_graph {
                         r0.ensure_decode_graph(long_ctx, Some(&c0))?;
+                        if let Some(rt) = &r0.lora_runtime {
+                            rt.state.set_device_ids(r0.decode_io.token_lora_ids.addr());
+                        }
                         r0.decode_graph.as_ref().unwrap().1.launch(&r0.stream)?;
                         r0.mark_tiered_moe_device_lru_dirty();
                         r0.last_logits_ptr = r0.captured_decode_logits_ptr;
                         r0.last_logits_rows = 1;
                     } else {
+                        r0.set_lora_uniform(lora_arr[0]);
                         let attn_batch = W34AttentionBatch {
                             query_start_loc: r0.decode_io.q_start_loc.addr() as *const i32,
                             context_lens_before: r0.decode_io.ctx_lens_before.addr() as *const i32,
@@ -874,8 +928,18 @@ impl Qwen3_5Engine {
                             .decode_io
                             .state_out_indices
                             .copy_from_host(&st_arr, &r_peer.stream)?;
+                        if r_peer.lora_runtime.is_some() {
+                            r_peer
+                                .decode_io
+                                .token_lora_ids
+                                .copy_from_host(&lora_arr, &r_peer.stream)?;
+                        }
                         if use_graph {
                             r_peer.ensure_decode_graph(long_ctx, Some(&cp))?;
+                            if let Some(rt) = &r_peer.lora_runtime {
+                                rt.state
+                                    .set_device_ids(r_peer.decode_io.token_lora_ids.addr());
+                            }
                             r_peer
                                 .decode_graph
                                 .as_ref()
@@ -886,6 +950,7 @@ impl Qwen3_5Engine {
                             r_peer.last_logits_ptr = r_peer.captured_decode_logits_ptr;
                             r_peer.last_logits_rows = 1;
                         } else {
+                            r_peer.set_lora_uniform(lora_arr[0]);
                             let attn_batch = W34AttentionBatch {
                                 query_start_loc: r_peer.decode_io.q_start_loc.addr() as *const i32,
                                 context_lens_before: r_peer.decode_io.ctx_lens_before.addr()
@@ -966,7 +1031,6 @@ impl Qwen3_5Engine {
         stop_on_eos: bool,
     ) -> Result<BenchMetrics> {
         self.reset_all_states()?;
-        self.radix = MambaRadixCache::new(16, 64);
         if self.speculative.is_some() {
             let max_chunk = if self.cfg.uses_tiered_moe() {
                 6144

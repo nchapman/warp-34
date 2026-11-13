@@ -174,6 +174,9 @@ pub(super) fn validate_config(dir: &Path, role: ModelRole) -> io::Result<()> {
             #[cfg(feature = "cuda")]
             crate::dflash::DFlash2Config::load(dir).map_err(|e| invalid(e.to_string()))?;
         }
+        ModelRole::Lora => {
+            crate::hub::validate_lora_dir(dir)?;
+        }
     }
     Ok(())
 }

@@ -123,6 +123,27 @@ impl OpenAiServerState {
             admission: Arc::new(Semaphore::new(32)),
         })
     }
+
+    pub fn resolve_request_lora(
+        &self,
+        req_model: Option<&str>,
+        explicit_lora: Option<&str>,
+    ) -> Result<(i32, String), String> {
+        if let Some(lora_name) = explicit_lora.filter(|s| !s.is_empty()) {
+            let id = self
+                .worker
+                .lora_registry
+                .resolve_name(lora_name)
+                .ok_or_else(|| format!("unknown LoRA adapter '{lora_name}'"))?;
+            return Ok((id, lora_name.to_owned()));
+        }
+        if let Some(m) = req_model.filter(|s| !s.is_empty())
+            && let Some(id) = self.worker.lora_registry.resolve_name(m)
+        {
+            return Ok((id, m.to_owned()));
+        }
+        Ok((crate::lora::BASE_MODEL_LORA_ID, self.model_name.clone()))
+    }
 }
 
 pub(super) type ApiError = (StatusCode, Json<Value>);
@@ -234,9 +255,17 @@ pub fn router(state: Arc<OpenAiServerState>) -> Router {
         .with_state(state)
 }
 async fn models(State(s): State<Arc<OpenAiServerState>>) -> Json<Value> {
-    Json(
-        json!({"object":"list","data":[{"id":s.model_name,"object":"model","owned_by":"warp-34"}]}),
-    )
+    let mut data = Vec::with_capacity(1 + s.worker.lora_registry.len());
+    data.push(json!({"id":s.model_name,"object":"model","owned_by":"warp-34"}));
+    for entry in s.worker.lora_registry.entries() {
+        data.push(json!({
+            "id": entry.name,
+            "object": "model",
+            "owned_by": "warp-34",
+            "parent": s.model_name,
+        }));
+    }
+    Json(json!({"object":"list","data":data}))
 }
 async fn metrics(State(s): State<Arc<OpenAiServerState>>) -> impl IntoResponse {
     (
@@ -405,6 +434,8 @@ struct Prepared {
     images: Vec<crate::vision::PreprocessedImage>,
     params: SamplingParams,
     constraint: Option<crate::parser::TokenBitmaskConstraint>,
+    lora_id: i32,
+    served_model: String,
     stream: bool,
     include_usage: bool,
 }
@@ -415,6 +446,12 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
     if request.get("n").is_some_and(|n| n.as_u64() != Some(1)) {
         return Err("only n=1 is supported".into());
     }
+    let req_model = request.get("model").and_then(Value::as_str);
+    let explicit_lora = request
+        .get("lora")
+        .or_else(|| request.get("adapter"))
+        .and_then(Value::as_str);
+    let (lora_id, served_model) = s.resolve_request_lora(req_model, explicit_lora)?;
     let max_tokens = request
         .get("max_completion_tokens")
         .or_else(|| request.get("max_tokens"))
@@ -518,6 +555,8 @@ fn prepare(s: &OpenAiServerState, request: Value, chat: bool) -> Result<Prepared
         images,
         params,
         constraint,
+        lora_id,
+        served_model,
         stream,
         include_usage,
     })
@@ -554,11 +593,12 @@ async fn generate(
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images(
+        .submit_with_images_and_lora(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
+            prepared.lora_id,
         )
         .map_err(worker_api_err)?;
     let stream = prepared.stream;
@@ -569,6 +609,7 @@ async fn generate(
         generation,
         prepared.params,
         prepared.parser,
+        prepared.served_model,
         chat,
         prompt_len,
         request_id,
@@ -718,6 +759,7 @@ fn output_stream(
     mut generation: GenerationStream,
     params: SamplingParams,
     parser: Qwen3Parser,
+    served_model: String,
     chat: bool,
     prompt_len: usize,
     request_id: u64,
@@ -743,7 +785,7 @@ fn output_stream(
         let chunk = |delta: Value, lp: Value| {
             let choice = if chat { json!({"index":0,"delta":delta,"finish_reason":null,"logprobs":lp}) }
                 else { json!({"index":0,"text":delta["content"].as_str().unwrap_or(""),"finish_reason":null,"logprobs":lp}) };
-            json!({"id":id,"object":if chat {"chat.completion.chunk"} else {"text_completion"},"created":created,"model":s.model_name,"choices":[choice]})
+            json!({"id":id,"object":if chat {"chat.completion.chunk"} else {"text_completion"},"created":created,"model":&served_model,"choices":[choice]})
         };
         if chat { yield Output::Delta(chunk(json!({"role":"assistant"}),Value::Null)); }
         while let Some(event) = generation.events.recv().await {
@@ -806,7 +848,7 @@ fn output_stream(
         let lp = if !params.logprobs { Value::Null } else if chat { json!({"content":logs}) } else { super::completion_logprobs(&logs, &mut 0) };
         let choice = if chat { json!({"index":0,"message":{"role":"assistant","content":turn.content,"reasoning_content":turn.reasoning_content,"tool_calls":turn.tool_calls},"finish_reason":finish,"logprobs":lp}) }
             else { json!({"index":0,"text":text,"finish_reason":finish,"logprobs":lp}) };
-        yield Output::Complete(json!({"id":id,"object":if chat {"chat.completion"} else {"text_completion"},"created":created,"model":s.model_name,"choices":[choice],"usage":{"prompt_tokens":prompt_len,"completion_tokens":count,"total_tokens":prompt_len+count,"prompt_tokens_details":{"cached_tokens":cached}}}));
+        yield Output::Complete(json!({"id":id,"object":if chat {"chat.completion"} else {"text_completion"},"created":created,"model":served_model,"choices":[choice],"usage":{"prompt_tokens":prompt_len,"completion_tokens":count,"total_tokens":prompt_len+count,"prompt_tokens_details":{"cached_tokens":cached}}}));
     }
 }
 
@@ -1093,7 +1135,7 @@ async fn responses_create(
     let caller_scope = responses_caller_scope(&s, request.headers());
     let body = read_json(&s, request).await?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let (chat_req, meta) = crate::responses_api::translate_responses_to_chat(
+    let (chat_req, mut meta) = crate::responses_api::translate_responses_to_chat(
         &body,
         &s.model_name,
         &s.response_store,
@@ -1103,14 +1145,16 @@ async fn responses_create(
     .map_err(responses_api_err)?;
     let prep_state = s.clone();
     let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true)).await?;
+    meta.model.clone_from(&prepared.served_model);
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images(
+        .submit_with_images_and_lora(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
+            prepared.lora_id,
         )
         .map_err(worker_api_err)?;
     if let Some(ref scope) = caller_scope {
@@ -1343,21 +1387,23 @@ async fn anthropic_messages(
         .map_err(|err| to_anthropic_err(admission_error(err)))?;
     let body = read_json(&s, request).await.map_err(to_anthropic_err)?;
     let request_id = s.next_request_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let (chat_req, meta) =
+    let (chat_req, mut meta) =
         crate::anthropic_api::translate_anthropic_to_chat(&body, &s.model_name, request_id, true)
             .map_err(|e| anthropic_api_err(StatusCode::BAD_REQUEST, e))?;
     let prep_state = s.clone();
     let prepared = cpu(&s, move || prepare(&prep_state, chat_req, true))
         .await
         .map_err(to_anthropic_err)?;
+    meta.model.clone_from(&prepared.served_model);
     let prompt_len = prepared.prompt.len();
     let generation = s
         .worker
-        .submit_with_images(
+        .submit_with_images_and_lora(
             prepared.prompt,
             prepared.images,
             prepared.params.clone(),
             prepared.constraint,
+            prepared.lora_id,
         )
         .map_err(|e| to_anthropic_err(worker_api_err(e)))?;
 

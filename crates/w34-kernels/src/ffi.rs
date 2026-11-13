@@ -286,6 +286,21 @@ unsafe extern "C" {
         n: i32,
         k: i32,
     ) -> i32;
+    pub fn w34_cublas_lora_shrink_expand_f16(
+        handle: usize,
+        x: *const c_void,
+        y_inout: *mut c_void,
+        lora_a: *const c_void,
+        lora_b: *const c_void,
+        lowrank_ws: *mut c_void,
+        adapter_id: i32,
+        m: i32,
+        size_n: i32,
+        size_k: i32,
+        rank_pad: i32,
+        num_b_slices: i32,
+        b_slices4: *const i32,
+    ) -> i32;
     pub fn w34_cublas_gemm_bf16(
         handle: usize,
         a: *const c_void,

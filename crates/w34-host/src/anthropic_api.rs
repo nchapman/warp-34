@@ -727,6 +727,8 @@ pub fn translate_anthropic_to_chat(
         chat_req.insert("stop".into(), stops.clone());
     }
     for key in [
+        "lora",
+        "adapter",
         "min_p",
         "presence_penalty",
         "frequency_penalty",

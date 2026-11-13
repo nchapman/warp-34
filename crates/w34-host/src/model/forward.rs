@@ -38,7 +38,8 @@ impl Qwen3_5ModelRank {
         } else {
             0
         };
-        let has_active_midloop = self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1);
+        let midloop_specs = self.active_midloop_specs();
+        let has_active_midloop = midloop_specs.iter().any(|&(_, _, passes)| passes > 1);
         let midloop_residual = if has_active_midloop {
             self.scratch_arena.alloc_aligned(rows * streams * h * 2)?
         } else {
@@ -51,8 +52,7 @@ impl Qwen3_5ModelRank {
             let ssm_slot_b = first_st.ssm_state.len_bytes / total_slots;
             let active_slots = self.last_batch_state_slots.len().clamp(1, total_slots);
             let max_span_gdn = self
-                .cfg
-                .midloop
+                .active_midloop_specs()
                 .iter()
                 .filter(|&&(_, _, passes)| passes > 1)
                 .map(|&(a, b, _)| {
@@ -503,9 +503,25 @@ impl Qwen3_5ModelRank {
             .lm_head
             .as_ref()
             .ok_or_else(|| loader_err("checkpoint has no lm_head for token generation"))?;
-        let hidden = if contiguous {
-            final_out + (selected_rows[0] * h * 2) as u64
+        let orig_lora_ids_ptr = self.lora_runtime.as_ref().map_or(0, |rt| {
+            rt.state
+                .token_lora_ids_ptr
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
+        let (hidden, lm_lora_ids_ptr) = if contiguous {
+            let h_ptr = final_out + (selected_rows[0] * h * 2) as u64;
+            let l_ptr = if orig_lora_ids_ptr != 0 {
+                orig_lora_ids_ptr + (selected_rows[0] * 4) as u64
+            } else {
+                0
+            };
+            (h_ptr, l_ptr)
         } else {
+            let l_ptr = if orig_lora_ids_ptr != 0 {
+                self.batch_meta_arena.alloc_aligned(n * 4)?
+            } else {
+                0
+            };
             for (i, &row) in selected_rows.iter().enumerate() {
                 check_rc(
                     // SAFETY: rows were checked above and destination reserves n disjoint hidden rows.
@@ -519,10 +535,29 @@ impl Qwen3_5ModelRank {
                     },
                     "gather selected hidden rows",
                 )?;
+                if l_ptr != 0 {
+                    check_rc(
+                        // SAFETY: `orig_lora_ids_ptr` holds `num_tokens` i32s and `l_ptr` reserves `n` i32s.
+                        unsafe {
+                            ffi::w34_memcpy_d2d_async(
+                                (l_ptr + (i * 4) as u64) as *mut c_void,
+                                (orig_lora_ids_ptr + (row * 4) as u64) as *const c_void,
+                                4,
+                                self.stream.handle,
+                            )
+                        },
+                        "gather selected lora ids",
+                    )?;
+                }
             }
-            gathered
+            (gathered, l_ptr)
         };
-        lm_head.forward(
+        if orig_lora_ids_ptr != 0
+            && let Some(rt) = &self.lora_runtime
+        {
+            rt.state.set_device_ids(lm_lora_ids_ptr);
+        }
+        let lm_res = lm_head.forward(
             &ex,
             &self.cublas,
             self.marlin_ws.addr(),
@@ -530,7 +565,13 @@ impl Qwen3_5ModelRank {
             hidden,
             logits,
             n,
-        )?;
+        );
+        if orig_lora_ids_ptr != 0
+            && let Some(rt) = &self.lora_runtime
+        {
+            rt.state.set_device_ids(orig_lora_ids_ptr);
+        }
+        lm_res?;
         if emit_device_greedy {
             self.sample_forward_rows(
                 &ex,
@@ -635,8 +676,7 @@ impl Qwen3_5ModelRank {
         while layer_idx < self.layers.len() {
             if active_midloop.is_none()
                 && let Some(&(a, b, passes)) = self
-                    .cfg
-                    .midloop
+                    .active_midloop_specs()
                     .iter()
                     .find(|&&(a, _, passes)| a == layer_idx && passes > 1)
             {
@@ -721,8 +761,7 @@ impl Qwen3_5ModelRank {
             let redo_input_norm = layer.ple.is_some()
                 || active_midloop.is_some_and(|(a, _, _, pass_idx)| layer_idx == a && pass_idx > 0)
                 || self
-                    .cfg
-                    .midloop
+                    .active_midloop_specs()
                     .iter()
                     .any(|&(_, b, passes)| passes > 1 && b + 1 == layer_idx);
             let norm_layer_idx = if redo_input_norm { 0 } else { layer_idx };
@@ -1398,7 +1437,7 @@ impl Qwen3_5ModelRank {
         let has_init_ptr = self
             .batch_meta_arena
             .upload_slice(has_initial_state, &self.stream)?;
-        let mask_mode = if self.cfg.noncausal_full_attention {
+        let mask_mode = if self.active_noncausal_full_attention() {
             w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW
         } else {
             W34_ATTN_MASK_CAUSAL

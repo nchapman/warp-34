@@ -455,6 +455,8 @@ pub(crate) fn run_greedy_diff(
         kv_format,
         kv_pages,
         use_cuda_graph,
+        lora_modules,
+        active_lora,
         ..
     } = options;
     let golden_arg = golden_path.ok_or("--golden <dir-or-json> is required")?;
@@ -463,13 +465,15 @@ pub(crate) fn run_greedy_diff(
             "greedy-diff with --image does not support --speculative or --verify-lossless".into(),
         );
     }
-    let mut engine = load_cli_engine(
+    let mut engine = load_cli_engine_with_lora(
         &resolved_model,
         tp,
         policy,
         kv_pages,
         use_cuda_graph,
         &spec_config,
+        &lora_modules,
+        active_lora.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     let (_, mm_images) = if image_urls.is_empty() {
@@ -678,15 +682,19 @@ pub(crate) fn run_dump_diff(
         golden_path,
         kv_pages,
         use_cuda_graph,
+        lora_modules,
+        active_lora,
         ..
     } = options;
-    let mut engine = load_cli_engine(
+    let mut engine = load_cli_engine_with_lora(
         &resolved_model,
         tp,
         policy,
         kv_pages,
         use_cuda_graph,
         &spec_config,
+        &lora_modules,
+        active_lora.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     let (expanded_prompt, mm_images) = prepare_multimodal_prompt_and_images(
@@ -736,6 +744,8 @@ pub(crate) fn run_dump_diff(
         drop(engine);
         let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
         let mut engine_tp2 = Qwen3_5Engine::load(&resolved_model, 2, policy, pages, false)
+            .map_err(|e| e.to_string())?;
+        attach_cli_lora(&mut engine_tp2, &lora_modules, active_lora.as_deref(), true)
             .map_err(|e| e.to_string())?;
         if let Some(config) = &spec_config {
             engine_tp2
@@ -899,6 +909,21 @@ pub(crate) fn profile_bench_args(options: &CudaCliOptions, exe: &Path) -> Vec<St
     if options.bench_stage != "all" {
         args.push("--stage".to_string());
         args.push(options.bench_stage.clone());
+    }
+    if !options.lora_modules.is_empty() {
+        args.push("--lora-modules".to_string());
+        for spec in &options.lora_modules {
+            let rev_suffix = spec
+                .revision
+                .as_deref()
+                .map(|r| format!("@{r}"))
+                .unwrap_or_default();
+            args.push(format!("{}={}{rev_suffix}", spec.name, spec.path));
+        }
+    }
+    if let Some(ref active) = options.active_lora {
+        args.push("--active-lora".to_string());
+        args.push(active.clone());
     }
     args
 }

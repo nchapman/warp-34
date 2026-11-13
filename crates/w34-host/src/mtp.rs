@@ -195,7 +195,7 @@ pub(crate) fn plan_mtp_draft_lm_head_bytes(
     target_lm_head: &LinearProj,
     free_vram_after_mtp_init: usize,
 ) -> Option<(usize, usize, usize)> {
-    let LinearProj::DenseF16 { size_n, size_k, .. } = *target_lm_head else {
+    let LinearProj::DenseF16 { size_n, size_k, .. } = *target_lm_head.without_lora() else {
         return None;
     };
     if size_n == 0
@@ -841,7 +841,7 @@ impl Qwen3_5MtpRank {
                 weight_ptr,
                 size_n,
                 size_k,
-            } = *target_lm_head
+            } = *target_lm_head.without_lora()
             && let Some((qweight_bytes, scales_bytes, arena_bytes)) =
                 plan_mtp_draft_lm_head_bytes(target_lm_head, free_vram_post_mtp)
             && let Ok(mut arena) = DeviceArena::new(target.device.device_id, arena_bytes)

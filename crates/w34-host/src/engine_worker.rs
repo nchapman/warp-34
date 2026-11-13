@@ -143,6 +143,7 @@ struct Request {
     max_prefix_lookup_len: Option<usize>,
     mamba_branching_seqlen: Option<usize>,
     prefix_bidir_len: Option<usize>,
+    lora_id: i32,
     decision_tap: Option<DecisionReadoutTap>,
 }
 
@@ -232,6 +233,7 @@ pub struct EngineWorker {
     pub hidden_size: usize,
     pub kv_token_capacity: usize,
     pub unshareable_prefill: bool,
+    pub lora_registry: crate::lora::LoraAdapterRegistry,
     max_model_len: Option<usize>,
 }
 impl EngineWorker {
@@ -266,7 +268,7 @@ impl EngineWorker {
         loader: impl FnOnce() -> Result<Qwen3_5Engine, String> + Send + 'static,
         config: SchedulerConfig,
     ) -> Result<Self, String> {
-        let (sender, receiver) = mpsc::channel(32);
+        let (sender, receiver) = mpsc::channel(256);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
@@ -305,7 +307,7 @@ impl EngineWorker {
                     {
                         clamped_cfg.max_num_batched_tokens = 6144;
                         clamped_cfg.chunk_prefill_size = 6144;
-                    } else if engine.cfg.requires_atomic_prefix_prefill()
+                    } else if engine.requires_atomic_prefix_prefill()
                         && clamped_cfg.chunk_prefill_size == 2048
                         && clamped_cfg.max_num_batched_tokens == 2048
                     {
@@ -342,6 +344,7 @@ impl EngineWorker {
                         engine.cfg.hidden_size,
                         kv_token_capacity,
                         unshareable_prefill,
+                        engine.lora_registry.clone(),
                     );
                     if ready_tx.send(Ok(info)).is_ok() {
                         run(
@@ -371,6 +374,7 @@ impl EngineWorker {
             hidden_size,
             kv_token_capacity,
             unshareable_prefill,
+            lora_registry,
         ) = match ready_rx.recv() {
             Ok(Ok(info)) => info,
             Ok(Err(error)) => {
@@ -399,6 +403,7 @@ impl EngineWorker {
             hidden_size,
             kv_token_capacity,
             unshareable_prefill,
+            lora_registry,
             max_model_len: None,
         })
     }
@@ -517,6 +522,23 @@ impl EngineWorker {
         params: SamplingParams,
         constraint: Option<TokenBitmaskConstraint>,
     ) -> Result<GenerationStream, WorkerError> {
+        self.submit_with_images_and_lora(
+            prompt,
+            images,
+            params,
+            constraint,
+            crate::lora::BASE_MODEL_LORA_ID,
+        )
+    }
+
+    pub fn submit_with_images_and_lora(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        params: SamplingParams,
+        constraint: Option<TokenBitmaskConstraint>,
+        lora_id: i32,
+    ) -> Result<GenerationStream, WorkerError> {
         params.validate().map_err(WorkerError::invalid_request)?;
         if prompt.is_empty() || params.max_tokens == 0 {
             return Err(WorkerError::invalid_request(
@@ -541,6 +563,7 @@ impl EngineWorker {
             max_prefix_lookup_len: None,
             mamba_branching_seqlen: None,
             prefix_bidir_len: None,
+            lora_id,
             decision_tap: None,
         })?;
         Ok(GenerationStream {
@@ -583,6 +606,29 @@ impl EngineWorker {
         ),
         WorkerError,
     > {
+        self.submit_decision_candidate_logits_with_images_and_lora(
+            prompt,
+            images,
+            token_ids,
+            mamba_branching_seqlen,
+            crate::lora::BASE_MODEL_LORA_ID,
+        )
+    }
+
+    pub fn submit_decision_candidate_logits_with_images_and_lora(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        token_ids: Vec<i32>,
+        mamba_branching_seqlen: Option<usize>,
+        lora_id: i32,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
+        ),
+        WorkerError,
+    > {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let stream = self.submit_decision_internal(
             prompt,
@@ -590,6 +636,7 @@ impl EngineWorker {
             None,
             mamba_branching_seqlen,
             None,
+            lora_id,
             DecisionReadoutTap::CandidateLogits { token_ids, tx },
         )?;
         Ok((stream, rx))
@@ -633,6 +680,34 @@ impl EngineWorker {
         ),
         WorkerError,
     > {
+        self.submit_decision_hidden_positions_with_images_and_lora(
+            prompt,
+            images,
+            positions,
+            max_prefix_lookup_len,
+            mamba_branching_seqlen,
+            prefix_bidir_len,
+            crate::lora::BASE_MODEL_LORA_ID,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_decision_hidden_positions_with_images_and_lora(
+        &self,
+        prompt: Vec<i32>,
+        images: Vec<crate::vision::PreprocessedImage>,
+        positions: Vec<usize>,
+        max_prefix_lookup_len: Option<usize>,
+        mamba_branching_seqlen: Option<usize>,
+        prefix_bidir_len: Option<usize>,
+        lora_id: i32,
+    ) -> Result<
+        (
+            GenerationStream,
+            tokio::sync::oneshot::Receiver<Result<DecisionTapOutput, WorkerError>>,
+        ),
+        WorkerError,
+    > {
         let captured = vec![None; positions.len()];
         let (tx, rx) = tokio::sync::oneshot::channel();
         let stream = self.submit_decision_internal(
@@ -641,6 +716,7 @@ impl EngineWorker {
             max_prefix_lookup_len,
             mamba_branching_seqlen,
             prefix_bidir_len,
+            lora_id,
             DecisionReadoutTap::HiddenPositions {
                 positions,
                 captured,
@@ -650,6 +726,7 @@ impl EngineWorker {
         Ok((stream, rx))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn submit_decision_internal(
         &self,
         prompt: Vec<i32>,
@@ -657,6 +734,7 @@ impl EngineWorker {
         max_prefix_lookup_len: Option<usize>,
         mamba_branching_seqlen: Option<usize>,
         prefix_bidir_len: Option<usize>,
+        lora_id: i32,
         tap: DecisionReadoutTap,
     ) -> Result<GenerationStream, WorkerError> {
         if prompt.is_empty() {
@@ -690,6 +768,7 @@ impl EngineWorker {
             max_prefix_lookup_len,
             mamba_branching_seqlen,
             prefix_bidir_len,
+            lora_id,
             decision_tap: Some(tap),
         })?;
         Ok(GenerationStream {
@@ -737,7 +816,7 @@ pub fn run_batch_in_place(
     {
         clamped_cfg.max_num_batched_tokens = 6144;
         clamped_cfg.chunk_prefill_size = 6144;
-    } else if engine.cfg.requires_atomic_prefix_prefill()
+    } else if engine.requires_atomic_prefix_prefill()
         && clamped_cfg.chunk_prefill_size == 2048
         && clamped_cfg.max_num_batched_tokens == 2048
     {
@@ -791,6 +870,7 @@ pub fn run_batch_in_place(
                     max_prefix_lookup_len: None,
                     mamba_branching_seqlen: None,
                     prefix_bidir_len: None,
+                    lora_id: engine.active_lora_id,
                     decision_tap: None,
                 })
                 .map_err(|e| format!("failed to enqueue batch request: {e}"))?;
@@ -815,12 +895,16 @@ pub fn run_batch_in_place(
             }
             let cached = match events.terminal.get() {
                 Some(GenerationEvent::Finished { cached_tokens, .. }) => *cached_tokens,
-                Some(GenerationEvent::Error(e)) => return Err(e.to_string()),
+                Some(GenerationEvent::Error(e)) => {
+                    engine.radix.active_lora_id = engine.active_lora_id;
+                    return Err(e.to_string());
+                }
                 _ => cached_atomic.load(Ordering::Acquire) as usize,
             };
             results.push((gen_ids, cached));
         }
     }
+    engine.radix.active_lora_id = engine.active_lora_id;
     Ok((results, stats))
 }
 
@@ -889,7 +973,7 @@ fn enqueue(
     requests: &mut HashMap<u64, Request>,
     mut request: Request,
 ) {
-    if requests.len() >= 32 {
+    if requests.len() >= 256 {
         let err = WorkerError::overload("engine admission capacity exceeded");
         if let Some(tap) = request.decision_tap.take() {
             tap.fail(err.clone());
@@ -913,8 +997,21 @@ fn enqueue(
         request.set_terminal(GenerationEvent::Error(err));
         return;
     }
+    let lora_noncausal_or_midloop = request.lora_id >= 0
+        && engine.ranks[0].lora_runtime.as_ref().is_some_and(|rt| {
+            rt.adapter_noncausal
+                .get(request.lora_id as usize)
+                .copied()
+                .unwrap_or(false)
+                || rt
+                    .adapter_midloops
+                    .get(request.lora_id as usize)
+                    .is_some_and(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
+        });
     if engine.cfg.noncausal_full_attention
         || engine.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
+        || lora_noncausal_or_midloop
+        || request.prefix_bidir_len == Some(request.prompt.len())
     {
         request.prefix_bidir_len = Some(request.prompt.len());
         request.max_prefix_lookup_len = Some(0);
@@ -983,7 +1080,7 @@ fn enqueue(
         .vision
         .as_ref()
         .map_or_else(|| prompt_tokens.clone(), |v| v.radix_key.clone());
-    let id = sched.submit_request_with_prefix_and_bidir(
+    let id = sched.submit_request_with_lora_and_bidir(
         prompt_tokens,
         key,
         p.max_tokens,
@@ -995,6 +1092,7 @@ fn enqueue(
         request.max_prefix_lookup_len,
         request.mamba_branching_seqlen,
         request.prefix_bidir_len,
+        request.lora_id,
     );
     requests.insert(id, request);
 }

@@ -27,6 +27,7 @@ pub struct HubOptions {
 pub enum ModelRole {
     Target,
     Draft,
+    Lora,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -39,6 +40,15 @@ struct Manifest {
 /// Resolve a local model directory or acquire a supported Hub checkpoint.
 /// Downloads and progress messages happen before CUDA initialization.
 pub fn resolve_model(spec: &str, options: &HubOptions, role: ModelRole) -> io::Result<PathBuf> {
+    if role == ModelRole::Lora {
+        let mut lora_spec = crate::lora::LoraModuleSpec {
+            name: spec.to_string(),
+            path: spec.to_string(),
+            revision: options.revision.clone(),
+            resolved_dir: None,
+        };
+        return resolve_lora_adapter(&mut lora_spec, options.offline);
+    }
     if let Some(path) = local_model(spec, options)? {
         return Ok(path);
     }
@@ -53,6 +63,137 @@ pub fn resolve_model(spec: &str, options: &HubOptions, role: ModelRole) -> io::R
         HFClient::builder(),
         !env_enabled("HF_HUB_DISABLE_PROGRESS_BARS"),
     )
+}
+
+/// Resolve a local PEFT LoRA adapter directory or acquire one from Hugging Face Hub
+/// (supporting both root repositories `owner/repo` and subdirectories `owner/repo/sub/dir`).
+pub fn resolve_lora_adapter(
+    spec: &mut crate::lora::LoraModuleSpec,
+    offline: bool,
+) -> io::Result<PathBuf> {
+    let opts = HubOptions {
+        revision: spec.revision.clone(),
+        offline: offline || env_enabled("HF_HUB_OFFLINE"),
+    };
+    if let Some(dir) = local_model(&spec.path, &opts)? {
+        validate_lora_dir(&dir)?;
+        spec.resolved_dir = Some(dir.clone());
+        return Ok(dir);
+    }
+    let (id, subfolder) = crate::lora::split_hf_repo_and_subfolder(&spec.path)?;
+    let revision = opts.revision.as_deref().unwrap_or("main");
+    safe_revision(revision)?;
+    let normalized_sha = is_commit(revision).then(|| revision.to_ascii_lowercase());
+    let revision = normalized_sha.as_deref().unwrap_or(revision);
+    if opts.offline {
+        let offline_rev = opts.revision.as_deref().map(|_| revision);
+        let dir = crate::lora::resolve_cached_or_local_lora_dir(&spec.path, offline_rev)?;
+        validate_lora_dir(&dir)?;
+        eprintln!(
+            "Using cached LoRA adapter '{}': {}",
+            spec.name,
+            dir.display()
+        );
+        spec.resolved_dir = Some(dir.clone());
+        return Ok(dir);
+    }
+    let client = HFClient::builder().build().map_err(hub_error)?;
+    let repo_dir = client
+        .cache_dir()
+        .join(format!("models--{}", id.replace('/', "--")));
+    let client = HFClientSync::from_inner(client).map_err(hub_error)?;
+    let (owner, name) = id.rsplit_once('/').unwrap_or(("", &id));
+    let repo = client.model(owner, name);
+    let progress = !env_enabled("HF_HUB_DISABLE_PROGRESS_BARS");
+    eprintln!("Resolving Hugging Face LoRA {}@{revision}…", spec.path);
+    let lock = repo_download_lock(&repo_dir);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let info = repo.info().revision(revision).send().map_err(hub_error)?;
+    let commit = info
+        .sha
+        .filter(|s| is_commit(s))
+        .map(|s| s.to_ascii_lowercase())
+        .ok_or_else(|| invalid("Hub did not return a full commit SHA"))?;
+    if is_commit(revision) && !commit.eq_ignore_ascii_case(revision) {
+        return Err(invalid("Hub returned a different commit than requested"));
+    }
+    let available: BTreeSet<_> = info
+        .siblings
+        .ok_or_else(|| invalid("Hub returned no file listing for LoRA repository"))?
+        .into_iter()
+        .map(|s| s.rfilename)
+        .collect();
+    let required: Vec<String> = match &subfolder {
+        Some(sub) => vec![
+            format!("{sub}/adapter_config.json"),
+            format!("{sub}/adapter_model.safetensors"),
+        ],
+        None => vec![
+            "adapter_config.json".to_string(),
+            "adapter_model.safetensors".to_string(),
+        ],
+    };
+    for req in &required {
+        safe_path(req)?;
+        if !available.contains(req) {
+            return Err(invalid(format!(
+                "LoRA repository '{}' is missing required file '{req}'",
+                spec.path
+            )));
+        }
+    }
+    let optional_candidates: Vec<String> = match &subfolder {
+        Some(sub) => vec![
+            format!("{sub}/decision_config.json"),
+            format!("{sub}/readout.safetensors"),
+        ],
+        None => vec![
+            "decision_config.json".to_string(),
+            "readout.safetensors".to_string(),
+        ],
+    };
+    let mut optional_files = Vec::new();
+    for opt in optional_candidates {
+        safe_path(&opt)?;
+        if available.contains(&opt) {
+            optional_files.push(opt);
+        }
+    }
+    let reporter = progress::Reporter::new(progress)?;
+    let snap_dir = fetch_files(&repo, &commit, &required, &reporter)?;
+    if !optional_files.is_empty() {
+        let _ = fetch_files(&repo, &commit, &optional_files, &reporter);
+    }
+    let adapter_dir = match &subfolder {
+        Some(sub) => snap_dir.join(sub),
+        None => snap_dir,
+    };
+    validate_lora_dir(&adapter_dir)?;
+    if !is_commit(revision) {
+        atomic_write(&repo_dir.join("refs").join(revision), commit.as_bytes())?;
+    }
+    eprintln!(
+        "LoRA ready: {} ({}@{} -> {})",
+        spec.name,
+        id,
+        commit,
+        adapter_dir.display()
+    );
+    spec.resolved_dir = Some(adapter_dir.clone());
+    Ok(adapter_dir)
+}
+
+fn validate_lora_dir(dir: &Path) -> io::Result<()> {
+    crate::lora::PeftConfig::from_dir(dir)?;
+    let st_path = dir.join("adapter_model.safetensors");
+    if !fs::metadata(&st_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("missing or empty {}", st_path.display()),
+        ));
+    }
+    crate::loader::SafetensorsArchive::open(&st_path)?;
+    Ok(())
 }
 
 pub(crate) fn cache_dir() -> PathBuf {
