@@ -208,3 +208,94 @@ fn vec8_rms_norm_and_silu_mul_match_vec2_fallback_zero_ulp() {
         );
     }
 }
+
+#[test]
+fn gemma_rms_norm_above_12288_and_silu_mul_grid_y_above_65535_and_alignment_guards() {
+    let device = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(device.device_id).unwrap();
+    let ex = stream.exec(0, 0);
+
+    // 1. I8: Standalone `w34_gemma_rms_norm_f16` with `hidden_size = 14336 > 12288` must normalize
+    // the entire row instead of truncating at column 12,288.
+    let hs = 14_336usize;
+    let x_host = vec![f32_to_f16(2.0); hs];
+    let w_host = vec![f32_to_f16(0.5); hs];
+    let d_x = DeviceBuffer::alloc(device.device_id, hs * 2).unwrap();
+    let d_w = DeviceBuffer::alloc(device.device_id, hs * 2).unwrap();
+    let d_out = DeviceBuffer::alloc(device.device_id, hs * 2).unwrap();
+    d_x.copy_from_host(&x_host, &stream).unwrap();
+    d_w.copy_from_host(&w_host, &stream).unwrap();
+    d_out.copy_from_host(&vec![0x7BFFu16; hs], &stream).unwrap();
+    // SAFETY: `d_x`, `d_w`, and `d_out` are live device buffers sized for `hs` FP16 elements through `stream.synchronize()`.
+    let rc_norm = unsafe {
+        ffi::w34_gemma_rms_norm_f16(
+            &ex,
+            d_x.addr() as *const c_void,
+            d_w.addr() as *const c_void,
+            d_out.addr() as *mut c_void,
+            core::ptr::null(),
+            1,
+            hs as i32,
+            1e-6,
+        )
+    };
+    assert_eq!(rc_norm, 0);
+    let mut got_norm = vec![0u16; hs];
+    d_out.copy_to_host(&mut got_norm, &stream).unwrap();
+    stream.synchronize().unwrap();
+    // x = 2.0 everywhere => rms = 2.0 => x / rms * (1 + 0.5) = 1.5 everywhere (0x3E00).
+    let expected_1p5 = f32_to_f16(1.5);
+    assert!(
+        got_norm
+            .iter()
+            .all(|&u| (u as i32 - expected_1p5 as i32).abs() <= 1),
+        "gemma_rms_norm_f16(hs=14336) truncated or misnormalized tail: head={:#x}, tail={:#x}",
+        got_norm[0],
+        got_norm[hs - 1]
+    );
+
+    // 2. I10: `w34_silu_and_mul_f16` at `num_tokens = 65_536` must not fail CUDA's `grid.y <= 65535` cap.
+    let rows = 65_536usize;
+    let d = 8usize;
+    let gu = vec![f32_to_f16(1.0); rows * 2 * d];
+    let d_gu = DeviceBuffer::alloc(device.device_id, gu.len() * 2).unwrap();
+    let d_silu_out = DeviceBuffer::alloc(device.device_id, rows * d * 2).unwrap();
+    d_gu.copy_from_host(&gu, &stream).unwrap();
+    // SAFETY: `d_gu` and `d_silu_out` are live device buffers sized for `[rows, 2 * d]` and `[rows, d]` through `stream.synchronize()`.
+    let rc_silu = unsafe {
+        ffi::w34_silu_and_mul_f16(
+            &ex,
+            d_gu.addr() as *const c_void,
+            d_silu_out.addr() as *mut c_void,
+            core::ptr::null(),
+            rows as i32,
+            d as i32,
+        )
+    };
+    assert_eq!(
+        rc_silu, 0,
+        "w34_silu_and_mul_f16 must succeed at num_tokens=65536"
+    );
+    stream.synchronize().unwrap();
+
+    // 3. I10: `w34_small_n_gemm_f16` must reject unaligned (<16B) pointers before issuing `uint4` loads.
+    let d_sm_x = DeviceBuffer::alloc(device.device_id, 64).unwrap();
+    let d_sm_w = DeviceBuffer::alloc(device.device_id, 64).unwrap();
+    let d_sm_o = DeviceBuffer::alloc(device.device_id, 64).unwrap();
+    // SAFETY: `d_sm_x`, `d_sm_w`, and `d_sm_o` are live device buffers; `+2` byte offset intentionally exercises fast alignment rejection.
+    let rc_unaligned = unsafe {
+        ffi::w34_small_n_gemm_f16(
+            &ex,
+            (d_sm_x.addr() + 2) as *const c_void,
+            d_sm_w.addr() as *const c_void,
+            d_sm_o.addr() as *mut c_void,
+            1,
+            1,
+            8,
+        )
+    };
+    assert_ne!(
+        rc_unaligned, 0,
+        "w34_small_n_gemm_f16 must reject +2B unaligned uint4 pointer"
+    );
+}

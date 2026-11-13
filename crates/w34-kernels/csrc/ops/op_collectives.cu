@@ -55,7 +55,8 @@ __device__ __forceinline__ T* stage_epoch_ptr(T* base, const Signal* sig, bool o
         return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + off_bytes);
     }
     if (!odd) return base;
-    return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + min_bytes);
+    const size_t aligned_min_bytes = (min_bytes + 15ULL) & ~15ULL;
+    return reinterpret_cast<T*>(reinterpret_cast<char*>(base) + aligned_min_bytes);
 }
 
 template <typename T>
@@ -99,6 +100,22 @@ inline int tp2_block_cap(bool is_small) {
 
 inline int tp2_pcie_block_cap() {
     int cap = tp2_block_cap(true);
+    return (cap > kTp2PcieBlockCap) ? kTp2PcieBlockCap : cap;
+}
+
+inline int tp4_block_cap(bool is_small) {
+    int min_sms = 84;
+    if (w34_get_tp_min_sm_count(4, &min_sms) != 0 || min_sms < 1) {
+        min_sms = 1;
+    }
+    int cap = is_small ? kSmallMaxBlocks : kMaxBlocks;
+    if (cap > min_sms) cap = min_sms;
+    if (cap < 1) cap = 1;
+    return cap;
+}
+
+inline int tp4_pcie_block_cap() {
+    int cap = tp4_block_cap(true);
     return (cap > kTp2PcieBlockCap) ? kTp2PcieBlockCap : cap;
 }
 
@@ -1935,11 +1952,8 @@ extern "C" int w34_tp4_all_reduce_f16(
         rank < 0 || rank >= 4 || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    const bool vec8 = ((num_elems & 7) == 0) &&
-                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1 | (uintptr_t)stage2 | (uintptr_t)stage3) & 15u) == 0);
-    const int elems_per_block = vec8 ? 4096 : 512;
-    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
-    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    int blocks = (num_elems + w34_comm::kVec8F16ElemsPerBlock - 1) / w34_comm::kVec8F16ElemsPerBlock;
+    int cap = w34_comm::tp4_block_cap(num_elems <= 36 * 5120);
     if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
@@ -1980,7 +1994,7 @@ extern "C" int w34_tp4_all_reduce_residual_gemma_rms_norm_hadamard_f16(
     }
     if (num_tokens == 0) return 0;
     int blocks = num_tokens;
-    const int cap = w34_comm::tp2_pcie_block_cap();
+    const int cap = w34_comm::tp4_pcie_block_cap();
     if (blocks > cap) blocks = cap;
     w34_comm::Tp4Ptrs ptrs{
         {stage0, stage1, stage2, stage3},
@@ -2041,11 +2055,8 @@ extern "C" int w34_tp4_all_reduce_bf16(
         rank < 0 || rank >= 4 || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    const bool vec8 = ((num_elems & 7) == 0) &&
-                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1 | (uintptr_t)stage2 | (uintptr_t)stage3) & 15u) == 0);
-    const int elems_per_block = vec8 ? 4096 : 512;
-    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
-    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    int blocks = (num_elems + w34_comm::kVec8F16ElemsPerBlock - 1) / w34_comm::kVec8F16ElemsPerBlock;
+    int cap = w34_comm::tp4_block_cap(num_elems <= 36 * 5120);
     if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
@@ -2068,11 +2079,8 @@ extern "C" int w34_tp4_all_reduce_f32(
         rank < 0 || rank >= 4 || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    const bool vec4 = ((num_elems & 3) == 0) &&
-                      ((((uintptr_t)local_in | (uintptr_t)out | (uintptr_t)stage0 | (uintptr_t)stage1 | (uintptr_t)stage2 | (uintptr_t)stage3) & 15u) == 0);
-    const int elems_per_block = vec4 ? 2048 : 512;
-    int blocks = (num_elems + elems_per_block - 1) / elems_per_block;
-    int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    int blocks = (num_elems + w34_comm::kVec4F32ElemsPerBlock - 1) / w34_comm::kVec4F32ElemsPerBlock;
+    int cap = w34_comm::tp4_block_cap(num_elems <= 36 * 5120);
     if (num_elems <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
@@ -2138,7 +2146,7 @@ extern "C" int w34_tp4_gather_vocab_f16(
     }
     const int num_elems = num_rows * local_vocab_size;
     int blocks = (num_elems + 511) / 512;
-    const int cap = w34_comm::tp2_block_cap(num_elems <= 36 * 5120);
+    const int cap = w34_comm::tp4_block_cap(num_elems <= 36 * 5120);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::Tp4Ptrs ptrs{
@@ -2234,7 +2242,7 @@ extern "C" int w34_tp4_all_reduce_hc_combine_tap_f16(
         return (int)cudaErrorInvalidValue;
     }
     int blocks = num_tokens;
-    int cap = w34_comm::tp2_block_cap(num_tokens * hidden_size <= 36 * 5120);
+    int cap = w34_comm::tp4_block_cap(num_tokens * hidden_size <= 36 * 5120);
     if (num_tokens * hidden_size <= 36 * 5120 && cap > 16) cap = 16;
     if (blocks > cap) blocks = cap;
     w34_comm::Tp4Ptrs ptrs{

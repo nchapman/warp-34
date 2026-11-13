@@ -238,6 +238,16 @@ __global__ void kv_cache_write_kernel(
     const int tok = blockIdx.x;
     if (tok >= batch.total_tokens) return;
     if (batch.valid_token_mask != nullptr && batch.valid_token_mask[tok] == 0) return;
+    if (batch.valid_req_mask != nullptr && batch.query_start_loc != nullptr && batch.num_reqs > 0) {
+        int req = -1;
+        for (int r = 0; r < batch.num_reqs; ++r) {
+            if (tok >= batch.query_start_loc[r] && tok < batch.query_start_loc[r + 1]) {
+                req = r;
+                break;
+            }
+        }
+        if (req < 0 || batch.valid_req_mask[req] == 0) return;
+    }
 
     const int32_t slot = batch.write_slot_mapping[tok];
     if (slot < 0) return;
@@ -1140,6 +1150,13 @@ extern "C" int w34_paged_attention_scalar_f16(
     const void* q_in,
     void* attn_out,
     int num_q_heads) {
+    if (!ex || !layout || !batch || !q_in || !attn_out || num_q_heads <= 0 ||
+        layout->local_kv_heads <= 0 || num_q_heads % layout->local_kv_heads != 0 ||
+        batch->total_tokens < 0 || batch->num_reqs <= 0 || !batch->query_start_loc ||
+        !batch->seq_lens_after || !batch->block_tables || batch->max_blocks_per_req <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (batch->total_tokens == 0) return 0;
     dim3 grid((unsigned)batch->total_tokens, (unsigned)num_q_heads);
     w34_attn::paged_attention_kernel<__half><<<grid, 128, 0, (cudaStream_t)ex->stream>>>(
         *layout, *batch, (const __half*)q_in, (__half*)attn_out, num_q_heads);

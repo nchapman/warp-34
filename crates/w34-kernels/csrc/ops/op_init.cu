@@ -46,6 +46,7 @@ std::unique_lock<std::shared_mutex> acquire_device_sync_lock() {
 std::atomic<uint32_t> g_device_props_mask{0u};
 w34_device_props g_device_props[kMaxCachedDevices] = {};
 std::atomic<int> g_tp2_min_sms{0};
+std::atomic<int> g_tp4_min_sms{0};
 constexpr size_t vision_workspace_bytes = 1024 * 1024;
 constexpr int vision_plan_limit = 256;
 struct VisionPlan {
@@ -172,32 +173,45 @@ extern "C" int w34_get_current_device_props(w34_device_props* out_props) {
     return w34_get_device_props(dev_id, out_props);
 }
 
-extern "C" int w34_get_tp2_min_sm_count(int* out_min_sms) {
-    if (out_min_sms == nullptr) return (int)cudaErrorInvalidValue;
-    int cached = g_tp2_min_sms.load(std::memory_order_acquire);
-    if (cached > 0) {
-        *out_min_sms = cached;
-        return 0;
+extern "C" int w34_get_tp_min_sm_count(int tp_size, int* out_min_sms) {
+    if (out_min_sms == nullptr || tp_size <= 0 || tp_size > kMaxCachedDevices) {
+        return (int)cudaErrorInvalidValue;
+    }
+    std::atomic<int>* cache =
+        (tp_size == 2) ? &g_tp2_min_sms : ((tp_size == 4) ? &g_tp4_min_sms : nullptr);
+    if (cache != nullptr) {
+        int cached = cache->load(std::memory_order_acquire);
+        if (cached > 0) {
+            *out_min_sms = cached;
+            return 0;
+        }
     }
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) return (int)err;
     if (count <= 0) return (int)cudaErrorNoDevice;
+    const int limit = (count < tp_size) ? count : tp_size;
     w34_device_props p0{};
     int rc = w34_get_device_props(0, &p0);
     if (rc != 0) return rc;
     int min_sms = p0.multi_processor_count;
-    if (count >= 2) {
-        w34_device_props p1{};
-        rc = w34_get_device_props(1, &p1);
+    for (int d = 1; d < limit; ++d) {
+        w34_device_props pd{};
+        rc = w34_get_device_props(d, &pd);
         if (rc != 0) return rc;
-        if (p1.multi_processor_count < min_sms) {
-            min_sms = p1.multi_processor_count;
+        if (pd.multi_processor_count < min_sms) {
+            min_sms = pd.multi_processor_count;
         }
     }
-    g_tp2_min_sms.store(min_sms, std::memory_order_release);
+    if (cache != nullptr) {
+        cache->store(min_sms, std::memory_order_release);
+    }
     *out_min_sms = min_sms;
     return 0;
+}
+
+extern "C" int w34_get_tp2_min_sm_count(int* out_min_sms) {
+    return w34_get_tp_min_sm_count(2, out_min_sms);
 }
 
 extern "C" int w34_set_device(int device_id) {

@@ -132,7 +132,7 @@ __global__ void __launch_bounds__(32) moe_topk_router_256_k8_f16_kernel(
     }
 
     if (lane < 8) {
-        const float scale = (norm_topk_prob != 0 && w_sum > 1e-12f) ? (1.0f / w_sum) : 1.0f;
+        const float scale = (norm_topk_prob != 0 && w_sum > 0.0f && isfinite(w_sum)) ? (1.0f / w_sum) : 1.0f;
         topk_weights[(size_t)tok * 8 + lane] = my_w * scale;
         topk_ids[(size_t)tok * 8 + lane] = my_id;
     }
@@ -242,7 +242,7 @@ __global__ void moe_topk_router_warp256_f16_kernel(
     }
 
     if (lane < top_k) {
-        const float scale = (norm_topk_prob != 0 && w_sum > 1e-12f) ? (1.0f / w_sum) : 1.0f;
+        const float scale = (norm_topk_prob != 0 && w_sum > 0.0f && isfinite(w_sum)) ? (1.0f / w_sum) : 1.0f;
         topk_weights[(size_t)tok * top_k + lane] = my_w * scale;
         topk_ids[(size_t)tok * top_k + lane] = my_id;
     }
@@ -356,7 +356,7 @@ __global__ void moe_topk_router_f16_kernel(
         }
 
         if (lane == 0) {
-            const float scale = (norm_topk_prob != 0 && w_sum > 1e-12f) ? (1.0f / w_sum) : 1.0f;
+            const float scale = (norm_topk_prob != 0 && w_sum > 0.0f && isfinite(w_sum)) ? (1.0f / w_sum) : 1.0f;
             float* out_w = topk_weights + (size_t)tok * top_k;
             int32_t* out_id = topk_ids + (size_t)tok * top_k;
             for (int k = 0; k < top_k; ++k) {
@@ -380,7 +380,8 @@ extern "C" int w34_moe_topk_router_f16(
     int norm_topk_prob,
     int scoring_func) {
     if (ex == nullptr || router_logits == nullptr || topk_weights == nullptr || topk_ids == nullptr ||
-        num_tokens < 0 || num_experts <= 0 || num_experts > 1024 || top_k <= 0 || top_k > 32) {
+        num_tokens < 0 || num_experts <= 0 || num_experts > 1024 || top_k <= 0 || top_k > 32 ||
+        top_k > num_experts || (scoring_func != 0 && scoring_func != 1)) {
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens == 0) return 0;
@@ -954,6 +955,33 @@ extern "C" int w34_moe_gpu_lru_update_and_pull(
         !num_misses_buf || total_pairs < 0 || local_num_experts <= 0 || k_hot <= 0 ||
         max_misses < 0 || max_misses > 65535 || (max_misses > 0 && mapped_host_packs == nullptr)) {
         return (int)cudaErrorInvalidValue;
+    }
+    if (mapped_host_packs != nullptr && max_misses > 0) {
+        const int pack_factor = (bits == 2) ? 16 : 8;
+        if (!gate_up_packed_base || !gate_up_scales_base || !down_packed_base || !down_scales_base ||
+            n_interm <= 0 || (bits != 2 && bits != 4) ||
+            (((uintptr_t)mapped_host_packs | (uintptr_t)gate_up_packed_base |
+              (uintptr_t)gate_up_scales_base | (uintptr_t)down_packed_base |
+              (uintptr_t)down_scales_base) & 15) != 0 ||
+            k_hidden <= 0 || group_size <= 0 ||
+            n_interm > INT_MAX / 2 || n_interm % pack_factor != 0 || k_hidden % pack_factor != 0 ||
+            n_interm % group_size != 0 || k_hidden % group_size != 0 ||
+            (pack_stride_bytes & 15) != 0) {
+            return (int)cudaErrorInvalidValue;
+        }
+        const size_t gu_packed_bytes =
+            (size_t)(2 * n_interm) * (size_t)(k_hidden / pack_factor) * sizeof(uint32_t);
+        const size_t gu_scales_bytes =
+            (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
+        const size_t dn_packed_bytes =
+            (size_t)k_hidden * (size_t)(n_interm / pack_factor) * sizeof(uint32_t);
+        const size_t dn_scales_bytes =
+            (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
+        if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
+            (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
+            pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
+            return (int)cudaErrorInvalidValue;
+        }
     }
     if (total_pairs == 0) return 0;
 

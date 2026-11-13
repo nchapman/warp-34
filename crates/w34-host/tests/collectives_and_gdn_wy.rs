@@ -1195,3 +1195,91 @@ fn test_gdn_wy_duplicate_checkpoint_offsets_and_conv_kernel_size_validation() {
         );
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_tp4_all_reduce_mismatched_pointer_alignment_does_not_mismatch_grid() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let num_gpus = CudaDevice::count().unwrap_or(0);
+    if num_gpus < 1 {
+        return;
+    }
+    prepare_execution_plan(0).unwrap();
+    if num_gpus >= 2 {
+        prepare_execution_plan(1).unwrap();
+    }
+    // Use 4 non-blocking streams mapped across available GPUs (`rank % num_gpus`) with pinned
+    // mapped-host staging (`allow_p2p = false`) so 4 ranks run concurrently even on a 2-GPU host.
+    // `n = 4104` (`% 8 == 0`, `> 4096`): rank 0 gets 16B-aligned `local_in` (`+0 B`), while ranks
+    // 1..3 get `+4 B`-offset `local_in` (`vec8 == false`). All 4 ranks must still launch the same
+    // `gridDim.x` (`2` CTAs) so `barrier_tp4_epoch_release` never deadlocks.
+    let comm4 = Tp2Collectives::new_for_tp_with_p2p(4, 64 * 1024, false).unwrap();
+    let n = 4104usize;
+    let pad_u16 = 2usize; // +4B
+    let mut devs = Vec::new();
+    let mut streams = Vec::new();
+    let mut d_ins = Vec::new();
+    let mut d_outs = Vec::new();
+    for r in 0..4usize {
+        let dev_id = (r % (num_gpus.min(4) as usize)) as i32;
+        let dev = CudaDevice::set_current(dev_id).unwrap();
+        let s = CudaStream::new(dev_id).unwrap();
+        let off = if r == 0 { 0 } else { pad_u16 };
+        let mut h_in = vec![0u16; pad_u16 + n];
+        for i in 0..n {
+            h_in[off + i] = f32_to_f16(((i + r) % 11) as f32 * 0.25);
+        }
+        let d_in = DeviceBuffer::alloc(dev_id, (pad_u16 + n) * 2).unwrap();
+        let d_out = DeviceBuffer::alloc(dev_id, (pad_u16 + n) * 2).unwrap();
+        d_in.copy_from_host(&h_in, &s).unwrap();
+        s.synchronize().unwrap();
+        devs.push(dev);
+        streams.push(s);
+        d_ins.push((d_in, off));
+        d_outs.push((d_out, off));
+    }
+    std::thread::scope(|sc| {
+        let mut handles = Vec::new();
+        for (r, (((dev, s), (d_in, off_in)), (d_out, off_out))) in devs
+            .iter()
+            .zip(streams.iter())
+            .zip(d_ins.iter())
+            .zip(d_outs.iter())
+            .enumerate()
+        {
+            let c = &comm4;
+            handles.push(sc.spawn(move || {
+                dev.make_current().unwrap();
+                let ex = s.exec(0, 0);
+                c.all_reduce_f16(
+                    &ex,
+                    d_in.addr() + (*off_in * 2) as u64,
+                    d_out.addr() + (*off_out * 2) as u64,
+                    r as i32,
+                    n as i32,
+                )
+                .unwrap();
+                s.synchronize().unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+    for r in 0..4usize {
+        let (ref d_out, off_out) = d_outs[r];
+        let mut got = vec![0u16; pad_u16 + n];
+        d_out.copy_to_host(&mut got, &streams[r]).unwrap();
+        streams[r].synchronize().unwrap();
+        for i in 0..n {
+            let expected: f32 = (0..4usize)
+                .map(|rk| f16_to_f32(f32_to_f16(((i + rk) % 11) as f32 * 0.25)))
+                .sum();
+            let actual = f16_to_f32(got[off_out + i]);
+            assert!(
+                (actual - expected).abs() <= 1e-2,
+                "rank={r} idx={i}: actual={actual} expected={expected}"
+            );
+        }
+    }
+}

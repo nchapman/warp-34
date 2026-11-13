@@ -70,9 +70,9 @@ __global__ void hc_init_streams_f16_kernel(
 // Per-stream GemmaRMSNorm over [num_tokens, hc_count, hidden_size] with weight [hc_count, hidden_size].
 // Grid: (num_tokens, hc_count), Block: 256.
 __global__ void hc_rmsnorm_f16_kernel(
-    const __half* __restrict__ residual_in,
+    const __half* residual_in,
     const __half* __restrict__ norm_weight,
-    __half* __restrict__ normed_out,
+    __half* normed_out,
     const uint8_t* __restrict__ valid_token_mask,
     int num_tokens,
     int hc_count,
@@ -113,8 +113,8 @@ __global__ void hc_rmsnorm_f16_kernel(
 // Applies SiLU(down / hc_count) in-place or out-of-place on [num_tokens, hc_rank_dim]
 // and optionally computes inject_weights = 2.0 * sigmoid(inj / hc_count) on [num_tokens, hc_count].
 __global__ void hc_down_silu_inject_f16_kernel(
-    const __half* __restrict__ down_in,
-    __half* __restrict__ down_out,
+    const __half* down_in,
+    __half* down_out,
     const __half* __restrict__ inj_in,
     float* __restrict__ inject_weights_out,
     const uint8_t* __restrict__ valid_token_mask,
@@ -249,11 +249,11 @@ __global__ void hc_mix_streams_hadamard_f16_kernel(
 //   tap_bf16_out[tok * tap_stride_elems + tap_offset_elems + d] =
 //       bf16_rn((1 / hc_count) * sum_{s=0..hc_count-1} f32(residual_out[tok, s, d]))
 __global__ void hc_combine_f16_kernel(
-    const __half* __restrict__ residual_in,
+    const __half* residual_in,
     const __half* __restrict__ block_out,
     const float* __restrict__ inject_weights,
-    const __half* __restrict__ ple_delta,
-    __half* __restrict__ residual_out,
+    const __half* ple_delta,
+    __half* residual_out,
     __nv_bfloat16* __restrict__ tap_bf16_out,
     const uint8_t* __restrict__ valid_token_mask,
     int num_tokens,

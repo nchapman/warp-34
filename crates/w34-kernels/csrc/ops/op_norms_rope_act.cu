@@ -199,6 +199,65 @@ __global__ void gemma_rms_norm_f16_kernel(
     }
 }
 
+__global__ void gemma_rms_norm_strided_f16_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ weight,
+    __half* __restrict__ out,
+    __half* __restrict__ out_had64,
+    const uint8_t* __restrict__ valid_token_mask,
+    int hidden_size,
+    float eps) {
+    const int row = blockIdx.x;
+    __half* out_row = (out != nullptr) ? (out + (size_t)row * hidden_size) : nullptr;
+    __half* had_row = (out_had64 != nullptr) ? (out_had64 + (size_t)row * hidden_size) : nullptr;
+    if (valid_token_mask != nullptr && valid_token_mask[row] == 0) {
+        for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+            if (out_row != nullptr) out_row[i] = __float2half(0.0f);
+            if (had_row != nullptr) had_row[i] = __float2half(0.0f);
+        }
+        return;
+    }
+    const __half* x_row = x + (size_t)row * hidden_size;
+
+    __shared__ float s_warp[32];
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+        const float v = __half2float(x_row[i]);
+        sum_sq += v * v;
+    }
+    sum_sq = block_reduce_sum(sum_sq, s_warp);
+    const float inv_rms = rsqrtf(sum_sq / (float)hidden_size + eps);
+
+    if (had_row != nullptr) {
+        const int vec_cols = hidden_size >> 3;
+        for (int vi = threadIdx.x; vi < vec_cols; vi += blockDim.x) {
+            const int col = vi << 3;
+            uint4 ov;
+            __half* oh = reinterpret_cast<__half*>(&ov);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = __half2float(x_row[col + j]) * inv_rms;
+                const float w = 1.0f + __half2float(weight[col + j]);
+                const __half h = __float2half(v * w);
+                oh[j] = h;
+                if (out_row != nullptr) out_row[col + j] = h;
+            }
+            const uint4 rot = hadamard64_vec8_f16(ov, (int)threadIdx.x);
+            const __half* rh = reinterpret_cast<const __half*>(&rot);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                had_row[col + j] = rh[j];
+            }
+        }
+    } else if (out_row != nullptr) {
+        for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+            const float v = __half2float(x_row[i]) * inv_rms;
+            const float w = 1.0f + __half2float(weight[i]);
+            out_row[i] = __float2half(v * w);
+        }
+    }
+}
+
 template <int VEC_ITERS>
 __global__ void fused_add_gemma_rms_norm_vec8_f16_kernel(
     const __half* __restrict__ x,
@@ -566,11 +625,11 @@ __global__ void silu_and_mul_f16_kernel(
     __half* __restrict__ out,
     const uint8_t* __restrict__ valid_token_mask,
     int intermediate_size) {
-    const int tok = blockIdx.y;
+    const int tok = blockIdx.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
     if ((intermediate_size & 7) == 0 &&
         ((((uintptr_t)gate_up | (uintptr_t)out) & 15u) == 0u)) {
-        const int vcol = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+        const int vcol = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
         const int vec_cols = intermediate_size >> 3;
         if (vcol >= vec_cols) return;
         const uint4* row_in_v =
@@ -590,7 +649,7 @@ __global__ void silu_and_mul_f16_kernel(
         reinterpret_cast<uint4*>(out + (size_t)tok * intermediate_size)[vcol] = ov;
         return;
     }
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.x + threadIdx.x;
     if (col >= intermediate_size) return;
 
     const __half* row_in = gate_up + (size_t)tok * (2 * intermediate_size);
@@ -606,9 +665,9 @@ __global__ void silu_and_mul_split_f16_kernel(
     __half* __restrict__ out,
     const uint8_t* __restrict__ valid_token_mask,
     int intermediate_size) {
-    const int tok = blockIdx.y;
+    const int tok = blockIdx.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.x + threadIdx.x;
     if (col >= intermediate_size) return;
 
     const size_t idx = (size_t)tok * intermediate_size + col;
@@ -624,9 +683,9 @@ __global__ void apply_attn_output_gate_f16_kernel(
     __half* __restrict__ out,
     const uint8_t* __restrict__ valid_token_mask,
     int total_dim) {
-    const int tok = blockIdx.y;
+    const int tok = blockIdx.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int col = blockIdx.y * blockDim.x + threadIdx.x;
     if (col >= total_dim) return;
 
     const size_t idx = (size_t)tok * total_dim + col;
@@ -641,9 +700,9 @@ __global__ void silu_and_mul_hadamard_f16_kernel(
     __half* __restrict__ out,
     const uint8_t* __restrict__ valid_token_mask,
     int intermediate_size) {
-    const int tok = blockIdx.y;
+    const int tok = blockIdx.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
-    const int vcol = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int vcol = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
     const int vec_cols = intermediate_size >> 3;
     if (vcol >= vec_cols) return;
     const int col = vcol << 3;
@@ -687,9 +746,9 @@ __global__ void apply_attn_output_gate_hadamard_f16_kernel(
     __half* __restrict__ out,
     const uint8_t* __restrict__ valid_token_mask,
     int total_dim) {
-    const int tok = blockIdx.y;
+    const int tok = blockIdx.x;
     if (valid_token_mask != nullptr && valid_token_mask[tok] == 0) return;
-    const int vcol = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    const int vcol = (int)blockIdx.y * (int)blockDim.x + (int)threadIdx.x;
     const int vec_cols = total_dim >> 3;
     if (vcol >= vec_cols) return;
     const int col = vcol << 3;
@@ -789,6 +848,12 @@ extern "C" int w34_gemma_rms_norm_hadamard_f16(
                 (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had64,
                 valid_token_mask, hidden_size, eps);
         }
+        return (int)cudaGetLastError();
+    }
+    if (hidden_size > 12288) {
+        w34::gemma_rms_norm_strided_f16_kernel<<<num_tokens, 256, 0, (cudaStream_t)ex->stream>>>(
+            (const __half*)x, (const __half*)weight, (__half*)out, (__half*)out_had64,
+            valid_token_mask, hidden_size, eps);
         return (int)cudaGetLastError();
     }
     if (out_had64 != nullptr || out == nullptr) {
@@ -1157,7 +1222,9 @@ extern "C" int w34_silu_and_mul_f16(const w34_exec* ex, const void* gate_up, voi
                       ((((uintptr_t)gate_up | (uintptr_t)out) & 15u) == 0u);
     const unsigned blk = vec8 ? 128u : 256u;
     const unsigned cols = vec8 ? (unsigned)(intermediate_size >> 3) : (unsigned)intermediate_size;
-    dim3 grid((cols + blk - 1u) / blk, (unsigned)num_tokens);
+    const unsigned col_blocks = (cols + blk - 1u) / blk;
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
     w34::silu_and_mul_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)gate_up, (__half*)out, valid_token_mask, intermediate_size);
     return (int)cudaGetLastError();
@@ -1166,13 +1233,16 @@ extern "C" int w34_silu_and_mul_f16(const w34_exec* ex, const void* gate_up, voi
 extern "C" int w34_silu_and_mul_hadamard_f16(const w34_exec* ex, const void* gate_up, void* out,
                                              const uint8_t* valid_token_mask,
                                              int num_tokens, int intermediate_size) {
-    if (ex == nullptr || gate_up == nullptr || out == nullptr || (intermediate_size & 63) != 0) {
+    if (ex == nullptr || gate_up == nullptr || out == nullptr || (intermediate_size & 63) != 0 ||
+        ((((uintptr_t)gate_up | (uintptr_t)out) & 1u) != 0u)) {
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens <= 0 || intermediate_size <= 0) return 0;
     const unsigned blk = 128u;
     const unsigned cols = (unsigned)(intermediate_size >> 3);
-    dim3 grid((cols + blk - 1u) / blk, (unsigned)num_tokens);
+    const unsigned col_blocks = (cols + blk - 1u) / blk;
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
     w34::silu_and_mul_hadamard_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)gate_up, (__half*)out, valid_token_mask, intermediate_size);
     return (int)cudaGetLastError();
@@ -1185,7 +1255,9 @@ extern "C" int w34_silu_and_mul_split_f16(const w34_exec* ex, const void* gate, 
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens <= 0 || intermediate_size <= 0) return 0;
-    dim3 grid((unsigned)((intermediate_size + 255) / 256), (unsigned)num_tokens);
+    const unsigned col_blocks = (unsigned)((intermediate_size + 255) / 256);
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
     w34::silu_and_mul_split_f16_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)gate, (const __half*)up, (__half*)out,
         valid_token_mask, intermediate_size);
@@ -1200,7 +1272,9 @@ extern "C" int w34_apply_attn_output_gate_f16(const w34_exec* ex, const void* at
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens <= 0 || total_dim <= 0) return 0;
-    dim3 grid((unsigned)((total_dim + 255) / 256), (unsigned)num_tokens);
+    const unsigned col_blocks = (unsigned)((total_dim + 255) / 256);
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
     w34::apply_attn_output_gate_f16_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)attn_out, (const __half*)gate, (__half*)out,
         valid_token_mask, total_dim);
@@ -1819,7 +1893,10 @@ extern "C" int w34_small_n_gemm_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (m <= 0 || size_n <= 0 || size_k <= 0) return 0;
-    if ((size_k & 7) != 0) return (int)cudaErrorInvalidValue;
+    if ((size_k & 7) != 0 || ((((uintptr_t)x | (uintptr_t)w) & 15u) != 0u) ||
+        (((uintptr_t)out & 1u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
     cudaStream_t stream = (cudaStream_t)ex->stream;
     constexpr int kTile4 = 4;
     constexpr int kDecodeMaxM = 16;
@@ -1862,7 +1939,11 @@ extern "C" int w34_small_n_gemm_dual_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (m <= 0 || size_n0 <= 0 || size_n1 <= 0 || size_k <= 0) return 0;
-    if ((size_k & 7) != 0) return (int)cudaErrorInvalidValue;
+    if ((size_k & 7) != 0 ||
+        ((((uintptr_t)x | (uintptr_t)w0 | (uintptr_t)w1) & 15u) != 0u) ||
+        ((((uintptr_t)out0 | (uintptr_t)out1) & 1u) != 0u)) {
+        return (int)cudaErrorInvalidValue;
+    }
     cudaStream_t stream = (cudaStream_t)ex->stream;
     const int tiles_m = (m + 3) / 4;
     const int t0 = (size_n0 + 3) / 4;
@@ -1895,13 +1976,16 @@ extern "C" int w34_apply_attn_output_gate_hadamard_f16(
     int num_tokens,
     int total_dim) {
     if (ex == nullptr || attn_out == nullptr || gate == nullptr || out == nullptr ||
-        (total_dim & 63) != 0) {
+        (total_dim & 63) != 0 ||
+        ((((uintptr_t)attn_out | (uintptr_t)gate | (uintptr_t)out) & 1u) != 0u)) {
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens <= 0 || total_dim <= 0) return 0;
     const unsigned blk = 128u;
     const unsigned cols = (unsigned)(total_dim >> 3);
-    dim3 grid((cols + blk - 1u) / blk, (unsigned)num_tokens);
+    const unsigned col_blocks = (cols + blk - 1u) / blk;
+    if (col_blocks > 65535u) return (int)cudaErrorInvalidValue;
+    dim3 grid((unsigned)num_tokens, col_blocks);
     w34::apply_attn_output_gate_hadamard_f16_kernel<<<grid, blk, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)attn_out, (const __half*)gate, (__half*)out,
         valid_token_mask, total_dim);
@@ -1911,9 +1995,9 @@ extern "C" int w34_apply_attn_output_gate_hadamard_f16(
 namespace w34 {
 
 __global__ void midloop_damped_euler_f16_kernel(
-    __half* __restrict__ dst_f16,
-    const __half* __restrict__ x_prev_f16,
-    const __half* __restrict__ g_x_f16,
+    __half* dst_f16,
+    const __half* x_prev_f16,
+    const __half* g_x_f16,
     int64_t num_elems,
     float alpha) {
     const float one_minus_alpha = 1.0f - alpha;
@@ -1945,7 +2029,8 @@ extern "C" int w34_midloop_damped_euler_f16(
     const void* g_x_f16,
     int64_t num_elems,
     float alpha) {
-    if (ex == nullptr || dst_f16 == nullptr || x_prev_f16 == nullptr || g_x_f16 == nullptr) {
+    if (ex == nullptr || dst_f16 == nullptr || x_prev_f16 == nullptr || g_x_f16 == nullptr ||
+        ((((uintptr_t)dst_f16 | (uintptr_t)x_prev_f16 | (uintptr_t)g_x_f16) & 3u) != 0u)) {
         return (int)cudaErrorInvalidValue;
     }
     if (num_elems <= 0) return 0;

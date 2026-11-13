@@ -369,6 +369,34 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     }
 
     const float effective_gpu_share = (mapped_host_packs != nullptr) ? gpu_share_frac : 0.0f;
+    const int max_pull = w34_moe_bridge::hybrid_max_gpu_pull(
+        k_static, k_hot, num_tokens, effective_gpu_share);
+    if (max_pull > 0 && mapped_host_packs != nullptr && effective_gpu_share > 0.0f) {
+        const int pack_factor = (bits == 2) ? 16 : 8;
+        if (n_interm <= 0 || (bits != 2 && bits != 4) ||
+            (((uintptr_t)mapped_host_packs | (uintptr_t)gate_up_packed_base |
+              (uintptr_t)gate_up_scales_base | (uintptr_t)down_packed_base |
+              (uintptr_t)down_scales_base) & 15) != 0 ||
+            group_size <= 0 || max_pull > 65535 ||
+            n_interm > INT_MAX / 2 || n_interm % pack_factor != 0 || k_hidden % pack_factor != 0 ||
+            n_interm % group_size != 0 || k_hidden % group_size != 0 ||
+            (pack_stride_bytes & 15) != 0) {
+            return (int)cudaErrorInvalidValue;
+        }
+        const size_t gu_packed_bytes =
+            (size_t)(2 * n_interm) * (size_t)(k_hidden / pack_factor) * sizeof(uint32_t);
+        const size_t gu_scales_bytes =
+            (size_t)(2 * n_interm) * (size_t)(k_hidden / group_size) * sizeof(uint16_t);
+        const size_t dn_packed_bytes =
+            (size_t)k_hidden * (size_t)(n_interm / pack_factor) * sizeof(uint32_t);
+        const size_t dn_scales_bytes =
+            (size_t)k_hidden * (size_t)(n_interm / group_size) * sizeof(uint16_t);
+        if ((gu_packed_bytes & 15) != 0 || (gu_scales_bytes & 15) != 0 ||
+            (dn_packed_bytes & 15) != 0 || (dn_scales_bytes & 15) != 0 ||
+            pack_stride_bytes < gu_packed_bytes + gu_scales_bytes + dn_packed_bytes + dn_scales_bytes) {
+            return (int)cudaErrorInvalidValue;
+        }
+    }
     cudaStream_t stream = (cudaStream_t)ex->stream;
     w34_moe_bridge::moe_hybrid_plan_and_submit_kernel<<<1, 256, 0, stream>>>(
         static_cast<const __half*>(x_f16),
@@ -395,8 +423,6 @@ extern "C" int w34_moe_hybrid_submit_and_pull(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return (int)err;
 
-    const int max_pull = w34_moe_bridge::hybrid_max_gpu_pull(
-        k_static, k_hot, num_tokens, effective_gpu_share);
     if (max_pull > 0 && mapped_host_packs != nullptr && effective_gpu_share > 0.0f) {
         return w34_moe_pull_mapped_experts_with_count(
             ex,
@@ -430,7 +456,8 @@ extern "C" int w34_moe_hybrid_wait_and_add(
     int num_tokens,
     int k_hidden) {
     if (!ex || !d_req_slot || !d_resp_slot || !out_f16 || !num_misses_buf || num_tokens <= 0 ||
-        k_hidden <= 0 || (k_hidden & 3) != 0) {
+        num_tokens > w34_moe_bridge::kMaxTokens || k_hidden <= 0 ||
+        k_hidden > w34_moe_bridge::kMaxHidden || (k_hidden & 3) != 0) {
         return (int)cudaErrorInvalidValue;
     }
     const int total_elems = num_tokens * k_hidden;

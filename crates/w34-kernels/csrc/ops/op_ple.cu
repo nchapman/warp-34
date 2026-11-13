@@ -397,13 +397,13 @@ __global__ void ple_signed_sqrt_gate_f16_kernel(
 }
 
 __global__ void ple_signed_sqrt_gate_norm_add_f16_kernel(
-    const __half* __restrict__ norm_query,
-    const __half* __restrict__ norm_key,
-    const __half* __restrict__ value_in,
-    __half* __restrict__ ple_delta_out,
-    __half* __restrict__ residual_inout,
+    const __half* norm_query,
+    const __half* norm_key,
+    const __half* value_in,
+    __half* ple_delta_out,
+    __half* residual_inout,
     const __half* __restrict__ norm_conv_weight,
-    __half* __restrict__ norm_conv_out,
+    __half* norm_conv_out,
     const uint8_t* __restrict__ valid_token_mask,
     int num_tokens,
     int hc_count,

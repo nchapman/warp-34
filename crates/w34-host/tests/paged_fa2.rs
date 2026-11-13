@@ -614,3 +614,154 @@ fn tight_two_page_partial_tile_does_not_read_past_block_table() {
         }
     }
 }
+
+#[test]
+fn kv_write_and_qsa_respect_valid_req_mask_and_reject_bad_gqa() {
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let s = CudaStream::new(0).unwrap();
+    let ex = s.exec(0, 0);
+
+    // 1. `w34_kv_cache_write` (FP16) must skip requests where `valid_req_mask[req] == 0`.
+    let k_cache = upload(&s, &vec![0x1111u16; 16 * 256]);
+    let v_cache = upload(&s, &vec![0x2222u16; 16 * 256]);
+    let k_in = upload(&s, &vec![0x3c00u16; 2 * 256]);
+    let v_in = upload(&s, &vec![0x4000u16; 2 * 256]);
+    let starts = upload(&s, &[0i32, 1, 2]);
+    let slots = upload(&s, &[0i32, 1]);
+    let req_mask = upload(&s, &[1u8, 0u8]);
+    let layout = ffi::W34KvLayerLayout {
+        k_base: k_cache.addr(),
+        v_base: v_cache.addr(),
+        k_page_stride_bytes: 8192,
+        v_page_stride_bytes: 8192,
+        k_head_stride_bytes: 512,
+        v_head_stride_bytes: 512,
+        k_token_stride_bytes: 512,
+        v_token_stride_bytes: 512,
+        namespace_id: ffi::W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+        layer_id: 0,
+        local_kv_heads: 1,
+        head_dim: 256,
+        block_size: 16,
+        k_format: ffi::W34_KV_FORMAT_FP16,
+        v_format: ffi::W34_KV_FORMAT_FP16,
+        k_transform: 0,
+        v_transform: 0,
+        reserved: 0,
+    };
+    let batch = ffi::W34AttentionBatch {
+        query_start_loc: starts.addr() as *const i32,
+        context_lens_before: std::ptr::null(),
+        seq_lens_after: std::ptr::null(),
+        block_tables: std::ptr::null(),
+        write_slot_mapping: slots.addr() as *const i32,
+        valid_token_mask: std::ptr::null(),
+        valid_req_mask: req_mask.addr() as *const u8,
+        num_reqs: 2,
+        total_tokens: 2,
+        max_blocks_per_req: 1,
+        max_q_len: 1,
+        max_seq_len: 1,
+        mask_mode: ffi::W34_ATTN_MASK_CAUSAL,
+        sliding_window: 0,
+        sm_scale: 0.0625,
+        reserved: 0,
+    };
+    check_rc(
+        // SAFETY: live device buffers sized for 2 tokens across 2 requests.
+        unsafe {
+            ffi::w34_kv_cache_write(
+                &ex,
+                &layout,
+                &batch,
+                k_in.addr() as *const c_void,
+                v_in.addr() as *const c_void,
+            )
+        },
+        "FP16 kv_cache_write with valid_req_mask",
+    )
+    .unwrap();
+    let mut got_k = vec![0u16; 2 * 256];
+    k_cache.copy_to_host(&mut got_k, &s).unwrap();
+    s.synchronize().unwrap();
+    assert!(got_k[..256].iter().all(|&x| x == 0x3c00));
+    assert!(
+        got_k[256..512].iter().all(|&x| x == 0x1111),
+        "masked request must not overwrite KV slot 1"
+    );
+
+    // 2. `w34_qsa_select_blocks_f16` must emit 0 selected blocks when `valid_req_mask[req] == 0`.
+    let q_idx = upload(&s, &vec![0x3c00u16; 2 * 4 * 128]);
+    let comp_k = upload(&s, &vec![0x3c00u16; 4 * 128]);
+    let ctx = upload(&s, &[7i32, 7i32]);
+    let seq = upload(&s, &[8i32, 8i32]);
+    let pages = upload(&s, &[0i32, 0i32]);
+    let sel_phys = upload(&s, &[99i32; 2 * 4]);
+    let sel_log = upload(&s, &[99i32; 2 * 4]);
+    let num_sel = upload(&s, &[99i32, 99i32]);
+    let tok_pos = upload(&s, &[99i32, 99i32]);
+    let qsa_batch = ffi::W34AttentionBatch {
+        context_lens_before: ctx.addr() as *const i32,
+        seq_lens_after: seq.addr() as *const i32,
+        block_tables: pages.addr() as *const i32,
+        max_seq_len: 8,
+        ..batch
+    };
+    // SAFETY: `ex` and all device buffers are live on device 0 across this synchronous FFI validation check.
+    let rc_sel = unsafe {
+        ffi::w34_qsa_select_blocks_f16(
+            &ex,
+            q_idx.addr() as *const c_void,
+            comp_k.addr() as *const c_void,
+            &qsa_batch,
+            sel_phys.addr() as *mut i32,
+            sel_log.addr() as *mut i32,
+            num_sel.addr() as *mut i32,
+            tok_pos.addr() as *mut i32,
+            4,
+            128,
+            16,
+            4,
+            1,
+            1,
+        )
+    };
+    assert_eq!(rc_sel, 0);
+    let mut got_num_sel = [0i32; 2];
+    num_sel.copy_to_host(&mut got_num_sel, &s).unwrap();
+    s.synchronize().unwrap();
+    assert!(got_num_sel[0] > 0);
+    assert_eq!(
+        got_num_sel[1], 0,
+        "masked request must emit 0 selected QSA blocks"
+    );
+
+    // 3. `w34_qsa_sparse_paged_attn_f16` must reject invalid GQA ratios before launching GPU division.
+    let q = upload(&s, &vec![0u16; 5 * 256]);
+    let out = upload(&s, &vec![0u16; 5 * 256]);
+    let mut bad_layout = layout;
+    bad_layout.local_kv_heads = 2;
+    // SAFETY: `ex` and all device buffers are live on device 0; `bad_layout` intentionally tests fast error return.
+    let rc_bad = unsafe {
+        ffi::w34_qsa_sparse_paged_attn_f16(
+            &ex,
+            q.addr() as *const c_void,
+            std::ptr::null(),
+            &bad_layout,
+            sel_phys.addr() as *const i32,
+            sel_log.addr() as *const i32,
+            num_sel.addr() as *const i32,
+            tok_pos.addr() as *const i32,
+            std::ptr::null(),
+            out.addr() as *mut c_void,
+            1,
+            5,
+            4,
+            0.0625,
+        )
+    };
+    assert_ne!(
+        rc_bad, 0,
+        "non-divisible local_q_heads / local_kv_heads must fail fast"
+    );
+}

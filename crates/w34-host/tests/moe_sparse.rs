@@ -1463,3 +1463,130 @@ fn grouped_mma_moe_group_size_96_and_32_matches_cpu_reference() {
         });
     }
 }
+
+#[test]
+fn moe_router_lru_and_bridge_validate_before_mutating_state() {
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let ex = stream.exec(0, 0);
+
+    // 1. Router must reject `top_k > num_experts`.
+    let d_logits = DeviceBuffer::alloc(0, 4 * 2).unwrap();
+    let d_tw = DeviceBuffer::alloc(0, 8 * 4).unwrap();
+    let d_ids = DeviceBuffer::alloc(0, 8 * 4).unwrap();
+    // SAFETY: `d_logits`, `d_tw`, and `d_ids` are live device buffers; `top_k = 8 > num_experts = 4` exercises fast host-side rejection.
+    let rc_topk = unsafe {
+        w34_kernels::ffi::w34_moe_topk_router_f16(
+            &ex,
+            d_logits.addr() as *const c_void,
+            d_tw.addr() as *mut f32,
+            d_ids.addr() as *mut i32,
+            1,
+            4,
+            8,
+            1,
+            0,
+        )
+    };
+    assert_ne!(rc_topk, 0, "router must reject top_k > num_experts");
+
+    // 2. Sigmoid router with `norm_topk_prob = 1` and small positive probs (`w_sum ~ 3.7e-13 <= 1e-12`)
+    // must still normalize weights to sum to 1.0 instead of leaving raw `~1e-13` weights.
+    let neg_logits = vec![f32_to_f16(-30.0); 4];
+    d_logits.copy_from_host(&neg_logits, &stream).unwrap();
+    // SAFETY: `d_logits` (`4` FP16s), `d_tw` (`>= 2` f32s), and `d_ids` (`>= 2` i32s) remain live through `stream.synchronize()`.
+    let rc_sig = unsafe {
+        w34_kernels::ffi::w34_moe_topk_router_f16(
+            &ex,
+            d_logits.addr() as *const c_void,
+            d_tw.addr() as *mut f32,
+            d_ids.addr() as *mut i32,
+            1,
+            4,
+            2,
+            1,
+            1,
+        )
+    };
+    assert_eq!(rc_sig, 0);
+    let mut got_tw = [0.0f32; 2];
+    d_tw.copy_to_host(&mut got_tw, &stream).unwrap();
+    stream.synchronize().unwrap();
+    let tw_sum = got_tw[0] + got_tw[1];
+    assert!(
+        (tw_sum - 1.0).abs() < 1e-4,
+        "expected normalized sigmoid top-k sum ~ 1.0, got {tw_sum}"
+    );
+
+    // 3. `w34_moe_gpu_lru_update_and_pull` must validate pull arguments BEFORE mutating `step_counter`.
+    let d_gids = DeviceBuffer::alloc(0, 16).unwrap();
+    let d_e2s = DeviceBuffer::alloc(0, 16).unwrap();
+    let d_s2e = DeviceBuffer::alloc(0, 16).unwrap();
+    let d_slu = DeviceBuffer::alloc(0, 32).unwrap();
+    let d_step = DeviceBuffer::alloc(0, 16).unwrap();
+    let d_remap = DeviceBuffer::alloc(0, 16).unwrap();
+    let d_miss_e = DeviceBuffer::alloc(0, 16).unwrap();
+    let d_miss_s = DeviceBuffer::alloc(0, 16).unwrap();
+    let d_nmiss = DeviceBuffer::alloc(0, 16).unwrap();
+    let d_dummy = DeviceBuffer::alloc(0, 64).unwrap();
+    d_step.copy_from_host(&[7u64, 0u64], &stream).unwrap();
+    d_e2s.copy_from_host(&[-1i32; 4], &stream).unwrap();
+    d_gids.copy_from_host(&[0i32; 4], &stream).unwrap();
+    // SAFETY: all LRU and dummy buffers are live on device 0; `bits = 7` exercises host-side validation before kernel launch.
+    let rc_lru = unsafe {
+        w34_kernels::ffi::w34_moe_gpu_lru_update_and_pull(
+            &ex,
+            d_gids.addr() as *const i32,
+            d_e2s.addr() as *mut i32,
+            d_s2e.addr() as *mut i32,
+            d_slu.addr() as *mut u64,
+            d_step.addr() as *mut u64,
+            d_remap.addr() as *mut i32,
+            d_miss_e.addr() as *mut i32,
+            d_miss_s.addr() as *mut i32,
+            d_nmiss.addr() as *mut i32,
+            d_dummy.addr() as *const c_void,
+            d_dummy.addr() as *mut u32,
+            d_dummy.addr() as *mut c_void,
+            d_dummy.addr() as *mut u32,
+            d_dummy.addr() as *mut c_void,
+            1,
+            0,
+            4,
+            2,
+            1,
+            64,
+            128,
+            128,
+            64,
+            7, // invalid `bits`!
+        )
+    };
+    assert_ne!(rc_lru, 0);
+    let mut got_step = [0u64; 2];
+    d_step.copy_to_host(&mut got_step, &stream).unwrap();
+    stream.synchronize().unwrap();
+    assert_eq!(
+        got_step[0], 7,
+        "invalid pull args must be rejected before mutating GPU LRU step_counter"
+    );
+
+    // 4. `w34_moe_hybrid_wait_and_add` must reject `num_tokens > 8` (`MoeBridgeRespSlot::y_f32` cap).
+    // SAFETY: `d_dummy` and `d_nmiss` are live device buffers; `num_tokens = 16 > 8` exercises fast host-side bounds rejection.
+    let rc_wait = unsafe {
+        w34_kernels::ffi::w34_moe_hybrid_wait_and_add(
+            &ex,
+            d_dummy.addr() as *const c_void,
+            d_dummy.addr() as *const c_void,
+            d_dummy.addr() as *mut c_void,
+            d_nmiss.addr() as *const i32,
+            16,
+            4096,
+        )
+    };
+    assert_ne!(
+        rc_wait, 0,
+        "wait_and_add must reject num_tokens > kMaxTokens (8)"
+    );
+}

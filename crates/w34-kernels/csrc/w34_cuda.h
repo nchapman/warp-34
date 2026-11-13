@@ -132,6 +132,7 @@ int w34_get_device_count(int* out_count);
 int w34_get_device_props(int device_id, w34_device_props* out_props);
 int w34_get_current_device_props(w34_device_props* out_props);
 int w34_get_tp2_min_sm_count(int* out_min_sms);
+int w34_get_tp_min_sm_count(int tp_size, int* out_min_sms);
 int w34_set_device(int device_id);
 int w34_device_synchronize(void);
 int w34_get_mem_info(size_t* out_free, size_t* out_total);

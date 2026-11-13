@@ -247,6 +247,12 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
     const __half* raw_base = raw_k_cache + (size_t)base_slot * raw_stride;
     __half* comp_dst = comp_k_cache + (size_t)sub_block * head_dim;
 
+    // Single writer per 4-token compressed group: only the CTA writing the 4th slot (`slot & 3 == 3`)
+    // commits the compressed group into `comp_k_cache`.
+    if ((slot & 3) != 3) {
+        return;
+    }
+
     if (k_norm_weight == nullptr || positions == nullptr) {
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
             const float v0 = __half2float(raw_base[0 * raw_stride + d]);
@@ -255,12 +261,6 @@ __global__ void qsa_indexer_update_comp_k_f16_kernel(
             const float v3 = __half2float(raw_base[3 * raw_stride + d]);
             comp_dst[d] = __float2half(0.25f * (v0 + v1 + v2 + v3));
         }
-        return;
-    }
-
-    // Single writer per 4-token compressed group: only the CTA writing the 4th slot (`slot & 3 == 3`)
-    // commits the compressed group into `comp_k_cache`.
-    if ((slot & 3) != 3) {
         return;
     }
 
@@ -455,12 +455,23 @@ __global__ void qsa_select_blocks_f16_kernel(
     }
 
     // Locate request owning `tok`.
-    int req = 0;
+    int req = -1;
     for (int r = 0; r < batch.num_reqs; ++r) {
         if (tok >= batch.query_start_loc[r] && tok < batch.query_start_loc[r + 1]) {
             req = r;
             break;
         }
+    }
+    if (req < 0 || (batch.valid_req_mask != nullptr && batch.valid_req_mask[req] == 0)) {
+        if (threadIdx.x == 0) {
+            out_num_selected_blocks[tok] = 0;
+            out_token_seq_pos[tok] = 0;
+        }
+        for (int i = threadIdx.x; i < select_k_blocks; i += blockDim.x) {
+            dst_phys[i] = -1;
+            dst_log[i] = -1;
+        }
+        return;
     }
     const int q_start = batch.query_start_loc[req];
     const int ctx_before = (batch.context_lens_before != nullptr) ? batch.context_lens_before[req] : 0;
@@ -1367,8 +1378,9 @@ static int launch_qsa_sparse_paged_attn_f16(
     float sm_scale) {
     if (!ex || !q || !kv_layout || !selected_phys_blocks || !selected_logical_blocks ||
         !num_selected_blocks || !token_seq_pos || !out || num_tokens < 0 || local_q_heads <= 0 ||
-        kv_layout->head_dim != 256) {
-        return -1;
+        kv_layout->local_kv_heads <= 0 || (local_q_heads % kv_layout->local_kv_heads) != 0 ||
+        kv_layout->head_dim != 256 || select_k_blocks < 0) {
+        return (int)cudaErrorInvalidValue;
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);
