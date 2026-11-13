@@ -194,16 +194,19 @@ impl Qwen3_5Engine {
                     .iter()
                     .map(|c| (c.trigger_offset_1based, c.dst_slot))
                     .collect();
-                let mut next_tok =
-                    if ckpt_pairs.is_empty() && req_state.cow_src_state_slot.is_none() {
-                        self.decode_one_token(
-                            cur_tok,
-                            ctx_before,
-                            &req_state.kv_pages,
-                            req_state.active_state_slot,
-                        )?
-                    } else {
-                        let out = self.step_batch_slices(&[EngineBatchSlice {
+                let mut next_tok = if !use_gpu_sampler
+                    && ckpt_pairs.is_empty()
+                    && req_state.cow_src_state_slot.is_none()
+                {
+                    self.decode_one_token(
+                        cur_tok,
+                        ctx_before,
+                        &req_state.kv_pages,
+                        req_state.active_state_slot,
+                    )?
+                } else {
+                    let out = self.step_batch_slices_for_sampler(
+                        &[EngineBatchSlice {
                             tokens: &[cur_tok],
                             ctx_len_before: ctx_before,
                             block_table: &req_state.kv_pages,
@@ -213,9 +216,12 @@ impl Qwen3_5Engine {
                             spec_slots: &[],
                             checkpoints: &ckpt_pairs,
                             emit_all_query_tokens: false,
-                        }])?;
-                        out[0][0]
-                    };
+                        }],
+                        None,
+                        use_gpu_sampler,
+                    )?;
+                    if use_gpu_sampler { 0 } else { out[0][0] }
+                };
                 if use_gpu_sampler {
                     let (tok, lp) = self.sample_single_gpu_step(&mut sampler)?;
                     next_tok = tok;
@@ -291,12 +297,16 @@ impl Qwen3_5Engine {
                 .map_err(|_| loader_err("SafetensorsArchive::open for vision_encoder"))?;
             self.ranks[0].device.make_current()?;
             if self.ranks[0].device.mem_info()?.0 < 512 * 1024 * 1024 {
+                self.vision_embed_cache.clear();
                 for rank in &mut self.ranks {
                     rank.device.make_current()?;
-                    rank.decode_graph = None;
-                    rank.spec_verify_graph = None;
-                    rank.batched_decode_graphs.clear();
                     rank.stream.synchronize()?;
+                    rank.decode_graph.clear();
+                    rank.spec_verify_graphs.clear();
+                    rank.failed_spec_verify_keys.clear();
+                    rank.batched_spec_verify_graphs.clear();
+                    rank.failed_batched_spec_verify_keys.clear();
+                    rank.batched_decode_graphs.clear();
                 }
                 self.ranks[0].device.make_current()?;
             }
@@ -431,7 +441,6 @@ impl Qwen3_5Engine {
                 Ok(ids.first().copied().unwrap_or(0))
             } else {
                 let comm = self.tp2_comm.as_ref().unwrap().clone();
-                let (r0, peer_ranks) = self.ranks.split_first_mut().unwrap();
                 let ft_ref = slice.tokens;
                 let fp_ref = custom_positions;
                 let qs_ref = &q_start_loc;
@@ -445,9 +454,11 @@ impl Qwen3_5Engine {
                 let cd_ref = &checkpoint_dst_indices;
                 let co_ref = &checkpoint_token_offsets;
                 let sr_ref = selected_rows;
-                let (res0, peer_results) = std::thread::scope(|sc| {
-                    let c0 = comm.clone();
-                    let h0 = sc.spawn(move || -> Result<Vec<i32>> {
+                let comm_ref = &comm;
+                let pool = self.tp_workers.as_ref().unwrap().clone();
+                let (res0, peer_results) = pool.run_split(
+                    self.ranks.as_mut_slice(),
+                    |r0| -> Result<Vec<i32>> {
                         let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r0.upload_batch_meta(
                             ft_ref,
                             fp_ref,
@@ -479,59 +490,49 @@ impl Qwen3_5Engine {
                             q_len,
                             &attn_batch,
                             &gdn_batch,
-                            Some(&c0),
+                            Some(comm_ref),
                             sr_ref,
                         )
-                    });
-                    let mut peer_handles = Vec::with_capacity(peer_ranks.len());
-                    for r_peer in peer_ranks {
-                        let cp = comm.clone();
-                        peer_handles.push(sc.spawn(move || -> Result<()> {
-                            let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r_peer
-                                .upload_batch_meta(
-                                    ft_ref,
-                                    fp_ref,
-                                    qs_ref,
-                                    cb_ref,
-                                    sa_ref,
-                                    bt_ref,
-                                    ws_ref,
-                                    si_ref,
-                                    so_ref,
-                                    hi_ref,
-                                    &[],
-                                    cd_ref,
-                                    co_ref,
-                                    1,
-                                    q_len,
-                                    bt_ref.len(),
-                                    q_len,
-                                    seq_after,
-                                    0,
-                                    max_checkpoints_per_req,
-                                )?;
-                            if noncausal_prefix {
-                                attn_batch.mask_mode =
-                                    w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
-                            }
-                            let _ = r_peer.forward_selected_rows(
-                                tok_ptr,
-                                pos_ptr,
+                    },
+                    |_, r_peer| -> Result<()> {
+                        let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r_peer
+                            .upload_batch_meta(
+                                ft_ref,
+                                fp_ref,
+                                qs_ref,
+                                cb_ref,
+                                sa_ref,
+                                bt_ref,
+                                ws_ref,
+                                si_ref,
+                                so_ref,
+                                hi_ref,
+                                &[],
+                                cd_ref,
+                                co_ref,
+                                1,
                                 q_len,
-                                &attn_batch,
-                                &gdn_batch,
-                                Some(&cp),
-                                sr_ref,
+                                bt_ref.len(),
+                                q_len,
+                                seq_after,
+                                0,
+                                max_checkpoints_per_req,
                             )?;
-                            Ok(())
-                        }));
-                    }
-                    let mut peers = Vec::with_capacity(peer_handles.len());
-                    for hp in peer_handles {
-                        peers.push(hp.join().unwrap());
-                    }
-                    (h0.join().unwrap(), peers)
-                });
+                        if noncausal_prefix {
+                            attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
+                        }
+                        let _ = r_peer.forward_selected_rows(
+                            tok_ptr,
+                            pos_ptr,
+                            q_len,
+                            &attn_batch,
+                            &gdn_batch,
+                            Some(comm_ref),
+                            sr_ref,
+                        )?;
+                        Ok(())
+                    },
+                );
                 for pr in peer_results {
                     pr?;
                 }

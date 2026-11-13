@@ -69,6 +69,7 @@ pub struct NativeProposer {
     shifted: Vec<DeviceBuffer>,
     memos: Vec<PrefixMemo>,
     current: Option<PrefixMemo>,
+    memo_pinned_staging: Option<crate::cuda::MappedHostBuffer>,
     resident_tokens: Vec<i32>,
     processed: usize,
     mtp_batch_active_slot: usize,
@@ -156,8 +157,13 @@ impl NativeProposer {
 
     pub fn load(engine: &mut Qwen3_5Engine, config: &SpeculativeConfig) -> Result<Self> {
         for t in &mut engine.ranks {
-            t.decode_graph = None;
-            t.spec_verify_graph = None;
+            t.device.make_current()?;
+            t.stream.synchronize()?;
+            t.decode_graph.clear();
+            t.spec_verify_graphs.clear();
+            t.failed_spec_verify_keys.clear();
+            t.batched_spec_verify_graphs.clear();
+            t.failed_batched_spec_verify_keys.clear();
             t.batched_decode_graphs.clear();
         }
         if config.kind == SpeculativeKind::Mtp
@@ -329,6 +335,11 @@ impl NativeProposer {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let memo_pinned_staging = if matches!(ranks, Ranks::Mtp(_)) {
+            Some(crate::cuda::MappedHostBuffer::alloc(256 * 1024)?)
+        } else {
+            None
+        };
         Ok(Self {
             ranks,
             capacity,
@@ -341,6 +352,7 @@ impl NativeProposer {
             shifted,
             memos: vec![],
             current: None,
+            memo_pinned_staging,
             resident_tokens: vec![],
             processed: 0,
             mtp_batch_active_slot: 0,
@@ -674,6 +686,7 @@ impl NativeProposer {
         {
             self.current = None;
         }
+        let mut pending_pinned_memo_copy: Option<(usize, usize)> = None;
         if let Some(memo) = &mut self.current {
             if need_host_features {
                 let t0 = &engine.ranks[0];
@@ -681,108 +694,125 @@ impl NativeProposer {
                 let len_bytes = tokens.len() * self.row_bytes;
                 let old_len = memo.features.len();
                 grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
-                check_rc(
-                    // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
-                    // rank 0's stream is synchronized before ingest returns below.
-                    unsafe {
-                        ffi::w34_memcpy_d2h_async(
-                            memo.features[old_len..].as_mut_ptr().cast(),
-                            features[0] as *const _,
-                            len_bytes,
-                            t0.stream.handle,
-                        )
-                    },
-                    "proposer memo copy",
-                )?;
+                if let Some(pinned) = &self.memo_pinned_staging
+                    && len_bytes > 0
+                    && len_bytes <= pinned.len_bytes
+                {
+                    check_rc(
+                        // SAFETY: `features[0]` spans `len_bytes` on `t0.stream`, and `pinned`
+                        // remains live until `t0.stream` synchronizes at the end of `ingest`.
+                        unsafe {
+                            ffi::w34_memcpy_d2h_async(
+                                pinned.host_ptr,
+                                features[0] as *const _,
+                                len_bytes,
+                                t0.stream.handle,
+                            )
+                        },
+                        "proposer pinned memo copy",
+                    )?;
+                    pending_pinned_memo_copy = Some((old_len, len_bytes));
+                } else {
+                    check_rc(
+                        // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
+                        // rank 0's stream is synchronized before ingest returns below.
+                        unsafe {
+                            ffi::w34_memcpy_d2h_async(
+                                memo.features[old_len..].as_mut_ptr().cast(),
+                                features[0] as *const _,
+                                len_bytes,
+                                t0.stream.handle,
+                            )
+                        },
+                        "proposer memo copy",
+                    )?;
+                }
             }
             memo.tokens.extend_from_slice(tokens);
         }
+        let pool = engine.tp_workers.clone();
         let ingest_res: Result<()> = match &mut self.ranks {
             Ranks::DFlash(rs) => {
                 let n = tokens.len();
-                std::thread::scope(|scope| {
-                    let jobs: Vec<_> = rs
-                        .iter_mut()
+                crate::coordinated::run_tp_closures(
+                    pool.as_deref(),
+                    rs.iter_mut()
                         .zip(&engine.ranks)
                         .zip(features)
-                        .map(|((r, t), &ptr)| scope.spawn(move || r.ingest(t, ptr, n)))
-                        .collect();
-                    for job in jobs {
-                        job.join()
-                            .map_err(|_| loader_err("DFlash ingest rank panic"))??;
-                    }
-                    Ok(())
-                })
+                        .map(|((r, t), &ptr)| move || r.ingest(t, ptr, n)),
+                )
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .map(|_| ())
             }
             Ranks::Mtp(rs) => {
                 let row_bytes = self.row_bytes;
                 let before = self.processed;
                 let comm = engine.tp2_comm.as_deref();
-                std::thread::scope(|scope| {
-                    let mut jobs = Vec::new();
-                    for ((((r, t), tail), shifted), &ptr) in rs
-                        .iter_mut()
+                crate::coordinated::run_tp_closures(
+                    pool.as_deref(),
+                    rs.iter_mut()
                         .zip(&mut engine.ranks)
                         .zip(&self.tail)
                         .zip(&self.shifted)
                         .zip(features)
-                    {
-                        jobs.push(scope.spawn(move || -> Result<()> {
-                            t.device.make_current()?;
-                            r.truncate(before.saturating_sub(1))?;
-                            let (ids, input) = if before == 0 {
-                                (&tokens[1..], ptr)
-                            } else {
+                        .map(|((((r, t), tail), shifted), &ptr)| {
+                            move || -> Result<()> {
+                                t.device.make_current()?;
+                                r.truncate(before.saturating_sub(1))?;
+                                let (ids, input) = if before == 0 {
+                                    (&tokens[1..], ptr)
+                                } else {
+                                    check_rc(
+                                        // SAFETY: both resident buffers hold at least one MTP hidden row.
+                                        unsafe {
+                                            ffi::w34_memcpy_d2d_async(
+                                                shifted.addr() as *mut _,
+                                                tail.addr() as *const _,
+                                                row_bytes,
+                                                t.stream.handle,
+                                            )
+                                        },
+                                        "MTP preceding hidden",
+                                    )?;
+                                    if tokens.len() > 1 {
+                                        check_rc(
+                                            // SAFETY: rows<=max_rows and the final shifted row fits;
+                                            // source is the owned live capture for this whole batch.
+                                            unsafe {
+                                                ffi::w34_memcpy_d2d_async(
+                                                    (shifted.addr() + row_bytes as u64) as *mut _,
+                                                    ptr as *const _,
+                                                    (tokens.len() - 1) * row_bytes,
+                                                    t.stream.handle,
+                                                )
+                                            },
+                                            "MTP shifted hidden",
+                                        )?;
+                                    }
+                                    (tokens, shifted.addr())
+                                };
+                                r.ingest_kv_only_no_sync(t, ids, input, comm)?;
                                 check_rc(
-                                    // SAFETY: both resident buffers hold at least one MTP hidden row.
+                                    // SAFETY: tokens is nonempty and ptr spans every captured row;
+                                    // tail owns exactly one MTP hidden row and survives synchronization.
                                     unsafe {
                                         ffi::w34_memcpy_d2d_async(
-                                            shifted.addr() as *mut _,
-                                            tail.addr() as *const _,
+                                            tail.addr() as *mut _,
+                                            (ptr + ((tokens.len() - 1) * row_bytes) as u64)
+                                                as *const _,
                                             row_bytes,
                                             t.stream.handle,
                                         )
                                     },
-                                    "MTP preceding hidden",
+                                    "MTP tail hidden",
                                 )?;
-                                if tokens.len() > 1 {
-                                    check_rc(
-                                        // SAFETY: rows<=max_rows and the final shifted row fits;
-                                        // source is the owned live capture for this whole batch.
-                                        unsafe {
-                                            ffi::w34_memcpy_d2d_async(
-                                                (shifted.addr() + row_bytes as u64) as *mut _,
-                                                ptr as *const _,
-                                                (tokens.len() - 1) * row_bytes,
-                                                t.stream.handle,
-                                            )
-                                        },
-                                        "MTP shifted hidden",
-                                    )?;
-                                }
-                                (tokens, shifted.addr())
-                            };
-                            r.ingest_kv_only_no_sync(t, ids, input, comm)?;
-                            check_rc(
-                                // SAFETY: tokens is nonempty and ptr spans every captured row;
-                                // tail owns exactly one MTP hidden row and survives synchronization.
-                                unsafe {
-                                    ffi::w34_memcpy_d2d_async(
-                                        tail.addr() as *mut _,
-                                        (ptr + ((tokens.len() - 1) * row_bytes) as u64) as *const _,
-                                        row_bytes,
-                                        t.stream.handle,
-                                    )
-                                },
-                                "MTP tail hidden",
-                            )?;
-                            t.stream.synchronize()
-                        }));
-                    }
-                    jobs.into_iter()
-                        .map(|j| j.join().map_err(|_| loader_err("MTP ingest rank panic"))?)
-                        .collect::<Result<Vec<_>>>()
-                })
+                                t.stream.synchronize()
+                            }
+                        }),
+                )
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
                 .map(|_| ())
             }
         };
@@ -790,6 +820,20 @@ impl NativeProposer {
             let _ = engine.ranks[0].device.make_current();
             let _ = engine.ranks[0].stream.synchronize();
             return Err(e);
+        }
+        if let Some((old_len, len_bytes)) = pending_pinned_memo_copy
+            && let (Some(memo), Some(pinned)) = (&mut self.current, &self.memo_pinned_staging)
+        {
+            // SAFETY: `Mtp::ingest` synchronized `engine.ranks[0].stream`, completing the D2H
+            // into `pinned.host_ptr` (`len_bytes <= pinned.len_bytes`), and `memo.features`
+            // was grown to `old_len + len_bytes`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pinned.host_ptr.cast::<u8>(),
+                    memo.features.as_mut_ptr().add(old_len),
+                    len_bytes,
+                );
+            }
         }
         self.resident_tokens.extend_from_slice(tokens);
         self.processed += tokens.len();
@@ -880,25 +924,21 @@ impl NativeProposer {
                         }
                     }
                 } else {
-                    std::thread::scope(|scope| {
-                        let jobs: Vec<_> = rs
-                            .iter_mut()
+                    let pool = engine.tp_workers.clone();
+                    crate::coordinated::run_tp_closures(
+                        pool.as_deref(),
+                        rs.iter_mut()
                             .zip(&mut engine.ranks)
                             .zip(features)
                             .map(|((r, t), &ptr)| {
-                                scope.spawn(move || -> Result<Vec<i32>> {
+                                move || -> Result<Vec<i32>> {
                                     r.ingest_no_sync(t, ptr, n)?;
                                     r.forward_select_greedy_tp(t, anchor, comm)
-                                })
-                            })
-                            .collect();
-                        jobs.into_iter()
-                            .map(|j| {
-                                j.join()
-                                    .map_err(|_| loader_err("DFlash ingest+proposal rank panic"))?
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    })
+                                }
+                            }),
+                    )
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
                 };
                 let mut outputs = match outputs_res {
                     Ok(o) => o,
@@ -933,25 +973,46 @@ impl NativeProposer {
                     .current
                     .as_ref()
                     .map(|m| (m.tokens.len(), m.features.len()));
+                let mut pending_pinned_memo_copy: Option<(usize, usize)> = None;
                 if let Some(memo) = &mut self.current {
                     let t0 = &engine.ranks[0];
                     t0.device.make_current()?;
                     let len_bytes = tokens.len() * self.row_bytes;
                     let old_len = memo.features.len();
                     grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
-                    check_rc(
-                        // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
-                        // rank 0's stream is synchronized before ingest_and_propose returns below.
-                        unsafe {
-                            ffi::w34_memcpy_d2h_async(
-                                memo.features[old_len..].as_mut_ptr().cast(),
-                                features[0] as *const _,
-                                len_bytes,
-                                t0.stream.handle,
-                            )
-                        },
-                        "proposer memo copy",
-                    )?;
+                    if let Some(pinned) = &self.memo_pinned_staging
+                        && len_bytes > 0
+                        && len_bytes <= pinned.len_bytes
+                    {
+                        check_rc(
+                            // SAFETY: `features[0]` spans `len_bytes` on `t0.stream`, and `pinned`
+                            // remains live until `t0.stream` synchronizes during MTP draft readback.
+                            unsafe {
+                                ffi::w34_memcpy_d2h_async(
+                                    pinned.host_ptr,
+                                    features[0] as *const _,
+                                    len_bytes,
+                                    t0.stream.handle,
+                                )
+                            },
+                            "proposer pinned memo copy",
+                        )?;
+                        pending_pinned_memo_copy = Some((old_len, len_bytes));
+                    } else {
+                        check_rc(
+                            // SAFETY: features[0] spans rows*row_bytes on rank 0's stream, and
+                            // rank 0's stream is synchronized before ingest_and_propose returns below.
+                            unsafe {
+                                ffi::w34_memcpy_d2h_async(
+                                    memo.features[old_len..].as_mut_ptr().cast(),
+                                    features[0] as *const _,
+                                    len_bytes,
+                                    t0.stream.handle,
+                                )
+                            },
+                            "proposer memo copy",
+                        )?;
+                    }
                     memo.tokens.extend_from_slice(tokens);
                 }
                 let use_graph = engine.use_cuda_graph;
@@ -1045,75 +1106,72 @@ impl NativeProposer {
                         }
                     }
                 } else {
-                    std::thread::scope(|scope| {
-                        let mut jobs = Vec::new();
-                        for ((((r, t), tail), shifted), &ptr) in rs
-                            .iter_mut()
+                    let pool = engine.tp_workers.clone();
+                    crate::coordinated::run_tp_closures(
+                        pool.as_deref(),
+                        rs.iter_mut()
                             .zip(&mut engine.ranks)
                             .zip(&self.tail)
                             .zip(&self.shifted)
                             .zip(features)
-                        {
-                            jobs.push(scope.spawn(move || -> Result<Vec<i32>> {
-                                t.device.make_current()?;
-                                r.truncate(before.saturating_sub(1))?;
-                                let (ids, input) = if before == 0 {
-                                    (&tokens[1..], ptr)
-                                } else {
+                            .map(|((((r, t), tail), shifted), &ptr)| {
+                                move || -> Result<Vec<i32>> {
+                                    t.device.make_current()?;
+                                    r.truncate(before.saturating_sub(1))?;
+                                    let (ids, input) = if before == 0 {
+                                        (&tokens[1..], ptr)
+                                    } else {
+                                        check_rc(
+                                            // SAFETY: both resident buffers hold at least one MTP hidden row.
+                                            unsafe {
+                                                ffi::w34_memcpy_d2d_async(
+                                                    shifted.addr() as *mut _,
+                                                    tail.addr() as *const _,
+                                                    row_bytes,
+                                                    t.stream.handle,
+                                                )
+                                            },
+                                            "MTP preceding hidden",
+                                        )?;
+                                        if tokens.len() > 1 {
+                                            check_rc(
+                                                // SAFETY: rows<=max_rows and the final shifted row fits;
+                                                // source is the owned live capture for this whole batch.
+                                                unsafe {
+                                                    ffi::w34_memcpy_d2d_async(
+                                                        (shifted.addr() + row_bytes as u64)
+                                                            as *mut _,
+                                                        ptr as *const _,
+                                                        (tokens.len() - 1) * row_bytes,
+                                                        t.stream.handle,
+                                                    )
+                                                },
+                                                "MTP shifted hidden",
+                                            )?;
+                                        }
+                                        (tokens, shifted.addr())
+                                    };
+                                    r.ingest_kv_only_no_sync(t, ids, input, comm)?;
                                     check_rc(
-                                        // SAFETY: both resident buffers hold at least one MTP hidden row.
+                                        // SAFETY: tokens is nonempty and ptr spans every captured row;
+                                        // tail owns exactly one MTP hidden row on this device.
                                         unsafe {
                                             ffi::w34_memcpy_d2d_async(
-                                                shifted.addr() as *mut _,
-                                                tail.addr() as *const _,
+                                                tail.addr() as *mut _,
+                                                (ptr + ((tokens.len() - 1) * row_bytes) as u64)
+                                                    as *const _,
                                                 row_bytes,
                                                 t.stream.handle,
                                             )
                                         },
-                                        "MTP preceding hidden",
+                                        "MTP tail hidden",
                                     )?;
-                                    if tokens.len() > 1 {
-                                        check_rc(
-                                            // SAFETY: rows<=max_rows and the final shifted row fits;
-                                            // source is the owned live capture for this whole batch.
-                                            unsafe {
-                                                ffi::w34_memcpy_d2d_async(
-                                                    (shifted.addr() + row_bytes as u64) as *mut _,
-                                                    ptr as *const _,
-                                                    (tokens.len() - 1) * row_bytes,
-                                                    t.stream.handle,
-                                                )
-                                            },
-                                            "MTP shifted hidden",
-                                        )?;
-                                    }
-                                    (tokens, shifted.addr())
-                                };
-                                r.ingest_kv_only_no_sync(t, ids, input, comm)?;
-                                check_rc(
-                                    // SAFETY: tokens is nonempty and ptr spans every captured row;
-                                    // tail owns exactly one MTP hidden row on this device.
-                                    unsafe {
-                                        ffi::w34_memcpy_d2d_async(
-                                            tail.addr() as *mut _,
-                                            (ptr + ((tokens.len() - 1) * row_bytes) as u64)
-                                                as *const _,
-                                            row_bytes,
-                                            t.stream.handle,
-                                        )
-                                    },
-                                    "MTP tail hidden",
-                                )?;
-                                r.propose(t, anchor, tail.addr(), k, comm)
-                            }));
-                        }
-                        jobs.into_iter()
-                            .map(|j| {
-                                j.join()
-                                    .map_err(|_| loader_err("MTP ingest+proposal rank panic"))?
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    })
+                                    r.propose(t, anchor, tail.addr(), k, comm)
+                                }
+                            }),
+                    )
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
                 };
                 let outputs = match outputs_res {
                     Ok(o) => o,
@@ -1134,6 +1192,20 @@ impl NativeProposer {
                 };
                 if outputs.windows(2).any(|p| p[0] != p[1]) {
                     return Err(loader_err("MTP TP token disagreement"));
+                }
+                if let Some((old_len, len_bytes)) = pending_pinned_memo_copy
+                    && let (Some(memo), Some(pinned)) =
+                        (&mut self.current, &self.memo_pinned_staging)
+                {
+                    // SAFETY: MTP draft readback synchronized `engine.ranks[0].stream`, completing
+                    // the D2H into `pinned.host_ptr`, and `memo.features` spans `old_len + len_bytes`.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            pinned.host_ptr.cast::<u8>(),
+                            memo.features.as_mut_ptr().add(old_len),
+                            len_bytes,
+                        );
+                    }
                 }
                 self.resident_tokens.extend_from_slice(tokens);
                 self.processed += tokens.len();
@@ -1184,22 +1256,15 @@ impl NativeProposer {
                         .map(|(r, t)| r.collect_propose_host(t, k))
                         .collect::<Result<Vec<_>>>()?
                 } else {
-                    std::thread::scope(|scope| {
-                        let jobs: Vec<_> = rs
-                            .iter_mut()
-                            .zip(&mut engine.ranks)
-                            .zip(&self.tail)
-                            .map(|((r, t), tail)| {
-                                scope.spawn(move || r.propose(t, anchor, tail.addr(), k, comm))
-                            })
-                            .collect();
-                        jobs.into_iter()
-                            .map(|j| {
-                                j.join()
-                                    .map_err(|_| loader_err("MTP proposal rank panic"))?
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    })?
+                    let pool = engine.tp_workers.clone();
+                    crate::coordinated::run_tp_closures(
+                        pool.as_deref(),
+                        rs.iter_mut().zip(&mut engine.ranks).zip(&self.tail).map(
+                            |((r, t), tail)| move || r.propose(t, anchor, tail.addr(), k, comm),
+                        ),
+                    )
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?
                 };
                 if outputs.windows(2).any(|p| p[0] != p[1]) {
                     return Err(loader_err("MTP TP token disagreement"));
@@ -1246,21 +1311,15 @@ impl NativeProposer {
                         .map(|(r, t)| r.collect_select_greedy_host(t, anchor))
                         .collect::<Result<Vec<_>>>()?
                 } else {
-                    std::thread::scope(|scope| {
-                        let jobs: Vec<_> = rs
-                            .iter_mut()
+                    let pool = engine.tp_workers.clone();
+                    crate::coordinated::run_tp_closures(
+                        pool.as_deref(),
+                        rs.iter_mut()
                             .zip(&mut engine.ranks)
-                            .map(|(r, t)| {
-                                scope.spawn(move || r.forward_select_greedy_tp(t, anchor, comm))
-                            })
-                            .collect();
-                        jobs.into_iter()
-                            .map(|j| {
-                                j.join()
-                                    .map_err(|_| loader_err("DFlash proposal rank panic"))?
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    })?
+                            .map(|(r, t)| move || r.forward_select_greedy_tp(t, anchor, comm)),
+                    )
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?
                 };
                 if outputs.windows(2).any(|p| p[0] != p[1]) {
                     return Err(loader_err("DFlash TP token disagreement"));
@@ -1444,18 +1503,27 @@ impl NativeProposer {
                     .iter()
                     .map(|p| (p.trigger_offset_1based, p.dst_slot))
                     .collect();
-                let out = engine.step_batch_slices(&[EngineBatchSlice {
-                    tokens,
-                    ctx_len_before: cursor,
-                    block_table: &req.kv_pages,
-                    state_in_slot: req.current_state_in_slot(),
-                    state_out_slot: req.active_state_slot,
-                    has_initial_state: req.has_initial_state,
-                    spec_slots: &[],
-                    checkpoints: &pairs,
-                    emit_all_query_tokens: false,
-                }])?;
-                anchor = out[0][0];
+                let is_last_chunk = end == prompt.len();
+                let emit_last = is_last_chunk && max_new > 0;
+                let out = engine.step_batch_slices_for_sampler_filtered(
+                    &[EngineBatchSlice {
+                        tokens,
+                        ctx_len_before: cursor,
+                        block_table: &req.kv_pages,
+                        state_in_slot: req.current_state_in_slot(),
+                        state_out_slot: req.active_state_slot,
+                        has_initial_state: req.has_initial_state,
+                        spec_slots: &[],
+                        checkpoints: &pairs,
+                        emit_all_query_tokens: false,
+                    }],
+                    None,
+                    Some(&[emit_last]),
+                    processed_sampling && emit_last,
+                )?;
+                if emit_last && !processed_sampling {
+                    anchor = out[0][0];
+                }
                 let features = self.captured(engine)?;
                 self.ingest(engine, radix_tokens, &features)?;
                 req.commit_tokens(radix_tokens, &planned);
@@ -1518,35 +1586,16 @@ impl NativeProposer {
                 {
                     drafts.truncate(eos);
                 }
-                if processed_sampling {
-                    let mut hypothetical = sampler.clone();
-                    let mut valid = 0;
-                    for &id in &drafts {
-                        if hypothetical.materialize_pending_constraint().is_err()
-                            || hypothetical
-                                .constraint
-                                .as_ref()
-                                .is_some_and(|c| c.is_terminal_eos() || !c.is_token_allowed(id))
-                        {
-                            break;
-                        }
-                        hypothetical
-                            .try_commit_token(id)
-                            .map_err(|_| loader_err("draft grammar commit failed"))?;
-                        if hypothetical
-                            .constraint
-                            .as_ref()
-                            .is_some_and(|c| c.is_terminal_eos())
-                        {
-                            // A terminal EOS draft closes the grammar (`mask.fill(0)`); omit it from
-                            // `drafts` so the bonus row itself samples/verifies that position with a
-                            // non-empty bitmask rather than evaluating an empty post-EOS bonus row.
-                            break;
-                        }
-                        valid += 1;
-                    }
-                    drafts.truncate(valid);
-                }
+                let prepared_sampler = if processed_sampling {
+                    Some(crate::model::PreparedSpecSamplerRows::prepare_drafts(
+                        engine.cfg.vocab_size,
+                        &engine.cfg.eos_token_ids,
+                        &sampler,
+                        &mut drafts,
+                    )?)
+                } else {
+                    None
+                };
                 let k = drafts.len();
                 let mut verify = vec![anchor];
                 verify.extend_from_slice(&drafts);
@@ -1572,19 +1621,23 @@ impl NativeProposer {
                     .iter()
                     .map(|p| (p.trigger_offset_1based, p.dst_slot))
                     .collect();
-                let out = engine.step_batch_slices(&[EngineBatchSlice {
-                    tokens: &verify,
-                    ctx_len_before: before,
-                    block_table: &req.kv_pages,
-                    state_in_slot: tx.committed_slot,
-                    state_out_slot: *schedule.last().unwrap(),
-                    has_initial_state: true,
-                    spec_slots: &schedule,
-                    checkpoints: &pairs,
-                    emit_all_query_tokens: true,
-                }])?;
-                let (decision, round_lps) = if processed_sampling {
-                    engine.verify_speculative_gpu_step(&sampler, &drafts)?
+                let out = engine.step_batch_slices_for_sampler(
+                    &[EngineBatchSlice {
+                        tokens: &verify,
+                        ctx_len_before: before,
+                        block_table: &req.kv_pages,
+                        state_in_slot: tx.committed_slot,
+                        state_out_slot: *schedule.last().unwrap(),
+                        has_initial_state: true,
+                        spec_slots: &schedule,
+                        checkpoints: &pairs,
+                        emit_all_query_tokens: true,
+                    }],
+                    None,
+                    processed_sampling,
+                )?;
+                let (decision, round_lps) = if let Some(prepared) = prepared_sampler {
+                    engine.verify_speculative_gpu_prepared(prepared, &sampler, &drafts)?
                 } else {
                     (
                         RejectionSampler::greedy(&drafts, &out[0])

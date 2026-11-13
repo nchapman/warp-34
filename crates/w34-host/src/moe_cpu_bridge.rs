@@ -502,6 +502,7 @@ impl Runtime {
         self.layer_count.store(layers.len(), Ordering::Release);
         Ok(m)
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn prefill(
         &self,
@@ -537,13 +538,35 @@ impl Runtime {
                     .map(move |s| (toks[j * 96 + s] as usize, e as usize, weights[j * 96 + s]))
             })
             .collect::<Vec<_>>();
+        self.prefill_tasks(store, x, tokens, &tasks, out)
+    }
+
+    pub(crate) fn prefill_tasks(
+        &self,
+        store: &HostExpertStore,
+        x: &[u16],
+        tokens: usize,
+        tasks: &[(usize, usize, f32)],
+        out: &mut [u16],
+    ) -> crate::cuda::Result<()> {
+        let h = store.layout().hidden;
+        if x.len() != tokens.saturating_mul(h) || out.len() != x.len() {
+            return Err(bridge_error("invalid prefill buffers"));
+        }
+        let local_len = store.expert_ids().len();
+        if tasks
+            .iter()
+            .any(|&(tok, e, _)| tok >= tokens || e >= local_len)
+        {
+            return Err(bridge_error("invalid prefill task routes"));
+        }
         let _guard = PrefillGuard::enter(self);
         evaluate_into(
             &self.pool,
             store,
             Input::F16(x),
             tokens,
-            &tasks,
+            tasks,
             Output::F16(out),
         )
     }

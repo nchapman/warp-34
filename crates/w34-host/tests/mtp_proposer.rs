@@ -105,8 +105,8 @@ fn cached_4b_mtp_k123() {
     // Regression: when speculative taps are configured with a small `max_tap_rows` (e.g. 2 rows),
     // non-speculative forward passes (`step_tokens` / `step_batch_slices`, such as multimodal prefill
     // chunks exceeding `max_tap_rows`) must fall back to scratch `s.normed` without failing.
-    engine.ranks[0].decode_graph = None;
-    engine.ranks[0].spec_verify_graph = None;
+    engine.ranks[0].decode_graph.clear();
+    engine.ranks[0].spec_verify_graphs.clear();
     engine.ranks[0].batched_decode_graphs.clear();
     engine.ranks[0]
         .configure_speculative_taps(&[], true, 2)

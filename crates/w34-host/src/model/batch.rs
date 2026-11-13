@@ -162,10 +162,33 @@ impl Qwen3_5Engine {
         }
     }
 
-    fn step_spec_verify_graph(&mut self, s: &EngineBatchSlice<'_>) -> Result<Vec<Vec<i32>>> {
+    #[inline]
+    pub(crate) fn batch_lora_mode(&self, num_reqs: usize) -> GraphLoraMode {
+        if num_reqs == 0 || self.lora_registry.is_empty() {
+            return GraphLoraMode::BaseOnly;
+        }
+        let first = self.slice_lora_id(0);
+        if (1..num_reqs).all(|i| self.slice_lora_id(i) == first) {
+            GraphLoraMode::from_single(first)
+        } else {
+            GraphLoraMode::Mixed
+        }
+    }
+
+    fn step_spec_verify_graph(
+        &mut self,
+        s: &EngineBatchSlice<'_>,
+        skip_host_greedy: bool,
+    ) -> Result<Vec<Vec<i32>>> {
         let q_len = s.tokens.len();
         let long_ctx = !self.cfg.uses_qsa() && s.ctx_len_before + q_len > 1024;
+        let sample_mode = if skip_host_greedy {
+            DecodeGraphSampleMode::LogitsOnly
+        } else {
+            DecodeGraphSampleMode::PlainGreedy
+        };
         let lora_id = self.slice_lora_id(0);
+        let lora_mode = self.batch_lora_mode(1);
         let host_meta = SpecVerifyGraphIo::pack_meta_with_lora(s, lora_id)?;
         use crate::coordinated::{ReplayPhase, replay_ranks};
         let comm = self.tp2_comm.as_ref().cloned();
@@ -214,28 +237,35 @@ impl Qwen3_5Engine {
                         .block_tables
                         .copy_from_host(s.block_table, &r.stream)
                 }
-                ReplayPhase::Capture => {
-                    r.ensure_spec_verify_graph(q_len, long_ctx, comm.as_deref())
-                }
+                ReplayPhase::Capture => r.ensure_spec_verify_graph(
+                    q_len,
+                    long_ctx,
+                    sample_mode,
+                    lora_mode,
+                    comm.as_deref(),
+                ),
                 ReplayPhase::Launch => {
-                    if let Some(rt) = &r.lora_runtime {
-                        rt.state
-                            .set_device_ids(r.spec_verify_io.token_lora_ids_ptr());
-                    }
-                    r.spec_verify_graph.as_ref().unwrap().1.launch(&r.stream)?;
+                    r.bind_graph_lora_mode(lora_mode, r.spec_verify_io.token_lora_ids_ptr());
+                    let (captured_logits_ptr, graph) = r
+                        .find_spec_verify_graph(q_len, long_ctx, sample_mode, lora_mode)
+                        .ok_or_else(|| loader_err("missing captured spec_verify graph"))?;
+                    graph.launch(&r.stream)?;
                     r.mark_tiered_moe_device_lru_dirty();
                     r.speculative_logits_rows = if r.has_spec_logits_capacity(q_len) {
                         q_len
                     } else {
                         0
                     };
-                    r.last_logits_ptr = r.captured_spec_logits_ptr;
+                    r.last_logits_ptr = captured_logits_ptr;
                     r.last_logits_rows = q_len;
                     Ok(())
                 }
             }
         });
         finish_graph_replay(result)?;
+        if skip_host_greedy {
+            return Ok(vec![Vec::new()]);
+        }
         let mut out_ids = vec![0i32; q_len];
         self.ranks[0].device.make_current()?;
         self.ranks[0]
@@ -249,6 +279,184 @@ impl Qwen3_5Engine {
         Ok(vec![out_ids])
     }
 
+    fn step_batched_spec_verify_graph(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+        total_tokens: usize,
+        max_q_len: usize,
+        long_ctx: bool,
+        skip_host_greedy: bool,
+    ) -> Result<Vec<Vec<i32>>> {
+        let num_reqs = slices.len();
+        let sample_mode = if skip_host_greedy {
+            DecodeGraphSampleMode::LogitsOnly
+        } else {
+            DecodeGraphSampleMode::PlainGreedy
+        };
+        let lora_mode = self.batch_lora_mode(num_reqs);
+        let slice_lids =
+            (!self.slice_lora_ids.is_empty()).then_some(self.slice_lora_ids.as_slice());
+        let host_meta = BatchedSpecVerifyGraphIo::pack_meta_with_lora(
+            slices,
+            max_q_len,
+            slice_lids,
+            self.active_lora_id,
+        )?;
+        use crate::coordinated::{ReplayPhase, replay_ranks};
+        let comm = self.tp2_comm.as_ref().cloned();
+        if let Some(comm) = &comm {
+            let stage_bytes = total_tokens
+                .checked_mul(self.cfg.hidden_size)
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| loader_err("tp2 staging payload overflow"))?;
+            if stage_bytes > comm.max_stage_bytes_per_epoch {
+                return Err(loader_err(
+                    "tp2 batch staging bytes exceed max_stage_bytes_per_epoch",
+                ));
+            }
+        }
+        let meta_bytes = core::mem::size_of_val(&host_meta);
+        let bt_off = (meta_bytes + 63) & !63;
+        let result = replay_ranks(self.ranks.len(), |phase, rank| {
+            let r = &mut self.ranks[rank];
+            r.device.make_current()?;
+            match phase {
+                ReplayPhase::Upload => {
+                    if r.ple_runtime.is_some() {
+                        let mut flat_tokens = Vec::with_capacity(total_tokens);
+                        let mut q_start = Vec::with_capacity(num_reqs + 1);
+                        q_start.push(0i32);
+                        let mut st_in = Vec::with_capacity(num_reqs);
+                        let mut st_out = Vec::with_capacity(num_reqs);
+                        let mut has_init = Vec::with_capacity(num_reqs);
+                        let mut spec_slots = vec![-1i32; num_reqs * max_q_len];
+                        let mut ckpt_dst = vec![-1i32; num_reqs * MAX_SPEC_VERIFY_CHECKPOINTS];
+                        let mut ckpt_off = vec![-1i32; num_reqs * MAX_SPEC_VERIFY_CHECKPOINTS];
+                        for (idx, s) in slices.iter().enumerate() {
+                            flat_tokens.extend_from_slice(s.tokens);
+                            q_start.push(flat_tokens.len() as i32);
+                            st_in.push(s.state_in_slot);
+                            st_out.push(s.state_out_slot);
+                            has_init.push(u8::from(s.has_initial_state));
+                            spec_slots[idx * max_q_len..idx * max_q_len + s.spec_slots.len()]
+                                .copy_from_slice(s.spec_slots);
+                            for (e, &(trig_off, dst_slot)) in s.checkpoints.iter().enumerate() {
+                                ckpt_off[idx * MAX_SPEC_VERIFY_CHECKPOINTS + e] = trig_off;
+                                ckpt_dst[idx * MAX_SPEC_VERIFY_CHECKPOINTS + e] = dst_slot;
+                            }
+                        }
+                        r.stage_ple_f8_for_batch(
+                            &flat_tokens,
+                            &q_start,
+                            &st_in,
+                            &st_out,
+                            &has_init,
+                            &spec_slots,
+                            max_q_len,
+                            &ckpt_dst,
+                            &ckpt_off,
+                            MAX_SPEC_VERIFY_CHECKPOINTS,
+                        )?;
+                    }
+                    if r.batched_decode_io
+                        .pinned_in_flight
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        r.stream.synchronize()?;
+                    }
+                    let base = r.batched_decode_io.pinned_staging.host_ptr.cast::<u8>();
+                    // SAFETY: `meta_bytes` (~1.2 KiB) fits inside `PINNED_META_BYTES` (160 KiB)
+                    // and any prior slot-0 pinned transfer was synchronized above.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            host_meta.as_ptr().cast::<u8>(),
+                            base,
+                            meta_bytes,
+                        );
+                        r.batched_decode_io
+                            .pinned_in_flight
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        check_rc(
+                            ffi::w34_memcpy_h2d_async(
+                                r.batched_spec_verify_io.meta_i32.addr() as *mut c_void,
+                                base.cast(),
+                                meta_bytes,
+                                r.stream.handle,
+                            ),
+                            "upload pinned BatchedSpecVerifyGraphIo meta",
+                        )?;
+                    }
+                    r.batched_decode_io
+                        .upload_block_tables_slot(0, bt_off, slices, &r.stream)
+                }
+                ReplayPhase::Capture => r.ensure_batched_spec_verify_graph(
+                    num_reqs,
+                    total_tokens,
+                    max_q_len,
+                    long_ctx,
+                    sample_mode,
+                    lora_mode,
+                    comm.as_deref(),
+                ),
+                ReplayPhase::Launch => {
+                    r.bind_graph_lora_mode(
+                        lora_mode,
+                        r.batched_spec_verify_io.token_lora_ids_ptr(),
+                    );
+                    let (captured_logits_ptr, graph) = r
+                        .find_batched_spec_verify_graph(
+                            num_reqs,
+                            total_tokens,
+                            max_q_len,
+                            long_ctx,
+                            sample_mode,
+                            lora_mode,
+                        )
+                        .ok_or_else(|| loader_err("missing captured batched_spec_verify graph"))?;
+                    graph.launch(&r.stream)?;
+                    r.mark_tiered_moe_device_lru_dirty();
+                    r.speculative_logits_rows = if r.has_spec_logits_capacity(total_tokens) {
+                        total_tokens
+                    } else {
+                        0
+                    };
+                    r.last_logits_ptr = captured_logits_ptr;
+                    r.last_logits_rows = total_tokens;
+                    Ok(())
+                }
+            }
+        });
+        finish_graph_replay(result)?;
+        if skip_host_greedy {
+            return Ok(vec![Vec::new(); num_reqs]);
+        }
+        let mut flat_ids = vec![0i32; total_tokens];
+        self.ranks[0].device.make_current()?;
+        self.ranks[0]
+            .batched_spec_verify_io
+            .out_greedy_ids
+            .copy_to_host(&mut flat_ids, &self.ranks[0].stream)?;
+        self.ranks[0]
+            .batched_decode_io
+            .pinned_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        for r in &self.ranks[1..] {
+            r.device.make_current()?;
+            r.stream.synchronize()?;
+            r.batched_decode_io
+                .pinned_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        let mut per_req = Vec::with_capacity(num_reqs);
+        let mut cur = 0usize;
+        for s in slices {
+            let k = s.tokens.len();
+            per_req.push(flat_ids[cur..cur + k].to_vec());
+            cur += k;
+        }
+        Ok(per_req)
+    }
+
     pub fn captured_decode_graph_keys(&self) -> Vec<(usize, bool)> {
         let mut keys: Vec<(usize, bool)> = self.ranks[0]
             .batched_decode_graphs
@@ -260,6 +468,17 @@ impl Qwen3_5Engine {
         keys
     }
 
+    pub fn captured_batched_spec_verify_graph_shapes(&self) -> Vec<(usize, usize, usize, bool)> {
+        let mut shapes: Vec<(usize, usize, usize, bool)> = self.ranks[0]
+            .batched_spec_verify_graphs
+            .iter()
+            .map(|(k, _, _)| (k.0, k.1, k.2, k.3))
+            .collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        shapes
+    }
+
     fn step_batched_decode_graph(
         &mut self,
         slices: &[EngineBatchSlice<'_>],
@@ -269,6 +488,7 @@ impl Qwen3_5Engine {
         skip_host_greedy: bool,
     ) -> Result<Vec<Vec<i32>>> {
         let n = slices.len();
+        let lora_mode = self.batch_lora_mode(n);
         let slice_lids =
             (!self.slice_lora_ids.is_empty()).then_some(self.slice_lora_ids.as_slice());
         let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta_with_lora(
@@ -307,16 +527,17 @@ impl Qwen3_5Engine {
                     r.batched_decode_io
                         .upload_inputs(&host_meta, &host_masks, slices, &r.stream)
                 }
-                ReplayPhase::Capture => {
-                    r.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, comm.as_deref())
-                }
+                ReplayPhase::Capture => r.ensure_batched_decode_graph(
+                    bucket_b,
+                    long_ctx,
+                    sample_mode,
+                    lora_mode,
+                    comm.as_deref(),
+                ),
                 ReplayPhase::Launch => {
-                    if let Some(rt) = &r.lora_runtime {
-                        rt.state
-                            .set_device_ids(r.batched_decode_io.token_lora_ids_ptr());
-                    }
+                    r.bind_graph_lora_mode(lora_mode, r.batched_decode_io.token_lora_ids_ptr());
                     let (logits_ptr, graph) = r
-                        .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
+                        .find_batched_decode_graph(bucket_b, long_ctx, sample_mode, lora_mode)
                         .unwrap();
                     graph.launch(&r.stream)?;
                     r.mark_tiered_moe_device_lru_dirty();
@@ -362,10 +583,11 @@ impl Qwen3_5Engine {
         let Some(bucket_b) = decode_graph_bucket(slices.len()) else {
             return false;
         };
+        let lora_mode = self.batch_lora_mode(slices.len());
         let r0 = &self.ranks[0];
         if r0.current_pos_plane_stride != 0
             || r0.pending_visual_splice.is_some()
-            || !r0.supports_cuda_graph_for_tokens(bucket_b)
+            || !r0.supports_cuda_graph_for_tokens_with_lora(bucket_b, lora_mode)
         {
             return false;
         }
@@ -423,6 +645,7 @@ impl Qwen3_5Engine {
 
         let slot = slot & 1;
         let n = slices.len();
+        let lora_mode = self.batch_lora_mode(n);
         let slice_lids =
             (!self.slice_lora_ids.is_empty()).then_some(self.slice_lora_ids.as_slice());
         let (host_meta, host_masks) = BatchedDecodeGraphIo::pack_meta_with_lora(
@@ -435,14 +658,14 @@ impl Qwen3_5Engine {
         r0.device.make_current()?;
         if tokens_already_on_device
             && r0
-                .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
+                .find_batched_decode_graph(bucket_b, long_ctx, sample_mode, lora_mode)
                 .is_none()
         {
             return Err(loader_err(
                 "pipelined lookahead step missing pre-captured decode graph",
             ));
         }
-        r0.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, None)?;
+        r0.ensure_batched_decode_graph(bucket_b, long_ctx, sample_mode, lora_mode, None)?;
         r0.stage_ple_f8_for_decode_slices(slices)?;
         r0.batched_decode_io.upload_inputs_slot(
             slot,
@@ -457,12 +680,9 @@ impl Qwen3_5Engine {
             r0.batched_decode_io
                 .upload_fast_greedy_slot(slot, cfgs, sparse, bucket_b, &r0.stream)?;
         }
-        if let Some(rt) = &r0.lora_runtime {
-            rt.state
-                .set_device_ids(r0.batched_decode_io.token_lora_ids_ptr());
-        }
+        r0.bind_graph_lora_mode(lora_mode, r0.batched_decode_io.token_lora_ids_ptr());
         let (logits_ptr, graph) = r0
-            .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
+            .find_batched_decode_graph(bucket_b, long_ctx, sample_mode, lora_mode)
             .unwrap();
         graph.launch(&r0.stream)?;
         r0.mark_tiered_moe_device_lru_dirty();
@@ -665,6 +885,209 @@ impl Qwen3_5Engine {
         )
     }
 
+    fn try_step_spec_verify_graph_fastpath(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+        rope_pos_deltas: Option<&[i32]>,
+        all_emit: bool,
+        noncausal_override: bool,
+        skip_host_greedy: bool,
+    ) -> Option<Result<Vec<Vec<i32>>>> {
+        if rope_pos_deltas.is_some() || !all_emit || noncausal_override || !self.use_cuda_graph {
+            return None;
+        }
+        if slices.len() == 1 {
+            return self.try_single_spec_verify_graph(&slices[0], skip_host_greedy);
+        }
+        if (2..=MAX_BATCHED_SPEC_REQS).contains(&slices.len()) {
+            return self.try_batched_spec_verify_graph(slices, skip_host_greedy);
+        }
+        None
+    }
+
+    fn try_single_spec_verify_graph(
+        &mut self,
+        s: &EngineBatchSlice<'_>,
+        skip_host_greedy: bool,
+    ) -> Option<Result<Vec<Vec<i32>>>> {
+        let q_len = s.tokens.len();
+        if q_len == 0 {
+            return Some(Err(loader_err("empty slice in step_batch_slices")));
+        }
+        let max_pages = self.ranks[0].kv_pool.num_pages;
+        let seq_after = s.ctx_len_before + q_len;
+        if seq_after.div_ceil(16) > s.block_table.len()
+            || s.block_table
+                .iter()
+                .any(|&p| p < 0 || (p as usize) >= max_pages)
+        {
+            return Some(Err(loader_err(
+                "KV cache page capacity exceeded in step_batch_slices",
+            )));
+        }
+        let long_ctx = !self.cfg.uses_qsa() && seq_after > 1024;
+        let sample_mode = if skip_host_greedy {
+            DecodeGraphSampleMode::LogitsOnly
+        } else {
+            DecodeGraphSampleMode::PlainGreedy
+        };
+        let lora_mode = self.batch_lora_mode(1);
+        let spec_key = (q_len, long_ctx, sample_mode, lora_mode);
+        let can_use_spec_graph = (2..=MAX_SPEC_VERIFY_TOKENS).contains(&q_len)
+            && s.has_initial_state
+            && s.emit_all_query_tokens
+            && s.spec_slots.len() == q_len
+            && s.checkpoints.len() <= MAX_SPEC_VERIFY_CHECKPOINTS
+            && s.block_table.len() <= self.ranks[0].spec_verify_io.max_blocks_per_req
+            && self
+                .ranks
+                .iter()
+                .all(|r| r.supports_cuda_graph_for_tokens_with_lora(q_len, lora_mode))
+            && self.ranks.iter().all(|r| {
+                let expected_m = r
+                    .speculative_logits
+                    .as_ref()
+                    .map(|b| b.len_bytes / (r.local_vocab_size * 2));
+                r.current_pos_plane_stride == 0
+                    && r.pending_visual_splice.is_none()
+                    && !r.failed_spec_verify_keys.contains(&spec_key)
+                    && expected_m.is_none_or(|cap| q_len <= cap)
+            });
+        if !can_use_spec_graph {
+            return None;
+        }
+        let needs_capture = self.ranks.iter().any(|r| {
+            r.find_spec_verify_graph(q_len, long_ctx, sample_mode, lora_mode)
+                .is_none()
+        });
+        match self.step_spec_verify_graph(s, skip_host_greedy) {
+            Ok(out) => Some(Ok(out)),
+            Err(e) if needs_capture => {
+                for r in &mut self.ranks {
+                    r.spec_verify_graphs.retain(|(k, _, _)| *k != spec_key);
+                    if !r.failed_spec_verify_keys.contains(&spec_key) {
+                        r.failed_spec_verify_keys.push(spec_key);
+                    }
+                }
+                eprintln!(
+                    "[w34] warning: spec_verify CUDA Graph capture failed for shape {:?} ({e}); degrading shape to eager verification",
+                    spec_key
+                );
+                None
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn try_batched_spec_verify_graph(
+        &mut self,
+        slices: &[EngineBatchSlice<'_>],
+        skip_host_greedy: bool,
+    ) -> Option<Result<Vec<Vec<i32>>>> {
+        let max_pages = self.ranks[0].kv_pool.num_pages;
+        let mut valid_inputs = true;
+        let mut total_q = 0usize;
+        let mut max_q = 0usize;
+        let mut max_seq_after = 0usize;
+        for s in slices {
+            let q_len = s.tokens.len();
+            if q_len == 0 {
+                return Some(Err(loader_err("empty slice in step_batch_slices")));
+            }
+            let seq_after = s.ctx_len_before + q_len;
+            if seq_after.div_ceil(16) > s.block_table.len()
+                || s.block_table
+                    .iter()
+                    .any(|&p| p < 0 || (p as usize) >= max_pages)
+            {
+                return Some(Err(loader_err(
+                    "KV cache page capacity exceeded in step_batch_slices",
+                )));
+            }
+            total_q += q_len;
+            max_q = max_q.max(q_len);
+            max_seq_after = max_seq_after.max(seq_after);
+            if !s.has_initial_state
+                || !s.emit_all_query_tokens
+                || s.spec_slots.len() != q_len
+                || s.checkpoints.len() > MAX_SPEC_VERIFY_CHECKPOINTS
+                || s.block_table.len() > self.ranks[0].batched_decode_io.max_blocks_per_req
+            {
+                valid_inputs = false;
+            }
+        }
+        let long_ctx = !self.cfg.uses_qsa() && max_seq_after > 1024;
+        let sample_mode = if skip_host_greedy {
+            DecodeGraphSampleMode::LogitsOnly
+        } else {
+            DecodeGraphSampleMode::PlainGreedy
+        };
+        let lora_mode = self.batch_lora_mode(slices.len());
+        let bspec_key = (
+            slices.len(),
+            total_q,
+            max_q,
+            long_ctx,
+            sample_mode,
+            lora_mode,
+        );
+        let can_use_batched_spec = valid_inputs
+            && (2..=MAX_SPEC_VERIFY_TOKENS).contains(&max_q)
+            && total_q <= MAX_BATCHED_SPEC_TOKENS
+            && self
+                .ranks
+                .iter()
+                .all(|r| r.supports_cuda_graph_for_tokens_with_lora(total_q, lora_mode))
+            && self.ranks.iter().all(|r| {
+                let expected_m = r
+                    .speculative_logits
+                    .as_ref()
+                    .map(|b| b.len_bytes / (r.local_vocab_size * 2));
+                r.current_pos_plane_stride == 0
+                    && r.pending_visual_splice.is_none()
+                    && !r.failed_batched_spec_verify_keys.contains(&bspec_key)
+                    && expected_m.is_none_or(|cap| total_q <= cap)
+            });
+        if !can_use_batched_spec {
+            return None;
+        }
+        let needs_capture = self.ranks.iter().any(|r| {
+            r.find_batched_spec_verify_graph(
+                slices.len(),
+                total_q,
+                max_q,
+                long_ctx,
+                sample_mode,
+                lora_mode,
+            )
+            .is_none()
+        });
+        match self.step_batched_spec_verify_graph(
+            slices,
+            total_q,
+            max_q,
+            long_ctx,
+            skip_host_greedy,
+        ) {
+            Ok(out) => Some(Ok(out)),
+            Err(e) if needs_capture => {
+                for r in &mut self.ranks {
+                    r.batched_spec_verify_graphs
+                        .retain(|(k, _, _)| *k != bspec_key);
+                    if !r.failed_batched_spec_verify_keys.contains(&bspec_key) {
+                        r.failed_batched_spec_verify_keys.push(bspec_key);
+                    }
+                }
+                eprintln!(
+                    "[w34] warning: batched_spec_verify CUDA Graph capture failed for shape {:?} ({e}); degrading shape to eager verification",
+                    bspec_key
+                );
+                None
+            }
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     pub(crate) fn step_batch_slices_for_sampler_filtered_bidir(
         &mut self,
         slices: &[EngineBatchSlice<'_>],
@@ -688,6 +1111,7 @@ impl Qwen3_5Engine {
         }
         let all_emit = emit_mask.is_none_or(|m| m.iter().all(|&e| e));
         let max_pages = self.ranks[0].kv_pool.num_pages;
+        let lora_mode = self.batch_lora_mode(slices.len());
         if !noncausal_override
             && all_emit
             && let Some(bucket_b) = decode_graph_bucket(slices.len())
@@ -695,7 +1119,7 @@ impl Qwen3_5Engine {
             && self
                 .ranks
                 .iter()
-                .all(|r| r.supports_cuda_graph_for_tokens(bucket_b))
+                .all(|r| r.supports_cuda_graph_for_tokens_with_lora(bucket_b, lora_mode))
             && slices.iter().all(|s| {
                 s.tokens.len() == 1
                     && s.spec_slots.is_empty()
@@ -732,67 +1156,14 @@ impl Qwen3_5Engine {
                 skip_host_greedy,
             );
         }
-        if slices.len() == 1 && rope_pos_deltas.is_none() {
-            let s = &slices[0];
-            let q_len = s.tokens.len();
-            if q_len == 0 {
-                return Err(loader_err("empty slice in step_batch_slices"));
-            }
-            let max_pages = self.ranks[0].kv_pool.num_pages;
-            let seq_after = s.ctx_len_before + q_len;
-            if seq_after.div_ceil(16) > s.block_table.len()
-                || s.block_table
-                    .iter()
-                    .any(|&p| p < 0 || (p as usize) >= max_pages)
-            {
-                return Err(loader_err(
-                    "KV cache page capacity exceeded in step_batch_slices",
-                ));
-            }
-            let can_use_spec_graph = self.use_cuda_graph
-                && (2..=MAX_SPEC_VERIFY_TOKENS).contains(&q_len)
-                && s.has_initial_state
-                && s.emit_all_query_tokens
-                && s.spec_slots.len() == q_len
-                && s.checkpoints.len() <= MAX_SPEC_VERIFY_CHECKPOINTS
-                && s.block_table.len() <= self.ranks[0].spec_verify_io.max_blocks_per_req
-                && self
-                    .ranks
-                    .iter()
-                    .all(|r| r.supports_cuda_graph_for_tokens(q_len))
-                && self.ranks.iter().all(|r| {
-                    let expected_m = r
-                        .speculative_logits
-                        .as_ref()
-                        .map(|b| b.len_bytes / (r.local_vocab_size * 2));
-                    r.current_pos_plane_stride == 0
-                        && r.pending_visual_splice.is_none()
-                        && expected_m.is_none_or(|cap| cap == q_len)
-                        && r.spec_verify_graph
-                            .as_ref()
-                            .is_none_or(|((captured_m, _), _)| *captured_m == q_len)
-                });
-            if can_use_spec_graph {
-                let long_ctx = !self.cfg.uses_qsa() && seq_after > 1024;
-                let needs_capture = self.ranks.iter().any(|r| {
-                    r.spec_verify_graph
-                        .as_ref()
-                        .is_none_or(|(k, _)| *k != (q_len, long_ctx))
-                });
-                match self.step_spec_verify_graph(s) {
-                    Ok(out) => return Ok(out),
-                    Err(e) if needs_capture => {
-                        for r in &mut self.ranks {
-                            r.spec_verify_graph = None;
-                        }
-                        self.use_cuda_graph = false;
-                        eprintln!(
-                            "[w34] warning: spec_verify CUDA Graph capture failed ({e}); degrading to eager verification"
-                        );
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+        if let Some(res) = self.try_step_spec_verify_graph_fastpath(
+            slices,
+            rope_pos_deltas,
+            all_emit,
+            noncausal_override,
+            skip_host_greedy,
+        ) {
+            return res;
         }
         let num_reqs = slices.len();
         let mut flat_tokens = Vec::new();
@@ -955,7 +1326,7 @@ impl Qwen3_5Engine {
             )?
         } else {
             let comm = self.tp2_comm.as_ref().unwrap().clone();
-            let (r0, peer_ranks) = self.ranks.split_first_mut().unwrap();
+            let pool = self.tp_workers.as_ref().unwrap().clone();
             let ft_ref = &flat_tokens;
             let fp_ref = &flat_positions;
             let qs_ref = &q_start_loc;
@@ -981,9 +1352,10 @@ impl Qwen3_5Engine {
                 ));
             }
 
-            let (res0, peer_results) = std::thread::scope(|sc| {
-                let c0 = comm.clone();
-                let h0 = sc.spawn(move || -> Result<Vec<i32>> {
+            let comm_ref = &comm;
+            let (res0, peer_results) = pool.run_split(
+                self.ranks.as_mut_slice(),
+                |r0| -> Result<Vec<i32>> {
                     let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r0.upload_batch_meta(
                         ft_ref,
                         fp_ref,
@@ -1016,72 +1388,55 @@ impl Qwen3_5Engine {
                         total_tokens,
                         &attn_batch,
                         &gdn_batch,
-                        Some(&c0),
+                        Some(comm_ref),
                         sr_ref,
                         skip_host_greedy,
                     )
-                });
-
-                let mut peer_handles = Vec::with_capacity(peer_ranks.len());
-                for r_peer in peer_ranks {
-                    let cp = comm.clone();
-                    peer_handles.push(sc.spawn(move || -> Result<()> {
-                        let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r_peer
-                            .upload_batch_meta(
-                                ft_ref,
-                                fp_ref,
-                                qs_ref,
-                                cb_ref,
-                                sa_ref,
-                                bt_ref,
-                                ws_ref,
-                                si_ref,
-                                so_ref,
-                                hi_ref,
-                                sp_ref,
-                                cd_ref,
-                                co_ref,
-                                num_reqs,
-                                total_tokens,
-                                max_blocks_per_req,
-                                max_q_len,
-                                max_seq_len,
-                                max_verify_tokens,
-                                max_checkpoints_per_req,
-                            )?;
-                        r_peer.bind_lora_for_batch(Some(first_lora_id), flat_lora_ref)?;
-                        if noncausal_override {
-                            attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
-                        }
-                        let _ = r_peer.forward_selected_rows_maybe_skip_greedy(
-                            tok_ptr,
-                            pos_ptr,
-                            total_tokens,
-                            &attn_batch,
-                            &gdn_batch,
-                            Some(&cp),
-                            sr_ref,
-                            skip_host_greedy,
-                        )?;
-                        Ok(())
-                    }));
-                }
-                let j0 = h0
-                    .join()
-                    .map_err(|_| loader_err("tp2 rank 0 worker thread panicked"));
-                let mut peers = Vec::with_capacity(peer_handles.len());
-                for hp in peer_handles {
-                    peers.push(
-                        hp.join()
-                            .map_err(|_| loader_err("tp2 peer worker thread panicked")),
-                    );
-                }
-                (j0, peers)
-            });
+                },
+                |_, r_peer| -> Result<()> {
+                    let (tok_ptr, pos_ptr, mut attn_batch, gdn_batch) = r_peer.upload_batch_meta(
+                        ft_ref,
+                        fp_ref,
+                        qs_ref,
+                        cb_ref,
+                        sa_ref,
+                        bt_ref,
+                        ws_ref,
+                        si_ref,
+                        so_ref,
+                        hi_ref,
+                        sp_ref,
+                        cd_ref,
+                        co_ref,
+                        num_reqs,
+                        total_tokens,
+                        max_blocks_per_req,
+                        max_q_len,
+                        max_seq_len,
+                        max_verify_tokens,
+                        max_checkpoints_per_req,
+                    )?;
+                    r_peer.bind_lora_for_batch(Some(first_lora_id), flat_lora_ref)?;
+                    if noncausal_override {
+                        attn_batch.mask_mode = w34_kernels::ffi::W34_ATTN_MASK_SYMMETRIC_WINDOW;
+                    }
+                    let _ = r_peer.forward_selected_rows_maybe_skip_greedy(
+                        tok_ptr,
+                        pos_ptr,
+                        total_tokens,
+                        &attn_batch,
+                        &gdn_batch,
+                        Some(comm_ref),
+                        sr_ref,
+                        skip_host_greedy,
+                    )?;
+                    Ok(())
+                },
+            );
             for pr in peer_results {
-                pr??;
+                pr?;
             }
-            res0??
+            res0?
         };
 
         if skip_host_greedy {

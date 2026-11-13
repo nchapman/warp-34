@@ -4,20 +4,29 @@ use super::*;
 
 #[cfg(feature = "cuda")]
 impl Qwen3_5ModelRank {
-    /// Captures the `M=1` decode forward pass into `self.decode_graph`, keyed by `long_ctx`
+    /// Captures the `M=1` decode forward pass into `self.decode_graph`, keyed by `(long_ctx, lora_mode)`
     /// (`seq_after > 1024`: `false` = single-pass GQA mma, `true` = parallel Split-KV).
     pub fn ensure_decode_graph(
         &mut self,
         long_ctx: bool,
+        lora_mode: GraphLoraMode,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        const MAX_DECODE_CACHED_GRAPHS: usize = 8;
         let long_ctx = !self.cfg.uses_qsa() && long_ctx;
-        if let Some((captured_long, _)) = &self.decode_graph
-            && *captured_long == long_ctx
-        {
+        let key = (long_ctx, lora_mode);
+        if let Some(pos) = self.decode_graph.iter().position(|(k, _, _)| *k == key) {
+            if pos + 1 != self.decode_graph.len() {
+                let entry = self.decode_graph.remove(pos);
+                self.decode_graph.push(entry);
+            }
+            self.captured_decode_logits_ptr = self.decode_graph.last().unwrap().1;
             return Ok(());
         }
-        self.decode_graph = None;
+        if self.decode_graph.len() >= MAX_DECODE_CACHED_GRAPHS {
+            self.stream.synchronize()?;
+            self.decode_graph.remove(0);
+        }
         let max_seq_len = if long_ctx {
             (self.decode_io.max_blocks_per_req * 16).max(2048) as i32
         } else {
@@ -25,10 +34,10 @@ impl Qwen3_5ModelRank {
         };
         let attn_batch = W34AttentionBatch {
             query_start_loc: self.decode_io.q_start_loc.addr() as *const i32,
-            context_lens_before: self.decode_io.ctx_lens_before.addr() as *const i32,
-            seq_lens_after: self.decode_io.seq_lens_after.addr() as *const i32,
+            context_lens_before: self.decode_io.ctx_lens_before_ptr() as *const i32,
+            seq_lens_after: self.decode_io.seq_lens_after_ptr() as *const i32,
             block_tables: self.decode_io.block_tables.addr() as *const i32,
-            write_slot_mapping: self.decode_io.write_slot_mapping.addr() as *const i32,
+            write_slot_mapping: self.decode_io.write_slot_mapping_ptr() as *const i32,
             valid_token_mask: core::ptr::null(),
             valid_req_mask: core::ptr::null(),
             num_reqs: 1,
@@ -43,8 +52,8 @@ impl Qwen3_5ModelRank {
         };
         let gdn_batch = W34GdnBatch {
             query_start_loc: self.decode_io.q_start_loc.addr() as *const i32,
-            state_in_indices: self.decode_io.state_in_indices.addr() as *const i32,
-            state_out_indices: self.decode_io.state_out_indices.addr() as *const i32,
+            state_in_indices: self.decode_io.state_in_indices_ptr() as *const i32,
+            state_out_indices: self.decode_io.state_out_indices_ptr() as *const i32,
             spec_state_indices: core::ptr::null(),
             checkpoint_dst_indices: core::ptr::null(),
             checkpoint_token_offsets: core::ptr::null(),
@@ -55,9 +64,9 @@ impl Qwen3_5ModelRank {
             max_verify_tokens: 0,
             max_checkpoints_per_req: 0,
         };
-        let tok_ptr = self.decode_io.token_ids.addr();
-        let pos_ptr = self.decode_io.positions.addr();
-        let out_id_ptr = self.decode_io.out_greedy_id.addr();
+        let tok_ptr = self.decode_io.token_ids_ptr();
+        let pos_ptr = self.decode_io.positions_ptr();
+        let out_id_ptr = self.decode_io.out_greedy_id_ptr();
 
         self.stream.synchronize()?;
         let stream_handle = self.stream.handle;
@@ -71,10 +80,7 @@ impl Qwen3_5ModelRank {
             "w34_graph_begin_capture",
         )?;
         self.is_capturing_graph = true;
-        if let Some(rt) = &self.lora_runtime {
-            rt.state
-                .set_device_ids(self.decode_io.token_lora_ids.addr());
-        }
+        self.bind_graph_lora_mode(lora_mode, self.decode_io.token_lora_ids_ptr());
         let res = self.forward_device_batches(
             tok_ptr,
             pos_ptr,
@@ -103,8 +109,9 @@ impl Qwen3_5ModelRank {
         };
         res?;
         check_rc(end_rc, "w34_graph_end_capture")?;
-        self.captured_decode_logits_ptr = self.last_logits_ptr;
-        self.decode_graph = Some((long_ctx, captured));
+        let logits_ptr = self.last_logits_ptr;
+        self.captured_decode_logits_ptr = logits_ptr;
+        self.decode_graph.push((key, logits_ptr, captured));
         Ok(())
     }
 
@@ -115,21 +122,49 @@ impl Qwen3_5ModelRank {
             .is_some_and(|b| rows <= b.len_bytes / (self.local_vocab_size * 2))
     }
 
-    /// Captures a fixed-shape `M_verify = m_verify` (`2..=16`) single-request speculative
-    /// verification forward pass into `self.spec_verify_graph`.
+    /// Captures and caches up to `MAX_SPEC_VERIFY_CACHED_GRAPHS` (`4`) `(m_verify, long_ctx, sample_mode, lora_mode)`
+    /// single-request speculative verification graphs on this rank.
+    pub fn find_spec_verify_graph(
+        &self,
+        m_verify: usize,
+        long_ctx: bool,
+        sample_mode: DecodeGraphSampleMode,
+        lora_mode: GraphLoraMode,
+    ) -> Option<(u64, &CudaGraph)> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
+        let key = (m_verify, long_ctx, sample_mode, lora_mode);
+        self.spec_verify_graphs
+            .iter()
+            .find(|(k, _, _)| *k == key)
+            .map(|(_, logits_ptr, g)| (*logits_ptr, g))
+    }
+
     pub fn ensure_spec_verify_graph(
         &mut self,
         m_verify: usize,
         long_ctx: bool,
+        sample_mode: DecodeGraphSampleMode,
+        lora_mode: GraphLoraMode,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        const MAX_SPEC_VERIFY_CACHED_GRAPHS: usize = 4;
         let long_ctx = !self.cfg.uses_qsa() && long_ctx;
-        if let Some((captured_key, _)) = &self.spec_verify_graph
-            && *captured_key == (m_verify, long_ctx)
+        let key = (m_verify, long_ctx, sample_mode, lora_mode);
+        if let Some(pos) = self
+            .spec_verify_graphs
+            .iter()
+            .position(|(k, _, _)| *k == key)
         {
+            if pos + 1 != self.spec_verify_graphs.len() {
+                let entry = self.spec_verify_graphs.remove(pos);
+                self.spec_verify_graphs.push(entry);
+            }
             return Ok(());
         }
-        self.spec_verify_graph = None;
+        if self.spec_verify_graphs.len() >= MAX_SPEC_VERIFY_CACHED_GRAPHS {
+            self.stream.synchronize()?;
+            self.spec_verify_graphs.remove(0);
+        }
         let max_seq_len = if long_ctx {
             (self.spec_verify_io.max_blocks_per_req * 16).max(2048) as i32
         } else {
@@ -172,6 +207,7 @@ impl Qwen3_5ModelRank {
         let pos_ptr = self.spec_verify_io.positions_ptr();
         let out_ids_ptr = self.spec_verify_io.out_greedy_ids.addr();
         let selected_rows: Vec<usize> = (0..m_verify).collect();
+        let emit_greedy = matches!(sample_mode, DecodeGraphSampleMode::PlainGreedy);
 
         self.stream.synchronize()?;
         let stream_handle = self.stream.handle;
@@ -185,10 +221,7 @@ impl Qwen3_5ModelRank {
             "w34_graph_begin_capture (spec_verify)",
         )?;
         self.is_capturing_graph = true;
-        if let Some(rt) = &self.lora_runtime {
-            rt.state
-                .set_device_ids(self.spec_verify_io.token_lora_ids_ptr());
-        }
+        self.bind_graph_lora_mode(lora_mode, self.spec_verify_io.token_lora_ids_ptr());
         let res = self.forward_selected_rows_device(
             tok_ptr,
             pos_ptr,
@@ -197,8 +230,8 @@ impl Qwen3_5ModelRank {
             &gdn_batch,
             tp2,
             &selected_rows,
-            Some(out_ids_ptr),
-            true,
+            emit_greedy.then_some(out_ids_ptr),
+            emit_greedy,
         );
         self.is_capturing_graph = false;
         let mut graph = 0usize;
@@ -216,8 +249,157 @@ impl Qwen3_5ModelRank {
         };
         res?;
         check_rc(end_rc, "w34_graph_end_capture (spec_verify)")?;
-        self.captured_spec_logits_ptr = self.last_logits_ptr;
-        self.spec_verify_graph = Some(((m_verify, long_ctx), captured));
+        let captured_logits_ptr = self.last_logits_ptr;
+        self.spec_verify_graphs
+            .push((key, captured_logits_ptr, captured));
+        Ok(())
+    }
+
+    pub fn find_batched_spec_verify_graph(
+        &self,
+        num_reqs: usize,
+        total_tokens: usize,
+        max_q_len: usize,
+        long_ctx: bool,
+        sample_mode: DecodeGraphSampleMode,
+        lora_mode: GraphLoraMode,
+    ) -> Option<(u64, &CudaGraph)> {
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
+        let key = (
+            num_reqs,
+            total_tokens,
+            max_q_len,
+            long_ctx,
+            sample_mode,
+            lora_mode,
+        );
+        self.batched_spec_verify_graphs
+            .iter()
+            .find(|(k, _, _)| *k == key)
+            .map(|(_, logits_ptr, g)| (*logits_ptr, g))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_batched_spec_verify_graph(
+        &mut self,
+        num_reqs: usize,
+        total_tokens: usize,
+        max_q_len: usize,
+        long_ctx: bool,
+        sample_mode: DecodeGraphSampleMode,
+        lora_mode: GraphLoraMode,
+        tp2: Option<&Tp2Collectives>,
+    ) -> Result<()> {
+        const MAX_BATCHED_SPEC_CACHED_GRAPHS: usize = 4;
+        let long_ctx = !self.cfg.uses_qsa() && long_ctx;
+        let key = (
+            num_reqs,
+            total_tokens,
+            max_q_len,
+            long_ctx,
+            sample_mode,
+            lora_mode,
+        );
+        if let Some(pos) = self
+            .batched_spec_verify_graphs
+            .iter()
+            .position(|(k, _, _)| *k == key)
+        {
+            if pos + 1 != self.batched_spec_verify_graphs.len() {
+                let entry = self.batched_spec_verify_graphs.remove(pos);
+                self.batched_spec_verify_graphs.push(entry);
+            }
+            return Ok(());
+        }
+        if self.batched_spec_verify_graphs.len() >= MAX_BATCHED_SPEC_CACHED_GRAPHS {
+            self.stream.synchronize()?;
+            self.batched_spec_verify_graphs.remove(0);
+        }
+        let max_seq_len = if long_ctx {
+            (self.batched_decode_io.max_blocks_per_req * 16).max(2048) as i32
+        } else {
+            1024
+        };
+        let attn_batch = W34AttentionBatch {
+            query_start_loc: self.batched_spec_verify_io.q_start_loc_ptr() as *const i32,
+            context_lens_before: self.batched_spec_verify_io.ctx_lens_before_ptr() as *const i32,
+            seq_lens_after: self.batched_spec_verify_io.seq_lens_after_ptr() as *const i32,
+            block_tables: self.batched_decode_io.block_tables.addr() as *const i32,
+            write_slot_mapping: self.batched_spec_verify_io.write_slot_mapping_ptr() as *const i32,
+            valid_token_mask: core::ptr::null(),
+            valid_req_mask: core::ptr::null(),
+            num_reqs: num_reqs as i32,
+            total_tokens: total_tokens as i32,
+            max_blocks_per_req: self.batched_decode_io.max_blocks_per_req as i32,
+            max_q_len: max_q_len as i32,
+            max_seq_len,
+            mask_mode: W34_ATTN_MASK_CAUSAL,
+            sliding_window: 0,
+            sm_scale: (self.cfg.head_dim as f32).powf(-0.5),
+            reserved: 0,
+        };
+        let gdn_batch = W34GdnBatch {
+            query_start_loc: self.batched_spec_verify_io.q_start_loc_ptr() as *const i32,
+            state_in_indices: self.batched_spec_verify_io.state_in_indices_ptr() as *const i32,
+            state_out_indices: self.batched_spec_verify_io.state_out_indices_ptr() as *const i32,
+            spec_state_indices: self.batched_spec_verify_io.spec_state_indices_ptr() as *const i32,
+            checkpoint_dst_indices: self.batched_spec_verify_io.checkpoint_dst_indices_ptr()
+                as *const i32,
+            checkpoint_token_offsets: self.batched_spec_verify_io.checkpoint_token_offsets_ptr()
+                as *const i32,
+            has_initial_state: self.batched_spec_verify_io.has_initial_state.addr() as *const u8,
+            valid_req_mask: core::ptr::null(),
+            num_reqs: num_reqs as i32,
+            total_tokens: total_tokens as i32,
+            max_verify_tokens: max_q_len as i32,
+            max_checkpoints_per_req: MAX_SPEC_VERIFY_CHECKPOINTS as i32,
+        };
+        let tok_ptr = self.batched_spec_verify_io.token_ids_ptr();
+        let pos_ptr = self.batched_spec_verify_io.positions_ptr();
+        let out_ids_ptr = self.batched_spec_verify_io.out_greedy_ids.addr();
+        let selected_rows: Vec<usize> = (0..total_tokens).collect();
+        let emit_greedy = matches!(sample_mode, DecodeGraphSampleMode::PlainGreedy);
+
+        self.stream.synchronize()?;
+        let stream_handle = self.stream.handle;
+        let dev_id = self.device.device_id;
+        // SAFETY: bind current thread to `dev_id` before stream capture.
+        check_rc(unsafe { ffi::w34_set_device(dev_id) }, "w34_set_device")?;
+        check_rc(
+            // SAFETY: `stream_handle` is synchronized above on `dev_id`.
+            unsafe { ffi::w34_graph_begin_capture(stream_handle) },
+            "w34_graph_begin_capture (batched_spec_verify)",
+        )?;
+        self.is_capturing_graph = true;
+        self.bind_graph_lora_mode(lora_mode, self.batched_spec_verify_io.token_lora_ids_ptr());
+        let res = self.forward_selected_rows_device(
+            tok_ptr,
+            pos_ptr,
+            total_tokens,
+            &attn_batch,
+            &gdn_batch,
+            tp2,
+            &selected_rows,
+            emit_greedy.then_some(out_ids_ptr),
+            emit_greedy,
+        );
+        self.is_capturing_graph = false;
+        let mut graph = 0usize;
+        let mut graph_exec = 0usize;
+        // SAFETY: pair `begin_capture` with `end_capture` before propagating `res`.
+        let end_rc = unsafe {
+            ffi::w34_graph_end_capture(stream_handle, &raw mut graph, &raw mut graph_exec)
+        };
+        let captured = CudaGraph {
+            device_id: dev_id,
+            graph,
+            graph_exec,
+        };
+        res?;
+        check_rc(end_rc, "w34_graph_end_capture (batched_spec_verify)")?;
+        let captured_logits_ptr = self.last_logits_ptr;
+        self.batched_spec_verify_graphs
+            .push((key, captured_logits_ptr, captured));
         Ok(())
     }
 
@@ -226,11 +408,12 @@ impl Qwen3_5ModelRank {
         bucket_b: usize,
         long_ctx: bool,
         sample_mode: DecodeGraphSampleMode,
+        lora_mode: GraphLoraMode,
     ) -> Option<(u64, &CudaGraph)> {
         let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         self.batched_decode_graphs
             .iter()
-            .find(|(k, _, _)| *k == (bucket_b, long_ctx, sample_mode))
+            .find(|(k, _, _)| *k == (bucket_b, long_ctx, sample_mode, lora_mode))
             .map(|(_, ptr, g)| (*ptr, g))
     }
 
@@ -240,14 +423,32 @@ impl Qwen3_5ModelRank {
         bucket_b: usize,
         long_ctx: bool,
         sample_mode: DecodeGraphSampleMode,
+        lora_mode: GraphLoraMode,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
+        const MAX_LORA_DECODE_CACHED_GRAPHS: usize = 24;
         let long_ctx = !self.cfg.uses_qsa() && long_ctx;
-        if self
-            .find_batched_decode_graph(bucket_b, long_ctx, sample_mode)
-            .is_some()
+        let key = (bucket_b, long_ctx, sample_mode, lora_mode);
+        if let Some(pos) = self
+            .batched_decode_graphs
+            .iter()
+            .position(|(k, _, _)| *k == key)
         {
+            if pos + 1 != self.batched_decode_graphs.len() {
+                let entry = self.batched_decode_graphs.remove(pos);
+                self.batched_decode_graphs.push(entry);
+            }
             return Ok(());
+        }
+        if lora_mode != GraphLoraMode::BaseOnly
+            && self.batched_decode_graphs.len() >= MAX_LORA_DECODE_CACHED_GRAPHS
+            && let Some(evict_pos) = self
+                .batched_decode_graphs
+                .iter()
+                .position(|(k, _, _)| k.3 != GraphLoraMode::BaseOnly)
+        {
+            self.stream.synchronize()?;
+            self.batched_decode_graphs.remove(evict_pos);
         }
         let max_seq_len = if long_ctx {
             (self.batched_decode_io.max_blocks_per_req * 16).max(2048) as i32
@@ -305,10 +506,7 @@ impl Qwen3_5ModelRank {
             "w34_graph_begin_capture (batched_decode)",
         )?;
         self.is_capturing_graph = true;
-        if let Some(rt) = &self.lora_runtime {
-            rt.state
-                .set_device_ids(self.batched_decode_io.token_lora_ids_ptr());
-        }
+        self.bind_graph_lora_mode(lora_mode, self.batched_decode_io.token_lora_ids_ptr());
         let emit_device_greedy = sample_mode == DecodeGraphSampleMode::PlainGreedy;
         let res = self
             .forward_selected_rows_device(
@@ -370,8 +568,7 @@ impl Qwen3_5ModelRank {
         res?;
         check_rc(end_rc, "w34_graph_end_capture (batched_decode)")?;
         let logits_ptr = self.last_logits_ptr;
-        self.batched_decode_graphs
-            .push(((bucket_b, long_ctx, sample_mode), logits_ptr, captured));
+        self.batched_decode_graphs.push((key, logits_ptr, captured));
         Ok(())
     }
 

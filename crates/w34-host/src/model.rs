@@ -73,6 +73,8 @@ pub use rank_capacity::{
 };
 #[cfg(feature = "cuda")]
 use rank_capacity::{PoolCapacity, SharedVocabHost};
+#[cfg(feature = "cuda")]
+pub(crate) use sampling::PreparedSpecSamplerRows;
 pub(crate) use weights::RawLinearHost;
 #[cfg(feature = "cuda")]
 pub(crate) use weights::load_moe_layer_weights;

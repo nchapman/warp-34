@@ -1091,7 +1091,6 @@ impl HotExpertCache {
             self.adapted_slots_dirty = true;
         }
         self.sync_prefill_expert_to_slot(stream)?;
-        stream.synchronize()?;
         self.device_lru_dirty = false;
         Ok(())
     }
@@ -1203,7 +1202,14 @@ pub struct TieredMoeWorkspace {
     pub d_num_misses: crate::cuda::DeviceBuffer,
     pub h_prefill_x: MappedHostBuffer,
     pub h_prefill_out: MappedHostBuffer,
+    pub h_routing_pinned: MappedHostBuffer,
+    pub h_lru_sync_pinned: MappedHostBuffer,
+    pub h_chunk_slot_pinned: MappedHostBuffer,
+    pub h_topk_ids_scratch: Vec<i32>,
+    pub h_topk_weights_scratch: Vec<f32>,
+    pub cpu_tasks_scratch: Vec<(usize, usize, f32)>,
     pub d2h_done_event: crate::cuda::CudaEvent,
+    pub pinned_h2d_done_event: crate::cuda::CudaEvent,
 }
 
 impl TieredMoeWorkspace {
@@ -1277,7 +1283,13 @@ impl TieredMoeWorkspace {
         let prefill_buf_bytes = max_tokens.max(1) * layout.hidden * core::mem::size_of::<u16>();
         let h_prefill_x = MappedHostBuffer::alloc(prefill_buf_bytes)?;
         let h_prefill_out = MappedHostBuffer::alloc(prefill_buf_bytes)?;
+        let h_routing_pinned = MappedHostBuffer::alloc(pairs * 8)?;
+        let h_lru_sync_pinned = MappedHostBuffer::alloc(64 * 8208)?;
+        let h_chunk_slot_pinned =
+            MappedHostBuffer::alloc((1024 + 512 * 512) * core::mem::size_of::<i32>())?;
         let d2h_done_event = CudaEvent::new(device_id, false)?;
+        let pinned_h2d_done_event = CudaEvent::new(device_id, false)?;
+        pinned_h2d_done_event.record(&h2d_stream)?;
         h2d_stream.synchronize()?;
 
         Ok(Self {
@@ -1303,7 +1315,14 @@ impl TieredMoeWorkspace {
             d_num_misses,
             h_prefill_x,
             h_prefill_out,
+            h_routing_pinned,
+            h_lru_sync_pinned,
+            h_chunk_slot_pinned,
+            h_topk_ids_scratch: Vec::new(),
+            h_topk_weights_scratch: Vec::new(),
+            cpu_tasks_scratch: Vec::new(),
             d2h_done_event,
+            pinned_h2d_done_event,
         })
     }
 

@@ -874,49 +874,52 @@ __global__ void moe_pull_mapped_experts_kernel(
     size_t gu_scales_bytes,
     size_t dn_packed_bytes,
     size_t dn_scales_bytes) {
-    const int s = (int)blockIdx.y;
     const int num_staged = (num_staged_buf != nullptr) ? num_staged_buf[0] : num_staged_imm;
-    if (s >= num_staged) return;
-    const int le = src_local_experts[s];
-    const int dst_slot = dst_slots[s];
-    if (le < 0 || le >= local_num_experts || dst_slot < 0 || dst_slot >= dst_capacity) return;
+    if (num_staged <= 0) return;
 
-    const uint8_t* src_pack = mapped_host_packs + (size_t)le * pack_stride_bytes;
     const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t)gridDim.x * blockDim.x;
-
     const size_t gu_p_vec = gu_packed_bytes >> 4;
-    const uint4* src_gu_p = reinterpret_cast<const uint4*>(src_pack);
-    uint4* dst_gu_p = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(gate_up_packed_base) + (size_t)dst_slot * gu_packed_bytes);
-    for (size_t i = tid; i < gu_p_vec; i += stride) {
-        dst_gu_p[i] = src_gu_p[i];
-    }
-
     const size_t gu_s_vec = gu_scales_bytes >> 4;
-    const uint4* src_gu_s = reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes);
-    uint4* dst_gu_s = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(gate_up_scales_base) + (size_t)dst_slot * gu_scales_bytes);
-    for (size_t i = tid; i < gu_s_vec; i += stride) {
-        dst_gu_s[i] = src_gu_s[i];
-    }
-
     const size_t dn_p_vec = dn_packed_bytes >> 4;
-    const uint4* src_dn_p =
-        reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes + gu_scales_bytes);
-    uint4* dst_dn_p = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(down_packed_base) + (size_t)dst_slot * dn_packed_bytes);
-    for (size_t i = tid; i < dn_p_vec; i += stride) {
-        dst_dn_p[i] = src_dn_p[i];
-    }
-
     const size_t dn_s_vec = dn_scales_bytes >> 4;
-    const uint4* src_dn_s = reinterpret_cast<const uint4*>(
-        src_pack + gu_packed_bytes + gu_scales_bytes + dn_packed_bytes);
-    uint4* dst_dn_s = reinterpret_cast<uint4*>(
-        reinterpret_cast<uint8_t*>(down_scales_base) + (size_t)dst_slot * dn_scales_bytes);
-    for (size_t i = tid; i < dn_s_vec; i += stride) {
-        dst_dn_s[i] = src_dn_s[i];
+
+    for (int s = (int)blockIdx.y; s < num_staged; s += (int)gridDim.y) {
+        const int le = src_local_experts[s];
+        const int dst_slot = dst_slots[s];
+        if (le < 0 || le >= local_num_experts || dst_slot < 0 || dst_slot >= dst_capacity) continue;
+
+        const uint8_t* src_pack = mapped_host_packs + (size_t)le * pack_stride_bytes;
+
+        const uint4* src_gu_p = reinterpret_cast<const uint4*>(src_pack);
+        uint4* dst_gu_p = reinterpret_cast<uint4*>(
+            reinterpret_cast<uint8_t*>(gate_up_packed_base) + (size_t)dst_slot * gu_packed_bytes);
+        for (size_t i = tid; i < gu_p_vec; i += stride) {
+            dst_gu_p[i] = src_gu_p[i];
+        }
+
+        const uint4* src_gu_s = reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes);
+        uint4* dst_gu_s = reinterpret_cast<uint4*>(
+            reinterpret_cast<uint8_t*>(gate_up_scales_base) + (size_t)dst_slot * gu_scales_bytes);
+        for (size_t i = tid; i < gu_s_vec; i += stride) {
+            dst_gu_s[i] = src_gu_s[i];
+        }
+
+        const uint4* src_dn_p =
+            reinterpret_cast<const uint4*>(src_pack + gu_packed_bytes + gu_scales_bytes);
+        uint4* dst_dn_p = reinterpret_cast<uint4*>(
+            reinterpret_cast<uint8_t*>(down_packed_base) + (size_t)dst_slot * dn_packed_bytes);
+        for (size_t i = tid; i < dn_p_vec; i += stride) {
+            dst_dn_p[i] = src_dn_p[i];
+        }
+
+        const uint4* src_dn_s = reinterpret_cast<const uint4*>(
+            src_pack + gu_packed_bytes + gu_scales_bytes + dn_packed_bytes);
+        uint4* dst_dn_s = reinterpret_cast<uint4*>(
+            reinterpret_cast<uint8_t*>(down_scales_base) + (size_t)dst_slot * dn_scales_bytes);
+        for (size_t i = tid; i < dn_s_vec; i += stride) {
+            dst_dn_s[i] = src_dn_s[i];
+        }
     }
 }
 
@@ -1046,7 +1049,17 @@ extern "C" int w34_moe_pull_mapped_experts_with_count(
         return (int)cudaErrorInvalidValue;
     }
 
-    dim3 grid(64, (unsigned)max_staged);
+    w34_device_props dev_props{};
+    const int sm_count =
+        (w34_get_current_device_props(&dev_props) == 0 && dev_props.multi_processor_count > 0)
+            ? dev_props.multi_processor_count
+            : 84;
+    const int cap_y = (num_staged_buf != nullptr) ? 4 : 8;
+    const int grid_y = (max_staged < cap_y) ? max_staged : cap_y;
+    int grid_x = (2 * sm_count + grid_y - 1) / grid_y;
+    if (grid_x < 8) grid_x = 8;
+    if (grid_x > 64) grid_x = 64;
+    dim3 grid((unsigned)grid_x, (unsigned)grid_y);
     w34_moe::moe_pull_mapped_experts_kernel<<<grid, 256, 0, (cudaStream_t)ex->stream>>>(
         static_cast<const uint8_t*>(mapped_host_packs),
         src_local_experts,

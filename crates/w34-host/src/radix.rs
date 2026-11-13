@@ -91,6 +91,7 @@ pub struct MambaRadixCache {
     pub disable: bool,
     pub active_lora_id: i32,
     nodes: Vec<RadixNode>,
+    free_nodes: Vec<RadixNodeId>,
     /// Ordered from LRU (index 0) to MRU (last). Contains all alive non-root nodes.
     full_lru: Vec<RadixNodeId>,
     /// Ordered from LRU (index 0) to MRU (last). Contains all alive non-root nodes with `mamba_value.is_some()`.
@@ -119,6 +120,7 @@ impl MambaRadixCache {
             disable: false,
             active_lora_id: crate::lora::BASE_MODEL_LORA_ID,
             nodes: Vec::new(),
+            free_nodes: Vec::new(),
             full_lru: Vec::new(),
             mamba_lru: Vec::new(),
             tick_counter: 1,
@@ -142,6 +144,7 @@ impl MambaRadixCache {
 
     pub fn reset(&mut self) {
         self.nodes.clear();
+        self.free_nodes.clear();
         self.full_lru.clear();
         self.mamba_lru.clear();
         self.tick_counter = 1;
@@ -300,6 +303,18 @@ impl MambaRadixCache {
     /// Splits `child_id` at `split_token_len` (`0 < split_token_len < child.key.len()`).
     /// Returns the newly created intermediate node `new_node_id`, which has `mamba_value = None`
     /// and inherits `child.full_lock_ref` (`mamba_radix_cache.py:1210-1244`).
+    fn alloc_node(&mut self, make: impl FnOnce(RadixNodeId) -> RadixNode) -> RadixNodeId {
+        if let Some(id) = self.free_nodes.pop() {
+            debug_assert!(!self.nodes[id.0].alive);
+            self.nodes[id.0] = make(id);
+            id
+        } else {
+            let id = RadixNodeId(self.nodes.len());
+            self.nodes.push(make(id));
+            id
+        }
+    }
+
     fn split_node(&mut self, child_id: RadixNodeId, split_token_len: usize) -> RadixNodeId {
         let split_pages = split_token_len / self.page_size;
         let parent_id = self.nodes[child_id.0]
@@ -323,13 +338,12 @@ impl MambaRadixCache {
         let first_page_prefix = prefix_key[..self.page_size].to_vec();
         let first_page_suffix = suffix_key[..self.page_size].to_vec();
 
-        let new_node_id = RadixNodeId(self.nodes.len());
         let mut new_children = BTreeMap::new();
         new_children.insert(first_page_suffix, child_id);
 
         let tick = self.next_tick();
-        self.nodes.push(RadixNode {
-            id: new_node_id,
+        let new_node_id = self.alloc_node(|id| RadixNode {
+            id,
             parent: Some(parent_id),
             children: new_children,
             key: prefix_key,
@@ -629,10 +643,9 @@ impl MambaRadixCache {
             };
             let first_page = new_key[..self.page_size].to_vec();
             let added_pages = new_val.len();
-            let new_node_id = RadixNodeId(self.nodes.len());
             let tick = self.next_tick();
-            self.nodes.push(RadixNode {
-                id: new_node_id,
+            let new_node_id = self.alloc_node(|id| RadixNode {
+                id,
                 parent: Some(cur_node),
                 children: BTreeMap::new(),
                 key: new_key,
@@ -711,7 +724,7 @@ impl MambaRadixCache {
             .parent
             .expect("leaf node must have parent");
         self.nodes[parent_id.0].children.remove(&first_page);
-        self.nodes[leaf_id.0].alive = false;
+        self.retire_dead_node(leaf_id);
 
         // Iteratively delete exposed tombstone leaves (`mamba_radix_cache.py:1319-1340`).
         let mut cur_parent = parent_id;
@@ -735,9 +748,23 @@ impl MambaRadixCache {
                 .parent
                 .expect("non-root must have parent");
             self.nodes[grand_parent.0].children.remove(&p_first_page);
-            self.nodes[cur_parent.0].alive = false;
+            self.retire_dead_node(cur_parent);
             cur_parent = grand_parent;
         }
+    }
+
+    #[inline]
+    fn retire_dead_node(&mut self, id: RadixNodeId) {
+        debug_assert!(id != RadixNodeId::ROOT);
+        let node = &mut self.nodes[id.0];
+        debug_assert!(node.alive);
+        node.alive = false;
+        node.parent = None;
+        node.key = Vec::new();
+        node.value = Vec::new();
+        node.draft_pages = Vec::new();
+        node.children = BTreeMap::new();
+        self.free_nodes.push(id);
     }
 
     pub fn mark_node_decode_tail(&mut self, nid: RadixNodeId) {
@@ -1040,6 +1067,9 @@ impl ReqRadixState {
     /// Plans `C = 64` checkpoints crossed when advancing `query_len` tokens starting from
     /// `self.token_ids.len()`. Up to 2 checkpoints fit in the ping-pong buffer per launch.
     pub fn plan_checkpoints(&self, query_len: usize) -> Vec<PlannedCheckpoint> {
+        if self.ping_pong_slots[0] < 0 || self.ping_pong_slots[1] < 0 {
+            return Vec::new();
+        }
         let seq_before = self.token_ids.len();
         let mut out = Vec::new();
         let mut track_idx = self.next_track_idx;
@@ -1475,5 +1505,32 @@ mod tests {
         assert_eq!(hit.matched_tokens, 64);
         assert_eq!(hit.mamba_slot, Some(2));
         assert!(radix.sanity_check().is_ok());
+    }
+
+    #[test]
+    fn test_radix_dead_node_retirement_reclaims_arena_without_growth() {
+        let mut radix = MambaRadixCache::new(16, 64);
+        for session in 0..512i32 {
+            let mut req = ReqRadixState::new(16, 64, 1, [2, 3]);
+            let prompt: Vec<i32> = (0..128).map(|i| session * 1000 + i).collect();
+            req.kv_pages = (0..8).map(|p| session * 16 + p).collect();
+            let ckpts = req.plan_checkpoints(128);
+            req.commit_tokens(&prompt, &ckpts);
+            let don = req.donate_committed_checkpoint(&mut radix, Some(4), true);
+            assert_eq!(don.donated_seq_len, 128);
+            let ev = radix.evict_full_pages(8);
+            assert_eq!(ev.freed_kv_pages.len(), 8);
+            assert_eq!(
+                don.freed_mamba_slots.len() + ev.freed_mamba_slots.len(),
+                4,
+                "active_state_slot (1), ping_pong_slots ([2, 3]), and replacement (4) must all be returned"
+            );
+            assert!(radix.sanity_check().is_ok());
+        }
+        assert!(
+            radix.nodes.len() <= 8,
+            "retired dead nodes should be recycled via free_nodes; got nodes.len()={}",
+            radix.nodes.len()
+        );
     }
 }

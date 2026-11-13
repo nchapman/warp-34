@@ -3,6 +3,8 @@
 //! The scheduler owns admission, KV allocation, commits and resource release. This
 //! module executes one chunk only; it never commits or locks scheduler state.
 
+use std::sync::Arc;
+
 use crate::cuda::{self, DeviceBuffer};
 use crate::model::{EngineBatchSlice, Qwen3_5Engine, loader_err};
 use crate::scheduler::{ScheduledReqSlice, SeqEntry};
@@ -18,7 +20,7 @@ pub struct ScheduledVision {
     visual_indices: Vec<Option<(usize, usize)>>,
     images: Vec<PreprocessedImage>,
     visual_counts: Vec<usize>,
-    rank_device_embeds: Vec<Option<Vec<DeviceBuffer>>>,
+    rank_device_embeds: Vec<Option<Arc<Vec<DeviceBuffer>>>>,
     hidden_size: usize,
     valid: bool,
 }
@@ -125,11 +127,25 @@ impl ScheduledVision {
     ///
     /// Images entirely in the cached prefix are never encoded. An image crossing
     /// a chunk/cache boundary is encoded once, in full, on first use.
+    #[cfg(test)]
     pub fn step_prefill(
         &mut self,
         engine: &mut Qwen3_5Engine,
         seq: &SeqEntry,
         chunk_size: usize,
+    ) -> cuda::Result<(i32, ScheduledReqSlice)> {
+        let needs_final_logits = seq.max_new_tokens > 0 || engine.ranks[0].lm_head.is_some();
+        self.step_prefill_with_emit(engine, seq, chunk_size, needs_final_logits)
+    }
+
+    /// Executes one nonempty multimodal prefill chunk, running `lm_head` + greedy sampling
+    /// only when `slice.is_final_prefill_chunk && needs_final_logits`.
+    pub fn step_prefill_with_emit(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        seq: &SeqEntry,
+        chunk_size: usize,
+        needs_final_logits: bool,
     ) -> cuda::Result<(i32, ScheduledReqSlice)> {
         if !self.valid || engine.cfg.hidden_size != self.hidden_size {
             return Err(loader_err(
@@ -199,39 +215,75 @@ impl ScheduledVision {
                 continue;
             };
             if self.rank_device_embeds[image].is_none() {
-                engine.ensure_vision_encoder()?;
-                let rank0 = &engine.ranks[0];
-                rank0.device.make_current()?;
-                let dev0 = engine
-                    .vision_encoder
-                    .as_ref()
-                    .ok_or_else(|| loader_err("vision encoder unavailable"))?
-                    .encode_images(
+                const MAX_VISION_EMBED_CACHE_ENTRIES: usize = 8;
+                const MAX_VISION_EMBED_CACHE_BYTES: usize = 64 * 1024 * 1024;
+                let cache_key = (
+                    self.images[image].content_hash,
+                    self.images[image].grid_thw,
+                    self.images[image].patches_f32.len(),
+                );
+                if let Some(pos) = engine
+                    .vision_embed_cache
+                    .iter()
+                    .position(|(k, _)| *k == cache_key)
+                {
+                    if pos + 1 != engine.vision_embed_cache.len() {
+                        let hit = engine.vision_embed_cache.remove(pos);
+                        engine.vision_embed_cache.push(hit);
+                    }
+                    self.rank_device_embeds[image] =
+                        Some(engine.vision_embed_cache.last().unwrap().1.clone());
+                } else {
+                    engine.ensure_vision_encoder()?;
+                    let rank0 = &engine.ranks[0];
+                    rank0.device.make_current()?;
+                    let enc = engine
+                        .vision_encoder
+                        .as_ref()
+                        .ok_or_else(|| loader_err("vision encoder unavailable"))?;
+                    let dev0 = enc.encode_images(
                         std::slice::from_ref(&self.images[image]),
                         &rank0.cublas,
                         &rank0.stream,
                     )?;
-                let count = self.visual_counts[image]
-                    .checked_mul(self.hidden_size)
-                    .ok_or_else(|| loader_err("visual embedding size overflow"))?;
-                if count.checked_mul(2) != Some(dev0.len_bytes) {
-                    return Err(loader_err("visual token embedding count mismatch"));
-                }
-                let mut rank_bufs = Vec::with_capacity(engine.ranks.len());
-                if engine.ranks.len() == 1 {
-                    rank_bufs.push(dev0);
-                } else {
-                    let mut host = vec![0u16; count];
-                    dev0.copy_to_host(&mut host, &rank0.stream)?;
-                    rank_bufs.push(dev0);
-                    for peer in &engine.ranks[1..] {
-                        peer.device.make_current()?;
-                        let dev_peer = DeviceBuffer::alloc(peer.device.device_id, count * 2)?;
-                        dev_peer.copy_from_host(&host, &peer.stream)?;
-                        rank_bufs.push(dev_peer);
+                    let count = self.visual_counts[image]
+                        .checked_mul(self.hidden_size)
+                        .ok_or_else(|| loader_err("visual embedding size overflow"))?;
+                    if count.checked_mul(2) != Some(dev0.len_bytes) {
+                        return Err(loader_err("visual token embedding count mismatch"));
                     }
+                    let mut rank_bufs = Vec::with_capacity(engine.ranks.len());
+                    if engine.ranks.len() == 1 {
+                        rank_bufs.push(dev0);
+                    } else {
+                        let peers: Vec<(i32, &cuda::CudaStream)> = engine.ranks[1..]
+                            .iter()
+                            .map(|r| (r.device.device_id, &r.stream))
+                            .collect();
+                        let peer_bufs =
+                            enc.replicate_to_peers_pinned(&dev0, &rank0.stream, &peers)?;
+                        rank_bufs.push(dev0);
+                        rank_bufs.extend(peer_bufs);
+                    }
+                    let shared = Arc::new(rank_bufs);
+                    let entry_bytes = shared[0].len_bytes;
+                    if entry_bytes <= MAX_VISION_EMBED_CACHE_BYTES {
+                        while !engine.vision_embed_cache.is_empty()
+                            && (engine.vision_embed_cache.len() >= MAX_VISION_EMBED_CACHE_ENTRIES
+                                || engine
+                                    .vision_embed_cache
+                                    .iter()
+                                    .map(|(_, v)| v[0].len_bytes)
+                                    .sum::<usize>()
+                                    + entry_bytes
+                                    > MAX_VISION_EMBED_CACHE_BYTES)
+                        {
+                            engine.vision_embed_cache.remove(0);
+                        }
+                        engine.vision_embed_cache.push((cache_key, shared.clone()));
+                    }
+                    self.rank_device_embeds[image] = Some(shared);
                 }
-                self.rank_device_embeds[image] = Some(rank_bufs);
             }
             if row >= self.visual_counts[image] {
                 return Err(loader_err("missing visual token embedding"));
@@ -246,23 +298,40 @@ impl ScheduledVision {
                 spans.push((image, row, 1));
             }
         }
-        // Keep per-chunk index/concat buffers alive through forward and stream completion.
-        let mut buffers = Vec::new();
         let mut pointers = Vec::new();
         let row_bytes = self.hidden_size * 2;
-        for (rank_idx, rank) in engine.ranks.iter().enumerate() {
+        for (rank_idx, rank) in engine.ranks.iter_mut().enumerate() {
             if indices.is_empty() {
                 break;
             }
             rank.device.make_current()?;
-            let idx = DeviceBuffer::alloc(rank.device.device_id, indices.len() * 4)?;
-            idx.copy_from_host(&indices, &rank.stream)?;
+            let idx_bytes = indices.len() * 4;
+            if rank
+                .vision_splice_idx
+                .as_ref()
+                .is_none_or(|b| b.len_bytes < idx_bytes)
+            {
+                rank.vision_splice_idx =
+                    Some(DeviceBuffer::alloc(rank.device.device_id, idx_bytes)?);
+            }
+            let idx_buf = rank.vision_splice_idx.as_ref().unwrap();
+            idx_buf.copy_from_host(&indices, &rank.stream)?;
+            let idx_addr = idx_buf.addr();
             let emb_addr = if spans.len() == 1 {
                 let (image, start_row, _) = spans[0];
                 let dev_buf = &self.rank_device_embeds[image].as_ref().unwrap()[rank_idx];
                 dev_buf.addr() + (start_row * row_bytes) as u64
             } else {
-                let emb = DeviceBuffer::alloc(rank.device.device_id, indices.len() * row_bytes)?;
+                let emb_bytes = indices.len() * row_bytes;
+                if rank
+                    .vision_splice_emb
+                    .as_ref()
+                    .is_none_or(|b| b.len_bytes < emb_bytes)
+                {
+                    rank.vision_splice_emb =
+                        Some(DeviceBuffer::alloc(rank.device.device_id, emb_bytes)?);
+                }
+                let emb = rank.vision_splice_emb.as_ref().unwrap();
                 let mut dst_off = 0usize;
                 for &(image, start_row, row_count) in &spans {
                     let dev_buf = &self.rank_device_embeds[image].as_ref().unwrap()[rank_idx];
@@ -283,12 +352,9 @@ impl ScheduledVision {
                     )?;
                     dst_off += row_count;
                 }
-                let addr = emb.addr();
-                buffers.push(emb);
-                addr
+                emb.addr()
             };
-            pointers.push((emb_addr, idx.addr(), indices.len()));
-            buffers.push(idx);
+            pointers.push((emb_addr, idx_addr, indices.len()));
         }
         let checkpoints: Vec<_> = slice
             .planned_checkpoints
@@ -309,7 +375,7 @@ impl ScheduledVision {
         let noncausal_prefix = seq
             .prefix_bidir_len
             .is_some_and(|bidir_end| end <= bidir_end);
-        let emit_last_row = seq.max_new_tokens > 0 || engine.ranks[0].lm_head.is_some();
+        let emit_last_row = slice.is_final_prefill_chunk && needs_final_logits;
         engine.set_slice_lora_ids(&[seq.lora_id]);
         let result = engine.step_single_slice_with_mrope_and_vision_bidir(
             &engine_slice,
@@ -334,7 +400,6 @@ impl ScheduledVision {
                 sync_result = synced;
             }
         }
-        drop(buffers);
         if slice.is_final_prefill_chunk {
             self.rank_device_embeds.clear();
         }

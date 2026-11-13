@@ -1025,6 +1025,19 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         ),
         "warmup w34_sampler_greedy_top5_f16"
     )?;
+    warmup_ffi!(
+        ffi::w34_sampler_greedy_top5_f16(
+            &ex,
+            buf_a as *const c_void,
+            buf_b as *mut i32,
+            core::ptr::null_mut(),
+            buf_d as *mut f32,
+            1,
+            4096,
+            0,
+        ),
+        "warmup w34_sampler_greedy_top5_f16 split_top1"
+    )?;
     let sampler_cfg = ffi::W34SamplerRowCfg {
         temperature: 1.0,
         top_k: 8,
@@ -1115,6 +1128,21 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
             1024,
         ),
         "warmup w34_sampler_step_fast_greedy_masked_f16"
+    )?;
+    warmup_ffi!(
+        ffi::w34_sampler_shard_fast_greedy_f16(
+            &ex_sampler,
+            buf_a as *const c_void,
+            masked_greedy_cfg_dev as *const ffi::W34SamplerRowCfg,
+            masked_words_dev as *const u32,
+            core::ptr::null(),
+            buf_d as *mut f32,
+            buf_b as *mut i32,
+            1,
+            1024,
+            0,
+        ),
+        "warmup w34_sampler_shard_fast_greedy_f16"
     )?;
     warmup_ffi!(
         ffi::w34_sampler_step_f16(

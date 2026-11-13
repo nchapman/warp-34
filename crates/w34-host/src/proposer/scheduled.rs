@@ -132,18 +132,29 @@ impl NativeProposer {
             .collect();
         engine.set_active_lora_id(seq.lora_id);
         engine.clear_slice_lora_ids();
-        let out = engine.step_batch_slices(&[EngineBatchSlice {
-            tokens,
-            ctx_len_before: start,
-            block_table: &seq.radix_state.kv_pages,
-            state_in_slot: seq.radix_state.current_state_in_slot(),
-            state_out_slot: seq.radix_state.active_state_slot,
-            has_initial_state: seq.radix_state.has_initial_state,
-            spec_slots: &[],
-            checkpoints: &pairs,
-            emit_all_query_tokens: false,
-        }])?;
-        let mut anchor = out[0][0];
+        let is_last_chunk = end == seq.prompt_tokens.len();
+        let emit_last = is_last_chunk && seq.max_new_tokens > 0;
+        let out = engine.step_batch_slices_for_sampler_filtered(
+            &[EngineBatchSlice {
+                tokens,
+                ctx_len_before: start,
+                block_table: &seq.radix_state.kv_pages,
+                state_in_slot: seq.radix_state.current_state_in_slot(),
+                state_out_slot: seq.radix_state.active_state_slot,
+                has_initial_state: seq.radix_state.has_initial_state,
+                spec_slots: &[],
+                checkpoints: &pairs,
+                emit_all_query_tokens: false,
+            }],
+            None,
+            Some(&[emit_last]),
+            use_gpu_sampler && emit_last,
+        )?;
+        let mut anchor = if emit_last && !use_gpu_sampler {
+            out[0][0]
+        } else {
+            0
+        };
         let features = self.captured(engine)?;
         self.ingest(engine, radix_tokens, &features)?;
         seq.radix_state.commit_tokens(radix_tokens, &planned);
@@ -269,32 +280,16 @@ impl NativeProposer {
         }) {
             drafts.truncate(eos);
         }
-        if use_gpu_sampler {
-            let mut hypothetical = sampler.clone();
-            let mut valid = 0;
-            for &id in &drafts {
-                if hypothetical.materialize_pending_constraint().is_err()
-                    || hypothetical
-                        .constraint
-                        .as_ref()
-                        .is_some_and(|c| c.is_terminal_eos() || !c.is_token_allowed(id))
-                {
-                    break;
-                }
-                hypothetical
-                    .try_commit_token(id)
-                    .map_err(|_| loader_err("draft grammar commit failed"))?;
-                if hypothetical
-                    .constraint
-                    .as_ref()
-                    .is_some_and(|c| c.is_terminal_eos())
-                {
-                    break;
-                }
-                valid += 1;
-            }
-            drafts.truncate(valid);
-        }
+        let mut prepared_sampler = if use_gpu_sampler {
+            Some(crate::model::PreparedSpecSamplerRows::prepare_drafts(
+                engine.cfg.vocab_size,
+                &engine.cfg.eos_token_ids,
+                sampler,
+                &mut drafts,
+            )?)
+        } else {
+            None
+        };
         let mut extras = Vec::with_capacity(drafts.len());
         for _ in 0..drafts.len() {
             let Some(s) = engine.alloc_state_slot_preserving_leaves(radix) else {
@@ -303,6 +298,9 @@ impl NativeProposer {
             extras.push(s);
         }
         drafts.truncate(extras.len());
+        if let Some(prep) = &mut prepared_sampler {
+            prep.truncate_drafts(drafts.len());
+        }
         let k = drafts.len();
         let mut verify = vec![anchor];
         verify.extend_from_slice(&drafts);
@@ -318,17 +316,21 @@ impl NativeProposer {
             .iter()
             .map(|p| (p.trigger_offset_1based, p.dst_slot))
             .collect();
-        let step_res = engine.step_batch_slices(&[EngineBatchSlice {
-            tokens: &verify,
-            ctx_len_before: before,
-            block_table: &seq.radix_state.kv_pages,
-            state_in_slot: tx.committed_slot,
-            state_out_slot: *schedule.last().unwrap(),
-            has_initial_state: seq.radix_state.has_initial_state,
-            spec_slots: &schedule,
-            checkpoints: &pairs,
-            emit_all_query_tokens: true,
-        }]);
+        let step_res = engine.step_batch_slices_for_sampler(
+            &[EngineBatchSlice {
+                tokens: &verify,
+                ctx_len_before: before,
+                block_table: &seq.radix_state.kv_pages,
+                state_in_slot: tx.committed_slot,
+                state_out_slot: *schedule.last().unwrap(),
+                has_initial_state: seq.radix_state.has_initial_state,
+                spec_slots: &schedule,
+                checkpoints: &pairs,
+                emit_all_query_tokens: true,
+            }],
+            None,
+            use_gpu_sampler,
+        );
         let out = match step_res {
             Ok(v) => v,
             Err(e) => {
@@ -340,8 +342,8 @@ impl NativeProposer {
                 return Err(e);
             }
         };
-        let (decision, round_lps) = if use_gpu_sampler {
-            match engine.verify_speculative_gpu_step(sampler, &drafts) {
+        let (decision, round_lps) = if let Some(prepared) = prepared_sampler {
+            match engine.verify_speculative_gpu_prepared(prepared, sampler, &drafts) {
                 Ok(v) => v,
                 Err(e) => {
                     if !tx.spec_slots.is_empty() {
@@ -545,7 +547,7 @@ impl NativeProposer {
                 t.device.make_current()?;
                 check_rc(
                     // SAFETY: `src` holds at least `pending_ingest_rows` rows from slot 0's
-                    // last verify round, and `captured_verify_hidden` holds `(k+1)` rows.
+                    // last verify round, and `captured_verify_hidden` holds `(k+1)` rows on `t.stream`.
                     unsafe {
                         ffi::w34_memcpy_d2d_async(
                             dst as *mut _,
@@ -556,7 +558,6 @@ impl NativeProposer {
                     },
                     "promote single proposer slot 0 hidden copy",
                 )?;
-                t.stream.synchronize()?;
             }
         }
         self.mtp_batch_active_slot = 0;
@@ -733,6 +734,7 @@ impl NativeProposer {
         struct PreparedItem {
             slot: usize,
             drafts: Vec<i32>,
+            prepared_sampler: Option<crate::model::PreparedSpecSamplerRows>,
             verify: Vec<i32>,
             tx: StateTx,
             schedule: Vec<i32>,
@@ -814,8 +816,19 @@ impl NativeProposer {
             }
         }
 
+        let any_gpu_sampler = items.iter().any(|(_, _, _, sampler)| {
+            !sampler.params.is_plain_greedy(sampler.constraint.is_some())
+        });
+
+        struct ProposedSlot {
+            slot: usize,
+            anchor: i32,
+            drafts: Vec<i32>,
+            prepared_sampler: Option<crate::model::PreparedSpecSamplerRows>,
+            extras: Vec<i32>,
+        }
         // Pass 1: run proposer draft forwards for each active item using its reserved state slots.
-        let mut proposed: Vec<(usize, i32, Vec<i32>, Vec<i32>)> = Vec::with_capacity(batch_len);
+        let mut proposed: Vec<ProposedSlot> = Vec::with_capacity(batch_len);
         let propose_res: Result<()> = (|| {
             for ((slot, seq, pending_ingest, sampler), slot_extras) in
                 items.iter_mut().zip(all_extras.iter_mut())
@@ -863,11 +876,33 @@ impl NativeProposer {
                 }) {
                     drafts.truncate(eos);
                 }
+                let prepared_sampler = if any_gpu_sampler {
+                    match crate::model::PreparedSpecSamplerRows::prepare_drafts(
+                        engine.cfg.vocab_size,
+                        &engine.cfg.eos_token_ids,
+                        sampler,
+                        &mut drafts,
+                    ) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            engine.free_state_slots(&extras);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    None
+                };
                 if extras.len() > drafts.len() {
                     let excess = extras.split_off(drafts.len());
                     engine.free_state_slots(&excess);
                 }
-                proposed.push((slot, anchor, drafts, extras));
+                proposed.push(ProposedSlot {
+                    slot,
+                    anchor,
+                    drafts,
+                    prepared_sampler,
+                    extras,
+                });
             }
             Ok(())
         })();
@@ -875,15 +910,25 @@ impl NativeProposer {
             for extras in &all_extras {
                 engine.free_state_slots(extras);
             }
-            for (_, _, _, extras) in &proposed {
-                engine.free_state_slots(extras);
+            for item in &proposed {
+                engine.free_state_slots(&item.extras);
             }
             return Err(e);
         }
 
         // Pass 2: infallibly assemble `StateTx` schedules. Every fallible operation after this
         // point runs inside `res` so any error triggers deterministic `StateTx` cleanup.
-        for ((_, seq, _, _), (slot, anchor, drafts, extras)) in items.iter_mut().zip(proposed) {
+        for (
+            (_, seq, _, _),
+            ProposedSlot {
+                slot,
+                anchor,
+                drafts,
+                prepared_sampler,
+                extras,
+            },
+        ) in items.iter_mut().zip(proposed)
+        {
             let mut tx = StateTx::new(seq.radix_state.active_state_slot);
             tx.commit_prefill(seq.radix_state.token_ids.len());
             let schedule = if !drafts.is_empty() {
@@ -907,6 +952,7 @@ impl NativeProposer {
             prepared.push(PreparedItem {
                 slot,
                 drafts,
+                prepared_sampler,
                 verify,
                 tx,
                 schedule,
@@ -936,21 +982,24 @@ impl NativeProposer {
                         emit_all_query_tokens: true,
                     })
                     .collect();
-                let res = engine.step_batch_slices(&slices);
+                let res = engine.step_batch_slices_for_sampler(&slices, None, any_gpu_sampler);
                 engine.clear_slice_lora_ids();
                 res?
             };
 
-            let any_gpu_sampler = items.iter().any(|(_, _, _, sampler)| {
-                !sampler.params.is_plain_greedy(sampler.constraint.is_some())
-            });
             let decisions = if any_gpu_sampler {
-                let pairs: Vec<(&SamplerV1, &[i32])> = items
-                    .iter()
-                    .zip(&prepared)
-                    .map(|((_, _, _, sampler), prep)| (&**sampler, prep.drafts.as_slice()))
+                let pairs: Vec<(crate::model::PreparedSpecSamplerRows, &[i32])> = prepared
+                    .iter_mut()
+                    .map(|prep| {
+                        (
+                            prep.prepared_sampler
+                                .take()
+                                .expect("prepared_sampler present when any_gpu_sampler"),
+                            prep.drafts.as_slice(),
+                        )
+                    })
                     .collect();
-                engine.verify_batched_speculative_gpu_steps(&pairs)?
+                engine.verify_batched_speculative_gpu_prepared(pairs)?
             } else {
                 let mut ds = Vec::with_capacity(items.len());
                 for (idx, prep) in prepared.iter().enumerate() {
@@ -987,10 +1036,6 @@ impl NativeProposer {
                         "batched proposer verify hidden copy",
                     )?;
                 }
-            }
-            for t in &engine.ranks {
-                t.device.make_current()?;
-                t.stream.synchronize()?;
             }
 
             let mut all_emitted = Vec::with_capacity(items.len());

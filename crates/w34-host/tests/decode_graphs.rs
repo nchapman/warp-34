@@ -212,3 +212,141 @@ fn pipelined_fast_greedy_burst_matches_single_and_handles_staggered_finish_and_c
             state.worker.shutdown().await.unwrap();
         });
 }
+
+#[test]
+fn batched_spec_verify_graphs_match_eager_uniform_and_nonuniform() {
+    if common::require_or_skip_cached_model(
+        "Qwen/Qwen3.5-4B",
+        "batched_spec_verify_graphs_match_eager_uniform_and_nonuniform",
+    )
+    .is_none()
+    {
+        return;
+    }
+    let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for tp in [1, 2] {
+        let mut engine =
+            Qwen3_5Engine::load("Qwen/Qwen3.5-4B", tp, KvFormatPolicy::Tq4, Some(64), true)
+                .unwrap();
+        let shapes: &[&[usize]] = &[&[3, 3], &[2, 4], &[2, 3, 2]];
+        for shape in shapes {
+            let b = shape.len();
+            let eager_pages: Vec<Vec<i32>> = (0..b)
+                .map(|_| vec![engine.alloc_kv_page().unwrap()])
+                .collect();
+            let graph_pages: Vec<Vec<i32>> = (0..b)
+                .map(|_| vec![engine.alloc_kv_page().unwrap()])
+                .collect();
+            let eager_base: Vec<i32> = (0..b).map(|_| engine.alloc_state_slot().unwrap()).collect();
+            let graph_base: Vec<i32> = (0..b).map(|_| engine.alloc_state_slot().unwrap()).collect();
+
+            // Seed identical 1-token initial KV + GDN state for eager and graph slots.
+            let seed_tokens: Vec<i32> = (0..b).map(|i| 500 + (i * 19) as i32).collect();
+            engine.use_cuda_graph = false;
+            let seed_eager: Vec<_> = (0..b)
+                .map(|i| EngineBatchSlice {
+                    tokens: &seed_tokens[i..i + 1],
+                    ctx_len_before: 0,
+                    block_table: &eager_pages[i],
+                    state_in_slot: eager_base[i],
+                    state_out_slot: eager_base[i],
+                    has_initial_state: false,
+                    spec_slots: &[],
+                    checkpoints: &[],
+                    emit_all_query_tokens: false,
+                })
+                .collect();
+            let seed_graph: Vec<_> = (0..b)
+                .map(|i| EngineBatchSlice {
+                    tokens: &seed_tokens[i..i + 1],
+                    ctx_len_before: 0,
+                    block_table: &graph_pages[i],
+                    state_in_slot: graph_base[i],
+                    state_out_slot: graph_base[i],
+                    has_initial_state: false,
+                    spec_slots: &[],
+                    checkpoints: &[],
+                    emit_all_query_tokens: false,
+                })
+                .collect();
+            assert_eq!(
+                engine.step_batch_slices(&seed_eager).unwrap(),
+                engine.step_batch_slices(&seed_graph).unwrap()
+            );
+
+            let eager_sched: Vec<Vec<i32>> = (0..b)
+                .map(|i| {
+                    let mut v = vec![eager_base[i]];
+                    for _ in 1..shape[i] {
+                        v.push(engine.alloc_state_slot().unwrap());
+                    }
+                    v
+                })
+                .collect();
+            let graph_sched: Vec<Vec<i32>> = (0..b)
+                .map(|i| {
+                    let mut v = vec![graph_base[i]];
+                    for _ in 1..shape[i] {
+                        v.push(engine.alloc_state_slot().unwrap());
+                    }
+                    v
+                })
+                .collect();
+            let query_tokens: Vec<Vec<i32>> = (0..b)
+                .map(|i| {
+                    (0..shape[i])
+                        .map(|j| 900 + (i * 31 + j * 7) as i32)
+                        .collect()
+                })
+                .collect();
+
+            engine.use_cuda_graph = false;
+            let eager_slices: Vec<_> = (0..b)
+                .map(|i| EngineBatchSlice {
+                    tokens: &query_tokens[i],
+                    ctx_len_before: 1,
+                    block_table: &eager_pages[i],
+                    state_in_slot: eager_base[i],
+                    state_out_slot: *eager_sched[i].last().unwrap(),
+                    has_initial_state: true,
+                    spec_slots: &eager_sched[i],
+                    checkpoints: &[],
+                    emit_all_query_tokens: true,
+                })
+                .collect();
+            let eager_out = engine.step_batch_slices(&eager_slices).unwrap();
+
+            engine.use_cuda_graph = true;
+            let graph_slices: Vec<_> = (0..b)
+                .map(|i| EngineBatchSlice {
+                    tokens: &query_tokens[i],
+                    ctx_len_before: 1,
+                    block_table: &graph_pages[i],
+                    state_in_slot: graph_base[i],
+                    state_out_slot: *graph_sched[i].last().unwrap(),
+                    has_initial_state: true,
+                    spec_slots: &graph_sched[i],
+                    checkpoints: &[],
+                    emit_all_query_tokens: true,
+                })
+                .collect();
+            let graph_out = engine.step_batch_slices(&graph_slices).unwrap();
+            assert_eq!(graph_out, eager_out, "tp={tp} shape={shape:?}");
+
+            for pages in eager_pages.into_iter().chain(graph_pages) {
+                engine.free_kv_pages(&pages);
+            }
+            let freed: Vec<i32> = eager_sched
+                .into_iter()
+                .flatten()
+                .chain(graph_sched.into_iter().flatten())
+                .collect();
+            engine.free_state_slots(&freed);
+        }
+        assert_eq!(
+            engine.captured_batched_spec_verify_graph_shapes(),
+            vec![(2, 6, 3, false), (2, 6, 4, false), (3, 7, 3, false)],
+            "expected batched spec_verify graph shapes captured on tp={tp}"
+        );
+    }
+}

@@ -3,74 +3,282 @@
 use super::*;
 
 /// Static device buffers used by [`Qwen3_5ModelRank`] for `M=1` single-request decode.
+///
+/// Packs all 8 per-token `i32` inputs (`[token_id, pos, ctx_before, seq_after, write_slot,
+/// state_in, state_out, token_lora_id]`, `32 B`) into `meta_i32` and all 12 scalar/top-5
+/// readback words (`[greedy_id, local_max_val, top5_ids[5], top5_logprobs[5]]`, `48 B`) into
+/// `out_pack`, cutting `decode_one_token` and `step_tokens` from 9–10 pageable transfers and
+/// 4 syncs to a single pinned H2D + delta `block_table` update + single pinned D2H.
 #[cfg(feature = "cuda")]
 pub struct DecodeGraphIo {
-    pub token_ids: DeviceBuffer,
-    pub positions: DeviceBuffer,
+    pub meta_i32: DeviceBuffer,
     pub q_start_loc: DeviceBuffer,
-    pub ctx_lens_before: DeviceBuffer,
-    pub seq_lens_after: DeviceBuffer,
     pub block_tables: DeviceBuffer,
-    pub write_slot_mapping: DeviceBuffer,
-    pub state_in_indices: DeviceBuffer,
-    pub state_out_indices: DeviceBuffer,
     pub has_initial_state: DeviceBuffer,
-    pub out_greedy_id: DeviceBuffer,
-    pub out_top5_ids: DeviceBuffer,
-    pub out_top5_logprobs: DeviceBuffer,
-    pub local_max_val: DeviceBuffer,
+    pub out_pack: DeviceBuffer,
     pub local_max_id: DeviceBuffer,
     pub global_max_val: DeviceBuffer,
     pub global_max_id: DeviceBuffer,
-    pub token_lora_ids: DeviceBuffer,
+    pub cached_block_table: std::sync::Mutex<Vec<i32>>,
     pub max_blocks_per_req: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl DecodeGraphIo {
+    pub const META_I32_LEN: usize = 8;
+    pub const OUT_PACK_WORDS: usize = 12;
+
     pub fn new(device_id: i32, max_blocks_per_req: usize, stream: &CudaStream) -> Result<Self> {
-        let token_ids = DeviceBuffer::alloc(device_id, 4)?;
-        let positions = DeviceBuffer::alloc(device_id, 4)?;
+        let meta_i32 = DeviceBuffer::alloc(device_id, Self::META_I32_LEN * 4)?;
+        meta_i32.copy_from_host(
+            &[0, 0, 0, 1, 0, 0, 0, crate::lora::BASE_MODEL_LORA_ID],
+            stream,
+        )?;
         let q_start_loc = DeviceBuffer::alloc(device_id, 8)?;
         q_start_loc.copy_from_host(&[0i32, 1], stream)?;
-        let ctx_lens_before = DeviceBuffer::alloc(device_id, 4)?;
-        let seq_lens_after = DeviceBuffer::alloc(device_id, 4)?;
-        let block_tables = DeviceBuffer::alloc(device_id, max_blocks_per_req * 4)?;
-        let write_slot_mapping = DeviceBuffer::alloc(device_id, 4)?;
-        let state_in_indices = DeviceBuffer::alloc(device_id, 4)?;
-        let state_out_indices = DeviceBuffer::alloc(device_id, 4)?;
+        let block_tables = DeviceBuffer::alloc(device_id, max_blocks_per_req.max(1) * 4)?;
         let has_initial_state = DeviceBuffer::alloc(device_id, 4)?;
         has_initial_state.copy_from_host(&[1u8, 0, 0, 0], stream)?;
-        let out_greedy_id = DeviceBuffer::alloc(device_id, 4)?;
-        let out_top5_ids = DeviceBuffer::alloc(device_id, 5 * 4)?;
-        let out_top5_logprobs = DeviceBuffer::alloc(device_id, 5 * 4)?;
-        let local_max_val = DeviceBuffer::alloc(device_id, 4)?;
+        let out_pack = DeviceBuffer::alloc(device_id, Self::OUT_PACK_WORDS * 4)?;
         let local_max_id = DeviceBuffer::alloc(device_id, 4)?;
         let global_max_val = DeviceBuffer::alloc(device_id, 4)?;
         let global_max_id = DeviceBuffer::alloc(device_id, 4)?;
-        let token_lora_ids = DeviceBuffer::alloc(device_id, 4)?;
-        token_lora_ids.copy_from_host(&[crate::lora::BASE_MODEL_LORA_ID], stream)?;
         Ok(Self {
-            token_ids,
-            positions,
+            meta_i32,
             q_start_loc,
-            ctx_lens_before,
-            seq_lens_after,
             block_tables,
-            write_slot_mapping,
-            state_in_indices,
-            state_out_indices,
             has_initial_state,
-            out_greedy_id,
-            out_top5_ids,
-            out_top5_logprobs,
-            local_max_val,
+            out_pack,
             local_max_id,
             global_max_val,
             global_max_id,
-            token_lora_ids,
-            max_blocks_per_req,
+            cached_block_table: std::sync::Mutex::new(Vec::new()),
+            max_blocks_per_req: max_blocks_per_req.max(1),
         })
+    }
+
+    #[inline]
+    pub fn token_ids_ptr(&self) -> u64 {
+        self.meta_i32.addr()
+    }
+    #[inline]
+    pub fn positions_ptr(&self) -> u64 {
+        self.meta_i32.addr() + 4
+    }
+    #[inline]
+    pub fn ctx_lens_before_ptr(&self) -> u64 {
+        self.meta_i32.addr() + 8
+    }
+    #[inline]
+    pub fn seq_lens_after_ptr(&self) -> u64 {
+        self.meta_i32.addr() + 12
+    }
+    #[inline]
+    pub fn write_slot_mapping_ptr(&self) -> u64 {
+        self.meta_i32.addr() + 16
+    }
+    #[inline]
+    pub fn state_in_indices_ptr(&self) -> u64 {
+        self.meta_i32.addr() + 20
+    }
+    #[inline]
+    pub fn state_out_indices_ptr(&self) -> u64 {
+        self.meta_i32.addr() + 24
+    }
+    #[inline]
+    pub fn token_lora_ids_ptr(&self) -> u64 {
+        self.meta_i32.addr() + 28
+    }
+    #[inline]
+    pub fn out_greedy_id_ptr(&self) -> u64 {
+        self.out_pack.addr()
+    }
+    #[inline]
+    pub fn local_max_val_ptr(&self) -> u64 {
+        self.out_pack.addr() + 4
+    }
+    #[inline]
+    pub fn out_top5_ids_ptr(&self) -> u64 {
+        self.out_pack.addr() + 8
+    }
+    #[inline]
+    pub fn out_top5_logprobs_ptr(&self) -> u64 {
+        self.out_pack.addr() + 28
+    }
+
+    /// Uploads the 8-word decode metadata + any changed `block_table` suffix through `pinned`
+    /// (`BatchedDecodeGraphIo` slot 0) in at most 1–2 pinned async H2D copies.
+    pub fn upload_step_pinned(
+        &self,
+        meta: &[i32; Self::META_I32_LEN],
+        block_table: &[i32],
+        pinned: &BatchedDecodeGraphIo,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        if block_table.len() > self.max_blocks_per_req {
+            return Err(loader_err(
+                "decode_one_token block_table exceeds max_blocks_per_req",
+            ));
+        }
+        let delta_start = {
+            let guard = self.cached_block_table.lock().unwrap();
+            if guard.as_slice() == block_table {
+                None
+            } else if block_table.starts_with(guard.as_slice()) {
+                Some(guard.len())
+            } else {
+                Some(0)
+            }
+        };
+        let tail = delta_start.map_or(&[][..], |idx| &block_table[idx..]);
+        let meta_bytes = Self::META_I32_LEN * 4;
+        let bt_off = 64usize;
+        let tail_bytes = tail.len() * 4;
+        if bt_off + tail_bytes <= BatchedDecodeGraphIo::PINNED_META_BYTES {
+            if pinned
+                .pinned_in_flight
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                stream.synchronize()?;
+            }
+            let base = pinned.pinned_staging.host_ptr.cast::<u8>();
+            // SAFETY: `bt_off + tail_bytes <= PINNED_META_BYTES <= pinned_staging.len_bytes`,
+            // and any prior slot-0 pinned transfer was synchronized above.
+            unsafe {
+                core::ptr::copy_nonoverlapping(meta.as_ptr().cast::<u8>(), base, meta_bytes);
+                if tail_bytes > 0 {
+                    core::ptr::copy_nonoverlapping(
+                        tail.as_ptr().cast::<u8>(),
+                        base.add(bt_off),
+                        tail_bytes,
+                    );
+                }
+                pinned
+                    .pinned_in_flight
+                    .store(true, std::sync::atomic::Ordering::Release);
+                check_rc(
+                    ffi::w34_memcpy_h2d_async(
+                        self.meta_i32.addr() as *mut c_void,
+                        base.cast(),
+                        meta_bytes,
+                        stream.handle,
+                    ),
+                    "upload pinned DecodeGraphIo meta",
+                )?;
+                if let Some(start_idx) = delta_start
+                    && tail_bytes > 0
+                {
+                    let res = check_rc(
+                        ffi::w34_memcpy_h2d_async(
+                            (self.block_tables.addr() + (start_idx * 4) as u64) as *mut c_void,
+                            base.add(bt_off).cast(),
+                            tail_bytes,
+                            stream.handle,
+                        ),
+                        "upload pinned DecodeGraphIo block_table delta",
+                    );
+                    if let Err(e) = res {
+                        self.cached_block_table.lock().unwrap().clear();
+                        return Err(e);
+                    }
+                }
+            }
+        } else {
+            self.meta_i32.copy_from_host(meta, stream)?;
+            if delta_start.is_some() {
+                self.block_tables.copy_from_host(block_table, stream)?;
+            }
+        }
+        if delta_start.is_some() {
+            let mut guard = self.cached_block_table.lock().unwrap();
+            guard.clear();
+            guard.extend_from_slice(block_table);
+        }
+        Ok(())
+    }
+
+    pub fn read_greedy_id_pinned(
+        &self,
+        pinned: &BatchedDecodeGraphIo,
+        stream: &CudaStream,
+    ) -> Result<i32> {
+        let pout = unsafe {
+            // SAFETY: `PINNED_PIPELINE_OUT_OFFSET` lies within slot 0 (`PINNED_SLOT_BYTES`)
+            // at a 32 KiB-aligned boundary and holds >= 4 bytes.
+            pinned
+                .pinned_staging
+                .host_ptr
+                .cast::<u8>()
+                .add(BatchedDecodeGraphIo::PINNED_PIPELINE_OUT_OFFSET)
+        };
+        check_rc(
+            // SAFETY: `out_greedy_id_ptr` and `pout` both span 4 bytes on `stream`.
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    pout.cast(),
+                    self.out_greedy_id_ptr() as *const c_void,
+                    4,
+                    stream.handle,
+                )
+            },
+            "copy pinned DecodeGraphIo greedy id",
+        )?;
+        stream.synchronize()?;
+        pinned
+            .pinned_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        // SAFETY: `stream.synchronize()` completed the 4-byte D2H into aligned `pout`.
+        Ok(unsafe { core::ptr::read(pout.cast::<i32>()) })
+    }
+
+    pub fn read_step_outputs_pinned(
+        &self,
+        pinned: &BatchedDecodeGraphIo,
+        stream: &CudaStream,
+    ) -> Result<(i32, f32, [i32; 5], [f32; 5])> {
+        let bytes = Self::OUT_PACK_WORDS * 4;
+        let pout = unsafe {
+            // SAFETY: `PINNED_PIPELINE_OUT_OFFSET` has 32 KiB capacity (`>= 48 B`) at 64-byte alignment.
+            pinned
+                .pinned_staging
+                .host_ptr
+                .cast::<u8>()
+                .add(BatchedDecodeGraphIo::PINNED_PIPELINE_OUT_OFFSET)
+        };
+        check_rc(
+            // SAFETY: `out_pack` and `pout` both span 48 bytes on `stream`.
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    pout.cast(),
+                    self.out_pack.addr() as *const c_void,
+                    bytes,
+                    stream.handle,
+                )
+            },
+            "copy pinned DecodeGraphIo step outputs",
+        )?;
+        stream.synchronize()?;
+        pinned
+            .pinned_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut words = [0u32; Self::OUT_PACK_WORDS];
+        // SAFETY: `stream.synchronize()` completed the 48-byte D2H into aligned `pout`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pout.cast::<u32>(),
+                words.as_mut_ptr(),
+                Self::OUT_PACK_WORDS,
+            );
+        }
+        let greedy_id = words[0] as i32;
+        let local_max = f32::from_bits(words[1]);
+        let mut top5_ids = [0i32; 5];
+        let mut top5_lps = [0.0f32; 5];
+        for i in 0..5 {
+            top5_ids[i] = words[2 + i] as i32;
+            top5_lps[i] = f32::from_bits(words[7 + i]);
+        }
+        Ok((greedy_id, local_max, top5_ids, top5_lps))
     }
 }
 
@@ -212,6 +420,162 @@ impl SpecVerifyGraphIo {
     }
 }
 
+pub const MAX_BATCHED_SPEC_REQS: usize = 4;
+pub const MAX_BATCHED_SPEC_TOKENS: usize = 24;
+const BATCHED_SPEC_META_I32_LEN: usize = 4 * MAX_BATCHED_SPEC_TOKENS
+    + MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_TOKENS
+    + 2 * MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_CHECKPOINTS
+    + (MAX_BATCHED_SPEC_REQS + 1)
+    + 4 * MAX_BATCHED_SPEC_REQS;
+
+/// Multi-request (`B in 2..=4`, `total_tokens <= 24`) speculative verification CUDA Graph I/O.
+/// Reuses `BatchedDecodeGraphIo::block_tables` so zero extra KV block-table VRAM is needed.
+#[cfg(feature = "cuda")]
+pub struct BatchedSpecVerifyGraphIo {
+    pub meta_i32: DeviceBuffer,
+    pub has_initial_state: DeviceBuffer,
+    pub out_greedy_ids: DeviceBuffer,
+}
+
+#[cfg(feature = "cuda")]
+impl BatchedSpecVerifyGraphIo {
+    pub fn new(device_id: i32, stream: &CudaStream) -> Result<Self> {
+        let meta_i32 = DeviceBuffer::alloc(device_id, BATCHED_SPEC_META_I32_LEN * 4)?;
+        let has_initial_state = DeviceBuffer::alloc(device_id, MAX_BATCHED_SPEC_REQS)?;
+        has_initial_state.copy_from_host(&[1u8; MAX_BATCHED_SPEC_REQS], stream)?;
+        let out_greedy_ids = DeviceBuffer::alloc(device_id, MAX_BATCHED_SPEC_TOKENS * 4)?;
+        Ok(Self {
+            meta_i32,
+            has_initial_state,
+            out_greedy_ids,
+        })
+    }
+
+    #[inline]
+    pub fn token_ids_ptr(&self) -> u64 {
+        self.meta_i32.addr()
+    }
+    #[inline]
+    pub fn positions_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (MAX_BATCHED_SPEC_TOKENS * 4) as u64
+    }
+    #[inline]
+    pub fn write_slot_mapping_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (2 * MAX_BATCHED_SPEC_TOKENS * 4) as u64
+    }
+    #[inline]
+    pub fn spec_state_indices_ptr(&self) -> u64 {
+        self.meta_i32.addr() + (3 * MAX_BATCHED_SPEC_TOKENS * 4) as u64
+    }
+    #[inline]
+    pub fn checkpoint_dst_indices_ptr(&self) -> u64 {
+        self.spec_state_indices_ptr() + (MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_TOKENS * 4) as u64
+    }
+    #[inline]
+    pub fn checkpoint_token_offsets_ptr(&self) -> u64 {
+        self.checkpoint_dst_indices_ptr()
+            + (MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_CHECKPOINTS * 4) as u64
+    }
+    #[inline]
+    pub fn q_start_loc_ptr(&self) -> u64 {
+        self.checkpoint_token_offsets_ptr()
+            + (MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_CHECKPOINTS * 4) as u64
+    }
+    #[inline]
+    pub fn ctx_lens_before_ptr(&self) -> u64 {
+        self.q_start_loc_ptr() + ((MAX_BATCHED_SPEC_REQS + 1) * 4) as u64
+    }
+    #[inline]
+    pub fn seq_lens_after_ptr(&self) -> u64 {
+        self.ctx_lens_before_ptr() + (MAX_BATCHED_SPEC_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn state_in_indices_ptr(&self) -> u64 {
+        self.seq_lens_after_ptr() + (MAX_BATCHED_SPEC_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn state_out_indices_ptr(&self) -> u64 {
+        self.state_in_indices_ptr() + (MAX_BATCHED_SPEC_REQS * 4) as u64
+    }
+    #[inline]
+    pub fn token_lora_ids_ptr(&self) -> u64 {
+        self.state_out_indices_ptr() + (MAX_BATCHED_SPEC_REQS * 4) as u64
+    }
+
+    pub fn pack_meta_with_lora(
+        slices: &[EngineBatchSlice<'_>],
+        max_verify_tokens: usize,
+        slice_lora_ids: Option<&[i32]>,
+        default_lora_id: i32,
+    ) -> Result<[i32; BATCHED_SPEC_META_I32_LEN]> {
+        let num_reqs = slices.len();
+        if !(2..=MAX_BATCHED_SPEC_REQS).contains(&num_reqs)
+            || !(2..=MAX_SPEC_VERIFY_TOKENS).contains(&max_verify_tokens)
+        {
+            return Err(loader_err("invalid geometry for BatchedSpecVerifyGraphIo"));
+        }
+        let mut m = [-1i32; BATCHED_SPEC_META_I32_LEN];
+        let pos_base = MAX_BATCHED_SPEC_TOKENS;
+        let ws_base = 2 * MAX_BATCHED_SPEC_TOKENS;
+        let spec_base = 3 * MAX_BATCHED_SPEC_TOKENS;
+        let cp_dst_base = spec_base + MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_TOKENS;
+        let cp_off_base = cp_dst_base + MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_CHECKPOINTS;
+        let q_base = cp_off_base + MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_CHECKPOINTS;
+        let cb_base = q_base + MAX_BATCHED_SPEC_REQS + 1;
+        let sa_base = cb_base + MAX_BATCHED_SPEC_REQS;
+        let si_base = sa_base + MAX_BATCHED_SPEC_REQS;
+        let so_base = si_base + MAX_BATCHED_SPEC_REQS;
+        let lora_base = so_base + MAX_BATCHED_SPEC_REQS;
+        m[lora_base..lora_base + MAX_BATCHED_SPEC_TOKENS].fill(crate::lora::BASE_MODEL_LORA_ID);
+
+        let mut cursor = 0usize;
+        m[q_base] = 0;
+        for (r, s) in slices.iter().enumerate() {
+            let q_len = s.tokens.len();
+            let seq_after = s
+                .ctx_len_before
+                .checked_add(q_len)
+                .ok_or_else(|| loader_err("batched spec_verify sequence length overflow"))?;
+            if q_len == 0
+                || q_len > max_verify_tokens
+                || cursor + q_len > MAX_BATCHED_SPEC_TOKENS
+                || s.spec_slots.len() != q_len
+                || s.checkpoints.len() > MAX_SPEC_VERIFY_CHECKPOINTS
+                || s.block_table.len() < seq_after.div_ceil(16)
+            {
+                return Err(loader_err(
+                    "slice exceeds BatchedSpecVerifyGraphIo metadata capacity",
+                ));
+            }
+            let lid = slice_lora_ids
+                .and_then(|ids| ids.get(r).copied())
+                .unwrap_or(default_lora_id);
+            m[cursor..cursor + q_len].copy_from_slice(s.tokens);
+            for step in 0..q_len {
+                let pos = s.ctx_len_before + step;
+                m[pos_base + cursor + step] = pos as i32;
+                m[ws_base + cursor + step] = s.block_table[pos / 16] * 16 + ((pos % 16) as i32);
+                m[lora_base + cursor + step] = lid;
+            }
+            // Note: `w34_gdn_recurrent_strided_f16` indexes `spec_state_indices` at
+            // `r * max_verify_tokens + step`, so pack with dynamic pitch `max_verify_tokens`.
+            m[spec_base + r * max_verify_tokens..spec_base + r * max_verify_tokens + q_len]
+                .copy_from_slice(s.spec_slots);
+            for (e, &(trig_off, dst_slot)) in s.checkpoints.iter().enumerate() {
+                m[cp_dst_base + r * MAX_SPEC_VERIFY_CHECKPOINTS + e] = dst_slot;
+                m[cp_off_base + r * MAX_SPEC_VERIFY_CHECKPOINTS + e] = trig_off;
+            }
+            cursor += q_len;
+            m[q_base + r + 1] = cursor as i32;
+            m[cb_base + r] = s.ctx_len_before as i32;
+            m[sa_base + r] = seq_after as i32;
+            m[si_base + r] = s.state_in_slot;
+            m[so_base + r] = s.state_out_slot;
+        }
+        Ok(m)
+    }
+}
+
 pub const MAX_BATCHED_DECODE_REQS: usize = 16;
 pub const DECODE_GRAPH_BUCKETS: [usize; 5] = [1, 2, 4, 8, 16];
 const BATCHED_DECODE_META_I32_LEN: usize = 11 * MAX_BATCHED_DECODE_REQS + 1;
@@ -231,11 +595,37 @@ pub fn decode_graph_bucket(num_reqs: usize) -> Option<usize> {
 
 /// Sampler mode captured inside a `batched_decode_graph`.
 #[cfg(feature = "cuda")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DecodeGraphSampleMode {
     LogitsOnly,
     PlainGreedy,
     FastGreedy,
+}
+
+/// LoRA dispatch mode baked into a captured CUDA Graph.
+///
+/// - `BaseOnly`: all batch rows use the base model (`lora_id < 0`); zero LoRA kernels are launched.
+/// - `Uniform(lid)`: all batch rows share adapter `lid >= 0`; `set_uniform(lid)` skips inactive
+///   projections (`(adapter_mask >> lid) & 1 == 0`) and unlocks cuBLAS for `rows >= 8, rank_pad >= 64`.
+/// - `Mixed`: batch rows span distinct adapters and read `token_lora_ids` from device memory.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GraphLoraMode {
+    BaseOnly,
+    Uniform(i32),
+    Mixed,
+}
+
+#[cfg(feature = "cuda")]
+impl GraphLoraMode {
+    #[inline]
+    pub fn from_single(lora_id: i32) -> Self {
+        if lora_id < 0 {
+            Self::BaseOnly
+        } else {
+            Self::Uniform(lora_id)
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -279,9 +669,9 @@ impl BatchedDecodeGraphIo {
     pub const MAX_FAST_GREEDY_SPARSE: usize = MAX_BATCHED_DECODE_REQS * 32;
     pub const PINNED_META_BYTES: usize = 160 * 1024;
     pub const PINNED_SAMPLER_OFFSET: usize = 160 * 1024;
-    pub const PINNED_SAMPLER_BYTES: usize = 96 * 1024;
-    pub const PINNED_PIPELINE_OUT_OFFSET: usize = 224 * 1024;
+    pub const PINNED_SAMPLER_BYTES: usize = 576 * 1024;
     pub const PINNED_SLOT_BYTES: usize = Self::PINNED_META_BYTES + Self::PINNED_SAMPLER_BYTES;
+    pub const PINNED_PIPELINE_OUT_OFFSET: usize = Self::PINNED_SLOT_BYTES - 32 * 1024;
 
     pub fn new(device_id: i32, max_blocks_per_req: usize, _stream: &CudaStream) -> Result<Self> {
         let max_blocks = max_blocks_per_req.max(1);
@@ -330,7 +720,7 @@ impl BatchedDecodeGraphIo {
             pinned_staging,
             pinned_in_flight: std::sync::atomic::AtomicBool::new(false),
             pinned_sampler_in_flight: std::sync::atomic::AtomicBool::new(false),
-            cached_block_tables: std::sync::Mutex::new(Vec::new()),
+            cached_block_tables: std::sync::Mutex::new(vec![Vec::new(); MAX_BATCHED_DECODE_REQS]),
             cached_fast_greedy_cfgs: std::sync::Mutex::new(Vec::new()),
             cached_fast_greedy_sparse: std::sync::Mutex::new(Vec::new()),
             pipeline_done_events,
@@ -491,24 +881,19 @@ impl BatchedDecodeGraphIo {
         self.upload_inputs_slot(0, meta, masks, slices, false, false, stream)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn upload_inputs_slot(
+    /// Uploads changed per-row `block_table` spans into `self.block_tables` using compact
+    /// pinned staging decoupled from `max_blocks_per_req` row pitch.
+    pub fn upload_block_tables_slot(
         &self,
         slot: usize,
-        meta: &[i32; BATCHED_DECODE_META_I32_LEN],
-        masks: &[u8; BATCHED_DECODE_MASKS_U8_LEN],
+        pinned_byte_offset: usize,
         slices: &[EngineBatchSlice<'_>],
-        tokens_already_on_device: bool,
-        pipelined: bool,
         stream: &CudaStream,
     ) -> Result<()> {
         let slot = slot & 1;
-        let meta_bytes = BATCHED_DECODE_META_I32_LEN * 4;
-        if Self::META_AND_MASKS_BYTES > self.meta_i32.len_bytes {
-            return Err(loader_err("batched decode meta_i32 buffer too small"));
+        if slices.len() > MAX_BATCHED_DECODE_REQS {
+            return Err(loader_err("too many slices for BatchedDecodeGraphIo"));
         }
-        let masks_off = Self::MASKS_DEV_OFFSET;
-        let bt_off = (Self::META_AND_MASKS_BYTES + 63) & !63;
         let row_bytes = self.max_blocks_per_req * 4;
         let mut last_bt_end = 0usize;
         for (r, s) in slices.iter().enumerate() {
@@ -524,19 +909,148 @@ impl BatchedDecodeGraphIo {
         if last_bt_end > self.block_tables.len_bytes {
             return Err(loader_err("batched decode block_tables buffer too small"));
         }
-        let bt_unchanged = {
+        // Compute per-row dirty spans (`(row_idx, start_page_idx, tail_slice)`) against cached GPU state.
+        let mut dirty_spans: Vec<(usize, usize, &[i32])> = Vec::new();
+        let mut compact_bytes = 0usize;
+        {
             let guard = self.cached_block_tables.lock().unwrap();
-            guard.len() == slices.len()
-                && guard
-                    .iter()
-                    .zip(slices)
-                    .all(|(c, s)| c.as_slice() == s.block_table)
-        };
+            for (r, s) in slices.iter().enumerate() {
+                let cached = guard.get(r).map_or(&[][..], Vec::as_slice);
+                if cached == s.block_table {
+                    continue;
+                }
+                let start_idx = if s.block_table.starts_with(cached) {
+                    cached.len()
+                } else {
+                    0
+                };
+                let tail = &s.block_table[start_idx..];
+                if !tail.is_empty() {
+                    compact_bytes += tail.len() * 4;
+                    dirty_spans.push((r, start_idx, tail));
+                }
+            }
+        }
+        if dirty_spans.is_empty() {
+            return Ok(());
+        }
         let slot_end = (slot + 1) * Self::PINNED_SLOT_BYTES;
-        if bt_off + last_bt_end <= Self::PINNED_META_BYTES
+        let bt_base = self.block_tables.addr();
+        if pinned_byte_offset + compact_bytes <= Self::PINNED_META_BYTES
             && slot_end <= self.pinned_staging.len_bytes
         {
-            let _ = pipelined;
+            // SAFETY: `slot` is masked to `0..=1`, `slot_end <= pinned_staging.len_bytes`, and
+            // `pinned_byte_offset + compact_bytes <= PINNED_META_BYTES`. Caller already waited
+            // any prior slot-0 transfer before staging into slot 0.
+            unsafe {
+                let base = self
+                    .pinned_staging
+                    .host_ptr
+                    .cast::<u8>()
+                    .add(slot * Self::PINNED_SLOT_BYTES + pinned_byte_offset);
+                let mut cur_off = 0usize;
+                for &(_, _, tail) in &dirty_spans {
+                    let b = tail.len() * 4;
+                    core::ptr::copy_nonoverlapping(
+                        tail.as_ptr().cast::<u8>(),
+                        base.add(cur_off),
+                        b,
+                    );
+                    cur_off += b;
+                }
+                if slot == 0 {
+                    self.pinned_in_flight
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                let mut cur_off = 0usize;
+                for &(r, start_idx, tail) in &dirty_spans {
+                    let b = tail.len() * 4;
+                    let dst = bt_base + (r * row_bytes + start_idx * 4) as u64;
+                    if let Err(e) = check_rc(
+                        ffi::w34_memcpy_h2d_async(
+                            dst as *mut c_void,
+                            base.add(cur_off).cast(),
+                            b,
+                            stream.handle,
+                        ),
+                        "upload pinned compact block_table span",
+                    ) {
+                        let mut guard = self.cached_block_tables.lock().unwrap();
+                        for &(dr, _, _) in &dirty_spans {
+                            if let Some(c) = guard.get_mut(dr) {
+                                c.clear();
+                            }
+                        }
+                        return Err(e);
+                    }
+                    cur_off += b;
+                }
+            }
+        } else {
+            for &(r, start_idx, tail) in &dirty_spans {
+                let b = tail.len() * 4;
+                let dst = bt_base + (r * row_bytes + start_idx * 4) as u64;
+                if let Err(e) = check_rc(
+                    // SAFETY: `dst + b <= block_tables.len_bytes` verified above.
+                    unsafe {
+                        ffi::w34_memcpy_h2d_async(
+                            dst as *mut c_void,
+                            tail.as_ptr().cast(),
+                            b,
+                            stream.handle,
+                        )
+                    },
+                    "upload block_table span fallback",
+                ) {
+                    let mut guard = self.cached_block_tables.lock().unwrap();
+                    for &(dr, _, _) in &dirty_spans {
+                        if let Some(c) = guard.get_mut(dr) {
+                            c.clear();
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let mut guard = self.cached_block_tables.lock().unwrap();
+        if guard.len() < MAX_BATCHED_DECODE_REQS {
+            guard.resize_with(MAX_BATCHED_DECODE_REQS, Vec::new);
+        }
+        for &(r, _, _) in &dirty_spans {
+            guard[r].clear();
+            guard[r].extend_from_slice(slices[r].block_table);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_inputs_slot(
+        &self,
+        slot: usize,
+        meta: &[i32; BATCHED_DECODE_META_I32_LEN],
+        masks: &[u8; BATCHED_DECODE_MASKS_U8_LEN],
+        slices: &[EngineBatchSlice<'_>],
+        tokens_already_on_device: bool,
+        pipelined: bool,
+        stream: &CudaStream,
+    ) -> Result<()> {
+        let _ = pipelined;
+        let slot = slot & 1;
+        let meta_bytes = BATCHED_DECODE_META_I32_LEN * 4;
+        if Self::META_AND_MASKS_BYTES > self.meta_i32.len_bytes {
+            return Err(loader_err("batched decode meta_i32 buffer too small"));
+        }
+        let masks_off = Self::MASKS_DEV_OFFSET;
+        let bt_off = (Self::META_AND_MASKS_BYTES + 63) & !63;
+        let h2d_off = if tokens_already_on_device {
+            Self::TOKEN_IDS_BYTES
+        } else {
+            0
+        };
+        let slot_end = (slot + 1) * Self::PINNED_SLOT_BYTES;
+        if Self::META_AND_MASKS_BYTES <= Self::PINNED_META_BYTES
+            && slot_end <= self.pinned_staging.len_bytes
+        {
             if slot == 0
                 && self
                     .pinned_in_flight
@@ -544,25 +1058,14 @@ impl BatchedDecodeGraphIo {
             {
                 stream.synchronize()?;
             }
-            // SAFETY: slot is masked to 0/1 and slot_end is bounded by the owned
-            // pinned allocation above. This computes a pointer, not a host borrow.
-            let base = unsafe {
-                self.pinned_staging
+            // SAFETY: `slot` is masked to 0/1 and `slot_end` is bounded by `pinned_staging.len_bytes`.
+            // `META_AND_MASKS_BYTES <= PINNED_META_BYTES`, independent of `max_blocks_per_req`.
+            unsafe {
+                let base = self
+                    .pinned_staging
                     .host_ptr
                     .cast::<u8>()
-                    .add(slot * Self::PINNED_SLOT_BYTES)
-            };
-            let h2d_off = if tokens_already_on_device {
-                Self::TOKEN_IDS_BYTES
-            } else {
-                0
-            };
-            // SAFETY: the branch bounds metadata/masks and strided block-table
-            // bytes within this slot and the destination device buffers. Host
-            // sources are separate slices. Slot 0's previous upload is waited
-            // above; slot 1 reuse relies on the pipeline caller waiting its ticket.
-            // The &self API/flags alone do not serialize concurrent callers.
-            unsafe {
+                    .add(slot * Self::PINNED_SLOT_BYTES);
                 core::ptr::copy_nonoverlapping(
                     meta.as_ptr().cast::<u8>().add(h2d_off),
                     base.add(h2d_off),
@@ -573,17 +1076,6 @@ impl BatchedDecodeGraphIo {
                     base.add(masks_off),
                     BATCHED_DECODE_MASKS_U8_LEN,
                 );
-                if !bt_unchanged {
-                    for (r, s) in slices.iter().enumerate() {
-                        if !s.block_table.is_empty() {
-                            core::ptr::copy_nonoverlapping(
-                                s.block_table.as_ptr().cast::<u8>(),
-                                base.add(bt_off + r * row_bytes),
-                                s.block_table.len() * 4,
-                            );
-                        }
-                    }
-                }
                 if slot == 0 {
                     self.pinned_in_flight
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -597,28 +1089,11 @@ impl BatchedDecodeGraphIo {
                     ),
                     "upload pinned batched decode meta+masks",
                 )?;
-                if !bt_unchanged && last_bt_end > 0 {
-                    check_rc(
-                        ffi::w34_memcpy_h2d_async(
-                            self.block_tables.addr() as *mut c_void,
-                            base.add(bt_off).cast(),
-                            last_bt_end,
-                            stream.handle,
-                        ),
-                        "upload pinned batched decode block_tables",
-                    )?;
-                }
             }
-            if !bt_unchanged {
-                let mut guard = self.cached_block_tables.lock().unwrap();
-                guard.clear();
-                guard.extend(slices.iter().map(|s| s.block_table.to_vec()));
-            }
-            return Ok(());
+            return self.upload_block_tables_slot(slot, bt_off, slices, stream);
         }
         let mut combined = [0u8; Self::META_AND_MASKS_BYTES];
-        // SAFETY: fixed-size input arrays and combined's constant layout provide
-        // disjoint, in-bounds byte ranges; every i32 byte is initialized.
+        // SAFETY: fixed-size input arrays fit within `combined`'s constant layout.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 meta.as_ptr().cast::<u8>(),
@@ -631,16 +1106,8 @@ impl BatchedDecodeGraphIo {
                 BATCHED_DECODE_MASKS_U8_LEN,
             );
         }
-        let h2d_off = if tokens_already_on_device {
-            Self::TOKEN_IDS_BYTES
-        } else {
-            0
-        };
         check_rc(
-            // SAFETY: the device metadata extent was checked above and h2d_off
-            // skips only token IDs. This fallback uses pageable stack storage,
-            // relying on CUDA's host staging before that storage goes out of scope;
-            // it is not an asynchronously retained pinned source.
+            // SAFETY: `meta_i32` capacity was checked above.
             unsafe {
                 ffi::w34_memcpy_h2d_async(
                     (self.meta_i32.addr() + h2d_off as u64) as *mut c_void,
@@ -651,32 +1118,7 @@ impl BatchedDecodeGraphIo {
             },
             "upload batched decode meta+masks fallback",
         )?;
-        if !bt_unchanged {
-            let bt_base = self.block_tables.addr();
-            for (r, s) in slices.iter().enumerate() {
-                if !s.block_table.is_empty() {
-                    check_rc(
-                        // SAFETY: row and total table byte extents were checked
-                        // above. Engine callers supply ordinary pageable host
-                        // slices here, relying on CUDA host staging; this public
-                        // method does not itself rule out registered/pinned sources.
-                        unsafe {
-                            ffi::w34_memcpy_h2d_async(
-                                (bt_base + (r * row_bytes) as u64) as *mut c_void,
-                                s.block_table.as_ptr().cast(),
-                                s.block_table.len() * 4,
-                                stream.handle,
-                            )
-                        },
-                        "upload batched decode block_table row",
-                    )?;
-                }
-            }
-            let mut guard = self.cached_block_tables.lock().unwrap();
-            guard.clear();
-            guard.extend(slices.iter().map(|s| s.block_table.to_vec()));
-        }
-        Ok(())
+        self.upload_block_tables_slot(slot, bt_off, slices, stream)
     }
 
     pub fn upload_fast_greedy_slot(

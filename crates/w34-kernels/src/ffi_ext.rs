@@ -4,7 +4,10 @@
 use core::ffi::c_void;
 
 #[cfg(feature = "cuda")]
-use super::{W34AttentionBatch, W34Exec, W34GdnBatch, W34KvLayerLayout};
+use super::{
+    W34AttentionBatch, W34Exec, W34GdnBatch, W34KvLayerLayout, W34SamplerRowCfg,
+    W34SamplerSparseEntry,
+};
 
 #[cfg(feature = "cuda")]
 unsafe extern "C" {
@@ -935,5 +938,18 @@ unsafe extern "C" {
         num_adapters: i32,
         default_lora_id: i32,
         adapter_mask: u64,
+    ) -> i32;
+
+    pub fn w34_sampler_shard_fast_greedy_f16(
+        ex: *const W34Exec,
+        logits_f16: *const c_void,
+        row_cfgs: *const W34SamplerRowCfg,
+        bitmask_u32: *const u32,
+        sparse_entries: *const W34SamplerSparseEntry,
+        out_local_vals: *mut f32,
+        out_local_ids: *mut i32,
+        num_rows: i32,
+        local_vocab_size: i32,
+        vocab_offset: i32,
     ) -> i32;
 }

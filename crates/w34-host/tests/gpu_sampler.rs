@@ -1087,3 +1087,397 @@ fn gpu_sampler_back_to_back_reductions_high_warp_only_valid_and_nan() {
         }
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn split_k_greedy_top1_matches_single_cta() {
+    let vocab_size = 248_320usize;
+    let num_rows = 4usize;
+    let mut logits = vec![f32_to_f16(-3.0); num_rows * vocab_size];
+    // Row 0: ties across CTA split boundaries -> lowest index (17_000) wins.
+    logits[17_000] = f32_to_f16(2.0);
+    logits[93_120] = f32_to_f16(2.0);
+    logits[190_000] = f32_to_f16(2.0);
+    // Row 1: winner near end of vocab (248_319).
+    logits[vocab_size + 248_319] = f32_to_f16(7.5);
+    // Row 2: negative-only row, tie at -0.25 -> first index (31_040) wins.
+    logits[2 * vocab_size + 31_040] = f32_to_f16(-0.25);
+    logits[2 * vocab_size + 200_000] = f32_to_f16(-0.25);
+    // Row 3: non-zero `vocab_offset = 124_160`.
+    logits[3 * vocab_size + 55_555] = f32_to_f16(4.25);
+
+    prepare_execution_plan(0).unwrap();
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let mut arena = DeviceArena::new(0, 32 * 1024 * 1024).unwrap();
+    let d_logits = arena.upload_slice(&logits, &stream).unwrap();
+    let d_split_ids = arena.alloc_aligned(num_rows * 4).unwrap();
+    let d_split_vals = arena.alloc_aligned(num_rows * 4).unwrap();
+    let d_single_ids = arena.alloc_aligned(num_rows * 4).unwrap();
+    let d_single_vals = arena.alloc_aligned(num_rows * 4).unwrap();
+    let (ws_ptr, ws_cap) = arena.remaining_workspace();
+    let ex_split = stream.exec(ws_ptr, ws_cap);
+    let ex_single = stream.exec(0, 0);
+    // SAFETY: `d_logits` holds `num_rows * vocab_size` FP16 elements and outputs hold `num_rows` scalars.
+    unsafe {
+        assert_eq!(
+            ffi::w34_sampler_greedy_top5_f16(
+                &ex_split,
+                d_logits as *const c_void,
+                d_split_ids as *mut i32,
+                core::ptr::null_mut(),
+                d_split_vals as *mut f32,
+                num_rows as i32,
+                vocab_size as i32,
+                1000,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_sampler_greedy_top5_f16(
+                &ex_single,
+                d_logits as *const c_void,
+                d_single_ids as *mut i32,
+                core::ptr::null_mut(),
+                d_single_vals as *mut f32,
+                num_rows as i32,
+                vocab_size as i32,
+                1000,
+            ),
+            0
+        );
+    }
+    let mut split_ids = vec![0i32; num_rows];
+    let mut single_ids = vec![0i32; num_rows];
+    let mut split_vals = vec![0f32; num_rows];
+    let mut single_vals = vec![0f32; num_rows];
+    // SAFETY: host buffers match `num_rows * 4` device allocations.
+    unsafe {
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                split_ids.as_mut_ptr().cast(),
+                d_split_ids as *const c_void,
+                num_rows * 4,
+                stream.handle,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                single_ids.as_mut_ptr().cast(),
+                d_single_ids as *const c_void,
+                num_rows * 4,
+                stream.handle,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                split_vals.as_mut_ptr().cast(),
+                d_split_vals as *const c_void,
+                num_rows * 4,
+                stream.handle,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                single_vals.as_mut_ptr().cast(),
+                d_single_vals as *const c_void,
+                num_rows * 4,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(split_ids, single_ids);
+    assert_eq!(split_vals, single_vals);
+    assert_eq!(split_ids, vec![18_000, 249_319, 32_040, 56_555]);
+}
+
+#[cfg(feature = "cuda")]
+fn reduce_distributed_top1(v0: f32, i0: i32, v1: f32, i1: i32) -> (i32, i32) {
+    let take_1 = (v1 > v0) || (v1 == v0 && i1 >= 0 && (i0 < 0 || i1 < i0));
+    let gid = if take_1 { i1 } else { i0 };
+    if gid == -2 {
+        (2, -1)
+    } else if gid < 0 {
+        (1, -1)
+    } else {
+        (0, gid)
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn shard_fast_greedy_matches_full_sampler_across_edges() {
+    let vocab_size = 248_320usize;
+    let shard_vocab = vocab_size / 2;
+    let words_per_row = vocab_size.div_ceil(32);
+    let num_rows = 6usize;
+
+    let mut logits = vec![f32_to_f16(-3.0); num_rows * vocab_size];
+    let mut masks = vec![u32::MAX; num_rows * words_per_row];
+    let mut sparse = Vec::<ffi::W34SamplerSparseEntry>::new();
+    let mut cfgs = Vec::<W34SamplerRowCfg>::with_capacity(num_rows);
+
+    // Row 0: cross-shard tie at equal max FP16 (2.0): lower global id (17_000) wins.
+    logits[17_000] = f32_to_f16(2.0);
+    logits[190_000] = f32_to_f16(2.0);
+    cfgs.push(W34SamplerRowCfg {
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        draft_token_id: 17_000,
+        row_bitmask_word_offset: -1,
+        top_logprobs_k: -1,
+        ..Default::default()
+    });
+
+    // Row 1: masked + sparse penalties shift winner from shard 0 (500) onto shard 1 (150_005).
+    logits[vocab_size + 500] = f32_to_f16(4.0);
+    logits[vocab_size + 150_005] = f32_to_f16(3.2);
+    logits[vocab_size + 200_000] = f32_to_f16(6.0);
+    masks[words_per_row + (200_000 / 32)] &= !(1u32 << (200_000 % 32));
+    sparse.push(ffi::W34SamplerSparseEntry {
+        token_id: 500,
+        output_count: 3,
+        logit_bias: 0.0,
+        in_prompt: 1,
+        banned: 0,
+    });
+    sparse.push(ffi::W34SamplerSparseEntry {
+        token_id: 150_005,
+        output_count: 0,
+        logit_bias: 0.5,
+        in_prompt: 0,
+        banned: 0,
+    });
+    cfgs.push(W34SamplerRowCfg {
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.5,
+        frequency_penalty: 0.25,
+        draft_token_id: 500,
+        has_bitmask: 1,
+        row_bitmask_word_offset: words_per_row as i32,
+        sparse_offset: 0,
+        sparse_count: 2,
+        top_logprobs_k: -1,
+        ..Default::default()
+    });
+
+    // Row 2: all masked out -> status = 1.
+    masks[2 * words_per_row..3 * words_per_row].fill(0);
+    cfgs.push(W34SamplerRowCfg {
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        draft_token_id: -1,
+        has_bitmask: 1,
+        row_bitmask_word_offset: (2 * words_per_row) as i32,
+        top_logprobs_k: -1,
+        ..Default::default()
+    });
+
+    // Row 3: finite winner on shard 0, NaN on allowed token in shard 1 -> status = 2.
+    logits[3 * vocab_size + 42] = f32_to_f16(5.0);
+    logits[3 * vocab_size + 140_000] = 0x7e00u16;
+    cfgs.push(W34SamplerRowCfg {
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        draft_token_id: -1,
+        has_bitmask: 1,
+        row_bitmask_word_offset: (3 * words_per_row) as i32,
+        top_logprobs_k: -1,
+        ..Default::default()
+    });
+
+    // Row 4: NaN on masked-out token 88 in shard 0; allowed winner 210_123 in shard 1.
+    logits[4 * vocab_size + 88] = 0x7e00u16;
+    masks[4 * words_per_row + (88 / 32)] &= !(1u32 << (88 % 32));
+    logits[4 * vocab_size + 210_123] = f32_to_f16(1.75);
+    cfgs.push(W34SamplerRowCfg {
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        draft_token_id: 210_123,
+        has_bitmask: 1,
+        row_bitmask_word_offset: (4 * words_per_row) as i32,
+        top_logprobs_k: -1,
+        ..Default::default()
+    });
+
+    // Row 5: single allowed token 777 is also soft-banned -> full sampler relaxes soft ban.
+    masks[5 * words_per_row..6 * words_per_row].fill(0);
+    masks[5 * words_per_row + (777 / 32)] = 1u32 << (777 % 32);
+    logits[5 * vocab_size + 777] = f32_to_f16(0.5);
+    sparse.push(ffi::W34SamplerSparseEntry {
+        token_id: 777,
+        output_count: 0,
+        logit_bias: 0.0,
+        in_prompt: 0,
+        banned: 1,
+    });
+    cfgs.push(W34SamplerRowCfg {
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        draft_token_id: -1,
+        has_bitmask: 1,
+        row_bitmask_word_offset: (5 * words_per_row) as i32,
+        sparse_offset: 2,
+        sparse_count: 1,
+        top_logprobs_k: -1,
+        ..Default::default()
+    });
+
+    prepare_execution_plan(0).unwrap();
+    let _dev = CudaDevice::set_current(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let mut arena = DeviceArena::new(0, 96 * 1024 * 1024).unwrap();
+    let d_logits = arena.upload_slice(&logits, &stream).unwrap();
+    let d_masks = arena.upload_slice(&masks, &stream).unwrap();
+    let d_sparse = arena.upload_slice(&sparse, &stream).unwrap();
+    let d_cfgs = arena.upload_slice(&cfgs, &stream).unwrap();
+    let out_bytes = num_rows * core::mem::size_of::<W34SamplerRowOut>();
+    let d_out = arena.alloc_aligned(out_bytes).unwrap();
+    let (ws_ptr, ws_cap) = arena.remaining_workspace();
+    let ex = stream.exec(ws_ptr, ws_cap);
+    // SAFETY: all pointers reside in `arena` on device 0 with ample remaining workspace.
+    unsafe {
+        assert_eq!(
+            ffi::w34_sampler_step_f16(
+                &ex,
+                d_logits as *const c_void,
+                d_cfgs as *const W34SamplerRowCfg,
+                d_masks as *const u32,
+                d_sparse as *const ffi::W34SamplerSparseEntry,
+                d_out as *mut W34SamplerRowOut,
+                num_rows as i32,
+                vocab_size as i32,
+                sparse.len() as i32,
+            ),
+            0
+        );
+    }
+    let mut ref_outs = vec![W34SamplerRowOut::default(); num_rows];
+    // SAFETY: `ref_outs` matches `out_bytes`.
+    unsafe {
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                ref_outs.as_mut_ptr().cast(),
+                d_out as *const c_void,
+                out_bytes,
+                stream.handle,
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+    assert_eq!((ref_outs[5].status, ref_outs[5].sampled_id), (0, 777));
+
+    let shard_rows = 5usize;
+    let mut shard0 = vec![0u16; shard_rows * shard_vocab];
+    let mut shard1 = vec![0u16; shard_rows * shard_vocab];
+    for r in 0..shard_rows {
+        shard0[r * shard_vocab..(r + 1) * shard_vocab]
+            .copy_from_slice(&logits[r * vocab_size..r * vocab_size + shard_vocab]);
+        shard1[r * shard_vocab..(r + 1) * shard_vocab]
+            .copy_from_slice(&logits[r * vocab_size + shard_vocab..(r + 1) * vocab_size]);
+    }
+    let d_s0 = arena.upload_slice(&shard0, &stream).unwrap();
+    let d_s1 = arena.upload_slice(&shard1, &stream).unwrap();
+    let d_v0 = arena.alloc_aligned(shard_rows * 4).unwrap();
+    let d_i0 = arena.alloc_aligned(shard_rows * 4).unwrap();
+    let d_v1 = arena.alloc_aligned(shard_rows * 4).unwrap();
+    let d_i1 = arena.alloc_aligned(shard_rows * 4).unwrap();
+    let (ws2_ptr, ws2_cap) = arena.remaining_workspace();
+    let ex_s = stream.exec(ws2_ptr, ws2_cap);
+    // SAFETY: shard buffers hold `shard_rows * shard_vocab` FP16 elements; `d_cfgs` prefix has `shard_rows` rows.
+    unsafe {
+        assert_eq!(
+            ffi::w34_sampler_shard_fast_greedy_f16(
+                &ex_s,
+                d_s0 as *const c_void,
+                d_cfgs as *const W34SamplerRowCfg,
+                d_masks as *const u32,
+                d_sparse as *const ffi::W34SamplerSparseEntry,
+                d_v0 as *mut f32,
+                d_i0 as *mut i32,
+                shard_rows as i32,
+                shard_vocab as i32,
+                0,
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_sampler_shard_fast_greedy_f16(
+                &ex_s,
+                d_s1 as *const c_void,
+                d_cfgs as *const W34SamplerRowCfg,
+                d_masks as *const u32,
+                d_sparse as *const ffi::W34SamplerSparseEntry,
+                d_v1 as *mut f32,
+                d_i1 as *mut i32,
+                shard_rows as i32,
+                shard_vocab as i32,
+                shard_vocab as i32,
+            ),
+            0
+        );
+    }
+    let mut v0 = vec![0f32; shard_rows];
+    let mut i0 = vec![0i32; shard_rows];
+    let mut v1 = vec![0f32; shard_rows];
+    let mut i1 = vec![0i32; shard_rows];
+    // SAFETY: host vectors match `shard_rows * 4` device allocations.
+    unsafe {
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                v0.as_mut_ptr().cast(),
+                d_v0 as *const c_void,
+                shard_rows * 4,
+                stream.handle
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                i0.as_mut_ptr().cast(),
+                d_i0 as *const c_void,
+                shard_rows * 4,
+                stream.handle
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                v1.as_mut_ptr().cast(),
+                d_v1 as *const c_void,
+                shard_rows * 4,
+                stream.handle
+            ),
+            0
+        );
+        assert_eq!(
+            ffi::w34_memcpy_d2h_async(
+                i1.as_mut_ptr().cast(),
+                d_i1 as *const c_void,
+                shard_rows * 4,
+                stream.handle
+            ),
+            0
+        );
+    }
+    stream.synchronize().unwrap();
+    for r in 0..shard_rows {
+        assert_eq!(
+            reduce_distributed_top1(v0[r], i0[r], v1[r], i1[r]),
+            (ref_outs[r].status, ref_outs[r].sampled_id),
+            "row {r} distributed fast-greedy mismatch"
+        );
+    }
+}

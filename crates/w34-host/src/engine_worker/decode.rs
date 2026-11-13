@@ -96,6 +96,198 @@ fn capture_decision_tap(
     }
 }
 
+fn capture_batch_candidate_taps(
+    engine: &mut Qwen3_5Engine,
+    sched: &SchedulerV1,
+    slices: &[ScheduledReqSlice],
+    emit_mask: &[bool],
+    requests: &mut HashMap<u64, Request>,
+) {
+    let mut cand_reqs = Vec::<(u64, usize, usize, Vec<i32>)>::new();
+    let mut selected_row_idx = 0usize;
+    for (i, s) in slices.iter().enumerate() {
+        let is_selected = emit_mask[i];
+        let sel_row = selected_row_idx;
+        if is_selected {
+            selected_row_idx += 1;
+        } else {
+            continue;
+        }
+        if let Some(req) = requests.get(&s.req_id)
+            && let Some(DecisionReadoutTap::CandidateLogits { token_ids, .. }) = &req.decision_tap
+        {
+            let cached_toks = sched
+                .active
+                .iter()
+                .find(|seq| seq.req_id == s.req_id)
+                .map_or(0, |seq| seq.cached_prefix_tokens);
+            cand_reqs.push((s.req_id, sel_row, cached_toks, token_ids.clone()));
+        }
+    }
+    if cand_reqs.is_empty() {
+        return;
+    }
+    let query_refs: Vec<(usize, &[i32])> = cand_reqs
+        .iter()
+        .map(|(_, sel_row, _, tids)| (*sel_row, tids.as_slice()))
+        .collect();
+    match engine.read_batch_candidate_logits(&query_refs) {
+        Ok(batch_logits) => {
+            for ((req_id, _, cached_toks, _), logits) in cand_reqs.into_iter().zip(batch_logits) {
+                if let Some(req) = requests.get_mut(&req_id)
+                    && let Some(DecisionReadoutTap::CandidateLogits { tx, .. }) =
+                        req.decision_tap.take()
+                {
+                    let _ = tx.send(Ok(DecisionTapOutput::CandidateLogits {
+                        logits,
+                        cached_tokens: cached_toks,
+                    }));
+                }
+            }
+        }
+        Err(_) => {
+            finish_fallback_candidate_taps(engine, cand_reqs, requests);
+        }
+    }
+}
+
+fn finish_fallback_candidate_taps(
+    engine: &mut Qwen3_5Engine,
+    cand_reqs: Vec<(u64, usize, usize, Vec<i32>)>,
+    requests: &mut HashMap<u64, Request>,
+) {
+    for (req_id, sel_row, cached_toks, tids) in cand_reqs {
+        let Some(req) = requests.get_mut(&req_id) else {
+            continue;
+        };
+        let res = engine
+            .read_selected_row_candidate_logits(sel_row, &tids)
+            .map(|logits| DecisionTapOutput::CandidateLogits {
+                logits,
+                cached_tokens: cached_toks,
+            })
+            .map_err(WorkerError::Cuda);
+        if let Some(DecisionReadoutTap::CandidateLogits { tx, .. }) = req.decision_tap.take() {
+            if let Err(error) = &res {
+                req.set_terminal(GenerationEvent::Error(error.clone()));
+            }
+            let _ = tx.send(res);
+        }
+    }
+}
+
+fn capture_batch_hidden_taps(
+    engine: &mut Qwen3_5Engine,
+    sched: &SchedulerV1,
+    slices: &[ScheduledReqSlice],
+    requests: &mut HashMap<u64, Request>,
+) {
+    let mut flat_batch_rows = Vec::<usize>::new();
+    let mut row_owners = Vec::<(u64, usize)>::new();
+    let mut final_hidden_slices = Vec::<(u64, usize)>::new();
+    let mut batch_tok_offset = 0usize;
+    for s in slices {
+        let slice_len = s.query_tokens.len();
+        let chunk_start = s.ctx_len_before;
+        let chunk_end = chunk_start + slice_len;
+        let tok_off = batch_tok_offset;
+        batch_tok_offset += slice_len;
+        if let Some(req) = requests.get(&s.req_id)
+            && let Some(DecisionReadoutTap::HiddenPositions { positions, .. }) = &req.decision_tap
+        {
+            for (p_idx, &pos) in positions.iter().enumerate() {
+                if (chunk_start..chunk_end).contains(&pos) {
+                    row_owners.push((s.req_id, p_idx));
+                    flat_batch_rows.push(tok_off + (pos - chunk_start));
+                }
+            }
+            if s.is_final_prefill_chunk {
+                let cached_toks = sched
+                    .active
+                    .iter()
+                    .find(|seq| seq.req_id == s.req_id)
+                    .map_or(0, |seq| seq.cached_prefix_tokens);
+                final_hidden_slices.push((s.req_id, cached_toks));
+            }
+        }
+    }
+    if !flat_batch_rows.is_empty() {
+        apply_batch_hidden_read(engine, &flat_batch_rows, row_owners, requests);
+    }
+    for (req_id, cached_toks) in final_hidden_slices {
+        finalize_hidden_tap(req_id, cached_toks, requests);
+    }
+}
+
+fn apply_batch_hidden_read(
+    engine: &mut Qwen3_5Engine,
+    flat_batch_rows: &[usize],
+    row_owners: Vec<(u64, usize)>,
+    requests: &mut HashMap<u64, Request>,
+) {
+    match engine.read_norm_hidden_rows_f32(flat_batch_rows) {
+        Ok(rows) => {
+            for ((req_id, p_idx), row) in row_owners.into_iter().zip(rows) {
+                if let Some(req) = requests.get_mut(&req_id)
+                    && let Some(DecisionReadoutTap::HiddenPositions { captured, .. }) =
+                        &mut req.decision_tap
+                {
+                    captured[p_idx] = Some(row);
+                }
+            }
+        }
+        Err(e) => {
+            let err = WorkerError::Cuda(e);
+            for (req_id, _) in row_owners {
+                if let Some(req) = requests.get_mut(&req_id)
+                    && let Some(DecisionReadoutTap::HiddenPositions { tx, .. }) =
+                        req.decision_tap.take()
+                {
+                    req.set_terminal(GenerationEvent::Error(err.clone()));
+                    let _ = tx.send(Err(err.clone()));
+                }
+            }
+        }
+    }
+}
+
+fn finalize_hidden_tap(req_id: u64, cached_toks: usize, requests: &mut HashMap<u64, Request>) {
+    let Some(req) = requests.get_mut(&req_id) else {
+        return;
+    };
+    let Some(DecisionReadoutTap::HiddenPositions {
+        mut captured, tx, ..
+    }) = req.decision_tap.take()
+    else {
+        return;
+    };
+    let res = if captured.iter().all(Option::is_some) {
+        Ok(DecisionTapOutput::HiddenRows {
+            rows: captured.drain(..).map(Option::unwrap).collect(),
+            cached_tokens: cached_toks,
+        })
+    } else {
+        Err(WorkerError::internal(
+            "code_readout: missing hidden position after final prefill chunk",
+        ))
+    };
+    if let Err(error) = &res {
+        req.set_terminal(GenerationEvent::Error(error.clone()));
+    }
+    let _ = tx.send(res);
+}
+
+fn capture_batch_decision_taps(
+    engine: &mut Qwen3_5Engine,
+    sched: &SchedulerV1,
+    slices: &[ScheduledReqSlice],
+    emit_mask: &[bool],
+    requests: &mut HashMap<u64, Request>,
+) {
+    capture_batch_candidate_taps(engine, sched, slices, emit_mask, requests);
+    capture_batch_hidden_taps(engine, sched, slices, requests);
+}
+
 fn record_computed_prefill(slices: &[ScheduledReqSlice], requests: &HashMap<u64, Request>) {
     for s in slices {
         if s.is_prefill_chunk {
@@ -151,6 +343,150 @@ fn batch_is_noncausal_prefix_prefill(
     noncausal
 }
 
+fn step_vision_prefills(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &mut HashMap<u64, Request>,
+) -> Result<(), WorkerError> {
+    let has_active_decodes = sched
+        .active
+        .iter()
+        .any(|seq| !seq.finished && seq.is_prefill_complete());
+    let mut vision_budget = if has_active_decodes {
+        sched.cfg.effective_mixed_prefill_budget()
+    } else {
+        sched.cfg.max_num_batched_tokens
+    };
+    let vision_ids: Vec<_> = sched
+        .active
+        .iter()
+        .filter(|seq| {
+            !seq.finished && !seq.is_prefill_complete() && requests[&seq.req_id].vision.is_some()
+        })
+        .map(|seq| seq.req_id)
+        .collect();
+    for id in vision_ids {
+        if vision_budget == 0 {
+            break;
+        }
+        let Some(step_chunk) = plan_vision_step_chunk(sched, id, has_active_decodes, vision_budget)
+        else {
+            continue;
+        };
+        run_single_vision_prefill(engine, sched, requests, id, step_chunk, &mut vision_budget)?;
+    }
+    Ok(())
+}
+
+fn plan_vision_step_chunk(
+    sched: &SchedulerV1,
+    id: u64,
+    has_active_decodes: bool,
+    vision_budget: usize,
+) -> Option<usize> {
+    let seq = sched.active.iter().find(|seq| seq.req_id == id)?;
+    let rem = seq.prompt_tokens.len() - seq.prefilled_tokens;
+    let bidir_need = seq
+        .prefix_bidir_len
+        .filter(|&b| seq.prefilled_tokens < b)
+        .map(|b| b.min(seq.prompt_tokens.len()) - seq.prefilled_tokens);
+    if let Some(need) = bidir_need {
+        if has_active_decodes && need > vision_budget {
+            return None;
+        }
+        return Some(sched.cfg.chunk_prefill_size);
+    }
+    let aligned_budget = if vision_budget >= sched.cfg.mamba_chunk_size && rem > vision_budget {
+        (vision_budget / sched.cfg.mamba_chunk_size) * sched.cfg.mamba_chunk_size
+    } else {
+        vision_budget
+    };
+    Some(sched.cfg.chunk_prefill_size.min(aligned_budget.max(1)))
+}
+
+fn run_single_vision_prefill(
+    engine: &mut Qwen3_5Engine,
+    sched: &mut SchedulerV1,
+    requests: &mut HashMap<u64, Request>,
+    id: u64,
+    step_chunk: usize,
+    vision_budget: &mut usize,
+) -> Result<(), WorkerError> {
+    let seq = sched.active.iter().find(|seq| seq.req_id == id).unwrap();
+    let cached_toks = seq.cached_prefix_tokens;
+    let can_donate = seq.prefix_bidir_len.is_none();
+    engine.set_active_lora_id(seq.lora_id);
+    engine.clear_slice_lora_ids();
+    let request = requests.get_mut(&id).unwrap();
+    let needs_final_logits = request.sampler.params.max_tokens > 0
+        || matches!(
+            request.decision_tap,
+            Some(DecisionReadoutTap::CandidateLogits { .. })
+        );
+    let (greedy, slice) = request.vision.as_mut().unwrap().step_prefill_with_emit(
+        engine,
+        seq,
+        step_chunk,
+        needs_final_logits,
+    )?;
+    *vision_budget = vision_budget.saturating_sub(slice.query_tokens.len());
+    request.computed(slice.query_tokens.len());
+    capture_decision_tap(
+        engine,
+        &slice,
+        0,
+        (slice.is_final_prefill_chunk && needs_final_logits).then_some(0),
+        cached_toks,
+        request,
+    );
+    let token = if slice.is_final_prefill_chunk {
+        if request.sampler.params.max_tokens > 0 {
+            let sample = if request
+                .sampler
+                .params
+                .is_plain_greedy(request.sampler.constraint.is_some())
+            {
+                request
+                    .sampler
+                    .try_commit_token(greedy)
+                    .map(|()| (greedy, None))
+                    .map_err(WorkerError::internal)
+            } else {
+                engine
+                    .sample_single_gpu_step(&mut request.sampler)
+                    .map_err(WorkerError::Cuda)
+            };
+            match sample {
+                Ok((tok, lp)) => {
+                    emit(request, tok, lp);
+                    Some(tok)
+                }
+                Err(error) => {
+                    fail_request(engine, sched, requests, id, error);
+                    return Ok(());
+                }
+            }
+        } else {
+            Some(greedy)
+        }
+    } else {
+        None
+    };
+    let mut replacement = if !slice.is_final_prefill_chunk && can_donate {
+        engine.alloc_state_slot_from(&mut sched.radix)
+    } else {
+        None
+    };
+    release(
+        engine,
+        sched.commit_slice(&slice, token, || replacement.take()),
+    );
+    if let Some(slot) = replacement {
+        engine.free_state_slots(&[slot]);
+    }
+    Ok(())
+}
+
 pub(super) fn step_plain(
     engine: &mut Qwen3_5Engine,
     sched: &mut SchedulerV1,
@@ -161,77 +497,7 @@ pub(super) fn step_plain(
     let _batch_range = crate::profiling::Range::new(c"w34.serve.batch");
     // Vision prefill uses the same scheduler commit seam, but its 3-plane embedding
     // splice cannot share an ordinary text prefill batch. Decode can share batches.
-    let vision_ids: Vec<_> = sched
-        .active
-        .iter()
-        .filter(|seq| {
-            !seq.finished && !seq.is_prefill_complete() && requests[&seq.req_id].vision.is_some()
-        })
-        .map(|seq| seq.req_id)
-        .collect();
-    for id in vision_ids {
-        let seq = sched.active.iter().find(|seq| seq.req_id == id).unwrap();
-        let cached_toks = seq.cached_prefix_tokens;
-        engine.set_active_lora_id(seq.lora_id);
-        engine.clear_slice_lora_ids();
-        let request = requests.get_mut(&id).unwrap();
-        let (greedy, slice) = request.vision.as_mut().unwrap().step_prefill(
-            engine,
-            seq,
-            sched.cfg.chunk_prefill_size,
-        )?;
-        request.computed(slice.query_tokens.len());
-        //ScheduledVision::step_prefill executes forward_selected_rows on a 1-request slice
-        // with selected_rows = [q_len - 1] (selected_row index 0 on every chunk).
-        capture_decision_tap(
-            engine,
-            &slice,
-            0,
-            slice.is_final_prefill_chunk.then_some(0),
-            cached_toks,
-            request,
-        );
-        let token = if slice.is_final_prefill_chunk {
-            if request.sampler.params.max_tokens > 0 {
-                let sample = if request
-                    .sampler
-                    .params
-                    .is_plain_greedy(request.sampler.constraint.is_some())
-                {
-                    request
-                        .sampler
-                        .try_commit_token(greedy)
-                        .map(|()| (greedy, None))
-                        .map_err(WorkerError::internal)
-                } else {
-                    engine
-                        .sample_single_gpu_step(&mut request.sampler)
-                        .map_err(WorkerError::Cuda)
-                };
-                let (token, lp) = match sample {
-                    Ok(value) => value,
-                    Err(error) => {
-                        fail_request(engine, sched, requests, id, error);
-                        continue;
-                    }
-                };
-                emit(request, token, lp);
-                Some(token)
-            } else {
-                Some(greedy)
-            }
-        } else {
-            None
-        };
-        let mut replacement = engine.alloc_state_slot_from(&mut sched.radix);
-        release(
-            engine,
-            sched.commit_slice(&slice, token, || replacement.take()),
-        );
-        if let Some(slot) = replacement {
-            engine.free_state_slots(&[slot]);
-        }
-    }
+    step_vision_prefills(engine, sched, requests)?;
     let slices = sched.schedule_step();
     if slices.is_empty() {
         return Ok(());
@@ -335,37 +601,7 @@ pub(super) fn step_plain(
     engine.clear_slice_lora_ids();
     let greedy = greedy?;
     record_computed_prefill(&slices, requests);
-    {
-        let mut batch_tok_offset = 0usize;
-        let mut selected_row_idx = 0usize;
-        for (i, s) in slices.iter().enumerate() {
-            let slice_len = s.query_tokens.len();
-            let is_selected = emit_mask[i];
-            let sel_row = selected_row_idx;
-            if is_selected {
-                selected_row_idx += 1;
-            }
-            let tok_off = batch_tok_offset;
-            batch_tok_offset += slice_len;
-
-            let cached_toks = sched
-                .active
-                .iter()
-                .find(|seq| seq.req_id == s.req_id)
-                .map_or(0, |seq| seq.cached_prefix_tokens);
-            let Some(req) = requests.get_mut(&s.req_id) else {
-                continue;
-            };
-            capture_decision_tap(
-                engine,
-                s,
-                tok_off,
-                is_selected.then_some(sel_row),
-                cached_toks,
-                req,
-            );
-        }
-    }
+    capture_batch_decision_taps(engine, sched, &slices, &emit_mask, requests);
     let mut pending_errors: Vec<Option<WorkerError>> = vec![None; slices.len()];
     let sampled = if needs_gpu {
         let _sampler_range = crate::profiling::Range::new(c"w34.serve.sampler");

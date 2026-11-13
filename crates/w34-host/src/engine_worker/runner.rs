@@ -678,7 +678,13 @@ fn admit_requests(
                 // Admit exactly one request so its complete budget is reserved before
                 // considering the next. Existing requests can never lose capacity.
                 sched.cfg.max_num_seqs = before + 1;
-                sched.admit_waiting(|r| engine.alloc_three_state_slots_from(r));
+                sched.admit_waiting_by_shareability(|r, unshareable| {
+                    if unshareable {
+                        engine.alloc_state_slot_from(r).map(|s0| (s0, [-1, -1]))
+                    } else {
+                        engine.alloc_three_state_slots_from(r)
+                    }
+                });
                 record_admissions(sched, requests);
                 sched.cfg.max_num_seqs = limit;
                 if sched.active.len() == before {

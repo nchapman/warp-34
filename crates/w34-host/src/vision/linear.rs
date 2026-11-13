@@ -99,6 +99,39 @@ pub(super) fn forward_bias(
     output: u64,
     rows: usize,
 ) -> Result<()> {
+    let deferred = forward_bias_maybe_defer(
+        projection,
+        ex,
+        cublas,
+        workspace,
+        workspace_ints,
+        input,
+        bias,
+        output,
+        rows,
+        false,
+    )?;
+    debug_assert!(deferred.is_null());
+    Ok(())
+}
+
+/// Runs `projection` and either materializes `bias` immediately (returning `null()`) or, when
+/// `allow_defer` is true and the downstream vision op (`qkv_rope`, `bias_add` residual, or
+/// `bias_gelu`) accepts a bias pointer with identical `__float2half_rn` intermediate rounding,
+/// skips the standalone bias epilogue kernel and returns `bias as *const c_void`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn forward_bias_maybe_defer(
+    projection: &LinearProj,
+    ex: &W34Exec,
+    cublas: &CublasHandle,
+    workspace: u64,
+    workspace_ints: usize,
+    input: u64,
+    bias: u64,
+    output: u64,
+    rows: usize,
+    allow_defer: bool,
+) -> Result<*const c_void> {
     if let LinearProj::DenseF16 {
         weight_ptr,
         size_n,
@@ -106,7 +139,7 @@ pub(super) fn forward_bias(
     } = projection
     {
         // Do NOT split this into GEMM then bias: cuBLAS's fused rounding differs.
-        return cublas.gemm_f16_bias(
+        cublas.gemm_f16_bias(
             input,
             *weight_ptr,
             bias,
@@ -114,7 +147,8 @@ pub(super) fn forward_bias(
             rows as i32,
             *size_n as i32,
             *size_k as i32,
-        );
+        )?;
+        return Ok(std::ptr::null());
     }
     if let LinearProj::Hadamard {
         inner,
@@ -123,7 +157,8 @@ pub(super) fn forward_bias(
         block_size,
     } = projection
     {
-        return LinearProj::forward_hadamard_with_bias(
+        let defer_had = allow_defer && *size_n == inner.size_n();
+        LinearProj::forward_hadamard_with_bias(
             inner,
             *size_n,
             *size_k,
@@ -133,12 +168,20 @@ pub(super) fn forward_bias(
             workspace,
             workspace_ints,
             input,
-            Some(bias),
+            (!defer_had).then_some(bias),
             output,
             rows,
-        );
+        )?;
+        return Ok(if defer_had {
+            bias as *const c_void
+        } else {
+            std::ptr::null()
+        });
     }
     projection.forward(ex, cublas, workspace, workspace_ints, input, output, rows)?;
+    if allow_defer {
+        return Ok(bias as *const c_void);
+    }
     // The projection wrapper has already cropped any physical N padding.
     check_rc(
         // SAFETY: projection produced contiguous logical [rows, N] FP16 output;
@@ -155,7 +198,8 @@ pub(super) fn forward_bias(
             )
         },
         "w34_vision_bias_add_f16(projection)",
-    )
+    )?;
+    Ok(std::ptr::null())
 }
 
 #[cfg(test)]
@@ -444,5 +488,90 @@ mod gpu_tests {
                 assert_eq!(*value, f32_to_f16(32.0 + f16_to_f32(bias_values[i % n])));
             }
         }
+
+        // Verify `forward_bias_maybe_defer(..., true)` defers quantized bias to downstream fused consumer
+        // while keeping `DenseF16` bias fused inside cuBLAS/Marlin (`0`-ULP parity).
+        let deferred_dense = forward_bias_maybe_defer(
+            &dense,
+            &ex,
+            &cublas,
+            ws.addr(),
+            ws_ints,
+            input,
+            bias,
+            output.addr(),
+            rows,
+            true,
+        )
+        .unwrap();
+        assert!(deferred_dense.is_null());
+
+        let eager_gelu = DeviceBuffer::alloc(0, rows * n * 2).unwrap();
+        forward_bias(
+            &quant,
+            &ex,
+            &cublas,
+            ws.addr(),
+            ws_ints,
+            input,
+            bias,
+            eager_gelu.addr(),
+            rows,
+        )
+        .unwrap();
+        check_rc(
+            // SAFETY: `eager_gelu` holds `rows * n` FP16 elements on `stream`.
+            unsafe {
+                w34_kernels::ffi::w34_vision_bias_gelu_f16(
+                    &ex,
+                    eager_gelu.addr() as *const core::ffi::c_void,
+                    core::ptr::null(),
+                    eager_gelu.addr() as *mut core::ffi::c_void,
+                    rows as i32,
+                    n as i32,
+                    1,
+                )
+            },
+            "eager vision gelu",
+        )
+        .unwrap();
+
+        let deferred_quant = forward_bias_maybe_defer(
+            &quant,
+            &ex,
+            &cublas,
+            ws.addr(),
+            ws_ints,
+            input,
+            bias,
+            output.addr(),
+            rows,
+            true,
+        )
+        .unwrap();
+        assert_eq!(deferred_quant, bias as *const core::ffi::c_void);
+        let fused_gelu = DeviceBuffer::alloc(0, rows * n * 2).unwrap();
+        check_rc(
+            // SAFETY: `output`, `bias`, and `fused_gelu` are valid FP16 spans on `stream`.
+            unsafe {
+                w34_kernels::ffi::w34_vision_bias_gelu_f16(
+                    &ex,
+                    output.addr() as *const core::ffi::c_void,
+                    deferred_quant,
+                    fused_gelu.addr() as *mut core::ffi::c_void,
+                    rows as i32,
+                    n as i32,
+                    1,
+                )
+            },
+            "deferred fused vision gelu",
+        )
+        .unwrap();
+        let mut got_eager = vec![0u16; rows * n];
+        let mut got_fused = vec![0u16; rows * n];
+        eager_gelu.copy_to_host(&mut got_eager, &stream).unwrap();
+        fused_gelu.copy_to_host(&mut got_fused, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(got_fused, got_eager);
     }
 }

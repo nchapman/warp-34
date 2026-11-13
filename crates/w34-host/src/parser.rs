@@ -437,26 +437,26 @@ impl SamplerV1 {
 
         if has_rep || has_freq_pres || !self.params.logit_bias.is_empty() || has_bans {
             let vocab_i32 = i32::try_from(vocab_size).unwrap_or(i32::MAX);
-            let mut p_iter = self
-                .prompt_counts
+            let empty_map = std::collections::BTreeMap::new();
+            let prompt_src = if has_rep {
+                &self.prompt_counts
+            } else {
+                &empty_map
+            };
+            let output_src = if has_rep || has_freq_pres {
+                &self.output_counts
+            } else {
+                &empty_map
+            };
+            let mut p_iter = prompt_src
                 .iter()
-                .filter(|&(&tid, &cnt)| has_rep && cnt > 0 && tid >= 0 && tid < vocab_i32)
+                .filter(|&(&tid, &cnt)| cnt > 0 && tid >= 0 && tid < vocab_i32)
                 .peekable();
-            let mut o_iter = self
-                .output_counts
+            let mut o_iter = output_src
                 .iter()
-                .filter(|&(&tid, &cnt)| {
-                    (has_rep || has_freq_pres) && cnt > 0 && tid >= 0 && tid < vocab_i32
-                })
+                .filter(|&(&tid, &cnt)| cnt > 0 && tid >= 0 && tid < vocab_i32)
                 .peekable();
-            sparse_out.reserve(
-                (if has_rep { self.prompt_counts.len() } else { 0 })
-                    + (if has_rep || has_freq_pres {
-                        self.output_counts.len()
-                    } else {
-                        0
-                    }),
-            );
+            sparse_out.reserve(prompt_src.len() + output_src.len());
             loop {
                 match (p_iter.peek(), o_iter.peek()) {
                     (Some(&(&p_tid, _)), Some(&(&o_tid, &o_cnt))) if p_tid == o_tid => {

@@ -402,6 +402,10 @@ pub const TIERED_MOE_MAX_BATCH_TOKENS: usize = 6144;
 /// Maximum decode/verify batch size (`8` tokens) eligible for zero-copy GPU+CPU hybrid MoE execution.
 pub const TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS: usize = 8;
 
+/// Maximum decode/verify batch size (`16` tokens) eligible for pure-GPU mapped `GpuLru` execution
+/// inside CUDA Graphs when `!cache.has_cpu_bridge()` (e.g., `TP=2 / EP=2` `B=16` decode or `B=2..4` verify).
+pub const TIERED_MOE_GPU_LRU_MAX_DECODE_TOKENS: usize = 16;
+
 /// Maximum routed `top_k` (`16` experts/token) supported by the GPU+CPU hybrid MoE mailbox ABI.
 pub const TIERED_MOE_CPU_BRIDGE_MAX_TOP_K: usize = 16;
 

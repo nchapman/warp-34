@@ -46,11 +46,14 @@ impl Qwen3_5ModelRank {
             0
         };
         let mut midloop_gdn_snaps = Vec::new();
-        if has_active_midloop && let Some(first_st) = self.state_pool.layers.first() {
+        if has_active_midloop
+            && !self.last_batch_state_slots.is_empty()
+            && let Some(first_st) = self.state_pool.layers.first()
+        {
             let total_slots = self.state_pool.total_slots.max(1);
             let conv_slot_b = first_st.conv_state.len_bytes / total_slots;
             let ssm_slot_b = first_st.ssm_state.len_bytes / total_slots;
-            let active_slots = self.last_batch_state_slots.len().clamp(1, total_slots);
+            let active_slots = self.last_batch_state_slots.len().min(total_slots);
             let max_span_gdn = self
                 .active_midloop_specs()
                 .iter()
@@ -238,7 +241,7 @@ impl Qwen3_5ModelRank {
                 out_greedy_id_ptr,
                 [
                     self.decode_io.local_max_id.addr(),
-                    self.decode_io.local_max_val.addr(),
+                    self.decode_io.local_max_val_ptr(),
                     self.decode_io.global_max_val.addr(),
                 ],
             )?;
@@ -522,14 +525,20 @@ impl Qwen3_5ModelRank {
             } else {
                 0
             };
-            for (i, &row) in selected_rows.iter().enumerate() {
+            let mut i = 0usize;
+            while i < n {
+                let start_row = selected_rows[i];
+                let mut run_len = 1usize;
+                while i + run_len < n && selected_rows[i + run_len] == start_row + run_len {
+                    run_len += 1;
+                }
                 check_rc(
                     // SAFETY: rows were checked above and destination reserves n disjoint hidden rows.
                     unsafe {
                         ffi::w34_memcpy_d2d_async(
                             (gathered + (i * h * 2) as u64) as *mut c_void,
-                            (final_out + (row * h * 2) as u64) as *const c_void,
-                            h * 2,
+                            (final_out + (start_row * h * 2) as u64) as *const c_void,
+                            run_len * h * 2,
                             self.stream.handle,
                         )
                     },
@@ -541,14 +550,15 @@ impl Qwen3_5ModelRank {
                         unsafe {
                             ffi::w34_memcpy_d2d_async(
                                 (l_ptr + (i * 4) as u64) as *mut c_void,
-                                (orig_lora_ids_ptr + (row * 4) as u64) as *const c_void,
-                                4,
+                                (orig_lora_ids_ptr + (start_row * 4) as u64) as *const c_void,
+                                run_len * 4,
                                 self.stream.handle,
                             )
                         },
                         "gather selected lora ids",
                     )?;
                 }
+                i += run_len;
             }
             (gathered, l_ptr)
         };
@@ -671,6 +681,14 @@ impl Qwen3_5ModelRank {
             .ple_conv_state
             .as_ref()
             .map_or(0, |b| b.addr());
+        let top_k = self.cfg.num_experts_per_tok.max(1);
+        if !self.is_capturing_graph
+            && rows > 0
+            && let Some(tm) = self.tiered_moe.as_mut()
+            && !tm.supports_cuda_graph_for_tokens(rows, top_k)
+        {
+            tm.sync_all_dirty_from_device(&self.stream)?;
+        }
         let mut active_midloop: Option<(usize, usize, usize, usize)> = None;
         let mut layer_idx = 0usize;
         while layer_idx < self.layers.len() {
@@ -1416,21 +1434,14 @@ impl Qwen3_5ModelRank {
         let off_cd = push_slice(&mut packed, checkpoint_dst_indices);
         let off_co = push_slice(&mut packed, checkpoint_token_offsets);
         self.last_batch_state_slots.clear();
-        for &slot in state_in_indices
-            .iter()
-            .chain(state_out_indices.iter())
-            .chain(spec_state_indices.iter())
-            .chain(checkpoint_dst_indices.iter())
-        {
-            if slot >= 0 && (slot as usize) < self.state_pool.total_slots {
+        for (req_idx, &slot) in state_in_indices.iter().enumerate() {
+            let is_init = has_initial_state.get(req_idx).copied().unwrap_or(1) != 0;
+            if is_init && slot >= 0 && (slot as usize) < self.state_pool.total_slots {
                 let u = slot as usize;
                 if !self.last_batch_state_slots.contains(&u) {
                     self.last_batch_state_slots.push(u);
                 }
             }
-        }
-        if self.last_batch_state_slots.is_empty() {
-            self.last_batch_state_slots.push(0);
         }
         let base = self.batch_meta_arena.upload_slice(&packed, &self.stream)?;
         let ptr_at = |off: usize| -> u64 { base + (off * 4) as u64 };

@@ -33,6 +33,13 @@ pub(super) fn alloc_ple_runtime(
         f8_host_scratch,
         f8_host_slot: 0,
         ids_scratch: Vec::new(),
+        slice_tokens_scratch: Vec::new(),
+        slice_q_start_scratch: Vec::new(),
+        slice_st_in_scratch: Vec::new(),
+        slice_st_out_scratch: Vec::new(),
+        slice_has_init_scratch: Vec::new(),
+        slice_ckpt_dst_scratch: Vec::new(),
+        slice_ckpt_off_scratch: Vec::new(),
     })
 }
 
@@ -113,18 +120,64 @@ impl Qwen3_5ModelRank {
         max_gdn
     }
 
-    /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph.
-    pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
+    /// Returns whether all layers on this rank can execute `num_tokens` under `lora_mode`
+    /// inside a captured CUDA Graph.
+    pub fn supports_cuda_graph_for_tokens_with_lora(
+        &self,
+        num_tokens: usize,
+        lora_mode: GraphLoraMode,
+    ) -> bool {
         if self.lm_head.is_none()
             || self.cfg.noncausal_full_attention
-            || self.any_midloop_configured()
+            || self.cfg.midloop.iter().any(|&(_, _, passes)| passes > 1)
         {
             return false;
+        }
+        if let Some(rt) = &self.lora_runtime {
+            match lora_mode {
+                GraphLoraMode::BaseOnly => {}
+                GraphLoraMode::Uniform(lid) => {
+                    if lid < 0 {
+                        // Treated identically to BaseOnly.
+                    } else {
+                        let idx = lid as usize;
+                        if rt.adapter_noncausal.get(idx).copied().unwrap_or(false)
+                            || rt
+                                .adapter_midloops
+                                .get(idx)
+                                .is_some_and(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
+                        {
+                            return false;
+                        }
+                    }
+                }
+                GraphLoraMode::Mixed => {
+                    if rt.adapter_noncausal.iter().any(|&nc| nc)
+                        || rt
+                            .adapter_midloops
+                            .iter()
+                            .any(|ml| ml.iter().any(|&(_, _, passes)| passes > 1))
+                    {
+                        return false;
+                    }
+                }
+            }
         }
         let top_k = self.cfg.num_experts_per_tok.max(1);
         self.tiered_moe
             .as_ref()
             .is_none_or(|tm| tm.supports_cuda_graph_for_tokens(num_tokens, top_k))
+    }
+
+    /// Returns whether all layers on this rank can execute `num_tokens` inside a captured CUDA Graph
+    /// under conservative adapter-agnostic assumptions (`Mixed` when LoRA is attached).
+    pub fn supports_cuda_graph_for_tokens(&self, num_tokens: usize) -> bool {
+        let mode = if self.lora_runtime.is_some() {
+            GraphLoraMode::Mixed
+        } else {
+            GraphLoraMode::BaseOnly
+        };
+        self.supports_cuda_graph_for_tokens_with_lora(num_tokens, mode)
     }
 
     /// Initializes expert residency independently of residual topology and PLE.
@@ -249,30 +302,46 @@ impl Qwen3_5ModelRank {
         &mut self,
         slices: &[EngineBatchSlice<'_>],
     ) -> Result<()> {
-        if self.ple_runtime.is_none() || slices.is_empty() {
+        let Some(mut ple) = self.ple_runtime.take() else {
+            return Ok(());
+        };
+        if slices.is_empty() {
+            self.ple_runtime = Some(ple);
             return Ok(());
         }
         let n = slices.len();
-        let mut tokens = Vec::with_capacity(n);
-        let mut q_start = Vec::with_capacity(n + 1);
-        q_start.push(0i32);
-        let mut st_in = Vec::with_capacity(n);
-        let mut st_out = Vec::with_capacity(n);
-        let mut has_init = Vec::with_capacity(n);
-        let mut ckpt_dst = vec![-1i32; n];
-        let mut ckpt_off = vec![-1i32; n];
+        ple.slice_tokens_scratch.clear();
+        ple.slice_q_start_scratch.clear();
+        ple.slice_q_start_scratch.push(0i32);
+        ple.slice_st_in_scratch.clear();
+        ple.slice_st_out_scratch.clear();
+        ple.slice_has_init_scratch.clear();
+        ple.slice_ckpt_dst_scratch.clear();
+        ple.slice_ckpt_dst_scratch.resize(n, -1i32);
+        ple.slice_ckpt_off_scratch.clear();
+        ple.slice_ckpt_off_scratch.resize(n, -1i32);
         for (i, s) in slices.iter().enumerate() {
-            tokens.extend_from_slice(s.tokens);
-            q_start.push(tokens.len() as i32);
-            st_in.push(s.state_in_slot);
-            st_out.push(s.state_out_slot);
-            has_init.push(u8::from(s.has_initial_state));
+            ple.slice_tokens_scratch.extend_from_slice(s.tokens);
+            ple.slice_q_start_scratch
+                .push(ple.slice_tokens_scratch.len() as i32);
+            ple.slice_st_in_scratch.push(s.state_in_slot);
+            ple.slice_st_out_scratch.push(s.state_out_slot);
+            ple.slice_has_init_scratch
+                .push(u8::from(s.has_initial_state));
             if let Some(&(trig_off, dst_slot)) = s.checkpoints.first() {
-                ckpt_off[i] = trig_off;
-                ckpt_dst[i] = dst_slot;
+                ple.slice_ckpt_off_scratch[i] = trig_off;
+                ple.slice_ckpt_dst_scratch[i] = dst_slot;
             }
         }
-        self.stage_ple_f8_for_batch(
+        let mut tokens = core::mem::take(&mut ple.slice_tokens_scratch);
+        let mut q_start = core::mem::take(&mut ple.slice_q_start_scratch);
+        let mut st_in = core::mem::take(&mut ple.slice_st_in_scratch);
+        let mut st_out = core::mem::take(&mut ple.slice_st_out_scratch);
+        let mut has_init = core::mem::take(&mut ple.slice_has_init_scratch);
+        let mut ckpt_dst = core::mem::take(&mut ple.slice_ckpt_dst_scratch);
+        let mut ckpt_off = core::mem::take(&mut ple.slice_ckpt_off_scratch);
+        self.ple_runtime = Some(ple);
+        let res = self.stage_ple_f8_for_batch(
             &tokens,
             &q_start,
             &st_in,
@@ -283,7 +352,24 @@ impl Qwen3_5ModelRank {
             &ckpt_dst,
             &ckpt_off,
             1,
-        )
+        );
+        if let Some(ple) = &mut self.ple_runtime {
+            tokens.clear();
+            q_start.clear();
+            st_in.clear();
+            st_out.clear();
+            has_init.clear();
+            ckpt_dst.clear();
+            ckpt_off.clear();
+            ple.slice_tokens_scratch = tokens;
+            ple.slice_q_start_scratch = q_start;
+            ple.slice_st_in_scratch = st_in;
+            ple.slice_st_out_scratch = st_out;
+            ple.slice_has_init_scratch = has_init;
+            ple.slice_ckpt_dst_scratch = ckpt_dst;
+            ple.slice_ckpt_off_scratch = ckpt_off;
+        }
+        res
     }
 
     /// Configures replicated `TapPlan` auxiliary hidden-state capture for TP
@@ -301,8 +387,9 @@ impl Qwen3_5ModelRank {
     ) -> Result<()> {
         // Captured graphs own these destination addresses and the tap geometry.
         // Require configuration before capture rather than freeing live targets.
-        if self.decode_graph.is_some()
-            || self.spec_verify_graph.is_some()
+        if !self.decode_graph.is_empty()
+            || !self.spec_verify_graphs.is_empty()
+            || !self.batched_spec_verify_graphs.is_empty()
             || !self.batched_decode_graphs.is_empty()
         {
             return Err(loader_err(
@@ -348,7 +435,6 @@ impl Qwen3_5ModelRank {
         self.tap_aux_bf16 = tap_aux_bf16;
         self.last_final_hidden_f16 = last_final_hidden_f16;
         if tap_layer_ids.is_empty() && !export_final_hidden && max_tap_rows == 0 {
-            self.captured_spec_logits_ptr = 0;
             self.speculative_logits_rows = 0;
             self.speculative_logits = None;
         }

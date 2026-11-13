@@ -1048,6 +1048,155 @@ fn test_live_9b_heretic_lora_base_parity_and_mixed_batch() {
 }
 
 #[cfg(feature = "cuda")]
+fn verify_mixed_lora_decode_graph(eng_tp1: &mut crate::model::Qwen3_5Engine) {
+    for lid in [
+        crate::model::GraphLoraMode::BaseOnly,
+        crate::model::GraphLoraMode::Uniform(0),
+        crate::model::GraphLoraMode::Uniform(1),
+    ] {
+        assert!(
+            eng_tp1.ranks[0]
+                .decode_graph
+                .iter()
+                .any(|(k, _, _)| *k == (false, lid))
+        );
+    }
+
+    // Verify Mixed 1-token batched decode graph capture + eager parity across adapters [1, 0]:
+    let slices = [
+        crate::model::EngineBatchSlice {
+            tokens: &[2],
+            ctx_len_before: 0,
+            block_table: &[0],
+            state_in_slot: 0,
+            state_out_slot: 0,
+            has_initial_state: false,
+            spec_slots: &[],
+            checkpoints: &[],
+            emit_all_query_tokens: false,
+        },
+        crate::model::EngineBatchSlice {
+            tokens: &[5],
+            ctx_len_before: 0,
+            block_table: &[1],
+            state_in_slot: 1,
+            state_out_slot: 1,
+            has_initial_state: false,
+            spec_slots: &[],
+            checkpoints: &[],
+            emit_all_query_tokens: false,
+        },
+    ];
+    eng_tp1.reset_all_states().unwrap();
+    eng_tp1.use_cuda_graph = false;
+    eng_tp1.set_slice_lora_ids(&[1, 0]);
+    let mixed_decode_eager = eng_tp1.step_batch_slices(&slices).unwrap();
+    eng_tp1.reset_all_states().unwrap();
+    eng_tp1.use_cuda_graph = true;
+    eng_tp1.set_slice_lora_ids(&[1, 0]);
+    let mixed_decode_graph = eng_tp1.step_batch_slices(&slices).unwrap();
+    eng_tp1.clear_slice_lora_ids();
+    assert_eq!(mixed_decode_graph, mixed_decode_eager);
+    assert!(
+        eng_tp1.ranks[0]
+            .batched_decode_graphs
+            .iter()
+            .any(|(k, _, _)| {
+                *k == (
+                    2,
+                    false,
+                    crate::model::DecodeGraphSampleMode::PlainGreedy,
+                    crate::model::GraphLoraMode::Mixed,
+                )
+            })
+    );
+}
+
+#[cfg(feature = "cuda")]
+fn verify_dynamic_lora_graph_isolation(
+    eng_tp1: &mut crate::model::Qwen3_5Engine,
+    lora0_dir: &std::path::Path,
+    lora1_dir: &std::path::Path,
+    specs: &[LoraModuleSpec],
+) {
+    let lora2_tmp = tempfile::tempdir().unwrap();
+    fs::copy(
+        lora0_dir.join("adapter_config.json"),
+        lora2_tmp.path().join("adapter_config.json"),
+    )
+    .unwrap();
+    fs::copy(
+        lora0_dir.join("adapter_model.safetensors"),
+        lora2_tmp.path().join("adapter_model.safetensors"),
+    )
+    .unwrap();
+    let lora_mid_tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        lora_mid_tmp.path().join("adapter_config.json"),
+        r#"{"peft_type":"LORA","r":2,"lora_alpha":4.0,"use_rslora":true}"#,
+    )
+    .unwrap();
+    fs::copy(
+        lora1_dir.join("adapter_model.safetensors"),
+        lora_mid_tmp.path().join("adapter_model.safetensors"),
+    )
+    .unwrap();
+    fs::write(
+        lora_mid_tmp.path().join("decision_config.json"),
+        r#"{"format_version":1,"prompt_format":"quick-empty-think-medium-v1","codes":["A","B","C","D"],"token_ids":[2,3,4,5],"midloop":[[0,1,2]]}"#,
+    )
+    .unwrap();
+    eng_tp1
+        .attach_lora_adapters(&[
+            LoraModuleSpec {
+                name: "causal0".into(),
+                path: lora2_tmp.path().to_str().unwrap().into(),
+                revision: None,
+                resolved_dir: Some(lora2_tmp.path().to_path_buf()),
+            },
+            LoraModuleSpec {
+                name: "mid1".into(),
+                path: lora_mid_tmp.path().to_str().unwrap().into(),
+                revision: None,
+                resolved_dir: Some(lora_mid_tmp.path().to_path_buf()),
+            },
+        ])
+        .unwrap();
+    assert!(
+        eng_tp1.ranks[0]
+            .supports_cuda_graph_for_tokens_with_lora(1, crate::model::GraphLoraMode::BaseOnly)
+    );
+    assert!(
+        eng_tp1.ranks[0]
+            .supports_cuda_graph_for_tokens_with_lora(1, crate::model::GraphLoraMode::Uniform(0))
+    );
+    assert!(
+        !eng_tp1.ranks[0]
+            .supports_cuda_graph_for_tokens_with_lora(1, crate::model::GraphLoraMode::Uniform(1))
+    );
+    assert!(
+        !eng_tp1.ranks[0]
+            .supports_cuda_graph_for_tokens_with_lora(2, crate::model::GraphLoraMode::Mixed)
+    );
+
+    eng_tp1.attach_lora_adapters(specs).unwrap();
+    assert!(
+        eng_tp1.ranks[0]
+            .supports_cuda_graph_for_tokens_with_lora(1, crate::model::GraphLoraMode::BaseOnly)
+    );
+    for mode in [
+        crate::model::GraphLoraMode::Uniform(0),
+        crate::model::GraphLoraMode::Uniform(1),
+    ] {
+        assert!(!eng_tp1.ranks[0].supports_cuda_graph_for_tokens_with_lora(1, mode));
+    }
+    assert!(
+        !eng_tp1.ranks[0]
+            .supports_cuda_graph_for_tokens_with_lora(2, crate::model::GraphLoraMode::Mixed)
+    );
+}
+
+#[cfg(feature = "cuda")]
 #[test]
 fn test_synthetic_fp16_multi_lora_tp1_tp2_and_mtp() {
     let _gpu_guard = crate::LIB_GPU_ENGINE_LOCK
@@ -1662,6 +1811,7 @@ fn test_synthetic_fp16_multi_lora_tp1_tp2_and_mtp() {
     assert_ne!(plain_outs[0], plain_outs[1]);
     assert_ne!(plain_outs[0], plain_outs[2]);
     assert_ne!(plain_outs[1], plain_outs[2]);
+    verify_mixed_lora_decode_graph(&mut eng_tp1);
 
     // Verify non-contiguous selected_rows in a multi-token mixed-adapter batch with lm_head LoRA:
     // Slice 0: 3 tokens (lora_id=1), Slice 1: 4 tokens (lora_id=0, which has lm_head LoRA)
@@ -1842,7 +1992,7 @@ fn test_synthetic_fp16_multi_lora_tp1_tp2_and_mtp() {
     .unwrap();
 
     assert_eq!(eng_tp1.decision_profile.family_name(), "causal_lm");
-    eng_tp1.attach_lora_adapters(&specs).unwrap();
+    verify_dynamic_lora_graph_isolation(&mut eng_tp1, lora0_tmp.path(), lora1_tmp.path(), &specs);
     assert_eq!(
         eng_tp1
             .lora_registry

@@ -914,6 +914,11 @@ int w34_lora_shrink_expand_f16(
     const void* lora_b_stacked, const int32_t* token_lora_ids,
     float* lowrank_f32_ws, void* y_inout_f16, int m, int size_n, int size_k,
     int rank_pad, int num_adapters, int default_lora_id, uint64_t adapter_mask);
+int w34_sampler_shard_fast_greedy_f16(
+    const w34_exec* ex, const void* logits_f16, const w34_sampler_row_cfg* row_cfgs,
+    const uint32_t* bitmask_u32, const w34_sampler_sparse_entry* sparse_entries,
+    float* out_local_vals, int32_t* out_local_ids, int num_rows,
+    int local_vocab_size, int vocab_offset);
 
 #ifdef __cplusplus
 }

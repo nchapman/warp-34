@@ -869,7 +869,8 @@ __device__ __forceinline__ bool is_row_fast_greedy_masked(
     const bool is_greedy = (cfg.temperature <= 1e-6f || cfg.top_k == 1);
     const bool has_mask =
         (bitmask_u32 != nullptr && cfg.has_bitmask != 0 && cfg.row_bitmask_word_offset >= 0);
-    return is_greedy && has_mask && cfg.sparse_count == 0 && cfg.top_logprobs_k < 0;
+    const bool small_sparse = (cfg.sparse_count >= 0 && cfg.sparse_count <= kFastGreedyMaxSparse);
+    return is_greedy && has_mask && small_sparse && cfg.top_logprobs_k < 0;
 }
 
 __device__ __forceinline__ void eval_fast_greedy_elem(
@@ -944,7 +945,8 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
     const w34_sampler_sparse_entry* __restrict__ sparse_entries,
     FastGreedySplitPart* __restrict__ out_parts,
     int num_rows,
-    int vocab_size) {
+    int local_vocab_size,
+    int vocab_offset) {
     const int split_idx = (int)blockIdx.x;
     const int row = (int)blockIdx.y;
     if (row >= num_rows || split_idx >= kFastGreedySplits) return;
@@ -959,21 +961,24 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
     __shared__ int s_min_tid;
     __shared__ int s_max_tid;
 
-    const int chunk_elems = ((vocab_size + kFastGreedySplits - 1) / kFastGreedySplits + 7) & ~7;
+    const int chunk_elems = ((local_vocab_size + kFastGreedySplits - 1) / kFastGreedySplits + 7) & ~7;
     const int col_start = split_idx * chunk_elems;
-    const int col_end = (col_start + chunk_elems < vocab_size) ? (col_start + chunk_elems) : vocab_size;
+    const int col_end =
+        (col_start + chunk_elems < local_vocab_size) ? (col_start + chunk_elems) : local_vocab_size;
     const int span = col_end - col_start;
+    const int gid_start = vocab_offset + col_start;
+    const int gid_end = vocab_offset + col_end;
 
     const int tid = threadIdx.x;
     if (tid == 0) {
         int cnt = 0;
-        int min_t = vocab_size;
+        int min_t = gid_end;
         int max_t = -1;
         if (sparse_entries != nullptr && cfg.sparse_count > 0 && cfg.sparse_offset >= 0) {
             const w34_sampler_sparse_entry* row_sp = sparse_entries + cfg.sparse_offset;
             for (int i = 0; i < cfg.sparse_count; ++i) {
                 const w34_sampler_sparse_entry e = row_sp[i];
-                if (e.token_id >= col_start && e.token_id < col_end && cnt < kFastGreedyMaxSparse) {
+                if (e.token_id >= gid_start && e.token_id < gid_end && cnt < kFastGreedyMaxSparse) {
                     s_local[cnt++] = e;
                     if (e.token_id < min_t) min_t = e.token_id;
                     if (e.token_id > max_t) max_t = e.token_id;
@@ -992,7 +997,7 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
     const bool want_lp = (cfg.top_logprobs_k >= 0);
     const bool has_rep = fabsf(cfg.repetition_penalty - 1.0f) > 1e-6f;
 
-    const __half* row_logits = logits_f16 + (size_t)row * vocab_size;
+    const __half* row_logits = logits_f16 + (size_t)row * local_vocab_size;
     const __half* split_ptr = row_logits + col_start;
     const uint32_t* row_mask =
         (bitmask_u32 != nullptr && cfg.has_bitmask != 0 && cfg.row_bitmask_word_offset >= 0)
@@ -1006,25 +1011,38 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
     uint32_t local_nonfinite = 0u;
 
     const bool aligned16 = (((uintptr_t)split_ptr) & 15u) == 0u;
+    const bool mask_byte_aligned = ((vocab_offset & 7) == 0);
     if (span > 0) {
-        if (aligned16) {
+        if (aligned16 && (row_mask == nullptr || mask_byte_aligned)) {
             const int vec_end = span & ~7;
             for (int lc = (tid << 3); lc < vec_end; lc += 256 * 8) {
-                const int col0 = col_start + lc;
+                const int gid0 = gid_start + lc;
                 if (row_mask != nullptr) {
-                    const uint32_t mbyte = (row_mask[col0 >> 5] >> (col0 & 24)) & 0xffu;
+                    const uint32_t mbyte = (row_mask[gid0 >> 5] >> (gid0 & 24)) & 0xffu;
                     if (mbyte == 0u) continue;
                     HalfVec8 hv;
                     hv.u = *reinterpret_cast<const uint4*>(split_ptr + lc);
+                    if (local_cnt == 0 || gid0 + 7 < min_t || gid0 > max_t) {
 #pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        if (((mbyte >> j) & 1u) != 0u) {
-                            const float v = __half2float(hv.h[j]);
-                            if (!isfinite(v)) {
-                                local_nonfinite = 1u;
-                            } else {
-                                local_valid += 1u;
-                                local_best = better_pair(local_best, ValIdx{v, col0 + j});
+                        for (int j = 0; j < 8; ++j) {
+                            if (((mbyte >> j) & 1u) != 0u) {
+                                const float v = __half2float(hv.h[j]);
+                                if (!isfinite(v)) {
+                                    local_nonfinite = 1u;
+                                } else {
+                                    local_valid += 1u;
+                                    local_best = better_pair(local_best, ValIdx{v, gid0 + j});
+                                }
+                            }
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            if (((mbyte >> j) & 1u) != 0u) {
+                                eval_fast_greedy_elem(
+                                    hv.h[j], gid0 + j, cfg, has_rep, s_local, local_cnt,
+                                    local_raw_max, local_sum, false,
+                                    local_best, local_valid, local_nonfinite);
                             }
                         }
                     }
@@ -1032,7 +1050,7 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
                 }
                 HalfVec8 hv;
                 hv.u = *reinterpret_cast<const uint4*>(split_ptr + lc);
-                if (local_cnt == 0 || col0 + 7 < min_t || col0 > max_t) {
+                if (local_cnt == 0 || gid0 + 7 < min_t || gid0 > max_t) {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
                         const float v = __half2float(hv.h[j]);
@@ -1050,37 +1068,37 @@ __global__ void sampler_fast_greedy_split_f16_kernel(
                                 local_sum += expf(v - local_raw_max);
                             }
                             local_valid += 1u;
-                            local_best = better_pair(local_best, ValIdx{v, col0 + j});
+                            local_best = better_pair(local_best, ValIdx{v, gid0 + j});
                         }
                     }
                 } else {
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
                         eval_fast_greedy_elem(
-                            hv.h[j], col0 + j, cfg, has_rep, s_local, local_cnt,
+                            hv.h[j], gid0 + j, cfg, has_rep, s_local, local_cnt,
                             local_raw_max, local_sum, want_lp,
                             local_best, local_valid, local_nonfinite);
                     }
                 }
             }
             for (int lc = vec_end + tid; lc < span; lc += 256) {
-                const int col = col_start + lc;
-                if (row_mask != nullptr && ((row_mask[col >> 5] & (1u << (col & 31))) == 0u)) {
+                const int gid = gid_start + lc;
+                if (row_mask != nullptr && ((row_mask[gid >> 5] & (1u << (gid & 31))) == 0u)) {
                     continue;
                 }
                 eval_fast_greedy_elem(
-                    split_ptr[lc], col, cfg, has_rep, s_local, local_cnt,
+                    split_ptr[lc], gid, cfg, has_rep, s_local, local_cnt,
                     local_raw_max, local_sum, want_lp,
                     local_best, local_valid, local_nonfinite);
             }
         } else {
             for (int lc = tid; lc < span; lc += 256) {
-                const int col = col_start + lc;
-                if (row_mask != nullptr && ((row_mask[col >> 5] & (1u << (col & 31))) == 0u)) {
+                const int gid = gid_start + lc;
+                if (row_mask != nullptr && ((row_mask[gid >> 5] & (1u << (gid & 31))) == 0u)) {
                     continue;
                 }
                 eval_fast_greedy_elem(
-                    split_ptr[lc], col, cfg, has_rep, s_local, local_cnt,
+                    split_ptr[lc], gid, cfg, has_rep, s_local, local_cnt,
                     local_raw_max, local_sum, want_lp,
                     local_best, local_valid, local_nonfinite);
             }
@@ -1276,6 +1294,122 @@ __global__ void sampler_fast_greedy_merge_f16_kernel(
             row, logits_f16, cfg, sparse_entries,
             winner, global_raw_max, sum_exp_raw, valid_count, any_nonfinite,
             row_outs, vocab_size);
+    }
+}
+
+__global__ void sampler_shard_fast_greedy_merge_kernel(
+    const w34_sampler_row_cfg* __restrict__ row_cfgs,
+    const uint32_t* __restrict__ bitmask_u32,
+    const FastGreedySplitPart* __restrict__ fast_split_parts,
+    float* __restrict__ out_local_vals,
+    int32_t* __restrict__ out_local_ids,
+    int num_rows) {
+    const int row = (int)blockIdx.x;
+    if (row >= num_rows) return;
+    const w34_sampler_row_cfg cfg = row_cfgs[row];
+    const int lane = (int)threadIdx.x;
+    if (!is_row_fast_greedy_masked(cfg, bitmask_u32) || cfg.top_logprobs_k >= 0) {
+        if (lane == 0) {
+            out_local_vals[row] = INFINITY;
+            out_local_ids[row] = -3;
+        }
+        return;
+    }
+    FastGreedySplitPart p = {};
+    p.best_val = -FLT_MAX;
+    p.best_idx = -1;
+    if (lane < kFastGreedySplits) {
+        p = fast_split_parts[row * kFastGreedySplits + lane];
+    }
+    ValIdx winner = (p.valid_cnt > 0u) ? ValIdx{p.best_val, p.best_idx} : ValIdx{-FLT_MAX, -1};
+    uint32_t valid_count = p.valid_cnt;
+    uint32_t any_nonfinite = p.nonfinite;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, winner.val, off);
+        const int32_t oi = __shfl_xor_sync(0xffffffffu, winner.idx, off);
+        winner = better_pair(winner, ValIdx{ov, oi});
+        valid_count += __shfl_xor_sync(0xffffffffu, valid_count, off);
+        any_nonfinite |= __shfl_xor_sync(0xffffffffu, any_nonfinite, off);
+    }
+    if (lane == 0) {
+        if (any_nonfinite > 0u) {
+            out_local_vals[row] = INFINITY;
+            out_local_ids[row] = -2;
+        } else if (valid_count == 0u) {
+            out_local_vals[row] = -INFINITY;
+            out_local_ids[row] = -1;
+        } else {
+            out_local_vals[row] = winner.val;
+            out_local_ids[row] = winner.idx;
+        }
+    }
+}
+
+__global__ void sampler_greedy_top1_split_f16_kernel(
+    const __half* __restrict__ logits_f16,
+    ValIdx* __restrict__ out_parts,
+    int num_rows,
+    int local_vocab_size,
+    int vocab_offset) {
+    const int split_idx = (int)blockIdx.x;
+    const int row = (int)blockIdx.y;
+    if (row >= num_rows || split_idx >= kFastGreedySplits) return;
+
+    __shared__ float s_val[8];
+    __shared__ int32_t s_idx[8];
+
+    const int chunk_elems = ((local_vocab_size + kFastGreedySplits - 1) / kFastGreedySplits + 7) & ~7;
+    const int col_start = split_idx * chunk_elems;
+    const int col_end =
+        (col_start + chunk_elems < local_vocab_size) ? (col_start + chunk_elems) : local_vocab_size;
+    const int span = col_end - col_start;
+
+    const __half* split_ptr = logits_f16 + (size_t)row * local_vocab_size + col_start;
+    const int gid_start = vocab_offset + col_start;
+    const int tid = (int)threadIdx.x;
+
+    ValIdx local_best = {-FLT_MAX, -1};
+    if (span > 0) {
+        const bool aligned16 = (((uintptr_t)split_ptr) & 15u) == 0u;
+        const int vec_end = aligned16 ? (span & ~7) : 0;
+        for (int lc = (tid << 3); lc < vec_end; lc += 256 * 8) {
+            HalfVec8 hv;
+            hv.u = *reinterpret_cast<const uint4*>(split_ptr + lc);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float v = __half2float(hv.h[j]);
+                local_best = better_pair(local_best, ValIdx{v, gid_start + lc + j});
+            }
+        }
+        for (int lc = vec_end + tid; lc < span; lc += 256) {
+            const float v = __half2float(split_ptr[lc]);
+            local_best = better_pair(local_best, ValIdx{v, gid_start + lc});
+        }
+    }
+    const ValIdx split_best = block_reduce_max_pair(local_best, s_val, s_idx);
+    if (tid == 0) {
+        out_parts[row * kFastGreedySplits + split_idx] = split_best;
+    }
+}
+
+__global__ void sampler_greedy_top1_merge_f16_kernel(
+    const ValIdx* __restrict__ split_parts,
+    int32_t* __restrict__ out_greedy_ids,
+    float* __restrict__ out_max_vals,
+    int num_rows) {
+    const int row = (int)blockIdx.x;
+    if (row >= num_rows) return;
+    const int lane = (int)threadIdx.x;
+    ValIdx v = (lane < kFastGreedySplits)
+        ? split_parts[row * kFastGreedySplits + lane]
+        : ValIdx{-FLT_MAX, -1};
+    v = warp_reduce_max_pair(v);
+    if (lane == 0) {
+        out_greedy_ids[row] = v.idx;
+        if (out_max_vals != nullptr) {
+            out_max_vals[row] = v.val;
+        }
     }
 }
 
@@ -1996,7 +2130,29 @@ extern "C" int w34_sampler_greedy_top5_f16(
         num_rows <= 0 || local_vocab_size <= 0) {
         return (int)cudaErrorInvalidValue;
     }
-    w34_sampler::sampler_greedy_top5_f16_kernel<<<num_rows, 1024, 0, (cudaStream_t)ex->stream>>>(
+    cudaStream_t stream = (cudaStream_t)ex->stream;
+    const size_t split_bytes =
+        (size_t)num_rows * (size_t)w34_sampler::kFastGreedySplits * sizeof(w34_sampler::ValIdx);
+    if (out_top5_ids == nullptr && local_vocab_size >= 4096 && num_rows <= 16 &&
+        ex->scratch_ptr != 0 && ex->scratch_size >= split_bytes) {
+        auto* split_parts = reinterpret_cast<w34_sampler::ValIdx*>((uintptr_t)ex->scratch_ptr);
+        w34_sampler::sampler_greedy_top1_split_f16_kernel<<<
+            dim3((unsigned)w34_sampler::kFastGreedySplits, (unsigned)num_rows), 256, 0, stream>>>(
+            (const __half*)logits_f16,
+            split_parts,
+            num_rows,
+            local_vocab_size,
+            vocab_offset);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return (int)err;
+        w34_sampler::sampler_greedy_top1_merge_f16_kernel<<<(unsigned)num_rows, 32, 0, stream>>>(
+            split_parts,
+            out_greedy_ids,
+            out_top5_logprobs,
+            num_rows);
+        return (int)cudaGetLastError();
+    }
+    w34_sampler::sampler_greedy_top5_f16_kernel<<<num_rows, 1024, 0, stream>>>(
         (const __half*)logits_f16, out_greedy_ids, out_top5_ids, out_top5_logprobs,
         local_vocab_size, vocab_offset);
     return (int)cudaGetLastError();
@@ -2058,7 +2214,8 @@ extern "C" int w34_sampler_step_f16(
             nullptr,
             fast_parts,
             num_rows,
-            vocab_size);
+            vocab_size,
+            0);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return (int)err;
     }
@@ -2104,7 +2261,8 @@ extern "C" int w34_sampler_step_fast_greedy_masked_f16(
         sparse_entries,
         fast_parts,
         num_rows,
-        vocab_size);
+        vocab_size,
+        0);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return (int)err;
     w34_sampler::sampler_fast_greedy_merge_f16_kernel<<<(unsigned)num_rows, 32, 0, stream>>>(
@@ -2116,6 +2274,51 @@ extern "C" int w34_sampler_step_fast_greedy_masked_f16(
         row_outs,
         num_rows,
         vocab_size);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int w34_sampler_shard_fast_greedy_f16(
+    const w34_exec* ex,
+    const void* logits_f16,
+    const w34_sampler_row_cfg* row_cfgs,
+    const uint32_t* bitmask_u32,
+    const w34_sampler_sparse_entry* sparse_entries,
+    float* out_local_vals,
+    int32_t* out_local_ids,
+    int num_rows,
+    int local_vocab_size,
+    int vocab_offset) {
+    if (ex == nullptr || logits_f16 == nullptr || row_cfgs == nullptr ||
+        out_local_vals == nullptr || out_local_ids == nullptr ||
+        num_rows <= 0 || local_vocab_size < 512 || vocab_offset < 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const size_t parts_bytes =
+        (size_t)num_rows * w34_sampler::kFastGreedySplits * sizeof(w34_sampler::FastGreedySplitPart);
+    if (ex->scratch_ptr == 0 || ex->scratch_size < parts_bytes) {
+        return (int)cudaErrorMemoryAllocation;
+    }
+    cudaStream_t stream = (cudaStream_t)ex->stream;
+    auto* fast_parts = reinterpret_cast<w34_sampler::FastGreedySplitPart*>((uintptr_t)ex->scratch_ptr);
+    w34_sampler::sampler_fast_greedy_split_f16_kernel<<<
+        dim3((unsigned)w34_sampler::kFastGreedySplits, (unsigned)num_rows), 256, 0, stream>>>(
+        (const __half*)logits_f16,
+        row_cfgs,
+        bitmask_u32,
+        sparse_entries,
+        fast_parts,
+        num_rows,
+        local_vocab_size,
+        vocab_offset);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return (int)err;
+    w34_sampler::sampler_shard_fast_greedy_merge_kernel<<<(unsigned)num_rows, 32, 0, stream>>>(
+        row_cfgs,
+        bitmask_u32,
+        fast_parts,
+        out_local_vals,
+        out_local_ids,
+        num_rows);
     return (int)cudaGetLastError();
 }
 

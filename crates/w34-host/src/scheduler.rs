@@ -379,28 +379,48 @@ impl SchedulerV1 {
         self.admit_waiting_with_filter(alloc_three_state_slots, |_, _, _| true)
     }
 
+    pub fn admit_waiting_by_shareability<F>(&mut self, alloc_slots: F) -> Vec<RadixEvictResult>
+    where
+        F: FnMut(&mut MambaRadixCache, bool) -> Option<(i32, [i32; 2])>,
+    {
+        self.admit_waiting_internal(alloc_slots, |_, _, _| true)
+    }
+
     pub fn admit_waiting_with_filter<F, P>(
         &mut self,
         mut alloc_three_state_slots: F,
-        mut allow_prefix_hit: P,
+        allow_prefix_hit: P,
     ) -> Vec<RadixEvictResult>
     where
         F: FnMut(&mut MambaRadixCache) -> Option<(i32, [i32; 2])>,
         P: FnMut(u64, &[i32], usize) -> bool,
     {
+        self.admit_waiting_internal(|radix, _| alloc_three_state_slots(radix), allow_prefix_hit)
+    }
+
+    fn admit_waiting_internal<F, P>(
+        &mut self,
+        mut alloc_slots: F,
+        mut allow_prefix_hit: P,
+    ) -> Vec<RadixEvictResult>
+    where
+        F: FnMut(&mut MambaRadixCache, bool) -> Option<(i32, [i32; 2])>,
+        P: FnMut(u64, &[i32], usize) -> bool,
+    {
         self.radix.active_lora_id = crate::lora::BASE_MODEL_LORA_ID;
         let evictions = Vec::new();
         while self.active.len() < self.cfg.max_num_seqs {
-            let (lookup_len, raw_hit, allow_hit, pinned_hit) = {
+            let (lookup_len, raw_hit, allow_hit, pinned_hit, unshareable) = {
                 let Some(w) = self.waiting.front() else {
                     break;
                 };
                 // Match up to `radix_key_tokens.len() - 1` so at least the final prompt token is
                 // evaluated through `lm_head` to produce the first output token.
-                // Pin any warm prefix hit BEFORE `alloc_three_state_slots` so tight Mamba pools
+                // Pin any warm prefix hit BEFORE `alloc_slots` so tight Mamba pools
                 // (e.g. 262K single-GPU serving) never evict the checkpoint this request itself
                 // is about to resume from; release the pin immediately and fall back to cold
                 // eviction only when a minimal 3-slot pool has no fourth slot.
+                let unshareable = w.prefix_bidir_len.is_some();
                 let default_lookup = w.radix_key_tokens.len().saturating_sub(1);
                 let lookup_len = w
                     .max_prefix_lookup_len
@@ -410,7 +430,7 @@ impl SchedulerV1 {
                     || allow_prefix_hit(w.req_id, &w.radix_key_tokens, raw_hit.matched_tokens);
                 let pinned_hit =
                     allow_hit && raw_hit.matched_tokens > 0 && raw_hit.mamba_slot.is_some();
-                (lookup_len, raw_hit, allow_hit, pinned_hit)
+                (lookup_len, raw_hit, allow_hit, pinned_hit, unshareable)
             };
             let _ = lookup_len;
             let mut match_res = if !allow_hit {
@@ -423,14 +443,14 @@ impl SchedulerV1 {
             if pinned_hit {
                 self.radix.inc_lock_ref(match_res.last_node);
             }
-            let pinned_slots = alloc_three_state_slots(&mut self.radix);
+            let pinned_slots = alloc_slots(&mut self.radix, unshareable);
             if pinned_hit {
                 self.radix.dec_lock_ref(match_res.last_node);
             }
             let (active_slot, ping_pong_slots) = match pinned_slots {
                 Some(slots) => slots,
                 None if pinned_hit => {
-                    let Some(fallback_slots) = alloc_three_state_slots(&mut self.radix) else {
+                    let Some(fallback_slots) = alloc_slots(&mut self.radix, unshareable) else {
                         break;
                     };
                     match_res = self.radix.match_prefix(&[]);
@@ -1292,5 +1312,76 @@ mod tests {
         constrained.admit_waiting(|_| Some((0, [1, 2])));
         constrained.active[0].radix_state.kv_pages = (0..7).collect();
         assert!(constrained.schedule_step().is_empty());
+    }
+
+    #[test]
+    fn test_admit_waiting_by_shareability_reserves_one_gdn_slot_for_bidir() {
+        let mut sched = SchedulerV1::new(SchedulerConfig {
+            chunk_prefill_size: 64,
+            max_num_batched_tokens: 128,
+            ..SchedulerConfig::default()
+        });
+        // Pool has only 3 GDN state slots total: enough for 1 shareable request OR 3 unshareable requests.
+        let mut free_slots = vec![2, 1, 0];
+        for req_idx in 0..3 {
+            let prompt: Vec<i32> = (0..96).map(|i| req_idx * 1000 + i).collect();
+            sched.submit_request_with_prefix_and_bidir(
+                prompt.clone(),
+                prompt,
+                0,
+                0,
+                false,
+                Vec::new(),
+                Vec::new(),
+                false,
+                None,
+                None,
+                Some(64),
+            );
+        }
+        sched.admit_waiting_by_shareability(|_, unshareable| {
+            if unshareable {
+                free_slots.pop().map(|s| (s, [-1, -1]))
+            } else if free_slots.len() >= 3 {
+                Some((
+                    free_slots.pop().unwrap(),
+                    [free_slots.pop().unwrap(), free_slots.pop().unwrap()],
+                ))
+            } else {
+                None
+            }
+        });
+        assert_eq!(sched.active.len(), 3);
+        assert!(free_slots.is_empty());
+        for (idx, seq) in sched.active.iter_mut().enumerate() {
+            assert_eq!(seq.radix_state.ping_pong_slots, [-1, -1]);
+            seq.radix_state.kv_pages = (0..6).map(|p| (idx * 8 + p) as i32).collect();
+        }
+        // Run non-final 64-token bidir prefix chunks and final 32-token causal chunks cleanly with [-1, -1].
+        let step1 = sched.schedule_step();
+        assert_eq!(step1.len(), 2);
+        for s in &step1 {
+            assert!(s.planned_checkpoints.is_empty());
+            sched.commit_slice(s, None, || None);
+        }
+        let step2 = sched.schedule_step();
+        assert_eq!(step2.len(), 3);
+        let mut freed_slots = 0usize;
+        for s in &step2 {
+            assert!(s.planned_checkpoints.is_empty());
+            let tok = s.is_final_prefill_chunk.then_some(7);
+            if let Some(fin) = sched.commit_slice(s, tok, || None) {
+                freed_slots += fin.freed_mamba_slots.len();
+            }
+        }
+        let step3 = sched.schedule_step();
+        assert_eq!(step3.len(), 1);
+        for s in &step3 {
+            assert!(s.planned_checkpoints.is_empty());
+            if let Some(fin) = sched.commit_slice(s, Some(7), || None) {
+                freed_slots += fin.freed_mamba_slots.len();
+            }
+        }
+        assert_eq!(freed_slots, 3);
     }
 }

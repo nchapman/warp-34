@@ -622,17 +622,19 @@ fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
         Qwen3_5Engine::load("Qwen/Qwen3.5-4B", 1, KvFormatPolicy::Tq4, Some(16), true).unwrap();
     graphed.enable_speculative(&spec).unwrap();
     assert!(graphed.use_cuda_graph);
-    assert!(graphed.ranks[0].spec_verify_graph.is_none());
+    assert!(graphed.ranks[0].spec_verify_graphs.is_empty());
     let graphed_greedy = graphed
         .generate_with_radix_cache(&prompt, 16, 64, false)
         .unwrap()
         .generated_token_ids;
-    assert_eq!(
+    assert!(
         graphed.ranks[0]
-            .spec_verify_graph
-            .as_ref()
-            .map(|((m, _), _)| *m),
-        Some(4)
+            .spec_verify_graphs
+            .iter()
+            .any(|((m, _, mode, _), _, _)| {
+                *m == 4 && *mode == w34_host::model::DecodeGraphSampleMode::PlainGreedy
+            }),
+        "expected PlainGreedy spec_verify_graph for m=4"
     );
     assert_eq!(graphed_greedy, eager_greedy);
 
@@ -640,6 +642,15 @@ fn speculative_verify_cuda_graph_matches_eager_and_sampled() {
         .generate_sampled_with_radix_cache(&prompt, params, None, 64)
         .unwrap()
         .generated_token_ids;
+    assert!(
+        graphed.ranks[0]
+            .spec_verify_graphs
+            .iter()
+            .any(|((m, _, mode, _), _, _)| {
+                *m == 4 && *mode == w34_host::model::DecodeGraphSampleMode::LogitsOnly
+            }),
+        "expected LogitsOnly spec_verify_graph for m=4"
+    );
     assert_eq!(graphed_sampled, eager_sampled);
 }
 

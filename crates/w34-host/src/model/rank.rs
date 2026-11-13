@@ -3,6 +3,20 @@
 pub(super) use super::rank_capacity::*;
 use super::*;
 
+#[cfg(feature = "cuda")]
+pub(crate) type SpecVerifyGraphKey = (usize, bool, DecodeGraphSampleMode, GraphLoraMode);
+#[cfg(feature = "cuda")]
+pub(crate) type BatchedSpecVerifyGraphKey = (
+    usize,
+    usize,
+    usize,
+    bool,
+    DecodeGraphSampleMode,
+    GraphLoraMode,
+);
+#[cfg(feature = "cuda")]
+pub(crate) type BatchedDecodeGraphKey = (usize, bool, DecodeGraphSampleMode, GraphLoraMode);
+
 /// Shared PLE lookup data and rank-local staging buffers.
 #[cfg(feature = "cuda")]
 pub struct PleRankRuntime {
@@ -12,6 +26,13 @@ pub struct PleRankRuntime {
     pub f8_host_scratch: crate::cuda::MappedHostBuffer,
     pub f8_host_slot: usize,
     pub ids_scratch: Vec<i64>,
+    pub slice_tokens_scratch: Vec<i32>,
+    pub slice_q_start_scratch: Vec<i32>,
+    pub slice_st_in_scratch: Vec<i32>,
+    pub slice_st_out_scratch: Vec<i32>,
+    pub slice_has_init_scratch: Vec<u8>,
+    pub slice_ckpt_dst_scratch: Vec<i32>,
+    pub slice_ckpt_off_scratch: Vec<i32>,
 }
 
 /// One rank of a Qwen 3.5 / 3.8 model resident on a single GPU.
@@ -37,11 +58,15 @@ pub struct Qwen3_5ModelRank {
     pub kv_pool: KvPool,
     pub state_pool: StateBundlePool,
     pub decode_io: DecodeGraphIo,
-    pub decode_graph: Option<(bool, CudaGraph)>,
+    pub decode_graph: Vec<((bool, GraphLoraMode), u64, CudaGraph)>,
     pub spec_verify_io: SpecVerifyGraphIo,
-    pub spec_verify_graph: Option<((usize, bool), CudaGraph)>,
+    pub spec_verify_graphs: Vec<(SpecVerifyGraphKey, u64, CudaGraph)>,
+    pub failed_spec_verify_keys: Vec<SpecVerifyGraphKey>,
+    pub batched_spec_verify_io: BatchedSpecVerifyGraphIo,
+    pub batched_spec_verify_graphs: Vec<(BatchedSpecVerifyGraphKey, u64, CudaGraph)>,
+    pub failed_batched_spec_verify_keys: Vec<BatchedSpecVerifyGraphKey>,
     pub batched_decode_io: BatchedDecodeGraphIo,
-    pub batched_decode_graphs: Vec<((usize, bool, DecodeGraphSampleMode), u64, CudaGraph)>,
+    pub batched_decode_graphs: Vec<(BatchedDecodeGraphKey, u64, CudaGraph)>,
     pub aux_stream: CudaStream,
     pub aux_marlin_ws: DeviceBuffer,
     pub aux_fork_event: crate::cuda::CudaEvent,
@@ -55,11 +80,12 @@ pub struct Qwen3_5ModelRank {
     pub last_logits_ptr: u64,
     pub last_logits_rows: usize,
     pub captured_decode_logits_ptr: u64,
-    pub captured_spec_logits_ptr: u64,
     pub last_final_hidden_f16: Option<DeviceBuffer>,
     pub max_tap_rows: usize,
     pub current_pos_plane_stride: i32,
     pub pending_visual_splice: Option<(u64, u64, usize)>,
+    pub(crate) vision_splice_idx: Option<DeviceBuffer>,
+    pub(crate) vision_splice_emb: Option<DeviceBuffer>,
     pub last_norm_hidden_ptr: u64,
     pub last_norm_hidden_rows: usize,
     pub last_batch_state_slots: Vec<usize>,
@@ -340,8 +366,11 @@ impl Qwen3_5ModelRank {
         adapters: &[crate::lora::LoraAdapterHost],
     ) -> Result<()> {
         self.device.make_current()?;
-        self.decode_graph = None;
-        self.spec_verify_graph = None;
+        self.decode_graph.clear();
+        self.spec_verify_graphs.clear();
+        self.failed_spec_verify_keys.clear();
+        self.batched_spec_verify_graphs.clear();
+        self.failed_batched_spec_verify_keys.clear();
         self.batched_decode_graphs.clear();
         if !adapters.is_empty() {
             let target_scratch = if adapters
@@ -374,6 +403,18 @@ impl Qwen3_5ModelRank {
     pub fn set_lora_uniform(&self, lora_id: i32) {
         if let Some(rt) = &self.lora_runtime {
             rt.state.set_uniform(lora_id);
+        }
+    }
+
+    #[inline]
+    pub fn bind_graph_lora_mode(&self, lora_mode: GraphLoraMode, token_lora_ids_ptr: u64) {
+        let Some(rt) = &self.lora_runtime else {
+            return;
+        };
+        match lora_mode {
+            GraphLoraMode::BaseOnly => rt.state.set_uniform(crate::lora::BASE_MODEL_LORA_ID),
+            GraphLoraMode::Uniform(lid) => rt.state.set_uniform(lid),
+            GraphLoraMode::Mixed => rt.state.set_device_ids(token_lora_ids_ptr),
         }
     }
 
@@ -1681,6 +1722,7 @@ impl PrePoolModelRank {
             DecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         let spec_verify_io =
             SpecVerifyGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
+        let batched_spec_verify_io = BatchedSpecVerifyGraphIo::new(device_id, &stream)?;
         let batched_decode_io =
             BatchedDecodeGraphIo::new(device_id, capacity_plan.max_kv_pages_per_layer, &stream)?;
         device.synchronize()?;
@@ -1706,9 +1748,13 @@ impl PrePoolModelRank {
             kv_pool,
             state_pool,
             decode_io,
-            decode_graph: None,
+            decode_graph: Vec::new(),
             spec_verify_io,
-            spec_verify_graph: None,
+            spec_verify_graphs: Vec::new(),
+            failed_spec_verify_keys: Vec::new(),
+            batched_spec_verify_io,
+            batched_spec_verify_graphs: Vec::new(),
+            failed_batched_spec_verify_keys: Vec::new(),
             batched_decode_io,
             batched_decode_graphs: Vec::new(),
             aux_stream,
@@ -1723,11 +1769,12 @@ impl PrePoolModelRank {
             last_logits_ptr: 0,
             last_logits_rows: 0,
             captured_decode_logits_ptr: 0,
-            captured_spec_logits_ptr: 0,
             last_final_hidden_f16: None,
             max_tap_rows: 0,
             current_pos_plane_stride: 0,
             pending_visual_splice: None,
+            vision_splice_idx: None,
+            vision_splice_emb: None,
             last_norm_hidden_ptr: 0,
             last_norm_hidden_rows: 0,
             last_batch_state_slots: vec![0],

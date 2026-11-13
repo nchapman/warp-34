@@ -458,10 +458,8 @@ impl TieredMoeEngine {
                 // ~65 GB/s DDR5 vs ~25 GB/s PCIe bandwidth ratio) run on the 16-core CPU
                 // worker pool in parallel with GPU Pass 0 + PCIe `StreamedPrefill`!
                 let mut gpu_misses: Vec<usize> = Vec::new();
-                let mut cpu_job_le: Vec<i32> = Vec::new();
-                let mut cpu_job_n: Vec<i32> = Vec::new();
-                let mut cpu_job_toks: Vec<i32> = Vec::new();
-                let mut cpu_job_wts: Vec<f32> = Vec::new();
+                ws.cpu_tasks_scratch.clear();
+                let mut cpu_job_count = 0usize;
 
                 let mut promote_victim_slots: Vec<i32> = Vec::new();
                 let mut promote_new_ges: Vec<usize> = Vec::new();
@@ -585,17 +583,9 @@ impl TieredMoeEngine {
                         for &(_, ge) in &light_candidates {
                             let le = ge - local_start;
                             is_cpu_le[le] = true;
-                            let list = &exp_toks[le];
-                            cpu_job_le.push(le as i32);
-                            cpu_job_n.push(list.len() as i32);
-                            for s in 0..96 {
-                                if s < list.len() {
-                                    cpu_job_toks.push(list[s].0);
-                                    cpu_job_wts.push(list[s].1);
-                                } else {
-                                    cpu_job_toks.push(0);
-                                    cpu_job_wts.push(0.0);
-                                }
+                            cpu_job_count += 1;
+                            for &(tok, wt) in &exp_toks[le] {
+                                ws.cpu_tasks_scratch.push((tok as usize, le, wt));
                             }
                         }
                         for &ge in &misses_in_step {
@@ -673,10 +663,15 @@ impl TieredMoeEngine {
                     gpu_misses.clone_from(&misses_in_step);
                 }
 
+                // Ensure any prior `StreamedPrefill` call's async H2Ds from `ws.h_chunk_slot_pinned`
+                // and `ws.h_prefill_out` have completed (already satisfied after `execute_auto`'s
+                // routing sync, and prevents back-to-back direct `execute_layer` unit-test races).
+                ws.pinned_h2d_done_event.synchronize()?;
+
                 // Enqueue async D2H of `x_addr` into pinned `ws.h_prefill_x` and record `ws.d2h_done_event`
                 // WITHOUT blocking the host thread yet — we enqueue Pass 0 and all GPU cold chunks first!
                 let x_bytes = num_tokens * ws.layout.hidden * core::mem::size_of::<u16>();
-                if !cpu_job_le.is_empty() {
+                if cpu_job_count > 0 {
                     crate::cuda::check_rc(
                         // SAFETY: `ws.h_prefill_x` and `x_addr` cover `x_bytes` bytes.
                         unsafe {
@@ -761,14 +756,11 @@ impl TieredMoeEngine {
                         ws.h2d_done_events[next_buf].record(&ws.h2d_stream)?;
                     }
 
-                    // Build per-expert chunk slot table (`<= 512` i32s = 2 KB inline async H2D)
-                    // and remap all `num_tokens * top_k` pairs on the GPU via `w34_moe_remap_topk_ids_i32`.
+                    // Stage per-expert chunk slot table (`<= 1024` i32s) in double-buffered pinned
+                    // host memory (`ws.h_chunk_slot_pinned`) so `w34_memcpy_h2d_async` never blocks
+                    // `compute_stream` before CPU prefill starts.
                     let local_start = cache.expert_ids.start;
                     let local_len = cache.expert_ids.len();
-                    let mut local_to_chunk_slot = vec![-1i32; local_len];
-                    for (pos, &ge) in chunk.iter().enumerate() {
-                        local_to_chunk_slot[ge - local_start] = pos as i32;
-                    }
 
                     compute_stream.wait_event(&ws.h2d_done_events[buf_idx])?;
                     let stage_cap = ws.stage_tables[buf_idx].capacity;
@@ -797,8 +789,30 @@ impl TieredMoeEngine {
                         chunk.len(),
                     )?;
                     if c_idx == 0 && !promote_victim_slots.is_empty() {
-                        ws.d_miss_victim_slots
-                            .copy_from_host(&promote_victim_slots, compute_stream)?;
+                        if promote_victim_slots.len() <= 1024 {
+                            // SAFETY: `[0..1024]` i32s in `h_chunk_slot_pinned` are reserved for
+                            // `promote_victim_slots` (`<= 16` i32s), protected by `pinned_h2d_done_event`.
+                            unsafe {
+                                let p_vic = ws.h_chunk_slot_pinned.host_ptr.cast::<i32>();
+                                core::ptr::copy_nonoverlapping(
+                                    promote_victim_slots.as_ptr(),
+                                    p_vic,
+                                    promote_victim_slots.len(),
+                                );
+                                crate::cuda::check_rc(
+                                    w34_kernels::ffi::w34_memcpy_h2d_async(
+                                        ws.d_miss_victim_slots.addr() as *mut core::ffi::c_void,
+                                        p_vic.cast(),
+                                        promote_victim_slots.len() * 4,
+                                        compute_stream.handle,
+                                    ),
+                                    "w34_memcpy_h2d_async (promote_victim_slots)",
+                                )?;
+                            }
+                        } else {
+                            ws.d_miss_victim_slots
+                                .copy_from_host(&promote_victim_slots, compute_stream)?;
+                        }
                         cache.slots.unpack_staged(
                             compute_stream,
                             ws.d_stage_packs[0].addr(),
@@ -826,8 +840,38 @@ impl TieredMoeEngine {
                     }
                     ws.compute_done_events[buf_idx].record(compute_stream)?;
 
-                    ws.d_miss_local_experts
-                        .copy_from_host(&local_to_chunk_slot, compute_stream)?;
+                    if local_len <= 512 && c_idx < 512 {
+                        // SAFETY: `h_chunk_slot_pinned` reserves a disjoint `512`-i32 slice per `c_idx`
+                        // (`0..512`) starting at offset `1024`, protected across calls by `pinned_h2d_done_event`.
+                        unsafe {
+                            let p_slot = ws
+                                .h_chunk_slot_pinned
+                                .host_ptr
+                                .cast::<i32>()
+                                .add(1024 + c_idx * 512);
+                            let slot_slice = core::slice::from_raw_parts_mut(p_slot, local_len);
+                            slot_slice.fill(-1);
+                            for (pos, &ge) in chunk.iter().enumerate() {
+                                slot_slice[ge - local_start] = pos as i32;
+                            }
+                            crate::cuda::check_rc(
+                                w34_kernels::ffi::w34_memcpy_h2d_async(
+                                    ws.d_miss_local_experts.addr() as *mut core::ffi::c_void,
+                                    p_slot.cast(),
+                                    local_len * 4,
+                                    compute_stream.handle,
+                                ),
+                                "w34_memcpy_h2d_async (local_to_chunk_slot)",
+                            )?;
+                        }
+                    } else {
+                        let mut local_to_chunk_slot = vec![-1i32; local_len];
+                        for (pos, &ge) in chunk.iter().enumerate() {
+                            local_to_chunk_slot[ge - local_start] = pos as i32;
+                        }
+                        ws.d_miss_local_experts
+                            .copy_from_host(&local_to_chunk_slot, compute_stream)?;
+                    }
                     crate::cuda::check_rc(
                         // SAFETY: pointers and counts match allocated device buffers.
                         unsafe {
@@ -860,24 +904,21 @@ impl TieredMoeEngine {
                 // While the GPU is executing Pass 0 + `chunks` on `compute_stream`, wait only for
                 // `ws.d2h_done_event` (which was recorded before Pass 0!) and evaluate `cpu_job_le`
                 // across the 16-core AVX2/FMA worker pool in DDR5 RAM!
-                if !cpu_job_le.is_empty()
+                if cpu_job_count > 0
                     && let Some(ref runtime) = cache.bridge_runtime
                 {
                     ws.d2h_done_event.synchronize()?;
-                    cache.cpu_cold_evals += cpu_job_le.len() as u64;
+                    cache.cpu_cold_evals += cpu_job_count as u64;
                     // SAFETY: event completed D2H; these pinned buffers cover the batch and are exclusively used here.
                     unsafe {
-                        runtime.prefill(
+                        runtime.prefill_tasks(
                             store,
                             std::slice::from_raw_parts(
                                 ws.h_prefill_x.host_ptr.cast::<u16>(),
                                 num_tokens * ws.layout.hidden,
                             ),
                             num_tokens,
-                            &cpu_job_le,
-                            &cpu_job_n,
-                            &cpu_job_toks,
-                            &cpu_job_wts,
+                            &ws.cpu_tasks_scratch,
                             std::slice::from_raw_parts_mut(
                                 ws.h_prefill_out.host_ptr.cast::<u16>(),
                                 num_tokens * ws.layout.hidden,
@@ -909,6 +950,7 @@ impl TieredMoeEngine {
                         "w34_add_inplace_f16 (StreamedPrefill CPU hybrid)",
                     )?;
                 }
+                ws.pinned_h2d_done_event.record(compute_stream)?;
                 Ok(())
             }
 
@@ -926,7 +968,7 @@ impl TieredMoeEngine {
     ) -> bool {
         cache.slots.capacity >= cache.expert_ids.len()
             || (!cache.has_cpu_bridge()
-                && num_tokens <= TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
+                && num_tokens <= TIERED_MOE_GPU_LRU_MAX_DECODE_TOKENS
                 && num_tokens * top_k <= cache.slots.capacity
                 && store.mapped_dev_ptr() != 0)
             || (num_tokens <= TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
@@ -981,37 +1023,78 @@ impl TieredMoeEngine {
             );
         }
         let pairs = num_tokens * top_k;
-        let mut h_topk_ids = vec![0i32; pairs];
-        crate::cuda::check_rc(
-            // SAFETY: `d_topk_ids_addr` holds `pairs` i32 elements.
+        let ids_bytes = pairs * 4;
+        let need_weights = cache.bridge_runtime.is_some();
+        let mut h_topk_ids = core::mem::take(&mut ws.h_topk_ids_scratch);
+        let mut h_topk_weights = core::mem::take(&mut ws.h_topk_weights_scratch);
+        h_topk_ids.resize(pairs, 0);
+        if need_weights {
+            h_topk_weights.resize(pairs, 0.0);
+        } else {
+            h_topk_weights.clear();
+        }
+        if ids_bytes * 2 <= ws.h_routing_pinned.len_bytes {
+            // SAFETY: `ws.h_routing_pinned` spans at least `2 * ids_bytes` pinned bytes,
+            // and `compute_stream.synchronize()` completes both async DMAs before reading.
             unsafe {
-                w34_kernels::ffi::w34_memcpy_d2h_async(
-                    h_topk_ids.as_mut_ptr().cast::<core::ffi::c_void>(),
-                    d_topk_ids_addr as *const core::ffi::c_void,
-                    pairs * 4,
-                    compute_stream.handle,
-                )
-            },
-            "w34_memcpy_d2h_async (h_topk_ids)",
-        )?;
-        let mut h_topk_weights = Vec::new();
-        if cache.bridge_runtime.is_some() {
-            h_topk_weights.resize(pairs, 0.0f32);
+                let p_ids = ws.h_routing_pinned.host_ptr.cast::<i32>();
+                let p_wts = ws.h_routing_pinned.host_ptr.add(ids_bytes).cast::<f32>();
+                crate::cuda::check_rc(
+                    w34_kernels::ffi::w34_memcpy_d2h_async(
+                        p_ids.cast(),
+                        d_topk_ids_addr as *const core::ffi::c_void,
+                        ids_bytes,
+                        compute_stream.handle,
+                    ),
+                    "w34_memcpy_d2h_async (pinned h_topk_ids)",
+                )?;
+                if need_weights {
+                    crate::cuda::check_rc(
+                        w34_kernels::ffi::w34_memcpy_d2h_async(
+                            p_wts.cast(),
+                            d_topk_weights_addr as *const core::ffi::c_void,
+                            ids_bytes,
+                            compute_stream.handle,
+                        ),
+                        "w34_memcpy_d2h_async (pinned h_topk_weights)",
+                    )?;
+                }
+                compute_stream.synchronize()?;
+                core::ptr::copy_nonoverlapping(p_ids, h_topk_ids.as_mut_ptr(), pairs);
+                if need_weights {
+                    core::ptr::copy_nonoverlapping(p_wts, h_topk_weights.as_mut_ptr(), pairs);
+                }
+            }
+        } else {
             crate::cuda::check_rc(
-                // SAFETY: `d_topk_weights_addr` holds `pairs` f32 elements.
+                // SAFETY: `d_topk_ids_addr` holds `pairs` i32 elements.
                 unsafe {
                     w34_kernels::ffi::w34_memcpy_d2h_async(
-                        h_topk_weights.as_mut_ptr().cast::<core::ffi::c_void>(),
-                        d_topk_weights_addr as *const core::ffi::c_void,
-                        pairs * 4,
+                        h_topk_ids.as_mut_ptr().cast::<core::ffi::c_void>(),
+                        d_topk_ids_addr as *const core::ffi::c_void,
+                        ids_bytes,
                         compute_stream.handle,
                     )
                 },
-                "w34_memcpy_d2h_async (h_topk_weights)",
+                "w34_memcpy_d2h_async (h_topk_ids)",
             )?;
+            if need_weights {
+                crate::cuda::check_rc(
+                    // SAFETY: `d_topk_weights_addr` holds `pairs` f32 elements.
+                    unsafe {
+                        w34_kernels::ffi::w34_memcpy_d2h_async(
+                            h_topk_weights.as_mut_ptr().cast::<core::ffi::c_void>(),
+                            d_topk_weights_addr as *const core::ffi::c_void,
+                            ids_bytes,
+                            compute_stream.handle,
+                        )
+                    },
+                    "w34_memcpy_d2h_async (h_topk_weights)",
+                )?;
+            }
+            compute_stream.synchronize()?;
         }
-        compute_stream.synchronize()?;
-        Self::execute_layer(
+        let res = Self::execute_layer(
             mode,
             store,
             cache,
@@ -1027,7 +1110,10 @@ impl TieredMoeEngine {
             out_addr,
             num_tokens,
             top_k,
-        )
+        );
+        ws.h_topk_ids_scratch = h_topk_ids;
+        ws.h_topk_weights_scratch = h_topk_weights;
+        res
     }
 }
 
@@ -1221,6 +1307,133 @@ impl RankTieredMoe {
         self.caches
             .first()
             .and_then(|c| c.bridge_runtime.as_ref().cloned())
+    }
+
+    /// Coalesces `device_lru_dirty` metadata readback across all layers on this rank into
+    /// a single pinned D2H burst + 1 `stream.synchronize()` + async prefill-map H2D update.
+    pub fn sync_all_dirty_from_device(
+        &mut self,
+        stream: &crate::cuda::CudaStream,
+    ) -> crate::cuda::Result<()> {
+        if !self.caches.iter().any(|c| c.device_lru_dirty) {
+            return Ok(());
+        }
+        let pinned_cap = self.ws.h_lru_sync_pinned.len_bytes;
+        let pinned_base = self.ws.h_lru_sync_pinned.host_ptr.cast::<u8>();
+        let mut idx = 0usize;
+        while idx < self.caches.len() {
+            if !self.caches[idx].device_lru_dirty {
+                idx += 1;
+                continue;
+            }
+            let mut batch_records: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+            let mut off = 0usize;
+            while idx < self.caches.len() {
+                let c = &self.caches[idx];
+                if !c.device_lru_dirty {
+                    idx += 1;
+                    continue;
+                }
+                let e2s_b = c.expert_to_slot.len() * 4;
+                let s2e_b = c.slot_to_expert.len() * 4;
+                let slu_b = c.slot_last_used.len() * 8;
+                let need = (e2s_b + s2e_b + slu_b + 8 + 7) & !7;
+                if need > pinned_cap {
+                    break;
+                }
+                if off + need > pinned_cap {
+                    break;
+                }
+                let base_off = off;
+                let s2e_off = base_off + e2s_b;
+                let slu_off = (s2e_off + s2e_b + 7) & !7;
+                let step_off = slu_off + slu_b;
+                off = step_off + 8;
+                // SAFETY: `step_off + 8 <= pinned_cap`, 8-byte aligned for `u64` slices,
+                // and `stream.synchronize()` completes every D2H before reading.
+                unsafe {
+                    crate::cuda::check_rc(
+                        w34_kernels::ffi::w34_memcpy_d2h_async(
+                            pinned_base.add(base_off).cast(),
+                            c.d_expert_to_slot.addr() as *const core::ffi::c_void,
+                            e2s_b,
+                            stream.handle,
+                        ),
+                        "coalesced d_expert_to_slot D2H",
+                    )?;
+                    crate::cuda::check_rc(
+                        w34_kernels::ffi::w34_memcpy_d2h_async(
+                            pinned_base.add(s2e_off).cast(),
+                            c.d_slot_to_expert.addr() as *const core::ffi::c_void,
+                            s2e_b,
+                            stream.handle,
+                        ),
+                        "coalesced d_slot_to_expert D2H",
+                    )?;
+                    crate::cuda::check_rc(
+                        w34_kernels::ffi::w34_memcpy_d2h_async(
+                            pinned_base.add(slu_off).cast(),
+                            c.d_slot_last_used.addr() as *const core::ffi::c_void,
+                            slu_b,
+                            stream.handle,
+                        ),
+                        "coalesced d_slot_last_used D2H",
+                    )?;
+                    crate::cuda::check_rc(
+                        w34_kernels::ffi::w34_memcpy_d2h_async(
+                            pinned_base.add(step_off).cast(),
+                            c.d_step_counter.addr() as *const core::ffi::c_void,
+                            8,
+                            stream.handle,
+                        ),
+                        "coalesced d_step_counter D2H",
+                    )?;
+                }
+                batch_records.push((idx, base_off, s2e_off, slu_off, step_off));
+                idx += 1;
+            }
+            if batch_records.is_empty() {
+                self.caches[idx].sync_from_device_if_dirty(stream)?;
+                idx += 1;
+                continue;
+            }
+            stream.synchronize()?;
+            for (layer_idx, base_off, s2e_off, slu_off, step_off) in batch_records {
+                let c = &mut self.caches[layer_idx];
+                // SAFETY: `stream.synchronize()` completed all D2H into aligned `pinned_base` offsets.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        pinned_base.add(base_off).cast::<i32>(),
+                        c.expert_to_slot.as_mut_ptr(),
+                        c.expert_to_slot.len(),
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        pinned_base.add(s2e_off).cast::<i32>(),
+                        c.slot_to_expert.as_mut_ptr(),
+                        c.slot_to_expert.len(),
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        pinned_base.add(slu_off).cast::<u64>(),
+                        c.slot_last_used.as_mut_ptr(),
+                        c.slot_last_used.len(),
+                    );
+                    let step_val = core::ptr::read(pinned_base.add(step_off).cast::<u64>());
+                    c.step_clock = step_val.saturating_add(1).max(1);
+                }
+                let check_limit = if c.has_cpu_bridge() {
+                    c.k_static
+                } else {
+                    c.prefill_hot_limit()
+                }
+                .min(c.initial_slot_to_expert.len());
+                if (0..check_limit).any(|s| c.slot_to_expert[s] != c.initial_slot_to_expert[s]) {
+                    c.adapted_slots_dirty = true;
+                }
+                c.sync_prefill_expert_to_slot(stream)?;
+                c.device_lru_dirty = false;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

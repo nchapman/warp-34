@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
 use crate::cuda::{
-    CublasHandle, CudaDevice, CudaError, CudaStream, DeviceArena, DeviceBuffer, Result, check_rc,
-    f16_to_f32_slice, f32_to_f16_slice,
+    CublasHandle, CudaDevice, CudaError, CudaStream, DeviceArena, DeviceBuffer, MappedHostBuffer,
+    Result, check_rc, f16_to_f32_slice, f32_to_f16_slice,
 };
 #[cfg(all(feature = "cuda", test))]
 use crate::cuda::{f16_to_f32, f32_to_f16};
@@ -20,7 +20,7 @@ mod linear;
 #[cfg(feature = "cuda")]
 use crate::model::weights::LinearProj;
 #[cfg(feature = "cuda")]
-use linear::{forward_bias, load_projection, projection_scratch_bytes};
+use linear::{forward_bias, forward_bias_maybe_defer, load_projection, projection_scratch_bytes};
 
 /// Bounded diagnostic samples keyed by vision stage: shape and host FP32 values.
 #[cfg(feature = "cuda")]
@@ -941,6 +941,65 @@ struct VisionBlockGpu {
 }
 
 #[cfg(feature = "cuda")]
+struct VisionPosGpuEntry {
+    grid_thw_list: Vec<[usize; 3]>,
+    d_pos_interp: DeviceBuffer,
+    d_pos_hw: DeviceBuffer,
+    d_cu_seqlens: DeviceBuffer,
+}
+
+#[cfg(feature = "cuda")]
+impl VisionPosGpuEntry {
+    fn total_bytes(&self) -> usize {
+        self.d_pos_interp.len_bytes + self.d_pos_hw.len_bytes + self.d_cu_seqlens.len_bytes
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct VisionWorkspace {
+    marlin_ws: Option<DeviceBuffer>,
+    attention_scratch: Option<DeviceBuffer>,
+    d_patches: Option<DeviceBuffer>,
+    d_x: Option<DeviceBuffer>,
+    d_norm: Option<DeviceBuffer>,
+    d_qkv: Option<DeviceBuffer>,
+    d_attn_out: Option<DeviceBuffer>,
+    d_proj_out: Option<DeviceBuffer>,
+    d_mlp_interm: Option<DeviceBuffer>,
+    d_merger_mid: Option<DeviceBuffer>,
+    pinned_patches: Option<MappedHostBuffer>,
+    pinned_transfer: Option<MappedHostBuffer>,
+    pos_cache: Vec<VisionPosGpuEntry>,
+}
+
+#[cfg(feature = "cuda")]
+impl VisionWorkspace {
+    fn ensure_buf(
+        slot: &mut Option<DeviceBuffer>,
+        device_id: i32,
+        min_bytes: usize,
+    ) -> Result<&DeviceBuffer> {
+        let need = min_bytes.max(4);
+        if slot.as_ref().is_none_or(|b| b.len_bytes < need) {
+            *slot = Some(DeviceBuffer::alloc(device_id, need)?);
+        }
+        Ok(slot.as_ref().unwrap())
+    }
+
+    fn ensure_pinned(
+        slot: &mut Option<MappedHostBuffer>,
+        min_bytes: usize,
+    ) -> Result<&mut MappedHostBuffer> {
+        let need = min_bytes.max(16);
+        if slot.as_ref().is_none_or(|b| b.len_bytes < need) {
+            *slot = Some(MappedHostBuffer::alloc(need)?);
+        }
+        Ok(slot.as_mut().unwrap())
+    }
+}
+
+#[cfg(feature = "cuda")]
 pub struct Qwen3VisionEncoder {
     pub cfg: VisionConfig,
     pub device_id: i32,
@@ -955,6 +1014,7 @@ pub struct Qwen3VisionEncoder {
     merger_fc1_b: u64,
     merger_fc2_w: LinearProj,
     merger_fc2_b: u64,
+    workspace: std::sync::Mutex<VisionWorkspace>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1108,7 +1168,62 @@ impl Qwen3VisionEncoder {
             merger_fc1_b,
             merger_fc2_w,
             merger_fc2_b,
+            workspace: std::sync::Mutex::new(VisionWorkspace::default()),
         }))
+    }
+
+    /// Replicates an encoded `[total_merged, out_hidden]` `FP16` buffer from Rank 0 onto
+    /// `TP >= 2` peer ranks through a reusable pinned host buffer, avoiding pageable `Vec<u16>`
+    /// allocations and synchronizing all peer streams before returning.
+    pub fn replicate_to_peers_pinned(
+        &self,
+        dev0: &DeviceBuffer,
+        rank0_stream: &CudaStream,
+        peers: &[(i32, &CudaStream)],
+    ) -> Result<Vec<DeviceBuffer>> {
+        let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = dev0.len_bytes;
+        let pinned = VisionWorkspace::ensure_pinned(&mut ws.pinned_transfer, bytes)?;
+        let _dev0_guard = CudaDevice::set_current(self.device_id)?;
+        check_rc(
+            // SAFETY: `pinned` has capacity >= `bytes` and `rank0_stream` is synchronized before peer H2D reads.
+            unsafe {
+                ffi::w34_memcpy_d2h_async(
+                    pinned.host_ptr,
+                    dev0.addr() as *const c_void,
+                    bytes,
+                    rank0_stream.handle,
+                )
+            },
+            "vision TP replicate D2H pinned",
+        )?;
+        rank0_stream.synchronize()?;
+        let mut peer_bufs = Vec::with_capacity(peers.len());
+        for &(peer_dev, peer_stream) in peers {
+            let _peer_guard = CudaDevice::set_current(peer_dev)?;
+            let buf = DeviceBuffer::alloc(peer_dev, bytes)?;
+            check_rc(
+                // SAFETY: `pinned` holds `bytes` initialized bytes and `peer_stream` is synchronized below.
+                unsafe {
+                    ffi::w34_memcpy_h2d_async(
+                        buf.addr() as *mut c_void,
+                        pinned.host_ptr as *const c_void,
+                        bytes,
+                        peer_stream.handle,
+                    )
+                },
+                "vision TP replicate H2D pinned",
+            )?;
+            peer_stream.synchronize()?;
+            peer_bufs.push(buf);
+        }
+        Ok(peer_bufs)
+    }
+
+    /// Clears cached GPU workspace and positional interpolation buffers (e.g. under tight VRAM).
+    pub fn clear_workspace(&self) {
+        let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        *ws = VisionWorkspace::default();
     }
 
     /// Runs the full `Qwen3_VisionTransformer` forward pass on `images` and returns
@@ -1187,51 +1302,169 @@ impl Qwen3VisionEncoder {
         let marlin_ws_ints = CudaDevice::props_for(self.device_id)?
             .multi_processor_count
             .max(1) as usize;
-        let marlin_ws = DeviceBuffer::alloc(self.device_id, marlin_ws_ints * 4)?;
-        marlin_ws.zero_async(stream)?;
-        let attention_scratch = DeviceBuffer::alloc(self.device_id, scratch_bytes.max(4))?;
-        let ex = stream.exec(attention_scratch.addr(), scratch_bytes.max(4));
+        let mut ws = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let marlin_ws_addr = {
+            let need = marlin_ws_ints * 4;
+            let init_zero = ws.marlin_ws.as_ref().is_none_or(|b| b.len_bytes < need);
+            let buf = VisionWorkspace::ensure_buf(&mut ws.marlin_ws, self.device_id, need)?;
+            if init_zero {
+                buf.zero_async(stream)?;
+            }
+            buf.addr()
+        };
+        let attention_scratch_addr = VisionWorkspace::ensure_buf(
+            &mut ws.attention_scratch,
+            self.device_id,
+            scratch_bytes.max(4),
+        )?
+        .addr();
+        let ex = stream.exec(attention_scratch_addr, scratch_bytes.max(4));
 
-        let mut patches_f16 = vec![0u16; total_patches * patch_dim];
-        let mut patch_off = 0usize;
-        for img in images {
-            let len = img.patches_f32.len();
-            f32_to_f16_slice(
-                &img.patches_f32,
-                &mut patches_f16[patch_off..patch_off + len],
-            );
-            patch_off += len;
+        let patches_elems = total_patches * patch_dim;
+        let patches_bytes = patches_elems * 2;
+        let d_patches_addr =
+            VisionWorkspace::ensure_buf(&mut ws.d_patches, self.device_id, patches_bytes)?.addr();
+        {
+            // Synchronize any prior async H2D from `pinned_patches` before mutating it on host.
+            if ws.pinned_patches.is_some() {
+                stream.synchronize()?;
+            }
+            let pinned_patches =
+                VisionWorkspace::ensure_pinned(&mut ws.pinned_patches, patches_bytes)?;
+            // SAFETY: `pinned_patches` has capacity >= `patches_elems * 2` bytes (`u16`-aligned).
+            let dst_u16 = unsafe {
+                core::slice::from_raw_parts_mut(
+                    pinned_patches.host_ptr.cast::<u16>(),
+                    patches_elems,
+                )
+            };
+            let mut patch_off = 0usize;
+            for img in images {
+                let len = img.patches_f32.len();
+                f32_to_f16_slice(&img.patches_f32, &mut dst_u16[patch_off..patch_off + len]);
+                patch_off += len;
+            }
+            check_rc(
+                // SAFETY: `d_patches_addr` and `pinned_patches` each span `patches_bytes` bytes;
+                // `pinned_patches` remains owned in `self.workspace` under the mutex until completion.
+                unsafe {
+                    ffi::w34_memcpy_h2d_async(
+                        d_patches_addr as *mut c_void,
+                        pinned_patches.host_ptr as *const c_void,
+                        patches_bytes,
+                        stream.handle,
+                    )
+                },
+                "vision patches H2D pinned",
+            )?;
         }
 
-        let (pos_interp_f32, pos_hw, cu_seqlens) = interpolate_pos_embed_and_rot_ids(
-            &self.pos_embed_f32,
-            self.cfg.num_grid_per_side(),
-            hidden,
-            self.cfg.spatial_merge_size,
-            &grid_thw_list,
-        );
-        let mut pos_interp_f16 = vec![0u16; pos_interp_f32.len()];
-        f32_to_f16_slice(&pos_interp_f32, &mut pos_interp_f16);
+        let (d_pos_interp_addr, d_pos_hw_addr, d_cu_seqlens_addr) = {
+            const MAX_VISION_POS_CACHE_ENTRIES: usize = 8;
+            const MAX_VISION_POS_CACHE_BYTES: usize = 64 * 1024 * 1024;
+            if let Some(idx) = ws
+                .pos_cache
+                .iter()
+                .position(|e| e.grid_thw_list == grid_thw_list)
+            {
+                if idx + 1 != ws.pos_cache.len() {
+                    let entry = ws.pos_cache.remove(idx);
+                    ws.pos_cache.push(entry);
+                }
+                let hit = ws.pos_cache.last().unwrap();
+                (
+                    hit.d_pos_interp.addr(),
+                    hit.d_pos_hw.addr(),
+                    hit.d_cu_seqlens.addr(),
+                )
+            } else {
+                let (pos_interp_f32, pos_hw, cu_seqlens) = interpolate_pos_embed_and_rot_ids(
+                    &self.pos_embed_f32,
+                    self.cfg.num_grid_per_side(),
+                    hidden,
+                    self.cfg.spatial_merge_size,
+                    &grid_thw_list,
+                );
+                let mut pos_interp_f16 = vec![0u16; pos_interp_f32.len()];
+                f32_to_f16_slice(&pos_interp_f32, &mut pos_interp_f16);
 
-        let d_patches = DeviceBuffer::alloc(self.device_id, patches_f16.len() * 2)?;
-        let d_pos_interp = DeviceBuffer::alloc(self.device_id, pos_interp_f16.len() * 2)?;
-        let d_pos_hw = DeviceBuffer::alloc(self.device_id, pos_hw.len() * 4)?;
-        let d_cu_seqlens = DeviceBuffer::alloc(self.device_id, cu_seqlens.len() * 4)?;
-        d_patches.copy_from_host(&patches_f16, stream)?;
-        d_pos_interp.copy_from_host(&pos_interp_f16, stream)?;
-        d_pos_hw.copy_from_host(&pos_hw, stream)?;
-        d_cu_seqlens.copy_from_host(&cu_seqlens, stream)?;
+                let d_pos_interp = DeviceBuffer::alloc(self.device_id, pos_interp_f16.len() * 2)?;
+                let d_pos_hw = DeviceBuffer::alloc(self.device_id, pos_hw.len() * 4)?;
+                let d_cu_seqlens = DeviceBuffer::alloc(self.device_id, cu_seqlens.len() * 4)?;
+                d_pos_interp.copy_from_host(&pos_interp_f16, stream)?;
+                d_pos_hw.copy_from_host(&pos_hw, stream)?;
+                d_cu_seqlens.copy_from_host(&cu_seqlens, stream)?;
+                let addrs = (d_pos_interp.addr(), d_pos_hw.addr(), d_cu_seqlens.addr());
+                let entry = VisionPosGpuEntry {
+                    grid_thw_list,
+                    d_pos_interp,
+                    d_pos_hw,
+                    d_cu_seqlens,
+                };
+                let entry_bytes = entry.total_bytes();
+                if entry_bytes <= MAX_VISION_POS_CACHE_BYTES {
+                    while !ws.pos_cache.is_empty()
+                        && (ws.pos_cache.len() >= MAX_VISION_POS_CACHE_ENTRIES
+                            || ws
+                                .pos_cache
+                                .iter()
+                                .map(VisionPosGpuEntry::total_bytes)
+                                .sum::<usize>()
+                                + entry_bytes
+                                > MAX_VISION_POS_CACHE_BYTES)
+                    {
+                        ws.pos_cache.remove(0);
+                    }
+                    ws.pos_cache.push(entry);
+                }
+                addrs
+            }
+        };
 
-        let d_x = DeviceBuffer::alloc(self.device_id, total_patches * hidden * 2)?;
-        let d_norm = DeviceBuffer::alloc(self.device_id, total_patches * hidden * 2)?;
-        let d_qkv = DeviceBuffer::alloc(self.device_id, total_patches * 3 * hidden * 2)?;
-        let d_attn_out = DeviceBuffer::alloc(self.device_id, total_patches * hidden * 2)?;
-        let d_proj_out = DeviceBuffer::alloc(self.device_id, total_patches * hidden * 2)?;
-        let d_mlp_interm = DeviceBuffer::alloc(self.device_id, total_patches * interm * 2)?;
+        let _ =
+            VisionWorkspace::ensure_buf(&mut ws.d_x, self.device_id, total_patches * hidden * 2)?;
+        let _ = VisionWorkspace::ensure_buf(
+            &mut ws.d_norm,
+            self.device_id,
+            total_patches * hidden * 2,
+        )?;
+        let _ = VisionWorkspace::ensure_buf(
+            &mut ws.d_qkv,
+            self.device_id,
+            total_patches * 3 * hidden * 2,
+        )?;
+        let _ = VisionWorkspace::ensure_buf(
+            &mut ws.d_attn_out,
+            self.device_id,
+            total_patches * hidden * 2,
+        )?;
+        let _ = VisionWorkspace::ensure_buf(
+            &mut ws.d_proj_out,
+            self.device_id,
+            total_patches * hidden * 2,
+        )?;
+        let _ = VisionWorkspace::ensure_buf(
+            &mut ws.d_mlp_interm,
+            self.device_id,
+            total_patches * interm * 2,
+        )?;
+        let _ = VisionWorkspace::ensure_buf(
+            &mut ws.d_merger_mid,
+            self.device_id,
+            total_merged * merger_hidden * 2,
+        )?;
+        let d_x = ws.d_x.as_ref().unwrap();
+        let d_norm = ws.d_norm.as_ref().unwrap();
+        let d_qkv = ws.d_qkv.as_ref().unwrap();
+        let d_attn_out = ws.d_attn_out.as_ref().unwrap();
+        let d_proj_out = ws.d_proj_out.as_ref().unwrap();
+        let d_mlp_interm = ws.d_mlp_interm.as_ref().unwrap();
+        let d_merger_mid = ws.d_merger_mid.as_ref().unwrap();
+        let allow_defer_bias = trace.is_none();
 
         // 1. patch_embed.proj + bias + pos_embed
         cublas.gemm_f16_bias(
-            d_patches.addr(),
+            d_patches_addr,
             self.patch_proj_w,
             self.patch_proj_b,
             d_x.addr(),
@@ -1239,16 +1472,16 @@ impl Qwen3VisionEncoder {
             hidden as i32,
             patch_dim as i32,
         )?;
-        sample!("patch_embed", d_x, total_patches, hidden);
+        sample!("patch_embed", *d_x, total_patches, hidden);
         check_rc(
-            // SAFETY: `d_x` and `d_pos_interp` are valid device buffers of length `total_patches * hidden * 2`
+            // SAFETY: `d_x` and `d_pos_interp_addr` are valid device buffers of length `total_patches * hidden * 2`
             // bytes, execution stream is valid, and null bias indicates no additive bias vector.
             unsafe {
                 ffi::w34_vision_bias_add_f16(
                     &ex,
                     d_x.addr() as *const c_void,
                     core::ptr::null(),
-                    d_pos_interp.addr() as *const c_void,
+                    d_pos_interp_addr as *const c_void,
                     d_x.addr() as *mut c_void,
                     total_patches as i32,
                     hidden as i32,
@@ -1261,7 +1494,7 @@ impl Qwen3VisionEncoder {
 
         // 2. Transformer blocks 0..depth
         for (index, blk) in self.blocks.iter().enumerate() {
-            sample!(format!("blocks.{index}.input"), d_x, total_patches, hidden);
+            sample!(format!("blocks.{index}.input"), *d_x, total_patches, hidden);
             check_rc(
                 // SAFETY: `d_x` and `d_norm` are valid device buffers with capacity for `total_patches * hidden * 2` bytes,
                 // norm1 weight and bias pointers are valid weights loaded from safetensors, and epsilon is positive.
@@ -1281,39 +1514,40 @@ impl Qwen3VisionEncoder {
             )?;
             sample!(
                 format!("blocks.{index}.norm1"),
-                d_norm,
+                *d_norm,
                 total_patches,
                 hidden
             );
 
-            forward_bias(
+            let qkv_deferred_bias = forward_bias_maybe_defer(
                 &blk.qkv_w,
                 &ex,
                 cublas,
-                marlin_ws.addr(),
+                marlin_ws_addr,
                 marlin_ws_ints,
                 d_norm.addr(),
                 blk.qkv_b,
                 d_qkv.addr(),
                 total_patches,
+                allow_defer_bias,
             )?;
             sample!(
                 format!("blocks.{index}.qkv"),
-                d_qkv,
+                *d_qkv,
                 total_patches,
                 3 * hidden
             );
 
             check_rc(
-                // SAFETY: `d_qkv` contains valid packed QKV data, `d_pos_hw` and `d_cu_seqlens` are valid device integer
+                // SAFETY: `d_qkv` contains valid packed QKV data, `d_pos_hw_addr` and `d_cu_seqlens_addr` are valid device integer
                 // arrays for the image batch, `d_attn_out` has capacity for `total_patches * hidden * 2` bytes, and theta is 10000.0.
                 unsafe {
                     ffi::w34_vision_qkv_rope_attn_f16(
                         &ex,
                         d_qkv.addr() as *mut c_void,
-                        core::ptr::null(),
-                        d_pos_hw.addr() as *const i32,
-                        d_cu_seqlens.addr() as *const i32,
+                        qkv_deferred_bias,
+                        d_pos_hw_addr as *const i32,
+                        d_cu_seqlens_addr as *const i32,
                         d_attn_out.addr() as *mut c_void,
                         total_patches as i32,
                         images.len() as i32,
@@ -1326,25 +1560,26 @@ impl Qwen3VisionEncoder {
             )?;
             sample!(
                 format!("blocks.{index}.attn_output"),
-                d_attn_out,
+                *d_attn_out,
                 total_patches,
                 hidden
             );
 
-            forward_bias(
+            let proj_deferred_bias = forward_bias_maybe_defer(
                 &blk.proj_w,
                 &ex,
                 cublas,
-                marlin_ws.addr(),
+                marlin_ws_addr,
                 marlin_ws_ints,
                 d_attn_out.addr(),
                 blk.proj_b,
                 d_proj_out.addr(),
                 total_patches,
+                allow_defer_bias,
             )?;
             sample!(
                 format!("blocks.{index}.proj"),
-                d_proj_out,
+                *d_proj_out,
                 total_patches,
                 hidden
             );
@@ -1356,7 +1591,7 @@ impl Qwen3VisionEncoder {
                     ffi::w34_vision_bias_add_f16(
                         &ex,
                         d_proj_out.addr() as *const c_void,
-                        core::ptr::null(),
+                        proj_deferred_bias,
                         d_x.addr() as *const c_void,
                         d_x.addr() as *mut c_void,
                         total_patches as i32,
@@ -1385,25 +1620,26 @@ impl Qwen3VisionEncoder {
             )?;
             sample!(
                 format!("blocks.{index}.norm2"),
-                d_norm,
+                *d_norm,
                 total_patches,
                 hidden
             );
 
-            forward_bias(
+            let fc1_deferred_bias = forward_bias_maybe_defer(
                 &blk.fc1_w,
                 &ex,
                 cublas,
-                marlin_ws.addr(),
+                marlin_ws_addr,
                 marlin_ws_ints,
                 d_norm.addr(),
                 blk.fc1_b,
                 d_mlp_interm.addr(),
                 total_patches,
+                allow_defer_bias,
             )?;
             sample!(
                 format!("blocks.{index}.fc1"),
-                d_mlp_interm,
+                *d_mlp_interm,
                 total_patches,
                 interm
             );
@@ -1415,7 +1651,7 @@ impl Qwen3VisionEncoder {
                     ffi::w34_vision_bias_gelu_f16(
                         &ex,
                         d_mlp_interm.addr() as *const c_void,
-                        core::ptr::null(),
+                        fc1_deferred_bias,
                         d_mlp_interm.addr() as *mut c_void,
                         total_patches as i32,
                         interm as i32,
@@ -1425,20 +1661,21 @@ impl Qwen3VisionEncoder {
                 "w34_vision_bias_gelu_f16(mlp.fc1)",
             )?;
 
-            forward_bias(
+            let fc2_deferred_bias = forward_bias_maybe_defer(
                 &blk.fc2_w,
                 &ex,
                 cublas,
-                marlin_ws.addr(),
+                marlin_ws_addr,
                 marlin_ws_ints,
                 d_mlp_interm.addr(),
                 blk.fc2_b,
                 d_proj_out.addr(),
                 total_patches,
+                allow_defer_bias,
             )?;
             sample!(
                 format!("blocks.{index}.fc2"),
-                d_proj_out,
+                *d_proj_out,
                 total_patches,
                 hidden
             );
@@ -1450,7 +1687,7 @@ impl Qwen3VisionEncoder {
                     ffi::w34_vision_bias_add_f16(
                         &ex,
                         d_proj_out.addr() as *const c_void,
-                        core::ptr::null(),
+                        fc2_deferred_bias,
                         d_x.addr() as *const c_void,
                         d_x.addr() as *mut c_void,
                         total_patches as i32,
@@ -1459,10 +1696,15 @@ impl Qwen3VisionEncoder {
                 },
                 "w34_vision_bias_add_f16(mlp.fc2)",
             )?;
-            sample!(format!("blocks.{index}.output"), d_x, total_patches, hidden);
+            sample!(
+                format!("blocks.{index}.output"),
+                *d_x,
+                total_patches,
+                hidden
+            );
         }
 
-        sample!("merger.input", d_x, total_patches, hidden);
+        sample!("merger.input", *d_x, total_patches, hidden);
 
         // 3. PatchMerger: LayerNorm(hidden_size) -> view [total_merged, 4 * hidden_size] -> fc1 -> exact GELU -> fc2
         check_rc(
@@ -1483,19 +1725,19 @@ impl Qwen3VisionEncoder {
             "w34_vision_layernorm_f16(merger.norm)",
         )?;
 
-        let d_merger_mid = DeviceBuffer::alloc(self.device_id, total_merged * merger_hidden * 2)?;
         let d_visual_out = DeviceBuffer::alloc(self.device_id, total_merged * out_hidden * 2)?;
 
-        forward_bias(
+        let merger_fc1_deferred_bias = forward_bias_maybe_defer(
             &self.merger_fc1_w,
             &ex,
             cublas,
-            marlin_ws.addr(),
+            marlin_ws_addr,
             marlin_ws_ints,
             d_norm.addr(),
             self.merger_fc1_b,
             d_merger_mid.addr(),
             total_merged,
+            allow_defer_bias,
         )?;
 
         check_rc(
@@ -1505,7 +1747,7 @@ impl Qwen3VisionEncoder {
                 ffi::w34_vision_bias_gelu_f16(
                     &ex,
                     d_merger_mid.addr() as *const c_void,
-                    core::ptr::null(),
+                    merger_fc1_deferred_bias,
                     d_merger_mid.addr() as *mut c_void,
                     total_merged as i32,
                     merger_hidden as i32,
@@ -1519,7 +1761,7 @@ impl Qwen3VisionEncoder {
             &self.merger_fc2_w,
             &ex,
             cublas,
-            marlin_ws.addr(),
+            marlin_ws_addr,
             marlin_ws_ints,
             d_merger_mid.addr(),
             self.merger_fc2_b,

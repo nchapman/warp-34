@@ -179,6 +179,16 @@ SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
     ),
     SanitizerCase(
         subsystem="sampler_dflash_vision",
+        target="gpu_sampler",
+        test_name="split_k_greedy_top1_matches_single_cta",
+    ),
+    SanitizerCase(
+        subsystem="sampler_dflash_vision",
+        target="gpu_sampler",
+        test_name="shard_fast_greedy_matches_full_sampler_across_edges",
+    ),
+    SanitizerCase(
+        subsystem="sampler_dflash_vision",
         target="gpu_rejection_sampler",
         test_name="greedy_gpu_matches_host_at_each_rejection_and_masks_padding",
     ),

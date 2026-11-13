@@ -401,21 +401,41 @@ impl CudaDevice {
 /// Register slots before launching any GPU work or graphs that use them. A host
 /// worker must publish its error before acknowledging completion to the GPU.
 #[cfg(any(feature = "cuda", test))]
-#[derive(Default)]
 pub(crate) struct HostFailures {
-    slots: std::sync::Mutex<Vec<std::sync::Arc<std::sync::OnceLock<CudaError>>>>,
+    count: std::sync::atomic::AtomicUsize,
+    slots: std::sync::Mutex<std::sync::Arc<[std::sync::Arc<std::sync::OnceLock<CudaError>>]>>,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl Default for HostFailures {
+    fn default() -> Self {
+        Self {
+            count: std::sync::atomic::AtomicUsize::new(0),
+            slots: std::sync::Mutex::new(std::sync::Arc::from(&[][..])),
+        }
+    }
 }
 
 #[cfg(any(feature = "cuda", test))]
 impl HostFailures {
     pub(crate) fn register(&self) -> std::sync::Arc<std::sync::OnceLock<CudaError>> {
         let slot = std::sync::Arc::new(std::sync::OnceLock::new());
-        self.slots.lock().unwrap().push(slot.clone());
+        let mut guard = self.slots.lock().unwrap();
+        let mut next: Vec<_> = guard.iter().cloned().collect();
+        next.push(slot.clone());
+        *guard = next.into();
+        self.count
+            .store(guard.len(), std::sync::atomic::Ordering::Release);
         slot
     }
 
+    #[inline]
     pub(crate) fn check(&self) -> Result<()> {
-        for slot in self.slots.lock().unwrap().iter() {
+        if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return Ok(());
+        }
+        let snap = self.slots.lock().unwrap().clone();
+        for slot in snap.iter() {
             if let Some(error) = slot.get() {
                 return Err(error.clone());
             }
@@ -423,7 +443,11 @@ impl HostFailures {
         Ok(())
     }
 
+    #[inline]
     fn inherit(&self, source: &Self) {
+        if source.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return;
+        }
         // Release the source lock before taking ours, including for self-inheritance.
         // Sharing slots (not owners) preserves late publication without cycles.
         let snapshot = source.slots.lock().unwrap().clone();
@@ -431,14 +455,35 @@ impl HostFailures {
             return;
         }
         let mut slots = self.slots.lock().unwrap();
-        for slot in snapshot {
-            if !slots
+        if std::sync::Arc::ptr_eq(&*slots, &snapshot) {
+            return;
+        }
+        if slots.is_empty() {
+            let n = snapshot.len();
+            *slots = snapshot;
+            self.count.store(n, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        let all_present = snapshot.iter().all(|slot| {
+            slots
                 .iter()
-                .any(|existing| std::sync::Arc::ptr_eq(existing, &slot))
+                .any(|existing| std::sync::Arc::ptr_eq(existing, slot))
+        });
+        if all_present {
+            return;
+        }
+        let mut merged: Vec<_> = slots.iter().cloned().collect();
+        for slot in snapshot.iter() {
+            if !merged
+                .iter()
+                .any(|existing| std::sync::Arc::ptr_eq(existing, slot))
             {
-                slots.push(slot);
+                merged.push(slot.clone());
             }
         }
+        *slots = merged.into();
+        self.count
+            .store(slots.len(), std::sync::atomic::Ordering::Release);
     }
 }
 

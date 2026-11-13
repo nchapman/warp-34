@@ -16,17 +16,24 @@ pub struct BenchMetrics {
 
 /// Top-level `TP=1` / `TP=2` Qwen 3.5 / 3.8 inference engine.
 #[cfg(feature = "cuda")]
+pub(crate) type VisionEmbedCacheKey = (u64, [usize; 3], usize);
+#[cfg(feature = "cuda")]
+pub(crate) type VisionEmbedCacheEntry = (VisionEmbedCacheKey, Arc<Vec<DeviceBuffer>>);
+
+#[cfg(feature = "cuda")]
 pub struct Qwen3_5Engine {
     pub model_dir: std::path::PathBuf,
     pub cfg: ModelConfig,
     pub tp_size: usize,
     pub ranks: Vec<Qwen3_5ModelRank>,
     pub tp2_comm: Option<Arc<Tp2Collectives>>,
+    pub(crate) tp_workers: Option<Arc<crate::coordinated::TpWorkerPool>>,
     pub tokenizer: Option<Tokenizer>,
     pub use_cuda_graph: bool,
     pub radix: MambaRadixCache,
     pub speculative: Option<crate::proposer::NativeProposer>,
     pub vision_encoder: Option<crate::vision::Qwen3VisionEncoder>,
+    pub(crate) vision_embed_cache: Vec<VisionEmbedCacheEntry>,
     pub has_vision_weights: bool,
     pub decision_profile: crate::decision::DecisionModelProfile,
     pub lora_registry: crate::lora::LoraAdapterRegistry,
@@ -468,17 +475,28 @@ impl Qwen3_5Engine {
             None
         };
 
+        let tp_workers = if tp_size > 1 {
+            Some(Arc::new(
+                crate::coordinated::TpWorkerPool::new(tp_size - 1)
+                    .map_err(|e| loader_err_ctx("TpWorkerPool::new", e.to_string()))?,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             model_dir: dir.to_path_buf(),
             cfg,
             tp_size,
             ranks,
             tp2_comm,
+            tp_workers,
             tokenizer,
             use_cuda_graph,
             radix: MambaRadixCache::new(16, 64),
             speculative: None,
             vision_encoder: None,
+            vision_embed_cache: Vec::new(),
             has_vision_weights,
             decision_profile,
             lora_registry: crate::lora::LoraAdapterRegistry::new(),
