@@ -347,26 +347,9 @@ async fn execute_systemone_json(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let (mut lora_id, mut resolved_model) = s
+    let (lora_id, resolved_model) = s
         .resolve_request_lora(req_model_hint.as_deref(), explicit_lora.as_deref())
         .map_err(bad)?;
-    if lora_id < 0
-        && explicit_lora.is_none()
-        && req_model_hint.as_deref() != Some(s.model_name.as_str())
-        && matches!(
-            s.worker.decision_profile,
-            crate::decision::DecisionModelProfile::CausalLm { .. }
-        )
-        && let Some(entry) = s
-            .worker
-            .lora_registry
-            .entries()
-            .iter()
-            .find(|e| e.decision_profile.is_some())
-    {
-        lora_id = entry.lora_id;
-        resolved_model = entry.name.clone();
-    }
     let prep_state = s.clone();
     let (req_model, batch, images) = cpu(s, move || {
         Ok::<_, String>((|| {
