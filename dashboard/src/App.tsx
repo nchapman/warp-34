@@ -66,10 +66,8 @@ function PoolBar({
 function throughputPoints(history: Snapshot[], decisionMode = false): Point[] {
   return history.map((s, i) => ({
     time: s.uptime_seconds,
-    value: counterRate(
-      history.slice(Math.max(0, i - 5), i + 1),
-      (sample) =>
-        decisionMode ? sample.tokens.computed : sample.tokens.generated,
+    value: counterRate(history.slice(Math.max(0, i - 5), i + 1), (sample) =>
+      decisionMode ? sample.tokens.computed : sample.tokens.generated,
     ),
   }));
 }
@@ -133,13 +131,15 @@ function Overview({ state }: { state: MetricsState }) {
   const e2eRaw = recentHistogram(history, "e2e");
   const isDecisionWorkload = Boolean(
     latest &&
-      first &&
-      history.length > 1 &&
-      latest.tokens.generated === first.tokens.generated &&
-      (latest.tokens.computed > first.tokens.computed ||
-        (e2eRaw && e2eRaw.count > 0 && (!ttftRaw || ttftRaw.count === 0))),
+    first &&
+    history.length > 1 &&
+    latest.tokens.generated === first.tokens.generated &&
+    (latest.tokens.computed > first.tokens.computed ||
+      (e2eRaw && e2eRaw.count > 0 && (!ttftRaw || ttftRaw.count === 0))),
   );
-  const genRate = fresh ? counterRate(history, (s) => s.tokens.generated) : null;
+  const genRate = fresh
+    ? counterRate(history, (s) => s.tokens.generated)
+    : null;
   const promptRate = fresh
     ? counterRate(history, (s) => s.tokens.computed)
     : null;
