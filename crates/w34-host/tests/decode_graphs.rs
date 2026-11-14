@@ -225,10 +225,23 @@ fn batched_spec_verify_graphs_match_eager_uniform_and_nonuniform() {
     }
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for tp in [1, 2] {
-        let mut engine =
-            Qwen3_5Engine::load("Qwen/Qwen3.5-4B", tp, KvFormatPolicy::Tq4, Some(64), true)
-                .unwrap();
-        let shapes: &[&[usize]] = &[&[3, 3], &[2, 4], &[2, 3, 2]];
+        let mut engine = Qwen3_5Engine::load_for_serving(
+            "Qwen/Qwen3.5-4B",
+            tp,
+            KvFormatPolicy::Tq4,
+            Some(256),
+            true,
+            16,
+        )
+        .unwrap();
+        engine
+            .enable_speculative(&w34_host::proposer::SpeculativeConfig {
+                kind: w34_host::proposer::SpeculativeKind::Mtp,
+                mtp_k: 3,
+                draft_model: None,
+            })
+            .unwrap();
+        let shapes: &[&[usize]] = &[&[3, 3], &[2, 4], &[2, 3, 2], &[3, 3, 3, 3, 3, 3, 3, 3]];
         for shape in shapes {
             let b = shape.len();
             let eager_pages: Vec<Vec<i32>> = (0..b)
@@ -345,8 +358,13 @@ fn batched_spec_verify_graphs_match_eager_uniform_and_nonuniform() {
         }
         assert_eq!(
             engine.captured_batched_spec_verify_graph_shapes(),
-            vec![(2, 6, 3, false), (2, 6, 4, false), (3, 7, 3, false)],
-            "expected batched spec_verify graph shapes captured on tp={tp}"
+            vec![
+                (2, 6, 3, false),
+                (2, 6, 4, false),
+                (3, 7, 3, false),
+                (8, 24, 3, false),
+            ],
+            "expected batched spec_verify graph shapes captured with MTP attached on tp={tp}"
         );
     }
 }

@@ -24,7 +24,10 @@ use crate::model::{
 use std::path::Path;
 use w34_kernels::ffi::{self, W34_KV_NAMESPACE_MTP_FULL_ATTN};
 
+mod batched;
 mod propose;
+
+pub(crate) use batched::MtpIngestSlice;
 
 // Shared by pre-placement serving admission and the actual loader. The arena remains
 // FP16-sized even for quantized checkpoints; do not budget only its used bytes.
@@ -262,9 +265,21 @@ pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> 
 }
 
 pub const MAX_MTP_BATCH_SLOTS: usize = 8;
+pub(crate) const BATCHED_MTP_META_I32_LEN: usize =
+    10 * MAX_MTP_BATCH_SLOTS + (MAX_MTP_BATCH_SLOTS + 1);
+
+pub(crate) struct BatchedMtpProposeIo {
+    pub(crate) graphs: Vec<((usize, usize, bool), CudaGraph)>,
+    pub(crate) meta_dev: DeviceBuffer,
+    pub(crate) out_ids_dev: DeviceBuffer,
+    pub(crate) hidden_dev: DeviceBuffer,
+    pub(crate) block_tables_dev: DeviceBuffer,
+    pub(crate) cached_slots: Vec<usize>,
+}
 
 struct MtpGraphIo {
     propose_graphs: [Option<(usize, bool, CudaGraph)>; MAX_MTP_BATCH_SLOTS],
+    batched: BatchedMtpProposeIo,
     propose_arena: DeviceArena,
     meta_dev: DeviceBuffer,
     out_ids_dev: DeviceBuffer,
@@ -354,16 +369,22 @@ impl Qwen3_5MtpRank {
         self.draft_lm_head.is_some()
     }
 
+    fn clear_all_propose_graphs(&mut self) {
+        self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+        self.graph_io.batched.graphs.clear();
+        self.graph_io.batched.cached_slots.clear();
+    }
+
     /// Temporarily detaches the online-quantized `draft_lm_head` (falling back to `target.lm_head`)
     /// and invalidates any captured `propose_graphs`.
     pub fn take_quantized_draft_lm_head(&mut self) -> Option<LinearProj> {
-        self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+        self.clear_all_propose_graphs();
         self.draft_lm_head.take()
     }
 
     /// Restores a previously detached `draft_lm_head` and invalidates any captured `propose_graphs`.
     pub fn restore_quantized_draft_lm_head(&mut self, head: Option<LinearProj>) {
-        self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+        self.clear_all_propose_graphs();
         self.draft_lm_head = head;
     }
 
@@ -682,13 +703,37 @@ impl Qwen3_5MtpRank {
             .and_then(|n| n.checked_add(single_row_logits_bytes))
             .and_then(|n| n.checked_add(MTP_SCRATCH_SLACK + capacity.div_ceil(16) * 4))
             .ok_or_else(|| loader_err("MTP scratch size overflow"))?;
+        let arena_rows = if is_tiered_moe_mtp || uses_hc || qsa.is_some() {
+            1
+        } else {
+            MAX_MTP_BATCH_SLOTS
+        };
         let propose_arena_bytes = row_elements
             .checked_mul(2)
             .and_then(|n| n.checked_add(single_row_logits_bytes))
+            .and_then(|n| n.checked_mul(arena_rows))
             .and_then(|n| n.checked_add(MTP_SCRATCH_SLACK))
             .ok_or_else(|| loader_err("MTP propose arena overflow"))?;
+        let batched_bt_bytes = mtp_capacity.div_ceil(16).max(MAX_MTP_BATCH_SLOTS) * 4;
         let graph_io = MtpGraphIo {
             propose_graphs: std::array::from_fn(|_| None),
+            batched: BatchedMtpProposeIo {
+                graphs: Vec::new(),
+                meta_dev: DeviceBuffer::alloc(
+                    target.device.device_id,
+                    BATCHED_MTP_META_I32_LEN * 4,
+                )?,
+                out_ids_dev: DeviceBuffer::alloc(
+                    target.device.device_id,
+                    3 * MAX_MTP_BATCH_SLOTS * 4,
+                )?,
+                hidden_dev: DeviceBuffer::alloc(
+                    target.device.device_id,
+                    MAX_MTP_BATCH_SLOTS * mtp_row_elems * 2,
+                )?,
+                block_tables_dev: DeviceBuffer::alloc(target.device.device_id, batched_bt_bytes)?,
+                cached_slots: Vec::new(),
+            },
             propose_arena: DeviceArena::new(target.device.device_id, propose_arena_bytes)?,
             meta_dev: DeviceBuffer::alloc(target.device.device_id, 16 * 4)?,
             out_ids_dev: DeviceBuffer::alloc(target.device.device_id, 4 * 4)?,
@@ -953,8 +998,10 @@ impl Qwen3_5MtpRank {
             return Err(loader_err("insufficient MTP KV pages for batched slots"));
         }
         if self.batch_mode != batch_mode {
-            self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+            self.clear_all_propose_graphs();
             self.batch_mode = batch_mode;
+        } else {
+            self.graph_io.batched.cached_slots.clear();
         }
         self.slot_state = [(0, 0); MAX_MTP_BATCH_SLOTS];
         self.active_slot = 0;
@@ -980,8 +1027,10 @@ impl Qwen3_5MtpRank {
             ));
         }
         if !self.batch_mode {
-            self.graph_io.propose_graphs = std::array::from_fn(|_| None);
+            self.clear_all_propose_graphs();
             self.batch_mode = true;
+        } else {
+            self.graph_io.batched.cached_slots.clear();
         }
         self.slot_state = [(0, 0); MAX_MTP_BATCH_SLOTS];
         self.slot_state[0] = (self.len, self.committed);
@@ -990,6 +1039,39 @@ impl Qwen3_5MtpRank {
         self.pages = self.all_pages[..slot_pages].to_vec();
         self.pages_dev = self.all_pages_dev;
         self.capacity = slot_cap;
+        Ok(())
+    }
+    #[inline]
+    pub(crate) fn slot_len(&self, slot: usize) -> usize {
+        if slot == self.active_slot {
+            self.len
+        } else {
+            self.slot_state[slot].0
+        }
+    }
+    #[inline]
+    pub(crate) fn slot_committed(&self, slot: usize) -> usize {
+        if slot == self.active_slot {
+            self.committed
+        } else {
+            self.slot_state[slot].1
+        }
+    }
+    #[inline]
+    pub(crate) fn set_slot_state(&mut self, slot: usize, len: usize, committed: usize) {
+        self.slot_state[slot] = (len, committed);
+        if slot == self.active_slot {
+            self.len = len;
+            self.committed = committed;
+        }
+    }
+    pub(crate) fn truncate_slot(&mut self, slot: usize, len: usize) -> Result<()> {
+        let cur_len = self.slot_len(slot);
+        if len > cur_len {
+            return Err(loader_err("MTP truncate grows cache"));
+        }
+        let committed = self.slot_committed(slot).min(len);
+        self.set_slot_state(slot, len, committed);
         Ok(())
     }
     pub fn select_batch_slot(&mut self, slot: usize) -> Result<()> {

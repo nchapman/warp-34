@@ -746,7 +746,7 @@ impl Qwen3_5MtpRank {
     // Shared LinearProj dispatches small-N dense projections via w34_small_n_gemm_f16.
     // MTP keeps cuBLAS GEMM for DenseF16 (matching vLLM donor M=5 prefill) while
     // dispatching MarlinW4A16 projections for quantized MTP checkpoints.
-    fn project(
+    pub(super) fn project(
         proj: &LinearProj,
         ex: &W34Exec,
         t: &Qwen3_5ModelRank,
@@ -784,7 +784,7 @@ impl Qwen3_5MtpRank {
         }
     }
 
-    fn project_maybe_prerotated(
+    pub(super) fn project_maybe_prerotated(
         proj: &LinearProj,
         prerotated: bool,
         ex: &W34Exec,

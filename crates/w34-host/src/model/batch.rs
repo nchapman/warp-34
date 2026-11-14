@@ -479,6 +479,12 @@ impl Qwen3_5Engine {
         shapes
     }
 
+    pub fn captured_batched_mtp_propose_graph_shapes(&self) -> Vec<(usize, usize, bool)> {
+        self.speculative
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.captured_batched_mtp_propose_graph_shapes())
+    }
+
     fn step_batched_decode_graph(
         &mut self,
         slices: &[EngineBatchSlice<'_>],
@@ -1039,14 +1045,12 @@ impl Qwen3_5Engine {
                 .iter()
                 .all(|r| r.supports_cuda_graph_for_tokens_with_lora(total_q, lora_mode))
             && self.ranks.iter().all(|r| {
-                let expected_m = r
-                    .speculative_logits
-                    .as_ref()
-                    .map(|b| b.len_bytes / (r.local_vocab_size * 2));
+                let taps_fit = (r.tap_layer_ids.is_empty() && r.last_final_hidden_f16.is_none())
+                    || total_q <= r.max_tap_rows;
                 r.current_pos_plane_stride == 0
                     && r.pending_visual_splice.is_none()
                     && !r.failed_batched_spec_verify_keys.contains(&bspec_key)
-                    && expected_m.is_none_or(|cap| total_q <= cap)
+                    && taps_fit
             });
         if !can_use_batched_spec {
             return None;

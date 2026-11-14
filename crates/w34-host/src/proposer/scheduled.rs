@@ -749,13 +749,7 @@ impl NativeProposer {
         let batch_len = items.len();
         let k_cap = match &self.ranks {
             Ranks::Mtp(_) => {
-                if batch_len >= 5 {
-                    if engine.cfg.num_experts > 0 && self.max_rows > 256 {
-                        self.k.min(2)
-                    } else {
-                        self.k.min(1)
-                    }
-                } else if batch_len >= 3 {
+                if batch_len >= 3 {
                     if self.max_rows > 256 {
                         self.k.min(2)
                     } else {
@@ -791,14 +785,8 @@ impl NativeProposer {
             raw_budgets.iter().map(|&b| Vec::with_capacity(b)).collect();
         let max_verify_rows = if engine.cfg.uses_tiered_moe() {
             crate::moe_offload::TIERED_MOE_CPU_BRIDGE_MAX_DECODE_TOKENS
-        } else if matches!(self.ranks, Ranks::Mtp(_))
-            && engine.cfg.num_experts > 0
-            && engine.tp_size == 1
-            && batch_len >= 5
-        {
-            18
         } else {
-            usize::MAX
+            crate::model::MAX_BATCHED_SPEC_TOKENS
         };
         let mut total_verify_rows = batch_len;
         'outer: for round in 0..max_budget {
@@ -827,40 +815,75 @@ impl NativeProposer {
             prepared_sampler: Option<crate::model::PreparedSpecSamplerRows>,
             extras: Vec<i32>,
         }
-        // Pass 1: run proposer draft forwards for each active item using its reserved state slots.
+        // Pass 1: run proposer draft forwards across active items using their reserved state slots.
         let mut proposed: Vec<ProposedSlot> = Vec::with_capacity(batch_len);
         let propose_res: Result<()> = (|| {
+            let batched_drafts = {
+                let slots_vec: Vec<usize> = items.iter().map(|(s, _, _, _)| *s).collect();
+                let ingests_vec: Vec<&[i32]> = items
+                    .iter()
+                    .map(|(_, _, pending, _)| pending.as_slice())
+                    .collect();
+                let anchors_vec: Vec<i32> = items
+                    .iter()
+                    .map(|(_, seq, _, _)| {
+                        seq.generated_tokens
+                            .last()
+                            .copied()
+                            .ok_or_else(|| loader_err("missing anchor in batched MTP verify"))
+                    })
+                    .collect::<Result<Vec<i32>>>()?;
+                let k_budgets_vec: Vec<usize> = all_extras.iter().map(Vec::len).collect();
+                self.try_ingest_and_propose_mtp_batch(
+                    engine,
+                    &slots_vec,
+                    &ingests_vec,
+                    &anchors_vec,
+                    &k_budgets_vec,
+                )?
+            };
+            let mut batched_iter = batched_drafts.map(Vec::into_iter);
             for ((slot, seq, pending_ingest, sampler), slot_extras) in
                 items.iter_mut().zip(all_extras.iter_mut())
             {
                 let slot = *slot;
-                self.select_mtp_batch_slot(slot)?;
                 let anchor = *seq
                     .generated_tokens
                     .last()
                     .ok_or_else(|| loader_err("missing anchor in batched MTP verify"))?;
                 let mut extras = std::mem::take(slot_extras);
                 let k_budget = extras.len();
-                let propose_step = if pending_ingest.is_empty() {
-                    self.propose(engine, anchor, k_budget)
+                let mut drafts = if let Some(it) = batched_iter.as_mut() {
+                    pending_ingest.clear();
+                    it.next().unwrap_or_default()
                 } else {
-                    let ptrs: Vec<u64> = self.mtp_batch_slots[slot]
-                        .captured_verify_hidden
-                        .iter()
-                        .map(|b| b.addr())
-                        .collect();
-                    let res =
-                        self.ingest_and_propose(engine, pending_ingest, &ptrs, anchor, k_budget);
-                    if res.is_ok() {
-                        pending_ingest.clear();
-                    }
-                    res
-                };
-                let mut drafts = match propose_step {
-                    Ok(out) => out,
-                    Err(e) => {
-                        engine.free_state_slots(&extras);
-                        return Err(e);
+                    self.select_mtp_batch_slot(slot)?;
+                    let propose_step = if pending_ingest.is_empty() {
+                        self.propose(engine, anchor, k_budget)
+                    } else {
+                        let ptrs: Vec<u64> = self.mtp_batch_slots[slot]
+                            .captured_verify_hidden
+                            .iter()
+                            .map(|b| b.addr())
+                            .collect();
+                        let res = self.ingest_and_propose(
+                            engine,
+                            pending_ingest,
+                            &ptrs,
+                            anchor,
+                            k_budget,
+                        );
+                        if res.is_ok() {
+                            pending_ingest.clear();
+                        }
+                        res
+                    };
+                    match propose_step {
+                        Ok(out) => out,
+                        Err(e) => {
+                            engine.free_state_slots(&extras);
+                            return Err(e);
+                        }
                     }
                 };
                 if let Some(eos) = drafts.iter().enumerate().position(|(idx, id)| {

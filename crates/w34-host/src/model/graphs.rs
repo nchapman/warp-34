@@ -290,7 +290,7 @@ impl Qwen3_5ModelRank {
         lora_mode: GraphLoraMode,
         tp2: Option<&Tp2Collectives>,
     ) -> Result<()> {
-        const MAX_BATCHED_SPEC_CACHED_GRAPHS: usize = 4;
+        const MAX_BATCHED_SPEC_CACHED_GRAPHS: usize = 24;
         let long_ctx = !self.cfg.uses_qsa() && long_ctx;
         let key = (
             num_reqs,

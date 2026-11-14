@@ -577,17 +577,22 @@ impl NativeProposer {
             }
             return Ok(());
         }
-        self.reset()?;
-        self.current = None;
         let idx = self
             .memos
             .iter()
             .rposition(|m| m.tokens.starts_with(tokens) && m.features.len() >= need_mtp_bytes)
             .ok_or_else(|| loader_err("missing proposer prefix"))?;
         let mut memo = self.memos.remove(idx);
+        let start_tok = match self.prepare_mtp_partial_lcp_restore(engine, tokens, &memo.features) {
+            Ok(reused) => reused,
+            Err(e) => {
+                push_mtp_memo(&mut self.memos, memo);
+                return Err(e);
+            }
+        };
         let step = self.max_rows.min(MTP_STAGE_ROWS);
         let result = (|| {
-            for start in (0..tokens.len()).step_by(step) {
+            for start in (start_tok..tokens.len()).step_by(step) {
                 let end = (start + step).min(tokens.len());
                 let bytes = &memo.features[start * self.row_bytes..end * self.row_bytes];
                 let mut pointers = Vec::with_capacity(engine.tp_size);
@@ -603,6 +608,9 @@ impl NativeProposer {
             }
             Ok(())
         })();
+        if result.is_err() {
+            let _ = self.reset();
+        }
         if result.is_ok() && tokens.len() > 2048 {
             memo.tokens.truncate(tokens.len());
             if matches!(self.ranks, Ranks::Mtp(_)) {
@@ -632,6 +640,70 @@ impl NativeProposer {
         result?;
         self.last_restored_tokens = tokens.len();
         Ok(())
+    }
+
+    fn prepare_mtp_partial_lcp_restore(
+        &mut self,
+        engine: &Qwen3_5Engine,
+        tokens: &[i32],
+        memo_features: &[u8],
+    ) -> Result<usize> {
+        if let Ranks::Mtp(rs) = &mut self.ranks {
+            let self_lcp = self
+                .resident_tokens
+                .iter()
+                .zip(tokens)
+                .take_while(|(a, b)| a == b)
+                .count();
+            if rs.first().is_some_and(|r| r.is_batch_mode()) {
+                let slot_count = rs[0].batch_slot_count();
+                let best_donor = (0..slot_count)
+                    .filter(|&s| s != self.mtp_batch_active_slot)
+                    .map(|s| {
+                        let lcp = self.mtp_batch_slots[s]
+                            .resident_tokens
+                            .iter()
+                            .zip(tokens)
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        (s, lcp)
+                    })
+                    .max_by_key(|&(_, lcp)| lcp);
+                if let Some((donor, donor_lcp)) = best_donor
+                    && donor_lcp >= 16
+                    && donor_lcp >= self_lcp.saturating_add(256)
+                {
+                    let dst = self.mtp_batch_active_slot;
+                    for (r, t) in rs.iter_mut().zip(&engine.ranks) {
+                        r.copy_kv_from_slot(t, donor, dst, donor_lcp - 1)?;
+                    }
+                    self.resident_tokens.clear();
+                    self.resident_tokens.extend_from_slice(&tokens[..donor_lcp]);
+                }
+            }
+            let reuse_lcp = self
+                .resident_tokens
+                .iter()
+                .zip(tokens)
+                .take_while(|(a, b)| a == b)
+                .count();
+            if reuse_lcp >= 16 {
+                let tail_bytes =
+                    &memo_features[(reuse_lcp - 1) * self.row_bytes..reuse_lcp * self.row_bytes];
+                for ((r, t), tail) in rs.iter_mut().zip(&engine.ranks).zip(&self.tail) {
+                    r.truncate(reuse_lcp - 1)?;
+                    tail.copy_from_host(tail_bytes, &t.stream)?;
+                }
+                self.resident_tokens.truncate(reuse_lcp);
+                self.processed = reuse_lcp;
+                self.last_accepted.clear();
+                self.current = None;
+                return Ok(reuse_lcp);
+            }
+        }
+        self.reset()?;
+        self.current = None;
+        Ok(0)
     }
     fn captured(&self, engine: &Qwen3_5Engine) -> Result<Vec<u64>> {
         engine
@@ -1330,8 +1402,361 @@ impl NativeProposer {
             }
         }
     }
+
+    #[inline]
+    fn slot_processed(&self, slot: usize) -> usize {
+        if slot == self.mtp_batch_active_slot {
+            self.processed
+        } else {
+            self.mtp_batch_slots[slot].processed
+        }
+    }
+
+    #[inline]
+    fn slot_tail_addr(&self, slot: usize, rank_idx: usize) -> u64 {
+        if slot == self.mtp_batch_active_slot {
+            self.tail[rank_idx].addr()
+        } else {
+            self.mtp_batch_slots[slot].tail[rank_idx].addr()
+        }
+    }
+
+    fn stage_batched_mtp_memo_d2h(
+        &mut self,
+        t0: &crate::model::Qwen3_5ModelRank,
+        slots: &[usize],
+        pending_ingests: &[&[i32]],
+    ) -> Result<Vec<Option<(usize, usize, usize)>>> {
+        let mut staged = vec![None; slots.len()];
+        let mut pinned_cursor = 0usize;
+        let pinned_cap = self.memo_pinned_staging.as_ref().map_or(0, |p| p.len_bytes);
+        let pinned_ptr = self
+            .memo_pinned_staging
+            .as_ref()
+            .map_or(core::ptr::null_mut(), |p| p.host_ptr);
+        for (b, (&slot, &toks)) in slots.iter().zip(pending_ingests).enumerate() {
+            if toks.is_empty() {
+                continue;
+            }
+            let src = self.mtp_batch_slots[slot].captured_verify_hidden[0].addr();
+            let memo_opt = if slot == self.mtp_batch_active_slot {
+                &mut self.current
+            } else {
+                &mut self.mtp_batch_slots[slot].current
+            };
+            let Some(memo) = memo_opt else {
+                continue;
+            };
+            t0.device.make_current()?;
+            let len_bytes = toks.len() * self.row_bytes;
+            let old_len = memo.features.len();
+            grow_memo_features(&mut memo.features, old_len + len_bytes, self.row_bytes);
+            if !pinned_ptr.is_null() && pinned_cursor + len_bytes <= pinned_cap {
+                check_rc(
+                    // SAFETY: src spans len_bytes on t0.stream; pinned_ptr + pinned_cursor stays
+                    // live until collect_batched_propose_host synchronizes t0.stream.
+                    unsafe {
+                        ffi::w34_memcpy_d2h_async(
+                            pinned_ptr.cast::<u8>().add(pinned_cursor).cast(),
+                            src as *const _,
+                            len_bytes,
+                            t0.stream.handle,
+                        )
+                    },
+                    "batched MTP pinned memo copy",
+                )?;
+                staged[b] = Some((pinned_cursor, old_len, len_bytes));
+                pinned_cursor += len_bytes;
+            } else {
+                check_rc(
+                    // SAFETY: memo.features[old_len..] spans len_bytes and stays live until sync.
+                    unsafe {
+                        ffi::w34_memcpy_d2h_async(
+                            memo.features[old_len..].as_mut_ptr().cast(),
+                            src as *const _,
+                            len_bytes,
+                            t0.stream.handle,
+                        )
+                    },
+                    "batched MTP memo copy",
+                )?;
+            }
+        }
+        Ok(staged)
+    }
+
+    fn finish_batched_mtp_slot_commits(
+        &mut self,
+        slots: &[usize],
+        pending_ingests: &[&[i32]],
+        staged_memos: &[Option<(usize, usize, usize)>],
+    ) {
+        let pinned_ptr = self
+            .memo_pinned_staging
+            .as_ref()
+            .map_or(core::ptr::null(), |p| p.host_ptr.cast::<u8>());
+        for (b, (&slot, &toks)) in slots.iter().zip(pending_ingests).enumerate() {
+            if !toks.is_empty() {
+                let memo_opt = if slot == self.mtp_batch_active_slot {
+                    &mut self.current
+                } else {
+                    &mut self.mtp_batch_slots[slot].current
+                };
+                if let Some(memo) = memo_opt {
+                    if let Some((pinned_off, old_len, len_bytes)) = staged_memos[b]
+                        && !pinned_ptr.is_null()
+                    {
+                        // SAFETY: t0.stream synchronized during draft readback; both ranges valid.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                pinned_ptr.add(pinned_off),
+                                memo.features.as_mut_ptr().add(old_len),
+                                len_bytes,
+                            );
+                        }
+                    }
+                    memo.tokens.extend_from_slice(toks);
+                }
+                if slot == self.mtp_batch_active_slot {
+                    self.resident_tokens.extend_from_slice(toks);
+                    self.processed += toks.len();
+                } else {
+                    self.mtp_batch_slots[slot]
+                        .resident_tokens
+                        .extend_from_slice(toks);
+                    self.mtp_batch_slots[slot].processed += toks.len();
+                }
+            }
+            self.batch_slot_tick_counter += 1;
+            if slot == self.mtp_batch_active_slot {
+                self.active_slot_last_used_tick = self.batch_slot_tick_counter;
+            } else {
+                self.mtp_batch_slots[slot].last_used_tick = self.batch_slot_tick_counter;
+            }
+        }
+    }
+
+    pub(crate) fn try_ingest_and_propose_mtp_batch(
+        &mut self,
+        engine: &mut Qwen3_5Engine,
+        slots: &[usize],
+        pending_ingests: &[&[i32]],
+        anchors: &[i32],
+        k_budgets: &[usize],
+    ) -> Result<Option<Vec<Vec<i32>>>> {
+        let b_reqs = slots.len();
+        let k_max = k_budgets.iter().copied().max().unwrap_or(0);
+        if !engine.use_cuda_graph
+            || !(2..=crate::mtp::MAX_MTP_BATCH_SLOTS).contains(&b_reqs)
+            || !(1..=3).contains(&k_max)
+            || pending_ingests.len() != b_reqs
+            || anchors.len() != b_reqs
+            || k_budgets.len() != b_reqs
+        {
+            return Ok(None);
+        }
+        let total_ingest: usize = pending_ingests.iter().map(|t| t.len()).sum();
+        if total_ingest > self.max_rows {
+            return Ok(None);
+        }
+        let can_batch = match &self.ranks {
+            Ranks::Mtp(rs) => {
+                let r0 = &rs[0];
+                let slot_count = r0.batch_slot_count().min(self.mtp_batch_slots.len());
+                let slot_cap = r0.batch_slot_capacity();
+                let mut seen = 0u16;
+                r0.is_batch_mode()
+                    && r0.supports_cuda_graph()
+                    && slots.iter().zip(pending_ingests).all(|(&s, &toks)| {
+                        let ok = s < slot_count
+                            && s < 16
+                            && (seen & (1u16 << s)) == 0
+                            && self.slot_processed(s) >= 1
+                            && self.slot_processed(s) - 1 + toks.len() + k_max <= slot_cap;
+                        if s < 16 {
+                            seen |= 1u16 << s;
+                        }
+                        ok
+                    })
+            }
+            Ranks::DFlash(_) => false,
+        };
+        if !can_batch {
+            return Ok(None);
+        }
+
+        let staged_memos =
+            self.stage_batched_mtp_memo_d2h(&engine.ranks[0], slots, pending_ingests)?;
+        let num_ranks = engine.ranks.len();
+        let tail_ptrs_per_rank: Vec<Vec<u64>> = (0..num_ranks)
+            .map(|ri| slots.iter().map(|&s| self.slot_tail_addr(s, ri)).collect())
+            .collect();
+        let befores: Vec<usize> = slots.iter().map(|&s| self.slot_processed(s)).collect();
+
+        let drafts_res: Result<Vec<Vec<i32>>> = (|| {
+            let Ranks::Mtp(rs) = &mut self.ranks else {
+                unreachable!()
+            };
+            for (&slot, &before) in slots.iter().zip(&befores) {
+                for r in rs.iter_mut() {
+                    r.truncate_slot(slot, before - 1)?;
+                }
+            }
+            if total_ingest > 0 {
+                let slices: Vec<crate::mtp::MtpIngestSlice<'_>> = slots
+                    .iter()
+                    .zip(pending_ingests)
+                    .map(|(&slot, &tokens)| crate::mtp::MtpIngestSlice { slot, tokens })
+                    .collect();
+                for (ri, ((r, t), shifted)) in rs
+                    .iter_mut()
+                    .zip(&engine.ranks)
+                    .zip(&self.shifted)
+                    .enumerate()
+                {
+                    t.device.make_current()?;
+                    let mut row_cursor = 0usize;
+                    for (b, (&slot, &toks)) in slots.iter().zip(pending_ingests).enumerate() {
+                        if toks.is_empty() {
+                            continue;
+                        }
+                        let src = self.mtp_batch_slots[slot].captured_verify_hidden[ri].addr();
+                        let tail_ptr = tail_ptrs_per_rank[ri][b];
+                        let dst = shifted.addr() + (row_cursor * self.row_bytes) as u64;
+                        check_rc(
+                            // SAFETY: dst and tail_ptr span row_bytes on t.stream.
+                            unsafe {
+                                ffi::w34_memcpy_d2d_async(
+                                    dst as *mut _,
+                                    tail_ptr as *const _,
+                                    self.row_bytes,
+                                    t.stream.handle,
+                                )
+                            },
+                            "batched MTP shifted head",
+                        )?;
+                        if toks.len() > 1 {
+                            check_rc(
+                                // SAFETY: src and dst + row_bytes span (toks.len() - 1) * row_bytes.
+                                unsafe {
+                                    ffi::w34_memcpy_d2d_async(
+                                        (dst + self.row_bytes as u64) as *mut _,
+                                        src as *const _,
+                                        (toks.len() - 1) * self.row_bytes,
+                                        t.stream.handle,
+                                    )
+                                },
+                                "batched MTP shifted body",
+                            )?;
+                        }
+                        check_rc(
+                            // SAFETY: src tail row copied into tail_ptr after reading old tail_ptr above.
+                            unsafe {
+                                ffi::w34_memcpy_d2d_async(
+                                    tail_ptr as *mut _,
+                                    (src + ((toks.len() - 1) * self.row_bytes) as u64) as *const _,
+                                    self.row_bytes,
+                                    t.stream.handle,
+                                )
+                            },
+                            "batched MTP update tail",
+                        )?;
+                        row_cursor += toks.len();
+                    }
+                    r.ingest_kv_only_multi_slot_no_sync(t, &slices, shifted.addr())?;
+                }
+            }
+
+            let comm = engine.tp2_comm.as_deref();
+            let mut long_ctx_per_rank = [false; 2];
+            use crate::coordinated::{ReplayPhase, replay_ranks};
+            let replay_res = replay_ranks(rs.len(), |phase, ri| {
+                let r = &mut rs[ri];
+                let t = &engine.ranks[ri];
+                match phase {
+                    ReplayPhase::Upload => {
+                        long_ctx_per_rank[ri] = r.prepare_batched_propose_graph_inputs_async(
+                            t,
+                            slots,
+                            anchors,
+                            &tail_ptrs_per_rank[ri],
+                            k_max,
+                        )?;
+                        Ok(())
+                    }
+                    ReplayPhase::Capture => r.ensure_batched_propose_graph(
+                        t,
+                        b_reqs,
+                        k_max,
+                        long_ctx_per_rank[ri],
+                        comm,
+                    ),
+                    ReplayPhase::Launch => r.replay_batched_propose_graph_async(
+                        t,
+                        b_reqs,
+                        k_max,
+                        long_ctx_per_rank[ri],
+                    ),
+                }
+            });
+            let mut outputs = match replay_res {
+                Ok(()) => rs
+                    .iter_mut()
+                    .zip(&engine.ranks)
+                    .map(|(r, t)| r.collect_batched_propose_host(t, slots, k_budgets, k_max))
+                    .collect::<Result<Vec<_>>>()?,
+                Err(error) => {
+                    if error.partial_launch {
+                        eprintln!(
+                            "[w34] fatal: asymmetric batched MTP TP graph launch failure: {}",
+                            error.source
+                        );
+                        std::process::abort();
+                    }
+                    return Err(error.source);
+                }
+            };
+            if outputs.windows(2).any(|w| w[0] != w[1]) {
+                return Err(loader_err("batched MTP TP token disagreement"));
+            }
+            Ok(outputs.swap_remove(0))
+        })();
+
+        match drafts_res {
+            Ok(drafts) => {
+                self.finish_batched_mtp_slot_commits(slots, pending_ingests, &staged_memos);
+                Ok(Some(drafts))
+            }
+            Err(e) => {
+                for (b, (&slot, &toks)) in slots.iter().zip(pending_ingests).enumerate() {
+                    if !toks.is_empty() {
+                        let memo_opt = if slot == self.mtp_batch_active_slot {
+                            &mut self.current
+                        } else {
+                            &mut self.mtp_batch_slots[slot].current
+                        };
+                        if let Some(memo) = memo_opt
+                            && let Some((_, old_len, _)) = staged_memos[b]
+                        {
+                            memo.features.truncate(old_len);
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
     /// Runs one diagnostic drafter ingest + proposal step on `prompt` and `anchor`,
     /// recording `"drafter_hidden"` and `draft_proposal_ids` into `dump`.
+    pub fn captured_batched_mtp_propose_graph_shapes(&self) -> Vec<(usize, usize, bool)> {
+        match &self.ranks {
+            Ranks::Mtp(rs) => rs
+                .first()
+                .map_or_else(Vec::new, |r| r.captured_batched_propose_graph_shapes()),
+            Ranks::DFlash(_) => Vec::new(),
+        }
+    }
+
     pub fn dump_step(
         &mut self,
         engine: &mut Qwen3_5Engine,

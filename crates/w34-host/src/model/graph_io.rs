@@ -420,15 +420,15 @@ impl SpecVerifyGraphIo {
     }
 }
 
-pub const MAX_BATCHED_SPEC_REQS: usize = 4;
-pub const MAX_BATCHED_SPEC_TOKENS: usize = 24;
+pub const MAX_BATCHED_SPEC_REQS: usize = 8;
+pub const MAX_BATCHED_SPEC_TOKENS: usize = 48;
 const BATCHED_SPEC_META_I32_LEN: usize = 4 * MAX_BATCHED_SPEC_TOKENS
     + MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_TOKENS
     + 2 * MAX_BATCHED_SPEC_REQS * MAX_SPEC_VERIFY_CHECKPOINTS
     + (MAX_BATCHED_SPEC_REQS + 1)
     + 4 * MAX_BATCHED_SPEC_REQS;
 
-/// Multi-request (`B in 2..=4`, `total_tokens <= 24`) speculative verification CUDA Graph I/O.
+/// Multi-request (`B in 2..=8`, `total_tokens <= 48`) speculative verification CUDA Graph I/O.
 /// Reuses `BatchedDecodeGraphIo::block_tables` so zero extra KV block-table VRAM is needed.
 #[cfg(feature = "cuda")]
 pub struct BatchedSpecVerifyGraphIo {

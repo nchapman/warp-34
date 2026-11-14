@@ -661,3 +661,216 @@ fn batched_mtp_max4_handles_8_burst_and_reuses_warm_prefixes() {
         );
     }
 }
+
+#[test]
+fn batched_mtp_stochastic_and_tp2_greedy_stay_speculative() {
+    if common::require_or_skip_cached_model(
+        "Qwen/Qwen3.5-4B",
+        "batched_mtp_stochastic_and_tp2_greedy_stay_speculative",
+    )
+    .is_none()
+    {
+        return;
+    }
+    let _gpu_guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // 1. Stochastic B=4 batched MTP must stay in speculative verify rounds (not fall back to plain decode).
+    let stoch_worker = EngineWorker::from_loader(
+        || {
+            let mut engine = Qwen3_5Engine::load_for_serving(
+                "Qwen/Qwen3.5-4B",
+                1,
+                KvFormatPolicy::Tq4,
+                Some(512),
+                true,
+                16,
+            )
+            .map_err(|e| e.to_string())?;
+            engine
+                .enable_speculative(&SpeculativeConfig {
+                    kind: SpeculativeKind::Mtp,
+                    mtp_k: 3,
+                    draft_model: None,
+                })
+                .map_err(|e| e.to_string())?;
+            Ok(engine)
+        },
+        SchedulerConfig {
+            max_num_seqs: 4,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+
+    let prompts: Vec<Vec<i32>> = (0..4)
+        .map(|i| {
+            let mut p: Vec<i32> = (0..96).map(|j| 200 + ((j * 5) % 89)).collect();
+            p.extend((0..16).map(|j| 600 + (i * 19 + j)));
+            p
+        })
+        .collect();
+
+    let (stoch_got, stoch_rounds, stoch_accepted) = rt.block_on(async {
+        let mut streams: Vec<_> = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let sp = SamplingParams {
+                    max_tokens: 32,
+                    ignore_eos: true,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    seed: 1000 + i as u64,
+                    ..SamplingParams::default()
+                };
+                stoch_worker.submit(p.clone(), sp, None).unwrap()
+            })
+            .collect();
+        let mut it = streams.drain(..);
+        let (mut s0, mut s1, mut s2, mut s3) = (
+            it.next().unwrap(),
+            it.next().unwrap(),
+            it.next().unwrap(),
+            it.next().unwrap(),
+        );
+        let out = tokio::time::timeout(Duration::from_secs(120), async {
+            let (r0, r1, r2, r3) = tokio::join!(
+                collect_with_cached(&mut s0, 32),
+                collect_with_cached(&mut s1, 32),
+                collect_with_cached(&mut s2, 32),
+                collect_with_cached(&mut s3, 32),
+            );
+            Ok::<_, String>(vec![r0?, r1?, r2?, r3?])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let rounds = stoch_worker.stats.verify_rounds.load(Ordering::Relaxed);
+        let acc = stoch_worker.stats.accepted_drafts.load(Ordering::Relaxed);
+        stoch_worker.shutdown().await.unwrap();
+        (out, rounds, acc)
+    });
+    assert!(
+        stoch_rounds >= 20,
+        "stochastic B=4 must execute batched MTP verify rounds, got {stoch_rounds}"
+    );
+    assert!(
+        stoch_accepted > 0,
+        "stochastic B=4 batched MTP must accept draft tokens"
+    );
+    assert!(stoch_got.iter().all(|(toks, _)| toks.len() == 32));
+
+    // 2. TP=2 greedy B=4 batched MTP must match B=1 non-speculative greedy bit-for-bit.
+    let tp2_plain = EngineWorker::from_loader(
+        || {
+            Qwen3_5Engine::load_for_serving(
+                "Qwen/Qwen3.5-4B",
+                2,
+                KvFormatPolicy::Tq4,
+                Some(512),
+                true,
+                16,
+            )
+            .map_err(|e| e.to_string())
+        },
+        SchedulerConfig {
+            max_num_seqs: 1,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let greedy_short = SamplingParams {
+        max_tokens: 32,
+        ignore_eos: true,
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+    let tp2_expected = rt.block_on(async {
+        let mut out = Vec::with_capacity(prompts.len());
+        for p in &prompts {
+            let mut s = tp2_plain
+                .submit(p.clone(), greedy_short.clone(), None)
+                .unwrap();
+            let (toks, _) =
+                tokio::time::timeout(Duration::from_secs(90), collect_with_cached(&mut s, 32))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            out.push(toks);
+        }
+        tp2_plain.shutdown().await.unwrap();
+        out
+    });
+
+    let tp2_mtp = EngineWorker::from_loader(
+        || {
+            let mut engine = Qwen3_5Engine::load_for_serving(
+                "Qwen/Qwen3.5-4B",
+                2,
+                KvFormatPolicy::Tq4,
+                Some(512),
+                true,
+                16,
+            )
+            .map_err(|e| e.to_string())?;
+            engine
+                .enable_speculative(&SpeculativeConfig {
+                    kind: SpeculativeKind::Mtp,
+                    mtp_k: 3,
+                    draft_model: None,
+                })
+                .map_err(|e| e.to_string())?;
+            Ok(engine)
+        },
+        SchedulerConfig {
+            max_num_seqs: 4,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let (tp2_got, tp2_rounds, tp2_accepted) = rt.block_on(async {
+        let mut streams: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                tp2_mtp
+                    .submit(p.clone(), greedy_short.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        let mut it = streams.drain(..);
+        let (mut s0, mut s1, mut s2, mut s3) = (
+            it.next().unwrap(),
+            it.next().unwrap(),
+            it.next().unwrap(),
+            it.next().unwrap(),
+        );
+        let out = tokio::time::timeout(Duration::from_secs(120), async {
+            let (r0, r1, r2, r3) = tokio::join!(
+                collect_with_cached(&mut s0, 32),
+                collect_with_cached(&mut s1, 32),
+                collect_with_cached(&mut s2, 32),
+                collect_with_cached(&mut s3, 32),
+            );
+            Ok::<_, String>(vec![r0?, r1?, r2?, r3?])
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let rounds = tp2_mtp.stats.verify_rounds.load(Ordering::Relaxed);
+        let acc = tp2_mtp.stats.accepted_drafts.load(Ordering::Relaxed);
+        tp2_mtp.shutdown().await.unwrap();
+        (out, rounds, acc)
+    });
+    assert!(
+        tp2_rounds >= 30,
+        "TP=2 B=4 batched MTP must execute verify rounds, got {tp2_rounds}"
+    );
+    assert!(tp2_accepted > 0, "TP=2 B=4 batched MTP must accept drafts");
+    for (i, ((got, _), exp)) in tp2_got.iter().zip(&tp2_expected).enumerate() {
+        assert_eq!(got, exp, "TP=2 B=4 slot {i} must match greedy baseline");
+    }
+}
