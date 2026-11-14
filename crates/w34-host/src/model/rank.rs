@@ -1489,7 +1489,13 @@ impl PrePoolModelRank {
         };
         let min_state_slots_for_moe = if capacity.state_slots.is_some() {
             let cap = if tp_size >= 2 {
-                16
+                if capacity.dflash_reserve_bytes > 0 {
+                    capacity.dflash_min_state_slots.max(14)
+                } else if capacity.native_mtp && default_pages.unwrap_or(0) < 2048 {
+                    16
+                } else {
+                    18
+                }
             } else {
                 PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS
             };
@@ -1505,7 +1511,7 @@ impl PrePoolModelRank {
         let (tiered_moe, tiered_moe_hot_per_layer, actual_tiered_moe_bytes, post_pool_moe_reserve) =
             if cfg.uses_tiered_moe() {
                 let post_weight_available = device.mem_info()?.0;
-                let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer(
+                let (hot_per_layer, total_moe_reserve) = plan_tiered_moe_hot_per_layer_with_dflash(
                     &cfg,
                     tp_size,
                     post_weight_available,
@@ -1514,6 +1520,7 @@ impl PrePoolModelRank {
                         .saturating_add(capacity.lora_reserve.device_bytes_per_rank)
                         .saturating_add(rank0_extra_headroom),
                     bytes_per_state_slot.saturating_mul(min_state_slots_for_moe),
+                    capacity.dflash_reserve_bytes,
                 );
                 let stage_cap = select_tiered_moe_stage_capacity(&cfg, tp_size, hot_per_layer);
                 let tm = crate::moe_offload::RankTieredMoe::load_for_rank(

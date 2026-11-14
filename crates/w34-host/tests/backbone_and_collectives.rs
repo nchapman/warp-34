@@ -68,6 +68,14 @@ fn test_loader_all_five_cached_checkpoints() {
         .unwrap_or_else(|e| panic!("failed to parse config for {repo_id}: {e}"));
         assert_eq!(cfg.num_hidden_layers, expected_layers, "{repo_id} layers");
         assert_eq!(cfg.hidden_size, expected_hidden, "{repo_id} hidden_size");
+        if !dir.join("model.safetensors").is_file()
+            && !dir.join("model.safetensors.index.json").is_file()
+        {
+            eprintln!(
+                "SKIP test_loader_all_five_cached_checkpoints archive scan for {repo_id}: config-only snapshot"
+            );
+            continue;
+        }
 
         let archive = SafetensorsArchive::open(&dir)
             .unwrap_or_else(|e| panic!("failed to open safetensors for {repo_id}: {e}"));

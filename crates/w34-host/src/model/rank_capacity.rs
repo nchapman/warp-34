@@ -396,6 +396,27 @@ pub fn plan_tiered_moe_hot_per_layer(
     base_headroom_plus_kv_bytes: usize,
     min_state_pool_bytes: usize,
 ) -> (usize, usize) {
+    plan_tiered_moe_hot_per_layer_with_dflash(
+        cfg,
+        tp_size,
+        available_vram_after_weights_and_scratch,
+        base_headroom_plus_kv_bytes,
+        min_state_pool_bytes,
+        0,
+    )
+}
+
+/// Computes the per-layer hot expert cache capacity (`K_hot`) and total VRAM reserve
+/// for tiered MoE models (`qwen4_exp`), accounting for an explicit `DFlash2` resident
+/// drafter + sliding-window KV reserve when `dflash_reserve_bytes > 0`.
+pub fn plan_tiered_moe_hot_per_layer_with_dflash(
+    cfg: &ModelConfig,
+    tp_size: usize,
+    available_vram_after_weights_and_scratch: usize,
+    base_headroom_plus_kv_bytes: usize,
+    min_state_pool_bytes: usize,
+    dflash_reserve_bytes: usize,
+) -> (usize, usize) {
     if !cfg.uses_tiered_moe() {
         return (0, 0);
     }
@@ -410,7 +431,8 @@ pub fn plan_tiered_moe_hot_per_layer(
     {
         let hot = (local_experts / 2).max(1);
         let reserve = (cfg.num_hidden_layers * hot + TIERED_MOE_STAGE_RESERVE_SLOTS) * exp_bytes
-            + TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES;
+            + TIERED_MOE_SYNTHETIC_EXTRA_RESERVE_BYTES
+            + dflash_reserve_bytes;
         return (hot, reserve);
     }
     let min_hot = if tp_size >= 2 {
@@ -419,9 +441,10 @@ pub fn plan_tiered_moe_hot_per_layer(
         TIERED_MOE_TP1_MIN_HOT_EXPERTS.min(default_hot)
     };
     let extra_reserve = if tp_size >= 4 {
-        TIERED_MOE_TP4_STAGE_RESERVE_SLOTS * exp_bytes
+        (TIERED_MOE_TP4_STAGE_RESERVE_SLOTS * exp_bytes).saturating_add(dflash_reserve_bytes)
     } else {
-        TIERED_MOE_STAGE_RESERVE_SLOTS * exp_bytes + TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES
+        (TIERED_MOE_STAGE_RESERVE_SLOTS * exp_bytes)
+            .saturating_add(TIERED_MOE_MTP_AND_GRAPH_RESERVE_BYTES.max(dflash_reserve_bytes))
     };
     let fixed_overhead = base_headroom_plus_kv_bytes
         .saturating_add(min_state_pool_bytes)

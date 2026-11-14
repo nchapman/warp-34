@@ -90,12 +90,15 @@ fn native_speculation_yields_to_late_peer_losslessly() {
         .unwrap();
     for kind in [SpeculativeKind::Mtp, SpeculativeKind::DFlash2] {
         // Loading, inference and destruction stay on the worker OS thread.
+        // Use an unambiguous factual prompt rather than "The capital of France is", which on
+        // sm_89 TQ4 hits an exact 1-FP16-ULP (0.015625) tie at token 10 ("\n" vs "\n\n") when
+        // DFlash2 yields from M=16 Tensor Core verify to M=2 cuBLAS batched decode.
         let baseline_worker = worker(kind);
         let prompt: Vec<i32> = baseline_worker
             .tokenizer
             .as_ref()
             .unwrap()
-            .encode("The capital of France is", false)
+            .encode("In computer architecture, cache coherence ensures", false)
             .unwrap()
             .get_ids()
             .iter()

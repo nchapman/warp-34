@@ -140,7 +140,7 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
 // Grid: ((n_interm + 3) / 4, num_tokens * top_k) when !APPLY_HAD64, or (n_interm / 64, num_tokens * top_k) when APPLY_HAD64.
 // Block: 128 threads (4 warps).
 template <bool HAS_ZP = false, bool APPLY_HAD64 = false, int BITS = 4>
-__global__ void __launch_bounds__(128, 8) moe_w4a16_gate_up_silu_f16_kernel(
+__global__ void __launch_bounds__(128, APPLY_HAD64 ? 4 : 8) moe_w4a16_gate_up_silu_f16_kernel(
     const __half* __restrict__ x,
     const uint32_t* __restrict__ gate_up_packed,
     const __half* __restrict__ gate_up_scales,

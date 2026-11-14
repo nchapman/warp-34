@@ -58,7 +58,7 @@ FULL_SUITE_MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(
         repo_id="nchapman/Qwen3.5-4B-W4A16-HGPTQ",
         revision="493bf19cf3b9947d55320c93cb0f8d4c187a9083",
-        required_files=("config.json", "model.safetensors", "tokenizer.json"),
+        required_files=("config.json", "model.safetensors.index.json", "tokenizer.json"),
     ),
     ModelSpec(
         repo_id="nchapman/Qwen3.5-9B-W4A16-HGPTQ",

@@ -54,6 +54,11 @@ STACK_ALLOWLIST: tuple[tuple[str, int, str], ...] = (
         "libdevice __nv_powf/__nv_sinf/__nv_cosf call frame",
     ),
     (
+        "vision_qkv_bias_rope_inplace_f16_kernel",
+        32,
+        "libdevice __nv_powf/__nv_sinf/__nv_cosf call frame",
+    ),
+    (
         "sampler_step_f16_kernel",
         32,
         "__noinline__ radix helper call frame (0 register spill)",
@@ -126,7 +131,10 @@ def find_or_build_archive(repo_root: pathlib.Path, profile: str = "release") -> 
         cmd.append("--release")
     subprocess.run(cmd, cwd=repo_root, env=env, check=True)
     candidates = sorted(
-        build_root.glob("w34-kernels-*/out/libw34_kernels.a"),
+        [
+            *build_root.glob("w34-kernels-*/out/libw34_kernels.a"),
+            *build_root.glob("w34-kernels/*/out/libw34_kernels.a"),
+        ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )

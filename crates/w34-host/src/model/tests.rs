@@ -245,6 +245,27 @@ mod serving_capacity_tests {
         );
         assert_eq!(hot_tp2_default, 128);
 
+        // When DFlash2 reserve exceeds default MTP/graph reserve (e.g. 24 GiB sm_89 TP=2
+        // Flash-Next serving at 4096 KV pages), `plan_tiered_moe_hot_per_layer_with_dflash`
+        // steps `hot_per_layer` down so target GDN state slots are preserved.
+        let (hot_without_dflash, _) = plan_tiered_moe_hot_per_layer_with_dflash(
+            &cfg,
+            2,
+            13_200 * 1024 * 1024,
+            1_800 * 1024 * 1024,
+            600 * 1024 * 1024,
+            0,
+        );
+        let (hot_with_dflash, _) = plan_tiered_moe_hot_per_layer_with_dflash(
+            &cfg,
+            2,
+            13_200 * 1024 * 1024,
+            1_800 * 1024 * 1024,
+            600 * 1024 * 1024,
+            2_400 * 1024 * 1024,
+        );
+        assert!(hot_with_dflash < hot_without_dflash);
+
         // TP=2 at 12288 pages + MTP reserve (~4.3 GiB base+KV+MTP) and 1.2 GiB state pool:
         // exact 8-aligned hot_per_layer = 104, fitting within 19_600 MiB.
         let base_plus_kv_12k = gib + 1536 * 1024 * 1024 + 1824 * 1024 * 1024;

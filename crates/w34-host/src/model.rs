@@ -69,7 +69,7 @@ pub use rank_capacity::{
     TIERED_MOE_TP2_DEFAULT_HOT, TIERED_MOE_TP2_MIN_HOT_EXPERTS, TIERED_MOE_TP4_STAGE_RESERVE_SLOTS,
     WEIGHT_ARENA_ALIGNMENT_BYTES, default_tiered_moe_hot_ceiling, plan_host_embed_offload,
     plan_mtp_tiered_moe_hot_experts, plan_scratch_arena_bytes, plan_scratch_arena_bytes_with_lora,
-    plan_target_kv_pages, plan_tiered_moe_hot_per_layer,
+    plan_target_kv_pages, plan_tiered_moe_hot_per_layer, plan_tiered_moe_hot_per_layer_with_dflash,
 };
 #[cfg(feature = "cuda")]
 use rank_capacity::{PoolCapacity, SharedVocabHost};
