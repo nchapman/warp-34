@@ -80,6 +80,21 @@ fn test_tq4_and_q8_0_byte_budgets() {
 }
 
 #[cfg(feature = "cuda")]
+fn kv_policies_for_outlier_test(dev: &CudaDevice) -> Vec<KvFormatPolicy> {
+    let mut policies = vec![
+        KvFormatPolicy::Q8_0,
+        KvFormatPolicy::Tq4,
+        KvFormatPolicy::Tq4All,
+    ];
+    if dev.props().expect("props").supports_fp8_kv() {
+        policies.push(KvFormatPolicy::Fp8);
+    } else {
+        assert!(KvPool::new(0, 0, &[3], 2, 256, 16, 4, KvFormatPolicy::Fp8).is_err());
+    }
+    policies
+}
+
+#[cfg(feature = "cuda")]
 #[test]
 fn test_wht256_outlier_protection_and_long_context_needle() {
     let _guard = GPU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -87,18 +102,12 @@ fn test_wht256_outlier_protection_and_long_context_needle() {
     let stream = CudaStream::new(dev.device_id).expect("stream");
     let ex = stream.exec(0, 0);
 
-    // 1. Verify WHT-256 rotation protects channel-outlier KV vectors on Tq4/Tq4All and
-    //    preserves 0-ULP page-table permutation invariance across Q8_0, Tq4, and Tq4All.
-    for policy in [
-        KvFormatPolicy::Q8_0,
-        KvFormatPolicy::Tq4,
-        KvFormatPolicy::Tq4All,
-    ] {
+    for policy in kv_policies_for_outlier_test(&dev) {
         let layer_ids = [3, 7, 11, 15, 19];
         let pool = KvPool::new(0, 0, &layer_ids, 2, 256, 16, 16, policy).expect("KvPool");
-        // Test ordinal 0 (Q8_0 for Q8_0 policy, rotated TQ4 for Tq4 and Tq4All)
+        // Test ordinal 0 (Q8_0/Fp8 identity, rotated TQ4 for Tq4 and Tq4All)
         let layout = pool.layers[0].layout;
-        let expected_transform = if policy == KvFormatPolicy::Q8_0 {
+        let expected_transform = if matches!(policy, KvFormatPolicy::Q8_0 | KvFormatPolicy::Fp8) {
             W34_KV_TRANSFORM_IDENTITY
         } else {
             W34_KV_TRANSFORM_RADEMACHER_WHT256

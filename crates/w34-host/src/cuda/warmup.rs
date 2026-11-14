@@ -746,6 +746,43 @@ pub fn prepare_execution_plan(device_id: i32) -> Result<()> {
         )?;
     }
 
+    if dev.props()?.supports_fp8_kv() {
+        let layout_256_fp8 = W34KvLayerLayout {
+            k_token_stride_bytes: 264,
+            v_token_stride_bytes: 264,
+            k_head_stride_bytes: 16 * 264,
+            v_head_stride_bytes: 16 * 264,
+            k_page_stride_bytes: 16 * 264,
+            v_page_stride_bytes: 16 * 264,
+            k_format: ffi::W34_KV_FORMAT_FP8_E4M3,
+            v_format: ffi::W34_KV_FORMAT_FP8_E4M3,
+            k_transform: ffi::W34_KV_TRANSFORM_IDENTITY,
+            v_transform: ffi::W34_KV_TRANSFORM_IDENTITY,
+            ..layout_256
+        };
+        warmup_ffi!(
+            ffi::w34_kv_cache_write(
+                &ex,
+                &layout_256_fp8,
+                &attn_batch,
+                buf_c as *const c_void,
+                buf_c as *const c_void,
+            ),
+            "warmup w34_kv_cache_write fp8_e4m3"
+        )?;
+        warmup_ffi!(
+            ffi::w34_paged_attention_f16(
+                &ex,
+                &layout_256_fp8,
+                &attn_batch,
+                buf_c as *const c_void,
+                buf_d as *mut c_void,
+                4,
+            ),
+            "warmup w34_paged_attention_f16 fp8_e4m3"
+        )?;
+    }
+
     let bf16_layout = W34KvLayerLayout {
         namespace_id: ffi::W34_KV_NAMESPACE_DFLASH_DRAFT_CTX,
         k_format: ffi::W34_KV_FORMAT_BF16,

@@ -260,12 +260,15 @@ pub(crate) fn run_bench(
                 None
             }
         });
-        let num_fa_layers = engine.ranks[0].kv_pool.layers.len();
-        let kv_bytes_per_token = policy.bytes_per_token(
-            num_fa_layers,
-            engine.cfg.num_key_value_heads,
-            engine.cfg.head_dim,
-        );
+        let kv_bytes_per_token: usize = engine.ranks[0]
+            .kv_pool
+            .layers
+            .iter()
+            .map(|l| {
+                (l.layout.k_token_stride_bytes as usize + l.layout.v_token_stride_bytes as usize)
+                    * engine.cfg.num_key_value_heads
+            })
+            .sum();
         decode_summary = serde_json::json!({
             "model": model,
             "tp": tp,

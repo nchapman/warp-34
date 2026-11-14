@@ -4,8 +4,8 @@
 #[cfg(feature = "cuda")]
 use crate::cuda::{DeviceBuffer, Result};
 use w34_kernels::ffi::{
-    W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4,
-    W34_KV_TRANSFORM_IDENTITY, W34_KV_TRANSFORM_RADEMACHER_WHT256,
+    W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP8_E4M3, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0,
+    W34_KV_FORMAT_TQ4, W34_KV_TRANSFORM_IDENTITY, W34_KV_TRANSFORM_RADEMACHER_WHT256,
 };
 #[cfg(feature = "cuda")]
 use w34_kernels::ffi::{W34_KV_NAMESPACE_TARGET_FULL_ATTN, W34KvLayerLayout};
@@ -27,11 +27,15 @@ pub enum KvFormatPolicy {
     Bf16,
     /// Plain 8-bit (`Q8_0` `272 B`/row for both `K` and `V`, `34,816 B/token`, `1.88x` compression on 27B).
     Q8_0,
+    /// Native `sm_89+` hardware `FP8 E4M3` (`block_fp8_e4m3_256` `264 B`/row for both `K` and `V`,
+    /// `33,792 B/token`, `1.94x` compression on 27B; rejected on `< sm_89`).
+    Fp8,
     /// Tail-anchored TurboQuant 4-bit (default): the last 4 (`N - 4..=N - 1`) full-attention
-    /// layers use unrotated 8-bit `Q8_0` (`272 B`/row); all preceding full-attention layers use
-    /// WHT-256 rotated 4-bit `TQ4` (`132 B`/row) with per-128 post-WHT RMS normalization and
-    /// least-squares scales (`21,376 B/token`, `3.07x` compression on 27B — fits full `262k`
-    /// context on 1x 3090 Ti while matching `FP16` oracle accuracy).
+    /// layers use unrotated 8-bit (`FP8 E4M3` `264 B`/row on `sm_89+`, `Q8_0` `272 B`/row on
+    /// `sm_86`); all preceding full-attention layers use WHT-256 rotated 4-bit `TQ4` (`132 B`/row)
+    /// with per-128 post-WHT RMS normalization and least-squares scales (`21,120`–`21,376 B/token`,
+    /// `3.07`–`3.10x` compression on 27B — fits full `262k` context on 24 GB cards while matching
+    /// `FP16` oracle accuracy).
     Tq4,
     /// Uniform all-layer TurboQuant 4-bit (`132 B`/row on every full-attention layer,
     /// `16,896 B/token`, `3.88x` compression on 27B).
@@ -43,6 +47,15 @@ impl KvFormatPolicy {
         self,
         full_attn_layer_ordinal: usize,
         num_full_attn_layers: usize,
+    ) -> (i32, i32, i32, i32) {
+        self.resolve_layer_with_fp8(full_attn_layer_ordinal, num_full_attn_layers, false)
+    }
+
+    pub fn resolve_layer_with_fp8(
+        self,
+        full_attn_layer_ordinal: usize,
+        num_full_attn_layers: usize,
+        supports_fp8_kv: bool,
     ) -> (i32, i32, i32, i32) {
         match self {
             Self::Fp16 => (
@@ -63,12 +76,23 @@ impl KvFormatPolicy {
                 W34_KV_TRANSFORM_IDENTITY,
                 W34_KV_TRANSFORM_IDENTITY,
             ),
+            Self::Fp8 => (
+                W34_KV_FORMAT_FP8_E4M3,
+                W34_KV_FORMAT_FP8_E4M3,
+                W34_KV_TRANSFORM_IDENTITY,
+                W34_KV_TRANSFORM_IDENTITY,
+            ),
             Self::Tq4 => {
                 let is_boundary = full_attn_layer_ordinal >= num_full_attn_layers.saturating_sub(4);
                 if is_boundary {
+                    let boundary_fmt = if supports_fp8_kv {
+                        W34_KV_FORMAT_FP8_E4M3
+                    } else {
+                        W34_KV_FORMAT_Q8_0
+                    };
                     (
-                        W34_KV_FORMAT_Q8_0,
-                        W34_KV_FORMAT_Q8_0,
+                        boundary_fmt,
+                        boundary_fmt,
                         W34_KV_TRANSFORM_IDENTITY,
                         W34_KV_TRANSFORM_IDENTITY,
                     )
@@ -96,9 +120,20 @@ impl KvFormatPolicy {
         kv_heads: usize,
         head_dim: usize,
     ) -> usize {
+        self.bytes_per_token_with_fp8(num_full_attn_layers, kv_heads, head_dim, false)
+    }
+
+    pub fn bytes_per_token_with_fp8(
+        self,
+        num_full_attn_layers: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        supports_fp8_kv: bool,
+    ) -> usize {
         (0..num_full_attn_layers)
             .map(|ord| {
-                let (k_fmt, v_fmt, _, _) = self.resolve_layer(ord, num_full_attn_layers);
+                let (k_fmt, v_fmt, _, _) =
+                    self.resolve_layer_with_fp8(ord, num_full_attn_layers, supports_fp8_kv);
                 kv_heads
                     * (kv_format_row_bytes(k_fmt, head_dim) + kv_format_row_bytes(v_fmt, head_dim))
             })
@@ -122,6 +157,7 @@ pub fn kv_format_row_bytes(format: i32, head_dim: usize) -> usize {
         W34_KV_FORMAT_FP16 | W34_KV_FORMAT_BF16 => head_dim * 2,
         W34_KV_FORMAT_TQ4 => 66 * (head_dim / 128),
         W34_KV_FORMAT_Q8_0 => 68 * (head_dim / 64),
+        W34_KV_FORMAT_FP8_E4M3 => head_dim + 4 * (head_dim / 128),
         _ => head_dim * 2,
     }
 }
@@ -248,11 +284,24 @@ impl KvPool {
         num_pages: usize,
         policy: KvFormatPolicy,
     ) -> Result<Self> {
+        let dev_props = crate::cuda::CudaDevice { device_id }.props()?;
+        let supports_fp8_kv = dev_props.supports_fp8_kv();
+        if matches!(policy, KvFormatPolicy::Fp8) && !supports_fp8_kv {
+            return Err(crate::cuda::CudaError::with_detail(
+                -23,
+                "unsupported KV format on GPU architecture",
+                format!(
+                    "--kv-format fp8 requires sm_89+ hardware FP8 (40-series or newer); GPU {device_id} ({}) is {}",
+                    dev_props.name,
+                    dev_props.sm_tag()
+                ),
+            ));
+        }
         let num_full = layer_ids.len();
         let mut layers = Vec::with_capacity(num_full);
         for (ord, &layer_id) in layer_ids.iter().enumerate() {
             let (k_format, v_format, k_transform, v_transform) =
-                policy.resolve_layer(ord, num_full);
+                policy.resolve_layer_with_fp8(ord, num_full, supports_fp8_kv);
             let k_tok_bytes = kv_format_row_bytes(k_format, head_dim);
             let v_tok_bytes = kv_format_row_bytes(v_format, head_dim);
             let k_head_stride = block_size * k_tok_bytes;
@@ -569,8 +618,8 @@ impl StateBundlePool {
 mod tests {
     use super::*;
     use w34_kernels::ffi::{
-        W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4,
-        W34_KV_TRANSFORM_IDENTITY, W34_KV_TRANSFORM_RADEMACHER_WHT256,
+        W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP8_E4M3, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0,
+        W34_KV_FORMAT_TQ4, W34_KV_TRANSFORM_IDENTITY, W34_KV_TRANSFORM_RADEMACHER_WHT256,
     };
 
     #[test]
@@ -580,12 +629,14 @@ mod tests {
         assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_BF16, 256), 512);
         assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_TQ4, 256), 132);
         assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_Q8_0, 256), 272);
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_FP8_E4M3, 256), 264);
 
         // Head dim 128 (proposer draft context)
         assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_FP16, 128), 256);
         assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_BF16, 128), 256);
         assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_TQ4, 128), 66);
         assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_Q8_0, 128), 136);
+        assert_eq!(kv_format_row_bytes(W34_KV_FORMAT_FP8_E4M3, 128), 132);
     }
 
     #[test]
@@ -631,6 +682,33 @@ mod tests {
     }
 
     #[test]
+    fn test_kv_format_policy_fp8_and_sm89_tq4_resolution() {
+        let num_layers = 16;
+        for layer in 0..num_layers {
+            let (k_fp8, v_fp8, kt_fp8, vt_fp8) =
+                KvFormatPolicy::Fp8.resolve_layer(layer, num_layers);
+            assert_eq!(k_fp8, W34_KV_FORMAT_FP8_E4M3);
+            assert_eq!(v_fp8, W34_KV_FORMAT_FP8_E4M3);
+            assert_eq!(kt_fp8, W34_KV_TRANSFORM_IDENTITY);
+            assert_eq!(vt_fp8, W34_KV_TRANSFORM_IDENTITY);
+
+            let (k_sm89, v_sm89, kt_sm89, vt_sm89) =
+                KvFormatPolicy::Tq4.resolve_layer_with_fp8(layer, num_layers, true);
+            if layer >= num_layers - 4 {
+                assert_eq!(k_sm89, W34_KV_FORMAT_FP8_E4M3);
+                assert_eq!(v_sm89, W34_KV_FORMAT_FP8_E4M3);
+                assert_eq!(kt_sm89, W34_KV_TRANSFORM_IDENTITY);
+                assert_eq!(vt_sm89, W34_KV_TRANSFORM_IDENTITY);
+            } else {
+                assert_eq!(k_sm89, W34_KV_FORMAT_TQ4);
+                assert_eq!(v_sm89, W34_KV_FORMAT_TQ4);
+                assert_eq!(kt_sm89, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+                assert_eq!(vt_sm89, W34_KV_TRANSFORM_RADEMACHER_WHT256);
+            }
+        }
+    }
+
+    #[test]
     fn test_kv_format_policy_bytes_per_token_calculation() {
         let num_full_attn_layers = 16;
         let kv_heads = 8;
@@ -649,6 +727,18 @@ mod tests {
         // 4 boundary layers * 8 * (272 + 272) + 12 interior layers * 8 * (132 + 132)
         let expected_tq4 = 4 * 8 * 544 + 12 * 8 * 264;
         assert_eq!(tq4_boundary_bytes, expected_tq4); // 42,752 bytes/tok (~3.07x)
+
+        let fp8_bytes =
+            KvFormatPolicy::Fp8.bytes_per_token(num_full_attn_layers, kv_heads, head_dim);
+        assert_eq!(fp8_bytes, 16 * 8 * (264 + 264)); // 67,584 bytes/tok (~1.94x)
+
+        let tq4_sm89_bytes = KvFormatPolicy::Tq4.bytes_per_token_with_fp8(
+            num_full_attn_layers,
+            kv_heads,
+            head_dim,
+            true,
+        );
+        assert_eq!(tq4_sm89_bytes, 4 * 8 * 528 + 12 * 8 * 264); // 42,240 bytes/tok (~3.10x)
     }
 
     #[test]

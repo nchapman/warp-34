@@ -68,6 +68,7 @@ mod tests {
         assert_eq!(W34_KV_FORMAT_BF16, 1);
         assert_eq!(W34_KV_FORMAT_TQ4, 2);
         assert_eq!(W34_KV_FORMAT_Q8_0, 3);
+        assert_eq!(W34_KV_FORMAT_FP8_E4M3, 4);
 
         assert_eq!(W34_KV_TRANSFORM_IDENTITY, 0);
         assert_eq!(W34_KV_TRANSFORM_RADEMACHER_WHT256, 1);

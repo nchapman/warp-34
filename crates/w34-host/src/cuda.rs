@@ -253,6 +253,11 @@ impl CudaDeviceProps {
         format!("sm_{}{}", self.compute_major, self.compute_minor)
     }
 
+    #[inline]
+    pub fn supports_fp8_kv(&self) -> bool {
+        self.compute_major > 8 || (self.compute_major == 8 && self.compute_minor >= 9)
+    }
+
     pub fn arch_family(&self) -> Result<CudaArchFamily> {
         match (self.compute_major, self.compute_minor) {
             (8, 6) => Ok(CudaArchFamily::AmpereSm86),

@@ -905,6 +905,14 @@ impl Qwen3_5ModelRank {
         let device = CudaDevice::set_current(device_id)?;
         let dev_props = device.props()?;
         dev_props.validate_supported()?;
+        let supports_fp8_kv = dev_props.supports_fp8_kv();
+        if matches!(kv_policy, KvFormatPolicy::Fp8) && !supports_fp8_kv {
+            return Err(loader_err_msg(format!(
+                "--kv-format fp8 requires sm_89+ hardware FP8 (40-series or newer); GPU {device_id} ({}) is {}",
+                dev_props.name,
+                dev_props.sm_tag()
+            )));
+        }
         let marlin_ws_bytes = dev_props.marlin_workspace_bytes();
         let stream = CudaStream::new(device_id)?;
         let cublas = CublasHandle::new(&stream)?;
@@ -946,7 +954,8 @@ impl Qwen3_5ModelRank {
             scratch_bytes = crate::scheduler::DEFAULT_SCRATCH_ARENA_BYTES;
         }
         let pages = requested_kv_pages.unwrap_or(DEFAULT_TARGET_KV_PAGES);
-        let (page_bytes, state_bytes) = target_pool_geometry(cfg, tp_size, kv_policy);
+        let (page_bytes, state_bytes) =
+            target_pool_geometry_with_fp8(cfg, tp_size, kv_policy, supports_fp8_kv);
         let archive_has_vision = has_vision_weights(cfg, archive);
         let min_state_floor = if capacity.dflash_reserve_bytes != 0 {
             capacity.dflash_min_state_slots
@@ -1467,8 +1476,9 @@ impl PrePoolModelRank {
 
         let requested_kv_pages = capacity.kv_pages;
         let block_size = KV_PAGE_BLOCK_TOKENS;
+        let supports_fp8_kv = device.props()?.supports_fp8_kv();
         let (bytes_per_kv_page_all_layers, bytes_per_state_slot) =
-            target_pool_geometry(&cfg, tp_size, kv_policy);
+            target_pool_geometry_with_fp8(&cfg, tp_size, kv_policy, supports_fp8_kv);
         let default_state_slots =
             if cfg.uses_ple() || est_weight_bytes >= LARGE_MODEL_WEIGHT_THRESHOLD_BYTES {
                 PLE_OR_LARGE_MODEL_DEFAULT_STATE_SLOTS

@@ -248,7 +248,8 @@ fn prefill_variant_fixture(benchmark: bool) {
         .collect();
     let write_slots_dev = arena.upload_slice(&write_slots_host, &stream).unwrap();
 
-    for (fmt, transform, row_bytes) in [
+    let supports_fp8_kv = _dev.props().unwrap().supports_fp8_kv();
+    let mut formats = vec![
         (
             ffi::W34_KV_FORMAT_FP16,
             ffi::W34_KV_TRANSFORM_IDENTITY,
@@ -264,7 +265,36 @@ fn prefill_variant_fixture(benchmark: bool) {
             ffi::W34_KV_TRANSFORM_RADEMACHER_WHT256,
             132usize,
         ),
-    ] {
+    ];
+    if supports_fp8_kv {
+        formats.push((
+            ffi::W34_KV_FORMAT_FP8_E4M3,
+            ffi::W34_KV_TRANSFORM_IDENTITY,
+            264usize,
+        ));
+        formats.push((
+            ffi::W34_KV_FORMAT_FP8_E4M3,
+            ffi::W34_KV_TRANSFORM_RADEMACHER_WHT256,
+            264usize,
+        ));
+    } else {
+        let err = match crate::cache::KvPool::new(
+            0,
+            ffi::W34_KV_NAMESPACE_TARGET_FULL_ATTN,
+            &[0],
+            1,
+            256,
+            16,
+            2,
+            crate::cache::KvFormatPolicy::Fp8,
+        ) {
+            Ok(_) => panic!("KvFormatPolicy::Fp8 must be rejected on < sm_89"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("sm_89+"), "unexpected err: {err}");
+    }
+
+    for (fmt, transform, row_bytes) in formats {
         let pool_bytes = num_pages * kv_heads * 16 * row_bytes;
         let k_pool = DeviceBuffer::alloc(0, pool_bytes).unwrap();
         let v_pool = DeviceBuffer::alloc(0, pool_bytes).unwrap();

@@ -30,10 +30,11 @@ typedef enum {
 } w34_kv_namespace;
 
 typedef enum {
-    W34_KV_FORMAT_FP16  = 0, // 2 B/elem (512 B/row at d=256, 256 B/row at d=128)
-    W34_KV_FORMAT_BF16  = 1, // 2 B/elem (512 B/row at d=256, 256 B/row at d=128)
-    W34_KV_FORMAT_TQ4   = 2, // block_tq4_0: 66 B per 128 elems (132 B/row at d=256)
-    W34_KV_FORMAT_Q8_0  = 3, // block_q8_0:  68 B per 64 elems  (272 B/row at d=256)
+    W34_KV_FORMAT_FP16     = 0, // 2 B/elem (512 B/row at d=256, 256 B/row at d=128)
+    W34_KV_FORMAT_BF16     = 1, // 2 B/elem (512 B/row at d=256, 256 B/row at d=128)
+    W34_KV_FORMAT_TQ4      = 2, // block_tq4_0:        66 B per 128 elems (132 B/row at d=256)
+    W34_KV_FORMAT_Q8_0     = 3, // block_q8_0:         68 B per 64 elems  (272 B/row at d=256)
+    W34_KV_FORMAT_FP8_E4M3 = 4, // block_fp8_e4m3_256: 264 B per 256 elems (sm_89+ Ada/Hopper+)
 } w34_kv_format;
 
 typedef enum {
@@ -69,7 +70,9 @@ For physical page `p`, local KV head `h in 0..local_kv_heads`, and intra-page to
 - `k_row_ptr = (const uint8_t*)k_base + p * k_page_stride_bytes + h * k_head_stride_bytes + u * k_token_stride_bytes`
 - `v_row_ptr = (const uint8_t*)v_base + p * v_page_stride_bytes + h * v_head_stride_bytes + u * v_token_stride_bytes`
 
-**Alignment Note:** For `TQ4` (`d = 256`), `k_token_stride_bytes = 132 B` (`2 * sizeof(block_tq4_0)`), which is `4`-byte aligned (`132 % 16 == 4`), while `k_head_stride_bytes = 16 * 132 = 2112 B` (`2112 % 16 == 0`). Kernels addressing `TQ4` rows MUST compute byte pointers using explicit byte strides and perform `block_tq4_0`-aligned loads (`__half d` + `uint32_t` / `uchar4` packed nibbles), never assuming `float4` (`16 B`) alignment on individual `TQ4` rows.
+**Alignment & Architecture Notes:**
+- For `TQ4` (`d = 256`), `k_token_stride_bytes = 132 B` (`2 * sizeof(block_tq4_0)`), which is `4`-byte aligned (`132 % 16 == 4`), while `k_head_stride_bytes = 16 * 132 = 2112 B` (`2112 % 16 == 0`). Kernels addressing `TQ4` rows MUST compute byte pointers using explicit byte strides and perform `block_tq4_0`-aligned loads (`__half d` + `uint32_t` / `uchar4` packed nibbles), never assuming `float4` (`16 B`) alignment on individual `TQ4` rows.
+- For `FP8_E4M3` (`d = 256`, `sm_89+` only), `block_fp8_e4m3_256` places the contiguous `uint8_t qs[256]` payload at offset `0..256` and two FP32 per-128-channel dequant scales `float d0, d1` (`amax / 448.0f`) at offset `256..264` (`k_token_stride_bytes = 264 B`, `8`-byte aligned; `k_head_stride_bytes = 4224 B`, `16`-byte aligned). Each 32-lane warp reads or writes all 256 bytes in a single coalesced `uint2` (`LDG.E.64` / `STG.E.64`) transaction and converts via hardware `__nv_cvt_float2_to_fp8x2` (`__NV_SATFINITE`) / `__nv_cvt_fp8x2_to_halfraw2` under `#if __CUDA_ARCH__ >= 890`. On `sm_89+`, `KvFormatPolicy::Fp8` (`--kv-format fp8`) uses `FP8_E4M3` (`Identity` transform) across all target full-attention/QSA layers, and `KvFormatPolicy::Tq4` (`--kv-format tq4`) upgrades its 4 tail-anchor boundary layers from rotated `Q8_0` (`272 B`) to unrotated `FP8_E4M3` (`264 B`, `3.10×` compression on 27B). Devices below `sm_89` reject `--kv-format fp8` cleanly before weight loading (`CudaDeviceProps::supports_fp8_kv()`).
 
 ## 4. `AttentionBatch` Descriptor
 

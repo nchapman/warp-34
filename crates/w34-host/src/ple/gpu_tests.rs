@@ -2,8 +2,8 @@ use super::*;
 use crate::cuda::{CudaDevice, CudaStream, DeviceBuffer, f16_to_f32};
 use core::ffi::c_void;
 use w34_kernels::ffi::{
-    W34_ATTN_MASK_CAUSAL, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4,
-    W34_KV_NAMESPACE_TARGET_FULL_ATTN, W34_KV_TRANSFORM_IDENTITY,
+    W34_ATTN_MASK_CAUSAL, W34_KV_FORMAT_FP8_E4M3, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0,
+    W34_KV_FORMAT_TQ4, W34_KV_NAMESPACE_TARGET_FULL_ATTN, W34_KV_TRANSFORM_IDENTITY,
     W34_KV_TRANSFORM_RADEMACHER_WHT256, W34AttentionBatch, W34GdnBatch, W34KvLayerLayout,
     w34_kv_cache_write_strided,
 };
@@ -843,7 +843,7 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
         }
     }
 
-    for (fmt, xform, row_bytes, tol, rmse_tol) in [
+    let mut qsa_kv_cases = vec![
         (
             W34_KV_FORMAT_FP16,
             W34_KV_TRANSFORM_IDENTITY,
@@ -868,7 +868,22 @@ fn test_gpu_hc_ple_qsa_kernels_parity() {
             2.6e-2f32,
             7.0e-3f32,
         ),
-    ] {
+    ];
+    if CudaDevice::set_current(0)
+        .unwrap()
+        .props()
+        .unwrap()
+        .supports_fp8_kv()
+    {
+        qsa_kv_cases.push((
+            W34_KV_FORMAT_FP8_E4M3,
+            W34_KV_TRANSFORM_IDENTITY,
+            264usize,
+            2.0e-2f32,
+            6.0e-3f32,
+        ));
+    }
+    for (fmt, xform, row_bytes, tol, rmse_tol) in qsa_kv_cases {
         let d_kc = DeviceBuffer::alloc(0, nu_pages * block_size * row_bytes).unwrap();
         let d_vc = DeviceBuffer::alloc(0, nu_pages * block_size * row_bytes).unwrap();
         let layout = W34KvLayerLayout {

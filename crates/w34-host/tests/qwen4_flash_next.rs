@@ -1313,10 +1313,18 @@ fn verify_qwen4_exp_quantized_kv(dir: &Path, extended_prompt: &[i32]) {
         .expect("dump_prompt TP=1 FP16 ref");
     drop(engine_tp1_fp16_ref);
 
-    for (policy, min_cos) in [
+    let mut policies = vec![
         (KvFormatPolicy::Q8_0, 0.999),
+        (KvFormatPolicy::Tq4, 0.99),
         (KvFormatPolicy::Tq4All, 0.99),
-    ] {
+    ];
+    if w34_host::cuda::CudaDevice::props_for(0)
+        .map(|p| p.supports_fp8_kv())
+        .unwrap_or(false)
+    {
+        policies.push((KvFormatPolicy::Fp8, 0.999));
+    }
+    for (policy, min_cos) in policies {
         let mut engine_tp1_qkv = Qwen3_5Engine::load_from_dir(dir, 1, policy, Some(64), true)
             .expect("load synthetic qwen4_exp TP=1 quantized KV");
         let qkv_dump = engine_tp1_qkv

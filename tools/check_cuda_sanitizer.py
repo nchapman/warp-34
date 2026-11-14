@@ -67,7 +67,12 @@ SANITIZER_MATRIX: tuple[SanitizerCase, ...] = (
         target="moe_sparse",
         test_name="dual_small_n_gemm_and_warp256_router_match_references",
     ),
-    # 2. KV Cache, TQ4/Q8_0, Paged Attention, Paged FA2, & QSA
+    # 2. KV Cache, TQ4/Q8_0/FP8, Paged Attention, Paged FA2, & QSA
+    SanitizerCase(
+        subsystem="kv_attn",
+        target="lib",
+        test_name="cuda::tests::test_prefill_64q_zero_ulp_parity_across_kv_formats",
+    ),
     SanitizerCase(
         subsystem="kv_attn",
         target="paged_fa2",

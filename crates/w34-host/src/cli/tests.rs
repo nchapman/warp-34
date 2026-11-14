@@ -483,14 +483,23 @@ fn non_utf8_resolved_paths_are_rejected() {
 }
 
 #[test]
-fn kv_policy_parsing_and_tensor_diff_metrics() {
-    assert_eq!(parse_kv_policy("fp16").unwrap(), KvFormatPolicy::Fp16);
-    assert_eq!(parse_kv_policy("bf16").unwrap(), KvFormatPolicy::Bf16);
-    assert_eq!(parse_kv_policy("q8_0").unwrap(), KvFormatPolicy::Q8_0);
-    assert_eq!(parse_kv_policy("tq4").unwrap(), KvFormatPolicy::Tq4);
-    assert_eq!(parse_kv_policy("tq4_all").unwrap(), KvFormatPolicy::Tq4All);
+fn kv_policy_parsing_variants() {
+    for (name, expected) in [
+        ("fp16", KvFormatPolicy::Fp16),
+        ("bf16", KvFormatPolicy::Bf16),
+        ("fp8", KvFormatPolicy::Fp8),
+        ("fp8_e4m3", KvFormatPolicy::Fp8),
+        ("q8_0", KvFormatPolicy::Q8_0),
+        ("tq4", KvFormatPolicy::Tq4),
+        ("tq4_all", KvFormatPolicy::Tq4All),
+    ] {
+        assert_eq!(parse_kv_policy(name).unwrap(), expected);
+    }
     assert!(parse_kv_policy("invalid").is_err());
+}
 
+#[test]
+fn kv_policy_parsing_and_tensor_diff_metrics() {
     let (max_abs, rel_l2, cos) = tensor_diff_metrics(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]);
     assert_eq!(max_abs, 0.0);
     assert!(rel_l2 < 1e-12);

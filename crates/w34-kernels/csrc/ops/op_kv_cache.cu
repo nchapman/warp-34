@@ -63,6 +63,92 @@ __device__ void write_kv_row(
         }
         return;
     }
+    if (head_dim == 256 && format == W34_KV_FORMAT_FP8_E4M3) {
+#if __CUDA_ARCH__ >= 890
+        if ((int)(threadIdx.x >> 5) == target_warp) {
+            const int lane = threadIdx.x & 31;
+            block_fp8_e4m3_256* blk = reinterpret_cast<block_fp8_e4m3_256*>(dst_row);
+            if (transform == W34_KV_TRANSFORM_RADEMACHER_WHT256) {
+                float w[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = 32 * j + lane;
+                    w[j] = __half2float(src_row[col]) * kTq4Signs256[col];
+                }
+                wht256_warp(w, lane);
+                float amax0 = fmaxf(fmaxf(fabsf(w[0]), fabsf(w[1])), fmaxf(fabsf(w[2]), fabsf(w[3])));
+                float amax1 = fmaxf(fmaxf(fabsf(w[4]), fabsf(w[5])), fmaxf(fabsf(w[6]), fabsf(w[7])));
+                amax0 = warp_reduce_max(amax0);
+                amax1 = warp_reduce_max(amax1);
+                const float d0 = amax0 * (1.0f / 448.0f);
+                const float d1 = amax1 * (1.0f / 448.0f);
+                const float inv_d0 = (d0 > 1e-30f) ? (1.0f / d0) : 0.0f;
+                const float inv_d1 = (d1 > 1e-30f) ? (1.0f / d1) : 0.0f;
+                if (lane == 0) {
+                    blk->d0 = d0;
+                    blk->d1 = d1;
+                }
+                const uint16_t p01 = __nv_cvt_float2_to_fp8x2(make_float2(w[0] * inv_d0, w[1] * inv_d0), __NV_SATFINITE, __NV_E4M3);
+                const uint16_t p23 = __nv_cvt_float2_to_fp8x2(make_float2(w[2] * inv_d0, w[3] * inv_d0), __NV_SATFINITE, __NV_E4M3);
+                const uint16_t p45 = __nv_cvt_float2_to_fp8x2(make_float2(w[4] * inv_d1, w[5] * inv_d1), __NV_SATFINITE, __NV_E4M3);
+                const uint16_t p67 = __nv_cvt_float2_to_fp8x2(make_float2(w[6] * inv_d1, w[7] * inv_d1), __NV_SATFINITE, __NV_E4M3);
+                blk->qs[lane]       = static_cast<uint8_t>(p01 & 0xFFu);
+                blk->qs[lane + 32]  = static_cast<uint8_t>(p01 >> 8);
+                blk->qs[lane + 64]  = static_cast<uint8_t>(p23 & 0xFFu);
+                blk->qs[lane + 96]  = static_cast<uint8_t>(p23 >> 8);
+                blk->qs[lane + 128] = static_cast<uint8_t>(p45 & 0xFFu);
+                blk->qs[lane + 160] = static_cast<uint8_t>(p45 >> 8);
+                blk->qs[lane + 192] = static_cast<uint8_t>(p67 & 0xFFu);
+                blk->qs[lane + 224] = static_cast<uint8_t>(p67 >> 8);
+            } else {
+                float v[8];
+                const __half* src8 = src_row + (lane << 3);
+                if ((((uintptr_t)src8) & 15u) == 0u) {
+                    const uint4 raw = *reinterpret_cast<const uint4*>(src8);
+                    const __half2 h0 = *reinterpret_cast<const __half2*>(&raw.x);
+                    const __half2 h1 = *reinterpret_cast<const __half2*>(&raw.y);
+                    const __half2 h2 = *reinterpret_cast<const __half2*>(&raw.z);
+                    const __half2 h3 = *reinterpret_cast<const __half2*>(&raw.w);
+                    v[0] = __half2float(h0.x); v[1] = __half2float(h0.y);
+                    v[2] = __half2float(h1.x); v[3] = __half2float(h1.y);
+                    v[4] = __half2float(h2.x); v[5] = __half2float(h2.y);
+                    v[6] = __half2float(h3.x); v[7] = __half2float(h3.y);
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) v[j] = __half2float(src8[j]);
+                }
+                // Lanes 0..15 hold [0..128), lanes 16..31 hold [128..256); xor 8,4,2,1 stays in half-warp.
+                float amax = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(v[j]));
+#pragma unroll
+                for (int off = 8; off > 0; off >>= 1) {
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+                }
+                const float d = amax * (1.0f / 448.0f);
+                const float inv_d = (d > 1e-30f) ? (1.0f / d) : 0.0f;
+                if (lane == 0) blk->d0 = d;
+                if (lane == 16) blk->d1 = d;
+                const uint16_t p0 = __nv_cvt_float2_to_fp8x2(make_float2(v[0] * inv_d, v[1] * inv_d), __NV_SATFINITE, __NV_E4M3);
+                const uint16_t p1 = __nv_cvt_float2_to_fp8x2(make_float2(v[2] * inv_d, v[3] * inv_d), __NV_SATFINITE, __NV_E4M3);
+                const uint16_t p2 = __nv_cvt_float2_to_fp8x2(make_float2(v[4] * inv_d, v[5] * inv_d), __NV_SATFINITE, __NV_E4M3);
+                const uint16_t p3 = __nv_cvt_float2_to_fp8x2(make_float2(v[6] * inv_d, v[7] * inv_d), __NV_SATFINITE, __NV_E4M3);
+                uint8_t* dst8 = blk->qs + (lane << 3);
+                if ((((uintptr_t)dst8) & 7u) == 0u) {
+                    *reinterpret_cast<uint2*>(dst8) = make_uint2(
+                        static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16),
+                        static_cast<uint32_t>(p2) | (static_cast<uint32_t>(p3) << 16));
+                } else {
+                    dst8[0] = static_cast<uint8_t>(p0 & 0xFFu); dst8[1] = static_cast<uint8_t>(p0 >> 8);
+                    dst8[2] = static_cast<uint8_t>(p1 & 0xFFu); dst8[3] = static_cast<uint8_t>(p1 >> 8);
+                    dst8[4] = static_cast<uint8_t>(p2 & 0xFFu); dst8[5] = static_cast<uint8_t>(p2 >> 8);
+                    dst8[6] = static_cast<uint8_t>(p3 & 0xFFu); dst8[7] = static_cast<uint8_t>(p3 >> 8);
+                }
+            }
+        }
+#endif
+        return;
+    }
     if (head_dim == 256 && transform == W34_KV_TRANSFORM_RADEMACHER_WHT256 &&
         format == W34_KV_FORMAT_TQ4) {
         // TurboQuant Algorithm 1 (arXiv:2504.19874) at b=4 with Seed-42 Rademacher +
@@ -224,6 +310,14 @@ __device__ __forceinline__ float read_kv_elem(
         const block_q8_0_64* blk = (const block_q8_0_64*)(row_ptr + sb * sizeof(block_q8_0_64));
         return blk->d * (float)blk->qs[idx];
     }
+#if __CUDA_ARCH__ >= 890
+    if (format == W34_KV_FORMAT_FP8_E4M3) {
+        const block_fp8_e4m3_256* blk = reinterpret_cast<const block_fp8_e4m3_256*>(row_ptr);
+        const float d = (col < 128) ? blk->d0 : blk->d1;
+        const __half_raw hr = __nv_cvt_fp8_to_halfraw(blk->qs[col], __NV_E4M3);
+        return d * __half2float(*reinterpret_cast<const __half*>(&hr));
+    }
+#endif
     return 0.0f;
 }
 
@@ -742,6 +836,10 @@ extern "C" int w34_kv_cache_write_strided(
     if (ex == nullptr || layout == nullptr || batch == nullptr || k_in == nullptr || v_in == nullptr) {
         return (int)cudaErrorInvalidValue;
     }
+    if (layout->k_format == W34_KV_FORMAT_FP8_E4M3 || layout->v_format == W34_KV_FORMAT_FP8_E4M3) {
+        if (layout->head_dim != 256) return (int)cudaErrorInvalidValue;
+        if (!w34_attn::current_device_supports_fp8_kv()) return (int)cudaErrorNotSupported;
+    }
     if (batch->total_tokens <= 0 || layout->local_kv_heads <= 0) return 0;
     const int min_stride = layout->local_kv_heads * layout->head_dim;
     if (k_row_stride < min_stride || v_row_stride < min_stride) return (int)cudaErrorInvalidValue;
@@ -1155,6 +1253,10 @@ extern "C" int w34_paged_attention_scalar_f16(
         batch->total_tokens < 0 || batch->num_reqs <= 0 || !batch->query_start_loc ||
         !batch->seq_lens_after || !batch->block_tables || batch->max_blocks_per_req <= 0) {
         return (int)cudaErrorInvalidValue;
+    }
+    if (layout->k_format == W34_KV_FORMAT_FP8_E4M3 || layout->v_format == W34_KV_FORMAT_FP8_E4M3) {
+        if (layout->head_dim != 256) return (int)cudaErrorInvalidValue;
+        if (!w34_attn::current_device_supports_fp8_kv()) return (int)cudaErrorNotSupported;
     }
     if (batch->total_tokens == 0) return 0;
     dim3 grid((unsigned)batch->total_tokens, (unsigned)num_q_heads);

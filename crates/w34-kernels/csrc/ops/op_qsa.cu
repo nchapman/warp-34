@@ -10,6 +10,7 @@
 #include "hadamard_inline.cuh"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <float.h>
 #include <math.h>
@@ -36,6 +37,20 @@ struct qsa_block_q8_0_64 {
 };
 static_assert(sizeof(qsa_block_q8_0_64) == 68, "qsa_block_q8_0_64 must be 68 bytes");
 static_assert(alignof(qsa_block_q8_0_64) == 4, "qsa_block_q8_0_64 must be 4-byte aligned");
+
+struct qsa_block_fp8_e4m3_256 {
+    uint8_t qs[256];
+    float   d0;
+    float   d1;
+};
+static_assert(sizeof(qsa_block_fp8_e4m3_256) == 264, "qsa_block_fp8_e4m3_256 must be 264 bytes");
+static_assert(alignof(qsa_block_fp8_e4m3_256) == 4, "qsa_block_fp8_e4m3_256 must be 4-byte aligned");
+
+inline bool qsa_current_device_supports_fp8_kv() {
+    w34_device_props p{};
+    if (w34_get_current_device_props(&p) != 0) return false;
+    return p.compute_major > 8 || (p.compute_major == 8 && p.compute_minor >= 9);
+}
 
 __device__ __forceinline__ float qsa_warp_reduce_sum(float val) {
 #pragma unroll
@@ -842,6 +857,22 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
                 k_val[2 * sb] = kd * (float)k_blks[sb].qs[lane];
                 k_val[2 * sb + 1] = kd * (float)k_blks[sb].qs[lane + 32];
             }
+#if __CUDA_ARCH__ >= 890
+        } else if (kv_layout.k_format == W34_KV_FORMAT_FP8_E4M3) {
+            const qsa_block_fp8_e4m3_256* k_blk = reinterpret_cast<const qsa_block_fp8_e4m3_256*>(k_ptr);
+            const float kd0 = k_blk->d0;
+            const float kd1 = k_blk->d1;
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float kd = (sb < 2) ? kd0 : kd1;
+                const uint16_t bits = static_cast<uint16_t>(k_blk->qs[sb * 64 + lane]) |
+                                      (static_cast<uint16_t>(k_blk->qs[sb * 64 + lane + 32]) << 8);
+                const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3);
+                const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+                k_val[2 * sb]     = kd * f2.x;
+                k_val[2 * sb + 1] = kd * f2.y;
+            }
+#endif
         } else {
             const __half* k_tok = reinterpret_cast<const __half*>(k_ptr);
 #pragma unroll
@@ -892,6 +923,22 @@ __global__ void qsa_sparse_paged_attn_gqa_f16_kernel(
                 v_val[2 * sb] = vd * (float)v_blks[sb].qs[lane];
                 v_val[2 * sb + 1] = vd * (float)v_blks[sb].qs[lane + 32];
             }
+#if __CUDA_ARCH__ >= 890
+        } else if (kv_layout.v_format == W34_KV_FORMAT_FP8_E4M3) {
+            const qsa_block_fp8_e4m3_256* v_blk = reinterpret_cast<const qsa_block_fp8_e4m3_256*>(v_ptr);
+            const float vd0 = v_blk->d0;
+            const float vd1 = v_blk->d1;
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float vd = (sb < 2) ? vd0 : vd1;
+                const uint16_t bits = static_cast<uint16_t>(v_blk->qs[sb * 64 + lane]) |
+                                      (static_cast<uint16_t>(v_blk->qs[sb * 64 + lane + 32]) << 8);
+                const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3);
+                const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+                v_val[2 * sb]     = vd * f2.x;
+                v_val[2 * sb + 1] = vd * f2.y;
+            }
+#endif
         } else {
             const __half* v_tok = reinterpret_cast<const __half*>(v_ptr);
 #pragma unroll
@@ -1221,6 +1268,21 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
                 const float k1 = (float)k_blks[sb].qs[lane + 32];
                 dot += d * (q_reg[2 * sb] * k0 + q_reg[2 * sb + 1] * k1);
             }
+#if __CUDA_ARCH__ >= 890
+        } else if (head_dim == 256 && kv_layout.k_format == W34_KV_FORMAT_FP8_E4M3) {
+            const qsa_block_fp8_e4m3_256* k_blk = reinterpret_cast<const qsa_block_fp8_e4m3_256*>(k_ptr);
+            const float d0 = k_blk->d0;
+            const float d1 = k_blk->d1;
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float d = (sb < 2) ? d0 : d1;
+                const uint16_t bits = static_cast<uint16_t>(k_blk->qs[sb * 64 + lane]) |
+                                      (static_cast<uint16_t>(k_blk->qs[sb * 64 + lane + 32]) << 8);
+                const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3);
+                const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+                dot += d * (q_reg[2 * sb] * f2.x + q_reg[2 * sb + 1] * f2.y);
+            }
+#endif
         } else {
             const __half* k_tok = reinterpret_cast<const __half*>(k_ptr);
 #pragma unroll
@@ -1260,6 +1322,22 @@ __global__ void qsa_sparse_paged_attn_f16_kernel(
                 acc[2 * sb] = acc[2 * sb] * alpha + pd * (float)v_blks[sb].qs[lane];
                 acc[2 * sb + 1] = acc[2 * sb + 1] * alpha + pd * (float)v_blks[sb].qs[lane + 32];
             }
+#if __CUDA_ARCH__ >= 890
+        } else if (head_dim == 256 && kv_layout.v_format == W34_KV_FORMAT_FP8_E4M3) {
+            const qsa_block_fp8_e4m3_256* v_blk = reinterpret_cast<const qsa_block_fp8_e4m3_256*>(v_ptr);
+            const float d0 = v_blk->d0;
+            const float d1 = v_blk->d1;
+#pragma unroll
+            for (int sb = 0; sb < 4; ++sb) {
+                const float pd = beta * ((sb < 2) ? d0 : d1);
+                const uint16_t bits = static_cast<uint16_t>(v_blk->qs[sb * 64 + lane]) |
+                                      (static_cast<uint16_t>(v_blk->qs[sb * 64 + lane + 32]) << 8);
+                const __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3);
+                const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+                acc[2 * sb]     = acc[2 * sb] * alpha + pd * f2.x;
+                acc[2 * sb + 1] = acc[2 * sb + 1] * alpha + pd * f2.y;
+            }
+#endif
         } else {
             const __half* v_tok = reinterpret_cast<const __half*>(v_ptr);
 #pragma unroll
@@ -1386,6 +1464,10 @@ static int launch_qsa_sparse_paged_attn_f16(
         kv_layout->local_kv_heads <= 0 || (local_q_heads % kv_layout->local_kv_heads) != 0 ||
         kv_layout->head_dim != 256 || select_k_blocks < 0) {
         return (int)cudaErrorInvalidValue;
+    }
+    if ((kv_layout->k_format == W34_KV_FORMAT_FP8_E4M3 || kv_layout->v_format == W34_KV_FORMAT_FP8_E4M3) &&
+        !qsa_current_device_supports_fp8_kv()) {
+        return (int)cudaErrorNotSupported;
     }
     if (num_tokens == 0) return 0;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(ex->stream);

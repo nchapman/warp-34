@@ -910,7 +910,8 @@ pub fn run_batch_in_place(
 
 fn kv_format_name(engine: &Qwen3_5Engine) -> String {
     use w34_kernels::ffi::{
-        W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4,
+        W34_KV_FORMAT_BF16, W34_KV_FORMAT_FP8_E4M3, W34_KV_FORMAT_FP16, W34_KV_FORMAT_Q8_0,
+        W34_KV_FORMAT_TQ4,
     };
     let layers = &engine.ranks[0].kv_pool.layers;
     let all = |format| {
@@ -926,10 +927,17 @@ fn kv_format_name(engine: &Qwen3_5Engine) -> String {
         "bf16"
     } else if all(W34_KV_FORMAT_Q8_0) {
         "q8_0"
+    } else if all(W34_KV_FORMAT_FP8_E4M3) {
+        "fp8"
     } else if all(W34_KV_FORMAT_TQ4) {
         "tq4_all"
     } else if layers.iter().all(|l| {
-        [W34_KV_FORMAT_Q8_0, W34_KV_FORMAT_TQ4].contains(&l.layout.k_format)
+        [
+            W34_KV_FORMAT_Q8_0,
+            W34_KV_FORMAT_FP8_E4M3,
+            W34_KV_FORMAT_TQ4,
+        ]
+        .contains(&l.layout.k_format)
             && l.layout.k_format == l.layout.v_format
     }) {
         "tq4"

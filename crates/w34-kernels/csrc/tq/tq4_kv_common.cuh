@@ -1,10 +1,11 @@
 #pragma once
-// Shared TQ4 / Q8_0 KV block layouts and warp/block reduction + WHT-256 helpers.
+// Shared TQ4 / Q8_0 / FP8_E4M3 KV block layouts and warp/block reduction + WHT-256 helpers.
 #include "../w34_cuda.h"
 #include "tq4_codebook.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <float.h>
 #include <math.h>
@@ -31,6 +32,24 @@ struct block_q8_0_64 {
 };
 static_assert(sizeof(block_q8_0_64) == 68, "block_q8_0_64 must be 68 bytes");
 static_assert(alignof(block_q8_0_64) == 4, "block_q8_0_64 must be 4-byte aligned");
+
+// block_fp8_e4m3_256: 264 bytes per 256-dim head (`sm_89+` hardware FP8 E4M3).
+// Contiguous 256-byte `qs` payload at offset 0 followed by two FP32 per-128 scales
+// (`d0` for [0..128), `d1` for [128..256)) at offset 256 so every row is 8-byte aligned
+// (`264 = 33 * 8`), enabling single-instruction `uint2` (`LDG.E.64` / `STG.E.64`) warp I/O.
+struct block_fp8_e4m3_256 {
+    uint8_t qs[256];
+    float   d0;
+    float   d1;
+};
+static_assert(sizeof(block_fp8_e4m3_256) == 264, "block_fp8_e4m3_256 must be 264 bytes");
+static_assert(alignof(block_fp8_e4m3_256) == 4, "block_fp8_e4m3_256 must be 4-byte aligned");
+
+inline bool current_device_supports_fp8_kv() {
+    w34_device_props p{};
+    if (w34_get_current_device_props(&p) != 0) return false;
+    return p.compute_major > 8 || (p.compute_major == 8 && p.compute_minor >= 9);
+}
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll

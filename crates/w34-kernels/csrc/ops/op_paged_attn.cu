@@ -69,6 +69,41 @@ __device__ __forceinline__ void decode_kv_row_256_to_smem_f16(
         }
         return;
     }
+#if __CUDA_ARCH__ >= 890
+    if (format == W34_KV_FORMAT_FP8_E4M3) {
+        const block_fp8_e4m3_256* blk = reinterpret_cast<const block_fp8_e4m3_256*>(src_ptr);
+        const uint8_t* qs8 = blk->qs + (lane << 3);
+        uint2 q8;
+        if ((((uintptr_t)qs8) & 7u) == 0u) {
+            q8 = *reinterpret_cast<const uint2*>(qs8);
+        } else {
+            q8 = make_uint2(
+                static_cast<uint32_t>(qs8[0]) | (static_cast<uint32_t>(qs8[1]) << 8) |
+                    (static_cast<uint32_t>(qs8[2]) << 16) | (static_cast<uint32_t>(qs8[3]) << 24),
+                static_cast<uint32_t>(qs8[4]) | (static_cast<uint32_t>(qs8[5]) << 8) |
+                    (static_cast<uint32_t>(qs8[6]) << 16) | (static_cast<uint32_t>(qs8[7]) << 24));
+        }
+        const float d = (lane < 16) ? blk->d0 : blk->d1;
+        const __half2_raw r0 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(q8.x & 0xFFFFu), __NV_E4M3);
+        const __half2_raw r1 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(q8.x >> 16), __NV_E4M3);
+        const __half2_raw r2 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(q8.y & 0xFFFFu), __NV_E4M3);
+        const __half2_raw r3 = __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(q8.y >> 16), __NV_E4M3);
+        const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&r0));
+        const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&r1));
+        const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&r2));
+        const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&r3));
+        const __half2 h0 = __floats2half2_rn(f0.x * d, f0.y * d);
+        const __half2 h1 = __floats2half2_rn(f1.x * d, f1.y * d);
+        const __half2 h2 = __floats2half2_rn(f2.x * d, f2.y * d);
+        const __half2 h3 = __floats2half2_rn(f3.x * d, f3.y * d);
+        *reinterpret_cast<uint4*>(dst + (lane << 3)) = make_uint4(
+            *reinterpret_cast<const uint32_t*>(&h0),
+            *reinterpret_cast<const uint32_t*>(&h1),
+            *reinterpret_cast<const uint32_t*>(&h2),
+            *reinterpret_cast<const uint32_t*>(&h3));
+        return;
+    }
+#endif
     *reinterpret_cast<uint4*>(dst + (lane << 3)) = make_uint4(0u, 0u, 0u, 0u);
 }
 
@@ -1235,6 +1270,10 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
     if (ex == nullptr || layout == nullptr || batch == nullptr || q_in == nullptr || attn_out == nullptr) {
         return (int)cudaErrorInvalidValue;
     }
+    if (layout->k_format == W34_KV_FORMAT_FP8_E4M3 || layout->v_format == W34_KV_FORMAT_FP8_E4M3) {
+        if (layout->head_dim != 256) return (int)cudaErrorInvalidValue;
+        if (!w34_attn::current_device_supports_fp8_kv()) return (int)cudaErrorNotSupported;
+    }
     if (batch->total_tokens <= 0 || num_q_heads <= 0) return 0;
 
     const int fa2_rc = w34_paged_fa2_try(ex, layout, batch, q_in, attn_out, num_q_heads);
@@ -1247,9 +1286,11 @@ extern "C" int w34_paged_attention_f16(const w34_exec* ex, const w34_kv_layer_la
         (num_q_heads % layout->local_kv_heads == 0) &&
         (layout->k_format == W34_KV_FORMAT_TQ4 ||
          layout->k_format == W34_KV_FORMAT_Q8_0 ||
+         layout->k_format == W34_KV_FORMAT_FP8_E4M3 ||
          layout->k_format == W34_KV_FORMAT_FP16) &&
         (layout->v_format == W34_KV_FORMAT_TQ4 ||
          layout->v_format == W34_KV_FORMAT_Q8_0 ||
+         layout->v_format == W34_KV_FORMAT_FP8_E4M3 ||
          layout->v_format == W34_KV_FORMAT_FP16);
 
     if (can_use_gqa_mma) {
@@ -1417,6 +1458,10 @@ extern "C" int w34_paged_attention_f16_force_kernel_for_test(
     int use_64q) {
     if (ex == nullptr || layout == nullptr || batch == nullptr || q_in == nullptr || attn_out == nullptr) {
         return (int)cudaErrorInvalidValue;
+    }
+    if (layout->k_format == W34_KV_FORMAT_FP8_E4M3 || layout->v_format == W34_KV_FORMAT_FP8_E4M3) {
+        if (layout->head_dim != 256) return (int)cudaErrorInvalidValue;
+        if (!w34_attn::current_device_supports_fp8_kv()) return (int)cudaErrorNotSupported;
     }
     if (batch->total_tokens <= 0 || num_q_heads <= 0) return 0;
     if (layout->head_dim != 256 || layout->block_size != 16 || layout->local_kv_heads <= 0 ||

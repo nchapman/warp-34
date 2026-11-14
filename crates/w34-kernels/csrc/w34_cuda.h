@@ -24,10 +24,11 @@ enum {
 };
 
 enum {
-    W34_KV_FORMAT_FP16 = 0,
-    W34_KV_FORMAT_BF16 = 1,
-    W34_KV_FORMAT_TQ4  = 2,
-    W34_KV_FORMAT_Q8_0 = 3,
+    W34_KV_FORMAT_FP16     = 0,
+    W34_KV_FORMAT_BF16     = 1,
+    W34_KV_FORMAT_TQ4      = 2,
+    W34_KV_FORMAT_Q8_0     = 3,
+    W34_KV_FORMAT_FP8_E4M3 = 4,
 };
 
 enum {

@@ -604,11 +604,21 @@ pub(super) fn pool_weight_budget(use_live_budget: bool, used: usize, capacity: u
 
 /// Shared target pool geometry; QSA indexer KV is replicated, ordinary KV follows
 /// `local_kv_heads` (including replication when TP exceeds the KV head count).
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(test)]
 pub(super) fn target_pool_geometry(
     cfg: &ModelConfig,
     tp: usize,
     policy: KvFormatPolicy,
+) -> (usize, usize) {
+    target_pool_geometry_with_fp8(cfg, tp, policy, false)
+}
+
+#[cfg(any(test, feature = "cuda"))]
+pub(super) fn target_pool_geometry_with_fp8(
+    cfg: &ModelConfig,
+    tp: usize,
+    policy: KvFormatPolicy,
+    supports_fp8_kv: bool,
 ) -> (usize, usize) {
     let full = cfg
         .layer_types
@@ -619,7 +629,7 @@ pub(super) fn target_pool_geometry(
     let block = KV_PAGE_BLOCK_TOKENS;
     let mut page = 0usize;
     for ord in 0..full {
-        let (kf, vf, _, _) = policy.resolve_layer(ord, full);
+        let (kf, vf, _, _) = policy.resolve_layer_with_fp8(ord, full, supports_fp8_kv);
         let rows = crate::cache::kv_format_row_bytes(kf, cfg.head_dim)
             .saturating_add(crate::cache::kv_format_row_bytes(vf, cfg.head_dim));
         page = page.saturating_add(

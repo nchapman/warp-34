@@ -28,6 +28,7 @@ pub const W34_KV_FORMAT_FP16: i32 = 0;
 pub const W34_KV_FORMAT_BF16: i32 = 1;
 pub const W34_KV_FORMAT_TQ4: i32 = 2;
 pub const W34_KV_FORMAT_Q8_0: i32 = 3;
+pub const W34_KV_FORMAT_FP8_E4M3: i32 = 4;
 
 pub const W34_KV_TRANSFORM_IDENTITY: i32 = 0;
 pub const W34_KV_TRANSFORM_RADEMACHER_WHT256: i32 = 1;
