@@ -176,7 +176,7 @@ def parse_cuobjdump_resources(text: str) -> list[KernelResource]:
 
 def expected_arches_from_env(w34_arch_env: str | None) -> tuple[str, ...]:
     if not w34_arch_env or not w34_arch_env.strip():
-        return ("sm_86", "sm_89")
+        return ("sm_80", "sm_86", "sm_89")
     arches: list[str] = []
     for tok in re.split(r"[,\s;]+", w34_arch_env.strip()):
         if not tok:
@@ -189,7 +189,7 @@ def expected_arches_from_env(w34_arch_env: str | None) -> tuple[str, ...]:
 
 def audit_kernel_resources(
     entries: list[KernelResource],
-    expected_arches: tuple[str, ...] = ("sm_86", "sm_89"),
+    expected_arches: tuple[str, ...] = ("sm_80", "sm_86", "sm_89"),
     min_kernels_per_arch: int = MIN_KERNELS_PER_ARCH,
 ) -> list[str]:
     failures: list[str] = []

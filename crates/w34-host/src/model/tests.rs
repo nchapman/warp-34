@@ -245,6 +245,14 @@ mod serving_capacity_tests {
         );
         assert_eq!(hot_tp2_default, 128);
 
+        // On high-VRAM datacenter GPUs (e.g. 40 GiB / 80 GiB A100 where >= 4 GiB slack remains
+        // after placing all local experts in VRAM), `plan_tiered_moe_hot_per_layer` promotes
+        // `hot_per_layer` to 100% full GPU residency (`512` on TP=1, `256` on TP=2).
+        let (hot_tp1_a100_80g, _) = plan_tiered_moe_hot_per_layer(&cfg, 1, 60 * gib, 2 * gib, gib);
+        assert_eq!(hot_tp1_a100_80g, 512);
+        let (hot_tp2_a100_40g, _) = plan_tiered_moe_hot_per_layer(&cfg, 2, 30 * gib, 2 * gib, gib);
+        assert_eq!(hot_tp2_a100_40g, 256);
+
         // When DFlash2 reserve exceeds default MTP/graph reserve (e.g. 24 GiB sm_89 TP=2
         // Flash-Next serving at 4096 KV pages), `plan_tiered_moe_hot_per_layer_with_dflash`
         // steps `hot_per_layer` down so target GDN state slots are preserved.
@@ -328,6 +336,15 @@ mod serving_capacity_tests {
         // (even after RankTieredMoe consumes ~275 MiB for staging + slot tables) leaves enough
         // free VRAM for `plan_mtp_tiered_moe_hot_experts` to pick 192 on TP=1 and 256 on TP=2.
         let post_target_free_vram = post_target_extra_reserve - 280 * 1024 * 1024;
+        let full_residency_need = cfg.num_experts * exp_bytes + MTP_FULL_RESIDENCY_HEADROOM_BYTES;
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, full_residency_need),
+            cfg.num_experts
+        );
+        assert_eq!(
+            plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, full_residency_need - 1),
+            MTP_TP1_SERVING_HOT_EXPERTS
+        );
         assert_eq!(
             plan_mtp_tiered_moe_hot_experts(1, cfg.num_experts, exp_bytes, post_target_free_vram),
             MTP_TP1_STREAMED_PREFILL_MAX_HOT

@@ -119,6 +119,22 @@ inline int tp4_pcie_block_cap() {
     return (cap > kTp2PcieBlockCap) ? kTp2PcieBlockCap : cap;
 }
 
+constexpr int kRankP2pFlag = 4;
+
+inline cudaError_t query_p2p_device_stage(const void* ptr, bool* is_p2p_out) {
+    cudaPointerAttributes attr{};
+    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        return err;
+    }
+    *is_p2p_out = (attr.type == cudaMemoryTypeDevice);
+    return cudaSuccess;
+}
+
+inline int tp2_comm_block_cap(bool is_p2p) {
+    return is_p2p ? tp2_block_cap(true) : tp2_pcie_block_cap();
+}
+
 __device__ __forceinline__ void st_flag_release(uint32_t* addr, uint32_t val) {
     asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(val), "l"(addr) : "memory");
 }
@@ -193,10 +209,12 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f16_kernel(
     __half* __restrict__ s1,
     Signal* __restrict__ sig0,
     Signal* __restrict__ sig1,
-    int rank,
+    int rank_and_flags,
     int num_elems) {
+    const int rank = rank_and_flags & 1;
+    const bool is_p2p = (rank_and_flags & kRankP2pFlag) != 0;
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
+    const bool dma_tx = !is_p2p && ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
     bool odd = next_comm_bank_odd(self_sg, !dma_tx);
 
     __half* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
@@ -282,14 +300,16 @@ __global__ void __launch_bounds__(THREADS, (THREADS <= 256) ? 2 : 1) tp2_all_red
     __half* __restrict__ s1,
     Signal* __restrict__ sig0,
     Signal* __restrict__ sig1,
-    int rank,
+    int rank_and_flags,
     int num_tokens,
     int hidden_size,
     float eps,
     int tap_row_stride,
     int tap_col_offset) {
+    const int rank = rank_and_flags & 1;
+    const bool is_p2p = (rank_and_flags & kRankP2pFlag) != 0;
     const int num_elems = num_tokens * hidden_size;
-    const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
+    const bool dma_tx = !is_p2p && ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     bool odd = next_comm_bank_odd(self_sg, !dma_tx);
 
@@ -303,9 +323,10 @@ __global__ void __launch_bounds__(THREADS, (THREADS <= 256) ? 2 : 1) tp2_all_red
                       ((((uintptr_t)local_in | (uintptr_t)my_s | (uintptr_t)peer_s |
                          (uintptr_t)residual | (uintptr_t)weight | (uintptr_t)out |
                          (uintptr_t)out_had64 | (uintptr_t)ar_out) & 15u) == 0);
-    // When `dma_tx` is active (`>= 64 KiB`), Copy-Engine `cudaMemcpyAsync` has already staged
-    // all rows into `my_s`, so we run a single RX pass bracketed by two barriers.
-    const int num_stages = dma_tx
+    // When `dma_tx` is active (`>= 64 KiB` on PCIe mapped host memory), Copy-Engine `cudaMemcpyAsync`
+    // has already staged all rows into `my_s`, so we run a single RX pass bracketed by two barriers.
+    // On P2P VRAM (`is_p2p`), NVLink handles full-duplex TX+RX directly in a single 1-barrier stage.
+    const int num_stages = (dma_tx || is_p2p)
         ? 1
         : ((num_tokens > (int)gridDim.x * 12)
                ? 5
@@ -509,10 +530,12 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_bf16_kernel(
     __nv_bfloat16* __restrict__ s1,
     Signal* __restrict__ sig0,
     Signal* __restrict__ sig1,
-    int rank,
+    int rank_and_flags,
     int num_elems) {
+    const int rank = rank_and_flags & 1;
+    const bool is_p2p = (rank_and_flags & kRankP2pFlag) != 0;
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    const bool dma_tx = ((size_t)num_elems * sizeof(__nv_bfloat16) >= kDmaThresholdBytes);
+    const bool dma_tx = !is_p2p && ((size_t)num_elems * sizeof(__nv_bfloat16) >= kDmaThresholdBytes);
     bool odd = next_comm_bank_odd(self_sg, !dma_tx);
 
     __nv_bfloat16* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
@@ -592,10 +615,12 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_f32_kernel(
     float* s1,
     Signal* sig0,
     Signal* sig1,
-    int rank,
+    int rank_and_flags,
     int num_elems) {
+    const int rank = rank_and_flags & 1;
+    const bool is_p2p = (rank_and_flags & kRankP2pFlag) != 0;
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
-    const bool dma_tx = ((size_t)num_elems * sizeof(float) >= kDmaThresholdBytes);
+    const bool dma_tx = !is_p2p && ((size_t)num_elems * sizeof(float) >= kDmaThresholdBytes);
     bool odd = next_comm_bank_odd(self_sg, !dma_tx);
 
     float* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
@@ -777,10 +802,12 @@ __global__ void __launch_bounds__(512, 1) tp2_all_reduce_hc_combine_tap_f16_kern
     const float* inject_weights, const __half* ple_delta, __half* residual_out,
     __nv_bfloat16* tap_bf16_out, const uint8_t* valid_token_mask,
     __half* s0, __half* s1, Signal* sig0, Signal* sig1,
-    int rank, int num_tokens, int hc_count, int hidden_size,
+    int rank_and_flags, int num_tokens, int hc_count, int hidden_size,
     int tap_stride_elems, int tap_offset_elems) {
+    const int rank = rank_and_flags & 1;
+    const bool is_p2p = (rank_and_flags & kRankP2pFlag) != 0;
     const int num_elems = num_tokens * hidden_size;
-    const bool dma_tx = ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
+    const bool dma_tx = !is_p2p && ((size_t)num_elems * sizeof(__half) >= kDmaThresholdBytes);
     Signal* self_sg = (rank == 0) ? sig0 : sig1;
     bool odd = next_comm_bank_odd(self_sg, !dma_tx);
     __half* s0_buf = dma_tx ? s0 : stage_epoch_ptr(s0, self_sg, odd, num_elems);
@@ -1806,22 +1833,26 @@ extern "C" int w34_tp2_all_reduce_f16(const w34_exec* ex, const void* local_in, 
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
+    bool is_p2p = false;
+    cudaError_t p2p_err = w34_comm::query_p2p_device_stage(stage0, &is_p2p);
+    if (p2p_err != cudaSuccess) return (int)p2p_err;
     const size_t num_bytes = (size_t)num_elems * sizeof(__half);
-    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+    if (!is_p2p && num_bytes >= w34_comm::kDmaThresholdBytes) {
         cudaError_t cpy_err = cudaMemcpyAsync(
             (rank == 0) ? stage0 : stage1, local_in, num_bytes,
             cudaMemcpyDefault, (cudaStream_t)ex->stream);
         if (cpy_err != cudaSuccess) return (int)cpy_err;
     }
     int blocks = (num_elems + w34_comm::kVec8F16ElemsPerBlock - 1) / w34_comm::kVec8F16ElemsPerBlock;
-    const int cap = w34_comm::tp2_pcie_block_cap();
+    const int cap = w34_comm::tp2_comm_block_cap(is_p2p);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
+    const int rank_and_flags = rank | (is_p2p ? w34_comm::kRankP2pFlag : 0);
     w34_comm::tp2_all_reduce_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)local_in, (__half*)out,
         (__half*)stage0, (__half*)stage1,
         (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
-        rank, num_elems);
+        rank_and_flags, num_elems);
     return (int)cudaGetLastError();
 }
 
@@ -1850,18 +1881,22 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
         return (int)cudaErrorInvalidValue;
     }
     if (num_tokens == 0) return 0;
+    bool is_p2p = false;
+    cudaError_t p2p_err = w34_comm::query_p2p_device_stage(stage0, &is_p2p);
+    if (p2p_err != cudaSuccess) return (int)p2p_err;
     const size_t num_bytes = (size_t)num_tokens * (size_t)hidden_size * sizeof(__half);
-    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+    if (!is_p2p && num_bytes >= w34_comm::kDmaThresholdBytes) {
         cudaError_t cpy_err = cudaMemcpyAsync(
             (rank == 0) ? stage0 : stage1, local_in, num_bytes,
             cudaMemcpyDefault, (cudaStream_t)ex->stream);
         if (cpy_err != cudaSuccess) return (int)cpy_err;
     }
     int blocks = num_tokens;
-    // Cap blocks at `kTp2PcieBlockCap` (`16 * 512 = 8192` threads across 16 CTAs easily saturates PCIe Gen4
-    // x4/x8/x16 while avoiding 36..128-CTA host cache-line polling storms across the root complex).
-    const int cap = w34_comm::tp2_pcie_block_cap();
+    // Cap blocks at `kTp2PcieBlockCap` (`16`) on PCIe mapped host memory, or `kSmallMaxBlocks` (`36`)
+    // on NVLink P2P device memory.
+    const int cap = w34_comm::tp2_comm_block_cap(is_p2p);
     if (blocks > cap) blocks = cap;
+    const int rank_and_flags = rank | (is_p2p ? w34_comm::kRankP2pFlag : 0);
     if (hidden_size <= 2560) {
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 10>
             <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
@@ -1869,7 +1904,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
                 (const __half*)weight, (__half*)out, (__half*)out_had64,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
-                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+                rank_and_flags, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
     } else if (hidden_size <= 4096) {
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<256, 16>
             <<<blocks, 256, 0, (cudaStream_t)ex->stream>>>(
@@ -1877,7 +1912,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
                 (const __half*)weight, (__half*)out, (__half*)out_had64,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
-                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+                rank_and_flags, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
     } else if (hidden_size <= 5120) {
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 10>
             <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1885,7 +1920,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
                 (const __half*)weight, (__half*)out, (__half*)out_had64,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
-                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+                rank_and_flags, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
     } else {
         w34_comm::tp2_all_reduce_residual_gemma_rms_norm_f16_kernel<512, 12>
             <<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -1893,7 +1928,7 @@ extern "C" int w34_tp2_all_reduce_residual_gemma_rms_norm_hadamard_f16(
                 (const __half*)weight, (__half*)out, (__half*)out_had64,
                 (__nv_bfloat16*)tap_dst_bf16, (__half*)stage0, (__half*)stage1,
                 (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
-                rank, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
+                rank_and_flags, num_tokens, hidden_size, eps, tap_row_stride, tap_col_offset);
     }
     return (int)cudaGetLastError();
 }
@@ -1918,22 +1953,26 @@ extern "C" int w34_tp2_all_reduce_bf16(const w34_exec* ex, const void* local_in,
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
+    bool is_p2p = false;
+    cudaError_t p2p_err = w34_comm::query_p2p_device_stage(stage0, &is_p2p);
+    if (p2p_err != cudaSuccess) return (int)p2p_err;
     const size_t num_bytes = (size_t)num_elems * sizeof(__nv_bfloat16);
-    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+    if (!is_p2p && num_bytes >= w34_comm::kDmaThresholdBytes) {
         cudaError_t cpy_err = cudaMemcpyAsync(
             (rank == 0) ? stage0 : stage1, local_in, num_bytes,
             cudaMemcpyDefault, (cudaStream_t)ex->stream);
         if (cpy_err != cudaSuccess) return (int)cpy_err;
     }
     int blocks = (num_elems + w34_comm::kVec8F16ElemsPerBlock - 1) / w34_comm::kVec8F16ElemsPerBlock;
-    const int cap = w34_comm::tp2_pcie_block_cap();
+    const int cap = w34_comm::tp2_comm_block_cap(is_p2p);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
+    const int rank_and_flags = rank | (is_p2p ? w34_comm::kRankP2pFlag : 0);
     w34_comm::tp2_all_reduce_bf16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
         (const __nv_bfloat16*)local_in, (__nv_bfloat16*)out,
         (__nv_bfloat16*)stage0, (__nv_bfloat16*)stage1,
         (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
-        rank, num_elems);
+        rank_and_flags, num_elems);
     return (int)cudaGetLastError();
 }
 
@@ -1945,21 +1984,25 @@ extern "C" int w34_tp2_all_reduce_f32(const w34_exec* ex, const float* local_in,
         (rank != 0 && rank != 1) || num_elems <= 0) {
         return (int)cudaErrorInvalidValue;
     }
+    bool is_p2p = false;
+    cudaError_t p2p_err = w34_comm::query_p2p_device_stage(stage0, &is_p2p);
+    if (p2p_err != cudaSuccess) return (int)p2p_err;
     const size_t num_bytes = (size_t)num_elems * sizeof(float);
-    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+    if (!is_p2p && num_bytes >= w34_comm::kDmaThresholdBytes) {
         cudaError_t cpy_err = cudaMemcpyAsync(
             (rank == 0) ? stage0 : stage1, local_in, num_bytes,
             cudaMemcpyDefault, (cudaStream_t)ex->stream);
         if (cpy_err != cudaSuccess) return (int)cpy_err;
     }
     int blocks = (num_elems + w34_comm::kVec4F32ElemsPerBlock - 1) / w34_comm::kVec4F32ElemsPerBlock;
-    const int cap = w34_comm::tp2_pcie_block_cap();
+    const int cap = w34_comm::tp2_comm_block_cap(is_p2p);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
+    const int rank_and_flags = rank | (is_p2p ? w34_comm::kRankP2pFlag : 0);
     w34_comm::tp2_all_reduce_f32_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
         local_in, out, stage0, stage1,
         (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
-        rank, num_elems);
+        rank_and_flags, num_elems);
     return (int)cudaGetLastError();
 }
 
@@ -2006,9 +2049,12 @@ extern "C" int w34_tp2_gather_vocab_f16(
         (rank != 0 && rank != 1) || num_rows <= 0 || local_vocab_size <= 0) {
         return (int)cudaErrorInvalidValue;
     }
+    bool is_p2p = false;
+    cudaError_t p2p_err = w34_comm::query_p2p_device_stage(stage1, &is_p2p);
+    if (p2p_err != cudaSuccess) return (int)p2p_err;
     const int num_elems = num_rows * local_vocab_size;
     int blocks = (num_elems + w34_comm::kVec8F16ElemsPerBlock - 1) / w34_comm::kVec8F16ElemsPerBlock;
-    const int cap = w34_comm::tp2_pcie_block_cap();
+    const int cap = w34_comm::tp2_comm_block_cap(is_p2p);
     if (blocks > cap) blocks = cap;
     if (blocks < 1) blocks = 1;
     w34_comm::tp2_gather_vocab_f16_kernel<<<blocks, 512, 0, (cudaStream_t)ex->stream>>>(
@@ -2339,22 +2385,26 @@ extern "C" int w34_tp2_all_reduce_hc_combine_tap_f16(
         (tap_bf16_out != nullptr && (tap_offset_elems < 0 || tap_stride_elems < tap_offset_elems + hidden_size))) {
         return (int)cudaErrorInvalidValue;
     }
+    bool is_p2p = false;
+    cudaError_t p2p_err = w34_comm::query_p2p_device_stage(stage0, &is_p2p);
+    if (p2p_err != cudaSuccess) return (int)p2p_err;
     const size_t num_bytes = (size_t)num_tokens * (size_t)hidden_size * sizeof(__half);
-    if (num_bytes >= w34_comm::kDmaThresholdBytes) {
+    if (!is_p2p && num_bytes >= w34_comm::kDmaThresholdBytes) {
         cudaError_t cpy_err = cudaMemcpyAsync(
             (rank == 0) ? stage0 : stage1, local_block_out, num_bytes,
             cudaMemcpyDefault, (cudaStream_t)ex->stream);
         if (cpy_err != cudaSuccess) return (int)cpy_err;
     }
-    const int cap = w34_comm::tp2_pcie_block_cap();
+    const int cap = w34_comm::tp2_comm_block_cap(is_p2p);
     const int blocks = (num_tokens > cap) ? cap : num_tokens;
     const unsigned threads = (hidden_size > 2048) ? 512u : 256u;
+    const int rank_and_flags = rank | (is_p2p ? w34_comm::kRankP2pFlag : 0);
     w34_comm::tp2_all_reduce_hc_combine_tap_f16_kernel<<<blocks, threads, 0, (cudaStream_t)ex->stream>>>(
         (const __half*)residual_in, (const __half*)local_block_out, (__half*)ar_out,
         inject_weights, (const __half*)ple_delta, (__half*)residual_out,
         (__nv_bfloat16*)tap_bf16_out, valid_token_mask,
         (__half*)stage0, (__half*)stage1, (w34_comm::Signal*)sig0, (w34_comm::Signal*)sig1,
-        rank, num_tokens, hc_count, hidden_size, tap_stride_elems, tap_offset_elems);
+        rank_and_flags, num_tokens, hc_count, hidden_size, tap_stride_elems, tap_offset_elems);
     return (int)cudaGetLastError();
 }
 

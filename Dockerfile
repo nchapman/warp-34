@@ -27,9 +27,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ ./.cargo/
 COPY crates/ ./crates/
 COPY --from=dashboard /dashboard/dist ./dashboard/dist
-# Bound nvcc parallelism on smaller build hosts; kernels build as an sm_86 + sm_89 fatbinary by default.
+# Bound nvcc parallelism on smaller build hosts; kernels build as an sm_80 + sm_86 + sm_89 fatbinary by default.
 ARG W34_NVCC_JOBS=4
-ARG W34_ARCH=sm_86,sm_89
+ARG W34_ARCH=sm_80,sm_86,sm_89
 # Compress the embedded device code, not the executable with a runtime packer.
 # Keep native SASS for both GPU generations and the existing PTX fallback.
 ARG W34_NVCC_EXTRA=--compress-mode=size

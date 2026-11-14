@@ -218,14 +218,16 @@ impl CapacityPlanner {
     }
 }
 
-/// Architecture family for 30-series (`sm_86`) and 40-series (`sm_89`) GPUs.
+/// Architecture family for A100 (`sm_80`), 30-series (`sm_86`), and 40-series (`sm_89`) GPUs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CudaArchFamily {
+    /// NVIDIA Ampere datacenter (`sm_80`: A100 SXM4 / PCIe 40GB / 80GB, A30).
+    AmpereSm80,
     /// NVIDIA Ampere 30-series / workstation (`sm_86`: RTX 3060..3090 Ti, A4000..A6000, A40).
     AmpereSm86,
     /// NVIDIA Ada Lovelace 40-series / workstation (`sm_89`: RTX 4060..4090, RTX 6000 Ada, L40S).
     AdaSm89,
-    /// Other Ampere-or-newer architecture (`>= 8.0`, e.g. `sm_80`, `sm_87`, `sm_90`).
+    /// Other Ampere-or-newer architecture (`>= 8.0`, e.g. `sm_87`, `sm_90`).
     OtherAmpereOrNewer { major: i32, minor: i32 },
 }
 
@@ -260,16 +262,17 @@ impl CudaDeviceProps {
 
     pub fn arch_family(&self) -> Result<CudaArchFamily> {
         match (self.compute_major, self.compute_minor) {
+            (8, 0) => Ok(CudaArchFamily::AmpereSm80),
             (8, 6) => Ok(CudaArchFamily::AmpereSm86),
             (8, 9) => Ok(CudaArchFamily::AdaSm89),
-            (major, minor) if (major > 8 && minor >= 0) || (major == 8 && minor >= 6) => {
+            (major, minor) if major >= 8 && minor >= 0 => {
                 Ok(CudaArchFamily::OtherAmpereOrNewer { major, minor })
             }
             (major, minor) => Err(CudaError::with_detail(
                 -20,
                 "unsupported GPU compute capability",
                 format!(
-                    "GPU {} ({}) has compute capability {}.{} (sm_{}{}); warp-34 requires 30-series (sm_86) or 40-series (sm_89) (>= 8.6)",
+                    "GPU {} ({}) has compute capability {}.{} (sm_{}{}); warp-34 requires Ampere (sm_80 / sm_86) or Ada (sm_89) (>= 8.0)",
                     self.device_id, self.name, major, minor, major, minor
                 ),
             )),
