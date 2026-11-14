@@ -300,15 +300,18 @@ fn alloc_prefill_checkpoint_slot(
     engine: &mut Qwen3_5Engine,
     radix: &mut crate::radix::MambaRadixCache,
     s: &ScheduledReqSlice,
+    can_recycle_locked: bool,
 ) -> Option<i32> {
     if !s.is_prefill_chunk {
         return None;
     }
-    if s.is_final_prefill_chunk || s.ctx_len_before < 2048 {
-        engine.alloc_state_slot_from(radix)
-    } else {
-        engine.alloc_state_slot_preserving_leaves(radix)
-    }
+    engine
+        .alloc_state_slot_preserving_leaves(radix)
+        .or_else(|| {
+            (!can_recycle_locked && (s.is_final_prefill_chunk || s.ctx_len_before < 2048))
+                .then(|| engine.alloc_state_slot_from(radix))
+                .flatten()
+        })
 }
 
 fn batch_is_noncausal_prefix_prefill(
@@ -712,7 +715,17 @@ pub(super) fn step_plain(
         } else {
             None
         };
-        let mut replacement = alloc_prefill_checkpoint_slot(engine, &mut sched.radix, s);
+        let can_recycle_locked = sched
+            .active
+            .iter()
+            .find(|seq| seq.req_id == s.req_id)
+            .is_some_and(|seq| {
+                sched
+                    .radix
+                    .can_recycle_locked_mamba(seq.radix_state.last_locked_node)
+            });
+        let mut replacement =
+            alloc_prefill_checkpoint_slot(engine, &mut sched.radix, s, can_recycle_locked);
         release(engine, sched.commit_slice(s, token, || replacement.take()));
         if let Some(slot) = replacement {
             engine.free_state_slots(&[slot]);

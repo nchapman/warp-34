@@ -36,6 +36,9 @@ pub const DFLASH2_MAX_BATCH_ROWS: usize = 256;
 /// Paged-attention block size (`16` tokens/page) for the `DFlash2` draft context KV pool.
 const DFLASH2_KV_PAGE_BLOCK_TOKENS: usize = 16;
 
+/// Maximum concurrent ring-buffer KV slots (`16` sessions) for multi-session `DFlash2` serving.
+pub const MAX_DFLASH_BATCH_SLOTS: usize = 16;
+
 /// Alignment/padding slack (`1 MiB`) added to the `DFlash2Rank` weight arena capacity.
 const DFLASH2_WEIGHT_ARENA_SLACK_BYTES: usize = 1024 * 1024;
 
@@ -596,6 +599,20 @@ fn weight_arena_bytes(
     sum(&bytes)
 }
 
+fn dflash_ring_params(cfg: &DFlash2Config, tp: usize) -> (usize, usize) {
+    if cfg.model.hidden_size == 5120 && tp > 1 {
+        (
+            MAX_DFLASH_BATCH_SLOTS,
+            ((cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 16).max(144),
+        )
+    } else {
+        (
+            8,
+            (cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 9,
+        )
+    }
+}
+
 fn mandatory_bytes(
     cfg: &DFlash2Config,
     target: &ModelConfig,
@@ -605,11 +622,9 @@ fn mandatory_bytes(
 ) -> Result<usize> {
     let rows = sum(&[capacity, cfg.block_size])?;
     let logical_pages = rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
-    let slot_count = crate::mtp::MAX_MTP_BATCH_SLOTS;
-    let ring_phys_per_slot =
-        ((cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 16).max(256);
-    let phys_kv_pages = if cfg.window > 0 {
-        logical_pages.min(slot_count * ring_phys_per_slot)
+    let (slot_count, ring_phys_per_slot) = dflash_ring_params(cfg, tp);
+    let phys_kv_pages = if cfg.window > 0 && logical_pages >= ring_phys_per_slot {
+        slot_count * ring_phys_per_slot
     } else {
         logical_pages
     };
@@ -688,7 +703,7 @@ pub(crate) fn serving_reserve(
 
 struct DFlashGraphIo {
     forward_graph: Option<CudaGraph>,
-    select_greedy_graphs: [Option<CudaGraph>; crate::mtp::MAX_MTP_BATCH_SLOTS],
+    select_greedy_graphs: [Option<CudaGraph>; MAX_DFLASH_BATCH_SLOTS],
     forward_arena: DeviceArena,
     meta_dev: DeviceBuffer,
     topk_ids_dev: DeviceBuffer,
@@ -709,6 +724,7 @@ pub struct DFlash2Rank {
     all_pages: Vec<i32>,
     all_pages_dev: u64,
     ring_pages_dev_buf: Option<DeviceBuffer>,
+    ring_slot_count: usize,
     pages: Vec<i32>,
     pages_dev: u64,
     capacity: usize,
@@ -717,7 +733,7 @@ pub struct DFlash2Rank {
     committed: usize,
     active_slot: usize,
     batch_mode: bool,
-    slot_committed: [usize; crate::mtp::MAX_MTP_BATCH_SLOTS],
+    slot_committed: [usize; MAX_DFLASH_BATCH_SLOTS],
     proposal_anchor: Option<i32>,
     fc: Linear,
     hidden_norm: u64,
@@ -1187,11 +1203,9 @@ impl DFlash2Rank {
         let rope = weights.upload_slice(&table, &t.stream)?;
         let layer_ids: Vec<usize> = (0..c.num_hidden_layers).collect();
         let logical_pages = rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
-        let slot_count = crate::mtp::MAX_MTP_BATCH_SLOTS;
-        let ring_phys_per_slot =
-            ((cfg.window + cfg.block_size).div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS) + 16).max(256);
-        let phys_kv_pages = if cfg.window > 0 {
-            logical_pages.min(slot_count * ring_phys_per_slot)
+        let (slot_count, ring_phys_per_slot) = dflash_ring_params(&cfg, tp);
+        let phys_kv_pages = if cfg.window > 0 && logical_pages >= ring_phys_per_slot {
+            slot_count * ring_phys_per_slot
         } else {
             logical_pages
         };
@@ -1260,6 +1274,7 @@ impl DFlash2Rank {
             all_pages,
             all_pages_dev: pages_dev,
             ring_pages_dev_buf,
+            ring_slot_count: slot_count,
             pages,
             pages_dev,
             capacity,
@@ -1268,7 +1283,7 @@ impl DFlash2Rank {
             committed: 0,
             active_slot: 0,
             batch_mode: false,
-            slot_committed: [0; crate::mtp::MAX_MTP_BATCH_SLOTS],
+            slot_committed: [0; MAX_DFLASH_BATCH_SLOTS],
             proposal_anchor: None,
             fc,
             hidden_norm,
@@ -1290,8 +1305,10 @@ impl DFlash2Rank {
         self.kv.layers.iter().map(|l| l.layout).collect()
     }
     pub fn batch_slot_count(&self) -> usize {
-        if self.ring_pages_dev_buf.is_some() || self.all_pages.len() >= 4096 {
-            crate::mtp::MAX_MTP_BATCH_SLOTS
+        if self.ring_pages_dev_buf.is_some() {
+            self.ring_slot_count
+        } else if self.all_pages.len() >= 4096 {
+            8
         } else {
             4
         }
@@ -1311,11 +1328,11 @@ impl DFlash2Rank {
     pub fn ring_phys_pages_per_slot(&self) -> Option<usize> {
         self.ring_pages_dev_buf
             .as_ref()
-            .map(|_| self.all_pages.len() / crate::mtp::MAX_MTP_BATCH_SLOTS)
+            .map(|_| self.all_pages.len() / self.ring_slot_count)
     }
     fn bind_slot_pages(&mut self, slot: usize) {
         if let Some(ref ring_buf) = self.ring_pages_dev_buf {
-            let slot_count = crate::mtp::MAX_MTP_BATCH_SLOTS;
+            let slot_count = self.ring_slot_count;
             let phys_per_slot = self.all_pages.len() / slot_count;
             let logical_pages = self.rope_rows.div_ceil(DFLASH2_KV_PAGE_BLOCK_TOKENS);
             let base = slot * phys_per_slot;
@@ -1341,7 +1358,7 @@ impl DFlash2Rank {
             self.graph_io.select_greedy_graphs = std::array::from_fn(|_| None);
             self.batch_mode = batch_mode;
         }
-        self.slot_committed = [0; crate::mtp::MAX_MTP_BATCH_SLOTS];
+        self.slot_committed = [0; MAX_DFLASH_BATCH_SLOTS];
         self.active_slot = 0;
         self.committed = 0;
         self.proposal_anchor = None;
@@ -1365,7 +1382,7 @@ impl DFlash2Rank {
             ));
         }
         if self.ring_pages_dev_buf.is_some() {
-            let phys_per_slot = self.all_pages.len() / crate::mtp::MAX_MTP_BATCH_SLOTS;
+            let phys_per_slot = self.all_pages.len() / self.ring_slot_count;
             if self.committed > phys_per_slot * 16 {
                 return Err(loader_err(
                     "single-slot DFlash state exceeds slot 0 physical ring span",
@@ -1377,7 +1394,7 @@ impl DFlash2Rank {
             self.graph_io.select_greedy_graphs = std::array::from_fn(|_| None);
             self.batch_mode = true;
         }
-        self.slot_committed = [0; crate::mtp::MAX_MTP_BATCH_SLOTS];
+        self.slot_committed = [0; MAX_DFLASH_BATCH_SLOTS];
         self.slot_committed[0] = self.committed;
         self.active_slot = 0;
         self.proposal_anchor = None;
@@ -1417,7 +1434,7 @@ impl DFlash2Rank {
         tokens: usize,
     ) -> Result<()> {
         let slot_count = if self.ring_pages_dev_buf.is_some() {
-            crate::mtp::MAX_MTP_BATCH_SLOTS
+            self.ring_slot_count
         } else {
             self.batch_slot_count()
         };

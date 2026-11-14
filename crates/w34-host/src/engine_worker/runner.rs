@@ -73,7 +73,7 @@ pub(super) fn run(
     );
 }
 
-type MtpBatchSlots = [Option<(u64, Vec<i32>)>; crate::mtp::MAX_MTP_BATCH_SLOTS];
+type MtpBatchSlots = [Option<(u64, Vec<i32>)>; crate::mtp::MAX_PROPOSER_BATCH_SLOTS];
 
 /// Tick-to-tick speculative bookkeeping only. Engine ownership remains in `run`,
 /// outside the supervisor's caught closure.

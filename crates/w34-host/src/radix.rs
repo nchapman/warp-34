@@ -786,14 +786,68 @@ impl MambaRadixCache {
         false
     }
 
+    fn is_superseded_linear_internal(&self, nid: RadixNodeId) -> bool {
+        let n = &self.nodes[nid.0];
+        if n.mamba_lock_ref > 0
+            || n.children.is_empty()
+            || !self.has_non_decode_mamba_descendant(nid)
+        {
+            return false;
+        }
+        let non_decode_children = n
+            .children
+            .values()
+            .filter(|&&cid| {
+                let c = &self.nodes[cid.0];
+                !(c.children.is_empty() && c.is_decode_tail)
+            })
+            .count();
+        non_decode_children == 1
+    }
+
     fn is_reclaimable_decode_tail_leaf(&self, nid: RadixNodeId) -> bool {
         let n = &self.nodes[nid.0];
-        n.children.is_empty()
-            && n.is_decode_tail
-            && n.full_lock_ref == 0
-            && n.mamba_lock_ref == 0
-            && n.parent
-                .is_some_and(|pid| self.nodes[pid.0].mamba_value.is_some())
+        if !n.children.is_empty()
+            || !n.is_decode_tail
+            || n.full_lock_ref > 0
+            || n.mamba_lock_ref > 0
+        {
+            return false;
+        }
+        let mut anc = n.parent;
+        while let Some(pid) = anc {
+            if pid == RadixNodeId::ROOT {
+                break;
+            }
+            if self.nodes[pid.0].mamba_value.is_some() || self.has_non_decode_mamba_descendant(pid)
+            {
+                return true;
+            }
+            anc = self.nodes[pid.0].parent;
+        }
+        false
+    }
+
+    pub fn can_recycle_locked_mamba(&self, nid: RadixNodeId) -> bool {
+        if self.disable || nid == RadixNodeId::ROOT {
+            return false;
+        }
+        let n = &self.nodes[nid.0];
+        n.mamba_lock_ref == 1 && n.mamba_value.is_some()
+    }
+
+    fn reclaim_internal_mamba(&mut self, nid: RadixNodeId) -> Option<i32> {
+        if self.disable || nid == RadixNodeId::ROOT {
+            return None;
+        }
+        let n = &self.nodes[nid.0];
+        if n.mamba_lock_ref > 0 || n.children.is_empty() {
+            return None;
+        }
+        let slot = self.nodes[nid.0].mamba_value.take()?;
+        self.mamba_evictable_slots = self.mamba_evictable_slots.saturating_sub(1);
+        self.mamba_lru_remove(nid);
+        Some(slot)
     }
 
     /// Evicts up to `num_mamba_slots` unlocked GDN `StateBundle` slots in `mamba_lru` order
@@ -802,11 +856,7 @@ impl MambaRadixCache {
     pub fn has_evictable_internal_mamba(&self) -> bool {
         !self.disable
             && self.mamba_lru.iter().any(|&nid| {
-                let n = &self.nodes[nid.0];
-                (n.mamba_lock_ref == 0
-                    && n.children.len() == 1
-                    && self.has_non_decode_mamba_descendant(nid))
-                    || self.is_reclaimable_decode_tail_leaf(nid)
+                self.is_superseded_linear_internal(nid) || self.is_reclaimable_decode_tail_leaf(nid)
             })
     }
 
@@ -817,22 +867,17 @@ impl MambaRadixCache {
         }
 
         while out.freed_mamba_slots.len() < num_mamba_slots {
-            // Priority 1: Superseded single-child internal nodes that have a non-decode-tail
-            // Mamba descendant (`has_non_decode_mamba_descendant`), freeing 0 KV pages while
+            // Priority 1: Superseded linear internal nodes that have a non-decode-tail
+            // Mamba descendant (`is_superseded_linear_internal`), freeing 0 KV pages while
             // never tombstoning a prompt frontier whose only child is an unverified decode tail.
             // Priority 2: Unverified decode-tail leaf nodes (`is_reclaimable_decode_tail_leaf`)
-            // whose parent prompt frontier still holds a live Mamba snapshot.
+            // whose ancestor prompt frontier still holds a live Mamba snapshot.
             // Priority 3: Standard `mamba_lru` order.
             let candidate = self
                 .mamba_lru
                 .iter()
                 .copied()
-                .find(|&nid| {
-                    let n = &self.nodes[nid.0];
-                    n.mamba_lock_ref == 0
-                        && n.children.len() == 1
-                        && self.has_non_decode_mamba_descendant(nid)
-                })
+                .find(|&nid| self.is_superseded_linear_internal(nid))
                 .or_else(|| {
                     self.mamba_lru
                         .iter()
@@ -1148,8 +1193,10 @@ impl ReqRadixState {
         finish_req: bool,
     ) -> RadixDonationOutcome {
         assert!(
-            finish_req || replacement_slot.is_some(),
-            "replacement_slot must be Some(...) when finish_req == false"
+            finish_req
+                || replacement_slot.is_some()
+                || radix.can_recycle_locked_mamba(self.last_locked_node),
+            "replacement_slot must be Some(...) or last_locked_node recyclable when finish_req == false"
         );
         let mut outcome = RadixDonationOutcome::default();
 
@@ -1192,19 +1239,8 @@ impl ReqRadixState {
                 self.kv_pages[..cache_pages].copy_from_slice(&canonical_pages);
             }
 
-            if ins.mamba_already_existed {
-                // Keep `donated_mamba_slot` in our ping-pong buffer (or free `replacement_slot` if provided).
-                if let Some(rep) = replacement_slot {
-                    outcome.freed_mamba_slots.push(rep);
-                }
-            } else if let Some(rep) = replacement_slot {
-                self.ping_pong_slots[keep_idx] = rep;
-            } else {
-                // `finish_req == true`: mark donated slot as consumed (-1) so cleanup doesn't free it.
-                self.ping_pong_slots[keep_idx] = -1;
-            }
-
-            radix.dec_lock_ref(self.last_locked_node);
+            let prev_locked = self.last_locked_node;
+            radix.dec_lock_ref(prev_locked);
             if finish_req {
                 self.last_locked_node = RadixNodeId::ROOT;
                 self.protected_pages = cache_pages;
@@ -1212,6 +1248,21 @@ impl ReqRadixState {
                 radix.inc_lock_ref(ins.terminal_node);
                 self.last_locked_node = ins.terminal_node;
                 self.protected_pages = cache_pages;
+            }
+
+            if ins.mamba_already_existed {
+                // Keep `donated_mamba_slot` in our ping-pong buffer (or free `replacement_slot` if provided).
+                if let Some(rep) = replacement_slot {
+                    outcome.freed_mamba_slots.push(rep);
+                }
+            } else if let Some(rep) = replacement_slot {
+                self.ping_pong_slots[keep_idx] = rep;
+            } else if !finish_req && let Some(recycled) = radix.reclaim_internal_mamba(prev_locked)
+            {
+                self.ping_pong_slots[keep_idx] = recycled;
+            } else {
+                // `finish_req == true`: mark donated slot as consumed (-1) so cleanup doesn't free it.
+                self.ping_pong_slots[keep_idx] = -1;
             }
             self.last_track_seqlen = None;
         } else if finish_req {
@@ -1532,5 +1583,29 @@ mod tests {
             "retired dead nodes should be recycled via free_nodes; got nodes.len()={}",
             radix.nodes.len()
         );
+    }
+
+    #[test]
+    fn test_donate_committed_checkpoint_recycles_locked_mamba_when_replacement_none() {
+        let mut radix = MambaRadixCache::new(16, 64);
+        let turn0: Vec<i32> = (0..64).collect();
+        radix.insert(&turn0, &[1, 2, 3, 4], &[], 10, 0);
+
+        let mut req = ReqRadixState::new(16, 64, 1, [2, 3]);
+        let mut turn1 = turn0.clone();
+        turn1.extend(100..164);
+        let hit = radix.match_prefix(&turn1);
+        assert_eq!(hit.matched_tokens, 64);
+        assert_eq!(hit.mamba_slot, Some(10));
+        req.restore_prefix_hit(&mut radix, &turn1, &hit);
+        assert!(radix.can_recycle_locked_mamba(req.last_locked_node));
+
+        req.kv_pages.extend_from_slice(&[5, 6, 7, 8]);
+        let ckpts = req.plan_checkpoints(64);
+        req.commit_tokens(&turn1[64..], &ckpts);
+        let don = req.donate_committed_checkpoint(&mut radix, None, false);
+        assert_eq!(don.donated_seq_len, 128);
+        assert_eq!(req.ping_pong_slots, [10, 3]);
+        assert!(radix.sanity_check().is_ok());
     }
 }

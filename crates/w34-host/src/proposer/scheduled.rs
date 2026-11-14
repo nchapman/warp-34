@@ -162,15 +162,18 @@ impl NativeProposer {
 
         if end < seq.prompt_tokens.len() {
             if seq.radix_state.last_track_seqlen.is_some() {
-                let rep = if start < 2048 {
-                    engine.alloc_state_slot_from(radix)
-                } else {
-                    engine.alloc_state_slot_preserving_leaves(radix)
-                };
-                if let Some(rep) = rep {
+                let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
+                let rep = engine
+                    .alloc_state_slot_preserving_leaves(radix)
+                    .or_else(|| {
+                        (start < 2048 && !can_recycle)
+                            .then(|| engine.alloc_state_slot_from(radix))
+                            .flatten()
+                    });
+                if rep.is_some() || can_recycle {
                     let don = seq
                         .radix_state
-                        .donate_committed_checkpoint(radix, Some(rep), false);
+                        .donate_committed_checkpoint(radix, rep, false);
                     engine.free_kv_pages(&don.freed_kv_pages);
                     engine.free_state_slots(&don.freed_mamba_slots);
                 }
@@ -200,15 +203,22 @@ impl NativeProposer {
         {
             seq.finished = true;
         }
-        if !seq.finished
-            && seq.radix_state.last_track_seqlen.is_some()
-            && let Some(rep) = engine.alloc_state_slot_from(radix)
-        {
-            let don = seq
-                .radix_state
-                .donate_committed_checkpoint(radix, Some(rep), false);
-            engine.free_kv_pages(&don.freed_kv_pages);
-            engine.free_state_slots(&don.freed_mamba_slots);
+        if !seq.finished && seq.radix_state.last_track_seqlen.is_some() {
+            let can_recycle = radix.can_recycle_locked_mamba(seq.radix_state.last_locked_node);
+            let rep = engine
+                .alloc_state_slot_preserving_leaves(radix)
+                .or_else(|| {
+                    (!can_recycle)
+                        .then(|| engine.alloc_state_slot_from(radix))
+                        .flatten()
+                });
+            if rep.is_some() || can_recycle {
+                let don = seq
+                    .radix_state
+                    .donate_committed_checkpoint(radix, rep, false);
+                engine.free_kv_pages(&don.freed_kv_pages);
+                engine.free_state_slots(&don.freed_mamba_slots);
+            }
         }
         Ok(Some((anchor, lp)))
     }

@@ -410,7 +410,7 @@ impl SchedulerV1 {
         self.radix.active_lora_id = crate::lora::BASE_MODEL_LORA_ID;
         let evictions = Vec::new();
         while self.active.len() < self.cfg.max_num_seqs {
-            let (lookup_len, raw_hit, allow_hit, pinned_hit, unshareable) = {
+            let (lookup_len, mut match_res, pinned_hit, unshareable) = {
                 let Some(w) = self.waiting.front() else {
                     break;
                 };
@@ -425,21 +425,33 @@ impl SchedulerV1 {
                 let lookup_len = w
                     .max_prefix_lookup_len
                     .map_or(default_lookup, |cap| cap.min(default_lookup));
-                let raw_hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
-                let allow_hit = raw_hit.matched_tokens == 0
-                    || allow_prefix_hit(w.req_id, &w.radix_key_tokens, raw_hit.matched_tokens);
-                let pinned_hit =
-                    allow_hit && raw_hit.matched_tokens > 0 && raw_hit.mamba_slot.is_some();
-                (lookup_len, raw_hit, allow_hit, pinned_hit, unshareable)
+                let mut hit = self.radix.match_prefix(&w.radix_key_tokens[..lookup_len]);
+                // Each step trims below `hit.matched_tokens` (a 64-token Mamba checkpoint
+                // boundary), jumping directly to the next ancestor checkpoint. Cap the walk
+                // at 32 ancestor hops so admission work remains strictly O(1) bounded.
+                const MAX_ANCESTOR_FALLBACK_STEPS: usize = 32;
+                let mut steps = 0usize;
+                while hit.matched_tokens > 0
+                    && !allow_prefix_hit(w.req_id, &w.radix_key_tokens, hit.matched_tokens)
+                {
+                    if steps >= MAX_ANCESTOR_FALLBACK_STEPS {
+                        let branch = hit.mamba_branching_seqlen;
+                        hit = self.radix.match_prefix(&[]);
+                        hit.mamba_branching_seqlen = branch;
+                        break;
+                    }
+                    steps += 1;
+                    let next_lookup = hit.matched_tokens.saturating_sub(1);
+                    let mut shorter = self.radix.match_prefix(&w.radix_key_tokens[..next_lookup]);
+                    shorter.mamba_branching_seqlen = shorter
+                        .mamba_branching_seqlen
+                        .or(hit.mamba_branching_seqlen);
+                    hit = shorter;
+                }
+                let pinned_hit = hit.matched_tokens > 0 && hit.mamba_slot.is_some();
+                (lookup_len, hit, pinned_hit, unshareable)
             };
             let _ = lookup_len;
-            let mut match_res = if !allow_hit {
-                let mut cold = self.radix.match_prefix(&[]);
-                cold.mamba_branching_seqlen = raw_hit.mamba_branching_seqlen;
-                cold
-            } else {
-                raw_hit
-            };
             if pinned_hit {
                 self.radix.inc_lock_ref(match_res.last_node);
             }
@@ -709,10 +721,15 @@ impl SchedulerV1 {
         {
             // Donate intermediate chunked-prefill checkpoint immediately so concurrent
             // requests in the next step can hit the warm prefix!
-            if let Some(rep) = alloc_replacement_slot() {
+            let rep = alloc_replacement_slot();
+            if rep.is_some()
+                || self
+                    .radix
+                    .can_recycle_locked_mamba(seq.radix_state.last_locked_node)
+            {
                 Some(
                     seq.radix_state
-                        .donate_committed_checkpoint(&mut self.radix, Some(rep), false),
+                        .donate_committed_checkpoint(&mut self.radix, rep, false),
                 )
             } else {
                 None
@@ -1383,5 +1400,20 @@ mod tests {
             }
         }
         assert_eq!(freed_slots, 3);
+    }
+
+    #[test]
+    fn test_admit_waiting_with_filter_steps_down_to_ancestor_checkpoint() {
+        let mut sched = SchedulerV1::new(SchedulerConfig::default());
+        let prompt: Vec<i32> = (0..192).collect();
+        sched.radix.insert(&prompt[..64], &[1, 2, 3, 4], &[], 10, 0);
+        sched
+            .radix
+            .insert(&prompt[..128], &[1, 2, 3, 4, 5, 6, 7, 8], &[], 11, 4);
+        sched.submit_request(prompt, 16, Vec::new());
+        sched.admit_waiting_with_filter(|_| Some((1, [2, 3])), |_, _, matched| matched <= 64);
+        assert_eq!(sched.active.len(), 1);
+        assert_eq!(sched.active[0].cached_prefix_tokens, 64);
+        assert_eq!(sched.active[0].radix_state.cow_src_state_slot, Some(10));
     }
 }

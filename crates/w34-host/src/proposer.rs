@@ -309,7 +309,11 @@ impl NativeProposer {
         for (t, buffer) in engine.ranks.iter_mut().zip(logits) {
             t.speculative_logits = Some(buffer);
         }
-        let mtp_batch_slots = (0..MAX_MTP_BATCH_SLOTS)
+        let slot_count = match config.kind {
+            SpeculativeKind::Mtp => MAX_MTP_BATCH_SLOTS,
+            SpeculativeKind::DFlash2 => crate::dflash::MAX_DFLASH_BATCH_SLOTS,
+        };
+        let mtp_batch_slots = (0..slot_count)
             .map(|_| {
                 let slot_tail = if config.kind == SpeculativeKind::Mtp {
                     engine
@@ -548,11 +552,12 @@ impl NativeProposer {
             self.processed = n;
             self.last_accepted.clear();
             self.last_restored_tokens = n;
-            // For long session-specific prefixes (> 2048 tokens), move `memo` directly into
-            // `self.current` in O(1) without cloning 80-120 MiB on CPU; `commit_current_memo`
-            // returns it to `self.memos` on turn completion or abort. Keep short shared system
-            // prefixes (<= 2048 tokens) in `self.memos` for concurrent sibling sessions.
-            if n > 2048 {
+            // For long session-specific prefixes (> 2048 tokens) where `memo` is this turn's
+            // frontier (`memo.tokens.len() - n <= 256`), move `memo` directly into `self.current`
+            // in O(1) without cloning or page-faulting a new buffer on the worker thread.
+            // If `memo` belongs to a further-ahead session (`memo.tokens.len() - n > 256`),
+            // keep the longer `memo` in `self.memos` so the leading session retains its suffix.
+            if n > 2048 && memo.tokens.len().saturating_sub(n) <= 256 {
                 memo.tokens.truncate(n);
                 if matches!(self.ranks, Ranks::Mtp(_)) {
                     memo.features.truncate(n * self.row_bytes);
@@ -561,7 +566,9 @@ impl NativeProposer {
                 }
                 self.current = Some(memo);
             } else {
-                let features = if memo.features.len() >= n * self.row_bytes {
+                let features = if matches!(self.ranks, Ranks::Mtp(_))
+                    && memo.features.len() >= n * self.row_bytes
+                {
                     let mut f = Vec::new();
                     grow_memo_features(&mut f, n * self.row_bytes, self.row_bytes);
                     f.copy_from_slice(&memo.features[..n * self.row_bytes]);
@@ -611,7 +618,10 @@ impl NativeProposer {
         if result.is_err() {
             let _ = self.reset();
         }
-        if result.is_ok() && tokens.len() > 2048 {
+        if result.is_ok()
+            && tokens.len() > 2048
+            && memo.tokens.len().saturating_sub(tokens.len()) <= 256
+        {
             memo.tokens.truncate(tokens.len());
             if matches!(self.ranks, Ranks::Mtp(_)) {
                 memo.features.truncate(tokens.len() * self.row_bytes);

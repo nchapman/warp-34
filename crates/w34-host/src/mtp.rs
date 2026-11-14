@@ -264,7 +264,8 @@ pub fn validate_geometry(c: &ModelConfig, rank: usize, tp: usize) -> Result<()> 
     Ok(())
 }
 
-pub const MAX_MTP_BATCH_SLOTS: usize = 8;
+pub const MAX_MTP_BATCH_SLOTS: usize = 16;
+pub const MAX_PROPOSER_BATCH_SLOTS: usize = 16;
 pub(crate) const BATCHED_MTP_META_I32_LEN: usize =
     10 * MAX_MTP_BATCH_SLOTS + (MAX_MTP_BATCH_SLOTS + 1);
 
@@ -466,7 +467,9 @@ impl Qwen3_5MtpRank {
         } else {
             2 * 3 * h * (i / tp)
         };
-        let mtp_capacity = if (65536..131072).contains(&capacity) && !is_tiered_moe_mtp {
+        let mtp_capacity = if (65536..262144).contains(&capacity) && !is_tiered_moe_mtp && tp > 1 {
+            262144
+        } else if (65536..131072).contains(&capacity) && !is_tiered_moe_mtp {
             131072
         } else {
             capacity
@@ -981,8 +984,10 @@ impl Qwen3_5MtpRank {
         &self.kv
     }
     pub fn batch_slot_count(&self) -> usize {
-        if self.all_pages.len() >= 4096 {
+        if self.all_pages.len() >= 16384 {
             MAX_MTP_BATCH_SLOTS
+        } else if self.all_pages.len() >= 4096 {
+            8
         } else {
             4
         }
