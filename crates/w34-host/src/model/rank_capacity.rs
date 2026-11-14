@@ -249,7 +249,7 @@ pub fn plan_mtp_tiered_moe_hot_experts(
     let slots_medium_need = MTP_MEDIUM_HOT_EXPERTS
         .saturating_mul(expert_stride_bytes)
         .saturating_add(MTP_PARTIAL_CACHE_HEADROOM_BYTES);
-    if tp_size > 1 && free_vram_bytes >= slots_all_need {
+    if free_vram_bytes >= slots_all_need {
         local_experts
     } else if tp_size == 1
         && local_experts >= MTP_TP1_SERVING_HOT_EXPERTS
@@ -472,9 +472,17 @@ pub fn plan_tiered_moe_hot_per_layer_with_dflash(
     let hot = if available_vram_after_weights_and_scratch > fixed_overhead && per_hot_step > 0 {
         let max_affordable =
             (available_vram_after_weights_and_scratch - fixed_overhead) / per_hot_step;
-        let aligned =
-            (max_affordable / TIERED_MOE_HOT_SLOT_ALIGNMENT) * TIERED_MOE_HOT_SLOT_ALIGNMENT;
-        aligned.clamp(min_hot, default_hot)
+        let full_residency_slack = 4 * 1024 * 1024 * 1024usize;
+        let full_residency_need = fixed_overhead
+            .saturating_add(local_experts.saturating_mul(per_hot_step))
+            .saturating_add(full_residency_slack);
+        if available_vram_after_weights_and_scratch >= full_residency_need {
+            local_experts
+        } else {
+            let aligned =
+                (max_affordable / TIERED_MOE_HOT_SLOT_ALIGNMENT) * TIERED_MOE_HOT_SLOT_ALIGNMENT;
+            aligned.clamp(min_hot, default_hot)
+        }
     } else {
         min_hot
     };

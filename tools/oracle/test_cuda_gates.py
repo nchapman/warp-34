@@ -81,8 +81,8 @@ class CudaBinaryGateTests(unittest.TestCase):
         self.assertIn("custom_kernel: static SHARED=50000 > 49152", joined)
 
     def test_expected_arches_from_env(self) -> None:
-        self.assertEqual(cuda_bin.expected_arches_from_env(None), ("sm_86", "sm_89"))
-        self.assertEqual(cuda_bin.expected_arches_from_env(""), ("sm_86", "sm_89"))
+        self.assertEqual(cuda_bin.expected_arches_from_env(None), ("sm_80", "sm_86", "sm_89"))
+        self.assertEqual(cuda_bin.expected_arches_from_env(""), ("sm_80", "sm_86", "sm_89"))
         self.assertEqual(cuda_bin.expected_arches_from_env("sm_86"), ("sm_86",))
         self.assertEqual(cuda_bin.expected_arches_from_env("86, sm_89"), ("sm_86", "sm_89"))
 

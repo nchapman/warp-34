@@ -252,6 +252,22 @@ impl TieredMoeEngine {
                 "execute_layer batch exceeds TieredMoeWorkspace capacity",
             ));
         }
+        if cache.slots.capacity >= cache.expert_ids.len() {
+            return Self::execute_layer_device_lru(
+                store,
+                cache,
+                ws,
+                compute_stream,
+                x_addr,
+                d_topk_ids_addr,
+                d_topk_weights_addr,
+                shared_expert_out_addr,
+                shared_expert_gate_addr,
+                out_addr,
+                num_tokens,
+                top_k,
+            );
+        }
         cache.sync_from_device_if_dirty(compute_stream)?;
         let use_prefill_hot_limit = num_tokens < TIERED_MOE_LONG_PROMPT_ADAPT_MIN_TOKENS
             && (cache.has_cpu_bridge()

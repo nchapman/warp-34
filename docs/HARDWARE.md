@@ -1,12 +1,13 @@
-# RTX 30-Series (`sm_86`) & RTX 40-Series (`sm_89`) — Hardware Reference
+# NVIDIA A100 (`sm_80`), RTX 30-Series (`sm_86`) & RTX 40-Series (`sm_89`) — Hardware Reference
 
 Every number an optimization decision might depend on, each with its source.
-`warp-34` builds a multi-architecture fatbinary (`sm_86` + `sm_89` + PTX) by
+`warp-34` builds a multi-architecture fatbinary (`sm_80` + `sm_86` + `sm_89` + PTX) by
 default and queries per-device hardware properties (`CudaDeviceProps` /
-`w34_device_props`) at startup so every GeForce RTX 30-series (`sm_86`,
-28–84 SMs, 3–6 MiB L2) and RTX 40-series (`sm_89`, 24–142 SMs, 24–96 MiB L2)
-GPU runs natively without hardcoded SM or L2 constants. Primary optimization
-references are **1–2× RTX 3090 / 3090 Ti (`sm_86`)** and **1–2× RTX 4090
+`w34_device_props`) at startup so every NVIDIA A100 (`sm_80`, 108 SMs, 40 MiB L2,
+40/80 GiB HBM2e), GeForce RTX 30-series (`sm_86`, 28–84 SMs, 3–6 MiB L2), and
+RTX 40-series (`sm_89`, 24–142 SMs, 24–96 MiB L2) GPU runs natively without
+hardcoded SM or L2 constants. Primary optimization references are **1–2× NVIDIA A100
+40GB/80GB (`sm_80`)**, **1–2× RTX 3090 / 3090 Ti (`sm_86`)**, and **1–2× RTX 4090
 (`sm_89`)**.
 
 Sources are tagged inline:

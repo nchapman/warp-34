@@ -1,6 +1,6 @@
 // Incremental parallel nvcc build for w34-kernels.
-// Default fatbinary targets both 30-series (sm_86) and 40-series (sm_89);
-// override via W34_ARCH (e.g. W34_ARCH=sm_86, W34_ARCH=sm_89, or W34_ARCH=sm_86,sm_89).
+// Default fatbinary targets A100 (sm_80), 30-series (sm_86), and 40-series (sm_89);
+// override via W34_ARCH (e.g. W34_ARCH=sm_80, W34_ARCH=sm_86, W34_ARCH=sm_89, or W34_ARCH=sm_80,sm_86,sm_89).
 use std::env::{var, var_os};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ fn main() {
     sources.sort();
     headers.sort();
 
-    let arch_spec = var("W34_ARCH").unwrap_or_else(|_| "sm_86,sm_89".into());
+    let arch_spec = var("W34_ARCH").unwrap_or_else(|_| "sm_80,sm_86,sm_89".into());
     let gencode_flags = build_gencode_flags(&arch_spec);
 
     let extra = var("W34_NVCC_EXTRA").unwrap_or_default();

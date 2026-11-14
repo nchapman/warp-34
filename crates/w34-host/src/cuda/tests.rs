@@ -671,10 +671,37 @@ fn test_device_props_validation_across_30_and_40_series_lineup() {
     assert_eq!(large_sm_props.marlin_workspace_ints(), 160 * 64);
     assert_eq!(large_sm_props.marlin_workspace_bytes(), 160 * 64 * 4);
 
-    // Pre-sm_86 (< 8.6, e.g. Turing sm_75 or sm_80 without sm_80 SASS in the default fatbinary) is rejected.
+    // A100 datacenter lineup: A100 40GB / 80GB (108 SMs, 40 MiB L2, 166,912 B opt-in smem)
+    for (name, sms, l2_mib) in [
+        ("NVIDIA A100-SXM4-40GB", 108, 40),
+        ("NVIDIA A100-SXM4-80GB", 108, 40),
+        ("NVIDIA A100 80GB PCIe", 108, 40),
+    ] {
+        let props = CudaDeviceProps {
+            device_id: 0,
+            compute_major: 8,
+            compute_minor: 0,
+            multi_processor_count: sms,
+            max_shared_mem_per_block_optin: 166_912,
+            max_shared_mem_per_multiprocessor: 167_936,
+            l2_cache_bytes: l2_mib * 1024 * 1024,
+            persisting_l2_max_bytes: 25 * 1024 * 1024,
+            name: name.to_string(),
+        };
+        assert_eq!(props.sm_tag(), "sm_80");
+        assert!(!props.supports_fp8_kv());
+        assert_eq!(
+            props.validate_supported().unwrap(),
+            CudaArchFamily::AmpereSm80
+        );
+        assert_eq!(props.marlin_workspace_ints(), (sms as usize) * 64);
+        assert_eq!(props.marlin_workspace_bytes(), (sms as usize) * 64 * 4);
+    }
+
+    // Pre-Ampere (< 8.0, e.g. Turing sm_75 or Volta sm_70) is rejected.
     for (major, minor, name) in [
+        (7, 0, "Tesla V100-SXM2-16GB"),
         (7, 5, "NVIDIA GeForce RTX 2080 Ti"),
-        (8, 0, "NVIDIA A100-SXM4-80GB"),
     ] {
         let unsupported = CudaDeviceProps {
             compute_major: major,
@@ -709,7 +736,8 @@ fn test_runtime_gpu_device_props_and_tp2_sm_cap() {
     let family = props.validate_supported().unwrap();
     assert!(matches!(
         family,
-        CudaArchFamily::AmpereSm86
+        CudaArchFamily::AmpereSm80
+            | CudaArchFamily::AmpereSm86
             | CudaArchFamily::AdaSm89
             | CudaArchFamily::OtherAmpereOrNewer { .. }
     ));
