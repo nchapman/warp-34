@@ -47,20 +47,18 @@ be copied onto current runs without checking startup allocation. Specialized
 
 Maintain two distinct comparison tracks:
 
-1. **Matched checkpoint / engine comparison:** use identical plain GPTQ bytes
-   on warp-34, vLLM and SGLang where supported. Keep our existing plain GPTQ
-   checkpoints for now. Match source model, tokenizer/template, workload,
-   hardware and precision controls; label remaining differences. Compare
-   plain decoding first, then explicitly labeled speculation/KV sweeps.
-2. **Warp-34 quant comparison:** HGPTQ versus the existing plain quant on
-   warp-34, holding hardware, workloads and decoding mode constant. This is not
-   a second cross-engine campaign. For Flash-Next the existing reference is
-   AutoRound W4A16 with FP8 PLE, not plain GPTQ; label that distinction and do not
-   infer quality equivalence from bit width.
+1. **Practical engine comparison:** nchapman HGPTQ on warp-34 versus official-base
+   cyankiwi AWQ on vLLM/SGLang, as pinned in the [checkpoint policy](../MODELS.md).
+   These are not identical weights. Match source model, tokenizer/template,
+   workload, hardware and precision controls; label remaining differences.
+   Compare plain decoding first, then explicitly labeled speculation/KV sweeps.
+2. **Warp-34 configuration comparison:** hold the HGPTQ target fixed while
+   comparing KV formats, speculation and parallelism. Deprecated in-house plain
+   GPTQ exports and AutoRound targets are not active warp-34 baselines. Archived
+   cross-quant measurements remain historical evidence only.
 
-Third-party replacement selection is **deferred**; it is not needed for this
-refresh and no publisher is being declared popular or equivalent. Require the same underlying model/version (not a
-fine-tune, uncensored derivative, or similarly named predecessor), pinned
+Require the same underlying model/version (not a fine-tune, uncensored
+derivative, or similarly named predecessor), pinned
 revision, quantization coverage/group sizes, tensor exclusions, tokenizer and
 chat template. For Flash-Next explicitly record PLE representation and size;
 FP8 PLE versus lut4 PLE materially changes host memory and paging. Record MTP

@@ -19,7 +19,7 @@ repetitions = 5
 
 [engine_defaults]
 support = "unverified"
-cohort = "27b-0df-identical-gptq"
+cohort = "27b-hgptq-vs-cyankiwi-awq"
 gpu_count = 1
 parallelism = "single"
 base_url = "http://127.0.0.1:18034/v1"
@@ -48,10 +48,15 @@ launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE
 id = "vllm-tp1-fp16"
 engine = "vllm"
 version = "0.31.0"
-model_revision = "e28c5f952bdd9abac6420ac3efad651b40d15eb5"
-weight_format = "GPTQ-int4-g128"
+model = "/home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5"
+model_revision = "e3a700906e6a73ba4290b1873dc2ba8198527ab5"
+tokenizer_revision = "e3a700906e6a73ba4290b1873dc2ba8198527ab5"
+artifact_sha256 = "unknown"
+chat_template_sha256 = "unknown"
+weight_format = "AWQ-int4-g32"
+quantization_details = "cyankiwi AWQ, asymmetric INT4 group-32, compressed-tensors pack-quantized"
 cache_config = "FP16 auto KV; FP32 SSM; prefix on; max sequences 8; prefill budget 1024; GPU budget .90; CPU offload 0"
-launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--SergiioB--Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16/snapshots/e28c5f952bdd9abac6420ac3efad651b40d15eb5 --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034"
+launch_command = "PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034"
 
 [[engines]]
 id = "llamacpp-tp1-fp16"
@@ -82,7 +87,7 @@ artifact_sha256 = "unknown; pinned download pending inventory"
 tokenizer_revision = "embedded ninfer"
 chat_template_sha256 = "unknown; native renderer"
 weight_format = "ninfer grouped_search mixed Q4/Q5"
-quantization_details = "Q4 embeddings Q6 head; not identical GPTQ"
+quantization_details = "Q4 embeddings Q6 head; not identical HGPTQ/AWQ weights"
 kv_format = "int8"
 cache_config = "int8 practical lane, not FP16 baseline; 8192 KV capacity; concurrency 8"
 launch_command = "CUDA_VISIBLE_DEVICES=0 /tmp/w34-benchmark-refs/ninfer-3090/build-linux/apps/ninfer-serve /home/nchapman/.cache/huggingface/hub/models--WarlaxZ--Qwen3.8-27B-NInfer-3090/snapshots/ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1/qwen3_8_27b.ninfer --model-id qwen38-ninfer --host 127.0.0.1 --port 18034 --max-context 8192 --kv-capacity 8192 --max-concurrency 8 --kv-dtype int8 --no-thinking"

@@ -1,13 +1,18 @@
 # Comparison campaigns
 
-## 27B FP16 — first comparison
+Active configurations follow the [checkpoint policy](../../MODELS.md): nchapman
+HGPTQ targets versus official-base cyankiwi AWQ competitors. Changed profiles
+require new qualification; archived metrics do not transfer to the new weights.
+
+## 27B FP16 — refreshed configuration, historical results
 
 - Configuration: [27b-fp16-first.toml](27b-fp16-first.toml)
-- Results: [27b-fp16-first.md](27b-fp16-first.md)
+- Historical results only: [27b-fp16-first.md](27b-fp16-first.md). These predate
+  the corrected checkpoint policy and are not results for the current TOML.
 - Machine: one RTX 3090 Ti, GPU 0; engines run serially.
-- Model: `nchapman/Qwen3.8-27B-W4A16-HGPTQ`, snapshot
-  `0df81eadcfd59601cb82ccece2f16ea7d39244bf`.
-- Precision: GPTQ INT4 weights, FP16 activations/KV/convolution history,
+- Models: nchapman HGPTQ for warp-34; cyankiwi AWQ for vLLM/SGLang, pinned
+  in the TOML. This is a practical cross-quant comparison, not identical weights.
+- Precision: INT4 weights, FP16 activations/KV/convolution history,
   FP32 recurrent SSM; no speculation or CPU offload.
 - Three measured repetitions, one warmup per case/repetition.
 
@@ -22,18 +27,21 @@ Each engine receives **96 measured requests** across 12 trials. Warmup and
 priming are retained separately. SGLang uses two profiles: eight active requests
 with radix caching off for unique-prompt decode/throughput, then its cached
 two-active profile for the C1 agent/prefill cases. Its eight-active cached mode
-OOMed during C8; that attempt is retained separately. Exact commands are in
-the TOML.
+OOMed during C8 with the historical checkpoint; that attempt is retained
+separately and says nothing about AWQ capacity. Current candidate commands are
+in the TOML; original commands remain in archived receipts.
 
-### Reproduce
+### Run a new comparison
 
 From the repository root, launch the selected profile's `launch_command`.
 Run one engine at a time, wait for readiness, then:
 
 ```sh
 cd benchmarks/perf
+python3 -m w34perf inventory /absolute/path/to/pinned/cyankiwi/snapshot \
+  --out results/cyankiwi-27b.inventory.json
 python3 -m w34perf preflight campaigns/27b-fp16-first.toml \
-  --engine sglang27-fp16-uncached --inventory qualification/27b-gptq-0df.inventory.json \
+  --engine sglang27-fp16-uncached --inventory results/cyankiwi-27b.inventory.json \
   --out results/my-comparison-sglang-preflight.json
 python3 -m w34perf run campaigns/27b-fp16-first.toml \
   --engine sglang27-fp16-uncached --gpus 1 --case decode-c1 --case throughput-c8 \
@@ -43,7 +51,8 @@ python3 -m w34perf report results/my-comparison-sglang
 
 Repeat with `sglang27-fp16-cached --case agent-c1 --case prefill-primed-c1` for
 the cached SGLang cases, then `vllm27-fp16` and `warp34-fp16` without case filters.
-Use fresh output paths for each profile.
+Use fresh output paths for each profile and a separate HGPTQ inventory for
+warp-34. Do not reuse retired GPTQ inventories for either checkpoint.
 
 ### Reported metrics
 

@@ -1,4 +1,9 @@
-# Short upstream evaluation tooling qualification
+# Historical short upstream evaluation tooling qualification
+
+This document records earlier pinned models and commands only. It is **not a
+baseline for new models** and does not qualify the current cyankiwi AWQ recipes.
+Historical metrics and artifact identities below are unchanged. For active
+recipes see [automation](AUTOMATION.md); the updated quality recipes remain unqualified.
 
 ## Outcome
 

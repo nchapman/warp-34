@@ -88,8 +88,8 @@ and offline validation does not qualify a serving profile.
 python3 -m w34perf plan campaigns/flash-next-hgptq.toml --preset quick
 ```
 
-The two-track plan is now shared plain-GPTQ cross-engine baselines, followed by
-HGPTQ versus the existing quant **within warp-34**. Flash-Next's older quant is
+Active cross-engine baselines compare warp-34 HGPTQ against cyankiwi
+ official-base AWQ on vLLM/SGLang: a practical comparison, not identical weights. Flash-Next's older quant is
 AutoRound W4A16 with FP8 PLE, not plain GPTQ. Keep historical campaigns intact;
 results from a different GPU/CPU/topology are not a controlled quant comparison.
 
@@ -238,17 +238,23 @@ local hashes versus remote-advertised hashes and unresolved provenance.
 
 ## Online preflight and 27B one-card probes
 
+Create a new inventory for the pinned AWQ snapshot (do not reuse archived GPTQ hashes):
+
+```sh
+python3 -m w34perf inventory /home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --out results/27b-cyankiwi-awq.inventory.json
+```
+
 After starting a server, verify a **trusted** inventory and its indexed shard
 references, then compare the configured model ID to `/v1/models`:
 
 ```sh
 python3 -m w34perf preflight qualification/27b-one-card.toml \
-  --engine vllm27-1-fp16-0df \
-  --inventory qualification/27b-gptq-0df.inventory.json \
+  --engine vllm27-1-fp16-awq \
+  --inventory results/27b-cyankiwi-awq.inventory.json \
   --out results/vllm27-preflight-001.json
 # Add --root /other/pinned-snapshot if local artifact bytes were relocated.
 python3 -m w34perf run qualification/27b-one-card.toml \
-  --engine vllm27-1-fp16-0df --gpus 1 --out results/vllm27-probe-001
+  --engine vllm27-1-fp16-awq --gpus 1 --out results/vllm27-probe-001
 ```
 
 Preflight is single-attempt, deadline/response-size bounded and exclusive-create.
@@ -264,18 +270,20 @@ or automatically attach evidence to a subsequent run. Keep inventory, preflight,
 startup log and run bundle together. Inventory/root paths remain trusted inputs.
 
 The checked-in [one-card preset](qualification/27b-one-card.toml) pins the newer
-GPTQ `0df81ea...` for C1, **offered C8**, four-turn agent replay and an added
+cyankiwi AWQ `e3a700906e6a73ba4290b1873dc2ba8198527ab5` for competitors
+and warp-34 HGPTQ `ae51987e3339a2a70070702548571e10fe8bcbc2` for C1,
+**offered C8**, four-turn agent replay and an added
 primed longer-prefill case, three repetitions and 64-token ceilings (32 for
 primed prefill). Earlier three-engine runs used only the original three cases;
 their raw manifests remain authoritative. The additional SGLang FP16 profile
 explicitly sets its supported `SGLANG_MAMBA_CONV_DTYPE=float16` environment
 option: `--dtype float16` alone does not change its default BF16 convolution
-history. FP32 recurrent SSM state remains separate. This is the **only current GPTQ
-candidate**: obsolete `c11a884...` was removed from the local cache and local
-`refs/main` now points to 0df. Old hashes/failures remain historical evidence,
+history. FP32 recurrent SSM state remains separate. These are practical deployment comparisons, not identical weights; new artifact
+and template hashes remain unknown until inventoried. The old GPTQ probes do
+not qualify these new profiles. Old hashes/failures remain historical evidence,
 not instructions to fetch or reuse c11. Never start these profiles
 simultaneously on the same GPU/port. See the [qualification ledger](qualification/27b-one-card.json)
-for startup failures and successful probes. SGLang's original BF16 probe is
+for historical GPTQ startup failures and successful probes, not AWQ results. SGLang's original BF16 probe is
 **not relabeled as FP16**: the separate explicit-convolution FP16 run passes
 **48/48 measured requests over 12 trials**, including six added longer-prefill
 requests. Both variants have active-request limit 2, so offered C8 includes server

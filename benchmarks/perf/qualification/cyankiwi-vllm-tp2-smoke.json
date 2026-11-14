@@ -1,0 +1,538 @@
+[
+  {
+    "label": "27b-plain",
+    "repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+    "revision": "e3a700906e6a73ba4290b1873dc2ba8198527ab5",
+    "command": [
+      "vllm",
+      "serve",
+      "/home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5",
+      "--served-model-name",
+      "cyankiwi-smoke",
+      "--dtype",
+      "half",
+      "--tensor-parallel-size",
+      "2",
+      "--language-model-only",
+      "--max-model-len",
+      "16384",
+      "--max-num-seqs",
+      "8",
+      "--max-num-batched-tokens",
+      "2048",
+      "--gpu-memory-utilization",
+      "0.90",
+      "--mamba-ssm-cache-dtype",
+      "float32",
+      "--enable-prefix-caching",
+      "--enable-prompt-tokens-details",
+      "--generation-config",
+      "vllm",
+      "--seed",
+      "34",
+      "--cudagraph-capture-sizes",
+      "1",
+      "2",
+      "4",
+      "8",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18836"
+    ],
+    "passed": true,
+    "replies": [
+      {
+        "id": "chatcmpl-b1467b999de60a37",
+        "object": "chat.completion",
+        "created": 1794675149,
+        "model": "cyankiwi-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "4",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.31.0-tp2-d3b4a229",
+        "usage": {
+          "prompt_tokens": 23,
+          "total_tokens": 25,
+          "completion_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      },
+      {
+        "id": "chatcmpl-a3c52032775cf9fa",
+        "object": "chat.completion",
+        "created": 1794675149,
+        "model": "cyankiwi-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "4",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.31.0-tp2-d3b4a229",
+        "usage": {
+          "prompt_tokens": 23,
+          "total_tokens": 25,
+          "completion_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      }
+    ]
+  },
+  {
+    "label": "27b-mtp3",
+    "repo": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+    "revision": "e3a700906e6a73ba4290b1873dc2ba8198527ab5",
+    "command": [
+      "vllm",
+      "serve",
+      "/home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5",
+      "--served-model-name",
+      "cyankiwi-smoke",
+      "--dtype",
+      "half",
+      "--tensor-parallel-size",
+      "2",
+      "--language-model-only",
+      "--max-model-len",
+      "16384",
+      "--max-num-seqs",
+      "8",
+      "--max-num-batched-tokens",
+      "2048",
+      "--gpu-memory-utilization",
+      "0.90",
+      "--mamba-ssm-cache-dtype",
+      "float32",
+      "--enable-prefix-caching",
+      "--enable-prompt-tokens-details",
+      "--generation-config",
+      "vllm",
+      "--seed",
+      "34",
+      "--cudagraph-capture-sizes",
+      "1",
+      "2",
+      "4",
+      "8",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18836",
+      "--speculative-config",
+      "{\"method\":\"mtp\",\"num_speculative_tokens\":3}"
+    ],
+    "passed": true,
+    "replies": [
+      {
+        "id": "chatcmpl-90aae314ba9c9873",
+        "object": "chat.completion",
+        "created": 1794675261,
+        "model": "cyankiwi-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "4",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.31.0-tp2-5d218126",
+        "usage": {
+          "prompt_tokens": 23,
+          "total_tokens": 25,
+          "completion_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      },
+      {
+        "id": "chatcmpl-a454fc2f2cc8c49a",
+        "object": "chat.completion",
+        "created": 1794675261,
+        "model": "cyankiwi-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "4",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.31.0-tp2-5d218126",
+        "usage": {
+          "prompt_tokens": 23,
+          "total_tokens": 25,
+          "completion_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      }
+    ]
+  },
+  {
+    "label": "35b-plain",
+    "repo": "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit",
+    "revision": "f1e8415c4f29508fe281da4e256df26573213bfd",
+    "command": [
+      "vllm",
+      "serve",
+      "/home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.6-35B-A3B-AWQ-4bit/snapshots/f1e8415c4f29508fe281da4e256df26573213bfd",
+      "--served-model-name",
+      "cyankiwi-smoke",
+      "--dtype",
+      "half",
+      "--tensor-parallel-size",
+      "2",
+      "--language-model-only",
+      "--max-model-len",
+      "16384",
+      "--max-num-seqs",
+      "8",
+      "--max-num-batched-tokens",
+      "2048",
+      "--gpu-memory-utilization",
+      "0.90",
+      "--mamba-ssm-cache-dtype",
+      "float32",
+      "--enable-prefix-caching",
+      "--enable-prompt-tokens-details",
+      "--generation-config",
+      "vllm",
+      "--seed",
+      "34",
+      "--cudagraph-capture-sizes",
+      "1",
+      "2",
+      "4",
+      "8",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18836"
+    ],
+    "passed": true,
+    "replies": [
+      {
+        "id": "chatcmpl-95a4bd1ab418b201",
+        "object": "chat.completion",
+        "created": 1794675369,
+        "model": "cyankiwi-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "4",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.31.0-tp2-9c3c263d",
+        "usage": {
+          "prompt_tokens": 23,
+          "total_tokens": 25,
+          "completion_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      },
+      {
+        "id": "chatcmpl-b0c3ce1ce1834e83",
+        "object": "chat.completion",
+        "created": 1794675369,
+        "model": "cyankiwi-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "4",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.31.0-tp2-9c3c263d",
+        "usage": {
+          "prompt_tokens": 23,
+          "total_tokens": 25,
+          "completion_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      }
+    ]
+  },
+  {
+    "label": "35b-mtp3",
+    "repo": "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit",
+    "revision": "f1e8415c4f29508fe281da4e256df26573213bfd",
+    "command": [
+      "vllm",
+      "serve",
+      "/home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.6-35B-A3B-AWQ-4bit/snapshots/f1e8415c4f29508fe281da4e256df26573213bfd",
+      "--served-model-name",
+      "cyankiwi-smoke",
+      "--dtype",
+      "half",
+      "--tensor-parallel-size",
+      "2",
+      "--language-model-only",
+      "--max-model-len",
+      "16384",
+      "--max-num-seqs",
+      "8",
+      "--max-num-batched-tokens",
+      "2048",
+      "--gpu-memory-utilization",
+      "0.90",
+      "--mamba-ssm-cache-dtype",
+      "float32",
+      "--enable-prefix-caching",
+      "--enable-prompt-tokens-details",
+      "--generation-config",
+      "vllm",
+      "--seed",
+      "34",
+      "--cudagraph-capture-sizes",
+      "1",
+      "2",
+      "4",
+      "8",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18836",
+      "--speculative-config",
+      "{\"method\":\"mtp\",\"num_speculative_tokens\":3}"
+    ],
+    "passed": true,
+    "replies": [
+      {
+        "id": "chatcmpl-81b71f9688bbd6d4",
+        "object": "chat.completion",
+        "created": 1794675491,
+        "model": "cyankiwi-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "4",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.31.0-tp2-18a6b86c",
+        "usage": {
+          "prompt_tokens": 23,
+          "total_tokens": 25,
+          "completion_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      },
+      {
+        "id": "chatcmpl-acaacae4732a85d6",
+        "object": "chat.completion",
+        "created": 1794675491,
+        "model": "cyankiwi-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "4",
+              "refusal": null,
+              "annotations": null,
+              "audio": null,
+              "function_call": null,
+              "reasoning": null
+            },
+            "logprobs": null,
+            "finish_reason": "stop",
+            "stop_reason": null,
+            "token_ids": null,
+            "routed_experts": null
+          }
+        ],
+        "service_tier": null,
+        "system_fingerprint": "vllm-0.31.0-tp2-18a6b86c",
+        "usage": {
+          "prompt_tokens": 23,
+          "total_tokens": 25,
+          "completion_tokens": 2,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "completion_tokens_details": null
+        },
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "prompt_text": null,
+        "kv_transfer_params": null,
+        "ec_transfer_params": null,
+        "metrics": null
+      }
+    ]
+  }
+]

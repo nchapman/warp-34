@@ -3,9 +3,12 @@
 **Historical evidence:** these completed checks used TQ4 for warp-34. The new
 cross-engine baseline uses FP16 KV throughout; see [automation](AUTOMATION.md).
 Do not relabel the results below as FP16 results. Commands here preserve the
-original configurations.
+original configurations **for historical reference only**, not active runnable
+recipes or a baseline for new models. Do not use the old GPTQ commands for new
+runs. Use [suite.toml](suite.toml) and [automation](AUTOMATION.md) for the active
+HGPTQ/AWQ/GGUF recipes; those TP1 AWQ quality configurations remain unqualified.
 
-The primary user-facing configuration is **one 24GB RTX 3090, a 4K context,
+The historical configuration was **one 24GB RTX 3090, a 4K context,
 one active evaluation request, and 10 examples per task**, across warp-34,
 llama.cpp, vLLM and SGLang. These are short workflow checks, not comparative
 quality scores or throughput measurements. The previous [TP2 recipes](servers.md)

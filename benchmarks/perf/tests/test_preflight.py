@@ -179,16 +179,35 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(digest(inventory["files"]), inventory["inventory_sha256"])
         runnable = [e for e in cfg["engines"] if e["enabled"]]
         self.assertEqual(len(runnable), 4)
-        self.assertEqual({e["artifact_sha256"] for e in runnable}, {inventory["inventory_sha256"]})
-        self.assertEqual({e["model_revision"] for e in runnable}, {"0df81eadcfd59601cb82ccece2f16ea7d39244bf"})
+        self.assertEqual({e["artifact_sha256"] for e in runnable}, {"unknown"})
+        self.assertEqual({e["chat_template_sha256"] for e in runnable}, {"unknown"})
+        for e in runnable:
+            warp = e["engine"] == "warp-34"
+            revision = ("ae51987e3339a2a70070702548571e10fe8bcbc2" if warp else
+                        "e3a700906e6a73ba4290b1873dc2ba8198527ab5")
+            repo = ("models--nchapman--Qwen3.8-27B-W4A16-HGPTQ" if warp else
+                    "models--cyankiwi--Qwen3.8-27B-AWQ-INT4")
+            self.assertEqual(e["model_revision"], revision)
+            self.assertEqual(e["tokenizer_revision"], revision)
+            self.assertIn(repo + "/snapshots/" + revision, e["launch_command"])
+            self.assertNotIn("0df", e["id"])
+            if warp:
+                self.assertIn("--model " + e["model"], e["launch_command"])
+            else:
+                self.assertIn("--served-model-name " + e["model"], e["launch_command"])
+                self.assertIn("asymmetric int4 g32", e["quantization_details"])
         self.assertEqual({e["kv_format"] for e in runnable}, {"bf16", "fp16", "fp16-auto"})
         fp16_sglang = next(e for e in runnable if e["engine"] == "sglang" and e["activation_dtype"] == "float16")
         self.assertEqual(fp16_sglang["conv_state_dtype"], "float16")
         self.assertIn("-e SGLANG_MAMBA_CONV_DTYPE=float16", fp16_sglang["launch_command"])
-        snapshot_arg = "--model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/" + fp16_sglang["model_revision"]
+        snapshot_arg = "--model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/" + fp16_sglang["model_revision"]
         self.assertIn(snapshot_arg, fp16_sglang["launch_command"])
         failed = [e for e in cfg["engines"] if not e["enabled"]]
         self.assertEqual(len(failed), 2)
+        historical = next(e for e in failed if "0df-failed" in e["id"])
+        self.assertEqual(historical["artifact_sha256"], inventory["inventory_sha256"])
+        self.assertEqual(historical["model_revision"], "0df81eadcfd59601cb82ccece2f16ea7d39244bf")
+        self.assertTrue(all(e["weight_format"] == "compressed-tensors-GPTQ-int4" for e in failed))
         self.assertTrue(all(e["skip_reason"].startswith("Observed") for e in failed))
         old_failure = next(e for e in failed if "c11-failed" in e["id"])
         self.assertNotEqual(old_failure["artifact_sha256"], inventory["inventory_sha256"])

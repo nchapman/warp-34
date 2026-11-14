@@ -1,7 +1,8 @@
-# Historical TP2 server recipes for short tooling checks
+# TP2 server recipes — updated, not yet qualified
 
-The primary user-facing recipes are now [single-GPU 27B](single-gpu.md).
-This page preserves the earlier TP2 setups. Their archived run configurations
+The primary user-facing recipes are now the [automated single-GPU suite](AUTOMATION.md).
+These runnable TP2 recipes now select cyankiwi AWQ and have not been live-tested.
+Earlier GPTQ qualification is historical, not a baseline for the new models. Their archived run configurations
 record an 8K client context; the shared YAML now records 4K for the new single-GPU
 checks. Use the archived configuration to reproduce an old receipt exactly.
 
@@ -11,7 +12,7 @@ wait for `/v1/models` to return `warp34-quality`, then run both tasks. Do not
 infer readiness solely from one server's log wording. Bind to localhost.
 
 These are integration checks, **not a matched quality or performance comparison**:
-warp-34 uses HGPTQ/TQ4; the donor checks use regular GPTQ/native KV. MTP uses
+warp-34 uses HGPTQ/TQ4; the donor checks use cyankiwi AWQ/native KV. MTP uses
 built-in target weights, not a separately chosen DFlash2 model. MTP flag syntax
 and implementation differ by server.
 
@@ -31,9 +32,9 @@ These pin server releases, not all server dependencies. Preserve `uv pip freeze`
 for each server in the run receipt. The evaluator has its own hashed dependency
 lock. No Docker-in-Docker or driver changes are required.
 
-For the donor commands below, `MODEL` is an absolute local snapshot path for
-`SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16` revision
-`e28c5f952bdd9abac6420ac3efad651b40d15eb5`. This is **not** the HGPTQ checkpoint
+For the donor commands below, `AWQ` is an absolute local snapshot path for
+`cyankiwi/Qwen3.8-27B-AWQ-INT4` revision
+`e3a700906e6a73ba4290b1873dc2ba8198527ab5`. This is **not** the HGPTQ checkpoint
 used by the initial warp-34 checks. The [README](README.md) gives warp-34's
 HGPTQ/MTP-3 command. Retain exact snapshot identities even though the API alias
 is shared.
@@ -41,13 +42,13 @@ is shared.
 ```sh
 export PATH="/usr/local/cuda/bin:$PATH"
 export HF_HOME=/workspace/.hf_home
-export MODEL="$HF_HOME/hub/models--SergiioB--Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16/snapshots/e28c5f952bdd9abac6420ac3efad651b40d15eb5"
+export AWQ="$HF_HOME/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5"
 ```
 
 ## vLLM 0.31.0 — 27B TP2/MTP-3
 
 ```sh
-CUDA_VISIBLE_DEVICES=0,1 /workspace/vllm-venv/bin/vllm serve "$MODEL" \
+CUDA_VISIBLE_DEVICES=0,1 /workspace/vllm-venv/bin/vllm serve "$AWQ" \
   --served-model-name warp34-quality --dtype half --tensor-parallel-size 2 \
   --language-model-only --max-model-len 8192 --max-num-seqs 8 \
   --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90 \
@@ -56,19 +57,22 @@ CUDA_VISIBLE_DEVICES=0,1 /workspace/vllm-venv/bin/vllm serve "$MODEL" \
   --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
 ```
 
-The short check completed with 20 successful requests. Initial compilation and
-model loading are separate from the small evaluation workload.
+AWQ uses compressed-tensors pack-quantized 4-bit asymmetric group32 weights.
+Unquantized MTP weights are present. A separate [16K-context vLLM TP2 smoke](../perf/qualification/cyankiwi-vllm-tp2-smoke.md)
+passed startup and short generation in plain/MTP-3 modes, but does not qualify
+this exact recipe or evaluation workload. Historical successful requests do not
+qualify this changed recipe.
 
 ## SGLang 0.5.19 — 27B TP2/native MTP probe
 
-This recipe passed the 20-request tooling check; that does not qualify other
-GPTQ/MTP combinations. SGLang exposes this native MTP path via EAGLE flags and
+This updated recipe has not passed a live tooling check. SGLang exposes this
+native MTP path via EAGLE flags and
 the same target snapshot as the draft path:
 
 ```sh
 CUDA_VISIBLE_DEVICES=0,1 SGLANG_MAMBA_CONV_DTYPE=float16 \
   /workspace/sglang-venv/bin/python -m sglang.launch_server \
-  --model-path "$MODEL" --served-model-name warp34-quality \
+  --model-path "$AWQ" --served-model-name warp34-quality \
   --dtype float16 --tp-size 2 --context-length 8192 \
   --mamba-ssm-dtype float32 --mem-fraction-static 0.88 \
   --chunked-prefill-size 1024 --max-running-requests 8 --max-mamba-cache-size 32 \
@@ -77,7 +81,7 @@ CUDA_VISIBLE_DEVICES=0,1 SGLANG_MAMBA_CONV_DTYPE=float16 \
   --random-seed 34 --host 127.0.0.1 --port 18034 \
   --speculative-algorithm EAGLE --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-  --speculative-draft-model-path "$MODEL"
+  --speculative-draft-model-path "$AWQ"
 ```
 
 `SGLANG_MAMBA_CONV_DTYPE=float16` keeps convolution-cache dtype consistent with

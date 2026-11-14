@@ -12,34 +12,34 @@ timeout_s = 180
 
 [engine_defaults]
 support = "unverified"
-cohort = "same-gptq-0df-native16-qualification"
+cohort = "practical-hgptq-vs-cyankiwi-awq-native16-qualification"
 gpu_count = 1
 gpu_ids = "GPU-5327e569-682f-42dc-5cb1-7a0e35373ba3"
 parallelism = "single"
 base_url = "http://127.0.0.1:18034/v1"
-model = "qwen38-gptq"
-model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model = "qwen38-awq"
+model_revision = "e3a700906e6a73ba4290b1873dc2ba8198527ab5"
 source_model_revision = "unknown"
-artifact_sha256 = "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03"
-tokenizer_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
-chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
-weight_format = "compressed-tensors-GPTQ-int4"
-quantization_details = "g128 symmetric static actorder; vision/MTP/lm_head and GDN a/b projections unquantized; full inventory includes unused sidecars"
+artifact_sha256 = "unknown"
+tokenizer_revision = "e3a700906e6a73ba4290b1873dc2ba8198527ab5"
+chat_template_sha256 = "unknown"
+weight_format = "compressed-tensors-AWQ-int4"
+quantization_details = "cyankiwi official-base AWQ; asymmetric int4 g32 compressed-tensors; not identical weights to warp-34 HGPTQ"
 speculation = "none"
 request_overrides = {chat_template_kwargs = {enable_thinking = false}}
 
 [[engines]]
-id = "sglang27-1-bf16-0df"
+id = "sglang27-1-bf16-awq"
 engine = "sglang"
 version = "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1"
 container = "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9"
 activation_dtype = "bfloat16"
 kv_format = "bf16"
 cache_config = "BF16 KV 16384-token requested pool; FP32 SSM; 12 Mamba slots; max active 2; prefix/radix on; CPU offload 0; vision loaded; actual pools in startup log"
-launch_command = "docker run --rm --name w34-perf-sglang27-q4-bf16 --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-gptq --dtype bfloat16 --tp-size 1 --context-length 8192 --max-running-requests 2 --max-mamba-cache-size 12 --mamba-ssm-dtype float32 --max-total-tokens 16384 --mem-fraction-static 0.90 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 --cuda-graph-bs-prefill 512 1024 2048 --cpu-offload-gb 0 --random-seed 34 --host 0.0.0.0 --port 18034"
+launch_command = "docker run --rm --name w34-perf-sglang27-q4-bf16 --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-awq --dtype bfloat16 --tp-size 1 --context-length 8192 --max-running-requests 2 --max-mamba-cache-size 12 --mamba-ssm-dtype float32 --max-total-tokens 16384 --mem-fraction-static 0.90 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 --cuda-graph-bs-prefill 512 1024 2048 --cpu-offload-gb 0 --random-seed 34 --host 0.0.0.0 --port 18034"
 
 [[engines]]
-id = "sglang27-1-fp16-conv16-0df"
+id = "sglang27-1-fp16-conv16-awq"
 engine = "sglang"
 version = "0.5.19@0bcd822377da7b5718e674eaf9c870d349424dd1"
 container = "lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9"
@@ -47,32 +47,40 @@ activation_dtype = "float16"
 conv_state_dtype = "float16"
 kv_format = "fp16"
 cache_config = "FP16 KV and convolution history; FP32 SSM; 16384-token requested KV pool; 12 Mamba slots; max active 2; prefix/radix on; CPU offload 0; vision loaded"
-launch_command = "docker run --rm --name w34-perf-sglang27-q6-fp16-conv16 --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-gptq --dtype float16 --tp-size 1 --context-length 8192 --max-running-requests 2 --max-mamba-cache-size 12 --mamba-ssm-dtype float32 --max-total-tokens 16384 --mem-fraction-static 0.90 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 --cuda-graph-bs-prefill 512 1024 2048 --cpu-offload-gb 0 --random-seed 34 --host 0.0.0.0 --port 18034"
+launch_command = "docker run --rm --name w34-perf-sglang27-q6-fp16-conv16 --gpus device=0 --shm-size 2g -p 127.0.0.1:18034:18034 -v /home/nchapman/.cache/huggingface/hub:/models/hub:ro -e HF_HUB_CACHE=/models/hub -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e SGLANG_MAMBA_CONV_DTYPE=float16 --entrypoint python3 lmsysorg/sglang@sha256:d6e7288627be8b02be88e4bba38e73f6d50e2826869f753c13a4c4385ab3eda9 -m sglang.launch_server --model-path /models/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-awq --dtype float16 --tp-size 1 --context-length 8192 --max-running-requests 2 --max-mamba-cache-size 12 --mamba-ssm-dtype float32 --max-total-tokens 16384 --mem-fraction-static 0.90 --chunked-prefill-size 2048 --cuda-graph-bs-decode 1 2 --cuda-graph-bs-prefill 512 1024 2048 --cpu-offload-gb 0 --random-seed 34 --host 0.0.0.0 --port 18034"
 
 [[engines]]
-id = "vllm27-1-fp16-0df"
+id = "vllm27-1-fp16-awq"
 engine = "vllm"
 version = "0.31.0"
 activation_dtype = "float16"
 kv_format = "fp16-auto"
 cache_config = "FP16 auto KV; FP32 SSM; prefix cache on; max context 8192 / active 8 / batched tokens 2048; GPU budget 0.90; CPU offload 0; language-model-only"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --served-model-name qwen38-gptq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 vllm serve /home/nchapman/.cache/huggingface/hub/models--cyankiwi--Qwen3.8-27B-AWQ-INT4/snapshots/e3a700906e6a73ba4290b1873dc2ba8198527ab5 --served-model-name qwen38-awq --dtype half --tensor-parallel-size 1 --language-model-only --max-model-len 8192 --max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.90 --kv-cache-dtype auto --mamba-ssm-cache-dtype float32 --cpu-offload-gb 0 --generation-config vllm --seed 34 --cudagraph-capture-sizes 1 2 4 8 --host 127.0.0.1 --port 18034"
 
 [[engines]]
-id = "warp34-1-fp16-0df"
+id = "warp34-1-fp16-hgptq"
+model_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+tokenizer_revision = "ae51987e3339a2a70070702548571e10fe8bcbc2"
+weight_format = "compressed-tensors-HGPTQ-int4"
+quantization_details = "HGPTQ W4A16; symmetric int4 g128; not identical weights to cyankiwi AWQ"
 engine = "warp-34"
 version = "c9abf0f; binary sha256 25a2877a246a91b759ffcf77488b060fe34e63f6908a5f29067fe047f92c3d79"
-model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+model = "/home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2"
 activation_dtype = "float16"
 kv_format = "fp16"
 cache_config = "FP16 KV 1024 pages (16384 tokens); FP32 SSM; built-in radix/scheduler/graphs; no CPU weight offload; default serving admission"
 rendering_note = "Built-in ChatML renderer, not artifact Jinja execution; template hash identifies stored artifact only, not token-aligned rendering"
-launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/0df81eadcfd59601cb82ccece2f16ea7d39244bf --tp 1 --kv-format fp16 --kv-pages 1024 --host 127.0.0.1 --port 18034"
+launch_command = "env PATH=/opt/cuda/bin:$PATH CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ./target/release/w34 serve --model /home/nchapman/.cache/huggingface/hub/models--nchapman--Qwen3.8-27B-W4A16-HGPTQ/snapshots/ae51987e3339a2a70070702548571e10fe8bcbc2 --tp 1 --kv-format fp16 --kv-pages 1024 --host 127.0.0.1 --port 18034"
 
 # Failed variants remain explicit, not swapped in-place or asserted globally unsupported.
 # c11 is historical only: its local snapshot/blobs were retired. Do not re-enable it.
 [[engines]]
 id = "sglang27-1-fp16-c11-failed"
+cohort = "historical-same-gptq-qualification"
+model = "qwen38-gptq"
+weight_format = "compressed-tensors-GPTQ-int4"
+chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
 engine = "sglang"
 model_revision = "c11a884fe4b659eccdce66761f26d3775cf7696c"
 tokenizer_revision = "c11a884fe4b659eccdce66761f26d3775cf7696c"
@@ -83,6 +91,14 @@ skip_reason = "Observed startup failure: c11 quantized width 96 fails Marlin rep
 
 [[engines]]
 id = "sglang27-1-fp16-0df-failed"
+cohort = "historical-same-gptq-qualification"
+model = "qwen38-gptq"
+model_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+tokenizer_revision = "0df81eadcfd59601cb82ccece2f16ea7d39244bf"
+artifact_sha256 = "82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03"
+chat_template_sha256 = "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2"
+weight_format = "compressed-tensors-GPTQ-int4"
+quantization_details = "g128 symmetric static actorder; vision/MTP/lm_head and GDN a/b projections unquantized; full inventory includes unused sidecars"
 engine = "sglang"
 enabled = false
 skip_reason = "Observed FP16 startup failure: Triton GDN convolution has mismatched BF16/FP16 branches; see 27b-one-card.json"

@@ -10,7 +10,8 @@ Produce regularly refreshable, shareable comparisons against **vLLM, SGLang,
 llama.cpp, and Don-Chad/ninfer-3090**, independent of development oracles.
 Primary hardware: one and two RTX 3090 **Ti** 24 GB cards; no NVLink/P2P.
 **4-bit weights are the common ground**, with best practical equivalents for
-GGUF/`.ninfer` and identical GPTQ wherever possible. KV precision is a separate
+GGUF/`.ninfer`; active warp-34 HGPTQ versus cyankiwi official-base AWQ
+on vLLM/SGLang is a practical comparison, not identical weights. KV precision is a separate
 axis. No oracle dependencies, tensor parity, donor patches, or `nsys` requirements.
 
 A standalone suite is a product with its own fixtures, configuration, evidence,
@@ -24,9 +25,9 @@ Two explicitly separated comparisons:
 1. **4-bit deployment equivalents (primary):** one common source-model revision,
    approximately matched quantization/quality and full artifact provenance.
    Baseline KV + speculation off, then independent KV/speculation sweeps.
-2. **Same-artifact subset (controlled):** engines that accept the identical GPTQ
-   weights/tokenizer/template. This isolates more implementation differences;
-   it is not a universal five-engine comparison.
+2. **Historical same-artifact subset (controlled):** retain old identical-GPTQ
+   evidence without relabeling it as HGPTQ or AWQ. Active baselines use our HGPTQ
+   versus cyankiwi AWQ, with independent quality/provenance qualification.
 
 Don't issue one composite winner score. Report latency, throughput, goodput,
 capacity, quality, and resource tradeoffs separately. Tuning runs are not
@@ -39,7 +40,7 @@ Retain all failed, unsupported, and untested cells rather than dropping them.
 | Axis | Campaign targets |
 |---|---|
 | Source models | Mutually supported 27B dense first; then 4B, 9B, 35B-A3B MoE where supported |
-| Weights | GPTQ INT4 g128 shared subset; nearest independently qualified GGUF Q4 / ninfer 4-bit variants |
+| Weights | warp-34 HGPTQ; vLLM/SGLang cyankiwi official-base AWQ INT4 g32 asymmetric; independently qualified GGUF Q4 / ninfer variants |
 | GPUs | 1 card; 2 cards using documented TP/layer/pipeline strategy; separate 2× single-card replicas later |
 | KV | Native 16-bit baseline (label FP16/BF16); qualified 8-bit, 4-bit, mixed policies; no FP8 support assumptions on sm_86 |
 | Speculation | Off; native MTP; DFlash2 where supported, with pinned proposer and block settings |
@@ -300,7 +301,13 @@ explicitly documented as HTTP responsiveness in the repository README.
   rendered Markdown/CSV for all three runs. `git diff --check` passes and GPUs
   are free. Raw evidence remains in `/tmp`; archive before any public release.
 
-## Retire obsolete GPTQ cache revision
+## Historical: retire obsolete GPTQ cache revision
+
+Superseded for active runs: `qualification/27b-one-card.toml` now pins cyankiwi
+AWQ `e3a700906e6a73ba4290b1873dc2ba8198527ab5` for vLLM/SGLang and our
+HGPTQ `ae51987e3339a2a70070702548571e10fe8bcbc2` for warp-34. Generate new
+inventories/template hashes; old GPTQ receipts below are historical only and
+provide no AWQ qualification. No identical-weight claim applies.
 
 - User-directed policy: **use only `0df81eadcfd59601cb82ccece2f16ea7d39244bf`
   for current GPTQ runs**. Older c11 results/failure cells/golden provenance stay

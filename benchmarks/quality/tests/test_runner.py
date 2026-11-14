@@ -63,6 +63,37 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('--speculative-algorithm', c['engines']['sglang']['command'])
         self.assertEqual(c['engines']['llama']['command'].count('f16'), 4)
 
+    def test_pinned_model_selection(self):
+        engines = r.tomllib.loads((r.HERE / 'suite.toml').read_text())['engines']
+        expected = {
+            'warp': ('HGPTQ', '1de743eedefdb7422e6b171174c7080204f5b005'),
+            'vllm': ('AWQ', 'e3a700906e6a73ba4290b1873dc2ba8198527ab5'),
+            'sglang': ('AWQ', 'e3a700906e6a73ba4290b1873dc2ba8198527ab5'),
+            'llama': ('GGUF', '4ca720788d1e01f1bff70c033e0d0028fd02e502'),
+        }
+        for engine, (variable, revision) in expected.items():
+            with self.subTest(engine=engine):
+                self.assertEqual(engines[engine]['revision'], revision)
+                self.assertEqual(len(revision), 40)
+                command = ' '.join(engines[engine]['command'])
+                self.assertIn('${' + variable + '}', command)
+                self.assertNotIn('${GPTQ}', command)
+                with patch.dict(os.environ, {variable: '/pinned/' + variable}, clear=True):
+                    model_arg = next(x for x in engines[engine]['command']
+                                     if '${' + variable + '}' in x)
+                    self.assertTrue(r.expand(model_arg).startswith('/pinned/' + variable))
+
+    def test_active_recipes_have_no_old_model_refs(self):
+        import re
+        for name in ('suite.toml', 'AUTOMATION.md', 'servers.md', 'README.md'):
+            text = (r.HERE / name).read_text()
+            active = text if name.endswith('.toml') else '\n'.join(
+                re.findall(r'```(?:sh)?\n(.*?)```', text, re.S))
+            for old in ('${GPTQ}', '$GPTQ', 'export GPTQ=', 'SergiioB',
+                        'e28c5f952bdd9abac6420ac3efad651b40d15eb5',
+                        'nchapman/Qwen3.8-27B-W4A16-GPTQ'):
+                self.assertNotIn(old, active, name)
+
     def test_unresolved_and_limits(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(ValueError):

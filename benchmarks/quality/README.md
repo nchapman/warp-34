@@ -17,8 +17,12 @@ Use the [automated FP16-KV suite](AUTOMATION.md) to run warp-34,
 llama.cpp/Unsloth, vLLM and SGLang sequentially with one command. The checked-in
 runner manages server lifecycle and invokes the unchanged upstream CLI; it is
 not an evaluator adapter. Earlier [mixed-KV single-GPU checks](single-gpu.md),
-[TP2 qualification](QUALIFICATION.md) and [TP2 recipes](servers.md) remain
-historical records, not FP16-suite results.
+and [TP2 qualification](QUALIFICATION.md) remain historical records, not a baseline
+for new models. The active suite uses nchapman HGPTQ for warp-34 and cyankiwi AWQ
+for vLLM/SGLang. These quality recipes still need requalification; old results
+do not transfer. A separate [vLLM TP2 smoke](../perf/qualification/cyankiwi-vllm-tp2-smoke.md)
+passed startup/short generation, not quality evaluation. [Updated TP2 recipes](servers.md)
+with different limits likewise remain unqualified.
 
 ## Exact evaluator and tasks
 

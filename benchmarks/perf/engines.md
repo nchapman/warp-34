@@ -11,7 +11,8 @@ that all 4-bit formats use exactly four bits/parameter or have equal quality.
    Qwen revision; verify ninfer artifact provenance before picking the exact one.
    The 4B GPTQ entries in `suite.toml` are practical local smoke examples, **not**
    a qualified match for the ninfer/placeholder GGUF entries.
-2. Use the same GPTQ INT4 artifact for warp-34/vLLM/SGLang where supported.
+2. Use our HGPTQ for warp-34 and cyankiwi official-base AWQ for active
+   vLLM/SGLang baselines. This is a practical comparison, not identical weights.
    Target symmetric group-size 128 if compatible. Pin every shard, scale, config,
    tokenizer, template, and any native MTP/draft sidecar with a SHA-256 inventory.
 3. For llama.cpp choose the nearest **Q4_K_M or Q4_0** GGUF candidate based on
@@ -27,7 +28,7 @@ that all 4-bit formats use exactly four bits/parameter or have equal quality.
    functional tasks/long-context retrieval. This must not import development
    oracle outputs or grant a quality pass from matching a format label.
 6. Publish size and quality alongside speed. Equivalent 4-bit deployments answer
-   "what can users run on this hardware?"; a same-GPTQ subset can additionally
+   "what can users run on this hardware?"; a separately designed historical same-artifact subset can additionally
    isolate implementation differences. Keep these claims distinct.
 
 `model_revision` is the quantized artifact revision; `source_model_revision` is
@@ -95,7 +96,7 @@ advertised values, not verification of local GGUF/ninfer bytes.
 
 | Artifact | Immutable revision | Bytes | Status |
 |---|---|---:|---|
-| `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `0df81eadcfd59601cb82ccece2f16ea7d39244bf` | 19,610,855,960 (13 visible files incl. sidecars/tokenizer/template) | **Current GPTQ candidate**; full inventory re-verified after old-cache removal |
+| `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `0df81eadcfd59601cb82ccece2f16ea7d39244bf` | 19,610,855,960 (13 visible files incl. sidecars/tokenizer/template) | **Historical GPTQ candidate (not HGPTQ despite the renamed repo label)**; full inventory re-verified after old-cache removal |
 | Same repo, obsolete quant | `c11a884fe4b659eccdce66761f26d3775cf7696c` | 19,438,009,793 (historical inventory) | **Retired/deleted locally**; historical evidence only |
 | `WarlaxZ/Qwen3.8-27B-NInfer-3090/qwen3_8_27b.ninfer` | `ea90e8766354c723e6bd0cf0ed731d5d71ce5fa1` | 18,982,458,624 | 3090-specific candidate, not downloaded |
 | `unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` | 16,464,440,224 | Candidate, not downloaded |
@@ -114,7 +115,7 @@ The cached GPTQ README/recipe/config name the base repo but **do not record its
 source commit**. Do not fill `source_model_revision` from the model name, a current
 HF ref, or the NInfer card. The newer cached GPTQ `0df81ea...` is a different
 artifact with changed model bytes/index and an extra Q4 MTP sidecar; don't silently
-interchange them. **Only `0df81ea...` is approved for current GPTQ runs.** The
+interchange them. **This is historical GPTQ provenance, not current run guidance.** The
 obsolete `c11a88...` snapshot and unshared blobs were deleted locally, reclaiming
 18.6 GB; shared tokenizer/template/MTP blobs were preserved. The stale local
 `refs/main` was changed from c11 to 0df, so offline repo-ID resolution also uses
@@ -125,12 +126,12 @@ The tokenizer and froggeric v22.5 template differ from the official base
 metadata and need explicit alignment/audit. A same-artifact GPTQ smoke is valid
 without claiming cross-format source/quality equivalence.
 
-Current local inventory is [`qualification/27b-gptq-0df.inventory.json`](qualification/27b-gptq-0df.inventory.json),
+Historical GPTQ inventory is [`qualification/27b-gptq-0df.inventory.json`](qualification/27b-gptq-0df.inventory.json),
 stable hash `82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03`.
 Old `/tmp/w34-perf-27b-gptq-inventory.json` and hash
 `cfef8c491913394b330a74c92a1738a474e9e04e09d4f2cd422b0ad7cd8f2cf2`
 are **historical c11 evidence**, not an inventory to use for new runs.
-Retain the full current inventory with future run bundles. Inventory includes sidecars, so its total size is **not**
+Generate fresh inventories for active AWQ/HGPTQ run bundles; do not reuse these hashes. Inventory includes sidecars, so its total size is **not**
 text-only loaded weight bytes or VRAM usage.
 
 Runtime inventory found installed vLLM **0.31.0**, SGLang **v0.5.19** image
@@ -169,11 +170,22 @@ quality, and qualify each real Linux runtime/KV mode. Two-card NInfer stays
 **disabled/unverified** until an explicit successful pipeline probe; use
 `--gpus 1` for a single-card-only campaign without deleting matrix entries.
 
-### Repeated 27B one-card operational probes
+### Active 27B one-card baseline refresh
 
-The [probe preset](qualification/27b-one-card.toml), [full inventory](qualification/27b-gptq-0df.inventory.json),
+The [active preset](qualification/27b-one-card.toml) now selects
+`cyankiwi/Qwen3.8-27B-AWQ-INT4@e3a700906e6a73ba4290b1873dc2ba8198527ab5`
+(asymmetric int4 g32 compressed-tensors) for vLLM/SGLang and
+`nchapman/Qwen3.8-27B-W4A16-HGPTQ@ae51987e3339a2a70070702548571e10fe8bcbc2`
+for warp-34. Model and tokenizer pins are explicit; artifact/template hashes
+remain unknown pending fresh inventory. These are unverified practical profiles,
+not identical-weight comparisons. Historical successes/failures below do not
+qualify the new artifacts. Preserve archived inventories and receipts unchanged.
+
+### Historical repeated 27B one-card operational probes
+
+The [archived full inventory](qualification/27b-gptq-0df.inventory.json)
 and [machine-readable launch/probe ledger](qualification/27b-one-card.json) retain
-this follow-up. It deliberately selects **newer snapshot `0df81ea...` for all
+this historical follow-up. It deliberately selected **newer snapshot `0df81ea...` for all
 three runnable profiles**, rather than pretending SGLang used `c11a884...`.
 All **13 files / 19,610,855,960 bytes** were inventoried and re-verified, stable
 hash `82675bcf7919243f8a373072ddcd73d36fc76070b1182dfc8f531c49cd683d03`.

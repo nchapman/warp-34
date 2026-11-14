@@ -27,15 +27,22 @@ export NLTK_DATA="$HOME/nltk_data"
 
 # Local snapshot directories, not repository names; use the exact revisions below.
 export HGPTQ=/absolute/path/to/hgptq/snapshot
-export GPTQ=/absolute/path/to/gptq/snapshot
+export AWQ=/absolute/path/to/awq/snapshot
 export GGUF=/absolute/path/to/unsloth/snapshot
 ```
 
 | Variable | Hugging Face repository | Revision |
 |---|---|---|
 | `HGPTQ` | `nchapman/Qwen3.8-27B-W4A16-HGPTQ` | `1de743eedefdb7422e6b171174c7080204f5b005` |
-| `GPTQ` | `SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16` | `e28c5f952bdd9abac6420ac3efad651b40d15eb5` |
+| `AWQ` | `cyankiwi/Qwen3.8-27B-AWQ-INT4` | `e3a700906e6a73ba4290b1873dc2ba8198527ab5` |
 | `GGUF` | `unsloth/Qwen3.8-27B-GGUF` | `4ca720788d1e01f1bff70c033e0d0028fd02e502` |
+
+vLLM and SGLang now use cyankiwi AWQ: compressed-tensors pack-quantized,
+4-bit asymmetric group32. Unquantized MTP weights are present. A separate
+[vLLM TP2 smoke](../perf/qualification/cyankiwi-vllm-tp2-smoke.md) passed plain/MTP-3
+startup and short generation, but these **TP1 quality recipes remain unqualified**.
+New receipts are required; the historical GPTQ checks below do not qualify them. warp-34
+continues to use nchapman HGPTQ; deprecated nchapman GPTQ is not a substitute.
 
 The Unsloth directory must contain `Qwen3.8-27B-UD-Q4_K_XL.gguf` and
 `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`. Download pinned snapshots with the upstream
@@ -95,7 +102,7 @@ flags, and llama.cpp's hybrid recurrent allocation. This is separate from
 attention KV precision. Recurrent convolution storage/implementation is not
 identical across engines (llama.cpp uses FP32 recurrent buffers, whereas the
 other recipes use FP16 convolution storage). Weight quantization still differs:
-HGPTQ vs GPTQ vs Unsloth GGUF. This controls **KV precision**, not every numerical
+HGPTQ vs AWQ vs Unsloth GGUF. This controls **KV precision**, not every numerical
 or implementation difference; it is not a pure engine-parity test.
 
 No second GPU, transformer-layer CPU offload, reduced context or lower-precision
@@ -136,7 +143,11 @@ records their identity but does not replace a package manager or prove that an
 installed package has no local source edits. There is no aggregate quality score,
 throughput ranking or statistical significance claim from a smoke run.
 
-## Completed smoke qualification
+## Historical smoke qualification — not a baseline for the new models
+
+The following unchanged metrics used the former SergiioB GPTQ snapshot
+`e28c5f952bdd9abac6420ac3efad651b40d15eb5` for vLLM and SGLang,
+not cyankiwi AWQ. They do not demonstrate that the current recipes pass.
 
 `quality-fp16-suite-smoke10-001` ran the four-engine sequence without manual
 intervention in 10m25s on the pod's single selected RTX 3090. All four engines
