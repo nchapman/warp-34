@@ -229,7 +229,7 @@ function Overview({ state }: { state: MetricsState }) {
           <div className="panel-heading">
             <h2 id="throughput-title">Generation throughput</h2>
             <span className="legend">
-              <i className="amber-dot" />
+              <i className="violet-dot" />
               {isDecisionWorkload ? "Prompt tokens" : "Output tokens"}
             </span>
           </div>
@@ -262,7 +262,7 @@ function Overview({ state }: { state: MetricsState }) {
                 {number(latest?.requests.running)}
               </strong>
               <span>
-                <i className="sage-dot" />
+                <i className="aqua-dot" />
                 Running
               </span>
             </div>
@@ -271,7 +271,7 @@ function Overview({ state }: { state: MetricsState }) {
                 {number(latest?.requests.waiting)}
               </strong>
               <span>
-                <i className="stone-dot" />
+                <i className="indigo-dot" />
                 Queued
               </span>
             </div>
@@ -283,7 +283,7 @@ function Overview({ state }: { state: MetricsState }) {
             }))}
             label="Running and queued requests"
             unit="requests"
-            color="sage"
+            color="aqua"
             compact
           />
           <div className="request-totals">
@@ -433,11 +433,11 @@ function Overview({ state }: { state: MetricsState }) {
           <PoolBar name="GDN state" pool={latest?.pools.gdn} unit="slots" />
           <div className="capacity-legend">
             <span>
-              <i className="amber-dot" />
+              <i className="violet-dot" />
               Active / reserved
             </span>
             <span>
-              <i className="stone-dot" />
+              <i className="indigo-dot" />
               Evictable
             </span>
             <span>
@@ -541,7 +541,9 @@ function DashboardShell({ state }: { state: MetricsState }) {
       <header className="topbar">
         <Link className="brand" to="/" aria-label="warp34 home">
           <svg viewBox="0 0 32 32" aria-hidden="true">
-            <path d="m6 23 6-14h5l-6 14zm10 0 6-14h5l-6 14z" />
+            <path className="warp-bar-1" d="M4.5 23 9.5 9h4l-5 14z" />
+            <path className="warp-bar-2" d="M11.5 23 16.5 9h4l-5 14z" />
+            <path className="warp-bar-3" d="M18.5 23 23.5 9h4l-5 14z" />
           </svg>
           <span>
             warp<span className="brand-suffix">34</span>

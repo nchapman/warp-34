@@ -22,6 +22,11 @@ describe("dashboard states", () => {
       />,
     );
     expect(screen.getByRole("status")).toHaveTextContent("Engine ready");
+    expect(
+      screen
+        .getByRole("link", { name: "warp34 home" })
+        .querySelectorAll("path"),
+    ).toHaveLength(3);
     expect(screen.getByText("test/model")).toBeVisible();
     expect(
       screen.getByRole("img", {

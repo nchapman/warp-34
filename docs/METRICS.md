@@ -1,6 +1,6 @@
 # Metrics and built-in dashboard
 
-`warp34 serve` includes a read-only, warm-dark React dashboard at **`GET /`**.
+`warp34 serve` includes a read-only, ultraviolet-dark React dashboard at **`GET /`**.
 No external collector, CDN, Node runtime, or frontend files are needed at runtime:
 Vite's production assets are embedded in the Rust executable. Prometheus remains
 optional; use it for durable history, alerting, and fleet-wide aggregation.

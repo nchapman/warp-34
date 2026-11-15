@@ -851,7 +851,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                           </select>
                           <span className="pg-turn-index mono">#{idx}</span>
                           {msg.tool_calls && msg.tool_calls.length > 0 && (
-                            <span className="pg-badge amber">
+                            <span className="pg-badge violet">
                               {msg.tool_calls.length} tool_call
                               {msg.tool_calls.length > 1 ? "s" : ""}
                             </span>
@@ -1002,13 +1002,13 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                 <div className="pg-title-group">
                   <h2 id="resp-pane-title">Wire Response</h2>
                   {inFlight && (
-                    <span className="pg-badge amber">Streaming…</span>
+                    <span className="pg-badge violet">Streaming…</span>
                   )}
                   {callMetrics.status !== null && (
                     <span
                       className={`pg-badge ${
                         callMetrics.status >= 200 && callMetrics.status < 300
-                          ? "sage"
+                          ? "aqua"
                           : "danger"
                       }`}
                     >
@@ -1237,7 +1237,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                           <span>#{f.index}</span>
                           <span>+{f.elapsedMs}ms</span>
                           {f.event && (
-                            <span className="amber">event: {f.event}</span>
+                            <span className="violet">event: {f.event}</span>
                           )}
                         </div>
                         <pre>{f.data}</pre>

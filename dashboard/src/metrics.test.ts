@@ -11,7 +11,7 @@ import {
   MAX_SAMPLES,
 } from "./metrics";
 import { histogram, snapshot } from "./fixtures";
-import { chartPath } from "./Chart";
+import { chartAreaPath, chartPath } from "./Chart";
 
 describe("shared metric derivations", () => {
   it("has no invented rates or percentiles before observations", () => {
@@ -93,5 +93,22 @@ describe("shared metric derivations", () => {
     expect(path.match(/M/g)).toHaveLength(3);
     expect(path.match(/L/g)).toHaveLength(1);
     expect(path).not.toContain("NaN");
+
+    const area = chartAreaPath(
+      [
+        { time: 100, value: 1 },
+        { time: 102, value: 2 },
+        { time: 104, value: null },
+        { time: 106, value: 1 },
+        { time: 140, value: 1 },
+      ],
+      140,
+      2,
+      800,
+      200,
+    );
+    // Only the contiguous [100, 102] pair forms a closed area polygon; isolated points do not bridge gaps.
+    expect(area.match(/Z/g)).toHaveLength(1);
+    expect(area).not.toContain("NaN");
   });
 });

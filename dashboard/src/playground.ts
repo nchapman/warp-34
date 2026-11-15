@@ -65,9 +65,9 @@ export interface ParsedApiResult {
   };
 }
 
-// 8x8 warm-amber checkerboard PNG data URI for offline multimodal Vision testing
+// 8x8 ultraviolet checkerboard PNG data URI for offline multimodal Vision testing
 const SAMPLE_IMAGE_DATA_URL =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAGUlEQVR42mO4siBESV4ak2TAKgokGQalDgDVLkSBexfMuAAAAABJRU5ErkJggg==";
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAH0lEQVR42mM4UvgfiMQENYEImc2AUwJTCMLGLUEHOwBq2VCBA5MNrgAAAABJRU5ErkJggg==";
 
 export const ENDPOINTS: EndpointSpec[] = [
   {
