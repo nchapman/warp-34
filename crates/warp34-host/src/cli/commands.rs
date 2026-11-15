@@ -82,6 +82,8 @@ pub(crate) fn run_generate(
         resolved_model,
         tp,
         prompt,
+        system_prompt,
+        sampling,
         image_urls,
         allow_remote_images,
         max_tokens,
@@ -109,9 +111,48 @@ pub(crate) fn run_generate(
         &image_urls,
         allow_remote_images,
     )?;
-    let prompt_ids = engine.encode(&expanded_prompt).map_err(|e| e.to_string())?;
-    let (gen_ids, prompt_len, gen_len, ttft_ms, decode_tok_per_s, itl_ms) = if mm_images.is_empty()
+    let final_prompt = if let Some(ref sys) = system_prompt {
+        let msgs = vec![
+            crate::server::ChatMessage {
+                tool_calls: Vec::new(),
+                role: "system".to_string(),
+                content: Some(sys.clone()),
+                reasoning_content: None,
+            },
+            crate::server::ChatMessage {
+                tool_calls: Vec::new(),
+                role: "user".to_string(),
+                content: Some(expanded_prompt),
+                reasoning_content: None,
+            },
+        ];
+        crate::server::format_chatml_prompt(&msgs, None, false)
+    } else {
+        expanded_prompt
+    };
+    let prompt_ids = engine.encode(&final_prompt).map_err(|e| e.to_string())?;
+    let (gen_ids, prompt_len, gen_len, ttft_ms, decode_tok_per_s, itl_ms) = if sampling.is_custom()
     {
+        let params = sampling.to_sampling_params(max_tokens, &engine.cfg.eos_token_ids);
+        let m = engine
+            .generate_multimodal_sampled_with_radix_cache(
+                &prompt_ids,
+                &mm_images,
+                params,
+                None,
+                64,
+                true,
+            )
+            .map_err(|e| e.to_string())?;
+        (
+            m.generated_token_ids,
+            m.prompt_len,
+            m.gen_len,
+            m.ttft_ms,
+            m.decode_tok_per_s,
+            m.itl_ms,
+        )
+    } else if mm_images.is_empty() {
         let m = engine
             .generate_tokens(&prompt_ids, max_tokens, true)
             .map_err(|e| e.to_string())?;
@@ -623,6 +664,7 @@ pub(crate) fn run_serve(
         host,
         port,
         allow_remote_images,
+        kv_format,
         kv_pages,
         use_cuda_graph,
         lora_modules,
@@ -633,16 +675,28 @@ pub(crate) fn run_serve(
         .map(|name| name.trim().to_string())
         .unwrap_or(model);
     let max_num_seqs = serve.options.max_num_seqs;
+    let max_model_len = serve.options.max_model_len;
     let auth_enabled = serve.options.api_key.is_some();
+    let spec_label = match spec_config.as_ref().map(|s| s.kind) {
+        Some(crate::proposer::SpeculativeKind::Mtp) => format!(
+            "mtp (k={})",
+            spec_config.as_ref().map(|s| s.mtp_k).unwrap_or(3)
+        ),
+        Some(crate::proposer::SpeculativeKind::DFlash2) => "dflash2".to_string(),
+        None => "none".to_string(),
+    };
     let bind_addr = format!("{host}:{port}");
-    println!("[warp34 serve] loading model={model} tp={tp} for http://{bind_addr}");
+    println!(
+        "[warp34 serve] loading model={model} tp={tp} kv={kv_format} speculative={spec_label} for http://{bind_addr}"
+    );
     let worker_model = resolved_model;
     let state = crate::server::OpenAiServerState::from_loader_with_options(
         model,
         allow_remote_images,
         serve.options,
         move || {
-            let pages = kv_pages.or_else(|| spec_config.as_ref().map(|_| 256));
+            let pages =
+                ServeCliConfig::effective_kv_pages(kv_pages, max_model_len, spec_config.as_ref());
             let state_slot_seqs = serve_state_slot_seqs(max_num_seqs, spec_config.as_ref());
             let mut engine = Qwen3_5Engine::load_for_serving_with_speculative_and_lora(
                 &worker_model,
@@ -660,8 +714,9 @@ pub(crate) fn run_serve(
         },
     )?;
     println!(
-        "[warp34 serve] api_auth={} max_num_seqs={max_num_seqs} context_limit={} tokens (dashboard/metrics/health are public)",
+        "[warp34 serve] api_auth={} max_num_seqs={max_num_seqs} kv_pool={} tokens context_limit={} tokens (dashboard/metrics/health are public)",
         if auth_enabled { "enabled" } else { "disabled" },
+        state.worker.kv_token_capacity,
         state.worker.max_model_len(),
     );
     crate::server::run_blocking_server(&bind_addr, state)
@@ -680,6 +735,10 @@ pub(crate) fn run_chat(
         resolved_model,
         tp,
         prompt,
+        prompt_explicit,
+        system_prompt,
+        interactive,
+        sampling,
         image_urls,
         allow_remote_images,
         enable_thinking,
@@ -702,21 +761,58 @@ pub(crate) fn run_chat(
         active_lora.as_deref(),
     )
     .map_err(|e| e.to_string())?;
+    let enter_repl = interactive
+        || (!prompt_explicit
+            && image_urls.is_empty()
+            && std::io::IsTerminal::is_terminal(&std::io::stdin()));
+    if enter_repl {
+        return run_chat_repl(
+            &mut engine,
+            &model,
+            tp,
+            &kv_format,
+            system_prompt,
+            enable_thinking,
+            max_tokens,
+            sampling,
+        );
+    }
     let (expanded_prompt, mm_images) = prepare_multimodal_prompt_and_images(
         &engine.cfg,
         &prompt,
         &image_urls,
         allow_remote_images,
     )?;
-    let msgs = vec![crate::server::ChatMessage {
+    let mut msgs = Vec::with_capacity(2);
+    if let Some(sys) = system_prompt {
+        msgs.push(crate::server::ChatMessage {
+            tool_calls: Vec::new(),
+            role: "system".to_string(),
+            content: Some(sys),
+            reasoning_content: None,
+        });
+    }
+    msgs.push(crate::server::ChatMessage {
         tool_calls: Vec::new(),
         role: "user".to_string(),
         content: Some(expanded_prompt),
         reasoning_content: None,
-    }];
+    });
     let formatted = crate::server::format_chatml_prompt(&msgs, None, enable_thinking);
     let prompt_ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
-    let metrics = if mm_images.is_empty() {
+    let metrics = if sampling.is_custom() {
+        let params = sampling.to_sampling_params(max_tokens, &engine.cfg.eos_token_ids);
+        engine
+            .generate_multimodal_sampled_with_radix_cache(
+                &prompt_ids,
+                &mm_images,
+                params,
+                None,
+                64,
+                true,
+            )
+            .map_err(|e| e.to_string())?
+    } else if mm_images.is_empty() {
         engine
             .generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
             .map_err(|e| e.to_string())?
@@ -753,6 +849,222 @@ pub(crate) fn run_chat(
             "--- tool_calls ---\n{}",
             serde_json::to_string_pretty(&parsed.tool_calls).unwrap_or_default()
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn run_chat_repl(
+    engine: &mut Qwen3_5Engine,
+    model: &str,
+    tp: usize,
+    kv_format: &str,
+    mut system_prompt: Option<String>,
+    mut enable_thinking: bool,
+    max_tokens: usize,
+    mut sampling: CliSamplingOptions,
+) -> Result<ExitCode, String> {
+    use std::io::{BufRead, Write};
+    let kv_tokens = engine
+        .ranks
+        .first()
+        .map(|r| r.kv_pool.num_pages * 16)
+        .unwrap_or(0);
+    eprintln!(
+        "[warp34 chat] model={model} tp={tp} kv={kv_format} ({kv_tokens} tokens) thinking={}\n\
+         Interactive multi-turn REPL (MambaRadixCache prefix reuse enabled).\n\
+         Commands: /help  /clear  /system <text>  /think [on|off]  /temp <0..2>  /stats  /exit",
+        if enable_thinking { "on" } else { "off" }
+    );
+    let mut history: Vec<crate::server::ChatMessage> = Vec::new();
+    let mut last_stats: Option<(usize, usize, usize, f64, f64)> = None;
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut line = String::new();
+
+    loop {
+        print!("\n> ");
+        std::io::stdout().flush().ok();
+        line.clear();
+        let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        if n == 0 {
+            println!();
+            break;
+        }
+        let input = line.trim();
+        if input.is_empty() {
+            continue;
+        }
+        if let Some(cmd) = input.strip_prefix('/') {
+            let (verb, rest) = cmd
+                .split_once(char::is_whitespace)
+                .map(|(v, r)| (v, r.trim()))
+                .unwrap_or((cmd, ""));
+            match verb {
+                "exit" | "quit" | "q" => break,
+                "help" | "?" => {
+                    eprintln!(
+                        "Commands:\n\
+                         \x20 /clear, /reset       Clear conversation history\n\
+                         \x20 /system <prompt>     Set system prompt and reset conversation\n\
+                         \x20 /think [on|off]      Toggle <think> reasoning blocks\n\
+                         \x20 /temp <0..2>         Set sampling temperature (0 = greedy)\n\
+                         \x20 /stats               Show last turn prefill/decode/cache telemetry\n\
+                         \x20 /exit, /quit         Exit interactive chat"
+                    );
+                    continue;
+                }
+                "clear" | "reset" => {
+                    history.clear();
+                    eprintln!("[chat] conversation history cleared.");
+                    continue;
+                }
+                "system" => {
+                    system_prompt = (!rest.is_empty()).then(|| rest.to_string());
+                    history.clear();
+                    eprintln!(
+                        "[chat] system prompt {} and history reset.",
+                        if system_prompt.is_some() {
+                            "updated"
+                        } else {
+                            "cleared"
+                        }
+                    );
+                    continue;
+                }
+                "think" | "thinking" => {
+                    enable_thinking = match rest {
+                        "on" | "true" | "1" => true,
+                        "off" | "false" | "0" => false,
+                        _ => !enable_thinking,
+                    };
+                    eprintln!(
+                        "[chat] thinking mode: {}",
+                        if enable_thinking { "on" } else { "off" }
+                    );
+                    continue;
+                }
+                "temp" | "temperature" => {
+                    match rest.parse::<f32>() {
+                        Ok(t) if (0.0..=2.0).contains(&t) => {
+                            sampling.temperature = if t == 0.0 { None } else { Some(t) };
+                            eprintln!("[chat] temperature = {t}");
+                        }
+                        _ => eprintln!("[chat] usage: /temp <0.0..2.0>"),
+                    }
+                    continue;
+                }
+                "stats" => {
+                    if let Some((p_tok, c_tok, g_tok, ttft, tps)) = last_stats {
+                        eprintln!(
+                            "[stats] prompt={p_tok} tok (cached={c_tok} tok) gen={g_tok} tok ttft={ttft:.2} ms decode={tps:.2} tok/s"
+                        );
+                    } else {
+                        eprintln!("[stats] no turns generated yet.");
+                    }
+                    continue;
+                }
+                _ => {
+                    eprintln!("[chat] unknown command '/{verb}' (type /help for commands)");
+                    continue;
+                }
+            }
+        }
+
+        let mut trimmed_turns = 0usize;
+        let prompt_ids = loop {
+            let mut msgs = Vec::with_capacity(history.len() + 2);
+            if let Some(ref sys) = system_prompt {
+                msgs.push(crate::server::ChatMessage {
+                    tool_calls: Vec::new(),
+                    role: "system".to_string(),
+                    content: Some(sys.clone()),
+                    reasoning_content: None,
+                });
+            }
+            msgs.extend(history.iter().cloned());
+            msgs.push(crate::server::ChatMessage {
+                tool_calls: Vec::new(),
+                role: "user".to_string(),
+                content: Some(input.to_string()),
+                reasoning_content: None,
+            });
+            let formatted = crate::server::format_chatml_prompt(&msgs, None, enable_thinking);
+            let ids = engine.encode(&formatted).map_err(|e| e.to_string())?;
+            if kv_tokens > 0
+                && ids.len().saturating_add(max_tokens).saturating_add(4) > kv_tokens
+                && history.len() >= 2
+            {
+                history.drain(0..2);
+                trimmed_turns += 1;
+                continue;
+            }
+            break ids;
+        };
+        if trimmed_turns > 0 {
+            eprintln!(
+                "[chat] trimmed {trimmed_turns} older turn(s) to fit {kv_tokens}-token KV window."
+            );
+        }
+        let gen_res = if sampling.is_custom() {
+            let params = sampling.to_sampling_params(max_tokens, &engine.cfg.eos_token_ids);
+            engine.generate_multimodal_sampled_with_radix_cache(
+                &prompt_ids,
+                &[],
+                params,
+                None,
+                64,
+                true,
+            )
+        } else {
+            engine.generate_with_radix_cache(&prompt_ids, max_tokens, 64, true)
+        };
+        let metrics = match gen_res {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[chat] generation error: {e} (use /clear or increase --ctx-size)");
+                continue;
+            }
+        };
+        let raw_text = engine
+            .decode(&metrics.generated_token_ids)
+            .map_err(|e| e.to_string())?;
+        let parsed = crate::parser::Qwen3Parser::parse_complete(&raw_text, enable_thinking);
+        if let Some(ref r) = parsed.reasoning_content
+            && !r.trim().is_empty()
+        {
+            println!("\n[thinking]\n{}\n[/thinking]", r.trim());
+        }
+        let assistant_reply = parsed.content.clone().unwrap_or_default();
+        println!("\n{}", assistant_reply.trim());
+        eprintln!(
+            "[{} prompt tok ({} cached) | {} gen tok | ttft {:.1} ms | {:.1} tok/s]",
+            metrics.prompt_len,
+            metrics.cached_prefix_tokens,
+            metrics.gen_len,
+            metrics.ttft_ms,
+            metrics.decode_tok_per_s
+        );
+        last_stats = Some((
+            metrics.prompt_len,
+            metrics.cached_prefix_tokens,
+            metrics.gen_len,
+            metrics.ttft_ms,
+            metrics.decode_tok_per_s,
+        ));
+        history.push(crate::server::ChatMessage {
+            tool_calls: Vec::new(),
+            role: "user".to_string(),
+            content: Some(input.to_string()),
+            reasoning_content: None,
+        });
+        history.push(crate::server::ChatMessage {
+            tool_calls: Vec::new(),
+            role: "assistant".to_string(),
+            content: Some(assistant_reply),
+            reasoning_content: None,
+        });
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -762,3 +762,174 @@ fn lora_cli_flags_resolve_and_validate() {
             .any(|w| w == ["--active-lora", "heretic"])
     );
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn token_counts_ctx_size_and_serve_effective_kv_pages() {
+    assert_eq!(parse_token_count("4096", "--ctx-size").unwrap(), 4096);
+    assert_eq!(parse_token_count("32_768", "--ctx-size").unwrap(), 32_768);
+    assert_eq!(parse_token_count("4k", "--ctx-size").unwrap(), 4096);
+    assert_eq!(parse_token_count("64K", "--ctx-size").unwrap(), 65_536);
+    assert_eq!(parse_token_count("128k", "--ctx-size").unwrap(), 131_072);
+    assert_eq!(parse_token_count("1m", "--ctx-size").unwrap(), 1_048_576);
+    for bad in ["", " ", "-4", "k", "16x"] {
+        assert!(parse_token_count(bad, "--ctx-size").is_err(), "{bad}");
+    }
+
+    // --ctx-size / -c / --context-length / --kv-tokens convert tokens to 16-token pages.
+    for flag in ["--ctx-size", "-c", "--context-length", "--kv-tokens"] {
+        let opts = parse(&["serve", flag, "32k"]);
+        assert_eq!(opts.kv_pages, Some(2048));
+        assert!(validate_cuda_options(&opts, "serve").is_ok());
+    }
+    let rounded = parse(&["generate", "-c", "100"]);
+    assert_eq!(rounded.kv_pages, Some(7));
+
+    // --ctx-size and --kv-pages cannot be combined, and --ctx-size 0 is rejected before download.
+    for bad_args in [
+        &["serve", "--ctx-size", "0"][..],
+        &["serve", "--ctx-size", "2m"][..],
+        &["serve", "--kv-pages", "100000"][..],
+        &["serve", "--max-model-len", "2m"][..],
+        &["serve", "--ctx-size", "16k", "--kv-pages", "1024"][..],
+        &["serve", "-c", "4k", "--max-model-len", "8k"][..],
+        &["serve", "--kv-pages", "256", "--max-model-len", "8192"][..],
+    ] {
+        let res = prepare_cuda_cli(&args(bad_args), |_, _, _| {
+            panic!("invalid context sizing must fail before model resolution: {bad_args:?}")
+        });
+        assert!(res.is_err(), "{bad_args:?}");
+    }
+
+    // ServeCliConfig::effective_kv_pages auto-expands target KV pages when --max-model-len
+    // exceeds the default serving budget or when --speculative is active.
+    let mtp = crate::proposer::SpeculativeConfig {
+        kind: crate::proposer::SpeculativeKind::Mtp,
+        draft_model: None,
+        mtp_k: 3,
+    };
+    assert_eq!(ServeCliConfig::effective_kv_pages(None, None, None), None);
+    assert_eq!(
+        ServeCliConfig::effective_kv_pages(None, Some(16_384), None),
+        None
+    );
+    assert_eq!(
+        ServeCliConfig::effective_kv_pages(None, Some(65_536), None),
+        Some(4096)
+    );
+    assert_eq!(
+        ServeCliConfig::effective_kv_pages(None, None, Some(&mtp)),
+        Some(256)
+    );
+    assert_eq!(
+        ServeCliConfig::effective_kv_pages(None, Some(16_384), Some(&mtp)),
+        Some(1024)
+    );
+    assert_eq!(
+        ServeCliConfig::effective_kv_pages(Some(512), Some(65_536), Some(&mtp)),
+        Some(512)
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn positional_model_industry_aliases_and_sampling_validation() {
+    // Positional <model> works across subcommands.
+    for sub in ["serve", "chat", "generate", "bench"] {
+        let opts = parse(&[sub, "Qwen/Qwen3.5-4B"]);
+        assert_eq!(opts.model, "Qwen/Qwen3.5-4B");
+    }
+    // Combining positional <model> with --model is rejected.
+    assert!(parse_cuda_options(&args(&["serve", "org/pos", "--model", "org/flag"])).is_err());
+    // Extra unexpected positional arguments still fail with "unknown argument".
+    let extra_err = parse_cuda_options(&args(&["serve", "org/pos", "extra"]))
+        .err()
+        .unwrap();
+    assert!(extra_err.contains("unknown argument: extra"));
+
+    // Subcommand-aware default max_tokens.
+    assert_eq!(parse(&["chat"]).max_tokens, 512);
+    assert_eq!(parse(&["generate"]).max_tokens, 256);
+    assert_eq!(parse(&["greedy-diff", "--golden", "g.json"]).max_tokens, 64);
+
+    // Industry-standard flag aliases (vLLM, SGLang, llama.cpp).
+    let serve_opts = parse(&[
+        "serve",
+        "-hf",
+        "org/model",
+        "--alias",
+        "my-model",
+        "--max-running-requests",
+        "8",
+        "--max-model-len",
+        "64k",
+        "--kv-cache-dtype",
+        "auto",
+        "--speculative-algorithm",
+        "nextn",
+        "--num-speculative-tokens",
+        "2",
+    ]);
+    assert_eq!(serve_opts.model, "org/model");
+    assert_eq!(serve_opts.serve.model_name.as_deref(), Some("my-model"));
+    assert_eq!(serve_opts.serve.options.max_num_seqs, 8);
+    assert_eq!(serve_opts.serve.options.max_model_len, Some(65_536));
+    assert_eq!(
+        validate_cuda_options(&serve_opts, "serve").unwrap(),
+        KvFormatPolicy::Tq4
+    );
+    assert_eq!(
+        serve_opts.speculative_kind,
+        Some(crate::proposer::SpeculativeKind::Mtp)
+    );
+    assert_eq!(serve_opts.mtp_k, 2);
+
+    // Sampling flags on chat/generate and pre-download validation.
+    let gen_opts = parse(&[
+        "generate",
+        "Qwen/Qwen3.5-4B",
+        "--system",
+        "You are a concise Rust assistant.",
+        "--max-new-tokens",
+        "1k",
+        "--temp",
+        "0.6",
+        "--top-p",
+        "0.95",
+        "--top-k",
+        "20",
+        "--min-p",
+        "0.05",
+        "--seed",
+        "42",
+        "--repeat-penalty",
+        "1.05",
+        "--presence-penalty",
+        "0.2",
+        "--frequency-penalty",
+        "0.1",
+    ]);
+    assert!(gen_opts.sampling.is_custom());
+    assert_eq!(gen_opts.max_tokens, 1024);
+    assert_eq!(
+        gen_opts.system_prompt.as_deref(),
+        Some("You are a concise Rust assistant.")
+    );
+    assert!(validate_cuda_options(&gen_opts, "generate").is_ok());
+
+    for bad_sampling in [
+        &["generate", "--temp", "-0.5"][..],
+        &["generate", "--temp", "2.5"][..],
+        &["generate", "--top-p", "0.0"][..],
+        &["generate", "--repetition-penalty", "0.0"][..],
+        &["generate", "--presence-penalty", "3.0"][..],
+    ] {
+        assert!(
+            prepare_cuda_cli(&args(bad_sampling), |_, _, _| {
+                panic!("invalid sampling must fail before download")
+            })
+            .is_err(),
+            "{bad_sampling:?}"
+        );
+    }
+}

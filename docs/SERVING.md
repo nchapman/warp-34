@@ -7,10 +7,10 @@ sequences, automatic KV capacity, and the existing scheduler tuning.
 ```sh
 # Export WARP34_API_KEY securely through your deployment's secret manager first.
 CUDA_VISIBLE_DEVICES=0 ./target/release/warp34 serve \
-  --model nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
-  --served-model-name coding-model \
+  nchapman/Qwen3.5-4B-W4A16-HGPTQ --offline \
+  --alias coding-model \
   --api-key-env WARP34_API_KEY \
-  --max-num-seqs 4 --kv-pages 512 --max-model-len 8192
+  --max-num-seqs 4 -c 8k --max-model-len 8k
 
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $WARP34_API_KEY" \
@@ -70,9 +70,10 @@ the advertised alias rather than relying on permissive request-name handling.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--max-num-seqs N` | 16 | Active sequences, **1–16**; used for both GDN state-pool planning and worker scheduling |
-| `--max-model-len N` | Allocated KV token capacity | Optional total prompt + requested output admission ceiling |
-| `--kv-pages N` | Automatic; speculation defaults to 256 | Shared target KV pool, 16 tokens/page; allocates GPU memory |
+| `--max-num-seqs N` (aliases: `--max-running-requests`, `--parallel`, `-np`) | 16 | Active sequences, **1–16**; used for both GDN state-pool planning and worker scheduling |
+| `-c N`, `--ctx-size N` (aliases: `--context-length`, `--kv-tokens`) | Automatic (up to `32k` tokens; `4k` with `--speculative`) | Shared target KV pool in **tokens** (supports `k`/`M` suffixes like `8k`, `32k`, `64k`, `128k`; rounds up to 16-token pages) |
+| `--max-model-len N` | Allocated KV token capacity | Per-request total prompt + requested output admission ceiling (supports `k`/`M` suffixes; auto-expands target KV pool when `-c`/`--kv-pages` is omitted) |
+| `--kv-pages N` (alias: `--num-gpu-blocks-override`) | Automatic; speculation defaults to 256 | Low-level alternative to `--ctx-size`: shared target KV pool in 16-token pages (mutually exclusive with `--ctx-size`) |
 
 `--max-num-seqs` is an upper bound, not a promise that N arbitrary contexts fit at
 once. GPU memory may reduce state capacity, and KV availability can serialize or
@@ -80,11 +81,21 @@ queue requests. The ingress/admission bounds remain 32; this flag is not an HTTP
 connection or queue-size control. Larger than 16 requires engine graph/IO changes,
 not merely a CLI override. Lower concurrency can reduce planned GDN state memory.
 
-`--max-model-len` is an **admission policy**, not automatic KV sizing or a context
-extension. It must be positive and no greater than the allocated KV pool's token
-capacity; an impossible setting fails startup after capacity is known. Select a
-value within the checkpoint's supported context window. It does not infer or
-change RoPE/model context metadata, nor reserve that many tokens per request.
+`--ctx-size` (`-c`) sizes the shared GPU KV pool directly in tokens (so you never
+have to divide by 16-token pages), accepting human-friendly suffixes (`4k`, `16k`,
+`32k`, `64k`, `128k`, `256k`).
+
+`--max-model-len` sets the per-request **admission ceiling** (in tokens, also
+supporting `k`/`M` suffixes). When neither `--ctx-size` nor `--kv-pages` is
+explicitly passed, `--max-model-len` automatically expands the target KV page
+request when needed (for example, `warp34 serve Qwen/Qwen3.5-4B --max-model-len 64k`
+or `warp34 serve Qwen/Qwen3.5-4B --speculative mtp --max-model-len 16k`
+automatically requests `4,096` or `1,024` KV pages). When `--ctx-size` or
+`--kv-pages` *is* explicitly passed alongside `--max-model-len`, `warp34` validates
+`max_model_len <= kv_tokens` immediately at CLI parse time before any Hub download
+or GPU initialization. Select a value within the checkpoint's supported context
+window; it does not infer or change RoPE/model context metadata, nor reserve that
+many tokens per request.
 
 The limit checks the fully tokenized prompt (including expanded image tokens)
 plus requested output tokens before worker enqueue. It applies to all generative
