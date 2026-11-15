@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Chart, type Point } from "./Chart";
+import { Playground } from "./Playground";
 import {
   counterRate,
   duration,
@@ -508,7 +509,9 @@ function ConnectionGuide() {
 }
 
 export function Dashboard({ state }: { state: MetricsState }) {
-  const [page, setPage] = useState<"overview" | "connect">("overview");
+  const [page, setPage] = useState<"overview" | "playground" | "connect">(
+    "overview",
+  );
   const latest = state.history.at(-1);
   return (
     <div className="app-shell">
@@ -540,6 +543,13 @@ export function Dashboard({ state }: { state: MetricsState }) {
           Overview
         </button>
         <button
+          className={page === "playground" ? "selected" : ""}
+          aria-current={page === "playground" ? "page" : undefined}
+          onClick={() => setPage("playground")}
+        >
+          Playground
+        </button>
+        <button
           className={page === "connect" ? "selected" : ""}
           aria-current={page === "connect" ? "page" : undefined}
           onClick={() => setPage("connect")}
@@ -549,7 +559,13 @@ export function Dashboard({ state }: { state: MetricsState }) {
         <span className="nav-label">INFERENCE CONSOLE</span>
       </nav>
       <main id="main">
-        {page === "overview" ? <Overview state={state} /> : <ConnectionGuide />}
+        {page === "overview" ? (
+          <Overview state={state} />
+        ) : page === "playground" ? (
+          <Playground model={latest?.model ?? null} />
+        ) : (
+          <ConnectionGuide />
+        )}
       </main>
       <footer>
         <span>

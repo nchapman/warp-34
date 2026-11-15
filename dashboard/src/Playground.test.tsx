@@ -1,0 +1,406 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Dashboard } from "./App";
+import { snapshot } from "./fixtures";
+import {
+  ENDPOINTS,
+  appendAssistantTurnToBody,
+  applyMessagesToBody,
+  applySseFrameToResult,
+  drainSseBuffer,
+  emptyParsedResult,
+  extractMessagesFromBody,
+  formatCurlCommand,
+  parseJsonResponse,
+} from "./playground";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("playground wire helpers", () => {
+  it("extracts and updates messages across OpenAI Chat, Responses, and Anthropic", () => {
+    const chatBody = {
+      model: "qwen",
+      messages: [
+        { role: "system", content: "sys" },
+        { role: "user", content: "hi" },
+      ],
+    };
+    const extractedChat = extractMessagesFromBody("openai-chat", chatBody);
+    expect(extractedChat).toEqual([
+      { role: "system", content: "sys" },
+      { role: "user", content: "hi" },
+    ]);
+
+    const anthroBody = applyMessagesToBody(
+      "anthropic-messages",
+      { model: "qwen" },
+      [
+        { role: "system", content: "be concise" },
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "world" },
+      ],
+    );
+    expect(anthroBody.system).toBe("be concise");
+    expect(anthroBody.messages).toEqual([
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "world" },
+    ]);
+
+    const respBody = applyMessagesToBody(
+      "openai-responses",
+      { model: "qwen" },
+      [
+        { role: "system", content: "instructions text" },
+        { role: "user", content: "prompt text" },
+      ],
+    );
+    expect(respBody.instructions).toBe("instructions text");
+    expect(respBody.input).toEqual([{ role: "user", content: "prompt text" }]);
+  });
+
+  it("chains previous_response_id on stateful /v1/responses multi-turn append", () => {
+    const parsed = {
+      ...emptyParsedResult(),
+      content: "GDN uses fixed-size recurrent state.",
+      responseId: "resp_abc123",
+    };
+    const next = appendAssistantTurnToBody(
+      "openai-responses",
+      {
+        model: "qwen",
+        store: true,
+        input: [{ role: "user", content: "turn 1" }],
+      },
+      parsed,
+      "turn 2 follow-up",
+    );
+    expect(next.previous_response_id).toBe("resp_abc123");
+    expect(next.input).toEqual([{ role: "user", content: "turn 2 follow-up" }]);
+  });
+
+  it("parses SSE frames for OpenAI Chat reasoning, content, tool calls, and cached usage", () => {
+    const rawSse = [
+      'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"reasoning_content":"step 1. "}}]}\n\n',
+      'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Answer: 42"}}]}\n\n',
+      'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"check_gpu","arguments":"{\\"dev\\":0}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":120,"completion_tokens":18,"prompt_tokens_details":{"cached_tokens":96}}}\n\n',
+      "data: [DONE]\n\n",
+    ].join("");
+
+    const { frames, remainder } = drainSseBuffer(rawSse, 0, 25);
+    expect(remainder).toBe("");
+    expect(frames).toHaveLength(4);
+
+    let state = emptyParsedResult();
+    for (const f of frames) {
+      state = applySseFrameToResult("openai-chat", state, f);
+    }
+    expect(state.reasoning).toBe("step 1. ");
+    expect(state.content).toBe("Answer: 42");
+    expect(state.finishReason).toBe("tool_calls");
+    expect(state.toolCalls).toEqual([
+      { id: "call_9", name: "check_gpu", arguments: '{"dev":0}' },
+    ]);
+    expect(state.usage.inputTokens).toBe(120);
+    expect(state.usage.cachedTokens).toBe(96);
+    expect(state.usage.outputTokens).toBe(18);
+  });
+
+  it("parses SSE frames for Anthropic Messages and OpenAI Responses", () => {
+    const anthroFrames = drainSseBuffer(
+      [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":20,"cache_read_input_tokens":64}}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"pondering"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello anthropic"}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9,"cache_read_input_tokens":64}}\n\n',
+      ].join(""),
+      0,
+      10,
+    ).frames;
+
+    let anthroState = emptyParsedResult();
+    for (const f of anthroFrames) {
+      anthroState = applySseFrameToResult("anthropic-messages", anthroState, f);
+    }
+    expect(anthroState.reasoning).toBe("pondering");
+    expect(anthroState.content).toBe("hello anthropic");
+    expect(anthroState.finishReason).toBe("end_turn");
+    expect(anthroState.usage.inputTokens).toBe(84);
+    expect(anthroState.usage.cachedTokens).toBe(64);
+    expect(anthroState.usage.outputTokens).toBe(9);
+
+    const respFrames = drainSseBuffer(
+      [
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"streamed text"}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_77","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"streamed text"}]}],"usage":{"input_tokens":50,"output_tokens":12,"input_tokens_details":{"cached_tokens":32},"output_tokens_details":{"reasoning_tokens":4}}}}\n\n',
+      ].join(""),
+      0,
+      15,
+    ).frames;
+
+    let respState = emptyParsedResult();
+    for (const f of respFrames) {
+      respState = applySseFrameToResult("openai-responses", respState, f);
+    }
+    expect(respState.responseId).toBe("resp_77");
+    expect(respState.content).toBe("streamed text");
+    expect(respState.finishReason).toBe("completed");
+    expect(respState.usage.cachedTokens).toBe(32);
+    expect(respState.usage.reasoningTokens).toBe(4);
+  });
+
+  it("formats cURL commands with Bearer or x-api-key headers and escaped quotes", () => {
+    const chatEp = ENDPOINTS.find((e) => e.id === "chat-completions")!;
+    const anthroEp = ENDPOINTS.find((e) => e.id === "anthropic-messages")!;
+
+    const chatCurl = formatCurlCommand(
+      "http://127.0.0.1:8000",
+      chatEp,
+      '{"prompt":"it\'s ok"}',
+      "secret-token",
+    );
+    expect(chatCurl).toContain("Authorization: Bearer secret-token");
+    expect(chatCurl).toContain("'http://127.0.0.1:8000/v1/chat/completions'");
+
+    const anthroCurl = formatCurlCommand(
+      "http://127.0.0.1:8000",
+      anthroEp,
+      "{}",
+      "anthro-key",
+    );
+    expect(anthroCurl).toContain("x-api-key: anthro-key");
+  });
+
+  it("parses non-streaming decision responses with cached token counts", () => {
+    const parsed = parseJsonResponse("decisions", {
+      model: "glide",
+      decisions: [{ id: "q1", answer: true, confidence: 0.99 }],
+      usage: { input_tokens: 140, cached_tokens: 128, output_tokens: 0 },
+    });
+    expect(parsed.usage.inputTokens).toBe(140);
+    expect(parsed.usage.cachedTokens).toBe(128);
+    expect(parsed.content).toContain('"answer": true');
+
+    const compSync = parseJsonResponse("openai-completions", {
+      id: "cmpl-1",
+      choices: [{ text: "void* out,", finish_reason: "length" }],
+      usage: { prompt_tokens: 12, completion_tokens: 4, cached_tokens: 8 },
+    });
+    expect(compSync.content).toBe("void* out,");
+    expect(compSync.finishReason).toBe("length");
+    expect(compSync.usage.cachedTokens).toBe(8);
+
+    const compFrames = drainSseBuffer(
+      [
+        'data: {"id":"cmpl-2","choices":[{"text":"int n"}]}\n\n',
+        'data: {"id":"cmpl-2","choices":[{"text":");","finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}}\n\n',
+        "data: [DONE]\n\n",
+      ].join(""),
+      0,
+      5,
+    ).frames;
+    let compStream = emptyParsedResult();
+    for (const f of compFrames) {
+      compStream = applySseFrameToResult("openai-completions", compStream, f);
+    }
+    expect(compStream.content).toBe("int n);");
+    expect(compStream.finishReason).toBe("stop");
+    expect(compStream.usage.outputTokens).toBe(3);
+  });
+});
+
+describe("Playground UI integration", () => {
+  it("switches to Playground, syncs structured turns with raw JSON, and executes requests", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers({ "content-type": "application/json" }),
+      text: async () =>
+        JSON.stringify({
+          id: "chatcmpl-test",
+          choices: [
+            {
+              index: 0,
+              finish_reason: "stop",
+              message: {
+                role: "assistant",
+                reasoning_content: "Verified warp shuffle.",
+                content: "Use __shfl_down_sync with mask 0xffffffff.",
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 64,
+            completion_tokens: 12,
+            prompt_tokens_details: { cached_tokens: 48 },
+          },
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <Dashboard
+        state={{
+          history: [snapshot({ model: "nchapman/Qwen3.8-27B-W4A16-HGPTQ" })],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+    expect(
+      screen.getByRole("heading", { name: "API Playground" }),
+    ).toBeVisible();
+
+    // Edit turn 2 content and verify it reflects in Raw JSON mode
+    const turn2 = screen.getByLabelText("Turn 2 content");
+    fireEvent.change(turn2, { target: { value: "Custom kernel question" } });
+
+    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    const rawEditor = screen.getByLabelText(
+      "Request JSON body",
+    ) as HTMLTextAreaElement;
+    expect(rawEditor.value).toContain("nchapman/Qwen3.8-27B-W4A16-HGPTQ");
+    expect(rawEditor.value).toContain("Custom kernel question");
+
+    // Send the request and verify parsed output + multi-turn continuation
+    fireEvent.click(screen.getByRole("button", { name: "Send Request" }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Use __shfl_down_sync with mask 0xffffffff."),
+      ).toBeVisible();
+    });
+    expect(screen.getByText("Verified warp shuffle.")).toBeVisible();
+    expect(screen.getByText("200 OK")).toBeVisible();
+
+    // Append follow-up turn and send
+    const followUp = screen.getByLabelText("Follow-up user message");
+    fireEvent.change(followUp, {
+      target: { value: "Now show the 32-lane butterfly reduction." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Append & Send" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+    const secondCallBody = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(secondCallBody.messages).toHaveLength(4);
+    expect(secondCallBody.messages[2]).toEqual({
+      role: "assistant",
+      content: "Use __shfl_down_sync with mask 0xffffffff.",
+    });
+    expect(secondCallBody.messages[3]).toEqual({
+      role: "user",
+      content: "Now show the 32-lane butterfly reduction.",
+    });
+  });
+
+  it("streams text/event-stream SSE responses and records frames in the SSE tab", async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'data: {"id":"chatcmpl-sse","choices":[{"index":0,"delta":{"content":"Hello "}}]}\n\n',
+          ),
+        );
+        controller.enqueue(
+          encoder.encode(
+            'data: {"id":"chatcmpl-sse","choices":[{"index":0,"delta":{"content":"SSE!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":32,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":16}}}\n\ndata: [DONE]\n\n',
+          ),
+        );
+        controller.close();
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body: stream,
+      }),
+    );
+
+    render(
+      <Dashboard
+        state={{
+          history: [snapshot({ model: "test/model" })],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send Request" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Hello SSE!")).toBeVisible();
+    });
+
+    const sseTab = screen.getByRole("tab", { name: "SSE (3)" });
+    fireEvent.click(sseTab);
+    expect(screen.getByText("[DONE]")).toBeVisible();
+  });
+
+  it("validates invalid JSON, handles GET endpoints, and surfaces HTTP/network errors", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        headers: new Headers({ "content-type": "application/json" }),
+        text: async () =>
+          JSON.stringify({ error: { message: "invalid api key" } }),
+      })
+      .mockRejectedValueOnce(new Error("Connection refused"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <Dashboard
+        state={{
+          history: [snapshot({ model: "test/model" })],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+
+    // Switch to JSON Body and enter invalid JSON
+    fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
+    const rawEditor = screen.getByLabelText("Request JSON body");
+    fireEvent.change(rawEditor, { target: { value: "{bad json" } });
+    expect(screen.getByRole("alert")).toHaveTextContent(/JSON syntax error/);
+    expect(screen.getByRole("button", { name: "Send Request" })).toBeDisabled();
+
+    // Switch to GET /health and send
+    fireEvent.change(screen.getByLabelText("ENDPOINT"), {
+      target: { value: "health" },
+    });
+    expect(screen.getByText(/takes no request body/)).toBeVisible();
+
+    const sendBtn = screen.getByRole("button", { name: "Send Request" });
+    expect(sendBtn).not.toBeDisabled();
+    fireEvent.click(sendBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText("401 Unauthorized")).toBeVisible();
+    });
+    expect(screen.getByText(/invalid api key/)).toBeVisible();
+
+    // Second click triggers network failure
+    fireEvent.click(screen.getByRole("button", { name: "Send Request" }));
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("Connection refused");
+    });
+  });
+});
