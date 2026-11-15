@@ -30,11 +30,12 @@ COPY crates/warp34-kernels/Cargo.toml ./crates/warp34-kernels/Cargo.toml
 COPY crates/warp34-host/Cargo.toml ./crates/warp34-host/Cargo.toml
 RUN --mount=type=cache,id=warp34-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     mkdir -p crates/warp34-kernels/src crates/warp34-host/src \
+    && echo "fn main() {}" > crates/warp34-kernels/build.rs \
     && echo "" > crates/warp34-kernels/src/lib.rs \
     && echo "" > crates/warp34-host/src/lib.rs \
     && echo "fn main() {}" > crates/warp34-host/src/main.rs \
     && cargo build --locked --release --features cuda --bin warp34 \
-    && rm -rf crates/warp34-kernels/src \
+    && rm -rf crates/warp34-kernels/build.rs crates/warp34-kernels/src \
         target/release/.fingerprint/warp34-* \
         target/release/deps/libwarp34_* \
         target/release/deps/warp34* \
@@ -50,7 +51,8 @@ ENV WARP34_ARCH=${WARP34_ARCH} \
     WARP34_NVCC_EXTRA=${WARP34_NVCC_EXTRA}
 COPY crates/warp34-kernels/ ./crates/warp34-kernels/
 RUN --mount=type=cache,id=warp34-cargo-registry,target=/root/.cargo/registry,sharing=locked \
-    WARP34_NVCC_JOBS=${WARP34_NVCC_JOBS} \
+    touch crates/warp34-kernels/build.rs crates/warp34-kernels/src/lib.rs \
+    && WARP34_NVCC_JOBS=${WARP34_NVCC_JOBS} \
     cargo build --locked --release --features cuda -p warp34-kernels
 
 # Layer 3: Build warp34-host with embedded dashboard assets and remove /src/target

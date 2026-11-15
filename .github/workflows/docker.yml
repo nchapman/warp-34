@@ -25,7 +25,7 @@ env:
 
 jobs:
   checks:
-    runs-on: sprinters:aws:ubuntu-24.04-slim:m7a.xlarge:temp=gp3/24/max/max:spot=rerun
+    runs-on: sprinters:aws:ubuntu-26.04:m7a.xlarge:temp=gp3/24/max/max:spot=rerun
     outputs:
       build_image: ${{ steps.filter.outputs.build_image }}
     steps:
@@ -97,7 +97,7 @@ jobs:
   image:
     needs: checks
     if: needs.checks.outputs.build_image == 'true'
-    runs-on: sprinters:aws:ubuntu-24.04-minimal:m7a.4xlarge:temp=gp3/48/max/max:spot=rerun
+    runs-on: sprinters:aws:ubuntu-26.04-minimal:m7a.4xlarge:temp=gp3/48/max/max:spot=rerun
     permissions:
       contents: read
       packages: write
