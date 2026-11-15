@@ -136,8 +136,9 @@ describe("playground wire helpers", () => {
 
     const respFrames = drainSseBuffer(
       [
+        'event: response.reasoning_text.delta\ndata: {"type":"response.reasoning_text.delta","delta":"thinking step "}\n\n',
         'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"streamed text"}\n\n',
-        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_77","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"streamed text"}]}],"usage":{"input_tokens":50,"output_tokens":12,"input_tokens_details":{"cached_tokens":32},"output_tokens_details":{"reasoning_tokens":4}}}}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_77","status":"completed","output":[{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"thinking step "}]},{"type":"message","content":[{"type":"output_text","text":"streamed text"}]}],"usage":{"input_tokens":50,"output_tokens":12,"input_tokens_details":{"cached_tokens":32},"output_tokens_details":{"reasoning_tokens":4}}}}\n\n',
       ].join(""),
       0,
       15,
@@ -148,10 +149,98 @@ describe("playground wire helpers", () => {
       respState = applySseFrameToResult("openai-responses", respState, f);
     }
     expect(respState.responseId).toBe("resp_77");
+    expect(respState.reasoning).toBe("thinking step ");
     expect(respState.content).toBe("streamed text");
     expect(respState.finishReason).toBe("completed");
     expect(respState.usage.cachedTokens).toBe(32);
     expect(respState.usage.reasoningTokens).toBe(4);
+  });
+
+  it("preserves multimodal image_url blocks and structured tool_calls across multi-turn edits", () => {
+    const chatEp = ENDPOINTS.find((e) => e.id === "chat-completions")!;
+    const visionPreset = chatEp.presets.find((p) => p.id === "vision")!;
+    const initialBody = visionPreset.buildBody("qwen-vl");
+
+    const turns = extractMessagesFromBody("openai-chat", initialBody);
+    expect(turns).toHaveLength(1);
+    expect(turns[0].rawContentBlocks).toHaveLength(1);
+    expect(turns[0].content).toContain("Describe the colors");
+
+    // Edit text of the multimodal turn and ensure image_url block survives round-trip
+    turns[0].content = "Updated vision prompt";
+    const roundTripped = applyMessagesToBody("openai-chat", initialBody, turns);
+    const msg0 = (roundTripped.messages as Array<Record<string, unknown>>)[0];
+    expect(Array.isArray(msg0.content)).toBe(true);
+    expect(msg0.content).toEqual([
+      {
+        type: "image_url",
+        image_url: { url: expect.stringContaining("data:image/png;base64,") },
+      },
+      { type: "text", text: "Updated vision prompt" },
+    ]);
+
+    // Verify tool call continuation appends structured assistant.tool_calls + role:"tool"
+    const afterToolCall = appendAssistantTurnToBody(
+      "openai-chat",
+      {
+        model: "qwen",
+        messages: [{ role: "user", content: "Check GPU 0" }],
+      },
+      {
+        ...emptyParsedResult(),
+        reasoning: "Need to query device 0.",
+        toolCalls: [
+          {
+            id: "call_gpu0",
+            name: "query_gpu_status",
+            arguments: '{"device_index":0}',
+          },
+        ],
+      },
+      '{"temp_c":58,"free_mib":5120}',
+    );
+    const msgs = afterToolCall.messages as Array<Record<string, unknown>>;
+    expect(msgs).toHaveLength(3);
+    expect(msgs[1].role).toBe("assistant");
+    expect(msgs[1].reasoning_content).toBe("Need to query device 0.");
+    expect(msgs[1].tool_calls).toEqual([
+      {
+        id: "call_gpu0",
+        type: "function",
+        function: {
+          name: "query_gpu_status",
+          arguments: '{"device_index":0}',
+        },
+      },
+    ]);
+    expect(msgs[2]).toEqual({
+      role: "tool",
+      tool_call_id: "call_gpu0",
+      content: '{"temp_c":58,"free_mib":5120}',
+    });
+  });
+
+  it("enforces Anthropic thinking budget_tokens < max_tokens and stateful Responses scope", () => {
+    const anthroEp = ENDPOINTS.find((e) => e.id === "anthropic-messages")!;
+    const thinkingPreset = anthroEp.presets.find(
+      (p) => p.id === "messages-thinking",
+    )!;
+    const body = thinkingPreset.buildBody("qwen");
+    const thinking = body.thinking as { type: string; budget_tokens: number };
+    expect(thinking.type).toBe("enabled");
+    expect(thinking.budget_tokens).toBeGreaterThanOrEqual(1024);
+    expect(body.max_tokens as number).toBeGreaterThan(thinking.budget_tokens);
+
+    const respEp = ENDPOINTS.find((e) => e.id === "responses")!;
+    const statefulBody = JSON.stringify(respEp.presets[0].buildBody("qwen"));
+    const curlNoKey = formatCurlCommand(
+      "http://127.0.0.1:8001",
+      respEp,
+      statefulBody,
+      "",
+    );
+    expect(curlNoKey).toContain("curl -sSN");
+    expect(curlNoKey).toContain("Authorization: Bearer playground-local");
   });
 
   it("formats cURL commands with Bearer or x-api-key headers and escaped quotes", () => {
@@ -296,6 +385,7 @@ describe("Playground UI integration", () => {
     expect(secondCallBody.messages[2]).toEqual({
       role: "assistant",
       content: "Use __shfl_down_sync with mask 0xffffffff.",
+      reasoning_content: "Verified warp shuffle.",
     });
     expect(secondCallBody.messages[3]).toEqual({
       role: "user",
@@ -432,7 +522,7 @@ describe("Playground UI integration", () => {
       target: { value: "responses" },
     });
     expect(window.location.pathname + window.location.search).toBe(
-      "/playground?endpoint=responses",
+      "/playground?endpoint=responses&preset=responses-stream",
     );
 
     fireEvent.click(screen.getByRole("link", { name: "Connect" }));

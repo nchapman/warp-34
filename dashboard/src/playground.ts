@@ -12,6 +12,9 @@ export interface TurnMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
   tool_call_id?: string;
+  tool_calls?: unknown[];
+  reasoning_content?: string;
+  rawContentBlocks?: unknown[];
 }
 
 export interface EndpointPreset {
@@ -52,6 +55,7 @@ export interface ParsedApiResult {
   toolCalls: ParsedToolCall[];
   finishReason: string | null;
   responseId: string | null;
+  streamError: string | null;
   usage: {
     inputTokens: number | null;
     cachedTokens: number | null;
@@ -59,6 +63,10 @@ export interface ParsedApiResult {
     reasoningTokens: number | null;
   };
 }
+
+// 8x8 warm-amber checkerboard PNG data URI for offline multimodal Vision testing
+const SAMPLE_IMAGE_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAADklEQVQI12P4//8/A00wCgD/fQH5n3b68AAAAABJRU5ErkJggg==";
 
 export const ENDPOINTS: EndpointSpec[] = [
   {
@@ -203,6 +211,35 @@ export const ENDPOINTS: EndpointSpec[] = [
           chat_template_kwargs: { enable_thinking: false },
         }),
       },
+      {
+        id: "vision",
+        label: "Multimodal Vision (Data URL)",
+        description:
+          "Inline PNG data URL + text prompt for Vision-enabled checkpoints",
+        buildBody: (model) => ({
+          model,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "image_url",
+                  image_url: { url: SAMPLE_IMAGE_DATA_URL },
+                },
+                {
+                  type: "text",
+                  text: "Describe the colors and brightness of this sample image.",
+                },
+              ],
+            },
+          ],
+          max_tokens: 128,
+          temperature: 0,
+          stream: true,
+          stream_options: { include_usage: true },
+          chat_template_kwargs: { enable_thinking: false },
+        }),
+      },
     ],
   },
   {
@@ -245,7 +282,7 @@ export const ENDPOINTS: EndpointSpec[] = [
           input: [
             {
               role: "user",
-              content: "Run the sanitizer gate on thepaged_fa2 target.",
+              content: "Run the sanitizer gate on the paged_fa2 target.",
             },
           ],
           tools: [
@@ -295,6 +332,7 @@ export const ENDPOINTS: EndpointSpec[] = [
                 "Give a 3-bullet checklist for avoiding register spills in CUDA kernels.",
             },
           ],
+          thinking: { type: "disabled" },
           max_tokens: 256,
           temperature: 0,
           stream: true,
@@ -303,7 +341,8 @@ export const ENDPOINTS: EndpointSpec[] = [
       {
         id: "messages-thinking",
         label: "Extended Thinking",
-        description: "Anthropic thinking block + text block streaming",
+        description:
+          "Anthropic thinking block (budget_tokens < max_tokens) + text streaming",
         buildBody: (model) => ({
           model,
           messages: [
@@ -317,7 +356,7 @@ export const ENDPOINTS: EndpointSpec[] = [
             type: "enabled",
             budget_tokens: 1024,
           },
-          max_tokens: 512,
+          max_tokens: 2048,
           stream: true,
         }),
       },
@@ -360,9 +399,8 @@ export const ENDPOINTS: EndpointSpec[] = [
     presets: [
       {
         id: "decisions-multi",
-        label: "Multi-Decision Batch",
-        description:
-          "Calibrated forward/reverse probability readout over shared context",
+        label: "Multi-Decision Batch (noul + choice)",
+        description: "Shared-prefix evaluation over noul and choice fields",
         buildBody: (model) => ({
           model,
           context:
@@ -386,6 +424,30 @@ export const ENDPOINTS: EndpointSpec[] = [
                 medium: "Cross-subsystem runtime change",
                 high: "Unverified kernel or ABI change",
               },
+            },
+          ],
+        }),
+      },
+      {
+        id: "decisions-calibrated",
+        label: "Calibrated 2-Pass + Score Field",
+        description:
+          "Bidirectional order_passes:2 option-order calibration with ordinal score rubric",
+        buildBody: (model) => ({
+          model,
+          order_passes: 2,
+          context:
+            "Incident report: Node 0 GPU temperature is 64C, ECC error count is 0, NVLink P2P bandwidth measured at 478 GB/s unidirectional.",
+          decisions: [
+            {
+              id: "node_health_score",
+              type: "score",
+              question: "Rate the hardware readiness of Node 0 for production.",
+              criteria: [
+                "Critical hardware fault or ECC errors present",
+                "Degraded thermal or interconnect performance",
+                "Healthy thermal, ECC, and NVLink P2P metrics",
+              ],
             },
           ],
         }),
@@ -581,6 +643,7 @@ export function emptyParsedResult(): ParsedApiResult {
     toolCalls: [],
     finishReason: null,
     responseId: null,
+    streamError: null,
     usage: {
       inputTokens: null,
       cachedTokens: null,
@@ -593,6 +656,9 @@ export function emptyParsedResult(): ParsedApiResult {
 /**
  * Extracts a structured `TurnMessage[]` list from a raw request JSON object
  * for `/v1/chat/completions`, `/v1/responses`, or `/v1/messages`.
+ * Non-text blocks (e.g. `image_url`, `tool_use`, `tool_result`) and assistant
+ * `tool_calls` / `reasoning_content` are preserved on the `TurnMessage` so
+ * editing other turns never strips multimodal or tool metadata.
  */
 export function extractMessagesFromBody(
   kind: EndpointKind,
@@ -644,28 +710,51 @@ function normalizeTurnMessage(item: unknown): TurnMessage {
       ? rawRole
       : "user";
   let content = "";
+  let rawContentBlocks: unknown[] | undefined;
   if (typeof obj.content === "string") {
     content = obj.content;
   } else if (Array.isArray(obj.content)) {
-    content = obj.content
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (part && typeof part === "object" && "text" in part) {
-          return String((part as { text?: unknown }).text ?? "");
-        }
-        return JSON.stringify(part);
-      })
-      .join("\n");
+    const textParts: string[] = [];
+    const nonTextBlocks: unknown[] = [];
+    for (const part of obj.content) {
+      if (typeof part === "string") {
+        textParts.push(part);
+      } else if (
+        part &&
+        typeof part === "object" &&
+        (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string"
+      ) {
+        textParts.push((part as { text: string }).text);
+      } else {
+        nonTextBlocks.push(part);
+      }
+    }
+    content = textParts.join("\n");
+    if (nonTextBlocks.length > 0) {
+      rawContentBlocks = nonTextBlocks;
+    }
   }
   const turn: TurnMessage = { role, content };
+  if (rawContentBlocks) {
+    turn.rawContentBlocks = rawContentBlocks;
+  }
   if (typeof obj.tool_call_id === "string") {
     turn.tool_call_id = obj.tool_call_id;
+  }
+  if (Array.isArray(obj.tool_calls)) {
+    turn.tool_calls = obj.tool_calls;
+  }
+  if (typeof obj.reasoning_content === "string") {
+    turn.reasoning_content = obj.reasoning_content;
   }
   return turn;
 }
 
 /**
- * Applies an updated `TurnMessage[]` array back onto a cloned request JSON object.
+ * Applies an updated `TurnMessage[]` array back onto a cloned request JSON object,
+ * preserving any non-text blocks (`image_url`, `tool_use`, `tool_result`) and
+ * assistant `tool_calls` / `reasoning_content`.
  */
 export function applyMessagesToBody(
   kind: EndpointKind,
@@ -674,11 +763,28 @@ export function applyMessagesToBody(
 ): Record<string, unknown> {
   const next = { ...body };
   if (kind === "openai-chat") {
-    next.messages = messages.map((m) =>
-      m.tool_call_id
-        ? { role: m.role, content: m.content, tool_call_id: m.tool_call_id }
-        : { role: m.role, content: m.content },
-    );
+    next.messages = messages.map((m) => {
+      const msgObj: Record<string, unknown> = {
+        role: m.role,
+        content:
+          m.rawContentBlocks && m.rawContentBlocks.length > 0
+            ? [
+                ...m.rawContentBlocks,
+                ...(m.content ? [{ type: "text", text: m.content }] : []),
+              ]
+            : m.content,
+      };
+      if (m.tool_call_id) {
+        msgObj.tool_call_id = m.tool_call_id;
+      }
+      if (m.tool_calls && m.tool_calls.length > 0) {
+        msgObj.tool_calls = m.tool_calls;
+      }
+      if (m.reasoning_content) {
+        msgObj.reasoning_content = m.reasoning_content;
+      }
+      return msgObj;
+    });
     return next;
   }
   if (kind === "anthropic-messages") {
@@ -691,7 +797,13 @@ export function applyMessagesToBody(
     }
     next.messages = rest.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
-      content: m.content,
+      content:
+        m.rawContentBlocks && m.rawContentBlocks.length > 0
+          ? [
+              ...m.rawContentBlocks,
+              ...(m.content ? [{ type: "text", text: m.content }] : []),
+            ]
+          : m.content,
     }));
     return next;
   }
@@ -713,9 +825,9 @@ export function applyMessagesToBody(
 }
 
 /**
- * Appends the assistant response turn and a fresh follow-up user turn to a
- * conversational request body so multi-turn conversations and prefix caching
- * can be tested in one click.
+ * Appends the assistant response turn (preserving real `tool_calls` and
+ * `reasoning_content` when present) and a fresh follow-up `user` or `tool`
+ * turn to a conversational request body.
  */
 export function appendAssistantTurnToBody(
   kind: EndpointKind,
@@ -731,16 +843,41 @@ export function appendAssistantTurnToBody(
     };
   }
   const current = extractMessagesFromBody(kind, body);
-  const assistantContent =
-    parsed.content ||
-    (parsed.toolCalls.length > 0
-      ? parsed.toolCalls
-          .map((tc) => `[tool_call: ${tc.name}(${tc.arguments})]`)
-          .join("\n")
-      : "");
+  if (kind === "openai-chat" && parsed.toolCalls.length > 0) {
+    const assistantTurn: TurnMessage = {
+      role: "assistant",
+      content: parsed.content,
+      tool_calls: parsed.toolCalls.map((tc) => ({
+        id: tc.id,
+        type: "function",
+        function: { name: tc.name, arguments: tc.arguments },
+      })),
+      ...(parsed.reasoning ? { reasoning_content: parsed.reasoning } : {}),
+    };
+    const toolTurns: TurnMessage[] = parsed.toolCalls.map((tc, idx) => ({
+      role: "tool",
+      tool_call_id: tc.id,
+      content:
+        idx === 0 && nextUserContent.trim().length > 0
+          ? nextUserContent
+          : '{"status":"ok"}',
+    }));
+    return applyMessagesToBody(kind, body, [
+      ...current,
+      assistantTurn,
+      ...toolTurns,
+    ]);
+  }
+  const assistantTurn: TurnMessage = {
+    role: "assistant",
+    content: parsed.content,
+    ...(kind === "openai-chat" && parsed.reasoning
+      ? { reasoning_content: parsed.reasoning }
+      : {}),
+  };
   const updated: TurnMessage[] = [
     ...current,
-    { role: "assistant", content: assistantContent },
+    assistantTurn,
     { role: "user", content: nextUserContent },
   ];
   return applyMessagesToBody(kind, body, updated);
@@ -816,6 +953,10 @@ export function parseJsonResponse(
     if (typeof obj.status === "string") {
       res.finishReason = obj.status;
     }
+    const errObj = obj.error as Record<string, unknown> | undefined;
+    if (errObj && typeof errObj.message === "string") {
+      res.streamError = errObj.message;
+    }
     if (typeof obj.output_text === "string" && obj.output_text.length > 0) {
       res.content = obj.output_text;
     }
@@ -825,14 +966,27 @@ export function parseJsonResponse(
     for (const item of output) {
       if (!item || typeof item !== "object") continue;
       const it = item as Record<string, unknown>;
-      if (it.type === "reasoning" && Array.isArray(it.summary)) {
-        for (const s of it.summary) {
-          if (
-            s &&
-            typeof s === "object" &&
-            typeof (s as { text?: unknown }).text === "string"
-          ) {
-            reasoningParts.push((s as { text: string }).text);
+      if (it.type === "reasoning") {
+        if (Array.isArray(it.content)) {
+          for (const c of it.content) {
+            if (
+              c &&
+              typeof c === "object" &&
+              typeof (c as { text?: unknown }).text === "string"
+            ) {
+              reasoningParts.push((c as { text: string }).text);
+            }
+          }
+        }
+        if (reasoningParts.length === 0 && Array.isArray(it.summary)) {
+          for (const s of it.summary) {
+            if (
+              s &&
+              typeof s === "object" &&
+              typeof (s as { text?: unknown }).text === "string"
+            ) {
+              reasoningParts.push((s as { text: string }).text);
+            }
           }
         }
       } else if (it.type === "message" && Array.isArray(it.content)) {
@@ -994,6 +1148,14 @@ export function applySseFrameToResult(
     next.responseId = parsed.id;
   }
 
+  // Surface mid-stream error frames across OpenAI, Anthropic, and Responses streams
+  if (parsed.error && typeof parsed.error === "object") {
+    const errMsg = (parsed.error as { message?: unknown }).message;
+    if (typeof errMsg === "string" && errMsg.length > 0) {
+      next.streamError = errMsg;
+    }
+  }
+
   if (kind === "openai-chat") {
     const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
     const first = choices[0] as Record<string, unknown> | undefined;
@@ -1062,7 +1224,8 @@ export function applySseFrameToResult(
     const evType =
       typeof parsed.type === "string" ? parsed.type : (frame.event ?? "");
     if (
-      evType === "response.reasoning_summary_text.delta" &&
+      (evType === "response.reasoning_text.delta" ||
+        evType === "response.reasoning_summary_text.delta") &&
       typeof parsed.delta === "string"
     ) {
       next.reasoning += parsed.delta;
@@ -1089,6 +1252,7 @@ export function applySseFrameToResult(
               : next.toolCalls,
           finishReason: finalParsed.finishReason ?? next.finishReason,
           responseId: finalParsed.responseId ?? next.responseId,
+          streamError: finalParsed.streamError ?? next.streamError,
           usage: finalParsed.usage,
         };
       }
@@ -1200,20 +1364,39 @@ export function formatCurlCommand(
   apiKey: string,
 ): string {
   const url = `${origin}${endpoint.path}`;
+  let isStreaming = false;
+  let needsStatefulScope = false;
+  try {
+    const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+    isStreaming = Boolean(parsed.stream);
+    needsStatefulScope =
+      endpoint.kind === "openai-responses" &&
+      (parsed.store === true ||
+        typeof parsed.previous_response_id === "string");
+  } catch {
+    // Ignore invalid JSON when formatting cURL
+  }
+  const flag = isStreaming ? "-sSN" : "-sS";
   const lines: string[] = [
     endpoint.method === "GET"
-      ? `curl -sS '${url}'`
-      : `curl -sS -X ${endpoint.method} '${url}'`,
+      ? `curl ${flag} '${url}'`
+      : `curl ${flag} -X ${endpoint.method} '${url}'`,
   ];
   if (endpoint.method !== "GET") {
     lines.push(`  -H 'Content-Type: application/json'`);
   }
-  if (apiKey.trim().length > 0) {
+  const effectiveKey =
+    apiKey.trim().length > 0
+      ? apiKey.trim()
+      : needsStatefulScope
+        ? "playground-local"
+        : "";
+  if (effectiveKey.length > 0) {
     if (endpoint.kind === "anthropic-messages") {
-      lines.push(`  -H 'x-api-key: ${shellEscapeSingleQuotes(apiKey.trim())}'`);
+      lines.push(`  -H 'x-api-key: ${shellEscapeSingleQuotes(effectiveKey)}'`);
     } else {
       lines.push(
-        `  -H 'Authorization: Bearer ${shellEscapeSingleQuotes(apiKey.trim())}'`,
+        `  -H 'Authorization: Bearer ${shellEscapeSingleQuotes(effectiveKey)}'`,
       );
     }
   }
