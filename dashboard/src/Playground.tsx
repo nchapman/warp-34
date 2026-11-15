@@ -1,11 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams, useSearchParams } from "react-router";
 import {
   ENDPOINTS,
-  type EndpointSpec,
-  type ParsedApiResult,
-  type SseFrame,
-  type TurnMessage,
   appendAssistantTurnToBody,
   applyMessagesToBody,
   applySseFrameToResult,
@@ -14,6 +10,10 @@ import {
   extractMessagesFromBody,
   formatCurlCommand,
   parseJsonResponse,
+  type EndpointSpec,
+  type ParsedApiResult,
+  type SseFrame,
+  type TurnMessage,
 } from "./playground";
 
 interface PlaygroundProps {
@@ -24,228 +24,322 @@ interface PlaygroundProps {
 type RequestTab = "structured" | "json";
 type ResponseTab = "parsed" | "raw" | "sse" | "curl";
 
-function resolveRouteEndpointAndPreset(
+interface CallMetrics {
+  status: number | null;
+  statusText: string;
+  ttftMs: number | null;
+  e2eMs: number | null;
+}
+
+const DEFAULT_MODEL = "default";
+const MAX_SSE_INSPECTOR_FRAMES = 512;
+const MAX_SSE_BUFFER_CHARS = 1_048_576;
+const REQUEST_IDLE_TIMEOUT_MS = 120_000;
+const MAX_IMAGES_PER_REQUEST = 4;
+
+function resolveRoute(
   pathEndpointId: string | undefined,
   searchParams: URLSearchParams,
-  fallbackId: string,
-): { endpoint: EndpointSpec; presetId: string } {
-  const epParam = pathEndpointId ?? searchParams.get("endpoint") ?? fallbackId;
+  decisionMode: boolean,
+): {
+  endpoint: EndpointSpec;
+  presetId: string;
+} {
+  const requestedEndpoint = pathEndpointId ?? searchParams.get("endpoint");
+  const fallbackId = decisionMode ? "decisions" : "chat-completions";
   const endpoint =
-    ENDPOINTS.find((e) => e.id === epParam) ??
+    ENDPOINTS.find((e) => e.id === requestedEndpoint) ??
     ENDPOINTS.find((e) => e.id === fallbackId) ??
     ENDPOINTS[0];
-  const presetParam = searchParams.get("preset");
-  const validPreset = endpoint.presets.find((p) => p.id === presetParam);
-  return {
-    endpoint,
-    presetId: validPreset?.id ?? endpoint.presets[0]?.id ?? "",
-  };
+  const requestedPreset = searchParams.get("preset");
+  const preset =
+    endpoint.presets.find((p) => p.id === requestedPreset) ??
+    endpoint.presets[0];
+  return { endpoint, presetId: preset.id };
+}
+
+function readFileAsEngineDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      if (
+        file.type === "image/png" ||
+        file.type === "image/jpeg" ||
+        result.startsWith("data:image/png;") ||
+        result.startsWith("data:image/jpeg;")
+      ) {
+        resolve(result);
+        return;
+      }
+      // Transcode WebP/GIF/BMP to PNG data URL so warp-34's native Rust PNG/JPEG decoder accepts it
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth || img.width || 64;
+        canvas.height = img.naturalHeight || img.height || 64;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(result);
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        resolve(canvas.toDataURL("image/png"));
+      };
+      img.onerror = () => resolve(result);
+      img.src = result;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 export function Playground({ model, decisionMode = false }: PlaygroundProps) {
-  const modelName = model ?? "default";
-  const defaultEndpointId = decisionMode ? "decisions" : "chat-completions";
   const { endpointId: pathEndpointId } = useParams<{ endpointId?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
-  const initialRoute = resolveRouteEndpointAndPreset(
-    pathEndpointId,
-    searchParams,
-    defaultEndpointId,
-  );
+  const defaultEndpointId = decisionMode ? "decisions" : "chat-completions";
+  const initial = resolveRoute(pathEndpointId, searchParams, decisionMode);
+  const [endpointId, setEndpointId] = useState<string>(initial.endpoint.id);
+  const endpoint = ENDPOINTS.find((e) => e.id === endpointId) ?? ENDPOINTS[0];
 
-  const [endpointId, setEndpointId] = useState<string>(
-    initialRoute.endpoint.id,
-  );
-  const [presetId, setPresetId] = useState<string>(initialRoute.presetId);
-  const [requestTab, setRequestTab] = useState<RequestTab>(
-    initialRoute.endpoint.conversational ? "structured" : "json",
-  );
-  const [responseTab, setResponseTab] = useState<ResponseTab>("parsed");
-  const [apiKey, setApiKey] = useState<string>("");
+  const [presetId, setPresetId] = useState<string>(initial.presetId);
+  const activeModel = model ?? DEFAULT_MODEL;
 
-  const updateRouteParams = (nextEpId: string, nextPresetId: string) => {
-    setSearchParams({ endpoint: nextEpId, preset: nextPresetId });
-  };
-
-  const endpoint: EndpointSpec = useMemo(
-    () => ENDPOINTS.find((e) => e.id === endpointId) ?? ENDPOINTS[0],
-    [endpointId],
-  );
+  function updateRouteParams(nextEndpointId: string, nextPresetId: string) {
+    const spec = ENDPOINTS.find((e) => e.id === nextEndpointId) ?? ENDPOINTS[0];
+    const nextParams = new URLSearchParams();
+    if (nextEndpointId !== defaultEndpointId) {
+      nextParams.set("endpoint", nextEndpointId);
+    }
+    if (nextPresetId !== spec.presets[0].id) {
+      nextParams.set("preset", nextPresetId);
+    }
+    setSearchParams(nextParams, { replace: true });
+  }
 
   const [rawJson, setRawJson] = useState<string>(() => {
     const preset =
-      initialRoute.endpoint.presets.find(
-        (p) => p.id === initialRoute.presetId,
-      ) ?? initialRoute.endpoint.presets[0];
-    if (!preset || initialRoute.endpoint.method === "GET") return "";
-    return JSON.stringify(preset.buildBody(modelName), null, 2);
+      initial.endpoint.presets.find((p) => p.id === initial.presetId) ??
+      initial.endpoint.presets[0];
+    return initial.endpoint.method === "GET"
+      ? ""
+      : JSON.stringify(preset.buildBody(activeModel), null, 2);
   });
-
   const [jsonError, setJsonError] = useState<string | null>(null);
-  const [followUpText, setFollowUpText] = useState<string>("");
+  const [apiKey, setApiKey] = useState<string>("");
+  const [requestTab, setRequestTab] = useState<RequestTab>(() =>
+    initial.endpoint.conversational ? "structured" : "json",
+  );
+  const [responseTab, setResponseTab] = useState<ResponseTab>("parsed");
 
-  // Execution / response state
-  const [running, setRunning] = useState<boolean>(false);
-  const [statusCode, setStatusCode] = useState<number | null>(null);
-  const [statusText, setStatusText] = useState<string>("");
-  const [ttftMs, setTtftMs] = useState<number | null>(null);
-  const [totalMs, setTotalMs] = useState<number | null>(null);
-  const [rawResponse, setRawResponse] = useState<string>("");
-  const [sseFrames, setSseFrames] = useState<SseFrame[]>([]);
+  const [inFlight, setInFlight] = useState<boolean>(false);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const [callMetrics, setCallMetrics] = useState<CallMetrics>({
+    status: null,
+    statusText: "",
+    ttftMs: null,
+    e2eMs: null,
+  });
   const [parsedResult, setParsedResult] =
     useState<ParsedApiResult>(emptyParsedResult);
-  const [requestError, setRequestError] = useState<string | null>(null);
+  const [rawResponse, setRawResponse] = useState<string>("");
+  const [sseFrames, setSseFrames] = useState<SseFrame[]>([]);
+  const [followUpText, setFollowUpText] = useState<string>("");
   const [copiedCurl, setCopiedCurl] = useState<boolean>(false);
 
   const abortRef = useRef<AbortController | null>(null);
-  const prevModelRef = useRef<string>(modelName);
+  const prevModelRef = useRef<string>(activeModel);
 
-  // Keep `model` field synced if the server swaps models or resolves from "connecting..."
   useEffect(() => {
-    if (prevModelRef.current === modelName) return;
-    const oldModel = prevModelRef.current;
-    prevModelRef.current = modelName;
-    if (!rawJson.trim()) return;
+    return () => {
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  // Keep the request JSON's `model` field synced when the first live metrics snapshot arrives
+  useEffect(() => {
+    if (prevModelRef.current === activeModel) return;
+    const prev = prevModelRef.current;
+    prevModelRef.current = activeModel;
     try {
-      const obj = JSON.parse(rawJson) as Record<string, unknown>;
-      if (obj.model === oldModel || obj.model === "default") {
-        obj.model = modelName;
-        setRawJson(JSON.stringify(obj, null, 2));
+      const parsed = JSON.parse(rawJson) as Record<string, unknown>;
+      if (parsed.model === prev || parsed.model === DEFAULT_MODEL) {
+        parsed.model = activeModel;
+        setRawJson(JSON.stringify(parsed, null, 2));
       }
     } catch {
-      // Ignore if user has mid-edit invalid JSON
+      // Leave user's unparseable JSON untouched
     }
-  }, [modelName, rawJson]);
+  }, [activeModel, rawJson]);
 
   // Synchronize endpoint & preset state when URL path or search params change externally
-  // (e.g. browser Back/Forward or deep links like `/playground/decisions`).
   useEffect(() => {
-    const resolved = resolveRouteEndpointAndPreset(
-      pathEndpointId,
-      searchParams,
-      defaultEndpointId,
-    );
+    const resolved = resolveRoute(pathEndpointId, searchParams, decisionMode);
     if (resolved.endpoint.id !== endpointId || resolved.presetId !== presetId) {
       setEndpointId(resolved.endpoint.id);
       setPresetId(resolved.presetId);
       const nextPreset =
         resolved.endpoint.presets.find((p) => p.id === resolved.presetId) ??
         resolved.endpoint.presets[0];
-      if (!nextPreset || resolved.endpoint.method === "GET") {
-        setRawJson("");
-      } else {
-        setRawJson(JSON.stringify(nextPreset.buildBody(modelName), null, 2));
-      }
+      setRawJson(
+        resolved.endpoint.method === "GET"
+          ? ""
+          : JSON.stringify(nextPreset.buildBody(activeModel), null, 2),
+      );
       setJsonError(null);
       setRequestTab(resolved.endpoint.conversational ? "structured" : "json");
     }
-  }, [pathEndpointId, searchParams, defaultEndpointId]);
+  }, [pathEndpointId, searchParams, decisionMode]);
 
-  const parsedBody = useMemo<Record<string, unknown> | null>(() => {
-    if (endpoint.method === "GET" || !rawJson.trim()) return {};
+  function selectEndpoint(nextId: string) {
+    const nextSpec = ENDPOINTS.find((e) => e.id === nextId) ?? ENDPOINTS[0];
+    const firstPreset = nextSpec.presets[0];
+    setEndpointId(nextSpec.id);
+    setPresetId(firstPreset.id);
+    updateRouteParams(nextSpec.id, firstPreset.id);
+    const body = firstPreset.buildBody(activeModel);
+    setRawJson(nextSpec.method === "GET" ? "" : JSON.stringify(body, null, 2));
+    setJsonError(null);
+    setRequestTab(nextSpec.conversational ? "structured" : "json");
+    clearResponseState();
+  }
+
+  function selectPreset(nextPresetId: string) {
+    const preset =
+      endpoint.presets.find((p) => p.id === nextPresetId) ??
+      endpoint.presets[0];
+    setPresetId(preset.id);
+    updateRouteParams(endpoint.id, preset.id);
+    const body = preset.buildBody(activeModel);
+    setRawJson(endpoint.method === "GET" ? "" : JSON.stringify(body, null, 2));
+    setJsonError(null);
+    clearResponseState();
+  }
+
+  function clearResponseState() {
+    setRequestError(null);
+    setCallMetrics({ status: null, statusText: "", ttftMs: null, e2eMs: null });
+    setParsedResult(emptyParsedResult());
+    setRawResponse("");
+    setSseFrames([]);
+  }
+
+  function parseCurrentBody(): Record<string, unknown> | null {
+    if (endpoint.method === "GET") return {};
     try {
       const val = JSON.parse(rawJson);
-      if (val && typeof val === "object" && !Array.isArray(val)) {
-        return val as Record<string, unknown>;
+      if (!val || typeof val !== "object" || Array.isArray(val)) {
+        return null;
       }
-      return null;
+      return val as Record<string, unknown>;
     } catch {
       return null;
     }
-  }, [rawJson, endpoint.method]);
+  }
 
-  const structuredTurns = useMemo<TurnMessage[]>(() => {
-    if (!endpoint.conversational || !parsedBody) return [];
-    return extractMessagesFromBody(endpoint.kind, parsedBody);
-  }, [endpoint.conversational, endpoint.kind, parsedBody]);
-
-  const selectEndpoint = (nextId: string) => {
-    const nextEp = ENDPOINTS.find((e) => e.id === nextId) ?? ENDPOINTS[0];
-    const firstPreset = nextEp.presets[0];
-    const nextPresetId = firstPreset?.id ?? "";
-    setEndpointId(nextEp.id);
-    setPresetId(nextPresetId);
-    updateRouteParams(nextEp.id, nextPresetId);
-    if (!firstPreset || nextEp.method === "GET") {
-      setRawJson("");
-    } else {
-      setRawJson(JSON.stringify(firstPreset.buildBody(modelName), null, 2));
-    }
-    setJsonError(null);
-    setRequestTab(nextEp.conversational ? "structured" : "json");
-    clearResponseState();
-  };
-
-  const selectPreset = (nextPresetId: string) => {
-    const preset = endpoint.presets.find((p) => p.id === nextPresetId);
-    if (!preset) return;
-    setPresetId(preset.id);
-    updateRouteParams(endpoint.id, preset.id);
-    if (endpoint.method === "GET") {
-      setRawJson("");
-    } else {
-      setRawJson(JSON.stringify(preset.buildBody(modelName), null, 2));
-    }
-    setJsonError(null);
-    clearResponseState();
-  };
-
-  const clearResponseState = () => {
-    setStatusCode(null);
-    setStatusText("");
-    setTtftMs(null);
-    setTotalMs(null);
-    setRawResponse("");
-    setSseFrames([]);
-    setParsedResult(emptyParsedResult());
-    setRequestError(null);
-  };
-
-  const updateBodyObject = (
-    updater: (current: Record<string, unknown>) => Record<string, unknown>,
-  ) => {
-    if (!parsedBody) return;
-    const updated = updater(parsedBody);
+  function updateBodyObject(
+    updater: (body: Record<string, unknown>) => Record<string, unknown>,
+  ) {
+    const current = parseCurrentBody();
+    if (!current) return;
+    const updated = updater(current);
     setRawJson(JSON.stringify(updated, null, 2));
     setJsonError(null);
-  };
+  }
 
-  const updateTurns = (nextTurns: TurnMessage[]) => {
-    updateBodyObject((curr) =>
-      applyMessagesToBody(endpoint.kind, curr, nextTurns),
+  const bodyObj = parseCurrentBody();
+  const messages: TurnMessage[] =
+    endpoint.conversational && bodyObj
+      ? extractMessagesFromBody(endpoint.kind, bodyObj)
+      : [];
+
+  const totalImages = messages.reduce(
+    (sum, m) => sum + (m.images?.length ?? 0),
+    0,
+  );
+
+  function handleMessageChange(index: number, patch: Partial<TurnMessage>) {
+    updateBodyObject((curr) => {
+      const list = extractMessagesFromBody(endpoint.kind, curr).map((m, i) =>
+        i === index ? { ...m, ...patch } : m,
+      );
+      return applyMessagesToBody(endpoint.kind, curr, list);
+    });
+  }
+
+  async function handleAttachImages(index: number, files: FileList | File[]) {
+    const fileArr = Array.from(files).filter((f) =>
+      f.type.startsWith("image/"),
     );
-  };
+    if (fileArr.length === 0) return;
+    const remainingBudget = Math.max(0, MAX_IMAGES_PER_REQUEST - totalImages);
+    const toRead = fileArr.slice(0, remainingBudget);
+    if (toRead.length === 0) return;
+    const dataUrls = await Promise.all(toRead.map(readFileAsEngineDataUrl));
+    updateBodyObject((curr) => {
+      const list = extractMessagesFromBody(endpoint.kind, curr).map((m, i) =>
+        i === index ? { ...m, images: [...(m.images ?? []), ...dataUrls] } : m,
+      );
+      return applyMessagesToBody(endpoint.kind, curr, list);
+    });
+  }
 
-  const handleRawJsonChange = (val: string) => {
-    setRawJson(val);
-    if (!val.trim() && endpoint.method === "GET") {
+  function handleRemoveImage(turnIdx: number, imgIdx: number) {
+    updateBodyObject((curr) => {
+      const list = extractMessagesFromBody(endpoint.kind, curr).map((m, i) => {
+        if (i !== turnIdx || !m.images) return m;
+        const nextImgs = m.images.filter((_, j) => j !== imgIdx);
+        return { ...m, images: nextImgs.length > 0 ? nextImgs : undefined };
+      });
+      return applyMessagesToBody(endpoint.kind, curr, list);
+    });
+  }
+
+  function handleAddMessage(role: TurnMessage["role"] = "user") {
+    updateBodyObject((curr) => {
+      const list = [
+        ...extractMessagesFromBody(endpoint.kind, curr),
+        { role, content: "" },
+      ];
+      return applyMessagesToBody(endpoint.kind, curr, list);
+    });
+  }
+
+  function handleRemoveMessage(index: number) {
+    updateBodyObject((curr) => {
+      const list = extractMessagesFromBody(endpoint.kind, curr).filter(
+        (_, i) => i !== index,
+      );
+      return applyMessagesToBody(endpoint.kind, curr, list);
+    });
+  }
+
+  function handleRawJsonEdit(value: string) {
+    setRawJson(value);
+    if (endpoint.method === "GET") {
       setJsonError(null);
       return;
     }
     try {
-      JSON.parse(val);
-      setJsonError(null);
-    } catch (e) {
-      setJsonError(e instanceof Error ? e.message : "Invalid JSON");
+      const parsed = JSON.parse(value);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        setJsonError("Request body must be a JSON object");
+      } else {
+        setJsonError(null);
+      }
+    } catch (err) {
+      setJsonError((err as Error).message);
     }
-  };
+  }
 
-  const cancelInFlight = () => {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setRunning(false);
-  };
-
-  const executeRequest = async (overrideBodyJson?: string) => {
-    const bodyToSend = overrideBodyJson ?? rawJson;
+  async function executeRequest(overrideJson?: string) {
+    const payloadText = overrideJson ?? rawJson;
     let reqObj: Record<string, unknown> | null = null;
     if (endpoint.method !== "GET") {
       try {
-        reqObj = JSON.parse(bodyToSend) as Record<string, unknown>;
-        setJsonError(null);
-      } catch (e) {
-        setJsonError(e instanceof Error ? e.message : "Invalid JSON payload");
-        setRequestTab("json");
+        reqObj = JSON.parse(payloadText) as Record<string, unknown>;
+      } catch (err) {
+        setJsonError((err as Error).message);
         return;
       }
     }
@@ -253,16 +347,28 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    let timedOut = false;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const resetIdleTimer = () => {
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, REQUEST_IDLE_TIMEOUT_MS);
+    };
+    const clearIdleTimer = () => {
+      if (idleTimer !== null) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
 
-    setRunning(true);
-    setStatusCode(null);
-    setStatusText("");
-    setTtftMs(null);
-    setTotalMs(null);
+    setInFlight(true);
+    setRequestError(null);
+    setCallMetrics({ status: null, statusText: "", ttftMs: null, e2eMs: null });
+    setParsedResult(emptyParsedResult());
     setRawResponse("");
     setSseFrames([]);
-    setParsedResult(emptyParsedResult());
-    setRequestError(null);
 
     const headers: Record<string, string> = {};
     if (endpoint.method !== "GET") {
@@ -283,241 +389,266 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
       if (endpoint.kind === "anthropic-messages") {
         headers["x-api-key"] = effectiveKey;
       } else {
-        headers.Authorization = `Bearer ${effectiveKey}`;
+        headers["Authorization"] = `Bearer ${effectiveKey}`;
       }
     }
 
     const startTime = performance.now();
-    let recordedFirstByte = false;
+    let firstByteMs: number | null = null;
 
     try {
-      const res = await fetch(endpoint.path, {
+      resetIdleTimer();
+      const response = await fetch(endpoint.path, {
         method: endpoint.method,
         headers,
-        body: endpoint.method === "GET" ? undefined : bodyToSend,
+        body: endpoint.method === "GET" ? undefined : payloadText,
         signal: controller.signal,
       });
+      resetIdleTimer();
 
-      setStatusCode(res.status);
-      setStatusText(
-        res.statusText ||
-          (res.status >= 200 && res.status < 300 ? "OK" : "Error"),
-      );
-      const contentType = res.headers.get("content-type") ?? "";
+      const contentType = response.headers.get("content-type") ?? "";
+      const isEventStream = contentType.includes("text/event-stream");
 
-      if (contentType.includes("text/event-stream") && res.body) {
-        const reader = res.body.getReader();
+      if (isEventStream && response.body) {
+        const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
         let frameIndex = 0;
-        let folded = emptyParsedResult();
-        const collectedFrames: SseFrame[] = [];
+        let runningParsed = emptyParsedResult();
+        const retainedFrames: SseFrame[] = [];
 
         while (true) {
+          resetIdleTimer();
           const { value, done } = await reader.read();
           if (done) break;
-          const now = performance.now();
-          if (!recordedFirstByte) {
-            recordedFirstByte = true;
-            setTtftMs(now - startTime);
+          const nowMs = Math.round(performance.now() - startTime);
+          if (firstByteMs === null) {
+            firstByteMs = nowMs;
+            setCallMetrics({
+              status: response.status,
+              statusText: response.statusText || "OK",
+              ttftMs: firstByteMs,
+              e2eMs: null,
+            });
           }
           buffer += decoder.decode(value, { stream: true });
-          const drained = drainSseBuffer(buffer, frameIndex, now - startTime);
+          if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+            throw new Error("SSE frame buffer exceeded 1 MiB limit.");
+          }
+          const drained = drainSseBuffer(buffer, frameIndex, nowMs);
           buffer = drained.remainder;
           if (drained.frames.length > 0) {
             frameIndex += drained.frames.length;
             for (const f of drained.frames) {
-              folded = applySseFrameToResult(endpoint.kind, folded, f);
-              if (collectedFrames.length < 512) {
-                collectedFrames.push(f);
+              runningParsed = applySseFrameToResult(
+                endpoint.kind,
+                runningParsed,
+                f,
+              );
+              if (retainedFrames.length < MAX_SSE_INSPECTOR_FRAMES) {
+                retainedFrames.push(f);
               }
             }
-            setParsedResult(folded);
-            if (folded.streamError) {
-              setRequestError(folded.streamError);
+            setSseFrames(retainedFrames.slice());
+            setParsedResult(runningParsed);
+            if (runningParsed.streamError) {
+              setRequestError(runningParsed.streamError);
             }
-            setSseFrames([...collectedFrames]);
-            const lastNonDone = [...drained.frames]
-              .reverse()
-              .find((f) => f.data !== "[DONE]");
-            if (lastNonDone) {
-              setRawResponse(lastNonDone.data);
+            const lastData = drained.frames.at(-1);
+            if (lastData && lastData.data !== "[DONE]") {
+              setRawResponse(lastData.data);
             }
           }
         }
-        setTotalMs(performance.now() - startTime);
+
+        const totalMs = Math.round(performance.now() - startTime);
+        setCallMetrics({
+          status: response.status,
+          statusText: response.statusText || "OK",
+          ttftMs: firstByteMs ?? totalMs,
+          e2eMs: totalMs,
+        });
       } else {
-        const text = await res.text();
-        const elapsed = performance.now() - startTime;
-        setTtftMs(elapsed);
-        setTotalMs(elapsed);
+        const text = await response.text();
+        const totalMs = Math.round(performance.now() - startTime);
+        setCallMetrics({
+          status: response.status,
+          statusText: response.statusText || (response.ok ? "OK" : "Error"),
+          ttftMs: totalMs,
+          e2eMs: totalMs,
+        });
         try {
-          const json = JSON.parse(text);
-          setRawResponse(JSON.stringify(json, null, 2));
-          if (res.ok) {
-            setParsedResult(parseJsonResponse(endpoint.kind, json));
+          const jsonVal = JSON.parse(text);
+          setRawResponse(JSON.stringify(jsonVal, null, 2));
+          if (response.ok) {
+            setParsedResult(parseJsonResponse(endpoint.kind, jsonVal));
           } else {
-            const errMsg =
-              json?.error?.message ??
-              json?.message ??
-              `HTTP ${res.status} error`;
-            setRequestError(String(errMsg));
+            setParsedResult({
+              ...emptyParsedResult(),
+              content: JSON.stringify(jsonVal, null, 2),
+            });
           }
         } catch {
           setRawResponse(text);
-          if (!res.ok) {
-            setRequestError(text || `HTTP ${res.status}`);
-          }
+          setParsedResult({
+            ...emptyParsedResult(),
+            content: text,
+          });
         }
       }
-    } catch (e) {
-      if ((e as { name?: string })?.name === "AbortError") {
-        setRequestError("Request cancelled by user");
+    } catch (err) {
+      if ((err as Error).name === "AbortError") {
+        setRequestError(
+          timedOut
+            ? "Request timed out waiting for server activity."
+            : "Request aborted by user.",
+        );
       } else {
-        setRequestError(e instanceof Error ? e.message : String(e));
+        setRequestError((err as Error).message || "Network request failed.");
       }
     } finally {
-      if (abortRef.current === controller) {
-        abortRef.current = null;
-        setRunning(false);
-      }
+      clearIdleTimer();
+      setInFlight(false);
     }
-  };
+  }
 
-  const handleAppendAndContinue = (andSend: boolean) => {
-    if (!parsedBody) return;
-    const nextObj = appendAssistantTurnToBody(
+  function handleAppendAndContinue(sendImmediately: boolean) {
+    if (!bodyObj) return;
+    const nextBody = appendAssistantTurnToBody(
       endpoint.kind,
-      parsedBody,
+      bodyObj,
       parsedResult,
       followUpText,
     );
-    const nextJson = JSON.stringify(nextObj, null, 2);
+    const nextJson = JSON.stringify(nextBody, null, 2);
     setRawJson(nextJson);
+    setJsonError(null);
     setFollowUpText("");
-    if (andSend) {
+    if (
+      sendImmediately &&
+      (followUpText.trim().length > 0 || parsedResult.toolCalls.length > 0)
+    ) {
       void executeRequest(nextJson);
     }
-  };
+  }
 
-  const origin =
-    typeof window !== "undefined"
-      ? window.location.origin
-      : "http://127.0.0.1:8000";
-
-  const curlCommand = useMemo(
-    () => formatCurlCommand(origin, endpoint, rawJson, apiKey),
-    [origin, endpoint, rawJson, apiKey],
+  const curlCommand = formatCurlCommand(
+    window.location.origin,
+    endpoint,
+    rawJson,
+    apiKey,
   );
 
-  const handleCopyCurl = () => {
-    void navigator.clipboard?.writeText(curlCommand);
-    setCopiedCurl(true);
-    setTimeout(() => setCopiedCurl(false), 1500);
-  };
-
-  const streamTokPerSec = useMemo(() => {
-    const outTok = parsedResult.usage.outputTokens;
-    if (!outTok || outTok <= 1 || ttftMs === null || totalMs === null) {
-      return null;
+  async function handleCopyCurl() {
+    try {
+      await navigator.clipboard?.writeText(curlCommand);
+      setCopiedCurl(true);
+      setTimeout(() => setCopiedCurl(false), 1500);
+    } catch {
+      setResponseTab("curl");
     }
-    const decodeWindowSec = (totalMs - ttftMs) / 1000;
-    if (decodeWindowSec <= 0.005) return null;
-    return (outTok - 1) / decodeWindowSec;
-  }, [parsedResult.usage.outputTokens, ttftMs, totalMs]);
+  }
 
-  const cachedRatioPct = useMemo(() => {
-    const { inputTokens, cachedTokens } = parsedResult.usage;
-    if (inputTokens && inputTokens > 0 && cachedTokens !== null) {
-      return Math.round((cachedTokens / inputTokens) * 100);
-    }
-    return null;
-  }, [parsedResult.usage]);
+  const decodeTokPerSec =
+    parsedResult.usage.outputTokens &&
+    parsedResult.usage.outputTokens > 1 &&
+    callMetrics.e2eMs !== null &&
+    callMetrics.ttftMs !== null &&
+    callMetrics.e2eMs > callMetrics.ttftMs
+      ? (
+          (parsedResult.usage.outputTokens * 1000) /
+          (callMetrics.e2eMs - callMetrics.ttftMs)
+        ).toFixed(1)
+      : null;
 
-  const canAppendTurn =
+  const hasAssistantReply =
     endpoint.conversational &&
-    !running &&
-    Boolean(parsedResult.content || parsedResult.toolCalls.length > 0);
-
-  const endpointGroups = [
-    "Generative",
-    "Decision & Scoring",
-    "Tokenizer & Counts",
-    "System",
-  ] as const;
+    (parsedResult.content.length > 0 || parsedResult.toolCalls.length > 0);
 
   return (
-    <section className="playground-section" aria-label="API Playground">
-      <div className="playground-header">
+    <div className="playground">
+      <div className="section-heading">
         <div>
-          <h1 className="page-title">API Playground</h1>
-          <p className="page-sub">
+          <h1>API Playground</h1>
+          <p>
             Inspect wire payloads, SSE frames, prefix cache hits, and multi-turn
             state against this engine.
           </p>
         </div>
         <div className="playground-auth">
-          <label className="pg-field-label" htmlFor="pg-api-key">
+          <label htmlFor="pg-api-key" className="eyebrow">
             API KEY
           </label>
           <input
             id="pg-api-key"
             type="password"
-            className="pg-input pg-auth-input"
             placeholder="Optional Bearer / x-api-key"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
+            autoComplete="off"
           />
         </div>
       </div>
 
       <div className="playground-workspace">
-        {/* Left Endpoint Sidebar (wide viewports) */}
-        <aside className="panel pg-sidebar" aria-label="API Endpoints">
-          {endpointGroups.map((group) => (
+        <aside className="panel pg-sidebar" aria-label="API endpoints">
+          {(
+            [
+              "Generative",
+              "Decision & Scoring",
+              "Tokenizer & Counts",
+              "System",
+            ] as const
+          ).map((group) => (
             <div key={group} className="pg-sidebar-group">
-              <div className="pg-sidebar-group-title">{group}</div>
-              <div className="pg-sidebar-list">
-                {ENDPOINTS.filter((e) => e.group === group).map((ep) => {
-                  const active = ep.id === endpoint.id;
-                  return (
-                    <button
-                      key={ep.id}
-                      type="button"
-                      className={`pg-sidebar-item ${active ? "active" : ""}`}
-                      onClick={() => selectEndpoint(ep.id)}
+              <span className="eyebrow">{group.toUpperCase()}</span>
+              <div className="pg-sidebar-items">
+                {ENDPOINTS.filter((ep) => ep.group === group).map((ep) => (
+                  <button
+                    key={ep.id}
+                    type="button"
+                    className={`pg-sidebar-item ${
+                      endpoint.id === ep.id ? "active" : ""
+                    }`}
+                    onClick={() => selectEndpoint(ep.id)}
+                  >
+                    <span
+                      className={`method-badge method-${ep.method.toLowerCase()}`}
                     >
-                      <span
-                        className={`method-badge method-${ep.method.toLowerCase()}`}
-                      >
-                        {ep.method}
-                      </span>
-                      <span className="pg-sidebar-path">{ep.path}</span>
-                    </button>
-                  );
-                })}
+                      {ep.method}
+                    </span>
+                    <span className="pg-sidebar-path mono">{ep.path}</span>
+                  </button>
+                ))}
               </div>
             </div>
           ))}
         </aside>
 
-        {/* Main Playground Workbench */}
         <div className="pg-main">
-          {/* Preset & Action Bar (includes Endpoint select on narrower screens) */}
-          <div className="panel playground-toolbar">
+          <section
+            className="panel playground-toolbar"
+            aria-label="Endpoint controls"
+          >
             <div className="pg-field pg-endpoint-mobile">
-              <label className="pg-field-label" htmlFor="pg-endpoint-select">
+              <label htmlFor="pg-endpoint" className="eyebrow">
                 ENDPOINT
               </label>
               <select
-                id="pg-endpoint-select"
-                className="pg-select"
+                id="pg-endpoint"
                 value={endpoint.id}
                 onChange={(e) => selectEndpoint(e.target.value)}
               >
-                {endpointGroups.map((group) => (
+                {(
+                  [
+                    "Generative",
+                    "Decision & Scoring",
+                    "Tokenizer & Counts",
+                    "System",
+                  ] as const
+                ).map((group) => (
                   <optgroup key={group} label={group}>
-                    {ENDPOINTS.filter((e) => e.group === group).map((ep) => (
+                    {ENDPOINTS.filter((ep) => ep.group === group).map((ep) => (
                       <option key={ep.id} value={ep.id}>
                         {ep.label}
                       </option>
@@ -528,22 +659,12 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
             </div>
 
             <div className="pg-field">
-              <label className="pg-field-label" htmlFor="pg-preset-select">
-                PRESET
-                {endpoint.presets.find((p) => p.id === presetId)
-                  ?.description ? (
-                  <span className="pg-preset-desc">
-                    {" · "}
-                    {
-                      endpoint.presets.find((p) => p.id === presetId)
-                        ?.description
-                    }
-                  </span>
-                ) : null}
+              <label htmlFor="pg-preset" className="eyebrow">
+                PRESET ·{" "}
+                {endpoint.presets.find((p) => p.id === presetId)?.description}
               </label>
               <select
-                id="pg-preset-select"
-                className="pg-select"
+                id="pg-preset"
                 value={presetId}
                 onChange={(e) => selectPreset(e.target.value)}
               >
@@ -559,140 +680,323 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
               <button
                 type="button"
                 className="pg-btn pg-btn-secondary"
-                onClick={handleCopyCurl}
+                onClick={() => void handleCopyCurl()}
               >
                 {copiedCurl ? "Copied cURL" : "Copy cURL"}
               </button>
-              {running ? (
+              {inFlight ? (
                 <button
                   type="button"
                   className="pg-btn pg-btn-danger"
-                  onClick={cancelInFlight}
+                  onClick={() => abortRef.current?.abort()}
                 >
-                  Stop Stream
+                  Abort
                 </button>
               ) : (
                 <button
                   type="button"
                   className="pg-btn pg-btn-primary"
-                  disabled={Boolean(jsonError) && endpoint.method !== "GET"}
+                  disabled={Boolean(jsonError)}
                   onClick={() => void executeRequest()}
                 >
                   Send Request
                 </button>
               )}
             </div>
-          </div>
+          </section>
 
-          {/* Split Workbench: Request Left, Response Right */}
           <div className="playground-grid">
-            {/* Request Column */}
-            <div className="panel playground-pane">
-              <div className="pg-pane-head">
-                <div className="pg-pane-title">
+            <section
+              className="panel playground-pane"
+              aria-labelledby="req-pane-title"
+            >
+              <div className="panel-heading pg-pane-heading">
+                <div className="pg-title-group">
                   <span
                     className={`method-badge method-${endpoint.method.toLowerCase()}`}
                   >
                     {endpoint.method}
                   </span>
-                  <code className="pg-path">{endpoint.path}</code>
+                  <h2 id="req-pane-title" className="mono">
+                    {endpoint.path}
+                  </h2>
                 </div>
-                <div
-                  className="pg-subtabs"
-                  role="tablist"
-                  aria-label="Request View"
-                >
-                  {endpoint.conversational && (
+                {endpoint.conversational && (
+                  <div
+                    className="pg-tab-group"
+                    role="tablist"
+                    aria-label="Request editor mode"
+                  >
                     <button
                       type="button"
                       role="tab"
                       aria-selected={requestTab === "structured"}
-                      className={`pg-subtab ${requestTab === "structured" ? "active" : ""}`}
+                      className={requestTab === "structured" ? "active" : ""}
                       onClick={() => setRequestTab("structured")}
                     >
-                      Messages &amp; Params
+                      Messages & Params
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={requestTab === "json"}
-                    className={`pg-subtab ${requestTab === "json" ? "active" : ""}`}
-                    onClick={() => setRequestTab("json")}
-                  >
-                    JSON Body
-                  </button>
-                </div>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={requestTab === "json"}
+                      className={requestTab === "json" ? "active" : ""}
+                      onClick={() => setRequestTab("json")}
+                    >
+                      JSON Body
+                    </button>
+                  </div>
+                )}
               </div>
 
-              {jsonError && (
-                <div role="alert" className="notice notice-warn pg-notice">
-                  <span className="notice-dot" />
-                  <span>JSON syntax error: {jsonError}</span>
-                </div>
-              )}
-
-              {endpoint.method === "GET" ? (
-                <div className="pg-empty-body">
-                  <code>GET {endpoint.path}</code> takes no request body. Click{" "}
-                  <strong>Send Request</strong> to inspect the live response.
-                </div>
-              ) : requestTab === "structured" &&
-                endpoint.conversational &&
-                parsedBody ? (
+              {endpoint.conversational &&
+              requestTab === "structured" &&
+              bodyObj ? (
                 <div className="pg-structured">
                   <ParameterBar
                     endpoint={endpoint}
-                    body={parsedBody}
+                    body={bodyObj}
                     onUpdate={updateBodyObject}
                   />
-                  <StructuredTurnEditor
-                    endpoint={endpoint}
-                    turns={structuredTurns}
-                    onChange={updateTurns}
-                  />
+
+                  <div className="pg-messages-header">
+                    <span className="eyebrow">
+                      {endpoint.kind === "openai-responses"
+                        ? "INSTRUCTIONS & INPUT TURNS"
+                        : "MESSAGES ARRAY"}
+                    </span>
+                    <div className="pg-message-add-btns">
+                      <button
+                        type="button"
+                        className="pg-mini-btn"
+                        onClick={() => handleAddMessage("user")}
+                      >
+                        + User turn
+                      </button>
+                      <button
+                        type="button"
+                        className="pg-mini-btn"
+                        onClick={() => handleAddMessage("assistant")}
+                      >
+                        + Assistant turn
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="pg-messages-list">
+                    {messages.map((msg, idx) => (
+                      <div
+                        key={idx}
+                        className="pg-message-row"
+                        onDragOver={(e) => {
+                          if (msg.role === "user") {
+                            e.preventDefault();
+                          }
+                        }}
+                        onDrop={(e) => {
+                          if (
+                            msg.role === "user" &&
+                            e.dataTransfer?.files?.length
+                          ) {
+                            e.preventDefault();
+                            void handleAttachImages(idx, e.dataTransfer.files);
+                          }
+                        }}
+                      >
+                        <div className="pg-message-meta">
+                          <select
+                            aria-label={`Turn ${idx + 1} role`}
+                            value={msg.role}
+                            onChange={(e) =>
+                              handleMessageChange(idx, {
+                                role: e.target.value as TurnMessage["role"],
+                              })
+                            }
+                          >
+                            <option value="system">system</option>
+                            <option value="user">user</option>
+                            <option value="assistant">assistant</option>
+                            {endpoint.kind === "openai-chat" && (
+                              <option value="tool">tool</option>
+                            )}
+                          </select>
+                          <span className="pg-turn-index mono">#{idx}</span>
+                          {msg.tool_calls && msg.tool_calls.length > 0 && (
+                            <span className="pg-badge amber">
+                              {msg.tool_calls.length} tool_call
+                              {msg.tool_calls.length > 1 ? "s" : ""}
+                            </span>
+                          )}
+                          <div className="pg-turn-actions">
+                            {msg.role === "user" &&
+                              totalImages < MAX_IMAGES_PER_REQUEST && (
+                                <label className="pg-mini-btn pg-upload-label">
+                                  + Image
+                                  <input
+                                    type="file"
+                                    accept="image/png,image/jpeg,image/webp,image/gif"
+                                    multiple
+                                    aria-label={`Attach image to turn ${idx + 1}`}
+                                    className="pg-upload-input"
+                                    onChange={(e) => {
+                                      if (
+                                        e.target.files &&
+                                        e.target.files.length > 0
+                                      ) {
+                                        void handleAttachImages(
+                                          idx,
+                                          e.target.files,
+                                        );
+                                        e.target.value = "";
+                                      }
+                                    }}
+                                  />
+                                </label>
+                              )}
+                            <button
+                              type="button"
+                              className="pg-remove-btn"
+                              aria-label={`Remove turn ${idx + 1}`}
+                              onClick={() => handleRemoveMessage(idx)}
+                            >
+                              ×
+                            </button>
+                          </div>
+                        </div>
+
+                        {msg.images && msg.images.length > 0 && (
+                          <div className="pg-turn-images">
+                            {msg.images.map((imgUrl, imgIdx) => (
+                              <div key={imgIdx} className="pg-turn-thumb">
+                                <img
+                                  src={imgUrl}
+                                  alt={`Turn ${idx + 1} attachment ${imgIdx + 1}`}
+                                  className="pg-turn-thumb-img"
+                                />
+                                <span className="pg-turn-thumb-meta mono">
+                                  {imgUrl.startsWith("data:image/jpeg")
+                                    ? "JPEG"
+                                    : imgUrl.startsWith("data:image/png")
+                                      ? "PNG"
+                                      : "IMG"}{" "}
+                                  #{imgIdx + 1}
+                                </span>
+                                <button
+                                  type="button"
+                                  className="pg-remove-btn pg-thumb-remove"
+                                  aria-label={`Remove image ${imgIdx + 1} from turn ${idx + 1}`}
+                                  onClick={() => handleRemoveImage(idx, imgIdx)}
+                                >
+                                  ×
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        <textarea
+                          aria-label={`Turn ${idx + 1} content`}
+                          rows={Math.min(
+                            8,
+                            Math.max(2, msg.content.split("\n").length),
+                          )}
+                          value={msg.content}
+                          placeholder={
+                            msg.role === "user"
+                              ? "user content (or drop / paste an image)…"
+                              : `${msg.role} content…`
+                          }
+                          onChange={(e) =>
+                            handleMessageChange(idx, {
+                              content: e.target.value,
+                            })
+                          }
+                          onPaste={(e) => {
+                            if (
+                              msg.role === "user" &&
+                              e.clipboardData?.files?.length
+                            ) {
+                              const imgFiles = Array.from(
+                                e.clipboardData.files,
+                              ).filter((f) => f.type.startsWith("image/"));
+                              if (imgFiles.length > 0) {
+                                e.preventDefault();
+                                void handleAttachImages(idx, imgFiles);
+                              }
+                            }
+                          }}
+                          onKeyDown={(e) => {
+                            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                              e.preventDefault();
+                              void executeRequest();
+                            }
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : endpoint.method === "GET" ? (
+                <div className="pg-empty-body">
+                  <code>GET {endpoint.path}</code> takes no request body. Click{" "}
+                  <b>Send Request</b> to inspect the response.
                 </div>
               ) : (
-                <div className="pg-json-wrap">
+                <div className="pg-json-editor">
                   <textarea
                     aria-label="Request JSON body"
-                    className="pg-json-editor"
-                    spellCheck={false}
+                    className="mono"
+                    rows={18}
                     value={rawJson}
-                    onChange={(e) => handleRawJsonChange(e.target.value)}
+                    onChange={(e) => handleRawJsonEdit(e.target.value)}
+                    onKeyDown={(e) => {
+                      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                        e.preventDefault();
+                        void executeRequest();
+                      }
+                    }}
                   />
+                  {jsonError && (
+                    <div className="pg-json-error" role="alert">
+                      JSON syntax error: {jsonError}
+                    </div>
+                  )}
                 </div>
               )}
-            </div>
+            </section>
 
-            {/* Response Column */}
-            <div className="panel playground-pane">
-              <div className="pg-pane-head">
-                <div className="pg-pane-title">
-                  <span className="pg-section-title">Wire Response</span>
-                  {statusCode !== null && (
-                    <span
-                      className={`pg-status-badge ${statusCode >= 200 && statusCode < 300 ? "ok" : "err"}`}
-                    >
-                      {statusCode} {statusText}
-                    </span>
+            <section
+              className="panel playground-pane"
+              aria-labelledby="resp-pane-title"
+            >
+              <div className="panel-heading pg-pane-heading">
+                <div className="pg-title-group">
+                  <h2 id="resp-pane-title">Wire Response</h2>
+                  {inFlight && (
+                    <span className="pg-badge amber">Streaming…</span>
                   )}
-                  {parsedResult.finishReason && (
-                    <span className="pg-meta-pill">
-                      stop: {parsedResult.finishReason}
+                  {callMetrics.status !== null && (
+                    <span
+                      className={`pg-badge ${
+                        callMetrics.status >= 200 && callMetrics.status < 300
+                          ? "sage"
+                          : "danger"
+                      }`}
+                    >
+                      {callMetrics.status} {callMetrics.statusText}
                     </span>
                   )}
                 </div>
                 <div
-                  className="pg-subtabs"
+                  className="pg-tab-group"
                   role="tablist"
-                  aria-label="Response View"
+                  aria-label="Response inspector view"
                 >
                   <button
                     type="button"
                     role="tab"
                     aria-selected={responseTab === "parsed"}
-                    className={`pg-subtab ${responseTab === "parsed" ? "active" : ""}`}
+                    className={responseTab === "parsed" ? "active" : ""}
                     onClick={() => setResponseTab("parsed")}
                   >
                     Parsed
@@ -701,27 +1005,25 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                     type="button"
                     role="tab"
                     aria-selected={responseTab === "raw"}
-                    className={`pg-subtab ${responseTab === "raw" ? "active" : ""}`}
+                    className={responseTab === "raw" ? "active" : ""}
                     onClick={() => setResponseTab("raw")}
                   >
                     Response JSON
                   </button>
-                  {endpoint.supportsStream && (
-                    <button
-                      type="button"
-                      role="tab"
-                      aria-selected={responseTab === "sse"}
-                      className={`pg-subtab ${responseTab === "sse" ? "active" : ""}`}
-                      onClick={() => setResponseTab("sse")}
-                    >
-                      SSE ({sseFrames.length})
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={responseTab === "sse"}
+                    className={responseTab === "sse" ? "active" : ""}
+                    onClick={() => setResponseTab("sse")}
+                  >
+                    SSE ({sseFrames.length})
+                  </button>
                   <button
                     type="button"
                     role="tab"
                     aria-selected={responseTab === "curl"}
-                    className={`pg-subtab ${responseTab === "curl" ? "active" : ""}`}
+                    className={responseTab === "curl" ? "active" : ""}
                     onClick={() => setResponseTab("curl")}
                   >
                     cURL
@@ -729,128 +1031,138 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                 </div>
               </div>
 
-              {/* Telemetry Ribbon */}
-              <div className="pg-telemetry-bar">
-                <div className="pg-metric">
-                  <span className="pg-metric-k">CLIENT TTFT</span>
-                  <span className="pg-metric-v">
-                    {ttftMs !== null ? `${ttftMs.toFixed(1)} ms` : "—"}
-                  </span>
-                </div>
-                <div className="pg-metric">
-                  <span className="pg-metric-k">TOTAL E2E</span>
-                  <span className="pg-metric-v">
-                    {totalMs !== null ? `${totalMs.toFixed(1)} ms` : "—"}
-                  </span>
-                </div>
-                <div className="pg-metric">
-                  <span className="pg-metric-k">STREAM PACE</span>
-                  <span className="pg-metric-v">
-                    {streamTokPerSec !== null
-                      ? `${streamTokPerSec.toFixed(1)} tok/s`
+              <div className="pg-metrics-strip" aria-label="Response telemetry">
+                <div>
+                  <span className="eyebrow">CLIENT TTFT</span>
+                  <strong className="numeric">
+                    {callMetrics.ttftMs !== null
+                      ? `${callMetrics.ttftMs} ms`
                       : "—"}
-                  </span>
+                  </strong>
                 </div>
-                <div className="pg-metric">
-                  <span className="pg-metric-k">PROMPT / CACHED</span>
-                  <span className="pg-metric-v">
-                    {parsedResult.usage.inputTokens ?? "—"}
-                    {" / "}
+                <div>
+                  <span className="eyebrow">TOTAL E2E</span>
+                  <strong className="numeric">
+                    {callMetrics.e2eMs !== null
+                      ? `${callMetrics.e2eMs} ms`
+                      : "—"}
+                  </strong>
+                </div>
+                <div>
+                  <span className="eyebrow">STREAM PACE</span>
+                  <strong className="numeric">
+                    {decodeTokPerSec ? `${decodeTokPerSec} tok/s` : "—"}
+                  </strong>
+                </div>
+                <div>
+                  <span className="eyebrow">PROMPT / CACHED</span>
+                  <strong className="numeric">
+                    {parsedResult.usage.inputTokens ?? "—"} /{" "}
                     <span
                       className={
-                        parsedResult.usage.cachedTokens &&
-                        parsedResult.usage.cachedTokens > 0
-                          ? "pg-accent"
+                        (parsedResult.usage.cachedTokens ?? 0) > 0
+                          ? "healthy"
                           : ""
                       }
                     >
                       {parsedResult.usage.cachedTokens ?? "—"}
-                      {cachedRatioPct !== null ? ` (${cachedRatioPct}%)` : ""}
                     </span>
-                  </span>
+                  </strong>
                 </div>
-                <div className="pg-metric">
-                  <span className="pg-metric-k">OUTPUT TOKENS</span>
-                  <span className="pg-metric-v">
+                <div>
+                  <span className="eyebrow">OUTPUT TOKENS</span>
+                  <strong className="numeric">
                     {parsedResult.usage.outputTokens ?? "—"}
-                  </span>
+                  </strong>
                 </div>
               </div>
 
               {requestError && (
-                <div role="alert" className="notice notice-err pg-notice">
-                  <span className="notice-dot" />
-                  <span>{requestError}</span>
+                <div className="notice" role="alert">
+                  <strong>Request failed:</strong> {requestError}
                 </div>
               )}
 
               {responseTab === "parsed" && (
-                <div className="pg-response-body">
+                <div className="pg-parsed-view">
                   {parsedResult.reasoning && (
-                    <div className="pg-reasoning-box">
-                      <div className="pg-box-label">
+                    <details className="pg-block pg-reasoning-block" open>
+                      <summary className="eyebrow">
                         REASONING / THINKING STREAM
-                      </div>
-                      <pre className="pg-pre pg-reasoning-pre">
-                        {parsedResult.reasoning}
-                      </pre>
-                    </div>
+                        {parsedResult.usage.reasoningTokens !== null &&
+                          ` (${parsedResult.usage.reasoningTokens} tok)`}
+                      </summary>
+                      <pre className="mono">{parsedResult.reasoning}</pre>
+                    </details>
                   )}
 
                   {parsedResult.toolCalls.length > 0 && (
-                    <div className="pg-tools-box">
-                      <div className="pg-box-label">TOOL CALLS</div>
-                      {parsedResult.toolCalls.map((tc, i) => (
-                        <div key={`${tc.id}-${i}`} className="pg-tool-call">
-                          <div className="pg-tool-head">
-                            <code>{tc.name}</code>
-                            <span className="pg-tool-id">{tc.id}</span>
+                    <div className="pg-block">
+                      <span className="eyebrow">TOOL CALLS</span>
+                      {parsedResult.toolCalls.map((tc) => (
+                        <div key={tc.id} className="pg-tool-call mono">
+                          <div className="pg-tool-header">
+                            <strong>{tc.name}</strong>
+                            <span className="muted">id: {tc.id}</span>
                           </div>
-                          <pre className="pg-pre">{tc.arguments}</pre>
+                          <pre>{tc.arguments}</pre>
                         </div>
                       ))}
                     </div>
                   )}
 
-                  <div className="pg-output-box">
-                    <div className="pg-box-label">
-                      {endpoint.conversational
-                        ? "ASSISTANT OUTPUT"
-                        : "RESPONSE PAYLOAD"}
-                      {parsedResult.responseId ? (
-                        <span className="pg-resp-id">
-                          {parsedResult.responseId}
+                  <div className="pg-block">
+                    <div className="pg-block-header">
+                      <span className="eyebrow">
+                        {endpoint.conversational
+                          ? "ASSISTANT OUTPUT"
+                          : "RESPONSE PAYLOAD"}
+                      </span>
+                      {parsedResult.finishReason && (
+                        <span className="mono muted">
+                          stop: {parsedResult.finishReason}
                         </span>
-                      ) : null}
+                      )}
                     </div>
-                    <pre className="pg-pre pg-output-pre">
+                    <pre className="pg-output-pre mono">
                       {parsedResult.content ||
-                        (running
-                          ? "Awaiting tokens..."
+                        (inFlight
+                          ? "Waiting for tokens…"
                           : "Send a request to inspect the response.")}
                     </pre>
                   </div>
 
-                  {canAppendTurn && (
-                    <div className="pg-continue-bar">
-                      <div className="pg-box-label">
-                        CONTINUE CONVERSATION (TESTS PREFIX CACHE &amp; STATEFUL
-                        CHAINS)
+                  {hasAssistantReply && !inFlight && (
+                    <div className="pg-continue-box">
+                      <div className="pg-continue-header">
+                        <span className="eyebrow">
+                          CONTINUE MULTI-TURN CONVERSATION
+                        </span>
+                        <button
+                          type="button"
+                          className="pg-mini-btn"
+                          onClick={() => handleAppendAndContinue(false)}
+                        >
+                          ↪ Append assistant turn to messages[]
+                        </button>
                       </div>
-                      <div className="pg-continue-controls">
+                      <div className="pg-continue-row">
                         <input
                           type="text"
                           aria-label="Follow-up user message"
-                          className="pg-input pg-continue-input"
                           placeholder={
                             parsedResult.toolCalls.length > 0
-                              ? 'Tool output JSON (default: {"status":"ok"})...'
-                              : "Type follow-up user turn..."
+                              ? 'Tool output JSON (default: {"status":"ok"})…'
+                              : "Type next user turn to append & send (tests prefix cache reuse)…"
                           }
                           value={followUpText}
                           onChange={(e) => setFollowUpText(e.target.value)}
                           onKeyDown={(e) => {
-                            if (e.key === "Enter" && !e.shiftKey) {
+                            if (
+                              e.key === "Enter" &&
+                              (followUpText.trim().length > 0 ||
+                                parsedResult.toolCalls.length > 0)
+                            ) {
                               e.preventDefault();
                               handleAppendAndContinue(true);
                             }
@@ -858,17 +1170,14 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                         />
                         <button
                           type="button"
-                          className="pg-btn pg-btn-secondary"
-                          onClick={() => handleAppendAndContinue(false)}
-                        >
-                          Append Only
-                        </button>
-                        <button
-                          type="button"
                           className="pg-btn pg-btn-primary"
+                          disabled={
+                            followUpText.trim().length === 0 &&
+                            parsedResult.toolCalls.length === 0
+                          }
                           onClick={() => handleAppendAndContinue(true)}
                         >
-                          Append &amp; Send
+                          Append & Send
                         </button>
                       </div>
                     </div>
@@ -877,35 +1186,32 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
               )}
 
               {responseTab === "raw" && (
-                <div className="pg-response-body">
-                  <pre className="pg-pre pg-raw-pre">
-                    {rawResponse || "// No response body captured yet"}
-                  </pre>
-                </div>
+                <pre
+                  className="pg-code-box mono"
+                  aria-label="Raw response payload"
+                >
+                  {rawResponse || "No response payload captured yet."}
+                </pre>
               )}
 
               {responseTab === "sse" && (
-                <div className="pg-response-body pg-sse-list">
+                <div className="pg-sse-list" aria-label="SSE frames">
                   {sseFrames.length === 0 ? (
-                    <div className="pg-empty-body">
-                      No SSE frames recorded. Enable{" "}
-                      <code>&quot;stream&quot;: true</code> and send a request.
-                    </div>
+                    <p className="muted">
+                      No SSE frames recorded. Enable <code>stream: true</code>{" "}
+                      and send a request.
+                    </p>
                   ) : (
                     sseFrames.map((f) => (
-                      <div key={f.index} className="pg-sse-frame">
+                      <div key={f.index} className="pg-sse-frame mono">
                         <div className="pg-sse-meta">
-                          <span className="pg-sse-idx">#{f.index}</span>
-                          <span className="pg-sse-time">
-                            +{f.elapsedMs.toFixed(1)} ms
-                          </span>
+                          <span>#{f.index}</span>
+                          <span>+{f.elapsedMs}ms</span>
                           {f.event && (
-                            <span className="pg-sse-event">
-                              event: {f.event}
-                            </span>
+                            <span className="amber">event: {f.event}</span>
                           )}
                         </div>
-                        <pre className="pg-pre pg-sse-data">{f.data}</pre>
+                        <pre>{f.data}</pre>
                       </div>
                     ))
                   )}
@@ -913,27 +1219,29 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
               )}
 
               {responseTab === "curl" && (
-                <div className="pg-response-body">
-                  <pre className="pg-pre pg-raw-pre">{curlCommand}</pre>
-                </div>
+                <pre className="pg-code-box mono" aria-label="cURL command">
+                  {curlCommand}
+                </pre>
               )}
-            </div>
+            </section>
           </div>
         </div>
       </div>
-    </section>
+    </div>
   );
 }
 
-interface ParameterBarProps {
+function ParameterBar({
+  endpoint,
+  body,
+  onUpdate,
+}: {
   endpoint: EndpointSpec;
   body: Record<string, unknown>;
   onUpdate: (
-    updater: (curr: Record<string, unknown>) => Record<string, unknown>,
+    updater: (b: Record<string, unknown>) => Record<string, unknown>,
   ) => void;
-}
-
-function ParameterBar({ endpoint, body, onUpdate }: ParameterBarProps) {
+}) {
   const maxTokensKey =
     endpoint.kind === "openai-responses" ? "max_output_tokens" : "max_tokens";
   const maxTokens =
@@ -941,74 +1249,59 @@ function ParameterBar({ endpoint, body, onUpdate }: ParameterBarProps) {
       ? (body[maxTokensKey] as number)
       : 256;
   const temperature =
-    typeof body.temperature === "number" ? (body.temperature as number) : 0;
+    typeof body.temperature === "number" ? body.temperature : 0;
   const stream = Boolean(body.stream);
 
-  const thinkingEnabled = useMemo(() => {
-    if (endpoint.kind === "openai-chat") {
-      const kw = body.chat_template_kwargs as
-        Record<string, unknown> | undefined;
-      return kw?.enable_thinking !== false;
-    }
-    if (endpoint.kind === "anthropic-messages") {
-      const th = body.thinking as Record<string, unknown> | undefined;
-      return th?.type === "enabled";
-    }
-    return false;
-  }, [endpoint.kind, body]);
+  const thinkingEnabled =
+    endpoint.kind === "openai-chat"
+      ? Boolean(
+          (body.chat_template_kwargs as Record<string, unknown> | undefined)
+            ?.enable_thinking,
+        )
+      : endpoint.kind === "anthropic-messages"
+        ? (body.thinking as Record<string, unknown> | undefined)?.type ===
+          "enabled"
+        : false;
 
   const minMaxTokens =
     endpoint.kind === "anthropic-messages" && thinkingEnabled ? 1025 : 1;
 
   return (
-    <div className="pg-param-bar">
-      <div className="pg-param-item">
-        <label className="pg-field-label" htmlFor="pg-max-tokens">
-          {maxTokensKey.toUpperCase()}
-        </label>
+    <div className="pg-params-bar">
+      <label className="pg-param">
+        <span className="eyebrow">{maxTokensKey.toUpperCase()}</span>
         <input
-          id="pg-max-tokens"
           type="number"
           min={minMaxTokens}
           max={4096}
-          className="pg-input pg-num-input"
           value={maxTokens}
           onChange={(e) => {
-            const val = Number.parseInt(e.target.value, 10);
-            if (!Number.isNaN(val) && val > 0) {
-              const clamped = Math.min(4096, Math.max(minMaxTokens, val));
-              onUpdate((curr) => ({ ...curr, [maxTokensKey]: clamped }));
-            }
+            const val = Math.min(
+              4096,
+              Math.max(minMaxTokens, Number(e.target.value) || minMaxTokens),
+            );
+            onUpdate((curr) => ({ ...curr, [maxTokensKey]: val }));
           }}
         />
-      </div>
+      </label>
 
-      <div className="pg-param-item">
-        <label className="pg-field-label" htmlFor="pg-temperature">
-          TEMPERATURE
-        </label>
+      <label className="pg-param">
+        <span className="eyebrow">TEMPERATURE</span>
         <input
-          id="pg-temperature"
           type="number"
-          step={0.1}
           min={0}
           max={2}
-          className="pg-input pg-num-input"
+          step={0.1}
           value={temperature}
           onChange={(e) => {
-            const val = Number.parseFloat(e.target.value);
-            if (!Number.isNaN(val) && val >= 0) {
-              onUpdate((curr) => ({
-                ...curr,
-                temperature: Math.min(2, val),
-              }));
-            }
+            const val = Math.min(2, Math.max(0, Number(e.target.value) || 0));
+            onUpdate((curr) => ({ ...curr, temperature: val }));
           }}
         />
-      </div>
+      </label>
 
       {endpoint.supportsStream && (
-        <label className="pg-toggle">
+        <label className="pg-param pg-checkbox">
           <input
             type="checkbox"
             checked={stream}
@@ -1036,7 +1329,7 @@ function ParameterBar({ endpoint, body, onUpdate }: ParameterBarProps) {
 
       {(endpoint.kind === "openai-chat" ||
         endpoint.kind === "anthropic-messages") && (
-        <label className="pg-toggle">
+        <label className="pg-param pg-checkbox">
           <input
             type="checkbox"
             checked={thinkingEnabled}
@@ -1056,10 +1349,7 @@ function ParameterBar({ endpoint, body, onUpdate }: ParameterBarProps) {
                       typeof curr.max_tokens === "number"
                         ? curr.max_tokens
                         : 256;
-                    next.thinking = {
-                      type: "enabled",
-                      budget_tokens: 1024,
-                    };
+                    next.thinking = { type: "enabled", budget_tokens: 1024 };
                     next.max_tokens = Math.min(4096, Math.max(currMax, 2048));
                   } else {
                     next.thinking = { type: "disabled" };
@@ -1072,108 +1362,6 @@ function ParameterBar({ endpoint, body, onUpdate }: ParameterBarProps) {
           <span>Thinking</span>
         </label>
       )}
-    </div>
-  );
-}
-
-interface StructuredTurnEditorProps {
-  endpoint: EndpointSpec;
-  turns: TurnMessage[];
-  onChange: (next: TurnMessage[]) => void;
-}
-
-function StructuredTurnEditor({
-  endpoint,
-  turns,
-  onChange,
-}: StructuredTurnEditorProps) {
-  const updateTurn = (idx: number, patch: Partial<TurnMessage>) => {
-    const next = turns.map((t, i) => (i === idx ? { ...t, ...patch } : t));
-    onChange(next);
-  };
-
-  const removeTurn = (idx: number) => {
-    onChange(turns.filter((_, i) => i !== idx));
-  };
-
-  const addTurn = (role: TurnMessage["role"]) => {
-    onChange([...turns, { role, content: "" }]);
-  };
-
-  return (
-    <div className="pg-turns">
-      <div className="pg-turns-head">
-        <span className="pg-box-label">MESSAGES ARRAY</span>
-        <div className="pg-turn-add-group">
-          <button
-            type="button"
-            className="pg-mini-btn"
-            onClick={() => addTurn("user")}
-          >
-            + User turn
-          </button>
-          <button
-            type="button"
-            className="pg-mini-btn"
-            onClick={() => addTurn("assistant")}
-          >
-            + Assistant turn
-          </button>
-        </div>
-      </div>
-
-      {turns.map((turn, idx) => (
-        <div key={idx} className={`pg-turn-card pg-role-${turn.role}`}>
-          <div className="pg-turn-top">
-            <select
-              aria-label={`Turn ${idx + 1} Role`}
-              className="pg-role-select"
-              value={turn.role}
-              onChange={(e) =>
-                updateTurn(idx, {
-                  role: e.target.value as TurnMessage["role"],
-                })
-              }
-            >
-              <option value="system">system</option>
-              <option value="user">user</option>
-              <option value="assistant">assistant</option>
-              {endpoint.kind === "openai-chat" && (
-                <option value="tool">tool</option>
-              )}
-            </select>
-            <span className="pg-turn-idx">#{idx}</span>
-            {turn.rawContentBlocks && turn.rawContentBlocks.length > 0 && (
-              <span className="pg-meta-pill">
-                +{turn.rawContentBlocks.length} multimodal block
-                {turn.rawContentBlocks.length > 1 ? "s" : ""} preserved
-              </span>
-            )}
-            {turn.tool_calls && turn.tool_calls.length > 0 && (
-              <span className="pg-meta-pill">
-                +{turn.tool_calls.length} tool_call
-                {turn.tool_calls.length > 1 ? "s" : ""}
-              </span>
-            )}
-            <button
-              type="button"
-              className="pg-turn-remove"
-              aria-label={`Remove turn ${idx + 1}`}
-              onClick={() => removeTurn(idx)}
-            >
-              ×
-            </button>
-          </div>
-          <textarea
-            aria-label={`Turn ${idx + 1} content`}
-            className="pg-turn-textarea"
-            rows={Math.min(8, Math.max(2, turn.content.split("\n").length))}
-            value={turn.content}
-            onChange={(e) => updateTurn(idx, { content: e.target.value })}
-            placeholder={`Enter ${turn.role} message...`}
-          />
-        </div>
-      ))}
     </div>
   );
 }

@@ -955,8 +955,21 @@ footer {
   font-size: 10px;
   color: var(--subtle);
 }
-.pg-remove-btn {
+.pg-turn-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pg-upload-label {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+.pg-upload-input {
+  display: none;
+}
+.pg-remove-btn {
   border: 0;
   background: transparent;
   color: var(--subtle);
@@ -965,6 +978,36 @@ footer {
 }
 .pg-remove-btn:hover {
   color: var(--red);
+}
+.pg-turn-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 2px 0;
+}
+.pg-turn-thumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 7px 4px 5px;
+  background: var(--surface);
+  border: 1px solid #4c4030;
+  border-radius: 4px;
+}
+.pg-turn-thumb-img {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  image-rendering: pixelated;
+}
+.pg-turn-thumb-meta {
+  font-size: 10px;
+  color: var(--accent);
+}
+.pg-thumb-remove {
+  font-size: 13px;
 }
 .pg-json-editor textarea {
   width: 100%;

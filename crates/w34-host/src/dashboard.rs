@@ -10,7 +10,7 @@ use axum::{
 use include_dir::{Dir, include_dir};
 
 static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../dashboard/dist");
-const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self'; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
@@ -90,7 +90,7 @@ mod tests {
             response.headers()[header::CONTENT_SECURITY_POLICY]
                 .to_str()
                 .unwrap()
-                .contains("frame-ancestors 'none'")
+                .contains("img-src 'self' data: blob:")
         );
         let html = response.text().await.unwrap();
         assert!(html.contains("warp-34"));

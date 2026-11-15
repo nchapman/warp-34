@@ -11,6 +11,7 @@ export type EndpointKind =
 export interface TurnMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  images?: string[];
   tool_call_id?: string;
   tool_calls?: unknown[];
   reasoning_content?: string;
@@ -66,7 +67,7 @@ export interface ParsedApiResult {
 
 // 8x8 warm-amber checkerboard PNG data URI for offline multimodal Vision testing
 const SAMPLE_IMAGE_DATA_URL =
-  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAADklEQVQI12P4//8/A00wCgD/fQH5n3b68AAAAABJRU5ErkJggg==";
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAGUlEQVR42mO4siBESV4ak2TAKgokGQalDgDVLkSBexfMuAAAAABJRU5ErkJggg==";
 
 export const ENDPOINTS: EndpointSpec[] = [
   {
@@ -710,6 +711,7 @@ function normalizeTurnMessage(item: unknown): TurnMessage {
       ? rawRole
       : "user";
   let content = "";
+  const images: string[] = [];
   let rawContentBlocks: unknown[] | undefined;
   if (typeof obj.content === "string") {
     content = obj.content;
@@ -719,13 +721,52 @@ function normalizeTurnMessage(item: unknown): TurnMessage {
     for (const part of obj.content) {
       if (typeof part === "string") {
         textParts.push(part);
-      } else if (
-        part &&
-        typeof part === "object" &&
-        (part as { type?: unknown }).type === "text" &&
-        typeof (part as { text?: unknown }).text === "string"
+        continue;
+      }
+      if (!part || typeof part !== "object") {
+        nonTextBlocks.push(part);
+        continue;
+      }
+      const p = part as Record<string, unknown>;
+      if (
+        (p.type === "text" ||
+          p.type === "input_text" ||
+          p.type === "output_text") &&
+        typeof p.text === "string"
       ) {
-        textParts.push((part as { text: string }).text);
+        textParts.push(p.text);
+      } else if (p.type === "image_url" || p.type === "input_image") {
+        const rawUrl = p.image_url;
+        const url =
+          typeof rawUrl === "string"
+            ? rawUrl
+            : rawUrl &&
+                typeof rawUrl === "object" &&
+                typeof (rawUrl as { url?: unknown }).url === "string"
+              ? (rawUrl as { url: string }).url
+              : null;
+        if (url) {
+          images.push(url);
+        } else {
+          nonTextBlocks.push(part);
+        }
+      } else if (
+        p.type === "image" &&
+        p.source &&
+        typeof p.source === "object"
+      ) {
+        const src = p.source as Record<string, unknown>;
+        if (
+          src.type === "base64" &&
+          typeof src.media_type === "string" &&
+          typeof src.data === "string"
+        ) {
+          images.push(`data:${src.media_type};base64,${src.data}`);
+        } else if (src.type === "url" && typeof src.url === "string") {
+          images.push(src.url);
+        } else {
+          nonTextBlocks.push(part);
+        }
       } else {
         nonTextBlocks.push(part);
       }
@@ -736,6 +777,9 @@ function normalizeTurnMessage(item: unknown): TurnMessage {
     }
   }
   const turn: TurnMessage = { role, content };
+  if (images.length > 0) {
+    turn.images = images;
+  }
   if (rawContentBlocks) {
     turn.rawContentBlocks = rawContentBlocks;
   }
@@ -751,10 +795,64 @@ function normalizeTurnMessage(item: unknown): TurnMessage {
   return turn;
 }
 
+function buildImageBlocksForKind(
+  kind: EndpointKind,
+  images: string[],
+): unknown[] {
+  return images.map((url) => {
+    if (kind === "openai-responses") {
+      return { type: "input_image", image_url: url };
+    }
+    if (kind === "anthropic-messages") {
+      const b64Idx = url.indexOf(";base64,");
+      if (url.startsWith("data:") && b64Idx > 5) {
+        const mediaType = url.slice(5, b64Idx);
+        const data = url.slice(b64Idx + 8);
+        return {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: mediaType,
+            data,
+          },
+        };
+      }
+      return {
+        type: "image",
+        source: {
+          type: "url",
+          url,
+        },
+      };
+    }
+    return {
+      type: "image_url",
+      image_url: { url },
+    };
+  });
+}
+
+function serializeTurnContent(kind: EndpointKind, m: TurnMessage): unknown {
+  const imgBlocks =
+    m.images && m.images.length > 0
+      ? buildImageBlocksForKind(kind, m.images)
+      : [];
+  const rawBlocks = m.rawContentBlocks ?? [];
+  if (imgBlocks.length === 0 && rawBlocks.length === 0) {
+    return m.content;
+  }
+  const textType = kind === "openai-responses" ? "input_text" : "text";
+  return [
+    ...imgBlocks,
+    ...rawBlocks,
+    ...(m.content ? [{ type: textType, text: m.content }] : []),
+  ];
+}
+
 /**
  * Applies an updated `TurnMessage[]` array back onto a cloned request JSON object,
- * preserving any non-text blocks (`image_url`, `tool_use`, `tool_result`) and
- * assistant `tool_calls` / `reasoning_content`.
+ * preserving attached images (`image_url` / `input_image` / Anthropic `image`),
+ * non-text blocks (`tool_use`, `tool_result`), and assistant `tool_calls` / `reasoning_content`.
  */
 export function applyMessagesToBody(
   kind: EndpointKind,
@@ -766,13 +864,7 @@ export function applyMessagesToBody(
     next.messages = messages.map((m) => {
       const msgObj: Record<string, unknown> = {
         role: m.role,
-        content:
-          m.rawContentBlocks && m.rawContentBlocks.length > 0
-            ? [
-                ...m.rawContentBlocks,
-                ...(m.content ? [{ type: "text", text: m.content }] : []),
-              ]
-            : m.content,
+        content: serializeTurnContent("openai-chat", m),
       };
       if (m.tool_call_id) {
         msgObj.tool_call_id = m.tool_call_id;
@@ -797,13 +889,7 @@ export function applyMessagesToBody(
     }
     next.messages = rest.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
-      content:
-        m.rawContentBlocks && m.rawContentBlocks.length > 0
-          ? [
-              ...m.rawContentBlocks,
-              ...(m.content ? [{ type: "text", text: m.content }] : []),
-            ]
-          : m.content,
+      content: serializeTurnContent("anthropic-messages", m),
     }));
     return next;
   }
@@ -817,7 +903,7 @@ export function applyMessagesToBody(
     }
     next.input = rest.map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
-      content: m.content,
+      content: serializeTurnContent("openai-responses", m),
     }));
     return next;
   }

@@ -163,7 +163,7 @@ describe("playground wire helpers", () => {
 
     const turns = extractMessagesFromBody("openai-chat", initialBody);
     expect(turns).toHaveLength(1);
-    expect(turns[0].rawContentBlocks).toHaveLength(1);
+    expect(turns[0].images).toHaveLength(1);
     expect(turns[0].content).toContain("Describe the colors");
 
     // Edit text of the multimodal turn and ensure image_url block survives round-trip
@@ -177,6 +177,41 @@ describe("playground wire helpers", () => {
         image_url: { url: expect.stringContaining("data:image/png;base64,") },
       },
       { type: "text", text: "Updated vision prompt" },
+    ]);
+
+    // Verify Anthropic and Responses serialization of attached images
+    const anthroVision = applyMessagesToBody(
+      "anthropic-messages",
+      { model: "qwen-vl" },
+      turns,
+    );
+    const anthroMsg0 = (
+      anthroVision.messages as Array<Record<string, unknown>>
+    )[0];
+    expect(anthroMsg0.content).toEqual([
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/png",
+          data: expect.any(String),
+        },
+      },
+      { type: "text", text: "Updated vision prompt" },
+    ]);
+
+    const respVision = applyMessagesToBody(
+      "openai-responses",
+      { model: "qwen-vl" },
+      turns,
+    );
+    const respMsg0 = (respVision.input as Array<Record<string, unknown>>)[0];
+    expect(respMsg0.content).toEqual([
+      {
+        type: "input_image",
+        image_url: expect.stringContaining("data:image/png;base64,"),
+      },
+      { type: "input_text", text: "Updated vision prompt" },
     ]);
 
     // Verify tool call continuation appends structured assistant.tool_calls + role:"tool"
@@ -522,7 +557,7 @@ describe("Playground UI integration", () => {
       target: { value: "responses" },
     });
     expect(window.location.pathname + window.location.search).toBe(
-      "/playground?endpoint=responses&preset=responses-stream",
+      "/playground?endpoint=responses",
     );
 
     fireEvent.click(screen.getByRole("link", { name: "Connect" }));
@@ -533,5 +568,35 @@ describe("Playground UI integration", () => {
     fireEvent(window, new PopStateEvent("popstate"));
     expect(screen.getByRole("heading", { name: "Overview" })).toBeVisible();
     expect(document.title).toBe("warp-34 · Overview");
+  });
+
+  it("uploads an image file onto a user turn, renders thumbnail preview, and removes it", async () => {
+    render(
+      <Dashboard
+        state={{
+          history: [snapshot({ model: "nchapman/Qwen3.5-VL" })],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Playground" }));
+
+    const fileInput = screen.getByLabelText(
+      "Attach image to turn 2",
+    ) as HTMLInputElement;
+    const pngBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+    const file = new File([pngBytes], "sample.png", { type: "image/png" });
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    await waitFor(() => {
+      expect(screen.getByAltText("Turn 2 attachment 1")).toBeVisible();
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove image 1 from turn 2" }),
+    );
+    expect(screen.queryByAltText("Turn 2 attachment 1")).toBeNull();
   });
 });
