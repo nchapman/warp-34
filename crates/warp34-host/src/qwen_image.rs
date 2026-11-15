@@ -13,6 +13,15 @@ pub mod text_encoder;
 #[cfg(feature = "cuda")]
 pub use text_encoder::{Qwen3VlConditioningEncoder, Qwen3VlConditioningOutput};
 
+#[path = "qwen_image/transformer.rs"]
+pub mod transformer;
+#[cfg(feature = "cuda")]
+pub use transformer::{
+    QwenImage21ExtractOutput, QwenImage21KvCacheGpu, QwenImage21TransformerEngine,
+    QwenImage21TransformerTp2Engine,
+};
+pub use transformer::{euler_cfg_step_f16, pack_latents_chw_to_hwc, unpack_latents_hwc_to_chw};
+
 /// System prompt used by `QwenImage21Pipeline` in `diffusers`.
 pub const SYS_PROMPT: &str = "Comprehend and analyze the provided prompt.";
 
@@ -1584,5 +1593,352 @@ mod tests {
             mm_max_diff < 5e-3,
             "Qwen3-VL multimodal pre-norm max diff {mm_max_diff} exceeded 5e-3"
         );
+    }
+
+    #[test]
+    fn test_pack_unpack_latents_and_euler_cfg_step() {
+        use crate::cuda::{f16_to_f32, f32_to_f16};
+
+        let chw: Vec<u32> = (0..(4 * 2 * 3)).collect();
+        let hwc = pack_latents_chw_to_hwc(&chw, 4, 2, 3);
+        let roundtrip = unpack_latents_hwc_to_chw(&hwc, 4, 2, 3);
+        assert_eq!(roundtrip, chw);
+        // Token 1 (row 0, col 1), channel 2 -> chw[2 * 6 + 1] = 13
+        assert_eq!(hwc[4 + 2], 13);
+
+        let mut sample = [f32_to_f16(1.0), f32_to_f16(-0.5)];
+        let cond = [f32_to_f16(0.4), f32_to_f16(-0.2)];
+        let uncond = [f32_to_f16(0.2), f32_to_f16(-0.6)];
+        euler_cfg_step_f16(&mut sample, &cond, Some(&uncond), 2.0, 1.0, 0.5);
+        // guided_0 = 0.2 + 2.0 * (0.4 - 0.2) = 0.6 -> 1.0 + (-0.5) * 0.6 = 0.7
+        // guided_1 = -0.6 + 2.0 * (-0.2 - (-0.6)) = 0.2 -> -0.5 + (-0.5) * 0.2 = -0.6
+        assert!((f16_to_f32(sample[0]) - 0.7).abs() < 2e-3);
+        assert!((f16_to_f32(sample[1]) - (-0.6)).abs() < 2e-3);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_qwen_image_transformer_extract_cached_graph_and_tp2_match_oracle() {
+        use crate::cuda::{
+            CublasHandle, CudaDevice, CudaStream, f16_to_f32, f16_to_f32_slice, f32_to_f16,
+        };
+        use std::ffi::c_void;
+        use warp34_kernels::ffi;
+
+        if CudaDevice::count().unwrap_or(0) <= 0 {
+            return;
+        }
+        let _dev = CudaDevice::set_current(0).unwrap();
+        let stream = CudaStream::new(0).unwrap();
+        let cublas = CublasHandle::new(&stream).unwrap();
+
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/oracle/fixtures/qwen_image_ops.safetensors");
+        let arch = SafetensorsArchive::open(&fixture_path).unwrap();
+
+        let cfg = QwenImage21TransformerConfig {
+            patch_size: 1,
+            in_channels: 8,
+            out_channels: 8,
+            num_layers: 1,
+            attention_head_dim: 128,
+            num_attention_heads: 2,
+            context_in_dim: 64,
+            mlp_ratio: 2,
+            axes_dims_rope: [16, 56, 56],
+            eps: 1e-6,
+            causal_condition: true,
+            quant: QuantScheme::Unquantized,
+        };
+        let quant = QuantScheme::Unquantized;
+        let engine = QwenImage21TransformerEngine::load_with_prefix(
+            &arch,
+            &cfg,
+            &quant,
+            "dit.weight.",
+            0,
+            0,
+            1,
+            &stream,
+        )
+        .unwrap();
+
+        let enc_hidden = arch.read_f16_bits("dit.enc_hidden").unwrap();
+        let cond_latents = arch.read_f16_bits("dit.cond_latents").unwrap();
+        let target_latents_0 = arch.read_f16_bits("dit.target_latents_0").unwrap();
+        let target_latents_1 = arch.read_f16_bits("dit.target_latents_1").unwrap();
+        let t0 = arch.read_f32("dit.t0").unwrap()[0];
+        let t1 = arch.read_f32("dit.t1").unwrap()[0];
+
+        let img_shapes = [(1usize, 2usize, 2usize), (1usize, 2usize, 4usize)];
+        let vlm_img_mask = [false, false, true, false, true, true];
+
+        let mut kv_cache = engine.new_kv_cache();
+        let extract_out = engine
+            .forward_extract(
+                &cond_latents,
+                &target_latents_0,
+                &enc_hidden,
+                &vlm_img_mask,
+                &img_shapes,
+                t0,
+                Some(&mut kv_cache),
+                &cublas,
+                &stream,
+            )
+            .unwrap();
+        assert_eq!(extract_out.prefix_len, 7);
+        assert_eq!(extract_out.target_tokens, 8);
+
+        let max_diff = |got_f16: &[u16], oracle_name: &str| -> f32 {
+            let exp = arch.read_f32(oracle_name).unwrap();
+            assert_eq!(got_f16.len(), exp.len(), "length mismatch on {oracle_name}");
+            let mut got = vec![0.0f32; got_f16.len()];
+            f16_to_f32_slice(got_f16, &mut got);
+            got.iter()
+                .zip(exp.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        let diff_full = max_diff(&extract_out.full_output_f16, "dit.out_extract_full");
+        assert!(
+            diff_full < 5e-3,
+            "dit.out_extract_full max diff {diff_full} exceeded 5e-3"
+        );
+        let diff_tgt0 = max_diff(&extract_out.target_output_f16, "dit.out_extract_target");
+        assert!(
+            diff_tgt0 < 5e-3,
+            "dit.out_extract_target max diff {diff_tgt0} exceeded 5e-3"
+        );
+
+        let (cache_k0, cache_v0) = kv_cache.read_prefix_kv(0, &stream).unwrap();
+        let diff_ck = max_diff(&cache_k0, "dit.cache_l0_k");
+        let diff_cv = max_diff(&cache_v0, "dit.cache_l0_v");
+        assert!(
+            diff_ck < 5e-3,
+            "dit.cache_l0_k max diff {diff_ck} exceeded 5e-3"
+        );
+        assert!(
+            diff_cv < 5e-3,
+            "dit.cache_l0_v max diff {diff_cv} exceeded 5e-3"
+        );
+
+        // Step 1 (warms graph), Step 2 (captures + launches graph), Step 3 (replays captured graph)
+        let mut step0_cached = Vec::new();
+        for step_idx in 0..3 {
+            let cached_out = engine
+                .forward_cached(&target_latents_1, t1, &mut kv_cache, true, &cublas, &stream)
+                .unwrap();
+            let diff_cached = max_diff(&cached_out, "dit.out_cached_target");
+            assert!(
+                diff_cached < 5e-3,
+                "dit.out_cached_target (step {step_idx}) max diff {diff_cached} exceeded 5e-3"
+            );
+            if step_idx == 0 {
+                step0_cached = cached_out;
+            } else {
+                // Captured and replayed CUDA graph must be bit-identical to uncaptured execution!
+                assert_eq!(
+                    cached_out, step0_cached,
+                    "CUDA graph replay differed at step {step_idx}"
+                );
+            }
+        }
+
+        // Verify TP=2 sharding (2 ranks of 1 head each) matches the oracle
+        let eng_r0 = QwenImage21TransformerEngine::load_with_prefix(
+            &arch,
+            &cfg,
+            &quant,
+            "dit.weight.",
+            0,
+            0,
+            2,
+            &stream,
+        )
+        .unwrap();
+        let eng_r1 = QwenImage21TransformerEngine::load_with_prefix(
+            &arch,
+            &cfg,
+            &quant,
+            "dit.weight.",
+            0,
+            1,
+            2,
+            &stream,
+        )
+        .unwrap();
+
+        // Collect rank-1's partial branch outputs before allreduce, then add them on rank-0 during rank-0's pass
+        let mut r1_partials: Vec<Vec<u16>> = Vec::new();
+        let _ = eng_r1
+            .forward_extract_with_allreduce(
+                &cond_latents,
+                &target_latents_0,
+                &enc_hidden,
+                &vlm_img_mask,
+                &img_shapes,
+                t0,
+                None,
+                &cublas,
+                &stream,
+                Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
+                    let mut h = vec![0u16; n_elems];
+                    // SAFETY: `h` and `d_buf` both hold `n_elems * 2` bytes.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            h.as_mut_ptr() as *mut c_void,
+                            d_buf as *const c_void,
+                            n_elems * 2,
+                            st.handle,
+                        );
+                    }
+                    st.synchronize()?;
+                    r1_partials.push(h);
+                    // Zero rank-1 buffer on first pass since we only need its partial projections
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        // Actually, because layer 0 MLP depends on the allreduced layer 0 attention output,
+        // let's record rank-1 attention partial first, then run rank-0 + rank-1 in lockstep per allreduce!
+        // With 1 layer, there are 2 allreduces: [0] = attn.to_out, [1] = img_mlp.out.
+        let r1_attn_partial = r1_partials[0].clone();
+        let mut r1_mlp_input_recorded: Vec<u16> = Vec::new();
+        let mut ar_idx = 0usize;
+        let tp2_out = eng_r0
+            .forward_extract_with_allreduce(
+                &cond_latents,
+                &target_latents_0,
+                &enc_hidden,
+                &vlm_img_mask,
+                &img_shapes,
+                t0,
+                None,
+                &cublas,
+                &stream,
+                Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
+                    let mut h0 = vec![0u16; n_elems];
+                    // SAFETY: `h0` and `d_buf` both hold `n_elems * 2` bytes.
+                    unsafe {
+                        ffi::warp34_memcpy_d2h_async(
+                            h0.as_mut_ptr() as *mut c_void,
+                            d_buf as *const c_void,
+                            n_elems * 2,
+                            st.handle,
+                        );
+                    }
+                    st.synchronize()?;
+                    if ar_idx == 0 {
+                        for (a, &b) in h0.iter_mut().zip(r1_attn_partial.iter()) {
+                            *a = f32_to_f16(f16_to_f32(*a) + f16_to_f32(b));
+                        }
+                        r1_mlp_input_recorded = h0.clone();
+                    } else {
+                        // Replay rank-1 with the exact allreduced attention output to get rank-1's MLP partial
+                        let mut r1_mlp_partial = Vec::new();
+                        let mut sub_idx = 0usize;
+                        let _ = eng_r1.forward_extract_with_allreduce(
+                            &cond_latents,
+                            &target_latents_0,
+                            &enc_hidden,
+                            &vlm_img_mask,
+                            &img_shapes,
+                            t0,
+                            None,
+                            &cublas,
+                            st,
+                            Some(|d_b1: u64, n1: usize, st1: &CudaStream| {
+                                if sub_idx == 0 {
+                                    // SAFETY: `r1_mlp_input_recorded` and `d_b1` both hold `n1 * 2` bytes.
+                                    unsafe {
+                                        ffi::warp34_memcpy_h2d_async(
+                                            d_b1 as *mut c_void,
+                                            r1_mlp_input_recorded.as_ptr() as *const c_void,
+                                            n1 * 2,
+                                            st1.handle,
+                                        );
+                                    }
+                                    st1.synchronize()?;
+                                } else {
+                                    r1_mlp_partial.resize(n1, 0u16);
+                                    // SAFETY: `r1_mlp_partial` and `d_b1` both hold `n1 * 2` bytes.
+                                    unsafe {
+                                        ffi::warp34_memcpy_d2h_async(
+                                            r1_mlp_partial.as_mut_ptr() as *mut c_void,
+                                            d_b1 as *const c_void,
+                                            n1 * 2,
+                                            st1.handle,
+                                        );
+                                    }
+                                    st1.synchronize()?;
+                                }
+                                sub_idx += 1;
+                                Ok(())
+                            }),
+                        )?;
+                        for (a, &b) in h0.iter_mut().zip(r1_mlp_partial.iter()) {
+                            *a = f32_to_f16(f16_to_f32(*a) + f16_to_f32(b));
+                        }
+                    }
+                    // SAFETY: `d_buf` and `h0` both hold `n_elems * 2` bytes.
+                    unsafe {
+                        ffi::warp34_memcpy_h2d_async(
+                            d_buf as *mut c_void,
+                            h0.as_ptr() as *const c_void,
+                            n_elems * 2,
+                            st.handle,
+                        );
+                    }
+                    st.synchronize()?;
+                    ar_idx += 1;
+                    Ok(())
+                }),
+            )
+            .unwrap();
+
+        let diff_tp2 = max_diff(&tp2_out.full_output_f16, "dit.out_extract_full");
+        assert!(
+            diff_tp2 < 5e-3,
+            "TP=2 dit.out_extract_full max diff {diff_tp2} exceeded 5e-3"
+        );
+
+        // If 2 GPUs are present, also verify real 2-GPU hardware TP=2 execution with Tp2Collectives!
+        if CudaDevice::count().unwrap_or(0) >= 2 {
+            let tp2_engine = QwenImage21TransformerTp2Engine::load_with_prefix(
+                &arch,
+                &cfg,
+                &quant,
+                "dit.weight.",
+                64,
+            )
+            .unwrap();
+            let (mut c0, mut c1) = tp2_engine.new_kv_caches();
+            let hw_extract = tp2_engine
+                .forward_extract(
+                    &cond_latents,
+                    &target_latents_0,
+                    &enc_hidden,
+                    &vlm_img_mask,
+                    &img_shapes,
+                    t0,
+                    Some((&mut c0, &mut c1)),
+                )
+                .unwrap();
+            let diff_hw_extract = max_diff(&hw_extract.full_output_f16, "dit.out_extract_full");
+            assert!(
+                diff_hw_extract < 5e-3,
+                "2-GPU TP=2 extract max diff {diff_hw_extract} exceeded 5e-3"
+            );
+            let hw_cached = tp2_engine
+                .forward_cached(&target_latents_1, t1, (&mut c0, &mut c1))
+                .unwrap();
+            let diff_hw_cached = max_diff(&hw_cached, "dit.out_cached_target");
+            assert!(
+                diff_hw_cached < 5e-3,
+                "2-GPU TP=2 cached max diff {diff_hw_cached} exceeded 5e-3"
+            );
+        }
     }
 }

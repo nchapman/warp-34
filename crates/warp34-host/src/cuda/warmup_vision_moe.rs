@@ -182,6 +182,84 @@ pub(super) fn warmup_vision_moe_and_qwen4(
             "warmup warp34_mha_fa2_d128_f16"
         )?;
     }
+    warmup_ffi!(
+        ffi::warp34_qwen_image_timestep_sinusoidal_f16(
+            ex,
+            buf_a as *const f32,
+            buf_c as *mut c_void,
+            1,
+            256,
+            10000.0,
+            1000.0,
+        ),
+        "warmup warp34_qwen_image_timestep_sinusoidal_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_qwen_image_silu_f16(ex, buf_a as *const c_void, buf_c as *mut c_void, 128),
+        "warmup warp34_qwen_image_silu_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_qwen_image_build_joint_hidden_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            zero_i32 as *const i32,
+            buf_c as *mut c_void,
+            1,
+            1,
+            1,
+            128,
+        ),
+        "warmup warp34_qwen_image_build_joint_hidden_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_qwen_image_adaln_modulate_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            core::ptr::null(),
+            buf_c as *mut c_void,
+            1,
+            128,
+            512,
+            0,
+            1e-6,
+        ),
+        "warmup warp34_qwen_image_adaln_modulate_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_qwen_image_gated_residual_f16(
+            ex,
+            buf_c as *mut c_void,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            core::ptr::null(),
+            1,
+            128,
+            512,
+            128,
+        ),
+        "warmup warp34_qwen_image_gated_residual_f16"
+    )?;
+    warmup_ffi!(
+        ffi::warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
+            ex,
+            buf_a as *const c_void,
+            buf_b as *const c_void,
+            buf_c as *const c_void,
+            buf_c as *const c_void,
+            buf_a as *const f32,
+            buf_b as *const f32,
+            buf_c as *mut c_void,
+            buf_d as *mut c_void,
+            core::ptr::null_mut(),
+            1,
+            2,
+            0,
+            1e-6,
+        ),
+        "warmup warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16"
+    )?;
     for (n_exp, top_k) in [(8i32, 2i32), (256, 8), (512, 2)] {
         warmup_ffi!(
             ffi::warp34_moe_topk_router_f16(

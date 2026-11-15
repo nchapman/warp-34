@@ -1023,4 +1023,75 @@ unsafe extern "C" {
         h_k: i32,
         is_causal: i32,
     ) -> i32;
+
+    pub fn warp34_qwen_image_timestep_sinusoidal_f16(
+        ex: *const Warp34Exec,
+        timesteps: *const f32,
+        out: *mut c_void,
+        num_rows: i32,
+        timestep_dim: i32,
+        max_period: f32,
+        time_factor: f32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_silu_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        out: *mut c_void,
+        n: i64,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_build_joint_hidden_f16(
+        ex: *const Warp34Exec,
+        txt_hidden: *const c_void,
+        img_hidden: *const c_void,
+        row_map: *const i32,
+        out_joint: *mut c_void,
+        total_rows: i32,
+        txt_rows: i32,
+        img_rows: i32,
+        hidden_size: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_adaln_modulate_f16(
+        ex: *const Warp34Exec,
+        x: *const c_void,
+        modulation: *const c_void,
+        target_token_mask: *const u8,
+        out: *mut c_void,
+        num_tokens: i32,
+        hidden_size: i32,
+        mod_stride: i32,
+        scale_col_offset: i32,
+        eps: f32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_gated_residual_f16(
+        ex: *const Warp34Exec,
+        residual: *mut c_void,
+        branch_out: *const c_void,
+        modulation: *const c_void,
+        target_token_mask: *const u8,
+        num_tokens: i32,
+        hidden_size: i32,
+        mod_stride: i32,
+        gate_col_offset: i32,
+    ) -> i32;
+
+    pub fn warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
+        ex: *const Warp34Exec,
+        q_in: *const c_void,
+        k_in: *const c_void,
+        norm_q_w: *const c_void,
+        norm_k_w: *const c_void,
+        cos_table: *const f32,
+        sin_table: *const f32,
+        q_out: *mut c_void,
+        k_out: *mut c_void,
+        cache_k_out: *mut c_void,
+        num_tokens: i32,
+        num_heads: i32,
+        cache_write_len: i32,
+        eps: f32,
+    ) -> i32;
 }

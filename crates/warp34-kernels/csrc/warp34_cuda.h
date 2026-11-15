@@ -941,6 +941,30 @@ int warp34_mha_fa2_d128_f16(
     const warp34_exec* ex, const void* q, const void* k, const void* v, void* out,
     int b, int seqlen_q, int seqlen_k, int h, int h_k, int is_causal);
 
+int warp34_qwen_image_timestep_sinusoidal_f16(
+    const warp34_exec* ex, const float* timesteps, void* out,
+    int num_rows, int timestep_dim, float max_period, float time_factor);
+int warp34_qwen_image_silu_f16(
+    const warp34_exec* ex, const void* x, void* out, int64_t n);
+int warp34_qwen_image_build_joint_hidden_f16(
+    const warp34_exec* ex, const void* txt_hidden, const void* img_hidden,
+    const int32_t* row_map, void* out_joint,
+    int total_rows, int txt_rows, int img_rows, int hidden_size);
+int warp34_qwen_image_adaln_modulate_f16(
+    const warp34_exec* ex, const void* x, const void* modulation,
+    const uint8_t* target_token_mask, void* out,
+    int num_tokens, int hidden_size, int mod_stride, int scale_col_offset, float eps);
+int warp34_qwen_image_gated_residual_f16(
+    const warp34_exec* ex, void* residual, const void* branch_out,
+    const void* modulation, const uint8_t* target_token_mask,
+    int num_tokens, int hidden_size, int mod_stride, int gate_col_offset);
+int warp34_qwen_image_qk_rmsnorm_complex_rope_d128_f16(
+    const warp34_exec* ex, const void* q_in, const void* k_in,
+    const void* norm_q_w, const void* norm_k_w,
+    const float* cos_table, const float* sin_table,
+    void* q_out, void* k_out, void* cache_k_out,
+    int num_tokens, int num_heads, int cache_write_len, float eps);
+
 #ifdef __cplusplus
 }
 #endif
