@@ -39,6 +39,22 @@ const MAX_IMAGES_PER_REQUEST = 4;
 const MAX_IMAGE_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_CANVAS_DIM = 2048;
 
+function formatDisplayJson(val: unknown): string {
+  const formatted = JSON.stringify(
+    val,
+    (key, v) => {
+      if (key === "b64_json" && typeof v === "string" && v.length > 256) {
+        return `${v.slice(0, 64)}… [${v.length} base64 chars]`;
+      }
+      return v;
+    },
+    2,
+  );
+  return formatted.length > MAX_SSE_BUFFER_CHARS
+    ? `${formatted.slice(0, MAX_SSE_BUFFER_CHARS)}\n… [response truncated at 1 MiB]`
+    : formatted;
+}
+
 function resolveRoute(
   pathEndpointId: string | undefined,
   searchParams: URLSearchParams,
@@ -588,10 +604,6 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
         });
       } else {
         const rawText = await response.text();
-        const text =
-          rawText.length > MAX_SSE_BUFFER_CHARS
-            ? `${rawText.slice(0, MAX_SSE_BUFFER_CHARS)}\n… [response truncated at 1 MiB]`
-            : rawText;
         const totalMs = Math.round(performance.now() - startTime);
         setCallMetrics({
           status: response.status,
@@ -600,17 +612,22 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
           e2eMs: totalMs,
         });
         try {
-          const jsonVal = JSON.parse(text);
-          setRawResponse(JSON.stringify(jsonVal, null, 2));
+          const jsonVal = JSON.parse(rawText);
+          const displayJson = formatDisplayJson(jsonVal);
+          setRawResponse(displayJson);
           if (response.ok) {
             setParsedResult(parseJsonResponse(endpoint.kind, jsonVal));
           } else {
             setParsedResult({
               ...emptyParsedResult(),
-              content: JSON.stringify(jsonVal, null, 2),
+              content: displayJson,
             });
           }
         } catch {
+          const text =
+            rawText.length > MAX_SSE_BUFFER_CHARS
+              ? `${rawText.slice(0, MAX_SSE_BUFFER_CHARS)}\n… [response truncated at 1 MiB]`
+              : rawText;
           setRawResponse(text);
           setParsedResult({
             ...emptyParsedResult(),
@@ -1252,7 +1269,9 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                       <span className="eyebrow">
                         {endpoint.conversational
                           ? "ASSISTANT OUTPUT"
-                          : "RESPONSE PAYLOAD"}
+                          : endpoint.kind === "openai-images"
+                            ? "GENERATED IMAGE"
+                            : "RESPONSE PAYLOAD"}
                       </span>
                       {parsedResult.finishReason && (
                         <span className="mono muted">
@@ -1260,12 +1279,6 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                         </span>
                       )}
                     </div>
-                    <pre className="pg-output-pre mono">
-                      {parsedResult.content ||
-                        (inFlight
-                          ? "Waiting for tokens…"
-                          : "Send a request to inspect the response.")}
-                    </pre>
                     {parsedResult.images && parsedResult.images.length > 0 && (
                       <div
                         className="pg-image-output-grid"
@@ -1274,7 +1287,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                           gridTemplateColumns:
                             "repeat(auto-fit, minmax(260px, 1fr))",
                           gap: "12px",
-                          marginTop: "12px",
+                          marginBottom: "12px",
                         }}
                       >
                         {parsedResult.images.map((src, idx) => (
@@ -1340,6 +1353,14 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                         ))}
                       </div>
                     )}
+                    <pre className="pg-output-pre mono">
+                      {parsedResult.content ||
+                        (inFlight
+                          ? endpoint.kind === "openai-images"
+                            ? "Synthesizing image…"
+                            : "Waiting for tokens…"
+                          : "Send a request to inspect the response.")}
+                    </pre>
                   </div>
 
                   {hasAssistantReply && !inFlight && (
