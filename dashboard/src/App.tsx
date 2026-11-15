@@ -544,7 +544,7 @@ function DashboardShell({ state }: { state: MetricsState }) {
             <path d="m6 23 6-14h5l-6 14zm10 0 6-14h5l-6 14z" />
           </svg>
           <span>
-            warp<span className="brand-suffix">-34</span>
+            warp<span className="brand-suffix">34</span>
           </span>
         </Link>
         <div className="topbar-right">
