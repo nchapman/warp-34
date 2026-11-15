@@ -31,6 +31,7 @@ pub mod ple;
 pub mod profiling;
 #[cfg(feature = "cuda")]
 pub mod proposer;
+pub mod qwen_image;
 pub mod radix;
 mod remote_images;
 pub mod request_constraints;

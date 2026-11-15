@@ -469,6 +469,7 @@ impl ModelConfig {
         Self::from_json_with_policy(root, /* backbone_sliding_window_fatal = */ false)
     }
 
+    #[allow(clippy::cognitive_complexity)]
     fn from_json_with_policy(root: &Json, backbone_sliding_window_fatal: bool) -> io::Result<Self> {
         let tc = root.get("text_config").unwrap_or(root);
         let is_truthy = |v: &serde_json::Value| -> bool {
@@ -610,29 +611,44 @@ impl ModelConfig {
                 ),
             ));
         }
+        let is_qwen3_vl = matches!(model_type.as_str(), "qwen3_vl" | "qwen3_vl_text")
+            || architectures
+                .iter()
+                .any(|a| a == "Qwen3VLForConditionalGeneration");
         let rope_theta = rope_params
             .and_then(|rp| rp.get("rope_theta"))
             .or_else(|| tc.get("rope_theta"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(10_000_000.0) as f32;
-        let partial_rotary_factor = rope_params
-            .and_then(|rp| rp.get("partial_rotary_factor"))
-            .or_else(|| tc.get("partial_rotary_factor"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.25);
-        let rotary_dim = ((head_dim as f64) * partial_rotary_factor).round() as usize;
-        let mut mrope_section = [11usize, 11, 10];
+            .unwrap_or(if is_qwen3_vl {
+                5_000_000.0
+            } else {
+                10_000_000.0
+            }) as f32;
+        let mut mrope_section = if is_qwen3_vl {
+            [24usize, 20, 20]
+        } else {
+            [11usize, 11, 10]
+        };
         if let Some(arr) = rope_params
             .and_then(|rp| rp.get("mrope_section"))
+            .or_else(|| rope_scaling.and_then(|rs| rs.get("mrope_section")))
+            .or_else(|| tc.get("mrope_section"))
             .and_then(|v| v.as_array())
             && arr.len() == 3
         {
             mrope_section = [
-                arr[0].as_u64().unwrap_or(11) as usize,
-                arr[1].as_u64().unwrap_or(11) as usize,
-                arr[2].as_u64().unwrap_or(10) as usize,
+                arr[0].as_u64().unwrap_or(mrope_section[0] as u64) as usize,
+                arr[1].as_u64().unwrap_or(mrope_section[1] as u64) as usize,
+                arr[2].as_u64().unwrap_or(mrope_section[2] as u64) as usize,
             ];
         }
+        let default_partial_rotary = if is_qwen3_vl { 1.0 } else { 0.25 };
+        let partial_rotary_factor = rope_params
+            .and_then(|rp| rp.get("partial_rotary_factor"))
+            .or_else(|| tc.get("partial_rotary_factor"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default_partial_rotary);
+        let rotary_dim = ((head_dim as f64) * partial_rotary_factor).round() as usize;
 
         let tie_word_embeddings = tc
             .get("tie_word_embeddings")
@@ -653,7 +669,7 @@ impl ModelConfig {
         let attn_output_gate = tc
             .get("attn_output_gate")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(!is_qwen3_vl);
 
         let linear_num_key_heads = tc
             .get("linear_num_key_heads")
@@ -691,6 +707,8 @@ impl ModelConfig {
                     _ => LayerKind::FullAttention,
                 })
                 .collect()
+        } else if is_qwen3_vl {
+            vec![LayerKind::FullAttention; num_hidden_layers]
         } else {
             let interval = tc
                 .get("full_attention_interval")
@@ -698,7 +716,7 @@ impl ModelConfig {
                 .unwrap_or(4) as usize;
             (0..num_hidden_layers)
                 .map(|i| {
-                    if interval > 1 && (i + 1) % interval == 0 {
+                    if interval == 1 || (interval > 1 && (i + 1) % interval == 0) {
                         LayerKind::FullAttention
                     } else {
                         LayerKind::LinearAttention
@@ -1669,6 +1687,14 @@ impl ModelConfig {
             .iter()
             .filter(|&&k| k == LayerKind::LinearAttention)
             .count()
+    }
+
+    pub fn is_qwen3_vl(&self) -> bool {
+        matches!(self.model_type.as_str(), "qwen3_vl" | "qwen3_vl_text")
+            || self
+                .architectures
+                .iter()
+                .any(|a| a == "Qwen3VLForConditionalGeneration")
     }
 
     pub fn is_qwen4_exp(&self) -> bool {

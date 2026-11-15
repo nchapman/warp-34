@@ -382,7 +382,9 @@ fn download(
         .map(|s| s.rfilename)
         .collect();
     let metadata = files::metadata_files(&available)?;
-    if role == ModelRole::Target && !available.contains("tokenizer.json") {
+    let has_tokenizer = available.contains("tokenizer.json")
+        || (files::is_pipeline_files(&available) && available.contains("processor/tokenizer.json"));
+    if role == ModelRole::Target && !has_tokenizer {
         return Err(invalid(
             "checkpoint has no tokenizer.json required by warp34",
         ));
@@ -490,6 +492,22 @@ fn cached_files(dir: &Path) -> io::Result<BTreeSet<String>> {
                 safe_path(name)?;
                 if dir.join(name).is_file() {
                     names.insert(name.into());
+                }
+            }
+        }
+    }
+    if names.contains("model_index.json") && !names.contains("config.json") {
+        for sub in files::PIPELINE_SUBDIRS {
+            let sub_dir = dir.join(sub);
+            if !sub_dir.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(&sub_dir)? {
+                let entry = entry?;
+                if entry.path().is_file() {
+                    let rel = format!("{sub}/{}", entry.file_name().to_string_lossy());
+                    safe_path(&rel)?;
+                    names.insert(rel);
                 }
             }
         }

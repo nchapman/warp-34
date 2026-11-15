@@ -74,25 +74,35 @@ impl SafetensorsArchive {
     pub fn base_dir(&self) -> Option<&Path> {
         self.base_dir.as_deref()
     }
-    /// Opens either a checkpoint directory (`model.safetensors` or `model.safetensors.index.json`)
+    /// Opens either a checkpoint directory (`model.safetensors`,
+    /// `diffusion_pytorch_model.safetensors`, or their `.index.json` manifests)
     /// or a standalone `.safetensors` file directly.
     pub fn open(path: &Path) -> io::Result<Self> {
         if path.is_file() {
             return Self::open_single_file(path);
         }
-        let index_path = path.join("model.safetensors.index.json");
-        if index_path.exists() {
-            Self::open_indexed_dir(path, &index_path)
-        } else {
-            let single = path.join("model.safetensors");
-            if !single.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("No model.safetensors or index in {}", path.display()),
-                ));
+        for idx_name in [
+            "model.safetensors.index.json",
+            "diffusion_pytorch_model.safetensors.index.json",
+        ] {
+            let index_path = path.join(idx_name);
+            if index_path.exists() {
+                return Self::open_indexed_dir(path, &index_path);
             }
-            Self::open_single_file(&single)
         }
+        for single_name in ["model.safetensors", "diffusion_pytorch_model.safetensors"] {
+            let single = path.join(single_name);
+            if single.exists() {
+                return Self::open_single_file(&single);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "No model.safetensors / diffusion_pytorch_model.safetensors or index in {}",
+                path.display()
+            ),
+        ))
     }
 
     fn parse_safetensors_header(file: &File) -> io::Result<(u64, u64, Json)> {
