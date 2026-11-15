@@ -16,6 +16,7 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/", get(index))
         .route("/playground", get(index))
+        .route("/playground/{*path}", get(index))
         .route("/connect", get(index))
         .route("/favicon.svg", get(favicon))
         .route("/assets/{*path}", get(asset))
@@ -132,7 +133,7 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
-        for route in ["/playground", "/connect"] {
+        for route in ["/playground", "/playground/chat-completions", "/connect"] {
             let resp = client.get(format!("{base}{route}")).send().await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{route}");
             assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-cache");

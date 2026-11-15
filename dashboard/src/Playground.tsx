@@ -480,481 +480,535 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
         </div>
       </div>
 
-      <section
-        className="panel playground-toolbar"
-        aria-label="Endpoint controls"
-      >
-        <div className="pg-field">
-          <label htmlFor="pg-endpoint" className="eyebrow">
-            ENDPOINT
-          </label>
-          <select
-            id="pg-endpoint"
-            value={endpoint.id}
-            onChange={(e) => selectEndpoint(e.target.value)}
-          >
-            {(
-              [
-                "Generative",
-                "Decision & Scoring",
-                "Tokenizer & Counts",
-                "System",
-              ] as const
-            ).map((group) => (
-              <optgroup key={group} label={group}>
+      <div className="playground-workspace">
+        <aside className="panel pg-sidebar" aria-label="API endpoints">
+          {(
+            [
+              "Generative",
+              "Decision & Scoring",
+              "Tokenizer & Counts",
+              "System",
+            ] as const
+          ).map((group) => (
+            <div key={group} className="pg-sidebar-group">
+              <span className="eyebrow">{group.toUpperCase()}</span>
+              <div className="pg-sidebar-items">
                 {ENDPOINTS.filter((ep) => ep.group === group).map((ep) => (
-                  <option key={ep.id} value={ep.id}>
-                    {ep.label}
+                  <button
+                    key={ep.id}
+                    type="button"
+                    className={`pg-sidebar-item ${
+                      endpoint.id === ep.id ? "active" : ""
+                    }`}
+                    onClick={() => selectEndpoint(ep.id)}
+                  >
+                    <span
+                      className={`method-badge method-${ep.method.toLowerCase()}`}
+                    >
+                      {ep.method}
+                    </span>
+                    <span className="pg-sidebar-path mono">{ep.path}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </aside>
+
+        <div className="pg-main">
+          <section
+            className="panel playground-toolbar"
+            aria-label="Endpoint controls"
+          >
+            <div className="pg-field pg-endpoint-mobile">
+              <label htmlFor="pg-endpoint" className="eyebrow">
+                ENDPOINT
+              </label>
+              <select
+                id="pg-endpoint"
+                value={endpoint.id}
+                onChange={(e) => selectEndpoint(e.target.value)}
+              >
+                {(
+                  [
+                    "Generative",
+                    "Decision & Scoring",
+                    "Tokenizer & Counts",
+                    "System",
+                  ] as const
+                ).map((group) => (
+                  <optgroup key={group} label={group}>
+                    {ENDPOINTS.filter((ep) => ep.group === group).map((ep) => (
+                      <option key={ep.id} value={ep.id}>
+                        {ep.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+            </div>
+
+            <div className="pg-field">
+              <label htmlFor="pg-preset" className="eyebrow">
+                PRESET ·{" "}
+                {endpoint.presets.find((p) => p.id === presetId)?.description}
+              </label>
+              <select
+                id="pg-preset"
+                value={presetId}
+                onChange={(e) => selectPreset(e.target.value)}
+              >
+                {endpoint.presets.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}
                   </option>
                 ))}
-              </optgroup>
-            ))}
-          </select>
-        </div>
-
-        <div className="pg-field">
-          <label htmlFor="pg-preset" className="eyebrow">
-            PRESET
-          </label>
-          <select
-            id="pg-preset"
-            value={presetId}
-            onChange={(e) => selectPreset(e.target.value)}
-          >
-            {endpoint.presets.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.label}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="pg-actions">
-          <button
-            type="button"
-            className="pg-btn pg-btn-secondary"
-            onClick={() => void handleCopyCurl()}
-          >
-            {copiedCurl ? "Copied cURL" : "Copy cURL"}
-          </button>
-          {inFlight ? (
-            <button
-              type="button"
-              className="pg-btn pg-btn-danger"
-              onClick={() => abortRef.current?.abort()}
-            >
-              Abort
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="pg-btn pg-btn-primary"
-              disabled={Boolean(jsonError)}
-              onClick={() => void executeRequest()}
-            >
-              Send Request
-            </button>
-          )}
-        </div>
-      </section>
-
-      <div className="playground-grid">
-        <section
-          className="panel playground-pane"
-          aria-labelledby="req-pane-title"
-        >
-          <div className="panel-heading pg-pane-heading">
-            <div className="pg-title-group">
-              <span
-                className={`method-badge method-${endpoint.method.toLowerCase()}`}
-              >
-                {endpoint.method}
-              </span>
-              <h2 id="req-pane-title" className="mono">
-                {endpoint.path}
-              </h2>
+              </select>
             </div>
-            {endpoint.conversational && (
-              <div
-                className="pg-tab-group"
-                role="tablist"
-                aria-label="Request editor mode"
+
+            <div className="pg-actions">
+              <button
+                type="button"
+                className="pg-btn pg-btn-secondary"
+                onClick={() => void handleCopyCurl()}
               >
+                {copiedCurl ? "Copied cURL" : "Copy cURL"}
+              </button>
+              {inFlight ? (
                 <button
                   type="button"
-                  role="tab"
-                  aria-selected={requestTab === "structured"}
-                  className={requestTab === "structured" ? "active" : ""}
-                  onClick={() => setRequestTab("structured")}
+                  className="pg-btn pg-btn-danger"
+                  onClick={() => abortRef.current?.abort()}
                 >
-                  Messages & Params
+                  Abort
                 </button>
+              ) : (
                 <button
                   type="button"
-                  role="tab"
-                  aria-selected={requestTab === "json"}
-                  className={requestTab === "json" ? "active" : ""}
-                  onClick={() => setRequestTab("json")}
+                  className="pg-btn pg-btn-primary"
+                  disabled={Boolean(jsonError)}
+                  onClick={() => void executeRequest()}
                 >
-                  JSON Body
+                  Send Request
                 </button>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          </section>
 
-          {endpoint.conversational && requestTab === "structured" && bodyObj ? (
-            <div className="pg-structured">
-              <ParameterBar
-                endpoint={endpoint}
-                body={bodyObj}
-                onUpdate={updateBodyObject}
-              />
-
-              <div className="pg-messages-header">
-                <span className="eyebrow">
-                  {endpoint.kind === "openai-responses"
-                    ? "INSTRUCTIONS & INPUT TURNS"
-                    : "MESSAGES ARRAY"}
-                </span>
-                <div className="pg-message-add-btns">
-                  <button
-                    type="button"
-                    className="pg-mini-btn"
-                    onClick={() => handleAddMessage("user")}
+          <div className="playground-grid">
+            <section
+              className="panel playground-pane"
+              aria-labelledby="req-pane-title"
+            >
+              <div className="panel-heading pg-pane-heading">
+                <div className="pg-title-group">
+                  <span
+                    className={`method-badge method-${endpoint.method.toLowerCase()}`}
                   >
-                    + User turn
-                  </button>
-                  <button
-                    type="button"
-                    className="pg-mini-btn"
-                    onClick={() => handleAddMessage("assistant")}
-                  >
-                    + Assistant turn
-                  </button>
+                    {endpoint.method}
+                  </span>
+                  <h2 id="req-pane-title" className="mono">
+                    {endpoint.path}
+                  </h2>
                 </div>
+                {endpoint.conversational && (
+                  <div
+                    className="pg-tab-group"
+                    role="tablist"
+                    aria-label="Request editor mode"
+                  >
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={requestTab === "structured"}
+                      className={requestTab === "structured" ? "active" : ""}
+                      onClick={() => setRequestTab("structured")}
+                    >
+                      Messages & Params
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      aria-selected={requestTab === "json"}
+                      className={requestTab === "json" ? "active" : ""}
+                      onClick={() => setRequestTab("json")}
+                    >
+                      JSON Body
+                    </button>
+                  </div>
+                )}
               </div>
 
-              <div className="pg-messages-list">
-                {messages.map((msg, idx) => (
-                  <div key={idx} className="pg-message-row">
-                    <div className="pg-message-meta">
-                      <select
-                        aria-label={`Turn ${idx + 1} role`}
-                        value={msg.role}
-                        onChange={(e) =>
-                          handleMessageChange(idx, {
-                            role: e.target.value as TurnMessage["role"],
-                          })
-                        }
-                      >
-                        <option value="system">system</option>
-                        <option value="user">user</option>
-                        <option value="assistant">assistant</option>
-                        {endpoint.kind === "openai-chat" && (
-                          <option value="tool">tool</option>
-                        )}
-                      </select>
-                      <span className="pg-turn-index mono">#{idx}</span>
+              {endpoint.conversational &&
+              requestTab === "structured" &&
+              bodyObj ? (
+                <div className="pg-structured">
+                  <ParameterBar
+                    endpoint={endpoint}
+                    body={bodyObj}
+                    onUpdate={updateBodyObject}
+                  />
+
+                  <div className="pg-messages-header">
+                    <span className="eyebrow">
+                      {endpoint.kind === "openai-responses"
+                        ? "INSTRUCTIONS & INPUT TURNS"
+                        : "MESSAGES ARRAY"}
+                    </span>
+                    <div className="pg-message-add-btns">
                       <button
                         type="button"
-                        className="pg-remove-btn"
-                        aria-label={`Remove turn ${idx + 1}`}
-                        onClick={() => handleRemoveMessage(idx)}
+                        className="pg-mini-btn"
+                        onClick={() => handleAddMessage("user")}
                       >
-                        ×
+                        + User turn
+                      </button>
+                      <button
+                        type="button"
+                        className="pg-mini-btn"
+                        onClick={() => handleAddMessage("assistant")}
+                      >
+                        + Assistant turn
                       </button>
                     </div>
-                    <textarea
-                      aria-label={`Turn ${idx + 1} content`}
-                      rows={Math.min(
-                        8,
-                        Math.max(2, msg.content.split("\n").length),
-                      )}
-                      value={msg.content}
-                      placeholder={`${msg.role} content…`}
-                      onChange={(e) =>
-                        handleMessageChange(idx, { content: e.target.value })
-                      }
-                      onKeyDown={(e) => {
-                        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-                          e.preventDefault();
-                          void executeRequest();
-                        }
-                      }}
-                    />
                   </div>
-                ))}
-              </div>
-            </div>
-          ) : endpoint.method === "GET" ? (
-            <div className="pg-empty-body">
-              <code>GET {endpoint.path}</code> takes no request body. Click{" "}
-              <b>Send Request</b> to inspect the response.
-            </div>
-          ) : (
-            <div className="pg-json-editor">
-              <textarea
-                aria-label="Request JSON body"
-                className="mono"
-                rows={18}
-                value={rawJson}
-                onChange={(e) => handleRawJsonEdit(e.target.value)}
-                onKeyDown={(e) => {
-                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-                    e.preventDefault();
-                    void executeRequest();
-                  }
-                }}
-              />
-              {jsonError && (
-                <div className="pg-json-error" role="alert">
-                  JSON syntax error: {jsonError}
-                </div>
-              )}
-            </div>
-          )}
-        </section>
 
-        <section
-          className="panel playground-pane"
-          aria-labelledby="resp-pane-title"
-        >
-          <div className="panel-heading pg-pane-heading">
-            <div className="pg-title-group">
-              <h2 id="resp-pane-title">Wire Response</h2>
-              {inFlight && <span className="pg-badge amber">Streaming…</span>}
-              {callMetrics.status !== null && (
-                <span
-                  className={`pg-badge ${
-                    callMetrics.status >= 200 && callMetrics.status < 300
-                      ? "sage"
-                      : "danger"
-                  }`}
-                >
-                  {callMetrics.status} {callMetrics.statusText}
-                </span>
-              )}
-            </div>
-            <div
-              className="pg-tab-group"
-              role="tablist"
-              aria-label="Response inspector view"
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={responseTab === "parsed"}
-                className={responseTab === "parsed" ? "active" : ""}
-                onClick={() => setResponseTab("parsed")}
-              >
-                Parsed
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={responseTab === "raw"}
-                className={responseTab === "raw" ? "active" : ""}
-                onClick={() => setResponseTab("raw")}
-              >
-                Response JSON
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={responseTab === "sse"}
-                className={responseTab === "sse" ? "active" : ""}
-                onClick={() => setResponseTab("sse")}
-              >
-                SSE ({sseFrames.length})
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={responseTab === "curl"}
-                className={responseTab === "curl" ? "active" : ""}
-                onClick={() => setResponseTab("curl")}
-              >
-                cURL
-              </button>
-            </div>
-          </div>
-
-          <div className="pg-metrics-strip" aria-label="Response telemetry">
-            <div>
-              <span className="eyebrow">CLIENT TTFT</span>
-              <strong className="numeric">
-                {callMetrics.ttftMs !== null ? `${callMetrics.ttftMs} ms` : "—"}
-              </strong>
-            </div>
-            <div>
-              <span className="eyebrow">TOTAL E2E</span>
-              <strong className="numeric">
-                {callMetrics.e2eMs !== null ? `${callMetrics.e2eMs} ms` : "—"}
-              </strong>
-            </div>
-            <div>
-              <span className="eyebrow">STREAM PACE</span>
-              <strong className="numeric">
-                {decodeTokPerSec ? `${decodeTokPerSec} tok/s` : "—"}
-              </strong>
-            </div>
-            <div>
-              <span className="eyebrow">PROMPT / CACHED</span>
-              <strong className="numeric">
-                {parsedResult.usage.inputTokens ?? "—"} /{" "}
-                <span
-                  className={
-                    (parsedResult.usage.cachedTokens ?? 0) > 0 ? "healthy" : ""
-                  }
-                >
-                  {parsedResult.usage.cachedTokens ?? "—"}
-                </span>
-              </strong>
-            </div>
-            <div>
-              <span className="eyebrow">OUTPUT TOKENS</span>
-              <strong className="numeric">
-                {parsedResult.usage.outputTokens ?? "—"}
-              </strong>
-            </div>
-          </div>
-
-          {requestError && (
-            <div className="notice" role="alert">
-              <strong>Request failed:</strong> {requestError}
-            </div>
-          )}
-
-          {responseTab === "parsed" && (
-            <div className="pg-parsed-view">
-              {parsedResult.reasoning && (
-                <details className="pg-block pg-reasoning-block" open>
-                  <summary className="eyebrow">
-                    REASONING / THINKING STREAM
-                    {parsedResult.usage.reasoningTokens !== null &&
-                      ` (${parsedResult.usage.reasoningTokens} tok)`}
-                  </summary>
-                  <pre className="mono">{parsedResult.reasoning}</pre>
-                </details>
-              )}
-
-              {parsedResult.toolCalls.length > 0 && (
-                <div className="pg-block">
-                  <span className="eyebrow">TOOL CALLS</span>
-                  {parsedResult.toolCalls.map((tc) => (
-                    <div key={tc.id} className="pg-tool-call mono">
-                      <div className="pg-tool-header">
-                        <strong>{tc.name}</strong>
-                        <span className="muted">id: {tc.id}</span>
+                  <div className="pg-messages-list">
+                    {messages.map((msg, idx) => (
+                      <div key={idx} className="pg-message-row">
+                        <div className="pg-message-meta">
+                          <select
+                            aria-label={`Turn ${idx + 1} role`}
+                            value={msg.role}
+                            onChange={(e) =>
+                              handleMessageChange(idx, {
+                                role: e.target.value as TurnMessage["role"],
+                              })
+                            }
+                          >
+                            <option value="system">system</option>
+                            <option value="user">user</option>
+                            <option value="assistant">assistant</option>
+                            {endpoint.kind === "openai-chat" && (
+                              <option value="tool">tool</option>
+                            )}
+                          </select>
+                          <span className="pg-turn-index mono">#{idx}</span>
+                          <button
+                            type="button"
+                            className="pg-remove-btn"
+                            aria-label={`Remove turn ${idx + 1}`}
+                            onClick={() => handleRemoveMessage(idx)}
+                          >
+                            ×
+                          </button>
+                        </div>
+                        <textarea
+                          aria-label={`Turn ${idx + 1} content`}
+                          rows={Math.min(
+                            8,
+                            Math.max(2, msg.content.split("\n").length),
+                          )}
+                          value={msg.content}
+                          placeholder={`${msg.role} content…`}
+                          onChange={(e) =>
+                            handleMessageChange(idx, {
+                              content: e.target.value,
+                            })
+                          }
+                          onKeyDown={(e) => {
+                            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                              e.preventDefault();
+                              void executeRequest();
+                            }
+                          }}
+                        />
                       </div>
-                      <pre>{tc.arguments}</pre>
+                    ))}
+                  </div>
+                </div>
+              ) : endpoint.method === "GET" ? (
+                <div className="pg-empty-body">
+                  <code>GET {endpoint.path}</code> takes no request body. Click{" "}
+                  <b>Send Request</b> to inspect the response.
+                </div>
+              ) : (
+                <div className="pg-json-editor">
+                  <textarea
+                    aria-label="Request JSON body"
+                    className="mono"
+                    rows={18}
+                    value={rawJson}
+                    onChange={(e) => handleRawJsonEdit(e.target.value)}
+                    onKeyDown={(e) => {
+                      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                        e.preventDefault();
+                        void executeRequest();
+                      }
+                    }}
+                  />
+                  {jsonError && (
+                    <div className="pg-json-error" role="alert">
+                      JSON syntax error: {jsonError}
                     </div>
-                  ))}
+                  )}
                 </div>
               )}
+            </section>
 
-              <div className="pg-block">
-                <div className="pg-block-header">
-                  <span className="eyebrow">
-                    {endpoint.conversational
-                      ? "ASSISTANT OUTPUT"
-                      : "RESPONSE PAYLOAD"}
-                  </span>
-                  {parsedResult.finishReason && (
-                    <span className="mono muted">
-                      stop: {parsedResult.finishReason}
+            <section
+              className="panel playground-pane"
+              aria-labelledby="resp-pane-title"
+            >
+              <div className="panel-heading pg-pane-heading">
+                <div className="pg-title-group">
+                  <h2 id="resp-pane-title">Wire Response</h2>
+                  {inFlight && (
+                    <span className="pg-badge amber">Streaming…</span>
+                  )}
+                  {callMetrics.status !== null && (
+                    <span
+                      className={`pg-badge ${
+                        callMetrics.status >= 200 && callMetrics.status < 300
+                          ? "sage"
+                          : "danger"
+                      }`}
+                    >
+                      {callMetrics.status} {callMetrics.statusText}
                     </span>
                   )}
                 </div>
-                <pre className="pg-output-pre mono">
-                  {parsedResult.content ||
-                    (inFlight
-                      ? "Waiting for tokens…"
-                      : "Send a request to inspect the response.")}
-                </pre>
+                <div
+                  className="pg-tab-group"
+                  role="tablist"
+                  aria-label="Response inspector view"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={responseTab === "parsed"}
+                    className={responseTab === "parsed" ? "active" : ""}
+                    onClick={() => setResponseTab("parsed")}
+                  >
+                    Parsed
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={responseTab === "raw"}
+                    className={responseTab === "raw" ? "active" : ""}
+                    onClick={() => setResponseTab("raw")}
+                  >
+                    Response JSON
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={responseTab === "sse"}
+                    className={responseTab === "sse" ? "active" : ""}
+                    onClick={() => setResponseTab("sse")}
+                  >
+                    SSE ({sseFrames.length})
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={responseTab === "curl"}
+                    className={responseTab === "curl" ? "active" : ""}
+                    onClick={() => setResponseTab("curl")}
+                  >
+                    cURL
+                  </button>
+                </div>
               </div>
 
-              {hasAssistantReply && !inFlight && (
-                <div className="pg-continue-box">
-                  <div className="pg-continue-header">
-                    <span className="eyebrow">
-                      CONTINUE MULTI-TURN CONVERSATION
+              <div className="pg-metrics-strip" aria-label="Response telemetry">
+                <div>
+                  <span className="eyebrow">CLIENT TTFT</span>
+                  <strong className="numeric">
+                    {callMetrics.ttftMs !== null
+                      ? `${callMetrics.ttftMs} ms`
+                      : "—"}
+                  </strong>
+                </div>
+                <div>
+                  <span className="eyebrow">TOTAL E2E</span>
+                  <strong className="numeric">
+                    {callMetrics.e2eMs !== null
+                      ? `${callMetrics.e2eMs} ms`
+                      : "—"}
+                  </strong>
+                </div>
+                <div>
+                  <span className="eyebrow">STREAM PACE</span>
+                  <strong className="numeric">
+                    {decodeTokPerSec ? `${decodeTokPerSec} tok/s` : "—"}
+                  </strong>
+                </div>
+                <div>
+                  <span className="eyebrow">PROMPT / CACHED</span>
+                  <strong className="numeric">
+                    {parsedResult.usage.inputTokens ?? "—"} /{" "}
+                    <span
+                      className={
+                        (parsedResult.usage.cachedTokens ?? 0) > 0
+                          ? "healthy"
+                          : ""
+                      }
+                    >
+                      {parsedResult.usage.cachedTokens ?? "—"}
                     </span>
-                    <button
-                      type="button"
-                      className="pg-mini-btn"
-                      onClick={() => handleAppendAndContinue(false)}
-                    >
-                      ↪ Append assistant turn to messages[]
-                    </button>
-                  </div>
-                  <div className="pg-continue-row">
-                    <input
-                      type="text"
-                      aria-label="Follow-up user message"
-                      placeholder="Type next user turn to append & send (tests prefix cache reuse)…"
-                      value={followUpText}
-                      onChange={(e) => setFollowUpText(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (
-                          e.key === "Enter" &&
-                          followUpText.trim().length > 0
-                        ) {
-                          e.preventDefault();
-                          handleAppendAndContinue(true);
-                        }
-                      }}
-                    />
-                    <button
-                      type="button"
-                      className="pg-btn pg-btn-primary"
-                      disabled={followUpText.trim().length === 0}
-                      onClick={() => handleAppendAndContinue(true)}
-                    >
-                      Append & Send
-                    </button>
-                  </div>
+                  </strong>
+                </div>
+                <div>
+                  <span className="eyebrow">OUTPUT TOKENS</span>
+                  <strong className="numeric">
+                    {parsedResult.usage.outputTokens ?? "—"}
+                  </strong>
+                </div>
+              </div>
+
+              {requestError && (
+                <div className="notice" role="alert">
+                  <strong>Request failed:</strong> {requestError}
                 </div>
               )}
-            </div>
-          )}
 
-          {responseTab === "raw" && (
-            <pre className="pg-code-box mono" aria-label="Raw response payload">
-              {rawResponse || "No response payload captured yet."}
-            </pre>
-          )}
+              {responseTab === "parsed" && (
+                <div className="pg-parsed-view">
+                  {parsedResult.reasoning && (
+                    <details className="pg-block pg-reasoning-block" open>
+                      <summary className="eyebrow">
+                        REASONING / THINKING STREAM
+                        {parsedResult.usage.reasoningTokens !== null &&
+                          ` (${parsedResult.usage.reasoningTokens} tok)`}
+                      </summary>
+                      <pre className="mono">{parsedResult.reasoning}</pre>
+                    </details>
+                  )}
 
-          {responseTab === "sse" && (
-            <div className="pg-sse-list" aria-label="SSE frames">
-              {sseFrames.length === 0 ? (
-                <p className="muted">
-                  No SSE frames recorded. Enable <code>stream: true</code> and
-                  send a request.
-                </p>
-              ) : (
-                sseFrames.map((f) => (
-                  <div key={f.index} className="pg-sse-frame mono">
-                    <div className="pg-sse-meta">
-                      <span>#{f.index}</span>
-                      <span>+{f.elapsedMs}ms</span>
-                      {f.event && (
-                        <span className="amber">event: {f.event}</span>
+                  {parsedResult.toolCalls.length > 0 && (
+                    <div className="pg-block">
+                      <span className="eyebrow">TOOL CALLS</span>
+                      {parsedResult.toolCalls.map((tc) => (
+                        <div key={tc.id} className="pg-tool-call mono">
+                          <div className="pg-tool-header">
+                            <strong>{tc.name}</strong>
+                            <span className="muted">id: {tc.id}</span>
+                          </div>
+                          <pre>{tc.arguments}</pre>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="pg-block">
+                    <div className="pg-block-header">
+                      <span className="eyebrow">
+                        {endpoint.conversational
+                          ? "ASSISTANT OUTPUT"
+                          : "RESPONSE PAYLOAD"}
+                      </span>
+                      {parsedResult.finishReason && (
+                        <span className="mono muted">
+                          stop: {parsedResult.finishReason}
+                        </span>
                       )}
                     </div>
-                    <pre>{f.data}</pre>
+                    <pre className="pg-output-pre mono">
+                      {parsedResult.content ||
+                        (inFlight
+                          ? "Waiting for tokens…"
+                          : "Send a request to inspect the response.")}
+                    </pre>
                   </div>
-                ))
-              )}
-            </div>
-          )}
 
-          {responseTab === "curl" && (
-            <pre className="pg-code-box mono" aria-label="cURL command">
-              {curlCommand}
-            </pre>
-          )}
-        </section>
+                  {hasAssistantReply && !inFlight && (
+                    <div className="pg-continue-box">
+                      <div className="pg-continue-header">
+                        <span className="eyebrow">
+                          CONTINUE MULTI-TURN CONVERSATION
+                        </span>
+                        <button
+                          type="button"
+                          className="pg-mini-btn"
+                          onClick={() => handleAppendAndContinue(false)}
+                        >
+                          ↪ Append assistant turn to messages[]
+                        </button>
+                      </div>
+                      <div className="pg-continue-row">
+                        <input
+                          type="text"
+                          aria-label="Follow-up user message"
+                          placeholder="Type next user turn to append & send (tests prefix cache reuse)…"
+                          value={followUpText}
+                          onChange={(e) => setFollowUpText(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (
+                              e.key === "Enter" &&
+                              followUpText.trim().length > 0
+                            ) {
+                              e.preventDefault();
+                              handleAppendAndContinue(true);
+                            }
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="pg-btn pg-btn-primary"
+                          disabled={followUpText.trim().length === 0}
+                          onClick={() => handleAppendAndContinue(true)}
+                        >
+                          Append & Send
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {responseTab === "raw" && (
+                <pre
+                  className="pg-code-box mono"
+                  aria-label="Raw response payload"
+                >
+                  {rawResponse || "No response payload captured yet."}
+                </pre>
+              )}
+
+              {responseTab === "sse" && (
+                <div className="pg-sse-list" aria-label="SSE frames">
+                  {sseFrames.length === 0 ? (
+                    <p className="muted">
+                      No SSE frames recorded. Enable <code>stream: true</code>{" "}
+                      and send a request.
+                    </p>
+                  ) : (
+                    sseFrames.map((f) => (
+                      <div key={f.index} className="pg-sse-frame mono">
+                        <div className="pg-sse-meta">
+                          <span>#{f.index}</span>
+                          <span>+{f.elapsedMs}ms</span>
+                          {f.event && (
+                            <span className="amber">event: {f.event}</span>
+                          )}
+                        </div>
+                        <pre>{f.data}</pre>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              {responseTab === "curl" && (
+                <pre className="pg-code-box mono" aria-label="cURL command">
+                  {curlCommand}
+                </pre>
+              )}
+            </section>
+          </div>
+        </div>
       </div>
     </div>
   );

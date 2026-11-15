@@ -569,6 +569,10 @@ function DashboardShell({ state }: { state: MetricsState }) {
             path="/playground"
             element={<Playground model={latest?.model ?? null} />}
           />
+          <Route
+            path="/playground/:endpointId"
+            element={<Playground model={latest?.model ?? null} />}
+          />
           <Route path="/connect" element={<ConnectionGuide />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
