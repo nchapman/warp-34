@@ -659,4 +659,80 @@ describe("Playground UI integration", () => {
     );
     expect(screen.queryByAltText("Turn 2 attachment 1")).toBeNull();
   });
+
+  it("supports /v1/images/generations structured controls, renders generated PNGs, and forwards to /v1/images/edits", async () => {
+    const fakeB64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          created: 1700000000,
+          model: "Qwen/Qwen-Image-2.1-Turbo",
+          data: [
+            {
+              b64_json: fakeB64,
+              width: 512,
+              height: 512,
+              channels: 4,
+              steps: 8,
+              seed: 42,
+              timings: {
+                condition_encode_ms: 46.0,
+                vae_encode_ms: 0.0,
+                denoise_step0_ms: 219.0,
+                denoise_cached_ms: 1366.0,
+                vae_decode_ms: 152.0,
+                total_ms: 1783.0,
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    window.history.replaceState(null, "", "/playground");
+    render(
+      <Dashboard
+        state={{
+          history: [snapshot({ model: "Qwen/Qwen-Image-2.1-Turbo" })],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    expect((screen.getByLabelText("ENDPOINT") as HTMLSelectElement).value).toBe(
+      "images-generations",
+    );
+
+    fireEvent.change(screen.getByLabelText("Image size"), {
+      target: { value: "512x512" },
+    });
+    fireEvent.click(screen.getByLabelText("Transparent RGBA"));
+    fireEvent.change(screen.getByLabelText("Image prompt"), {
+      target: { value: "Translucent crystal lotus on dark water" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Send Request" }));
+
+    await waitFor(() => {
+      expect(screen.getByAltText("Generated output 1")).toBeVisible();
+    });
+    expect(screen.getByText(/512x512x4 \(RGBA\) · steps=8/)).toBeVisible();
+    expect(screen.getByRole("link", { name: "Download PNG" })).toHaveAttribute(
+      "href",
+      `data:image/png;base64,${fakeB64}`,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "↪ Edit Image" }));
+    expect((screen.getByLabelText("ENDPOINT") as HTMLSelectElement).value).toBe(
+      "images-edits",
+    );
+    expect(screen.getByAltText("Condition image 1")).toHaveAttribute(
+      "src",
+      `data:image/png;base64,${fakeB64}`,
+    );
+  });
 });
