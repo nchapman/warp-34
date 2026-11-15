@@ -182,9 +182,19 @@ function Overview({ state }: { state: MetricsState }) {
           <p>Your inference engine, at a glance.</p>
         </div>
         <span className="window-label">
-          <span className="tiny-clock" aria-hidden="true">
-            ◷
-          </span>{" "}
+          <svg
+            className="tiny-clock"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="8" cy="8" r="6.25" />
+            <path d="M8 4.5V8l2.4 1.5" />
+          </svg>
           Last 5 minutes · local history
         </span>
       </div>
@@ -207,7 +217,22 @@ function Overview({ state }: { state: MetricsState }) {
       )}
       <section className="engine-strip" aria-label="Engine configuration">
         <div className="model-icon" aria-hidden="true">
-          ◇
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.65"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <polygon
+              points="12 3 3 7.5 12 12 21 7.5 12 3"
+              fill="currentColor"
+              fillOpacity="0.18"
+            />
+            <polyline points="3 12 12 16.5 21 12" />
+            <polyline points="3 16.5 12 21 21 16.5" />
+          </svg>
         </div>
         <div className="model-info">
           <span className="eyebrow">LOADED MODEL</span>
