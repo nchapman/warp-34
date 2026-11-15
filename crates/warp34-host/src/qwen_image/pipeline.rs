@@ -20,7 +20,7 @@ use crate::cuda::f32_to_f16;
 #[cfg(feature = "cuda")]
 use crate::cuda::{CublasHandle, CudaDevice, CudaError, CudaStream, Result};
 #[cfg(feature = "cuda")]
-use crate::loader::{QuantScheme, SafetensorsArchive};
+use crate::loader::SafetensorsArchive;
 #[cfg(feature = "cuda")]
 use crate::qwen_image::text_encoder::{Qwen3VlConditioningEncoder, Qwen3VlConditioningOutput};
 #[cfg(feature = "cuda")]
@@ -460,12 +460,13 @@ impl QwenImage21PipelineEngine {
             QwenImage21VaeWeightsGpu::from_archive(&vae_archive, &cfg.vae, "", vae_dev)?;
         let vae = QwenImage21VaeEngine::new(vae_weights)?;
 
-        let quant = QuantScheme::Unquantized;
+        let tf_quant = &cfg.transformer.quant;
+        let te_quant = &cfg.text_encoder.quant;
         let (transformer, conditioning) = if tp_size == 2 {
             let tf_tp2 = QwenImage21TransformerTp2Engine::load_with_prefix(
                 &transformer_archive,
                 &cfg.transformer,
-                &quant,
+                tf_quant,
                 "",
                 8192,
             )?;
@@ -474,7 +475,7 @@ impl QwenImage21PipelineEngine {
             let te_encoder = Qwen3VlConditioningEncoder::load(
                 Arc::clone(&text_archive),
                 &cfg.text_encoder,
-                &quant,
+                te_quant,
                 0,
                 &te_stream,
             )?;
@@ -492,7 +493,7 @@ impl QwenImage21PipelineEngine {
             let tf_single = QwenImage21TransformerEngine::load(
                 &transformer_archive,
                 &cfg.transformer,
-                &quant,
+                tf_quant,
                 0,
                 &tf_stream,
             )?;
@@ -501,7 +502,7 @@ impl QwenImage21PipelineEngine {
             let te_encoder = Qwen3VlConditioningEncoder::load(
                 Arc::clone(&text_archive),
                 &cfg.text_encoder,
-                &quant,
+                te_quant,
                 1,
                 &te_stream,
             )?;
@@ -523,7 +524,7 @@ impl QwenImage21PipelineEngine {
             let tf_single = QwenImage21TransformerEngine::load(
                 &transformer_archive,
                 &cfg.transformer,
-                &quant,
+                tf_quant,
                 0,
                 &tf_stream,
             )?;
@@ -532,7 +533,7 @@ impl QwenImage21PipelineEngine {
             match Qwen3VlConditioningEncoder::load(
                 Arc::clone(&text_archive),
                 &cfg.text_encoder,
-                &quant,
+                te_quant,
                 0,
                 &te_stream,
             ) {
@@ -669,7 +670,7 @@ impl QwenImage21PipelineEngine {
                 let encoder = Qwen3VlConditioningEncoder::load(
                     Arc::clone(archive),
                     &self.cfg.text_encoder,
-                    &QuantScheme::Unquantized,
+                    &self.cfg.text_encoder.quant,
                     *device_id,
                     &stream,
                 )?;
@@ -690,7 +691,7 @@ impl QwenImage21PipelineEngine {
             let tf_single = QwenImage21TransformerEngine::load(
                 &self.transformer_archive,
                 &self.cfg.transformer,
-                &QuantScheme::Unquantized,
+                &self.cfg.transformer.quant,
                 0,
                 &tf_stream,
             )?;

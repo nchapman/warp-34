@@ -446,18 +446,28 @@ impl QwenImage21TransformerEngine {
         let out_dim = cfg.out_channels * cfg.patch_size * cfg.patch_size;
         let ctx_dim = cfg.context_in_dim;
 
-        let per_block_bytes =
-            (4 * qkv_dim_local * inner_dim + 3 * mlp_local * inner_dim + 2 * head_dim) * 2;
-        let top_level_bytes = (256 * inner_dim
-            + inner_dim * inner_dim
-            + ctx_dim
-            + inner_dim * ctx_dim
-            + inner_dim * inner_dim
-            + inner_dim * in_dim
-            + 4 * inner_dim * inner_dim
-            + inner_dim * inner_dim
-            + out_dim * inner_dim)
-            * 2;
+        let block_linear_elems = 4usize
+            .saturating_mul(qkv_dim_local)
+            .saturating_mul(inner_dim)
+            .saturating_add(3usize.saturating_mul(mlp_local).saturating_mul(inner_dim));
+        let per_block_bytes = if *quant == QuantScheme::Unquantized {
+            block_linear_elems
+                .saturating_add(2usize.saturating_mul(head_dim))
+                .saturating_mul(2)
+        } else {
+            let bytes_per_elem_num = if quant.bits() == 8 { 5 } else { 3 };
+            (block_linear_elems.saturating_mul(bytes_per_elem_num)) / 4
+                + 2usize.saturating_mul(head_dim).saturating_mul(2)
+                + 64 * 1024
+        };
+        let top_level_elems = 256usize
+            .saturating_mul(inner_dim)
+            .saturating_add(7usize.saturating_mul(inner_dim).saturating_mul(inner_dim))
+            .saturating_add(ctx_dim)
+            .saturating_add(inner_dim.saturating_mul(ctx_dim))
+            .saturating_add(inner_dim.saturating_mul(in_dim))
+            .saturating_add(out_dim.saturating_mul(inner_dim));
+        let top_level_bytes = top_level_elems.saturating_mul(2);
         let est_bytes = cfg
             .num_layers
             .saturating_mul(per_block_bytes)
@@ -888,7 +898,25 @@ impl QwenImage21TransformerEngine {
             }
             addr
         };
-        let exec_scratch_bytes = lse_scratch_bytes.max(64 * 1024);
+        let had_scratch_bytes = self
+            .blocks
+            .first()
+            .map(|b| {
+                [
+                    &b.to_q,
+                    &b.to_k,
+                    &b.to_v,
+                    &b.to_out,
+                    &b.mlp_gate_up,
+                    &b.mlp_out,
+                ]
+                .into_iter()
+                .filter_map(|p| p.input_transform_workspace_bytes(total_seq_len))
+                .max()
+                .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let exec_scratch_bytes = lse_scratch_bytes.max(had_scratch_bytes).max(64 * 1024);
         let exec_scratch_addr = QwenImage21Workspace::ensure_buf(
             &mut ws.exec_scratch,
             self.device_id,
@@ -1195,6 +1223,9 @@ impl QwenImage21TransformerEngine {
                 "warp34_qwen_image_adaln_modulate_f16(img_norm1)",
             )?;
 
+            let qkv_share_h64 = block.to_q.can_fuse_h64_from_producer()
+                && block.to_k.can_fuse_h64_from_producer()
+                && block.to_v.can_fuse_h64_from_producer();
             block.to_q.forward(
                 &ex,
                 cublas,
@@ -1204,24 +1235,45 @@ impl QwenImage21TransformerEngine {
                 d_q,
                 total_seq_len,
             )?;
-            block.to_k.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_norm,
-                d_k,
-                total_seq_len,
-            )?;
-            block.to_v.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_norm,
-                d_v,
-                total_seq_len,
-            )?;
+            if qkv_share_h64 {
+                block.to_k.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    ex.scratch_ptr,
+                    d_k,
+                    total_seq_len,
+                )?;
+                block.to_v.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    ex.scratch_ptr,
+                    d_v,
+                    total_seq_len,
+                )?;
+            } else {
+                block.to_k.forward(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_k,
+                    total_seq_len,
+                )?;
+                block.to_v.forward(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_v,
+                    total_seq_len,
+                )?;
+            }
 
             let cache_k_ptr = kv_cache
                 .as_ref()
@@ -1565,7 +1617,25 @@ impl QwenImage21TransformerEngine {
             }
             addr
         };
-        let exec_scratch_bytes = lse_scratch_bytes.max(64 * 1024);
+        let had_scratch_bytes = self
+            .blocks
+            .first()
+            .map(|b| {
+                [
+                    &b.to_q,
+                    &b.to_k,
+                    &b.to_v,
+                    &b.to_out,
+                    &b.mlp_gate_up,
+                    &b.mlp_out,
+                ]
+                .into_iter()
+                .filter_map(|p| p.input_transform_workspace_bytes(target_tokens))
+                .max()
+                .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let exec_scratch_bytes = lse_scratch_bytes.max(had_scratch_bytes).max(64 * 1024);
         let exec_scratch_addr = QwenImage21Workspace::ensure_buf(
             &mut ws.exec_scratch,
             self.device_id,
@@ -1706,6 +1776,9 @@ impl QwenImage21TransformerEngine {
                 let k_cache_tail = k_cache_full + tail_byte_off;
                 let v_cache_tail = v_cache_full + tail_byte_off;
 
+                let qkv_share_h64 = block.to_q.can_fuse_h64_from_producer()
+                    && block.to_k.can_fuse_h64_from_producer()
+                    && block.to_v.can_fuse_h64_from_producer();
                 block.to_q.forward(
                     &ex,
                     cublas,
@@ -1715,25 +1788,47 @@ impl QwenImage21TransformerEngine {
                     d_q,
                     target_tokens,
                 )?;
-                block.to_k.forward(
-                    &ex,
-                    cublas,
-                    marlin_ws_addr,
-                    marlin_ws_ints,
-                    d_norm,
-                    d_k,
-                    target_tokens,
-                )?;
-                // Write target V directly into the tail of `layer_v[layer_idx]` (`[prefix_len..prefix_len + target_tokens]`).
-                block.to_v.forward(
-                    &ex,
-                    cublas,
-                    marlin_ws_addr,
-                    marlin_ws_ints,
-                    d_norm,
-                    v_cache_tail,
-                    target_tokens,
-                )?;
+                if qkv_share_h64 {
+                    block.to_k.forward_prerotated(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        ex.scratch_ptr,
+                        d_k,
+                        target_tokens,
+                    )?;
+                    // Write target V directly into the tail of `layer_v[layer_idx]` (`[prefix_len..prefix_len + target_tokens]`).
+                    block.to_v.forward_prerotated(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        ex.scratch_ptr,
+                        v_cache_tail,
+                        target_tokens,
+                    )?;
+                } else {
+                    block.to_k.forward(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_norm,
+                        d_k,
+                        target_tokens,
+                    )?;
+                    // Write target V directly into the tail of `layer_v[layer_idx]` (`[prefix_len..prefix_len + target_tokens]`).
+                    block.to_v.forward(
+                        &ex,
+                        cublas,
+                        marlin_ws_addr,
+                        marlin_ws_ints,
+                        d_norm,
+                        v_cache_tail,
+                        target_tokens,
+                    )?;
+                }
 
                 // Write rotated target K directly into `k_cache_tail`.
                 check_rc(
@@ -2060,6 +2155,31 @@ pub struct QwenImage21TransformerTp2Engine {
 }
 
 #[cfg(feature = "cuda")]
+fn chunked_all_reduce_f16(
+    comm: &Tp2Collectives,
+    ex: &ffi::Warp34Exec,
+    d_buf: u64,
+    rank: i32,
+    n_elems: usize,
+) -> Result<()> {
+    let max_chunk = (comm.max_stage_bytes_per_epoch / 2).min(i32::MAX as usize) & !7usize;
+    if max_chunk == 0 {
+        return Err(CudaError::new(
+            -10,
+            "Tp2Collectives max_stage_bytes_per_epoch too small for chunked_all_reduce_f16",
+        ));
+    }
+    let mut off = 0usize;
+    while off < n_elems {
+        let chunk = (n_elems - off).min(max_chunk);
+        let ptr = d_buf + (off * 2) as u64;
+        comm.all_reduce_f16(ex, ptr, ptr, rank, chunk as i32)?;
+        off += chunk;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 impl QwenImage21TransformerTp2Engine {
     pub fn load_with_prefix(
         archive: &SafetensorsArchive,
@@ -2096,7 +2216,7 @@ impl QwenImage21TransformerTp2Engine {
             &stream1,
         )?;
 
-        let max_stage_bytes = (max_tokens.max(8192) * cfg.inner_dim() * 2).max(256 * 1024);
+        let max_stage_bytes = (max_tokens.max(16384) * cfg.inner_dim() * 2).max(256 * 1024);
         let comm = Arc::new(Tp2Collectives::new_for_tp(2, max_stage_bytes)?);
         Ok(Self {
             rank0,
@@ -2145,7 +2265,7 @@ impl QwenImage21TransformerTp2Engine {
                     &self.stream1,
                     Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
                         let ex = st.exec(0, 0);
-                        comm1.all_reduce_f16(&ex, d_buf, d_buf, 1, n_elems as i32)
+                        chunked_all_reduce_f16(&comm1, &ex, d_buf, 1, n_elems)
                     }),
                 )
             });
@@ -2162,7 +2282,7 @@ impl QwenImage21TransformerTp2Engine {
                 &self.stream0,
                 Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
                     let ex = st.exec(0, 0);
-                    comm0.all_reduce_f16(&ex, d_buf, d_buf, 0, n_elems as i32)
+                    chunked_all_reduce_f16(&comm0, &ex, d_buf, 0, n_elems)
                 }),
             );
             let r1 = h1
@@ -2194,7 +2314,7 @@ impl QwenImage21TransformerTp2Engine {
                     &self.stream1,
                     Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
                         let ex = st.exec(0, 0);
-                        comm1.all_reduce_f16(&ex, d_buf, d_buf, 1, n_elems as i32)
+                        chunked_all_reduce_f16(&comm1, &ex, d_buf, 1, n_elems)
                     }),
                 )
             });
@@ -2208,7 +2328,7 @@ impl QwenImage21TransformerTp2Engine {
                 &self.stream0,
                 Some(|d_buf: u64, n_elems: usize, st: &CudaStream| {
                     let ex = st.exec(0, 0);
-                    comm0.all_reduce_f16(&ex, d_buf, d_buf, 0, n_elems as i32)
+                    chunked_all_reduce_f16(&comm0, &ex, d_buf, 0, n_elems)
                 }),
             );
             let r1 = h1

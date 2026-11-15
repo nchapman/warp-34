@@ -707,6 +707,7 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         cfg_scale,
         seed,
         rgba_output,
+        compare_tp2,
         golden_path,
         ..
     } = options;
@@ -719,9 +720,10 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
     } else {
         output_resolution
     };
+    let effective_tp = if compare_tp2 { 1 } else { tp };
     let mut engine = crate::qwen_image::QwenImage21PipelineEngine::load(
         std::path::Path::new(&resolved_model),
-        tp,
+        effective_tp,
     )
     .map_err(|e| e.to_string())?;
     let steps = image_steps.unwrap_or_else(|| {
@@ -747,6 +749,26 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
         rgba_output: rgba_output || golden_path.is_some(),
     };
     let res = engine.generate(&req).map_err(|e| e.to_string())?;
+    if compare_tp2 {
+        drop(engine);
+        let mut engine_tp2 = crate::qwen_image::QwenImage21PipelineEngine::load(
+            std::path::Path::new(&resolved_model),
+            2,
+        )
+        .map_err(|e| e.to_string())?;
+        let res_tp2 = engine_tp2.generate(&req).map_err(|e| e.to_string())?;
+        let (psnr, max_diff) = compute_image_psnr(&res.pixels_u8, &res_tp2.pixels_u8)?;
+        println!(
+            "[warp34 dump-diff tp1-vs-tp2] model={model} size={}x{}x{} steps={steps} psnr={psnr:.2}dB max_px_diff={max_diff} tp1_ms={:.2} tp2_ms={:.2}",
+            res.width, res.height, res.channels, res.timings.total_ms, res_tp2.timings.total_ms,
+        );
+        if psnr < 35.0 {
+            return Err(format!(
+                "dump-diff tp1-vs-tp2 PSNR {psnr:.2} dB below 35.0 dB threshold"
+            ));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(ref golden) = golden_path {
         let bytes = std::fs::read(golden)
             .map_err(|e| format!("failed to read golden image '{golden}': {e}"))?;
@@ -760,9 +782,14 @@ fn run_qwen_image_dump_diff(options: CudaCliOptions) -> Result<ExitCode, String>
             res.channels,
             res.timings.total_ms,
         );
-        if psnr < 28.0 {
+        let min_psnr = if engine.cfg.transformer.quant != crate::loader::QuantScheme::Unquantized {
+            20.0
+        } else {
+            28.0
+        };
+        if psnr < min_psnr {
             return Err(format!(
-                "dump-diff PSNR {psnr:.2} dB below 28.0 dB threshold against '{golden}'"
+                "dump-diff PSNR {psnr:.2} dB below {min_psnr:.1} dB threshold against '{golden}'"
             ));
         }
     } else {

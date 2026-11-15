@@ -122,25 +122,25 @@ impl Qwen3VlConditioningEncoder {
         let raw_layer_bytes: usize = archive
             .iter_entries()
             .filter(|(name, _)| name.contains("layers."))
-            .map(|(_, info)| {
-                let bytes = info.len_bytes as usize;
-                if matches!(info.dtype.as_str(), "I32" | "U32") {
-                    bytes.saturating_mul(2)
-                } else {
-                    bytes
-                }
-            })
+            .map(|(_, info)| info.len_bytes as usize)
             .sum();
-        let per_layer_f16 = (q_dim * hidden
-            + 2 * kv_dim * hidden
-            + hidden * q_dim
-            + 3 * interm * hidden
-            + 2 * hidden
-            + 2 * head_dim)
-            * 2;
-        let est_bytes = raw_layer_bytes
-            .max(cfg.num_hidden_layers.saturating_mul(per_layer_f16))
-            .saturating_add(64 * 1024 * 1024);
+        let per_layer_f16 = q_dim
+            .saturating_mul(hidden)
+            .saturating_add(2usize.saturating_mul(kv_dim).saturating_mul(hidden))
+            .saturating_add(hidden.saturating_mul(q_dim))
+            .saturating_add(3usize.saturating_mul(interm).saturating_mul(hidden))
+            .saturating_add(2usize.saturating_mul(hidden))
+            .saturating_add(2usize.saturating_mul(head_dim))
+            .saturating_mul(2);
+        let dense_bytes = cfg.num_hidden_layers.saturating_mul(per_layer_f16);
+        let base_bytes = if *quant == QuantScheme::Unquantized || raw_layer_bytes == 0 {
+            dense_bytes
+        } else {
+            raw_layer_bytes
+                .saturating_add(raw_layer_bytes / 4)
+                .min(dense_bytes)
+        };
+        let est_bytes = base_bytes.saturating_add(64 * 1024 * 1024);
         let mut arena = DeviceArena::new(device_id, est_bytes)?;
 
         let upload_f16 =
@@ -426,7 +426,25 @@ impl Qwen3VlConditioningEncoder {
             }
             addr
         };
-        let exec_scratch_bytes = lse_scratch_bytes.max(64 * 1024);
+        let had_scratch_bytes = self
+            .layers
+            .first()
+            .map(|l| {
+                [
+                    &l.q_proj,
+                    &l.k_proj,
+                    &l.v_proj,
+                    &l.o_proj,
+                    &l.gate_up_proj,
+                    &l.down_proj,
+                ]
+                .into_iter()
+                .filter_map(|p| p.input_transform_workspace_bytes(seq_len))
+                .max()
+                .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let exec_scratch_bytes = lse_scratch_bytes.max(had_scratch_bytes).max(64 * 1024);
         let exec_scratch_addr =
             Qwen3VlWorkspace::ensure_buf(&mut ws.exec_scratch, self.device_id, exec_scratch_bytes)?;
         let ex = stream.exec(exec_scratch_addr, exec_scratch_bytes);
@@ -520,6 +538,9 @@ impl Qwen3VlConditioningEncoder {
                 "warp34_rms_norm_f16(input_layernorm)",
             )?;
 
+            let qkv_share_h64 = layer.q_proj.can_fuse_h64_from_producer()
+                && layer.k_proj.can_fuse_h64_from_producer()
+                && layer.v_proj.can_fuse_h64_from_producer();
             layer.q_proj.forward(
                 &ex,
                 cublas,
@@ -529,24 +550,45 @@ impl Qwen3VlConditioningEncoder {
                 d_q,
                 seq_len,
             )?;
-            layer.k_proj.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_norm,
-                d_k,
-                seq_len,
-            )?;
-            layer.v_proj.forward(
-                &ex,
-                cublas,
-                marlin_ws_addr,
-                marlin_ws_ints,
-                d_norm,
-                d_v,
-                seq_len,
-            )?;
+            if qkv_share_h64 {
+                layer.k_proj.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    ex.scratch_ptr,
+                    d_k,
+                    seq_len,
+                )?;
+                layer.v_proj.forward_prerotated(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    ex.scratch_ptr,
+                    d_v,
+                    seq_len,
+                )?;
+            } else {
+                layer.k_proj.forward(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_k,
+                    seq_len,
+                )?;
+                layer.v_proj.forward(
+                    &ex,
+                    cublas,
+                    marlin_ws_addr,
+                    marlin_ws_ints,
+                    d_norm,
+                    d_v,
+                    seq_len,
+                )?;
+            }
 
             check_rc(
                 // SAFETY: `d_q` (`[seq_len, q_dim]`) and `d_k` (`[seq_len, kv_dim]`) are normalized and rotated in-place

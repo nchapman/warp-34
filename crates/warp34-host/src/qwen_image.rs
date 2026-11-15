@@ -2127,4 +2127,96 @@ mod tests {
         assert_eq!(rgb_rt.len(), 4 * 4 * 3);
         let _ = f32_to_f16(0.0);
     }
+
+    #[test]
+    fn parses_w4a16_hgptq_transformer_and_text_encoder_quant_configs() {
+        let tf_cfg_json = serde_json::json!({
+            "_class_name": "QwenImage21Transformer2DModel",
+            "patch_size": 1,
+            "in_channels": 64,
+            "out_channels": 64,
+            "num_layers": 32,
+            "attention_head_dim": 128,
+            "num_attention_heads": 32,
+            "context_in_dim": 4096,
+            "mlp_ratio": 3,
+            "axes_dims_rope": [16, 56, 56],
+            "causal_condition": true,
+            "eps": 1e-6,
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["Linear"],
+                        "weights": {
+                            "num_bits": 4,
+                            "type": "int",
+                            "symmetric": true,
+                            "strategy": "group",
+                            "group_size": 64,
+                            "actorder": "static"
+                        }
+                    }
+                },
+                "ignore": [
+                    "img_in",
+                    "txt_in",
+                    "proj_out",
+                    "norm_out.linear",
+                    "time_text_embed.timestep_embedder.linear_1",
+                    "time_text_embed.timestep_embedder.linear_2",
+                    "re:^transformer_blocks\\.\\d+\\.modulation\\.1$"
+                ],
+                "transform_config": {
+                    "config_groups": {
+                        "h64_in": {
+                            "type": "hadamard",
+                            "head_dim": 64,
+                            "randomize": false,
+                            "apply": [
+                                {
+                                    "location": "weight_input",
+                                    "targets": ["re:^transformer_blocks\\.\\d+\\.(attn\\.(to_q|to_k|to_v|to_out\\.0)|mlp\\.(gate_up_proj|down_proj))$"],
+                                    "inverse": true
+                                },
+                                {
+                                    "location": "input",
+                                    "targets": ["re:^transformer_blocks\\.\\d+\\.(attn\\.(to_q|to_k|to_v|to_out\\.0)|mlp\\.(gate_up_proj|down_proj))$"],
+                                    "inverse": false
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let tf_cfg = QwenImage21TransformerConfig::from_json(&tf_cfg_json).unwrap();
+        assert_ne!(tf_cfg.quant, QuantScheme::Unquantized);
+        assert_eq!(
+            tf_cfg.quant.for_linear("img_in").unwrap(),
+            QuantScheme::Unquantized
+        );
+        assert_eq!(
+            tf_cfg
+                .quant
+                .for_linear("transformer_blocks.0.modulation.1")
+                .unwrap(),
+            QuantScheme::Unquantized
+        );
+        assert_ne!(
+            tf_cfg
+                .quant
+                .for_linear("transformer_blocks.0.attn.to_q")
+                .unwrap(),
+            QuantScheme::Unquantized
+        );
+        assert_eq!(
+            tf_cfg
+                .quant
+                .input_hadamard("transformer_blocks.0.attn.to_q")
+                .unwrap(),
+            Some(64)
+        );
+    }
 }
