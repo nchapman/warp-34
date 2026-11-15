@@ -141,8 +141,13 @@ pub(crate) fn run_image(options: CudaCliOptions) -> Result<ExitCode, String> {
             .map(|s| s.len().max(1))
             .unwrap_or(40)
     });
+    let effective_prompt = if rgba_output && condition_images.is_empty() {
+        crate::qwen_image::ensure_rgba_transparency_prompt(&prompt)
+    } else {
+        prompt
+    };
     let req = crate::qwen_image::QwenImage21GenerationRequest {
-        prompt,
+        prompt: effective_prompt,
         negative_prompt,
         condition_images,
         width,

@@ -422,7 +422,7 @@ export const ENDPOINTS: EndpointSpec[] = [
         buildBody: (model) => ({
           model,
           prompt:
-            "An isometric glowing crystal potion bottle with gold filigree, isolated sticker icon with transparent background",
+            "This is an RGBA image with transparency. An isometric glowing crystal potion bottle with gold filigree, isolated sticker icon. The image has alpha channel and the background is transparent.",
           size: "1024x1024",
           steps: 8,
           guidance_scale: 1.0,

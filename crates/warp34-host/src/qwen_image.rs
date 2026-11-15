@@ -73,6 +73,25 @@ pub fn format_t2i_prompt(user_prompt: &str) -> String {
     PROMPT_TEMPLATE_T2I.replace("{}", p)
 }
 
+/// Applies Qwen-Image-2.1's trained RGBA transparency trigger envelope when not already present:
+/// `"This is an RGBA image with transparency. <prompt>. The image has alpha channel and the background is transparent."`
+pub fn ensure_rgba_transparency_prompt(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return String::from(
+            "This is an RGBA image with transparency. The image has alpha channel and the background is transparent.",
+        );
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("rgba image") || lower.contains("alpha channel") {
+        return prompt.to_string();
+    }
+    let body = trimmed.trim_end_matches('.');
+    format!(
+        "This is an RGBA image with transparency. {body}. The image has alpha channel and the background is transparent."
+    )
+}
+
 /// Formats a user prompt and `num_images` vision placeholders using `PROMPT_TEMPLATE_TI2I`.
 /// Matches `QwenImage21Pipeline._get_qwen_prompt_embeds`.
 pub fn format_ti2i_prompt(user_prompt: &str, num_images: usize) -> String {

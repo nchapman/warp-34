@@ -1310,6 +1310,8 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                                 height: "auto",
                                 display: "block",
                                 borderRadius: "4px",
+                                background:
+                                  "repeating-conic-gradient(#161a22 0% 25%, #262d3d 0% 50%) 50% / 20px 20px",
                               }}
                             />
                             <figcaption
@@ -1615,6 +1617,35 @@ function extractConditionImages(
   return out;
 }
 
+const RGBA_PROMPT_PREFIX = "This is an RGBA image with transparency. ";
+const RGBA_PROMPT_SUFFIX =
+  "The image has alpha channel and the background is transparent.";
+
+function wrapRgbaTransparencyPrompt(prompt: string): string {
+  const trimmed = prompt.trim();
+  if (!trimmed) return `${RGBA_PROMPT_PREFIX}${RGBA_PROMPT_SUFFIX}`;
+  const lower = trimmed.toLowerCase();
+  if (lower.includes("rgba image") || lower.includes("alpha channel")) {
+    return prompt;
+  }
+  const body = trimmed.replace(/\.+$/, "");
+  return `${RGBA_PROMPT_PREFIX}${body}. ${RGBA_PROMPT_SUFFIX}`;
+}
+
+function unwrapRgbaTransparencyPrompt(prompt: string): string {
+  let out = prompt.trim();
+  if (out.toLowerCase().startsWith(RGBA_PROMPT_PREFIX.toLowerCase())) {
+    out = out.slice(RGBA_PROMPT_PREFIX.length).trim();
+  }
+  if (out.toLowerCase().endsWith(RGBA_PROMPT_SUFFIX.toLowerCase())) {
+    out = out
+      .slice(0, out.length - RGBA_PROMPT_SUFFIX.length)
+      .trim()
+      .replace(/\.+$/, "");
+  }
+  return out;
+}
+
 const IMAGE_SIZE_OPTIONS = [
   "1024x1024",
   "512x512",
@@ -1759,8 +1790,17 @@ function ImageRequestEditor({
             onChange={(e) => {
               const checked = e.target.checked;
               onUpdate((curr) => {
+                const currPrompt =
+                  typeof curr.prompt === "string" ? curr.prompt : "";
+                const nextPrompt =
+                  !isEditEndpoint && currPrompt.length > 0
+                    ? checked
+                      ? wrapRgbaTransparencyPrompt(currPrompt)
+                      : unwrapRgbaTransparencyPrompt(currPrompt)
+                    : currPrompt;
                 const next: Record<string, unknown> = {
                   ...curr,
+                  prompt: nextPrompt,
                   background: checked ? "transparent" : "opaque",
                 };
                 delete next.rgba;

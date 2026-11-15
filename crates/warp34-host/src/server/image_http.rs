@@ -832,11 +832,17 @@ async fn handle_image_request(
         .num_inference_steps
         .unwrap_or(state.worker.default_steps);
 
+    let effective_prompt = if parsed.rgba_output && parsed.condition_images.is_empty() {
+        crate::qwen_image::ensure_rgba_transparency_prompt(&parsed.prompt)
+    } else {
+        parsed.prompt.clone()
+    };
+
     let mut data = Vec::with_capacity(parsed.n);
     for idx in 0..parsed.n {
         let item_seed = parsed.seed.wrapping_add(idx as u64);
         let gen_req = QwenImage21GenerationRequest {
-            prompt: parsed.prompt.clone(),
+            prompt: effective_prompt.clone(),
             negative_prompt: parsed.negative_prompt.clone(),
             condition_images: parsed.condition_images.clone(),
             width: parsed.width,
@@ -858,7 +864,7 @@ async fn handle_image_request(
         let b64 = encode_base64(&res.png_bytes);
         data.push(json!({
             "b64_json": b64,
-            "revised_prompt": parsed.prompt,
+            "revised_prompt": effective_prompt,
             "width": res.width,
             "height": res.height,
             "channels": res.channels,
