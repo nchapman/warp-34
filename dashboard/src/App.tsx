@@ -501,34 +501,38 @@ function ConnectionGuide() {
           <p>One engine. Your tools.</p>
         </div>
       </div>
-      <section className="panel guide">
-        <span className="eyebrow">OPENAI-COMPATIBLE API</span>
-        <h2>Bring your coding agent.</h2>
-        <p>
-          Point an OpenAI-compatible client at this server’s base URL and use
-          the loaded model identifier shown in Overview.
-        </p>
-        <label>Base URL</label>
-        <code>{base}/v1</code>
-        <p>
-          Native Responses and Anthropic Messages endpoints are also available.
-          Model capabilities and client configuration vary; this page does not
-          change engine settings.
-        </p>
-      </section>
-      <section className="panel guide">
-        <span className="eyebrow">OBSERVABILITY</span>
-        <h2>Use your own monitoring.</h2>
-        <p>
-          Scrape <a href="/metrics">/metrics</a> with Prometheus, or consume the
-          same counters and histogram buckets as JSON at{" "}
-          <a href="/api/metrics">/api/metrics</a>. This dashboard keeps up to
-          five minutes of history in this tab; use an external collector for
-          persistence.
-        </p>
-        <pre>{`scrape_configs:\n  - job_name: warp34\n    scrape_interval: 10s\n    static_configs:\n      - targets: ['${window.location.host}']`}</pre>
-      </section>
-      <section className="guide-security">
+      <div className="connect-grid">
+        <section className="panel guide">
+          <span className="eyebrow">OPENAI-COMPATIBLE API</span>
+          <h2>Bring your coding agent.</h2>
+          <p>
+            Point an OpenAI-compatible client at this server’s base URL and use
+            the loaded model identifier shown in Overview.
+          </p>
+          <label>Base URL</label>
+          <code>{base}/v1</code>
+          <p>
+            Native Responses and Anthropic Messages endpoints are also
+            available. Model capabilities and client configuration vary; this
+            page does not change engine settings.
+          </p>
+        </section>
+        <section className="panel guide">
+          <span className="eyebrow">OBSERVABILITY</span>
+          <h2>Use your own monitoring.</h2>
+          <p>
+            Scrape <a href="/metrics">/metrics</a> with Prometheus, or consume
+            the same counters and histogram buckets as JSON at{" "}
+            <a href="/api/metrics">/api/metrics</a>. This dashboard keeps up to
+            five minutes of history in this tab; use an external collector for
+            persistence.
+          </p>
+          <label>Prometheus scrape config</label>
+          <pre>{`scrape_configs:\n  - job_name: warp34\n    scrape_interval: 10s\n    static_configs:\n      - targets: ['${window.location.host}']`}</pre>
+        </section>
+      </div>
+      <section className="panel guide-security">
+        <span className="eyebrow">EXPOSURE &amp; AUTHENTICATION</span>
         <h2>Keep your endpoint private.</h2>
         <p>
           API-key authentication is optional. When enabled, configure your

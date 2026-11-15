@@ -1037,7 +1037,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                     className={responseTab === "raw" ? "active" : ""}
                     onClick={() => setResponseTab("raw")}
                   >
-                    Response JSON
+                    Raw JSON
                   </button>
                   <button
                     type="button"
@@ -1062,7 +1062,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
 
               <div className="pg-metrics-strip" aria-label="Response telemetry">
                 <div>
-                  <span className="eyebrow">CLIENT TTFT</span>
+                  <span className="eyebrow">TTFT</span>
                   <strong className="numeric">
                     {callMetrics.ttftMs !== null
                       ? `${callMetrics.ttftMs} ms`
@@ -1078,13 +1078,13 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                   </strong>
                 </div>
                 <div>
-                  <span className="eyebrow">STREAM PACE</span>
+                  <span className="eyebrow">PACE</span>
                   <strong className="numeric">
                     {decodeTokPerSec ? `${decodeTokPerSec} tok/s` : "—"}
                   </strong>
                 </div>
                 <div>
-                  <span className="eyebrow">PROMPT / CACHED</span>
+                  <span className="eyebrow">IN / CACHED</span>
                   <strong className="numeric">
                     {parsedResult.usage.inputTokens ?? "—"} /{" "}
                     <span
@@ -1099,7 +1099,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                   </strong>
                 </div>
                 <div>
-                  <span className="eyebrow">OUTPUT TOKENS</span>
+                  <span className="eyebrow">OUTPUT</span>
                   <strong className="numeric">
                     {parsedResult.usage.outputTokens ?? "—"}
                   </strong>
@@ -1164,15 +1164,13 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
                   {hasAssistantReply && !inFlight && (
                     <div className="pg-continue-box">
                       <div className="pg-continue-header">
-                        <span className="eyebrow">
-                          CONTINUE MULTI-TURN CONVERSATION
-                        </span>
+                        <span className="eyebrow">MULTI-TURN CONTINUATION</span>
                         <button
                           type="button"
                           className="pg-mini-btn"
                           onClick={() => handleAppendAndContinue(false)}
                         >
-                          ↪ Append assistant turn to messages[]
+                          ↪ Append assistant turn
                         </button>
                       </div>
                       <div className="pg-continue-row">
