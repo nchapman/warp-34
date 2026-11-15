@@ -253,6 +253,66 @@ describe("playground wire helpers", () => {
       tool_call_id: "call_gpu0",
       content: '{"temp_c":58,"free_mib":5120}',
     });
+
+    // Verify Anthropic tool_use + tool_result continuation
+    const anthroAfterTool = appendAssistantTurnToBody(
+      "anthropic-messages",
+      {
+        model: "qwen",
+        messages: [{ role: "user", content: "Check GPU 0" }],
+      },
+      {
+        ...emptyParsedResult(),
+        toolCalls: [
+          {
+            id: "toolu_1",
+            name: "query_gpu_status",
+            arguments: '{"device_index":0}',
+          },
+        ],
+      },
+      '{"temp_c":58}',
+    );
+    const anthroMsgs = anthroAfterTool.messages as Array<
+      Record<string, unknown>
+    >;
+    expect(anthroMsgs).toHaveLength(3);
+    expect(anthroMsgs[1]).toEqual({
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_1",
+          name: "query_gpu_status",
+          input: { device_index: 0 },
+        },
+      ],
+    });
+    expect(anthroMsgs[2]).toEqual({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_1",
+          content: '{"temp_c":58}',
+        },
+      ],
+    });
+
+    // Verify out-of-range SSE tool_call index does not throw or allocate huge arrays
+    const badIdxFrame = {
+      index: 0,
+      elapsedMs: 1,
+      event: null,
+      data: '{"choices":[{"delta":{"tool_calls":[{"index":-1,"id":"c1","function":{"name":"fn","arguments":"{}"}},{"index":99999999,"function":{"arguments":"{\\"x\\":1}"}}]}}]}',
+    };
+    const safeFolded = applySseFrameToResult(
+      "openai-chat",
+      emptyParsedResult(),
+      badIdxFrame,
+    );
+    expect(safeFolded.toolCalls).toHaveLength(1);
+    expect(safeFolded.toolCalls[0].name).toBe("fn");
   });
 
   it("enforces Anthropic thinking budget_tokens < max_tokens and stateful Responses scope", () => {

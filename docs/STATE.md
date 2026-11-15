@@ -1,5 +1,12 @@
 # warp-34 — Session Orientation & Current State
 
+## Embedded Web Console API Playground & Multi-Turn Wire Workbench (`dashboard/`, `crates/w34-host/src/dashboard.rs`)
+
+- **Interactive API Playground (`dashboard/src/{playground.ts,Playground.tsx,Playground.test.tsx}`, `dashboard/src/{App.tsx,style.css}`, `crates/w34-host/src/dashboard.rs`):**
+  - Added a routed `Playground` workbench (`react-router` `/playground`, `/playground/{*path}`, `/connect`, and `?endpoint=&preset=` query state) to the compile-time embedded React console (`Overview` | `Playground` | `Connect`).
+  - Covers all 13 HTTP endpoints (`POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`, `POST /v1/completions`, `POST /v1/decisions`, `POST /v1/systemone`, `POST /tokenize`, `POST /detokenize`, `POST /v1/chat/completions/input_tokens`, `POST /v1/responses/input_tokens`, `POST /v1/messages/count_tokens`, `GET /v1/models`, `GET /health`) with a sticky `276px` left endpoint sidebar on wide viewports (`> 1050px`) and a compact dropdown on narrow viewports.
+  - Supports two-way synchronized `Messages & Params` $\leftrightarrow$ `JSON Body` editing, client-side image upload (`+ Image`, drag-and-drop, clipboard paste, automatic WebP/GIF/BMP $\to$ PNG `<canvas>` transcoding, thumbnail previews under `img-src 'self' data: blob:`, and native `image_url` / `input_image` / Anthropic `base64` serialization), multi-turn `Append & Send` continuation (preserving `tool_calls` + `tool_result` / `function_call_output`, `reasoning_content`, and stateful `/v1/responses` `previous_response_id`), incremental SSE frame inspection, and `Copy cURL`.
+
 ## Full 1–2× NVIDIA A100 (`sm_80`) Support, NVLink P2P Collectives, & 80 GiB Full-Residency Tiered MoE
 
 - **`sm_80` Architecture Support & Static Binary Gates (`crates/w34-kernels/build.rs`, `crates/w34-host/src/cuda.rs`, `tools/check_cuda_binaries.py`, `tools/oracle/test_cuda_gates.py`, `Dockerfile`, `tests/dflash_proposer.rs`):**

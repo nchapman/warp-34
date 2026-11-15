@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useParams, useSearchParams } from "react-router";
+import { useNavigate, useParams, useSearchParams } from "react-router";
 import {
   ENDPOINTS,
   appendAssistantTurnToBody,
@@ -36,6 +36,8 @@ const MAX_SSE_INSPECTOR_FRAMES = 512;
 const MAX_SSE_BUFFER_CHARS = 1_048_576;
 const REQUEST_IDLE_TIMEOUT_MS = 120_000;
 const MAX_IMAGES_PER_REQUEST = 4;
+const MAX_IMAGE_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_CANVAS_DIM = 2048;
 
 function resolveRoute(
   pathEndpointId: string | undefined,
@@ -45,7 +47,7 @@ function resolveRoute(
   endpoint: EndpointSpec;
   presetId: string;
 } {
-  const requestedEndpoint = pathEndpointId ?? searchParams.get("endpoint");
+  const requestedEndpoint = searchParams.get("endpoint") ?? pathEndpointId;
   const fallbackId = decisionMode ? "decisions" : "chat-completions";
   const endpoint =
     ENDPOINTS.find((e) => e.id === requestedEndpoint) ??
@@ -60,6 +62,10 @@ function resolveRoute(
 
 function readFileAsEngineDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (file.size > MAX_IMAGE_FILE_BYTES) {
+      reject(new Error(`Image '${file.name}' exceeds 16 MiB limit.`));
+      return;
+    }
     const reader = new FileReader();
     reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
     reader.onload = () => {
@@ -76,18 +82,22 @@ function readFileAsEngineDataUrl(file: File): Promise<string> {
       // Transcode WebP/GIF/BMP to PNG data URL so warp-34's native Rust PNG/JPEG decoder accepts it
       const img = new Image();
       img.onload = () => {
+        const rawW = img.naturalWidth || img.width || 64;
+        const rawH = img.naturalHeight || img.height || 64;
+        const scale = Math.min(1, MAX_CANVAS_DIM / Math.max(rawW, rawH, 1));
         const canvas = document.createElement("canvas");
-        canvas.width = img.naturalWidth || img.width || 64;
-        canvas.height = img.naturalHeight || img.height || 64;
+        canvas.width = Math.max(1, Math.round(rawW * scale));
+        canvas.height = Math.max(1, Math.round(rawH * scale));
         const ctx = canvas.getContext("2d");
         if (!ctx) {
           resolve(result);
           return;
         }
-        ctx.drawImage(img, 0, 0);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         resolve(canvas.toDataURL("image/png"));
       };
-      img.onerror = () => resolve(result);
+      img.onerror = () =>
+        reject(new Error(`Failed to decode image '${file.name}'.`));
       img.src = result;
     };
     reader.readAsDataURL(file);
@@ -95,6 +105,7 @@ function readFileAsEngineDataUrl(file: File): Promise<string> {
 }
 
 export function Playground({ model, decisionMode = false }: PlaygroundProps) {
+  const navigate = useNavigate();
   const { endpointId: pathEndpointId } = useParams<{ endpointId?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
   const defaultEndpointId = decisionMode ? "decisions" : "chat-completions";
@@ -114,7 +125,12 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     if (nextPresetId !== spec.presets[0].id) {
       nextParams.set("preset", nextPresetId);
     }
-    setSearchParams(nextParams, { replace: true });
+    if (pathEndpointId) {
+      const qs = nextParams.toString();
+      navigate(qs ? `/playground?${qs}` : "/playground", { replace: true });
+    } else {
+      setSearchParams(nextParams, { replace: true });
+    }
   }
 
   const [rawJson, setRawJson] = useState<string>(() => {
@@ -275,13 +291,22 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     const remainingBudget = Math.max(0, MAX_IMAGES_PER_REQUEST - totalImages);
     const toRead = fileArr.slice(0, remainingBudget);
     if (toRead.length === 0) return;
-    const dataUrls = await Promise.all(toRead.map(readFileAsEngineDataUrl));
-    updateBodyObject((curr) => {
-      const list = extractMessagesFromBody(endpoint.kind, curr).map((m, i) =>
-        i === index ? { ...m, images: [...(m.images ?? []), ...dataUrls] } : m,
+    try {
+      const dataUrls = await Promise.all(toRead.map(readFileAsEngineDataUrl));
+      setRequestError(null);
+      updateBodyObject((curr) => {
+        const list = extractMessagesFromBody(endpoint.kind, curr).map((m, i) =>
+          i === index
+            ? { ...m, images: [...(m.images ?? []), ...dataUrls] }
+            : m,
+        );
+        return applyMessagesToBody(endpoint.kind, curr, list);
+      });
+    } catch (err) {
+      setRequestError(
+        err instanceof Error ? err.message : "Failed to attach image.",
       );
-      return applyMessagesToBody(endpoint.kind, curr, list);
-    });
+    }
   }
 
   function handleRemoveImage(turnIdx: number, imgIdx: number) {
@@ -469,7 +494,11 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
           e2eMs: totalMs,
         });
       } else {
-        const text = await response.text();
+        const rawText = await response.text();
+        const text =
+          rawText.length > MAX_SSE_BUFFER_CHARS
+            ? `${rawText.slice(0, MAX_SSE_BUFFER_CHARS)}\n… [response truncated at 1 MiB]`
+            : rawText;
         const totalMs = Math.round(performance.now() - startTime);
         setCallMetrics({
           status: response.status,

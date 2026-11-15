@@ -901,13 +901,64 @@ export function applyMessagesToBody(
     } else {
       delete next.instructions;
     }
-    next.input = rest.map((m) => ({
-      role: m.role === "assistant" ? "assistant" : "user",
-      content: serializeTurnContent("openai-responses", m),
-    }));
+    next.input = rest.flatMap((m) => {
+      if (m.role === "tool" && m.tool_call_id) {
+        return [
+          {
+            type: "function_call_output",
+            call_id: m.tool_call_id,
+            output: m.content,
+          },
+        ];
+      }
+      const items: unknown[] = [];
+      const content = serializeTurnContent("openai-responses", m);
+      if (
+        (typeof content === "string" && content.length > 0) ||
+        Array.isArray(content) ||
+        !m.tool_calls ||
+        m.tool_calls.length === 0
+      ) {
+        items.push({
+          role: m.role === "assistant" ? "assistant" : "user",
+          content,
+        });
+      }
+      if (m.tool_calls && m.tool_calls.length > 0) {
+        for (const tc of m.tool_calls) {
+          if (!tc || typeof tc !== "object") continue;
+          const t = tc as Record<string, unknown>;
+          const fn = (t.function ?? t) as Record<string, unknown>;
+          items.push({
+            type: "function_call",
+            call_id:
+              typeof t.call_id === "string"
+                ? t.call_id
+                : typeof t.id === "string"
+                  ? t.id
+                  : "call_0",
+            name: typeof fn.name === "string" ? fn.name : "function",
+            arguments: typeof fn.arguments === "string" ? fn.arguments : "{}",
+          });
+        }
+      }
+      return items;
+    });
     return next;
   }
   return next;
+}
+
+function safeJsonParseObject(raw: string): Record<string, unknown> {
+  try {
+    const val = JSON.parse(raw);
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      return val as Record<string, unknown>;
+    }
+  } catch {
+    // Fall back to empty object
+  }
+  return {};
 }
 
 /**
@@ -925,11 +976,50 @@ export function appendAssistantTurnToBody(
     return {
       ...body,
       previous_response_id: parsed.responseId,
-      input: [{ role: "user", content: nextUserContent }],
+      input:
+        parsed.toolCalls.length > 0
+          ? parsed.toolCalls.map((tc, idx) => ({
+              type: "function_call_output",
+              call_id: tc.id,
+              output:
+                idx === 0 && nextUserContent.trim().length > 0
+                  ? nextUserContent
+                  : '{"status":"ok"}',
+            }))
+          : [{ role: "user", content: nextUserContent }],
     };
   }
   const current = extractMessagesFromBody(kind, body);
-  if (kind === "openai-chat" && parsed.toolCalls.length > 0) {
+  if (parsed.toolCalls.length > 0) {
+    if (kind === "anthropic-messages") {
+      const assistantTurn: TurnMessage = {
+        role: "assistant",
+        content: parsed.content,
+        rawContentBlocks: parsed.toolCalls.map((tc) => ({
+          type: "tool_use",
+          id: tc.id,
+          name: tc.name,
+          input: safeJsonParseObject(tc.arguments),
+        })),
+      };
+      const toolResultTurn: TurnMessage = {
+        role: "user",
+        content: "",
+        rawContentBlocks: parsed.toolCalls.map((tc, idx) => ({
+          type: "tool_result",
+          tool_use_id: tc.id,
+          content:
+            idx === 0 && nextUserContent.trim().length > 0
+              ? nextUserContent
+              : '{"status":"ok"}',
+        })),
+      };
+      return applyMessagesToBody(kind, body, [
+        ...current,
+        assistantTurn,
+        toolResultTurn,
+      ]);
+    }
     const assistantTurn: TurnMessage = {
       role: "assistant",
       content: parsed.content,
@@ -1263,7 +1353,14 @@ export function applySseFrameToResult(
           for (const item of delta.tool_calls) {
             if (!item || typeof item !== "object") continue;
             const tc = item as Record<string, unknown>;
-            const idx = typeof tc.index === "number" ? tc.index : 0;
+            const rawIdx = tc.index;
+            const idx =
+              typeof rawIdx === "number" &&
+              Number.isSafeInteger(rawIdx) &&
+              rawIdx >= 0 &&
+              rawIdx < 32
+                ? rawIdx
+                : 0;
             while (next.toolCalls.length <= idx) {
               next.toolCalls.push({
                 id: `call_${next.toolCalls.length}`,
@@ -1339,7 +1436,16 @@ export function applySseFrameToResult(
           finishReason: finalParsed.finishReason ?? next.finishReason,
           responseId: finalParsed.responseId ?? next.responseId,
           streamError: finalParsed.streamError ?? next.streamError,
-          usage: finalParsed.usage,
+          usage: {
+            inputTokens:
+              finalParsed.usage.inputTokens ?? next.usage.inputTokens,
+            cachedTokens:
+              finalParsed.usage.cachedTokens ?? next.usage.cachedTokens,
+            outputTokens:
+              finalParsed.usage.outputTokens ?? next.usage.outputTokens,
+            reasoningTokens:
+              finalParsed.usage.reasoningTokens ?? next.usage.reasoningTokens,
+          },
         };
       }
     }
