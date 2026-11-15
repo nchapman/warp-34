@@ -84,11 +84,30 @@ fn main() {
     }
 
     if !plan.is_empty() {
+        plan.sort_by_key(|(src, _, _, _)| {
+            let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            let priority = match stem {
+                "op_marlin" => 0,
+                "op_vision_fa2" => 1,
+                "op_moe" => 2,
+                "op_paged_fa2" => 3,
+                "op_collectives" => 4,
+                "op_norms_rope_act" => 5,
+                "op_dflash2" => 6,
+                _ => 7,
+            };
+            let inv_len = u64::MAX - fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+            (priority, inv_len)
+        });
+        let default_jobs = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .min(16);
         let jobs = var("WARP34_NVCC_JOBS")
             .ok()
             .and_then(|j| j.parse::<usize>().ok())
             .filter(|&j| j > 0)
-            .unwrap_or(16)
+            .unwrap_or(default_jobs)
             .min(plan.len());
         println!(
             "cargo:warning=[warp34-kernels] nvcc: {} file(s), {jobs} job(s)",
@@ -149,7 +168,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=WARP34_ARCH");
-    println!("cargo:rerun-if-env-changed=WARP34_NVCC_JOBS");
     println!("cargo:rerun-if-env-changed=WARP34_NVCC_EXTRA");
 }
 
@@ -211,6 +229,8 @@ fn compile_one(nvcc: &Path, flags: &str, csrc: &Path, src: &Path, obj: &Path) {
     }
     let st = command
         .args(flags.split_whitespace())
+        .arg("--threads")
+        .arg("0")
         .arg("-c")
         .arg("-I")
         .arg(csrc)

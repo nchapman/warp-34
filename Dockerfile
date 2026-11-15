@@ -23,21 +23,45 @@ RUN apt-get update \
     && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
 WORKDIR /src
 # Frontend sources are not Rust build inputs; only the built assets are embedded.
+# Layer 1: Pre-build all third-party Rust & C++/CMake dependencies (cached until Cargo.lock changes).
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ ./.cargo/
-COPY crates/ ./crates/
-COPY --from=dashboard /dashboard/dist ./dashboard/dist
-# Bound nvcc parallelism on smaller build hosts; kernels build as an sm_80 + sm_86 + sm_89 fatbinary by default.
-ARG WARP34_NVCC_JOBS=4
-ARG WARP34_ARCH=sm_80,sm_86,sm_89
+COPY crates/warp34-kernels/Cargo.toml ./crates/warp34-kernels/Cargo.toml
+COPY crates/warp34-host/Cargo.toml ./crates/warp34-host/Cargo.toml
+RUN --mount=type=cache,id=warp34-cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    mkdir -p crates/warp34-kernels/src crates/warp34-host/src \
+    && echo "" > crates/warp34-kernels/src/lib.rs \
+    && echo "" > crates/warp34-host/src/lib.rs \
+    && echo "fn main() {}" > crates/warp34-host/src/main.rs \
+    && cargo build --locked --release --features cuda --bin warp34 \
+    && rm -rf crates/warp34-kernels/src \
+        target/release/.fingerprint/warp34-* \
+        target/release/deps/libwarp34_* \
+        target/release/deps/warp34* \
+        target/release/build/warp34-* \
+        target/release/warp34
+
+# Layer 2: Pre-build warp34-kernels sm_80 + sm_86 + sm_89 CUDA fatbinary (cached until crates/warp34-kernels changes).
 # Compress the embedded device code, not the executable with a runtime packer.
-# Keep native SASS for both GPU generations and the existing PTX fallback.
+ARG WARP34_NVCC_JOBS=8
+ARG WARP34_ARCH=sm_80,sm_86,sm_89
 ARG WARP34_NVCC_EXTRA=--compress-mode=size
-RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,target=/src/target,sharing=locked \
-    WARP34_ARCH=${WARP34_ARCH} WARP34_NVCC_JOBS=${WARP34_NVCC_JOBS} WARP34_NVCC_EXTRA=${WARP34_NVCC_EXTRA} \
-    cargo build --locked --release --features cuda --bin warp34 \
-    && cp target/release/warp34 /warp34
+ENV WARP34_ARCH=${WARP34_ARCH} \
+    WARP34_NVCC_EXTRA=${WARP34_NVCC_EXTRA}
+COPY crates/warp34-kernels/ ./crates/warp34-kernels/
+RUN --mount=type=cache,id=warp34-cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    WARP34_NVCC_JOBS=${WARP34_NVCC_JOBS} \
+    cargo build --locked --release --features cuda -p warp34-kernels
+
+# Layer 3: Build warp34-host with embedded dashboard assets and remove /src/target
+# so the final layer only exports the linked /warp34 binary.
+COPY crates/warp34-host/ ./crates/warp34-host/
+COPY --from=dashboard /dashboard/dist ./dashboard/dist
+RUN --mount=type=cache,id=warp34-cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    touch crates/warp34-host/src/lib.rs crates/warp34-host/src/main.rs \
+    && cargo build --locked --release --features cuda --bin warp34 \
+    && cp target/release/warp34 /warp34 \
+    && rm -rf target
 
 # Do not ship the multi-GB CUDA runtime image, toolkit, or driver stubs.
 # The host driver is injected by NVIDIA Container Toolkit with --gpus.
