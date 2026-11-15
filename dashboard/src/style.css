@@ -125,19 +125,27 @@ nav {
   gap: 28px;
   border-bottom: 1px solid var(--border);
 }
+nav a,
 nav button {
   padding: 0 1px 14px;
   background: none;
   border: 0;
   color: var(--muted);
   position: relative;
+  display: inline-flex;
+  align-items: center;
 }
+nav a:hover,
 nav button:hover {
   color: var(--text);
 }
+nav a.active,
+nav a.selected,
 nav button.selected {
   color: var(--text);
 }
+nav a.active::after,
+nav a.selected::after,
 nav button.selected::after {
   content: "";
   height: 2px;

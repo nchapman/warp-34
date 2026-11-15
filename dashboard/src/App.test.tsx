@@ -81,7 +81,7 @@ describe("dashboard states", () => {
         state={{ history: [], connection: "connecting", error: null }}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+    fireEvent.click(screen.getByRole("link", { name: "Connect" }));
     expect(
       screen.getByRole("heading", { name: "Bring your coding agent." }),
     ).toBeVisible();
@@ -92,6 +92,7 @@ describe("dashboard states", () => {
       "href",
       "/api/metrics",
     );
+    window.history.replaceState(null, "", "/");
   });
   it("populates throughput and latency panels for zero-generated-token decision workloads", () => {
     const s1 = snapshot({

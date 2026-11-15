@@ -1,4 +1,14 @@
-import { useState } from "react";
+import { useEffect } from "react";
+import {
+  BrowserRouter,
+  Link,
+  MemoryRouter,
+  NavLink,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+} from "react-router";
 import { Chart, type Point } from "./Chart";
 import { Playground } from "./Playground";
 import {
@@ -508,25 +518,35 @@ function ConnectionGuide() {
   );
 }
 
-export function Dashboard({ state }: { state: MetricsState }) {
-  const [page, setPage] = useState<"overview" | "playground" | "connect">(
-    "overview",
-  );
+function titleFromPathname(pathname: string): string {
+  if (pathname.startsWith("/playground")) return "warp-34 · Playground";
+  if (pathname.startsWith("/connect")) return "warp-34 · Connect";
+  return "warp-34 · Overview";
+}
+
+function DashboardShell({ state }: { state: MetricsState }) {
+  const location = useLocation();
   const latest = state.history.at(-1);
+  const isPlayground = location.pathname.startsWith("/playground");
+
+  useEffect(() => {
+    document.title = titleFromPathname(location.pathname);
+  }, [location.pathname]);
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main">
         Skip to content
       </a>
       <header className="topbar">
-        <a className="brand" href="/" aria-label="warp-34 home">
+        <Link className="brand" to="/" aria-label="warp-34 home">
           <svg viewBox="0 0 32 32" aria-hidden="true">
             <path d="m6 23 6-14h5l-6 14zm10 0 6-14h5l-6 14z" />
           </svg>
           <span>
             warp<span className="brand-suffix">-34</span>
           </span>
-        </a>
+        </Link>
         <div className="topbar-right">
           <span className="uptime">
             Uptime <b>{latest ? uptime(latest.uptime_seconds) : "—"}</b>
@@ -535,37 +555,23 @@ export function Dashboard({ state }: { state: MetricsState }) {
         </div>
       </header>
       <nav aria-label="Main navigation">
-        <button
-          className={page === "overview" ? "selected" : ""}
-          aria-current={page === "overview" ? "page" : undefined}
-          onClick={() => setPage("overview")}
-        >
+        <NavLink to="/" end>
           Overview
-        </button>
-        <button
-          className={page === "playground" ? "selected" : ""}
-          aria-current={page === "playground" ? "page" : undefined}
-          onClick={() => setPage("playground")}
-        >
-          Playground
-        </button>
-        <button
-          className={page === "connect" ? "selected" : ""}
-          aria-current={page === "connect" ? "page" : undefined}
-          onClick={() => setPage("connect")}
-        >
-          Connect
-        </button>
+        </NavLink>
+        <NavLink to="/playground">Playground</NavLink>
+        <NavLink to="/connect">Connect</NavLink>
         <span className="nav-label">INFERENCE CONSOLE</span>
       </nav>
       <main id="main">
-        {page === "overview" ? (
-          <Overview state={state} />
-        ) : page === "playground" ? (
-          <Playground model={latest?.model ?? null} />
-        ) : (
-          <ConnectionGuide />
-        )}
+        <Routes>
+          <Route path="/" element={<Overview state={state} />} />
+          <Route
+            path="/playground"
+            element={<Playground model={latest?.model ?? null} />}
+          />
+          <Route path="/connect" element={<ConnectionGuide />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       </main>
       <footer>
         <span>
@@ -578,10 +584,31 @@ export function Dashboard({ state }: { state: MetricsState }) {
               ? "Waiting to reconnect"
               : "Connecting to engine"}
           <span className="separator">·</span>
-          {page === "playground" ? "Interactive console" : "Read-only"}
+          {isPlayground ? "Interactive console" : "Read-only"}
         </span>
       </footer>
     </div>
+  );
+}
+
+export function Dashboard({
+  state,
+  initialEntries,
+}: {
+  state: MetricsState;
+  initialEntries?: string[];
+}) {
+  if (initialEntries) {
+    return (
+      <MemoryRouter initialEntries={initialEntries}>
+        <DashboardShell state={state} />
+      </MemoryRouter>
+    );
+  }
+  return (
+    <BrowserRouter>
+      <DashboardShell state={state} />
+    </BrowserRouter>
   );
 }
 

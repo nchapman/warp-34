@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router";
 import {
   ENDPOINTS,
   appendAssistantTurnToBody,
@@ -35,20 +36,61 @@ const MAX_SSE_INSPECTOR_FRAMES = 512;
 const MAX_SSE_BUFFER_CHARS = 1_048_576;
 const REQUEST_IDLE_TIMEOUT_MS = 120_000;
 
+function resolveInitialRoute(
+  searchParams: URLSearchParams,
+  decisionMode: boolean,
+): {
+  endpoint: EndpointSpec;
+  presetId: string;
+} {
+  const requestedEndpoint = searchParams.get("endpoint");
+  const fallbackId = decisionMode ? "decisions" : "chat-completions";
+  const endpoint =
+    ENDPOINTS.find((e) => e.id === requestedEndpoint) ??
+    ENDPOINTS.find((e) => e.id === fallbackId) ??
+    ENDPOINTS[0];
+  const requestedPreset = searchParams.get("preset");
+  const preset =
+    endpoint.presets.find((p) => p.id === requestedPreset) ??
+    endpoint.presets[0];
+  return { endpoint, presetId: preset.id };
+}
+
 export function Playground({ model, decisionMode = false }: PlaygroundProps) {
+  const [searchParams, setSearchParams] = useSearchParams();
   const defaultEndpointId = decisionMode ? "decisions" : "chat-completions";
-  const [endpointId, setEndpointId] = useState<string>(defaultEndpointId);
+  const initial = resolveInitialRoute(searchParams, decisionMode);
+  const [endpointId, setEndpointId] = useState<string>(initial.endpoint.id);
   const endpoint = ENDPOINTS.find((e) => e.id === endpointId) ?? ENDPOINTS[0];
 
-  const [presetId, setPresetId] = useState<string>(endpoint.presets[0].id);
+  const [presetId, setPresetId] = useState<string>(initial.presetId);
   const activeModel = model ?? DEFAULT_MODEL;
 
-  const [rawJson, setRawJson] = useState<string>(() =>
-    JSON.stringify(endpoint.presets[0].buildBody(activeModel), null, 2),
-  );
+  function updateRouteParams(nextEndpointId: string, nextPresetId: string) {
+    const spec = ENDPOINTS.find((e) => e.id === nextEndpointId) ?? ENDPOINTS[0];
+    const nextParams = new URLSearchParams();
+    if (nextEndpointId !== defaultEndpointId) {
+      nextParams.set("endpoint", nextEndpointId);
+    }
+    if (nextPresetId !== spec.presets[0].id) {
+      nextParams.set("preset", nextPresetId);
+    }
+    setSearchParams(nextParams, { replace: true });
+  }
+
+  const [rawJson, setRawJson] = useState<string>(() => {
+    const preset =
+      initial.endpoint.presets.find((p) => p.id === initial.presetId) ??
+      initial.endpoint.presets[0];
+    return initial.endpoint.method === "GET"
+      ? ""
+      : JSON.stringify(preset.buildBody(activeModel), null, 2);
+  });
   const [jsonError, setJsonError] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState<string>("");
-  const [requestTab, setRequestTab] = useState<RequestTab>("structured");
+  const [requestTab, setRequestTab] = useState<RequestTab>(() =>
+    initial.endpoint.conversational ? "structured" : "json",
+  );
   const [responseTab, setResponseTab] = useState<ResponseTab>("parsed");
 
   const [inFlight, setInFlight] = useState<boolean>(false);
@@ -96,6 +138,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
     const firstPreset = nextSpec.presets[0];
     setEndpointId(nextSpec.id);
     setPresetId(firstPreset.id);
+    updateRouteParams(nextSpec.id, firstPreset.id);
     const body = firstPreset.buildBody(activeModel);
     setRawJson(nextSpec.method === "GET" ? "" : JSON.stringify(body, null, 2));
     setJsonError(null);
@@ -108,6 +151,7 @@ export function Playground({ model, decisionMode = false }: PlaygroundProps) {
       endpoint.presets.find((p) => p.id === nextPresetId) ??
       endpoint.presets[0];
     setPresetId(preset.id);
+    updateRouteParams(endpoint.id, preset.id);
     const body = preset.buildBody(activeModel);
     setRawJson(endpoint.method === "GET" ? "" : JSON.stringify(body, null, 2));
     setJsonError(null);

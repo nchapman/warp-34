@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Dashboard } from "./App";
 import { snapshot } from "./fixtures";
 import {
@@ -13,6 +13,10 @@ import {
   formatCurlCommand,
   parseJsonResponse,
 } from "./playground";
+
+beforeEach(() => {
+  window.history.replaceState(null, "", "/");
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -250,7 +254,7 @@ describe("Playground UI integration", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+    fireEvent.click(screen.getByRole("link", { name: "Playground" }));
     expect(
       screen.getByRole("heading", { name: "API Playground" }),
     ).toBeVisible();
@@ -337,7 +341,7 @@ describe("Playground UI integration", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+    fireEvent.click(screen.getByRole("link", { name: "Playground" }));
     fireEvent.click(screen.getByRole("button", { name: "Send Request" }));
 
     await waitFor(() => {
@@ -373,7 +377,7 @@ describe("Playground UI integration", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Playground" }));
+    fireEvent.click(screen.getByRole("link", { name: "Playground" }));
 
     // Switch to JSON Body and enter invalid JSON
     fireEvent.click(screen.getByRole("tab", { name: "JSON Body" }));
@@ -402,5 +406,42 @@ describe("Playground UI integration", () => {
     await waitFor(() => {
       expect(screen.getByRole("alert")).toHaveTextContent("Connection refused");
     });
+  });
+
+  it("syncs navigation and endpoint selection with browser URL and popstate", () => {
+    window.history.replaceState(null, "", "/playground?endpoint=decisions");
+    render(
+      <Dashboard
+        state={{
+          history: [snapshot({ model: "test/model" })],
+          connection: "live",
+          error: null,
+        }}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "API Playground" }),
+    ).toBeVisible();
+    expect(document.title).toBe("warp-34 · Playground");
+    expect((screen.getByLabelText("ENDPOINT") as HTMLSelectElement).value).toBe(
+      "decisions",
+    );
+
+    fireEvent.change(screen.getByLabelText("ENDPOINT"), {
+      target: { value: "responses" },
+    });
+    expect(window.location.pathname + window.location.search).toBe(
+      "/playground?endpoint=responses",
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Connect" }));
+    expect(window.location.pathname).toBe("/connect");
+    expect(document.title).toBe("warp-34 · Connect");
+
+    window.history.replaceState(null, "", "/");
+    fireEvent(window, new PopStateEvent("popstate"));
+    expect(screen.getByRole("heading", { name: "Overview" })).toBeVisible();
+    expect(document.title).toBe("warp-34 · Overview");
   });
 });
